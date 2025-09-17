@@ -9,7 +9,7 @@ build/
 *-build/
 Testing/
 build-support/boost_*
-
+data/_TimeSeries
 # Build directories created by Clion
 cmake-build-*/
 
@@ -25,7 +25,8 @@ cmake-build-*/
 *.kdev4
 *.log
 *.swp
-
+*.fls
+*.jpeg
 #########################################
 # ignore tmp directory
 tmp

@@ -16,6 +16,7 @@
 #include "fls/json/fls_json.hpp"       // for JSON
 #include "fls/reader/csv_reader.hpp"   // for CSVReader
 #include "fls/reader/json_reader.hpp"  // for JSONReader
+#include "fls/reader/dctchannel_reader.hpp" // for DctChannelReader
 #include "fls/reader/table_reader.hpp" // for TableReader
 #include "fls/std/filesystem.hpp"      // for std::filesystem::directory_iterator, begin, path
 #include "fls/std/string.hpp"          // for std::string
@@ -41,6 +42,12 @@ Connection::Connection(const Config& config) {
 
 Connection& Connection::read_csv(const path& dir_path) {
 	m_table = CsvReader::Read(dir_path, *this);
+
+	return *this;
+}
+
+Connection& Connection::read_dct(const ProcessedDCTChannel& channel) {
+	m_table = DctChannelReader::Read(channel, *this);
 
 	return *this;
 }

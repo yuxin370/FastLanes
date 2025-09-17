@@ -27,6 +27,20 @@ endif ()
 add_compile_definitions(NOMINMAX)
 
 
+# # ----------------------------
+# # search for libjpeg
+# # ----------------------------
+# find_package(PkgConfig REQUIRED)
+# pkg_check_modules(JPEG REQUIRED libjpeg)
+
+# if pkg-config can not find libjpeg, using manual path.
+if(NOT JPEG_FOUND)
+    message(WARNING "pkg-config did not find libjpeg, using manual path.")
+    set(JPEG_LIBRARIES jpeg)
+    set(JPEG_INCLUDE_DIRS /usr/include)
+    set(JPEG_LIBRARY_DIRS /usr/lib/x86_64-linux-gnu)
+endif()
+
 # Project : ------------------------------------------------------------------------------------------------------------
 project(FastLanes)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
@@ -194,6 +208,16 @@ if (FLS_BUILD_TESTING OR FLS_BUILD_CUDA OR FLS_ENABLE_FSST_TESTING_AND_BENCHMARK
     endif ()
 endif ()
 
+# If JPEG_LIBRARY_DIRS exists, add the library path.
+if(JPEG_LIBRARY_DIRS)
+    link_directories(${JPEG_LIBRARY_DIRS})
+endif()
+
+
+# Compilation options
+# target_compile_options(jpeg_fastlanes PRIVATE -O2 -Wall -Wextra)
+# Optional: disable strict warnings
+# target_compile_options(jpeg_fastlanes PRIVATE -O2 -Wno-sign-conversion -Wno-float-conversion)
 
 # ALP: -----------------------------------------------------------------------------------------------------------------
 if (true)

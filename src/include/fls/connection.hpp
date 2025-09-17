@@ -15,6 +15,7 @@
 #include "fls/reader/rowgroup_reader.hpp"
 #include "fls/reader/rowgroup_view.hpp" //
 #include "fls/reader/segment.hpp"
+#include "fls/jpeg/jpeg_loader.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/std/filesystem.hpp" // for path
 #include "fls/std/vector.hpp"     // for vector
@@ -56,6 +57,7 @@ public:
 	friend class Wizard;
 	friend class Encoder;
 	friend class CsvReader;
+	friend class DctChannelReader;
 	friend class Rowgroup;
 
 public:
@@ -67,6 +69,9 @@ public:
 	Connection& read_csv(const path& dir_path);
 	/// READ CSV
 	Connection& read_json(const path& dir_path);
+	/// READ DCT CHANNEL
+	Connection& read_dct(const ProcessedDCTChannel& channel);
+
 	///! read a fls file return a reader
 	up<TableReader> read_fls(const path& file_path);
 	///!

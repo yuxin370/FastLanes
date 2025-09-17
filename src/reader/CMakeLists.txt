@@ -2,6 +2,7 @@ add_library(fls_reader
         OBJECT
         column_view.cpp
         csv_reader.cpp
+        dctchannel_reader.cpp
         external_reader.cpp
         json_reader.cpp
         rowgroup_view.cpp
