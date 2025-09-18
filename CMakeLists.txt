@@ -69,6 +69,14 @@ if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
     message(FATAL_ERROR "Only Clang >= 13 is supported!")
 endif ()
 
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "FLS: Configuring for Clang with libc++")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libc++")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++")
+    set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -stdlib=libc++")
+endif()
+
 # Disallow configuring in the source tree
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR "-- FLS : Please run CMake in a separate build directory!")

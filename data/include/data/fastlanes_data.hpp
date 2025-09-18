@@ -7,8 +7,6 @@
 #define DATA_FASTLANES_DATA_HPP
 
 #include "data/NextiaJD.hpp"
-#include "data/TimeSeries.hpp"
-#include "data/mnist.hpp"
 #include "data/clickbench.hpp"
 #include "data/embedding.hpp"
 #include "data/example.hpp"
