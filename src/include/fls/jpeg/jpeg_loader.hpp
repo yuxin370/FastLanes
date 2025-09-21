@@ -33,10 +33,10 @@ constexpr int zigzag_order[64] = {
 };
 
 // struct ZigzagBlock {
-//     std::array<int, 64> values;  // Zigzag 编码后的一个 8x8 DCT block
+//     std::array<int, 64> values;  //  8x8 DCT block after zigzag
 // };
 
-// 简单图像结构（可按 FastLanes RowGroup 接口替换）
+
 struct ImageRGB {
     unsigned int width;
     unsigned int height;
@@ -74,25 +74,15 @@ struct ZeroNonZeroPair {
     int nonzero_count;
 };
 
-// struct ProcessedDCTChannel {
-//     // std::vector<ZigzagBlock> raw_blocks;                      // 原始 zigzag 编码的块
-//     std::vector<int> raw_index;                                 // 原始编码块的index
-//     std::vector<DCTBlockRow> raw_blocks;                      // 原始编码块，由于含0过少而单独存
-//     std::vector<int> nonzero_values;                          // 仅包含非零元素
-//     std::vector<ZeroNonZeroPair> mixed_run_encoding_pattern;  // zero/nonzero 编码序列
-// };
-
-
 struct ProcessedDCTChannel {
-    // 每个通道有多个分段（left/mid/right）
-    std::vector<DCTBlockRow> raw_blocks;           // 原始块（保留结构）
-    std::vector<uint8_t> metadata;                   // 每个 block 的类型标签（1=高价值）
+    std::vector<DCTBlockRow> raw_blocks;           
+    std::vector<uint8_t> metadata;                   //（1=nonzero raws）
     size_t total_blocks = 0;
 
     std::vector<int16_t> DC_values;           // DC values
     std::vector<int16_t> AC_values;           // AC values
-    std::vector<int16_t> mix_run_nonzero_values;           // 所有非零值（扁平化）
-    std::vector<ZeroNonZeroPair> mix_run_pattern;  // 混合运行编码序列
+    std::vector<int16_t> mix_run_nonzero_values;           
+    std::vector<ZeroNonZeroPair> mix_run_pattern;  
 };
 
 class JpegLoader {
