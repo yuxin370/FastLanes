@@ -31,7 +31,7 @@ public:
 	// 	up<Table> mixed_run_encoding_pattern_tb;  // zero/nonzero 编码序列
 	// };
 
-	static up<Table> Read(const ProcessedDCTChannel& channel, const Connection& connection); 
+	static up<Table> Read(const ProcessedDCTChannel& channel, const int tag,const Connection& connection); 
 
 };
 

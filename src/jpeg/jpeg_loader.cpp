@@ -6,7 +6,11 @@
 
 #include "fls/jpeg/jpeg_loader.hpp"
 #include <jpeglib.h>
+#include <vector>
 #include <stdexcept>
+#include <cmath>
+#include <string.h>
+#include <cstdint>
 #include <cstdio>
 #include <algorithm>
 
@@ -18,43 +22,233 @@
 //     return zz;
 // }
 
-std::vector<ZeroNonZeroPair> count_zero_nonzero_pairs(const std::vector<int>& sequence) {
+std::vector<ZeroNonZeroPair> count_zero_nonzero_pairs(const std::vector<int16_t>& sequence) {
     std::vector<ZeroNonZeroPair> result;
     size_t i = 0, n = sequence.size();
     while (i < n) {
         int zc = 0, nzc = 0;
         while (i < n && sequence[i] == 0) ++zc, ++i;
         while (i < n && sequence[i] != 0) ++nzc, ++i;
-        result.push_back({zc, nzc});
+        if (zc > 0 || nzc > 0) {
+            result.push_back({zc, nzc});
+        }
     }
     return result;
 }
 
+std::tuple<size_t, size_t, size_t> compute_adaptive_split(const ImageHeader& header, size_t total_blocks, size_t sample_count = 1000) {
+    sample_count = std::min(sample_count, total_blocks);
+
+    std::vector<size_t> zero_counts(64, 0);
+    size_t block_index = 0;
+    size_t sampled = 0;
+
+    size_t step = total_blocks / sample_count;
+    if (step == 0) step = 1;
+
+    for (const auto& channel : header.channel_dcts) {
+        for (const auto& block : channel.blocks) {
+            if (block_index % step != 0) {
+                block_index++;
+                continue;
+            }
+
+            for (size_t i = 0; i < 64; ++i) {
+                if(block.data[i] == 0){
+                // if(block.data[zigzag_order[i]] == 0){
+                    zero_counts[i]++;
+                }
+            }
+            sampled++;
+            if (sampled >= sample_count) break;
+        }
+        if (sampled >= sample_count) break;
+        block_index++;
+    }
+
+    // 计算 0 占比
+    std::vector<float> ratios(64);
+    for (size_t i = 0; i < 64; ++i) {
+        ratios[i] = static_cast<float>(zero_counts[i]) / static_cast<float>(sampled);
+    }
+
+    // 划分三段
+    size_t l = 0, m = 0, r = 0;
+
+    // left: <50%
+    while (l < 64 && ratios[l] < 0.5f) l++;
+
+    // right: >90% 
+    while (r < 64 - l && ratios[63 - r] >= 0.9f) r++; 
+
+    m = 64 - l - r;
+
+    // 保证最小值
+    l = std::max(l, (size_t)1);
+    m = std::max(m, (size_t)1);
+    r = std::max(r, (size_t)1);
+    if (l + m + r != 64) r = 64 - l - m;
+
+    return {l,m,r};
+}
+
+
 ProcessedDCTChannel JpegLoader::process_channel(const ImageHeader& header) {
+    ProcessedDCTChannel result;
+    result.total_blocks = 0;
+    std::vector<int16_t> low_value_ac;
+    size_t block_idx = 0;
+
+
+    // 预分配 metadata（每个 block 1 bit → 用 uint8_t 数组压缩存储）
+    for (const auto& channel : header.channel_dcts) {
+        result.total_blocks += channel.blocks.size();
+    }
+    result.metadata.resize((result.total_blocks + 7) / 8, 0); // 向上取整：每字节存 8 个 bit
+
+    auto [left, mid, right] = compute_adaptive_split(header, result.total_blocks, 1000);
+    
+    int left_c = static_cast<int>(left) - 1; // 减去 DC
+    int mid_c  = static_cast<int>(mid);
+    // int right_c = static_cast<int>(right);
+
+    for (const auto& channel : header.channel_dcts) {
+        for (const auto& block : channel.blocks) {
+
+            // // --- 1. 转换为 ZigZag 顺序 ---
+            // std::vector<int16_t> zigzagged(64);
+            // for (size_t i = 0; i < 64; ++i) {
+            //     zigzagged[i] = block.data[zigzag_order[i]];
+            // }
+
+            // --- 2. 分离 DC 和 AC ---
+            int16_t dc = block.data[0];
+            std::vector<int16_t> ac_coefs(block.data + 1, block.data + 63); // 63 个
+            // std::vector<int16_t> ac_coefs(zigzagged.begin() + 1, zigzagged.end()); // 63 个
+
+            result.DC_values.push_back(dc);
+
+            // --- 4. 判断 mid 是否为高价值块 ---
+            auto nonzero_in_mid = std::count_if(ac_coefs.begin() + left_c, ac_coefs.begin() + left_c + mid_c, [](int16_t x) { return x != 0; });
+            bool is_high_value_mid = (static_cast<float>(nonzero_in_mid) >= static_cast<float>(mid_c) * 0.75f);
+
+            // --- 5. 处理 AC 值 ---
+            if (is_high_value_mid) {
+                // 保留完整 AC 结构（用于原始编码）
+                result.metadata[block_idx / 8] |= (1 << block_idx % 8);   // 设置该 bit 为 1
+
+                // 将 left 和 mid AC 系数加入 AC_values
+                result.AC_values.insert(result.AC_values.end(), ac_coefs.begin(), ac_coefs.begin() + left_c + mid_c);
+                
+                for (size_t i = static_cast<size_t>(left_c + mid_c); i < 63; ++i) {
+                    if (ac_coefs[i] != 0) {
+                        result.mix_run_nonzero_values.push_back(ac_coefs[i]);
+                    }
+                }
+            } else {
+                result.metadata[block_idx / 8] &= ~(1 << block_idx % 8);  // 设置该 bit 为 0
+                // mid 是低价值：仅保留 left_ac（因为 left 总是保留）
+                result.AC_values.insert(result.AC_values.end(), ac_coefs.begin(), ac_coefs.begin() + left_c);
+
+                for (size_t i = static_cast<size_t>(left_c); i < 63; ++i) {  // 合并 mid + right 段
+                    if (ac_coefs[i] != 0) {
+                        result.mix_run_nonzero_values.push_back(ac_coefs[i]);  // ✅ 正确命名
+                    }
+                }
+                // mid + right 合并，用于 mix-run
+                low_value_ac.insert(low_value_ac.end(), ac_coefs.begin() + left_c, ac_coefs.end());
+            }
+            
+        block_idx ++;
+        }
+    }
+    auto pairs = count_zero_nonzero_pairs(low_value_ac);
+    result.mix_run_pattern.insert(result.mix_run_pattern.end(), pairs.begin(), pairs.end());
+    return result;
+}
+
+
+// std::vector<DCTBlockRow> reconstruct_dct_blocks(
+//     const std::vector<int16_t>& DC_values,
+//     const std::vector<int16_t>& AC_values,
+//     const std::vector<ZeroNonZeroPair>& mix_run_pattern,
+//     const std::vector<uint8_t>& metadata,
+//     size_t total_blocks,
+//     size_t left_c,
+//     size_t mid_c,
+//     size_t right_c
+// ) {
+//     std::vector<DCTBlockRow> reconstructed;
+//     reconstructed.reserve(total_blocks);
+
+//     size_t ac_idx = 0;           // 指向 AC_values 的当前位置
+//     size_t mix_run_idx = 0;      // 指向 mix_run_pattern 的当前位置
+//     size_t dc_idx = 0;
+
+//     // 重建每个 block
+//     for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx) {
+//         DCTBlockRow block;
+//         std::vector<int16_t> zigzagged(64, 0);
+
+//         // 1. 恢复 DC
+//         zigzagged[0] = DC_values[dc_idx++];
+        
+//         // 2. 判断该 block 是高价值还是低价值
+//         size_t byte_idx = block_idx / 8;
+//         size_t bit_idx  = block_idx % 8;
+//         bool is_high_value = (metadata[byte_idx] & (1 << bit_idx)) != 0;
+
+//         if (is_high_value) {
+//             // 高价值：从 AC_values 中取 left + mid（共 left_c + mid_c 个）
+//             for (size_t i = 0; i < left_c + mid_c; ++i) {
+//                 zigzagged[i + 1] = AC_values[ac_idx++]; // AC 从索引 1 开始
+//             }
+//             // 剩余的 right_c 保持为 0（默认初始化）
+//         } else {
+//             // 低价值：从 AC_values 中取 left_c 个
+//             for (size_t i = 0; i < left_c; ++i) {
+//                 zigzagged[i + 1] = AC_values[ac_idx++];
+//             }
+
+//             // 从 mix_run_pattern 中重建 mid + right 段（共 mid_c + right_c = 63 - left_c 个）
+//             size_t remaining_ac = mid_c + right_c;
+//             size_t pos = 1 + left_c; // AC 起始位置（跳过 DC）
+
+//             while (remaining_ac > 0 && mix_run_idx < mix_run_pattern.size()) {
+//                 const auto& pair = mix_run_pattern[mix_run_idx++];
+//                 // 先写入 zero_count 个 0
+//                 for (int i = 0; i < pair.zero_count && remaining_ac > 0; ++i) {
+//                     zigzagged[pos++] = 0;
+//                     remaining_ac--;
+//                 }
+//                 // 再写入 nonzero_count 个非零值
+//                 for (int i = 0; i < pair.nonzero_count && remaining_ac > 0; ++i) {
+//                     // ⚠️ 注意：这里我们**不知道**非零值是多少！
+//                     // 所以我们**必须在压缩时也保存这些非零值！**
+//                     // 下面我们修正这个问题
+//                 }
+//             }
+//         }
+
+//         // 将 zigzagged 逆变换回行优先顺序
+//         for (int i = 0; i < 64; ++i) {
+//             block.data[zigzag_order_reverse[i]] = zigzagged[i];
+//         }
+
+//         reconstructed.push_back(block);
+//     }
+
+//     return reconstructed;
+// }
+
+ProcessedDCTChannel JpegLoader::process_channel_plain(const ImageHeader& header) {
     ProcessedDCTChannel result;
     // std::vector<int> flattened;
     // int index = 0, last_index = 0;
 
     for (const auto& channel : header.channel_dcts) {
         for (const auto& block : channel.blocks) {
-        result.raw_blocks.push_back(block);
-        //     // ZigzagBlock zz = zigzag_transform(block);
-        //     // result.raw_blocks.push_back(zz);
-            // index ++;
-            // auto zero_count = std::count(block.data, block.data + 64, 0);
-            // float zero_ratio = static_cast<float>(zero_count) / 64.0f;
-            // if (zero_ratio < threshold_ratio) {
-            //     result.raw_index.push_back(index-last_index);
-            //     result.raw_blocks.push_back(block);
-            //     last_index = index;
-            // } else {
-            //     for (int i = 0; i < 64; ++i) {
-            //     // for (int val : zz.values) {
-            //         int16_t val = block.data[zigzag_order[i]];
-            //         flattened.push_back(val);
-            //         if (val != 0) result.nonzero_values.push_back(val);
-            //     }
-            // }
+            result.raw_blocks.push_back(block); 
         }
     }
     
@@ -144,7 +338,15 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
             // 处理当前行的所有block
             for (JDIMENSION col = 0; col < comp->width_in_blocks; ++col) {
                 DCTBlockRow block;
-                memcpy(block.data, buffer[0][col], sizeof(block.data));
+                // memcpy(block.data, buffer[0][col], sizeof(block.data));
+
+                int16_t* src = buffer[0][col];  // 原始 block 数据
+
+                // 按 zigzag 顺序存到 block.data
+                for (size_t i = 0; i < 64; ++i) {
+                    block.data[i] = src[zigzag_order[i]];
+                }
+
                 cdct.blocks.push_back(block);
             }
         }

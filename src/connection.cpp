@@ -46,8 +46,8 @@ Connection& Connection::read_csv(const path& dir_path) {
 	return *this;
 }
 
-Connection& Connection::read_dct(const ProcessedDCTChannel& channel) {
-	m_table = DctChannelReader::Read(channel, *this);
+Connection& Connection::read_dct(const ProcessedDCTChannel& channel, const int tag) {
+	m_table = DctChannelReader::Read(channel, tag, *this);
 
 	return *this;
 }
