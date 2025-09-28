@@ -52,6 +52,13 @@ Connection& Connection::read_dct(const ProcessedDCTChannel& channel, const int t
 	return *this;
 }
 
+Connection& Connection::read_jpeg(const std::string& path) {
+	auto image_header = JpegLoader::load_header(path);
+	m_table = DctChannelReader::Read(image_header.channel_dcts, *this);
+
+	return *this;
+}
+
 Connection& Connection::read_json(const path& dir_path) {
 	m_table = JsonReader::Read(dir_path, *this);
 

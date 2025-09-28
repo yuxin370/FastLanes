@@ -32,7 +32,7 @@ class DctChannelReader {
 public:
 	// Original function for single channel with tag-based storage
 	static up<Table> Read(const ProcessedDCTChannel& channel, const int tag, const Connection& connection); 
-
+	static up<Table> Read(const std::vector<ChannelDCT>& channel, const Connection& connection);
 	// New functions for struct-based storage
 	// static up<Table> ReadMultipleChannels(const std::vector<ProcessedDCTChannel>& channels, const Connection& connection);
 	// static void AddChannelToTable(Table& table, const ProcessedDCTChannel& channel, const Connection& connection);

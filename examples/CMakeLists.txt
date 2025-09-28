@@ -11,6 +11,11 @@ target_link_libraries(cpp_example PUBLIC FastLanes)
 target_include_directories(jpeg_loader_example PRIVATE ${JPEG_INCLUDE_DIR})
 target_link_libraries(jpeg_loader_example PUBLIC FastLanes ${JPEG_LIBRARY})
 
+
+add_executable(jpeg_loader_example_simple ${CMAKE_CURRENT_SOURCE_DIR}/jpeg_loader_example_simple.cpp)
+target_include_directories(jpeg_loader_example_simple PRIVATE ${JPEG_INCLUDE_DIR})
+target_link_libraries(jpeg_loader_example_simple PUBLIC FastLanes ${JPEG_LIBRARY})
+
 if (WIN32 AND FLS_BUILD_SHARED_LIBS)
     add_custom_command(
             TARGET cpp_example
