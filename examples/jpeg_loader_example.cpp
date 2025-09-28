@@ -37,10 +37,29 @@ int main(int argc, char** argv) {
     auto ProcessedDCT = JpegLoader::process_channel(image_header);
 
 	try {
+		// auto       con1             = connect(); //DC
+		// auto       con2             = connect(); //AC
+		// auto       con3             = connect(); //mix_run_nonzero_values
+		// auto       con4             = connect(); //mix_run_pattern
+        // fs::path fls_file_base_path(argv[2]);
+
+        // if(!fs::exists(fls_file_base_path)){
+        //     fs::create_directories(fls_file_base_path);
+        // }
+
+		// // Step 1: Read the CSV file from the specified directory path
+		// con1->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,1); // DC
+        // con2->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,2); // AC
+        // con3->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,3); // mix_run_nonzero_values
+        // con4->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,4); // mix_run_pattern
+
+		// // Step 2: Write the data to the FastLanes file format in the specified directory
+		// con1->to_fls(fls_file_base_path / "DC.fls");
+        // con2->to_fls(fls_file_base_path / "AC.fls");
+        // con3->to_fls(fls_file_base_path / "mix_run_nonzero_values.fls");
+        // con4->to_fls(fls_file_base_path / "mix_run_pattern.fls");
+
 		auto       con1             = connect(); //DC
-		auto       con2             = connect(); //AC
-		auto       con3             = connect(); //mix_run_nonzero_values
-		auto       con4             = connect(); //mix_run_pattern
         fs::path fls_file_base_path(argv[2]);
 
         if(!fs::exists(fls_file_base_path)){
@@ -48,17 +67,10 @@ int main(int argc, char** argv) {
         }
 
 		// Step 1: Read the CSV file from the specified directory path
-		con1->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,1); // DC
-        con2->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,2); // AC
-        con3->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,3); // mix_run_nonzero_values
-        con4->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,4); // mix_run_pattern
+		con1->set_n_vectors_per_rowgroup(64).read_dct(ProcessedDCT,5); // DC
 
 		// Step 2: Write the data to the FastLanes file format in the specified directory
-		con1->to_fls(fls_file_base_path / "DC.fls");
-        con2->to_fls(fls_file_base_path / "AC.fls");
-        con3->to_fls(fls_file_base_path / "mix_run_nonzero_values.fls");
-        con4->to_fls(fls_file_base_path / "mix_run_pattern.fls");
-
+		con1->to_fls(fls_file_base_path / "image.fls");
 
 		exit(EXIT_SUCCESS);
 	} catch (std::exception& ex) {

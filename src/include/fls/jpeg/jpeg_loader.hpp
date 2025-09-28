@@ -89,9 +89,19 @@ class JpegLoader {
 public:
     static ImageHeader load_header(const std::string& path);
     static ImageRGB load_rgb(const std::string& path);
+    static ProcessedDCTChannel process_channel_plain(const ImageHeader& header); // without spliting
     static ProcessedDCTChannel process_channel(const ImageHeader& header);
-    static ProcessedDCTChannel process_channel_plain(const ImageHeader& header);
+    static ProcessedDCTChannel process_channel(const ImageHeader& header,
+                                               size_t left, size_t mid, size_t right);
 
+    // std::tuple<size_t, size_t, size_t> compute_adaptive_split(const ImageHeader& header,
+    //                                                                     size_t total_blocks,
+    //                                                                     size_t sample_count = 1000);
+    // std::tuple<size_t,size_t,size_t> compute_split_over_dataset(const std::vector<std::string>& paths,
+    //                                                                         size_t sample_budget = 10000);
+private:
+    ImageHeader image_header;
+    ProcessedDCTChannel pro_dct_blocks;
 };
 
 #endif // JPEG_LOADER_H
