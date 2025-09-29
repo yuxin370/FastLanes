@@ -22,6 +22,9 @@
 //     return zz;
 // }
 
+namespace fastlanes {
+ 
+
 std::vector<ZeroNonZeroPair> count_zero_nonzero_pairs(const std::vector<int16_t>& sequence) {
     std::vector<ZeroNonZeroPair> result;
     size_t i = 0, n = sequence.size();
@@ -353,3 +356,5 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
         .channel_dcts = std::move(channels),
     };
 }
+
+} // namespace fastlanes

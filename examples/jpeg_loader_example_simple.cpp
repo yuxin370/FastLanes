@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
         }
 
 		// Step 1: Read the CSV file from the specified directory path
-		con1->set_n_vectors_per_rowgroup(64).read_jpeg(jpeg_path); // DC
+		con1->read_jpeg(jpeg_path); // DC
 
 		// Step 2: Write the data to the FastLanes file format in the specified directory
 		con1->to_fls(fls_file_base_path / "image.fls");

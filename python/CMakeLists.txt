@@ -33,6 +33,10 @@ pybind11_add_module(_fastlanes ${FLS_BINDING_SRC})
 target_link_libraries(_fastlanes PRIVATE FastLanes)
 target_compile_features(_fastlanes PRIVATE cxx_std_20)
 
+find_path(JPEG_INCLUDE_DIR jpeglib.h PATHS /usr/include /usr/local/include)
+find_library(JPEG_LIBRARY jpeg PATHS /lib /usr/lib /usr/lib/x86_64-linux-gnu)
+target_link_libraries(_fastlanes PUBLIC FastLanes ${JPEG_LIBRARY})
+
 # ─────────────────────────────────────────────────────────────
 # 4) Debug Config: Apply -gdwarf-4, -O0 & frame-pointer flags only in Debug mode
 # ─────────────────────────────────────────────────────────────

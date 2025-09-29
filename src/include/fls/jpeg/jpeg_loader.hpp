@@ -8,6 +8,10 @@
 
 #include <string>
 #include <vector>
+#include "fls/std/filesystem.hpp"
+
+namespace fastlanes {
+
 #define threshold_ratio 0.25
 
 constexpr int zigzag_order_reverse[64] = {
@@ -103,6 +107,6 @@ private:
     ImageHeader image_header;
     ProcessedDCTChannel pro_dct_blocks;
 };
-
+} // namespace fastlanes
 #endif // JPEG_LOADER_H
 
