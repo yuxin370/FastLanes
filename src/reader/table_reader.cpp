@@ -20,6 +20,10 @@ namespace fastlanes {
 
 constexpr static auto const* TABLE_DESCRIPTOR_FILE_NAME {"table_descriptor.fbb"};
 
+size_t TableReader::get_num_rowgroups() const {
+    return m_table_descriptor->m_rowgroup_descriptors.size();
+}
+
 up<RowgroupReader> TableReader::get_rowgroup_reader(const n_t rowgroup_idx) const {
 	auto rowgroup_reader = make_unique<RowgroupReader>(
 	    m_file_path, *m_table_descriptor->m_rowgroup_descriptors[rowgroup_idx], m_connection);

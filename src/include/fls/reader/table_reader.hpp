@@ -25,6 +25,8 @@ public:
 public:
 	up<RowgroupReader> operator[](n_t rowgroup_idx) const;
 	//
+	[[nodiscard]] size_t get_num_rowgroups() const;
+
 	[[nodiscard]] up<RowgroupReader> get_rowgroup_reader(n_t rowgroup_idx) const;
 	//
 	[[nodiscard]] up<Table> materialize() const;
