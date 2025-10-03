@@ -32,6 +32,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <variant>
 
 namespace fastlanes {
@@ -513,4 +514,124 @@ string Attribute::ToStr(const col_pt& typed_column, n_t row_idx, const DataType&
 	return res;
 }
 
+struct NumericExtractor {
+    explicit NumericExtractor(double& out_val, n_t row_idx, const DataType& data_type)
+        : result(out_val), row_idx(row_idx), data_type(data_type) {}
+
+    double&        result;
+    const n_t      row_idx;
+    const DataType data_type;
+
+    template <typename PT>
+    void operator()(const up<TypedCol<PT>>& typed_col) {
+        const auto& value = typed_col->data[row_idx];
+
+        // Dispatch based on DataType (not just PT, because PT may not match data_type exactly)
+        switch (data_type) {
+            // Boolean
+            case DataType::BOOLEAN:
+                if constexpr (std::is_same_v<PT, uint8_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+
+            // Signed integers
+            case DataType::INT8:
+                if constexpr (std::is_same_v<PT, int8_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+            case DataType::INT16:
+                if constexpr (std::is_same_v<PT, int16_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+            case DataType::INT32:
+                if constexpr (std::is_same_v<PT, int32_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+            case DataType::INT64:
+                if constexpr (std::is_same_v<PT, int64_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+
+            // Unsigned integers
+            case DataType::UINT8:
+                if constexpr (std::is_same_v<PT, uint8_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+            case DataType::UINT16:
+                if constexpr (std::is_same_v<PT, uint16_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+            case DataType::UINT32:
+                if constexpr (std::is_same_v<PT, uint32_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+            case DataType::UINT64:
+                if constexpr (std::is_same_v<PT, uint64_t>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+
+            // Floating point
+            case DataType::FLOAT:
+                if constexpr (std::is_same_v<PT, float>) {
+                    result = static_cast<double>(value);
+                    return;
+                }
+                break;
+            case DataType::DOUBLE:
+                if constexpr (std::is_same_v<PT, double>) {
+                    result = value;
+                    return;
+                }
+                break;
+
+            // // Date (stored as int32)
+            // case DataType::DATE:
+            //     if constexpr (std::is_same_v<PT, int32_t>) {
+            //         result = static_cast<double>(value);
+            //         return;
+            //     }
+            //     break;
+
+            default:
+                break;
+        }
+
+        // If we reach here, type mismatch or unsupported
+        throw std::runtime_error(
+            "Type mismatch or non-numeric type in NumericExtractor: " +
+            std::to_string(static_cast<int>(data_type))
+        );
+    }
+
+    // Catch-all for any other unexpected type
+    void operator()(const auto&) {
+        throw std::runtime_error("Unsupported column type in NumericExtractor.");
+    }
+};
+
+
+double Attribute::ToDouble(const col_pt& typed_column, n_t row_idx, const DataType& data_type) {
+	double res;
+	visit(NumericExtractor {res, row_idx, data_type}, typed_column);
+
+	return res;
+}
 } // namespace fastlanes

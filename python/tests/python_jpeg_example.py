@@ -16,11 +16,10 @@ except ImportError:
     HAS_NUMPY = False
 
 try:
-    import pandas as pd
-    HAS_PANDAS = True
+    import torch
+    HAS_TORCH = True
 except ImportError:
-    HAS_PANDAS = False
-
+    HAS_TORCH = False
 
 def main():
     # 1) Print module docstring & version
@@ -44,36 +43,36 @@ def main():
     conn.inline_footer().read_jpeg(jpeg_path).to_fls(fls_file)
 
     # 5) Read FLS and decode to CSV (as before)
-    print("Decoding FLS to CSV...")
+    print("Decoding FLS to CSV:", csv_file)
     reader = conn.read_fls(fls_file)
     reader.to_csv(csv_file)
-    print("✅ CSV output saved to:", csv_file)
 
-    # 6) NEW: Use the new to_numpy_dct() method
-    print("\n🚀 Calling to_numpy_dct()...")
-    data_list = reader.to_numpy_dct()  # Returns List[List[str]]
+    # 6) NEW: Use the new dct_to_str_list() method
+    data_list_double = reader.dct_to_double_list()  # Returns List[List[double]]
 
-    print(f"Data shape: {len(data_list)} rows × {len(data_list[0]) if data_list else 0} columns")
-    print("First 3 rows (if available):")
-    for i, row in enumerate(data_list[:3]):
-        print(f"  Row {i}: {row}")
+    print(f"Data shape: {len(data_list_double)} rows × {len(data_list_double[0]) if data_list_double else 0} columns")
 
     # 7) Optional: Convert to NumPy array (dtype=object) or pandas DataFrame
     if HAS_NUMPY:
-        print("\n📦 Converting to NumPy array (dtype=object)...")
-        np_array = np.array(data_list, dtype=object)
-        print("NumPy array shape:", np_array.shape)
-        print("Sample element:", np_array[0, 0] if np_array.size > 0 else "N/A")
+        print("\n Converting to NumPy array ...")
+        np_array = np.array(data_list_double, dtype=object)
 
-    if HAS_PANDAS:
-        print("\n📊 Converting to pandas DataFrame...")
-        # You may want to extract column names from footer if available
-        # For now, use generic names
-        num_cols = len(data_list[0]) if data_list else 0
-        df = pd.DataFrame(data_list, columns=[f"col_{i}" for i in range(num_cols)])
-        print(df.head())
+        # 6) NEW: Use the new to_numpy_numeric() method
+        print("\n Calling to_numpy_numeric()...")
+        data_numpy_double = reader.to_numpy_numeric()  # Returns List[List[str]]
+        print(data_numpy_double)
 
-    print("\n✅ All done!")
+        if HAS_TORCH:
+            print("\n Converting to PyTorch tensor")
+            tensor = torch.from_numpy(data_numpy_double)
+            print("Tensor shape:", tensor.shape, "Tensor dtype:", tensor.dtype, "Tensor:\n", tensor)
+
+            if torch.cuda.is_available():
+                print("\n Moving tensor to GPU...")
+                gpu_tensor = tensor.cuda()  # tensor.to('cuda')
+                print("GPU Tensor shape:", gpu_tensor.shape, " device:", gpu_tensor.device, "  dtype:", gpu_tensor.dtype)
+            else:
+                print("\n CUDA not available. Skipping GPU test.")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ public:
 
 public:
 	static void   Ingest(col_pt& typed_column, const string& val_str, const ColumnDescriptorT& column_descriptor);
+	static double ToDouble(const col_pt& typed_column, n_t row_idx, const DataType& data_type);
 	static string ToStr(const col_pt& typed_column, n_t row_idx, const DataType& data_type);
 };
 
