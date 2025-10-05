@@ -268,6 +268,7 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
         ChannelDCT cdct;
         cdct.component_id = static_cast<uint8_t>(comp->component_id);
         cdct.qtable_id = static_cast<uint8_t>(comp->quant_tbl_no); // <-- NEW
+        cdct.color_space_id = 0; // <-- one image only one color space configuration
         cdct.width_in_blocks = comp->width_in_blocks;
         cdct.height_in_blocks = comp->height_in_blocks;
 
