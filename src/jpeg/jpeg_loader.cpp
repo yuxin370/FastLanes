@@ -455,8 +455,6 @@ std::vector<std::vector<std::vector<std::vector<double>>>> JpegLoader::to_rgb(
         throw std::runtime_error("Failed to load ImageHeader from " + file_path.string());
     }
 
-    JpegLoader::print_image_header(header);
-
     uint32_t img_width = header.width;
     uint32_t img_height = header.height;
 

@@ -101,46 +101,91 @@ py::array_t<double> to_numpy_numeric(fastlanes::TableReader& self) {
     return result;
 }
 
+py::array_t<uint8_t> to_numpy_rgb(fastlanes::TableReader& self, const char* path, bool channel_first = false) {
+    // self.to_rgb 返回可能是 [3][H][W] 或 [1][3][H][W]
+    auto rgb_out = self.to_rgb(path);
 
-py::array_t<double> to_numpy_rgb(fastlanes::TableReader& self, const char* path) {
-    auto rgb_channels = self.to_rgb(path);  // [3][H][W]
-
-    if (rgb_channels.size() != 3) {
-        throw std::runtime_error("Expected 3 channels (R, G, B)");
+    if (rgb_out.empty()) {
+        throw std::runtime_error("to_rgb returned empty result");
     }
 
-    size_t height = rgb_channels[0].size();
-    size_t width = (height > 0) ? rgb_channels[0][0].size() : 0;
+    // // Normalize to rgb_channels[channel][h][w] where channel==3
+    // std::vector<std::vector<std::vector<double>>> rgb_channels; // [3][H][W]
+    // if (rgb_out.size() == 3) {
+    //     // Already [3][H][W]
+    //     rgb_channels = rgb_out;
+    // } else if (rgb_out.size() == 1 && rgb_out[0].size() == 3) {
+    //     // [1][3][H][W] -> unwrap
+    //     rgb_channels = rgb_out[0];
+    // } else if (rgb_out.size() == 1 && rgb_out[0].size() == 1 && rgb_out[0][0].size() == 3) {
+    //     // very defensive: [1][1][3][H][W] unlikely, but just in case
+    //     rgb_channels = rgb_out[0][0];
+    // } else {
+    //     throw std::runtime_error("Unexpected shape from to_rgb(); expected [3][H][W] or [1][3][H][W]");
+    // }
 
-    // Validate dimensions
-    for (const auto& ch : rgb_channels) {
+    // if (rgb_channels.size() != 3) {
+    //     throw std::runtime_error("Expected 3 channels (R,G,B)");
+    // }
+
+    size_t height = rgb_out[0].size();
+    size_t width  = (height > 0) ? rgb_out[0][0].size() : 0;
+    if (height == 0 || width == 0) {
+        throw std::runtime_error("Empty image dimensions");
+    }
+
+    // Validate shapes
+    for (const auto& ch : rgb_out) {
         if (ch.size() != height) throw std::runtime_error("Channel height mismatch");
         for (const auto& row : ch) {
             if (row.size() != width) throw std::runtime_error("Channel width mismatch");
         }
     }
 
-    // Flatten in HWC order: (H, W, 3)
-    std::vector<double> flat_data;
-    flat_data.reserve(height * width * 3);
-
-    for (size_t h = 0; h < height; ++h) {
-        for (size_t w = 0; w < width; ++w) {
-            for (size_t c = 0; c < 3; ++c) {
-                flat_data.push_back(rgb_channels[c][h][w]);
+    // Prepare numpy array
+    py::array_t<uint8_t> result;
+    if (!channel_first) {
+        // HWC: (H, W, 3)
+        result = py::array_t<uint8_t>({static_cast<ssize_t>(height),
+                                       static_cast<ssize_t>(width),
+                                       static_cast<ssize_t>(3)});
+        uint8_t* out = result.mutable_data();
+        // out[(h * width + w) * 3 + c]
+        for (size_t h = 0; h < height; ++h) {
+            for (size_t w = 0; w < width; ++w) {
+                for (size_t c = 0; c < 3; ++c) {
+                    double v = rgb_out[c][h][w];
+                    // round then clamp
+                    int iv = static_cast<int>(std::round(v));
+                    if (iv < 0) iv = 0;
+                    else if (iv > 255) iv = 255;
+                    out[(h * width + w) * 3 + c] = static_cast<uint8_t>(iv);
+                }
+            }
+        }
+    } else {
+        // CHW: (3, H, W)
+        result = py::array_t<uint8_t>({static_cast<ssize_t>(3),
+                                       static_cast<ssize_t>(height),
+                                       static_cast<ssize_t>(width)});
+        uint8_t* out = result.mutable_data();
+        // out[(c * height + h) * width + w]
+        for (size_t c = 0; c < 3; ++c) {
+            for (size_t h = 0; h < height; ++h) {
+                for (size_t w = 0; w < width; ++w) {
+                    double v = rgb_out[c][h][w];
+                    int iv = static_cast<int>(std::round(v));
+                    if (iv < 0) iv = 0;
+                    else if (iv > 255) iv = 255;
+                    out[(c * height + h) * width + w] = static_cast<uint8_t>(iv);
+                }
             }
         }
     }
 
-    // Return as (height, width, 3) array
-    return py::array_t<double>(
-    {static_cast<ssize_t>(height),
-     static_cast<ssize_t>(width),
-     static_cast<ssize_t>(3)},
-    flat_data.data(),
-    py::cast(flat_data)
-    );
+    return result;
 }
+
 
 }
 
