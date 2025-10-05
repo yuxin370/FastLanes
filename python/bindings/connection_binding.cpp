@@ -19,6 +19,7 @@ void bind_connection(py::module_& m) {
 		.def("read_jpeg",
 	         &fastlanes::Connection::read_jpeg,
 	         py::arg("dir_path"),
+			 py::arg("header_path"),
 	         "Read Jpeg files from directory",
 	         py::return_value_policy::reference_internal)
 	    .def("to_fls",

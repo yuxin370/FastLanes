@@ -52,8 +52,9 @@ Connection& Connection::read_dct(const ProcessedDCTChannel& channel, const int t
 	return *this;
 }
 
-Connection& Connection::read_jpeg(const std::string& path) {
+Connection& Connection::read_jpeg(const std::string& path, const std::string& header_path) {
 	auto image_header = JpegLoader::load_header(path);
+	JpegLoader::dump_ImageHeader(image_header,header_path.c_str());
 	m_table = DctChannelReader::Read(image_header.channel_dcts, *this);
 
 	return *this;

@@ -13,8 +13,12 @@
 #include "fls/reader/rowgroup_reader.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/std/string.hpp"
+#include "fls/table/attribute.hpp"
 #include <filesystem> // std::filesystem::path, exists, is_directory, is_regular_file
 #include <utility>    // for std::move
+#include <cmath>
+#include <cassert>
+#include <algorithm>
 
 namespace fastlanes {
 
@@ -55,6 +59,46 @@ void TableReader::to_csv(const string& file_path) const {
 void TableReader::to_csv(const char* file_path) const {
 	to_csv(path(file_path));
 }
+
+
+std::vector<std::vector<std::vector<double>>> TableReader::to_rgb(const path& file_path) const {
+    std::vector<std::vector<double>> result;
+	for (n_t rowgroup_idx {0}; rowgroup_idx < m_table_descriptor->m_rowgroup_descriptors.size(); rowgroup_idx++) {
+		auto rowgroup_up = get_rowgroup_reader(rowgroup_idx)->materialize();
+
+
+        const auto& rowgroup = *rowgroup_up;
+        const auto& desc = rowgroup_up->m_descriptor;
+
+        const n_t n_rows = rowgroup.n_tup;
+        const n_t n_cols = rowgroup.internal_rowgroup.size();
+
+        size_t old_size = result.size();
+        result.resize(old_size + n_rows);
+        for (n_t i = 0; i < n_rows; ++i) {
+            result[old_size + i].resize(n_cols);
+        }
+
+        for (n_t row_idx = 0; row_idx < n_rows; row_idx++) {
+            for (n_t col_idx = 0; col_idx < n_cols; col_idx++) {
+                const auto& col = rowgroup.internal_rowgroup[col_idx];
+                result[old_size + row_idx][col_idx] =
+                    Attribute::ToDouble(col, row_idx, desc.m_column_descriptors[col_idx]->data_type);
+            }
+        }
+	}
+	auto res = JpegLoader::to_rgb(result, file_path.parent_path() / "header.meta");
+	return res[0];
+}
+
+std::vector<std::vector<std::vector<double>>> TableReader::to_rgb(const string& file_path) const {
+	return to_rgb(path(file_path));
+}
+
+std::vector<std::vector<std::vector<double>>> TableReader::to_rgb(const char* file_path) const {
+	return to_rgb(path(file_path));
+}
+
 
 TableReader::TableReader(const path& file_path, Connection& connection)
     : m_connection(connection)

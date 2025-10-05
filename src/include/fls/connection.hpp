@@ -71,7 +71,9 @@ public:
 	Connection& read_json(const path& dir_path);
 	/// READ DCT CHANNEL
 	Connection& read_dct(const ProcessedDCTChannel& channel, const int tag);
-	Connection& read_jpeg(const std::string& path);
+	
+	Connection& read_jpeg(const std::string& path, const std::string& header_path);
+	// Connection& read_jpeg(const std::string& path);
 	///! read a fls file return a reader
 	up<TableReader> read_fls(const path& file_path);
 	///!

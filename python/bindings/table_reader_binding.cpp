@@ -102,6 +102,46 @@ py::array_t<double> to_numpy_numeric(fastlanes::TableReader& self) {
 }
 
 
+py::array_t<double> to_numpy_rgb(fastlanes::TableReader& self, const char* path) {
+    auto rgb_channels = self.to_rgb(path);  // [3][H][W]
+
+    if (rgb_channels.size() != 3) {
+        throw std::runtime_error("Expected 3 channels (R, G, B)");
+    }
+
+    size_t height = rgb_channels[0].size();
+    size_t width = (height > 0) ? rgb_channels[0][0].size() : 0;
+
+    // Validate dimensions
+    for (const auto& ch : rgb_channels) {
+        if (ch.size() != height) throw std::runtime_error("Channel height mismatch");
+        for (const auto& row : ch) {
+            if (row.size() != width) throw std::runtime_error("Channel width mismatch");
+        }
+    }
+
+    // Flatten in HWC order: (H, W, 3)
+    std::vector<double> flat_data;
+    flat_data.reserve(height * width * 3);
+
+    for (size_t h = 0; h < height; ++h) {
+        for (size_t w = 0; w < width; ++w) {
+            for (size_t c = 0; c < 3; ++c) {
+                flat_data.push_back(rgb_channels[c][h][w]);
+            }
+        }
+    }
+
+    // Return as (height, width, 3) array
+    return py::array_t<double>(
+    {static_cast<ssize_t>(height),
+     static_cast<ssize_t>(width),
+     static_cast<ssize_t>(3)},
+    flat_data.data(),
+    py::cast(flat_data)
+    );
+}
+
 }
 
 void bind_table_reader(py::module_& m) {
@@ -111,10 +151,11 @@ void bind_table_reader(py::module_& m) {
 	       "to_csv", [](fastlanes::TableReader& self, const char* path) { self.to_csv(path); }, py::arg("file_path"))
 		.def("dct_to_double_list", &fastlanes::dct_to_double_list, "Convert FLS file to double list array")
 		.def("to_numpy_numeric", &fastlanes::to_numpy_numeric, "Convert numeric FLS table to NumPy float64 array")
+		.def("to_numpy_rgb", &fastlanes::to_numpy_rgb, "Convert DCT FLS table to NumPy RGB float64 array")
 	    .def("__repr__", [](const fastlanes::TableReader&) { return "<fastlanes.TableReader>"; })
 	    .def("__dir__", []() {
 		    return std::vector<std::string> {
-		        "to_csv","dct_to_double_list","to_numpy_numeric", "__repr__", "__dir__"
+		        "to_csv","dct_to_double_list","to_numpy_numeric", "to_numpy_rgb", "__repr__", "__dir__"
 		        // "to_csv", "__repr__", "__dir__"
 		        // Add more method/field names as you expose them
 		    };

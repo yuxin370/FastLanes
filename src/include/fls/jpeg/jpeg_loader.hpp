@@ -60,6 +60,7 @@ struct DCTBlockRow {
 
 struct ChannelDCT {
     uint8_t component_id;
+    uint8_t qtable_id;
     uint32_t width_in_blocks;
     uint32_t height_in_blocks;
     std::vector<DCTBlockRow> blocks;
@@ -68,6 +69,8 @@ struct ChannelDCT {
 struct ImageHeader {
     uint32_t width;
     uint32_t height;
+    uint32_t quality;
+    std::string color_space;
     // std::vector<uint8_t> rgb_data;  // Optional
     std::vector<QuantTable> quant_tables;
     std::vector<ChannelDCT> channel_dcts;
@@ -93,11 +96,14 @@ class JpegLoader {
 public:
     static ImageHeader load_header(const std::string& path);
     static ImageRGB load_rgb(const std::string& path);
+    static std::vector<std::vector<std::vector<std::vector<double>>>> to_rgb(const std::vector<std::vector<double>>& dct_blocks, const path& file_path);
     static ProcessedDCTChannel process_channel_plain(const ImageHeader& header); // without spliting
     static ProcessedDCTChannel process_channel(const ImageHeader& header);
     static ProcessedDCTChannel process_channel(const ImageHeader& header,
                                                size_t left, size_t mid, size_t right);
-
+    static void print_image_header(const ImageHeader& header);
+    static bool dump_ImageHeader(const ImageHeader& header, const char* filename);
+    static bool load_ImageHeader(ImageHeader& header, const char* filename);
     // std::tuple<size_t, size_t, size_t> compute_adaptive_split(const ImageHeader& header,
     //                                                                     size_t total_blocks,
     //                                                                     size_t sample_count = 1000);
@@ -105,7 +111,6 @@ public:
     //                                                                         size_t sample_budget = 10000);
 private:
     ImageHeader image_header;
-    ProcessedDCTChannel pro_dct_blocks;
 };
 } // namespace fastlanes
 #endif // JPEG_LOADER_H

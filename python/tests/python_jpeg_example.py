@@ -32,6 +32,7 @@ def main():
     # 3) Clean up old output files
     fls_file = "data.fls"
     csv_file = "decoded.csv"
+    header_file = "header.meta"
     if os.path.exists(fls_file):
         os.remove(fls_file)
     if os.path.exists(csv_file):
@@ -40,7 +41,7 @@ def main():
     # 4) Encode JPEG into FLS
     print("Encoding JPEG to FLS...")
     conn = pyfastlanes.connect()
-    conn.inline_footer().read_jpeg(jpeg_path).to_fls(fls_file)
+    conn.inline_footer().read_jpeg(jpeg_path,header_file).to_fls(fls_file)
 
     # 5) Read FLS and decode to CSV (as before)
     print("Decoding FLS to CSV:", csv_file)
@@ -61,6 +62,10 @@ def main():
         print("\n Calling to_numpy_numeric()...")
         data_numpy_double = reader.to_numpy_numeric()  # Returns List[List[str]]
         print(data_numpy_double)
+
+        print("\n Calling to_numpy_numeric()...")
+        data_numpy_rgb = reader.to_numpy_rgb(header_file)  # Returns List[List[str]]
+        print(data_numpy_rgb)
 
         if HAS_TORCH:
             print("\n Converting to PyTorch tensor")

@@ -46,8 +46,6 @@ up<Table> DctChannelReader::Read(const std::vector<ChannelDCT>& channels, const 
 
 	n_t  n_tup {0};
 	auto cur_rowgroup = make_unique<Rowgroup>(*rowgroup_descriptor, connection);
-	[[maybe_unused]] const auto n_cols = cur_rowgroup->ColCount();
-	FLS_ASSERT_EQUALITY(2, n_cols)
 	for(auto& channel : channels){
 	    for(auto& tuple : channel.blocks){
             // for(auto& tuple : channel.mixed_run_encoding_pattern){
