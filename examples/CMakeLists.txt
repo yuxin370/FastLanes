@@ -22,6 +22,10 @@ target_include_directories(jpeg_decoding_test PRIVATE ${JPEG_INCLUDE_DIR})
 target_link_libraries(jpeg_decoding_test PUBLIC FastLanes ${JPEG_LIBRARY})
 
 
+add_executable(jpeg_decoding_dir_test ${CMAKE_CURRENT_SOURCE_DIR}/jpeg_decoding_dir_test.cpp)
+target_include_directories(jpeg_decoding_dir_test PRIVATE ${JPEG_INCLUDE_DIR})
+target_link_libraries(jpeg_decoding_dir_test PUBLIC FastLanes ${JPEG_LIBRARY})
+
 if (WIN32 AND FLS_BUILD_SHARED_LIBS)
     add_custom_command(
             TARGET cpp_example

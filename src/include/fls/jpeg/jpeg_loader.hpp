@@ -61,6 +61,7 @@ struct DCTBlockRow {
 struct ChannelDCT {
     uint8_t component_id;
     uint8_t qtable_id;
+    uint8_t color_space_id;
     uint32_t width_in_blocks;
     uint32_t height_in_blocks;
     std::vector<DCTBlockRow> blocks;
@@ -70,7 +71,7 @@ struct ImageHeader {
     uint32_t width;
     uint32_t height;
     uint32_t quality;
-    std::string color_space;
+    std::vector<std::string> color_spaces;
     // std::vector<uint8_t> rgb_data;  // Optional
     std::vector<QuantTable> quant_tables;
     std::vector<ChannelDCT> channel_dcts;
@@ -96,7 +97,7 @@ class JpegLoader {
 public:
     static ImageHeader load_header(const std::string& path);
     static ImageRGB load_rgb(const std::string& path);
-    static std::vector<std::vector<std::vector<std::vector<double>>>> to_rgb(const std::vector<std::vector<double>>& dct_blocks, const path& file_path);
+    static std::vector<std::vector<std::vector<std::vector<uint8_t>>>> to_rgb(const std::vector<std::vector<double>>& dct_blocks, const path& file_path);
     static ProcessedDCTChannel process_channel_plain(const ImageHeader& header); // without spliting
     static ProcessedDCTChannel process_channel(const ImageHeader& header);
     static ProcessedDCTChannel process_channel(const ImageHeader& header,

@@ -1,7 +1,7 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// examples/jpeg_loader_example.cpp
+// examples/jpeg_decoding_test.cpp
 // ────────────────────────────────────────────────────────
 #include "fastlanes.hpp"
 #include "fls/connection.hpp"
@@ -17,7 +17,7 @@ using namespace fastlanes; // NOLINT
 namespace fs = std::filesystem;
 
 // Helper: compare two RGB images (allow small error due to IDCT rounding)
-bool images_approx_equal(const ImageRGB& img1, const std::vector<std::vector<std::vector<double>>>& img2_rgb) {
+bool images_approx_equal(const ImageRGB& img1, const std::vector<std::vector<std::vector<uint8_t>>>& img2_rgb) {
     bool match = true;
     if (img1.width != img2_rgb[0][0].size() || img1.height != img2_rgb[0].size()) {
         std::cerr << "Size mismatch!" << std::endl;
@@ -94,7 +94,8 @@ int main(int argc, char** argv) {
 		const auto fls_reader = con2.reset().read_fls(fls_dir / "image.fls");
 
         // This calls TableReader::to_rgb(), which uses header.meta to reconstruct
-        auto reconstructed_rgb = fls_reader->to_rgb((fls_dir / "header.meta").c_str()); // returns [3][H][W]
+        auto reconstructed_rgb_collection = fls_reader->to_rgb((fls_dir / "header.meta").c_str()); // returns [3][H][W]
+        auto reconstructed_rgb = reconstructed_rgb_collection[0];
 
         std::cout << "✅ Reconstructed RGB from DCT blocks. Shape: [3][" 
                   << reconstructed_rgb[0].size() << "][" << reconstructed_rgb[0][0].size() << "]" << std::endl;

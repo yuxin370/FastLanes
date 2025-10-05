@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <map>
 #include <cassert>
+#include <filesystem>
 
 namespace fastlanes {
  
@@ -29,6 +30,18 @@ std::string jpeg_color_space_to_string(J_COLOR_SPACE cs) {
         case JCS_CMYK:      return "CMYK";
         case JCS_YCCK:      return "YCCK";
         default:            return "Unknown";
+    }
+}
+
+// Helper: get number of channels from color space name
+size_t get_channel_count_from_color_space(const std::string& cs) {
+    if (cs == "Grayscale" || cs == "GRAY" || cs == "L") {
+        return 1;
+    } else if (cs == "YCbCr" || cs == "YUV" || cs == "RGB") {
+        return 3;
+    } else {
+        // You can extend this
+        throw std::runtime_error("Unknown color space: " + cs);
     }
 }
 
@@ -284,7 +297,10 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
     // You could implement a heuristic based on quant tables if needed.
     uint32_t quality = 0;
 
-    std::string color_space = jpeg_color_space_to_string(cinfo_dct.jpeg_color_space);
+    // std::string color_space = jpeg_color_space_to_string(cinfo_dct.jpeg_color_space);
+
+    std::vector<std::string> color_spaces;
+    color_spaces.push_back(jpeg_color_space_to_string(cinfo_dct.jpeg_color_space));
 
     jpeg_destroy_decompress(&cinfo_dct);
     fclose(infile);
@@ -293,7 +309,7 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
         .width = w,
         .height = h,
         .quality = quality,              // <-- NEW
-        .color_space = color_space,      // <-- NEW
+        .color_spaces = color_spaces,      // <-- NEW
         .quant_tables = std::move(qtables),
         .channel_dcts = std::move(channels),
     };
@@ -446,19 +462,58 @@ static void resize_or_crop_plane(const std::vector<std::vector<uint8_t>>& src,
     upsample_chroma_bilinear(src, dst, dst_h, dst_w);
 }
 
-std::vector<std::vector<std::vector<std::vector<double>>>> JpegLoader::to_rgb(
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>> JpegLoader::to_rgb(
     const std::vector<std::vector<double>>& dct_blocks,
-    const path& file_path) {
+    const std::filesystem::path& file_path) {
 
     ImageHeader header;
     if (!load_ImageHeader(header, file_path.c_str())) {
         throw std::runtime_error("Failed to load ImageHeader from " + file_path.string());
     }
 
-    uint32_t img_width = header.width;
-    uint32_t img_height = header.height;
+    printf("in to_rgb, we load image header:\n");
+    JpegLoader::print_image_header(header);
 
-    // 计算总块数并验证
+    if (header.channel_dcts.empty()) {
+        throw std::runtime_error("No channels in header.");
+    }
+
+    // === Step 1: Group channels by image (contiguous same color_space_id) ===
+    struct ImageRange {
+        size_t start_idx;      // start index in channel_dcts
+        size_t channel_count;  // expected channels for this image
+        uint8_t color_space_id;
+    };
+
+    std::vector<ImageRange> image_ranges;
+    size_t i = 0;
+    while (i < header.channel_dcts.size()) {
+        uint8_t cs_id = header.channel_dcts[i].color_space_id;
+        if (cs_id >= header.color_spaces.size()) {
+            throw std::runtime_error("Invalid color_space_id: " + std::to_string(cs_id));
+        }
+
+        std::string color_space_name = header.color_spaces[cs_id];
+        size_t expected_channels = get_channel_count_from_color_space(color_space_name);
+
+        // Check that next 'expected_channels' channels all have same cs_id
+        if (i + expected_channels > header.channel_dcts.size()) {
+            throw std::runtime_error("Incomplete channel group at end.");
+        }
+
+        for (size_t j = 0; j < expected_channels; ++j) {
+            if (header.channel_dcts[i + j].color_space_id != cs_id) {
+                throw std::runtime_error("Channel group has inconsistent color_space_id.");
+            }
+        }
+
+        image_ranges.push_back({i, expected_channels, cs_id});
+        i += expected_channels;
+    }
+
+    size_t num_images = image_ranges.size();
+
+    // === Step 2: Validate total DCT block count ===
     size_t total_blocks_expected = 0;
     for (const auto& ch : header.channel_dcts) {
         total_blocks_expected += static_cast<size_t>(ch.width_in_blocks) * ch.height_in_blocks;
@@ -469,129 +524,141 @@ std::vector<std::vector<std::vector<std::vector<double>>>> JpegLoader::to_rgb(
             ") != expected (" + std::to_string(total_blocks_expected) + ")");
     }
 
-    // 构建量化表映射
+    // === Step 3: Build quant table map ===
     std::map<uint8_t, const QuantTable*> qt_map;
     for (const auto& qt : header.quant_tables) {
         qt_map[qt.id] = &qt;
     }
 
-    // 逐通道重建
-    std::vector<std::vector<std::vector<uint8_t>>> planes; // [channel][h][w]
+    // === Step 4: Decode each image ===
+    std::vector<std::vector<std::vector<std::vector<uint8_t>>>> result;
+    result.resize(num_images);
+
     size_t block_idx = 0;
 
-    for (const auto& ch : header.channel_dcts) {
-        uint32_t w_blocks = ch.width_in_blocks;
-        uint32_t h_blocks = ch.height_in_blocks;
-        uint32_t plane_w = w_blocks * 8;
-        uint32_t plane_h = h_blocks * 8;
+    for (size_t img_idx = 0; img_idx < num_images; ++img_idx) {
+        const auto& range = image_ranges[img_idx];
+        uint32_t img_width = header.width;
+        uint32_t img_height = header.height;
 
-        auto qt_it = qt_map.find(ch.qtable_id);
-        if (qt_it == qt_map.end()) {
-            throw std::runtime_error("Quant table not found for component_id=" + std::to_string(ch.qtable_id));
-        }
-        const uint8_t* qtable = qt_it->second->data;
+        std::vector<std::vector<std::vector<uint8_t>>> planes;
+        planes.reserve(range.channel_count);
 
-        std::vector<std::vector<uint8_t>> plane(plane_h, std::vector<uint8_t>(plane_w));
+        // Decode each channel of this image
+        for (size_t ch_offset = 0; ch_offset < range.channel_count; ++ch_offset) {
+            const auto& ch = header.channel_dcts[range.start_idx + ch_offset];
 
-        for (size_t by = 0; by < h_blocks; ++by) {
-            for (size_t bx = 0; bx < w_blocks; ++bx) {
-                const auto& zigzag_coeffs = dct_blocks[block_idx++];
-                int16_t spatial_coeffs[64];
-                int dequant_coeffs[64];
+            uint32_t w_blocks = ch.width_in_blocks;
+            uint32_t h_blocks = ch.height_in_blocks;
+            uint32_t plane_w = w_blocks * 8;
+            uint32_t plane_h = h_blocks * 8;
 
-                // 1. Zigzag → spatial order 
-                for (int i = 0; i < 64; ++i) {
-                    spatial_coeffs[zigzag_order[i]] = static_cast<int16_t>(std::round(zigzag_coeffs.data()[i]));
-                }
+            auto qt_it = qt_map.find(ch.qtable_id);
+            if (qt_it == qt_map.end()) {
+                throw std::runtime_error("Quant table not found for qtable_id=" + std::to_string(ch.qtable_id));
+            }
+            const uint8_t* qtable = qt_it->second->data;
 
-                // 2. 反量化
-                for (int i = 0; i < 64; ++i) {
-                    dequant_coeffs[i] = static_cast<int>(spatial_coeffs[i]) * static_cast<int>(qtable[i]);
-                }
+            std::vector<std::vector<uint8_t>> plane(plane_h, std::vector<uint8_t>(plane_w));
 
-                // 3. IDCT → 8x8 像素块
-                uint8_t pixels[64];
-                idct_8x8(dequant_coeffs, pixels);
+            for (size_t by = 0; by < h_blocks; ++by) {
+                for (size_t bx = 0; bx < w_blocks; ++bx) {
+                    if (block_idx >= dct_blocks.size()) {
+                        throw std::runtime_error("Ran out of DCT blocks while decoding.");
+                    }
+                    const auto& zigzag_coeffs = dct_blocks[block_idx++];
+                    int16_t spatial_coeffs[64];
+                    int dequant_coeffs[64];
 
-                // 4. 写入平面
-                for (size_t y = 0; y < 8; ++y) {
-                    for (size_t x = 0; x < 8; ++x) {
-                        size_t py = by * 8 + y;
-                        size_t px = bx * 8 + x;
-                        if (py < plane_h && px < plane_w) {
-                            plane[py][px] = pixels[y * 8 + x];
+                    for (size_t k = 0; k < 64; ++k) {
+                        // Defensive: ensure zigzag_coeffs has at least 64 entries
+                        double coeff = (k < static_cast<int>(zigzag_coeffs.size())) ? zigzag_coeffs[k] : 0.0;
+                        spatial_coeffs[zigzag_order[k]] = static_cast<int16_t>(std::round(coeff));
+                    }
+
+                    for (size_t k = 0; k < 64; ++k) {
+                        dequant_coeffs[k] = static_cast<int>(spatial_coeffs[k]) * static_cast<int>(qtable[k]);
+                    }
+
+                    uint8_t pixels[64];
+                    idct_8x8(dequant_coeffs, pixels);
+
+                    for (size_t y = 0; y < 8; ++y) {
+                        for (size_t x = 0; x < 8; ++x) {
+                            size_t py = by * 8 + y;
+                            size_t px = bx * 8 + x;
+                            if (py < plane_h && px < plane_w) {
+                                plane[py][px] = pixels[y * 8 + x];
+                            }
                         }
                     }
                 }
             }
+            planes.push_back(std::move(plane));
         }
-        planes.push_back(std::move(plane));
-    }
 
-    if (planes.size() == 1) {
-        // Grayscale → RGB (直接复制)
-        planes.push_back(planes[0]);
-        planes.push_back(planes[0]);
-    } else if (planes.size() == 3) {
-        // 假设 channel_dcts 中顺序为 Y, Cb, Cr（通常 libjpeg 保持此顺序）
-        // 以 Y 平面为基准（plane 0）
-        const auto& y_plane = planes[0];
-        uint32_t y_plane_h = static_cast<uint32_t>(y_plane.size());
-        uint32_t y_plane_w = static_cast<uint32_t>(y_plane.empty() ? 0 : y_plane[0].size());
+        // Handle grayscale → RGB
+        if (planes.size() == 1) {
+            planes.push_back(planes[0]);
+            planes.push_back(planes[0]);
+        } else if (planes.size() != 3) {
+            throw std::runtime_error("Unsupported channel count: " + std::to_string(planes.size()));
+        }
 
-        // 如果 Y 平面本身小于图像，先把 Y 放大到图像尺寸（极少见，通常 Y >= img）
-        std::vector<std::vector<uint8_t>> y_fixed;
-        resize_or_crop_plane(planes[0], y_fixed, img_height, img_width);
-        planes[0] = std::move(y_fixed);
+        // === NEW: ensure each plane is resized/cropped to img_height x img_width ===
+        for (size_t c = 0; c < planes.size(); ++c) {
+            std::vector<std::vector<uint8_t>> fixed;
+            resize_or_crop_plane(planes[c], fixed, img_height, img_width);
+            planes[c] = std::move(fixed);
+        }
 
-        // 对每个色度分量：先把 Cb/Cr 放缩到 Y 平面原始尺寸（y_plane_h x y_plane_w）
-        // 再把结果裁剪或放缩到最终的 img_height x img_width（以处理 MCU padding 情况）
+        uint32_t y_plane_h = static_cast<uint32_t>(planes[0].size());
+        uint32_t y_plane_w = planes[0].empty() ? 0u : static_cast<uint32_t>(planes[0][0].size());
+
         for (size_t c = 1; c <= 2; ++c) {
-            // 当前 chroma plane 的尺寸
             uint32_t c_h = static_cast<uint32_t>(planes[c].size());
-            uint32_t c_w = static_cast<uint32_t>(planes[c].empty() ? 0 : planes[c][0].size());
+            uint32_t c_w = planes[c].empty() ? 0u : static_cast<uint32_t>(planes[c][0].size());
 
-            // 先把 chroma 放大到 Y plane 大小（如果 chroma 更小）
             std::vector<std::vector<uint8_t>> tmp;
             if (c_h != y_plane_h || c_w != y_plane_w) {
-                // 如果 chroma 更大也没关系，resize_or_crop_plane 会裁剪
+                // 将 chroma 放大/裁剪到 Y 的原始尺寸
                 resize_or_crop_plane(planes[c], tmp, y_plane_h, y_plane_w);
             } else {
-                tmp = planes[c]; // 大小相等，直接使用
+                tmp = planes[c];
             }
 
-            // 最后把该平面裁剪或上采样到最终图像像素大小（img_height x img_width）
+            // 最后把该平面裁剪/上采样到最终图像尺寸
             std::vector<std::vector<uint8_t>> final_plane;
             resize_or_crop_plane(tmp, final_plane, img_height, img_width);
             planes[c] = std::move(final_plane);
         }
 
-    } else {
-        throw std::runtime_error("Unsupported channel count: " + std::to_string(planes.size()));
-    }
+        // Prepare result storage for this image: [3][H][W] of uint8_t
+        result[img_idx].resize(3);
+        for (size_t c = 0; c < 3; ++c) {
+            result[img_idx][c].assign(img_height, std::vector<uint8_t>(img_width));
+        }
 
-    // 转换为 [image][channel][height][width] 格式（double）
-    std::vector<std::vector<std::vector<std::vector<double>>>> result;
-    result.resize(1);                    // 1 image
-    result[0].resize(3);                 // R, G, B
-    for (size_t c = 0; c < 3; ++c) {
-        result[0][c].resize(img_height, std::vector<double>(img_width));
-    }
-
-    for (uint32_t y = 0; y < img_height; ++y) {
-        for (uint32_t x = 0; x < img_width; ++x) {
-            uint8_t Y = planes[0][y][x];
-            uint8_t Cb = planes[1][y][x];
-            uint8_t Cr = planes[2][y][x];
-            uint8_t r, g, b;
-            ycbcr_to_rgb(Y, Cb, Cr, r, g, b);
-            result[0][0][y][x] = static_cast<double>(r);
-            result[0][1][y][x] = static_cast<double>(g);
-            result[0][2][y][x] = static_cast<double>(b);
+        // Convert to RGB uint8
+        for (uint32_t y = 0; y < img_height; ++y) {
+            for (uint32_t x = 0; x < img_width; ++x) {
+                uint8_t Y = planes[0][y][x];
+                uint8_t Cb = planes[1][y][x];
+                uint8_t Cr = planes[2][y][x];
+                uint8_t r, g, b;
+                ycbcr_to_rgb(Y, Cb, Cr, r, g, b);
+                result[img_idx][0][y][x] = r;
+                result[img_idx][1][y][x] = g;
+                result[img_idx][2][y][x] = b;
+            }
         }
     }
 
-    return result; // shape: [1][3][H][W]
+    if (block_idx != dct_blocks.size()) {
+        throw std::runtime_error("Unused DCT blocks remain after decoding all images.");
+    }
+
+    return result; // shape: [N][3][H][W], values in uint8_t
 }
 
 
@@ -601,8 +668,13 @@ void JpegLoader::print_image_header(const ImageHeader& header) {
     printf("Width: %u pixels\n", header.width);
     printf("Height: %u pixels\n", header.height);
     printf("Quality: %u (0 = unknown)\n", header.quality);           // <-- NEW
-    printf("Color Space: %s\n", header.color_space.c_str());         // <-- NEW
+    // printf("Color Space: %s\n", header.color_space.c_str());         // <-- NEW
     printf("\n");
+
+    printf("Color Space (%zu config):\n", header.color_spaces.size());
+    for (size_t i = 0; i < header.color_spaces.size(); ++i) {
+        printf("Color Space %zu: %s\n",i, header.color_spaces[i].c_str());         // <-- NEW
+    }
     
     printf("Quantization Tables (%zu tables):\n", header.quant_tables.size());
     for (size_t i = 0; i < header.quant_tables.size(); ++i) {
@@ -624,7 +696,8 @@ void JpegLoader::print_image_header(const ImageHeader& header) {
         const auto& channel = header.channel_dcts[ch];
         printf("  Channel %zu:\n", ch);
         printf("    Component ID: %d\n", (int)channel.component_id);
-        printf("    Quant Table ID: %d\n", (int)channel.qtable_id);  // <-- NEW
+        printf("    Quant Table ID: %d\n", (int)channel.qtable_id);  
+        printf("    Color Space ID: %d\n", (int)channel.color_space_id);  
         printf("    Width in blocks: %u\n", channel.width_in_blocks);
         printf("    Height in blocks: %u\n", channel.height_in_blocks);
         printf("    Total blocks: %zu\n", channel.blocks.size());
@@ -662,11 +735,20 @@ bool JpegLoader::dump_ImageHeader(const ImageHeader& header, const char* filenam
     fwrite(&header.height, sizeof(uint32_t), 1, fp);
     fwrite(&header.quality, sizeof(uint32_t), 1, fp); // <-- NEW
 
+    // uint64_t color_space_len = header.color_space.size();
+    // fwrite(&color_space_len, sizeof(uint64_t), 1, fp);
+    // if (color_space_len > 0) {
+    //     fwrite(header.color_space.data(), sizeof(char), color_space_len, fp);
+
     // Color space: write length + string
-    uint64_t color_space_len = header.color_space.size();
-    fwrite(&color_space_len, sizeof(uint64_t), 1, fp);
-    if (color_space_len > 0) {
-        fwrite(header.color_space.data(), sizeof(char), color_space_len, fp);
+    uint64_t cs_count = header.color_spaces.size();
+    fwrite(&cs_count, sizeof(uint64_t), 1, fp);
+    for (const auto& cs : header.color_spaces) {
+        uint64_t color_space_len = cs.size();
+        fwrite(&color_space_len, sizeof(uint64_t), 1, fp);
+        if (color_space_len > 0) {
+            fwrite(cs.data(), sizeof(char), color_space_len, fp);
+        }
     }
 
     // Quant tables
@@ -684,6 +766,7 @@ bool JpegLoader::dump_ImageHeader(const ImageHeader& header, const char* filenam
     for (const auto& ch : header.channel_dcts) {
         fwrite(&ch.component_id, sizeof(uint8_t), 1, fp);
         fwrite(&ch.qtable_id, sizeof(uint8_t), 1, fp);            // <-- NEW
+        fwrite(&ch.color_space_id, sizeof(uint8_t), 1, fp);            // <-- NEW
         fwrite(&ch.width_in_blocks, sizeof(uint32_t), 1, fp);
         fwrite(&ch.height_in_blocks, sizeof(uint32_t), 1, fp);
         // Note: blocks are NOT saved in header dump (as before)
@@ -705,12 +788,23 @@ bool JpegLoader::load_ImageHeader(ImageHeader& header, const char* filename) {
     fread(&header.height, sizeof(uint32_t), 1, fp);
     fread(&header.quality, sizeof(uint32_t), 1, fp); // <-- NEW
 
+    // uint64_t color_space_len;
+    // fread(&color_space_len, sizeof(uint64_t), 1, fp);
+    // header.color_space.resize(color_space_len);
+    // if (color_space_len > 0) {
+    //     fread(&header.color_space[0], sizeof(char), color_space_len, fp);
+
     // Color space
-    uint64_t color_space_len;
-    fread(&color_space_len, sizeof(uint64_t), 1, fp);
-    header.color_space.resize(color_space_len);
-    if (color_space_len > 0) {
-        fread(&header.color_space[0], sizeof(char), color_space_len, fp);
+    uint64_t cs_count;
+    fread(&cs_count, sizeof(uint64_t), 1, fp);
+    header.color_spaces.resize(cs_count);
+    for (size_t i = 0; i < cs_count; ++i) {
+        uint64_t color_space_len;
+        fread(&color_space_len, sizeof(uint64_t), 1, fp);
+        header.color_spaces[i].resize(color_space_len);
+        if (color_space_len > 0) {
+            fread(&header.color_spaces[i][0], sizeof(char), color_space_len, fp);
+        }
     }
 
     // Quant tables
@@ -732,6 +826,7 @@ bool JpegLoader::load_ImageHeader(ImageHeader& header, const char* filename) {
         auto& ch = header.channel_dcts[ch_idx];
         fread(&ch.component_id, sizeof(uint8_t), 1, fp);
         fread(&ch.qtable_id, sizeof(uint8_t), 1, fp);             // <-- NEW
+        fread(&ch.color_space_id, sizeof(uint8_t), 1, fp);             // <-- NEW
         fread(&ch.width_in_blocks, sizeof(uint32_t), 1, fp);
         fread(&ch.height_in_blocks, sizeof(uint32_t), 1, fp);
         ch.blocks.clear(); // blocks not stored in header file

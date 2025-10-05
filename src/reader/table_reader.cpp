@@ -61,7 +61,7 @@ void TableReader::to_csv(const char* file_path) const {
 }
 
 
-std::vector<std::vector<std::vector<double>>> TableReader::to_rgb(const path& file_path) const {
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>>  TableReader::to_rgb(const path& file_path) const {
     std::vector<std::vector<double>> result;
 	for (n_t rowgroup_idx {0}; rowgroup_idx < m_table_descriptor->m_rowgroup_descriptors.size(); rowgroup_idx++) {
 		auto rowgroup_up = get_rowgroup_reader(rowgroup_idx)->materialize();
@@ -88,15 +88,15 @@ std::vector<std::vector<std::vector<double>>> TableReader::to_rgb(const path& fi
         }
 	}
 	auto res = JpegLoader::to_rgb(result, file_path.parent_path() / "header.meta");
-	return res[0];
+	return res;
 }
 
-std::vector<std::vector<std::vector<double>>> TableReader::to_rgb(const string& file_path) const {
-	return to_rgb(path(file_path));
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const std::string& file_path) const {
+    return to_rgb(path(file_path));
 }
 
-std::vector<std::vector<std::vector<double>>> TableReader::to_rgb(const char* file_path) const {
-	return to_rgb(path(file_path));
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const char* file_path) const {
+    return to_rgb(path(file_path));
 }
 
 
