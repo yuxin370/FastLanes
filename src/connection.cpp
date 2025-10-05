@@ -177,8 +177,9 @@ Connection& Connection::read_jpeg_dir(const std::string& dir_path, const std::st
     // Step 2: Deduplicate headers
     ImageHeader unified_header = deduplicate_headers(all_headers);
 
-	printf("unified header is as follows:\n");
-	JpegLoader::print_image_header(unified_header);
+	// printf("unified header is as follows:\n");
+	// JpegLoader::print_image_header(unified_header);
+	
     // Step 3: Dump unified header
     JpegLoader::dump_ImageHeader(unified_header, header_path.c_str());
 

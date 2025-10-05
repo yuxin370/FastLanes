@@ -472,8 +472,8 @@ std::vector<std::vector<std::vector<std::vector<uint8_t>>>> JpegLoader::to_rgb(
         throw std::runtime_error("Failed to load ImageHeader from " + file_path.string());
     }
 
-    printf("in to_rgb, we load image header:\n");
-    JpegLoader::print_image_header(header);
+    // printf("in to_rgb, we load image header:\n");
+    // JpegLoader::print_image_header(header);
 
     if (header.channel_dcts.empty()) {
         throw std::runtime_error("No channels in header.");
