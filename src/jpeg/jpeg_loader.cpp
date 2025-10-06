@@ -157,7 +157,7 @@ ProcessedDCTChannel JpegLoader::process_channel(const ImageHeader& header,
                 // left + mid
                 pro_dct_blocks.AC_values.insert(pro_dct_blocks.AC_values.end(),
                                         ac_coefs.begin(), ac_coefs.begin() + left_c + mid_c);
-                // right 非零并入 mix_run_nonzero_values
+                // right merge into mix_run_nonzero_values
                 for (size_t i = static_cast<size_t>(left_c + mid_c); i < 63; ++i) {
                     if (ac_coefs[i] != 0) {
                         pro_dct_blocks.mix_run_nonzero_values.push_back(ac_coefs[i]);
@@ -168,7 +168,7 @@ ProcessedDCTChannel JpegLoader::process_channel(const ImageHeader& header,
                 // left
                 pro_dct_blocks.AC_values.insert(pro_dct_blocks.AC_values.end(),
                                         ac_coefs.begin(), ac_coefs.begin() + left_c);
-                // mid+right：非零值入 mix_run_nonzero_values；完整序列用于 run-length
+                // mid+right：nonzero value merge into mix_run_nonzero_values
                 for (size_t i = static_cast<size_t>(left_c); i < 63; ++i) {
                     if (ac_coefs[i] != 0) {
                         pro_dct_blocks.mix_run_nonzero_values.push_back(ac_coefs[i]);
@@ -267,7 +267,7 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
         jpeg_component_info* comp = &cinfo_dct.comp_info[ci];
         ChannelDCT cdct;
         cdct.component_id = static_cast<uint8_t>(comp->component_id);
-        cdct.qtable_id = static_cast<uint8_t>(comp->quant_tbl_no); // <-- NEW
+        cdct.qtable_id = static_cast<uint8_t>(comp->quant_tbl_no);
         cdct.color_space_id = 0; // <-- one image only one color space configuration
         cdct.width_in_blocks = comp->width_in_blocks;
         cdct.height_in_blocks = comp->height_in_blocks;
@@ -309,8 +309,8 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
     return {
         .width = w,
         .height = h,
-        .quality = quality,              // <-- NEW
-        .color_spaces = color_spaces,      // <-- NEW
+        .quality = quality,             
+        .color_spaces = color_spaces,     
         .quant_tables = std::move(qtables),
         .channel_dcts = std::move(channels),
     };
@@ -427,10 +427,7 @@ void ycbcr_to_rgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t& r, uint8_t& g, uin
     b = static_cast<uint8_t>(std::clamp(B, 0.0, 255.0));
 }
 
-// 把 src（src_h x src_w）裁剪或上采样到 dst_h x dst_w
-// - 如果 src 大于目标：裁剪（左上对齐）
-// - 如果 src 小于目标：使用双线性插值放大（调用 upsample_chroma_bilinear）
-// - 如果大小相等：直接拷贝
+
 static void resize_or_crop_plane(const std::vector<std::vector<uint8_t>>& src,
                                  std::vector<std::vector<uint8_t>>& dst,
                                  uint32_t dst_h, uint32_t dst_w) {
@@ -442,13 +439,11 @@ static void resize_or_crop_plane(const std::vector<std::vector<uint8_t>>& src,
     const size_t src_w = src[0].size();
 
     if (static_cast<uint32_t>(src_h) == dst_h && static_cast<uint32_t>(src_w) == dst_w) {
-        // 直接拷贝
         dst = src;
         return;
     }
 
     if (static_cast<uint32_t>(src_h) >= dst_h && static_cast<uint32_t>(src_w) >= dst_w) {
-        // 都大于等于 → 裁剪到目标（左上角对齐）
         dst.assign(dst_h, std::vector<uint8_t>(dst_w));
         for (uint32_t y = 0; y < dst_h; ++y) {
             for (uint32_t x = 0; x < dst_w; ++x) {
@@ -458,8 +453,6 @@ static void resize_or_crop_plane(const std::vector<std::vector<uint8_t>>& src,
         return;
     }
 
-    // 其他情况（至少有一维小于目标） → 使用双线性上采样到目标
-    // 注意：upsample_chroma_bilinear 支持任意 src/dst 大小
     upsample_chroma_bilinear(src, dst, dst_h, dst_w);
 }
 
@@ -622,13 +615,11 @@ std::vector<std::vector<std::vector<std::vector<uint8_t>>>> JpegLoader::to_rgb(
 
             std::vector<std::vector<uint8_t>> tmp;
             if (c_h != y_plane_h || c_w != y_plane_w) {
-                // 将 chroma 放大/裁剪到 Y 的原始尺寸
                 resize_or_crop_plane(planes[c], tmp, y_plane_h, y_plane_w);
             } else {
                 tmp = planes[c];
             }
 
-            // 最后把该平面裁剪/上采样到最终图像尺寸
             std::vector<std::vector<uint8_t>> final_plane;
             resize_or_crop_plane(tmp, final_plane, img_height, img_width);
             planes[c] = std::move(final_plane);
@@ -668,13 +659,13 @@ void JpegLoader::print_image_header(const ImageHeader& header) {
     printf("=== Image Header ===\n");
     printf("Width: %u pixels\n", header.width);
     printf("Height: %u pixels\n", header.height);
-    printf("Quality: %u (0 = unknown)\n", header.quality);           // <-- NEW
-    // printf("Color Space: %s\n", header.color_space.c_str());         // <-- NEW
+    printf("Quality: %u (0 = unknown)\n", header.quality);          
+    // printf("Color Space: %s\n", header.color_space.c_str());        
     printf("\n");
 
     printf("Color Space (%zu config):\n", header.color_spaces.size());
     for (size_t i = 0; i < header.color_spaces.size(); ++i) {
-        printf("Color Space %zu: %s\n",i, header.color_spaces[i].c_str());         // <-- NEW
+        printf("Color Space %zu: %s\n",i, header.color_spaces[i].c_str());         
     }
     
     printf("Quantization Tables (%zu tables):\n", header.quant_tables.size());
@@ -734,7 +725,7 @@ bool JpegLoader::dump_ImageHeader(const ImageHeader& header, const char* filenam
     // Basic image info
     fwrite(&header.width, sizeof(uint32_t), 1, fp);
     fwrite(&header.height, sizeof(uint32_t), 1, fp);
-    fwrite(&header.quality, sizeof(uint32_t), 1, fp); // <-- NEW
+    fwrite(&header.quality, sizeof(uint32_t), 1, fp);
 
     // uint64_t color_space_len = header.color_space.size();
     // fwrite(&color_space_len, sizeof(uint64_t), 1, fp);
@@ -766,8 +757,8 @@ bool JpegLoader::dump_ImageHeader(const ImageHeader& header, const char* filenam
     fwrite(&ch_count, sizeof(uint64_t), 1, fp);
     for (const auto& ch : header.channel_dcts) {
         fwrite(&ch.component_id, sizeof(uint8_t), 1, fp);
-        fwrite(&ch.qtable_id, sizeof(uint8_t), 1, fp);            // <-- NEW
-        fwrite(&ch.color_space_id, sizeof(uint8_t), 1, fp);            // <-- NEW
+        fwrite(&ch.qtable_id, sizeof(uint8_t), 1, fp);           
+        fwrite(&ch.color_space_id, sizeof(uint8_t), 1, fp);           
         fwrite(&ch.width_in_blocks, sizeof(uint32_t), 1, fp);
         fwrite(&ch.height_in_blocks, sizeof(uint32_t), 1, fp);
         // Note: blocks are NOT saved in header dump (as before)
@@ -787,7 +778,7 @@ bool JpegLoader::load_ImageHeader(ImageHeader& header, const char* filename) {
 
     fread(&header.width, sizeof(uint32_t), 1, fp);
     fread(&header.height, sizeof(uint32_t), 1, fp);
-    fread(&header.quality, sizeof(uint32_t), 1, fp); // <-- NEW
+    fread(&header.quality, sizeof(uint32_t), 1, fp);
 
     // uint64_t color_space_len;
     // fread(&color_space_len, sizeof(uint64_t), 1, fp);
@@ -826,8 +817,8 @@ bool JpegLoader::load_ImageHeader(ImageHeader& header, const char* filename) {
     for (size_t ch_idx = 0; ch_idx < ch_count; ++ch_idx) {
         auto& ch = header.channel_dcts[ch_idx];
         fread(&ch.component_id, sizeof(uint8_t), 1, fp);
-        fread(&ch.qtable_id, sizeof(uint8_t), 1, fp);             // <-- NEW
-        fread(&ch.color_space_id, sizeof(uint8_t), 1, fp);             // <-- NEW
+        fread(&ch.qtable_id, sizeof(uint8_t), 1, fp);            
+        fread(&ch.color_space_id, sizeof(uint8_t), 1, fp);            
         fread(&ch.width_in_blocks, sizeof(uint32_t), 1, fp);
         fread(&ch.height_in_blocks, sizeof(uint32_t), 1, fp);
         ch.blocks.clear(); // blocks not stored in header file

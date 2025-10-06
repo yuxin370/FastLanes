@@ -58,6 +58,14 @@ struct DCTBlockRow {
     int16_t data[64];  // One 8x8 block's DCT coefficients
 };
 
+// enum class ColorSpace : uint8_t {
+//     Grayscale = 0,
+//     RGB       = 1,
+//     YCbCr     = 2,
+//     CMYK      = 3,
+//     YCCK      = 4
+// };
+
 struct ChannelDCT {
     uint8_t component_id;
     uint8_t qtable_id;

@@ -84,8 +84,8 @@ static up<ColumnDescriptorT> make_typed_child(const string& name, DataType dt, c
     child->name = name;
     child->data_type = dt;
     child->idx = idx;
-    child->max = make_unique<BinaryValueT>();  // 初始化 max
-    child->encoding_rpn = make_unique<RPNT>(); // 初始化 encoding_rpn
+    child->max = make_unique<BinaryValueT>();  //  max
+    child->encoding_rpn = make_unique<RPNT>(); // encoding_rpn
     return child;
 }
 
@@ -102,10 +102,9 @@ up<ColumnDescriptorT> make_dct_channel_struct_column_descriptor(const string& na
     dct_channel_struct->name = name;
     dct_channel_struct->data_type = DataType::STRUCT;
     dct_channel_struct->children = std::move(children);
-    dct_channel_struct->max = make_unique<BinaryValueT>();  // 初始化 max
-    dct_channel_struct->encoding_rpn = make_unique<RPNT>(); // 初始化 encoding_rpn
+    dct_channel_struct->max = make_unique<BinaryValueT>();  //  max
+    dct_channel_struct->encoding_rpn = make_unique<RPNT>(); //  encoding_rpn
     
-    // // 设置子列的索引
     // for (n_t i = 0; i < dct_channel_struct->children.size(); i++) {
     //     dct_channel_struct->children[i]->idx = i;
     // }
@@ -127,7 +126,7 @@ void ingest_dct_channel_into_struct(up<Rowgroup>& cur_rowgroup, const ProcessedD
     if (auto* struct_ptr = std::get_if<std::unique_ptr<fastlanes::Struct>>(&variant_elem)) {
         if (*struct_ptr && !(*struct_ptr)->internal_rowgroup.empty()) {
             // 1. DC values - append using standard Attribute::Ingest with error checking
-            auto& physical_column0 = (*struct_ptr)->internal_rowgroup[0]; // 解引用 unique_ptr
+            auto& physical_column0 = (*struct_ptr)->internal_rowgroup[0]; 
             for (auto v : channel.DC_values) {
                 try {
                     Attribute::Ingest(physical_column0, std::to_string(v), 
@@ -138,7 +137,7 @@ void ingest_dct_channel_into_struct(up<Rowgroup>& cur_rowgroup, const ProcessedD
             }
 
             // 2. AC values - append using standard Attribute::Ingest with error checking
-            auto& physical_column1 = (*struct_ptr)->internal_rowgroup[1]; // 解引用 unique_ptr
+            auto& physical_column1 = (*struct_ptr)->internal_rowgroup[1]; 
             for (auto v : channel.AC_values) {
                 // auto& physical_column = cur_rowgroup->internal_rowgroup[1];
                 try {
@@ -150,7 +149,7 @@ void ingest_dct_channel_into_struct(up<Rowgroup>& cur_rowgroup, const ProcessedD
             }
 
             // 3. mix_run_nonzero_values - append using standard Attribute::Ingest with error checking
-            auto& physical_column2 = (*struct_ptr)->internal_rowgroup[2]; // 解引用 unique_ptr
+            auto& physical_column2 = (*struct_ptr)->internal_rowgroup[2]; 
             for (auto v : channel.mix_run_nonzero_values) {
                 // auto& physical_column = cur_rowgroup->internal_rowgroup[2];
                 try {
@@ -162,7 +161,7 @@ void ingest_dct_channel_into_struct(up<Rowgroup>& cur_rowgroup, const ProcessedD
             }
 
             // 4. mix_run_pattern - append using standard Attribute::Ingest with error checking
-            auto& physical_column3 = (*struct_ptr)->internal_rowgroup[3]; // 解引用 unique_ptr
+            auto& physical_column3 = (*struct_ptr)->internal_rowgroup[3]; 
             for (auto& pattern : channel.mix_run_pattern) {
                 // auto& physical_column = cur_rowgroup->internal_rowgroup[3];
                 try {
@@ -188,7 +187,7 @@ up<Table> DctChannelReader::Read(const ProcessedDCTChannel& channel, const int t
     {
     case 1:
     // --------------------------
-    // 1. DC values → 单列
+    // 1. DC values → single column
     // --------------------------
     {
         auto rowgroup_descriptor = make_unique<RowgroupDescriptorT>();
@@ -227,7 +226,7 @@ up<Table> DctChannelReader::Read(const ProcessedDCTChannel& channel, const int t
     }
     break;
     // --------------------------
-    // 2. AC values → 单列
+    // 2. AC values → single column
     // --------------------------
     case 2:
     {
@@ -268,7 +267,7 @@ up<Table> DctChannelReader::Read(const ProcessedDCTChannel& channel, const int t
     break;
 
     // --------------------------
-    // 3. mix_run_nonzero_values → 单列
+    // 3. mix_run_nonzero_values → single column
     // --------------------------
     case 3:
     {
@@ -308,7 +307,7 @@ up<Table> DctChannelReader::Read(const ProcessedDCTChannel& channel, const int t
     }
     break;
     // --------------------------
-    // 4. mix_run_pattern → 两列 (zero_count, nonzero_count)
+    // 4. mix_run_pattern → two column (zero_count, nonzero_count)
     // --------------------------
     case 4:
     {
@@ -362,7 +361,7 @@ up<Table> DctChannelReader::Read(const ProcessedDCTChannel& channel, const int t
     }
     break;
     // --------------------------
-    // DCT Channel as Struct → 单列struct，包含所有字段
+    // DCT Channel as Struct → single columnstruct，include all the data
     // --------------------------
     case 5: // New case for struct-based storage
     {
@@ -387,7 +386,7 @@ up<Table> DctChannelReader::Read(const ProcessedDCTChannel& channel, const int t
         
         cur_rowgroup->n_tup = 1; // One struct row per channel
         
-        // 处理填充
+       
         const n_t leftover = cur_rowgroup->n_tup % CFG::VEC_SZ;
         if (leftover != 0) {
             n_t how_many_to_fill = CFG::VEC_SZ - leftover;
