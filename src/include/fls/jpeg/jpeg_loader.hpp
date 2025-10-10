@@ -47,6 +47,13 @@ struct ImageRGB {
     std::vector<unsigned char> data;  // RGBRGB...
 };
 
+enum class ColorSpace : uint8_t {
+    Grayscale = 0,
+    RGB       = 1,
+    YCbCr     = 2,
+    CMYK      = 3,
+    YCCK      = 4
+};
 
 struct QuantTable {
     uint8_t id;
@@ -57,14 +64,6 @@ struct QuantTable {
 struct DCTBlockRow {
     int16_t data[64];  // One 8x8 block's DCT coefficients
 };
-
-// enum class ColorSpace : uint8_t {
-//     Grayscale = 0,
-//     RGB       = 1,
-//     YCbCr     = 2,
-//     CMYK      = 3,
-//     YCCK      = 4
-// };
 
 struct ChannelDCT {
     uint8_t component_id;
@@ -78,9 +77,8 @@ struct ChannelDCT {
 struct ImageHeader {
     uint32_t width;
     uint32_t height;
-    uint32_t quality;
-    std::vector<std::string> color_spaces;
-    // std::vector<uint8_t> rgb_data;  // Optional
+    uint8_t quality;
+    std::vector<ColorSpace> color_spaces;
     std::vector<QuantTable> quant_tables;
     std::vector<ChannelDCT> channel_dcts;
 };

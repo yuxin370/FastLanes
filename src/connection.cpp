@@ -83,7 +83,7 @@ ImageHeader deduplicate_headers(const std::vector<ImageHeader>& all_headers) {
     unified_header.height  = all_headers[0].height;
     unified_header.quality = all_headers[0].quality;
 
-    std::unordered_map<std::string, uint8_t> color_space_to_id;
+    std::unordered_map<ColorSpace, uint8_t> color_space_to_id;
 
     // Helper: check if two quant tables are identical
     auto quant_table_equal = [](const QuantTable &a, const QuantTable &b) -> bool {
@@ -118,7 +118,7 @@ ImageHeader deduplicate_headers(const std::vector<ImageHeader>& all_headers) {
         if (hdr.color_spaces.empty()) {
             throw std::runtime_error("Image header has no color space info.");
         }
-        const std::string &img_color_space = hdr.color_spaces[0];
+        const ColorSpace &img_color_space = hdr.color_spaces[0];
         uint8_t color_space_id;
         auto it = color_space_to_id.find(img_color_space);
         if (it != color_space_to_id.end()) {

@@ -21,27 +21,67 @@
 namespace fastlanes {
  
 
-// Helper: convert libjpeg color space to string
-std::string jpeg_color_space_to_string(J_COLOR_SPACE cs) {
+// // Helper: convert libjpeg color space to string
+// std::string jpeg_color_space_to_string(J_COLOR_SPACE cs) {
+//     switch (cs) {
+//         case JCS_GRAYSCALE: return "Grayscale";
+//         case JCS_RGB:       return "RGB";
+//         case JCS_YCbCr:     return "YCbCr";
+//         case JCS_CMYK:      return "CMYK";
+//         case JCS_YCCK:      return "YCCK";
+//         default:            return "Unknown";
+//     }
+// }
+
+// // Helper: get number of channels from color space name
+// size_t get_channel_count_from_color_space(const std::string& cs) {
+//     if (cs == "Grayscale" || cs == "GRAY" || cs == "L") {
+//         return 1;
+//     } else if (cs == "YCbCr" || cs == "YUV" || cs == "RGB") {
+//         return 3;
+//     } else {
+//         // You can extend this
+//         throw std::runtime_error("Unknown color space: " + cs);
+//     }
+// }
+
+
+// Helper: convert libjpeg color space to ColorSpace enum
+ColorSpace jpeg_color_space_to_color_space(J_COLOR_SPACE cs) {
     switch (cs) {
-        case JCS_GRAYSCALE: return "Grayscale";
-        case JCS_RGB:       return "RGB";
-        case JCS_YCbCr:     return "YCbCr";
-        case JCS_CMYK:      return "CMYK";
-        case JCS_YCCK:      return "YCCK";
-        default:            return "Unknown";
+        case JCS_GRAYSCALE: return ColorSpace::Grayscale;
+        case JCS_RGB:       return ColorSpace::RGB;
+        case JCS_YCbCr:     return ColorSpace::YCbCr;
+        case JCS_CMYK:      return ColorSpace::CMYK;
+        case JCS_YCCK:      return ColorSpace::YCCK;
+        default:            throw std::runtime_error("Unsupported JPEG color space");
     }
 }
 
-// Helper: get number of channels from color space name
-size_t get_channel_count_from_color_space(const std::string& cs) {
-    if (cs == "Grayscale" || cs == "GRAY" || cs == "L") {
-        return 1;
-    } else if (cs == "YCbCr" || cs == "YUV" || cs == "RGB") {
-        return 3;
-    } else {
-        // You can extend this
-        throw std::runtime_error("Unknown color space: " + cs);
+// Helper: get number of channels from ColorSpace enum
+size_t get_channel_count_from_color_space(ColorSpace cs) {
+    switch (cs) {
+        case ColorSpace::Grayscale:
+            return 1;
+        case ColorSpace::RGB:
+        case ColorSpace::YCbCr:
+            return 3;
+        case ColorSpace::CMYK:
+        case ColorSpace::YCCK:
+            return 4;
+        default:
+            throw std::runtime_error("Unknown color space");
+    }
+}
+
+const char* color_space_to_cstring(ColorSpace cs) {
+    switch (cs) {
+        case ColorSpace::Grayscale: return "Grayscale";
+        case ColorSpace::RGB:       return "RGB";
+        case ColorSpace::YCbCr:     return "YCbCr";
+        case ColorSpace::CMYK:      return "CMYK";
+        case ColorSpace::YCCK:      return "YCCK";
+        default:                    return "Unknown";
     }
 }
 
@@ -296,12 +336,12 @@ ImageHeader JpegLoader::load_header(const std::string& path) {
 
     // Estimate quality: optional. Here we set to 0 (unknown) since libjpeg doesn't store it.
     // You could implement a heuristic based on quant tables if needed.
-    uint32_t quality = 0;
+    uint8_t quality = 0;
 
     // std::string color_space = jpeg_color_space_to_string(cinfo_dct.jpeg_color_space);
 
-    std::vector<std::string> color_spaces;
-    color_spaces.push_back(jpeg_color_space_to_string(cinfo_dct.jpeg_color_space));
+    std::vector<ColorSpace> color_spaces;
+    color_spaces.push_back(jpeg_color_space_to_color_space(cinfo_dct.jpeg_color_space));
 
     jpeg_destroy_decompress(&cinfo_dct);
     fclose(infile);
@@ -487,7 +527,7 @@ std::vector<std::vector<std::vector<std::vector<uint8_t>>>> JpegLoader::to_rgb(
             throw std::runtime_error("Invalid color_space_id: " + std::to_string(cs_id));
         }
 
-        std::string color_space_name = header.color_spaces[cs_id];
+        ColorSpace color_space_name = header.color_spaces[cs_id];
         size_t expected_channels = get_channel_count_from_color_space(color_space_name);
 
         // Check that next 'expected_channels' channels all have same cs_id
@@ -665,9 +705,9 @@ void JpegLoader::print_image_header(const ImageHeader& header) {
 
     printf("Color Space (%zu config):\n", header.color_spaces.size());
     for (size_t i = 0; i < header.color_spaces.size(); ++i) {
-        printf("Color Space %zu: %s\n",i, header.color_spaces[i].c_str());         
+        printf("Color Space %zu: %s\n", i, color_space_to_cstring(header.color_spaces[i]));
     }
-    
+        
     printf("Quantization Tables (%zu tables):\n", header.quant_tables.size());
     for (size_t i = 0; i < header.quant_tables.size(); ++i) {
         const auto& qt = header.quant_tables[i];
@@ -725,7 +765,7 @@ bool JpegLoader::dump_ImageHeader(const ImageHeader& header, const char* filenam
     // Basic image info
     fwrite(&header.width, sizeof(uint32_t), 1, fp);
     fwrite(&header.height, sizeof(uint32_t), 1, fp);
-    fwrite(&header.quality, sizeof(uint32_t), 1, fp);
+    fwrite(&header.quality, sizeof(uint8_t), 1, fp);
 
     // uint64_t color_space_len = header.color_space.size();
     // fwrite(&color_space_len, sizeof(uint64_t), 1, fp);
@@ -736,11 +776,8 @@ bool JpegLoader::dump_ImageHeader(const ImageHeader& header, const char* filenam
     uint64_t cs_count = header.color_spaces.size();
     fwrite(&cs_count, sizeof(uint64_t), 1, fp);
     for (const auto& cs : header.color_spaces) {
-        uint64_t color_space_len = cs.size();
-        fwrite(&color_space_len, sizeof(uint64_t), 1, fp);
-        if (color_space_len > 0) {
-            fwrite(cs.data(), sizeof(char), color_space_len, fp);
-        }
+        uint8_t cs_val = static_cast<uint8_t>(cs);
+        fwrite(&cs_val, sizeof(uint8_t), 1, fp);
     }
 
     // Quant tables
@@ -778,7 +815,7 @@ bool JpegLoader::load_ImageHeader(ImageHeader& header, const char* filename) {
 
     fread(&header.width, sizeof(uint32_t), 1, fp);
     fread(&header.height, sizeof(uint32_t), 1, fp);
-    fread(&header.quality, sizeof(uint32_t), 1, fp);
+    fread(&header.quality, sizeof(uint8_t), 1, fp);
 
     // uint64_t color_space_len;
     // fread(&color_space_len, sizeof(uint64_t), 1, fp);
@@ -791,12 +828,13 @@ bool JpegLoader::load_ImageHeader(ImageHeader& header, const char* filename) {
     fread(&cs_count, sizeof(uint64_t), 1, fp);
     header.color_spaces.resize(cs_count);
     for (size_t i = 0; i < cs_count; ++i) {
-        uint64_t color_space_len;
-        fread(&color_space_len, sizeof(uint64_t), 1, fp);
-        header.color_spaces[i].resize(color_space_len);
-        if (color_space_len > 0) {
-            fread(&header.color_spaces[i][0], sizeof(char), color_space_len, fp);
+        uint8_t cs_val;
+        fread(&cs_val, sizeof(uint8_t), 1, fp);
+        if (cs_val > static_cast<uint8_t>(ColorSpace::YCCK)) {
+            fclose(fp);
+            throw std::runtime_error("Invalid ColorSpace value in header file: " + std::to_string(cs_val));
         }
+        header.color_spaces[i] = static_cast<ColorSpace>(cs_val);
     }
 
     // Quant tables

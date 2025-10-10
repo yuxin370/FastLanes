@@ -49,7 +49,7 @@ def main():
     reader.to_csv(csv_file)
 
     # 6) NEW: Use the new dct_to_str_list() method
-    data_list_double = reader.dct_to_double_list()  # Returns List[List[double]]
+    data_list_double = reader.to_double_list()  # Returns List[List[double]]
 
     print(f"Data shape: {len(data_list_double)} rows × {len(data_list_double[0]) if data_list_double else 0} columns")
 
@@ -60,11 +60,11 @@ def main():
 
         # 6) NEW: Use the new to_numpy_numeric() method
         print("\n Calling to_numpy_numeric()...")
-        data_numpy_double = reader.to_numpy_numeric()  # Returns List[List[str]]
+        data_numpy_double = reader.to_numpy_numeric() 
         print(data_numpy_double)
 
         print("\n Calling to_numpy_numeric()...")
-        data_numpy_rgb = reader.to_numpy_rgb(header_file)  # Returns List[List[str]]
+        data_numpy_rgb = reader.to_numpy_rgb(header_file,False) 
         print(data_numpy_rgb)
 
         if HAS_TORCH:

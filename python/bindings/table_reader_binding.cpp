@@ -17,7 +17,7 @@ namespace py = pybind11;
 
 namespace fastlanes {
 
-std::vector<std::vector<double>> dct_to_double_list(fastlanes::TableReader& self) {
+std::vector<std::vector<double>> to_double_list(fastlanes::TableReader& self) {
     size_t num_rowgroups = self.get_num_rowgroups();
     // n_t total_rows = 0;
     n_t total_cols = 0;
@@ -189,13 +189,13 @@ void bind_table_reader(py::module_& m) {
 
 	cls.def(
 	       "to_csv", [](fastlanes::TableReader& self, const char* path) { self.to_csv(path); }, py::arg("file_path"))
-		.def("dct_to_double_list", &fastlanes::dct_to_double_list, "Convert FLS file to double list array")
+		.def("to_double_list", &fastlanes::to_double_list, "Convert FLS file to double list array")
 		.def("to_numpy_numeric", &fastlanes::to_numpy_numeric, "Convert numeric FLS table to NumPy float64 array")
 		.def("to_numpy_rgb", &fastlanes::to_numpy_rgb, "Convert DCT FLS table to NumPy RGB float64 array")
 	    .def("__repr__", [](const fastlanes::TableReader&) { return "<fastlanes.TableReader>"; })
 	    .def("__dir__", []() {
 		    return std::vector<std::string> {
-		        "to_csv","dct_to_double_list","to_numpy_numeric", "to_numpy_rgb", "__repr__", "__dir__"
+		        "to_csv","to_double_list","to_numpy_numeric", "to_numpy_rgb", "__repr__", "__dir__"
 		        // "to_csv", "__repr__", "__dir__"
 		        // Add more method/field names as you expose them
 		    };
