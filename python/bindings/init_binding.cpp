@@ -10,6 +10,7 @@ namespace py = pybind11;
 
 void bind_connection(py::module_&);
 void bind_table_reader(py::module_&);
+void bind_jpeg_loader(py::module_&);
 
 PYBIND11_MODULE(_fastlanes, m) {
 	m.doc() = "Python bindings for FastLanes";
@@ -18,4 +19,5 @@ PYBIND11_MODULE(_fastlanes, m) {
 
 	bind_connection(m);
 	bind_table_reader(m);
+	bind_jpeg_loader(m);
 }

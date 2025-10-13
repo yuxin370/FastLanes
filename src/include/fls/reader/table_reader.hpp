@@ -15,7 +15,7 @@ namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
 class Connection;
 class RowgroupReader;
-struct TableDescriptorT;
+class TableDescriptorHandle;
 class Table;
 /*--------------------------------------------------------------------------------------------------------------------*/
 class FLS_API TableReader {
@@ -40,9 +40,9 @@ public:
 	std::vector<std::vector<std::vector<std::vector<uint8_t>>>> to_rgb(const string& file_path) const;
 	std::vector<std::vector<std::vector<std::vector<uint8_t>>>> to_rgb(const char* file_path) const;
 private:
-	up<TableDescriptorT> m_table_descriptor;
-	Connection&          m_connection;
-	const path           m_file_path;
+	up<TableDescriptorHandle> m_table_descriptor_handle;
+	Connection&               m_connection;
+	const path                m_file_path;
 };
 
 } // namespace fastlanes
