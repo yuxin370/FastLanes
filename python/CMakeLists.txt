@@ -13,6 +13,7 @@ set(FLS_BINDING_SRC
         bindings/init_binding.cpp
         bindings/connection_binding.cpp
         bindings/table_reader_binding.cpp
+        bindings/jpeg_loader_binding.cpp
 )
 
 # ─────────────────────────────────────────────────────────────

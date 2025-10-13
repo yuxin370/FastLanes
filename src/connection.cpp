@@ -157,18 +157,39 @@ Connection& Connection::read_jpeg_dir(const std::string& dir_path, const std::st
 
     std::vector<ImageHeader> all_headers;
 
+	std::vector<fs::path> files;
+	for (const auto& entry : fs::directory_iterator(dir_path)) {
+		if (!entry.is_regular_file()) continue;
+		const auto& p = entry.path();
+		if (is_jpeg_file(p)) {
+			files.push_back(p);
+		}
+	}
+
+	std::sort(files.begin(), files.end(),
+			[](const fs::path& a, const fs::path& b) {
+				return a.filename().string() < b.filename().string();
+			});
+
+	for (size_t k = 0; k < files.size(); ++k) {
+		printf("Reading header from: %s\n", files[k].string().c_str());
+		auto header = JpegLoader::load_header(files[k].string());
+		all_headers.push_back(std::move(header));
+		
+	}
+
     // Step 1: Iterate all JPEG files
-    for (const auto& entry : fs::directory_iterator(dir_path)) {
-        if (is_jpeg_file(entry.path())) {
-            try {
-                auto header = JpegLoader::load_header(entry.path().string());
-                all_headers.push_back(std::move(header));
-            } catch (const std::exception& e) {
-                // Optionally warn and skip
-                continue;
-            }
-        }
-    }
+    // for (const auto& entry : fs::directory_iterator(dir_path)) {
+    //     if (is_jpeg_file(entry.path())) {
+    //         try {
+    //             auto header = JpegLoader::load_header(entry.path().string());
+    //             all_headers.push_back(std::move(header));
+    //         } catch (const std::exception& e) {
+    //             // Optionally warn and skip
+    //             continue;
+    //         }
+    //     }
+    // }
 
     if (all_headers.empty()) {
         throw std::runtime_error("No valid JPEG files found in directory: " + dir_path);

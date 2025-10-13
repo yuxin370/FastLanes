@@ -104,11 +104,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    std::sort(jpeg_paths.begin(), jpeg_paths.end(),
+            [](const std::string& a, const std::string& b) {
+                const auto fa = fs::path(a).filename().string();
+                const auto fb = fs::path(b).filename().string();
+                if (fa != fb) return fa < fb;
+                // 同名时用完整路径打破并列（极少见，但更稳妥）
+                return a < b;
+            });
+            
     // 预先载入所有原始 JPEG（用于后续验证）
     std::vector<ImageRGB> originals;
     originals.reserve(jpeg_paths.size());
     for (const auto& jp : jpeg_paths) {
         try {
+            printf("Loading original JPEG: %s\n", jp.c_str());
             auto rgb = JpegLoader::load_rgb(jp);
             originals.push_back(std::move(rgb));
             // std::cout << "Loaded original: " << jp << " (" << originals.back().width << "x" << originals.back().height << ")" << std::endl;
