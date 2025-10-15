@@ -7,8 +7,8 @@
 #define FLS_READER_DCT_CHANEEL_READER_HPP
 
 #include "fls/common/alias.hpp" // for up, idx_t
-#include "fls/std/filesystem.hpp"
 #include "fls/jpeg/jpeg_loader.hpp"
+#include "fls/std/filesystem.hpp"
 #include "fls/std/vector.hpp"
 #include "fls/table/rowgroup.hpp"
 #include <string>
@@ -23,7 +23,7 @@ struct ColumnDescriptorT;
 
 // Forward declarations for struct creation functions
 up<ColumnDescriptorT> make_dct_channel_struct_column_descriptor(const string& name);
-void ingest_dct_channel_into_struct(col_pt& dct_struct_col, const ProcessedDCTChannel& channel);
+void                  ingest_dct_channel_into_struct(col_pt& dct_struct_col, const ProcessedDCTChannel& channel);
 
 /*--------------------------------------------------------------------------------------------------------------------*\
  * DctChannelReader
@@ -31,12 +31,12 @@ void ingest_dct_channel_into_struct(col_pt& dct_struct_col, const ProcessedDCTCh
 class DctChannelReader {
 public:
 	// Original function for single channel with tag-based storage
-	static up<Table> Read(const ProcessedDCTChannel& channel, const int tag, const Connection& connection); 
+	static up<Table> Read(const ProcessedDCTChannel& channel, const int tag, const Connection& connection);
 	static up<Table> Read(const std::vector<ChannelDCT>& channel, const Connection& connection);
 	// New functions for struct-based storage
-	// static up<Table> ReadMultipleChannels(const std::vector<ProcessedDCTChannel>& channels, const Connection& connection);
-	// static void AddChannelToTable(Table& table, const ProcessedDCTChannel& channel, const Connection& connection);
-
+	// static up<Table> ReadMultipleChannels(const std::vector<ProcessedDCTChannel>& channels, const Connection&
+	// connection); static void AddChannelToTable(Table& table, const ProcessedDCTChannel& channel, const Connection&
+	// connection);
 };
 
 } // namespace fastlanes

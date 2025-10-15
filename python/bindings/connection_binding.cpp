@@ -16,16 +16,16 @@ void bind_connection(py::module_& m) {
 	         py::arg("dir_path"),
 	         "Read CSV files from directory",
 	         py::return_value_policy::reference_internal)
-		.def("read_jpeg",
+	    .def("read_jpeg",
 	         &fastlanes::Connection::read_jpeg,
 	         py::arg("dir_path"),
-			 py::arg("header_path"),
+	         py::arg("header_path"),
 	         "Read Jpeg file",
 	         py::return_value_policy::reference_internal)
-		.def("read_jpeg_dir",
+	    .def("read_jpeg_dir",
 	         &fastlanes::Connection::read_jpeg_dir,
 	         py::arg("dir_path"),
-			 py::arg("header_path"),
+	         py::arg("header_path"),
 	         "Read Jpeg files from directory",
 	         py::return_value_policy::reference_internal)
 	    .def("to_fls",

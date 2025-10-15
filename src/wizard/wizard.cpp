@@ -82,27 +82,26 @@ void gather_statistics(const rowgroup_pt& rowgroup, vector<up<ColumnDescriptorT>
 }
 
 void init_column_descriptor(ColumnDescriptorT& column_descriptor) {
-    if (!column_descriptor.max) {
-        column_descriptor.max = make_unique<BinaryValueT>();
-    }
-    if (!column_descriptor.encoding_rpn) {
-        column_descriptor.encoding_rpn = make_unique<RPNT>();
-    }
+	if (!column_descriptor.max) {
+		column_descriptor.max = make_unique<BinaryValueT>();
+	}
+	if (!column_descriptor.encoding_rpn) {
+		column_descriptor.encoding_rpn = make_unique<RPNT>();
+	}
 
-    if (column_descriptor.data_type == DataType::STRUCT || 
-        column_descriptor.data_type == DataType::LIST) {
-        for (auto& child : column_descriptor.children) {
-            init_column_descriptor(*child);
-        }
-    }
+	if (column_descriptor.data_type == DataType::STRUCT || column_descriptor.data_type == DataType::LIST) {
+		for (auto& child : column_descriptor.children) {
+			init_column_descriptor(*child);
+		}
+	}
 }
 
 void init(vector<up<ColumnDescriptorT>>& column_descriptors) {
-    for (n_t col_idx {0}; col_idx < column_descriptors.size(); col_idx++) {
-        auto& column_descriptor = column_descriptors[col_idx];
-        init_column_descriptor(*column_descriptor);
-    }
-}/*--------------------------------------------------------------------------------------------------------------------*/
+	for (n_t col_idx {0}; col_idx < column_descriptors.size(); col_idx++) {
+		auto& column_descriptor = column_descriptors[col_idx];
+		init_column_descriptor(*column_descriptor);
+	}
+} /*--------------------------------------------------------------------------------------------------------------------*/
 struct constant_visitor {
 	ColumnDescriptorT& column_descriptor;
 

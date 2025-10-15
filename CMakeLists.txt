@@ -27,20 +27,6 @@ endif ()
 add_compile_definitions(NOMINMAX)
 
 
-# # ----------------------------
-# # search for libjpeg
-# # ----------------------------
-# find_package(PkgConfig REQUIRED)
-# pkg_check_modules(JPEG REQUIRED libjpeg)
-
-# if pkg-config can not find libjpeg, using manual path.
-if(NOT JPEG_FOUND)
-    message(WARNING "pkg-config did not find libjpeg, using manual path.")
-    set(JPEG_LIBRARIES jpeg)
-    set(JPEG_INCLUDE_DIRS /usr/include)
-    set(JPEG_LIBRARY_DIRS /usr/lib/x86_64-linux-gnu)
-endif()
-
 # Project : ------------------------------------------------------------------------------------------------------------
 project(FastLanes)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
@@ -68,14 +54,6 @@ endif ()
 if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
     message(FATAL_ERROR "Only Clang >= 13 is supported!")
 endif ()
-
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    message(STATUS "FLS: Configuring for Clang with libc++")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libc++")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++")
-    set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -stdlib=libc++")
-endif()
 
 # Disallow configuring in the source tree
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
@@ -236,16 +214,6 @@ if (FLS_BUILD_TESTING OR FLS_BUILD_CUDA OR FLS_ENABLE_FSST_TESTING_AND_BENCHMARK
     endif ()
 endif ()
 
-# If JPEG_LIBRARY_DIRS exists, add the library path.
-if(JPEG_LIBRARY_DIRS)
-    link_directories(${JPEG_LIBRARY_DIRS})
-endif()
-
-
-# Compilation options
-# target_compile_options(jpeg_fastlanes PRIVATE -O2 -Wall -Wextra)
-# Optional: disable strict warnings
-# target_compile_options(jpeg_fastlanes PRIVATE -O2 -Wno-sign-conversion -Wno-float-conversion)
 
 # ALP: -----------------------------------------------------------------------------------------------------------------
 if (true)
@@ -300,12 +268,12 @@ if (FLS_BUILD_TESTING OR
         message("-- FLS : Using FASTLANES_DATA_DIR from environment: ${data_SOURCE_DIR}")
     else ()
         include(FetchContent)
-        # FetchContent_Declare(
-        #         data
-        #         GIT_REPOSITORY https://github.com/cwida/FastLanes_Data.git
-        #         GIT_TAG main
-        # )
-        # FetchContent_MakeAvailable(data)
+        FetchContent_Declare(
+                data
+                GIT_REPOSITORY https://github.com/cwida/FastLanes_Data.git
+                GIT_TAG main
+        )
+        FetchContent_MakeAvailable(data)
         set(data_SOURCE_DIR "${data_SOURCE_DIR}")  # from FetchContent
         message("-- FLS : Fetched FastLanes_Data into: ${data_SOURCE_DIR}")
     endif ()

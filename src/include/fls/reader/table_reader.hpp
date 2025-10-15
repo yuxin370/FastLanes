@@ -39,6 +39,7 @@ public:
 	std::vector<std::vector<std::vector<std::vector<uint8_t>>>> to_rgb(const path& file_path) const;
 	std::vector<std::vector<std::vector<std::vector<uint8_t>>>> to_rgb(const string& file_path) const;
 	std::vector<std::vector<std::vector<std::vector<uint8_t>>>> to_rgb(const char* file_path) const;
+
 private:
 	up<TableDescriptorHandle> m_table_descriptor_handle;
 	Connection&               m_connection;

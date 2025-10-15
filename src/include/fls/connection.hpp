@@ -11,11 +11,11 @@
 #include "fls/common/status.hpp"
 #include "fls/footer/rowgroup_descriptor.hpp" // for Footer
 #include "fls/footer/table_descriptor.hpp"
+#include "fls/jpeg/jpeg_loader.hpp"
 #include "fls/reader/column_view.hpp" //
 #include "fls/reader/rowgroup_reader.hpp"
 #include "fls/reader/rowgroup_view.hpp" //
 #include "fls/reader/segment.hpp"
-#include "fls/jpeg/jpeg_loader.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/std/filesystem.hpp" // for path
 #include "fls/std/vector.hpp"     // for vector
@@ -71,9 +71,9 @@ public:
 	Connection& read_json(const path& dir_path);
 	/// READ DCT CHANNEL
 	Connection& read_dct(const ProcessedDCTChannel& channel, const int tag);
-	
+
 	Connection& read_jpeg(const std::string& path, const std::string& header_path);
-	
+
 	Connection& read_jpeg_dir(const std::string& path, const std::string& header_path);
 	// Connection& read_jpeg(const std::string& path);
 	///! read a fls file return a reader

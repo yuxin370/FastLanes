@@ -13,24 +13,24 @@
 #include "fls/flatbuffers/flatbuffers.hpp"
 #include "fls/footer/operator_token_generated.h"
 #include "fls/info.hpp"
-#include "fls/json/fls_json.hpp"       // for JSON
-#include "fls/reader/csv_reader.hpp"   // for CSVReader
-#include "fls/reader/json_reader.hpp"  // for JSONReader
+#include "fls/json/fls_json.hpp"            // for JSON
+#include "fls/reader/csv_reader.hpp"        // for CSVReader
 #include "fls/reader/dctchannel_reader.hpp" // for DctChannelReader
-#include "fls/reader/table_reader.hpp" // for TableReader
-#include "fls/std/filesystem.hpp"      // for std::filesystem::directory_iterator, begin, path
-#include "fls/std/string.hpp"          // for std::string
-#include "fls/std/vector.hpp"          // for fastlanes::vector
-#include "fls/table/rowgroup.hpp"      // for Rowgroup
-#include "fls/table/table.hpp"         // for Table
-#include "fls/wizard/wizard.hpp"       // for Wizard
-#include <algorithm>                   // for std::ranges::none_of
-#include <cstdint>                     // for uint64_t
-#include <filesystem>
-#include <memory>    // for std::make_unique, unique_ptr
-#include <stdexcept> // for std::runtime_error
-#include <set>
+#include "fls/reader/json_reader.hpp"       // for JSONReader
+#include "fls/reader/table_reader.hpp"      // for TableReader
+#include "fls/std/filesystem.hpp"           // for std::filesystem::directory_iterator, begin, path
+#include "fls/std/string.hpp"               // for std::string
+#include "fls/std/vector.hpp"               // for fastlanes::vector
+#include "fls/table/rowgroup.hpp"           // for Rowgroup
+#include "fls/table/table.hpp"              // for Table
+#include "fls/wizard/wizard.hpp"            // for Wizard
+#include <algorithm>                        // for std::ranges::none_of
 #include <cctype>
+#include <cstdint> // for uint64_t
+#include <filesystem>
+#include <memory> // for std::make_unique, unique_ptr
+#include <set>
+#include <stdexcept> // for std::runtime_error
 
 namespace fastlanes {
 
@@ -56,160 +56,156 @@ Connection& Connection::read_dct(const ProcessedDCTChannel& channel, const int t
 
 Connection& Connection::read_jpeg(const std::string& path, const std::string& header_path) {
 	auto image_header = JpegLoader::load_header(path);
-	JpegLoader::dump_ImageHeader(image_header,header_path.c_str());
+	JpegLoader::dump_ImageHeader(image_header, header_path.c_str());
 	m_table = DctChannelReader::Read(image_header.channel_dcts, *this);
 
 	return *this;
 }
 
-
-
 // Helper: case-insensitive extension check
 bool is_jpeg_file(const std::filesystem::path& p) {
-    static const std::set<std::string> jpeg_exts = {".jpg", ".jpeg", ".JPG", ".JPEG"};
-    auto ext = p.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-    return jpeg_exts.count(ext) > 0;
+	static const std::set<std::string> jpeg_exts = {".jpg", ".jpeg", ".JPG", ".JPEG"};
+	auto                               ext       = p.extension().string();
+	std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+	return jpeg_exts.count(ext) > 0;
 }
-
 
 ImageHeader deduplicate_headers(const std::vector<ImageHeader>& all_headers) {
-    if (all_headers.empty()) {
-        throw std::runtime_error("Input headers vector is empty.");
-    }
+	if (all_headers.empty()) {
+		throw std::runtime_error("Input headers vector is empty.");
+	}
 
-    ImageHeader unified_header;
-    unified_header.width   = all_headers[0].width;
-    unified_header.height  = all_headers[0].height;
-    unified_header.quality = all_headers[0].quality;
+	ImageHeader unified_header;
+	unified_header.width   = all_headers[0].width;
+	unified_header.height  = all_headers[0].height;
+	unified_header.quality = all_headers[0].quality;
 
-    std::unordered_map<ColorSpace, uint8_t> color_space_to_id;
+	std::unordered_map<ColorSpace, uint8_t> color_space_to_id;
 
-    // Helper: check if two quant tables are identical
-    auto quant_table_equal = [](const QuantTable &a, const QuantTable &b) -> bool {
-        if (a.precision != b.precision) return false;
-        for (int i = 0; i < 64; ++i) {
-            if (a.data[i] != b.data[i]) return false;
-        }
-        return true;
-    };
+	// Helper: check if two quant tables are identical
+	auto quant_table_equal = [](const QuantTable& a, const QuantTable& b) -> bool {
+		if (a.precision != b.precision)
+			return false;
+		for (int i = 0; i < 64; ++i) {
+			if (a.data[i] != b.data[i])
+				return false;
+		}
+		return true;
+	};
 
-    // Map a QuantTable to its unified index
-    auto quant_table_to_id = [&](const QuantTable &qt) -> uint8_t {
-        for (size_t i = 0; i < unified_header.quant_tables.size(); ++i) {
-            if (quant_table_equal(unified_header.quant_tables[i], qt)) {
-                return static_cast<uint8_t>(i);
-            }
-        }
-        // Not found: add to unified_header
-        QuantTable new_qt = qt;
-        new_qt.id = static_cast<uint8_t>(unified_header.quant_tables.size());
-        unified_header.quant_tables.push_back(new_qt);
-        return new_qt.id;
-    };
+	// Map a QuantTable to its unified index
+	auto quant_table_to_id = [&](const QuantTable& qt) -> uint8_t {
+		for (size_t i = 0; i < unified_header.quant_tables.size(); ++i) {
+			if (quant_table_equal(unified_header.quant_tables[i], qt)) {
+				return static_cast<uint8_t>(i);
+			}
+		}
+		// Not found: add to unified_header
+		QuantTable new_qt = qt;
+		new_qt.id         = static_cast<uint8_t>(unified_header.quant_tables.size());
+		unified_header.quant_tables.push_back(new_qt);
+		return new_qt.id;
+	};
 
-    for (const auto &hdr : all_headers) {
-        // 1. Size check
-        if (unified_header.width != hdr.width || unified_header.height != hdr.height) {
-            throw std::runtime_error("Different size images are not supported yet.");
-        }
+	for (const auto& hdr : all_headers) {
+		// 1. Size check
+		if (unified_header.width != hdr.width || unified_header.height != hdr.height) {
+			throw std::runtime_error("Different size images are not supported yet.");
+		}
 
-        // 2. Color space mapping
-        if (hdr.color_spaces.empty()) {
-            throw std::runtime_error("Image header has no color space info.");
-        }
-        const ColorSpace &img_color_space = hdr.color_spaces[0];
-        uint8_t color_space_id;
-        auto it = color_space_to_id.find(img_color_space);
-        if (it != color_space_to_id.end()) {
-            color_space_id = it->second;
-        } else {
-            color_space_id = static_cast<uint8_t>(unified_header.color_spaces.size());
-            unified_header.color_spaces.push_back(img_color_space);
-            color_space_to_id[img_color_space] = color_space_id;
-        }
+		// 2. Color space mapping
+		if (hdr.color_spaces.empty()) {
+			throw std::runtime_error("Image header has no color space info.");
+		}
+		const ColorSpace& img_color_space = hdr.color_spaces[0];
+		uint8_t           color_space_id;
+		auto              it = color_space_to_id.find(img_color_space);
+		if (it != color_space_to_id.end()) {
+			color_space_id = it->second;
+		} else {
+			color_space_id = static_cast<uint8_t>(unified_header.color_spaces.size());
+			unified_header.color_spaces.push_back(img_color_space);
+			color_space_to_id[img_color_space] = color_space_id;
+		}
 
-        // 3. Merge ChannelDCT
-        for (const auto &src_channel : hdr.channel_dcts) {
-            ChannelDCT new_channel = src_channel; // copy
-            new_channel.color_space_id = color_space_id;
+		// 3. Merge ChannelDCT
+		for (const auto& src_channel : hdr.channel_dcts) {
+			ChannelDCT new_channel     = src_channel; // copy
+			new_channel.color_space_id = color_space_id;
 
-            if (src_channel.qtable_id >= hdr.quant_tables.size()) {
-                throw std::runtime_error("Invalid qtable_id in source channel");
-            }
-            const QuantTable &qt = hdr.quant_tables[src_channel.qtable_id];
-            new_channel.qtable_id = quant_table_to_id(qt);
+			if (src_channel.qtable_id >= hdr.quant_tables.size()) {
+				throw std::runtime_error("Invalid qtable_id in source channel");
+			}
+			const QuantTable& qt  = hdr.quant_tables[src_channel.qtable_id];
+			new_channel.qtable_id = quant_table_to_id(qt);
 
-            unified_header.channel_dcts.push_back(std::move(new_channel));
-        }
-    }
+			unified_header.channel_dcts.push_back(std::move(new_channel));
+		}
+	}
 
-    return unified_header;
+	return unified_header;
 }
 
-
 Connection& Connection::read_jpeg_dir(const std::string& dir_path, const std::string& header_path) {
-    namespace fs = std::filesystem;
+	namespace fs = std::filesystem;
 
-    if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
-        throw std::runtime_error("Directory does not exist: " + dir_path);
-    }
+	if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
+		throw std::runtime_error("Directory does not exist: " + dir_path);
+	}
 
-    std::vector<ImageHeader> all_headers;
+	std::vector<ImageHeader> all_headers;
 
 	std::vector<fs::path> files;
 	for (const auto& entry : fs::directory_iterator(dir_path)) {
-		if (!entry.is_regular_file()) continue;
+		if (!entry.is_regular_file())
+			continue;
 		const auto& p = entry.path();
 		if (is_jpeg_file(p)) {
 			files.push_back(p);
 		}
 	}
 
-	std::sort(files.begin(), files.end(),
-			[](const fs::path& a, const fs::path& b) {
-				return a.filename().string() < b.filename().string();
-			});
+	std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
+		return a.filename().string() < b.filename().string();
+	});
 
 	for (size_t k = 0; k < files.size(); ++k) {
 		printf("Reading header from: %s\n", files[k].string().c_str());
 		auto header = JpegLoader::load_header(files[k].string());
 		all_headers.push_back(std::move(header));
-		
 	}
 
-    // Step 1: Iterate all JPEG files
-    // for (const auto& entry : fs::directory_iterator(dir_path)) {
-    //     if (is_jpeg_file(entry.path())) {
-    //         try {
-    //             auto header = JpegLoader::load_header(entry.path().string());
-    //             all_headers.push_back(std::move(header));
-    //         } catch (const std::exception& e) {
-    //             // Optionally warn and skip
-    //             continue;
-    //         }
-    //     }
-    // }
+	// Step 1: Iterate all JPEG files
+	// for (const auto& entry : fs::directory_iterator(dir_path)) {
+	//     if (is_jpeg_file(entry.path())) {
+	//         try {
+	//             auto header = JpegLoader::load_header(entry.path().string());
+	//             all_headers.push_back(std::move(header));
+	//         } catch (const std::exception& e) {
+	//             // Optionally warn and skip
+	//             continue;
+	//         }
+	//     }
+	// }
 
-    if (all_headers.empty()) {
-        throw std::runtime_error("No valid JPEG files found in directory: " + dir_path);
-    }
+	if (all_headers.empty()) {
+		throw std::runtime_error("No valid JPEG files found in directory: " + dir_path);
+	}
 
-    // Step 2: Deduplicate headers
-    ImageHeader unified_header = deduplicate_headers(all_headers);
+	// Step 2: Deduplicate headers
+	ImageHeader unified_header = deduplicate_headers(all_headers);
 
 	// printf("unified header is as follows:\n");
 	// JpegLoader::print_image_header(unified_header);
-	
-    // Step 3: Dump unified header
-    JpegLoader::dump_ImageHeader(unified_header, header_path.c_str());
 
-    // Step 4: Flatten all DCTs into a single list expected by DctChannelReader::Read
-    m_table = DctChannelReader::Read(unified_header.channel_dcts, *this);
+	// Step 3: Dump unified header
+	JpegLoader::dump_ImageHeader(unified_header, header_path.c_str());
 
-    return *this;
+	// Step 4: Flatten all DCTs into a single list expected by DctChannelReader::Read
+	m_table = DctChannelReader::Read(unified_header.channel_dcts, *this);
+
+	return *this;
 }
-
 
 Connection& Connection::read_json(const path& dir_path) {
 	m_table = JsonReader::Read(dir_path, *this);
