@@ -15,3 +15,8 @@ target_link_libraries(jpeg_loader
         PUBLIC
         FastLanes::headers
 )
+
+target_link_libraries(jpeg_loader
+        PUBLIC
+        ${ADDITIONAL_LIBS}
+)

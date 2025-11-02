@@ -1,0 +1,4 @@
+[submodule "external/GPUJPEG"]
+	path = external/GPUJPEG
+	url = https://github.com/yuxin370/GPUJPEG.git
+	branch = expose_idct
