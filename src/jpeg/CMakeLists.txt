@@ -16,7 +16,12 @@ target_link_libraries(jpeg_loader
         FastLanes::headers
 )
 
-target_link_libraries(jpeg_loader
-        PUBLIC
-        ${ADDITIONAL_LIBS}
+target_include_directories(jpeg_loader
+    PRIVATE
+        ${GPUJPEG_INCLUDE_DIR}     # 你定义的 GPUJPEG 头文件路径
+)
+
+target_compile_options(jpeg_loader PRIVATE
+    -Wno-gnu-anonymous-struct
+    -Wno-nested-anon-types
 )

@@ -28,7 +28,11 @@ namespace fastlanes {
 constexpr static auto const* TABLE_DESCRIPTOR_FILE_NAME {"table_descriptor.fbb"};
 
 size_t TableReader::get_num_rowgroups() const {
-	return m_table_descriptor->m_rowgroup_descriptors.size();
+    if (!m_table_descriptor_handle || !*m_table_descriptor_handle) {
+        return 0;
+    }
+    auto* rg_vec = m_table_descriptor_handle->Get()->m_rowgroup_descriptors();
+    return rg_vec ? rg_vec->size() : 0;
 }
 
 up<RowgroupReader> TableReader::get_rowgroup_reader(const n_t rowgroup_idx) const {
@@ -72,7 +76,12 @@ void TableReader::to_csv(const char* file_path) const {
 
 std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const path& file_path) const {
 	std::vector<std::vector<double>> result;
-	for (n_t rowgroup_idx {0}; rowgroup_idx < m_table_descriptor->m_rowgroup_descriptors.size(); rowgroup_idx++) {
+	auto* table_desc = m_table_descriptor_handle->Get();
+	auto* rg_vec = table_desc->m_rowgroup_descriptors();
+	if (!rg_vec) {
+		// handle error or return
+	}
+	for (n_t rowgroup_idx {0}; rowgroup_idx < rg_vec->size(); rowgroup_idx++) {
 		auto rowgroup_up = get_rowgroup_reader(rowgroup_idx)->materialize();
 
 		const auto& rowgroup = *rowgroup_up;

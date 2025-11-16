@@ -6,17 +6,26 @@
 
 #include "fls/jpeg/jpeg_loader.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cctype>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <jpeglib.h>
 #include <map>
+#include <mutex>
 #include <stdexcept>
-#include <string.h>
-#include <vector>
+#include <thread>
+#include <utility>
+
+
+
+#include "gpujpeg_decoder.h"
 
 namespace fastlanes {
 
@@ -43,6 +52,33 @@ namespace fastlanes {
 //         throw std::runtime_error("Unknown color space: " + cs);
 //     }
 // }
+
+// helper: check if this is jpeg file
+static bool is_jpeg_ext(const fs::path& p) {
+    auto ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return (ext == ".jpg" || ext == ".jpeg" || ext == ".jfif");
+}
+
+// helper: read whole file to vector
+static std::vector<uint8_t> read_file_to_vec(const fs::path& file) {
+    std::ifstream ifs(file, std::ios::binary | std::ios::ate);
+    if (!ifs) {
+        throw std::runtime_error("Cannot open file: " + file.string());
+    }
+    std::streamsize size = ifs.tellg();
+    if (size < 0) {
+        throw std::runtime_error("Failed to stat file: " + file.string());
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
+    ifs.seekg(0, std::ios::beg);
+    if (size > 0 && !ifs.read(reinterpret_cast<char*>(buf.data()), size)) {
+        throw std::runtime_error("Failed to read file: " + file.string());
+    }
+    return buf;
+}
+
 
 // Helper: convert libjpeg color space to ColorSpace enum
 ColorSpace jpeg_color_space_to_color_space(J_COLOR_SPACE cs) {
@@ -254,6 +290,333 @@ ProcessedDCTChannel JpegLoader::process_channel_plain(const ImageHeader& header)
 	// pro_dct_blocks.mixed_run_encoding_pattern = count_zero_nonzero_pairs(flattened);
 	return result;
 }
+
+ImageRGB JpegLoader::load_rgb_gpu(const std::string& path) {
+    // 1.  initialized libgpujpeg
+    static bool initialized = false;
+    if (!initialized) {
+        if (gpujpeg_init_device(0, 0) != 0) {
+            throw std::runtime_error("Failed to initialize GPUJPEG device");
+        }
+        initialized = true;
+    }
+
+    // 2. construct decoder
+    struct gpujpeg_decoder* decoder = gpujpeg_decoder_create(nullptr);
+    if (!decoder) {
+        throw std::runtime_error("Failed to create GPUJPEG decoder");
+    }
+
+    // 3. set output format: RGB, interleaved (packed), 8-bit
+    // GPUJPEG_RGB + GPUJPEG_444_U8_P012 = packed RGB (RGBRGB...)
+    // note：P012N means "packed non-planar"
+    gpujpeg_decoder_set_output_format(decoder, GPUJPEG_RGB, GPUJPEG_444_U8_P012);
+
+    // 4. read the whole jpeg file to memory
+    FILE* infile = fopen(path.c_str(), "rb");
+    if (!infile) {
+        gpujpeg_decoder_destroy(decoder);
+        throw std::runtime_error("Cannot open file: " + path);
+    }
+
+    fseek(infile, 0, SEEK_END);
+    // long file_size = ftell(infile);
+	size_t file_size = static_cast<size_t>(ftell(infile));
+    fseek(infile, 0, SEEK_SET);
+
+    std::vector<uint8_t> jpeg_data(file_size);
+    size_t read_size = fread(jpeg_data.data(), 1, file_size, infile);
+    fclose(infile);
+
+    if (read_size != static_cast<size_t>(file_size)) {
+        gpujpeg_decoder_destroy(decoder);
+        throw std::runtime_error("Failed to read entire JPEG file");
+    }
+
+    // 5. set default output（libgpujpeg allocate host memory automatically）
+    struct gpujpeg_decoder_output decoder_output;
+    gpujpeg_decoder_output_set_default(&decoder_output);
+
+    // 6. execute GPU decoding
+    if (gpujpeg_decoder_decode(decoder, jpeg_data.data(), file_size, &decoder_output) != 0) {
+        gpujpeg_decoder_destroy(decoder);
+        throw std::runtime_error("GPUJPEG decoding failed");
+    }
+
+    // 7. get iamge parameters
+    // unsigned int w = decoder_output.param_image.width;
+    // unsigned int h = decoder_output.param_image.height;
+	auto w = static_cast<unsigned int>(decoder_output.param_image.width);
+	auto h = static_cast<unsigned int>(decoder_output.param_image.height);
+
+    // 8. copy decoding results（libgpujpeg already in memory）
+    std::vector<unsigned char> buffer(decoder_output.data, 
+                                      decoder_output.data + decoder_output.data_size);
+
+    // 9. clean
+    gpujpeg_decoder_destroy(decoder);
+
+    // 10. return the result
+    return ImageRGB{w, h, std::move(buffer)};
+}
+
+
+std::vector<ImageRGB> JpegLoader::load_rgb_dir_gpu(const std::string& dir_path) {
+    // 1) collect all JPEG files in the directory and sort it
+    fs::path dir(dir_path);
+    if (!fs::exists(dir) || !fs::is_directory(dir)) {
+        throw std::runtime_error("Not a directory: " + dir.string());
+    }
+
+    std::vector<fs::path> files;
+    files.reserve(1024);
+    for (auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        const auto& p = entry.path();
+        if (is_jpeg_ext(p)) files.push_back(p);
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        throw std::runtime_error("No JPEG files found in: " + dir.string());
+    }
+
+    // 2) initialize GPUJPEG once
+    static std::once_flag s_gpu_init_once;
+    std::call_once(s_gpu_init_once, [] {
+        if (gpujpeg_init_device(/*device_id*/0, /*flags*/0) != 0) {
+            throw std::runtime_error("Failed to initialize GPUJPEG device");
+        }
+    });
+
+    // 3) prefetch thread: read files into memory
+    using WorkItem = std::pair<fs::path, std::vector<uint8_t>>;
+    BoundedQueue<WorkItem> queue(/*capacity=*/8);
+    std::atomic<bool> prefetch_ok{true};
+
+    std::thread prefetcher([&] {
+        try {
+            for (const auto& p : files) {
+                auto data = read_file_to_vec(p);
+                queue.push(WorkItem{p, std::move(data)});
+            }
+        } catch (...) {
+            prefetch_ok.store(false);
+        }
+        queue.close();
+    });
+
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() { if (t.joinable()) t.join(); }
+    } joiner{prefetcher};
+
+    // 4) main thread, decode images one by one
+    std::vector<ImageRGB> results;
+    results.reserve(files.size());
+
+    WorkItem item;
+    while (queue.pop(item)) {
+        const auto& path = item.first;
+        auto& jpeg_data = item.second;
+
+        struct gpujpeg_decoder* decoder = gpujpeg_decoder_create(nullptr);
+        if (!decoder) {
+            queue.close();
+            throw std::runtime_error("Failed to create GPUJPEG decoder");
+        }
+        gpujpeg_decoder_set_output_format(decoder, GPUJPEG_RGB, GPUJPEG_444_U8_P012);
+
+        gpujpeg_decoder_output decoder_output;
+        gpujpeg_decoder_output_set_default(&decoder_output);
+
+        if (gpujpeg_decoder_decode(decoder,
+                                   jpeg_data.data(),
+                                   jpeg_data.size(),
+                                   &decoder_output) != 0) {
+            gpujpeg_decoder_destroy(decoder);
+            queue.close();
+            throw std::runtime_error("GPUJPEG decoding failed: " + path.string());
+        }
+
+        unsigned int w = static_cast<unsigned int>(decoder_output.param_image.width);
+        unsigned int h = static_cast<unsigned int>(decoder_output.param_image.height);
+
+        std::vector<unsigned char> buffer(
+            decoder_output.data,
+            decoder_output.data + decoder_output.data_size
+        );
+
+        gpujpeg_decoder_destroy(decoder);
+        results.push_back(ImageRGB{w, h, std::move(buffer)});
+    }
+
+    if (!prefetch_ok.load()) {
+        throw std::runtime_error("Prefetch thread failed while reading files.");
+    }
+
+    return results;
+}
+
+
+std::vector<ImageRGB>
+JpegLoader::load_rgb_dir_gpu_mt(const std::string& dir_path,
+                                int num_workers,
+                                size_t queue_capacity)
+{
+	printf("JpegLoader::load_rgb_dir_gpu_mt(): dir_path=%s, num_workers=%d, queue_capacity=%zu\n",
+	       dir_path.c_str(), num_workers, queue_capacity);
+    // 0) 合法化 worker 数
+    if (num_workers <= 0) {
+        num_workers = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    }
+
+    // 1) 收集并排序所有 JPEG 文件
+    fs::path dir(dir_path);
+    if (!fs::exists(dir) || !fs::is_directory(dir)) {
+        throw std::runtime_error("Not a directory: " + dir.string());
+    }
+
+    std::vector<fs::path> files;
+    files.reserve(1024);
+    for (auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (is_jpeg_ext(entry.path())) {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        throw std::runtime_error("No JPEG files found in: " + dir.string());
+    }
+
+    const size_t file_count = files.size();
+
+    // 2) 只初始化一次 GPU 设备
+    static std::once_flag s_gpu_init_once;
+    std::call_once(s_gpu_init_once, [] {
+        if (gpujpeg_init_device(/*device_id*/0, /*flags*/0) != 0) {
+            throw std::runtime_error("Failed to initialize GPUJPEG device");
+        }
+    });
+
+    // 3) 定义 WorkItem：带 index，方便保持输出顺序
+    struct WorkItem {
+        size_t index;
+        fs::path path;
+        std::vector<uint8_t> jpeg_data;
+    };
+
+    if (queue_capacity == 0) {
+        queue_capacity = 8; // 默认队列大小
+    }
+    BoundedQueue<WorkItem> queue(queue_capacity);
+
+    std::atomic<bool> prefetch_ok{true};
+    std::exception_ptr prefetch_ex;
+
+    // 4) 预取线程：读文件 -> 放入队列
+    std::thread prefetcher([&] {
+        try {
+            for (size_t i = 0; i < file_count; ++i) {
+                const auto& p = files[i];
+                auto data = read_file_to_vec(p);
+                queue.push(WorkItem{i, p, std::move(data)});
+            }
+        } catch (...) {
+            prefetch_ok.store(false);
+            prefetch_ex = std::current_exception();
+        }
+        queue.close();
+    });
+
+    // RAII：保证异常或正常退出时 join 预取线程
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable()) t.join();
+        }
+    } prefetch_joiner{prefetcher};
+
+    // 5) 结果数组：预先 resize，多个线程按 index 写入，保持顺序
+    std::vector<ImageRGB> results(file_count);
+
+    // 用来传播 worker 线程里的异常
+    std::atomic<bool> worker_ok{true};
+    std::exception_ptr worker_ex;
+
+    // 6) worker 线程函数：每个线程一个 decoder（=> 每个线程一个 default stream）
+    auto worker_func = [&](int worker_id) {
+        try {
+            // 每个线程自建一个 decoder
+            gpujpeg_decoder* decoder = gpujpeg_decoder_create(nullptr);
+            if (!decoder) {
+                throw std::runtime_error("Failed to create GPUJPEG decoder");
+            }
+            gpujpeg_decoder_set_output_format(decoder, GPUJPEG_RGB, GPUJPEG_444_U8_P012);
+
+            gpujpeg_decoder_output decoder_output;
+            gpujpeg_decoder_output_set_default(&decoder_output);
+
+            WorkItem item;
+            while (queue.pop(item)) {
+                // 同一个 decoder 在本线程内复用，多张图重复 decode
+                int rc = gpujpeg_decoder_decode(decoder,
+                                                item.jpeg_data.data(),
+                                                item.jpeg_data.size(),
+                                                &decoder_output);
+                if (rc != 0) {
+                    throw std::runtime_error("GPUJPEG decoding failed: " + item.path.string());
+                }
+
+                // 拷贝结果到自己的 ImageRGB，然后写入 results[index]
+                ImageRGB img;
+                img.width  = static_cast<unsigned int>(decoder_output.param_image.width);
+                img.height = static_cast<unsigned int>(decoder_output.param_image.height);
+                img.data.assign(decoder_output.data,
+                                decoder_output.data + decoder_output.data_size);
+
+                results[item.index] = std::move(img);
+            }
+
+            gpujpeg_decoder_destroy(decoder);
+        } catch (...) {
+            worker_ok.store(false);
+            worker_ex = std::current_exception();
+            // 让其他线程尽快停下来
+            queue.close();
+        }
+    };
+
+    // 7) 启动多个 worker
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(num_workers));
+    for (int i = 0; i < num_workers; ++i) {
+        workers.emplace_back(worker_func, i);
+    }
+
+    // RAII join 所有 worker
+    struct WorkerJoiner {
+        std::vector<std::thread>& w;
+        ~WorkerJoiner() {
+            for (auto& t : w) {
+                if (t.joinable()) t.join();
+            }
+        }
+    } workers_joiner{workers};
+
+    // 8) 检查错误并返回
+    if (!prefetch_ok.load()) {
+        if (prefetch_ex) std::rethrow_exception(prefetch_ex);
+        throw std::runtime_error("Prefetch thread failed.");
+    }
+    if (!worker_ok.load()) {
+        if (worker_ex) std::rethrow_exception(worker_ex);
+        throw std::runtime_error("Worker thread failed.");
+    }
+
+    return results;
+}
+
 
 ImageRGB JpegLoader::load_rgb(const std::string& path) {
 	FILE* infile = fopen(path.c_str(), "rb");
@@ -508,6 +871,160 @@ static void resize_or_crop_plane(const std::vector<std::vector<uint8_t>>& src,
 
 	upsample_chroma_bilinear(src, dst, dst_h, dst_w);
 }
+
+
+
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>>
+JpegLoader::to_rgb_gpu(const std::vector<std::vector<double>>& dct_blocks,
+                   const path& file_path)
+{
+    // 0) 读取 JPEG 文件到内存
+    size_t   jpeg_size = 0;
+    uint8_t* jpeg_buf  = nullptr;
+    if (gpujpeg_image_load_from_file(file_path.string().c_str(),
+                                     &jpeg_buf, &jpeg_size) != 0) {
+        throw std::runtime_error("Failed to read JPEG file: " + file_path.string());
+    }
+
+    // RAII: 确保 jpeg_buf 被正确释放
+    auto jpeg_buf_guard =
+        std::unique_ptr<uint8_t, decltype(&gpujpeg_image_destroy)>(
+            jpeg_buf, &gpujpeg_image_destroy);
+
+    // 1) 解析 JPEG，拿到参数
+    gpujpeg_image_info info;
+    std::memset(&info, 0, sizeof(info));
+    if (gpujpeg_decoder_get_image_info2(jpeg_buf, jpeg_size,
+                                        &info, 0, 0) != GPUJPEG_NOERR) {
+        throw std::runtime_error("gpujpeg_decoder_get_image_info2 failed for: " +
+                                 file_path.string());
+    }
+
+    // 强制输出 RGB / planar 4:4:4
+    info.param_image.color_space  = GPUJPEG_RGB;
+    info.param_image.pixel_format = GPUJPEG_444_U8_P012;
+
+    // 2) 创建并初始化 decoder
+    gpujpeg_decoder* dec_raw = gpujpeg_decoder_create(0);
+    if (!dec_raw) {
+        throw std::runtime_error("gpujpeg_decoder_create failed");
+    }
+    auto decoder =
+        std::unique_ptr<gpujpeg_decoder, decltype(&gpujpeg_decoder_destroy)>(
+            dec_raw, &gpujpeg_decoder_destroy);
+
+    if (gpujpeg_decoder_init(decoder.get(),
+                             &info.param, &info.param_image) != 0) {
+        throw std::runtime_error("gpujpeg_decoder_init failed");
+    }
+
+    // 3) 先 decode 一遍（参考 GPUJPEG 示例），让内部量化缓冲区准备好
+    gpujpeg_decoder_output out_norm;
+    gpujpeg_decoder_output_set_default(&out_norm);
+    out_norm.type = GPUJPEG_DECODER_OUTPUT_INTERNAL_BUFFER;
+
+    if (gpujpeg_decoder_decode(decoder.get(),
+                               jpeg_buf, jpeg_size,
+                               &out_norm) != GPUJPEG_NOERR) {
+        throw std::runtime_error("gpujpeg_decoder_decode (reference pass) failed");
+    }
+
+    // 4) 查询 GPUJPEG 期望的总系数量
+    const size_t coeff_count = gpujpeg_decoder_get_coefficients_count(decoder.get());
+    if (coeff_count == 0) {
+        throw std::runtime_error("gpujpeg_decoder_get_coefficients_count returned 0");
+    }
+
+    if (dct_blocks.empty()) {
+        throw std::runtime_error("dct_blocks is empty");
+    }
+    if (coeff_count % 64 != 0) {
+        throw std::runtime_error("GPUJPEG coefficient count is not divisible by 64");
+    }
+    const size_t block_count = coeff_count / 64;
+    if (block_count != dct_blocks.size()) {
+        throw std::runtime_error(
+            "Coefficient count mismatch: GPUJPEG expects " +
+            std::to_string(block_count) + " blocks, dct_blocks has " +
+            std::to_string(dct_blocks.size()));
+    }
+
+    // 5) 把你的 DCT block（zig-zag 顺序）转换成 GPUJPEG 要的 int16_t flat buffer
+    //
+    // 这里有一个重要假设：
+    //  - GPUJPEG 内部的量化系数缓冲区也是按 block 顺序平铺，
+    //    每个 block 有 64 个系数，顺序与 dct_blocks 中的顺序一致。
+    //  - 每个 block 内部的 64 个系数就是 zig-zag 顺序（和你 dct_blocks 的定义一致）。
+    //
+    // 如果实际库实现不是这样，这里就需要根据 GPUJPEG 的实际系数布局做重排。
+    std::vector<int16_t> coeffs(coeff_count);
+    size_t idx = 0;
+    for (const auto& block : dct_blocks) {
+        for (size_t k = 0; k < 64; ++k) {
+            double v = (k < block.size()) ? block[k] : 0.0;
+            long q   = std::lround(v);
+            if (q < std::numeric_limits<int16_t>::min())
+                q = std::numeric_limits<int16_t>::min();
+            if (q > std::numeric_limits<int16_t>::max())
+                q = std::numeric_limits<int16_t>::max();
+            coeffs[idx++] = static_cast<int16_t>(q);
+        }
+    }
+
+    // 6) 把量化系数写回 GPUJPEG 的 decoder（Host → Device）
+    if (gpujpeg_decoder_set_quantized_coefficients_host(decoder.get(),
+                                                        coeffs.data(),
+                                                        coeffs.size()) != GPUJPEG_NOERR) {
+        throw std::runtime_error("gpujpeg_decoder_set_quantized_coefficients_host failed");
+    }
+
+    // 7) 调用新 API：用外部系数跑 IDCT + 后处理，得到 RGB
+    gpujpeg_decoder_output out;
+    gpujpeg_decoder_output_set_default(&out);
+    out.type = GPUJPEG_DECODER_OUTPUT_INTERNAL_BUFFER;
+
+    if (gpujpeg_decoder_process_external_coefficients(decoder.get(), &out)
+        != GPUJPEG_NOERR) {
+        throw std::runtime_error("gpujpeg_decoder_process_external_coefficients failed");
+    }
+
+    // 8) 把 GPUJPEG planar RGB 缓冲区转成 [N][3][H][W]（这里 N=1）
+    const uint32_t width  = static_cast<uint32_t>(out.param_image.width);
+    const uint32_t height = static_cast<uint32_t>(out.param_image.height);
+
+    if (out.param_image.pixel_format != GPUJPEG_444_U8_P012) {
+        throw std::runtime_error("Unexpected pixel format from GPUJPEG");
+    }
+    if (out.param_image.color_space != GPUJPEG_RGB &&
+        out.param_image.color_space != GPUJPEG_NONE) {
+        throw std::runtime_error("Unexpected color space from GPUJPEG");
+    }
+
+    const size_t plane_size = static_cast<size_t>(width) * height;
+    if (out.data_size < plane_size * 3) {
+        throw std::runtime_error("GPUJPEG output buffer too small");
+    }
+
+    const uint8_t* base = out.data;
+
+    std::vector<std::vector<std::vector<std::vector<uint8_t>>>> result;
+    result.resize(1);           // 只处理一张图
+    auto& img = result[0];
+    img.resize(3);
+
+    for (size_t c = 0; c < 3; ++c) {
+        img[c].assign(height, std::vector<uint8_t>(width));
+        const uint8_t* src_plane = base + c * plane_size;
+        for (uint32_t y = 0; y < height; ++y) {
+            std::memcpy(img[c][y].data(),
+                        src_plane + static_cast<size_t>(y) * width,
+                        width);
+        }
+    }
+
+    return result; // [1][3][H][W]
+}
+
 
 std::vector<std::vector<std::vector<std::vector<uint8_t>>>>
 JpegLoader::to_rgb(const std::vector<std::vector<double>>& dct_blocks, const std::filesystem::path& file_path) {

@@ -11,6 +11,9 @@
 ###########################################################################
 # 1. Public-header interface target
 ###########################################################################
+find_path(JPEG_INCLUDE_DIR jpeglib.h PATHS /usr/include /usr/local/include)
+find_library(JPEG_LIBRARY jpeg PATHS /lib /usr/lib /usr/lib/x86_64-linux-gnu)
+
 add_library(fls_headers INTERFACE)
 
 target_include_directories(fls_headers
@@ -80,7 +83,11 @@ target_compile_features(FastLanes PUBLIC cxx_std_20)
 target_link_libraries(FastLanes
         PUBLIC
         FastLanes::headers
+        ${JPEG_LIBRARY}
+        ${GPUJPEG_LIB}
 )
+
+target_include_directories(FastLanes PRIVATE ${JPEG_INCLUDE_DIR} ${GPUJPEG_INCLUDE_DIR})
 
 add_library(FastLanes::core ALIAS FastLanes)
 

@@ -16,6 +16,13 @@ if (CLANG_CXX AND CLANG_C)
 endif ()
 
 
+set(GPUJPEG_ROOT "${CMAKE_SOURCE_DIR}/external/GPUJPEG")
+set(GPUJPEG_LIB "${GPUJPEG_ROOT}/build/libgpujpeg.so")
+set(GPUJPEG_INCLUDE_DIR "${GPUJPEG_ROOT}/libgpujpeg")
+if(NOT EXISTS "${GPUJPEG_LIB}")
+    message(FATAL_ERROR "GPUJPEG library not found at ${GPUJPEG_LIB}")
+endif()
+
 #  ---------------------------------------------------------------------------------------------------------------------
 # Prevent Windows <minwindef.h> from defining min/max macros,
 # which collide with std::numeric_limits<…>::max() and
@@ -32,23 +39,6 @@ add_compile_definitions(NOMINMAX)
 # # ----------------------------
 # find_package(PkgConfig REQUIRED)
 # pkg_check_modules(JPEG REQUIRED libjpeg)
-
-# if pkg-config can not find libjpeg, using manual path.
-if(NOT JPEG_FOUND)
-    message(WARNING "pkg-config did not find libjpeg, using manual path.")
-    set(JPEG_LIBRARIES jpeg)
-    set(JPEG_INCLUDE_DIRS /usr/include)
-    set(JPEG_LIBRARY_DIRS /usr/lib/x86_64-linux-gnu)
-endif()
-
-# GPUJPEG
-set(GPUJPEG_ROOT "${CMAKE_SOURCE_DIR}/external/GPUJPEG")
-set(GPUJPEG_LIB "${GPUJPEG_ROOT}/build/libgpujpeg.a")
-include_directories(${GPUJPEG_ROOT}/src)
-include_directories(${GPUJPEG_ROOT}/include)
-
-# link static library
-set(ADDITIONAL_LIBS ${ADDITIONAL_LIBS} ${GPUJPEG_LIB})
 
 # Project : ------------------------------------------------------------------------------------------------------------
 project(FastLanes)

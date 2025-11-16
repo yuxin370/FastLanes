@@ -9,6 +9,8 @@
 #include "fls/std/filesystem.hpp"
 #include <string>
 #include <vector>
+#include <queue>
+namespace fs = std::filesystem;
 
 namespace fastlanes {
 
@@ -80,12 +82,55 @@ struct ProcessedDCTChannel {
 	std::vector<ZeroNonZeroPair> mix_run_pattern;
 };
 
+// prefetch thread: read file
+// main thread: deocding
+// currently only used in jpeg loader, it is better to be moved out of this file.
+template <typename T>
+class BoundedQueue {
+public:
+    explicit BoundedQueue(size_t capacity) : cap_(capacity) {}
+    void push(T item) {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_produce_.wait(lk, [&]{ return q_.size() < cap_ || closed_; });
+        if (closed_) return;
+        q_.push(std::move(item));
+        cv_consume_.notify_one();
+    }
+    bool pop(T& out) {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_consume_.wait(lk, [&]{ return !q_.empty() || closed_; });
+        if (q_.empty()) return false;
+        out = std::move(q_.front());
+        q_.pop();
+        cv_produce_.notify_one();
+        return true;
+    }
+    void close() {
+        std::lock_guard<std::mutex> lk(m_);
+        closed_ = true;
+        cv_consume_.notify_all();
+        cv_produce_.notify_all();
+    }
+private:
+    std::mutex m_;
+    std::condition_variable cv_produce_, cv_consume_;
+    std::queue<T> q_;
+    size_t cap_;
+    bool closed_ = false;
+};
+
+
 class JpegLoader {
 public:
 	static ImageHeader load_header(const std::string& path);
 	static ImageRGB    load_rgb(const std::string& path);
+	static ImageRGB    load_rgb_gpu(const std::string& path);
+	static std::vector<ImageRGB> load_rgb_dir_gpu(const std::string& dir_path);
+	static std::vector<ImageRGB> load_rgb_dir_gpu_mt(const std::string& dir_path, int num_workers, size_t queue_capacity);
 	static std::vector<std::vector<std::vector<std::vector<uint8_t>>>>
 	                           to_rgb(const std::vector<std::vector<double>>& dct_blocks, const path& file_path);
+	static std::vector<std::vector<std::vector<std::vector<uint8_t>>>>
+							   to_rgb_gpu(const std::vector<std::vector<double>>& dct_blocks, const path& file_path);
 	static ProcessedDCTChannel process_channel_plain(const ImageHeader& header); // without spliting
 	static ProcessedDCTChannel process_channel(const ImageHeader& header);
 	static ProcessedDCTChannel process_channel(const ImageHeader& header, size_t left, size_t mid, size_t right);
