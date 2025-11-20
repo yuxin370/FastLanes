@@ -8,6 +8,7 @@
 
 #include "data/NextiaJD.hpp"
 #include "data/TimeSeries.hpp"
+#include "data/DCTBlocks.hpp"
 #include "data/clickbench.hpp"
 #include "data/embedding.hpp"
 #include "data/example.hpp"

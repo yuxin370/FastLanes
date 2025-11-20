@@ -9,7 +9,7 @@ build/
 *-build/
 Testing/
 build-support/boost_*
-
+data/fls
 # Build directories created by Clion
 cmake-build-*/
 
