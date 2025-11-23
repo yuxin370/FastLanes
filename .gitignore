@@ -10,6 +10,11 @@ build/
 Testing/
 build-support/boost_*
 data/_TimeSeries
+data/fls
+build*
+data/flower_photos
+data/generated
+data/dct_blocks
 # Build directories created by Clion
 cmake-build-*/
 

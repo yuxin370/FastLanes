@@ -37,6 +37,7 @@ struct ImageRGB {
 };
 
 enum class ColorSpace : uint8_t { Grayscale = 0, RGB = 1, YCbCr = 2, CMYK = 3, YCCK = 4 };
+enum class SampleFactor : uint8_t { SF_444 = 0, SF_422 = 1, SF_420 = 2, SF_400 = 3 };
 
 struct QuantTable {
 	uint8_t id;
@@ -48,23 +49,72 @@ struct DCTBlockRow {
 	int16_t data[64]; // One 8x8 block's DCT coefficients
 };
 
-struct ChannelDCT {
-	uint8_t                  component_id;
-	uint8_t                  qtable_id;
-	uint8_t                  color_space_id;
-	uint32_t                 width_in_blocks;
-	uint32_t                 height_in_blocks;
-	std::vector<DCTBlockRow> blocks;
+
+struct ImageInfo {
+    uint32_t width;    // 该图像的像素宽（可能和别的图不同）
+    uint32_t height;   // 该图像的像素高
+    uint8_t  quality;  // 如果需要的话
+
+    // 该图的颜色空间 / 采样模式
+    uint8_t  color_space_id;    // 索引到 ImageHeader::color_spaces
+    uint8_t  sample_factor_id;  // 索引到 ImageHeader::sample_factors
+
+    // 该图像在 channel_dcts 里的通道范围
+    uint32_t first_channel_index;  // 起始通道索引
+    uint32_t channel_count;        // 通道数（如 3: Y/Cb/Cr 或 R/G/B）
 };
 
-struct ImageHeader {
-	uint32_t                width;
-	uint32_t                height;
-	uint8_t                 quality;
-	std::vector<ColorSpace> color_spaces;
-	std::vector<QuantTable> quant_tables;
-	std::vector<ChannelDCT> channel_dcts;
+
+struct ChannelDCT {
+    uint8_t                  component_id;      // 通道 ID，比如 libjpeg 的 component_id
+    uint8_t                 qtable_id;         // 索引到 ImageHeader::quant_tables
+
+    uint32_t                 width_in_blocks;   // 这个通道的 block 网格宽度
+    uint32_t                 height_in_blocks;  // 这个通道的 block 网格高度
+    std::vector<DCTBlockRow> blocks;            // blocks 顺序由你定义（一般按行扫）
 };
+
+
+
+struct ImageHeader {
+
+    // 所有可能的采样配置（例如 4:4:4, 4:2:2, 4:2:0, 4:0:0）
+    std::vector<SampleFactor> sample_factors;
+
+    // 所有可能的颜色空间配置（Grayscale / YCbCr / RGB / ...）
+    std::vector<ColorSpace>   color_spaces;
+
+    // 去重后的量化表池
+    std::vector<QuantTable>   quant_tables;
+
+    // 数据集中所有通道的 DCT 信息，按顺序平铺
+    // 每个 ChannelDCT 通过 qtable_id / color_space_id / sample_factor_id
+    // 引用上面三个 vector 里的统一定义
+    std::vector<ChannelDCT>   channel_dcts;
+
+    // 每张图像的元信息：尺寸 / 质量 / 在 channel_dcts 里的起始位置与通道个数
+    std::vector<ImageInfo>    images;
+};
+
+
+
+// struct ChannelDCT {
+// 	uint8_t                  component_id;
+// 	uint8_t                  qtable_id;
+// 	uint8_t                  color_space_id;
+// 	uint32_t                 width_in_blocks;
+// 	uint32_t                 height_in_blocks;
+// 	std::vector<DCTBlockRow> blocks;
+// };
+
+// struct ImageHeader {
+// 	uint32_t                width;
+// 	uint32_t                height;
+// 	uint8_t                 quality;
+// 	std::vector<ColorSpace> color_spaces;
+// 	std::vector<QuantTable> quant_tables;
+// 	std::vector<ChannelDCT> channel_dcts;
+// };
 
 struct ZeroNonZeroPair {
 	int zero_count;
@@ -127,6 +177,7 @@ public:
 	static ImageRGB    load_rgb_gpu(const std::string& path);
 	static std::vector<ImageRGB> load_rgb_dir_gpu(const std::string& dir_path);
 	static std::vector<ImageRGB> load_rgb_dir_gpu_mt(const std::string& dir_path, int num_workers, size_t queue_capacity);
+	// static std::vector<ImageRGB> load_rgb_dir_gpu_mt_ms(const std::string& dir_path, int num_workers, size_t queue_capacity);
 	static std::vector<std::vector<std::vector<std::vector<uint8_t>>>>
 	                           to_rgb(const std::vector<std::vector<double>>& dct_blocks, const path& file_path);
 	static std::vector<std::vector<std::vector<std::vector<uint8_t>>>>

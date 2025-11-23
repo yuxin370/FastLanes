@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
 		// read_jpeg_dir 会遍历目录、读取 headers、deduplicate 并把 unified header 写入 header.meta
 		fs::path header_meta = fls_dir / "header.meta";
 		con->read_jpeg_dir(jpeg_dir, header_meta.string());
+		std::cout << "✅ header writed : " << header_meta << std::endl;
 		// 将内存中的 DCT table 写到 image.fls
 		con->to_fls((fls_dir / "image.fls").string());
 		std::cout << "✅ Wrote unified header and FLS to: " << fls_dir << std::endl;

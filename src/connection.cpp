@@ -70,142 +70,405 @@ bool is_jpeg_file(const std::filesystem::path& p) {
 	return jpeg_exts.count(ext) > 0;
 }
 
-ImageHeader deduplicate_headers(const std::vector<ImageHeader>& all_headers) {
-	if (all_headers.empty()) {
-		throw std::runtime_error("Input headers vector is empty.");
-	}
+// ImageHeader deduplicate_headers(const std::vector<ImageHeader>& all_headers) {
+// 	if (all_headers.empty()) {
+// 		throw std::runtime_error("Input headers vector is empty.");
+// 	}
 
-	ImageHeader unified_header;
-	unified_header.width   = all_headers[0].width;
-	unified_header.height  = all_headers[0].height;
-	unified_header.quality = all_headers[0].quality;
+// 	ImageHeader unified_header;
+// 	unified_header.width   = all_headers[0].width;
+// 	unified_header.height  = all_headers[0].height;
+// 	unified_header.quality = all_headers[0].quality;
 
-	std::unordered_map<ColorSpace, uint8_t> color_space_to_id;
+// 	std::unordered_map<ColorSpace, uint8_t> color_space_to_id;
 
-	// Helper: check if two quant tables are identical
-	auto quant_table_equal = [](const QuantTable& a, const QuantTable& b) -> bool {
-		if (a.precision != b.precision)
-			return false;
-		for (int i = 0; i < 64; ++i) {
-			if (a.data[i] != b.data[i])
-				return false;
-		}
-		return true;
-	};
+// 	// Helper: check if two quant tables are identical
+// 	auto quant_table_equal = [](const QuantTable& a, const QuantTable& b) -> bool {
+// 		if (a.precision != b.precision)
+// 			return false;
+// 		for (int i = 0; i < 64; ++i) {
+// 			if (a.data[i] != b.data[i])
+// 				return false;
+// 		}
+// 		return true;
+// 	};
 
-	// Map a QuantTable to its unified index
-	auto quant_table_to_id = [&](const QuantTable& qt) -> uint8_t {
-		for (size_t i = 0; i < unified_header.quant_tables.size(); ++i) {
-			if (quant_table_equal(unified_header.quant_tables[i], qt)) {
-				return static_cast<uint8_t>(i);
-			}
-		}
-		// Not found: add to unified_header
-		QuantTable new_qt = qt;
-		new_qt.id         = static_cast<uint8_t>(unified_header.quant_tables.size());
-		unified_header.quant_tables.push_back(new_qt);
-		return new_qt.id;
-	};
+// 	// Map a QuantTable to its unified index
+// 	auto quant_table_to_id = [&](const QuantTable& qt) -> uint8_t {
+// 		for (size_t i = 0; i < unified_header.quant_tables.size(); ++i) {
+// 			if (quant_table_equal(unified_header.quant_tables[i], qt)) {
+// 				return static_cast<uint8_t>(i);
+// 			}
+// 		}
+// 		// Not found: add to unified_header
+// 		QuantTable new_qt = qt;
+// 		new_qt.id         = static_cast<uint8_t>(unified_header.quant_tables.size());
+// 		unified_header.quant_tables.push_back(new_qt);
+// 		return new_qt.id;
+// 	};
 
-	for (const auto& hdr : all_headers) {
-		// 1. Size check
-		if (unified_header.width != hdr.width || unified_header.height != hdr.height) {
-			throw std::runtime_error("Different size images are not supported yet.");
-		}
+// 	for (const auto& hdr : all_headers) {
+// 		// 1. Size check
+// 		if (unified_header.width != hdr.width || unified_header.height != hdr.height) {
+// 			throw std::runtime_error("Different size images are not supported yet.");
+// 		}
 
-		// 2. Color space mapping
-		if (hdr.color_spaces.empty()) {
-			throw std::runtime_error("Image header has no color space info.");
-		}
-		const ColorSpace& img_color_space = hdr.color_spaces[0];
-		uint8_t           color_space_id;
-		auto              it = color_space_to_id.find(img_color_space);
-		if (it != color_space_to_id.end()) {
-			color_space_id = it->second;
-		} else {
-			color_space_id = static_cast<uint8_t>(unified_header.color_spaces.size());
-			unified_header.color_spaces.push_back(img_color_space);
-			color_space_to_id[img_color_space] = color_space_id;
-		}
+// 		// 2. Color space mapping
+// 		if (hdr.color_spaces.empty()) {
+// 			throw std::runtime_error("Image header has no color space info.");
+// 		}
+// 		const ColorSpace& img_color_space = hdr.color_spaces[0];
+// 		uint8_t           color_space_id;
+// 		auto              it = color_space_to_id.find(img_color_space);
+// 		if (it != color_space_to_id.end()) {
+// 			color_space_id = it->second;
+// 		} else {
+// 			color_space_id = static_cast<uint8_t>(unified_header.color_spaces.size());
+// 			unified_header.color_spaces.push_back(img_color_space);
+// 			color_space_to_id[img_color_space] = color_space_id;
+// 		}
 
-		// 3. Merge ChannelDCT
-		for (const auto& src_channel : hdr.channel_dcts) {
-			ChannelDCT new_channel     = src_channel; // copy
-			new_channel.color_space_id = color_space_id;
+// 		// 3. Merge ChannelDCT
+// 		for (const auto& src_channel : hdr.channel_dcts) {
+// 			ChannelDCT new_channel     = src_channel; // copy
+// 			new_channel.color_space_id = color_space_id;
 
-			if (src_channel.qtable_id >= hdr.quant_tables.size()) {
-				throw std::runtime_error("Invalid qtable_id in source channel");
-			}
-			const QuantTable& qt  = hdr.quant_tables[src_channel.qtable_id];
-			new_channel.qtable_id = quant_table_to_id(qt);
+// 			if (src_channel.qtable_id >= hdr.quant_tables.size()) {
+// 				throw std::runtime_error("Invalid qtable_id in source channel");
+// 			}
+// 			const QuantTable& qt  = hdr.quant_tables[src_channel.qtable_id];
+// 			new_channel.qtable_id = quant_table_to_id(qt);
 
-			unified_header.channel_dcts.push_back(std::move(new_channel));
-		}
-	}
+// 			unified_header.channel_dcts.push_back(std::move(new_channel));
+// 		}
+// 	}
 
-	return unified_header;
-}
+// 	return unified_header;
+// }
+
+// ImageHeader deduplicate_headers(const std::vector<ImageHeader>& all_headers) {
+//     if (all_headers.empty()) {
+//         throw std::runtime_error("Input headers vector is empty.");
+//     }
+
+//     ImageHeader unified_header;
+
+//     // 映射：ColorSpace / SampleFactor -> unified id
+//     std::unordered_map<ColorSpace,   uint8_t> color_space_to_id;
+//     std::unordered_map<SampleFactor, uint8_t> sample_factor_to_id;
+
+//     // 量化表比较函数
+//     auto quant_table_equal = [](const QuantTable& a, const QuantTable& b) -> bool {
+//         if (a.precision != b.precision)
+//             return false;
+//         for (int i = 0; i < 64; ++i) {
+//             if (a.data[i] != b.data[i])
+//                 return false;
+//         }
+//         return true;
+//     };
+
+//     // 根据内容，把量化表映射到 unified_header.quant_tables 的 index
+//     auto quant_table_to_id = [&](const QuantTable& qt) -> uint8_t {
+//         for (size_t i = 0; i < unified_header.quant_tables.size(); ++i) {
+//             if (quant_table_equal(unified_header.quant_tables[i], qt)) {
+//                 return static_cast<uint8_t>(i);
+//             }
+//         }
+//         QuantTable new_qt = qt;
+//         new_qt.id         = static_cast<uint8_t>(unified_header.quant_tables.size());
+//         unified_header.quant_tables.push_back(new_qt);
+//         return new_qt.id;
+//     };
+
+//     uint32_t channel_offset = 0; // 当前 unified_header.channel_dcts 的长度，用于修正 first_channel_index
+
+//     for (const auto& hdr : all_headers) {
+//         // 1) 为这个 header 构造本地的 sample_factor / color_space remap
+//         std::vector<uint8_t> local_sf_remap(hdr.sample_factors.size());
+//         for (size_t i = 0; i < hdr.sample_factors.size(); ++i) {
+//             const auto sf = hdr.sample_factors[i];
+//             auto it = sample_factor_to_id.find(sf);
+//             if (it != sample_factor_to_id.end()) {
+//                 local_sf_remap[i] = it->second;
+//             } else {
+//                 uint8_t new_id = static_cast<uint8_t>(unified_header.sample_factors.size());
+//                 unified_header.sample_factors.push_back(sf);
+//                 sample_factor_to_id[sf] = new_id;
+//                 local_sf_remap[i]       = new_id;
+//             }
+//         }
+
+//         std::vector<uint8_t> local_cs_remap(hdr.color_spaces.size());
+//         for (size_t i = 0; i < hdr.color_spaces.size(); ++i) {
+//             const auto cs = hdr.color_spaces[i];
+//             auto it = color_space_to_id.find(cs);
+//             if (it != color_space_to_id.end()) {
+//                 local_cs_remap[i] = it->second;
+//             } else {
+//                 uint8_t new_id = static_cast<uint8_t>(unified_header.color_spaces.size());
+//                 unified_header.color_spaces.push_back(cs);
+//                 color_space_to_id[cs] = new_id;
+//                 local_cs_remap[i]     = new_id;
+//             }
+//         }
+
+//         // 2) 追加通道，顺便 remap 量化表 id
+//         uint32_t this_header_channel_base = channel_offset;
+//         for (const auto& src_channel : hdr.channel_dcts) {
+//             ChannelDCT new_channel = src_channel;
+
+//             if (src_channel.qtable_id >= hdr.quant_tables.size()) {
+//                 throw std::runtime_error("Invalid qtable_id in source channel");
+//             }
+//             const QuantTable& qt  = hdr.quant_tables[src_channel.qtable_id];
+//             new_channel.qtable_id = quant_table_to_id(qt);
+
+//             unified_header.channel_dcts.push_back(std::move(new_channel));
+//             channel_offset++;
+//         }
+
+//         // 3) 追加图像信息，修正 ID 和 first_channel_index
+//         for (const auto& src_img : hdr.images) {
+//             ImageInfo img = src_img;
+
+//             if (src_img.color_space_id >= local_cs_remap.size()) {
+//                 throw std::runtime_error("Invalid color_space_id in source image");
+//             }
+//             if (src_img.sample_factor_id >= local_sf_remap.size()) {
+//                 throw std::runtime_error("Invalid sample_factor_id in source image");
+//             }
+
+//             img.color_space_id   = local_cs_remap[src_img.color_space_id];
+//             img.sample_factor_id = local_sf_remap[src_img.sample_factor_id];
+//             img.first_channel_index = this_header_channel_base + src_img.first_channel_index;
+
+//             unified_header.images.push_back(img);
+//         }
+//     }
+
+//     return unified_header;
+// }
+
+
 
 Connection& Connection::read_jpeg_dir(const std::string& dir_path, const std::string& header_path) {
-	namespace fs = std::filesystem;
+    namespace fs = std::filesystem;
 
-	if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
-		throw std::runtime_error("Directory does not exist: " + dir_path);
-	}
+    if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
+        throw std::runtime_error("Directory does not exist: " + dir_path);
+    }
 
-	std::vector<ImageHeader> all_headers;
+    std::vector<fs::path> files;
+    for (const auto& entry : fs::directory_iterator(dir_path)) {
+        if (!entry.is_regular_file())
+            continue;
+        const auto& p = entry.path();
+        if (is_jpeg_file(p)) {
+            files.push_back(p);
+        }
+    }
 
-	std::vector<fs::path> files;
-	for (const auto& entry : fs::directory_iterator(dir_path)) {
-		if (!entry.is_regular_file())
-			continue;
-		const auto& p = entry.path();
-		if (is_jpeg_file(p)) {
-			files.push_back(p);
-		}
-	}
+    std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
+        return a.filename().string() < b.filename().string();
+    });
 
-	std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
-		return a.filename().string() < b.filename().string();
-	});
+    if (files.empty()) {
+        throw std::runtime_error("No valid JPEG files found in directory: " + dir_path);
+    }
 
-	for (size_t k = 0; k < files.size(); ++k) {
-		printf("Reading header from: %s\n", files[k].string().c_str());
-		auto header = JpegLoader::load_header(files[k].string());
-		all_headers.push_back(std::move(header));
-	}
+    // ====== 增量去重相关状态 ======
+    ImageHeader unified_header;
 
-	// Step 1: Iterate all JPEG files
-	// for (const auto& entry : fs::directory_iterator(dir_path)) {
-	//     if (is_jpeg_file(entry.path())) {
-	//         try {
-	//             auto header = JpegLoader::load_header(entry.path().string());
-	//             all_headers.push_back(std::move(header));
-	//         } catch (const std::exception& e) {
-	//             // Optionally warn and skip
-	//             continue;
-	//         }
-	//     }
-	// }
+    // 映射：ColorSpace / SampleFactor -> unified id
+    std::unordered_map<ColorSpace,   uint8_t> color_space_to_id;
+    std::unordered_map<SampleFactor, uint8_t> sample_factor_to_id;
 
-	if (all_headers.empty()) {
-		throw std::runtime_error("No valid JPEG files found in directory: " + dir_path);
-	}
+    // 量化表比较函数
+    auto quant_table_equal = [](const QuantTable& a, const QuantTable& b) -> bool {
+        if (a.precision != b.precision)
+            return false;
+        for (int i = 0; i < 64; ++i) {
+            if (a.data[i] != b.data[i])
+                return false;
+        }
+        return true;
+    };
 
-	// Step 2: Deduplicate headers
-	ImageHeader unified_header = deduplicate_headers(all_headers);
+    // 根据内容，把量化表映射到 unified_header.quant_tables 的 index
+    auto quant_table_to_id = [&](const QuantTable& qt) -> uint8_t {
+        for (size_t i = 0; i < unified_header.quant_tables.size(); ++i) {
+            if (quant_table_equal(unified_header.quant_tables[i], qt)) {
+                return static_cast<uint8_t>(i);
+            }
+        }
+        QuantTable new_qt = qt;
+        new_qt.id         = static_cast<uint8_t>(unified_header.quant_tables.size());
+        unified_header.quant_tables.push_back(new_qt);
+        return new_qt.id;
+    };
 
-	// printf("unified header is as follows:\n");
-	// JpegLoader::print_image_header(unified_header);
+    bool any_header_loaded = false;
 
-	// Step 3: Dump unified header
-	JpegLoader::dump_ImageHeader(unified_header, header_path.c_str());
+    // ====== 逐图增量合并 ======
+    for (size_t k = 0; k < files.size(); ++k) {
+        printf("Reading header from: %s\n", files[k].string().c_str());
 
-	// Step 4: Flatten all DCTs into a single list expected by DctChannelReader::Read
-	m_table = DctChannelReader::Read(unified_header.channel_dcts, *this);
+        ImageHeader hdr;
+        try {
+            hdr = JpegLoader::load_header(files[k].string());
+        } catch (const std::exception& e) {
+            // 这里看你需求，可以选择 continue 或者直接抛异常
+            // 为了稳妥，这里先跳过异常文件
+            fprintf(stderr, "Failed to load header from %s: %s\n",
+                    files[k].string().c_str(), e.what());
+            continue;
+        }
 
-	return *this;
+        any_header_loaded = true;
+
+        // 1) 为这个 header 构造本地的 sample_factor / color_space remap
+        std::vector<uint8_t> local_sf_remap(hdr.sample_factors.size());
+        for (size_t i = 0; i < hdr.sample_factors.size(); ++i) {
+            const auto sf = hdr.sample_factors[i];
+            auto it = sample_factor_to_id.find(sf);
+            if (it != sample_factor_to_id.end()) {
+                local_sf_remap[i] = it->second;
+            } else {
+                uint8_t new_id = static_cast<uint8_t>(unified_header.sample_factors.size());
+                unified_header.sample_factors.push_back(sf);
+                sample_factor_to_id[sf] = new_id;
+                local_sf_remap[i]       = new_id;
+            }
+        }
+
+        std::vector<uint8_t> local_cs_remap(hdr.color_spaces.size());
+        for (size_t i = 0; i < hdr.color_spaces.size(); ++i) {
+            const auto cs = hdr.color_spaces[i];
+            auto it = color_space_to_id.find(cs);
+            if (it != color_space_to_id.end()) {
+                local_cs_remap[i] = it->second;
+            } else {
+                uint8_t new_id = static_cast<uint8_t>(unified_header.color_spaces.size());
+                unified_header.color_spaces.push_back(cs);
+                color_space_to_id[cs] = new_id;
+                local_cs_remap[i]     = new_id;
+            }
+        }
+
+        // 2) 追加通道，顺便 remap 量化表 id
+        uint32_t channel_offset = static_cast<uint32_t>(unified_header.channel_dcts.size());
+
+        for (const auto& src_channel : hdr.channel_dcts) {
+            ChannelDCT new_channel = src_channel;
+
+            if (src_channel.qtable_id >= hdr.quant_tables.size()) {
+                throw std::runtime_error("Invalid qtable_id in source channel");
+            }
+            const QuantTable& qt  = hdr.quant_tables[src_channel.qtable_id];
+            new_channel.qtable_id = quant_table_to_id(qt);
+
+            unified_header.channel_dcts.push_back(std::move(new_channel));
+        }
+
+        // 3) 追加图像信息，修正 ID 和 first_channel_index
+        for (const auto& src_img : hdr.images) {
+            ImageInfo img = src_img;
+
+            if (src_img.color_space_id >= local_cs_remap.size()) {
+                throw std::runtime_error("Invalid color_space_id in source image");
+            }
+            if (src_img.sample_factor_id >= local_sf_remap.size()) {
+                throw std::runtime_error("Invalid sample_factor_id in source image");
+            }
+
+            img.color_space_id      = local_cs_remap[src_img.color_space_id];
+            img.sample_factor_id    = local_sf_remap[src_img.sample_factor_id];
+            img.first_channel_index = channel_offset + src_img.first_channel_index;
+
+            unified_header.images.push_back(img);
+        }
+
+        // hdr 在这里离开作用域，释放当前图像的头部内存
+    }
+
+    if (!any_header_loaded || unified_header.images.empty()) {
+        throw std::runtime_error("No valid JPEG headers were successfully loaded from directory: " + dir_path);
+    }
+
+    // printf("unified header is as follows:\n");
+    // JpegLoader::print_image_header(unified_header);
+
+    // Dump unified header
+    JpegLoader::dump_ImageHeader(unified_header, header_path.c_str());
+
+    // Flatten all DCTs into a single list expected by DctChannelReader::Read
+    m_table = DctChannelReader::Read(unified_header.channel_dcts, *this);
+
+    return *this;
 }
+
+
+// Connection& Connection::read_jpeg_dir(const std::string& dir_path, const std::string& header_path) {
+// 	namespace fs = std::filesystem;
+
+// 	if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
+// 		throw std::runtime_error("Directory does not exist: " + dir_path);
+// 	}
+
+// 	std::vector<ImageHeader> all_headers;
+
+// 	std::vector<fs::path> files;
+// 	for (const auto& entry : fs::directory_iterator(dir_path)) {
+// 		if (!entry.is_regular_file())
+// 			continue;
+// 		const auto& p = entry.path();
+// 		if (is_jpeg_file(p)) {
+// 			files.push_back(p);
+// 		}
+// 	}
+
+// 	std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
+// 		return a.filename().string() < b.filename().string();
+// 	});
+
+// 	for (size_t k = 0; k < files.size(); ++k) {
+// 		printf("Reading header from: %s\n", files[k].string().c_str());
+// 		auto header = JpegLoader::load_header(files[k].string());
+// 		all_headers.push_back(std::move(header));
+// 	}
+
+// 	// Step 1: Iterate all JPEG files
+// 	// for (const auto& entry : fs::directory_iterator(dir_path)) {
+// 	//     if (is_jpeg_file(entry.path())) {
+// 	//         try {
+// 	//             auto header = JpegLoader::load_header(entry.path().string());
+// 	//             all_headers.push_back(std::move(header));
+// 	//         } catch (const std::exception& e) {
+// 	//             // Optionally warn and skip
+// 	//             continue;
+// 	//         }
+// 	//     }
+// 	// }
+
+// 	if (all_headers.empty()) {
+// 		throw std::runtime_error("No valid JPEG files found in directory: " + dir_path);
+// 	}
+
+// 	// Step 2: Deduplicate headers
+// 	ImageHeader unified_header = deduplicate_headers(all_headers);
+
+// 	// printf("unified header is as follows:\n");
+// 	// JpegLoader::print_image_header(unified_header);
+
+// 	// Step 3: Dump unified header
+// 	JpegLoader::dump_ImageHeader(unified_header, header_path.c_str());
+
+// 	// Step 4: Flatten all DCTs into a single list expected by DctChannelReader::Read
+// 	m_table = DctChannelReader::Read(unified_header.channel_dcts, *this);
+
+// 	return *this;
+// }
 
 Connection& Connection::read_json(const path& dir_path) {
 	m_table = JsonReader::Read(dir_path, *this);

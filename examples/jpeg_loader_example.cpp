@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
 
 	// example 2: load jpeg and write it into fls
 	auto image_header = JpegLoader::load_header(argv[1]);
-	std::cout << "\n[DCT] Image size: " << image_header.width << "x" << image_header.height << std::endl;
+	std::cout << "\n[DCT] Image size: " << image_header.images[0].width << "x" << image_header.images[0].height << std::endl;
 
 	auto ProcessedDCT = JpegLoader::process_channel(image_header);
 
