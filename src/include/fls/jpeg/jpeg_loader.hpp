@@ -42,7 +42,7 @@ enum class SampleFactor : uint8_t { SF_444 = 0, SF_422 = 1, SF_420 = 2, SF_400 =
 struct QuantTable {
 	uint8_t id;
 	uint8_t precision; // 0: 8-bit
-	uint8_t data[64];  // Zigzag order
+	uint8_t data[64]; 
 };
 
 struct DCTBlockRow {
@@ -67,7 +67,7 @@ struct ImageInfo {
 
 struct ChannelDCT {
     uint8_t                  component_id;      // 通道 ID，比如 libjpeg 的 component_id
-    uint8_t                 qtable_id;         // 索引到 ImageHeader::quant_tables
+    uint8_t                  qtable_id;         // 索引到 ImageHeader::quant_tables
 
     uint32_t                 width_in_blocks;   // 这个通道的 block 网格宽度
     uint32_t                 height_in_blocks;  // 这个通道的 block 网格高度

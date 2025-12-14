@@ -87,7 +87,7 @@ target_link_libraries(FastLanes
         ${GPUJPEG_LIB}
 )
 
-target_include_directories(FastLanes PRIVATE ${JPEG_INCLUDE_DIR} ${GPUJPEG_INCLUDE_DIR})
+target_include_directories(FastLanes PRIVATE ${JPEG_INCLUDE_DIR} ${GPUJPEG_INCLUDE_DIRS})
 
 add_library(FastLanes::core ALIAS FastLanes)
 

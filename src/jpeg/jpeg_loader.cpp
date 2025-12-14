@@ -26,9 +26,9 @@
 
 
 #include "gpujpeg_decoder.h"
-// #include "gpujpeg_common.h"
-// #include "gpujpeg_type.h"
-// #include "gpujpeg_table.h"
+#include "gpujpeg_common_internal.h"   // 先把枚举/struct 都定义好
+#include "gpujpeg_decoder_internal.h"
+#include "gpujpeg_table.h"
 
 namespace fastlanes {
 
@@ -82,6 +82,118 @@ static std::vector<uint8_t> read_file_to_vec(const fs::path& file) {
     return buf;
 }
 
+static int get_comp_count(ColorSpace cs) {
+    switch (cs) {
+    case ColorSpace::Grayscale: return 1;
+    case ColorSpace::RGB:
+    case ColorSpace::YCbCr:     return 3;
+    case ColorSpace::CMYK:
+    case ColorSpace::YCCK:      return 4;
+    default:
+        throw std::runtime_error("Unknown ColorSpace");
+    }
+}
+
+static gpujpeg_color_space to_gpujpeg_color_space(ColorSpace cs) {
+    switch (cs) {
+    case ColorSpace::Grayscale:
+        // GPUJPEG 没有专门的灰度枚举，一般做法是：
+        //  - color_space 用 YCbCr (BT.601 full range)
+        //  - comp_count=1 + subsampling=4:0:0
+        return GPUJPEG_YCBCR_BT601_256LVLS;
+
+    case ColorSpace::YCbCr:
+        // 原始 JPEG 一般就是 BT.601 full range（对应 JPEG 语义）
+        // 你也可以返回 GPUJPEG_YCBCR（BT.709 限幅），取决于数据集约定
+        return GPUJPEG_YCBCR_BT601_256LVLS; // == GPUJPEG_YCBCR_JPEG
+
+    case ColorSpace::RGB:
+        return GPUJPEG_RGB;
+
+    case ColorSpace::CMYK:
+    case ColorSpace::YCCK:
+        // GPUJPEG 当前不支持 CMYK / YCCK
+        // 这里直接报错比较安全，避免误解码
+        throw std::runtime_error("GPUJPEG does not support CMYK/YCCK color spaces");
+
+    default:
+        throw std::runtime_error("Unknown ColorSpace for to_gpujpeg_color_space");
+    }
+}
+
+
+
+static gpujpeg_sampling_factor_t to_gpujpeg_subsampling(SampleFactor sf) {
+    switch (sf) {
+    case SampleFactor::SF_444: return GPUJPEG_SUBSAMPLING_444;
+    case SampleFactor::SF_422: return GPUJPEG_SUBSAMPLING_422;
+    case SampleFactor::SF_420: return GPUJPEG_SUBSAMPLING_420;
+    case SampleFactor::SF_400: return GPUJPEG_SUBSAMPLING_400;
+    default:
+        throw std::runtime_error("Unknown SampleFactor");
+    }
+}
+
+
+
+static void
+sync_quant_tables_from_header_to_decoder(const ImageHeader& header,
+                                         const ImageInfo&   img,
+                                         gpujpeg_decoder*   decoder)
+{
+    // 映射：全局 qtable_id (来自 unified_header/channel_dcts) -> GPUJPEG 本地槽位 [0..)
+    std::unordered_map<uint8_t, uint8_t> qid_global_to_local;
+
+    uint8_t next_local_qid = 0;
+
+    // 对该图像的每个通道
+    for (uint32_t c = 0; c < img.channel_count; ++c) {
+        const ChannelDCT& ch = header.channel_dcts[img.first_channel_index + c];
+        const uint8_t qid_global = ch.qtable_id;
+
+        // 分配/获取本地槽位
+        uint8_t qid_local;
+        auto it = qid_global_to_local.find(qid_global);
+        if (it == qid_global_to_local.end()) {
+            // 第一次遇到这个全局 qid：分配一个新的本地槽位
+            if (next_local_qid >= GPUJPEG_MAX_COMPONENT_COUNT) {
+                throw std::runtime_error(
+                    "Too many distinct quant tables used by one image: " +
+                    std::to_string((int)next_local_qid));
+            }
+            qid_local = next_local_qid++;
+            qid_global_to_local[qid_global] = qid_local;
+
+            // 利用“id == index”的性质，直接按下标取 global table
+            if (qid_global >= header.quant_tables.size()) {
+                throw std::runtime_error(
+                    "qtable_id out of range for this header: " +
+                    std::to_string((int)qid_global));
+            }
+            const QuantTable& qt = header.quant_tables[qid_global];
+
+            auto* tbl = &decoder->table_quantization[qid_local];
+
+            // header.quant_tables[i].data 是 zigzag 顺序，
+            // GPUJPEG 的 table_raw 也是 zigzag
+            for (int i = 0; i < 64; ++i) {
+                tbl->table_raw[i] = qt.data[i];
+            }
+            
+            // 生成 natural 顺序 + 上传到 device
+            if (gpujpeg_table_quantization_decoder_compute(tbl) != 0) {
+                throw std::runtime_error(
+                    "gpujpeg_table_quantization_decoder_compute failed for local qid="
+                    + std::to_string((int)qid_local));
+            }
+        } else {
+            qid_local = it->second;
+        }
+
+        // 告诉 decoder：第 c 个 component 使用哪个本地量化表槽位
+        decoder->comp_table_quantization_map[c] = qid_local;
+    }
+}
 
 // Helper: convert libjpeg color space to ColorSpace enum
 ColorSpace jpeg_color_space_to_color_space(J_COLOR_SPACE cs) {
@@ -143,6 +255,121 @@ const char* sample_factor_to_cstring(SampleFactor sf) {
     case SampleFactor::SF_400: return "4:0:0";
     default:                   return "Unknown";
     }
+}
+
+// 利用 ImageHeader + 某一张 ImageInfo 初始化一个 gpujpeg_decoder
+static void init_decoder_for_image(const ImageHeader& header,
+                                   const ImageInfo&   img,
+                                   gpujpeg_decoder*   decoder)
+{
+    if (!decoder)
+        throw std::runtime_error("init_decoder_for_image: decoder is null");
+
+    if (img.color_space_id >= header.color_spaces.size())
+        throw std::runtime_error("init_decoder_for_image: invalid color_space_id");
+
+    if (img.sample_factor_id >= header.sample_factors.size())
+        throw std::runtime_error("init_decoder_for_image: invalid sample_factor_id");
+
+    ColorSpace   cs = header.color_spaces[img.color_space_id];
+    SampleFactor sf = header.sample_factors[img.sample_factor_id];
+
+    const int comp_count_from_cs = get_comp_count(cs);
+    if (comp_count_from_cs != static_cast<int>(img.channel_count)) {
+        throw std::runtime_error(
+            "init_decoder_for_image: channel_count mismatch with color_space");
+    }
+
+    // 1) 默认参数
+    gpujpeg_parameters       param;
+    gpujpeg_image_parameters param_image;
+    gpujpeg_set_default_parameters(&param);
+    gpujpeg_image_set_default_parameters(&param_image);
+
+    // 2) 设置 subsampling（决定 param.comp_count + sampling_factor）
+    // gpujpeg_sampling_factor_t subsampling = to_gpujpeg_subsampling(sf);
+    gpujpeg_sampling_factor_t subsampling =
+        (cs == ColorSpace::Grayscale)
+            ? GPUJPEG_SUBSAMPLING_400    // 灰度强制 4:0:0
+            : to_gpujpeg_subsampling(sf); // 其他按 JPEG 真实 subsampling
+
+    gpujpeg_parameters_chroma_subsampling(&param, subsampling);
+    // param.comp_count 已在上面设置好了
+
+    // 3) 图像尺寸
+    param_image.width  = static_cast<int>(img.width);
+    param_image.height = static_cast<int>(img.height);
+
+    param_image.color_space = to_gpujpeg_color_space(cs);
+    param.color_space_internal = to_gpujpeg_color_space(cs);
+    // printf("init_decoder_for_image: image size: %ux%u\n",
+    //        param_image.width, param_image.height);  
+
+    // // 4) 输出格式：我们希望解码得到 RGBRGB... 的打包格式
+    // printf("init_decoder_for_image: set color_space_internal and color_space=%s, sample_factor=%s, comp_count=%d\n",
+    //        color_space_to_cstring(cs),
+    //        sample_factor_to_cstring(sf),
+    //        static_cast<int>(img.channel_count));
+    if (comp_count_from_cs == 1) {
+        // 灰度：单通道 U8
+        // param_image.color_space  = GPUJPEG_YCBCR_BT601_256LVLS; // 实际上灰度也走这个分支
+        param_image.pixel_format = GPUJPEG_U8;
+    } else {
+        // 多通道：让 GPUJPEG 做 YCbCr->RGB，输出 packed RGB
+        // param_image.color_space  = GPUJPEG_RGB;
+        param_image.pixel_format = GPUJPEG_444_U8_P012;
+    }
+
+    // 5) 典型 JPEG 是 interleaved
+    param.interleaved = 1;
+
+    // 6) 初始化 decoder（这一步会算好 coder->data_size、d_data_quantized 等）
+    if (gpujpeg_decoder_init(decoder, &param, &param_image) != 0) {
+        throw std::runtime_error("gpujpeg_decoder_init failed");
+    }
+
+    // 初始化好 decoder 之后，先把 header 里的量化表同步过去
+    sync_quant_tables_from_header_to_decoder(header, img, decoder);
+
+    // 7) 用 ImageHeader 里的 block 数校验一下 coefficients 个数是否一致
+    size_t expected_blocks = 0;
+    for (uint32_t c = 0; c < img.channel_count; ++c) {
+        const auto& ch = header.channel_dcts[img.first_channel_index + c];
+        expected_blocks += static_cast<size_t>(ch.width_in_blocks) *
+                           static_cast<size_t>(ch.height_in_blocks);
+    }
+    const size_t expected_coeffs = expected_blocks * 64;
+
+    size_t coder_coeffs = gpujpeg_decoder_get_coefficients_count(decoder);
+    if (coder_coeffs == 0) {
+        throw std::runtime_error(
+            "init_decoder_for_image: decoder coefficients count is 0 (init failed?)");
+    }
+    if (coder_coeffs != expected_coeffs) {
+        throw std::runtime_error(
+            "init_decoder_for_image: coefficients count mismatch, header vs gpujpeg");
+    }
+
+    // 8) 设置**输出格式**（和真实 JPEG 色彩空间无关，是你想要的最终结果）
+    // if (comp_count_from_cs == 1) {
+    //     // 灰度：如果你想输出单通道，就这样：
+    //     gpujpeg_decoder_set_output_format(
+    //         decoder,
+    //         GPUJPEG_YCBCR_BT601_256LVLS,   // 输出色彩空间（灰度/亮度）
+    //         GPUJPEG_U8                      // 单通道 8bit
+    //     );
+    //     printf("Note: Decoding grayscale image as single-channel U8 output.\n");
+    //     // 如果你想统一输出 RGB（灰度复制三通道），可以传 GPUJPEG_RGB + 444_U8_P012，
+    //     // 但要确认 GPUJPEG 这条路径支持。否则就自己在 CPU 侧复制 Y→RGB。
+    // } else {
+    //     // 多通道图像：输出 RGB 打包
+    //     gpujpeg_decoder_set_output_format(
+    //         decoder,
+    //         GPUJPEG_RGB,                    // 目标输出色彩空间
+    //         GPUJPEG_444_U8_P012             // RGBRGB... packed
+    //     );
+    //     printf("Note: Decoding image as packed RGB output.\n");
+    // }
 }
 
 // 从 libjpeg 的采样因子推断 SampleFactor
@@ -1209,18 +1436,147 @@ std::vector<std::vector<std::vector<std::vector<uint8_t>>>>
 JpegLoader::to_rgb_gpu(const std::vector<std::vector<double>>& dct_blocks,
                        const path& file_path)
 {
-    // 1) 从自定义 header 文件读取 ImageHeader（数据集级别）
+    using namespace std;
     ImageHeader header;
     if (!load_ImageHeader(header, file_path.string().c_str())) {
-        throw std::runtime_error("Failed to load ImageHeader from " + file_path.string());
+        throw runtime_error("Failed to load ImageHeader from " + file_path.string());
     }
     if (header.images.empty()) {
-        throw std::runtime_error("ImageHeader contains no images.");
+        throw runtime_error("ImageHeader contains no images.");
     }
 
-    // todo
-    return std::vector<std::vector<std::vector<std::vector<uint8_t>>>>(); // [N][3][H][W]
-    // return result; // [N][3][H][W]
+    // 初始化 GPUJPEG
+    static once_flag s_gpu_init;
+    call_once(s_gpu_init, [] {
+        if (gpujpeg_init_device(0, 0) != 0) {
+            throw runtime_error("Failed to initialize GPUJPEG device");
+        }
+    });
+
+    vector<vector<vector<vector<uint8_t>>>> results;
+    results.resize(header.images.size());
+
+    size_t global_block_idx = 0;
+
+
+    // === 创建解码器 ===
+    gpujpeg_decoder* decoder = gpujpeg_decoder_create(nullptr);
+    if (!decoder) throw std::runtime_error("Failed to create GPUJPEG decoder");
+
+
+    for (size_t img_idx = 0; img_idx < header.images.size(); ++img_idx) {
+        const auto& img = header.images[img_idx];
+        uint32_t img_w = img.width;
+        uint32_t img_h = img.height;
+
+        gpujpeg_decoder_output decoder_output;
+        gpujpeg_decoder_output_set_default(&decoder_output);
+
+        // ✅ 使用 ImageHeader + ImageInfo 初始化 gpujpeg_decoder
+        init_decoder_for_image(header, img, decoder);
+
+        // 如果想明确指定输出为 RGB packed，可以再调一次：
+        // gpujpeg_decoder_set_output_format(decoder, GPUJPEG_RGB, GPUJPEG_444_U8_P012);
+
+        // === 构建外部量化系数缓冲区 ===
+        std::vector<int16_t> coeffs;
+        coeffs.reserve(img.channel_count * 64);
+
+        for (uint32_t c = 0; c < img.channel_count; ++c) {
+            const auto& ch = header.channel_dcts[img.first_channel_index + c];
+
+            // 查找量化表
+            const QuantTable* qt = nullptr;
+            for (const auto& q : header.quant_tables) {
+                if (q.id == ch.qtable_id) { qt = &q; break; }
+            }
+            if (!qt) {
+                gpujpeg_decoder_destroy(decoder);
+                throw std::runtime_error("Quant table not found for channel " + std::to_string(c));
+            }
+
+            const uint32_t num_blocks =
+                ch.width_in_blocks * ch.height_in_blocks;
+
+            for (uint32_t b = 0; b < num_blocks; ++b) {
+                if (global_block_idx >= dct_blocks.size()) {
+                    gpujpeg_decoder_destroy(decoder);
+                    throw std::runtime_error("Ran out of DCT blocks for GPU decode");
+                }
+
+                int16_t block_nat[64];
+                const auto& src = dct_blocks[global_block_idx];
+
+                for (size_t k = 0; k < 64; ++k) {
+                    // dct_blocks[k] 是按 zigzag 存的，这里转成 natural 顺序
+                    int zz = zigzag_order[k];
+                    double val = (k < src.size()) ? src[k] : 0.0;
+                    block_nat[zz] = static_cast<int16_t>(std::round(val));
+                }
+
+                // 这里只是把「量化后的系数」按 natural 顺序排好，真正的反量化（乘 qtable）
+                // 会在 GPUJPEG 内部完成；如果你希望自己先乘一遍，再传给 GPU 也可以，
+                // 那样就必须同步修改 GPU 端的 dequant 逻辑。
+
+                coeffs.insert(coeffs.end(), block_nat, block_nat + 64);
+                ++global_block_idx;
+            }
+        }
+
+        // ✅ 校验一下和 gpujpeg 初始化时预期的系数个数是否一致
+        size_t expect_coeffs = gpujpeg_decoder_get_coefficients_count(decoder);
+        if (coeffs.size() != expect_coeffs) {
+            gpujpeg_decoder_destroy(decoder);
+            throw std::runtime_error(
+                "coeffs.size() != gpujpeg_decoder_get_coefficients_count(decoder)");
+        }
+
+        // === 上传系数到 GPUJPEG ===
+        // ⚠️ 注意：这里传的是「元素个数」，不要乘 sizeof(int16_t)
+        if (gpujpeg_decoder_set_quantized_coefficients_host(
+                decoder, coeffs.data(), coeffs.size()) != 0)
+        {
+            gpujpeg_decoder_destroy(decoder);
+            throw std::runtime_error("Failed to set external coefficients to GPUJPEG");
+        }
+
+        // === 执行 GPU 解码（外部系数路径） ===
+        if (gpujpeg_decoder_process_external_coefficients(decoder, &decoder_output) != 0) {
+            gpujpeg_decoder_destroy(decoder);
+            throw std::runtime_error("GPUJPEG external coefficients decoding failed");
+        }
+
+        // === 拷贝输出 ===
+        unsigned char* out_data = decoder_output.data;
+        // size_t out_size = decoder_output.data_size;
+
+        // // 理论上这里 out_size 应该是 img_w * img_h * 3（RGB packed）
+        // if (out_size != static_cast<size_t>(img_w) * img_h * 3) {
+        //     fprintf(stderr,
+        //             "Warning: decoded size mismatch (expected %u x %u x 3 = %zu, got %zu)\n",
+        //             img_w, img_h,
+        //             static_cast<size_t>(img_w) * img_h * 3,
+        //             out_size);
+        // }
+
+        std::vector<std::vector<std::vector<uint8_t>>> rgb(
+            3, std::vector<std::vector<uint8_t>>(img_h, std::vector<uint8_t>(img_w)));
+
+        for (uint32_t y = 0; y < img_h; ++y) {
+            for (uint32_t x = 0; x < img_w; ++x) {
+                size_t idx = (static_cast<size_t>(y) * img_w + x) * 3;
+                rgb[0][y][x] = out_data[idx + 0];
+                rgb[1][y][x] = out_data[idx + 1];
+                rgb[2][y][x] = out_data[idx + 2];
+            }
+        }
+
+        results[img_idx] = std::move(rgb);
+    }
+
+    gpujpeg_decoder_destroy(decoder);
+
+    return results;
 }
 
 // std::vector<std::vector<std::vector<std::vector<uint8_t>>>>

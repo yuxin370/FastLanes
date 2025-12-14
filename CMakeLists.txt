@@ -18,7 +18,10 @@ endif ()
 
 set(GPUJPEG_ROOT "${CMAKE_SOURCE_DIR}/external/GPUJPEG")
 set(GPUJPEG_LIB "${GPUJPEG_ROOT}/build/libgpujpeg.so")
-set(GPUJPEG_INCLUDE_DIR "${GPUJPEG_ROOT}/libgpujpeg")
+set(GPUJPEG_INCLUDE_DIRS 
+    "${GPUJPEG_ROOT}/libgpujpeg" 
+    "${GPUJPEG_ROOT}/src")
+
 if(NOT EXISTS "${GPUJPEG_LIB}")
     message(FATAL_ERROR "GPUJPEG library not found at ${GPUJPEG_LIB}")
 endif()

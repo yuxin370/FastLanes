@@ -18,7 +18,7 @@ target_link_libraries(jpeg_loader
 
 target_include_directories(jpeg_loader
     PRIVATE
-        ${GPUJPEG_INCLUDE_DIR}     # 你定义的 GPUJPEG 头文件路径
+        ${GPUJPEG_INCLUDE_DIRS}     # 你定义的 GPUJPEG 头文件路径
 )
 
 target_compile_options(jpeg_loader PRIVATE

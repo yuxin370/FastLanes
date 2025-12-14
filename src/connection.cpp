@@ -312,7 +312,7 @@ Connection& Connection::read_jpeg_dir(const std::string& dir_path, const std::st
 
     // ====== 逐图增量合并 ======
     for (size_t k = 0; k < files.size(); ++k) {
-        printf("Reading header from: %s\n", files[k].string().c_str());
+        // printf("Reading header from: %s\n", files[k].string().c_str());
 
         ImageHeader hdr;
         try {

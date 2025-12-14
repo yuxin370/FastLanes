@@ -74,7 +74,7 @@ void TableReader::to_csv(const char* file_path) const {
 	to_csv(path(file_path));
 }
 
-std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const path& file_path) const {
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const path& file_path, bool is_gpu) const {
 	std::vector<std::vector<double>> result;
 	auto* table_desc = m_table_descriptor_handle->Get();
 	auto* rg_vec = table_desc->m_rowgroup_descriptors();
@@ -104,16 +104,21 @@ std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(
 			}
 		}
 	}
+	if(is_gpu){
+		// GPU 版本
+		auto res = JpegLoader::to_rgb_gpu(result, file_path.parent_path() / "header.meta");
+		return res;
+	}
 	auto res = JpegLoader::to_rgb(result, file_path.parent_path() / "header.meta");
 	return res;
 }
 
-std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const std::string& file_path) const {
-	return to_rgb(path(file_path));
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const std::string& file_path, bool is_gpu) const {
+	return to_rgb(path(file_path),is_gpu);
 }
 
-std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const char* file_path) const {
-	return to_rgb(path(file_path));
+std::vector<std::vector<std::vector<std::vector<uint8_t>>>> TableReader::to_rgb(const char* file_path, bool is_gpu) const {
+	return to_rgb(path(file_path),is_gpu);
 }
 
 TableReader::TableReader(const path& file_path, Connection& connection)

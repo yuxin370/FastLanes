@@ -52,13 +52,14 @@ bool images_approx_equal(const ImageRGB& img1, const std::vector<std::vector<std
 }
 
 int main(int argc, char** argv) {
-	if (argc < 3) {
-		std::cerr << "Usage: ./jpeg_loader_demo <image.jpg> <fls_output_dir>" << std::endl;
+	if (argc < 4) {
+		std::cerr << "Usage: ./jpeg_decoding_test <image.jpg> <fls_output_dir> <is_gpu>" << std::endl;
 		return 1;
 	}
 
 	std::string jpeg_path = argv[1];
 	fs::path    fls_dir(argv[2]);
+	bool 		is_gpu = (std::string(argv[3]) == "1");
 
 	// ─────────────── Step 1: Load original RGB ───────────────
 	auto original_rgb = JpegLoader::load_rgb(jpeg_path);
@@ -88,7 +89,8 @@ int main(int argc, char** argv) {
 		const auto fls_reader = con2.reset().read_fls(fls_dir / "image.fls");
 
 		// This calls TableReader::to_rgb(), which uses header.meta to reconstruct
-		auto reconstructed_rgb_collection = fls_reader->to_rgb((fls_dir / "header.meta").c_str()); // returns [3][H][W]
+		std::cout << "🔄 Reconstructing RGB from DCT blocks in FLS... is_gpu = "<< is_gpu << std::endl;
+		auto reconstructed_rgb_collection = fls_reader->to_rgb((fls_dir / "header.meta").c_str(),is_gpu); // returns [3][H][W]
 		auto reconstructed_rgb            = reconstructed_rgb_collection[0];
 
 		std::cout << "✅ Reconstructed RGB from DCT blocks. Shape: [3][" << reconstructed_rgb[0].size() << "]["
