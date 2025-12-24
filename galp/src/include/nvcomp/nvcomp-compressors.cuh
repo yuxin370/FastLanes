@@ -30,7 +30,7 @@
 #include "nvcomp/zstd.hpp"
 
 namespace hwc {
-using nvcompCompressionManager = nvcomp::PimplManager;
+using nvcompCompressionManager = nvcomp::nvcompManagerBase;
 
 nvcompCompressionManager* get_compressor_manager(const enums_nvcomp::CompressionType compression_type,
                                                  const nvcompType_t                  data_type  = NVCOMP_TYPE_CHAR,
