@@ -4,16 +4,12 @@
 set(GALP_GENERATED_BINDINGS_SOURCES
         generated-bindings/alp-double-decompress_column-bindings.cu
         generated-bindings/alp-double-query_column-bindings.cu
-        generated-bindings/alp-double-query_multi_column-bindings.cu
         generated-bindings/alp-float-decompress_column-bindings.cu
         generated-bindings/alp-float-query_column-bindings.cu
-        generated-bindings/alp-float-query_multi_column-bindings.cu
         generated-bindings/alpextended-double-decompress_column-bindings.cu
         generated-bindings/alpextended-double-query_column-bindings.cu
-        generated-bindings/alpextended-double-query_multi_column-bindings.cu
         generated-bindings/alpextended-float-decompress_column-bindings.cu
         generated-bindings/alpextended-float-query_column-bindings.cu
-        generated-bindings/alpextended-float-query_multi_column-bindings.cu
         generated-bindings/bp-uint32_t-decompress_column-bindings.cu
         generated-bindings/bp-uint32_t-query_column-bindings.cu
         generated-bindings/bp-uint64_t-decompress_column-bindings.cu
@@ -21,16 +17,28 @@ set(GALP_GENERATED_BINDINGS_SOURCES
         generated-bindings/ffor-uint32_t-compute_column-bindings.cu
         generated-bindings/ffor-uint32_t-decompress_column-bindings.cu
         generated-bindings/ffor-uint32_t-query_column-bindings.cu
-        generated-bindings/ffor-uint32_t-query_multi_column-bindings.cu
         generated-bindings/ffor-uint64_t-compute_column-bindings.cu
         generated-bindings/ffor-uint64_t-decompress_column-bindings.cu
         generated-bindings/ffor-uint64_t-query_column-bindings.cu
-        generated-bindings/ffor-uint64_t-query_multi_column-bindings.cu
         generated-bindings/freq-uint32_t-decompress_column-bindings.cu
         generated-bindings/freq-uint64_t-decompress_column-bindings.cu
         generated-bindings/freqextended-uint32_t-decompress_column-bindings.cu
         generated-bindings/freqextended-uint64_t-decompress_column-bindings.cu
 )
+
+set(GALP_MULTI_COLUMN_BINDINGS
+        generated-bindings/alp-double-query_multi_column-bindings.cu
+        generated-bindings/alp-float-query_multi_column-bindings.cu
+        generated-bindings/alpextended-double-query_multi_column-bindings.cu
+        generated-bindings/alpextended-float-query_multi_column-bindings.cu
+        generated-bindings/ffor-uint32_t-query_multi_column-bindings.cu
+        generated-bindings/ffor-uint64_t-query_multi_column-bindings.cu
+)
+
+if(GALP_ENABLE_MULTI_COLUMN)
+    list(APPEND GALP_GENERATED_BINDINGS_SOURCES ${GALP_MULTI_COLUMN_BINDINGS})
+endif()
+
 add_library(generated-bindings STATIC ${GALP_GENERATED_BINDINGS_SOURCES})
 target_compile_options(generated-bindings PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr>)
 # target_compile_options(generated-bindings PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_ANALYZE_FLAGS}>)

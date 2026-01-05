@@ -157,23 +157,34 @@ query_column(const ColumnT column, const ProgramParameters params, const bool qu
 	return verification::compare_data(&a, &b, 1);
 }
 
+
+#ifndef GALP_ENABLE_MULTI_COLUMN
+#define GALP_ENABLE_MULTI_COLUMN 1
+#endif
+
+#if GALP_ENABLE_MULTI_COLUMN
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
 query_multi_column(const ColumnT column, const ProgramParameters params, const bool query_result, const T magic_value) {
-	const bool answer = bindings::query_multi_column<T, ColumnT>(column,
-	                                                             params.unpack_n_vecs,
-	                                                             params.unpack_n_vals,
-	                                                             params.unpacker,
-	                                                             params.patcher,
-	                                                             magic_value,
-	                                                             params.n_samples);
-
-	// Weird hack to avoid refactor_
-	T a = query_result ? 1.0 : 0.0;
-	T b = answer ? 1.0 : 0.0;
-
-	return verification::compare_data(&a, &b, 1);
+    const bool answer = bindings::query_multi_column<T, ColumnT>(column,
+                                                                 params.unpack_n_vecs,
+                                                                 params.unpack_n_vals,
+                                                                 params.unpacker,
+                                                                 params.patcher,
+                                                                 magic_value,
+                                                                 params.n_samples);
+    T a = query_result ? 1.0 : 0.0;
+    T b = answer ? 1.0 : 0.0;
+    return verification::compare_data(&a, &b, 1);
 }
+#else
+template <typename T, typename ColumnT>
+verification::ExecutionResult<T>
+query_multi_column(const ColumnT, const ProgramParameters, const bool, const T) {
+    throw std::invalid_argument("QueryMultiColumn is disabled at build time (GALP_ENABLE_MULTI_COLUMN=OFF).");
+}
+#endif
+
 
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
