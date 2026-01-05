@@ -11,12 +11,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cuda_runtime.h>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <cuda_runtime.h>
-#include <stdexcept>
 
 static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
 	if (e != cudaSuccess) {
@@ -114,28 +113,31 @@ verification::ExecutionResult<T> decompress_column_time(const ColumnT column, co
 	auto column_device = column.copy_to_device();
 
 	{
-		const T* warm = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-		    column_device, params.unpack_n_vecs, params.unpack_n_vals,
-		    params.unpacker, params.patcher, /*n_samples=*/1);
+		const T* warm = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
+		                                                                                params.unpack_n_vecs,
+		                                                                                params.unpack_n_vals,
+		                                                                                params.unpacker,
+		                                                                                params.patcher,
+		                                                                                /*n_samples=*/1);
 		CUDA_CHECK(cudaDeviceSynchronize(), "warmup sync");
 		delete[] warm;
 	}
 
 	const T* out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-	    column_device, params.unpack_n_vecs, params.unpack_n_vals,
-	    params.unpacker, params.patcher, params.n_samples);
+	    column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples);
 
 	printf("[KERNEL TIME] unpack_vecs=%u unpack_vals=%u patcher=%d n_samples=%u \n",
-	       params.unpack_n_vecs, params.unpack_n_vals, (int)params.patcher, params.n_samples);
+	       params.unpack_n_vecs,
+	       params.unpack_n_vals,
+	       (int)params.patcher,
+	       params.n_samples);
 
 	flsgpu::host::free_column(column_device);
 
 	delete[] out;
 
-	return verification::ExecutionResult<T>{};
+	return verification::ExecutionResult<T> {};
 }
-
-
 
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
@@ -157,7 +159,6 @@ query_column(const ColumnT column, const ProgramParameters params, const bool qu
 	return verification::compare_data(&a, &b, 1);
 }
 
-
 #ifndef GALP_ENABLE_MULTI_COLUMN
 #define GALP_ENABLE_MULTI_COLUMN 1
 #endif
@@ -166,25 +167,23 @@ query_column(const ColumnT column, const ProgramParameters params, const bool qu
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
 query_multi_column(const ColumnT column, const ProgramParameters params, const bool query_result, const T magic_value) {
-    const bool answer = bindings::query_multi_column<T, ColumnT>(column,
-                                                                 params.unpack_n_vecs,
-                                                                 params.unpack_n_vals,
-                                                                 params.unpacker,
-                                                                 params.patcher,
-                                                                 magic_value,
-                                                                 params.n_samples);
-    T a = query_result ? 1.0 : 0.0;
-    T b = answer ? 1.0 : 0.0;
-    return verification::compare_data(&a, &b, 1);
+	const bool answer = bindings::query_multi_column<T, ColumnT>(column,
+	                                                             params.unpack_n_vecs,
+	                                                             params.unpack_n_vals,
+	                                                             params.unpacker,
+	                                                             params.patcher,
+	                                                             magic_value,
+	                                                             params.n_samples);
+	T          a      = query_result ? 1.0 : 0.0;
+	T          b      = answer ? 1.0 : 0.0;
+	return verification::compare_data(&a, &b, 1);
 }
 #else
 template <typename T, typename ColumnT>
-verification::ExecutionResult<T>
-query_multi_column(const ColumnT, const ProgramParameters, const bool, const T) {
-    throw std::invalid_argument("QueryMultiColumn is disabled at build time (GALP_ENABLE_MULTI_COLUMN=OFF).");
+verification::ExecutionResult<T> query_multi_column(const ColumnT, const ProgramParameters, const bool, const T) {
+	throw std::invalid_argument("QueryMultiColumn is disabled at build time (GALP_ENABLE_MULTI_COLUMN=OFF).");
 }
 #endif
-
 
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
@@ -293,13 +292,12 @@ std::vector<verification::ExecutionResult<T>> execute_freq(const ProgramParamete
 	if (params.kernel == enums::Kernel::QueryMultiColumn) {
 		throw std::invalid_argument("QueryMultiColumn not supported for FREQ columns.\n");
 	}
-	// for (vbw_t vbw{params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) 
+	// for (vbw_t vbw{params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw)
 	{
 		bool query_result = false;
 		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
 
-		auto column = data::columns::generate_freq_column<T>(
-		    params.n_values, data::ValueRange<uint16_t>(0));
+		auto column = data::columns::generate_freq_column<T>(params.n_values, data::ValueRange<uint16_t>(0));
 		for (uint16_t ec {params.ec_range.min}; ec <= params.ec_range.max; ++ec) {
 			column = data::columns::modify_freq_exception_count(column, ec);
 
