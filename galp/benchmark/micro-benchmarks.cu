@@ -192,8 +192,8 @@ execute_kernel(const ColumnT column, const ProgramParameters params, const bool 
 		return decompress_column_time<T, ColumnT>(column, params);
 	} else if (params.kernel == enums::Kernel::Query) {
 		return query_column<T, ColumnT>(column, params, query_result, magic_value);
-	} else if (params.kernel == enums::Kernel::QueryMultiColumn) {
-		return query_multi_column<T, ColumnT>(column, params, query_result, magic_value);
+	// } else if (params.kernel == enums::Kernel::QueryMultiColumn) {
+	// 	return query_multi_column<T, ColumnT>(column, params, query_result, magic_value);
 	} else {
 		throw std::invalid_argument("Kernel not implemented yet.\n");
 	}
