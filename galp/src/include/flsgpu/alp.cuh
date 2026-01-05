@@ -204,11 +204,6 @@ public:
 	}
 };
 
-template <typename ToT, typename FromT>
-constexpr ToT __device__ __forceinline__ reinterpret_as(FromT value) {
-	ToT* ptr = reinterpret_cast<ToT*>(&value);
-	return *ptr;
-}
 
 template <typename T>
 constexpr void __device__ __forceinline__

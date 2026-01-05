@@ -54,6 +54,38 @@ struct FFORColumn {
 	UINT_T*     bases;
 };
 
+
+template <typename T>
+struct FREQColumn {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	size_t      n_values;
+	size_t 		n_vecs;
+
+	T* 		  	frequent_value;  	// frequent values 
+
+	size_t    	n_exceptions; 		// total number of exceptions
+	size_t*   	exceptions_offsets; // expection offsets in exception array
+	T* 		  	exceptions; 		// exception values
+	uint16_t* 	positions;  		// exception positions in vectors
+	uint16_t* 	counts; 			// number of exceptions per vector
+};
+
+template <typename T>
+struct FREQExtendedColumn {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	size_t      n_values;
+	size_t 		n_vecs;
+
+	T*   		frequent_value;  	// frequent values 
+
+	size_t    	n_exceptions; 		// total number of exceptions
+	size_t*   	exceptions_offsets; // expection offsets in exception array
+	T*   		exceptions; 		// exception values
+	uint16_t* 	positions;  		// exception positions in vectors
+	uint16_t* 	offsets_counts; 	// offsets and counts per lane
+};
+
+
 template <typename T>
 struct ALPColumn {
 	using INT_T  = typename utils::same_width_int<T>::type;
@@ -145,6 +177,165 @@ struct FFORColumn {
 		    get_n_values(), bp.copy_to_device(), GPUArray<UINT_T>(bp.get_n_vecs(), bases).release()};
 	}
 };
+
+
+template <typename T>
+struct FREQExtendedColumn {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using DeviceColumnT = typename device::FREQExtendedColumn<T>;
+	size_t      n_values;
+
+
+	T*   		frequent_value;  	// frequent values 
+	size_t    	n_exceptions; 		// total number of exceptions
+	size_t*   	exceptions_offsets; // expection offsets in exception array
+	T*   		exceptions; 		// exception values
+	uint16_t* 	positions;  		// exception positions in vectors
+	uint16_t* 	offsets_counts; 	// offsets and counts per lane
+
+
+	size_t get_n_values() const {
+		return n_values;
+	}
+
+	size_t get_n_vecs() const {
+		return utils::get_n_vecs_from_size(n_values);
+	}
+
+	device::FREQExtendedColumn<T> copy_to_device() const {
+		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		return device::FREQExtendedColumn<T> {
+		    n_values,
+			get_n_vecs(),
+		    GPUArray<T>(get_n_vecs(), frequent_value).release(),
+		    n_exceptions,
+		    GPUArray<size_t>(get_n_vecs(), exceptions_offsets).release(),
+		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
+		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
+		    GPUArray<uint16_t>(get_n_vecs() * utils::get_n_lanes<T>(), offsets_counts).release(),
+		};
+	}
+};
+
+
+template <typename T>
+struct FREQColumn {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using DeviceColumnT = typename device::FREQColumn<T>;
+	size_t      n_values;
+
+
+	T*   		frequent_value;  	// frequent values 
+	size_t    	n_exceptions; 		// total number of exceptions
+	size_t*   	exceptions_offsets; // expection offsets in exception array
+	T*   		exceptions; 		// exception values
+	uint16_t* 	positions;  		// exception positions in vectors
+	uint16_t* 	counts; 			// number of exceptions per vector
+
+
+	size_t get_n_values() const {
+		return n_values;
+	}
+
+	size_t get_n_vecs() const {
+		return utils::get_n_vecs_from_size(n_values);
+	}
+
+	device::FREQColumn<T> copy_to_device() const {
+		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		return device::FREQColumn<T> {
+		    n_values,
+			get_n_vecs(),
+		    GPUArray<T>(get_n_vecs(), frequent_value).release(),
+		    n_exceptions,
+		    GPUArray<size_t>(get_n_vecs(), exceptions_offsets).release(),
+		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
+		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
+		    GPUArray<uint16_t>(get_n_vecs(), counts).release(),
+		};
+	}
+
+	std::tuple<T*, uint16_t*, uint16_t*> convert_exceptions_to_lane_divided_format() const {
+		constexpr auto N_LANES         = utils::get_n_lanes<T>();
+		constexpr auto VALUES_PER_LANE = utils::get_values_per_lane<T>();
+
+		// New exception allocations
+		T*        out_exceptions = reinterpret_cast<T*>(malloc(sizeof(T) * n_exceptions));
+		uint16_t* out_positions  = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * n_exceptions));
+		uint16_t* out_offsets_counts =
+		    reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * get_n_vecs() * N_LANES));
+
+		// Intermediate arrays for reordering positions and exceptions
+		T        vec_exceptions[consts::VALUES_PER_VECTOR];
+		T        vec_exceptions_positions[consts::VALUES_PER_VECTOR];
+		uint16_t lane_counts[N_LANES];
+
+		// Copies of pointers for pointer arithmetic
+		T*        c_exceptions         = exceptions;
+		uint16_t* c_positions          = positions;
+		T*        c_out_exceptions     = out_exceptions;
+		uint16_t* c_out_positions      = out_positions;
+		uint16_t* c_out_offsets_counts = out_offsets_counts;
+
+		for (size_t vec_index {0}; vec_index < get_n_vecs(); ++vec_index) {
+			uint32_t vec_exception_count = counts[vec_index];
+
+			// Reset counts
+			for (size_t j {0}; j < N_LANES; ++j) {
+				lane_counts[j] = 0;
+			}
+
+			// Split all exceptions into lanes
+			for (size_t exception_index {0}; exception_index < vec_exception_count; ++exception_index) {
+				T        exception = c_exceptions[exception_index];
+				uint16_t position  = c_positions[exception_index];
+
+				uint32_t lane                 = position % N_LANES;
+				uint32_t lane_exception_count = lane_counts[lane];
+				++lane_counts[lane];
+				vec_exceptions[lane * VALUES_PER_LANE + lane_exception_count]           = exception;
+				vec_exceptions_positions[lane * VALUES_PER_LANE + lane_exception_count] = position;
+			}
+
+			// Merge and concatenate all exceptions per lane into single contiguous
+			// array
+			uint32_t vec_exceptions_counter = 0;
+			for (size_t lane {0}; lane < N_LANES; ++lane) {
+				uint32_t exc_in_lane_count = lane_counts[lane];
+				for (size_t exc_in_lane {0}; exc_in_lane < exc_in_lane_count; ++exc_in_lane) {
+
+					c_out_exceptions[vec_exceptions_counter] = vec_exceptions[lane * VALUES_PER_LANE + exc_in_lane];
+					c_out_positions[vec_exceptions_counter] =
+					    vec_exceptions_positions[lane * VALUES_PER_LANE + exc_in_lane];
+					++vec_exceptions_counter;
+				}
+
+				c_out_offsets_counts[lane] = (exc_in_lane_count << 10) | (vec_exceptions_counter - exc_in_lane_count);
+			}
+
+			c_exceptions += vec_exception_count;
+			c_positions += vec_exception_count;
+			c_out_exceptions += vec_exception_count;
+			c_out_positions += vec_exception_count;
+			c_out_offsets_counts += utils::get_n_lanes<T>();
+		}
+
+		return std::make_tuple(out_exceptions, out_positions, out_offsets_counts);
+	}
+
+	FREQExtendedColumn<T> create_extended_column() const {
+		auto [e_exceptions, e_positions, e_offsets_counts] = convert_exceptions_to_lane_divided_format();
+		return FREQExtendedColumn<T> {n_values,
+		                             utils::copy_array(frequent_value, get_n_vecs()),
+		                             n_exceptions,
+		                             utils::copy_array(exceptions_offsets, get_n_vecs()),
+		                             e_exceptions,
+		                             e_positions,
+		                             e_offsets_counts};
+	}
+
+};
+
 
 template <typename T>
 struct ALPExtendedColumn {
@@ -347,6 +538,24 @@ void free_column(FFORColumn<T> column) {
 }
 
 template <typename T>
+void free_column(FREQColumn<T> column) {
+	delete[] column.frequent_value;
+	delete[] column.exceptions_offsets;
+	delete[] column.exceptions;
+	delete[] column.positions;
+	delete[] column.counts;
+}
+
+template <typename T>
+void free_column(FREQExtendedColumn<T> column) {
+	delete[] column.frequent_value;
+	delete[] column.exceptions_offsets;
+	delete[] column.exceptions;
+	delete[] column.positions;
+	delete[] column.offsets_counts;
+}
+
+template <typename T>
 void free_column(ALPColumn<T> column) {
 	free_column(column.ffor);
 	delete[] column.factor_indices;
@@ -382,6 +591,25 @@ void free_column(device::FFORColumn<T> column) {
 	free_column(column.bp);
 	free_device_pointer(column.bases);
 }
+
+template <typename T>
+void free_column(device::FREQColumn<T> column) {
+	free_device_pointer(column.frequent_value);
+	free_device_pointer(column.exceptions_offsets);
+	free_device_pointer(column.exceptions);
+	free_device_pointer(column.positions);
+	free_device_pointer(column.counts);
+}
+
+template <typename T>
+void free_column(device::FREQExtendedColumn<T> column) {
+	free_device_pointer(column.frequent_value);
+	free_device_pointer(column.exceptions_offsets);
+	free_device_pointer(column.exceptions);
+	free_device_pointer(column.positions);
+	free_device_pointer(column.offsets_counts);
+}
+
 
 template <typename T>
 void free_column(device::ALPColumn<T> column) {

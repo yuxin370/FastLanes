@@ -4,6 +4,7 @@ set(GALP_CORE_SOURCES
 )
 add_library(galp_core STATIC ${GALP_CORE_SOURCES})
 target_compile_options(galp_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr>)
+# target_compile_options(galp_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_ANALYZE_FLAGS}>)
 target_include_directories(galp_core PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CUDAToolkit_INCLUDE_DIRS})

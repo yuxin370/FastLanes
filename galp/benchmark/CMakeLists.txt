@@ -26,9 +26,14 @@ set(GALP_GENERATED_BINDINGS_SOURCES
         generated-bindings/ffor-uint64_t-decompress_column-bindings.cu
         generated-bindings/ffor-uint64_t-query_column-bindings.cu
         generated-bindings/ffor-uint64_t-query_multi_column-bindings.cu
+        generated-bindings/freq-uint32_t-decompress_column-bindings.cu
+        generated-bindings/freq-uint64_t-decompress_column-bindings.cu
+        generated-bindings/freqextended-uint32_t-decompress_column-bindings.cu
+        generated-bindings/freqextended-uint64_t-decompress_column-bindings.cu
 )
 add_library(generated-bindings STATIC ${GALP_GENERATED_BINDINGS_SOURCES})
 target_compile_options(generated-bindings PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr>)
+# target_compile_options(generated-bindings PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_ANALYZE_FLAGS}>)
 target_include_directories(generated-bindings PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CUDAToolkit_INCLUDE_DIRS})

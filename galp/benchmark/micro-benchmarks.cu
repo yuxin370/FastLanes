@@ -15,6 +15,15 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cuda_runtime.h>
+#include <stdexcept>
+
+static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
+	if (e != cudaSuccess) {
+		fprintf(stderr, "[CUDA] %s: %s\n", msg, cudaGetErrorString(e));
+		throw std::runtime_error(msg);
+	}
+}
 
 struct ProgramParameters {
 	enums::DataType            data_type;
@@ -101,6 +110,34 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 }
 
 template <typename T, typename ColumnT>
+verification::ExecutionResult<T> decompress_column_time(const ColumnT column, const ProgramParameters params) {
+	auto column_device = column.copy_to_device();
+
+	{
+		const T* warm = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
+		    column_device, params.unpack_n_vecs, params.unpack_n_vals,
+		    params.unpacker, params.patcher, /*n_samples=*/1);
+		CUDA_CHECK(cudaDeviceSynchronize(), "warmup sync");
+		delete[] warm;
+	}
+
+	const T* out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
+	    column_device, params.unpack_n_vecs, params.unpack_n_vals,
+	    params.unpacker, params.patcher, params.n_samples);
+
+	printf("[KERNEL TIME] unpack_vecs=%u unpack_vals=%u patcher=%d n_samples=%u \n",
+	       params.unpack_n_vecs, params.unpack_n_vals, (int)params.patcher, params.n_samples);
+
+	flsgpu::host::free_column(column_device);
+
+	delete[] out;
+
+	return verification::ExecutionResult<T>{};
+}
+
+
+
+template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
 query_column(const ColumnT column, const ProgramParameters params, const bool query_result, const T magic_value) {
 	auto       column_device = column.copy_to_device();
@@ -142,7 +179,7 @@ template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
 execute_kernel(const ColumnT column, const ProgramParameters params, const bool query_result, const T magic_value) {
 	if (params.kernel == enums::Kernel::Decompress) {
-		return decompress_column<T, ColumnT>(column, params);
+		return decompress_column_time<T, ColumnT>(column, params);
 	} else if (params.kernel == enums::Kernel::Query) {
 		return query_column<T, ColumnT>(column, params, query_result, magic_value);
 	} else if (params.kernel == enums::Kernel::QueryMultiColumn) {
@@ -237,6 +274,59 @@ std::vector<verification::ExecutionResult<T>> execute_alp(const ProgramParameter
 	return results;
 }
 
+template <typename T>
+std::vector<verification::ExecutionResult<T>> execute_freq(const ProgramParameters params) {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	auto results = std::vector<verification::ExecutionResult<T>>();
+
+	if (params.kernel == enums::Kernel::QueryMultiColumn) {
+		throw std::invalid_argument("QueryMultiColumn not supported for FREQ columns.\n");
+	}
+	// for (vbw_t vbw{params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) 
+	{
+		bool query_result = false;
+		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
+
+		auto column = data::columns::generate_freq_column<T>(
+		    params.n_values, data::ValueRange<uint16_t>(0));
+		for (uint16_t ec {params.ec_range.min}; ec <= params.ec_range.max; ++ec) {
+			column = data::columns::modify_freq_exception_count(column, ec);
+
+			if (params.kernel == enums::Kernel::Query) {
+				throw std::invalid_argument("Query kernel not supported for FREQ columns.\n");
+			}
+
+			if (params.patcher == enums::Patcher::Dummy || params.patcher == enums::Patcher::Stateless ||
+			    params.patcher == enums::Patcher::Stateful) {
+				results.push_back(
+				    execute_kernel<T, flsgpu::host::FREQColumn<T>>(column, params, query_result, magic_value));
+			} else {
+				auto column_extended = column.create_extended_column();
+
+				results.push_back(execute_kernel<T, flsgpu::host::FREQExtendedColumn<T>>(
+				    column_extended, params, query_result, magic_value));
+
+				flsgpu::host::free_column(column_extended);
+			}
+		}
+
+		flsgpu::host::free_column(column);
+	}
+
+	return results;
+}
+
+/*
+Usage:
+./micro-benchmarks \
+  <data_type> <kernel> \
+  <unpack_n_vecs> <unpack_n_vals> \
+  <unpacker> <patcher> \
+  <start_vbw> <end_vbw> \
+  <start_ec> <end_ec> \
+  <n_vecs> <n_samples> <print_debug>
+*/
+
 int main(int argc, char** argv) {
 	CLIArgs           args(argc, argv);
 	ProgramParameters params = args.parse();
@@ -245,7 +335,8 @@ int main(int argc, char** argv) {
 	bool    print_debug = params.print_option != enums::Print::PrintNothing;
 	switch (params.data_type) {
 	case enums::DataType::U32:
-		exit_code = verification::process_results(execute_ffor<uint32_t>(params), print_debug);
+		exit_code = verification::process_results(execute_freq<uint32_t>(params), print_debug);
+		// exit_code = verification::process_results(execute_ffor<uint32_t>(params), print_debug);
 		break;
 	case enums::DataType::U64:
 		exit_code = verification::process_results(execute_ffor<uint64_t>(params), print_debug);

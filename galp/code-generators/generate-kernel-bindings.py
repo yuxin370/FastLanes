@@ -11,14 +11,13 @@ import sys
 import argparse
 import logging
 
-GENERATED_BINDINGS_DIR = "./src/generated-bindings/"
+GENERATED_BINDINGS_DIR = "/home/tangyuxin/cleanFastlanes/FastLanes/galp/benchmark/generated-bindings-tp/"
 
 FILE_HEADER = """
+#include "engine/kernels.cuh"
+#include "engine/multi-column-host-kernels.cuh"
+#include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
-
-#include "kernel-bindings.cuh"
-#include "../engine/kernels.cuh"
-#include "../engine/multi-column-host-kernels.cuh"
 
 namespace bindings{
 """
@@ -47,6 +46,8 @@ ENCODINGS = [
     "FFOR",
     "ALP",
     "ALPExtended",
+    "FREQ",
+    "FREQExtended",
 ]
 
 UNPACKERS = [
@@ -105,6 +106,10 @@ def get_column_t(
         column_t = f"ALPExtendedColumn<{data_type}>"
     elif "ALP" in encoding:
         column_t = f"ALPColumn<{data_type}>"
+    elif "FREQExtended" in encoding:
+        column_t = f"FREQExtendedColumn<{data_type}>"
+    elif "FREQ" in encoding:
+        column_t = f"FREQColumn<{data_type}>"
     return (
         "flsgpu::device::"
         if function != "query_multi_column" or for_decompressor
@@ -134,6 +139,11 @@ def get_decompressor_type(
     elif "ALP" in encoding:
         functor = f"ALPFunctor<{data_type}, {n_vec}>"
         patcher_t = f"flsgpu::device::{patcher}ALPExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+    elif "FREQExtended" in encoding:
+        patcher_t = f"flsgpu::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+        decompressor_t = "FREQDecompressor"
+    elif "FREQ" in encoding:
+        patcher_t = f"flsgpu::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
 
     loader_t = ""
     if "Stateful" in unpacker and "StatefulBranchless" not in unpacker:
@@ -152,9 +162,11 @@ def get_decompressor_type(
             loader_t += f"RegisterLoader<{data_type}, {n_vec}, {unpacker[-1]}>"
         unpacker = "Stateful"
 
-    unpacker_t = f"flsgpu::device::BitUnpacker{unpacker}<{data_type}, {n_vec}, {n_val},  flsgpu::device::{functor} {loader_t}>"
+    unpacker_t = f"flsgpu::device::BitUnpacker{unpacker}<{data_type}, {n_vec}, {n_val},  flsgpu::device::{functor} {loader_t}>,"
 
-    return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t}, {patcher_t} {column_t}>"
+    if "FREQ" in encoding or "FREQExtended" not in encoding:
+        unpacker_t = f""
+    return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {column_t}>"
 
 
 def get_if_statement(
@@ -285,6 +297,49 @@ def get_if_statement_check_wrapper(
 
 
 def main(args):
+    for encoding, patchers_per_encoding in zip(
+        ["FREQ", "FREQExtended"], [PATCHERS[1:4], PATCHERS[4:]]
+    ):
+        for data_type in ["uint32_t", "uint64_t"]:
+            for binding in ["decompress_column"]:
+                is_query_column = binding == "query_column"
+                is_multi_column = binding == "query_multi_column"
+                write_file(
+                    f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                    [
+                        get_function(
+                            encoding,
+                            data_type,
+                            binding,
+                            (
+                                "bool"
+                                if is_query_column or is_multi_column
+                                else data_type + "*"
+                            ),
+                            [
+                                get_if_statement_check_wrapper(
+                                    args.disable_unnecessary,
+                                    encoding,
+                                    data_type,
+                                    binding,
+                                    n_vec,
+                                    n_val,
+                                    unpacker,
+                                    patcher,
+                                    is_query_column=is_query_column or is_multi_column,
+                                    n_repetitions=None,
+                                )
+                                for n_vec in [1, 4]
+                                for n_val in [1]
+                                for unpacker in UNPACKERS[1:]
+                                for patcher in patchers_per_encoding
+                            ],
+                            is_query_column=is_query_column,
+                            is_multi_column=is_multi_column,
+                        )
+                    ],
+                )
+
     for encoding in ["BP", "FFOR"]:
         for data_type in ["uint32_t", "uint64_t"]:
             for binding, is_query_column in zip(

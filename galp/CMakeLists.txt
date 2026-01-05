@@ -66,6 +66,14 @@ set(CLANG_ONLY_WARNINGS
         -Wno-unused-variable
 )
 
+# set(NVCC_ANALYZE_FLAGS
+#     --resource-usage
+#     --keep
+#     --keep-dir=${CMAKE_BINARY_DIR}/nvcc_keep
+#     -Xptxas=-v
+# )
+
+
 macro(apply_warnings tgt)
     target_compile_options(${tgt} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:${COMMON_WARNINGS}>

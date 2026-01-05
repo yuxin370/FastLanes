@@ -328,6 +328,80 @@ T* decompress(const flsgpu::host::ALPExtendedColumn<T> column) {
 	return alp::decode(column, new T[column.get_n_values()]);
 }
 
+template <typename T>
+T* decompress(const flsgpu::host::FREQColumn<T> column) {
+    const size_t n_values = column.get_n_values();
+    const size_t n_vecs   = column.get_n_vecs();
+
+    T* out_array = new T[n_values];
+
+    for (size_t vi = 0; vi < n_vecs; ++vi) {
+        const size_t out_base = vi * consts::VALUES_PER_VECTOR;
+        const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+
+        // 1) fill with frequent value
+        const T fv = column.frequent_value[vi];
+        std::fill_n(out_array + out_base, vec_n, fv);
+
+        // 2) patch exceptions
+        const uint16_t cnt = column.counts[vi];
+        const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
+
+        const uint16_t* pos_ptr = column.positions + off;
+        const T*        exc_ptr = column.exceptions + off;
+
+        for (uint16_t i = 0; i < cnt; ++i) {
+            const uint16_t pos = pos_ptr[i]; // position inside this vector
+            if (pos < vec_n) {
+                out_array[out_base + pos] = exc_ptr[i];
+            }
+        }
+    }
+
+    return out_array;
+}
+
+
+template <typename T>
+T* decompress(const flsgpu::host::FREQExtendedColumn<T> column) {
+    const size_t n_values = column.get_n_values();
+    const size_t n_vecs   = column.get_n_vecs();
+
+    constexpr size_t N_LANES = utils::get_n_lanes<T>();
+
+    T* out_array = new T[n_values];
+
+    for (size_t vi = 0; vi < n_vecs; ++vi) {
+        const size_t out_base = vi * consts::VALUES_PER_VECTOR;
+        const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+
+        // 1) fill with frequent value
+        const T fv = column.frequent_value[vi];
+        std::fill_n(out_array + out_base, vec_n, fv);
+
+        // 2) patch exceptions: iterate lane segments
+        const size_t exc_base = static_cast<size_t>(column.exceptions_offsets[vi]);
+
+        for (size_t lane = 0; lane < N_LANES; ++lane) {
+            const uint16_t offset_count = column.offsets_counts[vi * N_LANES + lane];
+            const uint16_t cnt          = offset_count >> 10;
+            const uint16_t lane_off     = offset_count & 0x3FF;
+
+            const uint16_t* pos_ptr = column.positions + exc_base + lane_off;
+            const T*        exc_ptr = column.exceptions + exc_base + lane_off;
+
+            for (uint16_t i = 0; i < cnt; ++i) {
+                const uint16_t pos = pos_ptr[i]; // position inside this vector
+                if (pos < vec_n) {
+                    out_array[out_base + pos] = exc_ptr[i];
+                }
+            }
+        }
+    }
+
+    return out_array;
+}
+
 } // namespace bindings
 
 namespace columns {
@@ -451,6 +525,52 @@ flsgpu::host::ALPColumn<T> generate_alp_column(const size_t               n_valu
 	// Not supported (yet)
 	column.compressed_size_bytes_alp          = 0;
 	column.compressed_size_bytes_alp_extended = 0;
+
+	return column;
+}
+
+template <typename T>
+flsgpu::host::FREQColumn<T> generate_freq_column(const size_t               n_values,
+                                               const ValueRange<uint16_t> exceptions_per_vec) {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+
+	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+	auto         column = flsgpu::host::FREQColumn<T>();
+
+	column.n_values = n_values;
+	column.frequent_value = primitives::fill_array_with_random_bytes(new T[n_vecs], n_vecs);
+
+	column.counts = primitives::fill_array_with_random_data<uint16_t>(
+	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
+
+	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
+	column.exceptions_offsets = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
+	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
+	column.positions =
+	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
+
+	return column;
+}
+
+template <typename T>
+flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn<T> column,
+                                                      const ValueRange<uint16_t> exceptions_per_vec) {
+	const size_t n_values = column.n_values;
+	const size_t n_vecs   = utils::get_n_vecs_from_size(n_values);
+
+	delete[] column.counts;
+	delete[] column.exceptions_offsets;
+	delete[] column.exceptions;
+	delete[] column.positions;
+
+	// Copied from generate_alp_column
+	column.counts = primitives::fill_array_with_random_data<uint16_t>(
+	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
+	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
+	column.exceptions_offsets = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
+	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
+	column.positions =
+	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
 
 	return column;
 }
