@@ -1,3 +1,8 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# data/time_series/tables/truncate.py
+# ────────────────────────────────────────────────────────
 import pandas as pd
 
 def truncate_csv(input_file, output_file, num_lines):
