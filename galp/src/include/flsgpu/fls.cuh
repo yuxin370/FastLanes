@@ -41,6 +41,29 @@ struct FFORFunctor : FunctorBase<T> {
 		return value + bases[vector_index];
 	}
 };
+// todo: considering using share memory to cache keys
+template <typename T, unsigned UNPACK_N_VECTORS>
+struct DICTFunctor : FunctorBase<T> {
+  using UINT_T = typename utils::same_width_uint<T>::type;
+  const UINT_T* __restrict__ 		keys;
+  UINT_T 							bases[UNPACK_N_VECTORS];
+
+  __device__ __forceinline__
+  DICTFunctor(const UINT_T* a_bases, const UINT_T* a_keys) : keys(a_keys) {
+#pragma unroll
+    for (int v=0; v<UNPACK_N_VECTORS; ++v) bases[v] = a_bases[v];
+  }
+
+  __device__ __forceinline__
+  UINT_T operator()(UINT_T value, vi_t vector_index) override {
+    const auto idx = value + bases[vector_index];
+
+    // return __ldg(keys + idx);   
+    return keys[idx];
+
+  }
+};
+
 
 template <typename T>
 struct BitUnpackerBase {
@@ -1119,6 +1142,31 @@ struct FREQDecompressor : DecompressorBase<T> {
 	}
 };
 
+template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
+struct DICTDecompressor : DecompressorBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	UnpackerT 					unpacker;
+	__device__ __forceinline__ DICTDecompressor(const DICTColumn<T> column, const vi_t vector_index, const lane_t lane)
+	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	               lane,
+	               column.ffor.bp.bit_widths[vector_index],
+	               DICTFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index,
+	                                               column.keys)){ // column.keys at global memory
+	}
+
+	// outer key pointer, which may points to shared memory
+	__device__ __forceinline__ DICTDecompressor(const DICTColumn<T> column, const vi_t vector_index, const lane_t lane, const UINT_T* __restrict keys_ptr)
+		: unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+					lane,
+					column.ffor.bp.bit_widths[vector_index],
+					DICTFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index,
+													keys_ptr)) {
+	}
+
+	void __device__ unpack_next_into(T* __restrict out) {
+		unpacker.unpack_next_into(out);
+	}
+};
 
 }} // namespace flsgpu::device
 

@@ -54,6 +54,16 @@ struct FFORColumn {
 	UINT_T*     bases;
 };
 
+template <typename T>
+struct DICTColumn {
+ 	using UINT_T = typename utils::same_width_uint<T>::type;
+	size_t             n_values;
+	FFORColumn<UINT_T> ffor;  // index stream (FFOR-compressed)
+
+	UINT_T*      		keys;      // dictionary keys (shared by all vectors)
+	size_t             	key_count; // number of keys in dictionary
+};
+
 
 template <typename T>
 struct FREQColumn {
@@ -178,6 +188,27 @@ struct FFORColumn {
 	}
 };
 
+template <typename T>
+struct DICTColumn {
+	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using DeviceColumnT = typename device::DICTColumn<T>;
+
+	FFORColumn<UINT_T> ffor;      // index stream
+	UINT_T*            keys;      // host dictionary keys
+	size_t             key_count; // number of keys
+
+	size_t get_n_values() const {
+		return ffor.bp.n_values;
+	}
+	size_t get_n_vecs() const {
+		return ffor.bp.get_n_vecs();
+	}
+
+	device::DICTColumn<T> copy_to_device() const {
+		return device::DICTColumn<T>{
+			get_n_values(), ffor.copy_to_device(), GPUArray<UINT_T>(key_count, keys).release(), key_count};
+	}
+};
 
 template <typename T>
 struct FREQExtendedColumn {
@@ -538,6 +569,12 @@ void free_column(FFORColumn<T> column) {
 }
 
 template <typename T>
+void free_column(DICTColumn<T> column) {
+  free_column(column.ffor);
+  delete[] column.keys;
+}
+
+template <typename T>
 void free_column(FREQColumn<T> column) {
 	delete[] column.frequent_value;
 	delete[] column.exceptions_offsets;
@@ -590,6 +627,12 @@ template <typename T>
 void free_column(device::FFORColumn<T> column) {
 	free_column(column.bp);
 	free_device_pointer(column.bases);
+}
+
+template <typename T>
+void free_column(device::DICTColumn<T> column) {
+  free_column(column.ffor);
+  free_device_pointer(column.keys);
 }
 
 template <typename T>

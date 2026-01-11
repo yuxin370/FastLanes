@@ -12,7 +12,7 @@
 
 template <typename T>
 struct SingleVectorPerWarpThreadblockMapping {
-	static constexpr unsigned N_WARPS_PER_BLOCK   = std::max(utils::get_n_lanes<T>() / consts::THREADS_PER_WARP, 2);
+	static constexpr unsigned N_WARPS_PER_BLOCK   = std::max(utils::get_n_lanes<T>() / consts::THREADS_PER_WARP, 8);
 	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
 	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK =
 	    N_THREADS_PER_BLOCK / std::max(utils::get_n_lanes<T>(), consts::THREADS_PER_WARP);
@@ -25,7 +25,7 @@ struct SingleVectorPerWarpThreadblockMapping {
 };
 template <typename T>
 struct FillWarpThreadblockMapping {
-	static constexpr unsigned N_WARPS_PER_BLOCK   = std::max(utils::get_n_lanes<T>() / consts::THREADS_PER_WARP, 2);
+	static constexpr unsigned N_WARPS_PER_BLOCK   = std::max(utils::get_n_lanes<T>() / consts::THREADS_PER_WARP, 8);
 	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
 	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK = N_THREADS_PER_BLOCK / utils::get_n_lanes<T>();
 

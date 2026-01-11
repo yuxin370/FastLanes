@@ -1,7 +1,7 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/benchmark/nvcomp/nvcomp-compressors.cu
+// galp/benchmark/nvcomp/nvcomp-compressors-old.cu
 // ────────────────────────────────────────────────────────
 #include "nvcomp/nvcomp-compressors.cuh"
 #include <assert.h>

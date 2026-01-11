@@ -3,14 +3,31 @@
 // ────────────────────────────────────────────────────────
 // galp/src/include/engine/kernels.cuh
 // ────────────────────────────────────────────────────────
+#include "flsgpu/consts.cuh"
 #include "engine/device-utils.cuh"
 #include "flsgpu/flsgpu-api.cuh"
 #include <cstddef>
+#include <type_traits>
 
 #ifndef FLS_GLOBAL_CUH
 #define FLS_GLOBAL_CUH
 
 namespace kernels {
+
+template <typename ColumnT>
+struct is_dict_column : std::false_type {};
+
+template <typename T>
+struct is_dict_column<flsgpu::device::DICTColumn<T>> : std::true_type {
+  using UINT_T = typename flsgpu::device::DICTColumn<T>::UINT_T;
+};
+
+template <typename T>
+struct is_dict_column<flsgpu::host::DICTColumn<T>> : std::true_type {
+  using UINT_T = typename flsgpu::host::DICTColumn<T>::UINT_T;
+};
+
+
 
 namespace device {
 
@@ -22,9 +39,41 @@ __global__ void decompress_column(const ColumnT column, T* out) {
 	const int32_t      vector_index = mapping.get_vector_index();
 
 	T registers[N_VALUES];
+
+	size_t n_vecs = utils::get_n_vecs_from_size(column.n_values);
+	if ((size_t)vector_index >= n_vecs) return;
+
 	out += vector_index * consts::VALUES_PER_VECTOR;
 
 	auto iterator = DecompressorT(column, vector_index, lane);
+
+	// ---- DICT shared keys staging (only for DICT columns) ----
+	// auto iterator = [&]() {
+	// 	if constexpr (is_dict_column<ColumnT>::value) {
+	// 		using UINT_T = typename is_dict_column<ColumnT>::UINT_T;
+			
+	// 		// set a upper bound to avoid too large key_count
+
+	// 		const UINT_T* keys_ptr = column.keys;
+	// 		if( column.key_count * sizeof(UINT_T) <= consts::MAX_SHARED_DICT_BYTES){
+	// 		// if(column.key_count < 32 && column.key_count * sizeof(UINT_T) <= consts::MAX_SHARED_DICT_BYTES){
+	// 			extern __shared__ __align__(16) unsigned char smem[];
+	// 			auto* s_keys = reinterpret_cast<UINT_T*>(smem);
+
+	// 			for (size_t i = threadIdx.x; i < column.key_count; i += blockDim.x) {
+	// 				s_keys[i] = column.keys[i];
+	// 			}
+	// 			__syncthreads();
+	// 			keys_ptr = s_keys;
+	// 		}
+
+
+	// 		// pass keys_ptr
+	// 		return DecompressorT(column, vector_index, lane, keys_ptr);
+	// 	} else {
+	// 		return DecompressorT(column, vector_index, lane);
+	// 	}
+	// }();
 
 	for (si_t i = 0; i < mapping.N_VALUES_IN_LANE; i += UNPACK_N_VALUES) {
 		iterator.unpack_next_into(registers);
@@ -116,7 +165,6 @@ __host__ T* decompress_column(const ColumnT column, const uint32_t n_samples) {
 	size_t                      n_vecs = utils::get_n_vecs_from_size(column.n_values);
 	const ThreadblockMapping<T> mapping(UNPACK_N_VECTORS, n_vecs);
 	GPUArray<T>                 device_out(column.n_values);
-    bool                        result;
 
     cudaEvent_t ev_start{}, ev_stop{};
     CUDA_SAFE_CALL(cudaEventCreate(&ev_start));
@@ -124,9 +172,22 @@ __host__ T* decompress_column(const ColumnT column, const uint32_t n_samples) {
 
     CUDA_SAFE_CALL(cudaEventRecord(ev_start, 0));
 
+	size_t shmem_bytes = 0;
+	// if constexpr (is_dict_column<ColumnT>::value) {
+	// 	using UINT_T = typename is_dict_column<ColumnT>::UINT_T;
+	// 	if(column.key_count * sizeof(UINT_T) <= consts::MAX_SHARED_DICT_BYTES)
+	// 	// if(column.key_count < 32 && column.key_count * sizeof(UINT_T) <= consts::MAX_SHARED_DICT_BYTES)
+	// 		shmem_bytes = column.key_count * sizeof(UINT_T);
+		
+	// 	printf("Decompress kernel shared memory usage: %zu bytes, corresponding to key counts = %d\n", shmem_bytes, column.key_count);
+	// }
+
+
+	printf("Decompress kernel launch parameters: n_blocks=%u, n_threads_per_block=%u\n",
+	       (unsigned)mapping.n_blocks, (unsigned)mapping.N_THREADS_PER_BLOCK);
 	for (uint32_t i {0}; i < n_samples; ++i) {
 		device::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>
-		    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK>>>(column, device_out.get());
+		    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK, shmem_bytes>>>(column, device_out.get());
 		// CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		CUDA_SAFE_CALL(cudaGetLastError());
         // no cudaDeviceSynchronize()

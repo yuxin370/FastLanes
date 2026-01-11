@@ -13,6 +13,7 @@
 #include "fls_gen/unpack/unpack.hpp"
 #include "flsgpu/flsgpu-api.cuh"
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <tuple>
 
 namespace data {
@@ -329,6 +331,38 @@ T* decompress(const flsgpu::host::ALPExtendedColumn<T> column) {
 }
 
 template <typename T>
+T* decompress(const flsgpu::host::DICTColumn<T> column) {
+    using UINT_T = typename flsgpu::host::DICTColumn<T>::UINT_T;
+
+    const size_t n_values = column.get_n_values();
+
+    // 1) decompress the index stream 
+    UINT_T* indices = decompress(column.ffor); 
+
+    // 2) map indices through dictionary keys
+    T* out_array = new T[n_values];
+
+    for (size_t i = 0; i < n_values; ++i) {
+        const size_t idx = static_cast<size_t>(indices[i]);
+
+        // guard to avoid OOB (shouldn't happen if generator is correct)
+        UINT_T bits = 0;
+        if (idx < column.key_count) {
+            bits = column.keys[idx];
+        }
+
+        // bitcast UINT_T -> T safely
+        T v;
+        std::memcpy(&v, &bits, sizeof(T));
+        out_array[i] = v;
+    }
+
+    delete[] indices;
+    return out_array;
+}
+
+
+template <typename T>
 T* decompress(const flsgpu::host::FREQColumn<T> column) {
     const size_t n_values = column.get_n_values();
     const size_t n_vecs   = column.get_n_vecs();
@@ -493,40 +527,44 @@ generate_binary_ffor_column(const size_t n_values, const ValueRange<vbw_t> value
 	                       });
 }
 
+static inline size_t key_count_from_bits(vbw_t bw) {
+    if (bw >= 63) { // avoid overflow
+        throw std::invalid_argument("value_bit_width too large for key_count");
+    }
+    return size_t{1ULL} << bw;
+}
+
 template <typename T>
-flsgpu::host::ALPColumn<T> generate_alp_column(const size_t               n_values,
-                                               const ValueRange<vbw_t>    bit_width_range,
-                                               const ValueRange<uint16_t> exceptions_per_vec,
-                                               const unsigned             repeat = 1) {
-	static_assert(std::is_floating_point<T>::value, "T should be a floating point type.");
-	using UINT_T = typename utils::same_width_uint<T>::type;
+flsgpu::host::DICTColumn<T>
+generate_random_dict_column(const size_t   n_values,
+                            const vbw_t    value_bit_width, // bit-width of indices 
+                            const unsigned repeat = 1) {
+    using UINT_T = typename utils::same_width_uint<T>::type;
 
-	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
-	auto         column = flsgpu::host::ALPColumn<T>();
-	column.ffor = generate_random_ffor_column<UINT_T>(n_values, bit_width_range, ValueRange<UINT_T>(2, 20), repeat);
+    auto column = flsgpu::host::DICTColumn<T>();
 
-	// Note we halve the frac and fact because otherwise you
-	// are more likely to have integer overflow in the decoding for some
-	// combinations of compression parameters
-	column.factor_indices = primitives::fill_array_with_random_data<uint8_t>(
-	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(consts::as<T>::FACT_ARR_COUNT / 2));
-	column.fraction_indices = primitives::fill_array_with_random_data<uint8_t>(
-	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(consts::as<T>::FRAC_ARR_COUNT / 2));
+    // 1) key_count = 2^bw
+    column.key_count = std::min(key_count_from_bits(value_bit_width), size_t{8192}); // limit to 8192 keys
+    // 2) keys: 0,1,2,...,key_count-1（for debug）
+    column.keys = primitives::fill_array_with_sequence<UINT_T>(
+        new UINT_T[column.key_count], column.key_count, UINT_T{0}, UINT_T{1});
 
-	column.counts = primitives::fill_array_with_random_data<uint16_t>(
-	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
+    // 3) indices ∈ [0, key_count-1]
+    UINT_T* indices = primitives::fill_array_with_random_data<UINT_T>(
+        new UINT_T[n_values], n_values, repeat, UINT_T{0}, UINT_T(column.key_count - 1));
 
-	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
-	column.exceptions_offsets = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
-	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
-	column.positions =
-	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
+    // 4) BP compress indices
+    auto bp = bindings::compress<UINT_T>(indices, n_values, value_bit_width);
+    delete[] indices;
 
-	// Not supported (yet)
-	column.compressed_size_bytes_alp          = 0;
-	column.compressed_size_bytes_alp_extended = 0;
+    // 5) set FFOR bases all to 0（idx = value + base）
+    const size_t n_vecs = bp.get_n_vecs();
+    column.ffor = flsgpu::host::FFORColumn<UINT_T>{
+        bp,
+        primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T{0}),
+    };
 
-	return column;
+    return column;
 }
 
 template <typename T>
@@ -574,6 +612,45 @@ flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn
 
 	return column;
 }
+
+
+template <typename T>
+flsgpu::host::ALPColumn<T> generate_alp_column(const size_t               n_values,
+                                               const ValueRange<vbw_t>    bit_width_range,
+                                               const ValueRange<uint16_t> exceptions_per_vec,
+                                               const unsigned             repeat = 1) {
+	static_assert(std::is_floating_point<T>::value, "T should be a floating point type.");
+	using UINT_T = typename utils::same_width_uint<T>::type;
+
+	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+	auto         column = flsgpu::host::ALPColumn<T>();
+	column.ffor = generate_random_ffor_column<UINT_T>(n_values, bit_width_range, ValueRange<UINT_T>(2, 20), repeat);
+
+	// Note we halve the frac and fact because otherwise you
+	// are more likely to have integer overflow in the decoding for some
+	// combinations of compression parameters
+	column.factor_indices = primitives::fill_array_with_random_data<uint8_t>(
+	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(consts::as<T>::FACT_ARR_COUNT / 2));
+	column.fraction_indices = primitives::fill_array_with_random_data<uint8_t>(
+	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(consts::as<T>::FRAC_ARR_COUNT / 2));
+
+	column.counts = primitives::fill_array_with_random_data<uint16_t>(
+	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
+
+	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
+	column.exceptions_offsets = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
+	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
+	column.positions =
+	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
+
+	// Not supported (yet)
+	column.compressed_size_bytes_alp          = 0;
+	column.compressed_size_bytes_alp_extended = 0;
+
+	return column;
+}
+
+
 
 template <typename T>
 flsgpu::host::ALPColumn<T> modify_alp_exception_count(flsgpu::host::ALPColumn<T> column,
