@@ -361,6 +361,38 @@ T* decompress(const flsgpu::host::DICTColumn<T> column) {
     return out_array;
 }
 
+template <typename T>
+T* decompress(const flsgpu::host::CROSSRLEColumn<T> column) {
+    using UINT_T = typename flsgpu::host::CROSSRLEColumn<T>::UINT_T;
+
+    const size_t n_values = column.get_n_values();
+    UINT_T* out = new UINT_T[n_values];
+
+    if (n_values == 0) return out;
+
+    size_t covered = 0;
+    for (size_t r = 0; r < column.n_runs; ++r) {
+        const size_t start = static_cast<size_t>(column.run_positions[r]);// global start
+        const size_t len   = column.lengths[r];
+
+        if (start > n_values || start + len > n_values) {
+            throw std::runtime_error("CROSSRLE: run out of bounds");
+        }
+
+        UINT_T bits = column.values[r];
+        T v;
+        std::memcpy(&v, &bits, sizeof(T));
+
+        std::fill_n(out + start, len, v);
+        covered += len;
+    }
+
+    if (covered != n_values) {
+        throw std::runtime_error("CROSSRLE: sum(lengths) != n_values");
+    }
+
+    return out;
+}
 
 template <typename T>
 T* decompress(const flsgpu::host::FREQColumn<T> column) {
@@ -532,6 +564,73 @@ static inline size_t key_count_from_bits(vbw_t bw) {
         throw std::invalid_argument("value_bit_width too large for key_count");
     }
     return size_t{1ULL} << bw;
+}
+
+template <typename T>
+flsgpu::host::CROSSRLEColumn<T>
+generate_cross_rle_column(const size_t   n_values,
+                          const vbw_t    value_bit_width, // bit-width of values (UINT_T)
+                          const unsigned repeat = 1) {
+    using UINT_T = typename utils::same_width_uint<T>::type;
+    const size_t VPV = consts::VALUES_PER_VECTOR;
+
+    auto column = flsgpu::host::CROSSRLEColumn<T>();
+    column.n_values = n_values;
+    const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+	
+    // values range: 0 .. mask(value_bit_width)
+    const UINT_T max_value = utils::h_set_first_n_bits<UINT_T>(value_bit_width);
+    auto gen_value = primitives::get_random_number_generator<UINT_T>(UINT_T{0}, max_value);
+
+    // run length generat：repeat higher -> run longer -> run count less)
+    // max_run_len = min(VPV, 4*repeat)
+    const size_t max_run_len =
+        std::max<size_t>(1, std::min<size_t>(VPV, size_t{4} * std::max<unsigned>(1, repeat)));
+    auto gen_run_len = primitives::get_random_number_generator<size_t>(1, max_run_len);
+
+    // staged in vector
+    std::vector<UINT_T>   values_vec;
+    std::vector<size_t>   lengths_vec;
+    std::vector<uint32_t> runpos_vec;
+
+    column.offsets = new uint32_t[n_vecs + 1];
+
+    size_t run_idx = 0;
+    for (size_t vi = 0; vi < n_vecs; ++vi) {
+        column.offsets[vi] = static_cast<uint32_t>(run_idx);
+
+        const size_t out_base = vi * VPV;
+        const size_t vec_n    = std::min<size_t>(VPV, n_values - out_base);
+
+        for (size_t pos = 0; pos < vec_n;) {
+            const size_t len = std::min(gen_run_len(), vec_n - pos);
+
+            values_vec.push_back(gen_value());
+            lengths_vec.push_back(len);
+            runpos_vec.push_back(static_cast<uint32_t>(out_base + pos)); // pos < VPV
+
+            pos += len;
+            ++run_idx;
+
+        }
+    }
+
+    column.offsets[n_vecs] = static_cast<uint16_t>(run_idx);
+    column.n_runs          = run_idx;
+
+    assert(primitives::sum_array<size_t, size_t>(lens.data(), lens.size()) == n_values);
+
+    column.values        = (column.n_runs ? new UINT_T[column.n_runs] : nullptr);
+    column.lengths       = (column.n_runs ? new size_t[column.n_runs] : nullptr);
+    column.run_positions = (column.n_runs ? new uint16_t[column.n_runs] : nullptr);
+
+    for (size_t i = 0; i < column.n_runs; ++i) {
+        column.values[i]        = values_vec[i];
+        column.lengths[i]       = lengths_vec[i];
+        column.run_positions[i] = runpos_vec[i];
+    }
+
+    return column;
 }
 
 template <typename T>

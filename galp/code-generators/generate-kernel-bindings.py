@@ -48,7 +48,8 @@ ENCODINGS = [
     "ALPExtended",
     "FREQ",
     "FREQExtended",
-    "DICT"
+    "DICT",
+    "CROSSRLE"
 ]
 
 UNPACKERS = [
@@ -72,6 +73,12 @@ UNPACKERS = [
     #"StatefulRegisterBranchless4",
     "StatefulBranchless",
 ]
+
+EXPANDERS = [
+    "None",
+    "Dummy"
+]
+
 MULTI_COLUMN_UNPACKERS = [
     UNPACKERS[1],
     UNPACKERS[2],
@@ -113,6 +120,8 @@ def get_column_t(
         column_t = f"FREQColumn<{data_type}>"
     elif "DICT" in encoding:
         column_t = f"DICTColumn<{data_type}>"
+    elif "CROSSRLE" in encoding:
+        column_t = f"CROSSRLEColumn<{data_type}>"
     return (
         "flsgpu::device::"
         if function != "query_multi_column" or for_decompressor
@@ -126,6 +135,7 @@ def get_decompressor_type(
     function: str,
     unpacker: str,
     patcher: str,
+    expander: str,
     n_vec: int,
     n_val: int,
 ) -> str:
@@ -133,6 +143,7 @@ def get_decompressor_type(
     functor = f"BPFunctor<{data_type}>"
     patcher_t = f""
     decompressor_t = f"{encoding}Decompressor"
+    expander_t = f""
     if "FFOR" in encoding:
         functor = f"FFORFunctor<{data_type}, {n_vec}>"
     elif "ALPExtended" in encoding:
@@ -149,6 +160,8 @@ def get_decompressor_type(
         patcher_t = f"flsgpu::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
     elif "DICT" in encoding:
         functor = f"DICTFunctor<{data_type}, {n_vec}>"
+    elif "CROSSRLE" in encoding:
+        expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
 
     loader_t = ""
     if "Stateful" in unpacker and "StatefulBranchless" not in unpacker:
@@ -171,7 +184,10 @@ def get_decompressor_type(
 
     if "FREQ" in encoding or "FREQExtended" in encoding:
         unpacker_t = f""
-    return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {column_t}>"
+    if "CROSSRLE" in encoding:
+        unpacker_t = f""
+        patcher_t = f""
+    return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {expander_t} {column_t}>"
 
 
 def get_if_statement(
@@ -182,6 +198,7 @@ def get_if_statement(
     n_val: int,
     unpacker: str,
     patcher: str,
+    expander: str = "None",
     is_query_column: bool = False,
     n_columns: int | None = None,
     n_repetitions: int | None = None,
@@ -192,16 +209,25 @@ def get_if_statement(
     assert n_val in [1, 32]
     assert unpacker in UNPACKERS
     assert patcher in PATCHERS
+    assert expander in EXPANDERS
 
     column_t = get_column_t(encoding, data_type, function)
     decompressor_t = get_decompressor_type(
-        encoding, data_type, function, unpacker, patcher, n_vec, n_val
+        encoding, data_type, function, unpacker, patcher, expander, n_vec, n_val
     )
     extra_param = (
         "," + str(n_columns)
         if n_columns
         else ", magic_value" if is_query_column else ""
     )
+
+    if encoding is "CROSSRLE":
+        return (
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == enums::Expander::{expander} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            + "{"  # }
+            f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+            "}"
+        )
     return (
         f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && unpacker == enums::Unpacker::{unpacker} && patcher == enums::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
         + "{"  # }
@@ -249,6 +275,7 @@ def get_if_statement_check_wrapper(
     n_val: int,
     unpacker: str,
     patcher: str,
+    expander: str = "None",
     is_query_column: bool = False,
     n_columns: int | None = None,
     n_repetitions: int | None = None,
@@ -295,6 +322,7 @@ def get_if_statement_check_wrapper(
         n_val,
         unpacker,
         patcher,
+        expander,
         is_query_column,
         n_columns,
         n_repetitions,
@@ -341,6 +369,40 @@ def main(args):
                             ],
                             is_query_column=is_query_column,
                             is_multi_column=is_multi_column,
+                        )
+                    ],
+                )
+
+    for encoding in ["CROSSRLE"]:
+        for data_type in ["uint32_t", "uint64_t"]:
+            for binding, is_query_column in zip(
+                ["decompress_column"], [False]
+            ):
+                write_file(
+                    f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                    [
+                        get_function(
+                            encoding,
+                            data_type,
+                            binding,
+                            "bool" if is_query_column else data_type + "*",
+                            [
+                                get_if_statement_check_wrapper(
+                                    args.disable_unnecessary,
+                                    encoding,
+                                    data_type,
+                                    binding,
+                                    n_vec,
+                                    n_val,
+                                    unpacker,
+                                    "None",
+                                    is_query_column=is_query_column,
+                                )
+                                for n_vec in [1, 4]
+                                for n_val in [1]
+                                for unpacker in UNPACKERS
+                            ],
+                            is_query_column=is_query_column,
                         )
                     ],
                 )

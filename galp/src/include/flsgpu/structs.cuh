@@ -66,6 +66,20 @@ struct DICTColumn {
 
 
 template <typename T>
+struct CROSSRLEColumn {
+	using UINT_T        = typename utils::same_width_uint<T>::type;
+	size_t             	n_values;
+	size_t 			   	n_vecs;
+
+	size_t			 	n_runs; // number of runs : is this needed?
+	UINT_T*      		values; 
+	size_t*             lengths;
+	uint32_t* 			offsets;  //  each vector's start run idx
+	uint32_t* 			run_positions;  // runs' start position (offset) in decompressed array
+	
+};
+
+template <typename T>
 struct FREQColumn {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	size_t      n_values;
@@ -187,6 +201,64 @@ struct FFORColumn {
 		    get_n_values(), bp.copy_to_device(), GPUArray<UINT_T>(bp.get_n_vecs(), bases).release()};
 	}
 };
+
+
+template <typename T>
+struct CROSSRLEColumn {
+	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using DeviceColumnT = typename device::CROSSRLEColumn<T>;
+	size_t             n_values;
+
+	size_t			 	n_runs; // number of runs : is this needed?
+	UINT_T*      		values; 
+	size_t*             lengths;
+	uint32_t* 			offsets;  //  each vector's start run idx
+	uint32_t* 			run_positions;  // runs' start position (offset) in decompressed array
+	
+
+
+	size_t get_n_values() const {
+		return n_values;
+	}
+	size_t get_n_vecs() const {
+		return utils::get_n_vecs_from_size(n_values);
+	}
+
+	device::CROSSRLEColumn<T> copy_to_device() const {
+		return device::CROSSRLEColumn<T> {
+		    get_n_values(), 
+			GPUArray<UINT_T>(n_runs, values).release(), 
+			n_runs,
+			GPUArray<size_t>(n_runs, lengths).release(), 
+			GPUArray<uint16_t>(n_runs, run_positions).release(), 
+			GPUArray<uint16_t>(n_runs, offsets).release()};
+	}
+};
+
+// template <typename T>
+// struct CROSSRLEExtendedColumn {
+// 	using UINT_T        = typename utils::same_width_uint<T>::type;
+// 	using DeviceColumnT = typename device::CROSSRLEExtendedColumn<T>;
+// 	size_t             n_values;
+
+// 	UINT_T*      		values;     
+// 	size_t*             lengths;
+// 	uint16_t* 			run_positions;  // runs' positions in vectors
+// 	uint16_t* 			offsets;  // offset of each run in decompressed vectors
+
+
+// 	size_t get_n_values() const {
+// 		return n_values;
+// 	}
+// 	size_t get_n_vecs() const {
+// 		return utils::get_n_vecs_from_size(n_values);
+// 	}
+
+// 	device::CROSSRLEExtendedColumn<T> copy_to_device() const {
+// 		return device::CROSSRLEExtendedColumn<T> {
+// 		    get_n_values(), GPUArray<UINT_T>(get_n_vecs(), values).release(), GPUArray<size_t>(get_n_vecs(), lengths).release()};
+// 	}
+// };
 
 template <typename T>
 struct DICTColumn {
@@ -593,6 +665,14 @@ void free_column(FREQExtendedColumn<T> column) {
 }
 
 template <typename T>
+void free_column(CROSSRLEColumn<T> column) {
+	delete[] column.values;
+	delete[] column.lengths;
+	delete[] column.run_positions;
+	delete[] column.offsets;
+}
+
+template <typename T>
 void free_column(ALPColumn<T> column) {
 	free_column(column.ffor);
 	delete[] column.factor_indices;
@@ -651,6 +731,15 @@ void free_column(device::FREQExtendedColumn<T> column) {
 	free_device_pointer(column.exceptions);
 	free_device_pointer(column.positions);
 	free_device_pointer(column.offsets_counts);
+}
+
+
+template <typename T>
+void free_column(device::CROSSRLEColumn<T> column) {
+	free_device_pointer(column.values);
+	free_device_pointer(column.lengths);
+	free_device_pointer(column.run_positions);
+	free_device_pointer(column.offsets);
 }
 
 

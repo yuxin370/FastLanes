@@ -353,6 +353,35 @@ std::vector<verification::ExecutionResult<T>> execute_dict(const ProgramParamete
 	return results;
 }
 
+// execute_cross_rle
+template <typename T>
+std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramParameters params) {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	auto results = std::vector<verification::ExecutionResult<T>>();
+
+
+	if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
+		throw std::invalid_argument("QueryMultiColumn/Query not supported for CROSS RLE columns.\n");
+	}
+
+	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		bool query_result = false;
+		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
+
+		flsgpu::host::CROSSRLEColumn<T> column;
+
+		column = data::columns::generate_random_cross_rle_column<T>(
+			params.n_values, vbw, 20);
+
+		results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEColumn<T>>(column, params, query_result, magic_value));
+
+		flsgpu::host::free_column(column);
+
+	}
+
+	return results;
+}
+
 /*
 Usage:
 ./micro-benchmarks \
@@ -373,7 +402,8 @@ int main(int argc, char** argv) {
 	switch (params.data_type) {
 	case enums::DataType::U32:
 		// exit_code = verification::process_results(execute_dict<uint32_t>(params), print_debug);
-		exit_code = verification::process_results(execute_freq<uint32_t>(params), print_debug);
+		// exit_code = verification::process_results(execute_freq<uint32_t>(params), print_debug);
+		exit_code = verification::process_results(execute_cross_rle<uint32_t>(params), print_debug);
 		// exit_code = verification::process_results(execute_ffor<uint32_t>(params), print_debug);
 		break;
 	case enums::DataType::U64:
