@@ -225,13 +225,17 @@ struct CROSSRLEColumn {
 	}
 
 	device::CROSSRLEColumn<T> copy_to_device() const {
-		return device::CROSSRLEColumn<T> {
-		    get_n_values(), 
-			GPUArray<UINT_T>(n_runs, values).release(), 
+		const size_t n_vecs = get_n_vecs();
+
+		return device::CROSSRLEColumn<T>{
+			get_n_values(),
+			n_vecs,
 			n_runs,
-			GPUArray<size_t>(n_runs, lengths).release(), 
-			GPUArray<uint16_t>(n_runs, run_positions).release(), 
-			GPUArray<uint16_t>(n_runs, offsets).release()};
+			GPUArray<UINT_T>(n_runs, values).release(),
+			GPUArray<size_t>(n_runs, lengths).release(),
+			GPUArray<uint32_t>(n_vecs + 1, offsets).release(),
+			GPUArray<uint32_t>(n_runs, run_positions).release(),
+		};
 	}
 };
 

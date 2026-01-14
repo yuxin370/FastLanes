@@ -615,14 +615,14 @@ generate_cross_rle_column(const size_t   n_values,
         }
     }
 
-    column.offsets[n_vecs] = static_cast<uint16_t>(run_idx);
+    column.offsets[n_vecs] = static_cast<uint32_t>(run_idx);
     column.n_runs          = run_idx;
 
-    assert(primitives::sum_array<size_t, size_t>(lens.data(), lens.size()) == n_values);
+    assert((primitives::sum_array<size_t, size_t>(lens.data(), lens.size()) == n_values));
 
     column.values        = (column.n_runs ? new UINT_T[column.n_runs] : nullptr);
     column.lengths       = (column.n_runs ? new size_t[column.n_runs] : nullptr);
-    column.run_positions = (column.n_runs ? new uint16_t[column.n_runs] : nullptr);
+    column.run_positions = (column.n_runs ? new uint32_t[column.n_runs] : nullptr);
 
     for (size_t i = 0; i < column.n_runs; ++i) {
         column.values[i]        = values_vec[i];

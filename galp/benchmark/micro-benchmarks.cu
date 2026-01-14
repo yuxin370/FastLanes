@@ -370,7 +370,7 @@ std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramPar
 
 		flsgpu::host::CROSSRLEColumn<T> column;
 
-		column = data::columns::generate_random_cross_rle_column<T>(
+		column = data::columns::generate_cross_rle_column<T>(
 			params.n_values, vbw, 20);
 
 		results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEColumn<T>>(column, params, query_result, magic_value));
