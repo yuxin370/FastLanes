@@ -11,62 +11,27 @@ uint32_t* decompress_column<uint32_t, flsgpu::device::CROSSRLEColumn<uint32_t>>(
     const flsgpu::device::CROSSRLEColumn<uint32_t> column,
     const unsigned                                 unpack_n_vectors,
     const unsigned                                 unpack_n_values,
-    const enums::Unpacker                          unpacker,
-    const enums::Patcher                           patcher,
+    const enums::Expander                          expander,
     const uint32_t                                 n_samples) {
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && expander == enums::Expander::None) {
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && expander == enums::Expander::Dummy) {
 		return kernels::host::decompress_column<
 		    uint32_t,
 		    1,
 		    1,
 		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
 		                                         1,
-		                                         flsgpu::device::NoneCROSSRLEExpander<uint32_t, 1, 1>,
+		                                         flsgpu::device::DummyCROSSRLEExpander<uint32_t, 1, 1>,
 		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
 		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && expander == enums::Expander::None) {
-		return kernels::host::decompress_column<
-		    uint32_t,
-		    1,
-		    32,
-		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
-		                                         1,
-		                                         flsgpu::device::NoneCROSSRLEExpander<uint32_t, 1, 32>,
-		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
-		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
-	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && expander == enums::Expander::None) {
-		return kernels::host::decompress_column<
-		    uint32_t,
-		    1,
-		    1,
-		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
-		                                         1,
-		                                         flsgpu::device::NoneCROSSRLEExpander<uint32_t, 1, 1>,
-		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
-		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
-	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && expander == enums::Expander::None) {
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && expander == enums::Expander::Dummy) {
 		return kernels::host::decompress_column<
 		    uint32_t,
 		    4,
 		    1,
 		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
 		                                         4,
-		                                         flsgpu::device::NoneCROSSRLEExpander<uint32_t, 4, 1>,
-		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
-		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
-	}
-
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && expander == enums::Expander::None) {
-		return kernels::host::decompress_column<
-		    uint32_t,
-		    4,
-		    1,
-		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
-		                                         4,
-		                                         flsgpu::device::NoneCROSSRLEExpander<uint32_t, 4, 1>,
+		                                         flsgpu::device::DummyCROSSRLEExpander<uint32_t, 4, 1>,
 		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
 		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
 	}

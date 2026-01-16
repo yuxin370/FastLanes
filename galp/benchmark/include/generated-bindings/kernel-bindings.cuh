@@ -21,6 +21,13 @@ T* decompress_column(const ColumnT         column,
                      const uint32_t        n_samples);
 
 template <typename T, typename ColumnT>
+T* decompress_column(const ColumnT         column,
+                     const unsigned        unpack_n_vectors,
+                     const unsigned        unpack_n_values,
+                     const enums::Expander expander,
+                     const uint32_t        n_samples);
+
+template <typename T, typename ColumnT>
 bool query_column(const ColumnT         column,
                   const unsigned        unpack_n_vectors,
                   const unsigned        unpack_n_values,
@@ -71,6 +78,28 @@ uint64_t* decompress_column(const flsgpu::device::FFORColumn<uint64_t> column,
                             const enums::Unpacker                      unpacker,
                             const enums::Patcher                       patcher,
                             const uint32_t                             n_samples);
+uint32_t*    decompress_column(const flsgpu::device::DICTColumn<uint32_t> column,
+                            const unsigned                         unpack_n_vectors,
+                            const unsigned                         unpack_n_values,
+                            const enums::Unpacker                  unpacker,
+                            const enums::Patcher                   patcher,
+                            const uint32_t                         n_samples);
+uint64_t*   decompress_column(const flsgpu::device::DICTColumn<uint64_t> column,
+                            const unsigned                          unpack_n_vectors,
+                            const unsigned                          unpack_n_values,
+                            const enums::Unpacker                   unpacker,
+                            const enums::Patcher                    patcher,
+                            const uint32_t                          n_samples);
+uint32_t*    decompress_column(const flsgpu::device::CROSSRLEColumn<uint32_t> column,
+                            const unsigned                         unpack_n_vectors,
+                            const unsigned                         unpack_n_values,
+                            const enums::Expander                  expander,
+                            const uint32_t                         n_samples);
+uint64_t*   decompress_column(const flsgpu::device::CROSSRLEColumn<uint64_t> column,
+                            const unsigned                          unpack_n_vectors,
+                            const unsigned                          unpack_n_values,
+                            const enums::Expander                   expander,
+                            const uint32_t                          n_samples);
 uint32_t*    decompress_column(const flsgpu::device::FREQColumn<uint32_t> column,
                             const unsigned                         unpack_n_vectors,
                             const unsigned                         unpack_n_values,
@@ -80,7 +109,7 @@ uint32_t*    decompress_column(const flsgpu::device::FREQColumn<uint32_t> column
 uint64_t*   decompress_column(const flsgpu::device::FREQColumn<uint64_t> column,
                             const unsigned                          unpack_n_vectors,
                             const unsigned                          unpack_n_values,
-                            const enums::Unpacker                  unpacker,
+                            const enums::Unpacker                   unpacker,
                             const enums::Patcher                    patcher,
                             const uint32_t                          n_samples);
 uint32_t*    decompress_column(const flsgpu::device::FREQExtendedColumn<uint32_t> column,
@@ -92,7 +121,7 @@ uint32_t*    decompress_column(const flsgpu::device::FREQExtendedColumn<uint32_t
 uint64_t*   decompress_column(const flsgpu::device::FREQExtendedColumn<uint64_t> column,
                             const unsigned                                  unpack_n_vectors,
                             const unsigned                                  unpack_n_values,
-                            const enums::Unpacker                          unpacker,
+                            const enums::Unpacker                           unpacker,
                             const enums::Patcher                            patcher,
                             const uint32_t                                  n_samples);
 float*    decompress_column(const flsgpu::device::ALPColumn<float> column,

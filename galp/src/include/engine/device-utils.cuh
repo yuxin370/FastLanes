@@ -20,7 +20,7 @@ struct SingleVectorPerWarpThreadblockMapping {
 	const unsigned n_blocks;
 
 	SingleVectorPerWarpThreadblockMapping(const size_t unpack_n_vecs, const size_t n_vecs)
-	    : n_blocks(n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK)) {
+	    : n_blocks(std::max(static_cast<unsigned long>(1), n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK))) {
 	}
 };
 template <typename T>
@@ -32,7 +32,7 @@ struct FillWarpThreadblockMapping {
 	const unsigned n_blocks;
 
 	FillWarpThreadblockMapping(const size_t unpack_n_vecs, const size_t n_vecs)
-	    : n_blocks(n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK)) {
+	    : n_blocks((std::max(static_cast<unsigned long>(1), n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK)))) {
 	}
 };
 

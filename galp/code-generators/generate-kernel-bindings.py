@@ -11,7 +11,7 @@ import sys
 import argparse
 import logging
 
-GENERATED_BINDINGS_DIR = "/home/tangyuxin/cleanFastlanes/FastLanes/galp/benchmark/generated-bindings-tp/"
+GENERATED_BINDINGS_DIR = "/home/pc/FastLanes/galp/benchmark/generated-bindings-tp"
 
 FILE_HEADER = """
 #include "engine/kernels.cuh"
@@ -53,6 +53,7 @@ ENCODINGS = [
 ]
 
 UNPACKERS = [
+    "None",
     "Dummy",
     "OldFls",
     #"SwitchCase",
@@ -203,6 +204,7 @@ def get_if_statement(
     n_columns: int | None = None,
     n_repetitions: int | None = None,
 ) -> str:
+
     assert data_type in DATA_TYPES
     assert function in FUNCTIONS
     assert n_vec in [1, 2, 4, 8]
@@ -221,7 +223,7 @@ def get_if_statement(
         else ", magic_value" if is_query_column else ""
     )
 
-    if encoding is "CROSSRLE":
+    if encoding == "CROSSRLE":
         return (
             f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == enums::Expander::{expander} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
             + "{"  # }
@@ -249,7 +251,7 @@ def get_function(
     assert not (is_multi_column and is_compute_column)
     column_t = get_column_t(encoding, data_type, function)
     return (
-        f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values, const enums::Unpacker unpacker, const enums::Patcher patcher {', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
+        f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values{', const enums::Expander expander' if encoding == "CROSSRLE" else ', const enums::Unpacker unpacker, const enums::Patcher patcher '}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
         + "{"
         + "\n".join(content)
         + f'throw std::invalid_argument("Could not find correct binding in {function} {encoding}<{data_type}>");'
@@ -394,13 +396,14 @@ def main(args):
                                     binding,
                                     n_vec,
                                     n_val,
-                                    unpacker,
                                     "None",
+                                    "None",
+                                    expander,
                                     is_query_column=is_query_column,
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
-                                for unpacker in UNPACKERS
+                                for expander in EXPANDERS[1:]
                             ],
                             is_query_column=is_query_column,
                         )

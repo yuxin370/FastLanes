@@ -69,6 +69,21 @@ Unpacker string_to_unpacker(const std::string& str) {
 	throw std::invalid_argument("Unknown unpacker type: " + str);
 }
 
+
+Expander string_to_expander(const std::string& str) {
+	static const std::unordered_map<std::string, Expander> mapping = {
+	    {"none", Expander::None},
+	    {"dummy", Expander::Dummy},
+	};
+	
+	auto it = mapping.find(str);
+	if (it != mapping.end()) {
+		return it->second;
+	}
+
+	throw std::invalid_argument("Unknown expander type: " + str);
+}
+
 Patcher string_to_patcher(const std::string& str) {
 	static const std::unordered_map<std::string, Patcher> mapping = {
 	    {"none", Patcher::None},

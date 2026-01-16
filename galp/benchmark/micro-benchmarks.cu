@@ -32,6 +32,7 @@ struct ProgramParameters {
 	uint32_t                   unpack_n_vals;
 	enums::Unpacker            unpacker;
 	enums::Patcher             patcher;
+	enums::Expander            expander;
 	data::ValueRange<vbw_t>    bit_width_range;
 	data::ValueRange<uint16_t> ec_range;
 	size_t                     n_values;
@@ -46,6 +47,7 @@ struct CLIArgs {
 	uint32_t    unpack_n_vals;
 	std::string patcher;
 	std::string unpacker;
+	std::string expander;
 	vbw_t       start_vbw;
 	vbw_t       end_vbw;
 	uint16_t    start_ec;
@@ -55,7 +57,7 @@ struct CLIArgs {
 	uint32_t    print_debug;
 
 	CLIArgs(const int argc, char** argv) {
-		constexpr int32_t CORRECT_ARG_COUNT = 14;
+		constexpr int32_t CORRECT_ARG_COUNT = 15;
 		if (argc != CORRECT_ARG_COUNT) {
 			throw std::invalid_argument("Wrong arg count.\n");
 		}
@@ -67,6 +69,7 @@ struct CLIArgs {
 		unpack_n_vals      = std::stoul(argv[++argcounter]);
 		unpacker           = argv[++argcounter];
 		patcher            = argv[++argcounter];
+		expander		   = argv[++argcounter];
 		start_vbw          = std::stoul(argv[++argcounter]);
 		end_vbw            = std::stoul(argv[++argcounter]);
 		start_ec           = std::stoul(argv[++argcounter]);
@@ -84,6 +87,7 @@ struct CLIArgs {
 		    unpack_n_vals,
 		    enums::string_to_unpacker(unpacker),
 		    enums::string_to_patcher(patcher),
+			enums::string_to_expander(expander),
 		    data::ValueRange<vbw_t>(start_vbw, end_vbw),
 		    data::ValueRange<uint16_t>(start_ec, end_ec),
 		    n_vecs * consts::VALUES_PER_VECTOR,
@@ -98,8 +102,16 @@ private:
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T> decompress_column(const ColumnT column, const ProgramParameters params) {
 	auto     column_device = column.copy_to_device();
-	const T* out           = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-        column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples);
+    T* out;
+
+    if constexpr (std::is_same_v<ColumnT, flsgpu::host::CROSSRLEColumn<T>>) {
+        out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
+            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.expander, params.n_samples);
+    } else {
+        out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
+            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples);
+    }
+
 	flsgpu::host::free_column(column_device);
 
 	const T* correct_out = data::bindings::decompress(column);

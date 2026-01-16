@@ -1104,7 +1104,7 @@ public:
 template <typename T>
 struct CROSSRLEExpanderBase {
 public:
-	__device__ __forceinline__ virtual void fill_and_patch(T* out) = 0;
+	__device__ __forceinline__ virtual void rle_expand(T* out) = 0;
   	__device__ virtual ~CROSSRLEExpanderBase() = default;
 };
 
@@ -1117,7 +1117,7 @@ private:
 	si_t         start_index = 0;
 	UINT_T*    	 vec_values[UNPACK_N_VECTORS];
 	size_t*    	 vec_lengths[UNPACK_N_VECTORS];
-	uint32_t*	 vec_runs_positions[UNPACK_N_VECTORS]; // the starting position of the first run in each vector
+	uint32_t	 vec_runs_positions[UNPACK_N_VECTORS]; // the starting position of the first run in each vector
 
 	const lane_t lane;
 	
@@ -1126,15 +1126,15 @@ public:
 	void __device__ __forceinline__ rle_expand(T* out) override {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
-		const int first_pos = start_index * N_LANES + lane;  // this is the lane in corresponding vectors
+		const int first_pos = start_index * N_LANES + lane;  // the lane in corresponding vectors
 		const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1); // the last lane in corresponding vectors
 		
 		start_index += UNPACK_N_VALUES; // will traverse the whole vectors (UNPACK_N_VALUES one time, for UNPACK_N_VECTORS vectors)
 
-		// locate corresponding runs and expand it into out
+		
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
-			size_t  current_run_position = vec_runs_positions[v]; // the starting position in decompressed arrays of the current run
+			uint32_t  current_run_position = vec_runs_positions[v]; // the starting position in decompressed arrays of the current run
 			size_t  run_index            = 0;
 			size_t  run_length           = vec_lengths[v][run_index];
 			UINT_T  current_value        = vec_values[v][run_index];
@@ -1148,7 +1148,7 @@ public:
 					run_length    = vec_lengths[v][run_index];
 					current_value = vec_values[v][run_index];
 				}
-				out[v * UNPACK_N_VALUES + i] = current_value; // not friendly for branch prediction
+				out[v * UNPACK_N_VALUES + i] = current_value; 
 			}	
 		}
 	}
@@ -1162,7 +1162,7 @@ public:
 			auto vec_index              = vector_index + v;
 			vec_values[v]               = column.values + column.offsets[vec_index];
 			vec_lengths[v]              = column.lengths + column.offsets[vec_index];
-			vec_runs_positions[v]       = column.run_positions + column.offsets[vec_index]; 
+			vec_runs_positions[v]       = column.run_positions[column.offsets[vec_index]];
 		}
 	}
 };
@@ -1236,16 +1236,16 @@ struct DICTDecompressor : DecompressorBase<T> {
 	}
 };
 
-template <typename T, unsigned UNPACK_N_VECTORS, typename ExaanderT, typename ColumnT>
+template <typename T, unsigned UNPACK_N_VECTORS, typename ExpanderT, typename ColumnT>
 struct CROSSRLEDecompressor : DecompressorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	ExaanderT 					exaander;
+	ExpanderT 					expander;
 	__device__ __forceinline__ CROSSRLEDecompressor(const CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : exaander(ExaanderT(column, vector_index, lane)){ 
+	    : expander(ExpanderT(column, vector_index, lane)){ 
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
-		exaander.unpack_next_into(out);
+		expander.rle_expand(out);
 	}
 };
 

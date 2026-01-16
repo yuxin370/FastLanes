@@ -57,6 +57,11 @@ enum class Patcher {
 	PrefetchAllBranchless,
 };
 
+enum class Expander {
+	None,
+	Dummy
+};
+
 enum class Print {
 	PrintNothing,
 	PrintDebug,
@@ -67,6 +72,7 @@ DataType string_to_data_type(const std::string& str);
 Kernel   string_to_kernel(const std::string& str);
 Unpacker string_to_unpacker(const std::string& str);
 Patcher  string_to_patcher(const std::string& str);
+Expander string_to_expander(const std::string& str);
 
 } // namespace enums
 

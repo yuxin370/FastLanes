@@ -26,6 +26,8 @@ set(GALP_GENERATED_BINDINGS_SOURCES
         generated-bindings/freqextended-uint64_t-decompress_column-bindings.cu
         generated-bindings/dict-uint32_t-decompress_column-bindings.cu
         generated-bindings/dict-uint64_t-decompress_column-bindings.cu
+        generated-bindings/crossrle-uint32_t-decompress_column-bindings.cu
+        generated-bindings/crossrle-uint64_t-decompress_column-bindings.cu
 )
 
 set(GALP_MULTI_COLUMN_BINDINGS
