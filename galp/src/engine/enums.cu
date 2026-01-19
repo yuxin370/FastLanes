@@ -74,6 +74,7 @@ Expander string_to_expander(const std::string& str) {
 	static const std::unordered_map<std::string, Expander> mapping = {
 	    {"none", Expander::None},
 	    {"dummy", Expander::Dummy},
+		{"stateful", Expander::Stateful},
 	};
 
 	auto it = mapping.find(str);
@@ -104,6 +105,45 @@ Patcher string_to_patcher(const std::string& str) {
 
 	throw std::invalid_argument("Unknown patcher type: " + str);
 }
+
+
+Encoding string_to_encoding(const std::string& str) {
+	static const std::unordered_map<std::string, Encoding> mapping = {
+	    {"ALP", Encoding::ALP},
+		{"BitPacking", Encoding::BIT_PACKING},
+		{"FFOR", Encoding::FFOR},
+		{"Frequency", Encoding::FREQUENCY},
+		{"CrossRLE", Encoding::CROSS_RLE},
+		{"Dictionary", Encoding::DICTIONARY},
+	};
+
+	auto it = mapping.find(str);
+	if (it != mapping.end()) {
+		return it->second;
+	}
+
+	throw std::invalid_argument("Unknown encoding type: " + str);
+}
+
+std::string encoding_to_string(const Encoding type) {
+	switch (type) {
+	case Encoding::ALP:
+		return "ALP";
+	case Encoding::BIT_PACKING:
+		return "BitPacking";
+	case Encoding::FFOR:
+		return "FFOR";
+	case Encoding::FREQUENCY:
+		return "Frequency";
+	case Encoding::CROSS_RLE:
+		return "CrossRLE";
+	case Encoding::DICTIONARY:
+		return "Dictionary";
+	default:
+		throw std::invalid_argument("Could not parse encoding");
+	}
+}
+
 } // namespace enums
 
 namespace enums_nvcomp {

@@ -365,7 +365,7 @@ T* decompress(const flsgpu::host::CROSSRLEColumn<T> column) {
 	using UINT_T = typename flsgpu::host::CROSSRLEColumn<T>::UINT_T;
 
 	const size_t n_values = column.get_n_values();
-	UINT_T*      out      = new UINT_T[n_values];
+	T*           out      = new T[n_values];
 
 	if (n_values == 0)
 		return out;
@@ -569,8 +569,8 @@ template <typename T>
 flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
                                                           const vbw_t  value_bit_width, // bit-width of values (UINT_T)
                                                           const unsigned repeat = 1) {
-	using UINT_T     = typename utils::same_width_uint<T>::type;
-	const size_t VPV = consts::VALUES_PER_VECTOR;
+	using UINT_T       = typename utils::same_width_uint<T>::type;
+	const uint32_t VPV = consts::VALUES_PER_VECTOR;
 
 	auto column         = flsgpu::host::CROSSRLEColumn<T>();
 	column.n_values     = n_values;
@@ -582,12 +582,13 @@ flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
 
 	// run length generat：repeat higher -> run longer -> run count less)
 	// max_run_len = min(VPV, 4*repeat)
-	const size_t max_run_len = std::max<size_t>(1, std::min<size_t>(VPV, size_t {4} * std::max<unsigned>(1, repeat)));
-	auto         gen_run_len = primitives::get_random_number_generator<size_t>(1, max_run_len);
+	const uint32_t max_run_len =
+	    std::max<uint32_t>(1, std::min<uint32_t>(VPV, uint32_t {4} * std::max<unsigned>(1, repeat)));
+	auto gen_run_len = primitives::get_random_number_generator<uint32_t>(1, max_run_len);
 
 	// staged in vector
 	std::vector<UINT_T>   values_vec;
-	std::vector<size_t>   lengths_vec;
+	std::vector<uint32_t> lengths_vec;
 	std::vector<uint32_t> runpos_vec;
 
 	column.offsets = new uint32_t[n_vecs + 1];
@@ -596,15 +597,15 @@ flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
 	for (size_t vi = 0; vi < n_vecs; ++vi) {
 		column.offsets[vi] = static_cast<uint32_t>(run_idx);
 
-		const size_t out_base = vi * VPV;
-		const size_t vec_n    = std::min<size_t>(VPV, n_values - out_base);
+		const uint32_t out_base = vi * VPV;
+		const uint32_t vec_n    = std::min<uint32_t>(VPV, n_values - out_base);
 
-		for (size_t pos = 0; pos < vec_n;) {
-			const size_t len = std::min(gen_run_len(), vec_n - pos);
+		for (uint32_t pos = 0; pos < vec_n;) {
+			const uint32_t len = std::min(gen_run_len(), vec_n - pos);
 
 			values_vec.push_back(gen_value());
 			lengths_vec.push_back(len);
-			runpos_vec.push_back(static_cast<uint32_t>(out_base + pos)); // pos < VPV
+			runpos_vec.push_back(out_base + pos); // pos < VPV
 
 			pos += len;
 			++run_idx;
@@ -617,7 +618,7 @@ flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
 	assert((primitives::sum_array<size_t, size_t>(lens.data(), lens.size()) == n_values));
 
 	column.values        = (column.n_runs ? new UINT_T[column.n_runs] : nullptr);
-	column.lengths       = (column.n_runs ? new size_t[column.n_runs] : nullptr);
+	column.lengths       = (column.n_runs ? new uint32_t[column.n_runs] : nullptr);
 	column.run_positions = (column.n_runs ? new uint32_t[column.n_runs] : nullptr);
 
 	size_t offsets = 0;

@@ -27,6 +27,7 @@ static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
 
 struct ProgramParameters {
 	enums::DataType            data_type;
+	enums::Encoding     encoding_type;
 	enums::Kernel              kernel;
 	uint32_t                   unpack_n_vecs;
 	uint32_t                   unpack_n_vals;
@@ -42,6 +43,7 @@ struct ProgramParameters {
 
 struct CLIArgs {
 	std::string data_type;
+	std::string encoding_type;
 	std::string kernel;
 	uint32_t    unpack_n_vecs;
 	uint32_t    unpack_n_vals;
@@ -57,13 +59,14 @@ struct CLIArgs {
 	uint32_t    print_debug;
 
 	CLIArgs(const int argc, char** argv) {
-		constexpr int32_t CORRECT_ARG_COUNT = 15;
+		constexpr int32_t CORRECT_ARG_COUNT = 16;
 		if (argc != CORRECT_ARG_COUNT) {
 			throw std::invalid_argument("Wrong arg count.\n");
 		}
 
 		int32_t argcounter = 0;
 		data_type          = argv[++argcounter];
+		encoding_type   = argv[++argcounter];
 		kernel             = argv[++argcounter];
 		unpack_n_vecs      = std::stoul(argv[++argcounter]);
 		unpack_n_vals      = std::stoul(argv[++argcounter]);
@@ -82,6 +85,7 @@ struct CLIArgs {
 	ProgramParameters parse() {
 		return ProgramParameters {
 		    enums::string_to_data_type(data_type),
+			enums::string_to_encoding(encoding_type),
 		    enums::string_to_kernel(kernel),
 		    unpack_n_vecs,
 		    unpack_n_vals,
@@ -406,33 +410,84 @@ Usage:
   <n_vecs> <n_samples> <print_debug>
 */
 
+
+template <class T>
+static int32_t run_by_encoding_type(const ProgramParameters& params, bool print_debug) {
+    switch (params.encoding_type) {
+    case enums::Encoding::DICTIONARY:
+        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+        	return verification::process_results(execute_dict<T>(params), print_debug);
+        } else {
+			std::cerr << "[error] dictionary only supports u32/u64.\n";
+			return 1;
+		}
+    case enums::Encoding::FREQUENCY:
+        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+        return verification::process_results(execute_freq<T>(params), print_debug);
+        } else {
+			std::cerr << "[error] frequency only supports u32/u64.\n";
+			return 1;
+		}
+    case enums::Encoding::CROSS_RLE:
+	
+        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+        return verification::process_results(execute_cross_rle<T>(params), print_debug);
+        } else {
+			std::cerr << "[error] cross rle only supports u32/u64.\n";
+			return 1;
+		}
+    case enums::Encoding::FFOR:
+        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+	        return verification::process_results(execute_ffor<T>(params), print_debug);
+        } else {
+			std::cerr << "[error] ffor only supports u32/u64.\n";
+			return 1;
+		}
+
+    case enums::Encoding::ALP:
+        if constexpr (std::is_same_v<T, float>) {
+            return verification::process_results(execute_alp<float>(params), print_debug);
+        } else if constexpr (std::is_same_v<T, double>) {
+            return verification::process_results(execute_alp<double>(params), print_debug);
+        } else {
+            std::cerr << "[error] alp only supports f32/f64.\n";
+            return 1;
+        }
+    }
+
+    std::cerr << "[error] unknown encoding type.\n";
+    return 1;
+}
+
 int main(int argc, char** argv) {
-	CLIArgs           args(argc, argv);
-	ProgramParameters params = args.parse();
+    CLIArgs args(argc, argv);
+    ProgramParameters params = args.parse();
 
-	int32_t exit_code   = 0;
-	bool    print_debug = params.print_option != enums::Print::PrintNothing;
-	switch (params.data_type) {
-	case enums::DataType::U32:
-		// exit_code = verification::process_results(execute_dict<uint32_t>(params), print_debug);
-		exit_code = verification::process_results(execute_freq<uint32_t>(params), print_debug);
-		// exit_code = verification::process_results(execute_cross_rle<uint32_t>(params), print_debug);
-		// exit_code = verification::process_results(execute_ffor<uint32_t>(params), print_debug);
-		break;
-	case enums::DataType::U64:
-		exit_code = verification::process_results(execute_ffor<uint64_t>(params), print_debug);
-		break;
-	case enums::DataType::F32:
-		exit_code = verification::process_results(execute_alp<float>(params), print_debug);
-		break;
-	case enums::DataType::F64:
-		exit_code = verification::process_results(execute_alp<double>(params), print_debug);
-		break;
-	}
+    bool print_debug = params.print_option != enums::Print::PrintNothing;
 
-	if (params.print_option == enums::Print::PrintDebugExit0) {
-		exit(0);
-	}
+    int32_t exit_code = 0;
+    switch (params.data_type) {
+    case enums::DataType::U32:
+        exit_code = run_by_encoding_type<uint32_t>(params, print_debug);
+        break;
+    case enums::DataType::U64:
+        exit_code = run_by_encoding_type<uint64_t>(params, print_debug);
+        break;
+    case enums::DataType::F32:
+        exit_code = run_by_encoding_type<float>(params, print_debug);
+        break;
+    case enums::DataType::F64:
+        exit_code = run_by_encoding_type<double>(params, print_debug);
+        break;
+    default:
+        std::cerr << "[error] unknown data type.\n";
+        exit_code = 1;
+        break;
+    }
 
-	exit(exit_code);
+    if (params.print_option == enums::Print::PrintDebugExit0) {
+        std::exit(0);
+    }
+
+    std::exit(exit_code);
 }

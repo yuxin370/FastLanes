@@ -78,7 +78,8 @@ UNPACKERS = [
 
 EXPANDERS = [
     "None",
-    "Dummy"
+    "Dummy",
+    "Stateful"
 ]
 
 MULTI_COLUMN_UNPACKERS = [

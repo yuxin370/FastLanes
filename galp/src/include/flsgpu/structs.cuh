@@ -72,7 +72,7 @@ struct CROSSRLEColumn {
 
 	size_t    n_runs; // number of runs : is this needed?
 	UINT_T*   values;
-	size_t*   lengths;
+	uint32_t* lengths;
 	uint32_t* offsets;       //  each vector's start run idx
 	uint32_t* run_positions; // runs' start position (offset) in decompressed array
 };
@@ -207,7 +207,7 @@ struct CROSSRLEColumn {
 
 	size_t    n_runs; // number of runs : is this needed?
 	UINT_T*   values;
-	size_t*   lengths;
+	uint32_t* lengths;
 	uint32_t* offsets;       //  each vector's start run idx
 	uint32_t* run_positions; // runs' start position (offset) in decompressed array
 
@@ -226,7 +226,7 @@ struct CROSSRLEColumn {
 		    n_vecs,
 		    n_runs,
 		    GPUArray<UINT_T>(n_runs, values).release(),
-		    GPUArray<size_t>(n_runs, lengths).release(),
+		    GPUArray<uint32_t>(n_runs, lengths).release(),
 		    GPUArray<uint32_t>(n_vecs + 1, offsets).release(),
 		    GPUArray<uint32_t>(n_runs, run_positions).release(),
 		};

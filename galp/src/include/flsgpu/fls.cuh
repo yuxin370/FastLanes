@@ -1174,33 +1174,27 @@ private:
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	using INT_T  = typename utils::same_width_int<T>::type;
 
-	si_t         start_index = 0;
-	uint32_t     vec_base[UNPACK_N_VECTORS];
-	UINT_T*      vec_values[UNPACK_N_VECTORS];
-	size_t*      vec_lengths[UNPACK_N_VECTORS];
-	uint32_t     vec_runs_positions[UNPACK_N_VECTORS]; // the starting position of the first run in each vector
-	const lane_t lane;
+	si_t      start_index = 0;
+	uint32_t  vec_base[UNPACK_N_VECTORS];
+	UINT_T*   vec_values[UNPACK_N_VECTORS];
+	uint32_t* vec_lengths[UNPACK_N_VECTORS];
+	uint32_t  vec_runs_positions[UNPACK_N_VECTORS]; // the starting position of the first run in each vector
+	                                                // const lane_t lane;
 
 public:
 	void __device__ __forceinline__ rle_expand(T* out) override {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
-		const int first_pos = start_index * N_LANES + lane; // the lane in corresponding vectors
-		// const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1); // the last lane in corresponding vectors
-
-		start_index +=
-		    UNPACK_N_VALUES; // will traverse the whole vectors (UNPACK_N_VALUES one time, for UNPACK_N_VECTORS vectors)
-
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
-			uint32_t current_run_position =
-			    vec_runs_positions[v]; // the starting position in decompressed arrays of the current run
-			size_t run_index     = 0;
-			size_t run_length    = vec_lengths[v][run_index];
-			UINT_T current_value = vec_values[v][run_index];
+			// the starting position in decompressed arrays of the current run
+			uint32_t current_run_position = vec_runs_positions[v];
+			uint32_t run_index            = 0;
+			uint32_t run_length           = vec_lengths[v][run_index];
+			UINT_T   current_value        = vec_values[v][run_index];
 #pragma unroll
 			for (int i {0}; i < UNPACK_N_VALUES; ++i) {
-				const int global_position = static_cast<int>(vec_base[v]) + first_pos + i * N_LANES;
+				const int global_position = static_cast<int>(vec_base[v]) + (start_index + i) * N_LANES;
 				// move to the correct run
 				while (global_position >= current_run_position + run_length) {
 					current_run_position += run_length;
@@ -1211,19 +1205,98 @@ public:
 				out[v * UNPACK_N_VALUES + i] = current_value;
 			}
 		}
+
+		start_index += UNPACK_N_VALUES; // will traverse the whole vectors
 	}
 
 	__device__ __forceinline__
-	DummyCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : lane(lane) {
-
+	DummyCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index        = vector_index + v;
 			vec_values[v]         = column.values + column.offsets[vec_index];
 			vec_lengths[v]        = column.lengths + column.offsets[vec_index];
-			vec_base[v]           = static_cast<int32_t>(vec_index * consts::VALUES_PER_VECTOR);
+			vec_base[v]           = static_cast<int32_t>(vec_index * consts::VALUES_PER_VECTOR) + lane;
 			vec_runs_positions[v] = column.run_positions[column.offsets[vec_index]];
+		}
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct StatefulCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+private:
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename utils::same_width_int<T>::type;
+
+	si_t      start_index = 0;
+	uint32_t  vec_base[UNPACK_N_VECTORS];
+	UINT_T*   vec_values[UNPACK_N_VECTORS];
+	uint32_t* vec_lengths[UNPACK_N_VECTORS];
+
+	// --- persistent per-vector cursor state (Point 1) ---
+	uint32_t vec_run_index[UNPACK_N_VECTORS];
+	uint32_t vec_run_length[UNPACK_N_VECTORS];
+	uint32_t vec_run_pos[UNPACK_N_VECTORS];   // current run start position in decompressed space
+	UINT_T   vec_run_value[UNPACK_N_VECTORS]; // current run value (cached)
+
+public:
+	void __device__ __forceinline__ rle_expand(T* out) override {
+		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			// load persistent state into locals
+			uint32_t run_index  = vec_run_index[v];
+			uint32_t run_length = vec_run_length[v];
+			uint32_t run_pos    = vec_run_pos[v];
+			UINT_T   value      = vec_run_value[v];
+
+#pragma unroll
+			for (int i = 0; i < (int)UNPACK_N_VALUES; ++i) {
+				// global position is monotonic increasing across calls (start_index increases)
+				const uint32_t global_position =
+				    vec_base[v] + static_cast<uint32_t>(start_index + i) * (uint32_t)N_LANES;
+
+				// advance to the correct run
+				while (global_position >= run_pos + run_length) {
+					run_pos += run_length;
+					++run_index;
+
+					// Point 3: keep run_length/index 32-bit. Assumes lengths fit in uint32_t.
+					run_length = vec_lengths[v][run_index];
+					value      = vec_values[v][run_index];
+				}
+
+				out[v * UNPACK_N_VALUES + i] = value;
+			}
+
+			// store back persistent state
+			vec_run_index[v]  = run_index;
+			vec_run_length[v] = run_length;
+			vec_run_pos[v]    = run_pos;
+			vec_run_value[v]  = value;
+		}
+
+		start_index += UNPACK_N_VALUES;
+	}
+
+	__device__ __forceinline__ StatefulCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	                                                    const vi_t                              vector_index,
+	                                                    const lane_t                            lane) {
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			auto vec_index = vector_index + v;
+
+			vec_values[v]  = column.values + column.offsets[vec_index];
+			vec_lengths[v] = column.lengths + column.offsets[vec_index];
+
+			vec_base[v] = static_cast<uint32_t>(vec_index * consts::VALUES_PER_VECTOR) + (uint32_t)lane;
+
+			// init cursor state at first run
+			vec_run_index[v]  = 0;
+			vec_run_pos[v]    = column.run_positions[column.offsets[vec_index]];
+			vec_run_length[v] = static_cast<uint32_t>(vec_lengths[v][0]); // assumes <= UINT32_MAX
+			vec_run_value[v]  = vec_values[v][0];
 		}
 	}
 };

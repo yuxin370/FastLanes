@@ -204,7 +204,6 @@ public:
 	}
 };
 
-
 template <typename T>
 constexpr void __device__ __forceinline__
 overwrite_if_true(T* __restrict buffer, const T* __restrict new_value, const bool condition) {

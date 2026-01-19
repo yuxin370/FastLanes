@@ -58,7 +58,7 @@ enum class Patcher {
 	PrefetchAllBranchless,
 };
 
-enum class Expander { None, Dummy };
+enum class Expander { None, Dummy, Stateful };
 
 enum class Print {
 	PrintNothing,
@@ -66,11 +66,15 @@ enum class Print {
 	PrintDebugExit0,
 };
 
-DataType string_to_data_type(const std::string& str);
-Kernel   string_to_kernel(const std::string& str);
-Unpacker string_to_unpacker(const std::string& str);
-Patcher  string_to_patcher(const std::string& str);
-Expander string_to_expander(const std::string& str);
+enum class Encoding { ALP, BIT_PACKING, FFOR, FREQUENCY, CROSS_RLE, DICTIONARY };
+
+DataType    string_to_data_type(const std::string& str);
+Kernel      string_to_kernel(const std::string& str);
+Unpacker    string_to_unpacker(const std::string& str);
+Patcher     string_to_patcher(const std::string& str);
+Expander    string_to_expander(const std::string& str);
+Encoding    string_to_encoding(const std::string& str);
+std::string encoding_to_string(const Encoding type);
 
 } // namespace enums
 
