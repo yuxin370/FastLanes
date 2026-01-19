@@ -31,7 +31,7 @@ struct ProgramParameters {
 	uint32_t                   unpack_n_vecs;
 	uint32_t                   unpack_n_vals;
 	enums::Unpacker            unpacker;
-	enums::Patcher             patcher;
+	enums::Patcher             patcher; 
 	enums::Expander            expander;
 	data::ValueRange<vbw_t>    bit_width_range;
 	data::ValueRange<uint16_t> ec_range;
@@ -45,7 +45,7 @@ struct CLIArgs {
 	std::string kernel;
 	uint32_t    unpack_n_vecs;
 	uint32_t    unpack_n_vals;
-	std::string patcher;
+	std::string patcher; 
 	std::string unpacker;
 	std::string expander;
 	vbw_t       start_vbw;
@@ -68,7 +68,7 @@ struct CLIArgs {
 		unpack_n_vecs      = std::stoul(argv[++argcounter]);
 		unpack_n_vals      = std::stoul(argv[++argcounter]);
 		unpacker           = argv[++argcounter];
-		patcher            = argv[++argcounter];
+		patcher             = argv[++argcounter];
 		expander		   = argv[++argcounter];
 		start_vbw          = std::stoul(argv[++argcounter]);
 		end_vbw            = std::stoul(argv[++argcounter]);
@@ -86,7 +86,7 @@ struct CLIArgs {
 		    unpack_n_vecs,
 		    unpack_n_vals,
 		    enums::string_to_unpacker(unpacker),
-		    enums::string_to_patcher(patcher),
+		    enums::string_to_patcher(patcher) ,
 			enums::string_to_expander(expander),
 		    data::ValueRange<vbw_t>(start_vbw, end_vbw),
 		    data::ValueRange<uint16_t>(start_ec, end_ec),
@@ -104,16 +104,13 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 	auto     column_device = column.copy_to_device();
     T* out;
 
-    if constexpr (std::is_same_v<ColumnT, flsgpu::host::CROSSRLEColumn<T>>) {
-        out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.expander, params.n_samples);
-    } else if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTColumn<T>>){
+	if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTColumn<T>>){
 		bool use_shuffle = column.key_count <= 32;
         out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples, use_shuffle);
+            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher,  params.expander, params.n_samples, use_shuffle);
 	} else {
         out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples);
+            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher,  params.expander, params.n_samples);
     }
 
 	flsgpu::host::free_column(column_device);
@@ -134,19 +131,19 @@ verification::ExecutionResult<T> decompress_column_time(const ColumnT column, co
 		                                                                                params.unpack_n_vecs,
 		                                                                                params.unpack_n_vals,
 		                                                                                params.unpacker,
-		                                                                                params.patcher,
+		                                                                                params.patcher, 
 		                                                                                /*n_samples=*/1);
 		CUDA_CHECK(cudaDeviceSynchronize(), "warmup sync");
 		delete[] warm;
 	}
 
 	const T* out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-	    column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples);
+	    column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher,  params.expander, params.n_samples);
 
-	printf("[KERNEL TIME] unpack_vecs=%u unpack_vals=%u patcher=%d n_samples=%u \n",
+	printf("[KERNEL TIME] unpack_vecs=%u unpack_vals=%u patcher= %d n_samples=%u \n",
 	       params.unpack_n_vecs,
 	       params.unpack_n_vals,
-	       (int)params.patcher,
+	       (int)params.patcher, 
 	       params.n_samples);
 
 	flsgpu::host::free_column(column_device);
@@ -164,7 +161,7 @@ query_column(const ColumnT column, const ProgramParameters params, const bool qu
                                                                                    params.unpack_n_vecs,
                                                                                    params.unpack_n_vals,
                                                                                    params.unpacker,
-                                                                                   params.patcher,
+                                                                                   params.patcher, 
                                                                                    magic_value,
                                                                                    params.n_samples);
 	flsgpu::host::free_column(column_device);
@@ -188,7 +185,7 @@ query_multi_column(const ColumnT column, const ProgramParameters params, const b
 	                                                             params.unpack_n_vecs,
 	                                                             params.unpack_n_vals,
 	                                                             params.unpacker,
-	                                                             params.patcher,
+	                                                             params.patcher, 
 	                                                             magic_value,
 	                                                             params.n_samples);
 	T          a      = query_result ? 1.0 : 0.0;
@@ -281,8 +278,8 @@ std::vector<verification::ExecutionResult<T>> execute_alp(const ProgramParameter
 				magic_value  = _magic_value;
 			}
 
-			if (params.patcher == enums::Patcher::Dummy || params.patcher == enums::Patcher::Stateless ||
-			    params.patcher == enums::Patcher::Stateful) {
+			if (params.patcher  == enums::Patcher::Dummy || params.patcher  == enums::Patcher::Stateless ||
+			    params.patcher  == enums::Patcher::Stateful) {
 				results.push_back(
 				    execute_kernel<T, flsgpu::host::ALPColumn<T>>(column, params, query_result, magic_value));
 			} else {
@@ -322,8 +319,8 @@ std::vector<verification::ExecutionResult<T>> execute_freq(const ProgramParamete
 				throw std::invalid_argument("Query kernel not supported for FREQ columns.\n");
 			}
 
-			if (params.patcher == enums::Patcher::Dummy || params.patcher == enums::Patcher::Stateless ||
-			    params.patcher == enums::Patcher::Stateful) {
+			if (params.patcher  == enums::Patcher::Dummy || params.patcher  == enums::Patcher::Stateless ||
+			    params.patcher  == enums::Patcher::Stateful) {
 				results.push_back(
 				    execute_kernel<T, flsgpu::host::FREQColumn<T>>(column, params, query_result, magic_value));
 			} else {
@@ -403,7 +400,7 @@ Usage:
 ./micro-benchmarks \
   <data_type> <kernel> \
   <unpack_n_vecs> <unpack_n_vals> \
-  <unpacker> <patcher> \
+  <unpacker> <patcher>  <>\
   <start_vbw> <end_vbw> \
   <start_ec> <end_ec> \
   <n_vecs> <n_samples> <print_debug>
@@ -418,8 +415,8 @@ int main(int argc, char** argv) {
 	switch (params.data_type) {
 	case enums::DataType::U32:
 		// exit_code = verification::process_results(execute_dict<uint32_t>(params), print_debug);
-		// exit_code = verification::process_results(execute_freq<uint32_t>(params), print_debug);
-		exit_code = verification::process_results(execute_cross_rle<uint32_t>(params), print_debug);
+		exit_code = verification::process_results(execute_freq<uint32_t>(params), print_debug);
+		// exit_code = verification::process_results(execute_cross_rle<uint32_t>(params), print_debug);
 		// exit_code = verification::process_results(execute_ffor<uint32_t>(params), print_debug);
 		break;
 	case enums::DataType::U64:

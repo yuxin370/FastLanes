@@ -16,6 +16,7 @@ double* decompress_column<double, flsgpu::device::ALPColumn<double>>(const flsgp
                                                                      const unsigned        unpack_n_values,
                                                                      const enums::Unpacker unpacker,
                                                                      const enums::Patcher  patcher,
+                                                                     const enums::Expander expander,
                                                                      const uint32_t        n_samples) {
 
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&

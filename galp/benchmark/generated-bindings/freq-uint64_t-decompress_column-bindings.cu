@@ -17,8 +17,8 @@ decompress_column<uint64_t, flsgpu::device::FREQColumn<uint64_t>>(const flsgpu::
                                                                   const unsigned        unpack_n_values,
                                                                   const enums::Unpacker unpacker,
                                                                   const enums::Patcher  patcher,
+                                                                  const enums::Expander expander,
                                                                   const uint32_t        n_samples) {
-
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == enums::Patcher::Dummy) {
 		return kernels::host::decompress_column<
 		    uint64_t,
@@ -52,7 +52,6 @@ decompress_column<uint64_t, flsgpu::device::FREQColumn<uint64_t>>(const flsgpu::
 		                                     flsgpu::device::FREQColumn<uint64_t>>,
 		    flsgpu::device::FREQColumn<uint64_t>>(column, n_samples);
 	}
-
 	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == enums::Patcher::Dummy) {
 		return kernels::host::decompress_column<
 		    uint64_t,

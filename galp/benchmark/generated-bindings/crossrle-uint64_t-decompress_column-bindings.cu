@@ -15,6 +15,8 @@ uint64_t* decompress_column<uint64_t, flsgpu::device::CROSSRLEColumn<uint64_t>>(
     const flsgpu::device::CROSSRLEColumn<uint64_t> column,
     const unsigned                                 unpack_n_vectors,
     const unsigned                                 unpack_n_values,
+    const enums::Unpacker                          unpacker,
+    const enums::Patcher                           patcher,
     const enums::Expander                          expander,
     const uint32_t                                 n_samples) {
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && expander == enums::Expander::Dummy) {

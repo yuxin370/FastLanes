@@ -24,6 +24,7 @@ enum class Kernel {
 };
 
 enum class Unpacker {
+	None,
 	Dummy,
 	OldFls,
 	SwitchCase,

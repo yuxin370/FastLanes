@@ -17,40 +17,8 @@ decompress_column<uint32_t, flsgpu::device::FREQColumn<uint32_t>>(const flsgpu::
                                                                   const unsigned        unpack_n_values,
                                                                   const enums::Unpacker unpacker,
                                                                   const enums::Patcher  patcher,
+                                                                  const enums::Expander expander,
                                                                   const uint32_t        n_samples) {
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && patcher == enums::Patcher::Dummy) {
-		return kernels::host::decompress_column<
-		    uint32_t,
-		    1,
-		    32,
-		    flsgpu::device::FREQDecompressor<uint32_t,
-		                                     1,
-		                                     flsgpu::device::DummyFREQExceptionPatcher<uint32_t, 1, 32>,
-		                                     flsgpu::device::FREQColumn<uint32_t>>,
-		    flsgpu::device::FREQColumn<uint32_t>>(column, n_samples);
-	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && patcher == enums::Patcher::Stateless) {
-		return kernels::host::decompress_column<
-		    uint32_t,
-		    1,
-		    32,
-		    flsgpu::device::FREQDecompressor<uint32_t,
-		                                     1,
-		                                     flsgpu::device::StatelessFREQExceptionPatcher<uint32_t, 1, 32>,
-		                                     flsgpu::device::FREQColumn<uint32_t>>,
-		    flsgpu::device::FREQColumn<uint32_t>>(column, n_samples);
-	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && patcher == enums::Patcher::Stateful) {
-		return kernels::host::decompress_column<
-		    uint32_t,
-		    1,
-		    32,
-		    flsgpu::device::FREQDecompressor<uint32_t,
-		                                     1,
-		                                     flsgpu::device::StatefulFREQExceptionPatcher<uint32_t, 1, 32>,
-		                                     flsgpu::device::FREQColumn<uint32_t>>,
-		    flsgpu::device::FREQColumn<uint32_t>>(column, n_samples);
-	}
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == enums::Patcher::Dummy) {
 		return kernels::host::decompress_column<
 		    uint32_t,
@@ -84,7 +52,6 @@ decompress_column<uint32_t, flsgpu::device::FREQColumn<uint32_t>>(const flsgpu::
 		                                     flsgpu::device::FREQColumn<uint32_t>>,
 		    flsgpu::device::FREQColumn<uint32_t>>(column, n_samples);
 	}
-
 	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == enums::Patcher::Dummy) {
 		return kernels::host::decompress_column<
 		    uint32_t,

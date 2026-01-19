@@ -17,6 +17,7 @@ float* decompress_column<float, flsgpu::device::ALPExtendedColumn<float>>(
     const unsigned                                 unpack_n_values,
     const enums::Unpacker                          unpacker,
     const enums::Patcher                           patcher,
+    const enums::Expander                          expander,
     const uint32_t                                 n_samples) {
 	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == enums::Unpacker::OldFls &&
 	    patcher == enums::Patcher::Naive) {

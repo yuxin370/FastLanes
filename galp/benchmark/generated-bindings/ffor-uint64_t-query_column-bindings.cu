@@ -7,6 +7,7 @@
 #include "engine/multi-column-host-kernels.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
+
 namespace bindings {
 
 template <>

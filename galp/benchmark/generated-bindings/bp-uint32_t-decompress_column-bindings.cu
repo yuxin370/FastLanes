@@ -7,6 +7,7 @@
 #include "engine/multi-column-host-kernels.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
+
 namespace bindings {
 
 template <>
@@ -16,6 +17,7 @@ decompress_column<uint32_t, flsgpu::device::BPColumn<uint32_t>>(const flsgpu::de
                                                                 const unsigned        unpack_n_values,
                                                                 const enums::Unpacker unpacker,
                                                                 const enums::Patcher  patcher,
+                                                                const enums::Expander expander,
                                                                 const uint32_t        n_samples) {
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::None) {

@@ -82,8 +82,8 @@ EXPANDERS = [
 ]
 
 MULTI_COLUMN_UNPACKERS = [
-    UNPACKERS[1],
     UNPACKERS[2],
+    UNPACKERS[3],
 ]
 
 PATCHERS = [
@@ -186,11 +186,8 @@ def get_decompressor_type(
 
     unpacker_t = f"flsgpu::device::BitUnpacker{unpacker}<{data_type}, {n_vec}, {n_val},  flsgpu::device::{functor} {loader_t}>,"
 
-    if "FREQ" in encoding or "FREQExtended" in encoding:
+    if "FREQ" in encoding or "FREQExtended" in encoding or "CROSSRLE" in encoding:
         unpacker_t = f""
-    if "CROSSRLE" in encoding:
-        unpacker_t = f""
-        patcher_t = f""
     return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {expander_t} {column_t}>"
 
 
@@ -233,6 +230,13 @@ def get_if_statement(
             f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
         )
+    if encoding == "FREQ" or encoding == "FREQExtended":
+        return (
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && patcher == enums::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            + "{"  # }
+            f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+            "}"
+        )
     return (
         f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && unpacker == enums::Unpacker::{unpacker} && patcher == enums::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
         + "{"  # }
@@ -254,7 +258,8 @@ def get_function(
     assert not (is_multi_column and is_compute_column)
     column_t = get_column_t(encoding, data_type, function)
     return (
-        f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values{', const enums::Expander expander' if encoding == "CROSSRLE" else ', const enums::Unpacker unpacker, const enums::Patcher patcher '}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
+        # f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values{', const enums::Expander expander' if encoding == "CROSSRLE" else ', const enums::Unpacker unpacker, const enums::Patcher patcher '}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
+        f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values, const enums::Unpacker unpacker, const enums::Patcher patcher{', const enums::Expander expander' if function == "decompress_column" else ''}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
         + "{"
         + "\n".join(content)
         + f'throw std::invalid_argument("Could not find correct binding in {function} {encoding}<{data_type}>");'
@@ -362,14 +367,13 @@ def main(args):
                                     binding,
                                     n_vec,
                                     n_val,
-                                    unpacker,
+                                    "None",
                                     patcher,
                                     is_query_column=is_query_column or is_multi_column,
                                     n_repetitions=None,
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
-                                for unpacker in UNPACKERS[1:]
                                 for patcher in patchers_per_encoding
                             ],
                             is_query_column=is_query_column,
@@ -509,7 +513,7 @@ def main(args):
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
-                                for unpacker in UNPACKERS
+                                for unpacker in UNPACKERS[1:]
                             ],
                             is_query_column=is_query_column,
                         )
@@ -544,7 +548,7 @@ def main(args):
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
-                                for unpacker in UNPACKERS
+                                for unpacker in UNPACKERS[1:]
                             ],
                             is_multi_column=is_multi_column,
                             is_compute_column=is_compute_column,
@@ -586,7 +590,7 @@ def main(args):
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
-                                for unpacker in UNPACKERS[1:]
+                                for unpacker in UNPACKERS[2:]
                                 for patcher in patchers_per_encoding
                             ],
                             is_query_column=is_query_column,
