@@ -11,7 +11,7 @@ import sys
 import argparse
 import logging
 
-GENERATED_BINDINGS_DIR = "/home/pc/FastLanes/galp/benchmark/generated-bindings-tp"
+GENERATED_BINDINGS_DIR = "/home/tangyuxin/cleanFastlanes/FastLanes/galp/benchmark/generated-bindings-tp"
 
 FILE_HEADER = """
 #include "engine/kernels.cuh"
@@ -49,6 +49,7 @@ ENCODINGS = [
     "FREQ",
     "FREQExtended",
     "DICT",
+    "DICTShfl32",
     "CROSSRLE"
 ]
 
@@ -119,7 +120,7 @@ def get_column_t(
         column_t = f"FREQExtendedColumn<{data_type}>"
     elif "FREQ" in encoding:
         column_t = f"FREQColumn<{data_type}>"
-    elif "DICT" in encoding:
+    elif "DICT" in encoding or "DICTShfl32" in encoding:
         column_t = f"DICTColumn<{data_type}>"
     elif "CROSSRLE" in encoding:
         column_t = f"CROSSRLEColumn<{data_type}>"
@@ -159,6 +160,8 @@ def get_decompressor_type(
         decompressor_t = "FREQDecompressor"
     elif "FREQ" in encoding:
         patcher_t = f"flsgpu::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+    elif "DICTShfl32" in encoding:
+        functor = f"DICTShfl32Functor<{data_type}, {n_vec}>"
     elif "DICT" in encoding:
         functor = f"DICTFunctor<{data_type}, {n_vec}>"
     elif "CROSSRLE" in encoding:
@@ -438,13 +441,46 @@ def main(args):
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
-                                for unpacker in UNPACKERS
+                                for unpacker in UNPACKERS[1:]
                             ],
                             is_query_column=is_query_column,
                         )
                     ],
                 )
 
+    for encoding in ["DICTShfl32"]:
+        for data_type in ["uint32_t", "uint64_t"]:
+            for binding, is_query_column in zip(
+                ["decompress_column"], [False]
+            ):
+                write_file(
+                    f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                    [
+                        get_function(
+                            encoding,
+                            data_type,
+                            binding,
+                            "bool" if is_query_column else data_type + "*",
+                            [
+                                get_if_statement_check_wrapper(
+                                    args.disable_unnecessary,
+                                    encoding,
+                                    data_type,
+                                    binding,
+                                    n_vec,
+                                    n_val,
+                                    unpacker,
+                                    "None",
+                                    is_query_column=is_query_column,
+                                )
+                                for n_vec in [1, 4]
+                                for n_val in [1]
+                                for unpacker in UNPACKERS[1:]
+                            ],
+                            is_query_column=is_query_column,
+                        )
+                    ],
+                )
 
     for encoding in ["BP", "FFOR"]:
         for data_type in ["uint32_t", "uint64_t"]:

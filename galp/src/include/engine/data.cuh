@@ -332,140 +332,139 @@ T* decompress(const flsgpu::host::ALPExtendedColumn<T> column) {
 
 template <typename T>
 T* decompress(const flsgpu::host::DICTColumn<T> column) {
-    using UINT_T = typename flsgpu::host::DICTColumn<T>::UINT_T;
+	using UINT_T = typename flsgpu::host::DICTColumn<T>::UINT_T;
 
-    const size_t n_values = column.get_n_values();
+	const size_t n_values = column.get_n_values();
 
-    // 1) decompress the index stream 
-    UINT_T* indices = decompress(column.ffor); 
+	// 1) decompress the index stream
+	UINT_T* indices = decompress(column.ffor);
 
-    // 2) map indices through dictionary keys
-    T* out_array = new T[n_values];
+	// 2) map indices through dictionary keys
+	T* out_array = new T[n_values];
 
-    for (size_t i = 0; i < n_values; ++i) {
-        const size_t idx = static_cast<size_t>(indices[i]);
+	for (size_t i = 0; i < n_values; ++i) {
+		const size_t idx = static_cast<size_t>(indices[i]);
 
-        // guard to avoid OOB (shouldn't happen if generator is correct)
-        UINT_T bits = 0;
-        if (idx < column.key_count) {
-            bits = column.keys[idx];
-        }
+		UINT_T bits = 0;
+		if (idx < column.key_count) {
+			bits = column.keys[idx];
+		}
 
-        // bitcast UINT_T -> T safely
-        T v;
-        std::memcpy(&v, &bits, sizeof(T));
-        out_array[i] = v;
-    }
+		// bitcast UINT_T -> T safely
+		T v;
+		std::memcpy(&v, &bits, sizeof(T));
+		out_array[i] = v;
+	}
 
-    delete[] indices;
-    return out_array;
+	delete[] indices;
+	return out_array;
 }
 
 template <typename T>
 T* decompress(const flsgpu::host::CROSSRLEColumn<T> column) {
-    using UINT_T = typename flsgpu::host::CROSSRLEColumn<T>::UINT_T;
+	using UINT_T = typename flsgpu::host::CROSSRLEColumn<T>::UINT_T;
 
-    const size_t n_values = column.get_n_values();
-    UINT_T* out = new UINT_T[n_values];
+	const size_t n_values = column.get_n_values();
+	UINT_T*      out      = new UINT_T[n_values];
 
-    if (n_values == 0) return out;
+	if (n_values == 0)
+		return out;
 
-    size_t covered = 0;
-    for (size_t r = 0; r < column.n_runs; ++r) {
-        const size_t start = static_cast<size_t>(column.run_positions[r]);// global start
-        const size_t len   = column.lengths[r];
+	size_t covered = 0;
+	for (size_t r = 0; r < column.n_runs; ++r) {
+		const size_t start = static_cast<size_t>(column.run_positions[r]); // global start
+		const size_t len   = column.lengths[r];
 
-        if (start > n_values || start + len > n_values) {
-            throw std::runtime_error("CROSSRLE: run out of bounds");
-        }
+		if (start > n_values || start + len > n_values) {
+			throw std::runtime_error("CROSSRLE: run out of bounds");
+		}
 
-        UINT_T bits = column.values[r];
-        T v;
-        std::memcpy(&v, &bits, sizeof(T));
+		UINT_T bits = column.values[r];
+		T      v;
+		std::memcpy(&v, &bits, sizeof(T));
 
-        std::fill_n(out + start, len, v);
-        covered += len;
-    }
+		std::fill_n(out + start, len, v);
+		covered += len;
+	}
 
-    if (covered != n_values) {
-        throw std::runtime_error("CROSSRLE: sum(lengths) != n_values");
-    }
+	if (covered != n_values) {
+		throw std::runtime_error("CROSSRLE: sum(lengths) != n_values");
+	}
 
-    return out;
+	return out;
 }
 
 template <typename T>
 T* decompress(const flsgpu::host::FREQColumn<T> column) {
-    const size_t n_values = column.get_n_values();
-    const size_t n_vecs   = column.get_n_vecs();
+	const size_t n_values = column.get_n_values();
+	const size_t n_vecs   = column.get_n_vecs();
 
-    T* out_array = new T[n_values];
+	T* out_array = new T[n_values];
 
-    for (size_t vi = 0; vi < n_vecs; ++vi) {
-        const size_t out_base = vi * consts::VALUES_PER_VECTOR;
-        const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
+		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
 
-        // 1) fill with frequent value
-        const T fv = column.frequent_value[vi];
-        std::fill_n(out_array + out_base, vec_n, fv);
+		// 1) fill with frequent value
+		const T fv = column.frequent_value[vi];
+		std::fill_n(out_array + out_base, vec_n, fv);
 
-        // 2) patch exceptions
-        const uint16_t cnt = column.counts[vi];
-        const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
+		// 2) patch exceptions
+		const uint16_t cnt = column.counts[vi];
+		const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
 
-        const uint16_t* pos_ptr = column.positions + off;
-        const T*        exc_ptr = column.exceptions + off;
+		const uint16_t* pos_ptr = column.positions + off;
+		const T*        exc_ptr = column.exceptions + off;
 
-        for (uint16_t i = 0; i < cnt; ++i) {
-            const uint16_t pos = pos_ptr[i]; // position inside this vector
-            if (pos < vec_n) {
-                out_array[out_base + pos] = exc_ptr[i];
-            }
-        }
-    }
+		for (uint16_t i = 0; i < cnt; ++i) {
+			const uint16_t pos = pos_ptr[i]; // position inside this vector
+			if (pos < vec_n) {
+				out_array[out_base + pos] = exc_ptr[i];
+			}
+		}
+	}
 
-    return out_array;
+	return out_array;
 }
-
 
 template <typename T>
 T* decompress(const flsgpu::host::FREQExtendedColumn<T> column) {
-    const size_t n_values = column.get_n_values();
-    const size_t n_vecs   = column.get_n_vecs();
+	const size_t n_values = column.get_n_values();
+	const size_t n_vecs   = column.get_n_vecs();
 
-    constexpr size_t N_LANES = utils::get_n_lanes<T>();
+	constexpr size_t N_LANES = utils::get_n_lanes<T>();
 
-    T* out_array = new T[n_values];
+	T* out_array = new T[n_values];
 
-    for (size_t vi = 0; vi < n_vecs; ++vi) {
-        const size_t out_base = vi * consts::VALUES_PER_VECTOR;
-        const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
+		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
 
-        // 1) fill with frequent value
-        const T fv = column.frequent_value[vi];
-        std::fill_n(out_array + out_base, vec_n, fv);
+		// 1) fill with frequent value
+		const T fv = column.frequent_value[vi];
+		std::fill_n(out_array + out_base, vec_n, fv);
 
-        // 2) patch exceptions: iterate lane segments
-        const size_t exc_base = static_cast<size_t>(column.exceptions_offsets[vi]);
+		// 2) patch exceptions: iterate lane segments
+		const size_t exc_base = static_cast<size_t>(column.exceptions_offsets[vi]);
 
-        for (size_t lane = 0; lane < N_LANES; ++lane) {
-            const uint16_t offset_count = column.offsets_counts[vi * N_LANES + lane];
-            const uint16_t cnt          = offset_count >> 10;
-            const uint16_t lane_off     = offset_count & 0x3FF;
+		for (size_t lane = 0; lane < N_LANES; ++lane) {
+			const uint16_t offset_count = column.offsets_counts[vi * N_LANES + lane];
+			const uint16_t cnt          = offset_count >> 10;
+			const uint16_t lane_off     = offset_count & 0x3FF;
 
-            const uint16_t* pos_ptr = column.positions + exc_base + lane_off;
-            const T*        exc_ptr = column.exceptions + exc_base + lane_off;
+			const uint16_t* pos_ptr = column.positions + exc_base + lane_off;
+			const T*        exc_ptr = column.exceptions + exc_base + lane_off;
 
-            for (uint16_t i = 0; i < cnt; ++i) {
-                const uint16_t pos = pos_ptr[i]; // position inside this vector
-                if (pos < vec_n) {
-                    out_array[out_base + pos] = exc_ptr[i];
-                }
-            }
-        }
-    }
+			for (uint16_t i = 0; i < cnt; ++i) {
+				const uint16_t pos = pos_ptr[i]; // position inside this vector
+				if (pos < vec_n) {
+					out_array[out_base + pos] = exc_ptr[i];
+				}
+			}
+		}
+	}
 
-    return out_array;
+	return out_array;
 }
 
 } // namespace bindings
@@ -560,121 +559,118 @@ generate_binary_ffor_column(const size_t n_values, const ValueRange<vbw_t> value
 }
 
 static inline size_t key_count_from_bits(vbw_t bw) {
-    if (bw >= 63) { // avoid overflow
-        throw std::invalid_argument("value_bit_width too large for key_count");
-    }
-    return size_t{1ULL} << bw;
+	if (bw >= 63) { // avoid overflow
+		throw std::invalid_argument("value_bit_width too large for key_count");
+	}
+	return size_t {1ULL} << bw;
 }
 
 template <typename T>
-flsgpu::host::CROSSRLEColumn<T>
-generate_cross_rle_column(const size_t   n_values,
-                          const vbw_t    value_bit_width, // bit-width of values (UINT_T)
-                          const unsigned repeat = 1) {
-    using UINT_T = typename utils::same_width_uint<T>::type;
-    const size_t VPV = consts::VALUES_PER_VECTOR;
+flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
+                                                          const vbw_t  value_bit_width, // bit-width of values (UINT_T)
+                                                          const unsigned repeat = 1) {
+	using UINT_T     = typename utils::same_width_uint<T>::type;
+	const size_t VPV = consts::VALUES_PER_VECTOR;
 
-    auto column = flsgpu::host::CROSSRLEColumn<T>();
-    column.n_values = n_values;
-    const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
-	
-    // values range: 0 .. mask(value_bit_width)
-    const UINT_T max_value = utils::h_set_first_n_bits<UINT_T>(value_bit_width);
-    auto gen_value = primitives::get_random_number_generator<UINT_T>(UINT_T{0}, max_value);
+	auto column         = flsgpu::host::CROSSRLEColumn<T>();
+	column.n_values     = n_values;
+	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
 
-    // run length generat：repeat higher -> run longer -> run count less)
-    // max_run_len = min(VPV, 4*repeat)
-    const size_t max_run_len =
-        std::max<size_t>(1, std::min<size_t>(VPV, size_t{4} * std::max<unsigned>(1, repeat)));
-    auto gen_run_len = primitives::get_random_number_generator<size_t>(1, max_run_len);
+	// values range: 0 .. mask(value_bit_width)
+	const UINT_T max_value = utils::h_set_first_n_bits<UINT_T>(value_bit_width);
+	auto gen_value = primitives::get_random_number_generator<UINT_T>(UINT_T {0}, 30); // for debug, make it small
 
-    // staged in vector
-    std::vector<UINT_T>   values_vec;
-    std::vector<size_t>   lengths_vec;
-    std::vector<uint32_t> runpos_vec;
+	// run length generat：repeat higher -> run longer -> run count less)
+	// max_run_len = min(VPV, 4*repeat)
+	const size_t max_run_len = std::max<size_t>(1, std::min<size_t>(VPV, size_t {4} * std::max<unsigned>(1, repeat)));
+	auto         gen_run_len = primitives::get_random_number_generator<size_t>(1, max_run_len);
 
-    column.offsets = new uint32_t[n_vecs + 1];
+	// staged in vector
+	std::vector<UINT_T>   values_vec;
+	std::vector<size_t>   lengths_vec;
+	std::vector<uint32_t> runpos_vec;
 
-    size_t run_idx = 0;
-    for (size_t vi = 0; vi < n_vecs; ++vi) {
-        column.offsets[vi] = static_cast<uint32_t>(run_idx);
+	column.offsets = new uint32_t[n_vecs + 1];
 
-        const size_t out_base = vi * VPV;
-        const size_t vec_n    = std::min<size_t>(VPV, n_values - out_base);
+	size_t run_idx = 0;
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		column.offsets[vi] = static_cast<uint32_t>(run_idx);
 
-        for (size_t pos = 0; pos < vec_n;) {
-            const size_t len = std::min(gen_run_len(), vec_n - pos);
+		const size_t out_base = vi * VPV;
+		const size_t vec_n    = std::min<size_t>(VPV, n_values - out_base);
 
-            values_vec.push_back(gen_value());
-            lengths_vec.push_back(len);
-            runpos_vec.push_back(static_cast<uint32_t>(out_base + pos)); // pos < VPV
+		for (size_t pos = 0; pos < vec_n;) {
+			const size_t len = std::min(gen_run_len(), vec_n - pos);
 
-            pos += len;
-            ++run_idx;
+			values_vec.push_back(gen_value());
+			lengths_vec.push_back(len);
+			runpos_vec.push_back(static_cast<uint32_t>(out_base + pos)); // pos < VPV
 
-        }
-    }
+			pos += len;
+			++run_idx;
+		}
+	}
 
-    column.offsets[n_vecs] = static_cast<uint32_t>(run_idx);
-    column.n_runs          = run_idx;
+	column.offsets[n_vecs] = static_cast<uint32_t>(run_idx);
+	column.n_runs          = run_idx;
 
-    assert((primitives::sum_array<size_t, size_t>(lens.data(), lens.size()) == n_values));
+	assert((primitives::sum_array<size_t, size_t>(lens.data(), lens.size()) == n_values));
 
-    column.values        = (column.n_runs ? new UINT_T[column.n_runs] : nullptr);
-    column.lengths       = (column.n_runs ? new size_t[column.n_runs] : nullptr);
-    column.run_positions = (column.n_runs ? new uint32_t[column.n_runs] : nullptr);
+	column.values        = (column.n_runs ? new UINT_T[column.n_runs] : nullptr);
+	column.lengths       = (column.n_runs ? new size_t[column.n_runs] : nullptr);
+	column.run_positions = (column.n_runs ? new uint32_t[column.n_runs] : nullptr);
 
-    for (size_t i = 0; i < column.n_runs; ++i) {
-        column.values[i]        = values_vec[i];
-        column.lengths[i]       = lengths_vec[i];
-        column.run_positions[i] = runpos_vec[i];
-    }
+	size_t offsets = 0;
+	for (size_t i = 0; i < column.n_runs; ++i) {
+		column.values[i]        = values_vec[i];
+		column.lengths[i]       = lengths_vec[i];
+		column.run_positions[i] = runpos_vec[i];
+		offsets += lengths_vec[i];
+	}
 
-    return column;
+	return column;
 }
 
 template <typename T>
-flsgpu::host::DICTColumn<T>
-generate_random_dict_column(const size_t   n_values,
-                            const vbw_t    value_bit_width, // bit-width of indices 
-                            const unsigned repeat = 1) {
-    using UINT_T = typename utils::same_width_uint<T>::type;
+flsgpu::host::DICTColumn<T> generate_random_dict_column(const size_t   n_values,
+                                                        const vbw_t    value_bit_width, // bit-width of indices
+                                                        const unsigned repeat = 1) {
+	using UINT_T = typename utils::same_width_uint<T>::type;
 
-    auto column = flsgpu::host::DICTColumn<T>();
+	auto column = flsgpu::host::DICTColumn<T>();
 
-    // 1) key_count = 2^bw
-    column.key_count = std::min(key_count_from_bits(value_bit_width), size_t{8192}); // limit to 8192 keys
-    // 2) keys: 0,1,2,...,key_count-1（for debug）
-    column.keys = primitives::fill_array_with_sequence<UINT_T>(
-        new UINT_T[column.key_count], column.key_count, UINT_T{0}, UINT_T{1});
+	// 1) key_count = 2^bw
+	column.key_count = std::min(key_count_from_bits(value_bit_width), size_t {32}); // limit to 8192 keys
+	// 2) keys: 0,1,2,...,key_count-1（for debug）
+	column.keys = primitives::fill_array_with_sequence<UINT_T>(
+	    new UINT_T[column.key_count], column.key_count, UINT_T {0}, UINT_T {1});
 
-    // 3) indices ∈ [0, key_count-1]
-    UINT_T* indices = primitives::fill_array_with_random_data<UINT_T>(
-        new UINT_T[n_values], n_values, repeat, UINT_T{0}, UINT_T(column.key_count - 1));
+	// 3) indices ∈ [0, key_count-1]
+	UINT_T* indices = primitives::fill_array_with_random_data<UINT_T>(
+	    new UINT_T[n_values], n_values, repeat, UINT_T {0}, UINT_T(column.key_count - 1));
 
-    // 4) BP compress indices
-    auto bp = bindings::compress<UINT_T>(indices, n_values, value_bit_width);
-    delete[] indices;
+	// 4) BP compress indices
+	auto bp = bindings::compress<UINT_T>(indices, n_values, value_bit_width);
+	delete[] indices;
 
-    // 5) set FFOR bases all to 0（idx = value + base）
-    const size_t n_vecs = bp.get_n_vecs();
-    column.ffor = flsgpu::host::FFORColumn<UINT_T>{
-        bp,
-        primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T{0}),
+	// 5) set FFOR bases all to 0（idx = value + base）
+	const size_t n_vecs = bp.get_n_vecs();
+	column.ffor         = flsgpu::host::FFORColumn<UINT_T> {
+	            bp,
+	            primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0}),
     };
 
-    return column;
+	return column;
 }
 
 template <typename T>
-flsgpu::host::FREQColumn<T> generate_freq_column(const size_t               n_values,
-                                               const ValueRange<uint16_t> exceptions_per_vec) {
+flsgpu::host::FREQColumn<T> generate_freq_column(const size_t n_values, const ValueRange<uint16_t> exceptions_per_vec) {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 
 	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
 	auto         column = flsgpu::host::FREQColumn<T>();
 
-	column.n_values = n_values;
+	column.n_values       = n_values;
 	column.frequent_value = primitives::fill_array_with_random_bytes(new T[n_vecs], n_vecs);
 
 	column.counts = primitives::fill_array_with_random_data<uint16_t>(
@@ -691,7 +687,7 @@ flsgpu::host::FREQColumn<T> generate_freq_column(const size_t               n_va
 
 template <typename T>
 flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn<T> column,
-                                                      const ValueRange<uint16_t> exceptions_per_vec) {
+                                                        const ValueRange<uint16_t>  exceptions_per_vec) {
 	const size_t n_values = column.n_values;
 	const size_t n_vecs   = utils::get_n_vecs_from_size(n_values);
 
@@ -711,7 +707,6 @@ flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn
 
 	return column;
 }
-
 
 template <typename T>
 flsgpu::host::ALPColumn<T> generate_alp_column(const size_t               n_values,
@@ -748,8 +743,6 @@ flsgpu::host::ALPColumn<T> generate_alp_column(const size_t               n_valu
 
 	return column;
 }
-
-
 
 template <typename T>
 flsgpu::host::ALPColumn<T> modify_alp_exception_count(flsgpu::host::ALPColumn<T> column,

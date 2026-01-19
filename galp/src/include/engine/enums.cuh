@@ -57,10 +57,7 @@ enum class Patcher {
 	PrefetchAllBranchless,
 };
 
-enum class Expander {
-	None,
-	Dummy
-};
+enum class Expander { None, Dummy };
 
 enum class Print {
 	PrintNothing,

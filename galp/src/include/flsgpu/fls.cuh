@@ -41,29 +41,96 @@ struct FFORFunctor : FunctorBase<T> {
 		return value + bases[vector_index];
 	}
 };
-// todo: considering using share memory to cache keys
+
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct DICTFunctor : FunctorBase<T> {
-  using UINT_T = typename utils::same_width_uint<T>::type;
-  const UINT_T* __restrict__ 		keys;
-  UINT_T 							bases[UNPACK_N_VECTORS];
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	const UINT_T* __restrict__ keys;
+	UINT_T bases[UNPACK_N_VECTORS];
 
-  __device__ __forceinline__
-  DICTFunctor(const UINT_T* a_bases, const UINT_T* a_keys) : keys(a_keys) {
+	__device__ __forceinline__ DICTFunctor(const UINT_T* a_bases, const UINT_T* a_keys)
+	    : keys(a_keys) {
 #pragma unroll
-    for (int v=0; v<UNPACK_N_VECTORS; ++v) bases[v] = a_bases[v];
-  }
+		for (int v = 0; v < UNPACK_N_VECTORS; ++v)
+			bases[v] = a_bases[v];
+	}
 
-  __device__ __forceinline__
-  UINT_T operator()(UINT_T value, vi_t vector_index) override {
-    const auto idx = value + bases[vector_index];
+	__device__ __forceinline__ UINT_T operator()(UINT_T value, vi_t vector_index) override {
+		const auto idx = value + bases[vector_index];
 
-    // return __ldg(keys + idx);   
-    return keys[idx];
-
-  }
+		// return __ldg(keys + idx);
+		return keys[idx];
+	}
 };
 
+template <typename T, unsigned UNPACK_N_VECTORS>
+struct DICTShfl32Functor : FunctorBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+
+	UINT_T k_lane; // key of this lane
+	UINT_T bases[UNPACK_N_VECTORS];
+
+	__device__ __forceinline__
+	DICTShfl32Functor(const UINT_T* a_bases, const UINT_T* __restrict__ keys, const int32_t key_count) {
+		const int lane = (int)(threadIdx.x & 31);
+
+		// each lane loads its own key
+		k_lane = lane < key_count ? keys[lane] : 0;
+
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v)
+			bases[v] = a_bases[v];
+
+		// incase warp divergence
+		// __syncwarp();
+	}
+
+	__device__ __forceinline__ UINT_T operator()(UINT_T value, vi_t vector_index) override {
+		// key count must be <= 32
+		const int idx = (int)(value + bases[vector_index]);
+		return __shfl_sync(0xFFFFFFFFu, k_lane, idx);
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS>
+struct DICTAdaptiveFunctor : FunctorBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+
+	const UINT_T* __restrict__ keys;
+	int32_t key_count;
+
+	UINT_T k_lane; // only available when key_count<=32
+	UINT_T bases[UNPACK_N_VECTORS];
+	bool   use_shuffle;
+
+	__device__ __forceinline__
+	DICTAdaptiveFunctor(const UINT_T* a_bases, const UINT_T* __restrict__ keys, int32_t key_count)
+	    : keys(keys)
+	    , key_count(key_count) {
+
+		const int lane = (int)(threadIdx.x & 31);
+
+		use_shuffle = (key_count <= 32);
+
+		if (use_shuffle) {
+			k_lane = lane < key_count ? keys[lane] : 0;
+		}
+
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v)
+			bases[v] = a_bases[v];
+	}
+
+	__device__ __forceinline__ UINT_T operator()(UINT_T value, vi_t vector_index) override {
+		const int idx = (int)(value + bases[vector_index]);
+
+		if (use_shuffle) {
+			return __shfl_sync(0xFFFFFFFFu, k_lane, idx);
+		}
+
+		return keys[idx];
+	}
+};
 
 template <typename T>
 struct BitUnpackerBase {
@@ -641,12 +708,11 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<T> {
 	}
 };
 
-
 template <typename T>
 struct FREQExceptionPatcherBase {
 public:
 	__device__ __forceinline__ virtual void fill_and_patch(T* out) = 0;
-  	__device__ virtual ~FREQExceptionPatcherBase() = default;
+	__device__ virtual ~FREQExceptionPatcherBase()                 = default;
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
@@ -669,11 +735,10 @@ struct StatelessFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
 	uint16_t     exceptions_count[UNPACK_N_VECTORS];
 	uint16_t*    vec_exceptions_positions[UNPACK_N_VECTORS];
 	T*           vec_exceptions[UNPACK_N_VECTORS];
-	T      		 frequent_value[UNPACK_N_VECTORS];
+	T            frequent_value[UNPACK_N_VECTORS];
 	const lane_t lane;
 
 public:
-	
 	void __device__ __forceinline__ fill_and_patch(T* out) override {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
@@ -682,7 +747,7 @@ public:
 
 		start_index += UNPACK_N_VALUES;
 
-    // 1) broadcast fill (sequential write, no branches)
+		// 1) broadcast fill (sequential write, no branches)
 #pragma unroll
 		for (int v = 0; v < UNPACK_N_VECTORS; ++v) {
 			const T fv = frequent_value[v];
@@ -691,8 +756,8 @@ public:
 				out[v * UNPACK_N_VALUES + i] = fv;
 			}
 		}
-		
-	// 2) patch exceptions （stateless)
+
+		// 2) patch exceptions （stateless)
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			for (int i {0}; i < exceptions_count[v]; i++) {
@@ -716,16 +781,17 @@ public:
 
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
-			auto vec_index              = first_vector_index + v;
-			exceptions_count[v]         = column.counts[vec_index]; // exceotions count in this vector
-			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index]; // exceptions_offsets corresponds to offests in exceptions array
-			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index]; // get the first position/exception in this vector
-			frequent_value[v]			= column.frequent_value[vec_index]; // also the first values in this vector
+			auto vec_index      = first_vector_index + v;
+			exceptions_count[v] = column.counts[vec_index]; // exceotions count in this vector
+			vec_exceptions_positions[v] =
+			    column.positions +
+			    column.exceptions_offsets[vec_index]; // exceptions_offsets corresponds to offests in exceptions array
+			vec_exceptions[v] = column.exceptions +
+			                    column.exceptions_offsets[vec_index]; // get the first position/exception in this vector
+			frequent_value[v] = column.frequent_value[vec_index];     // also the first values in this vector
 		}
 	}
 };
-
-
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct StatefulFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
@@ -737,7 +803,7 @@ struct StatefulFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
 	T*           vec_exceptions[UNPACK_N_VECTORS];
 	const lane_t lane;
 	int32_t      exception_index[UNPACK_N_VECTORS] = {0};
-	T      		 frequent_value[UNPACK_N_VECTORS];
+	T            frequent_value[UNPACK_N_VECTORS];
 
 public:
 	void __device__ __forceinline__ fill_and_patch(T* out) override {
@@ -747,7 +813,7 @@ public:
 		const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
 		start_index += UNPACK_N_VALUES;
 
-    // 1) broadcast fill (sequential write, no branches)
+		// 1) broadcast fill (sequential write, no branches)
 #pragma unroll
 		for (int v = 0; v < UNPACK_N_VECTORS; ++v) {
 			const T fv = frequent_value[v];
@@ -757,7 +823,7 @@ public:
 			}
 		}
 
-	// 2) patch exceptions (stateful)
+		// 2) patch exceptions (stateful)
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			for (; exception_index[v] < exceptions_count[v]; exception_index[v]++) {
@@ -785,12 +851,10 @@ public:
 			exceptions_count[v]         = column.counts[vec_index];
 			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
-			frequent_value[v]			= column.frequent_value[vec_index];
+			frequent_value[v]           = column.frequent_value[vec_index];
 		}
 	}
 };
-
-
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct NaiveFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
@@ -799,7 +863,7 @@ private:
 	uint16_t* positions[UNPACK_N_VECTORS];
 	T*        exceptions[UNPACK_N_VECTORS];
 	uint16_t  current_position;
-	T      	  frequent_value[UNPACK_N_VECTORS];
+	T         frequent_value[UNPACK_N_VECTORS];
 
 public:
 	__device__ __forceinline__
@@ -873,7 +937,7 @@ private:
 	uint16_t* positions[UNPACK_N_VECTORS];
 	T*        exceptions[UNPACK_N_VECTORS];
 	uint16_t  current_position;
-	T      	  frequent_value[UNPACK_N_VECTORS];
+	T         frequent_value[UNPACK_N_VECTORS];
 
 public:
 	__device__ __forceinline__
@@ -889,8 +953,8 @@ public:
 			const auto exceptions_offset = column.exceptions_offsets[current_vector_index];
 			const auto lane_offset       = (offset_count & 0x3FF);
 
-			positions[v]  = column.positions + exceptions_offset + lane_offset;
-			exceptions[v] = column.exceptions + exceptions_offset + lane_offset;
+			positions[v]      = column.positions + exceptions_offset + lane_offset;
+			exceptions[v]     = column.exceptions + exceptions_offset + lane_offset;
 			frequent_value[v] = column.frequent_value[current_vector_index];
 		}
 	}
@@ -912,7 +976,6 @@ public:
 	}
 };
 
-
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct PrefetchPositionFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
 private:
@@ -921,12 +984,12 @@ private:
 	T*        exceptions[UNPACK_N_VECTORS];
 	uint16_t  next_position[UNPACK_N_VECTORS];
 	uint16_t  position;
-	T      	  frequent_value[UNPACK_N_VECTORS];
+	T         frequent_value[UNPACK_N_VECTORS];
 
 public:
 	__device__ __forceinline__ PrefetchPositionFREQExceptionPatcher(const FREQExtendedColumn<T> column,
-	                                                               const vi_t                 first_vector_index,
-	                                                               const lane_t               lane)
+	                                                                const vi_t                  first_vector_index,
+	                                                                const lane_t                lane)
 	    : position(lane) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
@@ -939,7 +1002,7 @@ public:
 			positions[v]                 = column.positions + exceptions_offset + lane_offset;
 			exceptions[v]                = column.exceptions + exceptions_offset + lane_offset;
 
-			next_position[v] = *positions[v];
+			next_position[v]  = *positions[v];
 			frequent_value[v] = column.frequent_value[vector_index];
 		}
 	}
@@ -963,8 +1026,6 @@ public:
 	}
 };
 
-
-
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct PrefetchAllFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
 private:
@@ -976,7 +1037,7 @@ private:
 	uint16_t next_position[UNPACK_N_VECTORS];
 	T        next_exception[UNPACK_N_VECTORS];
 	uint16_t current_position;
-	T      	 frequent_value[UNPACK_N_VECTORS];
+	T        frequent_value[UNPACK_N_VECTORS];
 
 public:
 	void __device__ __forceinline__ read_next_exception(vi_t v) {
@@ -991,8 +1052,9 @@ public:
 		}
 	}
 
-	__device__ __forceinline__
-	PrefetchAllFREQExceptionPatcher(const FREQExtendedColumn<T> column, const vi_t first_vector_index, const lane_t lane)
+	__device__ __forceinline__ PrefetchAllFREQExceptionPatcher(const FREQExtendedColumn<T> column,
+	                                                           const vi_t                  first_vector_index,
+	                                                           const lane_t                lane)
 	    : current_position(lane) {
 		// Parse the data from the column
 #pragma unroll
@@ -1042,16 +1104,15 @@ private:
 	uint16_t next_position[UNPACK_N_VECTORS];
 	T        next_exception[UNPACK_N_VECTORS];
 	uint16_t current_position;
-	T      	 frequent_value[UNPACK_N_VECTORS];
-
+	T        frequent_value[UNPACK_N_VECTORS];
 
 public:
 	void __device__ __forceinline__ read_next_exception() {
 	}
 
 	__device__ __forceinline__ PrefetchAllBranchlessFREQExceptionPatcher(const FREQExtendedColumn<T> column,
-	                                                                    const vi_t                 first_vector_index,
-	                                                                    const lane_t               lane)
+	                                                                     const vi_t                  first_vector_index,
+	                                                                     const lane_t                lane)
 	    : current_position(lane) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
@@ -1100,47 +1161,46 @@ public:
 	}
 };
 
-
 template <typename T>
 struct CROSSRLEExpanderBase {
 public:
 	__device__ __forceinline__ virtual void rle_expand(T* out) = 0;
-  	__device__ virtual ~CROSSRLEExpanderBase() = default;
+	__device__ virtual ~CROSSRLEExpanderBase()                 = default;
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct DummyCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
 private:
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T = typename utils::same_width_int<T>::type;
+	using INT_T  = typename utils::same_width_int<T>::type;
 
 	si_t         start_index = 0;
-	UINT_T*    	 vec_values[UNPACK_N_VECTORS];
-	size_t*    	 vec_lengths[UNPACK_N_VECTORS];
-	uint32_t	 vec_runs_positions[UNPACK_N_VECTORS]; // the starting position of the first run in each vector
-
+	uint32_t     vec_base[UNPACK_N_VECTORS];
+	UINT_T*      vec_values[UNPACK_N_VECTORS];
+	size_t*      vec_lengths[UNPACK_N_VECTORS];
+	uint32_t     vec_runs_positions[UNPACK_N_VECTORS]; // the starting position of the first run in each vector
 	const lane_t lane;
-	
 
 public:
 	void __device__ __forceinline__ rle_expand(T* out) override {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
-		const int first_pos = start_index * N_LANES + lane;  // the lane in corresponding vectors
-		const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1); // the last lane in corresponding vectors
-		
-		start_index += UNPACK_N_VALUES; // will traverse the whole vectors (UNPACK_N_VALUES one time, for UNPACK_N_VECTORS vectors)
+		const int first_pos = start_index * N_LANES + lane; // the lane in corresponding vectors
+		// const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1); // the last lane in corresponding vectors
 
-		
+		start_index +=
+		    UNPACK_N_VALUES; // will traverse the whole vectors (UNPACK_N_VALUES one time, for UNPACK_N_VECTORS vectors)
+
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
-			uint32_t  current_run_position = vec_runs_positions[v]; // the starting position in decompressed arrays of the current run
-			size_t  run_index            = 0;
-			size_t  run_length           = vec_lengths[v][run_index];
-			UINT_T  current_value        = vec_values[v][run_index];
+			uint32_t current_run_position =
+			    vec_runs_positions[v]; // the starting position in decompressed arrays of the current run
+			size_t run_index     = 0;
+			size_t run_length    = vec_lengths[v][run_index];
+			UINT_T current_value = vec_values[v][run_index];
 #pragma unroll
 			for (int i {0}; i < UNPACK_N_VALUES; ++i) {
-				const int global_position = first_pos + v * consts::VALUES_PER_VECTOR + i * N_LANES;
+				const int global_position = static_cast<int>(vec_base[v]) + first_pos + i * N_LANES;
 				// move to the correct run
 				while (global_position >= current_run_position + run_length) {
 					current_run_position += run_length;
@@ -1148,25 +1208,25 @@ public:
 					run_length    = vec_lengths[v][run_index];
 					current_value = vec_values[v][run_index];
 				}
-				out[v * UNPACK_N_VALUES + i] = current_value; 
-			}	
+				out[v * UNPACK_N_VALUES + i] = current_value;
+			}
 		}
 	}
 
 	__device__ __forceinline__
-	DummyCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane) 
-		: lane (lane) {
-	
+	DummyCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane)
+	    : lane(lane) {
+
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
-			auto vec_index              = vector_index + v;
-			vec_values[v]               = column.values + column.offsets[vec_index];
-			vec_lengths[v]              = column.lengths + column.offsets[vec_index];
-			vec_runs_positions[v]       = column.run_positions[column.offsets[vec_index]];
+			auto vec_index        = vector_index + v;
+			vec_values[v]         = column.values + column.offsets[vec_index];
+			vec_lengths[v]        = column.lengths + column.offsets[vec_index];
+			vec_base[v]           = static_cast<int32_t>(vec_index * consts::VALUES_PER_VECTOR);
+			vec_runs_positions[v] = column.run_positions[column.offsets[vec_index]];
 		}
 	}
 };
-
 
 template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
 struct BPDecompressor : DecompressorBase<T> {
@@ -1200,9 +1260,9 @@ struct FFORDecompressor : DecompressorBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, typename PatcherT, typename ColumnT>
 struct FREQDecompressor : DecompressorBase<T> {
-	PatcherT  					patcher;
+	PatcherT                   patcher;
 	__device__ __forceinline__ FREQDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
-	    : patcher(PatcherT(column, vector_index, lane)){
+	    : patcher(PatcherT(column, vector_index, lane)) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
@@ -1213,22 +1273,24 @@ struct FREQDecompressor : DecompressorBase<T> {
 template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
 struct DICTDecompressor : DecompressorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	UnpackerT 					unpacker;
+	UnpackerT                  unpacker;
 	__device__ __forceinline__ DICTDecompressor(const DICTColumn<T> column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,
 	               column.ffor.bp.bit_widths[vector_index],
 	               DICTFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index,
-	                                               column.keys)){ // column.keys at global memory
+	                                                column.keys)) { // column.keys at global memory
 	}
 
 	// outer key pointer, which may points to shared memory
-	__device__ __forceinline__ DICTDecompressor(const DICTColumn<T> column, const vi_t vector_index, const lane_t lane, const UINT_T* __restrict keys_ptr)
-		: unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
-					lane,
-					column.ffor.bp.bit_widths[vector_index],
-					DICTFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index,
-													keys_ptr)) {
+	__device__ __forceinline__ DICTDecompressor(const DICTColumn<T> column,
+	                                            const vi_t          vector_index,
+	                                            const lane_t        lane,
+	                                            const UINT_T* __restrict keys_ptr)
+	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	               lane,
+	               column.ffor.bp.bit_widths[vector_index],
+	               DICTFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index, keys_ptr)) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
@@ -1236,12 +1298,31 @@ struct DICTDecompressor : DecompressorBase<T> {
 	}
 };
 
+template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
+struct DICTShfl32Decompressor : DecompressorBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	UnpackerT unpacker;
+
+	__device__ __forceinline__
+	DICTShfl32Decompressor(const DICTColumn<T> column, const vi_t vector_index, const lane_t lane)
+	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	               lane,
+	               column.ffor.bp.bit_widths[vector_index],
+	               DICTShfl32Functor<T, UNPACK_N_VECTORS>(
+	                   column.ffor.bases + vector_index, (const UINT_T* __restrict__)column.keys, column.key_count)) {
+	}
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
+		unpacker.unpack_next_into(out);
+	}
+};
+
 template <typename T, unsigned UNPACK_N_VECTORS, typename ExpanderT, typename ColumnT>
 struct CROSSRLEDecompressor : DecompressorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	ExpanderT 					expander;
-	__device__ __forceinline__ CROSSRLEDecompressor(const CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : expander(ExpanderT(column, vector_index, lane)){ 
+	ExpanderT expander;
+	__device__ __forceinline__
+	CROSSRLEDecompressor(const CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane)
+	    : expander(ExpanderT(column, vector_index, lane)) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {

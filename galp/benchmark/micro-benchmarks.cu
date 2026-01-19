@@ -107,7 +107,11 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
     if constexpr (std::is_same_v<ColumnT, flsgpu::host::CROSSRLEColumn<T>>) {
         out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
             column_device, params.unpack_n_vecs, params.unpack_n_vals, params.expander, params.n_samples);
-    } else {
+    } else if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTColumn<T>>){
+		bool use_shuffle = column.key_count <= 32;
+        out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
+            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples, use_shuffle);
+	} else {
         out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
             column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher, params.n_samples);
     }

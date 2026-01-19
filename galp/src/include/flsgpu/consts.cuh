@@ -10,10 +10,10 @@
 
 namespace consts {
 
-constexpr int32_t  REGISTER_WIDTH    = 1024;
-constexpr int32_t  VALUES_PER_VECTOR = 1024;
-constexpr int32_t  THREADS_PER_WARP  = 32;
-constexpr unsigned MAX_UNPACK_N_VECS = 4;
+constexpr int32_t  REGISTER_WIDTH        = 1024;
+constexpr int32_t  VALUES_PER_VECTOR     = 1024;
+constexpr int32_t  THREADS_PER_WARP      = 32;
+constexpr unsigned MAX_UNPACK_N_VECS     = 4;
 constexpr size_t   MAX_SHARED_DICT_BYTES = 48 * 1024;
 
 template <class T>

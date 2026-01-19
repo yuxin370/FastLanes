@@ -56,59 +56,56 @@ struct FFORColumn {
 
 template <typename T>
 struct DICTColumn {
- 	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename utils::same_width_uint<T>::type;
 	size_t             n_values;
-	FFORColumn<UINT_T> ffor;  // index stream (FFOR-compressed)
+	FFORColumn<UINT_T> ffor; // index stream (FFOR-compressed)
 
-	UINT_T*      		keys;      // dictionary keys (shared by all vectors)
-	size_t             	key_count; // number of keys in dictionary
+	UINT_T* keys;      // dictionary keys (shared by all vectors)
+	size_t  key_count; // number of keys in dictionary
 };
-
 
 template <typename T>
 struct CROSSRLEColumn {
-	using UINT_T        = typename utils::same_width_uint<T>::type;
-	size_t             	n_values;
-	size_t 			   	n_vecs;
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	size_t n_values;
+	size_t n_vecs;
 
-	size_t			 	n_runs; // number of runs : is this needed?
-	UINT_T*      		values; 
-	size_t*             lengths;
-	uint32_t* 			offsets;  //  each vector's start run idx
-	uint32_t* 			run_positions;  // runs' start position (offset) in decompressed array
-	
+	size_t    n_runs; // number of runs : is this needed?
+	UINT_T*   values;
+	size_t*   lengths;
+	uint32_t* offsets;       //  each vector's start run idx
+	uint32_t* run_positions; // runs' start position (offset) in decompressed array
 };
 
 template <typename T>
 struct FREQColumn {
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	size_t      n_values;
-	size_t 		n_vecs;
+	size_t n_values;
+	size_t n_vecs;
 
-	T* 		  	frequent_value;  	// frequent values 
+	T* frequent_value; // frequent values
 
-	size_t    	n_exceptions; 		// total number of exceptions
-	size_t*   	exceptions_offsets; // expection offsets in exception array
-	T* 		  	exceptions; 		// exception values
-	uint16_t* 	positions;  		// exception positions in vectors
-	uint16_t* 	counts; 			// number of exceptions per vector
+	size_t    n_exceptions;       // total number of exceptions
+	size_t*   exceptions_offsets; // expection offsets in exception array
+	T*        exceptions;         // exception values
+	uint16_t* positions;          // exception positions in vectors
+	uint16_t* counts;             // number of exceptions per vector
 };
 
 template <typename T>
 struct FREQExtendedColumn {
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	size_t      n_values;
-	size_t 		n_vecs;
+	size_t n_values;
+	size_t n_vecs;
 
-	T*   		frequent_value;  	// frequent values 
+	T* frequent_value; // frequent values
 
-	size_t    	n_exceptions; 		// total number of exceptions
-	size_t*   	exceptions_offsets; // expection offsets in exception array
-	T*   		exceptions; 		// exception values
-	uint16_t* 	positions;  		// exception positions in vectors
-	uint16_t* 	offsets_counts; 	// offsets and counts per lane
+	size_t    n_exceptions;       // total number of exceptions
+	size_t*   exceptions_offsets; // expection offsets in exception array
+	T*        exceptions;         // exception values
+	uint16_t* positions;          // exception positions in vectors
+	uint16_t* offsets_counts;     // offsets and counts per lane
 };
-
 
 template <typename T>
 struct ALPColumn {
@@ -202,20 +199,17 @@ struct FFORColumn {
 	}
 };
 
-
 template <typename T>
 struct CROSSRLEColumn {
 	using UINT_T        = typename utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::CROSSRLEColumn<T>;
-	size_t             n_values;
+	size_t n_values;
 
-	size_t			 	n_runs; // number of runs : is this needed?
-	UINT_T*      		values; 
-	size_t*             lengths;
-	uint32_t* 			offsets;  //  each vector's start run idx
-	uint32_t* 			run_positions;  // runs' start position (offset) in decompressed array
-	
-
+	size_t    n_runs; // number of runs : is this needed?
+	UINT_T*   values;
+	size_t*   lengths;
+	uint32_t* offsets;       //  each vector's start run idx
+	uint32_t* run_positions; // runs' start position (offset) in decompressed array
 
 	size_t get_n_values() const {
 		return n_values;
@@ -227,42 +221,17 @@ struct CROSSRLEColumn {
 	device::CROSSRLEColumn<T> copy_to_device() const {
 		const size_t n_vecs = get_n_vecs();
 
-		return device::CROSSRLEColumn<T>{
-			get_n_values(),
-			n_vecs,
-			n_runs,
-			GPUArray<UINT_T>(n_runs, values).release(),
-			GPUArray<size_t>(n_runs, lengths).release(),
-			GPUArray<uint32_t>(n_vecs + 1, offsets).release(),
-			GPUArray<uint32_t>(n_runs, run_positions).release(),
+		return device::CROSSRLEColumn<T> {
+		    get_n_values(),
+		    n_vecs,
+		    n_runs,
+		    GPUArray<UINT_T>(n_runs, values).release(),
+		    GPUArray<size_t>(n_runs, lengths).release(),
+		    GPUArray<uint32_t>(n_vecs + 1, offsets).release(),
+		    GPUArray<uint32_t>(n_runs, run_positions).release(),
 		};
 	}
 };
-
-// template <typename T>
-// struct CROSSRLEExtendedColumn {
-// 	using UINT_T        = typename utils::same_width_uint<T>::type;
-// 	using DeviceColumnT = typename device::CROSSRLEExtendedColumn<T>;
-// 	size_t             n_values;
-
-// 	UINT_T*      		values;     
-// 	size_t*             lengths;
-// 	uint16_t* 			run_positions;  // runs' positions in vectors
-// 	uint16_t* 			offsets;  // offset of each run in decompressed vectors
-
-
-// 	size_t get_n_values() const {
-// 		return n_values;
-// 	}
-// 	size_t get_n_vecs() const {
-// 		return utils::get_n_vecs_from_size(n_values);
-// 	}
-
-// 	device::CROSSRLEExtendedColumn<T> copy_to_device() const {
-// 		return device::CROSSRLEExtendedColumn<T> {
-// 		    get_n_values(), GPUArray<UINT_T>(get_n_vecs(), values).release(), GPUArray<size_t>(get_n_vecs(), lengths).release()};
-// 	}
-// };
 
 template <typename T>
 struct DICTColumn {
@@ -281,25 +250,23 @@ struct DICTColumn {
 	}
 
 	device::DICTColumn<T> copy_to_device() const {
-		return device::DICTColumn<T>{
-			get_n_values(), ffor.copy_to_device(), GPUArray<UINT_T>(key_count, keys).release(), key_count};
+		return device::DICTColumn<T> {
+		    get_n_values(), ffor.copy_to_device(), GPUArray<UINT_T>(key_count, keys).release(), key_count};
 	}
 };
 
 template <typename T>
 struct FREQExtendedColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::FREQExtendedColumn<T>;
-	size_t      n_values;
+	size_t n_values;
 
-
-	T*   		frequent_value;  	// frequent values 
-	size_t    	n_exceptions; 		// total number of exceptions
-	size_t*   	exceptions_offsets; // expection offsets in exception array
-	T*   		exceptions; 		// exception values
-	uint16_t* 	positions;  		// exception positions in vectors
-	uint16_t* 	offsets_counts; 	// offsets and counts per lane
-
+	T*        frequent_value;     // frequent values
+	size_t    n_exceptions;       // total number of exceptions
+	size_t*   exceptions_offsets; // expection offsets in exception array
+	T*        exceptions;         // exception values
+	uint16_t* positions;          // exception positions in vectors
+	uint16_t* offsets_counts;     // offsets and counts per lane
 
 	size_t get_n_values() const {
 		return n_values;
@@ -313,7 +280,7 @@ struct FREQExtendedColumn {
 		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
 		return device::FREQExtendedColumn<T> {
 		    n_values,
-			get_n_vecs(),
+		    get_n_vecs(),
 		    GPUArray<T>(get_n_vecs(), frequent_value).release(),
 		    n_exceptions,
 		    GPUArray<size_t>(get_n_vecs(), exceptions_offsets).release(),
@@ -324,21 +291,18 @@ struct FREQExtendedColumn {
 	}
 };
 
-
 template <typename T>
 struct FREQColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::FREQColumn<T>;
-	size_t      n_values;
+	size_t n_values;
 
-
-	T*   		frequent_value;  	// frequent values 
-	size_t    	n_exceptions; 		// total number of exceptions
-	size_t*   	exceptions_offsets; // expection offsets in exception array
-	T*   		exceptions; 		// exception values
-	uint16_t* 	positions;  		// exception positions in vectors
-	uint16_t* 	counts; 			// number of exceptions per vector
-
+	T*        frequent_value;     // frequent values
+	size_t    n_exceptions;       // total number of exceptions
+	size_t*   exceptions_offsets; // expection offsets in exception array
+	T*        exceptions;         // exception values
+	uint16_t* positions;          // exception positions in vectors
+	uint16_t* counts;             // number of exceptions per vector
 
 	size_t get_n_values() const {
 		return n_values;
@@ -352,7 +316,7 @@ struct FREQColumn {
 		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
 		return device::FREQColumn<T> {
 		    n_values,
-			get_n_vecs(),
+		    get_n_vecs(),
 		    GPUArray<T>(get_n_vecs(), frequent_value).release(),
 		    n_exceptions,
 		    GPUArray<size_t>(get_n_vecs(), exceptions_offsets).release(),
@@ -367,10 +331,9 @@ struct FREQColumn {
 		constexpr auto VALUES_PER_LANE = utils::get_values_per_lane<T>();
 
 		// New exception allocations
-		T*        out_exceptions = reinterpret_cast<T*>(malloc(sizeof(T) * n_exceptions));
-		uint16_t* out_positions  = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * n_exceptions));
-		uint16_t* out_offsets_counts =
-		    reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * get_n_vecs() * N_LANES));
+		T*        out_exceptions     = reinterpret_cast<T*>(malloc(sizeof(T) * n_exceptions));
+		uint16_t* out_positions      = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * n_exceptions));
+		uint16_t* out_offsets_counts = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * get_n_vecs() * N_LANES));
 
 		// Intermediate arrays for reordering positions and exceptions
 		T        vec_exceptions[consts::VALUES_PER_VECTOR];
@@ -433,16 +396,14 @@ struct FREQColumn {
 	FREQExtendedColumn<T> create_extended_column() const {
 		auto [e_exceptions, e_positions, e_offsets_counts] = convert_exceptions_to_lane_divided_format();
 		return FREQExtendedColumn<T> {n_values,
-		                             utils::copy_array(frequent_value, get_n_vecs()),
-		                             n_exceptions,
-		                             utils::copy_array(exceptions_offsets, get_n_vecs()),
-		                             e_exceptions,
-		                             e_positions,
-		                             e_offsets_counts};
+		                              utils::copy_array(frequent_value, get_n_vecs()),
+		                              n_exceptions,
+		                              utils::copy_array(exceptions_offsets, get_n_vecs()),
+		                              e_exceptions,
+		                              e_positions,
+		                              e_offsets_counts};
 	}
-
 };
-
 
 template <typename T>
 struct ALPExtendedColumn {
@@ -646,8 +607,8 @@ void free_column(FFORColumn<T> column) {
 
 template <typename T>
 void free_column(DICTColumn<T> column) {
-  free_column(column.ffor);
-  delete[] column.keys;
+	free_column(column.ffor);
+	delete[] column.keys;
 }
 
 template <typename T>
@@ -715,8 +676,8 @@ void free_column(device::FFORColumn<T> column) {
 
 template <typename T>
 void free_column(device::DICTColumn<T> column) {
-  free_column(column.ffor);
-  free_device_pointer(column.keys);
+	free_column(column.ffor);
+	free_device_pointer(column.keys);
 }
 
 template <typename T>
@@ -737,7 +698,6 @@ void free_column(device::FREQExtendedColumn<T> column) {
 	free_device_pointer(column.offsets_counts);
 }
 
-
 template <typename T>
 void free_column(device::CROSSRLEColumn<T> column) {
 	free_device_pointer(column.values);
@@ -745,7 +705,6 @@ void free_column(device::CROSSRLEColumn<T> column) {
 	free_device_pointer(column.run_positions);
 	free_device_pointer(column.offsets);
 }
-
 
 template <typename T>
 void free_column(device::ALPColumn<T> column) {
