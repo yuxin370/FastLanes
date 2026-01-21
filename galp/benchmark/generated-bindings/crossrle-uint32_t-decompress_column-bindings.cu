@@ -1,4 +1,8 @@
-
+// ────────────────────────────────────────────────────────
+// |                      FastLanes                       |
+// ────────────────────────────────────────────────────────
+// galp/benchmark/generated-bindings/crossrle-uint32_t-decompress_column-bindings.cu
+// ────────────────────────────────────────────────────────
 #include "engine/kernels.cuh"
 #include "engine/multi-column-host-kernels.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
