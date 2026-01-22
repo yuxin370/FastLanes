@@ -41,6 +41,28 @@ uint32_t* decompress_column<uint32_t, flsgpu::device::CROSSRLEColumn<uint32_t>>(
 		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
 		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
 	}
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && expander == enums::Expander::StatefulShuffle) {
+		return kernels::host::decompress_column<
+		    uint32_t,
+		    1,
+		    1,
+		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
+		                                         1,
+		                                         flsgpu::device::StatefulShuffleCROSSRLEExpander<uint32_t, 1, 1>,
+		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
+		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
+	}
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && expander == enums::Expander::StatefulAdvance) {
+		return kernels::host::decompress_column<
+		    uint32_t,
+		    1,
+		    1,
+		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
+		                                         1,
+		                                         flsgpu::device::StatefulAdvanceCROSSRLEExpander<uint32_t, 1, 1>,
+		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
+		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
+	}
 	if (unpack_n_vectors == 4 && unpack_n_values == 1 && expander == enums::Expander::Dummy) {
 		return kernels::host::decompress_column<
 		    uint32_t,
@@ -60,6 +82,28 @@ uint32_t* decompress_column<uint32_t, flsgpu::device::CROSSRLEColumn<uint32_t>>(
 		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
 		                                         4,
 		                                         flsgpu::device::StatefulCROSSRLEExpander<uint32_t, 4, 1>,
+		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
+		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
+	}
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && expander == enums::Expander::StatefulShuffle) {
+		return kernels::host::decompress_column<
+		    uint32_t,
+		    4,
+		    1,
+		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
+		                                         4,
+		                                         flsgpu::device::StatefulShuffleCROSSRLEExpander<uint32_t, 4, 1>,
+		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
+		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
+	}
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && expander == enums::Expander::StatefulAdvance) {
+		return kernels::host::decompress_column<
+		    uint32_t,
+		    4,
+		    1,
+		    flsgpu::device::CROSSRLEDecompressor<uint32_t,
+		                                         4,
+		                                         flsgpu::device::StatefulAdvanceCROSSRLEExpander<uint32_t, 4, 1>,
 		                                         flsgpu::device::CROSSRLEColumn<uint32_t>>,
 		    flsgpu::device::CROSSRLEColumn<uint32_t>>(column, n_samples);
 	}

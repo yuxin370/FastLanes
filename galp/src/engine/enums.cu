@@ -74,7 +74,9 @@ Expander string_to_expander(const std::string& str) {
 	static const std::unordered_map<std::string, Expander> mapping = {
 	    {"none", Expander::None},
 	    {"dummy", Expander::Dummy},
-		{"stateful", Expander::Stateful},
+		{"stateful", Expander::Stateful},	
+		{"stateful-shuffle", Expander::StatefulShuffle},
+		{"stateful-advance", Expander::StatefulAdvance}, 
 	};
 
 	auto it = mapping.find(str);
@@ -109,12 +111,12 @@ Patcher string_to_patcher(const std::string& str) {
 
 Encoding string_to_encoding(const std::string& str) {
 	static const std::unordered_map<std::string, Encoding> mapping = {
-	    {"ALP", Encoding::ALP},
-		{"BitPacking", Encoding::BIT_PACKING},
-		{"FFOR", Encoding::FFOR},
-		{"Frequency", Encoding::FREQUENCY},
-		{"CrossRLE", Encoding::CROSS_RLE},
-		{"Dictionary", Encoding::DICTIONARY},
+	    {"alp", Encoding::ALP},
+		{"bit-packing", Encoding::BIT_PACKING},
+		{"ffor", Encoding::FFOR},
+		{"frequency", Encoding::FREQUENCY},
+		{"cross-rle", Encoding::CROSS_RLE},
+		{"dictionary", Encoding::DICTIONARY},
 	};
 
 	auto it = mapping.find(str);
@@ -128,17 +130,17 @@ Encoding string_to_encoding(const std::string& str) {
 std::string encoding_to_string(const Encoding type) {
 	switch (type) {
 	case Encoding::ALP:
-		return "ALP";
+		return "alp";
 	case Encoding::BIT_PACKING:
-		return "BitPacking";
+		return "bit-packing";
 	case Encoding::FFOR:
-		return "FFOR";
+		return "ffor";
 	case Encoding::FREQUENCY:
-		return "Frequency";
+		return "frequency";
 	case Encoding::CROSS_RLE:
-		return "CrossRLE";
+		return "cross-rle";
 	case Encoding::DICTIONARY:
-		return "Dictionary";
+		return "dictionary";
 	default:
 		throw std::invalid_argument("Could not parse encoding");
 	}
