@@ -77,6 +77,8 @@ Expander string_to_expander(const std::string& str) {
 		{"stateful", Expander::Stateful},	
 		{"stateful-shuffle", Expander::StatefulShuffle},
 		{"stateful-advance", Expander::StatefulAdvance}, 
+		{"stateful-extended", Expander::StatefulExtended},
+		{"branchless", Expander::Branchless}
 	};
 
 	auto it = mapping.find(str);

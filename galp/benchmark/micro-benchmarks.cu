@@ -390,7 +390,15 @@ std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramPar
 		column = data::columns::generate_cross_rle_column<T>(
 			params.n_values, vbw, 20);
 
-		results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEColumn<T>>(column, params, query_result, magic_value));
+		if(params.expander == enums::Expander::StatefulExtended){
+			auto column_extended = column.create_extended_column();
+			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEExtendedColumn<T>>(column_extended, params, query_result, magic_value));
+		}else if(params.expander == enums::Expander::Branchless){
+			auto column_lane_mask = column.create_lane_mask_column();
+			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLELaneMaskColumn<T>>(column_lane_mask, params, query_result, magic_value));
+		}else{
+			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEColumn<T>>(column, params, query_result, magic_value));
+		}
 
 		flsgpu::host::free_column(column);
 

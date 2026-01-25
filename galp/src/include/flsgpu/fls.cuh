@@ -1318,7 +1318,7 @@ private:
 	uint32_t vec_run_pos[UNPACK_N_VECTORS];   // current run start position in decompressed space
 	UINT_T   vec_run_value[UNPACK_N_VECTORS]; // current run value (cached)
 
-		__device__ __forceinline__ void advance_if_needed(const uint32_t gp,
+	__device__ __forceinline__ void advance_if_needed(const uint32_t gp,
 	                                                  uint32_t&      run_pos,
 	                                                  uint32_t&      run_len,
 	                                                  uint32_t&      run_idx,
@@ -1333,7 +1333,7 @@ private:
 		const uint32_t new_idx = run_idx + (uint32_t)need;
 		const uint32_t new_pos = run_pos + (need ? run_len : 0u);
 
-		// update only when need=1 
+		// update only when need=1
 		const uint32_t next_len = lengths[new_idx];
 		const UINT_T   next_val = values[new_idx];
 
@@ -1342,13 +1342,12 @@ private:
 		run_len = need ? next_len : run_len;
 		run_val = need ? next_val : run_val;
 	}
-public:
 
+public:
 	__device__ __forceinline__ void rle_expand(T* out) override {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
-
-#pragma unroll 
+#pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
 
 			uint32_t run_idx = vec_run_index[v];
@@ -1358,7 +1357,6 @@ public:
 
 			const uint32_t* __restrict__ lengths = vec_lengths[v];
 			const UINT_T* __restrict__ values    = vec_values[v];
-
 
 			uint32_t gp = vec_base[v] + (uint32_t)start_index * (uint32_t)N_LANES;
 
@@ -1412,167 +1410,307 @@ public:
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct StatefulShuffleCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
 private:
-    using UINT_T = typename utils::same_width_uint<T>::type;
-    using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename utils::same_width_int<T>::type;
 
-    si_t start_index = 0;
-    lane_t lane_;
+	si_t   start_index = 0;
+	lane_t lane_;
 
+	uint32_t  vec_base0[UNPACK_N_VECTORS];
+	UINT_T*   vec_values[UNPACK_N_VECTORS];
+	uint32_t* vec_lengths[UNPACK_N_VECTORS];
 
-    uint32_t  vec_base0[UNPACK_N_VECTORS];
-    UINT_T*   vec_values[UNPACK_N_VECTORS];
-    uint32_t* vec_lengths[UNPACK_N_VECTORS];
+	uint32_t vec_run_index[UNPACK_N_VECTORS];
+	uint32_t vec_run_length[UNPACK_N_VECTORS];
+	uint32_t vec_run_pos[UNPACK_N_VECTORS];
+	UINT_T   vec_run_value[UNPACK_N_VECTORS];
 
-    uint32_t vec_run_index[UNPACK_N_VECTORS];
-    uint32_t vec_run_length[UNPACK_N_VECTORS];
-    uint32_t vec_run_pos[UNPACK_N_VECTORS];
-    UINT_T   vec_run_value[UNPACK_N_VECTORS];
+	static __device__ __forceinline__ UINT_T shfl0(UINT_T x, unsigned mask, int width) {
+		if constexpr (sizeof(UINT_T) == 4) {
+			return (UINT_T)__shfl_sync(mask, (uint32_t)x, 0, width);
+		} else if constexpr (sizeof(UINT_T) == 8) {
 
-    static __device__ __forceinline__ UINT_T shfl0(UINT_T x, unsigned mask, int width) {
-        if constexpr (sizeof(UINT_T) == 4) {
-            return (UINT_T)__shfl_sync(mask, (uint32_t)x, 0, width);
-        } else if constexpr (sizeof(UINT_T) == 8) {
-
-            unsigned long long y = (unsigned long long)x;
-            y = __shfl_sync(mask, y, 0, width);
-            return (UINT_T)y;
-        } else {
-            return x;
-        }
-    }
+			unsigned long long y = (unsigned long long)x;
+			y                    = __shfl_sync(mask, y, 0, width);
+			return (UINT_T)y;
+		} else {
+			return x;
+		}
+	}
 
 public:
-    __device__ __forceinline__ void rle_expand(T* __restrict__ out) override {
-        constexpr int  N_LANES = utils::get_n_lanes<INT_T>();
-        const unsigned mask    = __activemask();
-        const int      lane    = (int)lane_;
+	__device__ __forceinline__ void rle_expand(T* __restrict__ out) override {
+		constexpr int  N_LANES = utils::get_n_lanes<INT_T>();
+		const unsigned mask    = __activemask();
+		const int      lane    = (int)lane_;
 
 #pragma unroll
-        for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
 
-            uint32_t run_idx = 0;
-            uint32_t run_pos = 0;
-            uint32_t run_len = 0;
-            UINT_T   run_val = 0;
+			uint32_t run_idx = 0;
+			uint32_t run_pos = 0;
+			uint32_t run_len = 0;
+			UINT_T   run_val = 0;
 
-            if (lane == 0) {
-                run_idx = vec_run_index[v];
-                run_pos = vec_run_pos[v];
-                run_len = vec_run_length[v];
-                run_val = vec_run_value[v];
-            }
+			if (lane == 0) {
+				run_idx = vec_run_index[v];
+				run_pos = vec_run_pos[v];
+				run_len = vec_run_length[v];
+				run_val = vec_run_value[v];
+			}
 
-            T* __restrict__ outv = out + v * UNPACK_N_VALUES;
-            const uint32_t base0 = vec_base0[v];
-
-#pragma unroll
-            for (int i = 0; i < (int)UNPACK_N_VALUES; ++i) {
-                // strip covers [strip_start, strip_end) in decompressed space 
-                const uint32_t strip_start = base0 + (uint32_t)(start_index + i) * (uint32_t)N_LANES;
-                const uint32_t strip_end   = strip_start + (uint32_t)N_LANES;
-
-
-                uint32_t run_end = 0;
-                if (lane == 0) {
-
-                    run_end = run_pos + run_len;
-                    while (strip_start >= run_end) {
-                        run_pos = run_end;
-                        ++run_idx;
-                        run_len = vec_lengths[v][run_idx];
-                        run_val = vec_values[v][run_idx];
-                        run_end = run_pos + run_len;
-                    }
-                }
-
-                const uint32_t b_run_pos = __shfl_sync(mask, run_pos, 0, N_LANES);
-                const uint32_t b_run_end = __shfl_sync(mask, run_end, 0, N_LANES);
-
-                // uniform branch: strip fully covered by current run
-                if (b_run_pos <= strip_start && b_run_end >= strip_end) {
-                    const UINT_T b_run_val = shfl0(run_val, mask, N_LANES);
-                    outv[i] = (T)b_run_val;
-                    continue;
-                }
-
-                // slow path: strip cover several run -> lane0 generate [seg_begin, seg_end) iteratelly
-                for (;;) {
-                    uint32_t packed_be = 0;  // [15:0]=begin, [31:16]=end
-                    UINT_T   seg_val   = 0;
-
-                    if (lane == 0) {
-                        const uint32_t local_run_end = run_pos + run_len;
-
-                        const uint32_t seg_begin_u =
-                            (run_pos > strip_start) ? (run_pos - strip_start) : 0u;
-                        const uint32_t seg_end_u =
-                            (local_run_end < strip_end) ? (local_run_end - strip_start) : (uint32_t)N_LANES;
-
-                        // one less shfl
-                        packed_be = (seg_begin_u & 0xFFFFu) | ((seg_end_u & 0xFFFFu) << 16);
-                        seg_val   = run_val;
-
-                        // if not cover the strip，push to next run
-                        if (seg_end_u < (uint32_t)N_LANES) {
-                            run_pos = local_run_end;
-                            ++run_idx;
-                            run_len = vec_lengths[v][run_idx];
-                            run_val = vec_values[v][run_idx];
-                        }
-                    }
-
-                    const uint32_t b_be = __shfl_sync(mask, packed_be, 0, N_LANES);
-                    const int seg_begin = (int)(b_be & 0xFFFFu);
-                    const int seg_end   = (int)(b_be >> 16);
-                    const UINT_T b_val  = shfl0(seg_val, mask, N_LANES);
-
-
-                    if (lane >= seg_begin && lane < seg_end) {
-                        outv[i] = (T)b_val;
-                    }
-
-                    if (seg_end >= N_LANES) break;
-                }
-            }
-
-            if (lane == 0) {
-                vec_run_index[v]  = run_idx;
-                vec_run_pos[v]    = run_pos;
-                vec_run_length[v] = run_len;
-                vec_run_value[v]  = run_val;
-            }
-        }
-
-        start_index += UNPACK_N_VALUES;
-    }
-
-    __device__ __forceinline__
-    StatefulShuffleCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
-                                   const vi_t vector_index,
-                                   const lane_t lane)
-        : lane_(lane) {
-        constexpr int N_LANES = utils::get_n_lanes<INT_T>();
+			T* __restrict__ outv = out + v * UNPACK_N_VALUES;
+			const uint32_t base0 = vec_base0[v];
 
 #pragma unroll
-        for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
-            const auto vec_index = vector_index + v;
+			for (int i = 0; i < (int)UNPACK_N_VALUES; ++i) {
+				// strip covers [strip_start, strip_end) in decompressed space
+				const uint32_t strip_start = base0 + (uint32_t)(start_index + i) * (uint32_t)N_LANES;
+				const uint32_t strip_end   = strip_start + (uint32_t)N_LANES;
 
-            uint32_t off = (lane_ == 0) ? column.offsets[vec_index] : 0;
-            off = __shfl_sync(0xFFFFFFFFu, off, 0, N_LANES);
+				uint32_t run_end = 0;
+				if (lane == 0) {
 
-            vec_values[v]  = column.values + off;
-            vec_lengths[v] = column.lengths + off;
+					run_end = run_pos + run_len;
+					while (strip_start >= run_end) {
+						run_pos = run_end;
+						++run_idx;
+						run_len = vec_lengths[v][run_idx];
+						run_val = vec_values[v][run_idx];
+						run_end = run_pos + run_len;
+					}
+				}
 
-            uint32_t rp = (lane_ == 0) ? column.run_positions[off] : 0;
-            rp = __shfl_sync(0xFFFFFFFFu, rp, 0, N_LANES);
-            vec_run_pos[v] = rp;
+				const uint32_t b_run_pos = __shfl_sync(mask, run_pos, 0, N_LANES);
+				const uint32_t b_run_end = __shfl_sync(mask, run_end, 0, N_LANES);
 
-            vec_base0[v] = (uint32_t)(vec_index * consts::VALUES_PER_VECTOR);
-            vec_run_index[v] = 0;
-            vec_run_length[v] = vec_lengths[v][0];
-            vec_run_value[v]  = vec_values[v][0];
-        }
-    }
+				// uniform branch: strip fully covered by current run
+				if (b_run_pos <= strip_start && b_run_end >= strip_end) {
+					const UINT_T b_run_val = shfl0(run_val, mask, N_LANES);
+					outv[i]                = (T)b_run_val;
+					continue;
+				}
+
+				// slow path: strip cover several run -> lane0 generate [seg_begin, seg_end) iteratelly
+				for (;;) {
+					uint32_t packed_be = 0; // [15:0]=begin, [31:16]=end
+					UINT_T   seg_val   = 0;
+
+					if (lane == 0) {
+						const uint32_t local_run_end = run_pos + run_len;
+
+						const uint32_t seg_begin_u = (run_pos > strip_start) ? (run_pos - strip_start) : 0u;
+						const uint32_t seg_end_u =
+						    (local_run_end < strip_end) ? (local_run_end - strip_start) : (uint32_t)N_LANES;
+
+						// one less shfl
+						packed_be = (seg_begin_u & 0xFFFFu) | ((seg_end_u & 0xFFFFu) << 16);
+						seg_val   = run_val;
+
+						// if not cover the strip，push to next run
+						if (seg_end_u < (uint32_t)N_LANES) {
+							run_pos = local_run_end;
+							++run_idx;
+							run_len = vec_lengths[v][run_idx];
+							run_val = vec_values[v][run_idx];
+						}
+					}
+
+					const uint32_t b_be      = __shfl_sync(mask, packed_be, 0, N_LANES);
+					const int      seg_begin = (int)(b_be & 0xFFFFu);
+					const int      seg_end   = (int)(b_be >> 16);
+					const UINT_T   b_val     = shfl0(seg_val, mask, N_LANES);
+
+					if (lane >= seg_begin && lane < seg_end) {
+						outv[i] = (T)b_val;
+					}
+
+					if (seg_end >= N_LANES)
+						break;
+				}
+			}
+
+			if (lane == 0) {
+				vec_run_index[v]  = run_idx;
+				vec_run_pos[v]    = run_pos;
+				vec_run_length[v] = run_len;
+				vec_run_value[v]  = run_val;
+			}
+		}
+
+		start_index += UNPACK_N_VALUES;
+	}
+
+	__device__ __forceinline__ StatefulShuffleCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	                                                           const vi_t                              vector_index,
+	                                                           const lane_t                            lane)
+	    : lane_(lane) {
+		constexpr int N_LANES = utils::get_n_lanes<INT_T>();
+
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			const auto vec_index = vector_index + v;
+
+			uint32_t off = (lane_ == 0) ? column.offsets[vec_index] : 0;
+			off          = __shfl_sync(0xFFFFFFFFu, off, 0, N_LANES);
+
+			vec_values[v]  = column.values + off;
+			vec_lengths[v] = column.lengths + off;
+
+			uint32_t rp    = (lane_ == 0) ? column.run_positions[off] : 0;
+			rp             = __shfl_sync(0xFFFFFFFFu, rp, 0, N_LANES);
+			vec_run_pos[v] = rp;
+
+			vec_base0[v]      = (uint32_t)(vec_index * consts::VALUES_PER_VECTOR);
+			vec_run_index[v]  = 0;
+			vec_run_length[v] = vec_lengths[v][0];
+			vec_run_value[v]  = vec_values[v][0];
+		}
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct StatefulExtendedCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+private:
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename utils::same_width_int<T>::type;
+
+	// k-space cursor: UNPACK_N_VALUES k each time
+	uint16_t start_k_ = 0;
+	lane_t   lane_;
+
+	// per-vector lane-run slice pointers (already offset to this lane)
+	const UINT_T*   lane_vals_[UNPACK_N_VECTORS];
+	const uint16_t* lane_lens_[UNPACK_N_VECTORS];
+
+	// per-vector lane-run state
+	uint16_t run_cnt_[UNPACK_N_VECTORS]; // number of runs in this lane (within this vector)
+	uint16_t run_idx_[UNPACK_N_VECTORS];
+	uint16_t run_pos_[UNPACK_N_VECTORS]; // start k of current run
+	uint16_t run_len_[UNPACK_N_VECTORS]; // length in k-space
+	UINT_T   run_val_[UNPACK_N_VECTORS];
+
+public:
+	__device__ __forceinline__ StatefulExtendedCROSSRLEExpander(const flsgpu::device::CROSSRLEExtendedColumn<T> col,
+	                                                            const vi_t   vec_index,
+	                                                            const lane_t lane)
+	    : lane_(lane) {
+		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			const uint32_t vec = (uint32_t)(vec_index + v);
+
+			// decode packed per-lane (offset,count) within this vector slice
+			const uint32_t packed   = col.offsets_counts[vec * N_LANES + (uint32_t)lane_];
+			const uint16_t lane_off = (uint16_t)(packed & 0xFFFFu);
+			const uint16_t lane_cnt = (uint16_t)(packed >> 16);
+
+			// global base for this vector slice
+			const size_t vec_base = col.lane_runs_offsets[vec];
+			const size_t base     = vec_base + (size_t)lane_off;
+
+			lane_vals_[v] = col.lane_values + base;
+			lane_lens_[v] = col.lane_lengths + base;
+
+			run_cnt_[v] = lane_cnt;
+			run_idx_[v] = 0;
+			run_pos_[v] = 0;
+
+			run_len_[v] = lane_lens_[v][0];
+			run_val_[v] = lane_vals_[v][0];
+		}
+	}
+
+	__device__ __forceinline__ void rle_expand(T* __restrict__ out) override {
+		// each lane for one stride
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			T* __restrict__ outv = out + v * UNPACK_N_VALUES;
+
+			const UINT_T*   vals    = lane_vals_[v];
+			const uint16_t* lens    = lane_lens_[v];
+			uint16_t        run_cnt = run_cnt_[v];
+			uint16_t        run_idx = run_idx_[v];
+			uint16_t        run_pos = run_pos_[v];
+			uint16_t        run_len = run_len_[v];
+			UINT_T          run_val = run_val_[v];
+
+			uint16_t run_end = (uint16_t)(run_pos + run_len);
+
+#pragma unroll
+			for (int i = 0; i < (int)UNPACK_N_VALUES; ++i) {
+				const uint16_t k = (uint16_t)(start_k_ + (uint16_t)i);
+
+				// advance to run covering k
+				while (k >= run_end && (uint16_t)(run_idx + 1) < run_cnt) {
+					run_pos = run_end;
+					++run_idx;
+					run_len = lens[run_idx];
+					run_val = vals[run_idx];
+					run_end = (uint16_t)(run_pos + run_len);
+				}
+
+				outv[i] = (T)run_val;
+			}
+
+			run_idx_[v] = run_idx;
+			run_pos_[v] = run_pos;
+			run_len_[v] = run_len;
+			run_val_[v] = run_val;
+		}
+
+		start_k_ = (uint16_t)(start_k_ + (uint16_t)UNPACK_N_VALUES);
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct BranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename utils::same_width_int<T>::type;
+
+	uint16_t start_k_ = 0;
+	lane_t   lane_;
+
+	const UINT_T* lane_vals_[UNPACK_N_VECTORS];
+	uint64_t      lane_mask_[UNPACK_N_VECTORS];
+
+	__device__ __forceinline__
+	BranchlessCROSSRLEExpander(const device::CROSSRLELaneMaskColumn<T> col, vi_t first_vec, lane_t lane)
+	    : lane_(lane) {
+		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			const uint32_t vec  = (uint32_t)(first_vec + v);
+			const uint32_t id   = vec * N_LANES + (uint32_t)lane_;
+			const uint32_t base = col.lane_run_base[id];
+			lane_vals_[v]       = col.lane_run_values + base;
+			lane_mask_[v]       = col.lane_boundary_mask[id];
+		}
+	}
+
+	__device__ __forceinline__ void rle_expand(T* __restrict__ out) override {
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			T* __restrict__ outv            = out + v * UNPACK_N_VALUES;
+			const UINT_T* __restrict__ vals = lane_vals_[v];
+			const uint64_t mask             = lane_mask_[v];
+
+#pragma unroll
+			for (int i = 0; i < (int)UNPACK_N_VALUES; ++i) {
+				const uint32_t k = (uint32_t)start_k_ + (uint32_t)i;
+
+				// prefix boundaries in [1..k]
+				// use 64-bit safe ops
+				const unsigned long long prefix = ((unsigned long long)mask & ((1ull << k) - 1ull));
+
+				const uint32_t run_id = (uint32_t)__popcll(prefix);
+
+				outv[i] = (T)vals[run_id];
+			}
+		}
+		start_k_ += (uint16_t)UNPACK_N_VALUES;
+	}
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
@@ -1666,9 +1804,8 @@ struct DICTShfl32Decompressor : DecompressorBase<T> {
 template <typename T, unsigned UNPACK_N_VECTORS, typename ExpanderT, typename ColumnT>
 struct CROSSRLEDecompressor : DecompressorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	ExpanderT expander;
-	__device__ __forceinline__
-	CROSSRLEDecompressor(const CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane)
+	ExpanderT                  expander;
+	__device__ __forceinline__ CROSSRLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : expander(ExpanderT(column, vector_index, lane)) {
 	}
 

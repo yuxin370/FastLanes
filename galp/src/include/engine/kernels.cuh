@@ -181,9 +181,6 @@ __host__ T* decompress_column(const ColumnT column, const uint32_t n_samples) {
 	// column.key_count);
 	// }
 
-	printf("Decompress kernel launch parameters: n_blocks=%u, n_threads_per_block=%u\n",
-	       (unsigned)mapping.n_blocks,
-	       (unsigned)mapping.N_THREADS_PER_BLOCK);
 	for (uint32_t i {0}; i < n_samples; ++i) {
 		device::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>
 		    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK, shmem_bytes>>>(column, device_out.get());

@@ -78,6 +78,33 @@ struct CROSSRLEColumn {
 };
 
 template <typename T>
+struct CROSSRLEExtendedColumn {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+
+	size_t n_values;
+	size_t n_vecs;
+
+	size_t    n_lane_runs;       // total runs after lane-projection
+	size_t*   lane_runs_offsets; // [n_vecs+1], global offset into lane_values/lane_lengths
+	UINT_T*   lane_values;       // [n_lane_runs]
+	uint16_t* lane_lengths;      // [n_lane_runs], length in k-space (stride index)
+	uint32_t* offsets_counts;    // [n_vecs * N_LANES], packed per-lane (offset,count) within vector slice
+};
+
+template <typename T>
+struct CROSSRLELaneMaskColumn {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+
+	size_t n_values;
+	size_t n_vecs;
+
+	size_t    n_lane_runs;        // total runs across all (vec,lane)
+	uint32_t* lane_run_base;      // [n_vecs*N_LANES + 1]  CSR base
+	UINT_T*   lane_run_values;    // [n_lane_runs]
+	uint64_t* lane_boundary_mask; // [n_vecs*N_LANES] bit k=1 => new run begins at k
+};
+
+template <typename T>
 struct FREQColumn {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	size_t n_values;
@@ -200,6 +227,75 @@ struct FFORColumn {
 };
 
 template <typename T>
+struct CROSSRLEExtendedColumn {
+	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using DeviceColumnT = typename device::CROSSRLEExtendedColumn<T>;
+
+	size_t n_values;
+
+	size_t    n_lane_runs;       // total runs after lane-projection
+	size_t*   lane_runs_offsets; // [n_vecs+1]
+	UINT_T*   lane_values;       // [n_lane_runs]
+	uint16_t* lane_lengths;      // [n_lane_runs]
+	uint32_t* offsets_counts;    // [n_vecs * N_LANES]
+
+	size_t get_n_values() const {
+		return n_values;
+	}
+	size_t get_n_vecs() const {
+		return utils::get_n_vecs_from_size(n_values);
+	}
+
+	device::CROSSRLEExtendedColumn<T> copy_to_device() const {
+		const size_t n_vecs = get_n_vecs();
+
+		return device::CROSSRLEExtendedColumn<T> {
+		    n_values,
+		    n_vecs,
+		    n_lane_runs,
+		    GPUArray<size_t>(n_vecs + 1, lane_runs_offsets).release(),
+		    GPUArray<UINT_T>(n_lane_runs, lane_values).release(),
+		    GPUArray<uint16_t>(n_lane_runs, lane_lengths).release(),
+		    GPUArray<uint32_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts).release(),
+		};
+	}
+};
+
+template <typename T>
+struct CROSSRLELaneMaskColumn {
+
+	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using DeviceColumnT = typename device::CROSSRLELaneMaskColumn<T>;
+
+	size_t n_values;
+
+	size_t    n_lane_runs;        // total runs across all (vec,lane)
+	uint32_t* lane_run_base;      // [n_vecs*N_LANES + 1]  CSR base
+	UINT_T*   lane_run_values;    // [n_lane_runs]
+	uint64_t* lane_boundary_mask; // [n_vecs*N_LANES] bit k=1 => new run begins at k
+
+	size_t get_n_values() const {
+		return n_values;
+	}
+	size_t get_n_vecs() const {
+		return utils::get_n_vecs_from_size(n_values);
+	}
+
+	device::CROSSRLELaneMaskColumn<T> copy_to_device() const {
+		const size_t n_vecs     = get_n_vecs();
+		const size_t total_runs = n_vecs * utils::get_n_lanes<T>();
+		return device::CROSSRLELaneMaskColumn<T> {
+		    get_n_values(),
+		    n_vecs,
+		    n_lane_runs,
+		    GPUArray<uint32_t>(total_runs + 1, lane_run_base).release(),
+		    GPUArray<UINT_T>(n_lane_runs, lane_run_values).release(),
+		    GPUArray<uint64_t>(total_runs, lane_boundary_mask).release(),
+		};
+	}
+};
+
+template <typename T>
 struct CROSSRLEColumn {
 	using UINT_T        = typename utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::CROSSRLEColumn<T>;
@@ -230,6 +326,295 @@ struct CROSSRLEColumn {
 		    GPUArray<uint32_t>(n_vecs + 1, offsets).release(),
 		    GPUArray<uint32_t>(n_runs, run_positions).release(),
 		};
+	}
+
+	CROSSRLELaneMaskColumn<T> create_lane_mask_column() const {
+		constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
+		constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
+		constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+
+		static_assert(VALUES_PER_LANE <= 64, "lane_boundary_mask uses uint64_t; extend if >64");
+		static_assert(VEC_VALUES == N_LANES * VALUES_PER_LANE, "expect VALUES_PER_VECTOR == N_LANES*VALUES_PER_LANE");
+
+		const size_t n_vecs   = get_n_vecs();
+		const size_t n_blocks = n_vecs * (size_t)N_LANES;
+
+		// 第一遍：统计 run_cnt 并生成 CSR base
+		auto* lane_run_cnt       = new uint16_t[n_blocks];
+		auto* lane_run_base      = new uint32_t[n_blocks + 1];
+		auto* lane_boundary_mask = new uint64_t[n_blocks];
+
+		for (size_t i = 0; i < n_blocks; ++i) {
+			lane_run_cnt[i]       = 0;
+			lane_boundary_mask[i] = 0ull;
+		}
+
+		for (size_t vec = 0; vec < n_vecs; ++vec) {
+			UINT_T tmp[VEC_VALUES];
+#pragma unroll
+			for (uint32_t i = 0; i < VEC_VALUES; ++i)
+				tmp[i] = (UINT_T)0;
+
+			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
+			const uint32_t r0       = offsets[vec];
+			const uint32_t r1       = offsets[vec + 1];
+
+			for (uint32_t r = r0; r < r1; ++r) {
+				const uint32_t run_start_g = run_positions[r];
+				const uint32_t run_len     = lengths[r];
+
+				if (run_start_g + run_len <= vec_base)
+					continue;
+				if (run_start_g >= vec_base + VEC_VALUES)
+					continue;
+
+				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
+				uint32_t local_end   = run_start_g + run_len - vec_base;
+				if (local_end > VEC_VALUES)
+					local_end = VEC_VALUES;
+
+				const UINT_T v = values[r];
+				for (uint32_t p = local_start; p < local_end; ++p)
+					tmp[p] = v;
+			}
+
+			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
+				uint64_t mask    = 0ull;
+				UINT_T   prev    = tmp[lane];
+				uint16_t run_cnt = 1;
+
+				for (uint32_t k = 1; k < VALUES_PER_LANE; ++k) {
+					const UINT_T   cur     = tmp[lane + k * N_LANES];
+					const uint32_t changed = (cur != prev) ? 1u : 0u;
+
+					// IMPORTANT: k can be >= 32, must shift in 64-bit
+					mask |= (uint64_t(changed) << k);
+
+					run_cnt += (uint16_t)changed;
+					prev = cur;
+				}
+
+				const size_t id        = vec * (size_t)N_LANES + (size_t)lane;
+				lane_boundary_mask[id] = mask;
+				lane_run_cnt[id]       = run_cnt;
+			}
+		}
+
+		lane_run_base[0]    = 0;
+		uint32_t total_runs = 0;
+		for (size_t id = 0; id < n_blocks; ++id) {
+			total_runs += (uint32_t)lane_run_cnt[id];
+			lane_run_base[id + 1] = total_runs;
+		}
+
+		// sencond round: lane_run_values
+		auto* lane_run_values = (total_runs ? new UINT_T[(size_t)total_runs] : nullptr);
+
+		for (size_t vec = 0; vec < n_vecs; ++vec) {
+			UINT_T tmp[VEC_VALUES];
+#pragma unroll
+			for (uint32_t i = 0; i < VEC_VALUES; ++i)
+				tmp[i] = (UINT_T)0;
+
+			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
+			const uint32_t r0       = offsets[vec];
+			const uint32_t r1       = offsets[vec + 1];
+
+			for (uint32_t r = r0; r < r1; ++r) {
+				const uint32_t run_start_g = run_positions[r];
+				const uint32_t run_len     = lengths[r];
+
+				if (run_start_g + run_len <= vec_base)
+					continue;
+				if (run_start_g >= vec_base + VEC_VALUES)
+					continue;
+
+				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
+				uint32_t local_end   = run_start_g + run_len - vec_base;
+				if (local_end > VEC_VALUES)
+					local_end = VEC_VALUES;
+
+				const UINT_T v = values[r];
+				for (uint32_t p = local_start; p < local_end; ++p)
+					tmp[p] = v;
+			}
+
+			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
+				const size_t   id      = vec * (size_t)N_LANES + (size_t)lane;
+				const uint32_t base    = lane_run_base[id];
+				const uint16_t run_cnt = lane_run_cnt[id];
+
+				uint32_t cursor           = base;
+				UINT_T   cur_val          = tmp[lane];
+				lane_run_values[cursor++] = cur_val;
+
+				for (uint32_t k = 1; k < VALUES_PER_LANE; ++k) {
+					const UINT_T v = tmp[lane + k * N_LANES];
+					if (v != cur_val) {
+						cur_val                   = v;
+						lane_run_values[cursor++] = cur_val;
+					}
+				}
+
+				(void)run_cnt;
+			}
+		}
+
+		delete[] lane_run_cnt;
+
+		return CROSSRLELaneMaskColumn<T> {n_values,
+		                                  (size_t)total_runs, // n_lane_runs
+		                                  lane_run_base,
+		                                  lane_run_values,
+		                                  lane_boundary_mask};
+	}
+
+	CROSSRLEExtendedColumn<T> create_extended_column() const {
+		auto [e_lane_runs_offsets, e_values, e_lengths, e_offsets_counts, e_total_runs] =
+		    convert_runs_to_lane_divided_format();
+		return CROSSRLEExtendedColumn<T> {
+		    n_values, e_total_runs, e_lane_runs_offsets, e_values, e_lengths, e_offsets_counts};
+	}
+
+	std::tuple<size_t*, UINT_T*, uint16_t*, uint32_t*, size_t> convert_runs_to_lane_divided_format() const {
+		constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
+		constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
+		constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+
+		const size_t n_vecs = get_n_vecs();
+
+		// count run counts of each (vec,lane), also, count the total vec count
+		auto* lane_run_counts = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * n_vecs * N_LANES));
+		auto* vec_total_runs  = reinterpret_cast<size_t*>(malloc(sizeof(size_t) * n_vecs));
+
+		for (size_t vec = 0; vec < n_vecs; ++vec) {
+
+			UINT_T tmp[VEC_VALUES];
+
+			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
+			const uint32_t r0       = offsets[vec];
+			const uint32_t r1       = offsets[vec + 1];
+
+			for (uint32_t r = r0; r < r1; ++r) {
+				const uint32_t run_start_g = run_positions[r];
+				const uint32_t run_len     = lengths[r];
+
+				if (run_start_g + run_len <= vec_base)
+					continue;
+				if (run_start_g >= vec_base + VEC_VALUES)
+					continue;
+
+				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
+				uint32_t local_end   = run_start_g + run_len - vec_base;
+				if (local_end > VEC_VALUES)
+					local_end = VEC_VALUES;
+
+				const UINT_T v = values[r];
+				for (uint32_t p = local_start; p < local_end; ++p)
+					tmp[p] = v;
+			}
+
+			size_t vec_runs = 0;
+
+			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
+				// k=0..VALUES_PER_LANE-1
+				UINT_T   prev    = tmp[lane];
+				uint16_t run_cnt = 1;
+
+				for (uint32_t k = 1; k < VALUES_PER_LANE; ++k) {
+					const UINT_T cur = tmp[lane + k * N_LANES];
+					run_cnt += (cur != prev);
+					prev = cur;
+				}
+
+				lane_run_counts[vec * N_LANES + lane] = run_cnt;
+				vec_runs += (size_t)run_cnt;
+			}
+
+			vec_total_runs[vec] = vec_runs;
+		}
+
+		// get lane_runs_offsets, and calculate total runs
+		auto*  lane_runs_offsets = reinterpret_cast<size_t*>(malloc(sizeof(size_t) * (n_vecs + 1)));
+		size_t total_runs        = 0;
+		lane_runs_offsets[0]     = 0;
+		for (size_t vec = 0; vec < n_vecs; ++vec) {
+			total_runs += vec_total_runs[vec];
+			lane_runs_offsets[vec + 1] = total_runs;
+		}
+
+		auto* out_values         = reinterpret_cast<UINT_T*>(malloc(sizeof(UINT_T) * total_runs));
+		auto* out_lengths        = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * total_runs));
+		auto* out_offsets_counts = reinterpret_cast<uint32_t*>(malloc(sizeof(uint32_t) * n_vecs * N_LANES));
+
+		// second round: write lane-run stream + offsets_counts
+		for (size_t vec = 0; vec < n_vecs; ++vec) {
+			UINT_T tmp[VEC_VALUES];
+			for (uint32_t i = 0; i < VEC_VALUES; ++i)
+				tmp[i] = (UINT_T)0;
+
+			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
+			const uint32_t r0       = offsets[vec];
+			const uint32_t r1       = offsets[vec + 1];
+
+			for (uint32_t r = r0; r < r1; ++r) {
+				const uint32_t run_start_g = run_positions[r];
+				const uint32_t run_len     = lengths[r];
+
+				if (run_start_g + run_len <= vec_base)
+					continue;
+				if (run_start_g >= vec_base + VEC_VALUES)
+					continue;
+
+				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
+				uint32_t local_end   = run_start_g + run_len - vec_base;
+				if (local_end > VEC_VALUES)
+					local_end = VEC_VALUES;
+
+				const UINT_T v = values[r];
+				for (uint32_t p = local_start; p < local_end; ++p)
+					tmp[p] = v;
+			}
+
+			const size_t vec_out_base = lane_runs_offsets[vec];
+			size_t       cursor       = vec_out_base;
+
+			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
+				const uint16_t run_cnt = lane_run_counts[vec * N_LANES + lane];
+
+				const uint16_t lane_off = (uint16_t)(cursor - vec_out_base);
+
+				// pack: [31:16]=count, [15:0]=offset
+				out_offsets_counts[vec * N_LANES + lane] = (uint32_t(run_cnt) << 16) | uint32_t(lane_off);
+
+				// write RLE of this lane（在 k-space）
+				UINT_T   cur_val = tmp[lane];
+				uint16_t cur_len = 1;
+
+				for (uint32_t k = 1; k < VALUES_PER_LANE; ++k) {
+					const UINT_T v = tmp[lane + k * N_LANES];
+					if (v == cur_val) {
+						++cur_len;
+					} else {
+						out_values[cursor]  = cur_val;
+						out_lengths[cursor] = cur_len;
+						++cursor;
+						cur_val = v;
+						cur_len = 1;
+					}
+				}
+				out_values[cursor]  = cur_val;
+				out_lengths[cursor] = cur_len;
+				++cursor;
+			}
+
+			// if (cursor != lane_runs_offsets[vec + 1]) { /* error */ }
+		}
+
+		free(lane_run_counts);
+		free(vec_total_runs);
+
+		return std::make_tuple(lane_runs_offsets, out_values, out_lengths, out_offsets_counts, total_runs);
 	}
 };
 
@@ -638,6 +1023,21 @@ void free_column(CROSSRLEColumn<T> column) {
 }
 
 template <typename T>
+void free_column(CROSSRLEExtendedColumn<T> column) {
+	delete[] column.lane_runs_offsets;
+	delete[] column.lane_values;
+	delete[] column.lane_lengths;
+	delete[] column.offsets_counts;
+}
+
+template <typename T>
+void free_column(CROSSRLELaneMaskColumn<T> column) {
+	delete[] column.lane_run_base;
+	delete[] column.lane_run_values;
+	delete[] column.lane_boundary_mask;
+}
+
+template <typename T>
 void free_column(ALPColumn<T> column) {
 	free_column(column.ffor);
 	delete[] column.factor_indices;
@@ -704,6 +1104,21 @@ void free_column(device::CROSSRLEColumn<T> column) {
 	free_device_pointer(column.lengths);
 	free_device_pointer(column.run_positions);
 	free_device_pointer(column.offsets);
+}
+
+template <typename T>
+void free_column(device::CROSSRLEExtendedColumn<T> column) {
+	free_device_pointer(column.lane_runs_offsets);
+	free_device_pointer(column.lane_values);
+	free_device_pointer(column.lane_lengths);
+	free_device_pointer(column.offsets_counts);
+}
+
+template <typename T>
+void free_column(device::CROSSRLELaneMaskColumn<T> column) {
+	free_device_pointer(column.lane_run_base);
+	free_device_pointer(column.lane_run_values);
+	free_device_pointer(column.lane_boundary_mask);
 }
 
 template <typename T>

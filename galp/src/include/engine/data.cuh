@@ -395,6 +395,139 @@ T* decompress(const flsgpu::host::CROSSRLEColumn<T> column) {
 }
 
 template <typename T>
+T* decompress(const flsgpu::host::CROSSRLEExtendedColumn<T> column) {
+	using UINT_T = typename flsgpu::host::CROSSRLEExtendedColumn<T>::UINT_T;
+
+	const size_t n_values = column.get_n_values();
+	const size_t n_vecs   = column.get_n_vecs();
+
+	T* out_array = new T[n_values];
+	if (n_values == 0)
+		return out_array;
+
+	constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
+	constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
+	constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		const size_t out_base = vi * (size_t)VEC_VALUES;
+		const size_t vec_n    = std::min<size_t>((size_t)VEC_VALUES, n_values - out_base);
+
+		// global base and end of this vector's lane-run
+		const size_t vec_run_base = column.lane_runs_offsets[vi];
+		const size_t vec_run_end  = column.lane_runs_offsets[vi + 1];
+		const size_t vec_run_len  = vec_run_end - vec_run_base;
+
+		// traverse lane, scatter k-space RLE to vectors
+		for (uint32_t lane = 0; lane < N_LANES; ++lane) {
+			const uint32_t packed   = column.offsets_counts[vi * (size_t)N_LANES + lane];
+			const uint16_t run_cnt  = (uint16_t)(packed >> 16);
+			const uint16_t lane_off = (uint16_t)(packed & 0xFFFFu);
+
+			// sanity: lane_off/run_cnt should be in the range of current vec
+			if ((size_t)lane_off + (size_t)run_cnt > vec_run_len) {
+				throw std::runtime_error("CROSSRLEExtended: lane_off+run_cnt out of vec slice bounds");
+			}
+			if (run_cnt == 0) {
+				throw std::runtime_error("CROSSRLEExtended: run_cnt == 0 (invalid)");
+			}
+
+			const UINT_T*   vals = column.lane_values + vec_run_base + (size_t)lane_off;
+			const uint16_t* lens = column.lane_lengths + vec_run_base + (size_t)lane_off;
+
+			uint32_t k = 0;
+			for (uint16_t r = 0; r < run_cnt; ++r) {
+				const uint32_t run_len = (uint32_t)lens[r];
+				const UINT_T   bits    = vals[r];
+
+				T v;
+				std::memcpy(&v, &bits, sizeof(T));
+
+				// pos = lane + k*N_LANES
+				for (uint32_t t = 0; t < run_len; ++t, ++k) {
+					const uint32_t pos_in_vec = lane + k * N_LANES;
+					if (pos_in_vec < vec_n) {
+						out_array[out_base + pos_in_vec] = v;
+					}
+				}
+			}
+
+			if (k != VALUES_PER_LANE) {
+				throw std::runtime_error("CROSSRLEExtended: sum(lane_lengths) != VALUES_PER_LANE");
+			}
+		}
+	}
+
+	return out_array;
+}
+
+template <typename T>
+T* decompress(const flsgpu::host::CROSSRLELaneMaskColumn<T> column) {
+	using UINT_T = typename flsgpu::host::CROSSRLELaneMaskColumn<T>::UINT_T;
+
+	const size_t n_values = column.n_values;
+	const size_t n_vecs   = column.get_n_vecs();
+
+	T* out_array = new T[n_values];
+	if (n_values == 0)
+		return out_array;
+
+	constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
+	constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
+	constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+
+	static_assert(VALUES_PER_LANE <= 64, "lane_boundary_mask is uint64_t; extend if VALUES_PER_LANE>64");
+	static_assert(VEC_VALUES == N_LANES * VALUES_PER_LANE, "expect VALUES_PER_VECTOR == N_LANES*VALUES_PER_LANE");
+
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		const size_t out_base = vi * (size_t)VEC_VALUES;
+		const size_t vec_n    = std::min<size_t>((size_t)VEC_VALUES, n_values - out_base);
+
+		for (uint32_t lane = 0; lane < N_LANES; ++lane) {
+			const size_t id = vi * (size_t)N_LANES + (size_t)lane;
+
+			const uint32_t base    = column.lane_run_base[id];
+			const uint32_t end     = column.lane_run_base[id + 1];
+			const uint32_t run_cnt = end - base;
+
+			if (run_cnt == 0) {
+				throw std::runtime_error("CROSSRLELaneMask: run_cnt == 0 (invalid)");
+			}
+
+			const uint64_t mask = column.lane_boundary_mask[id];
+
+			// run_cnt should equal popc(mask)+1
+			const uint32_t expected = (uint32_t)__builtin_popcountll((unsigned long long)mask) + 1u;
+			if (expected != run_cnt) {
+				throw std::runtime_error("CROSSRLELaneMask: popc(mask)+1 != run_cnt");
+			}
+
+			const UINT_T* vals = column.lane_run_values + (size_t)base;
+
+			for (uint32_t k = 0; k < VALUES_PER_LANE; ++k) {
+				const uint64_t prefix = (k == 0) ? 0ull : (mask & ((1ull << k) - 1ull));
+				const uint32_t run_id = (uint32_t)__builtin_popcountll((unsigned long long)prefix);
+
+				if (run_id >= run_cnt) {
+					throw std::runtime_error("CROSSRLELaneMask: run_id out of bounds");
+				}
+
+				T            v;
+				const UINT_T bits = vals[run_id];
+				std::memcpy(&v, &bits, sizeof(T));
+
+				const uint32_t pos_in_vec = lane + k * N_LANES;
+				if ((size_t)pos_in_vec < vec_n) {
+					out_array[out_base + (size_t)pos_in_vec] = v;
+				}
+			}
+		}
+	}
+
+	return out_array;
+}
+
+template <typename T>
 T* decompress(const flsgpu::host::FREQColumn<T> column) {
 	const size_t n_values = column.get_n_values();
 	const size_t n_vecs   = column.get_n_vecs();

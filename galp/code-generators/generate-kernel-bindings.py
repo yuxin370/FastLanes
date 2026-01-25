@@ -50,7 +50,9 @@ ENCODINGS = [
     "FREQExtended",
     "DICT",
     "DICTShfl32",
-    "CROSSRLE"
+    "CROSSRLE",
+    "CROSSRLEExtended",
+    "CROSSRLELaneMask",
 ]
 
 UNPACKERS = [
@@ -82,6 +84,8 @@ EXPANDERS = [
     "Stateful",
     "StatefulShuffle",
     "StatefulAdvance",
+    "StatefulExtended",
+    "Branchless"
 ]
 
 MULTI_COLUMN_UNPACKERS = [
@@ -125,6 +129,10 @@ def get_column_t(
         column_t = f"FREQColumn<{data_type}>"
     elif "DICT" in encoding or "DICTShfl32" in encoding:
         column_t = f"DICTColumn<{data_type}>"
+    elif "CROSSRLEExtended" in encoding:
+        column_t = f"CROSSRLEExtendedColumn<{data_type}>"
+    elif "CROSSRLELaneMask" in encoding:
+        column_t = f"CROSSRLELaneMaskColumn<{data_type}>"
     elif "CROSSRLE" in encoding:
         column_t = f"CROSSRLEColumn<{data_type}>"
     return (
@@ -167,6 +175,12 @@ def get_decompressor_type(
         functor = f"DICTShfl32Functor<{data_type}, {n_vec}>"
     elif "DICT" in encoding:
         functor = f"DICTFunctor<{data_type}, {n_vec}>"
+    elif "CROSSRLEExtended" in encoding:
+        expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
+        decompressor_t = "CROSSRLEDecompressor"
+    elif "CROSSRLELaneMask" in encoding:
+        expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
+        decompressor_t = "CROSSRLEDecompressor"
     elif "CROSSRLE" in encoding:
         expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
 
@@ -189,7 +203,7 @@ def get_decompressor_type(
 
     unpacker_t = f"flsgpu::device::BitUnpacker{unpacker}<{data_type}, {n_vec}, {n_val},  flsgpu::device::{functor} {loader_t}>,"
 
-    if "FREQ" in encoding or "FREQExtended" in encoding or "CROSSRLE" in encoding:
+    if "FREQ" in encoding or "FREQExtended" in encoding or "CROSSRLE" in encoding or "CROSSRLEExtended" in encoding or "CROSSRLELaneMask" in encoding:
         unpacker_t = f""
     return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {expander_t} {column_t}>"
 
@@ -226,7 +240,7 @@ def get_if_statement(
         else ", magic_value" if is_query_column else ""
     )
 
-    if encoding == "CROSSRLE":
+    if encoding == "CROSSRLE" or encoding == "CROSSRLEExtended" or encoding == "CROSSRLELaneMask":
         return (
             f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == enums::Expander::{expander} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
             + "{"  # }
@@ -385,7 +399,9 @@ def main(args):
                     ],
                 )
 
-    for encoding in ["CROSSRLE"]:
+    for encoding, expander_per_encoding in zip(
+        ["CROSSRLE", "CROSSRLEExtended","CROSSRLELaneMask"], [EXPANDERS[1:5], EXPANDERS[5:6],EXPANDERS[6:]]
+    ):
         for data_type in ["uint32_t", "uint64_t"]:
             for binding, is_query_column in zip(
                 ["decompress_column"], [False]
@@ -413,7 +429,7 @@ def main(args):
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
-                                for expander in EXPANDERS[1:]
+                                for expander in expander_per_encoding
                             ],
                             is_query_column=is_query_column,
                         )

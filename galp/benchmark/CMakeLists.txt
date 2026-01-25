@@ -28,6 +28,10 @@ set(GALP_GENERATED_BINDINGS_SOURCES
         generated-bindings/dict-uint64_t-decompress_column-bindings.cu
         generated-bindings/crossrle-uint32_t-decompress_column-bindings.cu
         generated-bindings/crossrle-uint64_t-decompress_column-bindings.cu
+        generated-bindings/crossrleextended-uint32_t-decompress_column-bindings.cu
+        generated-bindings/crossrleextended-uint64_t-decompress_column-bindings.cu
+        generated-bindings/crossrlelanemask-uint32_t-decompress_column-bindings.cu
+        generated-bindings/crossrlelanemask-uint64_t-decompress_column-bindings.cu
         # generated-bindings/dictshfl32-uint32_t-decompress_column-bindings.cu
         # generated-bindings/dictshfl32-uint64_t-decompress_column-bindings.cu
 )
