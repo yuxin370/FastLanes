@@ -1302,6 +1302,128 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct PrefetchStatefulCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+private:
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename utils::same_width_int<T>::type;
+
+	si_t      start_index = 0;
+	uint32_t  vec_base[UNPACK_N_VECTORS];
+	UINT_T*   vec_values[UNPACK_N_VECTORS];
+	uint32_t* vec_lengths[UNPACK_N_VECTORS];
+
+	// run count of each vector
+	uint32_t vec_run_count[UNPACK_N_VECTORS];
+
+	// persistent cursor state
+	uint32_t vec_run_index[UNPACK_N_VECTORS];
+	uint32_t vec_run_end[UNPACK_N_VECTORS];
+	UINT_T   vec_run_value[UNPACK_N_VECTORS];
+
+	// --- prefetch/cache next run meta ---
+	uint32_t vec_next_length[UNPACK_N_VECTORS];
+	UINT_T   vec_next_value[UNPACK_N_VECTORS];
+
+	__device__ __forceinline__ void load_next(int      v,
+	                                          uint32_t run_index,
+	                                          uint32_t run_count,
+	                                          const uint32_t* __restrict__ lengths,
+	                                          const UINT_T* __restrict__ values) {
+		const uint32_t ni = run_index + 1u;
+		if (ni < run_count) {
+#if __CUDA_ARCH__ >= 350
+			vec_next_length[v] = __ldg(lengths + ni);
+			vec_next_value[v]  = __ldg(values + ni);
+#else
+			vec_next_length[v] = lengths[ni];
+			vec_next_value[v]  = values[ni];
+#endif
+		}
+	}
+
+public:
+	__device__ __forceinline__ PrefetchStatefulCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	                                                            const vi_t                              vector_index,
+	                                                            const lane_t                            lane) {
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			const auto vec_index = vector_index + (vi_t)v;
+
+			const uint32_t off0 = column.offsets[vec_index];
+			const uint32_t off1 = column.offsets[vec_index + 1];
+
+			vec_values[v]    = column.values + off0;
+			vec_lengths[v]   = column.lengths + off0;
+			vec_run_count[v] = off1 - off0; // >=1
+
+			vec_base[v] = static_cast<uint32_t>(vec_index * consts::VALUES_PER_VECTOR) + (uint32_t)lane;
+
+			// init at first run
+			vec_run_index[v] = 0;
+			vec_run_value[v] = (UINT_T)vec_values[v][0];
+
+			const uint32_t run0_pos = column.run_positions[off0];
+			const uint32_t run0_len = (uint32_t)vec_lengths[v][0];
+			vec_run_end[v]          = run0_pos + run0_len; // end of run0
+
+			// prefetch next run meta
+			load_next(v, 0u, vec_run_count[v], vec_lengths[v], vec_values[v]);
+		}
+	}
+
+	void __device__ __forceinline__ rle_expand(T* out) override {
+		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			const UINT_T* __restrict__ values    = vec_values[v];
+			const uint32_t* __restrict__ lengths = vec_lengths[v];
+			const uint32_t run_count             = vec_run_count[v];
+
+			uint32_t run_index = vec_run_index[v];
+			uint32_t run_end   = vec_run_end[v];
+			UINT_T   value     = vec_run_value[v];
+
+			uint32_t next_len = vec_next_length[v];
+			UINT_T   next_val = vec_next_value[v];
+
+			uint32_t pos = vec_base[v] + (uint32_t)start_index * N_LANES;
+
+			const uint32_t last_pos = pos + (uint32_t)(UNPACK_N_VALUES - 1) * N_LANES;
+
+#pragma unroll
+			for (int i = 0; i < (int)UNPACK_N_VALUES; ++i) {
+				while (pos >= run_end && (run_index + 1u) < run_count) {
+					++run_index;
+
+					// consume prefetched next
+					value = next_val;
+					run_end += next_len; // contiguous runs
+
+					// refresh next
+					load_next(v, run_index, run_count, lengths, values);
+					next_len = vec_next_length[v];
+					next_val = vec_next_value[v];
+				}
+
+				out[v * UNPACK_N_VALUES + i] = (T)value;
+				pos += N_LANES;
+			}
+
+			// store back
+			vec_run_index[v] = run_index;
+			vec_run_end[v]   = run_end;
+			vec_run_value[v] = value;
+
+			vec_next_length[v] = next_len;
+			vec_next_value[v]  = next_val;
+		}
+
+		start_index += UNPACK_N_VALUES;
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct StatefulAdvanceCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
 private:
 	using UINT_T = typename utils::same_width_uint<T>::type;
@@ -1709,6 +1831,84 @@ struct BranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
 				outv[i] = (T)vals[run_id];
 			}
 		}
+		start_k_ += (uint16_t)UNPACK_N_VALUES;
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct PrefetchBranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename utils::same_width_int<T>::type;
+
+	uint16_t start_k_ = 0;
+	lane_t   lane_;
+
+	const UINT_T* lane_vals_[UNPACK_N_VECTORS];
+	uint64_t      lane_mask_[UNPACK_N_VECTORS];
+	uint16_t      lane_run_len_[UNPACK_N_VECTORS]; // the run count of this (vec,lane) (length of the CSR segment)
+
+	__device__ __forceinline__
+	PrefetchBranchlessCROSSRLEExpander(const device::CROSSRLELaneMaskColumn<T> col, vi_t first_vec, lane_t lane)
+	    : lane_(lane) {
+		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			const uint32_t vec = (uint32_t)(first_vec + v);
+			const uint32_t id  = vec * N_LANES + (uint32_t)lane_;
+
+			const uint32_t base = col.lane_run_base[id];
+			const uint32_t end  = col.lane_run_base[id + 1];
+
+			lane_vals_[v]    = col.lane_run_values + base;
+			lane_run_len_[v] = (uint16_t)(end - base); // >=1
+			lane_mask_[v]    = col.lane_boundary_mask[id];
+		}
+	}
+
+	__device__ __forceinline__ void rle_expand(T* __restrict__ out) override {
+		const uint32_t k0 = (uint32_t)start_k_;
+
+#pragma unroll
+		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
+			T* __restrict__ outv            = out + v * UNPACK_N_VALUES;
+			const UINT_T* __restrict__ vals = lane_vals_[v];
+			const uint64_t mask             = lane_mask_[v];
+
+			const uint32_t run_len = (uint32_t)lane_run_len_[v];
+			const uint32_t last    = run_len - 1u; // run_len >= 1
+
+			// run_id: prefix bits in [0..k-1]
+
+			uint32_t run_id = (uint32_t)__popcll(mask & ((1ull << k0) - 1ull));
+
+			// prefetch cur / next
+			UINT_T cur = vals[run_id];
+
+			uint32_t next_id = run_id + 1u;
+			next_id          = (next_id < run_len) ? next_id : last;
+			UINT_T next      = vals[next_id];
+
+#pragma unroll
+			for (uint32_t i = 0; i < (uint32_t)UNPACK_N_VALUES; ++i) {
+				outv[i] = (T)cur;
+
+				// assume that pos < 63 ( VALUES_PER_LANE <= 64 and start_k_ within lane)
+				const uint32_t inc = (uint32_t)((mask >> (k0 + i)) & 1ull);
+
+				// run_id += inc
+				run_id += inc;
+
+				// branchless: if (inc) cur = next;
+				const UINT_T m = (UINT_T)0 - (UINT_T)inc;
+				cur            = (cur & ~m) | (next & m);
+
+				// branchless prefetch-all: update next = vals[min(run_id+1, last)]
+				uint32_t rn = run_id + 1u;
+				rn          = (rn < run_len) ? rn : last;
+				next        = vals[rn];
+			}
+		}
+
 		start_k_ += (uint16_t)UNPACK_N_VALUES;
 	}
 };

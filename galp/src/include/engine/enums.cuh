@@ -58,7 +58,17 @@ enum class Patcher {
 	PrefetchAllBranchless,
 };
 
-enum class Expander { None, Dummy, Stateful, StatefulShuffle, StatefulAdvance, StatefulExtended, Branchless };
+enum class Expander {
+	None,
+	Dummy,
+	Stateful,
+	PrefetchStateful,
+	StatefulShuffle,
+	StatefulAdvance,
+	StatefulExtended,
+	Branchless,
+	PrefetchBranchless
+};
 
 enum class Print {
 	PrintNothing,

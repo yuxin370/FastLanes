@@ -82,10 +82,12 @@ EXPANDERS = [
     "None",
     "Dummy",
     "Stateful",
+    "PrefetchStateful",
     "StatefulShuffle",
     "StatefulAdvance",
     "StatefulExtended",
-    "Branchless"
+    "Branchless",
+    "PrefetchBranchless"
 ]
 
 MULTI_COLUMN_UNPACKERS = [
@@ -400,7 +402,7 @@ def main(args):
                 )
 
     for encoding, expander_per_encoding in zip(
-        ["CROSSRLE", "CROSSRLEExtended","CROSSRLELaneMask"], [EXPANDERS[1:5], EXPANDERS[5:6],EXPANDERS[6:]]
+        ["CROSSRLE", "CROSSRLEExtended","CROSSRLELaneMask"], [EXPANDERS[1:6], EXPANDERS[6:7],EXPANDERS[7:]]
     ):
         for data_type in ["uint32_t", "uint64_t"]:
             for binding, is_query_column in zip(

@@ -27,12 +27,12 @@ static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
 
 struct ProgramParameters {
 	enums::DataType            data_type;
-	enums::Encoding     encoding_type;
+	enums::Encoding            encoding_type;
 	enums::Kernel              kernel;
 	uint32_t                   unpack_n_vecs;
 	uint32_t                   unpack_n_vals;
 	enums::Unpacker            unpacker;
-	enums::Patcher             patcher; 
+	enums::Patcher             patcher;
 	enums::Expander            expander;
 	data::ValueRange<vbw_t>    bit_width_range;
 	data::ValueRange<uint16_t> ec_range;
@@ -47,7 +47,7 @@ struct CLIArgs {
 	std::string kernel;
 	uint32_t    unpack_n_vecs;
 	uint32_t    unpack_n_vals;
-	std::string patcher; 
+	std::string patcher;
 	std::string unpacker;
 	std::string expander;
 	vbw_t       start_vbw;
@@ -66,13 +66,13 @@ struct CLIArgs {
 
 		int32_t argcounter = 0;
 		data_type          = argv[++argcounter];
-		encoding_type   = argv[++argcounter];
+		encoding_type      = argv[++argcounter];
 		kernel             = argv[++argcounter];
 		unpack_n_vecs      = std::stoul(argv[++argcounter]);
 		unpack_n_vals      = std::stoul(argv[++argcounter]);
 		unpacker           = argv[++argcounter];
-		patcher             = argv[++argcounter];
-		expander		   = argv[++argcounter];
+		patcher            = argv[++argcounter];
+		expander           = argv[++argcounter];
 		start_vbw          = std::stoul(argv[++argcounter]);
 		end_vbw            = std::stoul(argv[++argcounter]);
 		start_ec           = std::stoul(argv[++argcounter]);
@@ -85,13 +85,13 @@ struct CLIArgs {
 	ProgramParameters parse() {
 		return ProgramParameters {
 		    enums::string_to_data_type(data_type),
-			enums::string_to_encoding(encoding_type),
+		    enums::string_to_encoding(encoding_type),
 		    enums::string_to_kernel(kernel),
 		    unpack_n_vecs,
 		    unpack_n_vals,
 		    enums::string_to_unpacker(unpacker),
-		    enums::string_to_patcher(patcher) ,
-			enums::string_to_expander(expander),
+		    enums::string_to_patcher(patcher),
+		    enums::string_to_expander(expander),
 		    data::ValueRange<vbw_t>(start_vbw, end_vbw),
 		    data::ValueRange<uint16_t>(start_ec, end_ec),
 		    n_vecs * consts::VALUES_PER_VECTOR,
@@ -105,17 +105,28 @@ private:
 
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T> decompress_column(const ColumnT column, const ProgramParameters params) {
-	auto     column_device = column.copy_to_device();
-    T* out;
+	auto column_device = column.copy_to_device();
+	T*   out;
 
-	if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTColumn<T>>){
+	if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTColumn<T>>) {
 		bool use_shuffle = column.key_count <= 32;
-        out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher,  params.expander, params.n_samples, use_shuffle);
+		out              = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
+                                                                              params.unpack_n_vecs,
+                                                                              params.unpack_n_vals,
+                                                                              params.unpacker,
+                                                                              params.patcher,
+                                                                              params.expander,
+                                                                              params.n_samples,
+                                                                              use_shuffle);
 	} else {
-        out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-            column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher,  params.expander, params.n_samples);
-    }
+		out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
+		                                                                      params.unpack_n_vecs,
+		                                                                      params.unpack_n_vals,
+		                                                                      params.unpacker,
+		                                                                      params.patcher,
+		                                                                      params.expander,
+		                                                                      params.n_samples);
+	}
 
 	flsgpu::host::free_column(column_device);
 
@@ -135,19 +146,24 @@ verification::ExecutionResult<T> decompress_column_time(const ColumnT column, co
 		                                                                                params.unpack_n_vecs,
 		                                                                                params.unpack_n_vals,
 		                                                                                params.unpacker,
-		                                                                                params.patcher, 
+		                                                                                params.patcher,
 		                                                                                /*n_samples=*/1);
 		CUDA_CHECK(cudaDeviceSynchronize(), "warmup sync");
 		delete[] warm;
 	}
 
-	const T* out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-	    column_device, params.unpack_n_vecs, params.unpack_n_vals, params.unpacker, params.patcher,  params.expander, params.n_samples);
+	const T* out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
+	                                                                               params.unpack_n_vecs,
+	                                                                               params.unpack_n_vals,
+	                                                                               params.unpacker,
+	                                                                               params.patcher,
+	                                                                               params.expander,
+	                                                                               params.n_samples);
 
 	printf("[KERNEL TIME] unpack_vecs=%u unpack_vals=%u patcher= %d n_samples=%u \n",
 	       params.unpack_n_vecs,
 	       params.unpack_n_vals,
-	       (int)params.patcher, 
+	       (int)params.patcher,
 	       params.n_samples);
 
 	flsgpu::host::free_column(column_device);
@@ -165,7 +181,7 @@ query_column(const ColumnT column, const ProgramParameters params, const bool qu
                                                                                    params.unpack_n_vecs,
                                                                                    params.unpack_n_vals,
                                                                                    params.unpacker,
-                                                                                   params.patcher, 
+                                                                                   params.patcher,
                                                                                    magic_value,
                                                                                    params.n_samples);
 	flsgpu::host::free_column(column_device);
@@ -189,7 +205,7 @@ query_multi_column(const ColumnT column, const ProgramParameters params, const b
 	                                                             params.unpack_n_vecs,
 	                                                             params.unpack_n_vals,
 	                                                             params.unpacker,
-	                                                             params.patcher, 
+	                                                             params.patcher,
 	                                                             magic_value,
 	                                                             params.n_samples);
 	T          a      = query_result ? 1.0 : 0.0;
@@ -210,8 +226,8 @@ execute_kernel(const ColumnT column, const ProgramParameters params, const bool 
 		return decompress_column<T, ColumnT>(column, params);
 	} else if (params.kernel == enums::Kernel::Query) {
 		return query_column<T, ColumnT>(column, params, query_result, magic_value);
-	// } else if (params.kernel == enums::Kernel::QueryMultiColumn) {
-	// 	return query_multi_column<T, ColumnT>(column, params, query_result, magic_value);
+		// } else if (params.kernel == enums::Kernel::QueryMultiColumn) {
+		// 	return query_multi_column<T, ColumnT>(column, params, query_result, magic_value);
 	} else {
 		throw std::invalid_argument("Kernel not implemented yet.\n");
 	}
@@ -282,8 +298,8 @@ std::vector<verification::ExecutionResult<T>> execute_alp(const ProgramParameter
 				magic_value  = _magic_value;
 			}
 
-			if (params.patcher  == enums::Patcher::Dummy || params.patcher  == enums::Patcher::Stateless ||
-			    params.patcher  == enums::Patcher::Stateful) {
+			if (params.patcher == enums::Patcher::Dummy || params.patcher == enums::Patcher::Stateless ||
+			    params.patcher == enums::Patcher::Stateful) {
 				results.push_back(
 				    execute_kernel<T, flsgpu::host::ALPColumn<T>>(column, params, query_result, magic_value));
 			} else {
@@ -323,8 +339,8 @@ std::vector<verification::ExecutionResult<T>> execute_freq(const ProgramParamete
 				throw std::invalid_argument("Query kernel not supported for FREQ columns.\n");
 			}
 
-			if (params.patcher  == enums::Patcher::Dummy || params.patcher  == enums::Patcher::Stateless ||
-			    params.patcher  == enums::Patcher::Stateful) {
+			if (params.patcher == enums::Patcher::Dummy || params.patcher == enums::Patcher::Stateless ||
+			    params.patcher == enums::Patcher::Stateful) {
 				results.push_back(
 				    execute_kernel<T, flsgpu::host::FREQColumn<T>>(column, params, query_result, magic_value));
 			} else {
@@ -358,13 +374,11 @@ std::vector<verification::ExecutionResult<T>> execute_dict(const ProgramParamete
 
 		flsgpu::host::DICTColumn<T> column;
 
-		column = data::columns::generate_random_dict_column<T>(
-			params.n_values, vbw, 20);
+		column = data::columns::generate_random_dict_column<T>(params.n_values, vbw, 20);
 
 		results.push_back(execute_kernel<T, flsgpu::host::DICTColumn<T>>(column, params, query_result, magic_value));
 
 		flsgpu::host::free_column(column);
-
 	}
 
 	return results;
@@ -376,7 +390,6 @@ std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramPar
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	auto results = std::vector<verification::ExecutionResult<T>>();
 
-
 	if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
 		throw std::invalid_argument("QueryMultiColumn/Query not supported for CROSS RLE columns.\n");
 	}
@@ -387,21 +400,23 @@ std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramPar
 
 		flsgpu::host::CROSSRLEColumn<T> column;
 
-		column = data::columns::generate_cross_rle_column<T>(
-			params.n_values, vbw, 20);
+		column = data::columns::generate_cross_rle_column<T>(params.n_values, vbw, 20);
 
-		if(params.expander == enums::Expander::StatefulExtended){
+		if (params.expander == enums::Expander::StatefulExtended) {
 			auto column_extended = column.create_extended_column();
-			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEExtendedColumn<T>>(column_extended, params, query_result, magic_value));
-		}else if(params.expander == enums::Expander::Branchless){
+			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEExtendedColumn<T>>(
+			    column_extended, params, query_result, magic_value));
+		} else if (params.expander == enums::Expander::Branchless || params.expander ==
+		               enums::Expander::PrefetchBranchless) {
 			auto column_lane_mask = column.create_lane_mask_column();
-			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLELaneMaskColumn<T>>(column_lane_mask, params, query_result, magic_value));
-		}else{
-			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEColumn<T>>(column, params, query_result, magic_value));
+			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLELaneMaskColumn<T>>(
+			    column_lane_mask, params, query_result, magic_value));
+		} else {
+			results.push_back(
+			    execute_kernel<T, flsgpu::host::CROSSRLEColumn<T>>(column, params, query_result, magic_value));
 		}
 
 		flsgpu::host::free_column(column);
-
 	}
 
 	return results;
@@ -418,84 +433,83 @@ Usage:
   <n_vecs> <n_samples> <print_debug>
 */
 
-
 template <class T>
 static int32_t run_by_encoding_type(const ProgramParameters& params, bool print_debug) {
-    switch (params.encoding_type) {
-    case enums::Encoding::DICTIONARY:
-        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
-        	return verification::process_results(execute_dict<T>(params), print_debug);
-        } else {
+	switch (params.encoding_type) {
+	case enums::Encoding::DICTIONARY:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_dict<T>(params), print_debug);
+		} else {
 			std::cerr << "[error] dictionary only supports u32/u64.\n";
 			return 1;
 		}
-    case enums::Encoding::FREQUENCY:
-        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
-        return verification::process_results(execute_freq<T>(params), print_debug);
-        } else {
+	case enums::Encoding::FREQUENCY:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_freq<T>(params), print_debug);
+		} else {
 			std::cerr << "[error] frequency only supports u32/u64.\n";
 			return 1;
 		}
-    case enums::Encoding::CROSS_RLE:
-	
-        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
-        return verification::process_results(execute_cross_rle<T>(params), print_debug);
-        } else {
+	case enums::Encoding::CROSS_RLE:
+
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_cross_rle<T>(params), print_debug);
+		} else {
 			std::cerr << "[error] cross rle only supports u32/u64.\n";
 			return 1;
 		}
-    case enums::Encoding::FFOR:
-        if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
-	        return verification::process_results(execute_ffor<T>(params), print_debug);
-        } else {
+	case enums::Encoding::FFOR:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_ffor<T>(params), print_debug);
+		} else {
 			std::cerr << "[error] ffor only supports u32/u64.\n";
 			return 1;
 		}
 
-    case enums::Encoding::ALP:
-        if constexpr (std::is_same_v<T, float>) {
-            return verification::process_results(execute_alp<float>(params), print_debug);
-        } else if constexpr (std::is_same_v<T, double>) {
-            return verification::process_results(execute_alp<double>(params), print_debug);
-        } else {
-            std::cerr << "[error] alp only supports f32/f64.\n";
-            return 1;
-        }
-    }
+	case enums::Encoding::ALP:
+		if constexpr (std::is_same_v<T, float>) {
+			return verification::process_results(execute_alp<float>(params), print_debug);
+		} else if constexpr (std::is_same_v<T, double>) {
+			return verification::process_results(execute_alp<double>(params), print_debug);
+		} else {
+			std::cerr << "[error] alp only supports f32/f64.\n";
+			return 1;
+		}
+	}
 
-    std::cerr << "[error] unknown encoding type.\n";
-    return 1;
+	std::cerr << "[error] unknown encoding type.\n";
+	return 1;
 }
 
 int main(int argc, char** argv) {
-    CLIArgs args(argc, argv);
-    ProgramParameters params = args.parse();
+	CLIArgs           args(argc, argv);
+	ProgramParameters params = args.parse();
 
-    bool print_debug = params.print_option != enums::Print::PrintNothing;
+	bool print_debug = params.print_option != enums::Print::PrintNothing;
 
-    int32_t exit_code = 0;
-    switch (params.data_type) {
-    case enums::DataType::U32:
-        exit_code = run_by_encoding_type<uint32_t>(params, print_debug);
-        break;
-    case enums::DataType::U64:
-        exit_code = run_by_encoding_type<uint64_t>(params, print_debug);
-        break;
-    case enums::DataType::F32:
-        exit_code = run_by_encoding_type<float>(params, print_debug);
-        break;
-    case enums::DataType::F64:
-        exit_code = run_by_encoding_type<double>(params, print_debug);
-        break;
-    default:
-        std::cerr << "[error] unknown data type.\n";
-        exit_code = 1;
-        break;
-    }
+	int32_t exit_code = 0;
+	switch (params.data_type) {
+	case enums::DataType::U32:
+		exit_code = run_by_encoding_type<uint32_t>(params, print_debug);
+		break;
+	case enums::DataType::U64:
+		exit_code = run_by_encoding_type<uint64_t>(params, print_debug);
+		break;
+	case enums::DataType::F32:
+		exit_code = run_by_encoding_type<float>(params, print_debug);
+		break;
+	case enums::DataType::F64:
+		exit_code = run_by_encoding_type<double>(params, print_debug);
+		break;
+	default:
+		std::cerr << "[error] unknown data type.\n";
+		exit_code = 1;
+		break;
+	}
 
-    if (params.print_option == enums::Print::PrintDebugExit0) {
-        std::exit(0);
-    }
+	if (params.print_option == enums::Print::PrintDebugExit0) {
+		std::exit(0);
+	}
 
-    std::exit(exit_code);
+	std::exit(exit_code);
 }

@@ -13,6 +13,17 @@ build-support/boost_*
 # Build directories created by Clion
 cmake-build-*/
 
+#test 
+python/tests/
+data/
+build*/
+galp/benchmark/generated-bindings-tp/
+galp/benchmark/generated-bindings-original/
+scripts/my_tool/*_result
+*.all
+*.ncu-rep
+*.nsys-rep
+*.sqlite
 #########################################
 # Editor temporary/working/backup files #
 .#*
