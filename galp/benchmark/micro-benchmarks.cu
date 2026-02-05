@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <chrono>
 
 static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
 	if (e != cudaSuccess) {
@@ -130,7 +131,15 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 
 	flsgpu::host::free_column(column_device);
 
+    // ---- CPU version timing (microseconds) ----
+    const auto cpu_start = std::chrono::steady_clock::now();
 	const T* correct_out = data::bindings::decompress(column);
+    const auto cpu_end   = std::chrono::steady_clock::now();
+
+    const auto cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
+    std::printf("[CPU decompress] %lld us\n", static_cast<long long>(cpu_us));
+    // ------------------------------------------
+	
 	auto     result      = verification::compare_data(correct_out, out, params.n_values);
 	delete correct_out;
 	delete out;
@@ -233,12 +242,43 @@ execute_kernel(const ColumnT column, const ProgramParameters params, const bool 
 	}
 }
 
+
+
+template <typename T>
+std::vector<verification::ExecutionResult<T>> execute_bp(const ProgramParameters params) {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	auto results = std::vector<verification::ExecutionResult<T>>();
+
+	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		printf("processing bitwidth = %d\n",vbw);
+		auto vbw_range = data::ValueRange<vbw_t>(vbw);
+		if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
+			throw std::invalid_argument("QueryMultiColumn not supported for Bit-Packing columns.\n");
+		}
+		bool                        query_result = false;
+		T                           magic_value  = consts::as<T>::MAGIC_NUMBER;
+		flsgpu::host::BPColumn<T> column;
+
+		column = data::columns::generate_random_bp_column<T>(
+		    params.n_values, vbw_range, params.unpack_n_vecs);
+
+		results.push_back(execute_kernel<T, flsgpu::host::BPColumn<T>>(column, params, query_result, magic_value));
+
+		flsgpu::host::free_column(column);
+	}
+
+	return results;
+}
+
+
+
 template <typename T>
 std::vector<verification::ExecutionResult<T>> execute_ffor(const ProgramParameters params) {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	auto results = std::vector<verification::ExecutionResult<T>>();
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		printf("processing bitwidth = %d\n",vbw);
 		auto vbw_range = data::ValueRange<vbw_t>(vbw);
 		if (params.kernel == enums::Kernel::QueryMultiColumn) {
 			vbw_range = params.bit_width_range;
@@ -369,6 +409,7 @@ std::vector<verification::ExecutionResult<T>> execute_dict(const ProgramParamete
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		printf("processing bitwidth = %d\n",vbw);
 		bool query_result = false;
 		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
 
@@ -395,6 +436,7 @@ std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramPar
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		printf("processing bitwidth = %d\n",vbw);
 		bool query_result = false;
 		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
 
@@ -436,6 +478,13 @@ Usage:
 template <class T>
 static int32_t run_by_encoding_type(const ProgramParameters& params, bool print_debug) {
 	switch (params.encoding_type) {
+	case enums::Encoding::BIT_PACKING:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_bp<T>(params), print_debug);
+		} else {
+			std::cerr << "[error] bit_packing only supports u32/u64.\n";
+			return 1;
+		}
 	case enums::Encoding::DICTIONARY:
 		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
 			return verification::process_results(execute_dict<T>(params), print_debug);
