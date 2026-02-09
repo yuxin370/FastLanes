@@ -62,8 +62,10 @@ set_target_properties(generated-bindings PROPERTIES CUDA_SEPARABLE_COMPILATION O
 
 add_executable(compressors-benchmarks compressors-benchmarks.cu nvcomp/benchmark-compressors.cu nvcomp/nvcomp-compressors.cu)
 apply_warnings(compressors-benchmarks)
+target_include_directories(compressors-benchmarks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(compressors-benchmarks PRIVATE galp_core)
 
 add_executable(micro-benchmarks micro-benchmarks.cu nvcomp/benchmark-compressors.cu nvcomp/nvcomp-compressors.cu)
 apply_warnings(micro-benchmarks)
+target_include_directories(micro-benchmarks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(micro-benchmarks PRIVATE galp_core generated-bindings)

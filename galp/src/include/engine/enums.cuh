@@ -6,16 +6,12 @@
 #ifndef ENUMS_CUH
 #define ENUMS_CUH
 
+#include "engine/types.cuh"
 #include <stdexcept>
 #include <string>
 
 namespace enums {
-enum class DataType {
-	U32,
-	U64,
-	F32,
-	F64,
-};
+using DataType = types::DataType;
 
 enum class Kernel {
 	Decompress,
@@ -76,9 +72,9 @@ enum class Print {
 	PrintDebugExit0,
 };
 
-enum class Encoding { ALP, BIT_PACKING, FFOR, FREQUENCY, CROSS_RLE, DICTIONARY };
+enum class Encoding { ALP, BIT_PACKING, FFOR, FREQUENCY, CROSS_RLE, DICTIONARY, SLPATCH, CONSTANT };
 
-DataType    string_to_data_type(const std::string& str);
+types::DataType string_to_data_type(const std::string& str);
 Kernel      string_to_kernel(const std::string& str);
 Unpacker    string_to_unpacker(const std::string& str);
 Patcher     string_to_patcher(const std::string& str);

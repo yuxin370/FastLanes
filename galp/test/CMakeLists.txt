@@ -2,6 +2,7 @@ add_executable(galp_tests
         thrust_memcpy_test.cu
         thrust_core_test.cu
         galp_test.cu
+        reader_test.cu
 )
 
 

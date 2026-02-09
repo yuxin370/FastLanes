@@ -130,7 +130,7 @@ def get_column_t(
     elif "FREQ" in encoding:
         column_t = f"FREQColumn<{data_type}>"
     elif "DICT" in encoding or "DICTShfl32" in encoding:
-        column_t = f"DICTColumn<{data_type}>"
+        column_t = f"DICTFFORColumn<{data_type}>"
     elif "CROSSRLEExtended" in encoding:
         column_t = f"CROSSRLEExtendedColumn<{data_type}>"
     elif "CROSSRLELaneMask" in encoding:

@@ -4,7 +4,7 @@
 // galp/benchmark/nvcomp/benchmark-compressors.cu
 // ────────────────────────────────────────────────────────
 #include "alp/alp-bindings.cuh"
-#include "engine/data.cuh"
+#include "data.cuh"
 #include "engine/device-utils.cuh"
 #include "engine/kernels.cuh"
 #include "flsgpu/flsgpu-api.cuh"

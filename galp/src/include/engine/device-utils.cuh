@@ -6,6 +6,7 @@
 #include "flsgpu/flsgpu-api.cuh"
 #include <algorithm>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 #ifndef GPU_DEVICE_UTILS_CUH
 #define GPU_DEVICE_UTILS_CUH
@@ -104,6 +105,21 @@ using VectorToWarpMapping = OneVectorPerWarpMapping<T, UNPACK_N_VECTORS>;
 template <typename T, unsigned UNPACK_N_VECTORS>
 using VectorToWarpMapping = FillWarpMapping<T, UNPACK_N_VECTORS>;
 #endif
+
+struct WorkItemLaunchConfig {
+	dim3 grid;
+	dim3 block;
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS = 1>
+inline WorkItemLaunchConfig make_workitem_launch_config(const size_t n_items) {
+	using Mapping = ThreadblockMapping<T>;
+	const size_t concurrent =
+	    static_cast<size_t>(Mapping::N_CONCURRENT_VECTORS_PER_BLOCK) * static_cast<size_t>(UNPACK_N_VECTORS);
+	const size_t blocks = std::max<size_t>(1, (n_items + concurrent - 1) / concurrent);
+	return WorkItemLaunchConfig {dim3(static_cast<uint32_t>(blocks)),
+	                             dim3(static_cast<uint32_t>(Mapping::N_THREADS_PER_BLOCK))};
+}
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, unsigned N_LANES>
 __device__ __forceinline__ void write_registers_to_global(const lane_t lane,

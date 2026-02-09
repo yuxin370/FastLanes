@@ -37,8 +37,8 @@ struct FFORFunctor : FunctorBase<T> {
 		}
 	};
 
-	__device__ __forceinline__ UINT_T operator()(const UINT_T value, const vi_t vector_index) override {
-		return value + bases[vector_index];
+	__device__ __forceinline__ T operator()(const UINT_T value, const vi_t vector_index) override {
+		return static_cast<T>(value + bases[vector_index]);
 	}
 };
 
@@ -55,11 +55,43 @@ struct DICTFunctor : FunctorBase<T> {
 			bases[v] = a_bases[v];
 	}
 
-	__device__ __forceinline__ UINT_T operator()(UINT_T value, vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) override {
 		const auto idx = value + bases[vector_index];
 
 		// return __ldg(keys + idx);
-		return keys[idx];
+		return static_cast<T>(keys[idx]);
+	}
+};
+
+template <typename T, typename IndexT, typename KeyT = IndexT>
+struct DICTIndexFunctor {
+	const KeyT* __restrict__ keys;
+	__device__ __forceinline__ DICTIndexFunctor(const KeyT* a_keys)
+	    : keys(a_keys) {
+	}
+
+	__device__ __forceinline__ T operator()(IndexT value, vi_t) {
+		return static_cast<T>(keys[value]);
+	}
+};
+
+template <typename T, typename IndexT, unsigned UNPACK_N_VECTORS>
+struct DICTFunctorIdx {
+	using KEY_T = typename utils::same_width_uint<T>::type;
+	const KEY_T* __restrict__ keys;
+	IndexT bases[UNPACK_N_VECTORS];
+
+	__device__ __forceinline__ DICTFunctorIdx(const IndexT* a_bases, const KEY_T* a_keys)
+	    : keys(a_keys) {
+#pragma unroll
+		for (int v = 0; v < UNPACK_N_VECTORS; ++v) {
+			bases[v] = a_bases[v];
+		}
+	}
+
+	__device__ __forceinline__ T operator()(IndexT value, vi_t vector_index) {
+		const auto idx = static_cast<size_t>(value + bases[vector_index]);
+		return static_cast<T>(keys[idx]);
 	}
 };
 
@@ -85,10 +117,10 @@ struct DICTShfl32Functor : FunctorBase<T> {
 		// __syncwarp();
 	}
 
-	__device__ __forceinline__ UINT_T operator()(UINT_T value, vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) override {
 		// key count must be <= 32
 		const int idx = (int)(value + bases[vector_index]);
-		return __shfl_sync(0xFFFFFFFFu, k_lane, idx);
+		return static_cast<T>(__shfl_sync(0xFFFFFFFFu, k_lane, idx));
 	}
 };
 
@@ -121,14 +153,14 @@ struct DICTAdaptiveFunctor : FunctorBase<T> {
 			bases[v] = a_bases[v];
 	}
 
-	__device__ __forceinline__ UINT_T operator()(UINT_T value, vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) override {
 		const int idx = (int)(value + bases[vector_index]);
 
 		if (use_shuffle) {
-			return __shfl_sync(0xFFFFFFFFu, k_lane, idx);
+			return static_cast<T>(__shfl_sync(0xFFFFFFFFu, k_lane, idx));
 		}
 
-		return keys[idx];
+		return static_cast<T>(keys[idx]);
 	}
 };
 
@@ -708,11 +740,64 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<T> {
 	}
 };
 
+template <typename OutT, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor>
+struct BitUnpackerStatefulBranchlessIdx : BitUnpackerBase<OutT> {
+	using UINT_T = typename utils::same_width_uint<IndexT>::type;
+	OutputProcessor processor;
+
+	const UINT_T* in;
+	const int32_t vector_offset;
+	const vbw_t   value_bit_width;
+
+	int32_t offset_first = 0;
+	UINT_T  value_mask;
+
+	__device__ __forceinline__ BitUnpackerStatefulBranchlessIdx(const UINT_T* __restrict a_in,
+	                                                            const lane_t    lane,
+	                                                            const vbw_t     value_bit_width,
+	                                                            OutputProcessor processor)
+	    : in(a_in + lane)
+	    , vector_offset(utils::get_compressed_vector_size<IndexT>(value_bit_width))
+	    , value_bit_width(value_bit_width)
+	    , value_mask(utils::set_first_n_bits<UINT_T>(value_bit_width))
+	    , processor(processor) {
+	}
+
+	__device__ __forceinline__ void unpack_next_into(OutT* __restrict out) override {
+		constexpr int32_t N_LANES        = utils::get_n_lanes<UINT_T>();
+		constexpr int32_t BIT_COUNT      = utils::sizeof_in_bits<IndexT>();
+		constexpr int32_t LANE_BIT_WIDTH = utils::get_lane_bitwidth<UINT_T>();
+
+#pragma unroll
+		for (int32_t i {0}; i < UNPACK_N_VALUES; i++) {
+			const auto offset_second = BIT_COUNT - offset_first;
+
+#pragma unroll
+			for (int32_t v {0}; v < UNPACK_N_VECTORS; v++) {
+				const auto v_in = in + v * vector_offset;
+				const auto raw  = ((v_in[0] >> offset_first) & value_mask) |
+				                 ((v_in[N_LANES] & (value_mask >> offset_second)) << offset_second);
+				out[UNPACK_N_VALUES * v + i] = processor(static_cast<IndexT>(raw), v);
+			}
+
+			in += (offset_second <= value_bit_width) * N_LANES;
+			offset_first = (offset_first + value_bit_width) % LANE_BIT_WIDTH;
+		}
+	}
+};
+
 template <typename T>
 struct FREQExceptionPatcherBase {
 public:
 	__device__ __forceinline__ virtual void fill_and_patch(T* out) = 0;
 	__device__ virtual ~FREQExceptionPatcherBase()                 = default;
+};
+
+template <typename T>
+struct SLPATCHExceptionPatcherBase {
+public:
+	__device__ __forceinline__ virtual void patch(T* out) = 0;
+	__device__ virtual ~SLPATCHExceptionPatcherBase()     = default;
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
@@ -852,6 +937,112 @@ public:
 			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
 			frequent_value[v]           = column.frequent_value[vec_index];
+		}
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct StatefulSLPATCHExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
+	using INT_T = typename utils::same_width_int<T>::type;
+
+	si_t         start_index = 0;
+	uint16_t     exceptions_count[UNPACK_N_VECTORS];
+	uint16_t*    vec_exceptions_positions[UNPACK_N_VECTORS];
+	T*           vec_exceptions[UNPACK_N_VECTORS];
+	const lane_t lane;
+	int32_t      exception_index[UNPACK_N_VECTORS] = {0};
+
+public:
+	void __device__ __forceinline__ patch(T* out) override {
+		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+
+		const int first_pos = start_index * N_LANES + lane;
+		const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
+		start_index += UNPACK_N_VALUES;
+
+		// patch exceptions
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			for (; exception_index[v] < exceptions_count[v]; exception_index[v]++) {
+				auto position  = vec_exceptions_positions[v][exception_index[v]];
+				auto exception = vec_exceptions[v][exception_index[v]];
+				if (position >= first_pos) {
+					if (position <= last_pos && position % N_LANES == lane) {
+						out[(position - first_pos) / N_LANES + v * UNPACK_N_VALUES] = exception;
+					}
+					if (position + 1 > last_pos) {
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	__device__ __forceinline__
+	StatefulSLPATCHExceptionPatcher(const SLPATCHColumn<T> column, const vi_t first_vector_index, const lane_t lane)
+	    : lane(lane) {
+
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			auto vec_index              = first_vector_index + v;
+			exceptions_count[v]         = column.counts[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
+			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
+		}
+	}
+};
+
+template <typename T, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct StatefulSLPATCHDictExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
+	using INT_T = typename utils::same_width_int<T>::type;
+	using KEY_T = typename utils::same_width_uint<T>::type;
+
+	si_t                        start_index = 0;
+	uint16_t                    exceptions_count[UNPACK_N_VECTORS];
+	uint16_t*                   vec_exceptions_positions[UNPACK_N_VECTORS];
+	IndexT*                     vec_exceptions[UNPACK_N_VECTORS];
+	DICTIndexFunctor<T, IndexT, KEY_T> processor;
+	const lane_t                lane;
+	int32_t                     exception_index[UNPACK_N_VECTORS] = {0};
+
+public:
+	void __device__ __forceinline__ patch(T* out) override {
+		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+
+		const int first_pos = start_index * N_LANES + lane;
+		const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
+		start_index += UNPACK_N_VALUES;
+
+		// patch exceptions with mapped dictionary values
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			for (; exception_index[v] < exceptions_count[v]; exception_index[v]++) {
+				auto position  = vec_exceptions_positions[v][exception_index[v]];
+				auto exception = vec_exceptions[v][exception_index[v]];
+				if (position >= first_pos) {
+					if (position <= last_pos && position % N_LANES == lane) {
+						out[(position - first_pos) / N_LANES + v * UNPACK_N_VALUES] = processor(exception, v);
+					}
+					if (position + 1 > last_pos) {
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	__device__ __forceinline__ StatefulSLPATCHDictExceptionPatcher(const DICTSLPATCHColumn<T, IndexT> column,
+	                                                               const vi_t                 first_vector_index,
+	                                                               const lane_t               lane)
+	    : processor(column.keys)
+	    , lane(lane) {
+
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			auto vec_index              = first_vector_index + v;
+			exceptions_count[v]         = column.index.counts[vec_index];
+			vec_exceptions_positions[v] = column.index.positions + column.index.exceptions_offsets[vec_index];
+			vec_exceptions[v]           = column.index.exceptions + column.index.exceptions_offsets[vec_index];
 		}
 	}
 };
@@ -1943,11 +2134,29 @@ struct FFORDecompressor : DecompressorBase<T> {
 	}
 };
 
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename ColumnT>
+struct CONSTANTDecompressor : DecompressorBase<T> {
+	T value;
+	__device__ __forceinline__ CONSTANTDecompressor(const ColumnT column,
+	                                                [[maybe_unused]] const vi_t vector_index,
+	                                                [[maybe_unused]] const lane_t lane)
+	    : value(column.value) {
+	}
+
+	void __device__ unpack_next_into(T* __restrict out) {
+		constexpr unsigned kCount = UNPACK_N_VECTORS * UNPACK_N_VALUES;
+		#pragma unroll
+		for (unsigned i = 0; i < kCount; ++i) {
+			out[i] = value;
+		}
+	}
+};
+
 template <typename T, unsigned UNPACK_N_VECTORS, typename PatcherT, typename ColumnT>
 struct FREQDecompressor : DecompressorBase<T> {
 	PatcherT                   patcher;
 	__device__ __forceinline__ FREQDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
-	    : patcher(PatcherT(column, vector_index, lane)) {
+	    : patcher(column, vector_index, lane) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
@@ -1955,27 +2164,128 @@ struct FREQDecompressor : DecompressorBase<T> {
 	}
 };
 
-template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
-struct DICTDecompressor : DecompressorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename PatcherT, typename ColumnT>
+struct SLPATCHDecompressor : DecompressorBase<T> {
+	PatcherT                   patcher;
 	UnpackerT                  unpacker;
-	__device__ __forceinline__ DICTDecompressor(const DICTColumn<T> column, const vi_t vector_index, const lane_t lane)
+	__device__ __forceinline__ SLPATCHDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
+	    : patcher(column, vector_index, lane)
+	    , unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	               lane,
+	               column.ffor.bp.bit_widths[vector_index],
+	               FFORFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index)) {
+	}
+
+	void __device__ unpack_next_into(T* __restrict out) {
+		unpacker.unpack_next_into(out);
+		patcher.patch(out);
+	}
+};
+
+template <typename T,
+          typename IndexT,
+          unsigned UNPACK_N_VECTORS,
+          unsigned UNPACK_N_VALUES,
+          typename UnpackerT,
+          typename ColumnT>
+struct RLEDecompressor : DecompressorBase<T> {
+	UnpackerT unpacker;
+
+	const T*      rle_values;
+	const size_t* rle_offsets;
+	const IndexT* rsum_bases;
+	IndexT        prefix[UNPACK_N_VECTORS];
+	const vi_t    base_vector_index;
+	const int32_t n_lanes;
+
+	__device__ __forceinline__ RLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,
 	               column.ffor.bp.bit_widths[vector_index],
-	               DICTFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index,
-	                                                column.keys)) { // column.keys at global memory
+	               FFORFunctor<IndexT, UNPACK_N_VECTORS>(column.ffor.bases + vector_index))
+	    , rle_values(column.rle_values)
+	    , rle_offsets(column.rle_offsets)
+	    , rsum_bases(column.rsum_bases)
+	    , base_vector_index(vector_index)
+	    , n_lanes(utils::get_n_lanes<IndexT>()) {
+#pragma unroll
+		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
+			const IndexT* base_ptr = rsum_bases + (vector_index + v) * n_lanes;
+			prefix[v]              = base_ptr[lane];
+		}
+	}
+
+	void __device__ unpack_next_into(T* __restrict out) {
+		IndexT deltas[UNPACK_N_VALUES * UNPACK_N_VECTORS];
+		unpacker.unpack_next_into(deltas);
+
+#pragma unroll
+		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
+			const size_t base_offset = rle_offsets[base_vector_index + v];
+			IndexT       cur         = prefix[v];
+
+#pragma unroll
+			for (unsigned i = 0; i < UNPACK_N_VALUES; ++i) {
+				cur += deltas[i + v * UNPACK_N_VALUES];
+				out[i + v * UNPACK_N_VALUES] = rle_values[base_offset + static_cast<size_t>(cur)];
+			}
+			prefix[v] = cur;
+		}
+	}
+};
+
+template <typename T,
+          unsigned UNPACK_N_VECTORS,
+          unsigned UNPACK_N_VALUES,
+          typename UnpackerT,
+          typename PatcherT,
+          typename ColumnT,
+          typename ProcessorT = DICTFunctor<T, UNPACK_N_VECTORS>>
+struct DICTSLPATCHDecompressor : DecompressorBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	PatcherT  patcher;
+	UnpackerT unpacker;
+
+	__device__ __forceinline__ DICTSLPATCHDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
+	    : patcher(column, vector_index, lane)
+	    , unpacker(column.index.ffor.bp.packed_array + column.index.ffor.bp.vector_offsets[vector_index],
+	               lane,
+	               column.index.ffor.bp.bit_widths[vector_index],
+	               ProcessorT(column.index.ffor.bases + vector_index, column.keys)) {
+	}
+
+	void __device__ unpack_next_into(T* __restrict out) {
+		unpacker.unpack_next_into(out);
+		patcher.patch(out);
+	}
+};
+
+template <typename T,
+          unsigned UNPACK_N_VECTORS,
+          typename UnpackerT,
+          typename ColumnT,
+          typename ProcessorT = DICTFunctor<T, UNPACK_N_VECTORS>>
+struct DICTDecompressor : DecompressorBase<T> {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	UnpackerT unpacker;
+	__device__ __forceinline__
+	DICTDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
+	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	               lane,
+	               column.ffor.bp.bit_widths[vector_index],
+	               ProcessorT(column.ffor.bases + vector_index,
+	                          column.keys)) { // column.keys at global memory
 	}
 
 	// outer key pointer, which may points to shared memory
-	__device__ __forceinline__ DICTDecompressor(const DICTColumn<T> column,
-	                                            const vi_t          vector_index,
-	                                            const lane_t        lane,
-	                                            const UINT_T* __restrict keys_ptr)
+	__device__ __forceinline__ DICTDecompressor(const ColumnT column,
+	                                            const vi_t              vector_index,
+	                                            const lane_t            lane,
+	                                            const typename ColumnT::KEY_T* __restrict keys_ptr)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,
 	               column.ffor.bp.bit_widths[vector_index],
-	               DICTFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index, keys_ptr)) {
+	               ProcessorT(column.ffor.bases + vector_index, keys_ptr)) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
@@ -1989,7 +2299,7 @@ struct DICTShfl32Decompressor : DecompressorBase<T> {
 	UnpackerT unpacker;
 
 	__device__ __forceinline__
-	DICTShfl32Decompressor(const DICTColumn<T> column, const vi_t vector_index, const lane_t lane)
+	DICTShfl32Decompressor(const DICTFFORColumn<T> column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,
 	               column.ffor.bp.bit_widths[vector_index],
@@ -2006,7 +2316,7 @@ struct CROSSRLEDecompressor : DecompressorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	ExpanderT                  expander;
 	__device__ __forceinline__ CROSSRLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
-	    : expander(ExpanderT(column, vector_index, lane)) {
+	    : expander(column, vector_index, lane) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {

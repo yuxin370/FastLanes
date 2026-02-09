@@ -1,6 +1,8 @@
 set(GALP_CORE_SOURCES
         alp/alp-bindings.cu
         engine/enums.cu
+        engine/dispatch.cu
+        engine/expression.cu
 )
 add_library(galp_core STATIC ${GALP_CORE_SOURCES})
 target_compile_options(galp_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr>)

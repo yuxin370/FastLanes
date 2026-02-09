@@ -3,7 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/benchmark/micro-benchmarks.cu
 // ────────────────────────────────────────────────────────
-#include "engine/data.cuh"
+#include "data.cuh"
 #include "engine/enums.cuh"
 #include "engine/kernels.cuh"
 #include "engine/verification.cuh"
@@ -109,7 +109,7 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 	auto column_device = column.copy_to_device();
 	T*   out;
 
-	if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTColumn<T>>) {
+	if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTFFORColumn<T>>) {
 		bool use_shuffle = column.key_count <= 32;
 		out              = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
                                                                               params.unpack_n_vecs,
@@ -413,11 +413,11 @@ std::vector<verification::ExecutionResult<T>> execute_dict(const ProgramParamete
 		bool query_result = false;
 		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
 
-		flsgpu::host::DICTColumn<T> column;
+		flsgpu::host::DICTFFORColumn<T> column;
 
 		column = data::columns::generate_random_dict_column<T>(params.n_values, vbw, 20);
 
-		results.push_back(execute_kernel<T, flsgpu::host::DICTColumn<T>>(column, params, query_result, magic_value));
+		results.push_back(execute_kernel<T, flsgpu::host::DICTFFORColumn<T>>(column, params, query_result, magic_value));
 
 		flsgpu::host::free_column(column);
 	}

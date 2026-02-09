@@ -7,20 +7,8 @@
 #include <unordered_map>
 
 namespace enums {
-DataType string_to_data_type(const std::string& str) {
-	static const std::unordered_map<std::string, DataType> mapping = {
-	    {"u32", DataType::U32},
-	    {"u64", DataType::U64},
-	    {"f32", DataType::F32},
-	    {"f64", DataType::F64},
-	};
-
-	auto it = mapping.find(str);
-	if (it != mapping.end()) {
-		return it->second;
-	}
-
-	throw std::invalid_argument("Unknown kernel type: " + str);
+types::DataType string_to_data_type(const std::string& str) {
+	return types::string_to_data_type(str);
 }
 
 Kernel string_to_kernel(const std::string& str) {
@@ -121,6 +109,8 @@ Encoding string_to_encoding(const std::string& str) {
 		{"frequency", Encoding::FREQUENCY},
 		{"cross-rle", Encoding::CROSS_RLE},
 		{"dictionary", Encoding::DICTIONARY},
+		{"slpatch", Encoding::SLPATCH},
+		{"constant", Encoding::CONSTANT},
 	};
 
 	auto it = mapping.find(str);
@@ -145,6 +135,10 @@ std::string encoding_to_string(const Encoding type) {
 		return "cross-rle";
 	case Encoding::DICTIONARY:
 		return "dictionary";
+	case Encoding::SLPATCH:
+		return "slpatch";
+	case Encoding::CONSTANT:
+		return "constant";
 	default:
 		throw std::invalid_argument("Could not parse encoding");
 	}

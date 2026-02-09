@@ -1,7 +1,7 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/src/include/engine/data.cuh
+// galp/benchmark/include/data.cuh
 // ────────────────────────────────────────────────────────
 #ifndef DATA_CUH
 #define DATA_CUH
@@ -330,14 +330,14 @@ T* decompress(const flsgpu::host::ALPExtendedColumn<T> column) {
 	return alp::decode(column, new T[column.get_n_values()]);
 }
 
-template <typename T>
-T* decompress(const flsgpu::host::DICTColumn<T> column) {
-	using UINT_T = typename flsgpu::host::DICTColumn<T>::UINT_T;
+template <typename T, typename IndexT = typename flsgpu::host::DICTFFORColumn<T>::INDEX_T>
+T* decompress(const flsgpu::host::DICTFFORColumn<T, IndexT> column) {
+	using KEY_T = typename flsgpu::host::DICTFFORColumn<T, IndexT>::KEY_T;
 
 	const size_t n_values = column.get_n_values();
 
 	// 1) decompress the index stream
-	UINT_T* indices = decompress(column.ffor);
+	IndexT* indices = decompress(column.ffor);
 
 	// 2) map indices through dictionary keys
 	T* out_array = new T[n_values];
@@ -345,7 +345,7 @@ T* decompress(const flsgpu::host::DICTColumn<T> column) {
 	for (size_t i = 0; i < n_values; ++i) {
 		const size_t idx = static_cast<size_t>(indices[i]);
 
-		UINT_T bits = 0;
+		KEY_T bits = 0;
 		if (idx < column.key_count) {
 			bits = column.keys[idx];
 		}
@@ -561,6 +561,34 @@ T* decompress(const flsgpu::host::FREQColumn<T> column) {
 }
 
 template <typename T>
+T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
+	const size_t n_values = column.get_n_values();
+	const size_t n_vecs   = column.get_n_vecs();
+
+	T* out_array = decompress(column.ffor);
+
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
+		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+
+		const uint16_t cnt = column.counts[vi];
+		const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
+
+		const uint16_t* pos_ptr = column.positions + off;
+		const T*        exc_ptr = column.exceptions + off;
+
+		for (uint16_t i = 0; i < cnt; ++i) {
+			const uint16_t pos = pos_ptr[i];
+			if (pos < vec_n) {
+				out_array[out_base + pos] = exc_ptr[i];
+			}
+		}
+	}
+
+	return out_array;
+}
+
+template <typename T>
 T* decompress(const flsgpu::host::FREQExtendedColumn<T> column) {
 	const size_t n_values = column.get_n_values();
 	const size_t n_vecs   = column.get_n_vecs();
@@ -766,12 +794,12 @@ flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
 }
 
 template <typename T>
-flsgpu::host::DICTColumn<T> generate_random_dict_column(const size_t   n_values,
-                                                        const vbw_t    value_bit_width, // bit-width of indices
-                                                        const unsigned repeat = 1) {
+flsgpu::host::DICTFFORColumn<T> generate_random_dict_column(const size_t   n_values,
+                                                            const vbw_t    value_bit_width, // bit-width of indices
+                                                            const unsigned repeat = 1) {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 
-	auto column = flsgpu::host::DICTColumn<T>();
+	auto column = flsgpu::host::DICTFFORColumn<T>();
 
 	// 1) key_count = 2^bw
 	column.key_count = std::min(key_count_from_bits(value_bit_width), size_t {32}); // limit to 8192 keys
@@ -805,6 +833,7 @@ flsgpu::host::FREQColumn<T> generate_freq_column(const size_t n_values, const Va
 	auto         column = flsgpu::host::FREQColumn<T>();
 
 	column.n_values       = n_values;
+	column.n_vecs         = n_vecs;
 	column.frequent_value = primitives::fill_array_with_random_bytes(new T[n_vecs], n_vecs);
 
 	column.counts = primitives::fill_array_with_random_data<uint16_t>(
@@ -824,6 +853,7 @@ flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn
                                                         const ValueRange<uint16_t>  exceptions_per_vec) {
 	const size_t n_values = column.n_values;
 	const size_t n_vecs   = utils::get_n_vecs_from_size(n_values);
+	column.n_vecs         = n_vecs;
 
 	delete[] column.counts;
 	delete[] column.exceptions_offsets;

@@ -1,11 +1,24 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/src/include/flsgpu/structs.cuh
+// galp/src/engine/expression.cu
 // ────────────────────────────────────────────────────────
-#ifndef STRUCTS_CUH
-#define STRUCTS_CUH
+#include "engine/expression.cuh"
+#include "engine/reader.cuh"
 
-#include "flsgpu/columns/all.cuh"
+namespace expr {
 
-#endif // STRUCTS_CUH
+std::vector<Expression> assemble(reader::Rowgroup& rowgroup) {
+	std::vector<Expression> out;
+	out.reserve(rowgroup.columns.size());
+	for (auto& col : rowgroup.columns) {
+		auto ops = ops_for_token(col.token);
+		if (ops.empty()) {
+			throw std::runtime_error("unsupported operator token in expression assembly");
+		}
+		out.push_back(Expression {&col, std::move(ops)});
+	}
+	return out;
+}
+
+} // namespace expr

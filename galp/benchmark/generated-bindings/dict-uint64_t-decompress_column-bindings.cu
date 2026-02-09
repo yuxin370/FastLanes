@@ -12,7 +12,7 @@ namespace bindings {
 
 template <>
 uint64_t*
-decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::device::DICTColumn<uint64_t> column,
+decompress_column<uint64_t, flsgpu::device::DICTFFORColumn<uint64_t>>(const flsgpu::device::DICTFFORColumn<uint64_t> column,
                                                                   const unsigned        unpack_n_vectors,
                                                                   const unsigned        unpack_n_values,
                                                                   const enums::Unpacker unpacker,
@@ -30,8 +30,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        uint64_t,
 		        1,
 		        flsgpu::device::BitUnpackerDummy<uint64_t, 1, 1, flsgpu::device::DICTFunctor<uint64_t, 1>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 
 	if (use_shuffle == false && unpack_n_vectors == 1 && unpack_n_values == 1 &&
@@ -44,8 +44,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        uint64_t,
 		        1,
 		        flsgpu::device::BitUnpackerStatefulBranchless<uint64_t, 1, 1, flsgpu::device::DICTFunctor<uint64_t, 1>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 	if (use_shuffle == false && unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::None) {
@@ -57,8 +57,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        uint64_t,
 		        4,
 		        flsgpu::device::BitUnpackerDummy<uint64_t, 4, 1, flsgpu::device::DICTFunctor<uint64_t, 4>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 
 	if (use_shuffle == false && unpack_n_vectors == 4 && unpack_n_values == 1 &&
@@ -71,8 +71,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        uint64_t,
 		        4,
 		        flsgpu::device::BitUnpackerStatefulBranchless<uint64_t, 4, 1, flsgpu::device::DICTFunctor<uint64_t, 4>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 	if (use_shuffle == true && unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::None) {
@@ -84,8 +84,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        uint64_t,
 		        1,
 		        flsgpu::device::BitUnpackerDummy<uint64_t, 1, 1, flsgpu::device::DICTShfl32Functor<uint64_t, 1>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 
 	if (use_shuffle == true && unpack_n_vectors == 1 && unpack_n_values == 1 &&
@@ -99,8 +99,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        1,
 		        flsgpu::device::
 		            BitUnpackerStatefulBranchless<uint64_t, 1, 1, flsgpu::device::DICTShfl32Functor<uint64_t, 1>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 	if (use_shuffle == true && unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::None) {
@@ -112,8 +112,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        uint64_t,
 		        4,
 		        flsgpu::device::BitUnpackerDummy<uint64_t, 4, 1, flsgpu::device::DICTShfl32Functor<uint64_t, 4>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 
 	if (use_shuffle == true && unpack_n_vectors == 4 && unpack_n_values == 1 &&
@@ -127,8 +127,8 @@ decompress_column<uint64_t, flsgpu::device::DICTColumn<uint64_t>>(const flsgpu::
 		        4,
 		        flsgpu::device::
 		            BitUnpackerStatefulBranchless<uint64_t, 4, 1, flsgpu::device::DICTShfl32Functor<uint64_t, 4>>,
-		        flsgpu::device::DICTColumn<uint64_t>>,
-		    flsgpu::device::DICTColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::DICTFFORColumn<uint64_t>>,
+		    flsgpu::device::DICTFFORColumn<uint64_t>>(column, n_samples);
 	}
 	throw std::invalid_argument("Could not find correct binding in decompress_column DICT<uint64_t>");
 }

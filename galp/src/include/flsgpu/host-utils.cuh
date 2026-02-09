@@ -82,16 +82,24 @@ public:
 
 	// Move constructor
 	GPUArray(GPUArray&& other) noexcept
-	    : device_ptr(other.device_ptr) {
-		other.device_ptr = nullptr;
+	    : allocation_size(other.allocation_size)
+	    , memory_size(other.memory_size)
+	    , device_ptr(other.device_ptr) {
+		other.allocation_size = 0;
+		other.memory_size     = 0;
+		other.device_ptr      = nullptr;
 	}
 
 	// Assignment operator
 	GPUArray& operator=(GPUArray&& other) noexcept {
 		if (this != &other) {
 			free_device_pointer(device_ptr);
+			allocation_size  = other.allocation_size;
+			memory_size      = other.memory_size;
 			device_ptr       = other.device_ptr;
-			other.device_ptr = nullptr;
+			other.allocation_size = 0;
+			other.memory_size     = 0;
+			other.device_ptr      = nullptr;
 		}
 		return *this;
 	}

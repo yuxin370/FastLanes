@@ -3,8 +3,10 @@
 // ────────────────────────────────────────────────────────
 // galp/src/include/engine/kernels.cuh
 // ────────────────────────────────────────────────────────
+#include "engine/device-exec.cuh"
 #include "engine/device-utils.cuh"
 #include "flsgpu/consts.cuh"
+#include "flsgpu/fls.cuh"
 #include "flsgpu/flsgpu-api.cuh"
 #include <cstddef>
 #include <type_traits>
@@ -17,17 +19,42 @@ namespace kernels {
 template <typename ColumnT>
 struct is_dict_column : std::false_type {};
 
-template <typename T>
-struct is_dict_column<flsgpu::device::DICTColumn<T>> : std::true_type {
-	using UINT_T = typename flsgpu::device::DICTColumn<T>::UINT_T;
+template <typename T, typename IndexT>
+struct is_dict_column<flsgpu::device::DICTFFORColumn<T, IndexT>> : std::true_type {
+	using UINT_T = typename flsgpu::device::DICTFFORColumn<T, IndexT>::UINT_T;
 };
 
-template <typename T>
-struct is_dict_column<flsgpu::host::DICTColumn<T>> : std::true_type {
-	using UINT_T = typename flsgpu::host::DICTColumn<T>::UINT_T;
+template <typename T, typename IndexT>
+struct is_dict_column<flsgpu::host::DICTFFORColumn<T, IndexT>> : std::true_type {
+	using UINT_T = typename flsgpu::host::DICTFFORColumn<T, IndexT>::UINT_T;
 };
 
 namespace device {
+
+template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES>
+__global__ void decompress_rowgroup(const dispatch::DeviceExpression<T>* exprs,
+                                    const dispatch::WorkItem*            work_items,
+                                    const size_t                         n_items) {
+	const auto         mapping      = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
+	const lane_t       lane         = mapping.get_lane();
+	const uint32_t     item_idx     = static_cast<uint32_t>(mapping.get_vector_index());
+	if (item_idx >= n_items) {
+		return;
+	}
+
+	const auto work         = work_items[item_idx];
+	const auto expr         = exprs[work.expr_index];
+	const vi_t vector_index = static_cast<vi_t>(work.vector_index);
+
+	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
+	if (static_cast<size_t>(vector_index) >= n_vecs) {
+		return;
+	}
+
+	T* out = expr.out + vector_index * consts::VALUES_PER_VECTOR;
+
+	device_exec::execute_plan<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane, out);
+}
 
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
 __global__ void decompress_column(const ColumnT column, T* out) {
