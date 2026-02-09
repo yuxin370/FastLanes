@@ -9,7 +9,7 @@ build/
 *-build/
 Testing/
 build-support/boost_*
-/home/tangyuxin/cleanFastlanes/FastLanes/galp/benchmark/generated-bindings/dictshfl32*
+galp/benchmark/generated-bindings/dictshfl32*
 
 # Build directories created by Clion
 cmake-build-*/
