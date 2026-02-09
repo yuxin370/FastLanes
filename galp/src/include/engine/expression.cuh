@@ -6,8 +6,8 @@
 #ifndef ENGINE_EXPRESSION_CUH
 #define ENGINE_EXPRESSION_CUH
 
-#include "flsgpu/structs.cuh"
 #include "fls/footer/operator_token_generated.h"
+#include "flsgpu/structs.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -107,22 +107,21 @@ struct DeviceExpression {
 	uint8_t  dict_index_bits = 0;
 	T*       out;
 	union {
-		flsgpu::device::BPColumn<T>               bp;
-		flsgpu::device::CONSTANTColumn<T>         constant;
-		flsgpu::device::FFORColumn<T>             ffor;
-		flsgpu::device::SLPATCHColumn<T>          slpatch;
-		flsgpu::device::DICTFFORColumn<T>         dictffor;
-		flsgpu::device::DICTFFORColumn<T, uint8_t> dictffor_u8;
-		flsgpu::device::DICTSLPATCHColumn<T>      dictslpatch;
+		flsgpu::device::BPColumn<T>                   bp;
+		flsgpu::device::CONSTANTColumn<T>             constant;
+		flsgpu::device::FFORColumn<T>                 ffor;
+		flsgpu::device::SLPATCHColumn<T>              slpatch;
+		flsgpu::device::DICTFFORColumn<T>             dictffor;
+		flsgpu::device::DICTFFORColumn<T, uint8_t>    dictffor_u8;
+		flsgpu::device::DICTSLPATCHColumn<T>          dictslpatch;
 		flsgpu::device::DICTSLPATCHColumn<T, uint8_t> dictslpatch_u8;
-		flsgpu::device::FREQColumn<T>             freq;
-		flsgpu::device::CROSSRLEColumn<T>         crossrle;
-		flsgpu::device::RLEColumn<T, uint16_t>    rle;
+		flsgpu::device::FREQColumn<T>                 freq;
+		flsgpu::device::CROSSRLEColumn<T>             crossrle;
+		flsgpu::device::RLEColumn<T, uint16_t>        rle;
 	} col;
 };
 
-inline bool ops_match(const std::vector<expr::OperatorKind>& ops,
-                      std::initializer_list<expr::OperatorKind> expected) {
+inline bool ops_match(const std::vector<expr::OperatorKind>& ops, std::initializer_list<expr::OperatorKind> expected) {
 	if (ops.size() != expected.size()) {
 		return false;
 	}

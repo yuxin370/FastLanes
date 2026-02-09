@@ -28,7 +28,7 @@ Kernel string_to_kernel(const std::string& str) {
 
 Unpacker string_to_unpacker(const std::string& str) {
 	static const std::unordered_map<std::string, Unpacker> mapping = {
-		{"none", Unpacker::None},
+	    {"none", Unpacker::None},
 	    {"dummy", Unpacker::Dummy},
 	    {"old-fls", Unpacker::OldFls},
 	    {"switch-case", Unpacker::SwitchCase},
@@ -62,14 +62,13 @@ Expander string_to_expander(const std::string& str) {
 	static const std::unordered_map<std::string, Expander> mapping = {
 	    {"none", Expander::None},
 	    {"dummy", Expander::Dummy},
-		{"stateful", Expander::Stateful},	
-		{"stateful-shuffle", Expander::StatefulShuffle},
-		{"prefetch-stateful", Expander::PrefetchStateful},
-		{"stateful-advance", Expander::StatefulAdvance}, 
-		{"stateful-extended", Expander::StatefulExtended},
-		{"branchless", Expander::Branchless},
-		{"prefetch-branchless", Expander::PrefetchBranchless}
-	};
+	    {"stateful", Expander::Stateful},
+	    {"stateful-shuffle", Expander::StatefulShuffle},
+	    {"prefetch-stateful", Expander::PrefetchStateful},
+	    {"stateful-advance", Expander::StatefulAdvance},
+	    {"stateful-extended", Expander::StatefulExtended},
+	    {"branchless", Expander::Branchless},
+	    {"prefetch-branchless", Expander::PrefetchBranchless}};
 
 	auto it = mapping.find(str);
 	if (it != mapping.end()) {
@@ -100,17 +99,16 @@ Patcher string_to_patcher(const std::string& str) {
 	throw std::invalid_argument("Unknown patcher type: " + str);
 }
 
-
 Encoding string_to_encoding(const std::string& str) {
 	static const std::unordered_map<std::string, Encoding> mapping = {
 	    {"alp", Encoding::ALP},
-		{"bit-packing", Encoding::BIT_PACKING},
-		{"ffor", Encoding::FFOR},
-		{"frequency", Encoding::FREQUENCY},
-		{"cross-rle", Encoding::CROSS_RLE},
-		{"dictionary", Encoding::DICTIONARY},
-		{"slpatch", Encoding::SLPATCH},
-		{"constant", Encoding::CONSTANT},
+	    {"bit-packing", Encoding::BIT_PACKING},
+	    {"ffor", Encoding::FFOR},
+	    {"frequency", Encoding::FREQUENCY},
+	    {"cross-rle", Encoding::CROSS_RLE},
+	    {"dictionary", Encoding::DICTIONARY},
+	    {"slpatch", Encoding::SLPATCH},
+	    {"constant", Encoding::CONSTANT},
 	};
 
 	auto it = mapping.find(str);

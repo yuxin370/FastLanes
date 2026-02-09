@@ -13,7 +13,6 @@
 #include "fls/io/io.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/std/filesystem.hpp"
-
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
@@ -102,7 +101,7 @@ size_t data_type_size(const fastlanes::DataType dt) {
 
 std::string format_bytes(double bytes) {
 	static constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-	size_t unit = 0;
+	size_t                       unit     = 0;
 	while (bytes >= 1024.0 && unit < (sizeof(kUnits) / sizeof(kUnits[0]) - 1)) {
 		bytes /= 1024.0;
 		++unit;
@@ -124,7 +123,8 @@ fastlanes::TableDescriptorHandle load_table_descriptor(const std::filesystem::pa
 		    file_path, footer.table_descriptor_offset, footer.table_descriptor_size, /*verify=*/true);
 	}
 
-	return fastlanes::TableDescriptorHandle::FromFile(file_path.parent_path() / "table_descriptor.fbb", /*verify=*/true);
+	return fastlanes::TableDescriptorHandle::FromFile(file_path.parent_path() / "table_descriptor.fbb",
+	                                                  /*verify=*/true);
 }
 
 double measure_rowgroup_io_ms(const std::filesystem::path& file_path, const fastlanes::RowgroupDescriptor* rg) {
@@ -133,7 +133,7 @@ double measure_rowgroup_io_ms(const std::filesystem::path& file_path, const fast
 	}
 	using Clock = std::chrono::steady_clock;
 	fastlanes::Buf buf(rg->m_size());
-	fastlanes::io  io = fastlanes::make_unique<fastlanes::File>(file_path);
+	fastlanes::io  io    = fastlanes::make_unique<fastlanes::File>(file_path);
 	const auto     start = Clock::now();
 	fastlanes::IO::range_read(io, buf, rg->m_offset(), rg->m_size());
 	const auto end = Clock::now();
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
 			throw std::runtime_error("failed to load table descriptor");
 		}
 
-		const auto* rowgroups   = td->m_rowgroup_descriptors();
+		const auto*  rowgroups   = td->m_rowgroup_descriptors();
 		const size_t n_rowgroups = rowgroups ? rowgroups->size() : 0;
 		if (n_rowgroups == 0) {
 			throw std::runtime_error("no rowgroups found");
@@ -185,10 +185,10 @@ int main(int argc, char** argv) {
 		size_t total_rgs     = 0;
 
 		for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
-			const auto* rg = rowgroups->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
+			const auto*  rg    = rowgroups->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
 			const double io_ms = measure_rowgroup_io_ms(opt.input, rg);
 
-			const auto* cols = rg->m_column_descriptors();
+			const auto*  cols       = rg->m_column_descriptors();
 			const size_t rg_columns = cols ? cols->size() : 0;
 			const size_t rg_vectors = rg_columns * static_cast<size_t>(rg->m_n_vec());
 
@@ -206,20 +206,19 @@ int main(int argc, char** argv) {
 				}
 			}
 
-			const auto ctor_start = std::chrono::steady_clock::now();
-			auto rowgroup_reader = table_reader->get_rowgroup_reader(static_cast<fastlanes::n_t>(rg_idx));
-			const auto ctor_end = std::chrono::steady_clock::now();
+			const auto ctor_start      = std::chrono::steady_clock::now();
+			auto       rowgroup_reader = table_reader->get_rowgroup_reader(static_cast<fastlanes::n_t>(rg_idx));
+			const auto ctor_end        = std::chrono::steady_clock::now();
 
-			const double ctor_ms =
-			    std::chrono::duration<double, std::milli>(ctor_end - ctor_start).count();
+			const double ctor_ms = std::chrono::duration<double, std::milli>(ctor_end - ctor_start).count();
 
 			double build_ms = ctor_ms - io_ms;
 			if (build_ms < 0.0) {
 				build_ms = 0.0;
 			}
 
-			const auto decode_start = std::chrono::steady_clock::now();
-			const fastlanes::n_t n_vec = static_cast<fastlanes::n_t>(rg->m_n_vec());
+			const auto           decode_start = std::chrono::steady_clock::now();
+			const fastlanes::n_t n_vec        = static_cast<fastlanes::n_t>(rg->m_n_vec());
 			for (uint32_t sample = 0; sample < opt.samples; ++sample) {
 				for (fastlanes::n_t vec_idx {0}; vec_idx < n_vec; ++vec_idx) {
 					rowgroup_reader->get_chunk(vec_idx);
@@ -227,8 +226,7 @@ int main(int argc, char** argv) {
 			}
 			const auto decode_end = std::chrono::steady_clock::now();
 
-			const double decode_ms =
-			    std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+			const double decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
 
 			end_to_end_ms += (build_ms + decode_ms);
 			kernel_ms += decode_ms;
@@ -244,22 +242,25 @@ int main(int argc, char** argv) {
 
 		const double total_samples =
 		    (total_rgs > 0) ? (static_cast<double>(opt.samples) * static_cast<double>(total_rgs)) : 0.0;
-		const double avg_us        = (total_samples > 0.0) ? (kernel_ms * 1000.0 / total_samples) : 0.0;
+		const double avg_us = (total_samples > 0.0) ? (kernel_ms * 1000.0 / total_samples) : 0.0;
 		const double total_bytes_processed =
 		    (total_rgs > 0) ? (static_cast<double>(total_bytes) * static_cast<double>(opt.samples)) : 0.0;
-		const double kernel_seconds = kernel_ms / 1000.0;
-		const double kernel_throughput_bps   = (kernel_seconds > 0.0) ? (total_bytes_processed / kernel_seconds) : 0.0;
-		const double kernel_throughput_gbps  = kernel_throughput_bps / 1e9;
+		const double kernel_seconds         = kernel_ms / 1000.0;
+		const double kernel_throughput_bps  = (kernel_seconds > 0.0) ? (total_bytes_processed / kernel_seconds) : 0.0;
+		const double kernel_throughput_gbps = kernel_throughput_bps / 1e9;
 		const double kernel_throughput_gibps =
 		    (kernel_seconds > 0.0) ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * kernel_seconds)) : 0.0;
-		const double e2e_seconds = end_to_end_ms / 1000.0;
-		const double e2e_throughput_bps   = (e2e_seconds > 0.0) ? (total_bytes_processed / e2e_seconds) : 0.0;
-		const double e2e_throughput_gbps  = e2e_throughput_bps / 1e9;
+		const double e2e_seconds         = end_to_end_ms / 1000.0;
+		const double e2e_throughput_bps  = (e2e_seconds > 0.0) ? (total_bytes_processed / e2e_seconds) : 0.0;
+		const double e2e_throughput_gbps = e2e_throughput_bps / 1e9;
 		const double e2e_throughput_gibps =
 		    (e2e_seconds > 0.0) ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_seconds)) : 0.0;
-		const double cols_per_rg = (total_rgs > 0) ? (static_cast<double>(total_columns) / static_cast<double>(total_rgs)) : 0.0;
-		const double vectors_per_rg = (total_rgs > 0) ? (static_cast<double>(total_items) / static_cast<double>(total_rgs)) : 0.0;
-		// const double vecs_per_col = (total_columns > 0) ? (static_cast<double>(total_items) / static_cast<double>(total_columns)) : 0.0;
+		const double cols_per_rg =
+		    (total_rgs > 0) ? (static_cast<double>(total_columns) / static_cast<double>(total_rgs)) : 0.0;
+		const double vectors_per_rg =
+		    (total_rgs > 0) ? (static_cast<double>(total_items) / static_cast<double>(total_rgs)) : 0.0;
+		// const double vecs_per_col = (total_columns > 0) ? (static_cast<double>(total_items) /
+		// static_cast<double>(total_columns)) : 0.0;
 
 		std::cout << "Benchmark results:\n";
 		std::cout << "  rowgroups: " << total_rgs << "\n";
@@ -273,8 +274,10 @@ int main(int argc, char** argv) {
 		std::cout << "  h2d_ms:        " << h2d_ms << "\n";
 		std::cout << "  teardown_ms:   " << teardown_ms << "\n";
 		std::cout << "  avg_us:    " << avg_us << " (per rowgroup per sample)\n";
-		std::cout << "  kernel_throughput: " << kernel_throughput_gbps << " (GB/s), " << kernel_throughput_gibps << " (GiB/s)\n";
-		std::cout << "  end_to_end_throughput: " << e2e_throughput_gbps << " (GB/s), " << e2e_throughput_gibps << " (GiB/s)\n";
+		std::cout << "  kernel_throughput: " << kernel_throughput_gbps << " (GB/s), " << kernel_throughput_gibps
+		          << " (GiB/s)\n";
+		std::cout << "  end_to_end_throughput: " << e2e_throughput_gbps << " (GB/s), " << e2e_throughput_gibps
+		          << " (GiB/s)\n";
 		// std::cout << "  avg_vecs_per_col: " << vecs_per_col << "\n";
 		return 0;
 	} catch (const std::exception& ex) {

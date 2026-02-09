@@ -29,11 +29,12 @@ using DICTUnpacker = flsgpu::device::BitUnpackerStatefulBranchless<T,
                                                                    flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>>;
 
 template <typename T, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-using DICTUnpackerIdx = flsgpu::device::BitUnpackerStatefulBranchlessIdx<T,
-                                                                         IndexT,
-                                                                         UNPACK_N_VECTORS,
-                                                                         UNPACK_N_VALUES,
-                                                                         flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>>;
+using DICTUnpackerIdx =
+    flsgpu::device::BitUnpackerStatefulBranchlessIdx<T,
+                                                     IndexT,
+                                                     UNPACK_N_VECTORS,
+                                                     UNPACK_N_VALUES,
+                                                     flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>>;
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 using DefaultFREQPatcher = flsgpu::device::StatefulFREQExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
@@ -58,8 +59,8 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::CONSTANTColumn<T>>) {
-		using DecompressorT =
-		    flsgpu::device::CONSTANTDecompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, flsgpu::device::CONSTANTColumn<T>>;
+		using DecompressorT = flsgpu::device::
+		    CONSTANTDecompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, flsgpu::device::CONSTANTColumn<T>>;
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::FFORColumn<T>>) {
@@ -70,17 +71,18 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::DICTFFORColumn<T, uint8_t>>) {
-		using IndexT       = uint8_t;
-		using ProcessorT   = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
-		using DecompressorT = flsgpu::device::DICTDecompressor<T,
-		                                                       UNPACK_N_VECTORS,
-		                                                       DICTUnpackerIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
-		                                                       flsgpu::device::DICTFFORColumn<T, IndexT>,
-		                                                       ProcessorT>;
+		using IndexT     = uint8_t;
+		using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
+		using DecompressorT =
+		    flsgpu::device::DICTDecompressor<T,
+		                                     UNPACK_N_VECTORS,
+		                                     DICTUnpackerIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                     flsgpu::device::DICTFFORColumn<T, IndexT>,
+		                                     ProcessorT>;
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::DICTFFORColumn<T, uint16_t>>) {
-		using ProcessorT   = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>;
+		using ProcessorT    = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>;
 		using DecompressorT = flsgpu::device::DICTDecompressor<T,
 		                                                       UNPACK_N_VECTORS,
 		                                                       DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
@@ -89,10 +91,11 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::DICTSLPATCHColumn<T, uint8_t>>) {
-		using IndexT       = uint8_t;
-		using ProcessorT   = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
-		using UnpackerT    = DICTUnpackerIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-		using PatcherT     = flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+		using IndexT     = uint8_t;
+		using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
+		using UnpackerT  = DICTUnpackerIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+		using PatcherT =
+		    flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 		using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
 		                                                              UNPACK_N_VECTORS,
 		                                                              UNPACK_N_VALUES,
@@ -103,13 +106,10 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::DICTSLPATCHColumn<T, uint16_t>>) {
-		using IndexT    = uint16_t;
+		using IndexT     = uint16_t;
 		using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>;
 		using UnpackerT =
-		    flsgpu::device::BitUnpackerStatefulBranchless<T,
-		                                                  UNPACK_N_VECTORS,
-		                                                  UNPACK_N_VALUES,
-		                                                  ProcessorT>;
+		    flsgpu::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
 		using PatcherT =
 		    flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 		using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
@@ -149,11 +149,11 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::RLEColumn<T, uint16_t>>) {
-		using UnpackerT = flsgpu::device::BitUnpackerStatefulBranchless<
-		    uint16_t,
-		    UNPACK_N_VECTORS,
-		    UNPACK_N_VALUES,
-		    flsgpu::device::FFORFunctor<uint16_t, UNPACK_N_VECTORS>>;
+		using UnpackerT =
+		    flsgpu::device::BitUnpackerStatefulBranchless<uint16_t,
+		                                                  UNPACK_N_VECTORS,
+		                                                  UNPACK_N_VALUES,
+		                                                  flsgpu::device::FFORFunctor<uint16_t, UNPACK_N_VECTORS>>;
 		using DecompressorT = flsgpu::device::RLEDecompressor<T,
 		                                                      uint16_t,
 		                                                      UNPACK_N_VECTORS,
@@ -172,8 +172,8 @@ template <typename HostColT>
 DecompressResult decompress_common(const HostColT& host_col, const Config& cfg) {
 	using T = typename host_value_type<HostColT>::type;
 
-	auto device_col = host_col.copy_to_device();
-	auto* out       = detail::decompress_device(device_col, cfg);
+	auto  device_col = host_col.copy_to_device();
+	auto* out        = detail::decompress_device(device_col, cfg);
 	flsgpu::host::free_column(device_col);
 
 	return make_result<T>(out);
@@ -182,10 +182,11 @@ DecompressResult decompress_common(const HostColT& host_col, const Config& cfg) 
 template <typename HostColT>
 DecompressResult decompress_host(const HostColT& host_col, const PlanKind plan, const Config& cfg) {
 	using T = typename host_value_type<HostColT>::type;
-	static_assert(is_supported_type_v<T>,
-	              "dispatch::decompress only supports int8_t and int16_t columns");
+	static_assert(is_supported_type_v<T>, "dispatch::decompress only supports int8_t and int16_t columns");
 
-	auto fail = []() -> DecompressResult { throw std::runtime_error("dispatch plan/column mismatch"); };
+	auto fail = []() -> DecompressResult {
+		throw std::runtime_error("dispatch plan/column mismatch");
+	};
 
 	switch (plan) {
 	case PlanKind::UNCOMPRESSED: {
@@ -285,9 +286,7 @@ void release_batch(Batch<T>& batch) {
 }
 
 template <typename T>
-void launch_batch_no_sync(const Batch<T>&                      batch,
-                          GPUArray<DeviceExpression<T>>&       d_exprs,
-                          GPUArray<WorkItem>&                  d_items) {
+void launch_batch_no_sync(const Batch<T>& batch, GPUArray<DeviceExpression<T>>& d_exprs, GPUArray<WorkItem>& d_items) {
 	if (batch.device_exprs.empty() || batch.work_items.empty()) {
 		return;
 	}
@@ -320,8 +319,8 @@ inline size_t resolve_alias(const std::vector<expr::Expression>& expressions, si
 inline DecompressResult clone_result(const DecompressResult& src, const size_t n_values) {
 	return std::visit(
 	    [&](auto&& ptr) -> DecompressResult {
-		    using T    = std::remove_pointer_t<decltype(ptr.get())>;
-		    auto out   = std::make_unique<T[]>(n_values);
+		    using T  = std::remove_pointer_t<decltype(ptr.get())>;
+		    auto out = std::make_unique<T[]>(n_values);
 		    std::memcpy(out.get(), ptr.get(), n_values * sizeof(T));
 		    return DecompressResult {std::move(out)};
 	    },
@@ -331,7 +330,7 @@ inline DecompressResult clone_result(const DecompressResult& src, const size_t n
 } // namespace
 
 DecompressResult decompress(const expr::Expression& expression, const Config& cfg) {
-	auto& col  = *expression.column;
+	auto& col = *expression.column;
 	return std::visit(
 	    [&](auto&& host_col) -> DecompressResult {
 		    using HostColT = std::decay_t<decltype(host_col)>;
@@ -342,8 +341,7 @@ DecompressResult decompress(const expr::Expression& expression, const Config& cf
 	    col.host);
 }
 
-RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>& expressions,
-                                             const Config&                        cfg) {
+RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg) {
 	(void)cfg;
 	RowgroupDecompressResult result;
 	result.columns.resize(expressions.size());
@@ -369,7 +367,7 @@ RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>
 	}
 
 	dispatch::for_each_type(SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
+		using T     = typename decltype(tag)::type;
 		auto& batch = batches.template get<T>();
 		detail::launch_batch(batch);
 		detail::finalize_batch(batch, result);
@@ -395,12 +393,11 @@ RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>
 	return result;
 }
 
-BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressions,
-                                   const Config&                        cfg) {
+BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg) {
 	BenchmarkResult result {};
 	result.n_samples = cfg.n_samples;
 
-	typename detail::BatchSetFromList<SupportedTypes>::type batches;
+	typename detail::BatchSetFromList<SupportedTypes>::type       batches;
 	typename detail::DeviceBatchSetFromList<SupportedTypes>::type device_batches;
 
 	for (size_t i = 0; i < expressions.size(); ++i) {
@@ -424,14 +421,15 @@ BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressi
 	}
 
 	dispatch::for_each_type(SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
+		using T     = typename decltype(tag)::type;
 		auto& batch = batches.template get<T>();
 		result.n_work_items += batch.work_items.size();
 		if (batch.device_exprs.empty() || batch.work_items.empty()) {
 			return;
 		}
 		auto& dev = device_batches.template get<T>();
-		dev.d_exprs = std::make_unique<GPUArray<DeviceExpression<T>>>(batch.device_exprs.size(), batch.device_exprs.data());
+		dev.d_exprs =
+		    std::make_unique<GPUArray<DeviceExpression<T>>>(batch.device_exprs.size(), batch.device_exprs.data());
 		dev.d_items = std::make_unique<GPUArray<WorkItem>>(batch.work_items.size(), batch.work_items.data());
 	});
 
@@ -448,7 +446,7 @@ BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressi
 
 	for (uint32_t sample = 0; sample < cfg.n_samples; ++sample) {
 		dispatch::for_each_type(SupportedTypes {}, [&](auto tag) {
-			using T = typename decltype(tag)::type;
+			using T     = typename decltype(tag)::type;
 			auto& batch = batches.template get<T>();
 			auto& dev   = device_batches.template get<T>();
 			if (dev.empty()) {
@@ -470,7 +468,7 @@ BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressi
 	result.avg_us   = (cfg.n_samples > 0) ? (result.total_ms * 1000.0 / static_cast<double>(cfg.n_samples)) : 0.0;
 
 	dispatch::for_each_type(SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
+		using T     = typename decltype(tag)::type;
 		auto& batch = batches.template get<T>();
 		detail::release_batch(batch);
 	});
@@ -478,59 +476,40 @@ BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressi
 	return result;
 }
 
-template DecompressResult detail::decompress_host(const flsgpu::host::BPColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::FFORColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::DICTFFORColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::CONSTANTColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::FREQColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::SLPATCHColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::CROSSRLEColumn<int8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::RLEColumn<int8_t, uint16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::BPColumn<int16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::FFORColumn<int16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::DICTFFORColumn<int16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::DICTFFORColumn<int16_t, uint8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int16_t, uint8_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::SLPATCHColumn<int16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::FREQColumn<int16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
-template DecompressResult detail::decompress_host(const flsgpu::host::RLEColumn<int16_t, uint16_t>&,
-                                                  const PlanKind,
-                                                  const Config&);
+template DecompressResult detail::decompress_host(const flsgpu::host::BPColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::FFORColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::DICTFFORColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::CONSTANTColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::FREQColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::SLPATCHColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::CROSSRLEColumn<int8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::RLEColumn<int8_t, uint16_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::BPColumn<int16_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::FFORColumn<int16_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::DICTFFORColumn<int16_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::DICTFFORColumn<int16_t, uint8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int16_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int16_t, uint8_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::SLPATCHColumn<int16_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::FREQColumn<int16_t>&, const PlanKind, const Config&);
+template DecompressResult
+detail::decompress_host(const flsgpu::host::RLEColumn<int16_t, uint16_t>&, const PlanKind, const Config&);
 
 } // namespace dispatch

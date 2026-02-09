@@ -18,13 +18,13 @@ namespace device {
 
 template <typename T, typename IndexT>
 struct RLEColumn {
-	size_t            n_values;
-	size_t            n_vecs;
+	size_t             n_values;
+	size_t             n_vecs;
 	FFORColumn<IndexT> ffor;
-	IndexT*           rsum_bases;   // n_vecs * n_lanes(IndexT)
-	T*                rle_values;   // concatenated per-vector values
-	size_t*           rle_offsets;  // per-vector base offset into rle_values
-	size_t            n_rle_values; // total values length
+	IndexT*            rsum_bases;   // n_vecs * n_lanes(IndexT)
+	T*                 rle_values;   // concatenated per-vector values
+	size_t*            rle_offsets;  // per-vector base offset into rle_values
+	size_t             n_rle_values; // total values length
 };
 
 } // namespace device
@@ -86,25 +86,23 @@ inline ParseResultT<flsgpu::host::RLEColumn<T, IndexT>> parse_rle(const ParseCon
 		throw std::runtime_error("EXP_RLE: missing operand tokens");
 	}
 
-	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto   seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 4)));
-	const auto   seg_rsum = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
-	const auto seg_bitpacked =
-	    ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
-	const auto seg_bw = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_base = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+	const size_t base_idx    = ctx.operand_tokens->size() - 1;
+	const auto   seg_vals    = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 4)));
+	const auto   seg_rsum    = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
+	const auto seg_bitpacked = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
+	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
 
-	auto bp_parts = detail::parse_bp_segments<typename utils::same_width_uint<IndexT>::type>(
-	    seg_bitpacked,
-	    seg_bw,
-	    ctx.n_vecs);
+	auto bp_parts =
+	    detail::parse_bp_segments<typename utils::same_width_uint<IndexT>::type>(seg_bitpacked, seg_bw, ctx.n_vecs);
 
 	auto* bases_ffor = detail::copy_segment_array<typename utils::same_width_uint<IndexT>::type>(seg_base);
-	flsgpu::host::BPColumn<IndexT> bp {ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
+	flsgpu::host::BPColumn<IndexT> bp {
+	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
 	flsgpu::host::FFORColumn<IndexT> ffor {bp, bases_ffor};
 
 	const size_t expected_bases = ctx.n_vecs * utils::get_n_lanes<IndexT>();
-	auto*        rsum_bases      = detail::copy_segment_array<IndexT>(seg_rsum);
+	auto*        rsum_bases     = detail::copy_segment_array<IndexT>(seg_rsum);
 	if (seg_rsum.data_span.size() / sizeof(IndexT) != expected_bases) {
 		throw std::runtime_error("EXP_RLE: rsum bases size mismatch");
 	}
@@ -113,13 +111,13 @@ inline ParseResultT<flsgpu::host::RLEColumn<T, IndexT>> parse_rle(const ParseCon
 	if (entrypoints.size() != ctx.n_vecs) {
 		throw std::runtime_error("EXP_RLE: values entrypoint count mismatch");
 	}
-	auto offsets_vec = detail::build_vector_offsets<T>(entrypoints);
-	auto* offsets    = new size_t[ctx.n_vecs];
+	auto  offsets_vec = detail::build_vector_offsets<T>(entrypoints);
+	auto* offsets     = new size_t[ctx.n_vecs];
 	for (size_t i = 0; i < ctx.n_vecs; ++i) {
 		offsets[i] = offsets_vec[i];
 	}
 
-	auto* values       = detail::copy_segment_array<T>(seg_vals);
+	auto*        values = detail::copy_segment_array<T>(seg_vals);
 	const size_t n_vals = seg_vals.data_span.size() / sizeof(T);
 
 	flsgpu::host::RLEColumn<T, IndexT> host {ctx.n_values, ctx.n_vecs, ffor, rsum_bases, values, offsets, n_vals};

@@ -94,9 +94,9 @@ inline BPParseResult<T> parse_bp_segments(const fastlanes::SegmentView& seg_bitp
 	if (entry.size() != n_vecs) {
 		throw std::runtime_error("bitpacked entrypoint count mismatch");
 	}
-	auto offsets = build_vector_offsets<T>(entry);
-	auto* packed = copy_segment_array<T>(seg_bitpacked);
-	auto* bws    = copy_segment_array<vbw_t>(seg_bw);
+	auto  offsets = build_vector_offsets<T>(entry);
+	auto* packed  = copy_segment_array<T>(seg_bitpacked);
+	auto* bws     = copy_segment_array<vbw_t>(seg_bw);
 
 	auto* offsets_arr = new size_t[n_vecs];
 	for (size_t i = 0; i < n_vecs; ++i) {

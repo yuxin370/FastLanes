@@ -21,9 +21,9 @@ inline void free_rowgroup(reader::Rowgroup& rowgroup) {
 }
 
 struct TableDecompressResult {
-	size_t rowgroups      = 0;
-	size_t total_columns  = 0;
-	std::vector<size_t> rowgroup_indices;
+	size_t                                          rowgroups     = 0;
+	size_t                                          total_columns = 0;
+	std::vector<size_t>                             rowgroup_indices;
 	std::vector<dispatch::RowgroupDecompressResult> results;
 };
 
@@ -51,8 +51,8 @@ inline TableDecompressResult decompress_table(const std::filesystem::path& fls_p
                                               RowgroupPredicate&&          should_decompress,
                                               RowgroupCallback&&           on_rowgroup,
                                               const bool                   collect_results = false) {
-	reader::reader rdr(fls_path);
-	const size_t   n_rowgroups   = rdr.rowgroup_count();
+	reader::reader        rdr(fls_path);
+	const size_t          n_rowgroups = rdr.rowgroup_count();
 	TableDecompressResult table_result;
 	if (collect_results) {
 		table_result.rowgroup_indices.reserve(n_rowgroups);
@@ -86,11 +86,7 @@ inline TableDecompressResult decompress_table(const std::filesystem::path& fls_p
                                               RowgroupCallback&&           on_rowgroup,
                                               const bool                   collect_results = false) {
 	return decompress_table(
-	    fls_path,
-	    cfg,
-	    [](size_t) { return true; },
-	    std::forward<RowgroupCallback>(on_rowgroup),
-	    collect_results);
+	    fls_path, cfg, [](size_t) { return true; }, std::forward<RowgroupCallback>(on_rowgroup), collect_results);
 }
 
 inline TableDecompressResult decompress_table(const std::filesystem::path& fls_path,
@@ -100,7 +96,8 @@ inline TableDecompressResult decompress_table(const std::filesystem::path& fls_p
 	    fls_path,
 	    cfg,
 	    [](size_t) { return true; },
-	    [](size_t, reader::Rowgroup&, const std::vector<expr::Expression>&, const dispatch::RowgroupDecompressResult&) {},
+	    [](size_t, reader::Rowgroup&, const std::vector<expr::Expression>&, const dispatch::RowgroupDecompressResult&) {
+	    },
 	    collect_results);
 }
 

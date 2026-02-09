@@ -8,12 +8,12 @@
 
 #include "engine/verification.cuh"
 #include "fls/cor/lyt/buf.hpp"
+#include "fls/expression/rpn.hpp"
 #include "fls/file/file_footer.hpp"
 #include "fls/file/file_header.hpp"
 #include "fls/footer/operator_token_generated.h"
 #include "fls/footer/rowgroup_descriptor_generated.h"
 #include "fls/footer/table_descriptor.hpp"
-#include "fls/expression/rpn.hpp"
 #include "fls/io/file.hpp"
 #include "fls/io/io.hpp"
 #include "fls/reader/column_view.hpp"
@@ -81,11 +81,11 @@ using HostColumnVariant = std::variant<flsgpu::host::BPColumn<int8_t>,
                                        flsgpu::host::RLEColumn<int16_t, uint16_t>>;
 
 struct Column {
-	std::string                        name;
-	fastlanes::OperatorToken           token;
-	HostColumnVariant                  host;
-	bool                               skip_decompress = false;
-	std::optional<size_t>              alias_of;
+	std::string              name;
+	fastlanes::OperatorToken token;
+	HostColumnVariant        host;
+	bool                     skip_decompress = false;
+	std::optional<size_t>    alias_of;
 };
 
 struct Rowgroup {
@@ -168,8 +168,8 @@ public:
 
 			const auto op_token = ops->Get(0);
 			Column     result;
-			result.name            = col_desc.name() ? col_desc.name()->str() : std::string {};
-			result.token           = op_token;
+			result.name          = col_desc.name() ? col_desc.name()->str() : std::string {};
+			result.token         = op_token;
 			auto& column_view    = rg_view[static_cast<fastlanes::n_t>(col_idx)];
 			auto* operand_tokens = rpn->operand_tokens();
 
@@ -177,109 +177,96 @@ public:
 
 			switch (op_token) {
 				using enum fastlanes::OperatorToken;
-			case EXP_UNCOMPRESSED_I08:
-			{
+			case EXP_UNCOMPRESSED_I08: {
 				auto parsed = columns::parse_uncompressed<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_CONSTANT_I08:
-			{
+			case EXP_CONSTANT_I08: {
 				auto parsed = columns::parse_constant<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_FFOR_I08:
-			{
+			case EXP_FFOR_I08: {
 				auto parsed = columns::parse_ffor<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_FFOR_I16:
-			{
+			case EXP_FFOR_I16: {
 				auto parsed = columns::parse_ffor<int16_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_FFOR_SLPATCH_I08:
-			{
+			case EXP_FFOR_SLPATCH_I08: {
 				auto parsed = columns::parse_slpatch<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_FFOR_SLPATCH_I16:
-			{
+			case EXP_FFOR_SLPATCH_I16: {
 				auto parsed = columns::parse_slpatch<int16_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_FREQUENCY_I08:
-			{
+			case EXP_FREQUENCY_I08: {
 				auto parsed = columns::parse_frequency<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_FREQUENCY_I16:
-			{
+			case EXP_FREQUENCY_I16: {
 				auto parsed = columns::parse_frequency<int16_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_CROSS_RLE_I08:
-			{
+			case EXP_CROSS_RLE_I08: {
 				auto parsed = columns::parse_cross_rle<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_DICT_I08_FFOR_SLPATCH_U08:
-			{
+			case EXP_DICT_I08_FFOR_SLPATCH_U08: {
 				auto parsed = columns::parse_dict_slpatch<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_DICT_I08_FFOR_U08:
-			{
+			case EXP_DICT_I08_FFOR_U08: {
 				auto parsed = columns::parse_dict_ffor<int8_t>(ctx);
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_DICT_I16_FFOR_U16:
-			{
+			case EXP_DICT_I16_FFOR_U16: {
 				auto parsed = columns::parse_dict_ffor<int16_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_DICT_I16_FFOR_U08:
-			{
+			case EXP_DICT_I16_FFOR_U08: {
 				auto parsed = columns::parse_dict_ffor<int16_t, uint8_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_DICT_I08_U08:
-			{
+			case EXP_DICT_I08_U08: {
 				if (!operand_tokens || operand_tokens->size() < 2) {
 					throw std::runtime_error("EXP_DICT_I08_U08: missing operand tokens");
 				}
-				const auto index_col_idx = static_cast<size_t>(operand_tokens->Get(0));
-				auto&      index_col     = self(self, index_col_idx);
+				const auto index_col_idx  = static_cast<size_t>(operand_tokens->Get(0));
+				auto&      index_col      = self(self, index_col_idx);
 				index_col.skip_decompress = true;
 
 				auto index_ffor = std::visit(
 				    [](auto&& col) -> flsgpu::host::FFORColumn<uint8_t> {
 					    using HostColT = std::decay_t<decltype(col)>;
 					    if constexpr (std::is_same_v<HostColT, flsgpu::host::FFORColumn<int8_t>>) {
-						    auto*                          packed = utils::copy_array(col.bp.packed_array, col.bp.n_packed_values);
-						    auto*                          bws    = utils::copy_array(col.bp.bit_widths, col.bp.get_n_vecs());
-						    auto*                          offs   = utils::copy_array(col.bp.vector_offsets, col.bp.get_n_vecs());
-						    flsgpu::host::BPColumn<uint8_t> bp {col.bp.n_values, col.bp.n_packed_values, packed, bws, offs};
-						    auto*                          bases = utils::copy_array(col.bases, col.get_n_vecs());
+						    auto* packed = utils::copy_array(col.bp.packed_array, col.bp.n_packed_values);
+						    auto* bws    = utils::copy_array(col.bp.bit_widths, col.bp.get_n_vecs());
+						    auto* offs   = utils::copy_array(col.bp.vector_offsets, col.bp.get_n_vecs());
+						    flsgpu::host::BPColumn<uint8_t> bp {
+						        col.bp.n_values, col.bp.n_packed_values, packed, bws, offs};
+						    auto* bases = utils::copy_array(col.bases, col.get_n_vecs());
 						    return flsgpu::host::FFORColumn<uint8_t> {bp, bases};
 					    } else if constexpr (std::is_same_v<HostColT, flsgpu::host::BPColumn<int8_t>>) {
-						    auto*                          packed = utils::copy_array(col.packed_array, col.n_packed_values);
-						    auto*                          bws    = utils::copy_array(col.bit_widths, col.get_n_vecs());
-						    auto*                          offs   = utils::copy_array(col.vector_offsets, col.get_n_vecs());
+						    auto* packed = utils::copy_array(col.packed_array, col.n_packed_values);
+						    auto* bws    = utils::copy_array(col.bit_widths, col.get_n_vecs());
+						    auto* offs   = utils::copy_array(col.vector_offsets, col.get_n_vecs());
 						    flsgpu::host::BPColumn<uint8_t> bp {col.n_values, col.n_packed_values, packed, bws, offs};
-						    auto*                          bases = new uint8_t[bp.get_n_vecs()];
+						    auto*                           bases = new uint8_t[bp.get_n_vecs()];
 						    std::memset(bases, 0, bp.get_n_vecs() * sizeof(uint8_t));
 						    return flsgpu::host::FFORColumn<uint8_t> {bp, bases};
 					    } else {
@@ -289,50 +276,43 @@ public:
 				    index_col.host);
 
 				auto parsed = columns::parse_dict_ffor_with_index<int8_t>(ctx, std::move(index_ffor));
-				result.host            = std::move(parsed.host);
+				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_DICT_I16_FFOR_SLPATCH_U16:
-			{
+			case EXP_DICT_I16_FFOR_SLPATCH_U16: {
 				auto parsed = columns::parse_dict_slpatch<int16_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_DICT_I16_FFOR_SLPATCH_U08:
-			{
+			case EXP_DICT_I16_FFOR_SLPATCH_U08: {
 				auto parsed = columns::parse_dict_slpatch<int16_t, uint8_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_RLE_I08_U16:
-			{
+			case EXP_RLE_I08_U16: {
 				auto parsed = columns::parse_rle<int8_t, uint16_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_RLE_I16_U16:
-			{
+			case EXP_RLE_I16_U16: {
 				auto parsed = columns::parse_rle<int16_t, uint16_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
-			case EXP_EQUAL:
-			{
+			case EXP_EQUAL: {
 				if (!operand_tokens || operand_tokens->size() < 1) {
 					throw std::runtime_error("EXP_EQUAL: missing operand tokens");
 				}
 				const auto src_col_idx = static_cast<size_t>(operand_tokens->Get(0));
 				auto&      src_col     = self(self, src_col_idx);
-				result.host          = src_col.host;
+				result.host            = src_col.host;
 				result.skip_decompress = true;
 				result.alias_of        = src_col_idx;
 				break;
 			}
-			default:
-			{
+			default: {
 				std::ostringstream msg;
-				msg << "unsupported operator token for this reader: "
-				    << fastlanes::token_to_string(op_token)
+				msg << "unsupported operator token for this reader: " << fastlanes::token_to_string(op_token)
 				    << " (col_index=" << col_idx
 				    << ", name=" << (col_desc.name() ? col_desc.name()->str() : std::string("<unnamed>")) << ")";
 				throw std::runtime_error(msg.str());

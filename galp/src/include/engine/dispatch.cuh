@@ -6,15 +6,15 @@
 #ifndef ENGINE_DISPATCH_CUH
 #define ENGINE_DISPATCH_CUH
 
-#include "engine/types.cuh"
 #include "engine/device-utils.cuh"
 #include "engine/expression.cuh"
 #include "engine/kernels.cuh"
+#include "engine/types.cuh"
 #include "flsgpu/structs.cuh"
 #include <memory>
 #include <optional>
-#include <tuple>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -212,7 +212,7 @@ void fill_device_expr(DeviceExpression<T>& expr, const HostColT& host_col, const
 	case PlanKind::DICT_FFOR:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint8_t>>) {
 			expr.dict_index_bits = 8;
-			expr.col.dictffor_u8  = host_col.copy_to_device();
+			expr.col.dictffor_u8 = host_col.copy_to_device();
 			return;
 		}
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint16_t>>) {
@@ -223,7 +223,7 @@ void fill_device_expr(DeviceExpression<T>& expr, const HostColT& host_col, const
 		break;
 	case PlanKind::DICT_FFOR_SLPATCH:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint8_t>>) {
-			expr.dict_index_bits  = 8;
+			expr.dict_index_bits    = 8;
 			expr.col.dictslpatch_u8 = host_col.copy_to_device();
 			return;
 		}
@@ -296,10 +296,10 @@ void free_device_expr(const DeviceExpression<T>& expr) {
 
 template <typename T>
 struct Batch {
-	std::vector<size_t>                 expr_indices;
-	std::vector<DeviceExpression<T>>    device_exprs;
-	std::vector<GPUArray<T>>            device_outputs;
-	std::vector<WorkItem>               work_items;
+	std::vector<size_t>              expr_indices;
+	std::vector<DeviceExpression<T>> device_exprs;
+	std::vector<GPUArray<T>>         device_outputs;
+	std::vector<WorkItem>            work_items;
 };
 
 template <typename... Ts>
@@ -321,10 +321,7 @@ struct BatchSetFromList<dispatch::TypeList<Ts...>> {
 };
 
 template <typename T, typename HostColT>
-void add_expression_to_batch(const size_t expr_index,
-                             const HostColT& host_col,
-                             const PlanKind plan,
-                             Batch<T>& batch) {
+void add_expression_to_batch(const size_t expr_index, const HostColT& host_col, const PlanKind plan, Batch<T>& batch) {
 	DeviceExpression<T> expr {};
 	expr.plan     = plan;
 	expr.n_values = host_col.get_n_values();
@@ -339,8 +336,7 @@ void add_expression_to_batch(const size_t expr_index,
 
 	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
 	for (size_t vec = 0; vec < n_vecs; ++vec) {
-		batch.work_items.push_back(
-		    WorkItem {device_idx, static_cast<uint32_t>(vec)});
+		batch.work_items.push_back(WorkItem {device_idx, static_cast<uint32_t>(vec)});
 	}
 }
 
@@ -375,11 +371,9 @@ void finalize_batch(Batch<T>& batch, RowgroupDecompressResult& result) {
 
 } // namespace detail
 
-DecompressResult decompress(const expr::Expression& expression, const Config& cfg = {});
-RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>& expressions,
-                                             const Config&                        cfg = {});
-BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressions,
-                                   const Config&                        cfg = {});
+DecompressResult         decompress(const expr::Expression& expression, const Config& cfg = {});
+RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
+BenchmarkResult          benchmark_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
 
 } // namespace dispatch
 

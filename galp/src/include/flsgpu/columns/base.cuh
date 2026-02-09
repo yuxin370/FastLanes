@@ -11,8 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace flsgpu {
-namespace device {
+namespace flsgpu { namespace device {
 
 template <typename T>
 struct FunctorBase {
@@ -31,7 +30,6 @@ struct DecompressorBase {
 	virtual void __device__ unpack_next_into(T* __restrict out);
 };
 
-} // namespace device
-} // namespace flsgpu
+}} // namespace flsgpu::device
 
 #endif // FLSGPU_COLUMNS_BASE_CUH

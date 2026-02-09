@@ -387,8 +387,8 @@ inline ParseResultT<flsgpu::host::CROSSRLEColumn<T>> parse_cross_rle(const Parse
 		throw std::runtime_error("EXP_CROSS_RLE: missing operand tokens");
 	}
 	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+	const auto   seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto   seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
 
 	const size_t n_runs        = seg_lens.data_span.size() / sizeof(uint32_t);
 	auto*        values        = detail::copy_segment_array<typename utils::same_width_uint<T>::type>(seg_vals);
@@ -401,7 +401,7 @@ inline ParseResultT<flsgpu::host::CROSSRLEColumn<T>> parse_cross_rle(const Parse
 		pos += lengths[i];
 	}
 
-	auto* offsets = new uint32_t[ctx.n_vecs + 1];
+	auto*    offsets = new uint32_t[ctx.n_vecs + 1];
 	uint32_t cur     = 0;
 	uint32_t idx_run = 0;
 	for (size_t v = 0; v < ctx.n_vecs; ++v) {

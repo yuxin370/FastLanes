@@ -17,8 +17,8 @@ struct DICTFFORColumn {
 	using KEY_T   = typename utils::same_width_uint<T>::type;
 	using INDEX_T = IndexT;
 	using UINT_T  = KEY_T;
-	size_t              n_values;
-	FFORColumn<IndexT>  ffor; // index stream (FFOR-compressed)
+	size_t             n_values;
+	FFORColumn<IndexT> ffor; // index stream (FFOR-compressed)
 
 	KEY_T* keys;      // dictionary keys (shared by all vectors)
 	size_t key_count; // number of keys in dictionary
@@ -36,8 +36,8 @@ struct DICTFFORColumn {
 	using DeviceColumnT = typename device::DICTFFORColumn<T, IndexT>;
 
 	FFORColumn<IndexT> ffor; // index stream (FFOR-compressed)
-	KEY_T*            keys;
-	size_t            key_count;
+	KEY_T*             keys;
+	size_t             key_count;
 
 	size_t get_n_values() const {
 		return ffor.get_n_values();
@@ -84,8 +84,8 @@ inline ParseResultT<flsgpu::host::DICTFFORColumn<T, IndexT>> parse_dict_ffor(con
 	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(2)));
 	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(3)));
 
-	auto bp_parts = detail::parse_bp_segments<IndexT>(seg_bitpacked, seg_bw, ctx.n_vecs);
-	auto* bases   = detail::copy_segment_array<IndexT>(seg_base);
+	auto  bp_parts = detail::parse_bp_segments<IndexT>(seg_bitpacked, seg_bw, ctx.n_vecs);
+	auto* bases    = detail::copy_segment_array<IndexT>(seg_base);
 
 	flsgpu::host::BPColumn<IndexT> bp_idx {
 	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
@@ -96,9 +96,8 @@ inline ParseResultT<flsgpu::host::DICTFFORColumn<T, IndexT>> parse_dict_ffor(con
 }
 
 template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
-inline ParseResultT<flsgpu::host::DICTFFORColumn<T, IndexT>> parse_dict_ffor_with_index(
-    const ParseContext& ctx,
-    flsgpu::host::FFORColumn<IndexT> index_ffor) {
+inline ParseResultT<flsgpu::host::DICTFFORColumn<T, IndexT>>
+parse_dict_ffor_with_index(const ParseContext& ctx, flsgpu::host::FFORColumn<IndexT> index_ffor) {
 	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 2) {
 		throw std::runtime_error("EXP_DICT: missing operand tokens");
 	}

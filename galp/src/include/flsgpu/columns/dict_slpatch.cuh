@@ -17,8 +17,8 @@ struct DICTSLPATCHColumn {
 	using KEY_T   = typename utils::same_width_uint<T>::type;
 	using INDEX_T = IndexT;
 	using UINT_T  = KEY_T;
-	size_t                 n_values;
-	SLPATCHColumn<IndexT>  index;     // index stream (FFOR+SLPATCH)
+	size_t                n_values;
+	SLPATCHColumn<IndexT> index;     // index stream (FFOR+SLPATCH)
 	KEY_T*                keys;      // dictionary keys (shared by all vectors)
 	size_t                key_count; // number of keys in dictionary
 };
@@ -35,8 +35,8 @@ struct DICTSLPATCHColumn {
 	using DeviceColumnT = typename device::DICTSLPATCHColumn<T, IndexT>;
 
 	SLPATCHColumn<IndexT> index;     // index stream (FFOR+SLPATCH)
-	KEY_T*               keys;      // host dictionary keys
-	size_t               key_count; // number of keys
+	KEY_T*                keys;      // host dictionary keys
+	size_t                key_count; // number of keys
 
 	size_t get_n_values() const {
 		return index.get_n_values();
@@ -73,11 +73,11 @@ inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> parse_dict_slpat
 	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 7) {
 		throw std::runtime_error("EXP_DICT_FFOR_SLPATCH: missing operand tokens");
 	}
-	const auto   key_seg_idx = static_cast<uint32_t>(ctx.operand_tokens->Get(0));
-	const auto   seg_keys    = ctx.column_view.GetSegment(key_seg_idx);
-	using KEY_T             = typename utils::same_width_uint<T>::type;
-	const size_t key_count  = seg_keys.data_span.size() / sizeof(KEY_T);
-	auto*        keys       = detail::copy_segment_array<KEY_T>(seg_keys);
+	const auto key_seg_idx = static_cast<uint32_t>(ctx.operand_tokens->Get(0));
+	const auto seg_keys    = ctx.column_view.GetSegment(key_seg_idx);
+	using KEY_T            = typename utils::same_width_uint<T>::type;
+	const size_t key_count = seg_keys.data_span.size() / sizeof(KEY_T);
+	auto*        keys      = detail::copy_segment_array<KEY_T>(seg_keys);
 
 	const auto seg_exc       = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(1)));
 	const auto seg_pos       = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(2)));
@@ -86,8 +86,8 @@ inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> parse_dict_slpat
 	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(5)));
 	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(6)));
 
-	auto bp_parts = detail::parse_bp_segments<IndexT>(seg_bitpacked, seg_bw, ctx.n_vecs);
-	auto* bases   = detail::copy_segment_array<IndexT>(seg_base);
+	auto  bp_parts = detail::parse_bp_segments<IndexT>(seg_bitpacked, seg_bw, ctx.n_vecs);
+	auto* bases    = detail::copy_segment_array<IndexT>(seg_base);
 
 	flsgpu::host::BPColumn<IndexT> bp_idx {
 	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};

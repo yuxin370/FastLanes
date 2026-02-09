@@ -90,21 +90,21 @@ inline ParseResultT<flsgpu::host::CROSSRLELaneMaskColumn<T>> parse_cross_rle_lan
 		throw std::runtime_error("EXP_CROSS_RLE_LANE_MASK: missing operand tokens");
 	}
 	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+	const auto   seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto   seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
 
-	const size_t n_runs = seg_lens.data_span.size() / sizeof(uint32_t);
-	auto*        values = detail::copy_segment_array<UINT_T>(seg_vals);
+	const size_t n_runs  = seg_lens.data_span.size() / sizeof(uint32_t);
+	auto*        values  = detail::copy_segment_array<UINT_T>(seg_vals);
 	auto*        lengths = detail::copy_segment_array<uint32_t>(seg_lens);
 
-	auto* run_positions = new uint32_t[n_runs];
-	uint32_t pos = 0;
+	auto*    run_positions = new uint32_t[n_runs];
+	uint32_t pos           = 0;
 	for (size_t i = 0; i < n_runs; ++i) {
 		run_positions[i] = pos;
 		pos += lengths[i];
 	}
 
-	auto* offsets = new uint32_t[ctx.n_vecs + 1];
+	auto*    offsets = new uint32_t[ctx.n_vecs + 1];
 	uint32_t cur     = 0;
 	uint32_t idx_run = 0;
 	for (size_t v = 0; v < ctx.n_vecs; ++v) {
@@ -248,13 +248,8 @@ inline ParseResultT<flsgpu::host::CROSSRLELaneMaskColumn<T>> parse_cross_rle_lan
 	delete[] offsets;
 	delete[] run_positions;
 
-	return ParseResultT<flsgpu::host::CROSSRLELaneMaskColumn<T>> {
-	    flsgpu::host::CROSSRLELaneMaskColumn<T> {
-	        ctx.n_values,
-	        (size_t)total_runs,
-	        lane_run_base,
-	        lane_run_values,
-	        lane_boundary_mask}};
+	return ParseResultT<flsgpu::host::CROSSRLELaneMaskColumn<T>> {flsgpu::host::CROSSRLELaneMaskColumn<T> {
+	    ctx.n_values, (size_t)total_runs, lane_run_base, lane_run_values, lane_boundary_mask}};
 }
 
 } // namespace reader::columns

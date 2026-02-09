@@ -94,9 +94,9 @@ public:
 	GPUArray& operator=(GPUArray&& other) noexcept {
 		if (this != &other) {
 			free_device_pointer(device_ptr);
-			allocation_size  = other.allocation_size;
-			memory_size      = other.memory_size;
-			device_ptr       = other.device_ptr;
+			allocation_size       = other.allocation_size;
+			memory_size           = other.memory_size;
+			device_ptr            = other.device_ptr;
 			other.allocation_size = 0;
 			other.memory_size     = 0;
 			other.device_ptr      = nullptr;

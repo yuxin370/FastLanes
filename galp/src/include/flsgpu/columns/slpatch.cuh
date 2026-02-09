@@ -100,20 +100,21 @@ inline ParseResultT<flsgpu::host::SLPATCHColumn<T>> parse_slpatch(const ParseCon
 		throw std::runtime_error("EXP_FFOR_SLPATCH: missing operand tokens");
 	}
 
-	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto   seg_bitpacked =
-	    ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
-	const auto seg_bw   = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_base = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+	const size_t base_idx    = ctx.operand_tokens->size() - 1;
+	const auto seg_bitpacked = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
+	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
 
 	const auto seg_exc = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 5)));
 	const auto seg_pos = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 4)));
 	const auto seg_cnt = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
 
-	auto bp_parts = detail::parse_bp_segments<typename utils::same_width_uint<T>::type>(seg_bitpacked, seg_bw, ctx.n_vecs);
-	auto* bases   = detail::copy_segment_array<typename utils::same_width_uint<T>::type>(seg_base);
+	auto bp_parts =
+	    detail::parse_bp_segments<typename utils::same_width_uint<T>::type>(seg_bitpacked, seg_bw, ctx.n_vecs);
+	auto* bases = detail::copy_segment_array<typename utils::same_width_uint<T>::type>(seg_base);
 
-	flsgpu::host::BPColumn<T> bp {ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
+	flsgpu::host::BPColumn<T> bp {
+	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
 	flsgpu::host::FFORColumn<T> ffor {bp, bases};
 
 	auto* counts     = detail::copy_segment_array<uint16_t>(seg_cnt);
@@ -122,8 +123,8 @@ inline ParseResultT<flsgpu::host::SLPATCHColumn<T>> parse_slpatch(const ParseCon
 
 	auto exc = detail::build_exception_offsets(counts, ctx.n_vecs);
 
-	return ParseResultT<flsgpu::host::SLPATCHColumn<T>> {
-	    flsgpu::host::SLPATCHColumn<T> {ctx.n_values, ctx.n_vecs, ffor, exc.total, exc.offsets, exceptions, positions, counts}};
+	return ParseResultT<flsgpu::host::SLPATCHColumn<T>> {flsgpu::host::SLPATCHColumn<T> {
+	    ctx.n_values, ctx.n_vecs, ffor, exc.total, exc.offsets, exceptions, positions, counts}};
 }
 
 } // namespace reader::columns

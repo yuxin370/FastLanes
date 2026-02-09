@@ -95,21 +95,21 @@ inline ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> parse_cross_rle_ext
 		throw std::runtime_error("EXP_CROSS_RLE_EXTENDED: missing operand tokens");
 	}
 	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+	const auto   seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto   seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
 
-	const size_t n_runs = seg_lens.data_span.size() / sizeof(uint32_t);
-	auto*        values = detail::copy_segment_array<UINT_T>(seg_vals);
+	const size_t n_runs  = seg_lens.data_span.size() / sizeof(uint32_t);
+	auto*        values  = detail::copy_segment_array<UINT_T>(seg_vals);
 	auto*        lengths = detail::copy_segment_array<uint32_t>(seg_lens);
 
-	auto* run_positions = new uint32_t[n_runs];
-	uint32_t pos = 0;
+	auto*    run_positions = new uint32_t[n_runs];
+	uint32_t pos           = 0;
 	for (size_t i = 0; i < n_runs; ++i) {
 		run_positions[i] = pos;
 		pos += lengths[i];
 	}
 
-	auto* offsets = new uint32_t[ctx.n_vecs + 1];
+	auto*    offsets = new uint32_t[ctx.n_vecs + 1];
 	uint32_t cur     = 0;
 	uint32_t idx_run = 0;
 	for (size_t v = 0; v < ctx.n_vecs; ++v) {
@@ -183,9 +183,9 @@ inline ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> parse_cross_rle_ext
 		lane_runs_offsets[vec + 1] = total_runs;
 	}
 
-	auto* lane_values        = (total_runs ? new UINT_T[total_runs] : nullptr);
-	auto* lane_lengths       = (total_runs ? new uint16_t[total_runs] : nullptr);
-	auto* offsets_counts     = new uint32_t[ctx.n_vecs * N_LANES];
+	auto* lane_values    = (total_runs ? new UINT_T[total_runs] : nullptr);
+	auto* lane_lengths   = (total_runs ? new uint16_t[total_runs] : nullptr);
+	auto* offsets_counts = new uint32_t[ctx.n_vecs * N_LANES];
 
 	for (size_t vec = 0; vec < ctx.n_vecs; ++vec) {
 		UINT_T tmp[VEC_VALUES];
@@ -220,7 +220,7 @@ inline ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> parse_cross_rle_ext
 		size_t       cursor       = vec_out_base;
 
 		for (uint32_t lane = 0; lane < N_LANES; ++lane) {
-			const uint16_t run_cnt = lane_run_counts[vec * N_LANES + lane];
+			const uint16_t run_cnt  = lane_run_counts[vec * N_LANES + lane];
 			const uint16_t lane_off = (uint16_t)(cursor - vec_out_base);
 
 			offsets_counts[vec * N_LANES + lane] = (uint32_t(run_cnt) << 16) | uint32_t(lane_off);
@@ -253,14 +253,8 @@ inline ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> parse_cross_rle_ext
 	delete[] offsets;
 	delete[] run_positions;
 
-	return ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> {
-	    flsgpu::host::CROSSRLEExtendedColumn<T> {
-	        ctx.n_values,
-	        total_runs,
-	        lane_runs_offsets,
-	        lane_values,
-	        lane_lengths,
-	        offsets_counts}};
+	return ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> {flsgpu::host::CROSSRLEExtendedColumn<T> {
+	    ctx.n_values, total_runs, lane_runs_offsets, lane_values, lane_lengths, offsets_counts}};
 }
 
 } // namespace reader::columns

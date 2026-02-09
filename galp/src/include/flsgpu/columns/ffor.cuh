@@ -67,16 +67,17 @@ inline ParseResultT<flsgpu::host::FFORColumn<T>> parse_ffor(const ParseContext& 
 	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 3) {
 		throw std::runtime_error("EXP_FFOR: missing operand tokens");
 	}
-	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto   seg_bitpacked =
-	    ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
-	const auto seg_bw   = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_base = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+	const size_t base_idx    = ctx.operand_tokens->size() - 1;
+	const auto seg_bitpacked = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
+	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
 
-	auto bp_parts = detail::parse_bp_segments<typename utils::same_width_uint<T>::type>(seg_bitpacked, seg_bw, ctx.n_vecs);
-	auto* bases   = detail::copy_segment_array<typename utils::same_width_uint<T>::type>(seg_base);
+	auto bp_parts =
+	    detail::parse_bp_segments<typename utils::same_width_uint<T>::type>(seg_bitpacked, seg_bw, ctx.n_vecs);
+	auto* bases = detail::copy_segment_array<typename utils::same_width_uint<T>::type>(seg_base);
 
-	flsgpu::host::BPColumn<T> bp {ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
+	flsgpu::host::BPColumn<T> bp {
+	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
 
 	return ParseResultT<flsgpu::host::FFORColumn<T>> {flsgpu::host::FFORColumn<T> {bp, bases}};
 }

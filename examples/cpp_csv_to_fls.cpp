@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
 		printf(" -   ----------------- - \n");
 		const std::filesystem::path input_path = argv[1];
 		const std::filesystem::path output_fls = argv[2];
-		const bool overwrite = (argc >= 4 && std::string_view(argv[3]) == "--overwrite");
+		const bool                  overwrite  = (argc >= 4 && std::string_view(argv[3]) == "--overwrite");
 
 		if (!std::filesystem::exists(input_path)) {
 			throw std::runtime_error("input path does not exist: " + input_path.string());

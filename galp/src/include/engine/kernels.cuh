@@ -35,9 +35,9 @@ template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES>
 __global__ void decompress_rowgroup(const dispatch::DeviceExpression<T>* exprs,
                                     const dispatch::WorkItem*            work_items,
                                     const size_t                         n_items) {
-	const auto         mapping      = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
-	const lane_t       lane         = mapping.get_lane();
-	const uint32_t     item_idx     = static_cast<uint32_t>(mapping.get_vector_index());
+	const auto     mapping  = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
+	const lane_t   lane     = mapping.get_lane();
+	const uint32_t item_idx = static_cast<uint32_t>(mapping.get_vector_index());
 	if (item_idx >= n_items) {
 		return;
 	}

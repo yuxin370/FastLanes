@@ -997,13 +997,13 @@ struct StatefulSLPATCHDictExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
 	using INT_T = typename utils::same_width_int<T>::type;
 	using KEY_T = typename utils::same_width_uint<T>::type;
 
-	si_t                        start_index = 0;
-	uint16_t                    exceptions_count[UNPACK_N_VECTORS];
-	uint16_t*                   vec_exceptions_positions[UNPACK_N_VECTORS];
-	IndexT*                     vec_exceptions[UNPACK_N_VECTORS];
+	si_t                               start_index = 0;
+	uint16_t                           exceptions_count[UNPACK_N_VECTORS];
+	uint16_t*                          vec_exceptions_positions[UNPACK_N_VECTORS];
+	IndexT*                            vec_exceptions[UNPACK_N_VECTORS];
 	DICTIndexFunctor<T, IndexT, KEY_T> processor;
-	const lane_t                lane;
-	int32_t                     exception_index[UNPACK_N_VECTORS] = {0};
+	const lane_t                       lane;
+	int32_t                            exception_index[UNPACK_N_VECTORS] = {0};
 
 public:
 	void __device__ __forceinline__ patch(T* out) override {
@@ -1032,8 +1032,8 @@ public:
 	}
 
 	__device__ __forceinline__ StatefulSLPATCHDictExceptionPatcher(const DICTSLPATCHColumn<T, IndexT> column,
-	                                                               const vi_t                 first_vector_index,
-	                                                               const lane_t               lane)
+	                                                               const vi_t   first_vector_index,
+	                                                               const lane_t lane)
 	    : processor(column.keys)
 	    , lane(lane) {
 
@@ -2136,16 +2136,16 @@ struct FFORDecompressor : DecompressorBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename ColumnT>
 struct CONSTANTDecompressor : DecompressorBase<T> {
-	T value;
-	__device__ __forceinline__ CONSTANTDecompressor(const ColumnT column,
-	                                                [[maybe_unused]] const vi_t vector_index,
+	T                          value;
+	__device__ __forceinline__ CONSTANTDecompressor(const ColumnT                 column,
+	                                                [[maybe_unused]] const vi_t   vector_index,
 	                                                [[maybe_unused]] const lane_t lane)
 	    : value(column.value) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
 		constexpr unsigned kCount = UNPACK_N_VECTORS * UNPACK_N_VALUES;
-		#pragma unroll
+#pragma unroll
 		for (unsigned i = 0; i < kCount; ++i) {
 			out[i] = value;
 		}
@@ -2267,9 +2267,8 @@ template <typename T,
           typename ProcessorT = DICTFunctor<T, UNPACK_N_VECTORS>>
 struct DICTDecompressor : DecompressorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
-	UnpackerT unpacker;
-	__device__ __forceinline__
-	DICTDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
+	UnpackerT                  unpacker;
+	__device__ __forceinline__ DICTDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,
 	               column.ffor.bp.bit_widths[vector_index],
@@ -2279,8 +2278,8 @@ struct DICTDecompressor : DecompressorBase<T> {
 
 	// outer key pointer, which may points to shared memory
 	__device__ __forceinline__ DICTDecompressor(const ColumnT column,
-	                                            const vi_t              vector_index,
-	                                            const lane_t            lane,
+	                                            const vi_t    vector_index,
+	                                            const lane_t  lane,
 	                                            const typename ColumnT::KEY_T* __restrict keys_ptr)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,

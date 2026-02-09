@@ -179,10 +179,10 @@ inline ParseResultT<flsgpu::host::FREQColumn<T>> parse_frequency(const ParseCont
 		throw std::runtime_error("EXP_FREQUENCY: missing operand tokens");
 	}
 	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto   seg_fv  = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
-	const auto   seg_exc = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
-	const auto   seg_pos = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto   seg_cnt = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+	const auto   seg_fv   = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
+	const auto   seg_exc  = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
+	const auto   seg_pos  = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto   seg_cnt  = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
 
 	if (seg_fv.data_span.size() != sizeof(T)) {
 		throw std::runtime_error("EXP_FREQUENCY: invalid frequent value size");
@@ -199,8 +199,8 @@ inline ParseResultT<flsgpu::host::FREQColumn<T>> parse_frequency(const ParseCont
 
 	auto exc = detail::build_exception_offsets(counts, ctx.n_vecs);
 
-	return ParseResultT<flsgpu::host::FREQColumn<T>> {
-	    flsgpu::host::FREQColumn<T> {ctx.n_values, ctx.n_vecs, fv_arr, exc.total, exc.offsets, exceptions, positions, counts}};
+	return ParseResultT<flsgpu::host::FREQColumn<T>> {flsgpu::host::FREQColumn<T> {
+	    ctx.n_values, ctx.n_vecs, fv_arr, exc.total, exc.offsets, exceptions, positions, counts}};
 }
 
 } // namespace reader::columns
