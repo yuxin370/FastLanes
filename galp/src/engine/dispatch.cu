@@ -172,8 +172,9 @@ template <typename HostColT>
 DecompressResult decompress_common(const HostColT& host_col, const Config& cfg) {
 	using T = typename host_value_type<HostColT>::type;
 
-	auto  device_col = host_col.copy_to_device();
-	auto* out        = detail::decompress_device(device_col, cfg);
+	auto device_col = host_col.copy_to_device();
+	flsgpu::memory::sync_h2d();
+	auto* out = detail::decompress_device(device_col, cfg);
 	flsgpu::host::free_column(device_col);
 
 	return make_result<T>(out);

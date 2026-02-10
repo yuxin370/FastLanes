@@ -8,7 +8,9 @@
 #include "engine/kernels.cuh"
 #include "engine/verification.cuh"
 #include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/host-utils.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +19,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <chrono>
 
 static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
 	if (e != cudaSuccess) {
@@ -107,7 +108,8 @@ private:
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T> decompress_column(const ColumnT column, const ProgramParameters params) {
 	auto column_device = column.copy_to_device();
-	T*   out;
+	flsgpu::memory::sync_h2d();
+	T* out;
 
 	if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTFFORColumn<T>>) {
 		bool use_shuffle = column.key_count <= 32;
@@ -131,16 +133,16 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 
 	flsgpu::host::free_column(column_device);
 
-    // ---- CPU version timing (microseconds) ----
-    const auto cpu_start = std::chrono::steady_clock::now();
-	const T* correct_out = data::bindings::decompress(column);
-    const auto cpu_end   = std::chrono::steady_clock::now();
+	// ---- CPU version timing (microseconds) ----
+	const auto cpu_start   = std::chrono::steady_clock::now();
+	const T*   correct_out = data::bindings::decompress(column);
+	const auto cpu_end     = std::chrono::steady_clock::now();
 
-    const auto cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
-    std::printf("[CPU decompress] %lld us\n", static_cast<long long>(cpu_us));
-    // ------------------------------------------
-	
-	auto     result      = verification::compare_data(correct_out, out, params.n_values);
+	const auto cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
+	std::printf("[CPU decompress] %lld us\n", static_cast<long long>(cpu_us));
+	// ------------------------------------------
+
+	auto result = verification::compare_data(correct_out, out, params.n_values);
 	delete correct_out;
 	delete out;
 	return result;
@@ -149,6 +151,7 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T> decompress_column_time(const ColumnT column, const ProgramParameters params) {
 	auto column_device = column.copy_to_device();
+	flsgpu::memory::sync_h2d();
 
 	{
 		const T* warm = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
@@ -185,14 +188,15 @@ verification::ExecutionResult<T> decompress_column_time(const ColumnT column, co
 template <typename T, typename ColumnT>
 verification::ExecutionResult<T>
 query_column(const ColumnT column, const ProgramParameters params, const bool query_result, const T magic_value) {
-	auto       column_device = column.copy_to_device();
-	const bool answer        = bindings::query_column<T, typename ColumnT::DeviceColumnT>(column_device,
-                                                                                   params.unpack_n_vecs,
-                                                                                   params.unpack_n_vals,
-                                                                                   params.unpacker,
-                                                                                   params.patcher,
-                                                                                   magic_value,
-                                                                                   params.n_samples);
+	auto column_device = column.copy_to_device();
+	flsgpu::memory::sync_h2d();
+	const bool answer = bindings::query_column<T, typename ColumnT::DeviceColumnT>(column_device,
+	                                                                               params.unpack_n_vecs,
+	                                                                               params.unpack_n_vals,
+	                                                                               params.unpacker,
+	                                                                               params.patcher,
+	                                                                               magic_value,
+	                                                                               params.n_samples);
 	flsgpu::host::free_column(column_device);
 
 	// Weird hack to avoid refactor_
@@ -242,25 +246,22 @@ execute_kernel(const ColumnT column, const ProgramParameters params, const bool 
 	}
 }
 
-
-
 template <typename T>
 std::vector<verification::ExecutionResult<T>> execute_bp(const ProgramParameters params) {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	auto results = std::vector<verification::ExecutionResult<T>>();
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
-		printf("processing bitwidth = %d\n",vbw);
+		printf("processing bitwidth = %d\n", vbw);
 		auto vbw_range = data::ValueRange<vbw_t>(vbw);
 		if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
 			throw std::invalid_argument("QueryMultiColumn not supported for Bit-Packing columns.\n");
 		}
-		bool                        query_result = false;
-		T                           magic_value  = consts::as<T>::MAGIC_NUMBER;
+		bool                      query_result = false;
+		T                         magic_value  = consts::as<T>::MAGIC_NUMBER;
 		flsgpu::host::BPColumn<T> column;
 
-		column = data::columns::generate_random_bp_column<T>(
-		    params.n_values, vbw_range, params.unpack_n_vecs);
+		column = data::columns::generate_random_bp_column<T>(params.n_values, vbw_range, params.unpack_n_vecs);
 
 		results.push_back(execute_kernel<T, flsgpu::host::BPColumn<T>>(column, params, query_result, magic_value));
 
@@ -270,15 +271,13 @@ std::vector<verification::ExecutionResult<T>> execute_bp(const ProgramParameters
 	return results;
 }
 
-
-
 template <typename T>
 std::vector<verification::ExecutionResult<T>> execute_ffor(const ProgramParameters params) {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	auto results = std::vector<verification::ExecutionResult<T>>();
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
-		printf("processing bitwidth = %d\n",vbw);
+		printf("processing bitwidth = %d\n", vbw);
 		auto vbw_range = data::ValueRange<vbw_t>(vbw);
 		if (params.kernel == enums::Kernel::QueryMultiColumn) {
 			vbw_range = params.bit_width_range;
@@ -409,7 +408,7 @@ std::vector<verification::ExecutionResult<T>> execute_dict(const ProgramParamete
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
-		printf("processing bitwidth = %d\n",vbw);
+		printf("processing bitwidth = %d\n", vbw);
 		bool query_result = false;
 		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
 
@@ -417,7 +416,8 @@ std::vector<verification::ExecutionResult<T>> execute_dict(const ProgramParamete
 
 		column = data::columns::generate_random_dict_column<T>(params.n_values, vbw, 20);
 
-		results.push_back(execute_kernel<T, flsgpu::host::DICTFFORColumn<T>>(column, params, query_result, magic_value));
+		results.push_back(
+		    execute_kernel<T, flsgpu::host::DICTFFORColumn<T>>(column, params, query_result, magic_value));
 
 		flsgpu::host::free_column(column);
 	}
@@ -436,7 +436,7 @@ std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramPar
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
-		printf("processing bitwidth = %d\n",vbw);
+		printf("processing bitwidth = %d\n", vbw);
 		bool query_result = false;
 		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
 
@@ -448,8 +448,8 @@ std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramPar
 			auto column_extended = column.create_extended_column();
 			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLEExtendedColumn<T>>(
 			    column_extended, params, query_result, magic_value));
-		} else if (params.expander == enums::Expander::Branchless || params.expander ==
-		               enums::Expander::PrefetchBranchless) {
+		} else if (params.expander == enums::Expander::Branchless ||
+		           params.expander == enums::Expander::PrefetchBranchless) {
 			auto column_lane_mask = column.create_lane_mask_column();
 			results.push_back(execute_kernel<T, flsgpu::host::CROSSRLELaneMaskColumn<T>>(
 			    column_lane_mask, params, query_result, magic_value));

@@ -10,6 +10,7 @@
 #include "engine/expression.cuh"
 #include "engine/kernels.cuh"
 #include "engine/types.cuh"
+#include "flsgpu/host-utils.cuh"
 #include "flsgpu/structs.cuh"
 #include <memory>
 #include <optional>
@@ -347,6 +348,7 @@ void launch_batch(const Batch<T>& batch) {
 	}
 	GPUArray<DeviceExpression<T>> d_exprs(batch.device_exprs.size(), batch.device_exprs.data());
 	GPUArray<WorkItem>            d_items(batch.work_items.size(), batch.work_items.data());
+	flsgpu::memory::sync_h2d();
 
 	constexpr unsigned UNPACK_N_VECTORS = 1;
 	constexpr unsigned UNPACK_N_VALUES  = 1;

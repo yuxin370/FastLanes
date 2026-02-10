@@ -7,14 +7,13 @@
 #include "engine/expression.cuh"
 #include "engine/pipeline.cuh"
 #include "engine/reader.cuh"
-#include "fls/footer/datatype_generated.h"
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/file/file_footer.hpp"
 #include "fls/file/file_header.hpp"
+#include "fls/footer/datatype_generated.h"
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/io/file.hpp"
 #include "fls/io/io.hpp"
-
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -37,17 +36,17 @@ enum class Mode {
 };
 
 struct Options {
-	Mode                          mode      = Mode::ReadTable;
-	std::filesystem::path         input;
+	Mode                                 mode = Mode::ReadTable;
+	std::filesystem::path                input;
 	std::optional<std::filesystem::path> output;
-	std::optional<size_t>         rowgroup;
-	uint32_t                      samples   = 1;
-	bool                          header    = true;
-	uint32_t                      launch_iters = 100000;
-	uint32_t                      launch_grid  = 1;
-	uint32_t                      launch_block = 1;
-	bool                          estimate_launch = false;
-	uint32_t                      estimate_iters  = 10000;
+	std::optional<size_t>                rowgroup;
+	uint32_t                             samples         = 1;
+	bool                                 header          = true;
+	uint32_t                             launch_iters    = 100000;
+	uint32_t                             launch_grid     = 1;
+	uint32_t                             launch_block    = 1;
+	bool                                 estimate_launch = false;
+	uint32_t                             estimate_iters  = 10000;
 };
 
 size_t data_type_size(const fastlanes::DataType dt) {
@@ -77,7 +76,7 @@ size_t data_type_size(const fastlanes::DataType dt) {
 
 std::string format_bytes(double bytes) {
 	static constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-	size_t unit = 0;
+	size_t                       unit     = 0;
 	while (bytes >= 1024.0 && unit < (sizeof(kUnits) / sizeof(kUnits[0]) - 1)) {
 		bytes /= 1024.0;
 		++unit;
@@ -99,7 +98,8 @@ fastlanes::TableDescriptorHandle load_table_descriptor(const std::filesystem::pa
 		    file_path, footer.table_descriptor_offset, footer.table_descriptor_size, /*verify=*/true);
 	}
 
-	return fastlanes::TableDescriptorHandle::FromFile(file_path.parent_path() / "table_descriptor.fbb", /*verify=*/true);
+	return fastlanes::TableDescriptorHandle::FromFile(file_path.parent_path() / "table_descriptor.fbb",
+	                                                  /*verify=*/true);
 }
 
 double measure_rowgroup_io_ms(const std::filesystem::path& file_path, const fastlanes::RowgroupDescriptor* rg) {
@@ -108,7 +108,7 @@ double measure_rowgroup_io_ms(const std::filesystem::path& file_path, const fast
 	}
 	using Clock = std::chrono::steady_clock;
 	fastlanes::Buf buf(rg->m_size());
-	fastlanes::io  io = fastlanes::make_unique<fastlanes::File>(file_path);
+	fastlanes::io  io    = fastlanes::make_unique<fastlanes::File>(file_path);
 	const auto     start = Clock::now();
 	fastlanes::IO::range_read(io, buf, rg->m_offset(), rg->m_size());
 	const auto end = Clock::now();
@@ -117,7 +117,7 @@ double measure_rowgroup_io_ms(const std::filesystem::path& file_path, const fast
 
 template <typename T>
 struct DeviceBatch {
-	dispatch::detail::Batch<T>                                      batch;
+	dispatch::detail::Batch<T>                             batch;
 	std::optional<GPUArray<dispatch::DeviceExpression<T>>> d_exprs;
 	std::optional<GPUArray<dispatch::WorkItem>>            d_items;
 };
@@ -161,7 +161,7 @@ template <typename BatchesT>
 bool batches_have_work(BatchesT& batches) {
 	bool has_work = false;
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
+		using T     = typename decltype(tag)::type;
 		auto& batch = batches.template get<T>();
 		if (!batch.batch.device_exprs.empty() && !batch.batch.work_items.empty()) {
 			has_work = true;
@@ -196,7 +196,7 @@ double build_gpu_batches(const std::vector<expr::Expression>& expressions, Batch
 	}
 
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
+		using T     = typename decltype(tag)::type;
 		auto& batch = batches.template get<T>();
 		if (!batch.batch.device_exprs.empty() && !batch.batch.work_items.empty()) {
 			batch.d_exprs.emplace(batch.batch.device_exprs.size(), batch.batch.device_exprs.data());
@@ -213,6 +213,7 @@ double run_gpu_kernels(BatchesT& batches, uint32_t samples) {
 	if (!batches_have_work(batches)) {
 		return 0.0;
 	}
+	flsgpu::memory::sync_h2d();
 
 	cudaEvent_t start {};
 	cudaEvent_t stop {};
@@ -223,7 +224,7 @@ double run_gpu_kernels(BatchesT& batches, uint32_t samples) {
 
 	for (uint32_t sample = 0; sample < samples; ++sample) {
 		dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
-			using T = typename decltype(tag)::type;
+			using T     = typename decltype(tag)::type;
 			auto& batch = batches.template get<T>();
 			if (!batch.batch.device_exprs.empty() && !batch.batch.work_items.empty()) {
 				launch_batch_no_sync(batch);
@@ -245,7 +246,7 @@ double run_gpu_kernels(BatchesT& batches, uint32_t samples) {
 template <typename BatchesT>
 void free_gpu_batches(BatchesT& batches) {
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
+		using T     = typename decltype(tag)::type;
 		auto& batch = batches.template get<T>();
 		for (auto& expr : batch.batch.device_exprs) {
 			dispatch::detail::free_device_expr(expr);
@@ -254,22 +255,21 @@ void free_gpu_batches(BatchesT& batches) {
 }
 
 void print_usage(const char* prog) {
-	std::cerr
-	    << "Usage:\n"
-	    << "  " << prog << " read_table <input.fls> [output.csv] [--rowgroup N] [--no-header]\n"
-	    << "  " << prog << " benchmark <input.fls> [--rowgroup N] [--samples N]\n"
-	    << "  " << prog << " measure_launch [--iters N] [--grid N] [--block N]\n"
-	    << "\n"
-	    << "Options:\n"
-	    << "  --rowgroup N   Only process the given rowgroup\n"
-	    << "  --samples N    Number of benchmark repetitions (default: 1)\n"
-	    << "  --no-header    Skip CSV header\n"
-	    << "  --out PATH     Output CSV path (read_table mode)\n"
-	    << "  --iters N      Launch measurement iterations (default: 100000)\n"
-	    << "  --grid N       Launch grid size for measurement (default: 1)\n"
-	    << "  --block N      Launch block size for measurement (default: 1)\n"
-	    << "  --estimate-launch  Estimate launch overhead during benchmark\n"
-	    << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n";
+	std::cerr << "Usage:\n"
+	          << "  " << prog << " read_table <input.fls> [output.csv] [--rowgroup N] [--no-header]\n"
+	          << "  " << prog << " benchmark <input.fls> [--rowgroup N] [--samples N]\n"
+	          << "  " << prog << " measure_launch [--iters N] [--grid N] [--block N]\n"
+	          << "\n"
+	          << "Options:\n"
+	          << "  --rowgroup N   Only process the given rowgroup\n"
+	          << "  --samples N    Number of benchmark repetitions (default: 1)\n"
+	          << "  --no-header    Skip CSV header\n"
+	          << "  --out PATH     Output CSV path (read_table mode)\n"
+	          << "  --iters N      Launch measurement iterations (default: 100000)\n"
+	          << "  --grid N       Launch grid size for measurement (default: 1)\n"
+	          << "  --block N      Launch block size for measurement (default: 1)\n"
+	          << "  --estimate-launch  Estimate launch overhead during benchmark\n"
+	          << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n";
 }
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -361,16 +361,16 @@ void write_cell(std::ostream& out, const PtrT& ptr, size_t row) {
 	}
 }
 
-void write_row(std::ostream& out,
-               const std::vector<size_t>&                     col_indices,
-               const dispatch::RowgroupDecompressResult&       result,
-               const size_t                                    row) {
+void write_row(std::ostream&                             out,
+               const std::vector<size_t>&                col_indices,
+               const dispatch::RowgroupDecompressResult& result,
+               const size_t                              row) {
 	for (size_t ci = 0; ci < col_indices.size(); ++ci) {
 		if (ci > 0) {
 			out << "|";
 		}
-		const auto col_idx = col_indices[ci];
-		const auto& opt    = result.columns[col_idx];
+		const auto  col_idx = col_indices[ci];
+		const auto& opt     = result.columns[col_idx];
 		if (!opt.has_value()) {
 			continue;
 		}
@@ -379,7 +379,8 @@ void write_row(std::ostream& out,
 	out << "\n";
 }
 
-__global__ void empty_kernel() {}
+__global__ void empty_kernel() {
+}
 
 double measure_gpu_launch_us(uint32_t iters, dim3 grid, dim3 block) {
 	// warmup
@@ -437,10 +438,10 @@ int main(int argc, char** argv) {
 	try {
 		if (opt.mode == Mode::MeasureLaunch) {
 			const uint32_t iters = opt.launch_iters;
-			const dim3 grid(opt.launch_grid);
-			const dim3 block(opt.launch_block);
-			const double gpu_us = measure_gpu_launch_us(iters, grid, block);
-			const double cpu_us = measure_cpu_launch_us(iters, grid, block);
+			const dim3     grid(opt.launch_grid);
+			const dim3     block(opt.launch_block);
+			const double   gpu_us = measure_gpu_launch_us(iters, grid, block);
+			const double   cpu_us = measure_cpu_launch_us(iters, grid, block);
 			std::cout << "Launch overhead (" << iters << " iters, grid=" << opt.launch_grid
 			          << ", block=" << opt.launch_block << "):\n";
 			std::cout << "  gpu_event_us: " << gpu_us << "\n";
@@ -479,7 +480,7 @@ int main(int argc, char** argv) {
 				auto expressions = expr::assemble(rowgroup);
 				auto result      = dispatch::decompress_rowgroup(expressions);
 
-				std::vector<size_t> col_indices;
+				std::vector<size_t>      col_indices;
 				std::vector<std::string> col_names;
 				for (size_t i = 0; i < expressions.size(); ++i) {
 					const auto& expr = expressions[i];
@@ -516,26 +517,26 @@ int main(int argc, char** argv) {
 		}
 
 		if (opt.mode == Mode::Benchmark) {
-			double end_to_end_ms = 0.0;
-			double kernel_ms     = 0.0;
-			double setup_ms      = 0.0;
-			double h2d_ms        = 0.0;
-			double teardown_ms   = 0.0;
-			size_t total_launches = 0;
+			double end_to_end_ms     = 0.0;
+			double kernel_ms         = 0.0;
+			double setup_ms          = 0.0;
+			double h2d_ms            = 0.0;
+			double teardown_ms       = 0.0;
+			size_t total_launches    = 0;
 			size_t total_launch_grid = 0;
-			size_t total_columns = 0;
-			size_t total_items   = 0;
-			size_t total_bytes   = 0;
-			size_t total_rgs     = 0;
+			size_t total_columns     = 0;
+			size_t total_items       = 0;
+			size_t total_bytes       = 0;
+			size_t total_rgs         = 0;
 
-			const auto td_handle = load_table_descriptor(opt.input);
-			const auto* td       = td_handle.Get();
+			const auto  td_handle = load_table_descriptor(opt.input);
+			const auto* td        = td_handle.Get();
 			if (!td) {
 				throw std::runtime_error("failed to load table descriptor");
 			}
 
 			for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
-				const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
+				const auto*  rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
 				const double io_ms = measure_rowgroup_io_ms(opt.input, rg);
 
 				size_t rg_bytes = 0;
@@ -556,9 +557,9 @@ int main(int argc, char** argv) {
 				}
 
 				const auto setup_start = std::chrono::steady_clock::now();
-				auto rowgroup    = rdr.read_rowgroup(rg_idx);
-				auto expressions = expr::assemble(rowgroup);
-				const auto setup_end = std::chrono::steady_clock::now();
+				auto       rowgroup    = rdr.read_rowgroup(rg_idx);
+				auto       expressions = expr::assemble(rowgroup);
+				const auto setup_end   = std::chrono::steady_clock::now();
 
 				const double setup_total_ms =
 				    std::chrono::duration<double, std::milli>(setup_end - setup_start).count();
@@ -576,22 +577,22 @@ int main(int argc, char** argv) {
 				const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
 
 				using Batches = typename DeviceBatchSetFromList<dispatch::SupportedTypes>::type;
-				Batches batches;
-				const double rg_h2d_ms = build_gpu_batches(expressions, batches);
-				size_t rg_launches = 0;
-				size_t rg_launch_grid = 0;
+				Batches      batches;
+				const double rg_h2d_ms      = build_gpu_batches(expressions, batches);
+				size_t       rg_launches    = 0;
+				size_t       rg_launch_grid = 0;
 				dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
-					using T = typename decltype(tag)::type;
+					using T     = typename decltype(tag)::type;
 					auto& batch = batches.template get<T>();
 					if (!batch.batch.device_exprs.empty() && !batch.batch.work_items.empty()) {
 						++rg_launches;
 						rg_launch_grid += batch.batch.work_items.size();
 					}
 				});
-				const double rg_kernel_ms = run_gpu_kernels(batches, opt.samples);
-				const auto teardown_start = std::chrono::steady_clock::now();
+				const double rg_kernel_ms   = run_gpu_kernels(batches, opt.samples);
+				const auto   teardown_start = std::chrono::steady_clock::now();
 				free_gpu_batches(batches);
-				const auto teardown_end = std::chrono::steady_clock::now();
+				const auto   teardown_end = std::chrono::steady_clock::now();
 				const double rg_teardown_ms =
 				    std::chrono::duration<double, std::milli>(teardown_end - teardown_start).count();
 
@@ -611,51 +612,74 @@ int main(int argc, char** argv) {
 			}
 
 			const double total_samples = (total_rgs > 0) ? (static_cast<double>(opt.samples) * total_rgs) : 0.0;
-			const double avg_us = (total_samples > 0.0) ? (kernel_ms * 1000.0 / total_samples) : 0.0;
+			const double avg_us        = (total_samples > 0.0) ? (kernel_ms * 1000.0 / total_samples) : 0.0;
 			const double total_bytes_processed =
 			    (total_rgs > 0) ? (static_cast<double>(total_bytes) * static_cast<double>(opt.samples)) : 0.0;
 			const double kernel_seconds = kernel_ms / 1000.0;
-			const double kernel_throughput_bps = (kernel_seconds > 0.0) ? (total_bytes_processed / kernel_seconds) : 0.0;
+			const double kernel_throughput_bps =
+			    (kernel_seconds > 0.0) ? (total_bytes_processed / kernel_seconds) : 0.0;
 			const double kernel_throughput_gbps = kernel_throughput_bps / 1e9;
 			const double kernel_throughput_gibps =
 			    (kernel_seconds > 0.0) ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * kernel_seconds)) : 0.0;
-			const double e2e_seconds = end_to_end_ms / 1000.0;
-			const double e2e_throughput_bps = (e2e_seconds > 0.0) ? (total_bytes_processed / e2e_seconds) : 0.0;
-			const double e2e_throughput_gbps = e2e_throughput_bps / 1e9;
-			const double e2e_throughput_gibps =
-			    (e2e_seconds > 0.0) ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_seconds)) : 0.0;
-			const double cols_per_rg = (total_rgs > 0) ? (static_cast<double>(total_columns) / static_cast<double>(total_rgs)) : 0.0;
-			const double vectors_per_rg = (total_rgs > 0) ? (static_cast<double>(total_items) / static_cast<double>(total_rgs)) : 0.0;
+			const double e2e_no_teardown_seconds = end_to_end_ms / 1000.0;
+			const double e2e_no_teardown_bps =
+			    (e2e_no_teardown_seconds > 0.0) ? (total_bytes_processed / e2e_no_teardown_seconds) : 0.0;
+			const double e2e_no_teardown_gbps = e2e_no_teardown_bps / 1e9;
+			const double e2e_no_teardown_gibps =
+			    (e2e_no_teardown_seconds > 0.0)
+			        ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_no_teardown_seconds))
+			        : 0.0;
+
+			const double end_to_end_with_teardown_ms = end_to_end_ms + teardown_ms;
+			const double e2e_with_teardown_seconds   = end_to_end_with_teardown_ms / 1000.0;
+			const double e2e_with_teardown_bps =
+			    (e2e_with_teardown_seconds > 0.0) ? (total_bytes_processed / e2e_with_teardown_seconds) : 0.0;
+			const double e2e_with_teardown_gbps = e2e_with_teardown_bps / 1e9;
+			const double e2e_with_teardown_gibps =
+			    (e2e_with_teardown_seconds > 0.0)
+			        ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_with_teardown_seconds))
+			        : 0.0;
+			const double cols_per_rg =
+			    (total_rgs > 0) ? (static_cast<double>(total_columns) / static_cast<double>(total_rgs)) : 0.0;
+			const double vectors_per_rg =
+			    (total_rgs > 0) ? (static_cast<double>(total_items) / static_cast<double>(total_rgs)) : 0.0;
 			const double avg_grid_per_launch =
-			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches)) : 0.0;
-
-
+			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
+			                         : 0.0;
 
 			std::cout << "Benchmark results:\n";
 			std::cout << "  rowgroups: " << total_rgs << "\n";
 			std::cout << "  columns:   " << total_columns << " (avg " << cols_per_rg << " per rowgroup)\n";
 			std::cout << "  vectors: " << total_items << " (avg " << vectors_per_rg << " per rowgroup)\n";
 			std::cout << "  samples:   " << opt.samples << "\n";
-			std::cout << "  bytes:     " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
+			std::cout << "  bytes:     " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes))
+			          << ")\n";
+			std::cout << "  end_to_end_ms: " << end_to_end_with_teardown_ms << "\n";
 			std::cout << "  end_to_end_ms (no teardown): " << end_to_end_ms << "\n";
 			std::cout << "  kernel_ms:     " << kernel_ms << "\n";
 			std::cout << "  setup_ms:      " << setup_ms << "\n";
 			std::cout << "  h2d_ms:        " << h2d_ms << "\n";
-			std::cout << "  teardown_ms:   " << teardown_ms << "\n"; //  cudaFree on device buffers, any implicit synchronization caused by freeing those buffers
+			std::cout
+			    << "  teardown_ms:   " << teardown_ms
+			    << "\n"; //  cudaFree on device buffers, any implicit synchronization caused by freeing those buffers
 			std::cout << "  avg_us:    " << avg_us << " (per rowgroup per sample)\n";
-			std::cout << "  kernel_throughput: " << kernel_throughput_gbps << " (GB/s), " << kernel_throughput_gibps << " (GiB/s)\n";
-			std::cout << "  end_to_end_throughput: " << e2e_throughput_gbps << " (GB/s), " << e2e_throughput_gibps << " (GiB/s)\n";
+			std::cout << "  kernel_throughput: " << kernel_throughput_gbps << " (GB/s), " << kernel_throughput_gibps
+			          << " (GiB/s)\n";
+			std::cout << "  end_to_end_throughput: " << e2e_with_teardown_gbps << " (GB/s), " << e2e_with_teardown_gibps
+			          << " (GiB/s)\n";
+			std::cout << "  end_to_end_throughput (no teardown): " << e2e_no_teardown_gbps << " (GB/s), "
+			          << e2e_no_teardown_gibps << " (GiB/s)\n";
 			std::cout << "  kernel_launches: " << total_launches << "\n";
 			std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
 			if (opt.estimate_launch && total_launches > 0) {
 				const uint32_t block = utils::get_n_lanes<int8_t>();
-				uint32_t grid = static_cast<uint32_t>(avg_grid_per_launch);
+				uint32_t       grid  = static_cast<uint32_t>(avg_grid_per_launch);
 				if (grid == 0) {
 					grid = 1;
 				}
-				const double launch_us = measure_gpu_launch_us(opt.estimate_iters, dim3(grid), dim3(block));
+				const double launch_us          = measure_gpu_launch_us(opt.estimate_iters, dim3(grid), dim3(block));
 				const double launch_overhead_ms = (launch_us * static_cast<double>(total_launches)) / 1000.0;
-				const double launch_pct = (kernel_ms > 0.0) ? (launch_overhead_ms * 100.0 / kernel_ms) : 0.0;
+				const double launch_pct         = (kernel_ms > 0.0) ? (launch_overhead_ms * 100.0 / kernel_ms) : 0.0;
 				std::cout << "  launch_overhead_ms (est): " << launch_overhead_ms << "\n";
 				std::cout << "  launch_overhead_pct (est): " << launch_pct << "%\n";
 				std::cout << "  launch_overhead_us (per kernel, est): " << launch_us << "\n";

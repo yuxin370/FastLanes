@@ -250,11 +250,24 @@ int main(int argc, char** argv) {
 		const double kernel_throughput_gbps = kernel_throughput_bps / 1e9;
 		const double kernel_throughput_gibps =
 		    (kernel_seconds > 0.0) ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * kernel_seconds)) : 0.0;
-		const double e2e_seconds         = end_to_end_ms / 1000.0;
-		const double e2e_throughput_bps  = (e2e_seconds > 0.0) ? (total_bytes_processed / e2e_seconds) : 0.0;
-		const double e2e_throughput_gbps = e2e_throughput_bps / 1e9;
-		const double e2e_throughput_gibps =
-		    (e2e_seconds > 0.0) ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_seconds)) : 0.0;
+		const double e2e_no_teardown_seconds = end_to_end_ms / 1000.0;
+		const double e2e_no_teardown_bps =
+		    (e2e_no_teardown_seconds > 0.0) ? (total_bytes_processed / e2e_no_teardown_seconds) : 0.0;
+		const double e2e_no_teardown_gbps = e2e_no_teardown_bps / 1e9;
+		const double e2e_no_teardown_gibps =
+		    (e2e_no_teardown_seconds > 0.0)
+		        ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_no_teardown_seconds))
+		        : 0.0;
+
+		const double end_to_end_with_teardown_ms = end_to_end_ms + teardown_ms;
+		const double e2e_with_teardown_seconds   = end_to_end_with_teardown_ms / 1000.0;
+		const double e2e_with_teardown_bps =
+		    (e2e_with_teardown_seconds > 0.0) ? (total_bytes_processed / e2e_with_teardown_seconds) : 0.0;
+		const double e2e_with_teardown_gbps = e2e_with_teardown_bps / 1e9;
+		const double e2e_with_teardown_gibps =
+		    (e2e_with_teardown_seconds > 0.0)
+		        ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_with_teardown_seconds))
+		        : 0.0;
 		const double cols_per_rg =
 		    (total_rgs > 0) ? (static_cast<double>(total_columns) / static_cast<double>(total_rgs)) : 0.0;
 		const double vectors_per_rg =
@@ -268,6 +281,7 @@ int main(int argc, char** argv) {
 		std::cout << "  vectors: " << total_items << " (avg " << vectors_per_rg << " per rowgroup)\n";
 		std::cout << "  samples:   " << opt.samples << "\n";
 		std::cout << "  bytes:     " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
+		std::cout << "  end_to_end_ms: " << end_to_end_with_teardown_ms << "\n";
 		std::cout << "  end_to_end_ms (no teardown): " << end_to_end_ms << "\n";
 		std::cout << "  kernel_ms:     " << kernel_ms << "\n";
 		std::cout << "  setup_ms:      " << setup_ms << "\n";
@@ -276,8 +290,10 @@ int main(int argc, char** argv) {
 		std::cout << "  avg_us:    " << avg_us << " (per rowgroup per sample)\n";
 		std::cout << "  kernel_throughput: " << kernel_throughput_gbps << " (GB/s), " << kernel_throughput_gibps
 		          << " (GiB/s)\n";
-		std::cout << "  end_to_end_throughput: " << e2e_throughput_gbps << " (GB/s), " << e2e_throughput_gibps
+		std::cout << "  end_to_end_throughput: " << e2e_with_teardown_gbps << " (GB/s), " << e2e_with_teardown_gibps
 		          << " (GiB/s)\n";
+		std::cout << "  end_to_end_throughput (no teardown): " << e2e_no_teardown_gbps << " (GB/s), "
+		          << e2e_no_teardown_gibps << " (GiB/s)\n";
 		// std::cout << "  avg_vecs_per_col: " << vecs_per_col << "\n";
 		return 0;
 	} catch (const std::exception& ex) {
