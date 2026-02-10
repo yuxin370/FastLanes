@@ -8,6 +8,7 @@
 #include "flsgpu/consts.cuh"
 #include "flsgpu/fls.cuh"
 #include "flsgpu/flsgpu-api.cuh"
+#include <algorithm>
 #include <cstddef>
 #include <type_traits>
 
@@ -33,7 +34,7 @@ namespace device {
 
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES>
 __global__ void decompress_rowgroup(const dispatch::DeviceExpression<T>* exprs,
-                                    const dispatch::WorkItem*            work_items,
+                                    const dispatch::WorkItemAny*         work_items,
                                     const size_t                         n_items) {
 	const auto     mapping  = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
 	const lane_t   lane     = mapping.get_lane();
@@ -42,7 +43,16 @@ __global__ void decompress_rowgroup(const dispatch::DeviceExpression<T>* exprs,
 		return;
 	}
 
-	const auto work         = work_items[item_idx];
+	const auto work = work_items[item_idx];
+	if constexpr (std::is_same_v<T, int8_t>) {
+		if (work.type != dispatch::TypeTag::I8) {
+			return;
+		}
+	} else if constexpr (std::is_same_v<T, int16_t>) {
+		if (work.type != dispatch::TypeTag::I16) {
+			return;
+		}
+	}
 	const auto expr         = exprs[work.expr_index];
 	const vi_t vector_index = static_cast<vi_t>(work.vector_index);
 
@@ -54,6 +64,57 @@ __global__ void decompress_rowgroup(const dispatch::DeviceExpression<T>* exprs,
 	T* out = expr.out + vector_index * consts::VALUES_PER_VECTOR;
 
 	device_exec::execute_plan<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane, out);
+}
+
+template <int UNPACK_N_VECTORS, int UNPACK_N_VALUES>
+__global__ void decompress_table(const dispatch::DeviceExpression<int8_t>*  exprs_i8,
+                                 const dispatch::DeviceExpression<int16_t>* exprs_i16,
+                                 const dispatch::WorkItemAny*               work_items,
+                                 const size_t                               n_items) {
+	constexpr uint32_t lanes_i8    = utils::get_n_lanes<int8_t>();
+	constexpr uint32_t lanes_i16   = utils::get_n_lanes<int16_t>();
+	constexpr uint32_t group_lanes = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
+
+	const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+	const uint32_t item_idx      = global_thread / group_lanes;
+	if (item_idx >= n_items) {
+		return;
+	}
+	const uint32_t lane = global_thread - item_idx * group_lanes;
+
+	const auto work = work_items[item_idx];
+	switch (work.type) {
+	case dispatch::TypeTag::I8: {
+		if (lane >= lanes_i8 || exprs_i8 == nullptr) {
+			return;
+		}
+		const auto   expr         = exprs_i8[work.expr_index];
+		const vi_t   vector_index = static_cast<vi_t>(work.vector_index);
+		const size_t n_vecs       = utils::get_n_vecs_from_size(expr.n_values);
+		if (static_cast<size_t>(vector_index) >= n_vecs) {
+			return;
+		}
+		int8_t* out = expr.out + vector_index * consts::VALUES_PER_VECTOR;
+		device_exec::execute_plan<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane, out);
+		break;
+	}
+	case dispatch::TypeTag::I16: {
+		if (lane >= lanes_i16 || exprs_i16 == nullptr) {
+			return;
+		}
+		const auto   expr         = exprs_i16[work.expr_index];
+		const vi_t   vector_index = static_cast<vi_t>(work.vector_index);
+		const size_t n_vecs       = utils::get_n_vecs_from_size(expr.n_values);
+		if (static_cast<size_t>(vector_index) >= n_vecs) {
+			return;
+		}
+		int16_t* out = expr.out + vector_index * consts::VALUES_PER_VECTOR;
+		device_exec::execute_plan<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane, out);
+		break;
+	}
+	default:
+		break;
+	}
 }
 
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>

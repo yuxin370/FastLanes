@@ -1,10 +1,10 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/src/include/engine/dispatch.cuh
+// galp/src/include/engine/dispatch/common.cuh
 // ────────────────────────────────────────────────────────
-#ifndef ENGINE_DISPATCH_CUH
-#define ENGINE_DISPATCH_CUH
+#ifndef ENGINE_DISPATCH_COMMON_CUH
+#define ENGINE_DISPATCH_COMMON_CUH
 
 #include "engine/device-utils.cuh"
 #include "engine/expression.cuh"
@@ -295,12 +295,14 @@ void free_device_expr(const DeviceExpression<T>& expr) {
 	}
 }
 
+} // namespace detail
+
 template <typename T>
 struct Batch {
 	std::vector<size_t>              expr_indices;
 	std::vector<DeviceExpression<T>> device_exprs;
 	std::vector<GPUArray<T>>         device_outputs;
-	std::vector<WorkItem>            work_items;
+	std::vector<WorkItemAny>         work_items;
 };
 
 template <typename... Ts>
@@ -321,6 +323,34 @@ struct BatchSetFromList<dispatch::TypeList<Ts...>> {
 	using type = BatchSet<Ts...>;
 };
 
+template <typename T>
+struct DeviceBatch {
+	std::optional<GPUArray<DeviceExpression<T>>> d_exprs;
+	std::optional<GPUArray<WorkItemAny>>         d_items;
+
+	bool empty() const {
+		return !d_exprs || !d_items;
+	}
+};
+
+template <typename... Ts>
+struct DeviceBatchSet {
+	std::tuple<DeviceBatch<Ts>...> batches;
+
+	template <typename T>
+	DeviceBatch<T>& get() {
+		return std::get<DeviceBatch<T>>(batches);
+	}
+};
+
+template <typename List>
+struct DeviceBatchSetFromList;
+
+template <typename... Ts>
+struct DeviceBatchSetFromList<dispatch::TypeList<Ts...>> {
+	using type = DeviceBatchSet<Ts...>;
+};
+
 template <typename T, typename HostColT>
 void add_expression_to_batch(const size_t expr_index, const HostColT& host_col, const PlanKind plan, Batch<T>& batch) {
 	DeviceExpression<T> expr {};
@@ -329,7 +359,7 @@ void add_expression_to_batch(const size_t expr_index, const HostColT& host_col, 
 	batch.device_outputs.emplace_back(expr.n_values);
 	expr.out = batch.device_outputs.back().get();
 
-	fill_device_expr(expr, host_col, plan);
+	detail::fill_device_expr(expr, host_col, plan);
 
 	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size());
 	batch.device_exprs.push_back(expr);
@@ -337,9 +367,11 @@ void add_expression_to_batch(const size_t expr_index, const HostColT& host_col, 
 
 	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
 	for (size_t vec = 0; vec < n_vecs; ++vec) {
-		batch.work_items.push_back(WorkItem {device_idx, static_cast<uint32_t>(vec)});
+		batch.work_items.push_back(WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>()});
 	}
 }
+
+namespace detail {
 
 template <typename T>
 void launch_batch(const Batch<T>& batch) {
@@ -347,7 +379,7 @@ void launch_batch(const Batch<T>& batch) {
 		return;
 	}
 	GPUArray<DeviceExpression<T>> d_exprs(batch.device_exprs.size(), batch.device_exprs.data());
-	GPUArray<WorkItem>            d_items(batch.work_items.size(), batch.work_items.data());
+	GPUArray<WorkItemAny>         d_items(batch.work_items.size(), batch.work_items.data());
 	flsgpu::memory::sync_h2d();
 
 	constexpr unsigned UNPACK_N_VECTORS = 1;
@@ -373,10 +405,6 @@ void finalize_batch(Batch<T>& batch, RowgroupDecompressResult& result) {
 
 } // namespace detail
 
-DecompressResult         decompress(const expr::Expression& expression, const Config& cfg = {});
-RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
-BenchmarkResult          benchmark_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
-
 } // namespace dispatch
 
-#endif // ENGINE_DISPATCH_CUH
+#endif // ENGINE_DISPATCH_COMMON_CUH

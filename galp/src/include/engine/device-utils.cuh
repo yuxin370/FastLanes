@@ -121,6 +121,26 @@ inline WorkItemLaunchConfig make_workitem_launch_config(const size_t n_items) {
 	                             dim3(static_cast<uint32_t>(Mapping::N_THREADS_PER_BLOCK))};
 }
 
+struct TableLaunchConfig {
+	dim3     grid;
+	dim3     block;
+	uint32_t group_lanes;
+	uint32_t groups_per_block;
+};
+
+inline TableLaunchConfig make_table_launch_config(const size_t n_items) {
+	constexpr uint32_t lanes_i8      = utils::get_n_lanes<int8_t>();
+	constexpr uint32_t lanes_i16     = utils::get_n_lanes<int16_t>();
+	constexpr uint32_t group_lanes   = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
+	constexpr uint32_t block_threads = ThreadblockMapping<int8_t>::N_THREADS_PER_BLOCK;
+	static_assert(block_threads % group_lanes == 0, "block size must be multiple of max lanes");
+	const uint32_t groups_per_block = block_threads / group_lanes;
+	const size_t   blocks           = std::max<size_t>(1, (n_items + groups_per_block - 1) / groups_per_block);
+
+	return TableLaunchConfig {
+	    dim3(static_cast<uint32_t>(blocks)), dim3(static_cast<uint32_t>(block_threads)), group_lanes, groups_per_block};
+}
+
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, unsigned N_LANES>
 __device__ __forceinline__ void write_registers_to_global(const lane_t lane,
                                                           const si_t   index_offset,

@@ -95,10 +95,29 @@ enum class PlanKind : uint8_t {
 	DICT_FFOR_SLPATCH,
 };
 
-struct WorkItem {
+enum class TypeTag : uint8_t {
+	I8,
+	I16,
+};
+
+struct WorkItemAny {
 	uint32_t expr_index;
 	uint32_t vector_index;
+	TypeTag  type;
 };
+
+template <typename T>
+constexpr TypeTag type_tag_for();
+
+template <>
+constexpr TypeTag type_tag_for<int8_t>() {
+	return TypeTag::I8;
+}
+
+template <>
+constexpr TypeTag type_tag_for<int16_t>() {
+	return TypeTag::I16;
+}
 
 template <typename T>
 struct DeviceExpression {

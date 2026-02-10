@@ -6,7 +6,8 @@
 #ifndef ENGINE_PIPELINE_CUH
 #define ENGINE_PIPELINE_CUH
 
-#include "engine/dispatch.cuh"
+#include "engine/dispatch/column.cuh"
+#include "engine/dispatch/rowgroup.cuh"
 #include "engine/expression.cuh"
 #include "engine/reader.cuh"
 #include "flsgpu/structs.cuh"

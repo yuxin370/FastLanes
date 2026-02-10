@@ -3,7 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/test/reader_test.cu
 // ────────────────────────────────────────────────────────
-#include "engine/dispatch.cuh"
+#include "engine/dispatch/rowgroup.cuh"
 #include "engine/pipeline.cuh"
 #include "engine/reader.cuh"
 #include "fls/connection.hpp"
@@ -148,14 +148,14 @@ bool rowgroup_supported(const fastlanes::RowgroupDescriptor*                rg,
 	return unsupported.empty();
 }
 
-void compare_rowgroup_outputs(const reader::Rowgroup&              rowgroup,
-                              const fastlanes::Rowgroup&           expected_rowgroup,
-                              const fastlanes::RowgroupDescriptor* rg,
-                              const std::vector<expr::Expression>& expressions,
-                              bool                                 verbose,
-                              size_t*                              compared_columns_out,
-                              const dispatch::RowgroupDecompressResult* precomputed = nullptr,
-                              bool                                 free_columns = true) {
+void compare_rowgroup_outputs(const reader::Rowgroup&                   rowgroup,
+                              const fastlanes::Rowgroup&                expected_rowgroup,
+                              const fastlanes::RowgroupDescriptor*      rg,
+                              const std::vector<expr::Expression>&      expressions,
+                              bool                                      verbose,
+                              size_t*                                   compared_columns_out,
+                              const dispatch::RowgroupDecompressResult* precomputed  = nullptr,
+                              bool                                      free_columns = true) {
 	ASSERT_NE(rg, nullptr);
 	ASSERT_NE(rg->m_column_descriptors(), nullptr);
 	ASSERT_EQ(rowgroup.columns.size(), rg->m_column_descriptors()->size());
@@ -164,10 +164,10 @@ void compare_rowgroup_outputs(const reader::Rowgroup&              rowgroup,
 	const size_t expected_rows = static_cast<size_t>(expected_rowgroup.RowCount());
 	ASSERT_GE(rowgroup.n_values, expected_rows);
 
-	dispatch::RowgroupDecompressResult local_result;
+	dispatch::RowgroupDecompressResult        local_result;
 	const dispatch::RowgroupDecompressResult* rowgroup_result_ptr = precomputed;
 	if (rowgroup_result_ptr == nullptr) {
-		local_result = dispatch::decompress_rowgroup(expressions);
+		local_result        = dispatch::decompress_rowgroup(expressions);
 		rowgroup_result_ptr = &local_result;
 	}
 	ASSERT_EQ(rowgroup_result_ptr->columns.size(), rowgroup.columns.size());
@@ -194,8 +194,8 @@ void compare_rowgroup_outputs(const reader::Rowgroup&              rowgroup,
 
 		std::ostringstream trace;
 		trace << "col=" << i << " name=" << col_name << " dtype=" << dtype_name << " token=" << token_str
-		      << " ops=" << ops_str << " n_values=" << n_values
-		      << " n_vecs=" << rowgroup.n_vecs << " expected_rows=" << expected_rows;
+		      << " ops=" << ops_str << " n_values=" << n_values << " n_vecs=" << rowgroup.n_vecs
+		      << " expected_rows=" << expected_rows;
 		if (rowgroup.columns[i].skip_decompress) {
 			trace << " skip_decompress=1";
 		}
@@ -458,9 +458,9 @@ TEST(Reader, DecompressTable) {
 	    fls_path,
 	    {},
 	    should_decompress,
-	    [&](size_t rg_idx,
-	        reader::Rowgroup& rowgroup,
-	        const std::vector<expr::Expression>& expressions,
+	    [&](size_t                                    rg_idx,
+	        reader::Rowgroup&                         rowgroup,
+	        const std::vector<expr::Expression>&      expressions,
 	        const dispatch::RowgroupDecompressResult& result) {
 		    const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
 		    ASSERT_NE(rg, nullptr);
