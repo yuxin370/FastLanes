@@ -20,12 +20,20 @@ set(GALP_GENERATED_BINDINGS_SOURCES
         generated-bindings/ffor-uint64_t-compute_column-bindings.cu
         generated-bindings/ffor-uint64_t-decompress_column-bindings.cu
         generated-bindings/ffor-uint64_t-query_column-bindings.cu
+        generated-bindings/slpatch-uint32_t-decompress_column-bindings.cu
+        generated-bindings/slpatch-uint64_t-decompress_column-bindings.cu
         generated-bindings/freq-uint32_t-decompress_column-bindings.cu
         generated-bindings/freq-uint64_t-decompress_column-bindings.cu
         generated-bindings/freqextended-uint32_t-decompress_column-bindings.cu
         generated-bindings/freqextended-uint64_t-decompress_column-bindings.cu
         generated-bindings/dict-uint32_t-decompress_column-bindings.cu
         generated-bindings/dict-uint64_t-decompress_column-bindings.cu
+        generated-bindings/dictslpatch-uint32_t-decompress_column-bindings.cu
+        generated-bindings/dictslpatch-uint64_t-decompress_column-bindings.cu
+        generated-bindings/rle-uint32_t-decompress_column-bindings.cu
+        generated-bindings/rle-uint64_t-decompress_column-bindings.cu
+        generated-bindings/constant-uint32_t-decompress_column-bindings.cu
+        generated-bindings/constant-uint64_t-decompress_column-bindings.cu
         generated-bindings/crossrle-uint32_t-decompress_column-bindings.cu
         generated-bindings/crossrle-uint64_t-decompress_column-bindings.cu
         generated-bindings/crossrleextended-uint32_t-decompress_column-bindings.cu

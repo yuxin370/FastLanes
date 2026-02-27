@@ -111,25 +111,13 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 	flsgpu::memory::sync_h2d();
 	T* out;
 
-	if constexpr (std::is_same_v<ColumnT, flsgpu::host::DICTFFORColumn<T>>) {
-		bool use_shuffle = column.key_count <= 32;
-		out              = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
-                                                                              params.unpack_n_vecs,
-                                                                              params.unpack_n_vals,
-                                                                              params.unpacker,
-                                                                              params.patcher,
-                                                                              params.expander,
-                                                                              params.n_samples,
-                                                                              use_shuffle);
-	} else {
-		out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
-		                                                                      params.unpack_n_vecs,
-		                                                                      params.unpack_n_vals,
-		                                                                      params.unpacker,
-		                                                                      params.patcher,
-		                                                                      params.expander,
-		                                                                      params.n_samples);
-	}
+	out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
+		                                                                  params.unpack_n_vecs,
+		                                                                  params.unpack_n_vals,
+		                                                                  params.unpacker,
+		                                                                  params.patcher,
+		                                                                  params.expander,
+		                                                                  params.n_samples);
 
 	flsgpu::host::free_column(column_device);
 
@@ -425,6 +413,94 @@ std::vector<verification::ExecutionResult<T>> execute_dict(const ProgramParamete
 	return results;
 }
 
+template <typename T>
+std::vector<verification::ExecutionResult<T>> execute_slpatch(const ProgramParameters params) {
+	auto results = std::vector<verification::ExecutionResult<T>>();
+
+	if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
+		throw std::invalid_argument("QueryMultiColumn/Query not supported for SLPATCH columns.\n");
+	}
+
+	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		printf("processing bitwidth = %d\n", vbw);
+		bool query_result = false;
+		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
+
+		auto column =
+		    data::columns::generate_slpatch_column<T>(params.n_values, data::ValueRange<vbw_t>(vbw), params.ec_range);
+
+		results.push_back(execute_kernel<T, flsgpu::host::SLPATCHColumn<T>>(column, params, query_result, magic_value));
+		flsgpu::host::free_column(column);
+	}
+
+	return results;
+}
+
+template <typename T>
+std::vector<verification::ExecutionResult<T>> execute_dict_slpatch(const ProgramParameters params) {
+	auto results = std::vector<verification::ExecutionResult<T>>();
+
+	if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
+		throw std::invalid_argument("QueryMultiColumn/Query not supported for DICT+SLPATCH columns.\n");
+	}
+
+	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		printf("processing bitwidth = %d\n", vbw);
+		bool query_result = false;
+		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
+
+		auto column = data::columns::generate_dict_slpatch_column<T>(
+		    params.n_values, data::ValueRange<vbw_t>(vbw), params.ec_range, 256);
+
+		results.push_back(
+		    execute_kernel<T, flsgpu::host::DICTSLPATCHColumn<T>>(column, params, query_result, magic_value));
+		flsgpu::host::free_column(column);
+	}
+
+	return results;
+}
+
+template <typename T>
+std::vector<verification::ExecutionResult<T>> execute_rle(const ProgramParameters params) {
+	auto results = std::vector<verification::ExecutionResult<T>>();
+
+	if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
+		throw std::invalid_argument("QueryMultiColumn/Query not supported for RLE columns.\n");
+	}
+
+	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
+		printf("processing bitwidth = %d\n", vbw);
+		bool query_result = false;
+		T    magic_value  = consts::as<T>::MAGIC_NUMBER;
+
+		auto column = data::columns::generate_rle_column<T>(params.n_values);
+
+		results.push_back(execute_kernel<T, flsgpu::host::RLEColumn<T, typename utils::same_width_uint<T>::type>>(
+		    column, params, query_result, magic_value));
+		flsgpu::host::free_column(column);
+	}
+
+	return results;
+}
+
+template <typename T>
+std::vector<verification::ExecutionResult<T>> execute_constant(const ProgramParameters params) {
+	auto results = std::vector<verification::ExecutionResult<T>>();
+
+	if (params.kernel == enums::Kernel::QueryMultiColumn || params.kernel == enums::Kernel::Query) {
+		throw std::invalid_argument("QueryMultiColumn/Query not supported for CONSTANT columns.\n");
+	}
+
+	bool query_result = false;
+	T    magic_value  = consts::as<T>::MAGIC_NUMBER;
+
+	auto column = data::columns::generate_constant_column<T>(params.n_values);
+	results.push_back(execute_kernel<T, flsgpu::host::CONSTANTColumn<T>>(column, params, query_result, magic_value));
+	flsgpu::host::free_column(column);
+
+	return results;
+}
+
 // execute_cross_rle
 template <typename T>
 std::vector<verification::ExecutionResult<T>> execute_cross_rle(const ProgramParameters params) {
@@ -512,6 +588,34 @@ static int32_t run_by_encoding_type(const ProgramParameters& params, bool print_
 			return verification::process_results(execute_ffor<T>(params), print_debug);
 		} else {
 			std::cerr << "[error] ffor only supports u32/u64.\n";
+			return 1;
+		}
+	case enums::Encoding::SLPATCH:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_slpatch<T>(params), print_debug);
+		} else {
+			std::cerr << "[error] slpatch only supports u32/u64.\n";
+			return 1;
+		}
+	case enums::Encoding::DICT_SLPATCH:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_dict_slpatch<T>(params), print_debug);
+		} else {
+			std::cerr << "[error] dict-slpatch only supports u32/u64.\n";
+			return 1;
+		}
+	case enums::Encoding::RLE:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_rle<T>(params), print_debug);
+		} else {
+			std::cerr << "[error] rle only supports u32/u64.\n";
+			return 1;
+		}
+	case enums::Encoding::CONSTANT:
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+			return verification::process_results(execute_constant<T>(params), print_debug);
+		} else {
+			std::cerr << "[error] constant only supports u32/u64.\n";
 			return 1;
 		}
 

@@ -63,6 +63,7 @@ Expander string_to_expander(const std::string& str) {
 	    {"none", Expander::None},
 	    {"dummy", Expander::Dummy},
 	    {"stateful", Expander::Stateful},
+	    {"stateful-cache", Expander::StatefulCache},
 	    {"stateful-shuffle", Expander::StatefulShuffle},
 	    {"prefetch-stateful", Expander::PrefetchStateful},
 	    {"stateful-advance", Expander::StatefulAdvance},
@@ -109,6 +110,8 @@ Encoding string_to_encoding(const std::string& str) {
 	    {"dictionary", Encoding::DICTIONARY},
 	    {"slpatch", Encoding::SLPATCH},
 	    {"constant", Encoding::CONSTANT},
+	    {"rle", Encoding::RLE},
+	    {"dict-slpatch", Encoding::DICT_SLPATCH},
 	};
 
 	auto it = mapping.find(str);
@@ -137,6 +140,10 @@ std::string encoding_to_string(const Encoding type) {
 		return "slpatch";
 	case Encoding::CONSTANT:
 		return "constant";
+	case Encoding::RLE:
+		return "rle";
+	case Encoding::DICT_SLPATCH:
+		return "dict-slpatch";
 	default:
 		throw std::invalid_argument("Could not parse encoding");
 	}

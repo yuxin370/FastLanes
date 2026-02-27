@@ -122,23 +122,39 @@ inline WorkItemLaunchConfig make_workitem_launch_config(const size_t n_items) {
 }
 
 struct TableLaunchConfig {
-	dim3     grid;
-	dim3     block;
-	uint32_t group_lanes;
-	uint32_t groups_per_block;
+	dim3 grid;
+	dim3 block;
+};
+
+struct TableWorkItemMapping {
+	static constexpr uint32_t LANES_I8    = utils::get_n_lanes<int8_t>();
+	static constexpr uint32_t LANES_I16   = utils::get_n_lanes<int16_t>();
+	static constexpr uint32_t GROUP_LANES = (LANES_I8 > LANES_I16) ? LANES_I8 : LANES_I16;
+
+	__device__ __forceinline__ uint32_t get_item_index() const {
+		const uint32_t groups_per_block = blockDim.x / GROUP_LANES;
+		const uint32_t group_in_block   = threadIdx.x / GROUP_LANES;
+		return blockIdx.x * groups_per_block + group_in_block;
+	}
+
+	__device__ __forceinline__ uint32_t get_lane() const {
+		return threadIdx.x - (threadIdx.x / GROUP_LANES) * GROUP_LANES;
+	}
+
+	__device__ __forceinline__ uint32_t get_group_stride() const {
+		const uint32_t groups_per_block = blockDim.x / GROUP_LANES;
+		return gridDim.x * groups_per_block;
+	}
 };
 
 inline TableLaunchConfig make_table_launch_config(const size_t n_items) {
-	constexpr uint32_t lanes_i8      = utils::get_n_lanes<int8_t>();
-	constexpr uint32_t lanes_i16     = utils::get_n_lanes<int16_t>();
-	constexpr uint32_t group_lanes   = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
+	constexpr uint32_t group_lanes   = TableWorkItemMapping::GROUP_LANES;
 	constexpr uint32_t block_threads = ThreadblockMapping<int8_t>::N_THREADS_PER_BLOCK;
 	static_assert(block_threads % group_lanes == 0, "block size must be multiple of max lanes");
 	const uint32_t groups_per_block = block_threads / group_lanes;
 	const size_t   blocks           = std::max<size_t>(1, (n_items + groups_per_block - 1) / groups_per_block);
 
-	return TableLaunchConfig {
-	    dim3(static_cast<uint32_t>(blocks)), dim3(static_cast<uint32_t>(block_threads)), group_lanes, groups_per_block};
+	return TableLaunchConfig {dim3(static_cast<uint32_t>(blocks)), dim3(static_cast<uint32_t>(block_threads))};
 }
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, unsigned N_LANES>

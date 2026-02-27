@@ -361,6 +361,105 @@ T* decompress(const flsgpu::host::DICTFFORColumn<T, IndexT> column) {
 }
 
 template <typename T>
+T* decompress(const flsgpu::host::CONSTANTColumn<T> column) {
+	T* out_array = new T[column.get_n_values()];
+	primitives::fill_array_with_constant(out_array, column.get_n_values(), column.value);
+	return out_array;
+}
+
+template <typename T>
+T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
+	const size_t n_values = column.get_n_values();
+	const size_t n_vecs   = column.get_n_vecs();
+
+	T* out_array = decompress(column.ffor);
+
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
+		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+
+		const uint16_t cnt = column.counts[vi];
+		const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
+
+		const uint16_t* pos_ptr = column.positions + off;
+		const T*        exc_ptr = column.exceptions + off;
+
+		for (uint16_t i = 0; i < cnt; ++i) {
+			const uint16_t pos = pos_ptr[i];
+			if (pos < vec_n) {
+				out_array[out_base + pos] = exc_ptr[i];
+			}
+		}
+	}
+
+	return out_array;
+}
+
+template <typename T, typename IndexT>
+T* decompress(const flsgpu::host::DICTSLPATCHColumn<T, IndexT> column) {
+	using KEY_T           = typename flsgpu::host::DICTSLPATCHColumn<T, IndexT>::KEY_T;
+	const size_t n_values = column.get_n_values();
+
+	IndexT* indices   = decompress(column.index);
+	T*      out_array = new T[n_values];
+
+	for (size_t i = 0; i < n_values; ++i) {
+		const size_t idx = static_cast<size_t>(indices[i]);
+
+		KEY_T bits = 0;
+		if (idx < column.key_count) {
+			bits = column.keys[idx];
+		}
+
+		T v;
+		std::memcpy(&v, &bits, sizeof(T));
+		out_array[i] = v;
+	}
+
+	delete[] indices;
+	return out_array;
+}
+
+template <typename T, typename IndexT>
+T* decompress(const flsgpu::host::RLEColumn<T, IndexT> column) {
+	const size_t n_values        = column.n_values;
+	const size_t n_vecs          = column.n_vecs;
+	const size_t n_lanes         = utils::get_n_lanes<IndexT>();
+	const size_t values_per_lane = utils::get_values_per_lane<IndexT>();
+
+	T* out_array = new T[n_values];
+	if (n_values == 0) {
+		return out_array;
+	}
+
+	IndexT* deltas = decompress(column.ffor);
+
+	for (size_t v = 0; v < n_vecs; ++v) {
+		const size_t out_base = v * consts::VALUES_PER_VECTOR;
+		const size_t base_off = column.rle_offsets[v];
+
+		for (size_t lane = 0; lane < n_lanes; ++lane) {
+			IndexT cur = column.rsum_bases[v * n_lanes + lane];
+			for (size_t i = 0; i < values_per_lane; ++i) {
+				const size_t idx = out_base + lane + i * n_lanes;
+				if (idx >= n_values) {
+					break;
+				}
+				cur += deltas[idx];
+				const size_t rle_idx = base_off + static_cast<size_t>(cur);
+				if (rle_idx >= column.n_rle_values) {
+					throw std::runtime_error("RLE: index out of bounds in rle_values");
+				}
+				out_array[idx] = column.rle_values[rle_idx];
+			}
+		}
+	}
+
+	delete[] deltas;
+	return out_array;
+}
+
+template <typename T>
 T* decompress(const flsgpu::host::CROSSRLEColumn<T> column) {
 	using UINT_T = typename flsgpu::host::CROSSRLEColumn<T>::UINT_T;
 
@@ -561,34 +660,6 @@ T* decompress(const flsgpu::host::FREQColumn<T> column) {
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
-	const size_t n_values = column.get_n_values();
-	const size_t n_vecs   = column.get_n_vecs();
-
-	T* out_array = decompress(column.ffor);
-
-	for (size_t vi = 0; vi < n_vecs; ++vi) {
-		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
-		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
-
-		const uint16_t cnt = column.counts[vi];
-		const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
-
-		const uint16_t* pos_ptr = column.positions + off;
-		const T*        exc_ptr = column.exceptions + off;
-
-		for (uint16_t i = 0; i < cnt; ++i) {
-			const uint16_t pos = pos_ptr[i];
-			if (pos < vec_n) {
-				out_array[out_base + pos] = exc_ptr[i];
-			}
-		}
-	}
-
-	return out_array;
-}
-
-template <typename T>
 T* decompress(const flsgpu::host::FREQExtendedColumn<T> column) {
 	const size_t n_values = column.get_n_values();
 	const size_t n_vecs   = column.get_n_vecs();
@@ -631,6 +702,24 @@ T* decompress(const flsgpu::host::FREQExtendedColumn<T> column) {
 } // namespace bindings
 
 namespace columns {
+
+inline vbw_t bit_width_for_max_value(const size_t max_value) {
+	vbw_t  bw = 0;
+	size_t v  = max_value;
+	while (v > 0) {
+		++bw;
+		v >>= 1;
+	}
+	return bw == 0 ? 1 : bw;
+}
+
+template <typename T>
+flsgpu::host::FFORColumn<T> make_ffor_from_values(const T* values, const size_t n_values, const vbw_t bit_width) {
+	auto         bp     = bindings::compress(values, n_values, bit_width);
+	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+	auto*        bases  = primitives::fill_array_with_constant<T>(new T[n_vecs], n_vecs, T {0});
+	return flsgpu::host::FFORColumn<T> {bp, bases};
+}
 
 template <typename T>
 flsgpu::host::BPColumn<T> generate_index_bp_column(const size_t n_values, const vbw_t value_bit_width) {
@@ -846,6 +935,109 @@ flsgpu::host::FREQColumn<T> generate_freq_column(const size_t n_values, const Va
 	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
 
 	return column;
+}
+
+template <typename T>
+flsgpu::host::SLPATCHColumn<T> generate_slpatch_column(const size_t               n_values,
+                                                       const ValueRange<vbw_t>    bit_width_range,
+                                                       const ValueRange<uint16_t> exceptions_per_vec,
+                                                       const unsigned             repeat = 1) {
+	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+
+	const vbw_t bit_width = std::max<vbw_t>(1, bit_width_range.max);
+	T*          base_vals = arrays::generate_random_array<T>(n_values, bit_width);
+	auto        ffor      = make_ffor_from_values(base_vals, n_values, bit_width);
+	delete[] base_vals;
+
+	auto* counts = primitives::fill_array_with_random_data<uint16_t>(
+	    new uint16_t[n_vecs], n_vecs, repeat, exceptions_per_vec.min, exceptions_per_vec.max);
+
+	const size_t n_exceptions       = primitives::sum_array<uint16_t, size_t>(counts, n_vecs);
+	auto*        exceptions_offsets = primitives::prefix_sum_array(counts, new size_t[n_vecs], n_vecs);
+	auto*        exceptions         = primitives::fill_array_with_random_bytes(new T[n_exceptions], n_exceptions);
+	auto*        positions = primitives::generate_positions<uint16_t>(new uint16_t[n_exceptions], counts, n_vecs);
+
+	return flsgpu::host::SLPATCHColumn<T> {
+	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, exceptions, positions, counts};
+}
+
+template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
+flsgpu::host::DICTSLPATCHColumn<T, IndexT> generate_dict_slpatch_column(const size_t               n_values,
+                                                                        const ValueRange<vbw_t>    bit_width_range,
+                                                                        const ValueRange<uint16_t> exceptions_per_vec,
+                                                                        const size_t               key_count) {
+	const size_t n_vecs    = utils::get_n_vecs_from_size(n_values);
+	const vbw_t  needed_bw = bit_width_for_max_value(key_count > 0 ? key_count - 1 : 0);
+	const vbw_t  bit_width = std::max<vbw_t>(1, std::min(bit_width_range.max, needed_bw));
+
+	auto* indices = primitives::fill_array_with_random_data<IndexT>(
+	    new IndexT[n_values], n_values, 1, IndexT {0}, static_cast<IndexT>(key_count > 0 ? key_count - 1 : 0));
+	auto ffor = make_ffor_from_values(indices, n_values, bit_width);
+	delete[] indices;
+
+	auto* counts = primitives::fill_array_with_random_data<uint16_t>(
+	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
+
+	const size_t n_exceptions       = primitives::sum_array<uint16_t, size_t>(counts, n_vecs);
+	auto*        exceptions_offsets = primitives::prefix_sum_array(counts, new size_t[n_vecs], n_vecs);
+	auto*        exceptions         = primitives::fill_array_with_random_data<IndexT>(
+        new IndexT[n_exceptions], n_exceptions, 1, IndexT {0}, static_cast<IndexT>(key_count > 0 ? key_count - 1 : 0));
+	auto* positions = primitives::generate_positions<uint16_t>(new uint16_t[n_exceptions], counts, n_vecs);
+
+	flsgpu::host::SLPATCHColumn<IndexT> slpatch_idx {
+	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, exceptions, positions, counts};
+
+	using KEY_T = typename flsgpu::host::DICTSLPATCHColumn<T, IndexT>::KEY_T;
+	auto* keys  = primitives::fill_array_with_random_bytes(new KEY_T[key_count], key_count);
+
+	return flsgpu::host::DICTSLPATCHColumn<T, IndexT> {slpatch_idx, keys, key_count};
+}
+
+template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
+flsgpu::host::RLEColumn<T, IndexT> generate_rle_column(const size_t n_values) {
+	const size_t n_vecs          = utils::get_n_vecs_from_size(n_values);
+	const size_t n_lanes         = utils::get_n_lanes<IndexT>();
+	const size_t values_per_lane = utils::get_values_per_lane<IndexT>();
+	const size_t vec_values      = consts::VALUES_PER_VECTOR;
+	const size_t rle_len         = values_per_lane + 1;
+	const size_t n_rle_values    = n_vecs * rle_len;
+
+	auto* rle_values  = primitives::fill_array_with_random_bytes(new T[n_rle_values], n_rle_values);
+	auto* rle_offsets = new size_t[n_vecs];
+	for (size_t v = 0; v < n_vecs; ++v) {
+		rle_offsets[v] = v * rle_len;
+	}
+
+	auto* rsum_bases =
+	    primitives::fill_array_with_constant<IndexT>(new IndexT[n_vecs * n_lanes], n_vecs * n_lanes, IndexT {0});
+
+	auto* deltas = primitives::fill_array_with_constant<IndexT>(new IndexT[n_values], n_values, IndexT {0});
+	for (size_t v = 0; v < n_vecs; ++v) {
+		const size_t base = v * vec_values;
+		for (size_t lane = 0; lane < n_lanes; ++lane) {
+			for (size_t i = 0; i < values_per_lane; ++i) {
+				const size_t idx = base + lane + i * n_lanes;
+				if (idx >= n_values) {
+					break;
+				}
+				deltas[idx] = IndexT {1};
+			}
+		}
+	}
+
+	auto ffor = make_ffor_from_values(deltas, n_values, vbw_t {1});
+	delete[] deltas;
+
+	return flsgpu::host::RLEColumn<T, IndexT> {
+	    n_values, n_vecs, ffor, rsum_bases, rle_values, rle_offsets, n_rle_values};
+}
+
+template <typename T>
+flsgpu::host::CONSTANTColumn<T> generate_constant_column(const size_t n_values) {
+	auto*   tmp   = primitives::fill_array_with_random_bytes(new T[1], 1);
+	const T value = tmp[0];
+	delete[] tmp;
+	return flsgpu::host::CONSTANTColumn<T> {n_values, value};
 }
 
 template <typename T>

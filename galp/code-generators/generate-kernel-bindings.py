@@ -49,10 +49,14 @@ ENCODINGS = [
     "FREQ",
     "FREQExtended",
     "DICT",
+    "DICTSLPATCH",
     "DICTShfl32",
     "CROSSRLE",
     "CROSSRLEExtended",
     "CROSSRLELaneMask",
+    "SLPATCH",
+    "RLE",
+    "CONSTANT",
 ]
 
 UNPACKERS = [
@@ -82,6 +86,7 @@ EXPANDERS = [
     "None",
     "Dummy",
     "Stateful",
+    "StatefulCache",
     "PrefetchStateful",
     "StatefulShuffle",
     "StatefulAdvance",
@@ -119,8 +124,18 @@ def get_column_t(
     encoding: str, data_type: str, function: str, for_decompressor: bool = False
 ) -> str:
     column_t = f"BPColumn<{data_type}>"
-    if "FFOR" in encoding:
+    if "CROSSRLEExtended" in encoding:
+        column_t = f"CROSSRLEExtendedColumn<{data_type}>"
+    elif "CROSSRLELaneMask" in encoding:
+        column_t = f"CROSSRLELaneMaskColumn<{data_type}>"
+    elif "CROSSRLE" in encoding:
+        column_t = f"CROSSRLEColumn<{data_type}>"
+    elif "DICTSLPATCH" in encoding:
+        column_t = f"DICTSLPATCHColumn<{data_type}>"
+    elif "FFOR" in encoding:
         column_t = f"FFORColumn<{data_type}>"
+    elif "SLPATCH" in encoding:
+        column_t = f"SLPATCHColumn<{data_type}>"
     elif "ALPExtended" in encoding:
         column_t = f"ALPExtendedColumn<{data_type}>"
     elif "ALP" in encoding:
@@ -131,12 +146,10 @@ def get_column_t(
         column_t = f"FREQColumn<{data_type}>"
     elif "DICT" in encoding or "DICTShfl32" in encoding:
         column_t = f"DICTFFORColumn<{data_type}>"
-    elif "CROSSRLEExtended" in encoding:
-        column_t = f"CROSSRLEExtendedColumn<{data_type}>"
-    elif "CROSSRLELaneMask" in encoding:
-        column_t = f"CROSSRLELaneMaskColumn<{data_type}>"
-    elif "CROSSRLE" in encoding:
-        column_t = f"CROSSRLEColumn<{data_type}>"
+    elif encoding == "RLE":
+        column_t = f"RLEColumn<{data_type}, {data_type}>"
+    elif "CONSTANT" in encoding:
+        column_t = f"CONSTANTColumn<{data_type}>"
     return (
         "flsgpu::device::"
         if function != "query_multi_column" or for_decompressor
@@ -161,6 +174,10 @@ def get_decompressor_type(
     expander_t = f""
     if "FFOR" in encoding:
         functor = f"FFORFunctor<{data_type}, {n_vec}>"
+    elif "SLPATCH" in encoding and "DICTSLPATCH" not in encoding:
+        functor = f"FFORFunctor<{data_type}, {n_vec}>"
+        patcher_t = f"flsgpu::device::{patcher}SLPATCHExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+        decompressor_t = "SLPATCHDecompressor"
     elif "ALPExtended" in encoding:
         functor = f"ALPFunctor<{data_type}, {n_vec}>"
         patcher_t = f"flsgpu::device::{patcher}ALPExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
@@ -173,10 +190,25 @@ def get_decompressor_type(
         decompressor_t = "FREQDecompressor"
     elif "FREQ" in encoding:
         patcher_t = f"flsgpu::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+    elif "DICTSLPATCH" in encoding:
+        functor = f"DICTFunctor<{data_type}, {n_vec}>"
+        index_t = f"utils::same_width_uint<{data_type}>::type"
+        patcher_t = (
+            f"flsgpu::device::{patcher}SLPATCHDictExceptionPatcher<"
+            f"{data_type}, {index_t}, {n_vec}, {n_val}>,"
+        )
+        decompressor_t = "DICTSLPATCHDecompressor"
     elif "DICTShfl32" in encoding:
         functor = f"DICTShfl32Functor<{data_type}, {n_vec}>"
     elif "DICT" in encoding:
         functor = f"DICTFunctor<{data_type}, {n_vec}>"
+    elif encoding == "RLE":
+        code_t = data_type
+        functor = f"FFORFunctor<{code_t}, {n_vec}>"
+        decompressor_t = "RLEDecompressor"
+        expander_name = "Dummy" if expander == "None" else expander
+    elif "CONSTANT" in encoding:
+        decompressor_t = "CONSTANTDecompressor"
     elif "CROSSRLEExtended" in encoding:
         expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
         decompressor_t = "CROSSRLEDecompressor"
@@ -207,6 +239,16 @@ def get_decompressor_type(
 
     if "FREQ" in encoding or "FREQExtended" in encoding or "CROSSRLE" in encoding or "CROSSRLEExtended" in encoding or "CROSSRLELaneMask" in encoding:
         unpacker_t = f""
+    if "CONSTANT" in encoding:
+        return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {n_val}, {column_t}>"
+    if encoding == "RLE":
+        rle_expander_t = (
+            f"flsgpu::device::{expander_name}RLEExpander<"
+            f"{data_type}, {code_t}, {n_vec}, {n_val}>,"
+        )
+        return f"flsgpu::device::{decompressor_t}<{data_type}, {code_t}, {n_vec}, {n_val}, {unpacker_t} {rle_expander_t} {column_t}>"
+    if "DICTSLPATCH" in encoding:
+        return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {n_val}, {unpacker_t} {patcher_t} {column_t}>"
     return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {expander_t} {column_t}>"
 
 
@@ -245,6 +287,13 @@ def get_if_statement(
     if encoding == "CROSSRLE" or encoding == "CROSSRLEExtended" or encoding == "CROSSRLELaneMask":
         return (
             f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == enums::Expander::{expander} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            + "{"  # }
+            f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+            "}"
+        )
+    if encoding == "CONSTANT":
+        return (
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
             + "{"  # }
             f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
@@ -336,9 +385,11 @@ def get_if_statement_check_wrapper(
     old_fls_filter = unpacker == "OldFls" and (
         n_vec != 1 or data_type not in ["uint32_t", "float"]
     )
-
     is_filtered = (
-        unnessary_filter or switch_case_filter or multi_column_filter or old_fls_filter
+        unnessary_filter
+        or switch_case_filter
+        or multi_column_filter
+        or old_fls_filter
     )
     if is_filtered:
         return ""
@@ -473,6 +524,40 @@ def main(args):
                     ],
                 )
 
+    for encoding in ["DICTSLPATCH"]:
+        for data_type in ["uint32_t", "uint64_t"]:
+            for binding, is_query_column in zip(
+                ["decompress_column"], [False]
+            ):
+                write_file(
+                    f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                    [
+                        get_function(
+                            encoding,
+                            data_type,
+                            binding,
+                            "bool" if is_query_column else data_type + "*",
+                            [
+                                get_if_statement_check_wrapper(
+                                    args.disable_unnecessary,
+                                    encoding,
+                                    data_type,
+                                    binding,
+                                    n_vec,
+                                    n_val,
+                                    unpacker,
+                                    "Stateful",
+                                    is_query_column=is_query_column,
+                                )
+                                for n_vec in [1, 4]
+                                for n_val in [1]
+                                for unpacker in UNPACKERS[1:]
+                            ],
+                            is_query_column=is_query_column,
+                        )
+                    ],
+                )
+
     for encoding in ["DICTShfl32"]:
         for data_type in ["uint32_t", "uint64_t"]:
             for binding, is_query_column in zip(
@@ -573,6 +658,102 @@ def main(args):
                             ],
                             is_multi_column=is_multi_column,
                             is_compute_column=is_compute_column,
+                        )
+                    ],
+                )
+
+    for encoding in ["SLPATCH"]:
+        for data_type in ["uint32_t", "uint64_t"]:
+            for binding, is_query_column in zip(["decompress_column"], [False]):
+                write_file(
+                    f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                    [
+                        get_function(
+                            encoding,
+                            data_type,
+                            binding,
+                            "bool" if is_query_column else data_type + "*",
+                            [
+                                get_if_statement_check_wrapper(
+                                    args.disable_unnecessary,
+                                    encoding,
+                                    data_type,
+                                    binding,
+                                    n_vec,
+                                    n_val,
+                                    unpacker,
+                                    "Stateful",
+                                    is_query_column=is_query_column,
+                                )
+                                for n_vec in [1, 4]
+                                for n_val in [1]
+                                for unpacker in UNPACKERS[1:]
+                            ],
+                            is_query_column=is_query_column,
+                        )
+                    ],
+                )
+
+    for encoding in ["RLE"]:
+        for data_type in ["uint32_t", "uint64_t"]:
+            for binding, is_query_column in zip(["decompress_column"], [False]):
+                write_file(
+                    f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                    [
+                        get_function(
+                            encoding,
+                            data_type,
+                            binding,
+                            "bool" if is_query_column else data_type + "*",
+                            [
+                                get_if_statement_check_wrapper(
+                                    args.disable_unnecessary,
+                                    encoding,
+                                    data_type,
+                                    binding,
+                                    n_vec,
+                                    n_val,
+                                    unpacker,
+                                    "None",
+                                    is_query_column=is_query_column,
+                                )
+                                for n_vec in [1, 4]
+                                for n_val in [1]
+                                for unpacker in UNPACKERS[1:]
+                                
+                            ],
+                            is_query_column=is_query_column,
+                        )
+                    ],
+                )
+
+    for encoding in ["CONSTANT"]:
+        for data_type in ["uint32_t", "uint64_t"]:
+            for binding, is_query_column in zip(["decompress_column"], [False]):
+                write_file(
+                    f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                    [
+                        get_function(
+                            encoding,
+                            data_type,
+                            binding,
+                            "bool" if is_query_column else data_type + "*",
+                            [
+                                get_if_statement_check_wrapper(
+                                    args.disable_unnecessary,
+                                    encoding,
+                                    data_type,
+                                    binding,
+                                    n_vec,
+                                    n_val,
+                                    "None",
+                                    "None",
+                                    is_query_column=is_query_column,
+                                )
+                                for n_vec in [1, 4]
+                                for n_val in [1]
+                            ],
+                            is_query_column=is_query_column,
                         )
                     ],
                 )

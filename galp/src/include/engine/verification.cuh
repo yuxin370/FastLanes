@@ -79,10 +79,10 @@ ExecutionResult<T> compare_data(const T* a, const T* b, const size_t size) {
 	for (size_t i {0}; i < size; ++i) {
 		if (!byte_compare(a[i], b[i])) {
 			differences.push_back(Difference<T> {i, a[i], b[i]});
-			printf("Difference found at index %lu: original=%lu, other=%lu\n",
-			       i,
-			       static_cast<uint64_t>(a[i]),
-			       static_cast<uint64_t>(b[i]));
+			// printf("Difference found at index %lu: original=%lu, other=%lu\n",
+			//        i,
+			//        static_cast<uint64_t>(a[i]),
+			//        static_cast<uint64_t>(b[i]));
 			if (differences.size() > LOG_N_MISTAKES) {
 				break;
 			}

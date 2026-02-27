@@ -58,6 +58,7 @@ enum class Expander {
 	None,
 	Dummy,
 	Stateful,
+	StatefulCache,
 	PrefetchStateful,
 	StatefulShuffle,
 	StatefulAdvance,
@@ -72,7 +73,18 @@ enum class Print {
 	PrintDebugExit0,
 };
 
-enum class Encoding { ALP, BIT_PACKING, FFOR, FREQUENCY, CROSS_RLE, DICTIONARY, SLPATCH, CONSTANT };
+enum class Encoding {
+	ALP,
+	BIT_PACKING,
+	FFOR,
+	FREQUENCY,
+	CROSS_RLE,
+	DICTIONARY,
+	SLPATCH,
+	CONSTANT,
+	RLE,
+	DICT_SLPATCH,
+};
 
 types::DataType string_to_data_type(const std::string& str);
 Kernel          string_to_kernel(const std::string& str);

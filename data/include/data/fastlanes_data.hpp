@@ -8,8 +8,8 @@
 
 #include "data/NextiaJD.hpp"
 #include "data/TimeSeries.hpp"
-#include "data/mnist.hpp"
 #include "data/clickbench.hpp"
+#include "data/dct_blocks.hpp"
 #include "data/embedding.hpp"
 #include "data/example.hpp"
 #include "data/fannie_mae.hpp"
@@ -17,6 +17,7 @@
 #include "data/galp.hpp"
 #include "data/generated.hpp"
 #include "data/issues.hpp"
+#include "data/mnist.hpp"
 #include "data/public_bi.hpp"
 #include "data/sdrbench.hpp"
 #include "data/test.hpp"

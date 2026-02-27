@@ -16,7 +16,6 @@ cmake-build-*/
 
 #test 
 python/tests/
-data/
 build*/
 galp/benchmark/generated-bindings-tp/
 galp/benchmark/generated-bindings-original/
@@ -25,6 +24,11 @@ scripts/my_tool/*_result
 *.ncu-rep
 *.nsys-rep
 *.sqlite
+
+#data
+data/fls/
+data/dct_blocks/
+
 #########################################
 # Editor temporary/working/backup files #
 .#*
