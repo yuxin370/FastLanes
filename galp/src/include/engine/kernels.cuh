@@ -8,6 +8,5 @@
 
 #include "engine/kernels/device.cuh"
 #include "engine/kernels/host.cuh"
-#include "engine/kernels/traits.cuh"
 
 #endif // FLS_GLOBAL_CUH

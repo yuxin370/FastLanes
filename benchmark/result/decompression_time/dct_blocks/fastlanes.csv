@@ -1,0 +1,71 @@
+table_name,version,decompression_time_ms,n_repetition
+celeba,0.1.4,544.53,1000
+cifar10,0.1.4,391.43,1000
+mnist,0.1.4,463.726,1000
+tiny-imagenet,0.1.4,506.31,1000
+
+
+Benchmark results:
+  rowgroups: 1
+  columns:   64 (avg 64 per rowgroup)
+  vectors: 4096 (avg 4096 per rowgroup)
+  samples:   1000
+  bytes:     5177344 (4.94 MiB)
+  end_to_end_ms: 542.482
+  end_to_end_ms (no teardown): 542.482
+  kernel_ms:     542.482
+  setup_ms:      0
+  h2d_ms:        0
+  teardown_ms:   0
+  avg_us:    542.482 (per rowgroup per sample)
+  kernel_throughput: 9.54381 (GB/s), 8.88836 (GiB/s)
+  end_to_end_throughput: 9.54381 (GB/s), 8.88836 (GiB/s)
+  end_to_end_throughput (no teardown): 9.54381 (GB/s), 8.88836 (GiB/s)
+Benchmark results:
+  rowgroups: 1
+  columns:   64 (avg 64 per rowgroup)
+  vectors: 4096 (avg 4096 per rowgroup)
+  samples:   1000
+  bytes:     4325376 (4.12 MiB)
+  end_to_end_ms: 387.454
+  end_to_end_ms (no teardown): 387.454
+  kernel_ms:     387.422
+  setup_ms:      0.032749
+  h2d_ms:        0
+  teardown_ms:   0
+  avg_us:    387.422 (per rowgroup per sample)
+  kernel_throughput: 11.1645 (GB/s), 10.3978 (GiB/s)
+  end_to_end_throughput: 11.1636 (GB/s), 10.3969 (GiB/s)
+  end_to_end_throughput (no teardown): 11.1636 (GB/s), 10.3969 (GiB/s)
+Benchmark results:
+  rowgroups: 1
+  columns:   64 (avg 64 per rowgroup)
+  vectors: 4096 (avg 4096 per rowgroup)
+  samples:   1000
+  bytes:     4390912 (4.19 MiB)
+  end_to_end_ms: 468.92
+  end_to_end_ms (no teardown): 468.92
+  kernel_ms:     468.654
+  setup_ms:      0.265767
+  h2d_ms:        0
+  teardown_ms:   0
+  avg_us:    468.654 (per rowgroup per sample)
+  kernel_throughput: 9.3692 (GB/s), 8.72575 (GiB/s)
+  end_to_end_throughput: 9.36389 (GB/s), 8.7208 (GiB/s)
+  end_to_end_throughput (no teardown): 9.36389 (GB/s), 8.7208 (GiB/s)
+Benchmark results:
+  rowgroups: 1
+  columns:   64 (avg 64 per rowgroup)
+  vectors: 4096 (avg 4096 per rowgroup)
+  samples:   1000
+  bytes:     4325376 (4.12 MiB)
+  end_to_end_ms: 495.644
+  end_to_end_ms (no teardown): 495.644
+  kernel_ms:     495.644
+  setup_ms:      0
+  h2d_ms:        0
+  teardown_ms:   0
+  avg_us:    495.644 (per rowgroup per sample)
+  kernel_throughput: 8.72678 (GB/s), 8.12745 (GiB/s)
+  end_to_end_throughput: 8.72678 (GB/s), 8.12745 (GiB/s)
+  end_to_end_throughput (no teardown): 8.72678 (GB/s), 8.12745 (GiB/s)

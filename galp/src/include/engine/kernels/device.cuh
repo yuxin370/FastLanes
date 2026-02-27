@@ -8,7 +8,6 @@
 
 #include "engine/device-utils.cuh"
 #include "engine/kernels/execute_plan.cuh"
-#include "engine/kernels/traits.cuh"
 #include "flsgpu/consts.cuh"
 #include <cstddef>
 #include <cstdint>

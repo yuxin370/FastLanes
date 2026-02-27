@@ -1,0 +1,191 @@
+================================================================================
+压缩分析报告
+================================================================================
+
+📊 数据集: CELEBA (共 64 列)
+  表达式使用频次:
+    EXP_FFOR_SLPATCH_I08: 47 次 (73.4%)
+    EXP_FFOR_SLPATCH_I16: 14 次 (21.9%)
+    EXP_FFOR_I16: 1 次 (1.6%)
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 1 次 (1.6%)
+    EXP_FREQUENCY_I08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=3.45x, 范围=[3.45, 3.45]x
+    EXP_FFOR_I16: 平均=1.59x, 范围=[1.59, 1.59]x
+    EXP_FFOR_SLPATCH_I08: 平均=2.24x, 范围=[1.19, 3.70]x
+    EXP_FFOR_SLPATCH_I16: 平均=1.94x, 范围=[1.55, 2.25]x
+    EXP_FREQUENCY_I08: 平均=5.26x, 范围=[5.26, 5.26]x
+  整体平均压缩比: 2.23x
+
+📊 数据集: CIFAR10 (共 64 列)
+  表达式使用频次:
+    EXP_FFOR_SLPATCH_I08: 32 次 (50.0%)
+    EXP_FREQUENCY_I08: 19 次 (29.7%)
+    EXP_CROSS_RLE_I08: 9 次 (14.1%)
+    EXP_FFOR_SLPATCH_I16: 2 次 (3.1%)
+    EXP_UNCOMPRESSED_I08: 1 次 (1.6%)
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_CROSS_RLE_I08: 平均=∞x, 范围=[100.00, ∞]x
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=3.70x, 范围=[3.70, 3.70]x
+    EXP_FFOR_SLPATCH_I08: 平均=2.33x, 范围=[1.18, 3.85]x
+    EXP_FFOR_SLPATCH_I16: 平均=2.12x, 范围=[2.04, 2.20]x
+    EXP_FREQUENCY_I08: 平均=19.31x, 范围=[5.26, 50.00]x
+    EXP_UNCOMPRESSED_I08: 平均=1.00x, 范围=[1.00, 1.00]x
+  整体平均压缩比: 15.84x
+
+📊 数据集: CXR8 (共 64 列)
+  表达式使用频次:
+    EXP_CROSS_RLE_I08: 29 次 (45.3%)
+    EXP_FFOR_SLPATCH_I08: 12 次 (18.8%)
+    EXP_FREQUENCY_I08: 10 次 (15.6%)
+    EXP_CONSTANT_I08: 10 次 (15.6%)
+    EXP_UNCOMPRESSED_I08: 1 次 (1.6%)
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 1 次 (1.6%)
+    EXP_DICT_I08_U08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_CONSTANT_I08: 平均=∞x, 范围=[∞, ∞]x
+    EXP_CROSS_RLE_I08: 平均=∞x, 范围=[33.33, ∞]x
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=100.00x, 范围=[100.00, 100.00]x
+    EXP_DICT_I08_U08: 平均=∞x, 范围=[∞, ∞]x
+    EXP_FFOR_SLPATCH_I08: 平均=2.81x, 范围=[1.52, 4.00]x
+    EXP_FREQUENCY_I08: 平均=21.13x, 范围=[4.76, 50.00]x
+    EXP_UNCOMPRESSED_I08: 平均=1.00x, 范围=[1.00, 1.00]x
+  整体平均压缩比: 27.64x
+
+📊 数据集: DIV2K (共 64 列)
+  表达式使用频次:
+    EXP_FFOR_SLPATCH_I08: 33 次 (51.6%)
+    EXP_FREQUENCY_I08: 23 次 (35.9%)
+    EXP_CROSS_RLE_I08: 4 次 (6.2%)
+    EXP_FFOR_I08: 2 次 (3.1%)
+    EXP_UNCOMPRESSED_I08: 1 次 (1.6%)
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_CROSS_RLE_I08: 平均=62.50x, 范围=[50.00, 100.00]x
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=2.56x, 范围=[2.56, 2.56]x
+    EXP_FFOR_I08: 平均=1.03x, 范围=[1.02, 1.03]x
+    EXP_FFOR_SLPATCH_I08: 平均=2.47x, 范围=[1.23, 4.17]x
+    EXP_FREQUENCY_I08: 平均=19.13x, 范围=[4.35, 50.00]x
+    EXP_UNCOMPRESSED_I08: 平均=1.00x, 范围=[1.00, 1.00]x
+  整体平均压缩比: 12.15x
+
+📊 数据集: IMAGENET (共 64 列)
+  表达式使用频次:
+    EXP_FFOR_SLPATCH_I08: 38 次 (59.4%)
+    EXP_FFOR_SLPATCH_I16: 13 次 (20.3%)
+    EXP_FREQUENCY_I08: 12 次 (18.8%)
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=1.61x, 范围=[1.61, 1.61]x
+    EXP_FFOR_SLPATCH_I08: 平均=3.14x, 范围=[1.52, 5.26]x
+    EXP_FFOR_SLPATCH_I16: 平均=2.42x, 范围=[1.64, 3.03]x
+    EXP_FREQUENCY_I08: 平均=8.64x, 范围=[4.55, 14.29]x
+  整体平均压缩比: 4.00x
+
+📊 数据集: LFWA (共 64 列)
+  表达式使用频次:
+    EXP_FREQUENCY_I08: 30 次 (46.9%)
+    EXP_FFOR_SLPATCH_I08: 16 次 (25.0%)
+    EXP_CROSS_RLE_I08: 15 次 (23.4%)
+    EXP_FFOR_SLPATCH_I16: 2 次 (3.1%)
+    EXP_UNCOMPRESSED_I08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_CROSS_RLE_I08: 平均=∞x, 范围=[50.00, ∞]x
+    EXP_FFOR_SLPATCH_I08: 平均=1.98x, 范围=[1.22, 2.94]x
+    EXP_FFOR_SLPATCH_I16: 平均=2.12x, 范围=[2.11, 2.13]x
+    EXP_FREQUENCY_I08: 平均=33.69x, 范围=[2.70, 100.00]x
+    EXP_UNCOMPRESSED_I08: 平均=1.00x, 范围=[1.00, 1.00]x
+  整体平均压缩比: 36.03x
+
+📊 数据集: MNIST (共 64 列)
+  表达式使用频次:
+    EXP_FFOR_SLPATCH_I08: 41 次 (64.1%)
+    EXP_FREQUENCY_I08: 16 次 (25.0%)
+    EXP_FFOR_SLPATCH_I16: 3 次 (4.7%)
+    EXP_UNCOMPRESSED_I08: 2 次 (3.1%)
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 2 次 (3.1%)
+  压缩比统计 (按表达式):
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=4.10x, 范围=[2.94, 5.26]x
+    EXP_FFOR_SLPATCH_I08: 平均=2.38x, 范围=[0.89, 3.85]x
+    EXP_FFOR_SLPATCH_I16: 平均=1.95x, 范围=[1.94, 1.96]x
+    EXP_FREQUENCY_I08: 平均=27.73x, 范围=[3.85, 100.00]x
+    EXP_UNCOMPRESSED_I08: 平均=1.00x, 范围=[1.00, 1.00]x
+  整体平均压缩比: 8.71x
+
+📊 数据集: SVHN (共 64 列)
+  表达式使用频次:
+    EXP_FFOR_SLPATCH_I08: 19 次 (29.7%)
+    EXP_CROSS_RLE_I08: 18 次 (28.1%)
+    EXP_FREQUENCY_I08: 14 次 (21.9%)
+    EXP_CONSTANT_I08: 12 次 (18.8%)
+    EXP_UNCOMPRESSED_I08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_CONSTANT_I08: 平均=∞x, 范围=[∞, ∞]x
+    EXP_CROSS_RLE_I08: 平均=∞x, 范围=[100.00, ∞]x
+    EXP_FFOR_SLPATCH_I08: 平均=1.94x, 范围=[1.11, 3.33]x
+    EXP_FREQUENCY_I08: 平均=25.05x, 范围=[4.00, 50.00]x
+    EXP_UNCOMPRESSED_I08: 平均=1.00x, 范围=[1.00, 1.00]x
+  整体平均压缩比: 26.55x
+
+📊 数据集: TID2013 (共 64 列)
+  表达式使用频次:
+    EXP_FFOR_SLPATCH_I08: 51 次 (79.7%)
+    EXP_FFOR_SLPATCH_I16: 10 次 (15.6%)
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 2 次 (3.1%)
+    EXP_FFOR_I08: 1 次 (1.6%)
+  压缩比统计 (按表达式):
+    EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=2.54x, 范围=[2.22, 2.86]x
+    EXP_FFOR_I08: 平均=1.01x, 范围=[1.01, 1.01]x
+    EXP_FFOR_SLPATCH_I08: 平均=2.05x, 范围=[1.10, 3.12]x
+    EXP_FFOR_SLPATCH_I16: 平均=1.90x, 范围=[1.71, 2.30]x
+  整体平均压缩比: 2.03x
+
+================================================================================
+🌍 全局总计（不分数据集）
+================================================================================
+总列数: 576
+
+表达式使用总频次与占比:
+  EXP_FFOR_SLPATCH_I08: 289 次 (50.17%)
+  EXP_FREQUENCY_I08: 125 次 (21.70%)
+  EXP_CROSS_RLE_I08: 75 次 (13.02%)
+  EXP_FFOR_SLPATCH_I16: 44 次 (7.64%)
+  EXP_CONSTANT_I08: 22 次 (3.82%)
+  EXP_DICT_I08_FFOR_SLPATCH_U08: 9 次 (1.56%)
+  EXP_UNCOMPRESSED_I08: 7 次 (1.22%)
+  EXP_FFOR_I08: 3 次 (0.52%)
+  EXP_FFOR_I16: 1 次 (0.17%)
+  EXP_DICT_I08_U08: 1 次 (0.17%)
+
+全局压缩比统计（按表达式）:
+  EXP_CONSTANT_I08: 平均=∞x, 范围=[∞, ∞]x
+  EXP_CROSS_RLE_I08: 平均=∞x, 范围=[33.33, ∞]x
+  EXP_DICT_I08_FFOR_SLPATCH_U08: 平均=13.85x, 范围=[1.61, 100.00]x
+  EXP_DICT_I08_U08: 平均=∞x, 范围=[∞, ∞]x
+  EXP_FFOR_I08: 平均=1.02x, 范围=[1.01, 1.03]x
+  EXP_FFOR_I16: 平均=1.59x, 范围=[1.59, 1.59]x
+  EXP_FFOR_SLPATCH_I08: 平均=2.37x, 范围=[0.89, 5.26]x
+  EXP_FFOR_SLPATCH_I16: 平均=2.09x, 范围=[1.55, 3.03]x
+  EXP_FREQUENCY_I08: 平均=23.46x, 范围=[2.70, 100.00]x
+  EXP_UNCOMPRESSED_I08: 平均=1.00x, 范围=[1.00, 1.00]x
+
+全局整体平均压缩比: 13.53x
+
+================================================================================
+📈 各数据集汇总
+================================================================================
+CELEBA     | 总列数: 64  | 平均压缩比: 2.23x
+CIFAR10    | 总列数: 64  | 平均压缩比: 15.84x
+CXR8       | 总列数: 64  | 平均压缩比: 27.64x
+DIV2K      | 总列数: 64  | 平均压缩比: 12.15x
+IMAGENET   | 总列数: 64  | 平均压缩比: 4.00x
+LFWA       | 总列数: 64  | 平均压缩比: 36.03x
+MNIST      | 总列数: 64  | 平均压缩比: 8.71x
+SVHN       | 总列数: 64  | 平均压缩比: 26.55x
+TID2013    | 总列数: 64  | 平均压缩比: 2.03x
+
+⚠️  注意：发现 1 列压缩后体积增大（CR < 1）:
+    数据集: mnist, 表达式: EXP_FFOR_SLPATCH_I08, CR: 0.89x
+
+分析完成。

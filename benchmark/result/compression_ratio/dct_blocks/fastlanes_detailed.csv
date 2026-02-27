@@ -1,0 +1,577 @@
+compression,version,table_name,id,name,data_type,size(bytes),expression,bytes_per_value,bits_per_value
+FastLanes,0.1.4,celebA,0,Column_1,INT16,82496,"{[EXP_FFOR_I16][0, 1, 2]}",1.26,10.07
+FastLanes,0.1.4,celebA,1,Column_2,INT16,84340,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.29,10.30
+FastLanes,0.1.4,celebA,2,Column_3,INT16,84400,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.29,10.30
+FastLanes,0.1.4,celebA,3,Column_4,INT16,75980,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.16,9.27
+FastLanes,0.1.4,celebA,4,Column_5,INT16,75740,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.16,9.25
+FastLanes,0.1.4,celebA,5,Column_6,INT16,76100,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.16,9.29
+FastLanes,0.1.4,celebA,6,Column_7,INT16,61396,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.94,7.49
+FastLanes,0.1.4,celebA,7,Column_8,INT16,70384,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.07,8.59
+FastLanes,0.1.4,celebA,8,Column_9,INT16,70056,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.07,8.55
+FastLanes,0.1.4,celebA,9,Column_10,INT16,69392,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.06,8.47
+FastLanes,0.1.4,celebA,10,Column_11,INT16,58144,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.89,7.10
+FastLanes,0.1.4,celebA,11,Column_12,INT16,58832,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.90,7.18
+FastLanes,0.1.4,celebA,12,Column_13,INT16,59064,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.90,7.21
+FastLanes,0.1.4,celebA,13,Column_14,INT16,58944,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.90,7.20
+FastLanes,0.1.4,celebA,14,Column_15,INT16,58252,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.89,7.11
+FastLanes,0.1.4,celebA,15,Column_16,INT8,43840,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.67,5.35
+FastLanes,0.1.4,celebA,16,Column_17,INT8,50312,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.77,6.14
+FastLanes,0.1.4,celebA,17,Column_18,INT8,55010,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.84,6.72
+FastLanes,0.1.4,celebA,18,Column_19,INT8,54695,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.83,6.68
+FastLanes,0.1.4,celebA,19,Column_20,INT8,53661,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.82,6.55
+FastLanes,0.1.4,celebA,20,Column_21,INT8,53129,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.81,6.49
+FastLanes,0.1.4,celebA,21,Column_22,INT8,39044,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.60,4.77
+FastLanes,0.1.4,celebA,22,Column_23,INT8,42983,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.25
+FastLanes,0.1.4,celebA,23,Column_24,INT8,43115,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.26
+FastLanes,0.1.4,celebA,24,Column_25,INT8,47995,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.73,5.86
+FastLanes,0.1.4,celebA,25,Column_26,INT8,43232,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.28
+FastLanes,0.1.4,celebA,26,Column_27,INT8,36525,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.56,4.46
+FastLanes,0.1.4,celebA,27,Column_28,INT8,37325,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.57,4.56
+FastLanes,0.1.4,celebA,28,Column_29,INT8,31428,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.48,3.84
+FastLanes,0.1.4,celebA,29,Column_30,INT8,34327,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.52,4.19
+FastLanes,0.1.4,celebA,30,Column_31,INT8,35294,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.54,4.31
+FastLanes,0.1.4,celebA,31,Column_32,INT8,38394,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.59,4.69
+FastLanes,0.1.4,celebA,32,Column_33,INT8,35683,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.54,4.36
+FastLanes,0.1.4,celebA,33,Column_34,INT8,35181,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.54,4.29
+FastLanes,0.1.4,celebA,34,Column_35,INT8,34806,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.25
+FastLanes,0.1.4,celebA,35,Column_36,INT8,30662,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.47,3.74
+FastLanes,0.1.4,celebA,36,Column_37,INT8,26467,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.23
+FastLanes,0.1.4,celebA,37,Column_38,INT8,28336,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.43,3.46
+FastLanes,0.1.4,celebA,38,Column_39,INT8,34366,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.52,4.20
+FastLanes,0.1.4,celebA,39,Column_40,INT8,33901,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.52,4.14
+FastLanes,0.1.4,celebA,40,Column_41,INT8,28453,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.43,3.47
+FastLanes,0.1.4,celebA,41,Column_42,INT8,30462,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.72
+FastLanes,0.1.4,celebA,42,Column_43,INT8,28859,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.44,3.52
+FastLanes,0.1.4,celebA,43,Column_44,INT8,27694,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.42,3.38
+FastLanes,0.1.4,celebA,44,Column_45,INT8,27016,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.41,3.30
+FastLanes,0.1.4,celebA,45,Column_46,INT8,26019,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.18
+FastLanes,0.1.4,celebA,46,Column_47,INT8,27763,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.42,3.39
+FastLanes,0.1.4,celebA,47,Column_48,INT8,26425,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.23
+FastLanes,0.1.4,celebA,48,Column_49,INT8,23790,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.36,2.90
+FastLanes,0.1.4,celebA,49,Column_50,INT8,22098,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.34,2.70
+FastLanes,0.1.4,celebA,50,Column_51,INT8,25168,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.07
+FastLanes,0.1.4,celebA,51,Column_52,INT8,25441,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.11
+FastLanes,0.1.4,celebA,52,Column_53,INT8,24316,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.37,2.97
+FastLanes,0.1.4,celebA,53,Column_54,INT8,26893,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.41,3.28
+FastLanes,0.1.4,celebA,54,Column_55,INT8,23125,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.82
+FastLanes,0.1.4,celebA,55,Column_56,INT8,20045,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.31,2.45
+FastLanes,0.1.4,celebA,56,Column_57,INT8,19043,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.32
+FastLanes,0.1.4,celebA,57,Column_58,INT8,19007,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.29,2.32
+FastLanes,0.1.4,celebA,58,Column_59,INT8,18512,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.26
+FastLanes,0.1.4,celebA,59,Column_60,INT8,18029,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.20
+FastLanes,0.1.4,celebA,60,Column_61,INT8,19316,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.36
+FastLanes,0.1.4,celebA,61,Column_62,INT8,17809,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.17
+FastLanes,0.1.4,celebA,62,Column_63,INT8,17827,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.18
+FastLanes,0.1.4,celebA,63,Column_64,INT8,12522,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.19,1.53
+FastLanes,0.1.4,cifar10,0,Column_1,INT8,65792,"{[EXP_UNCOMPRESSED_I08][0]}",1.00,8.03
+FastLanes,0.1.4,cifar10,1,Column_2,INT16,59648,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.91,7.28
+FastLanes,0.1.4,cifar10,2,Column_3,INT16,64532,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.98,7.88
+FastLanes,0.1.4,cifar10,3,Column_4,INT8,55986,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.85,6.83
+FastLanes,0.1.4,cifar10,4,Column_5,INT8,54098,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.83,6.60
+FastLanes,0.1.4,cifar10,5,Column_6,INT8,54744,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.84,6.68
+FastLanes,0.1.4,cifar10,6,Column_7,INT8,43451,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.30
+FastLanes,0.1.4,cifar10,7,Column_8,INT8,48682,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.74,5.94
+FastLanes,0.1.4,cifar10,8,Column_9,INT8,50189,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.77,6.13
+FastLanes,0.1.4,cifar10,9,Column_10,INT8,50394,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.77,6.15
+FastLanes,0.1.4,cifar10,10,Column_11,INT8,42623,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.65,5.20
+FastLanes,0.1.4,cifar10,11,Column_12,INT8,42289,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.65,5.16
+FastLanes,0.1.4,cifar10,12,Column_13,INT8,43148,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.27
+FastLanes,0.1.4,cifar10,13,Column_14,INT8,38929,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.59,4.75
+FastLanes,0.1.4,cifar10,14,Column_15,INT8,34722,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.24
+FastLanes,0.1.4,cifar10,15,Column_16,INT8,25813,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.15
+FastLanes,0.1.4,cifar10,16,Column_17,INT8,32949,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.50,4.02
+FastLanes,0.1.4,cifar10,17,Column_18,INT8,34536,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.22
+FastLanes,0.1.4,cifar10,18,Column_19,INT8,35621,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.54,4.35
+FastLanes,0.1.4,cifar10,19,Column_20,INT8,35040,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.28
+FastLanes,0.1.4,cifar10,20,Column_21,INT8,34746,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.24
+FastLanes,0.1.4,cifar10,21,Column_22,INT8,23095,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.82
+FastLanes,0.1.4,cifar10,22,Column_23,INT8,26272,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.21
+FastLanes,0.1.4,cifar10,23,Column_24,INT8,26596,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.41,3.25
+FastLanes,0.1.4,cifar10,24,Column_25,INT8,28602,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.44,3.49
+FastLanes,0.1.4,cifar10,25,Column_26,INT8,25794,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.15
+FastLanes,0.1.4,cifar10,26,Column_27,INT8,18467,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.25
+FastLanes,0.1.4,cifar10,27,Column_28,INT8,18308,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.23
+FastLanes,0.1.4,cifar10,28,Column_29,INT8,9636,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.15,1.18
+FastLanes,0.1.4,cifar10,29,Column_30,INT8,17304,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.11
+FastLanes,0.1.4,cifar10,30,Column_31,INT8,17905,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.19
+FastLanes,0.1.4,cifar10,31,Column_32,INT8,19202,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.34
+FastLanes,0.1.4,cifar10,32,Column_33,INT8,19190,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.34
+FastLanes,0.1.4,cifar10,33,Column_34,INT8,18827,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.30
+FastLanes,0.1.4,cifar10,34,Column_35,INT8,17560,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.14
+FastLanes,0.1.4,cifar10,35,Column_36,INT8,12750,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.19,1.56
+FastLanes,0.1.4,cifar10,36,Column_37,INT8,3864,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.06,0.47
+FastLanes,0.1.4,cifar10,37,Column_38,INT8,10443,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.16,1.27
+FastLanes,0.1.4,cifar10,38,Column_39,INT8,17641,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.27,2.15
+FastLanes,0.1.4,cifar10,39,Column_40,INT8,17301,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.11
+FastLanes,0.1.4,cifar10,40,Column_41,INT8,8628,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.13,1.05
+FastLanes,0.1.4,cifar10,41,Column_42,INT8,9348,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.14,1.14
+FastLanes,0.1.4,cifar10,42,Column_43,INT8,9303,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.14,1.14
+FastLanes,0.1.4,cifar10,43,Column_44,INT8,7608,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.12,0.93
+FastLanes,0.1.4,cifar10,44,Column_45,INT8,4959,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.08,0.61
+FastLanes,0.1.4,cifar10,45,Column_46,INT8,3036,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.37
+FastLanes,0.1.4,cifar10,46,Column_47,INT8,7251,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.11,0.89
+FastLanes,0.1.4,cifar10,47,Column_48,INT8,5067,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.08,0.62
+FastLanes,0.1.4,cifar10,48,Column_49,INT8,2253,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.28
+FastLanes,0.1.4,cifar10,49,Column_50,INT8,1287,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.16
+FastLanes,0.1.4,cifar10,50,Column_51,INT8,1668,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.20
+FastLanes,0.1.4,cifar10,51,Column_52,INT8,1770,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.22
+FastLanes,0.1.4,cifar10,52,Column_53,INT8,1503,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.18
+FastLanes,0.1.4,cifar10,53,Column_54,INT8,4485,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.07,0.55
+FastLanes,0.1.4,cifar10,54,Column_55,INT8,1776,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.22
+FastLanes,0.1.4,cifar10,55,Column_56,INT8,883,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.11
+FastLanes,0.1.4,cifar10,56,Column_57,INT8,548,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.07
+FastLanes,0.1.4,cifar10,57,Column_58,INT8,728,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.09
+FastLanes,0.1.4,cifar10,58,Column_59,INT8,428,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.05
+FastLanes,0.1.4,cifar10,59,Column_60,INT8,167,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cifar10,60,Column_61,INT8,848,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.10
+FastLanes,0.1.4,cifar10,61,Column_62,INT8,167,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cifar10,62,Column_63,INT8,107,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cifar10,63,Column_64,INT8,77,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,0,Column_1,INT8,65792,"{[EXP_UNCOMPRESSED_I08][0]}",1.00,8.03
+FastLanes,0.1.4,cxr8,1,Column_2,INT8,43466,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.31
+FastLanes,0.1.4,cxr8,2,Column_3,INT8,38668,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.59,4.72
+FastLanes,0.1.4,cxr8,3,Column_4,INT8,26168,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.19
+FastLanes,0.1.4,cxr8,4,Column_5,INT8,29981,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.66
+FastLanes,0.1.4,cxr8,5,Column_6,INT8,33017,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.50,4.03
+FastLanes,0.1.4,cxr8,6,Column_7,INT8,21532,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.33,2.63
+FastLanes,0.1.4,cxr8,7,Column_8,INT8,23103,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.82
+FastLanes,0.1.4,cxr8,8,Column_9,INT8,22140,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.34,2.70
+FastLanes,0.1.4,cxr8,9,Column_10,INT8,19723,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.30,2.41
+FastLanes,0.1.4,cxr8,10,Column_11,INT8,13980,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.21,1.71
+FastLanes,0.1.4,cxr8,11,Column_12,INT8,16388,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.25,2.00
+FastLanes,0.1.4,cxr8,12,Column_13,INT8,17459,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.13
+FastLanes,0.1.4,cxr8,13,Column_14,INT8,16208,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.25,1.98
+FastLanes,0.1.4,cxr8,14,Column_15,INT8,8616,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.13,1.05
+FastLanes,0.1.4,cxr8,15,Column_16,INT8,1617,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.20
+FastLanes,0.1.4,cxr8,16,Column_17,INT8,3798,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.06,0.46
+FastLanes,0.1.4,cxr8,17,Column_18,INT8,6513,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.10,0.80
+FastLanes,0.1.4,cxr8,18,Column_19,INT8,8376,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.13,1.02
+FastLanes,0.1.4,cxr8,19,Column_20,INT8,5649,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.09,0.69
+FastLanes,0.1.4,cxr8,20,Column_21,INT8,3144,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.38
+FastLanes,0.1.4,cxr8,21,Column_22,INT8,373,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.05
+FastLanes,0.1.4,cxr8,22,Column_23,INT8,648,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.08
+FastLanes,0.1.4,cxr8,23,Column_24,INT8,893,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.11
+FastLanes,0.1.4,cxr8,24,Column_25,INT8,1740,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.21
+FastLanes,0.1.4,cxr8,25,Column_26,INT8,1078,"{[EXP_CROSS_RLE_I08][0, 1]}",0.02,0.13
+FastLanes,0.1.4,cxr8,26,Column_27,INT8,393,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.05
+FastLanes,0.1.4,cxr8,27,Column_28,INT8,1239,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.15
+FastLanes,0.1.4,cxr8,28,Column_29,INT8,1714,"{[EXP_CROSS_RLE_I08][0, 1]}",0.03,0.21
+FastLanes,0.1.4,cxr8,29,Column_30,INT8,152,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cxr8,30,Column_31,INT8,182,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cxr8,31,Column_32,INT8,252,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.03
+FastLanes,0.1.4,cxr8,32,Column_33,INT8,182,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cxr8,33,Column_34,INT8,172,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cxr8,34,Column_35,INT8,97,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,35,Column_36,INT8,207,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.03
+FastLanes,0.1.4,cxr8,36,Column_37,INT8,646,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.01,0.08
+FastLanes,0.1.4,cxr8,37,Column_38,INT8,47,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,38,Column_39,INT8,112,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,39,Column_40,INT8,112,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,40,Column_41,INT8,87,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,41,Column_42,INT8,147,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cxr8,42,Column_43,INT8,147,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cxr8,43,Column_44,INT8,127,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,cxr8,44,Column_45,INT8,67,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,45,Column_46,INT8,17,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,cxr8,46,Column_47,INT8,42,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,47,Column_48,INT8,62,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,48,Column_49,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,49,Column_50,INT8,3,"{[EXP_DICT_I08_U08][36, 0]}",0.00,0.00
+FastLanes,0.1.4,cxr8,50,Column_51,INT8,27,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,cxr8,51,Column_52,INT8,27,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,cxr8,52,Column_53,INT8,17,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,cxr8,53,Column_54,INT8,82,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,cxr8,54,Column_55,INT8,27,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,cxr8,55,Column_56,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,56,Column_57,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,57,Column_58,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,58,Column_59,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,59,Column_60,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,60,Column_61,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,61,Column_62,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,62,Column_63,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,cxr8,63,Column_64,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,div2k,0,Column_1,INT8,65792,"{[EXP_UNCOMPRESSED_I08][0]}",1.00,8.03
+FastLanes,0.1.4,div2k,1,Column_2,INT8,63360,"{[EXP_FFOR_I08][0, 1, 2]}",0.97,7.73
+FastLanes,0.1.4,div2k,2,Column_3,INT8,64000,"{[EXP_FFOR_I08][0, 1, 2]}",0.98,7.81
+FastLanes,0.1.4,div2k,3,Column_4,INT8,50360,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.77,6.15
+FastLanes,0.1.4,div2k,4,Column_5,INT8,51297,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.78,6.26
+FastLanes,0.1.4,div2k,5,Column_6,INT8,53354,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.81,6.51
+FastLanes,0.1.4,div2k,6,Column_7,INT8,43558,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.32
+FastLanes,0.1.4,div2k,7,Column_8,INT8,44953,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.69,5.49
+FastLanes,0.1.4,div2k,8,Column_9,INT8,45366,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.69,5.54
+FastLanes,0.1.4,div2k,9,Column_10,INT8,45746,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.70,5.58
+FastLanes,0.1.4,div2k,10,Column_11,INT8,38824,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.59,4.74
+FastLanes,0.1.4,div2k,11,Column_12,INT8,38380,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.59,4.69
+FastLanes,0.1.4,div2k,12,Column_13,INT8,40925,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.62,5.00
+FastLanes,0.1.4,div2k,13,Column_14,INT8,36977,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.56,4.51
+FastLanes,0.1.4,div2k,14,Column_15,INT8,34733,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.24
+FastLanes,0.1.4,div2k,15,Column_16,INT8,25817,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.15
+FastLanes,0.1.4,div2k,16,Column_17,INT8,30231,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.69
+FastLanes,0.1.4,div2k,17,Column_18,INT8,32949,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.50,4.02
+FastLanes,0.1.4,div2k,18,Column_19,INT8,34425,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.20
+FastLanes,0.1.4,div2k,19,Column_20,INT8,33484,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.51,4.09
+FastLanes,0.1.4,div2k,20,Column_21,INT8,32531,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.50,3.97
+FastLanes,0.1.4,div2k,21,Column_22,INT8,21520,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.33,2.63
+FastLanes,0.1.4,div2k,22,Column_23,INT8,24921,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.04
+FastLanes,0.1.4,div2k,23,Column_24,INT8,25573,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.39,3.12
+FastLanes,0.1.4,div2k,24,Column_25,INT8,27913,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.43,3.41
+FastLanes,0.1.4,div2k,25,Column_26,INT8,24800,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.03
+FastLanes,0.1.4,div2k,26,Column_27,INT8,19175,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.34
+FastLanes,0.1.4,div2k,27,Column_28,INT8,20203,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.31,2.47
+FastLanes,0.1.4,div2k,28,Column_29,INT8,16048,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.24,1.96
+FastLanes,0.1.4,div2k,29,Column_30,INT8,17021,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.08
+FastLanes,0.1.4,div2k,30,Column_31,INT8,18337,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.24
+FastLanes,0.1.4,div2k,31,Column_32,INT8,19881,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.30,2.43
+FastLanes,0.1.4,div2k,32,Column_33,INT8,19338,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.30,2.36
+FastLanes,0.1.4,div2k,33,Column_34,INT8,18877,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.30
+FastLanes,0.1.4,div2k,34,Column_35,INT8,17196,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.10
+FastLanes,0.1.4,div2k,35,Column_36,INT8,14985,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.23,1.83
+FastLanes,0.1.4,div2k,36,Column_37,INT8,6345,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.10,0.77
+FastLanes,0.1.4,div2k,37,Column_38,INT8,11940,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.18,1.46
+FastLanes,0.1.4,div2k,38,Column_39,INT8,16931,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.07
+FastLanes,0.1.4,div2k,39,Column_40,INT8,16592,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.25,2.03
+FastLanes,0.1.4,div2k,40,Column_41,INT8,10344,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.16,1.26
+FastLanes,0.1.4,div2k,41,Column_42,INT8,12735,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.19,1.55
+FastLanes,0.1.4,div2k,42,Column_43,INT8,14700,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.22,1.79
+FastLanes,0.1.4,div2k,43,Column_44,INT8,11979,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.18,1.46
+FastLanes,0.1.4,div2k,44,Column_45,INT8,7962,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.12,0.97
+FastLanes,0.1.4,div2k,45,Column_46,INT8,4509,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.07,0.55
+FastLanes,0.1.4,div2k,46,Column_47,INT8,9513,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.15,1.16
+FastLanes,0.1.4,div2k,47,Column_48,INT8,7563,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.12,0.92
+FastLanes,0.1.4,div2k,48,Column_49,INT8,4404,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.07,0.54
+FastLanes,0.1.4,div2k,49,Column_50,INT8,3225,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.39
+FastLanes,0.1.4,div2k,50,Column_51,INT8,3363,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.41
+FastLanes,0.1.4,div2k,51,Column_52,INT8,3318,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.41
+FastLanes,0.1.4,div2k,52,Column_53,INT8,2817,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.04,0.34
+FastLanes,0.1.4,div2k,53,Column_54,INT8,7896,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.12,0.96
+FastLanes,0.1.4,div2k,54,Column_55,INT8,3420,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.42
+FastLanes,0.1.4,div2k,55,Column_56,INT8,1467,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.18
+FastLanes,0.1.4,div2k,56,Column_57,INT8,1254,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.15
+FastLanes,0.1.4,div2k,57,Column_58,INT8,1719,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.21
+FastLanes,0.1.4,div2k,58,Column_59,INT8,1380,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.17
+FastLanes,0.1.4,div2k,59,Column_60,INT8,1278,"{[EXP_CROSS_RLE_I08][0, 1]}",0.02,0.16
+FastLanes,0.1.4,div2k,60,Column_61,INT8,1437,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.18
+FastLanes,0.1.4,div2k,61,Column_62,INT8,1188,"{[EXP_CROSS_RLE_I08][0, 1]}",0.02,0.15
+FastLanes,0.1.4,div2k,62,Column_63,INT8,1113,"{[EXP_CROSS_RLE_I08][0, 1]}",0.02,0.14
+FastLanes,0.1.4,div2k,63,Column_64,INT8,763,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.09
+FastLanes,0.1.4,imagenet,0,Column_1,INT16,80052,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.22,9.77
+FastLanes,0.1.4,imagenet,1,Column_2,INT16,70820,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.08,8.65
+FastLanes,0.1.4,imagenet,2,Column_3,INT16,60720,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.93,7.41
+FastLanes,0.1.4,imagenet,3,Column_4,INT16,48364,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.74,5.90
+FastLanes,0.1.4,imagenet,4,Column_5,INT8,37086,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.57,4.53
+FastLanes,0.1.4,imagenet,5,Column_6,INT8,29099,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.44,3.55
+FastLanes,0.1.4,imagenet,6,Column_7,INT8,23029,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.81
+FastLanes,0.1.4,imagenet,7,Column_8,INT8,17784,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.17
+FastLanes,0.1.4,imagenet,8,Column_9,INT16,67592,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.03,8.25
+FastLanes,0.1.4,imagenet,9,Column_10,INT16,57980,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.88,7.08
+FastLanes,0.1.4,imagenet,10,Column_11,INT16,50348,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.77,6.15
+FastLanes,0.1.4,imagenet,11,Column_12,INT8,43580,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.32
+FastLanes,0.1.4,imagenet,12,Column_13,INT8,34954,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.27
+FastLanes,0.1.4,imagenet,13,Column_14,INT8,23024,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.81
+FastLanes,0.1.4,imagenet,14,Column_15,INT8,20440,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.31,2.50
+FastLanes,0.1.4,imagenet,15,Column_16,INT8,17536,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.14
+FastLanes,0.1.4,imagenet,16,Column_17,INT16,55708,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.85,6.80
+FastLanes,0.1.4,imagenet,17,Column_18,INT16,53048,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.81,6.48
+FastLanes,0.1.4,imagenet,18,Column_19,INT16,46536,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.71,5.68
+FastLanes,0.1.4,imagenet,19,Column_20,INT8,37095,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.57,4.53
+FastLanes,0.1.4,imagenet,20,Column_21,INT8,29497,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.45,3.60
+FastLanes,0.1.4,imagenet,21,Column_22,INT8,22650,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.76
+FastLanes,0.1.4,imagenet,22,Column_23,INT8,18126,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.21
+FastLanes,0.1.4,imagenet,23,Column_24,INT8,14403,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.22,1.76
+FastLanes,0.1.4,imagenet,24,Column_25,INT16,49888,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.76,6.09
+FastLanes,0.1.4,imagenet,25,Column_26,INT16,44476,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.68,5.43
+FastLanes,0.1.4,imagenet,26,Column_27,INT8,40587,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.62,4.95
+FastLanes,0.1.4,imagenet,27,Column_28,INT8,33138,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.51,4.05
+FastLanes,0.1.4,imagenet,28,Column_29,INT8,25829,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.15
+FastLanes,0.1.4,imagenet,29,Column_30,INT8,18625,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.27
+FastLanes,0.1.4,imagenet,30,Column_31,INT8,15524,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.24,1.90
+FastLanes,0.1.4,imagenet,31,Column_32,INT8,16299,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.25,1.99
+FastLanes,0.1.4,imagenet,32,Column_33,INT16,43492,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.66,5.31
+FastLanes,0.1.4,imagenet,33,Column_34,INT8,38139,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.58,4.66
+FastLanes,0.1.4,imagenet,34,Column_35,INT8,30384,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.71
+FastLanes,0.1.4,imagenet,35,Column_36,INT8,24525,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.37,2.99
+FastLanes,0.1.4,imagenet,36,Column_37,INT8,20850,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.32,2.55
+FastLanes,0.1.4,imagenet,37,Column_38,INT8,14774,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.23,1.80
+FastLanes,0.1.4,imagenet,38,Column_39,INT8,12510,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.19,1.53
+FastLanes,0.1.4,imagenet,39,Column_40,INT8,9414,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.14,1.15
+FastLanes,0.1.4,imagenet,40,Column_41,INT8,36701,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.56,4.48
+FastLanes,0.1.4,imagenet,41,Column_42,INT8,30357,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.71
+FastLanes,0.1.4,imagenet,42,Column_43,INT8,23989,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.37,2.93
+FastLanes,0.1.4,imagenet,43,Column_44,INT8,21978,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.34,2.68
+FastLanes,0.1.4,imagenet,44,Column_45,INT8,17491,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.14
+FastLanes,0.1.4,imagenet,45,Column_46,INT8,11943,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.18,1.46
+FastLanes,0.1.4,imagenet,46,Column_47,INT8,8850,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.14,1.08
+FastLanes,0.1.4,imagenet,47,Column_48,INT8,7305,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.11,0.89
+FastLanes,0.1.4,imagenet,48,Column_49,INT8,26009,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.17
+FastLanes,0.1.4,imagenet,49,Column_50,INT8,21944,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.33,2.68
+FastLanes,0.1.4,imagenet,50,Column_51,INT8,17474,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.13
+FastLanes,0.1.4,imagenet,51,Column_52,INT8,16520,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.25,2.02
+FastLanes,0.1.4,imagenet,52,Column_53,INT8,12912,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.20,1.58
+FastLanes,0.1.4,imagenet,53,Column_54,INT8,9084,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.14,1.11
+FastLanes,0.1.4,imagenet,54,Column_55,INT8,7014,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.11,0.86
+FastLanes,0.1.4,imagenet,55,Column_56,INT8,5508,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.08,0.67
+FastLanes,0.1.4,imagenet,56,Column_57,INT8,19318,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.36
+FastLanes,0.1.4,imagenet,57,Column_58,INT8,14086,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.21,1.72
+FastLanes,0.1.4,imagenet,58,Column_59,INT8,14117,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.22,1.72
+FastLanes,0.1.4,imagenet,59,Column_60,INT8,12687,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.19,1.55
+FastLanes,0.1.4,imagenet,60,Column_61,INT8,8235,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.13,1.01
+FastLanes,0.1.4,imagenet,61,Column_62,INT8,8043,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.12,0.98
+FastLanes,0.1.4,imagenet,62,Column_63,INT8,5796,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.09,0.71
+FastLanes,0.1.4,imagenet,63,Column_64,INT8,4653,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.07,0.57
+FastLanes,0.1.4,lfwa,0,Column_1,INT8,65792,"{[EXP_UNCOMPRESSED_I08][0]}",1.00,8.03
+FastLanes,0.1.4,lfwa,1,Column_2,INT16,62148,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.95,7.59
+FastLanes,0.1.4,lfwa,2,Column_3,INT16,61284,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.94,7.48
+FastLanes,0.1.4,lfwa,3,Column_4,INT8,49790,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.76,6.08
+FastLanes,0.1.4,lfwa,4,Column_5,INT8,49656,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.76,6.06
+FastLanes,0.1.4,lfwa,5,Column_6,INT8,53612,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.82,6.54
+FastLanes,0.1.4,lfwa,6,Column_7,INT8,41394,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.63,5.05
+FastLanes,0.1.4,lfwa,7,Column_8,INT8,41607,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.63,5.08
+FastLanes,0.1.4,lfwa,8,Column_9,INT8,41066,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.63,5.01
+FastLanes,0.1.4,lfwa,9,Column_10,INT8,42254,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.64,5.16
+FastLanes,0.1.4,lfwa,10,Column_11,INT8,32687,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.50,3.99
+FastLanes,0.1.4,lfwa,11,Column_12,INT8,30722,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.47,3.75
+FastLanes,0.1.4,lfwa,12,Column_13,INT8,34060,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.52,4.16
+FastLanes,0.1.4,lfwa,13,Column_14,INT8,29798,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.45,3.64
+FastLanes,0.1.4,lfwa,14,Column_15,INT8,31151,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.48,3.80
+FastLanes,0.1.4,lfwa,15,Column_16,INT8,15009,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.23,1.83
+FastLanes,0.1.4,lfwa,16,Column_17,INT8,21971,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.34,2.68
+FastLanes,0.1.4,lfwa,17,Column_18,INT8,23851,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.36,2.91
+FastLanes,0.1.4,lfwa,18,Column_19,INT8,24235,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.37,2.96
+FastLanes,0.1.4,lfwa,19,Column_20,INT8,23493,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.36,2.87
+FastLanes,0.1.4,lfwa,20,Column_21,INT8,24474,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.37,2.99
+FastLanes,0.1.4,lfwa,21,Column_22,INT8,6276,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.10,0.77
+FastLanes,0.1.4,lfwa,22,Column_23,INT8,8940,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.14,1.09
+FastLanes,0.1.4,lfwa,23,Column_24,INT8,10845,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.17,1.32
+FastLanes,0.1.4,lfwa,24,Column_25,INT8,16665,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.25,2.03
+FastLanes,0.1.4,lfwa,25,Column_26,INT8,10347,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.16,1.26
+FastLanes,0.1.4,lfwa,26,Column_27,INT8,4329,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.07,0.53
+FastLanes,0.1.4,lfwa,27,Column_28,INT8,6498,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.10,0.79
+FastLanes,0.1.4,lfwa,28,Column_29,INT8,4572,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.07,0.56
+FastLanes,0.1.4,lfwa,29,Column_30,INT8,2676,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.04,0.33
+FastLanes,0.1.4,lfwa,30,Column_31,INT8,2766,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.04,0.34
+FastLanes,0.1.4,lfwa,31,Column_32,INT8,3951,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.06,0.48
+FastLanes,0.1.4,lfwa,32,Column_33,INT8,3426,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.42
+FastLanes,0.1.4,lfwa,33,Column_34,INT8,3030,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.37
+FastLanes,0.1.4,lfwa,34,Column_35,INT8,2514,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.04,0.31
+FastLanes,0.1.4,lfwa,35,Column_36,INT8,3954,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.06,0.48
+FastLanes,0.1.4,lfwa,36,Column_37,INT8,1458,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.18
+FastLanes,0.1.4,lfwa,37,Column_38,INT8,1392,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.17
+FastLanes,0.1.4,lfwa,38,Column_39,INT8,1671,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.20
+FastLanes,0.1.4,lfwa,39,Column_40,INT8,1785,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.22
+FastLanes,0.1.4,lfwa,40,Column_41,INT8,1052,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.13
+FastLanes,0.1.4,lfwa,41,Column_42,INT8,1587,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.19
+FastLanes,0.1.4,lfwa,42,Column_43,INT8,2196,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.27
+FastLanes,0.1.4,lfwa,43,Column_44,INT8,1686,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.21
+FastLanes,0.1.4,lfwa,44,Column_45,INT8,863,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.01,0.11
+FastLanes,0.1.4,lfwa,45,Column_46,INT8,588,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.07
+FastLanes,0.1.4,lfwa,46,Column_47,INT8,884,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.01,0.11
+FastLanes,0.1.4,lfwa,47,Column_48,INT8,818,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.01,0.10
+FastLanes,0.1.4,lfwa,48,Column_49,INT8,974,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.01,0.12
+FastLanes,0.1.4,lfwa,49,Column_50,INT8,943,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.12
+FastLanes,0.1.4,lfwa,50,Column_51,INT8,478,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.06
+FastLanes,0.1.4,lfwa,51,Column_52,INT8,573,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.07
+FastLanes,0.1.4,lfwa,52,Column_53,INT8,553,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.07
+FastLanes,0.1.4,lfwa,53,Column_54,INT8,1278,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.16
+FastLanes,0.1.4,lfwa,54,Column_55,INT8,1228,"{[EXP_CROSS_RLE_I08][0, 1]}",0.02,0.15
+FastLanes,0.1.4,lfwa,55,Column_56,INT8,338,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.04
+FastLanes,0.1.4,lfwa,56,Column_57,INT8,282,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.03
+FastLanes,0.1.4,lfwa,57,Column_58,INT8,478,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.06
+FastLanes,0.1.4,lfwa,58,Column_59,INT8,473,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.06
+FastLanes,0.1.4,lfwa,59,Column_60,INT8,177,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.02
+FastLanes,0.1.4,lfwa,60,Column_61,INT8,778,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.09
+FastLanes,0.1.4,lfwa,61,Column_62,INT8,453,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.06
+FastLanes,0.1.4,lfwa,62,Column_63,INT8,363,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.04
+FastLanes,0.1.4,lfwa,63,Column_64,INT8,317,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.04
+FastLanes,0.1.4,mnist,0,Column_1,INT8,65792,"{[EXP_UNCOMPRESSED_I08][0]}",1.00,8.03
+FastLanes,0.1.4,mnist,1,Column_2,INT16,66680,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.02,8.14
+FastLanes,0.1.4,mnist,2,Column_3,INT16,67616,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.03,8.25
+FastLanes,0.1.4,mnist,3,Column_4,INT8,73130,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",1.12,8.93
+FastLanes,0.1.4,mnist,4,Column_5,INT8,65792,"{[EXP_UNCOMPRESSED_I08][0]}",1.00,8.03
+FastLanes,0.1.4,mnist,5,Column_6,INT16,66580,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.02,8.13
+FastLanes,0.1.4,mnist,6,Column_7,INT8,56087,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.86,6.85
+FastLanes,0.1.4,mnist,7,Column_8,INT8,58342,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.89,7.12
+FastLanes,0.1.4,mnist,8,Column_9,INT8,58538,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.89,7.15
+FastLanes,0.1.4,mnist,9,Column_10,INT8,58162,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.89,7.10
+FastLanes,0.1.4,mnist,10,Column_11,INT8,48577,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.74,5.93
+FastLanes,0.1.4,mnist,11,Column_12,INT8,50544,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.77,6.17
+FastLanes,0.1.4,mnist,12,Column_13,INT8,55053,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.84,6.72
+FastLanes,0.1.4,mnist,13,Column_14,INT8,49991,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.76,6.10
+FastLanes,0.1.4,mnist,14,Column_15,INT8,44158,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.67,5.39
+FastLanes,0.1.4,mnist,15,Column_16,INT8,33817,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.52,4.13
+FastLanes,0.1.4,mnist,16,Column_17,INT8,41904,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.64,5.12
+FastLanes,0.1.4,mnist,17,Column_18,INT8,43418,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.66,5.30
+FastLanes,0.1.4,mnist,18,Column_19,INT8,46237,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.71,5.64
+FastLanes,0.1.4,mnist,19,Column_20,INT8,42391,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.65,5.17
+FastLanes,0.1.4,mnist,20,Column_21,INT8,36960,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.56,4.51
+FastLanes,0.1.4,mnist,21,Column_22,INT8,25655,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.13
+FastLanes,0.1.4,mnist,22,Column_23,INT8,31971,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.49,3.90
+FastLanes,0.1.4,mnist,23,Column_24,INT8,34196,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.52,4.17
+FastLanes,0.1.4,mnist,24,Column_25,INT8,38119,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.58,4.65
+FastLanes,0.1.4,mnist,25,Column_26,INT8,33838,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.52,4.13
+FastLanes,0.1.4,mnist,26,Column_27,INT8,25971,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.17
+FastLanes,0.1.4,mnist,27,Column_28,INT8,25911,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.16
+FastLanes,0.1.4,mnist,28,Column_29,INT8,19935,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.30,2.43
+FastLanes,0.1.4,mnist,29,Column_30,INT8,22109,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.34,2.70
+FastLanes,0.1.4,mnist,30,Column_31,INT8,25463,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.11
+FastLanes,0.1.4,mnist,31,Column_32,INT8,26323,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.21
+FastLanes,0.1.4,mnist,32,Column_33,INT8,26275,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.21
+FastLanes,0.1.4,mnist,33,Column_34,INT8,25529,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.12
+FastLanes,0.1.4,mnist,34,Column_35,INT8,19490,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.30,2.38
+FastLanes,0.1.4,mnist,35,Column_36,INT8,18404,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.25
+FastLanes,0.1.4,mnist,36,Column_37,INT8,16848,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.26,2.06
+FastLanes,0.1.4,mnist,37,Column_38,INT8,17593,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.15
+FastLanes,0.1.4,mnist,38,Column_39,INT8,19522,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.30,2.38
+FastLanes,0.1.4,mnist,39,Column_40,INT8,19061,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.33
+FastLanes,0.1.4,mnist,40,Column_41,INT8,17620,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.27,2.15
+FastLanes,0.1.4,mnist,41,Column_42,INT8,18059,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.20
+FastLanes,0.1.4,mnist,42,Column_43,INT8,18905,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.29,2.31
+FastLanes,0.1.4,mnist,43,Column_44,INT8,18071,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.28,2.21
+FastLanes,0.1.4,mnist,44,Column_45,INT8,17136,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.26,2.09
+FastLanes,0.1.4,mnist,45,Column_46,INT8,9675,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.15,1.18
+FastLanes,0.1.4,mnist,46,Column_47,INT8,17286,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.11
+FastLanes,0.1.4,mnist,47,Column_48,INT8,17154,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.09
+FastLanes,0.1.4,mnist,48,Column_49,INT8,16940,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.07
+FastLanes,0.1.4,mnist,49,Column_50,INT8,12633,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.19,1.54
+FastLanes,0.1.4,mnist,50,Column_51,INT8,6474,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.10,0.79
+FastLanes,0.1.4,mnist,51,Column_52,INT8,6174,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.09,0.75
+FastLanes,0.1.4,mnist,52,Column_53,INT8,5511,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.08,0.67
+FastLanes,0.1.4,mnist,53,Column_54,INT8,17220,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.26,2.10
+FastLanes,0.1.4,mnist,54,Column_55,INT8,6897,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.11,0.84
+FastLanes,0.1.4,mnist,55,Column_56,INT8,2142,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.26
+FastLanes,0.1.4,mnist,56,Column_57,INT8,1971,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.24
+FastLanes,0.1.4,mnist,57,Column_58,INT8,3114,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.05,0.38
+FastLanes,0.1.4,mnist,58,Column_59,INT8,2409,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.04,0.29
+FastLanes,0.1.4,mnist,59,Column_60,INT8,1016,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.12
+FastLanes,0.1.4,mnist,60,Column_61,INT8,2430,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.04,0.30
+FastLanes,0.1.4,mnist,61,Column_62,INT8,1073,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.13
+FastLanes,0.1.4,mnist,62,Column_63,INT8,1115,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.14
+FastLanes,0.1.4,mnist,63,Column_64,INT8,926,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.01,0.11
+FastLanes,0.1.4,svhn,0,Column_1,INT8,65792,"{[EXP_UNCOMPRESSED_I08][0]}",1.00,8.03
+FastLanes,0.1.4,svhn,1,Column_2,INT8,59130,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.90,7.22
+FastLanes,0.1.4,svhn,2,Column_3,INT8,57569,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.88,7.03
+FastLanes,0.1.4,svhn,3,Column_4,INT8,46012,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.70,5.62
+FastLanes,0.1.4,svhn,4,Column_5,INT8,50845,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.78,6.21
+FastLanes,0.1.4,svhn,5,Column_6,INT8,58983,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.90,7.20
+FastLanes,0.1.4,svhn,6,Column_7,INT8,45866,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.70,5.60
+FastLanes,0.1.4,svhn,7,Column_8,INT8,44336,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.68,5.41
+FastLanes,0.1.4,svhn,8,Column_9,INT8,42887,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.65,5.24
+FastLanes,0.1.4,svhn,9,Column_10,INT8,36726,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.56,4.48
+FastLanes,0.1.4,svhn,10,Column_11,INT8,26845,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.41,3.28
+FastLanes,0.1.4,svhn,11,Column_12,INT8,30873,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.47,3.77
+FastLanes,0.1.4,svhn,12,Column_13,INT8,35623,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.54,4.35
+FastLanes,0.1.4,svhn,13,Column_14,INT8,34577,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.22
+FastLanes,0.1.4,svhn,14,Column_15,INT8,33068,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.50,4.04
+FastLanes,0.1.4,svhn,15,Column_16,INT8,19372,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.30,2.36
+FastLanes,0.1.4,svhn,16,Column_17,INT8,25003,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.05
+FastLanes,0.1.4,svhn,17,Column_18,INT8,26098,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.19
+FastLanes,0.1.4,svhn,18,Column_19,INT8,25018,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.05
+FastLanes,0.1.4,svhn,19,Column_20,INT8,20774,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.32,2.54
+FastLanes,0.1.4,svhn,20,Column_21,INT8,16488,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.25,2.01
+FastLanes,0.1.4,svhn,21,Column_22,INT8,1473,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.18
+FastLanes,0.1.4,svhn,22,Column_23,INT8,5379,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.08,0.66
+FastLanes,0.1.4,svhn,23,Column_24,INT8,7734,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.12,0.94
+FastLanes,0.1.4,svhn,24,Column_25,INT8,13377,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.20,1.63
+FastLanes,0.1.4,svhn,25,Column_26,INT8,9858,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.15,1.20
+FastLanes,0.1.4,svhn,26,Column_27,INT8,5013,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.08,0.61
+FastLanes,0.1.4,svhn,27,Column_28,INT8,6750,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.10,0.82
+FastLanes,0.1.4,svhn,28,Column_29,INT8,1596,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.19
+FastLanes,0.1.4,svhn,29,Column_30,INT8,1590,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.19
+FastLanes,0.1.4,svhn,30,Column_31,INT8,2070,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.25
+FastLanes,0.1.4,svhn,31,Column_32,INT8,2457,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.04,0.30
+FastLanes,0.1.4,svhn,32,Column_33,INT8,1719,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.03,0.21
+FastLanes,0.1.4,svhn,33,Column_34,INT8,1245,"{[EXP_FREQUENCY_I08][0, 1, 2, 3]}",0.02,0.15
+FastLanes,0.1.4,svhn,34,Column_35,INT8,663,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.08
+FastLanes,0.1.4,svhn,35,Column_36,INT8,227,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.03
+FastLanes,0.1.4,svhn,36,Column_37,INT8,32,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,svhn,37,Column_38,INT8,117,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,svhn,38,Column_39,INT8,683,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.08
+FastLanes,0.1.4,svhn,39,Column_40,INT8,868,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.11
+FastLanes,0.1.4,svhn,40,Column_41,INT8,463,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.06
+FastLanes,0.1.4,svhn,41,Column_42,INT8,758,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.09
+FastLanes,0.1.4,svhn,42,Column_43,INT8,883,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.11
+FastLanes,0.1.4,svhn,43,Column_44,INT8,338,"{[EXP_CROSS_RLE_I08][0, 1]}",0.01,0.04
+FastLanes,0.1.4,svhn,44,Column_45,INT8,107,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,svhn,45,Column_46,INT8,27,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,svhn,46,Column_47,INT8,77,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,svhn,47,Column_48,INT8,27,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,svhn,48,Column_49,INT8,17,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,svhn,49,Column_50,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,50,Column_51,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,51,Column_52,INT8,27,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,svhn,52,Column_53,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,53,Column_54,INT8,77,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.01
+FastLanes,0.1.4,svhn,54,Column_55,INT8,17,"{[EXP_CROSS_RLE_I08][0, 1]}",0.00,0.00
+FastLanes,0.1.4,svhn,55,Column_56,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,56,Column_57,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,57,Column_58,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,58,Column_59,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,59,Column_60,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,60,Column_61,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,61,Column_62,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,62,Column_63,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,svhn,63,Column_64,INT8,0,"{[EXP_CONSTANT_I08][]}",0.00,0.00
+FastLanes,0.1.4,tid2013,0,Column_1,INT16,52770,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.15,9.16
+FastLanes,0.1.4,tid2013,1,Column_2,INT16,53530,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.16,9.29
+FastLanes,0.1.4,tid2013,2,Column_3,INT16,53966,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.17,9.37
+FastLanes,0.1.4,tid2013,3,Column_4,INT16,51162,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.11,8.88
+FastLanes,0.1.4,tid2013,4,Column_5,INT16,47100,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.02,8.18
+FastLanes,0.1.4,tid2013,5,Column_6,INT16,50138,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.09,8.70
+FastLanes,0.1.4,tid2013,6,Column_7,INT8,41760,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.91,7.25
+FastLanes,0.1.4,tid2013,7,Column_8,INT16,44550,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.97,7.73
+FastLanes,0.1.4,tid2013,8,Column_9,INT16,45374,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.98,7.88
+FastLanes,0.1.4,tid2013,9,Column_10,INT16,50306,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",1.09,8.73
+FastLanes,0.1.4,tid2013,10,Column_11,INT8,45838,"{[EXP_FFOR_I08][0, 1, 2]}",0.99,7.96
+FastLanes,0.1.4,tid2013,11,Column_12,INT8,37958,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.82,6.59
+FastLanes,0.1.4,tid2013,12,Column_13,INT8,37364,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.81,6.49
+FastLanes,0.1.4,tid2013,13,Column_14,INT8,36158,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.78,6.28
+FastLanes,0.1.4,tid2013,14,Column_15,INT16,40122,"{[EXP_FFOR_SLPATCH_I16][0, 1, 2, 3, 4, 5]}",0.87,6.97
+FastLanes,0.1.4,tid2013,15,Column_16,INT8,32776,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.71,5.69
+FastLanes,0.1.4,tid2013,16,Column_17,INT8,32400,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.70,5.62
+FastLanes,0.1.4,tid2013,17,Column_18,INT8,35739,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.78,6.20
+FastLanes,0.1.4,tid2013,18,Column_19,INT8,36062,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.78,6.26
+FastLanes,0.1.4,tid2013,19,Column_20,INT8,37088,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.80,6.44
+FastLanes,0.1.4,tid2013,20,Column_21,INT8,41189,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.89,7.15
+FastLanes,0.1.4,tid2013,21,Column_22,INT8,31178,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.68,5.41
+FastLanes,0.1.4,tid2013,22,Column_23,INT8,29850,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.65,5.18
+FastLanes,0.1.4,tid2013,23,Column_24,INT8,29775,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.65,5.17
+FastLanes,0.1.4,tid2013,24,Column_25,INT8,31868,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.69,5.53
+FastLanes,0.1.4,tid2013,25,Column_26,INT8,29595,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.64,5.14
+FastLanes,0.1.4,tid2013,26,Column_27,INT8,24434,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.24
+FastLanes,0.1.4,tid2013,27,Column_28,INT8,28282,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.61,4.91
+FastLanes,0.1.4,tid2013,28,Column_29,INT8,23574,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.51,4.09
+FastLanes,0.1.4,tid2013,29,Column_30,INT8,23000,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.50,3.99
+FastLanes,0.1.4,tid2013,30,Column_31,INT8,24203,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.20
+FastLanes,0.1.4,tid2013,31,Column_32,INT8,26930,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.58,4.68
+FastLanes,0.1.4,tid2013,32,Column_33,INT8,26072,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.57,4.53
+FastLanes,0.1.4,tid2013,33,Column_34,INT8,25700,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.56,4.46
+FastLanes,0.1.4,tid2013,34,Column_35,INT8,24457,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.25
+FastLanes,0.1.4,tid2013,35,Column_36,INT8,26086,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.57,4.53
+FastLanes,0.1.4,tid2013,36,Column_37,INT8,19192,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.42,3.33
+FastLanes,0.1.4,tid2013,37,Column_38,INT8,21406,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.72
+FastLanes,0.1.4,tid2013,38,Column_39,INT8,24215,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.53,4.20
+FastLanes,0.1.4,tid2013,39,Column_40,INT8,23408,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.51,4.06
+FastLanes,0.1.4,tid2013,40,Column_41,INT8,20696,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.45,3.59
+FastLanes,0.1.4,tid2013,41,Column_42,INT8,21079,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.66
+FastLanes,0.1.4,tid2013,42,Column_43,INT8,20655,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.45,3.59
+FastLanes,0.1.4,tid2013,43,Column_44,INT8,20177,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.44,3.50
+FastLanes,0.1.4,tid2013,44,Column_45,INT8,19336,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.42,3.36
+FastLanes,0.1.4,tid2013,45,Column_46,INT8,18550,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.22
+FastLanes,0.1.4,tid2013,46,Column_47,INT8,21067,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.46,3.66
+FastLanes,0.1.4,tid2013,47,Column_48,INT8,19463,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.42,3.38
+FastLanes,0.1.4,tid2013,48,Column_49,INT8,17714,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.08
+FastLanes,0.1.4,tid2013,49,Column_50,INT8,17539,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.04
+FastLanes,0.1.4,tid2013,50,Column_51,INT8,18353,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.19
+FastLanes,0.1.4,tid2013,51,Column_52,INT8,18271,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.40,3.17
+FastLanes,0.1.4,tid2013,52,Column_53,INT8,17619,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.38,3.06
+FastLanes,0.1.4,tid2013,53,Column_54,INT8,19905,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.43,3.46
+FastLanes,0.1.4,tid2013,54,Column_55,INT8,17788,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.39,3.09
+FastLanes,0.1.4,tid2013,55,Column_56,INT8,16274,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.83
+FastLanes,0.1.4,tid2013,56,Column_57,INT8,16086,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.79
+FastLanes,0.1.4,tid2013,57,Column_58,INT8,16130,"{[EXP_DICT_I08_FFOR_SLPATCH_U08][0, 1, 2, 3, 4, 5, 6]}",0.35,2.80
+FastLanes,0.1.4,tid2013,58,Column_59,INT8,15820,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.34,2.75
+FastLanes,0.1.4,tid2013,59,Column_60,INT8,14835,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.32,2.58
+FastLanes,0.1.4,tid2013,60,Column_61,INT8,16352,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.35,2.84
+FastLanes,0.1.4,tid2013,61,Column_62,INT8,14916,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.32,2.59
+FastLanes,0.1.4,tid2013,62,Column_63,INT8,14753,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.32,2.56
+FastLanes,0.1.4,tid2013,63,Column_64,INT8,14572,"{[EXP_FFOR_SLPATCH_I08][0, 1, 2, 3, 4, 5]}",0.32,2.53
