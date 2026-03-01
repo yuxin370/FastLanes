@@ -7,6 +7,7 @@
 #define FLS_READER_CUH
 
 #include "engine/verification.cuh"
+#include "engine/data/model.cuh"
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/file/file_footer.hpp"
@@ -61,38 +62,9 @@ inline fastlanes::TableDescriptorHandle load_table_descriptor(const std::filesys
 
 } // namespace detail
 
-using HostColumnVariant = std::variant<flsgpu::host::BPColumn<int8_t>,
-                                       flsgpu::host::FFORColumn<int8_t>,
-                                       flsgpu::host::DICTFFORColumn<int8_t>,
-                                       flsgpu::host::DICTSLPATCHColumn<int8_t>,
-                                       flsgpu::host::CONSTANTColumn<int8_t>,
-                                       flsgpu::host::FREQColumn<int8_t>,
-                                       flsgpu::host::SLPATCHColumn<int8_t>,
-                                       flsgpu::host::CROSSRLEColumn<int8_t>,
-                                       flsgpu::host::RLEColumn<int8_t, uint16_t>,
-                                       flsgpu::host::BPColumn<int16_t>,
-                                       flsgpu::host::FFORColumn<int16_t>,
-                                       flsgpu::host::DICTFFORColumn<int16_t>,
-                                       flsgpu::host::DICTFFORColumn<int16_t, uint8_t>,
-                                       flsgpu::host::DICTSLPATCHColumn<int16_t>,
-                                       flsgpu::host::DICTSLPATCHColumn<int16_t, uint8_t>,
-                                       flsgpu::host::SLPATCHColumn<int16_t>,
-                                       flsgpu::host::FREQColumn<int16_t>,
-                                       flsgpu::host::RLEColumn<int16_t, uint16_t>>;
-
-struct Column {
-	std::string              name;
-	fastlanes::OperatorToken token;
-	HostColumnVariant        host;
-	bool                     skip_decompress = false;
-	std::optional<size_t>    alias_of;
-};
-
-struct Rowgroup {
-	size_t              n_values;
-	size_t              n_vecs;
-	std::vector<Column> columns;
-};
+using HostColumnVariant = dispatch::EncodedPayload;
+using Column            = dispatch::Column;
+using Rowgroup          = dispatch::Rowgroup;
 
 class reader {
 public:

@@ -5,6 +5,7 @@
 // ────────────────────────────────────────────────────────
 #include "data.cuh"
 #include "engine/enums.cuh"
+#include "engine/types.cuh"
 #include "engine/kernels.cuh"
 #include "engine/verification.cuh"
 #include "flsgpu/flsgpu-api.cuh"
@@ -28,7 +29,7 @@ static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
 }
 
 struct ProgramParameters {
-	enums::DataType            data_type;
+	types::DataType            data_type;
 	enums::Encoding            encoding_type;
 	enums::Kernel              kernel;
 	uint32_t                   unpack_n_vecs;
@@ -86,7 +87,7 @@ struct CLIArgs {
 
 	ProgramParameters parse() {
 		return ProgramParameters {
-		    enums::string_to_data_type(data_type),
+		    types::string_to_data_type(data_type),
 		    enums::string_to_encoding(encoding_type),
 		    enums::string_to_kernel(kernel),
 		    unpack_n_vecs,
@@ -642,16 +643,16 @@ int main(int argc, char** argv) {
 
 	int32_t exit_code = 0;
 	switch (params.data_type) {
-	case enums::DataType::U32:
+	case types::DataType::U32:
 		exit_code = run_by_encoding_type<uint32_t>(params, print_debug);
 		break;
-	case enums::DataType::U64:
+	case types::DataType::U64:
 		exit_code = run_by_encoding_type<uint64_t>(params, print_debug);
 		break;
-	case enums::DataType::F32:
+	case types::DataType::F32:
 		exit_code = run_by_encoding_type<float>(params, print_debug);
 		break;
-	case enums::DataType::F64:
+	case types::DataType::F64:
 		exit_code = run_by_encoding_type<double>(params, print_debug);
 		break;
 	default:

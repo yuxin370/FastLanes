@@ -8,11 +8,9 @@
 
 #include <array>
 #include <cstdint>
-#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
-#include <variant>
 
 namespace types {
 
@@ -122,47 +120,5 @@ inline DataType string_to_data_type(std::string_view str) {
 }
 
 } // namespace types
-
-namespace dispatch {
-
-template <typename... Ts>
-struct TypeList {};
-
-using SupportedTypes = TypeList<int8_t, int16_t>;
-
-template <typename T, typename List>
-struct IsIn;
-
-template <typename T, typename... Ts>
-struct IsIn<T, TypeList<Ts...>> : std::bool_constant<(std::is_same_v<T, Ts> || ...)> {};
-
-template <typename T>
-inline constexpr bool is_supported_type_v = IsIn<T, SupportedTypes>::value;
-
-inline constexpr bool is_supported_data_type(types::DataType dt) {
-	return types::is_supported_data_type(dt);
-}
-
-template <typename List>
-struct DecompressVariantBuilder;
-
-template <typename... Ts>
-struct DecompressVariantBuilder<TypeList<Ts...>> {
-	using type = std::variant<std::unique_ptr<Ts[]>...>;
-};
-
-using DecompressResult = typename DecompressVariantBuilder<SupportedTypes>::type;
-
-template <typename T>
-inline DecompressResult make_result(T* ptr) {
-	return DecompressResult {std::unique_ptr<T[]>(ptr)};
-}
-
-template <typename... Ts, typename F>
-inline void for_each_type(TypeList<Ts...>, F&& f) {
-	(f(std::type_identity<Ts> {}), ...);
-}
-
-} // namespace dispatch
 
 #endif // ENGINE_TYPES_CUH

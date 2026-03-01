@@ -1,9 +1,10 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/src/engine/dispatch/column.cu
+// galp/src/engine/execution/column.cu
 // ────────────────────────────────────────────────────────
-#include "engine/dispatch/column.cuh"
+#include "engine/execution/column.cuh"
+#include "engine/data/value-store.cuh"
 #include "engine/reader.cuh"
 #include "flsgpu/fls.cuh"
 #include <cstring>
@@ -173,7 +174,7 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 }
 
 template <typename HostColT>
-DecompressResult decompress_common(const HostColT& host_col, const Config& cfg) {
+ValueStore decompress_common(const HostColT& host_col, const Config& cfg) {
 	using T = typename host_value_type<HostColT>::type;
 
 	auto device_col = host_col.copy_to_device();
@@ -181,15 +182,15 @@ DecompressResult decompress_common(const HostColT& host_col, const Config& cfg) 
 	auto* out = detail::decompress_device(device_col, cfg);
 	flsgpu::host::free_column(device_col);
 
-	return make_result<T>(out);
+	return make_value_store<T>(out);
 }
 
 template <typename HostColT>
-DecompressResult decompress_host(const HostColT& host_col, const PlanKind plan, const Config& cfg) {
+ValueStore decompress_host(const HostColT& host_col, const PlanKind plan, const Config& cfg) {
 	using T = typename host_value_type<HostColT>::type;
 	static_assert(is_supported_type_v<T>, "dispatch::decompress only supports int8_t and int16_t columns");
 
-	auto fail = []() -> DecompressResult {
+	auto fail = []() -> ValueStore {
 		throw std::runtime_error("dispatch plan/column mismatch");
 	};
 
@@ -257,10 +258,10 @@ DecompressResult decompress_host(const HostColT& host_col, const PlanKind plan, 
 
 } // namespace detail
 
-DecompressResult decompress(const expr::Expression& expression, const Config& cfg) {
+ValueStore decompress(const expr::Expression& expression, const Config& cfg) {
 	auto& col = *expression.column;
 	return std::visit(
-	    [&](auto&& host_col) -> DecompressResult {
+	    [&](auto&& host_col) -> ValueStore {
 		    using HostColT = std::decay_t<decltype(host_col)>;
 		    const auto plan =
 		        col.skip_decompress ? detail::plan_for_host_col<HostColT>() : plan_for_ops(expression.ops);
@@ -269,40 +270,40 @@ DecompressResult decompress(const expr::Expression& expression, const Config& cf
 	    col.host);
 }
 
-template DecompressResult detail::decompress_host(const flsgpu::host::BPColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore detail::decompress_host(const flsgpu::host::BPColumn<int8_t>&, const PlanKind, const Config&);
+template ValueStore
 detail::decompress_host(const flsgpu::host::FFORColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::DICTFFORColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::CONSTANTColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::FREQColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::SLPATCHColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::CROSSRLEColumn<int8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::RLEColumn<int8_t, uint16_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::BPColumn<int16_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::FFORColumn<int16_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::DICTFFORColumn<int16_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::DICTFFORColumn<int16_t, uint8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int16_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::DICTSLPATCHColumn<int16_t, uint8_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::SLPATCHColumn<int16_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::FREQColumn<int16_t>&, const PlanKind, const Config&);
-template DecompressResult
+template ValueStore
 detail::decompress_host(const flsgpu::host::RLEColumn<int16_t, uint16_t>&, const PlanKind, const Config&);
 
 } // namespace dispatch

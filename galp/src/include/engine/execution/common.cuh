@@ -1,14 +1,16 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/src/include/engine/dispatch/common.cuh
+// galp/src/include/engine/execution/common.cuh
 // ────────────────────────────────────────────────────────
-#ifndef ENGINE_DISPATCH_COMMON_CUH
-#define ENGINE_DISPATCH_COMMON_CUH
+#ifndef ENGINE_EXECUTION_COMMON_CUH
+#define ENGINE_EXECUTION_COMMON_CUH
 
 #include "engine/device-utils.cuh"
+#include "engine/data/value-store.cuh"
 #include "engine/expression.cuh"
 #include "engine/kernels.cuh"
+#include "engine/data/model.cuh"
 #include "engine/types.cuh"
 #include "flsgpu/host-utils.cuh"
 #include "flsgpu/structs.cuh"
@@ -20,10 +22,6 @@
 #include <variant>
 #include <vector>
 
-namespace reader {
-struct Rowgroup;
-} // namespace reader
-
 namespace dispatch {
 
 template <typename>
@@ -33,10 +31,15 @@ struct Config {
 	unsigned unpack_n_vectors = 1;
 	unsigned unpack_n_values  = 1;
 	uint32_t n_samples        = 1;
+
+	constexpr DecodeChunk chunk() const {
+		return DecodeChunk {unpack_n_vectors, unpack_n_values};
+	}
 };
 
-struct RowgroupDecompressResult {
-	std::vector<std::optional<DecompressResult>> columns;
+enum class ExecuteMode {
+	Materialize,
+	BenchmarkOnly,
 };
 
 struct BenchmarkResult {
@@ -130,7 +133,7 @@ struct host_value_type<flsgpu::host::RLEColumn<T, IndexT>> {
 namespace detail {
 
 template <typename HostColT>
-DecompressResult decompress_host(const HostColT& host_col, const PlanKind plan, const Config& cfg);
+ValueStore decompress_host(const HostColT& host_col, const PlanKind plan, const Config& cfg);
 
 template <typename HostColT>
 struct host_plan_kind;
@@ -374,6 +377,26 @@ void add_expression_to_batch(const size_t expr_index, const HostColT& host_col, 
 namespace detail {
 
 template <typename T>
+void launch_batch_no_sync(const dispatch::Batch<T>&         batch,
+                          const DeviceExpression<T>*        d_exprs,
+                          const WorkItemAny*                d_items,
+                          const size_t                      n_items,
+                          cudaStream_t                      stream = 0) {
+	if (batch.device_exprs.empty() || !d_exprs || !d_items || n_items == 0) {
+		return;
+	}
+	constexpr unsigned UNPACK_N_VECTORS = 1;
+	constexpr unsigned UNPACK_N_VALUES  = 1;
+	const int          threads          = utils::get_n_lanes<T>();
+	const dim3         block(static_cast<unsigned>(threads));
+	const dim3         grid(static_cast<unsigned>(n_items));
+
+	kernels::device::decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>
+	    <<<grid, block, 0, stream>>>(d_exprs, d_items, n_items);
+	CUDA_SAFE_CALL(cudaGetLastError());
+}
+
+template <typename T>
 void launch_batch(const Batch<T>& batch) {
 	if (batch.device_exprs.empty() || batch.work_items.empty()) {
 		return;
@@ -381,30 +404,33 @@ void launch_batch(const Batch<T>& batch) {
 	GPUArray<DeviceExpression<T>> d_exprs(batch.device_exprs.size(), batch.device_exprs.data());
 	GPUArray<WorkItemAny>         d_items(batch.work_items.size(), batch.work_items.data());
 	flsgpu::memory::sync_h2d();
-
-	constexpr unsigned UNPACK_N_VECTORS = 1;
-	constexpr unsigned UNPACK_N_VALUES  = 1;
-	const auto         launch           = make_workitem_launch_config<T, UNPACK_N_VECTORS>(batch.work_items.size());
-
-	kernels::device::decompress_rowgroup<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>
-	    <<<launch.grid, launch.block>>>(d_exprs.get(), d_items.get(), batch.work_items.size());
-	CUDA_SAFE_CALL(cudaGetLastError());
+	launch_batch_no_sync<T>(batch, d_exprs.get(), d_items.get(), batch.work_items.size());
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
 
 template <typename T>
-void finalize_batch(Batch<T>& batch, RowgroupDecompressResult& result) {
+void finalize_batch(Batch<T>& batch, RowgroupData& result) {
 	for (size_t idx = 0; idx < batch.device_exprs.size(); ++idx) {
 		auto& expr = batch.device_exprs[idx];
-		auto  host = std::make_unique<T[]>(expr.n_values);
+		auto  host = std::shared_ptr<T[]>(new T[expr.n_values], std::default_delete<T[]>());
 		batch.device_outputs[idx].copy_to_host(host.get());
-		result.columns[batch.expr_indices[idx]] = DecompressResult {std::move(host)};
+		MaterializedColumn out {};
+		out.values               = ValueStore {std::move(host)};
+		out.meta.column_index    = batch.expr_indices[idx];
+		out.meta.value_count     = expr.n_values;
+		out.meta.value_type      = types::ToDataType<T>::value;
+		out.meta.values_per_step = 1;
+		result.columns[batch.expr_indices[idx]] = std::move(out);
 		free_device_expr(expr);
 	}
+	batch.device_exprs.clear();
+	batch.device_outputs.clear();
+	batch.work_items.clear();
+	batch.expr_indices.clear();
 }
 
 } // namespace detail
 
 } // namespace dispatch
 
-#endif // ENGINE_DISPATCH_COMMON_CUH
+#endif // ENGINE_EXECUTION_COMMON_CUH

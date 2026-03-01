@@ -6,6 +6,7 @@
 #ifndef ENGINE_EXPRESSION_CUH
 #define ENGINE_EXPRESSION_CUH
 
+#include "engine/data/model.cuh"
 #include "fls/footer/operator_token_generated.h"
 #include "flsgpu/structs.cuh"
 #include <cstddef>
@@ -13,11 +14,6 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <vector>
-
-namespace reader {
-struct Column;
-struct Rowgroup;
-} // namespace reader
 
 namespace expr {
 
@@ -35,7 +31,7 @@ enum class OperatorKind {
 };
 
 struct Expression {
-	reader::Column*           column; // non-owning
+	dispatch::Column*         column; // non-owning
 	std::vector<OperatorKind> ops;    // logical operator chain
 };
 
@@ -77,7 +73,7 @@ inline std::vector<OperatorKind> ops_for_token(const fastlanes::OperatorToken to
 	}
 }
 
-std::vector<Expression> assemble(reader::Rowgroup& rowgroup);
+std::vector<Expression> assemble(dispatch::Rowgroup& rowgroup);
 
 } // namespace expr
 

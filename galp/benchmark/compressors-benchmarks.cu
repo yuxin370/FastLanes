@@ -14,6 +14,7 @@
 //   g++ -std=c++17 benchmark_runner.cpp -o compressors-benchmarks $(CUDA_LIBS) ...
 // =============================================================================
 #include "engine/enums.cuh"
+#include "engine/types.cuh"
 #include "flsgpu/consts.cuh"
 #include "generator/generate_binaries.hpp"
 #include "nvcomp/benchmark-compressors.cuh"
@@ -42,7 +43,7 @@ inline std::string extract_filename(const std::string& path) {
 }
 
 struct CLIArgs {
-	enums::DataType               data_type;
+	types::DataType               data_type;
 	enums_nvcomp::ComparisonType  comparison_type;
 	enums_nvcomp::CompressionType decompressor_enum;
 	std::string                   file_path;
@@ -59,7 +60,7 @@ inline CLIArgs parse_cli_args(int argc, char* argv[]) {
 
 	int     idx = 0;
 	CLIArgs args;
-	args.data_type         = enums::string_to_data_type(argv[++idx]);
+	args.data_type         = types::string_to_data_type(argv[++idx]);
 	args.comparison_type   = enums_nvcomp::string_to_comparison_type(argv[++idx]);
 	args.decompressor_enum = enums_nvcomp::string_to_compression_type(argv[++idx]);
 	args.file_path         = argv[++idx];
@@ -153,9 +154,9 @@ int main(int argc, char* argv[]) {
 	// -------------------------------------------------------------------------
 	if (argc == 6) {
 		CLIArgs args = parse_cli_args(argc, argv);
-		if (args.data_type == enums::DataType::F32)
+		if (args.data_type == types::DataType::F32)
 			execute_benchmark<float>(args);
-		else if (args.data_type == enums::DataType::F64)
+		else if (args.data_type == types::DataType::F64)
 			execute_benchmark<double>(args);
 		else
 			throw std::invalid_argument("Unsupported data type");
@@ -212,7 +213,7 @@ int main(int argc, char* argv[]) {
 	for (auto cmp : COMPARISONS)
 		for (auto decomp : COMPRESSORS)
 			for (const auto& path : gen.float_files) {
-				CLIArgs args {enums::DataType::F32, cmp, decomp, path, VECTOR_COUNT * consts::VALUES_PER_VECTOR};
+				CLIArgs args {types::DataType::F32, cmp, decomp, path, VECTOR_COUNT * consts::VALUES_PER_VECTOR};
 				execute_benchmark<float>(args);
 			}
 
@@ -222,14 +223,14 @@ int main(int argc, char* argv[]) {
 	for (auto cmp : COMPARISONS)
 		for (auto decomp : COMPRESSORS)
 			for (const auto& path : gen.double_files) {
-				CLIArgs args {enums::DataType::F64, cmp, decomp, path, VECTOR_COUNT * consts::VALUES_PER_VECTOR};
+				CLIArgs args {types::DataType::F64, cmp, decomp, path, VECTOR_COUNT * consts::VALUES_PER_VECTOR};
 				execute_benchmark<double>(args);
 			}
 
 	// -------------------------------------------------------------------------
 	// (3) Thrust path — only DECOMPRESSION_QUERY
 	// -------------------------------------------------------------------------
-	auto run_thrust = [&](enums::DataType dtype, const std::vector<std::string>& files) {
+	auto run_thrust = [&](types::DataType dtype, const std::vector<std::string>& files) {
 		for (const auto& path : files) {
 			CLIArgs args;
 			args.data_type         = dtype;
@@ -238,15 +239,15 @@ int main(int argc, char* argv[]) {
 			args.file_path         = path;
 			args.n_values          = VECTOR_COUNT * consts::VALUES_PER_VECTOR;
 
-			if (dtype == enums::DataType::F32)
+			if (dtype == types::DataType::F32)
 				execute_benchmark<float>(args);
 			else
 				execute_benchmark<double>(args);
 		}
 	};
 
-	run_thrust(enums::DataType::F32, gen.float_files);
-	run_thrust(enums::DataType::F64, gen.double_files);
+	run_thrust(types::DataType::F32, gen.float_files);
+	run_thrust(types::DataType::F64, gen.double_files);
 
 	return 0;
 }

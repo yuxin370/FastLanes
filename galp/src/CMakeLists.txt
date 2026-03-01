@@ -1,9 +1,9 @@
 set(GALP_CORE_SOURCES
         alp/alp-bindings.cu
         engine/enums.cu
-        engine/dispatch/column.cu
-        engine/dispatch/rowgroup.cu
-        engine/dispatch/table.cu
+        engine/execution/column.cu
+        engine/execution/rowgroup.cu
+        engine/execution/table.cu
         engine/expression.cu
 )
 add_library(galp_core STATIC ${GALP_CORE_SOURCES})

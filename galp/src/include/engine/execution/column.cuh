@@ -1,18 +1,17 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/src/include/engine/dispatch/rowgroup.cuh
+// galp/src/include/engine/execution/column.cuh
 // ────────────────────────────────────────────────────────
-#ifndef ENGINE_DISPATCH_ROWGROUP_CUH
-#define ENGINE_DISPATCH_ROWGROUP_CUH
+#ifndef ENGINE_EXECUTION_COLUMN_CUH
+#define ENGINE_EXECUTION_COLUMN_CUH
 
-#include "engine/dispatch/common.cuh"
+#include "engine/execution/common.cuh"
 
 namespace dispatch {
 
-RowgroupDecompressResult decompress_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
-BenchmarkResult          benchmark_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
+ValueStore decompress(const expr::Expression& expression, const Config& cfg = {});
 
 } // namespace dispatch
 
-#endif // ENGINE_DISPATCH_ROWGROUP_CUH
+#endif // ENGINE_EXECUTION_COLUMN_CUH

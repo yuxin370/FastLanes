@@ -6,12 +6,10 @@
 #ifndef ENUMS_CUH
 #define ENUMS_CUH
 
-#include "engine/types.cuh"
 #include <stdexcept>
 #include <string>
 
 namespace enums {
-using DataType = types::DataType;
 
 enum class Kernel {
 	Decompress,
@@ -86,7 +84,6 @@ enum class Encoding {
 	DICT_SLPATCH,
 };
 
-types::DataType string_to_data_type(const std::string& str);
 Kernel          string_to_kernel(const std::string& str);
 Unpacker        string_to_unpacker(const std::string& str);
 Patcher         string_to_patcher(const std::string& str);

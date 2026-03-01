@@ -4,11 +4,10 @@
 // galp/src/engine/expression.cu
 // ────────────────────────────────────────────────────────
 #include "engine/expression.cuh"
-#include "engine/reader.cuh"
 
 namespace expr {
 
-std::vector<Expression> assemble(reader::Rowgroup& rowgroup) {
+std::vector<Expression> assemble(dispatch::Rowgroup& rowgroup) {
 	std::vector<Expression> out;
 	out.reserve(rowgroup.columns.size());
 	for (auto& col : rowgroup.columns) {

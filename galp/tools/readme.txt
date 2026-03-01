@@ -1,30 +1,31 @@
-#decompress table
-/ path / to / FastLanes / build / galp / tools / galp_cli read_table / path / to / FastLanes / data / fls / galp -
-    test / data.fls / tmp / out.csv
+GALP CLI Quick Usage
 
-#only decompress one specific                                     rowgroup
-        / path / to / FastLanes / build / galp / tools / galp_cli read_table / path / to / FastLanes / data / fls /
-        galp -
-    test / data.fls / tmp / out.csv-- rowgroup 0
+Replace the placeholders below:
+- <GALP_CLI> = /path/to/FastLanes/build/galp/tools/galp_cli
+- <FLS_FILE> = /path/to/FastLanes/data/fls/galp-test/data.fls
 
-#benchmark：only GPU decompression, no materialize(mega kernel)
-        / path / to / FastLanes / build / galp / tools / galp_cli benchmark / path / to / FastLanes / data / fls /
-        galp -
-    test / data.fls-- samples 100
+1) Decompress full table to CSV
+<GALP_CLI> read_table <FLS_FILE> /tmp/out.csv
 
-#benchmark：full table, non mega kernel(one kernel per rowgroup& data - type)
-        / path / to / FastLanes / build / galp / tools / galp_cli benchmark / path / to / FastLanes / data / fls /
-        galp -
-    test / data.fls-- samples 100 --no - mega -
-    kernel
+2) Decompress one rowgroup only
+<GALP_CLI> read_table <FLS_FILE> /tmp/out.csv --rowgroup 0
 
-#benchmark：only GPU decompression, with kernel launch overhead(mega kernel)
-        / path / to / FastLanes / build / galp / tools / galp_cli benchmark / path / to / FastLanes / data / fls /
-        galp -
-    test / data.fls-- samples 100 --estimate - launch-- launch -
-    iters 10000
+3) Benchmark (GPU decompress only, default mega-kernel)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100
 
-#benchmark：only GPU decompression, with kernel launch overhead(only one rowgroup, multi kernel)
-        / path / to / FastLanes / build / galp / tools / galp_cli benchmark / path / to / FastLanes / data / fls /
-        galp -
-    test / data.fls-- samples 100 --estimate - launch-- launch - iters 10000 --rowgroup 0
+4) Benchmark (full table, non-mega path)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-mega-kernel
+
+5) Benchmark (true one-kernel-per-sample mixed dispatch)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --gpu-dispatch-kernel
+
+6) Benchmark with launch-overhead estimate (mega-kernel)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --estimate-launch --launch-iters 10000
+
+7) Benchmark one rowgroup with launch-overhead estimate (multi-kernel rowgroup path)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --estimate-launch --launch-iters 10000 --rowgroup 0
+
+Notes
+- Default mega path aggregates a full-table workset, then dispatches by type (can launch multiple kernels per sample).
+- `--gpu-dispatch-kernel` enables GPU-side mixed dispatch and runs one mixed kernel launch per sample.
+- `--no-mega-kernel` runs per-rowgroup worksets (typically more launches and higher host overhead).

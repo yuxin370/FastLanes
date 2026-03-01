@@ -3,8 +3,8 @@
 // ────────────────────────────────────────────────────────
 // galp/test/reader_test.cu
 // ────────────────────────────────────────────────────────
-#include "engine/dispatch/rowgroup.cuh"
-#include "engine/pipeline.cuh"
+#include "engine/execution/rowgroup.cuh"
+#include "engine/execution/table.cuh"
 #include "engine/reader.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
@@ -154,7 +154,7 @@ void compare_rowgroup_outputs(const reader::Rowgroup&                   rowgroup
                               const std::vector<expr::Expression>&      expressions,
                               bool                                      verbose,
                               size_t*                                   compared_columns_out,
-                              const dispatch::RowgroupDecompressResult* precomputed  = nullptr,
+                              const dispatch::RowgroupData* precomputed  = nullptr,
                               bool                                      free_columns = true) {
 	ASSERT_NE(rg, nullptr);
 	ASSERT_NE(rg->m_column_descriptors(), nullptr);
@@ -164,8 +164,8 @@ void compare_rowgroup_outputs(const reader::Rowgroup&                   rowgroup
 	const size_t expected_rows = static_cast<size_t>(expected_rowgroup.RowCount());
 	ASSERT_GE(rowgroup.n_values, expected_rows);
 
-	dispatch::RowgroupDecompressResult        local_result;
-	const dispatch::RowgroupDecompressResult* rowgroup_result_ptr = precomputed;
+	dispatch::RowgroupData        local_result;
+	const dispatch::RowgroupData* rowgroup_result_ptr = precomputed;
 	if (rowgroup_result_ptr == nullptr) {
 		local_result        = dispatch::decompress_rowgroup(expressions);
 		rowgroup_result_ptr = &local_result;
@@ -212,8 +212,8 @@ void compare_rowgroup_outputs(const reader::Rowgroup&                   rowgroup
 		}
 
 		ASSERT_TRUE(rowgroup_result_ptr->columns[i].has_value());
-		auto& result = *rowgroup_result_ptr->columns[i];
-		std::visit([&](auto& ptr) { ASSERT_NE(ptr, nullptr); }, result);
+		auto& column_data = *rowgroup_result_ptr->columns[i];
+		std::visit([&](auto& ptr) { ASSERT_NE(ptr, nullptr); }, column_data.values);
 
 		bool compared_this = false;
 		std::visit(
@@ -319,7 +319,7 @@ void compare_rowgroup_outputs(const reader::Rowgroup&                   rowgroup
 				    }
 			    }
 		    },
-		    result);
+		    column_data.values);
 
 		if (compared_this) {
 			++compared_columns;
@@ -454,14 +454,14 @@ TEST(Reader, DecompressTable) {
 		expected_total_columns += rg->m_column_descriptors()->size();
 	}
 
-	const auto table_result = pipeline::decompress_table(
+	const auto table_result = dispatch::decompress_table(
 	    fls_path,
 	    {},
 	    should_decompress,
 	    [&](size_t                                    rg_idx,
 	        reader::Rowgroup&                         rowgroup,
 	        const std::vector<expr::Expression>&      expressions,
-	        const dispatch::RowgroupDecompressResult& result) {
+	        const dispatch::RowgroupData& result) {
 		    const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
 		    ASSERT_NE(rg, nullptr);
 

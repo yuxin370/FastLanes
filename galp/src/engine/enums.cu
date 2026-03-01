@@ -7,9 +7,6 @@
 #include <unordered_map>
 
 namespace enums {
-types::DataType string_to_data_type(const std::string& str) {
-	return types::string_to_data_type(str);
-}
 
 Kernel string_to_kernel(const std::string& str) {
 	static const std::unordered_map<std::string, Kernel> mapping = {
