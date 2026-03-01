@@ -24,6 +24,8 @@ struct BenchmarkWorkset {
 	DeviceBatches                                  device_batches;
 	std::vector<dispatch::WorkItemAny>             work_items;
 	std::optional<GPUArray<dispatch::WorkItemAny>> d_items;
+	std::vector<dispatch::LaunchGroup>             launch_groups;
+	std::optional<GPUArray<dispatch::LaunchGroup>> d_launch_groups;
 };
 
 struct TableBenchmarkConfig {
@@ -55,7 +57,7 @@ double append_expressions(BenchmarkWorkset& workset,
                           size_t*                              out_total_bytes = nullptr,
                           size_t*                              out_n_exprs     = nullptr);
 
-// Finalize device buffers (d_exprs + d_items). Returns elapsed ms.
+// Finalize device buffers (d_exprs + d_items + d_launch_groups). Returns elapsed ms.
 double finalize_batches(BenchmarkWorkset& workset);
 
 // Run kernels on the whole workset. Returns kernel ms.

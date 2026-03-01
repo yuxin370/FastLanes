@@ -206,6 +206,8 @@ __global__ void decompress_dispatch_typed(const dispatch::DeviceExpression<T>* e
 template <int UNPACK_N_VECTORS, int UNPACK_N_VALUES>
 __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_t>*  exprs_i8,
                                           const dispatch::DeviceExpression<int16_t>* exprs_i16,
+                                          const dispatch::LaunchGroup*               launch_groups,
+                                          const size_t                               n_groups,
                                           const dispatch::WorkItemAny*               work_items,
                                           const size_t                               n_items) {
 	constexpr uint32_t lanes_i8    = utils::get_n_lanes<int8_t>();
@@ -213,16 +215,20 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 	constexpr uint32_t group_lanes = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
 
 	const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
-	const uint32_t item_idx      = global_thread / group_lanes;
-	if (item_idx >= n_items) {
+	const uint32_t group_idx     = global_thread / group_lanes;
+	if (group_idx >= n_groups || launch_groups == nullptr) {
 		return;
 	}
-	const uint32_t lane = global_thread - item_idx * group_lanes;
+	const auto     group = launch_groups[group_idx];
+	const uint32_t lane_in_group = global_thread - group_idx * group_lanes;
 
-	const auto work = work_items[item_idx];
-	switch (work.type) {
-	case dispatch::TypeTag::I8: {
-		if (lane >= lanes_i8 || exprs_i8 == nullptr) {
+	switch (group.mode) {
+	case dispatch::LaunchGroupMode::I8_SINGLE: {
+		if (exprs_i8 == nullptr || lane_in_group >= lanes_i8 || group.item0 >= n_items) {
+			return;
+		}
+		const auto work = work_items[group.item0];
+		if (work.type != dispatch::TypeTag::I8) {
 			return;
 		}
 		const auto   expr         = exprs_i8[work.expr_index];
@@ -232,11 +238,17 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 			return;
 		}
 		int8_t* out = expr.out + vector_index * consts::VALUES_PER_VECTOR;
-		device_exec::execute_plan<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane, out);
+		device_exec::execute_plan<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane_in_group, out);
 		break;
 	}
-	case dispatch::TypeTag::I16: {
-		if (lane >= lanes_i16 || exprs_i16 == nullptr) {
+	case dispatch::LaunchGroupMode::I16_PAIR: {
+		const uint32_t work_idx  = (lane_in_group < lanes_i16) ? group.item0 : group.item1;
+		const uint32_t lane_i16  = (lane_in_group < lanes_i16) ? lane_in_group : (lane_in_group - lanes_i16);
+		if (exprs_i16 == nullptr || lane_i16 >= lanes_i16 || work_idx >= n_items) {
+			return;
+		}
+		const auto work = work_items[work_idx];
+		if (work.type != dispatch::TypeTag::I16) {
 			return;
 		}
 		const auto   expr         = exprs_i16[work.expr_index];
@@ -246,7 +258,25 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 			return;
 		}
 		int16_t* out = expr.out + vector_index * consts::VALUES_PER_VECTOR;
-		device_exec::execute_plan<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane, out);
+		device_exec::execute_plan<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane_i16, out);
+		break;
+	}
+	case dispatch::LaunchGroupMode::I16_SINGLE: {
+		if (exprs_i16 == nullptr || lane_in_group >= lanes_i16 || group.item0 >= n_items) {
+			return;
+		}
+		const auto work = work_items[group.item0];
+		if (work.type != dispatch::TypeTag::I16) {
+			return;
+		}
+		const auto   expr         = exprs_i16[work.expr_index];
+		const vi_t   vector_index = static_cast<vi_t>(work.vector_index);
+		const size_t n_vecs       = utils::get_n_vecs_from_size(expr.n_values);
+		if (static_cast<size_t>(vector_index) >= n_vecs) {
+			return;
+		}
+		int16_t* out = expr.out + vector_index * consts::VALUES_PER_VECTOR;
+		device_exec::execute_plan<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES>(expr, vector_index, lane_in_group, out);
 		break;
 	}
 	default:

@@ -96,10 +96,22 @@ enum class TypeTag : uint8_t {
 	I16,
 };
 
+enum class LaunchGroupMode : uint8_t {
+	I8_SINGLE,
+	I16_PAIR,
+	I16_SINGLE,
+};
+
 struct WorkItemAny {
 	uint32_t expr_index;
 	uint32_t vector_index;
 	TypeTag  type;
+};
+
+struct LaunchGroup {
+	uint32_t        item0;
+	uint32_t        item1;
+	LaunchGroupMode mode;
 };
 
 template <typename T>
