@@ -330,10 +330,7 @@ template <typename T>
 struct DeviceBatch {
 	std::optional<GPUArray<DeviceExpression<T>>> d_exprs;
 	std::optional<GPUArray<WorkItemAny>>         d_items;
-
-	bool empty() const {
-		return !d_exprs || !d_items;
-	}
+	size_t                                       n_items = 0;
 };
 
 template <typename... Ts>
