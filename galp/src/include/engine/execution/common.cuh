@@ -6,11 +6,11 @@
 #ifndef ENGINE_EXECUTION_COMMON_CUH
 #define ENGINE_EXECUTION_COMMON_CUH
 
-#include "engine/device-utils.cuh"
+#include "engine/data/model.cuh"
 #include "engine/data/value-store.cuh"
+#include "engine/device-utils.cuh"
 #include "engine/expression.cuh"
 #include "engine/kernels.cuh"
-#include "engine/data/model.cuh"
 #include "engine/types.cuh"
 #include "flsgpu/host-utils.cuh"
 #include "flsgpu/structs.cuh"
@@ -180,8 +180,30 @@ constexpr PlanKind plan_for_host_col() {
 	return host_plan_kind<HostColT>::value;
 }
 
+template <typename T>
+bool should_use_freq_extended(const flsgpu::host::FREQColumn<T>& host_col,
+                              const bool                         freq_prefetch_all_branchless,
+                              const bool                         freq_hybrid_patcher,
+                              const float                        freq_branchless_threshold) {
+	if (!freq_prefetch_all_branchless) {
+		return false;
+	}
+	if (!freq_hybrid_patcher) {
+		return true;
+	}
+	if (host_col.get_n_vecs() == 0) {
+		return false;
+	}
+	const double exc_per_vec =
+	    static_cast<double>(host_col.n_exceptions) / static_cast<double>(host_col.get_n_vecs());
+	return exc_per_vec >= static_cast<double>(freq_branchless_threshold);
+}
+
 template <typename T, typename HostColT>
-void fill_device_expr(DeviceExpression<T>& expr, const HostColT& host_col, const PlanKind plan) {
+void fill_device_expr(DeviceExpression<T>& expr,
+                      const HostColT&      host_col,
+                      const PlanKind       plan,
+                      const bool           freq_use_extended            = false) {
 	switch (plan) {
 	case PlanKind::UNCOMPRESSED:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::BPColumn<T>>) {
@@ -197,7 +219,15 @@ void fill_device_expr(DeviceExpression<T>& expr, const HostColT& host_col, const
 		break;
 	case PlanKind::FREQUENCY:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
-			expr.col.freq = host_col.copy_to_device();
+			if (freq_use_extended) {
+				auto extended          = host_col.create_extended_column();
+				expr.col.freq_extended = extended.copy_to_device();
+				expr.freq_use_extended = true;
+				flsgpu::host::free_column(extended);
+				return;
+			}
+			expr.col.freq          = host_col.copy_to_device();
+			expr.freq_use_extended = false;
 			return;
 		}
 		break;
@@ -265,7 +295,11 @@ void free_device_expr(const DeviceExpression<T>& expr) {
 		flsgpu::host::free_column(expr.col.constant);
 		break;
 	case PlanKind::FREQUENCY:
-		flsgpu::host::free_column(expr.col.freq);
+		if (expr.freq_use_extended) {
+			flsgpu::host::free_column(expr.col.freq_extended);
+		} else {
+			flsgpu::host::free_column(expr.col.freq);
+		}
 		break;
 	case PlanKind::UNFFOR:
 		flsgpu::host::free_column(expr.col.ffor);
@@ -316,6 +350,11 @@ struct BatchSet {
 	Batch<T>& get() {
 		return std::get<Batch<T>>(batches);
 	}
+
+	template <typename T>
+	const Batch<T>& get() const {
+		return std::get<Batch<T>>(batches);
+	}
 };
 
 template <typename List>
@@ -341,6 +380,11 @@ struct DeviceBatchSet {
 	DeviceBatch<T>& get() {
 		return std::get<DeviceBatch<T>>(batches);
 	}
+
+	template <typename T>
+	const DeviceBatch<T>& get() const {
+		return std::get<DeviceBatch<T>>(batches);
+	}
 };
 
 template <typename List>
@@ -352,14 +396,25 @@ struct DeviceBatchSetFromList<dispatch::TypeList<Ts...>> {
 };
 
 template <typename T, typename HostColT>
-void add_expression_to_batch(const size_t expr_index, const HostColT& host_col, const PlanKind plan, Batch<T>& batch) {
+void add_expression_to_batch(const size_t    expr_index,
+                             const HostColT& host_col,
+                             const PlanKind  plan,
+                             Batch<T>&       batch,
+                             const bool      freq_prefetch_all_branchless = false,
+                             const bool      freq_hybrid_patcher          = false,
+                             const float     freq_branchless_threshold    = 6.0f) {
 	DeviceExpression<T> expr {};
 	expr.plan     = plan;
 	expr.n_values = host_col.get_n_values();
 	batch.device_outputs.emplace_back(expr.n_values);
 	expr.out = batch.device_outputs.back().get();
 
-	detail::fill_device_expr(expr, host_col, plan);
+	bool use_freq_extended = false;
+	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
+		use_freq_extended = detail::should_use_freq_extended(
+		    host_col, freq_prefetch_all_branchless, freq_hybrid_patcher, freq_branchless_threshold);
+	}
+	detail::fill_device_expr(expr, host_col, plan, use_freq_extended);
 
 	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size());
 	batch.device_exprs.push_back(expr);
@@ -373,12 +428,12 @@ void add_expression_to_batch(const size_t expr_index, const HostColT& host_col, 
 
 namespace detail {
 
-template <typename T>
-void launch_batch_no_sync(const dispatch::Batch<T>&         batch,
-                          const DeviceExpression<T>*        d_exprs,
-                          const WorkItemAny*                d_items,
-                          const size_t                      n_items,
-                          cudaStream_t                      stream = 0) {
+template <typename T, bool WRITE_OUT = true>
+void launch_batch_no_sync(const dispatch::Batch<T>&  batch,
+                          const DeviceExpression<T>* d_exprs,
+                          const WorkItemAny*         d_items,
+                          const size_t               n_items,
+                          cudaStream_t               stream = 0) {
 	if (batch.device_exprs.empty() || !d_exprs || !d_items || n_items == 0) {
 		return;
 	}
@@ -388,7 +443,7 @@ void launch_batch_no_sync(const dispatch::Batch<T>&         batch,
 	const dim3         block(static_cast<unsigned>(threads));
 	const dim3         grid(static_cast<unsigned>(n_items));
 
-	kernels::device::decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>
+	kernels::device::decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
 	    <<<grid, block, 0, stream>>>(d_exprs, d_items, n_items);
 	CUDA_SAFE_CALL(cudaGetLastError());
 }
@@ -412,11 +467,11 @@ void finalize_batch(Batch<T>& batch, RowgroupData& result) {
 		auto  host = std::shared_ptr<T[]>(new T[expr.n_values], std::default_delete<T[]>());
 		batch.device_outputs[idx].copy_to_host(host.get());
 		MaterializedColumn out {};
-		out.values               = ValueStore {std::move(host)};
-		out.meta.column_index    = batch.expr_indices[idx];
-		out.meta.value_count     = expr.n_values;
-		out.meta.value_type      = types::ToDataType<T>::value;
-		out.meta.values_per_step = 1;
+		out.values                              = ValueStore {std::move(host)};
+		out.meta.column_index                   = batch.expr_indices[idx];
+		out.meta.value_count                    = expr.n_values;
+		out.meta.value_type                     = types::ToDataType<T>::value;
+		out.meta.values_per_step                = 1;
 		result.columns[batch.expr_indices[idx]] = std::move(out);
 		free_device_expr(expr);
 	}
