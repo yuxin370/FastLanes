@@ -198,7 +198,7 @@ inline BenchmarkResult run_benchmark(PreparedBatches&& prepared, const Config& c
 	workset.host_batches = std::move(prepared.host_batches);
 	WorksetCleanupGuard guard(workset);
 
-	finalize_batches(workset);
+	prepare_dispatch_buffers(workset);
 	bench.n_work_items = workset.work_items.size();
 	bench.total_ms     = run_kernel(workset, cfg.n_samples, false);
 	bench.avg_us       = (cfg.n_samples > 0) ? (bench.total_ms * 1000.0 / static_cast<double>(cfg.n_samples)) : 0.0;
