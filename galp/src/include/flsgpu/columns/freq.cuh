@@ -11,6 +11,7 @@
 #include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/consts.cuh"
 #include "flsgpu/host-utils.cuh"
+#include <limits>
 
 namespace flsgpu {
 namespace device {
@@ -83,8 +84,10 @@ struct FREQColumn {
 
 		// Intermediate arrays for reordering positions and exceptions
 		T        vec_exceptions[consts::VALUES_PER_VECTOR];
-		T        vec_exceptions_positions[consts::VALUES_PER_VECTOR];
+		uint16_t vec_exceptions_positions[consts::VALUES_PER_VECTOR];
 		uint16_t lane_counts[N_LANES];
+		static_assert(consts::VALUES_PER_VECTOR <= std::numeric_limits<uint16_t>::max(),
+		              "FREQ position storage requires uint16_t-capable vector size");
 
 		// Copies of pointers for pointer arithmetic
 		T*        c_exceptions         = exceptions;

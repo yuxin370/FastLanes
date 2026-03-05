@@ -10,6 +10,7 @@
 #include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/consts.cuh"
 #include "flsgpu/host-utils.cuh"
+#include <limits>
 
 namespace flsgpu {
 namespace device {
@@ -129,8 +130,10 @@ inline ParseResultT<flsgpu::host::FREQExtendedColumn<T>> parse_frequency_extende
 	auto* out_offsets_counts = new uint16_t[ctx.n_vecs * N_LANES];
 
 	T        vec_exceptions[VEC_VALUES];
-	T        vec_exceptions_positions[VEC_VALUES];
+	uint16_t vec_exceptions_positions[VEC_VALUES];
 	uint16_t lane_counts[N_LANES];
+	static_assert(consts::VALUES_PER_VECTOR <= std::numeric_limits<uint16_t>::max(),
+	              "FREQ position storage requires uint16_t-capable vector size");
 
 	T*        c_exceptions         = exceptions;
 	uint16_t* c_positions          = positions;

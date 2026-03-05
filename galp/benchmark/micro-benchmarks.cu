@@ -7,10 +7,10 @@
 #include "engine/enums.cuh"
 #include "engine/types.cuh"
 #include "engine/kernels.cuh"
-#include "engine/verification.cuh"
 #include "flsgpu/flsgpu-api.cuh"
 #include "flsgpu/host-utils.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
+#include "verification.cuh"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -570,10 +570,11 @@ static int32_t run_by_encoding_type(const ProgramParameters& params, bool print_
 			return 1;
 		}
 	case enums::Encoding::FREQUENCY:
-		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t> || std::is_same_v<T, int8_t> ||
+		              std::is_same_v<T, int16_t>) {
 			return verification::process_results(execute_freq<T>(params), print_debug);
 		} else {
-			std::cerr << "[error] frequency only supports u32/u64.\n";
+			std::cerr << "[error] frequency only supports i8/i16/u32/u64.\n";
 			return 1;
 		}
 	case enums::Encoding::CROSS_RLE:
@@ -643,6 +644,12 @@ int main(int argc, char** argv) {
 
 	int32_t exit_code = 0;
 	switch (params.data_type) {
+	case types::DataType::I8:
+		exit_code = run_by_encoding_type<int8_t>(params, print_debug);
+		break;
+	case types::DataType::I16:
+		exit_code = run_by_encoding_type<int16_t>(params, print_debug);
+		break;
 	case types::DataType::U32:
 		exit_code = run_by_encoding_type<uint32_t>(params, print_debug);
 		break;
