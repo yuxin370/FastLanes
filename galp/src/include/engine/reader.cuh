@@ -6,7 +6,6 @@
 #ifndef FLS_READER_CUH
 #define FLS_READER_CUH
 
-#include "engine/verification.cuh"
 #include "engine/data/model.cuh"
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/expression/rpn.hpp"
