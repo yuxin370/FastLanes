@@ -96,22 +96,10 @@ enum class TypeTag : uint8_t {
 	I16,
 };
 
-enum class LaunchGroupMode : uint8_t {
-	I8_SINGLE,
-	I16_PAIR,
-	I16_SINGLE,
-};
-
 struct WorkItemAny {
 	uint32_t expr_index;
 	uint32_t vector_index;
 	TypeTag  type;
-};
-
-struct LaunchGroup {
-	uint32_t        item0;
-	uint32_t        item1;
-	LaunchGroupMode mode;
 };
 
 template <typename T>
@@ -132,6 +120,7 @@ struct DeviceExpression {
 	PlanKind plan;
 	size_t   n_values;
 	uint8_t  dict_index_bits = 0;
+	bool     freq_use_extended = false;
 	T*       out;
 	union {
 		flsgpu::device::BPColumn<T>                   bp;
@@ -143,6 +132,7 @@ struct DeviceExpression {
 		flsgpu::device::DICTSLPATCHColumn<T>          dictslpatch;
 		flsgpu::device::DICTSLPATCHColumn<T, uint8_t> dictslpatch_u8;
 		flsgpu::device::FREQColumn<T>                 freq;
+		flsgpu::device::FREQExtendedColumn<T>         freq_extended;
 		flsgpu::device::CROSSRLEColumn<T>             crossrle;
 		flsgpu::device::RLEColumn<T, uint16_t>        rle;
 	} col;
