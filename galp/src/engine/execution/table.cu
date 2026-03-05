@@ -13,7 +13,6 @@
 #include "fls/io/file.hpp"
 #include "fls/io/io.hpp"
 #include <chrono>
-#include <limits>
 
 namespace dispatch {
 namespace {
@@ -125,12 +124,19 @@ double append_expressions(BenchmarkWorkset&                 workset,
 		    [&](auto&& host_col) {
 			    using HostColT = std::decay_t<decltype(host_col)>;
 			    using T        = typename dispatch::host_value_type<HostColT>::type;
-			    if constexpr (dispatch::is_supported_type_v<T>) {
-				    if (out_total_bytes) {
-					    *out_total_bytes += host_col.get_n_values() * sizeof(T);
+				    if constexpr (dispatch::is_supported_type_v<T>) {
+					    if (out_total_bytes) {
+						    *out_total_bytes += host_col.get_n_values() * sizeof(T);
+					    }
+					    add_expression_to_batch<T>(
+					        i,
+					        host_col,
+					        plan,
+					        workset.host_batches.template get<T>(),
+					        workset.freq_prefetch_all_branchless,
+					        workset.freq_hybrid_patcher,
+					        workset.freq_branchless_threshold);
 				    }
-				    add_expression_to_batch<T>(i, host_col, plan, workset.host_batches.template get<T>());
-			    }
 		    },
 		    expr.column->host);
 	}
@@ -139,17 +145,61 @@ double append_expressions(BenchmarkWorkset&                 workset,
 	return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-double finalize_batches(BenchmarkWorkset& workset) {
+template <typename T>
+void bucket_frequency_work_items_by_patcher(dispatch::Batch<T>& batch) {
+	if (batch.work_items.empty() || batch.device_exprs.empty()) {
+		return;
+	}
+
+	std::vector<dispatch::WorkItemAny> non_frequency;
+	std::vector<dispatch::WorkItemAny> freq_stateful;
+	std::vector<dispatch::WorkItemAny> freq_branchless;
+	non_frequency.reserve(batch.work_items.size());
+	freq_stateful.reserve(batch.work_items.size() / 2);
+	freq_branchless.reserve(batch.work_items.size() / 2);
+
+	for (const auto& item : batch.work_items) {
+		if (item.expr_index >= batch.device_exprs.size()) {
+			non_frequency.push_back(item);
+			continue;
+		}
+
+		const auto& expr = batch.device_exprs[item.expr_index];
+		if (expr.plan != PlanKind::FREQUENCY) {
+			non_frequency.push_back(item);
+			continue;
+		}
+		if (expr.freq_use_extended) {
+			freq_branchless.push_back(item);
+		} else {
+			freq_stateful.push_back(item);
+		}
+	}
+
+	if (freq_stateful.empty() && freq_branchless.empty()) {
+		return;
+	}
+
+	std::vector<dispatch::WorkItemAny> reordered;
+	reordered.reserve(batch.work_items.size());
+	reordered.insert(reordered.end(), non_frequency.begin(), non_frequency.end());
+	reordered.insert(reordered.end(), freq_stateful.begin(), freq_stateful.end());
+	reordered.insert(reordered.end(), freq_branchless.begin(), freq_branchless.end());
+	batch.work_items.swap(reordered);
+}
+
+double prepare_dispatch_buffers(BenchmarkWorkset& workset) {
 	const auto start = std::chrono::steady_clock::now();
 
 	workset.d_items.reset();
-	workset.d_launch_groups.reset();
 	workset.work_items.clear();
-	workset.launch_groups.clear();
 
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
 		auto& host_batch = workset.host_batches.template get<T>();
+		if (workset.freq_bucket_by_patcher) {
+			bucket_frequency_work_items_by_patcher(host_batch);
+		}
 		if (!host_batch.device_exprs.empty() && !host_batch.work_items.empty()) {
 			auto& dev_batch = workset.device_batches.template get<T>();
 			dev_batch.d_exprs.emplace(host_batch.device_exprs.size(), host_batch.device_exprs.data());
@@ -162,29 +212,6 @@ double finalize_batches(BenchmarkWorkset& workset) {
 
 	if (!workset.work_items.empty()) {
 		workset.d_items.emplace(workset.work_items.size(), workset.work_items.data());
-
-		workset.launch_groups.reserve(workset.work_items.size());
-		size_t idx = 0;
-		while (idx < workset.work_items.size()) {
-			const auto& item = workset.work_items[idx];
-			if (item.type == dispatch::TypeTag::I16) {
-				if (idx + 1 < workset.work_items.size() && workset.work_items[idx + 1].type == dispatch::TypeTag::I16) {
-					workset.launch_groups.push_back(
-					    dispatch::LaunchGroup {static_cast<uint32_t>(idx), static_cast<uint32_t>(idx + 1), dispatch::LaunchGroupMode::I16_PAIR});
-					idx += 2;
-					continue;
-				}
-				workset.launch_groups.push_back(dispatch::LaunchGroup {
-				    static_cast<uint32_t>(idx), std::numeric_limits<uint32_t>::max(), dispatch::LaunchGroupMode::I16_SINGLE});
-				++idx;
-				continue;
-			}
-
-			workset.launch_groups.push_back(dispatch::LaunchGroup {
-			    static_cast<uint32_t>(idx), std::numeric_limits<uint32_t>::max(), dispatch::LaunchGroupMode::I8_SINGLE});
-			++idx;
-		}
-		workset.d_launch_groups.emplace(workset.launch_groups.size(), workset.launch_groups.data());
 	}
 
 	const auto end = std::chrono::steady_clock::now();
@@ -200,8 +227,7 @@ double run_kernel(BenchmarkWorkset& workset,
 	if (n_items == 0) {
 		return 0.0;
 	}
-	const size_t n_groups = workset.launch_groups.size();
-	if (gpu_dispatch_kernel && (!workset.d_items.has_value() || !workset.d_launch_groups.has_value() || n_groups == 0)) {
+	if (gpu_dispatch_kernel && !workset.d_items.has_value()) {
 		return 0.0;
 	}
 
@@ -223,15 +249,19 @@ double run_kernel(BenchmarkWorkset& workset,
 		}
 		return 0.0;
 	}
-	constexpr uint32_t lanes_i8    = utils::get_n_lanes<int8_t>();
-	constexpr uint32_t lanes_i16   = utils::get_n_lanes<int16_t>();
-	constexpr uint32_t group_lanes = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
+	constexpr uint32_t lanes_i8   = utils::get_n_lanes<int8_t>();
+	constexpr uint32_t lanes_i16  = utils::get_n_lanes<int16_t>();
+	constexpr uint32_t warp_lanes = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
+
+	const size_t mega_launches_per_sample = gpu_dispatch_kernel ? 1 : launches_per_sample;
 
 	if (out_grid) {
-		*out_grid = gpu_dispatch_kernel ? n_groups : (launches_per_sample > 0 ? typed_total_items_per_sample / launches_per_sample : 0);
+		*out_grid = gpu_dispatch_kernel
+		                ? ((n_items + 255) / 256)
+		                : (launches_per_sample > 0 ? typed_total_items_per_sample / launches_per_sample : 0);
 	}
 	if (out_launches) {
-		*out_launches = (gpu_dispatch_kernel ? 1 : launches_per_sample) * static_cast<size_t>(samples);
+		*out_launches = (gpu_dispatch_kernel ? mega_launches_per_sample : launches_per_sample) * static_cast<size_t>(samples);
 	}
 
 	flsgpu::memory::sync_h2d();
@@ -245,19 +275,21 @@ double run_kernel(BenchmarkWorkset& workset,
 	CUDA_SAFE_CALL(cudaEventCreate(&stop));
 
 	// Warm up at least once so timing is less biased by first-launch effects.
-	if (gpu_dispatch_kernel) {
-		const auto* exprs_i8  = workset.device_batches.template get<int8_t>().d_exprs.has_value()
-		                            ? workset.device_batches.template get<int8_t>().d_exprs->get()
-		                            : nullptr;
-		const auto* exprs_i16 = workset.device_batches.template get<int16_t>().d_exprs.has_value()
-		                            ? workset.device_batches.template get<int16_t>().d_exprs->get()
-		                            : nullptr;
-		const dim3 block(group_lanes);
-		const dim3 grid(static_cast<unsigned>(n_groups));
-		kernels::device::decompress_dispatch_mixed<1, 1>
-		    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_launch_groups->get(), n_groups, workset.d_items->get(), n_items);
-		CUDA_SAFE_CALL(cudaGetLastError());
-	} else {
+		if (gpu_dispatch_kernel) {
+			const auto* exprs_i8  = workset.device_batches.template get<int8_t>().d_exprs.has_value()
+			                            ? workset.device_batches.template get<int8_t>().d_exprs->get()
+			                            : nullptr;
+			const auto* exprs_i16 = workset.device_batches.template get<int16_t>().d_exprs.has_value()
+			                            ? workset.device_batches.template get<int16_t>().d_exprs->get()
+			                            : nullptr;
+			constexpr uint32_t block_threads = 256;
+			const dim3         block(block_threads);
+			const size_t       n_threads = n_items * static_cast<size_t>(warp_lanes);
+			const dim3         grid(static_cast<unsigned>((n_threads + block_threads - 1) / block_threads));
+			kernels::device::decompress_dispatch_mixed<1, 1, false>
+			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_items->get(), n_items);
+			CUDA_SAFE_CALL(cudaGetLastError());
+		} else {
 		dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 			using T            = typename decltype(tag)::type;
 			auto& host_batch   = workset.host_batches.template get<T>();
@@ -265,7 +297,7 @@ double run_kernel(BenchmarkWorkset& workset,
 			if (!device_batch.d_exprs.has_value() || !device_batch.d_items.has_value()) {
 				return;
 			}
-			dispatch::detail::launch_batch_no_sync<T>(
+			dispatch::detail::launch_batch_no_sync<T, false>(
 			    host_batch, device_batch.d_exprs->get(), device_batch.d_items->get(), device_batch.n_items, stream);
 		});
 	}
@@ -274,20 +306,22 @@ double run_kernel(BenchmarkWorkset& workset,
 	CUDA_SAFE_CALL(cudaEventRecord(start, stream));
 
 	for (uint32_t sample = 0; sample < samples; ++sample) {
-		if (gpu_dispatch_kernel) {
-			const auto* exprs_i8  = workset.device_batches.template get<int8_t>().d_exprs.has_value()
-			                            ? workset.device_batches.template get<int8_t>().d_exprs->get()
-			                            : nullptr;
-			const auto* exprs_i16 = workset.device_batches.template get<int16_t>().d_exprs.has_value()
-			                            ? workset.device_batches.template get<int16_t>().d_exprs->get()
-			                            : nullptr;
-			const dim3 block(group_lanes);
-			const dim3 grid(static_cast<unsigned>(n_groups));
-			kernels::device::decompress_dispatch_mixed<1, 1>
-			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_launch_groups->get(), n_groups, workset.d_items->get(), n_items);
-			CUDA_SAFE_CALL(cudaGetLastError());
-			continue;
-		}
+			if (gpu_dispatch_kernel) {
+				const auto* exprs_i8  = workset.device_batches.template get<int8_t>().d_exprs.has_value()
+				                            ? workset.device_batches.template get<int8_t>().d_exprs->get()
+				                            : nullptr;
+				const auto* exprs_i16 = workset.device_batches.template get<int16_t>().d_exprs.has_value()
+				                            ? workset.device_batches.template get<int16_t>().d_exprs->get()
+				                            : nullptr;
+				constexpr uint32_t block_threads = 256;
+				const dim3         block(block_threads);
+				const size_t       n_threads = n_items * static_cast<size_t>(warp_lanes);
+				const dim3         grid(static_cast<unsigned>((n_threads + block_threads - 1) / block_threads));
+				kernels::device::decompress_dispatch_mixed<1, 1, false>
+				    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_items->get(), n_items);
+				CUDA_SAFE_CALL(cudaGetLastError());
+				continue;
+			}
 		dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 			using T            = typename decltype(tag)::type;
 			auto& host_batch   = workset.host_batches.template get<T>();
@@ -295,7 +329,7 @@ double run_kernel(BenchmarkWorkset& workset,
 			if (!device_batch.d_exprs.has_value() || !device_batch.d_items.has_value()) {
 				return;
 			}
-			dispatch::detail::launch_batch_no_sync<T>(
+			dispatch::detail::launch_batch_no_sync<T, false>(
 			    host_batch, device_batch.d_exprs->get(), device_batch.d_items->get(), device_batch.n_items, stream);
 		});
 	}
@@ -370,8 +404,12 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
 
 			dispatch::BenchmarkWorkset workset;
+			workset.freq_prefetch_all_branchless = cfg.freq_prefetch_all_branchless;
+			workset.freq_hybrid_patcher          = cfg.freq_hybrid_patcher;
+			workset.freq_branchless_threshold    = cfg.freq_branchless_threshold;
+			workset.freq_bucket_by_patcher       = cfg.freq_bucket_by_patcher;
 			const double               rg_h2d_ms      = dispatch::append_expressions(workset, expressions);
-			const double               rg_finalize_ms = dispatch::finalize_batches(workset);
+			const double               rg_finalize_ms = dispatch::prepare_dispatch_buffers(workset);
 			size_t                     rg_launches    = 0;
 			size_t                     rg_launch_grid = 0;
 			const double               rg_kernel_ms =
@@ -400,6 +438,10 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	}
 
 	dispatch::BenchmarkWorkset workset;
+	workset.freq_prefetch_all_branchless = cfg.freq_prefetch_all_branchless;
+	workset.freq_hybrid_patcher          = cfg.freq_hybrid_patcher;
+	workset.freq_branchless_threshold    = cfg.freq_branchless_threshold;
+	workset.freq_bucket_by_patcher       = cfg.freq_bucket_by_patcher;
 	for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
 		const auto*  rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
 		const double io_ms = measure_rowgroup_io_ms(fls_path, rg);
@@ -433,7 +475,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		dispatch::free_rowgroup(rowgroup);
 	}
 
-	out.h2d_ms += dispatch::finalize_batches(workset);
+	out.h2d_ms += dispatch::prepare_dispatch_buffers(workset);
 	size_t launch_grid  = 0;
 	size_t launch_count = 0;
 	out.kernel_ms       = dispatch::run_kernel(workset, cfg.samples, cfg.gpu_dispatch_kernel, &launch_grid, &launch_count);
@@ -445,7 +487,6 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	const auto teardown_start = std::chrono::steady_clock::now();
 	dispatch::free_batches(workset);
 	workset.d_items.reset();
-	workset.d_launch_groups.reset();
 	const auto teardown_end = std::chrono::steady_clock::now();
 	out.teardown_ms += std::chrono::duration<double, std::milli>(teardown_end - teardown_start).count();
 

@@ -24,14 +24,20 @@ struct BenchmarkWorkset {
 	DeviceBatches                                  device_batches;
 	std::vector<dispatch::WorkItemAny>             work_items;
 	std::optional<GPUArray<dispatch::WorkItemAny>> d_items;
-	std::vector<dispatch::LaunchGroup>             launch_groups;
-	std::optional<GPUArray<dispatch::LaunchGroup>> d_launch_groups;
+	bool                                           freq_prefetch_all_branchless = false;
+	bool                                           freq_hybrid_patcher          = false;
+	float                                          freq_branchless_threshold     = 6.0f;
+	bool                                           freq_bucket_by_patcher        = false;
 };
 
 struct TableBenchmarkConfig {
-	uint32_t              samples              = 1;
-	bool                  mega_kernel          = true;
-	bool                  gpu_dispatch_kernel  = false; // true: single mixed-type kernel per sample
+	uint32_t              samples                      = 1;
+	bool                  mega_kernel                  = true;
+	bool                  gpu_dispatch_kernel          = false; // true: single mixed-type kernel per sample
+	bool                  freq_prefetch_all_branchless = false;
+	bool                  freq_hybrid_patcher          = false;
+	float                 freq_branchless_threshold    = 6.0f;
+	bool                  freq_bucket_by_patcher       = false;
 	std::optional<size_t> rowgroup;
 };
 
@@ -42,23 +48,23 @@ struct TableBenchmarkResult {
 	double h2d_ms        = 0.0;
 	double teardown_ms   = 0.0;
 
-	size_t total_launches    = 0;
-	size_t total_launch_grid = 0;
-	size_t total_columns     = 0;
-	size_t total_items       = 0;
-	size_t total_bytes       = 0;
-	size_t total_rgs         = 0;
-	uint32_t samples         = 1;
+	size_t   total_launches    = 0;
+	size_t   total_launch_grid = 0;
+	size_t   total_columns     = 0;
+	size_t   total_items       = 0;
+	size_t   total_bytes       = 0;
+	size_t   total_rgs         = 0;
+	uint32_t samples           = 1;
 };
 
 // Append one rowgroup's expressions into a workset. Returns elapsed ms.
-double append_expressions(BenchmarkWorkset& workset,
+double append_expressions(BenchmarkWorkset&                    workset,
                           const std::vector<expr::Expression>& expressions,
                           size_t*                              out_total_bytes = nullptr,
                           size_t*                              out_n_exprs     = nullptr);
 
-// Finalize device buffers (d_exprs + d_items + d_launch_groups). Returns elapsed ms.
-double finalize_batches(BenchmarkWorkset& workset);
+// Prepare dispatch-side device buffers (d_exprs + d_items). Returns elapsed ms.
+double prepare_dispatch_buffers(BenchmarkWorkset& workset);
 
 // Run kernels on the whole workset. Returns kernel ms.
 // out_grid reports grid size per kernel launch.
@@ -66,8 +72,8 @@ double finalize_batches(BenchmarkWorkset& workset);
 double run_kernel(BenchmarkWorkset& workset,
                   uint32_t          samples,
                   bool              gpu_dispatch_kernel = false,
-                  size_t*           out_grid     = nullptr,
-                  size_t*           out_launches = nullptr);
+                  size_t*           out_grid            = nullptr,
+                  size_t*           out_launches        = nullptr);
 
 // Free device-side batches.
 void free_batches(BenchmarkWorkset& workset);
@@ -80,9 +86,9 @@ inline TableData decompress_table(const std::filesystem::path& fls_path,
                                   const Config&                cfg,
                                   RowgroupPredicate&&          should_decompress,
                                   RowgroupCallback&&           on_rowgroup) {
-	reader::reader        rdr(fls_path);
-	const size_t          n_rowgroups = rdr.rowgroup_count();
-	TableData             table_data;
+	reader::reader rdr(fls_path);
+	const size_t   n_rowgroups = rdr.rowgroup_count();
+	TableData      table_data;
 
 	for (size_t rg_idx = 0; rg_idx < n_rowgroups; ++rg_idx) {
 		if (!std::forward<RowgroupPredicate>(should_decompress)(rg_idx)) {
@@ -93,8 +99,8 @@ inline TableData decompress_table(const std::filesystem::path& fls_path,
 
 		++table_data.rowgroups;
 		table_data.total_columns += expressions.size();
-		auto exec_result = dispatch::execute_rowgroup(expressions, cfg, dispatch::ExecuteMode::Materialize);
-		auto& result     = exec_result.materialized.value();
+		auto  exec_result = dispatch::execute_rowgroup(expressions, cfg, dispatch::ExecuteMode::Materialize);
+		auto& result      = exec_result.materialized.value();
 		std::forward<RowgroupCallback>(on_rowgroup)(rg_idx, rowgroup, expressions, result);
 		free_rowgroup(rowgroup);
 	}
