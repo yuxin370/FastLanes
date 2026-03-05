@@ -42,7 +42,11 @@ struct Options {
 	bool                                 estimate_launch = false;
 	uint32_t                             estimate_iters  = 10000;
 	bool                                 mega_kernel     = true;
-	bool                                 gpu_dispatch_kernel = false;
+	bool                                 gpu_dispatch_kernel          = false;
+	bool                                 freq_prefetch_all_branchless = false;
+	bool                                 freq_hybrid_patcher          = false;
+	float                                freq_branchless_threshold    = 6.0f;
+	bool                                 freq_bucket_by_patcher       = false;
 };
 
 std::string format_bytes(double bytes) {
@@ -73,8 +77,12 @@ void print_usage(const char* prog) {
 	          << "  --block N      Launch block size for measurement (default: 1)\n"
 	          << "  --estimate-launch  Estimate launch overhead during benchmark\n"
 	          << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n"
-	          << "  --no-mega-kernel   Benchmark full table using per-rowgroup kernels\n"
-	          << "  --gpu-dispatch-kernel  Use one mixed-type kernel launch per sample in mega mode\n";
+		          << "  --no-mega-kernel   Benchmark full table using per-rowgroup kernels\n"
+		          << "  --gpu-dispatch-kernel  Use one mixed-type kernel launch per sample in mega mode\n"
+		          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
+		          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
+		          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n"
+		          << "  --freq-bucket-by-patcher  Group FREQ work items by selected patcher\n";
 }
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -118,6 +126,22 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--gpu-dispatch-kernel") {
 			opt.gpu_dispatch_kernel = true;
+			continue;
+		}
+		if (arg == "--freq-prefetch-all-branchless") {
+			opt.freq_prefetch_all_branchless = true;
+			continue;
+		}
+		if (arg == "--freq-hybrid-patcher") {
+			opt.freq_hybrid_patcher = true;
+			continue;
+		}
+		if (arg == "--freq-branchless-threshold" && i + 1 < argc) {
+			opt.freq_branchless_threshold = std::stof(argv[++i]);
+			continue;
+		}
+		if (arg == "--freq-bucket-by-patcher") {
+			opt.freq_bucket_by_patcher = true;
 			continue;
 		}
 		if (arg == "--launch-iters" && i + 1 < argc) {
@@ -331,10 +355,14 @@ int main(int argc, char** argv) {
 
 		if (opt.mode == Mode::Benchmark) {
 			dispatch::TableBenchmarkConfig bench_cfg {};
-			bench_cfg.samples             = opt.samples;
-			bench_cfg.mega_kernel         = opt.mega_kernel;
-			bench_cfg.gpu_dispatch_kernel = opt.gpu_dispatch_kernel;
-			bench_cfg.rowgroup            = opt.rowgroup;
+			bench_cfg.samples                      = opt.samples;
+			bench_cfg.mega_kernel                  = opt.mega_kernel;
+			bench_cfg.gpu_dispatch_kernel          = opt.gpu_dispatch_kernel;
+			bench_cfg.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
+			bench_cfg.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
+			bench_cfg.freq_branchless_threshold    = opt.freq_branchless_threshold;
+			bench_cfg.freq_bucket_by_patcher       = opt.freq_bucket_by_patcher;
+			bench_cfg.rowgroup                     = opt.rowgroup;
 			const auto result     = dispatch::benchmark_table(opt.input, bench_cfg);
 
 			const double end_to_end_ms     = result.end_to_end_ms;
@@ -407,10 +435,14 @@ int main(int argc, char** argv) {
 			          << " (GiB/s)\n";
 			std::cout << "  end_to_end_throughput (no teardown): " << e2e_no_teardown_gbps << " (GB/s), "
 			          << e2e_no_teardown_gibps << " (GiB/s)\n";
-			std::cout << "  kernel_launches: " << total_launches << "\n";
-			std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
-			std::cout << "  gpu_dispatch_kernel: " << (opt.gpu_dispatch_kernel ? 1 : 0) << "\n";
-			if (opt.estimate_launch && total_launches > 0) {
+				std::cout << "  kernel_launches: " << total_launches << "\n";
+				std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
+				std::cout << "  gpu_dispatch_kernel: " << (opt.gpu_dispatch_kernel ? 1 : 0) << "\n";
+				std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";
+				std::cout << "  freq_hybrid_patcher: " << (opt.freq_hybrid_patcher ? 1 : 0) << "\n";
+				std::cout << "  freq_branchless_threshold: " << opt.freq_branchless_threshold << "\n";
+				std::cout << "  freq_bucket_by_patcher: " << (opt.freq_bucket_by_patcher ? 1 : 0) << "\n";
+				if (opt.estimate_launch && total_launches > 0) {
 				const uint32_t block = utils::get_n_lanes<int8_t>();
 				uint32_t       grid  = static_cast<uint32_t>(avg_grid_per_launch);
 				if (grid == 0) {
