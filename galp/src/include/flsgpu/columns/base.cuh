@@ -17,7 +17,9 @@ template <typename T>
 struct FunctorBase {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 
-	virtual __device__ __forceinline__ T operator()(const UINT_T value, [[maybe_unused]] const vi_t vector_index);
+	__device__ __forceinline__ T operator()(const UINT_T value, [[maybe_unused]] const vi_t vector_index) {
+		return static_cast<T>(value);
+	}
 };
 
 template <typename T>
@@ -27,7 +29,8 @@ struct DecompressorBase {
   const vi_t vector_index, const lane_t lane)
   */
 
-	virtual void __device__ unpack_next_into(T* __restrict out);
+	void __device__ unpack_next_into([[maybe_unused]] T* __restrict out) {
+	}
 };
 
 }} // namespace flsgpu::device

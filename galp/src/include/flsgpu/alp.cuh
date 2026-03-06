@@ -38,7 +38,7 @@ public:
 		}
 	}
 
-	__device__ __forceinline__ T operator()(const UINT_T value, const vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(const UINT_T value, const vi_t vector_index) {
 		return static_cast<T>(static_cast<INT_T>((value + bases[vector_index]) * factor[vector_index])) *
 		       frac10[vector_index];
 	}

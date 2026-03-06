@@ -43,6 +43,7 @@ struct Options {
 	uint32_t                             estimate_iters  = 10000;
 	bool                                 mega_kernel     = true;
 	bool                                 gpu_dispatch_kernel          = false;
+	bool                                 write_back                   = false;
 	bool                                 freq_prefetch_all_branchless = false;
 	bool                                 freq_hybrid_patcher          = false;
 	float                                freq_branchless_threshold    = 6.0f;
@@ -79,6 +80,7 @@ void print_usage(const char* prog) {
 	          << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n"
 		          << "  --no-mega-kernel   Benchmark full table using per-rowgroup kernels\n"
 		          << "  --gpu-dispatch-kernel  Use one mixed-type kernel launch per sample in mega mode\n"
+		          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
 		          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
 		          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
 		          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n"
@@ -126,6 +128,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--gpu-dispatch-kernel") {
 			opt.gpu_dispatch_kernel = true;
+			continue;
+		}
+		if (arg == "--write-back") {
+			opt.write_back = true;
 			continue;
 		}
 		if (arg == "--freq-prefetch-all-branchless") {
@@ -358,6 +364,7 @@ int main(int argc, char** argv) {
 			bench_cfg.samples                      = opt.samples;
 			bench_cfg.mega_kernel                  = opt.mega_kernel;
 			bench_cfg.gpu_dispatch_kernel          = opt.gpu_dispatch_kernel;
+			bench_cfg.write_out                    = opt.write_back;
 			bench_cfg.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
 			bench_cfg.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
 			bench_cfg.freq_branchless_threshold    = opt.freq_branchless_threshold;
@@ -438,6 +445,7 @@ int main(int argc, char** argv) {
 				std::cout << "  kernel_launches: " << total_launches << "\n";
 				std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
 				std::cout << "  gpu_dispatch_kernel: " << (opt.gpu_dispatch_kernel ? 1 : 0) << "\n";
+				std::cout << "  write_back: " << (opt.write_back ? 1 : 0) << "\n";
 				std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";
 				std::cout << "  freq_hybrid_patcher: " << (opt.freq_hybrid_patcher ? 1 : 0) << "\n";
 				std::cout << "  freq_branchless_threshold: " << opt.freq_branchless_threshold << "\n";

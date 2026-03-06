@@ -17,21 +17,22 @@ template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT 
 __device__ __forceinline__ void run_decompressor(DecompressorT&& iterator, const lane_t lane, T* __restrict out) {
 	const auto mapping = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
 	T          registers[UNPACK_N_VALUES * UNPACK_N_VECTORS];
-	uint32_t   sink = 0u;
+	uint32_t   acc = 2166136261u;
 	for (si_t i = 0; i < mapping.N_VALUES_IN_LANE; i += UNPACK_N_VALUES) {
 		iterator.unpack_next_into(registers);
 		if constexpr (WRITE_OUT) {
 			write_registers_to_global<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, mapping.N_LANES>(lane, i, registers, out);
 		} else {
-			using UINT_T = typename utils::same_width_uint<T>::type;
 #pragma unroll
 			for (int k = 0; k < UNPACK_N_VALUES * UNPACK_N_VECTORS; ++k) {
-				sink ^= static_cast<uint32_t>(static_cast<UINT_T>(registers[k]));
+				acc ^= static_cast<uint32_t>(registers[k]);
 			}
 		}
 	}
 	if constexpr (!WRITE_OUT) {
-		asm volatile("" : : "r"(sink) : "memory");
+		if (acc == 0u) {
+			out[0] = static_cast<T>(acc);
+		}
 	}
 }
 
@@ -219,10 +220,7 @@ __global__ void decompress_dispatch_typed(const dispatch::DeviceExpression<T>* e
 		return;
 	}
 
-	T* out = nullptr;
-	if constexpr (WRITE_OUT) {
-		out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
-	}
+	T* out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
 	device_exec::execute_plan<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(*expr, vector_index, lane, out);
 }
 
@@ -254,10 +252,7 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 		if (static_cast<size_t>(vector_index) >= n_vecs) {
 			return;
 		}
-		int8_t* out = nullptr;
-		if constexpr (WRITE_OUT) {
-			out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
-		}
+		int8_t* out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
 		device_exec::execute_plan<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(*expr, vector_index, lane, out);
 		break;
 	}
@@ -287,10 +282,7 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 		if (static_cast<size_t>(vector_index) >= n_vecs) {
 			return;
 		}
-		int16_t* out = nullptr;
-		if constexpr (WRITE_OUT) {
-			out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
-		}
+		int16_t* out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
 		device_exec::execute_plan<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(
 		    *expr, vector_index, lane_i16, out);
 		break;

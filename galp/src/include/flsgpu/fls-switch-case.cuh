@@ -884,7 +884,7 @@ struct BitUnpackerSwitchCase : BitUnpackerBase<T> {
 	    , processor(processor) {
 	}
 
-	__device__ __forceinline__ void unpack_next_into(T* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		switch_value_bit_width<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, OutputProcessor, CacheLoader<T, UNPACK_N_VECTORS>>(
 		    in, out, processor, value_bit_width, start_index);
 		start_index += UNPACK_N_VALUES;

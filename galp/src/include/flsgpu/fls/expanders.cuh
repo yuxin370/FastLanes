@@ -22,8 +22,9 @@ namespace device {
 template <typename ValueT, typename CodeT>
 struct RLEExpanderBase {
 public:
-	__device__ __forceinline__ virtual void expand_run_into(ValueT* out) = 0;
-	__device__ virtual ~RLEExpanderBase() = default;
+	__device__ __forceinline__ void expand_run_into([[maybe_unused]] ValueT* out) {
+	}
+	__device__ ~RLEExpanderBase() = default;
 };
 
 
@@ -50,7 +51,7 @@ public:
 		}
 	}
 
-	void __device__ __forceinline__ expand_run_into(ValueT* out) override {
+	void __device__ __forceinline__ expand_run_into(ValueT* out) {
 		CodeT codes[UNPACK_N_VECTORS * UNPACK_N_VALUES];
 #pragma unroll
 		for (unsigned i = 0; i < UNPACK_N_VECTORS * UNPACK_N_VALUES; ++i) {
@@ -73,8 +74,9 @@ public:
 template <typename T>
 struct CROSSRLEExpanderBase {
 public:
-	__device__ __forceinline__ virtual void expand_run_into(T* out) = 0;
-	__device__ virtual ~CROSSRLEExpanderBase()                 = default;
+	__device__ __forceinline__ void expand_run_into([[maybe_unused]] T* out) {
+	}
+	__device__ ~CROSSRLEExpanderBase()                 = default;
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
@@ -91,7 +93,7 @@ private:
 	                                                // const lane_t lane;
 
 public:
-	void __device__ __forceinline__ expand_run_into(T* out) override {
+	void __device__ __forceinline__ expand_run_into(T* out) {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
 #pragma unroll
@@ -149,7 +151,7 @@ private:
 	UINT_T   vec_run_value[UNPACK_N_VECTORS]; // current run value (cached)
 
 public:
-	void __device__ __forceinline__ expand_run_into(T* out) override {
+	void __device__ __forceinline__ expand_run_into(T* out) {
 		constexpr uint32_t N_LANES_U32 = static_cast<uint32_t>(utils::get_n_lanes<INT_T>());
 
 		// Hoist call-invariant base offset (monotonic across calls)
@@ -263,7 +265,7 @@ private:
 	UINT_T   vec_run_value[UNPACK_N_VECTORS]; // current run value (cached)
 
 public:
-	void __device__ __forceinline__ expand_run_into(T* out) override {
+	void __device__ __forceinline__ expand_run_into(T* out) {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
 #pragma unroll
@@ -394,7 +396,7 @@ public:
 		}
 	}
 
-	void __device__ __forceinline__ expand_run_into(T* out) override {
+	void __device__ __forceinline__ expand_run_into(T* out) {
 		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
 
 #pragma unroll
@@ -489,7 +491,7 @@ private:
 	}
 
 public:
-	__device__ __forceinline__ void expand_run_into(T* out) override {
+	__device__ __forceinline__ void expand_run_into(T* out) {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
 #pragma unroll
@@ -584,7 +586,7 @@ private:
 	}
 
 public:
-	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) override {
+	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) {
 		constexpr int  N_LANES = utils::get_n_lanes<INT_T>();
 		const unsigned mask    = __activemask();
 		const int      lane    = (int)lane_;
@@ -767,7 +769,7 @@ public:
 		}
 	}
 
-	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) override {
+	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) {
 		// each lane for one stride
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
@@ -834,7 +836,7 @@ struct BranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
 		}
 	}
 
-	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) override {
+	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) {
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
 			T* __restrict__ outv            = out + v * UNPACK_N_VALUES;
@@ -888,7 +890,7 @@ struct PrefetchBranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase
 		}
 	}
 
-	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) override {
+	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) {
 		const uint32_t k0 = (uint32_t)start_k_;
 
 #pragma unroll

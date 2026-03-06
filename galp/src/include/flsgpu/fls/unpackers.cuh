@@ -24,7 +24,8 @@ struct BitUnpackerBase {
   const UINT_T *__restrict in, const lane_t lane,
   const vbw_t value_bit_width, OutputProcessor processor)
 	*/
-	virtual __device__ __forceinline__ void unpack_next_into(T* __restrict out);
+	__device__ __forceinline__ void unpack_next_into([[maybe_unused]] T* __restrict out) {
+	}
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor>
@@ -41,7 +42,7 @@ struct BitUnpackerDummy : flsgpu::device::BitUnpackerBase<T> {
 	    : in(a_in + lane)
 	    , processor(processor) {};
 
-	__device__ __forceinline__ void unpack_next_into(T* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		constexpr int32_t N_LANES = utils::get_n_lanes<UINT_T>();
 
 #pragma unroll
@@ -75,7 +76,7 @@ struct BitUnpackerOldFls : flsgpu::device::BitUnpackerBase<T> {
 		static_assert(UNPACK_N_VALUES == utils::get_values_per_lane<T>(), "Old FLS can only unpack entire lanes");
 	};
 
-	__device__ __forceinline__ void unpack_next_into(T* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		UINT_T* u_out = reinterpret_cast<UINT_T*>(out);
 		oldfls::adjusted::unpack(in, u_out, value_bit_width);
 
@@ -89,8 +90,10 @@ template <typename T>
 struct LoaderBase {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 
-	virtual __device__ __forceinline__ void load_next_into(UINT_T* out);
-	virtual __device__ __forceinline__ void next_line();
+	__device__ __forceinline__ void load_next_into([[maybe_unused]] UINT_T* out) {
+	}
+	__device__ __forceinline__ void next_line() {
+	}
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS>
@@ -104,14 +107,14 @@ struct CacheLoader : LoaderBase<T> {
 	    : in(in)
 	    , vector_offset(vector_offset) {};
 
-	__device__ __forceinline__ void load_next_into(UINT_T* out) override {
+	__device__ __forceinline__ void load_next_into(UINT_T* out) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			out[v] = *(in + v * vector_offset);
 		}
 	}
 
-	__device__ __forceinline__ void next_line() override {
+	__device__ __forceinline__ void next_line() {
 		in += utils::get_n_lanes<T>();
 	}
 };
@@ -130,14 +133,14 @@ struct LocalMemoryLoader : LoaderBase<T> {
 		next_line();
 	};
 
-	__device__ __forceinline__ void load_next_into(UINT_T* out) override {
+	__device__ __forceinline__ void load_next_into(UINT_T* out) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			out[v] = buffers[v * BUFFER_SIZE + buffer_index];
 		}
 	}
 
-	__device__ __forceinline__ void next_line() override {
+	__device__ __forceinline__ void next_line() {
 		if (buffer_index >= BUFFER_SIZE - 1) {
 #pragma unroll
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
@@ -174,14 +177,14 @@ struct SharedMemoryLoader : LoaderBase<T> {
 		next_line();
 	};
 
-	__device__ __forceinline__ void load_next_into(UINT_T* out) override {
+	__device__ __forceinline__ void load_next_into(UINT_T* out) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			out[v] = buffers[v * BUFFER_SIZE + buffer_index];
 		}
 	}
 
-	__device__ __forceinline__ void next_line() override {
+	__device__ __forceinline__ void next_line() {
 		if (buffer_index >= BUFFER_SIZE - 1) {
 #pragma unroll
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
@@ -213,7 +216,7 @@ struct RegisterLoader : LoaderBase<T> {
 		next_line();
 	};
 
-	__device__ __forceinline__ void load_next_into(UINT_T* out) override {
+	__device__ __forceinline__ void load_next_into(UINT_T* out) {
 
 		switch (buffer_index) {
 		case 0: {
@@ -251,7 +254,7 @@ struct RegisterLoader : LoaderBase<T> {
 		}
 	}
 
-	__device__ __forceinline__ void next_line() override {
+	__device__ __forceinline__ void next_line() {
 		if (buffer_index >= BUFFER_SIZE - 1) {
 #pragma unroll
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
@@ -282,14 +285,14 @@ struct RegisterBranchlessLoader : LoaderBase<T> {
 		next_line();
 	};
 
-	__device__ __forceinline__ void load_next_into(UINT_T* out) override {
+	__device__ __forceinline__ void load_next_into(UINT_T* out) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			out[v] = buffers[v * BUFFER_SIZE];
 		}
 	}
 
-	__device__ __forceinline__ void next_line() override {
+	__device__ __forceinline__ void next_line() {
 		if (buffer_index >= BUFFER_SIZE - 1) {
 #pragma unroll
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
@@ -426,7 +429,7 @@ struct BitUnpackerStateless : BitUnpackerBase<T> {
 	    , vector_offset(utils::get_compressed_vector_size<UINT_T>(value_bit_width)) {
 	}
 
-	__device__ __forceinline__ void unpack_next_into(T* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		unpack_vector_stateless<T,
 		                        UNPACK_N_VECTORS,
 		                        UNPACK_N_VALUES,
@@ -491,7 +494,7 @@ struct BitUnpackerStatelessBranchless : BitUnpackerBase<T> {
 	    , vector_offset(utils::get_compressed_vector_size<UINT_T>(value_bit_width)) {
 	}
 
-	__device__ __forceinline__ void unpack_next_into(T* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 #pragma unroll
 		for (int32_t i {0}; i < UNPACK_N_VALUES; i++) {
 			unpack_vector_stateless_branchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>(
@@ -517,7 +520,7 @@ struct BitUnpackerStateful : BitUnpackerBase<T> {
 	    , processor(processor) {
 	}
 
-	__device__ __forceinline__ void unpack_next_into(T* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		UINT_T values[UNPACK_N_VECTORS];
 
 #pragma unroll
@@ -569,7 +572,7 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<T> {
 	    , processor(processor) {
 	}
 
-	__device__ __forceinline__ void unpack_next_into(T* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		constexpr int32_t N_LANES        = utils::get_n_lanes<UINT_T>();
 		constexpr int32_t BIT_COUNT      = utils::sizeof_in_bits<T>();
 		constexpr int32_t LANE_BIT_WIDTH = utils::get_lane_bitwidth<UINT_T>();
@@ -616,7 +619,7 @@ struct BitUnpackerStatefulBranchlessIdx : BitUnpackerBase<OutT> {
 	    , processor(processor) {
 	}
 
-	__device__ __forceinline__ void unpack_next_into(OutT* __restrict out) override {
+	__device__ __forceinline__ void unpack_next_into(OutT* __restrict out) {
 		constexpr int32_t N_LANES        = utils::get_n_lanes<UINT_T>();
 		constexpr int32_t BIT_COUNT      = utils::sizeof_in_bits<IndexT>();
 		constexpr int32_t LANE_BIT_WIDTH = utils::get_lane_bitwidth<UINT_T>();

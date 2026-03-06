@@ -34,6 +34,7 @@ struct TableBenchmarkConfig {
 	uint32_t              samples                      = 1;
 	bool                  mega_kernel                  = true;
 	bool                  gpu_dispatch_kernel          = false; // true: single mixed-type kernel per sample
+	bool                  write_out                    = false; // true: write decompressed values to global output buffers
 	bool                  freq_prefetch_all_branchless = false;
 	bool                  freq_hybrid_patcher          = false;
 	float                 freq_branchless_threshold    = 6.0f;
@@ -72,6 +73,7 @@ double prepare_dispatch_buffers(BenchmarkWorkset& workset);
 double run_kernel(BenchmarkWorkset& workset,
                   uint32_t          samples,
                   bool              gpu_dispatch_kernel = false,
+                  bool              write_out           = false,
                   size_t*           out_grid            = nullptr,
                   size_t*           out_launches        = nullptr);
 

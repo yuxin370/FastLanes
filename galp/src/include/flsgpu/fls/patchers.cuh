@@ -21,22 +21,24 @@ namespace device {
 template <typename T>
 struct FREQExceptionPatcherBase {
 public:
-	__device__ __forceinline__ virtual void fill_and_patch(T* out) = 0;
-	__device__ virtual ~FREQExceptionPatcherBase()                 = default;
+	__device__ __forceinline__ void fill_and_patch([[maybe_unused]] T* out) {
+	}
+	__device__ ~FREQExceptionPatcherBase()                 = default;
 };
 
 template <typename T>
 struct SLPATCHExceptionPatcherBase {
 public:
-	__device__ __forceinline__ virtual void patch(T* out) = 0;
-	__device__ virtual ~SLPATCHExceptionPatcherBase()     = default;
+	__device__ __forceinline__ void patch([[maybe_unused]] T* out) {
+	}
+	__device__ ~SLPATCHExceptionPatcherBase()     = default;
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct DummyFREQExceptionPatcher : flsgpu::device::FREQExceptionPatcherBase<T> {
 
 public:
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 	}
 
 	__device__ __forceinline__
@@ -56,7 +58,7 @@ struct StatelessFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
 	const lane_t lane;
 
 public:
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
 		const int first_pos = start_index * N_LANES + lane;
@@ -123,7 +125,7 @@ struct StatefulFREQExceptionPatcher : FREQExceptionPatcherBase<T> {
 	T            frequent_value[UNPACK_N_VECTORS];
 
 public:
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
 		const int first_pos = start_index * N_LANES + lane;
@@ -185,7 +187,7 @@ struct StatefulSLPATCHExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
 	int32_t      exception_index[UNPACK_N_VECTORS] = {0};
 
 public:
-	void __device__ __forceinline__ patch(T* out) override {
+	void __device__ __forceinline__ patch(T* out) {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
 		const int first_pos = start_index * N_LANES + lane;
@@ -238,7 +240,7 @@ struct StatefulSLPATCHDictExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
 	int32_t                            exception_index[UNPACK_N_VECTORS] = {0};
 
 public:
-	void __device__ __forceinline__ patch(T* out) override {
+	void __device__ __forceinline__ patch(T* out) {
 		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
 
 		const int first_pos = start_index * N_LANES + lane;
@@ -306,7 +308,7 @@ public:
 		}
 	}
 
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 #pragma unroll
 		for (int w {0}; w < UNPACK_N_VALUES; ++w) {
 #pragma unroll
@@ -382,7 +384,7 @@ public:
 		}
 	}
 
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 #pragma unroll
 		for (int w {0}; w < UNPACK_N_VALUES; ++w) {
 #pragma unroll
@@ -430,7 +432,7 @@ public:
 		}
 	}
 
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 #pragma unroll
 		for (int w {0}; w < UNPACK_N_VALUES; ++w) {
 #pragma unroll
@@ -500,7 +502,7 @@ public:
 		}
 	}
 
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 #pragma unroll
 		for (int w {0}; w < UNPACK_N_VALUES; ++w) {
 #pragma unroll
@@ -557,7 +559,7 @@ public:
 		}
 	}
 
-	void __device__ __forceinline__ fill_and_patch(T* out) override {
+	void __device__ __forceinline__ fill_and_patch(T* out) {
 		// NOTES: It is probably possible to remove the next_position variable
 		// as well as the next_exception, if you use prefetching. This would make
 		// it easier to do multiple vectors.

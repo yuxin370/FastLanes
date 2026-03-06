@@ -21,7 +21,7 @@ template <typename T>
 struct BPFunctor : FunctorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
 	__device__ __forceinline__   BPFunctor() {};
-	__device__ __forceinline__ T operator()(const UINT_T value, [[maybe_unused]] const vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(const UINT_T value, [[maybe_unused]] const vi_t vector_index) {
 		return value;
 	}
 };
@@ -37,7 +37,7 @@ struct FFORFunctor : FunctorBase<T> {
 		}
 	};
 
-	__device__ __forceinline__ T operator()(const UINT_T value, const vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(const UINT_T value, const vi_t vector_index) {
 		return static_cast<T>(value + bases[vector_index]);
 	}
 };
@@ -55,7 +55,7 @@ struct DICTFunctor : FunctorBase<T> {
 			bases[v] = a_bases[v];
 	}
 
-	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) {
 		const auto idx = value + bases[vector_index];
 
 		// return __ldg(keys + idx);
@@ -117,7 +117,7 @@ struct DICTShfl32Functor : FunctorBase<T> {
 		// __syncwarp();
 	}
 
-	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) {
 		// key count must be <= 32
 		const int idx = (int)(value + bases[vector_index]);
 		return static_cast<T>(__shfl_sync(0xFFFFFFFFu, k_lane, idx));
@@ -153,7 +153,7 @@ struct DICTAdaptiveFunctor : FunctorBase<T> {
 			bases[v] = a_bases[v];
 	}
 
-	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) override {
+	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) {
 		const int idx = (int)(value + bases[vector_index]);
 
 		if (use_shuffle) {
