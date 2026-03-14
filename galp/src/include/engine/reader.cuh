@@ -91,8 +91,9 @@ public:
 		}
 
 		const auto*  rg       = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
-		const size_t n_vecs   = static_cast<size_t>(rg->m_n_vec());
-		const size_t n_values = n_vecs * consts::VALUES_PER_VECTOR;
+		const size_t n_vecs    = static_cast<size_t>(rg->m_n_vec());
+		const size_t n_values  = n_vecs * consts::VALUES_PER_VECTOR;
+		const size_t n_tuples  = static_cast<size_t>(rg->m_n_tuples());
 
 		// Read rowgroup bytes
 		fastlanes::Buf buf(rg->m_size());
@@ -214,39 +215,7 @@ public:
 				break;
 			}
 			case EXP_DICT_I08_U08: {
-				if (!operand_tokens || operand_tokens->size() < 2) {
-					throw std::runtime_error("EXP_DICT_I08_U08: missing operand tokens");
-				}
-				const auto index_col_idx  = static_cast<size_t>(operand_tokens->Get(0));
-				auto&      index_col      = self(self, index_col_idx);
-				index_col.skip_decompress = true;
-
-				auto index_ffor = std::visit(
-				    [](auto&& col) -> flsgpu::host::FFORColumn<uint8_t> {
-					    using HostColT = std::decay_t<decltype(col)>;
-					    if constexpr (std::is_same_v<HostColT, flsgpu::host::FFORColumn<int8_t>>) {
-						    auto* packed = utils::copy_array(col.bp.packed_array, col.bp.n_packed_values);
-						    auto* bws    = utils::copy_array(col.bp.bit_widths, col.bp.get_n_vecs());
-						    auto* offs   = utils::copy_array(col.bp.vector_offsets, col.bp.get_n_vecs());
-						    flsgpu::host::BPColumn<uint8_t> bp {
-						        col.bp.n_values, col.bp.n_packed_values, packed, bws, offs};
-						    auto* bases = utils::copy_array(col.bases, col.get_n_vecs());
-						    return flsgpu::host::FFORColumn<uint8_t> {bp, bases};
-					    } else if constexpr (std::is_same_v<HostColT, flsgpu::host::BPColumn<int8_t>>) {
-						    auto* packed = utils::copy_array(col.packed_array, col.n_packed_values);
-						    auto* bws    = utils::copy_array(col.bit_widths, col.get_n_vecs());
-						    auto* offs   = utils::copy_array(col.vector_offsets, col.get_n_vecs());
-						    flsgpu::host::BPColumn<uint8_t> bp {col.n_values, col.n_packed_values, packed, bws, offs};
-						    auto*                           bases = new uint8_t[bp.get_n_vecs()];
-						    std::memset(bases, 0, bp.get_n_vecs() * sizeof(uint8_t));
-						    return flsgpu::host::FFORColumn<uint8_t> {bp, bases};
-					    } else {
-						    throw std::runtime_error("EXP_DICT_I08_U08: index column must be BP/FFOR int8");
-					    }
-				    },
-				    index_col.host);
-
-				auto parsed = columns::parse_dict_ffor_with_index<int8_t>(ctx, std::move(index_ffor));
+				auto parsed = columns::parse_dict_ref<int8_t, uint8_t>(ctx);
 				result.host = std::move(parsed.host);
 				break;
 			}
@@ -295,7 +264,7 @@ public:
 			return *built[col_idx];
 		};
 
-		Rowgroup out {n_values, n_vecs, {}};
+		Rowgroup out {n_values, n_vecs, n_tuples, {}};
 		out.columns.reserve(col_descs.size());
 		for (size_t i = 0; i < col_descs.size(); ++i) {
 			out.columns.push_back(build_column(build_column, i));

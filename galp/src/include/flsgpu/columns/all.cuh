@@ -15,6 +15,7 @@
 #include "flsgpu/columns/cross_rle_extended.cuh"
 #include "flsgpu/columns/cross_rle_lane_mask.cuh"
 #include "flsgpu/columns/dict_ffor.cuh"
+#include "flsgpu/columns/dict_ref.cuh"
 #include "flsgpu/columns/dict_slpatch.cuh"
 #include "flsgpu/columns/ffor.cuh"
 #include "flsgpu/columns/freq.cuh"

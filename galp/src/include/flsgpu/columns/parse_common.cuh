@@ -122,6 +122,28 @@ inline ExceptionOffsets build_exception_offsets(const uint16_t* counts, const si
 	return ExceptionOffsets {offsets, acc};
 }
 
+template <typename T>
+inline ExceptionOffsets build_exception_offsets_from_segment(const fastlanes::SegmentView& seg, const size_t n_vecs) {
+	const auto entry = extract_entrypoints(seg);
+	if (entry.size() != n_vecs) {
+		throw std::runtime_error("exception segment entrypoint count mismatch");
+	}
+
+	auto*  offsets    = new size_t[n_vecs];
+	size_t prev_bytes = 0;
+	for (size_t i = 0; i < n_vecs; ++i) {
+		const size_t cur_bytes = static_cast<size_t>(entry[i]);
+		if (cur_bytes < prev_bytes || (cur_bytes % sizeof(T)) != 0) {
+			delete[] offsets;
+			throw std::runtime_error("invalid exception segment entrypoints");
+		}
+		offsets[i] = prev_bytes / sizeof(T);
+		prev_bytes = cur_bytes;
+	}
+
+	return ExceptionOffsets {offsets, prev_bytes / sizeof(T)};
+}
+
 } // namespace detail
 } // namespace reader::columns
 

@@ -41,6 +41,7 @@ struct ColumnMeta {
 
 using EncodedPayload = std::variant<flsgpu::host::BPColumn<int8_t>,
                                     flsgpu::host::FFORColumn<int8_t>,
+                                    flsgpu::host::DICTREFColumn<int8_t, uint8_t>,
                                     flsgpu::host::DICTFFORColumn<int8_t>,
                                     flsgpu::host::DICTSLPATCHColumn<int8_t>,
                                     flsgpu::host::CONSTANTColumn<int8_t>,
@@ -74,6 +75,7 @@ struct MaterializedColumn {
 struct Rowgroup {
 	size_t              n_values = 0;
 	size_t              n_vecs   = 0;
+	size_t              n_tuples = 0;
 	std::vector<Column> columns;
 };
 

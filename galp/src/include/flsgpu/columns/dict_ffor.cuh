@@ -14,9 +14,9 @@ namespace device {
 
 template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
 struct DICTFFORColumn {
-	using KEY_T   = typename utils::same_width_uint<T>::type;
+	using UINT_T   = typename utils::same_width_uint<T>::type;
 	using INDEX_T = IndexT;
-	using UINT_T  = KEY_T;
+	using KEY_T = UINT_T;
 	size_t             n_values;
 	FFORColumn<IndexT> ffor; // index stream (FFOR-compressed)
 
@@ -68,6 +68,29 @@ void free_column(device::DICTFFORColumn<T, IndexT> column) {
 } // namespace flsgpu
 
 namespace reader::columns {
+
+inline flsgpu::host::FFORColumn<uint8_t> make_ffor_u8_from_ffor_i8(const flsgpu::host::FFORColumn<int8_t>& col) {
+	auto* packed = utils::copy_array(col.bp.packed_array, col.bp.n_packed_values);
+	auto* bws    = utils::copy_array(col.bp.bit_widths, col.bp.get_n_vecs());
+	auto* offs   = utils::copy_array(col.bp.vector_offsets, col.bp.get_n_vecs());
+	flsgpu::host::BPColumn<uint8_t> bp {col.bp.n_values, col.bp.n_packed_values, packed, bws, offs};
+
+	auto* bases = new uint8_t[col.get_n_vecs()];
+	for (size_t i = 0; i < col.get_n_vecs(); ++i) {
+		bases[i] = static_cast<uint8_t>(col.bases[i]);
+	}
+	return flsgpu::host::FFORColumn<uint8_t> {bp, bases};
+}
+
+inline flsgpu::host::FFORColumn<uint8_t> make_ffor_u8_from_bp_i8(const flsgpu::host::BPColumn<int8_t>& col) {
+	auto* packed = utils::copy_array(col.packed_array, col.n_packed_values);
+	auto* bws    = utils::copy_array(col.bit_widths, col.get_n_vecs());
+	auto* offs   = utils::copy_array(col.vector_offsets, col.get_n_vecs());
+	flsgpu::host::BPColumn<uint8_t> bp {col.n_values, col.n_packed_values, packed, bws, offs};
+	auto*                           bases = new uint8_t[bp.get_n_vecs()];
+	std::memset(bases, 0, bp.get_n_vecs() * sizeof(uint8_t));
+	return flsgpu::host::FFORColumn<uint8_t> {bp, bases};
+}
 
 template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
 inline ParseResultT<flsgpu::host::DICTFFORColumn<T, IndexT>> parse_dict_ffor(const ParseContext& ctx) {

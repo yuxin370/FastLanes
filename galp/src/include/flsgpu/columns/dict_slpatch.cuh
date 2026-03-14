@@ -6,6 +6,7 @@
 #ifndef FLSGPU_COLUMNS_DICT_SLPATCH_CUH
 #define FLSGPU_COLUMNS_DICT_SLPATCH_CUH
 
+#include "flsgpu/columns/dict_ffor.cuh"
 #include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/columns/slpatch.cuh"
 
@@ -68,6 +69,22 @@ void free_column(device::DICTSLPATCHColumn<T, IndexT> column) {
 
 namespace reader::columns {
 
+inline flsgpu::host::SLPATCHColumn<uint8_t>
+make_slpatch_u8_from_slpatch_i8(const flsgpu::host::SLPATCHColumn<int8_t>& col) {
+	auto index_ffor = make_ffor_u8_from_ffor_i8(col.ffor);
+
+	auto* offsets = utils::copy_array(col.exceptions_offsets, col.n_vecs);
+	auto* pos     = utils::copy_array(col.positions, col.n_exceptions);
+	auto* cnt     = utils::copy_array(col.counts, col.n_vecs);
+	auto* exc     = new uint8_t[col.n_exceptions];
+	for (size_t i = 0; i < col.n_exceptions; ++i) {
+		exc[i] = static_cast<uint8_t>(col.exceptions[i]);
+	}
+
+	return flsgpu::host::SLPATCHColumn<uint8_t> {
+	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, exc, pos, cnt};
+}
+
 template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
 inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> parse_dict_slpatch(const ParseContext& ctx) {
 	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 7) {
@@ -97,13 +114,29 @@ inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> parse_dict_slpat
 	auto* positions  = detail::copy_segment_array<uint16_t>(seg_pos);
 	auto* exceptions = detail::copy_segment_array<IndexT>(seg_exc);
 
-	auto exc = detail::build_exception_offsets(counts, ctx.n_vecs);
+	auto exc     = detail::build_exception_offsets_from_segment<IndexT>(seg_exc, ctx.n_vecs);
 
 	flsgpu::host::SLPATCHColumn<IndexT> slpatch_idx {
 	    ctx.n_values, ctx.n_vecs, ffor_idx, exc.total, exc.offsets, exceptions, positions, counts};
 
 	return ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
 	    flsgpu::host::DICTSLPATCHColumn<T, IndexT> {slpatch_idx, keys, key_count}};
+}
+
+template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
+inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>>
+parse_dict_slpatch_with_index(const ParseContext& ctx, flsgpu::host::SLPATCHColumn<IndexT> index_slpatch) {
+	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 2) {
+		throw std::runtime_error("EXP_DICT: missing operand tokens");
+	}
+	const auto key_seg_idx = static_cast<uint32_t>(ctx.operand_tokens->Get(ctx.operand_tokens->size() - 1));
+	const auto seg_keys    = ctx.column_view.GetSegment(key_seg_idx);
+	using KEY_T            = typename utils::same_width_uint<T>::type;
+	const size_t key_count = seg_keys.data_span.size() / sizeof(KEY_T);
+	auto*        keys      = detail::copy_segment_array<KEY_T>(seg_keys);
+
+	return ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
+	    flsgpu::host::DICTSLPATCHColumn<T, IndexT> {std::move(index_slpatch), keys, key_count}};
 }
 
 } // namespace reader::columns

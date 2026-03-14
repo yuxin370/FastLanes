@@ -200,7 +200,7 @@ inline ParseResultT<flsgpu::host::FREQColumn<T>> parse_frequency(const ParseCont
 	auto* positions  = detail::copy_segment_array<uint16_t>(seg_pos);
 	auto* exceptions = detail::copy_segment_array<T>(seg_exc);
 
-	auto exc = detail::build_exception_offsets(counts, ctx.n_vecs);
+	auto exc = detail::build_exception_offsets_from_segment<T>(seg_exc, ctx.n_vecs);
 
 	return ParseResultT<flsgpu::host::FREQColumn<T>> {flsgpu::host::FREQColumn<T> {
 	    ctx.n_values, ctx.n_vecs, fv_arr, exc.total, exc.offsets, exceptions, positions, counts}};
