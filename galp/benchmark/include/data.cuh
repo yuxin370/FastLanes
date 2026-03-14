@@ -267,6 +267,7 @@ namespace bindings {
 
 template <typename T>
 flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const vbw_t value_bit_width) {
+	using UINT_T                 = typename flsgpu::host::BPColumn<T>::UINT_T;
 	size_t n_vecs                 = utils::get_n_vecs_from_size(n_values);
 	size_t compressed_vector_size = utils::get_compressed_vector_size<T>(value_bit_width);
 	size_t n_packed_values        = n_vecs * compressed_vector_size;
@@ -283,7 +284,7 @@ flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const 
 	return flsgpu::host::BPColumn<T> {
 	    n_values,
 	    n_packed_values,
-	    packed_array,
+	    reinterpret_cast<UINT_T*>(packed_array),
 	    primitives::fill_array_with_constant<vbw_t>(new vbw_t[n_vecs], n_vecs, value_bit_width),
 	    primitives::fill_array_with_sequence<size_t>(new size_t[n_vecs], n_vecs, 0, compressed_vector_size),
 	};
@@ -291,13 +292,15 @@ flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const 
 
 template <typename T>
 T* decompress(const flsgpu::host::BPColumn<T> column) {
-	T* out_array      = new T[column.get_n_values()];
-	T* c_out_array    = out_array;
-	T* c_packed_array = column.packed_array;
+	using UINT_T         = typename flsgpu::host::BPColumn<T>::UINT_T;
+	T*      out_array       = new T[column.get_n_values()];
+	T*      c_out_array     = out_array;
+	UINT_T* c_packed_arrayu = column.packed_array;
 
 	for (size_t vi {0}; vi < column.get_n_vecs(); ++vi) {
-		c_packed_array = column.packed_array + column.vector_offsets[vi];
-		generated::unpack::fallback::scalar::unpack(c_packed_array, c_out_array, column.bit_widths[vi]);
+		c_packed_arrayu = column.packed_array + column.vector_offsets[vi];
+		generated::unpack::fallback::scalar::unpack(
+		    reinterpret_cast<T*>(c_packed_arrayu), c_out_array, column.bit_widths[vi]);
 		c_out_array += consts::VALUES_PER_VECTOR;
 	}
 
@@ -306,14 +309,17 @@ T* decompress(const flsgpu::host::BPColumn<T> column) {
 
 template <typename T>
 T* decompress(const flsgpu::host::FFORColumn<T> column) {
-	T* out_array      = new T[column.get_n_values()];
-	T* c_out_array    = out_array;
-	T* c_packed_array = column.bp.packed_array + column.bp.vector_offsets[0];
+	using UINT_T         = typename flsgpu::host::FFORColumn<T>::UINT_T;
+	T*     out_array      = new T[column.get_n_values()];
+	T*     c_out_array    = out_array;
+	UINT_T* c_packed_array = column.bp.packed_array + column.bp.vector_offsets[0];
 
 	for (size_t vi {0}; vi < column.get_n_vecs(); ++vi) {
 		c_packed_array = column.bp.packed_array + column.bp.vector_offsets[vi];
+		T base {};
+		std::memcpy(&base, &column.bases[vi], sizeof(T));
 		fastlanes::generated::unffor::fallback::scalar::unffor(
-		    c_packed_array, c_out_array, column.bp.bit_widths[vi], &column.bases[vi]);
+		    reinterpret_cast<const T*>(c_packed_array), c_out_array, column.bp.bit_widths[vi], &base);
 		c_out_array += consts::VALUES_PER_VECTOR;
 	}
 
@@ -373,13 +379,33 @@ T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
 	const size_t n_vecs   = column.get_n_vecs();
 
 	T* out_array = decompress(column.ffor);
+	if (n_vecs == 0) {
+		return out_array;
+	}
 
+	// Match original FastLanes SLPATCH semantics:
+	// each vector owns a contiguous exception slice whose length is counts[vi].
+	size_t running_off = 0;
+	for (size_t vi = 0; vi < n_vecs; ++vi) {
+		if (column.exceptions_offsets[vi] != running_off) {
+			delete[] out_array;
+			throw std::runtime_error("SLPATCH: exceptions_offsets/counts mismatch");
+		}
+		running_off += static_cast<size_t>(column.counts[vi]);
+	}
+	if (running_off != column.n_exceptions) {
+		delete[] out_array;
+		throw std::runtime_error("SLPATCH: total exceptions mismatch");
+	}
+
+	running_off = 0;
 	for (size_t vi = 0; vi < n_vecs; ++vi) {
 		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
 		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
 
 		const uint16_t cnt = column.counts[vi];
-		const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
+		const size_t   off = running_off;
+		running_off += static_cast<size_t>(cnt);
 
 		const uint16_t* pos_ptr = column.positions + off;
 		const T*        exc_ptr = column.exceptions + off;
@@ -715,9 +741,10 @@ inline vbw_t bit_width_for_max_value(const size_t max_value) {
 
 template <typename T>
 flsgpu::host::FFORColumn<T> make_ffor_from_values(const T* values, const size_t n_values, const vbw_t bit_width) {
+	using UINT_T       = typename flsgpu::host::FFORColumn<T>::UINT_T;
 	auto         bp     = bindings::compress(values, n_values, bit_width);
 	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
-	auto*        bases  = primitives::fill_array_with_constant<T>(new T[n_vecs], n_vecs, T {0});
+	auto*        bases  = primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0});
 	return flsgpu::host::FFORColumn<T> {bp, bases};
 }
 
@@ -734,10 +761,11 @@ flsgpu::host::BPColumn<T> generate_index_bp_column(const size_t n_values, const 
 
 template <typename T>
 flsgpu::host::FFORColumn<T> generate_index_ffor_column(const size_t n_values, const vbw_t value_bit_width) {
+	using UINT_T = typename flsgpu::host::FFORColumn<T>::UINT_T;
 	size_t n_vecs = utils::get_n_vecs_from_size(n_values);
 	return flsgpu::host::FFORColumn<T> {
 	    generate_index_bp_column<T>(n_values, value_bit_width),
-	    primitives::fill_array_with_random_data<T>(new T[n_vecs], n_vecs, 1, 0, 64),
+	    primitives::fill_array_with_random_data<UINT_T>(new UINT_T[n_vecs], n_vecs, 1, UINT_T {0}, UINT_T {64}),
 	};
 }
 
@@ -765,10 +793,12 @@ flsgpu::host::FFORColumn<T> generate_random_ffor_column(const size_t            
                                                         const ValueRange<vbw_t> value_bit_width,
                                                         const ValueRange<T>     bases,
                                                         const int32_t           repeat = 1) {
+	using UINT_T = typename flsgpu::host::FFORColumn<T>::UINT_T;
 	size_t n_vecs = utils::get_n_vecs_from_size(n_values);
 	return flsgpu::host::FFORColumn<T> {
 	    generate_random_bp_column<T>(n_values, value_bit_width, repeat),
-	    primitives::fill_array_with_random_data<T>(new T[n_vecs], n_vecs, 1, bases.min, bases.max),
+	    primitives::fill_array_with_random_data<UINT_T>(
+	        new UINT_T[n_vecs], n_vecs, 1, static_cast<UINT_T>(bases.min), static_cast<UINT_T>(bases.max)),
 	};
 }
 
@@ -793,18 +823,19 @@ generate_binary_bp_column(const size_t n_values, const ValueRange<vbw_t> value_b
 template <typename T>
 std::tuple<bool, flsgpu::host::FFORColumn<T>>
 generate_binary_ffor_column(const size_t n_values, const ValueRange<vbw_t> value_bit_width, const int32_t repeat = 1) {
+	using UINT_T                           = typename flsgpu::host::FFORColumn<T>::UINT_T;
 	size_t n_vecs                          = utils::get_n_vecs_from_size(n_values);
 	auto [contains_magic_value, bp_column] = generate_binary_bp_column<T>(n_values, value_bit_width, repeat);
-	T base                                 = 0;
+	UINT_T base                            = 0;
 
 	if (value_bit_width.max == 0) {
-		base = T {contains_magic_value};
+		base = static_cast<UINT_T>(contains_magic_value ? 1 : 0);
 	}
 
 	return std::make_tuple(contains_magic_value,
 	                       flsgpu::host::FFORColumn<T> {
 	                           bp_column,
-	                           primitives::fill_array_with_constant<T>(new T[n_vecs], n_vecs, base),
+	                           primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, base),
 	                       });
 }
 

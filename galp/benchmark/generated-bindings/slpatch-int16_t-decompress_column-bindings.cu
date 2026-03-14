@@ -1,7 +1,7 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/benchmark/generated-bindings/slpatch-uint64_t-decompress_column-bindings.cu
+// galp/benchmark/generated-bindings/slpatch-int16_t-decompress_column-bindings.cu
 // ────────────────────────────────────────────────────────
 #include "engine/kernels.cuh"
 #include "engine/multi-column-host-kernels.cuh"
@@ -11,8 +11,8 @@
 namespace bindings {
 
 template <>
-uint64_t* decompress_column<uint64_t, flsgpu::device::SLPATCHColumn<uint64_t>>(
-    const flsgpu::device::SLPATCHColumn<uint64_t> column,
+int16_t* decompress_column<int16_t, flsgpu::device::SLPATCHColumn<int16_t>>(
+    const flsgpu::device::SLPATCHColumn<int16_t> column,
     const unsigned                                unpack_n_vectors,
     const unsigned                                unpack_n_values,
     const enums::Unpacker                         unpacker,
@@ -22,118 +22,116 @@ uint64_t* decompress_column<uint64_t, flsgpu::device::SLPATCHColumn<uint64_t>>(
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::Stateful) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    1,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        1,
-		        flsgpu::device::BitUnpackerDummy<uint64_t, 1, 1, flsgpu::device::FFORFunctor<uint64_t, 1>>,
-		        flsgpu::device::StatefulSLPATCHExceptionPatcher<uint64_t, 1, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerDummy<int16_t, 1, 1, flsgpu::device::FFORFunctor<int16_t, 1>>,
+		        flsgpu::device::StatefulSLPATCHExceptionPatcher<int16_t, 1, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::Stateless) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    1,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        1,
-		        flsgpu::device::BitUnpackerDummy<uint64_t, 1, 1, flsgpu::device::FFORFunctor<uint64_t, 1>>,
-		        flsgpu::device::StatelessSLPATCHExceptionPatcher<uint64_t, 1, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerDummy<int16_t, 1, 1, flsgpu::device::FFORFunctor<int16_t, 1>>,
+		        flsgpu::device::StatelessSLPATCHExceptionPatcher<int16_t, 1, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
-
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
 	    patcher == enums::Patcher::Stateful) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    1,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<uint64_t, 1, 1, flsgpu::device::FFORFunctor<uint64_t, 1>>,
-		        flsgpu::device::StatefulSLPATCHExceptionPatcher<uint64_t, 1, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerStatefulBranchless<int16_t, 1, 1, flsgpu::device::FFORFunctor<int16_t, 1>>,
+		        flsgpu::device::StatefulSLPATCHExceptionPatcher<int16_t, 1, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
 	    patcher == enums::Patcher::Stateless) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    1,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<uint64_t, 1, 1, flsgpu::device::FFORFunctor<uint64_t, 1>>,
-		        flsgpu::device::StatelessSLPATCHExceptionPatcher<uint64_t, 1, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerStatefulBranchless<int16_t, 1, 1, flsgpu::device::FFORFunctor<int16_t, 1>>,
+		        flsgpu::device::StatelessSLPATCHExceptionPatcher<int16_t, 1, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
 	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::Stateful) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    4,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        4,
-		        flsgpu::device::BitUnpackerDummy<uint64_t, 4, 1, flsgpu::device::FFORFunctor<uint64_t, 4>>,
-		        flsgpu::device::StatefulSLPATCHExceptionPatcher<uint64_t, 4, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerDummy<int16_t, 4, 1, flsgpu::device::FFORFunctor<int16_t, 4>>,
+		        flsgpu::device::StatefulSLPATCHExceptionPatcher<int16_t, 4, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
 	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
 	    patcher == enums::Patcher::Stateless) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    4,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        4,
-		        flsgpu::device::BitUnpackerDummy<uint64_t, 4, 1, flsgpu::device::FFORFunctor<uint64_t, 4>>,
-		        flsgpu::device::StatelessSLPATCHExceptionPatcher<uint64_t, 4, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerDummy<int16_t, 4, 1, flsgpu::device::FFORFunctor<int16_t, 4>>,
+		        flsgpu::device::StatelessSLPATCHExceptionPatcher<int16_t, 4, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
-
 	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
 	    patcher == enums::Patcher::Stateful) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    4,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<uint64_t, 4, 1, flsgpu::device::FFORFunctor<uint64_t, 4>>,
-		        flsgpu::device::StatefulSLPATCHExceptionPatcher<uint64_t, 4, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerStatefulBranchless<int16_t, 4, 1, flsgpu::device::FFORFunctor<int16_t, 4>>,
+		        flsgpu::device::StatefulSLPATCHExceptionPatcher<int16_t, 4, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
 	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
 	    patcher == enums::Patcher::Stateless) {
 		return kernels::host::decompress_column<
-		    uint64_t,
+		    int16_t,
 		    4,
 		    1,
 		    flsgpu::device::SLPATCHDecompressor<
-		        uint64_t,
+		        int16_t,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<uint64_t, 4, 1, flsgpu::device::FFORFunctor<uint64_t, 4>>,
-		        flsgpu::device::StatelessSLPATCHExceptionPatcher<uint64_t, 4, 1>,
-		        flsgpu::device::SLPATCHColumn<uint64_t>>,
-		    flsgpu::device::SLPATCHColumn<uint64_t>>(column, n_samples);
+		        flsgpu::device::BitUnpackerStatefulBranchless<int16_t, 4, 1, flsgpu::device::FFORFunctor<int16_t, 4>>,
+		        flsgpu::device::StatelessSLPATCHExceptionPatcher<int16_t, 4, 1>,
+		        flsgpu::device::SLPATCHColumn<int16_t>>,
+		    flsgpu::device::SLPATCHColumn<int16_t>>(column, n_samples);
 	}
-	throw std::invalid_argument("Could not find correct binding in decompress_column SLPATCH<uint64_t>");
+	throw std::invalid_argument("Could not find correct binding in decompress_column SLPATCH<int16_t>");
 }
 
 } // namespace bindings

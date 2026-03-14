@@ -22,6 +22,7 @@ set(GALP_GENERATED_BINDINGS_SOURCES
         generated-bindings/ffor-uint64_t-query_column-bindings.cu
         generated-bindings/slpatch-uint32_t-decompress_column-bindings.cu
         generated-bindings/slpatch-uint64_t-decompress_column-bindings.cu
+        generated-bindings/slpatch-int16_t-decompress_column-bindings.cu
         generated-bindings/freq-uint32_t-decompress_column-bindings.cu
         generated-bindings/freq-uint64_t-decompress_column-bindings.cu
         generated-bindings/freq-int8_t-decompress_column-bindings.cu

@@ -593,10 +593,10 @@ static int32_t run_by_encoding_type(const ProgramParameters& params, bool print_
 			return 1;
 		}
 	case enums::Encoding::SLPATCH:
-		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+		if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t> || std::is_same_v<T, int16_t>) {
 			return verification::process_results(execute_slpatch<T>(params), print_debug);
 		} else {
-			std::cerr << "[error] slpatch only supports u32/u64.\n";
+			std::cerr << "[error] slpatch only supports i16/u32/u64.\n";
 			return 1;
 		}
 	case enums::Encoding::DICT_SLPATCH:

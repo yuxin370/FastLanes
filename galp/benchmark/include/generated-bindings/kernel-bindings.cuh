@@ -100,6 +100,13 @@ uint64_t* decompress_column(const flsgpu::device::SLPATCHColumn<uint64_t> column
                             const enums::Patcher                          patcher,
                             const enums::Expander                         expander,
                             const uint32_t                                n_samples);
+int16_t*  decompress_column(const flsgpu::device::SLPATCHColumn<int16_t> column,
+                            const unsigned                                unpack_n_vectors,
+                            const unsigned                                unpack_n_values,
+                            const enums::Unpacker                         unpacker,
+                            const enums::Patcher                          patcher,
+                            const enums::Expander                         expander,
+                            const uint32_t                                n_samples);
 uint32_t* decompress_column(const flsgpu::device::DICTSLPATCHColumn<uint32_t> column,
                             const unsigned                                    unpack_n_vectors,
                             const unsigned                                    unpack_n_values,
