@@ -228,7 +228,7 @@ public:
 
 template <typename T, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct StatefulSLPATCHDictExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
-	using INT_T = typename utils::same_width_int<T>::type;
+	using INT_T = typename utils::same_width_int<IndexT>::type;
 	using KEY_T = typename utils::same_width_uint<T>::type;
 
 	si_t                               start_index = 0;
@@ -274,6 +274,94 @@ public:
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index              = first_vector_index + v;
+			exceptions_count[v]         = column.index.counts[vec_index];
+			vec_exceptions_positions[v] = column.index.positions + column.index.exceptions_offsets[vec_index];
+			vec_exceptions[v]           = column.index.exceptions + column.index.exceptions_offsets[vec_index];
+		}
+	}
+};
+
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct StatelessSLPATCHExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
+	using INT_T = typename utils::same_width_int<T>::type;
+
+	si_t         start_index = 0;
+	uint16_t     exceptions_count[UNPACK_N_VECTORS];
+	uint16_t*    vec_exceptions_positions[UNPACK_N_VECTORS];
+	T*           vec_exceptions[UNPACK_N_VECTORS];
+	const lane_t lane;
+
+public:
+	void __device__ __forceinline__ patch(T* out) {
+		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		const int      first_pos = start_index * N_LANES + lane;
+		const int      last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
+		start_index += UNPACK_N_VALUES;
+
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			for (int i {0}; i < exceptions_count[v]; ++i) {
+				const auto position = vec_exceptions_positions[v][i];
+				if (position >= first_pos && position <= last_pos && position % N_LANES == lane) {
+					out[(position - first_pos) / N_LANES + v * UNPACK_N_VALUES] = vec_exceptions[v][i];
+				}
+			}
+		}
+	}
+
+	__device__ __forceinline__
+	StatelessSLPATCHExceptionPatcher(const SLPATCHColumn<T> column, const vi_t first_vector_index, const lane_t lane)
+	    : lane(lane) {
+
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			const auto vec_index         = first_vector_index + v;
+			exceptions_count[v]         = column.counts[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
+			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
+		}
+	}
+};
+
+template <typename T, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+struct StatelessSLPATCHDictExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
+	using INT_T = typename utils::same_width_int<IndexT>::type;
+	using KEY_T = typename utils::same_width_uint<T>::type;
+
+	si_t                               start_index = 0;
+	uint16_t                           exceptions_count[UNPACK_N_VECTORS];
+	uint16_t*                          vec_exceptions_positions[UNPACK_N_VECTORS];
+	IndexT*                            vec_exceptions[UNPACK_N_VECTORS];
+	DICTIndexFunctor<T, IndexT, KEY_T> processor;
+	const lane_t                       lane;
+
+public:
+	void __device__ __forceinline__ patch(T* out) {
+		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		const int      first_pos = start_index * N_LANES + lane;
+		const int      last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
+		start_index += UNPACK_N_VALUES;
+
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			for (int i {0}; i < exceptions_count[v]; ++i) {
+				const auto position = vec_exceptions_positions[v][i];
+				if (position >= first_pos && position <= last_pos && position % N_LANES == lane) {
+					out[(position - first_pos) / N_LANES + v * UNPACK_N_VALUES] = processor(vec_exceptions[v][i], v);
+				}
+			}
+		}
+	}
+
+	__device__ __forceinline__ StatelessSLPATCHDictExceptionPatcher(const DICTSLPATCHColumn<T, IndexT> column,
+	                                                                const vi_t   first_vector_index,
+	                                                                const lane_t lane)
+	    : processor(column.keys)
+	    , lane(lane) {
+
+#pragma unroll
+		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
+			const auto vec_index         = first_vector_index + v;
 			exceptions_count[v]         = column.index.counts[vec_index];
 			vec_exceptions_positions[v] = column.index.positions + column.index.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.index.exceptions + column.index.exceptions_offsets[vec_index];

@@ -11,24 +11,61 @@
 #ifndef GPU_DEVICE_UTILS_CUH
 #define GPU_DEVICE_UTILS_CUH
 
+namespace lane_policy {
+
+// Value-lane policy keeps FastLanes semantics:
+// logical lanes are derived from the encoded value type width.
+template <typename T>
+struct ValueLanePolicy {
+	static constexpr uint32_t semantic_lanes   = static_cast<uint32_t>(utils::get_n_lanes<T>());
+	static constexpr uint32_t scheduling_lanes = (semantic_lanes < uint32_t {consts::THREADS_PER_WARP})
+	                                                  ? uint32_t {consts::THREADS_PER_WARP}
+	                                                  : semantic_lanes;
+	static constexpr uint32_t values_per_lane  = static_cast<uint32_t>(utils::get_values_per_lane<T>());
+};
+
+// Dict policy intentionally separates output type and index-code type.
+// This is used to reason about semantic lanes (index stream) vs scheduling lanes.
+template <typename ValueT, typename IndexT>
+struct DictLanePolicy {
+	static constexpr uint32_t value_lanes  = ValueLanePolicy<ValueT>::semantic_lanes;
+	static constexpr uint32_t index_lanes  = ValueLanePolicy<IndexT>::semantic_lanes;
+	static constexpr uint32_t semantic_lanes   = index_lanes;
+	static constexpr uint32_t scheduling_lanes = (ValueLanePolicy<ValueT>::scheduling_lanes >
+	                                              ValueLanePolicy<IndexT>::scheduling_lanes)
+	                                                 ? ValueLanePolicy<ValueT>::scheduling_lanes
+	                                                 : ValueLanePolicy<IndexT>::scheduling_lanes;
+	static constexpr uint32_t values_per_lane  =
+	    static_cast<uint32_t>(consts::VALUES_PER_VECTOR / semantic_lanes);
+};
+
+} // namespace lane_policy
+
 template <typename T>
 struct SingleVectorPerWarpThreadblockMapping {
-	static constexpr unsigned N_WARPS_PER_BLOCK   = std::max(utils::get_n_lanes<T>() / consts::THREADS_PER_WARP, 8);
+	using Policy = lane_policy::ValueLanePolicy<T>;
+
+	static constexpr unsigned N_WARPS_PER_BLOCK =
+	    std::max(Policy::semantic_lanes / uint32_t {consts::THREADS_PER_WARP}, 8u); // at least 8 warps per block to ensure enough parallelism for latency hiding
 	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
 	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK =
-	    N_THREADS_PER_BLOCK / std::max(utils::get_n_lanes<T>(), consts::THREADS_PER_WARP);
+	    N_THREADS_PER_BLOCK / std::max(Policy::semantic_lanes, uint32_t {consts::THREADS_PER_WARP});
 
 	const unsigned n_blocks;
 
+	// to cover all the vectors, we need at least n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK) blocks
 	SingleVectorPerWarpThreadblockMapping(const size_t unpack_n_vecs, const size_t n_vecs)
 	    : n_blocks(std::max(static_cast<unsigned long>(1), n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK))) {
 	}
 };
 template <typename T>
 struct FillWarpThreadblockMapping {
-	static constexpr unsigned N_WARPS_PER_BLOCK   = std::max(utils::get_n_lanes<T>() / consts::THREADS_PER_WARP, 8);
+	using Policy = lane_policy::ValueLanePolicy<T>;
+
+	static constexpr unsigned N_WARPS_PER_BLOCK =
+	    std::max(Policy::semantic_lanes / uint32_t {consts::THREADS_PER_WARP}, 8u);
 	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
-	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK = N_THREADS_PER_BLOCK / utils::get_n_lanes<T>();
+	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK = N_THREADS_PER_BLOCK / Policy::semantic_lanes;
 
 	const unsigned n_blocks;
 
@@ -53,8 +90,10 @@ struct VectorToWarpMappingBase {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct SingleVectorPerWarpMapping : VectorToWarpMappingBase {
-	static constexpr uint32_t N_LANES          = utils::get_n_lanes<T>();
-	static constexpr uint32_t N_VALUES_IN_LANE = utils::get_values_per_lane<T>();
+	using Policy = lane_policy::ValueLanePolicy<T>;
+
+	static constexpr uint32_t N_LANES          = Policy::semantic_lanes;
+	static constexpr uint32_t N_VALUES_IN_LANE = Policy::values_per_lane;
 
 	__device__ __forceinline__ lane_t get_lane() const override {
 		return threadIdx.x % N_LANES;
@@ -77,8 +116,10 @@ struct SingleVectorPerWarpMapping : VectorToWarpMappingBase {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct FillWarpMapping : VectorToWarpMappingBase {
-	static constexpr uint32_t N_LANES          = utils::get_n_lanes<T>();
-	static constexpr uint32_t N_VALUES_IN_LANE = utils::get_values_per_lane<T>();
+	using Policy = lane_policy::ValueLanePolicy<T>;
+
+	static constexpr uint32_t N_LANES          = Policy::semantic_lanes;
+	static constexpr uint32_t N_VALUES_IN_LANE = Policy::values_per_lane;
 
 	__device__ __forceinline__ lane_t get_lane() const override {
 		return threadIdx.x % N_LANES;
@@ -100,62 +141,11 @@ struct FillWarpMapping : VectorToWarpMappingBase {
 
 #ifdef SingleVectorMapping
 template <typename T, unsigned UNPACK_N_VECTORS>
-using VectorToWarpMapping = OneVectorPerWarpMapping<T, UNPACK_N_VECTORS>;
+using VectorToWarpMapping = SingleVectorPerWarpMapping<T, UNPACK_N_VECTORS>;
 #else
 template <typename T, unsigned UNPACK_N_VECTORS>
 using VectorToWarpMapping = FillWarpMapping<T, UNPACK_N_VECTORS>;
 #endif
-
-struct WorkItemLaunchConfig {
-	dim3 grid;
-	dim3 block;
-};
-
-template <typename T, unsigned UNPACK_N_VECTORS = 1>
-inline WorkItemLaunchConfig make_workitem_launch_config(const size_t n_items) {
-	using Mapping = ThreadblockMapping<T>;
-	const size_t concurrent =
-	    static_cast<size_t>(Mapping::N_CONCURRENT_VECTORS_PER_BLOCK) * static_cast<size_t>(UNPACK_N_VECTORS);
-	const size_t blocks = std::max<size_t>(1, (n_items + concurrent - 1) / concurrent);
-	return WorkItemLaunchConfig {dim3(static_cast<uint32_t>(blocks)),
-	                             dim3(static_cast<uint32_t>(Mapping::N_THREADS_PER_BLOCK))};
-}
-
-struct TableLaunchConfig {
-	dim3 grid;
-	dim3 block;
-};
-
-struct TableWorkItemMapping {
-	static constexpr uint32_t LANES_I8    = utils::get_n_lanes<int8_t>();
-	static constexpr uint32_t LANES_I16   = utils::get_n_lanes<int16_t>();
-	static constexpr uint32_t GROUP_LANES = (LANES_I8 > LANES_I16) ? LANES_I8 : LANES_I16;
-
-	__device__ __forceinline__ uint32_t get_item_index() const {
-		const uint32_t groups_per_block = blockDim.x / GROUP_LANES;
-		const uint32_t group_in_block   = threadIdx.x / GROUP_LANES;
-		return blockIdx.x * groups_per_block + group_in_block;
-	}
-
-	__device__ __forceinline__ uint32_t get_lane() const {
-		return threadIdx.x - (threadIdx.x / GROUP_LANES) * GROUP_LANES;
-	}
-
-	__device__ __forceinline__ uint32_t get_group_stride() const {
-		const uint32_t groups_per_block = blockDim.x / GROUP_LANES;
-		return gridDim.x * groups_per_block;
-	}
-};
-
-inline TableLaunchConfig make_table_launch_config(const size_t n_items) {
-	constexpr uint32_t group_lanes   = TableWorkItemMapping::GROUP_LANES;
-	constexpr uint32_t block_threads = ThreadblockMapping<int8_t>::N_THREADS_PER_BLOCK;
-	static_assert(block_threads % group_lanes == 0, "block size must be multiple of max lanes");
-	const uint32_t groups_per_block = block_threads / group_lanes;
-	const size_t   blocks           = std::max<size_t>(1, (n_items + groups_per_block - 1) / groups_per_block);
-
-	return TableLaunchConfig {dim3(static_cast<uint32_t>(blocks)), dim3(static_cast<uint32_t>(block_threads))};
-}
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, unsigned N_LANES>
 __device__ __forceinline__ void write_registers_to_global(const lane_t lane,

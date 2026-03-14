@@ -3,6 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/execution/rowgroup.cu
 // ────────────────────────────────────────────────────────
+#include "engine/execution/dict_ref_resolver.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/execution/table.cuh"
 #include "engine/data/value-store.cuh"
@@ -25,35 +26,6 @@ inline size_t column_n_values(const expr::Expression& expression) {
 	}
 	return std::visit([](auto&& host_col) -> size_t { return host_col.get_n_values(); }, expression.column->host);
 }
-
-inline void cleanup_prepared(PreparedBatches& prepared) {
-	dispatch::for_each_type(SupportedTypes {}, [&](auto tag) {
-		using T     = typename decltype(tag)::type;
-		auto& batch = prepared.host_batches.template get<T>();
-		for (auto& expr : batch.device_exprs) {
-			detail::free_device_expr(expr);
-		}
-		batch.device_exprs.clear();
-		batch.device_outputs.clear();
-		batch.work_items.clear();
-		batch.expr_indices.clear();
-	});
-}
-
-struct PreparedCleanupGuard {
-	PreparedBatches* prepared = nullptr;
-	bool             active   = true;
-
-	explicit PreparedCleanupGuard(PreparedBatches& p) : prepared(&p) {}
-	~PreparedCleanupGuard() {
-		if (active && prepared) {
-			cleanup_prepared(*prepared);
-		}
-	}
-	void dismiss() {
-		active = false;
-	}
-};
 
 struct WorksetCleanupGuard {
 	BenchmarkWorkset* workset = nullptr;
@@ -107,13 +79,13 @@ inline PreparedBatches prepare_batches(const std::vector<expr::Expression>& expr
 		if (!expr.column || expr.column->skip_decompress) {
 			continue;
 		}
-		const auto plan = plan_for_ops(expr.ops);
 		++prepared.n_expressions;
 
 		std::visit(
 		    [&](auto&& host_col) {
 			    using HostColT = std::decay_t<decltype(host_col)>;
-			    using T        = typename host_value_type<HostColT>::type;
+			    using T                = typename host_value_type<HostColT>::type;
+			    constexpr auto plan = detail::plan_for_host_col<HostColT>();
 
 			    static_assert(is_supported_type_v<T>, "dispatch rowgroup only supports int8_t/int16_t");
 			    prepared.total_bytes += host_col.get_n_values() * sizeof(T);
@@ -134,14 +106,16 @@ inline PreparedBatches prepare_batches(const std::vector<expr::Expression>& expr
 inline RowgroupData run_materialize(PreparedBatches&                     prepared,
                                     const std::vector<expr::Expression>& expressions,
                                     const Config&                        cfg) {
-	PreparedCleanupGuard guard(prepared);
-
 	RowgroupData materialized;
 	materialized.columns.resize(expressions.size());
+	BenchmarkWorkset workset {};
+	workset.host_batches = std::move(prepared.host_batches);
+	WorksetCleanupGuard guard(workset);
+	prepare_dispatch_buffers(workset);
+	run_kernel(workset, 1, cfg.gpu_dispatch_kernel, true);
 	dispatch::for_each_type(SupportedTypes {}, [&](auto tag) {
 		using T     = typename decltype(tag)::type;
-		auto& batch = prepared.host_batches.template get<T>();
-		detail::launch_batch(batch);
+		auto& batch = workset.host_batches.template get<T>();
 		detail::finalize_batch(batch, materialized);
 	});
 
@@ -184,6 +158,7 @@ inline RowgroupData run_materialize(PreparedBatches&                     prepare
 	}
 
 	guard.dismiss();
+	free_batches(workset);
 	return materialized;
 }
 
@@ -200,7 +175,7 @@ inline BenchmarkResult run_benchmark(PreparedBatches&& prepared, const Config& c
 
 	prepare_dispatch_buffers(workset);
 	bench.n_work_items = workset.work_items.size();
-	bench.total_ms     = run_kernel(workset, cfg.n_samples, false);
+	bench.total_ms = run_kernel(workset, cfg.n_samples, false, false);
 	bench.avg_us       = (cfg.n_samples > 0) ? (bench.total_ms * 1000.0 / static_cast<double>(cfg.n_samples)) : 0.0;
 
 	guard.dismiss();
@@ -210,9 +185,12 @@ inline BenchmarkResult run_benchmark(PreparedBatches&& prepared, const Config& c
 
 } // namespace
 
-RowgroupExecuteResult execute_rowgroup(const std::vector<expr::Expression>& expressions,
-                                       const Config&                        cfg,
-                                       const ExecuteMode                    mode) {
+RowgroupExecuteResult execute_rowgroup(std::vector<expr::Expression>& expressions,
+                                       const Config&                  cfg,
+                                       const ExecuteMode              mode) {
+	dispatch::resolve_dict_refs(expressions);
+	// dispatch::sync_expression_ops_after_resolve(expressions); // only for validation
+
 	auto                 prepared = prepare_batches(expressions);
 	RowgroupExecuteResult out;
 	if (mode == ExecuteMode::Materialize) {
@@ -224,14 +202,31 @@ RowgroupExecuteResult execute_rowgroup(const std::vector<expr::Expression>& expr
 	return out;
 }
 
-RowgroupData decompress_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg) {
+RowgroupExecuteResult execute_rowgroup(const std::vector<expr::Expression>& expressions,
+                                       const Config&                        cfg,
+                                       const ExecuteMode                    mode) {
+	auto mutable_expressions = expressions;
+	return execute_rowgroup(mutable_expressions, cfg, mode);
+}
+
+RowgroupData decompress_rowgroup(std::vector<expr::Expression>& expressions, const Config& cfg) {
 	auto exec = execute_rowgroup(expressions, cfg, ExecuteMode::Materialize);
 	return std::move(exec.materialized.value());
 }
 
-BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg) {
+RowgroupData decompress_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg) {
+	auto mutable_expressions = expressions;
+	return decompress_rowgroup(mutable_expressions, cfg);
+}
+
+BenchmarkResult benchmark_rowgroup(std::vector<expr::Expression>& expressions, const Config& cfg) {
 	auto exec = execute_rowgroup(expressions, cfg, ExecuteMode::BenchmarkOnly);
 	return std::move(exec.benchmark.value());
+}
+
+BenchmarkResult benchmark_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg) {
+	auto mutable_expressions = expressions;
+	return benchmark_rowgroup(mutable_expressions, cfg);
 }
 
 } // namespace dispatch

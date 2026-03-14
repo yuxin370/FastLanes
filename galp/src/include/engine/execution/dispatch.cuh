@@ -13,9 +13,14 @@
 
 namespace device_exec {
 
-template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true, typename DecompressorT>
+template <typename T,
+          int UNPACK_N_VECTORS,
+          int UNPACK_N_VALUES,
+          bool WRITE_OUT = true,
+          typename MappingT = T,
+          typename DecompressorT>
 __device__ __forceinline__ void run_decompressor(DecompressorT&& iterator, const lane_t lane, T* __restrict out) {
-	const auto mapping = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
+	const auto mapping = VectorToWarpMapping<MappingT, UNPACK_N_VECTORS>();
 	T          registers[UNPACK_N_VALUES * UNPACK_N_VECTORS];
 	uint32_t   acc = 2166136261u;
 	for (si_t i = 0; i < mapping.N_VALUES_IN_LANE; i += UNPACK_N_VALUES) {
@@ -38,7 +43,10 @@ __device__ __forceinline__ void run_decompressor(DecompressorT&& iterator, const
 
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
 __device__ __forceinline__ void
-execute_plan(const dispatch::DeviceExpression<T>& expr, const vi_t vector_index, const lane_t lane, T* __restrict out) {
+execute_plan(const dispatch::DeviceExpression<T>& expr,
+             const vi_t                           vector_index,
+             const lane_t                         lane,
+             T* __restrict                        out) {
 	switch (expr.plan) {
 	case dispatch::PlanKind::UNCOMPRESSED: {
 		using UnpackerT = flsgpu::device::
@@ -87,10 +95,10 @@ execute_plan(const dispatch::DeviceExpression<T>& expr, const vi_t vector_index,
 			using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
 			using UnpackerT  = flsgpu::device::
 			    BitUnpackerStatefulBranchlessIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
-			using DecompressorT = flsgpu::device::
-			    DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, flsgpu::device::DICTFFORColumn<T, IndexT>, ProcessorT>;
-			auto iterator = DecompressorT(expr.col.dictffor_u8, vector_index, lane);
-			run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
+				using DecompressorT = flsgpu::device::
+				    DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, flsgpu::device::DICTFFORColumn<T, IndexT>, ProcessorT>;
+				auto iterator = DecompressorT(expr.col.dictffor_u8, vector_index, lane);
+				run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, uint8_t>(iterator, lane, out);
 		} else {
 			using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>;
 			using UnpackerT =
@@ -108,17 +116,17 @@ execute_plan(const dispatch::DeviceExpression<T>& expr, const vi_t vector_index,
 			using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
 			using UnpackerT  = flsgpu::device::
 			    BitUnpackerStatefulBranchlessIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
-			using PatcherT =
-			    flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-			using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
-			                                                              UNPACK_N_VECTORS,
-			                                                              UNPACK_N_VALUES,
-			                                                              UnpackerT,
-			                                                              PatcherT,
-			                                                              flsgpu::device::DICTSLPATCHColumn<T, IndexT>,
-			                                                              ProcessorT>;
-			auto iterator       = DecompressorT(expr.col.dictslpatch_u8, vector_index, lane);
-			run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
+				using PatcherT = flsgpu::device::
+				    StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+				using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
+				                                                              UNPACK_N_VECTORS,
+				                                                              UNPACK_N_VALUES,
+				                                                              UnpackerT,
+				                                                              PatcherT,
+				                                                              flsgpu::device::DICTSLPATCHColumn<T, IndexT>,
+				                                                              ProcessorT>;
+				auto iterator       = DecompressorT(expr.col.dictslpatch_u8, vector_index, lane);
+				run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, uint8_t>(iterator, lane, out);
 		} else {
 			using IndexT     = typename flsgpu::device::DICTSLPATCHColumn<T>::INDEX_T;
 			using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>;
@@ -228,7 +236,8 @@ template <int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
 __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_t>*  exprs_i8,
                                           const dispatch::DeviceExpression<int16_t>* exprs_i16,
                                           const dispatch::WorkItemAny*               work_items,
-                                          const size_t                               n_items) {
+                                          const size_t                               n_items,
+                                          const uint32_t                             i16_start_index) {
 	constexpr uint32_t lanes_i8   = utils::get_n_lanes<int8_t>();
 	constexpr uint32_t lanes_i16  = utils::get_n_lanes<int16_t>();
 	constexpr uint32_t warp_lanes = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
@@ -253,25 +262,43 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 			return;
 		}
 		int8_t* out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
-		device_exec::execute_plan<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(*expr, vector_index, lane, out);
+		device_exec::execute_plan<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(
+		    *expr, vector_index, lane, out);
 		break;
 	}
 	case dispatch::TypeTag::I16: {
 		if (exprs_i16 == nullptr) {
 			return;
 		}
-
-		// Pair adjacent i16 items so both halves of warp_lanes are used.
-		// If previous item is i16, this item is already handled as the second half.
-		if (item_idx > 0 && work_items[item_idx - 1].type == dispatch::TypeTag::I16) {
-			return;
+		const auto* expr0 = exprs_i16 + work.expr_index;
+		const bool  full_lanes_dict_u8 =
+		    (expr0->dict_index_bits == 8) &&
+		    (expr0->plan == dispatch::PlanKind::DICT_FFOR || expr0->plan == dispatch::PlanKind::DICT_FFOR_SLPATCH);
+		if (full_lanes_dict_u8) {
+			const vi_t   vector_index = static_cast<vi_t>(work.vector_index);
+			const size_t n_vecs       = utils::get_n_vecs_from_size(expr0->n_values);
+			if (static_cast<size_t>(vector_index) >= n_vecs) {
+				return;
+			}
+			int16_t* out = expr0->out + vector_index * consts::VALUES_PER_VECTOR;
+			device_exec::execute_plan<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(
+			    *expr0, vector_index, lane, out);
+			break;
 		}
 
+		// Pair contiguous i16 items in the i16 range [i16_start_index, n_items).
+		if (item_idx < i16_start_index) {
+			return;
+		}
+		const uint32_t i16_local = item_idx - i16_start_index;
+		if ((i16_local & 1u) != 0u) {
+			return; // odd local index is handled by previous even item
+		}
 		const bool has_second_i16 =
 		    (item_idx + 1 < n_items) && (work_items[item_idx + 1].type == dispatch::TypeTag::I16);
 		const bool run_second = has_second_i16 && (lane >= lanes_i16);
-		const auto work_i16   = run_second ? work_items[item_idx + 1] : work;
-		const auto lane_i16   = run_second ? (lane - lanes_i16) : lane;
+		auto       work_i16   = run_second ? work_items[item_idx + 1] : work;
+		auto       lane_i16   = run_second ? (lane - lanes_i16) : lane;
 		if (lane_i16 >= lanes_i16) {
 			return;
 		}

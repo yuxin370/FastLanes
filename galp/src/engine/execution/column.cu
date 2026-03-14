@@ -263,8 +263,7 @@ ValueStore decompress(const expr::Expression& expression, const Config& cfg) {
 	return std::visit(
 	    [&](auto&& host_col) -> ValueStore {
 		    using HostColT = std::decay_t<decltype(host_col)>;
-		    const auto plan =
-		        col.skip_decompress ? detail::plan_for_host_col<HostColT>() : plan_for_ops(expression.ops);
+		    const auto plan = detail::plan_for_host_col<HostColT>();
 		    return detail::decompress_host(host_col, plan, cfg);
 	    },
 	    col.host);

@@ -31,6 +31,7 @@ struct Config {
 	unsigned unpack_n_vectors = 1;
 	unsigned unpack_n_values  = 1;
 	uint32_t n_samples        = 1;
+	bool     gpu_dispatch_kernel = true;
 
 	constexpr DecodeChunk chunk() const {
 		return DecodeChunk {unpack_n_vectors, unpack_n_values};
@@ -110,6 +111,10 @@ struct host_value_type<flsgpu::host::DICTFFORColumn<T, IndexT>> {
 	using type = T;
 };
 template <typename T, typename IndexT>
+struct host_value_type<flsgpu::host::DICTREFColumn<T, IndexT>> {
+	using type = T;
+};
+template <typename T, typename IndexT>
 struct host_value_type<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
 	using type = T;
 };
@@ -156,6 +161,10 @@ struct host_plan_kind<flsgpu::host::SLPATCHColumn<T>> {
 };
 template <typename T, typename IndexT>
 struct host_plan_kind<flsgpu::host::DICTFFORColumn<T, IndexT>> {
+	static constexpr PlanKind value = PlanKind::DICT_FFOR;
+};
+template <typename T, typename IndexT>
+struct host_plan_kind<flsgpu::host::DICTREFColumn<T, IndexT>> {
 	static constexpr PlanKind value = PlanKind::DICT_FFOR;
 };
 template <typename T, typename IndexT>

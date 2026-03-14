@@ -27,7 +27,6 @@ struct BenchmarkWorkset {
 	bool                                           freq_prefetch_all_branchless = false;
 	bool                                           freq_hybrid_patcher          = false;
 	float                                          freq_branchless_threshold     = 6.0f;
-	bool                                           freq_bucket_by_patcher        = false;
 };
 
 struct TableBenchmarkConfig {
@@ -38,7 +37,6 @@ struct TableBenchmarkConfig {
 	bool                  freq_prefetch_all_branchless = false;
 	bool                  freq_hybrid_patcher          = false;
 	float                 freq_branchless_threshold    = 6.0f;
-	bool                  freq_bucket_by_patcher       = false;
 	std::optional<size_t> rowgroup;
 };
 
@@ -59,10 +57,10 @@ struct TableBenchmarkResult {
 };
 
 // Append one rowgroup's expressions into a workset. Returns elapsed ms.
-double append_expressions(BenchmarkWorkset&                    workset,
-                          const std::vector<expr::Expression>& expressions,
-                          size_t*                              out_total_bytes = nullptr,
-                          size_t*                              out_n_exprs     = nullptr);
+double append_expressions(BenchmarkWorkset&              workset,
+                          std::vector<expr::Expression>& expressions,
+                          size_t*                        out_total_bytes = nullptr,
+                          size_t*                        out_n_exprs     = nullptr);
 
 // Prepare dispatch-side device buffers (d_exprs + d_items). Returns elapsed ms.
 double prepare_dispatch_buffers(BenchmarkWorkset& workset);
