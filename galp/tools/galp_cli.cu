@@ -47,7 +47,6 @@ struct Options {
 	bool                                 freq_prefetch_all_branchless = false;
 	bool                                 freq_hybrid_patcher          = false;
 	float                                freq_branchless_threshold    = 6.0f;
-	bool                                 freq_bucket_by_patcher       = false;
 };
 
 std::string format_bytes(double bytes) {
@@ -83,8 +82,7 @@ void print_usage(const char* prog) {
 		          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
 		          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
 		          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
-		          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n"
-		          << "  --freq-bucket-by-patcher  Group FREQ work items by selected patcher\n";
+		          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n";
 }
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -95,6 +93,7 @@ bool parse_args(int argc, char** argv, Options& opt) {
 	std::string_view mode_arg = argv[1];
 	if (mode_arg == "read_table" || mode_arg == "read") {
 		opt.mode = Mode::ReadTable;
+		opt.gpu_dispatch_kernel = true;
 	} else if (mode_arg == "benchmark" || mode_arg == "bench") {
 		opt.mode = Mode::Benchmark;
 	} else if (mode_arg == "measure_launch" || mode_arg == "launch") {
@@ -144,10 +143,6 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--freq-branchless-threshold" && i + 1 < argc) {
 			opt.freq_branchless_threshold = std::stof(argv[++i]);
-			continue;
-		}
-		if (arg == "--freq-bucket-by-patcher") {
-			opt.freq_bucket_by_patcher = true;
 			continue;
 		}
 		if (arg == "--launch-iters" && i + 1 < argc) {
@@ -205,14 +200,14 @@ void write_cell(std::ostream& out, const PtrT& ptr, size_t row) {
 }
 
 void write_row(std::ostream&                             out,
-               const std::vector<size_t>&                col_indices,
+               const std::vector<size_t>&                value_indices,
                const dispatch::RowgroupData&             rowgroup_data,
                const size_t                              row) {
-	for (size_t ci = 0; ci < col_indices.size(); ++ci) {
+	for (size_t ci = 0; ci < value_indices.size(); ++ci) {
 		if (ci > 0) {
 			out << "|";
 		}
-		const auto  col_idx = col_indices[ci];
+		const auto  col_idx = value_indices[ci];
 		const auto& opt     = rowgroup_data.columns[col_idx];
 		if (!opt.has_value()) {
 			continue;
@@ -321,16 +316,36 @@ int main(int argc, char** argv) {
 			for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
 				auto rowgroup    = rdr.read_rowgroup(rg_idx);
 				auto expressions = expr::assemble(rowgroup);
-				auto result      = dispatch::decompress_rowgroup(expressions);
+				dispatch::Config decode_cfg {};
+				decode_cfg.gpu_dispatch_kernel = opt.gpu_dispatch_kernel;
+				auto result                        = dispatch::decompress_rowgroup(expressions, decode_cfg);
 
-				std::vector<size_t>      col_indices;
+				std::vector<size_t>      value_indices;
 				std::vector<std::string> col_names;
+				const auto resolve_value_index = [&](size_t idx) {
+					size_t cur = idx;
+					for (size_t step = 0; step < expressions.size(); ++step) {
+						if (cur >= expressions.size()) {
+							break;
+						}
+						const auto& e = expressions[cur];
+						if (!e.column || !e.column->skip_decompress || !e.column->alias_of.has_value()) {
+							break;
+						}
+						const size_t next = *e.column->alias_of;
+						if (next >= expressions.size() || next == cur) {
+							break;
+						}
+						cur = next;
+					}
+					return cur;
+				};
 				for (size_t i = 0; i < expressions.size(); ++i) {
 					const auto& expr = expressions[i];
-					if (!expr.column || expr.column->skip_decompress) {
+					if (!expr.column) {
 						continue;
 					}
-					col_indices.push_back(i);
+					value_indices.push_back(resolve_value_index(i));
 					auto name = expr.column->name;
 					if (name.empty()) {
 						name = "col_" + std::to_string(i);
@@ -349,9 +364,9 @@ int main(int argc, char** argv) {
 					header_written = true;
 				}
 
-				const size_t n_values = rowgroup.n_values;
-				for (size_t row = 0; row < n_values; ++row) {
-					write_row(*out, col_indices, result, row);
+				const size_t n_rows = rowgroup.n_tuples;
+				for (size_t row = 0; row < n_rows; ++row) {
+					write_row(*out, value_indices, result, row);
 				}
 
 				dispatch::free_rowgroup(rowgroup);
@@ -368,7 +383,6 @@ int main(int argc, char** argv) {
 			bench_cfg.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
 			bench_cfg.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
 			bench_cfg.freq_branchless_threshold    = opt.freq_branchless_threshold;
-			bench_cfg.freq_bucket_by_patcher       = opt.freq_bucket_by_patcher;
 			bench_cfg.rowgroup                     = opt.rowgroup;
 			const auto result     = dispatch::benchmark_table(opt.input, bench_cfg);
 
@@ -449,7 +463,6 @@ int main(int argc, char** argv) {
 				std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";
 				std::cout << "  freq_hybrid_patcher: " << (opt.freq_hybrid_patcher ? 1 : 0) << "\n";
 				std::cout << "  freq_branchless_threshold: " << opt.freq_branchless_threshold << "\n";
-				std::cout << "  freq_bucket_by_patcher: " << (opt.freq_bucket_by_patcher ? 1 : 0) << "\n";
 				if (opt.estimate_launch && total_launches > 0) {
 				const uint32_t block = utils::get_n_lanes<int8_t>();
 				uint32_t       grid  = static_cast<uint32_t>(avg_grid_per_launch);

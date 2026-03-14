@@ -28,8 +28,24 @@ Replace the placeholders below:
 8) Benchmark one rowgroup with launch-overhead estimate (multi-kernel rowgroup path)
 <GALP_CLI> benchmark <FLS_FILE> --samples 100 --estimate-launch --launch-iters 10000 --rowgroup 0
 
+9) Frequency uses Stateful patcher (default)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --gpu-dispatch-kernel
+
+10) Frequency uses Branchless patcher (extended + PrefetchAllBranchless)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --gpu-dispatch-kernel --freq-prefetch-all-branchless
+
+11) Frequency uses Hybrid selection (stateful/branchless by exception density)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --gpu-dispatch-kernel --freq-prefetch-all-branchless --freq-hybrid-patcher --freq-branchless-threshold 6
+
 Notes
 - Default mega path aggregates a full-table workset, then dispatches by type (can launch multiple kernels per sample).
 - `--gpu-dispatch-kernel` enables GPU-side mixed dispatch and runs one mixed kernel launch per sample.
 - `--no-mega-kernel` runs per-rowgroup worksets (typically more launches and higher host overhead).
 - `--write-back` forces benchmark kernels to write decompressed outputs to global memory.
+- Frequency patcher selection:
+- Stateful path is default (do not pass `--freq-prefetch-all-branchless`).
+- Branchless path is enabled by `--freq-prefetch-all-branchless`.
+- `--freq-hybrid-patcher` enables per-frequency-column selection between stateful and branchless.
+- `--freq-hybrid-patcher` is effective only when `--freq-prefetch-all-branchless` is enabled.
+- `--freq-branchless-threshold N` sets the hybrid cutoff by exception density (exceptions per vector).
+- `--freq-branchless-threshold` is effective only when both `--freq-prefetch-all-branchless` and `--freq-hybrid-patcher` are enabled.
