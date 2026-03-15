@@ -4,6 +4,7 @@ set(GALP_CORE_SOURCES
         engine/execution/column.cu
         engine/execution/rowgroup.cu
         engine/execution/table.cu
+        engine/io/to_csv.cu
         engine/expression.cu
 )
 add_library(galp_core STATIC ${GALP_CORE_SOURCES})

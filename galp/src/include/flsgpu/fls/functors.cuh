@@ -42,23 +42,22 @@ struct FFORFunctor : FunctorBase<T> {
 	}
 };
 
-template <typename T, unsigned UNPACK_N_VECTORS>
+template <typename T, unsigned UNPACK_N_VECTORS, typename IndexT = typename utils::same_width_uint<T>::type>
 struct DICTFunctor : FunctorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	const UINT_T* __restrict__ keys;
-	UINT_T bases[UNPACK_N_VECTORS];
+	using KEY_T = typename utils::same_width_uint<T>::type;
+	const KEY_T* __restrict__ keys;
+	IndexT bases[UNPACK_N_VECTORS];
 
-	__device__ __forceinline__ DICTFunctor(const UINT_T* a_bases, const UINT_T* a_keys)
+	__device__ __forceinline__ DICTFunctor(const IndexT* a_bases, const KEY_T* a_keys)
 	    : keys(a_keys) {
 #pragma unroll
 		for (int v = 0; v < UNPACK_N_VECTORS; ++v)
 			bases[v] = a_bases[v];
 	}
 
-	__device__ __forceinline__ T operator()(UINT_T value, vi_t vector_index) {
-		const auto idx = value + bases[vector_index];
+	__device__ __forceinline__ T operator()(IndexT value, vi_t vector_index) {
+		const auto idx = static_cast<size_t>(value + bases[vector_index]);
 
-		// return __ldg(keys + idx);
 		return static_cast<T>(keys[idx]);
 	}
 };
@@ -72,26 +71,6 @@ struct DICTIndexFunctor {
 
 	__device__ __forceinline__ T operator()(IndexT value, vi_t) {
 		return static_cast<T>(keys[value]);
-	}
-};
-
-template <typename T, typename IndexT, unsigned UNPACK_N_VECTORS>
-struct DICTFunctorIdx {
-	using KEY_T = typename utils::same_width_uint<T>::type;
-	const KEY_T* __restrict__ keys;
-	IndexT bases[UNPACK_N_VECTORS];
-
-	__device__ __forceinline__ DICTFunctorIdx(const IndexT* a_bases, const KEY_T* a_keys)
-	    : keys(a_keys) {
-#pragma unroll
-		for (int v = 0; v < UNPACK_N_VECTORS; ++v) {
-			bases[v] = a_bases[v];
-		}
-	}
-
-	__device__ __forceinline__ T operator()(IndexT value, vi_t vector_index) {
-		const auto idx = static_cast<size_t>(value + bases[vector_index]);
-		return static_cast<T>(keys[idx]);
 	}
 };
 

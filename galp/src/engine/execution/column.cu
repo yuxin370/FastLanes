@@ -23,19 +23,12 @@ using FFORUnpacker = flsgpu::device::BitUnpackerStatefulBranchless<T,
                                                                    UNPACK_N_VALUES,
                                                                    flsgpu::device::FFORFunctor<T, UNPACK_N_VECTORS>>;
 
-template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename IndexT = typename utils::same_width_uint<T>::type>
 using DICTUnpacker = flsgpu::device::BitUnpackerStatefulBranchless<T,
                                                                    UNPACK_N_VECTORS,
                                                                    UNPACK_N_VALUES,
-                                                                   flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>>;
-
-template <typename T, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-using DICTUnpackerIdx =
-    flsgpu::device::BitUnpackerStatefulBranchlessIdx<T,
-                                                     IndexT,
-                                                     UNPACK_N_VECTORS,
-                                                     UNPACK_N_VALUES,
-                                                     flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>>;
+                                                                   flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>,
+                                                                   IndexT>;
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 using DefaultFREQPatcher = flsgpu::device::StatefulFREQExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
@@ -73,11 +66,11 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::DICTFFORColumn<T, uint8_t>>) {
 		using IndexT     = uint8_t;
-		using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
+		using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
 		using DecompressorT =
 		    flsgpu::device::DICTDecompressor<T,
 		                                     UNPACK_N_VECTORS,
-		                                     DICTUnpackerIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                     DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, IndexT>,
 		                                     flsgpu::device::DICTFFORColumn<T, IndexT>,
 		                                     ProcessorT>;
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
@@ -93,8 +86,8 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::DICTSLPATCHColumn<T, uint8_t>>) {
 		using IndexT     = uint8_t;
-		using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
-		using UnpackerT  = DICTUnpackerIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+		using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
+		using UnpackerT  = DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, IndexT>;
 		using PatcherT =
 		    flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 		using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
@@ -225,14 +218,16 @@ ValueStore decompress_host(const HostColT& host_col, const PlanKind plan, const 
 		}
 		return fail();
 	}
-	case PlanKind::DICT_FFOR: {
+	case PlanKind::DICT_FFOR_U8:
+	case PlanKind::DICT_FFOR_U16: {
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint8_t>> ||
 		              std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint16_t>>) {
 			return decompress_common(host_col, cfg);
 		}
 		return fail();
 	}
-	case PlanKind::DICT_FFOR_SLPATCH: {
+	case PlanKind::DICT_FFOR_SLPATCH_U8:
+	case PlanKind::DICT_FFOR_SLPATCH_U16: {
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint8_t>> ||
 		              std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint16_t>>) {
 			return decompress_common(host_col, cfg);

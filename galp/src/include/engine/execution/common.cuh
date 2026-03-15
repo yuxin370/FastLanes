@@ -161,15 +161,18 @@ struct host_plan_kind<flsgpu::host::SLPATCHColumn<T>> {
 };
 template <typename T, typename IndexT>
 struct host_plan_kind<flsgpu::host::DICTFFORColumn<T, IndexT>> {
-	static constexpr PlanKind value = PlanKind::DICT_FFOR;
+	static constexpr PlanKind value =
+	    std::is_same_v<IndexT, uint8_t> ? PlanKind::DICT_FFOR_U8 : PlanKind::DICT_FFOR_U16;
 };
 template <typename T, typename IndexT>
 struct host_plan_kind<flsgpu::host::DICTREFColumn<T, IndexT>> {
-	static constexpr PlanKind value = PlanKind::DICT_FFOR;
+	static constexpr PlanKind value =
+	    std::is_same_v<IndexT, uint8_t> ? PlanKind::DICT_FFOR_U8 : PlanKind::DICT_FFOR_U16;
 };
 template <typename T, typename IndexT>
 struct host_plan_kind<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
-	static constexpr PlanKind value = PlanKind::DICT_FFOR_SLPATCH;
+	static constexpr PlanKind value =
+	    std::is_same_v<IndexT, uint8_t> ? PlanKind::DICT_FFOR_SLPATCH_U8 : PlanKind::DICT_FFOR_SLPATCH_U16;
 };
 template <typename T>
 struct host_plan_kind<flsgpu::host::FREQColumn<T>> {
@@ -252,27 +255,27 @@ void fill_device_expr(DeviceExpression<T>& expr,
 			return;
 		}
 		break;
-	case PlanKind::DICT_FFOR:
+	case PlanKind::DICT_FFOR_U8:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint8_t>>) {
-			expr.dict_index_bits = 8;
 			expr.col.dictffor_u8 = host_col.copy_to_device();
 			return;
 		}
+		break;
+	case PlanKind::DICT_FFOR_U16:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint16_t>>) {
-			expr.dict_index_bits = 16;
-			expr.col.dictffor    = host_col.copy_to_device();
+			expr.col.dictffor_u16 = host_col.copy_to_device();
 			return;
 		}
 		break;
-	case PlanKind::DICT_FFOR_SLPATCH:
+	case PlanKind::DICT_FFOR_SLPATCH_U8:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint8_t>>) {
-			expr.dict_index_bits    = 8;
 			expr.col.dictslpatch_u8 = host_col.copy_to_device();
 			return;
 		}
+		break;
+	case PlanKind::DICT_FFOR_SLPATCH_U16:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint16_t>>) {
-			expr.dict_index_bits = 16;
-			expr.col.dictslpatch = host_col.copy_to_device();
+			expr.col.dictslpatch_u16 = host_col.copy_to_device();
 			return;
 		}
 		break;
@@ -316,19 +319,17 @@ void free_device_expr(const DeviceExpression<T>& expr) {
 	case PlanKind::UNFFOR_SLPATCH:
 		flsgpu::host::free_column(expr.col.slpatch);
 		break;
-	case PlanKind::DICT_FFOR:
-		if (expr.dict_index_bits == 8) {
-			flsgpu::host::free_column(expr.col.dictffor_u8);
-		} else {
-			flsgpu::host::free_column(expr.col.dictffor);
-		}
+	case PlanKind::DICT_FFOR_U8:
+		flsgpu::host::free_column(expr.col.dictffor_u8);
 		break;
-	case PlanKind::DICT_FFOR_SLPATCH:
-		if (expr.dict_index_bits == 8) {
-			flsgpu::host::free_column(expr.col.dictslpatch_u8);
-		} else {
-			flsgpu::host::free_column(expr.col.dictslpatch);
-		}
+	case PlanKind::DICT_FFOR_U16:
+		flsgpu::host::free_column(expr.col.dictffor_u16);
+		break;
+	case PlanKind::DICT_FFOR_SLPATCH_U8:
+		flsgpu::host::free_column(expr.col.dictslpatch_u8);
+		break;
+	case PlanKind::DICT_FFOR_SLPATCH_U16:
+		flsgpu::host::free_column(expr.col.dictslpatch_u16);
 		break;
 	case PlanKind::CROSS_RLE:
 		flsgpu::host::free_column(expr.col.crossrle);

@@ -89,61 +89,64 @@ execute_plan(const dispatch::DeviceExpression<T>& expr,
 		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
 		break;
 	}
-	case dispatch::PlanKind::DICT_FFOR: {
-		if (expr.dict_index_bits == 8) {
-			using IndexT     = uint8_t;
-			using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
-			using UnpackerT  = flsgpu::device::
-			    BitUnpackerStatefulBranchlessIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
-				using DecompressorT = flsgpu::device::
-				    DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, flsgpu::device::DICTFFORColumn<T, IndexT>, ProcessorT>;
-				auto iterator = DecompressorT(expr.col.dictffor_u8, vector_index, lane);
-				run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, uint8_t>(iterator, lane, out);
-		} else {
-			using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>;
-			using UnpackerT =
-			    flsgpu::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
-			using DecompressorT = flsgpu::device::
-			    DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, flsgpu::device::DICTFFORColumn<T>, ProcessorT>;
-			auto iterator = DecompressorT(expr.col.dictffor, vector_index, lane);
-			run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
-		}
+	case dispatch::PlanKind::DICT_FFOR_U8: {
+		using ColumnT    = flsgpu::device::DICTFFORColumn<T, uint8_t>;
+		using IndexT     = typename ColumnT::INDEX_T;
+		using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
+		using UnpackerT  =
+		    flsgpu::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using DecompressorT =
+		    flsgpu::device::DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT, ProcessorT>;
+		auto iterator = DecompressorT(expr.col.dictffor_u8, vector_index, lane);
+		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, IndexT>(iterator, lane, out);
 		break;
 	}
-	case dispatch::PlanKind::DICT_FFOR_SLPATCH: {
-		if (expr.dict_index_bits == 8) {
-			using IndexT     = uint8_t;
-			using ProcessorT = flsgpu::device::DICTFunctorIdx<T, IndexT, UNPACK_N_VECTORS>;
-			using UnpackerT  = flsgpu::device::
-			    BitUnpackerStatefulBranchlessIdx<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
-				using PatcherT = flsgpu::device::
-				    StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-				using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
-				                                                              UNPACK_N_VECTORS,
-				                                                              UNPACK_N_VALUES,
-				                                                              UnpackerT,
-				                                                              PatcherT,
-				                                                              flsgpu::device::DICTSLPATCHColumn<T, IndexT>,
-				                                                              ProcessorT>;
-				auto iterator       = DecompressorT(expr.col.dictslpatch_u8, vector_index, lane);
-				run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, uint8_t>(iterator, lane, out);
-		} else {
-			using IndexT     = typename flsgpu::device::DICTSLPATCHColumn<T>::INDEX_T;
-			using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS>;
-			using UnpackerT =
-			    flsgpu::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
-			using PatcherT =
-			    flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-			using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
-			                                                              UNPACK_N_VECTORS,
-			                                                              UNPACK_N_VALUES,
-			                                                              UnpackerT,
-			                                                              PatcherT,
-			                                                              flsgpu::device::DICTSLPATCHColumn<T>,
-			                                                              ProcessorT>;
-			auto iterator       = DecompressorT(expr.col.dictslpatch, vector_index, lane);
-			run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
-		}
+	case dispatch::PlanKind::DICT_FFOR_U16: {
+		using ColumnT    = flsgpu::device::DICTFFORColumn<T, uint16_t>;
+		using IndexT     = typename ColumnT::INDEX_T;
+		using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
+		using UnpackerT =
+		    flsgpu::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using DecompressorT =
+		    flsgpu::device::DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT, ProcessorT>;
+		auto iterator = DecompressorT(expr.col.dictffor_u16, vector_index, lane);
+		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
+		break;
+	}
+	case dispatch::PlanKind::DICT_FFOR_SLPATCH_U8: {
+		using ColumnT    = flsgpu::device::DICTSLPATCHColumn<T, uint8_t>;
+		using IndexT     = typename ColumnT::INDEX_T;
+		using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
+		using UnpackerT =
+		    flsgpu::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using PatcherT = flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+		using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
+		                                                              UNPACK_N_VECTORS,
+		                                                              UNPACK_N_VALUES,
+		                                                              UnpackerT,
+		                                                              PatcherT,
+		                                                              ColumnT,
+		                                                              ProcessorT>;
+		auto iterator = DecompressorT(expr.col.dictslpatch_u8, vector_index, lane);
+		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, IndexT>(iterator, lane, out);
+		break;
+	}
+	case dispatch::PlanKind::DICT_FFOR_SLPATCH_U16: {
+		using ColumnT    = flsgpu::device::DICTSLPATCHColumn<T, uint16_t>;
+		using IndexT     = typename ColumnT::INDEX_T;
+		using ProcessorT = flsgpu::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
+		using UnpackerT =
+		    flsgpu::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using PatcherT = flsgpu::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+		using DecompressorT = flsgpu::device::DICTSLPATCHDecompressor<T,
+		                                                              UNPACK_N_VECTORS,
+		                                                              UNPACK_N_VALUES,
+		                                                              UnpackerT,
+		                                                              PatcherT,
+		                                                              ColumnT,
+		                                                              ProcessorT>;
+		auto iterator = DecompressorT(expr.col.dictslpatch_u16, vector_index, lane);
+		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
 		break;
 	}
 	case dispatch::PlanKind::FREQUENCY: {
@@ -271,9 +274,9 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 			return;
 		}
 		const auto* expr0 = exprs_i16 + work.expr_index;
-		const bool  full_lanes_dict_u8 =
-		    (expr0->dict_index_bits == 8) &&
-		    (expr0->plan == dispatch::PlanKind::DICT_FFOR || expr0->plan == dispatch::PlanKind::DICT_FFOR_SLPATCH);
+		const bool full_lanes_dict_u8 =
+		    (expr0->plan == dispatch::PlanKind::DICT_FFOR_U8 ||
+		     expr0->plan == dispatch::PlanKind::DICT_FFOR_SLPATCH_U8);
 		if (full_lanes_dict_u8) {
 			const vi_t   vector_index = static_cast<vi_t>(work.vector_index);
 			const size_t n_vecs       = utils::get_n_vecs_from_size(expr0->n_values);

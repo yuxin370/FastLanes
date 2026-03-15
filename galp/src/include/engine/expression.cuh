@@ -87,8 +87,10 @@ enum class PlanKind : uint8_t {
 	RLE,
 	FREQUENCY,
 	CROSS_RLE,
-	DICT_FFOR,
-	DICT_FFOR_SLPATCH,
+	DICT_FFOR_U8,
+	DICT_FFOR_U16,
+	DICT_FFOR_SLPATCH_U8,
+	DICT_FFOR_SLPATCH_U16,
 };
 
 enum class TypeTag : uint8_t {
@@ -119,7 +121,6 @@ template <typename T>
 struct DeviceExpression {
 	PlanKind plan;
 	size_t   n_values;
-	uint8_t  dict_index_bits = 0;
 	bool     freq_use_extended = false;
 	T*       out;
 	union {
@@ -127,9 +128,9 @@ struct DeviceExpression {
 		flsgpu::device::CONSTANTColumn<T>             constant;
 		flsgpu::device::FFORColumn<T>                 ffor;
 		flsgpu::device::SLPATCHColumn<T>              slpatch;
-		flsgpu::device::DICTFFORColumn<T>             dictffor;
+		flsgpu::device::DICTFFORColumn<T, uint16_t>   dictffor_u16;
 		flsgpu::device::DICTFFORColumn<T, uint8_t>    dictffor_u8;
-		flsgpu::device::DICTSLPATCHColumn<T>          dictslpatch;
+		flsgpu::device::DICTSLPATCHColumn<T, uint16_t> dictslpatch_u16;
 		flsgpu::device::DICTSLPATCHColumn<T, uint8_t> dictslpatch_u8;
 		flsgpu::device::FREQColumn<T>                 freq;
 		flsgpu::device::FREQExtendedColumn<T>         freq_extended;
@@ -175,10 +176,10 @@ inline PlanKind plan_for_ops(const std::vector<expr::OperatorKind>& ops) {
 		return PlanKind::RLE;
 	}
 	if (ops_match(ops, {UNFFOR, DICT})) {
-		return PlanKind::DICT_FFOR;
+		return PlanKind::DICT_FFOR_U16;
 	}
 	if (ops_match(ops, {UNFFOR, SLPATCH, DICT})) {
-		return PlanKind::DICT_FFOR_SLPATCH;
+		return PlanKind::DICT_FFOR_SLPATCH_U16;
 	}
 	throw std::runtime_error("unsupported operator chain in dispatch");
 }
