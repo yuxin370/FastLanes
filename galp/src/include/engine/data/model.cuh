@@ -6,10 +6,10 @@
 #ifndef ENGINE_DATA_MODEL_CUH
 #define ENGINE_DATA_MODEL_CUH
 
-#include "fls/footer/operator_token_generated.h"
-#include "flsgpu/columns/all.cuh"
 #include "engine/data/value-store.cuh"
 #include "engine/types.cuh"
+#include "fls/footer/operator_token_generated.h"
+#include "flsgpu/columns/all.cuh"
 #include <limits>
 #include <optional>
 #include <string>

@@ -91,9 +91,9 @@ public:
 		}
 
 		const auto*  rg       = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
-		const size_t n_vecs    = static_cast<size_t>(rg->m_n_vec());
-		const size_t n_values  = n_vecs * consts::VALUES_PER_VECTOR;
-		const size_t n_tuples  = static_cast<size_t>(rg->m_n_tuples());
+		const size_t n_vecs   = static_cast<size_t>(rg->m_n_vec());
+		const size_t n_values = n_vecs * consts::VALUES_PER_VECTOR;
+		const size_t n_tuples = static_cast<size_t>(rg->m_n_tuples());
 
 		// Read rowgroup bytes
 		fastlanes::Buf buf(rg->m_size());

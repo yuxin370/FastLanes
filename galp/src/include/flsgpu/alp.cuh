@@ -456,5 +456,5 @@ struct ALPDecompressor : DecompressorBase<T> {
 	}
 };
 
-}}     // namespace flsgpu::device
+}} // namespace flsgpu::device
 #endif // ALP_CUH

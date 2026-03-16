@@ -3,9 +3,9 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/execution/table.cu
 // ────────────────────────────────────────────────────────
+#include "engine/data/value-store.cuh"
 #include "engine/execution/dict_ref_resolver.cuh"
 #include "engine/execution/table.cuh"
-#include "engine/data/value-store.cuh"
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/file/file_footer.hpp"
 #include "fls/file/file_header.hpp"
@@ -137,8 +137,8 @@ double append_expressions(BenchmarkWorkset&              workset,
 
 		std::visit(
 		    [&](auto&& host_col) {
-			    using HostColT = std::decay_t<decltype(host_col)>;
-			    using T        = typename dispatch::host_value_type<HostColT>::type;
+			    using HostColT      = std::decay_t<decltype(host_col)>;
+			    using T             = typename dispatch::host_value_type<HostColT>::type;
 			    constexpr auto plan = dispatch::detail::plan_for_host_col<HostColT>();
 			    if constexpr (dispatch::is_supported_type_v<T>) {
 				    if (out_total_bytes) {
@@ -175,7 +175,8 @@ double prepare_dispatch_buffers(BenchmarkWorkset& workset) {
 			dev_batch.d_items.emplace(host_batch.work_items.size(), host_batch.work_items.data());
 			dev_batch.n_items = host_batch.work_items.size();
 			workset.work_items.reserve(workset.work_items.size() + host_batch.work_items.size());
-			workset.work_items.insert(workset.work_items.end(), host_batch.work_items.begin(), host_batch.work_items.end());
+			workset.work_items.insert(
+			    workset.work_items.end(), host_batch.work_items.begin(), host_batch.work_items.end());
 		}
 	});
 
@@ -202,8 +203,8 @@ double run_kernel(BenchmarkWorkset& workset,
 		return 0.0;
 	}
 
-	bool has_any_expr = false;
-	size_t launches_per_sample = 0;
+	bool   has_any_expr                 = false;
+	size_t launches_per_sample          = 0;
 	size_t typed_total_items_per_sample = 0;
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
@@ -232,7 +233,8 @@ double run_kernel(BenchmarkWorkset& workset,
 		                : (launches_per_sample > 0 ? typed_total_items_per_sample / launches_per_sample : 0);
 	}
 	if (out_launches) {
-		*out_launches = (gpu_dispatch_kernel ? mega_launches_per_sample : launches_per_sample) * static_cast<size_t>(samples);
+		*out_launches =
+		    (gpu_dispatch_kernel ? mega_launches_per_sample : launches_per_sample) * static_cast<size_t>(samples);
 	}
 
 	flsgpu::memory::sync_h2d();
@@ -246,11 +248,10 @@ double run_kernel(BenchmarkWorkset& workset,
 	CUDA_SAFE_CALL(cudaEventCreate(&stop));
 
 	const auto launch_mixed = [&](const dispatch::DeviceExpression<int8_t>*  exprs_i8,
-	                               const dispatch::DeviceExpression<int16_t>* exprs_i16,
-	                               const dim3&                                grid,
-	                               const dim3&                                block) {
-		const uint32_t i16_start_index =
-		    static_cast<uint32_t>(workset.device_batches.template get<int8_t>().n_items);
+	                              const dispatch::DeviceExpression<int16_t>* exprs_i16,
+	                              const dim3&                                grid,
+	                              const dim3&                                block) {
+		const uint32_t i16_start_index = static_cast<uint32_t>(workset.device_batches.template get<int8_t>().n_items);
 		if (write_out) {
 			kernels::device::decompress_dispatch_mixed<1, 1, true>
 			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_items->get(), n_items, i16_start_index);
@@ -263,12 +264,12 @@ double run_kernel(BenchmarkWorkset& workset,
 
 	// Warm up at least once so timing is less biased by first-launch effects.
 	if (gpu_dispatch_kernel) {
-		const auto* exprs_i8  = workset.device_batches.template get<int8_t>().d_exprs.has_value()
-		                            ? workset.device_batches.template get<int8_t>().d_exprs->get()
-		                            : nullptr;
-		const auto* exprs_i16 = workset.device_batches.template get<int16_t>().d_exprs.has_value()
-		                            ? workset.device_batches.template get<int16_t>().d_exprs->get()
-		                            : nullptr;
+		const auto*        exprs_i8      = workset.device_batches.template get<int8_t>().d_exprs.has_value()
+		                                       ? workset.device_batches.template get<int8_t>().d_exprs->get()
+		                                       : nullptr;
+		const auto*        exprs_i16     = workset.device_batches.template get<int16_t>().d_exprs.has_value()
+		                                       ? workset.device_batches.template get<int16_t>().d_exprs->get()
+		                                       : nullptr;
 		constexpr uint32_t block_threads = 256;
 		const dim3         block(block_threads);
 		const size_t       n_threads = n_items * static_cast<size_t>(warp_lanes);
@@ -284,18 +285,10 @@ double run_kernel(BenchmarkWorkset& workset,
 			}
 			if (write_out) {
 				dispatch::detail::launch_batch_no_sync<T, true>(
-				    host_batch,
-				    device_batch.d_exprs->get(),
-				    device_batch.d_items->get(),
-				    device_batch.n_items,
-				    stream);
+				    host_batch, device_batch.d_exprs->get(), device_batch.d_items->get(), device_batch.n_items, stream);
 			} else {
 				dispatch::detail::launch_batch_no_sync<T, false>(
-				    host_batch,
-				    device_batch.d_exprs->get(),
-				    device_batch.d_items->get(),
-				    device_batch.n_items,
-				    stream);
+				    host_batch, device_batch.d_exprs->get(), device_batch.d_items->get(), device_batch.n_items, stream);
 			}
 		});
 	}
@@ -305,12 +298,12 @@ double run_kernel(BenchmarkWorkset& workset,
 
 	for (uint32_t sample = 0; sample < samples; ++sample) {
 		if (gpu_dispatch_kernel) {
-			const auto* exprs_i8  = workset.device_batches.template get<int8_t>().d_exprs.has_value()
-			                            ? workset.device_batches.template get<int8_t>().d_exprs->get()
-			                            : nullptr;
-			const auto* exprs_i16 = workset.device_batches.template get<int16_t>().d_exprs.has_value()
-			                            ? workset.device_batches.template get<int16_t>().d_exprs->get()
-			                            : nullptr;
+			const auto*        exprs_i8      = workset.device_batches.template get<int8_t>().d_exprs.has_value()
+			                                       ? workset.device_batches.template get<int8_t>().d_exprs->get()
+			                                       : nullptr;
+			const auto*        exprs_i16     = workset.device_batches.template get<int16_t>().d_exprs.has_value()
+			                                       ? workset.device_batches.template get<int16_t>().d_exprs->get()
+			                                       : nullptr;
 			constexpr uint32_t block_threads = 256;
 			const dim3         block(block_threads);
 			const size_t       n_threads = n_items * static_cast<size_t>(warp_lanes);
@@ -327,18 +320,10 @@ double run_kernel(BenchmarkWorkset& workset,
 			}
 			if (write_out) {
 				dispatch::detail::launch_batch_no_sync<T, true>(
-				    host_batch,
-				    device_batch.d_exprs->get(),
-				    device_batch.d_items->get(),
-				    device_batch.n_items,
-				    stream);
+				    host_batch, device_batch.d_exprs->get(), device_batch.d_items->get(), device_batch.n_items, stream);
 			} else {
 				dispatch::detail::launch_batch_no_sync<T, false>(
-				    host_batch,
-				    device_batch.d_exprs->get(),
-				    device_batch.d_items->get(),
-				    device_batch.n_items,
-				    stream);
+				    host_batch, device_batch.d_exprs->get(), device_batch.d_items->get(), device_batch.n_items, stream);
 			}
 		});
 	}
@@ -416,19 +401,15 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			workset.freq_prefetch_all_branchless = cfg.freq_prefetch_all_branchless;
 			workset.freq_hybrid_patcher          = cfg.freq_hybrid_patcher;
 			workset.freq_branchless_threshold    = cfg.freq_branchless_threshold;
-			const double               rg_h2d_ms      = dispatch::append_expressions(workset, expressions);
-			const double               rg_finalize_ms = dispatch::prepare_dispatch_buffers(workset);
-			size_t                     rg_launches    = 0;
-			size_t                     rg_launch_grid = 0;
-			const double               rg_kernel_ms = dispatch::run_kernel(workset,
-			                                                               cfg.samples,
-			                                                               cfg.gpu_dispatch_kernel,
-			                                                               cfg.write_out,
-			                                                               &rg_launch_grid,
-			                                                               &rg_launches);
-			const auto                 teardown_start = std::chrono::steady_clock::now();
+			const double rg_h2d_ms               = dispatch::append_expressions(workset, expressions);
+			const double rg_finalize_ms          = dispatch::prepare_dispatch_buffers(workset);
+			size_t       rg_launches             = 0;
+			size_t       rg_launch_grid          = 0;
+			const double rg_kernel_ms            = dispatch::run_kernel(
+                workset, cfg.samples, cfg.gpu_dispatch_kernel, cfg.write_out, &rg_launch_grid, &rg_launches);
+			const auto teardown_start = std::chrono::steady_clock::now();
 			dispatch::free_batches(workset);
-			const auto teardown_end = std::chrono::steady_clock::now();
+			const auto   teardown_end = std::chrono::steady_clock::now();
 			const double rg_teardown_ms =
 			    std::chrono::duration<double, std::milli>(teardown_end - teardown_start).count();
 
@@ -490,12 +471,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	size_t launch_grid  = 0;
 	size_t launch_count = 0;
 	out.kernel_ms =
-	    dispatch::run_kernel(workset,
-	                         cfg.samples,
-	                         cfg.gpu_dispatch_kernel,
-	                         cfg.write_out,
-	                         &launch_grid,
-	                         &launch_count);
+	    dispatch::run_kernel(workset, cfg.samples, cfg.gpu_dispatch_kernel, cfg.write_out, &launch_grid, &launch_count);
 	if (!workset.work_items.empty()) {
 		out.total_launches    = launch_count;
 		out.total_launch_grid = launch_grid * launch_count;

@@ -17,26 +17,24 @@ namespace lane_policy {
 // logical lanes are derived from the encoded value type width.
 template <typename T>
 struct ValueLanePolicy {
-	static constexpr uint32_t semantic_lanes   = static_cast<uint32_t>(utils::get_n_lanes<T>());
-	static constexpr uint32_t scheduling_lanes = (semantic_lanes < uint32_t {consts::THREADS_PER_WARP})
-	                                                  ? uint32_t {consts::THREADS_PER_WARP}
-	                                                  : semantic_lanes;
-	static constexpr uint32_t values_per_lane  = static_cast<uint32_t>(utils::get_values_per_lane<T>());
+	static constexpr uint32_t semantic_lanes = static_cast<uint32_t>(utils::get_n_lanes<T>());
+	static constexpr uint32_t scheduling_lanes =
+	    (semantic_lanes < uint32_t {consts::THREADS_PER_WARP}) ? uint32_t {consts::THREADS_PER_WARP} : semantic_lanes;
+	static constexpr uint32_t values_per_lane = static_cast<uint32_t>(utils::get_values_per_lane<T>());
 };
 
 // Dict policy intentionally separates output type and index-code type.
 // This is used to reason about semantic lanes (index stream) vs scheduling lanes.
 template <typename ValueT, typename IndexT>
 struct DictLanePolicy {
-	static constexpr uint32_t value_lanes  = ValueLanePolicy<ValueT>::semantic_lanes;
-	static constexpr uint32_t index_lanes  = ValueLanePolicy<IndexT>::semantic_lanes;
-	static constexpr uint32_t semantic_lanes   = index_lanes;
-	static constexpr uint32_t scheduling_lanes = (ValueLanePolicy<ValueT>::scheduling_lanes >
-	                                              ValueLanePolicy<IndexT>::scheduling_lanes)
-	                                                 ? ValueLanePolicy<ValueT>::scheduling_lanes
-	                                                 : ValueLanePolicy<IndexT>::scheduling_lanes;
-	static constexpr uint32_t values_per_lane  =
-	    static_cast<uint32_t>(consts::VALUES_PER_VECTOR / semantic_lanes);
+	static constexpr uint32_t value_lanes    = ValueLanePolicy<ValueT>::semantic_lanes;
+	static constexpr uint32_t index_lanes    = ValueLanePolicy<IndexT>::semantic_lanes;
+	static constexpr uint32_t semantic_lanes = index_lanes;
+	static constexpr uint32_t scheduling_lanes =
+	    (ValueLanePolicy<ValueT>::scheduling_lanes > ValueLanePolicy<IndexT>::scheduling_lanes)
+	        ? ValueLanePolicy<ValueT>::scheduling_lanes
+	        : ValueLanePolicy<IndexT>::scheduling_lanes;
+	static constexpr uint32_t values_per_lane = static_cast<uint32_t>(consts::VALUES_PER_VECTOR / semantic_lanes);
 };
 
 } // namespace lane_policy
@@ -46,7 +44,8 @@ struct SingleVectorPerWarpThreadblockMapping {
 	using Policy = lane_policy::ValueLanePolicy<T>;
 
 	static constexpr unsigned N_WARPS_PER_BLOCK =
-	    std::max(Policy::semantic_lanes / uint32_t {consts::THREADS_PER_WARP}, 8u); // at least 8 warps per block to ensure enough parallelism for latency hiding
+	    std::max(Policy::semantic_lanes / uint32_t {consts::THREADS_PER_WARP},
+	             8u); // at least 8 warps per block to ensure enough parallelism for latency hiding
 	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
 	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK =
 	    N_THREADS_PER_BLOCK / std::max(Policy::semantic_lanes, uint32_t {consts::THREADS_PER_WARP});
@@ -64,7 +63,7 @@ struct FillWarpThreadblockMapping {
 
 	static constexpr unsigned N_WARPS_PER_BLOCK =
 	    std::max(Policy::semantic_lanes / uint32_t {consts::THREADS_PER_WARP}, 8u);
-	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
+	static constexpr unsigned N_THREADS_PER_BLOCK            = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
 	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK = N_THREADS_PER_BLOCK / Policy::semantic_lanes;
 
 	const unsigned n_blocks;

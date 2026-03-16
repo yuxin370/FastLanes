@@ -13,12 +13,12 @@ namespace bindings {
 template <>
 int8_t* decompress_column<int8_t, flsgpu::device::FREQExtendedColumn<int8_t>>(
     const flsgpu::device::FREQExtendedColumn<int8_t> column,
-    const unsigned                                     unpack_n_vectors,
-    const unsigned                                     unpack_n_values,
-    const enums::Unpacker                              unpacker,
-    const enums::Patcher                               patcher,
-    const enums::Expander                              expander,
-    const uint32_t                                     n_samples) {
+    const unsigned                                   unpack_n_vectors,
+    const unsigned                                   unpack_n_values,
+    const enums::Unpacker                            unpacker,
+    const enums::Patcher                             patcher,
+    const enums::Expander                            expander,
+    const uint32_t                                   n_samples) {
 	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == enums::Patcher::Naive) {
 		return kernels::host::decompress_column<
 		    int8_t,

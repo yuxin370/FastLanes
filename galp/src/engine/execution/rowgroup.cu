@@ -3,10 +3,10 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/execution/rowgroup.cu
 // ────────────────────────────────────────────────────────
+#include "engine/data/value-store.cuh"
 #include "engine/execution/dict_ref_resolver.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/execution/table.cuh"
-#include "engine/data/value-store.cuh"
 
 namespace dispatch {
 namespace {
@@ -31,7 +31,9 @@ struct WorksetCleanupGuard {
 	BenchmarkWorkset* workset = nullptr;
 	bool              active  = true;
 
-	explicit WorksetCleanupGuard(BenchmarkWorkset& ws) : workset(&ws) {}
+	explicit WorksetCleanupGuard(BenchmarkWorkset& ws)
+	    : workset(&ws) {
+	}
 	~WorksetCleanupGuard() {
 		if (active && workset) {
 			free_batches(*workset);
@@ -83,8 +85,8 @@ inline PreparedBatches prepare_batches(const std::vector<expr::Expression>& expr
 
 		std::visit(
 		    [&](auto&& host_col) {
-			    using HostColT = std::decay_t<decltype(host_col)>;
-			    using T                = typename host_value_type<HostColT>::type;
+			    using HostColT      = std::decay_t<decltype(host_col)>;
+			    using T             = typename host_value_type<HostColT>::type;
 			    constexpr auto plan = detail::plan_for_host_col<HostColT>();
 
 			    static_assert(is_supported_type_v<T>, "dispatch rowgroup only supports int8_t/int16_t");
@@ -103,9 +105,8 @@ inline PreparedBatches prepare_batches(const std::vector<expr::Expression>& expr
 	return prepared;
 }
 
-inline RowgroupData run_materialize(PreparedBatches&                     prepared,
-                                    const std::vector<expr::Expression>& expressions,
-                                    const Config&                        cfg) {
+inline RowgroupData
+run_materialize(PreparedBatches& prepared, const std::vector<expr::Expression>& expressions, const Config& cfg) {
 	RowgroupData materialized;
 	materialized.columns.resize(expressions.size());
 	BenchmarkWorkset workset {};
@@ -140,10 +141,10 @@ inline RowgroupData run_materialize(PreparedBatches&                     prepare
 		}
 
 		// Alias columns share the same host result buffer; avoid deep-copy.
-		materialized.columns[i] = materialized.columns[src_idx];
-		materialized.columns[i]->meta.column_index = i;
-		materialized.columns[i]->meta.column_name  = col->name;
-		materialized.columns[i]->meta.value_count  = alias_n_values;
+		materialized.columns[i]                       = materialized.columns[src_idx];
+		materialized.columns[i]->meta.column_index    = i;
+		materialized.columns[i]->meta.column_name     = col->name;
+		materialized.columns[i]->meta.value_count     = alias_n_values;
 		materialized.columns[i]->meta.values_per_step = cfg.chunk().values_per_step();
 	}
 
@@ -152,8 +153,8 @@ inline RowgroupData run_materialize(PreparedBatches&                     prepare
 		if (!col || !materialized.columns[i].has_value()) {
 			continue;
 		}
-		materialized.columns[i]->meta.column_index = i;
-		materialized.columns[i]->meta.column_name  = col->name;
+		materialized.columns[i]->meta.column_index    = i;
+		materialized.columns[i]->meta.column_name     = col->name;
 		materialized.columns[i]->meta.values_per_step = cfg.chunk().values_per_step();
 	}
 
@@ -175,7 +176,7 @@ inline BenchmarkResult run_benchmark(PreparedBatches&& prepared, const Config& c
 
 	prepare_dispatch_buffers(workset);
 	bench.n_work_items = workset.work_items.size();
-	bench.total_ms = run_kernel(workset, cfg.n_samples, false, false);
+	bench.total_ms     = run_kernel(workset, cfg.n_samples, false, false);
 	bench.avg_us       = (cfg.n_samples > 0) ? (bench.total_ms * 1000.0 / static_cast<double>(cfg.n_samples)) : 0.0;
 
 	guard.dismiss();
@@ -185,13 +186,12 @@ inline BenchmarkResult run_benchmark(PreparedBatches&& prepared, const Config& c
 
 } // namespace
 
-RowgroupExecuteResult execute_rowgroup(std::vector<expr::Expression>& expressions,
-                                       const Config&                  cfg,
-                                       const ExecuteMode              mode) {
+RowgroupExecuteResult
+execute_rowgroup(std::vector<expr::Expression>& expressions, const Config& cfg, const ExecuteMode mode) {
 	dispatch::resolve_dict_refs(expressions);
 	// dispatch::sync_expression_ops_after_resolve(expressions); // only for validation
 
-	auto                 prepared = prepare_batches(expressions);
+	auto                  prepared = prepare_batches(expressions);
 	RowgroupExecuteResult out;
 	if (mode == ExecuteMode::Materialize) {
 		out.materialized = run_materialize(prepared, expressions, cfg);
@@ -202,9 +202,8 @@ RowgroupExecuteResult execute_rowgroup(std::vector<expr::Expression>& expression
 	return out;
 }
 
-RowgroupExecuteResult execute_rowgroup(const std::vector<expr::Expression>& expressions,
-                                       const Config&                        cfg,
-                                       const ExecuteMode                    mode) {
+RowgroupExecuteResult
+execute_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg, const ExecuteMode mode) {
 	auto mutable_expressions = expressions;
 	return execute_rowgroup(mutable_expressions, cfg, mode);
 }

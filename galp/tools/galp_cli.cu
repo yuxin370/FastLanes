@@ -34,14 +34,14 @@ struct Options {
 	std::filesystem::path                input;
 	std::optional<std::filesystem::path> output;
 	std::optional<size_t>                rowgroup;
-	uint32_t                             samples         = 1;
-	bool                                 header          = true;
-	uint32_t                             launch_iters    = 100000;
-	uint32_t                             launch_grid     = 1;
-	uint32_t                             launch_block    = 1;
-	bool                                 estimate_launch = false;
-	uint32_t                             estimate_iters  = 10000;
-	bool                                 mega_kernel     = true;
+	uint32_t                             samples                      = 1;
+	bool                                 header                       = true;
+	uint32_t                             launch_iters                 = 100000;
+	uint32_t                             launch_grid                  = 1;
+	uint32_t                             launch_block                 = 1;
+	bool                                 estimate_launch              = false;
+	uint32_t                             estimate_iters               = 10000;
+	bool                                 mega_kernel                  = true;
 	bool                                 gpu_dispatch_kernel          = false;
 	bool                                 write_back                   = false;
 	bool                                 freq_prefetch_all_branchless = false;
@@ -77,12 +77,12 @@ void print_usage(const char* prog) {
 	          << "  --block N      Launch block size for measurement (default: 1)\n"
 	          << "  --estimate-launch  Estimate launch overhead during benchmark\n"
 	          << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n"
-		          << "  --no-mega-kernel   Benchmark full table using per-rowgroup kernels\n"
-		          << "  --gpu-dispatch-kernel  Use one mixed-type kernel launch per sample in mega mode\n"
-		          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
-		          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
-		          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
-		          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n";
+	          << "  --no-mega-kernel   Benchmark full table using per-rowgroup kernels\n"
+	          << "  --gpu-dispatch-kernel  Use one mixed-type kernel launch per sample in mega mode\n"
+	          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
+	          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
+	          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
+	          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n";
 }
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -92,7 +92,7 @@ bool parse_args(int argc, char** argv, Options& opt) {
 
 	std::string_view mode_arg = argv[1];
 	if (mode_arg == "read_table" || mode_arg == "read") {
-		opt.mode = Mode::ReadTable;
+		opt.mode                = Mode::ReadTable;
 		opt.gpu_dispatch_kernel = true;
 	} else if (mode_arg == "benchmark" || mode_arg == "bench") {
 		opt.mode = Mode::Benchmark;
@@ -299,7 +299,7 @@ int main(int argc, char** argv) {
 			bench_cfg.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
 			bench_cfg.freq_branchless_threshold    = opt.freq_branchless_threshold;
 			bench_cfg.rowgroup                     = opt.rowgroup;
-			const auto result     = dispatch::benchmark_table(opt.input, bench_cfg);
+			const auto result                      = dispatch::benchmark_table(opt.input, bench_cfg);
 
 			const double end_to_end_ms     = result.end_to_end_ms;
 			const double kernel_ms         = result.kernel_ms;
@@ -371,14 +371,14 @@ int main(int argc, char** argv) {
 			          << " (GiB/s)\n";
 			std::cout << "  end_to_end_throughput (no teardown): " << e2e_no_teardown_gbps << " (GB/s), "
 			          << e2e_no_teardown_gibps << " (GiB/s)\n";
-				std::cout << "  kernel_launches: " << total_launches << "\n";
-				std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
-				std::cout << "  gpu_dispatch_kernel: " << (opt.gpu_dispatch_kernel ? 1 : 0) << "\n";
-				std::cout << "  write_back: " << (opt.write_back ? 1 : 0) << "\n";
-				std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";
-				std::cout << "  freq_hybrid_patcher: " << (opt.freq_hybrid_patcher ? 1 : 0) << "\n";
-				std::cout << "  freq_branchless_threshold: " << opt.freq_branchless_threshold << "\n";
-				if (opt.estimate_launch && total_launches > 0) {
+			std::cout << "  kernel_launches: " << total_launches << "\n";
+			std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
+			std::cout << "  gpu_dispatch_kernel: " << (opt.gpu_dispatch_kernel ? 1 : 0) << "\n";
+			std::cout << "  write_back: " << (opt.write_back ? 1 : 0) << "\n";
+			std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";
+			std::cout << "  freq_hybrid_patcher: " << (opt.freq_hybrid_patcher ? 1 : 0) << "\n";
+			std::cout << "  freq_branchless_threshold: " << opt.freq_branchless_threshold << "\n";
+			if (opt.estimate_launch && total_launches > 0) {
 				const uint32_t block = utils::get_n_lanes<int8_t>();
 				uint32_t       grid  = static_cast<uint32_t>(avg_grid_per_launch);
 				if (grid == 0) {

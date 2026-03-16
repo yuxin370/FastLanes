@@ -5,8 +5,8 @@
 // ────────────────────────────────────────────────────────
 #include "data.cuh"
 #include "engine/enums.cuh"
-#include "engine/types.cuh"
 #include "engine/kernels.cuh"
+#include "engine/types.cuh"
 #include "flsgpu/flsgpu-api.cuh"
 #include "flsgpu/host-utils.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
@@ -113,12 +113,12 @@ verification::ExecutionResult<T> decompress_column(const ColumnT column, const P
 	T* out;
 
 	out = bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
-		                                                                  params.unpack_n_vecs,
-		                                                                  params.unpack_n_vals,
-		                                                                  params.unpacker,
-		                                                                  params.patcher,
-		                                                                  params.expander,
-		                                                                  params.n_samples);
+	                                                                      params.unpack_n_vecs,
+	                                                                      params.unpack_n_vals,
+	                                                                      params.unpacker,
+	                                                                      params.patcher,
+	                                                                      params.expander,
+	                                                                      params.n_samples);
 
 	flsgpu::host::free_column(column_device);
 

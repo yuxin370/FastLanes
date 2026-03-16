@@ -142,5 +142,5 @@ __host__ bool query_multi_column(const ColumnT column, const T magic_value, cons
 	d_out.copy_to_host(&result);
 	return result;
 }
-}}     // namespace kernels::host
+}} // namespace kernels::host
 #endif // MULTI_COLUMN_HOST_KERNELS_CUH

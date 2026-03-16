@@ -6,7 +6,6 @@
 #ifndef FLS_GLOBAL_CUH
 #define FLS_GLOBAL_CUH
 
-
 #include "engine/device-utils.cuh"
 #include "engine/execution/dispatch.cuh"
 #include "flsgpu/consts.cuh"
@@ -21,9 +20,9 @@ namespace device {
 
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
 __global__ void decompress_column(const ColumnT column, T* out) {
-	constexpr uint32_t N_VALUES = UNPACK_N_VALUES * UNPACK_N_VECTORS;
-	const auto         mapping  = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
-	const lane_t       lane     = mapping.get_lane();
+	constexpr uint32_t N_VALUES     = UNPACK_N_VALUES * UNPACK_N_VECTORS;
+	const auto         mapping      = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
+	const lane_t       lane         = mapping.get_lane();
 	const int32_t      vector_index = mapping.get_vector_index();
 
 	size_t n_vecs = utils::get_n_vecs_from_size(column.n_values);
@@ -53,12 +52,12 @@ __global__ void decompress_column(const ColumnT column, T* out) {
 
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
 __global__ void query_column(const ColumnT column, bool* out, const T magic_value) {
-	constexpr uint32_t N_VALUES = UNPACK_N_VALUES * UNPACK_N_VECTORS;
-	const auto         mapping  = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
-	const lane_t       lane     = mapping.get_lane();
+	constexpr uint32_t N_VALUES     = UNPACK_N_VALUES * UNPACK_N_VECTORS;
+	const auto         mapping      = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
+	const lane_t       lane         = mapping.get_lane();
 	const int32_t      vector_index = mapping.get_vector_index();
-	T    registers[N_VALUES];
-	auto checker = MagicChecker<T, N_VALUES>(magic_value);
+	T                  registers[N_VALUES];
+	auto               checker = MagicChecker<T, N_VALUES>(magic_value);
 
 	DecompressorT unpacker = DecompressorT(column, vector_index, lane);
 	for (si_t i = 0; i < mapping.N_VALUES_IN_LANE; i += UNPACK_N_VALUES) {
@@ -80,9 +79,9 @@ __global__ void compute_column(const ColumnT column, bool* __restrict out, const
 	const auto         mapping      = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
 	const lane_t       lane         = mapping.get_lane();
 	const vi_t         vector_index = mapping.get_vector_index();
-	T             registers[N_VALUES];
-	auto          checker      = MagicChecker<T, N_VALUES>(1);
-	DecompressorT decompressor = DecompressorT(column, vector_index, lane);
+	T                  registers[N_VALUES];
+	auto               checker      = MagicChecker<T, N_VALUES>(1);
+	DecompressorT      decompressor = DecompressorT(column, vector_index, lane);
 
 	for (si_t i = 0; i < mapping.N_VALUES_IN_LANE; i += UNPACK_N_VALUES) {
 		decompressor.unpack_next_into(registers);

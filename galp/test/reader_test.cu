@@ -148,14 +148,14 @@ bool rowgroup_supported(const fastlanes::RowgroupDescriptor*                rg,
 	return unsupported.empty();
 }
 
-void compare_rowgroup_outputs(const reader::Rowgroup&                   rowgroup,
-                              const fastlanes::Rowgroup&                expected_rowgroup,
-                              const fastlanes::RowgroupDescriptor*      rg,
-                              const std::vector<expr::Expression>&      expressions,
-                              bool                                      verbose,
-                              size_t*                                   compared_columns_out,
-                              const dispatch::RowgroupData* precomputed  = nullptr,
-                              bool                                      free_columns = true) {
+void compare_rowgroup_outputs(const reader::Rowgroup&              rowgroup,
+                              const fastlanes::Rowgroup&           expected_rowgroup,
+                              const fastlanes::RowgroupDescriptor* rg,
+                              const std::vector<expr::Expression>& expressions,
+                              bool                                 verbose,
+                              size_t*                              compared_columns_out,
+                              const dispatch::RowgroupData*        precomputed  = nullptr,
+                              bool                                 free_columns = true) {
 	ASSERT_NE(rg, nullptr);
 	ASSERT_NE(rg->m_column_descriptors(), nullptr);
 	ASSERT_EQ(rowgroup.columns.size(), rg->m_column_descriptors()->size());
@@ -458,10 +458,10 @@ TEST(Reader, DecompressTable) {
 	    fls_path,
 	    {},
 	    should_decompress,
-	    [&](size_t                                    rg_idx,
-	        reader::Rowgroup&                         rowgroup,
-	        const std::vector<expr::Expression>&      expressions,
-	        const dispatch::RowgroupData& result) {
+	    [&](size_t                               rg_idx,
+	        reader::Rowgroup&                    rowgroup,
+	        const std::vector<expr::Expression>& expressions,
+	        const dispatch::RowgroupData&        result) {
 		    const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
 		    ASSERT_NE(rg, nullptr);
 

@@ -15,8 +15,7 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu {
-namespace device {
+namespace flsgpu { namespace device {
 template <typename T>
 struct BitUnpackerBase {
 	/* Constructor, but cannot be enforced
@@ -566,9 +565,9 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 	UINT_T  value_mask;
 
 	__device__ __forceinline__ BitUnpackerStatefulBranchless(const UINT_T* __restrict a_in,
-	                                                         const lane_t                 lane,
-	                                                         const vbw_t                  value_bit_width,
-	                                                         OutputProcessor              processor)
+	                                                         const lane_t    lane,
+	                                                         const vbw_t     value_bit_width,
+	                                                         OutputProcessor processor)
 	    : in(a_in + lane)
 	    , value_bit_width(value_bit_width)
 	    , value_mask(utils::set_first_n_bits<UINT_T>(value_bit_width))
@@ -588,7 +587,7 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 #pragma unroll
 			for (int32_t v {0}; v < UNPACK_N_VECTORS; v++) {
 				const auto v_in = in + v * vector_offset;
-				const auto raw = ((v_in[0] >> offset_first) & value_mask) |
+				const auto raw  = ((v_in[0] >> offset_first) & value_mask) |
 				                 ((v_in[N_LANES] & (value_mask >> offset_second)) << offset_second);
 				out[UNPACK_N_VALUES * v + i] = processor(static_cast<InT>(raw), v);
 			}

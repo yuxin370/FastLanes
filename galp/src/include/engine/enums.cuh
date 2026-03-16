@@ -84,12 +84,12 @@ enum class Encoding {
 	DICT_SLPATCH,
 };
 
-Kernel          string_to_kernel(const std::string& str);
-Unpacker        string_to_unpacker(const std::string& str);
-Patcher         string_to_patcher(const std::string& str);
-Expander        string_to_expander(const std::string& str);
-Encoding        string_to_encoding(const std::string& str);
-std::string     encoding_to_string(const Encoding type);
+Kernel      string_to_kernel(const std::string& str);
+Unpacker    string_to_unpacker(const std::string& str);
+Patcher     string_to_patcher(const std::string& str);
+Expander    string_to_expander(const std::string& str);
+Encoding    string_to_encoding(const std::string& str);
+std::string encoding_to_string(const Encoding type);
 
 } // namespace enums
 

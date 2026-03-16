@@ -15,8 +15,7 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu {
-namespace device {
+namespace flsgpu { namespace device {
 template <typename T>
 struct BPFunctor : FunctorBase<T> {
 	using UINT_T = typename utils::same_width_uint<T>::type;
@@ -143,7 +142,6 @@ struct DICTAdaptiveFunctor : FunctorBase<T> {
 	}
 };
 
-} // namespace device
-} // namespace flsgpu
+}} // namespace flsgpu::device
 
 #endif // FLSGPU_FLS_FUNCTORS_CUH
