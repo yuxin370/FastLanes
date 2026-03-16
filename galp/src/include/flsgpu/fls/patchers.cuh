@@ -6,8 +6,8 @@
 #ifndef FLSGPU_FLS_PATCHERS_CUH
 #define FLSGPU_FLS_PATCHERS_CUH
 
-#include "flsgpu/fls/functors.cuh"
 #include "flsgpu/device-types.cuh"
+#include "flsgpu/fls/functors.cuh"
 #include "flsgpu/old-fls.cuh"
 #include "flsgpu/structs.cuh"
 #include "flsgpu/utils.cuh"
@@ -16,14 +16,13 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu {
-namespace device {
+namespace flsgpu { namespace device {
 template <typename T>
 struct FREQExceptionPatcherBase {
 public:
 	__device__ __forceinline__ void fill_and_patch([[maybe_unused]] T* out) {
 	}
-	__device__ ~FREQExceptionPatcherBase()                 = default;
+	__device__ ~FREQExceptionPatcherBase() = default;
 };
 
 template <typename T>
@@ -31,7 +30,7 @@ struct SLPATCHExceptionPatcherBase {
 public:
 	__device__ __forceinline__ void patch([[maybe_unused]] T* out) {
 	}
-	__device__ ~SLPATCHExceptionPatcherBase()     = default;
+	__device__ ~SLPATCHExceptionPatcherBase() = default;
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
@@ -104,7 +103,7 @@ public:
 			exceptions_count[v] = column.counts[vec_index]; // exceotions count in this vector
 			vec_exceptions_positions[v] =
 			    column.positions +
-			    column.exceptions_offsets[vec_index]; // exceptions_offsets corresponds to offests in exceptions array
+			    column.positions_offsets[vec_index]; // position offsets correspond to positions segment layout
 			vec_exceptions[v] = column.exceptions +
 			                    column.exceptions_offsets[vec_index]; // get the first position/exception in this vector
 			frequent_value[v] = column.frequent_value[vec_index];     // also the first values in this vector
@@ -168,7 +167,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index              = first_vector_index + v;
 			exceptions_count[v]         = column.counts[vec_index];
-			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.positions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
 			frequent_value[v]           = column.frequent_value[vec_index];
 		}
@@ -220,7 +219,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index              = first_vector_index + v;
 			exceptions_count[v]         = column.counts[vec_index];
-			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.positions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
 		}
 	}
@@ -275,7 +274,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index              = first_vector_index + v;
 			exceptions_count[v]         = column.index.counts[vec_index];
-			vec_exceptions_positions[v] = column.index.positions + column.index.exceptions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.index.positions + column.index.positions_offsets[vec_index];
 			vec_exceptions[v]           = column.index.exceptions + column.index.exceptions_offsets[vec_index];
 		}
 	}
@@ -293,7 +292,7 @@ struct StatelessSLPATCHExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
 
 public:
 	void __device__ __forceinline__ patch(T* out) {
-		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr auto N_LANES   = utils::get_n_lanes<INT_T>();
 		const int      first_pos = start_index * N_LANES + lane;
 		const int      last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
 		start_index += UNPACK_N_VALUES;
@@ -315,9 +314,9 @@ public:
 
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
-			const auto vec_index         = first_vector_index + v;
+			const auto vec_index        = first_vector_index + v;
 			exceptions_count[v]         = column.counts[vec_index];
-			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.positions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
 		}
 	}
@@ -337,7 +336,7 @@ struct StatelessSLPATCHDictExceptionPatcher : SLPATCHExceptionPatcherBase<T> {
 
 public:
 	void __device__ __forceinline__ patch(T* out) {
-		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr auto N_LANES   = utils::get_n_lanes<INT_T>();
 		const int      first_pos = start_index * N_LANES + lane;
 		const int      last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
 		start_index += UNPACK_N_VALUES;
@@ -361,9 +360,9 @@ public:
 
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
-			const auto vec_index         = first_vector_index + v;
+			const auto vec_index        = first_vector_index + v;
 			exceptions_count[v]         = column.index.counts[vec_index];
-			vec_exceptions_positions[v] = column.index.positions + column.index.exceptions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.index.positions + column.index.positions_offsets[vec_index];
 			vec_exceptions[v]           = column.index.exceptions + column.index.exceptions_offsets[vec_index];
 		}
 	}
@@ -674,8 +673,6 @@ public:
 	}
 };
 
-
-} // namespace device
-} // namespace flsgpu
+}} // namespace flsgpu::device
 
 #endif // FLSGPU_FLS_PATCHERS_CUH

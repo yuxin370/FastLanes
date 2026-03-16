@@ -26,6 +26,7 @@ struct FREQColumn {
 
 	size_t    n_exceptions;       // total number of exceptions
 	size_t*   exceptions_offsets; // expection offsets in exception array
+	size_t*   positions_offsets;  // position offsets in position array
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -47,6 +48,7 @@ struct FREQColumn {
 
 	size_t    n_exceptions;       // total number of exceptions
 	size_t*   exceptions_offsets; // expection offsets in exception array
+	size_t*   positions_offsets;  // position offsets
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -67,6 +69,7 @@ struct FREQColumn {
 		    GPUArray<T>(n_vecs, frequent_value).release(),
 		    n_exceptions,
 		    GPUArray<size_t>(n_vecs, exceptions_offsets).release(),
+		    GPUArray<size_t>(n_vecs, positions_offsets).release(),
 		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
 		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
 		    GPUArray<uint16_t>(n_vecs, counts).release(),
@@ -90,14 +93,14 @@ struct FREQColumn {
 		              "FREQ position storage requires uint16_t-capable vector size");
 
 		// Copies of pointers for pointer arithmetic
-		T*        c_exceptions         = exceptions;
-		uint16_t* c_positions          = positions;
 		T*        c_out_exceptions     = out_exceptions;
 		uint16_t* c_out_positions      = out_positions;
 		uint16_t* c_out_offsets_counts = out_offsets_counts;
 
 		for (size_t vec_index {0}; vec_index < get_n_vecs(); ++vec_index) {
-			uint32_t vec_exception_count = counts[vec_index];
+			uint32_t     vec_exception_count = counts[vec_index];
+			const size_t exc_base            = exceptions_offsets[vec_index];
+			const size_t pos_base            = positions_offsets[vec_index];
 
 			// Reset counts
 			for (size_t j {0}; j < N_LANES; ++j) {
@@ -106,8 +109,8 @@ struct FREQColumn {
 
 			// Split all exceptions into lanes
 			for (size_t exception_index {0}; exception_index < vec_exception_count; ++exception_index) {
-				T        exception = c_exceptions[exception_index];
-				uint16_t position  = c_positions[exception_index];
+				T        exception = exceptions[exc_base + exception_index];
+				uint16_t position  = positions[pos_base + exception_index];
 
 				uint32_t lane                 = position % N_LANES;
 				uint32_t lane_exception_count = lane_counts[lane];
@@ -130,8 +133,6 @@ struct FREQColumn {
 				c_out_offsets_counts[lane] = (exc_in_lane_count << 10) | (vec_exceptions_counter - exc_in_lane_count);
 			}
 
-			c_exceptions += vec_exception_count;
-			c_positions += vec_exception_count;
 			c_out_exceptions += vec_exception_count;
 			c_out_positions += vec_exception_count;
 			c_out_offsets_counts += utils::get_n_lanes<T>();
@@ -142,11 +143,17 @@ struct FREQColumn {
 
 	FREQExtendedColumn<T> create_extended_column() const {
 		auto [e_exceptions, e_positions, e_offsets_counts] = convert_exceptions_to_lane_divided_format();
+		auto*  e_offsets                                   = new size_t[get_n_vecs()];
+		size_t acc                                         = 0;
+		for (size_t i = 0; i < get_n_vecs(); ++i) {
+			e_offsets[i] = acc;
+			acc += static_cast<size_t>(counts[i]);
+		}
 		return FREQExtendedColumn<T> {n_values,
 		                              get_n_vecs(),
 		                              utils::copy_array(frequent_value, get_n_vecs()),
 		                              n_exceptions,
-		                              utils::copy_array(exceptions_offsets, get_n_vecs()),
+		                              e_offsets,
 		                              e_exceptions,
 		                              e_positions,
 		                              e_offsets_counts};
@@ -157,6 +164,7 @@ template <typename T>
 void free_column(FREQColumn<T> column) {
 	delete[] column.frequent_value;
 	delete[] column.exceptions_offsets;
+	delete[] column.positions_offsets;
 	delete[] column.exceptions;
 	delete[] column.positions;
 	delete[] column.counts;
@@ -166,6 +174,7 @@ template <typename T>
 void free_column(device::FREQColumn<T> column) {
 	free_device_pointer(column.frequent_value);
 	free_device_pointer(column.exceptions_offsets);
+	free_device_pointer(column.positions_offsets);
 	free_device_pointer(column.exceptions);
 	free_device_pointer(column.positions);
 	free_device_pointer(column.counts);
@@ -196,14 +205,15 @@ inline ParseResultT<flsgpu::host::FREQColumn<T>> parse_frequency(const ParseCont
 		fv_arr[i] = fv;
 	}
 
-	auto* counts     = detail::copy_segment_array<uint16_t>(seg_cnt);
+	auto* counts = detail::copy_segment_array<uint16_t>(seg_cnt);
+	auto  exc    = detail::build_exception_offsets_from_segment<T>(seg_exc, ctx.n_vecs);
+	auto  pos    = detail::build_exception_offsets_from_segment<uint16_t>(seg_pos, ctx.n_vecs);
+
 	auto* positions  = detail::copy_segment_array<uint16_t>(seg_pos);
 	auto* exceptions = detail::copy_segment_array<T>(seg_exc);
 
-	auto exc = detail::build_exception_offsets_from_segment<T>(seg_exc, ctx.n_vecs);
-
 	return ParseResultT<flsgpu::host::FREQColumn<T>> {flsgpu::host::FREQColumn<T> {
-	    ctx.n_values, ctx.n_vecs, fv_arr, exc.total, exc.offsets, exceptions, positions, counts}};
+	    ctx.n_values, ctx.n_vecs, fv_arr, exc.total, exc.offsets, pos.offsets, exceptions, positions, counts}};
 }
 
 } // namespace reader::columns

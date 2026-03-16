@@ -267,7 +267,7 @@ namespace bindings {
 
 template <typename T>
 flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const vbw_t value_bit_width) {
-	using UINT_T                 = typename flsgpu::host::BPColumn<T>::UINT_T;
+	using UINT_T                  = typename flsgpu::host::BPColumn<T>::UINT_T;
 	size_t n_vecs                 = utils::get_n_vecs_from_size(n_values);
 	size_t compressed_vector_size = utils::get_compressed_vector_size<T>(value_bit_width);
 	size_t n_packed_values        = n_vecs * compressed_vector_size;
@@ -292,7 +292,7 @@ flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const 
 
 template <typename T>
 T* decompress(const flsgpu::host::BPColumn<T> column) {
-	using UINT_T         = typename flsgpu::host::BPColumn<T>::UINT_T;
+	using UINT_T            = typename flsgpu::host::BPColumn<T>::UINT_T;
 	T*      out_array       = new T[column.get_n_values()];
 	T*      c_out_array     = out_array;
 	UINT_T* c_packed_arrayu = column.packed_array;
@@ -309,9 +309,9 @@ T* decompress(const flsgpu::host::BPColumn<T> column) {
 
 template <typename T>
 T* decompress(const flsgpu::host::FFORColumn<T> column) {
-	using UINT_T         = typename flsgpu::host::FFORColumn<T>::UINT_T;
-	T*     out_array      = new T[column.get_n_values()];
-	T*     c_out_array    = out_array;
+	using UINT_T           = typename flsgpu::host::FFORColumn<T>::UINT_T;
+	T*      out_array      = new T[column.get_n_values()];
+	T*      c_out_array    = out_array;
 	UINT_T* c_packed_array = column.bp.packed_array + column.bp.vector_offsets[0];
 
 	for (size_t vi {0}; vi < column.get_n_vecs(); ++vi) {
@@ -391,6 +391,10 @@ T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
 			delete[] out_array;
 			throw std::runtime_error("SLPATCH: exceptions_offsets/counts mismatch");
 		}
+		if (column.positions_offsets[vi] != running_off) {
+			delete[] out_array;
+			throw std::runtime_error("SLPATCH: positions_offsets/counts mismatch");
+		}
 		running_off += static_cast<size_t>(column.counts[vi]);
 	}
 	if (running_off != column.n_exceptions) {
@@ -407,7 +411,7 @@ T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
 		const size_t   off = running_off;
 		running_off += static_cast<size_t>(cnt);
 
-		const uint16_t* pos_ptr = column.positions + off;
+		const uint16_t* pos_ptr = column.positions + static_cast<size_t>(column.positions_offsets[vi]);
 		const T*        exc_ptr = column.exceptions + off;
 
 		for (uint16_t i = 0; i < cnt; ++i) {
@@ -668,11 +672,12 @@ T* decompress(const flsgpu::host::FREQColumn<T> column) {
 		std::fill_n(out_array + out_base, vec_n, fv);
 
 		// 2) patch exceptions
-		const uint16_t cnt = column.counts[vi];
-		const size_t   off = static_cast<size_t>(column.exceptions_offsets[vi]);
+		const uint16_t cnt     = column.counts[vi];
+		const size_t   exc_off = static_cast<size_t>(column.exceptions_offsets[vi]);
+		const size_t   pos_off = static_cast<size_t>(column.positions_offsets[vi]);
 
-		const uint16_t* pos_ptr = column.positions + off;
-		const T*        exc_ptr = column.exceptions + off;
+		const uint16_t* pos_ptr = column.positions + pos_off;
+		const T*        exc_ptr = column.exceptions + exc_off;
 
 		for (uint16_t i = 0; i < cnt; ++i) {
 			const uint16_t pos = pos_ptr[i]; // position inside this vector
@@ -741,7 +746,7 @@ inline vbw_t bit_width_for_max_value(const size_t max_value) {
 
 template <typename T>
 flsgpu::host::FFORColumn<T> make_ffor_from_values(const T* values, const size_t n_values, const vbw_t bit_width) {
-	using UINT_T       = typename flsgpu::host::FFORColumn<T>::UINT_T;
+	using UINT_T        = typename flsgpu::host::FFORColumn<T>::UINT_T;
 	auto         bp     = bindings::compress(values, n_values, bit_width);
 	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
 	auto*        bases  = primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0});
@@ -761,7 +766,7 @@ flsgpu::host::BPColumn<T> generate_index_bp_column(const size_t n_values, const 
 
 template <typename T>
 flsgpu::host::FFORColumn<T> generate_index_ffor_column(const size_t n_values, const vbw_t value_bit_width) {
-	using UINT_T = typename flsgpu::host::FFORColumn<T>::UINT_T;
+	using UINT_T  = typename flsgpu::host::FFORColumn<T>::UINT_T;
 	size_t n_vecs = utils::get_n_vecs_from_size(n_values);
 	return flsgpu::host::FFORColumn<T> {
 	    generate_index_bp_column<T>(n_values, value_bit_width),
@@ -793,7 +798,7 @@ flsgpu::host::FFORColumn<T> generate_random_ffor_column(const size_t            
                                                         const ValueRange<vbw_t> value_bit_width,
                                                         const ValueRange<T>     bases,
                                                         const int32_t           repeat = 1) {
-	using UINT_T = typename flsgpu::host::FFORColumn<T>::UINT_T;
+	using UINT_T  = typename flsgpu::host::FFORColumn<T>::UINT_T;
 	size_t n_vecs = utils::get_n_vecs_from_size(n_values);
 	return flsgpu::host::FFORColumn<T> {
 	    generate_random_bp_column<T>(n_values, value_bit_width, repeat),
@@ -938,8 +943,8 @@ flsgpu::host::DICTFFORColumn<T> generate_random_dict_column(const size_t   n_val
 	// 5) set FFOR bases all to 0（idx = value + base）
 	const size_t n_vecs = bp.get_n_vecs();
 	column.ffor         = flsgpu::host::FFORColumn<UINT_T> {
-	            bp,
-	            primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0}),
+        bp,
+        primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0}),
     };
 
 	return column;
@@ -961,6 +966,7 @@ flsgpu::host::FREQColumn<T> generate_freq_column(const size_t n_values, const Va
 
 	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
 	column.exceptions_offsets = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
+	column.positions_offsets  = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
 	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
 	column.positions =
 	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
@@ -985,11 +991,12 @@ flsgpu::host::SLPATCHColumn<T> generate_slpatch_column(const size_t             
 
 	const size_t n_exceptions       = primitives::sum_array<uint16_t, size_t>(counts, n_vecs);
 	auto*        exceptions_offsets = primitives::prefix_sum_array(counts, new size_t[n_vecs], n_vecs);
+	auto*        positions_offsets  = primitives::prefix_sum_array(counts, new size_t[n_vecs], n_vecs);
 	auto*        exceptions         = primitives::fill_array_with_random_bytes(new T[n_exceptions], n_exceptions);
 	auto*        positions = primitives::generate_positions<uint16_t>(new uint16_t[n_exceptions], counts, n_vecs);
 
 	return flsgpu::host::SLPATCHColumn<T> {
-	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, exceptions, positions, counts};
+	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, positions_offsets, exceptions, positions, counts};
 }
 
 template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
@@ -1011,12 +1018,13 @@ flsgpu::host::DICTSLPATCHColumn<T, IndexT> generate_dict_slpatch_column(const si
 
 	const size_t n_exceptions       = primitives::sum_array<uint16_t, size_t>(counts, n_vecs);
 	auto*        exceptions_offsets = primitives::prefix_sum_array(counts, new size_t[n_vecs], n_vecs);
+	auto*        positions_offsets  = primitives::prefix_sum_array(counts, new size_t[n_vecs], n_vecs);
 	auto*        exceptions         = primitives::fill_array_with_random_data<IndexT>(
         new IndexT[n_exceptions], n_exceptions, 1, IndexT {0}, static_cast<IndexT>(key_count > 0 ? key_count - 1 : 0));
 	auto* positions = primitives::generate_positions<uint16_t>(new uint16_t[n_exceptions], counts, n_vecs);
 
 	flsgpu::host::SLPATCHColumn<IndexT> slpatch_idx {
-	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, exceptions, positions, counts};
+	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, positions_offsets, exceptions, positions, counts};
 
 	using KEY_T = typename flsgpu::host::DICTSLPATCHColumn<T, IndexT>::KEY_T;
 	auto* keys  = primitives::fill_array_with_random_bytes(new KEY_T[key_count], key_count);
@@ -1080,6 +1088,7 @@ flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn
 
 	delete[] column.counts;
 	delete[] column.exceptions_offsets;
+	delete[] column.positions_offsets;
 	delete[] column.exceptions;
 	delete[] column.positions;
 
@@ -1088,6 +1097,7 @@ flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn
 	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
 	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
 	column.exceptions_offsets = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
+	column.positions_offsets  = primitives::prefix_sum_array(column.counts, new size_t[n_vecs], n_vecs);
 	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
 	column.positions =
 	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);

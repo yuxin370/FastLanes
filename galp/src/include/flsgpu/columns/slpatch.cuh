@@ -23,6 +23,7 @@ struct SLPATCHColumn {
 
 	size_t    n_exceptions;       // total number of exceptions
 	size_t*   exceptions_offsets; // exception offsets in exception array
+	size_t*   positions_offsets;  // position offsets in position array
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -44,6 +45,7 @@ struct SLPATCHColumn {
 
 	size_t    n_exceptions;       // total number of exceptions
 	size_t*   exceptions_offsets; // exception values
+	size_t*   positions_offsets;  // position offsets
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -64,6 +66,7 @@ struct SLPATCHColumn {
 		    ffor.copy_to_device(),
 		    n_exceptions,
 		    GPUArray<size_t>(n_vecs, exceptions_offsets).release(),
+		    GPUArray<size_t>(n_vecs, positions_offsets).release(),
 		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
 		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
 		    GPUArray<uint16_t>(n_vecs, counts).release(),
@@ -75,6 +78,7 @@ template <typename T>
 void free_column(SLPATCHColumn<T> column) {
 	free_column(column.ffor);
 	delete[] column.exceptions_offsets;
+	delete[] column.positions_offsets;
 	delete[] column.exceptions;
 	delete[] column.positions;
 	delete[] column.counts;
@@ -84,6 +88,7 @@ template <typename T>
 void free_column(device::SLPATCHColumn<T> column) {
 	free_column(column.ffor);
 	free_device_pointer(column.exceptions_offsets);
+	free_device_pointer(column.positions_offsets);
 	free_device_pointer(column.exceptions);
 	free_device_pointer(column.positions);
 	free_device_pointer(column.counts);
@@ -122,9 +127,10 @@ inline ParseResultT<flsgpu::host::SLPATCHColumn<T>> parse_slpatch(const ParseCon
 	auto* exceptions = detail::copy_segment_array<T>(seg_exc);
 
 	auto exc = detail::build_exception_offsets_from_segment<T>(seg_exc, ctx.n_vecs);
+	auto pos = detail::build_exception_offsets_from_segment<uint16_t>(seg_pos, ctx.n_vecs);
 
 	return ParseResultT<flsgpu::host::SLPATCHColumn<T>> {flsgpu::host::SLPATCHColumn<T> {
-	    ctx.n_values, ctx.n_vecs, ffor, exc.total, exc.offsets, exceptions, positions, counts}};
+	    ctx.n_values, ctx.n_vecs, ffor, exc.total, exc.offsets, pos.offsets, exceptions, positions, counts}};
 }
 
 } // namespace reader::columns

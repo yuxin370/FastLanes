@@ -73,16 +73,17 @@ inline flsgpu::host::SLPATCHColumn<uint8_t>
 make_slpatch_u8_from_slpatch_i8(const flsgpu::host::SLPATCHColumn<int8_t>& col) {
 	auto index_ffor = make_ffor_u8_from_ffor_i8(col.ffor);
 
-	auto* offsets = utils::copy_array(col.exceptions_offsets, col.n_vecs);
-	auto* pos     = utils::copy_array(col.positions, col.n_exceptions);
-	auto* cnt     = utils::copy_array(col.counts, col.n_vecs);
-	auto* exc     = new uint8_t[col.n_exceptions];
+	auto* offsets     = utils::copy_array(col.exceptions_offsets, col.n_vecs);
+	auto* pos_offsets = utils::copy_array(col.positions_offsets, col.n_vecs);
+	auto* pos         = utils::copy_array(col.positions, col.n_exceptions);
+	auto* cnt         = utils::copy_array(col.counts, col.n_vecs);
+	auto* exc         = new uint8_t[col.n_exceptions];
 	for (size_t i = 0; i < col.n_exceptions; ++i) {
 		exc[i] = static_cast<uint8_t>(col.exceptions[i]);
 	}
 
 	return flsgpu::host::SLPATCHColumn<uint8_t> {
-	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, exc, pos, cnt};
+	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, pos_offsets, exc, pos, cnt};
 }
 
 template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
@@ -115,9 +116,10 @@ inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> parse_dict_slpat
 	auto* exceptions = detail::copy_segment_array<IndexT>(seg_exc);
 
 	auto exc     = detail::build_exception_offsets_from_segment<IndexT>(seg_exc, ctx.n_vecs);
+	auto pos_off = detail::build_exception_offsets_from_segment<uint16_t>(seg_pos, ctx.n_vecs);
 
 	flsgpu::host::SLPATCHColumn<IndexT> slpatch_idx {
-	    ctx.n_values, ctx.n_vecs, ffor_idx, exc.total, exc.offsets, exceptions, positions, counts};
+	    ctx.n_values, ctx.n_vecs, ffor_idx, exc.total, exc.offsets, pos_off.offsets, exceptions, positions, counts};
 
 	return ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
 	    flsgpu::host::DICTSLPATCHColumn<T, IndexT> {slpatch_idx, keys, key_count}};
