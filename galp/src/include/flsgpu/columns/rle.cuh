@@ -86,9 +86,13 @@ inline ParseResultT<flsgpu::host::RLEColumn<T, IndexT>> parse_rle(const ParseCon
 		throw std::runtime_error("EXP_RLE: missing operand tokens");
 	}
 
-	const size_t base_idx    = ctx.operand_tokens->size() - 1;
-	const auto   seg_vals    = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 4)));
-	const auto   seg_rsum    = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
+	const size_t base_idx = ctx.operand_tokens->size() - 1;
+	// FastLanes decode consumes tokens from the tail as:
+	// dec_unffor(bitpacked,bw,base) -> dec_rsum(rsum_bases) -> dec_rle_map(rle_values)
+	// so operand order in the RPN token vector is:
+	// [rle_values, rsum_bases, bitpacked, bw, base]
+	const auto seg_vals      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 4)));
+	const auto seg_rsum      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
 	const auto seg_bitpacked = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
 	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
 	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));

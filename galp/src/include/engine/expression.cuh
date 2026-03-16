@@ -84,7 +84,8 @@ enum class PlanKind : uint8_t {
 	CONSTANT,
 	UNFFOR,
 	UNFFOR_SLPATCH,
-	RLE,
+	RLE_U8,
+	RLE_U16,
 	FREQUENCY,
 	CROSS_RLE,
 	DICT_FFOR_U8,
@@ -124,18 +125,19 @@ struct DeviceExpression {
 	bool     freq_use_extended = false;
 	T*       out;
 	union {
-		flsgpu::device::BPColumn<T>                   bp;
-		flsgpu::device::CONSTANTColumn<T>             constant;
-		flsgpu::device::FFORColumn<T>                 ffor;
-		flsgpu::device::SLPATCHColumn<T>              slpatch;
-		flsgpu::device::DICTFFORColumn<T, uint16_t>   dictffor_u16;
-		flsgpu::device::DICTFFORColumn<T, uint8_t>    dictffor_u8;
+		flsgpu::device::BPColumn<T>                    bp;
+		flsgpu::device::CONSTANTColumn<T>              constant;
+		flsgpu::device::FFORColumn<T>                  ffor;
+		flsgpu::device::SLPATCHColumn<T>               slpatch;
+		flsgpu::device::DICTFFORColumn<T, uint16_t>    dictffor_u16;
+		flsgpu::device::DICTFFORColumn<T, uint8_t>     dictffor_u8;
 		flsgpu::device::DICTSLPATCHColumn<T, uint16_t> dictslpatch_u16;
-		flsgpu::device::DICTSLPATCHColumn<T, uint8_t> dictslpatch_u8;
-		flsgpu::device::FREQColumn<T>                 freq;
-		flsgpu::device::FREQExtendedColumn<T>         freq_extended;
-		flsgpu::device::CROSSRLEColumn<T>             crossrle;
-		flsgpu::device::RLEColumn<T, uint16_t>        rle;
+		flsgpu::device::DICTSLPATCHColumn<T, uint8_t>  dictslpatch_u8;
+		flsgpu::device::FREQColumn<T>                  freq;
+		flsgpu::device::FREQExtendedColumn<T>          freq_extended;
+		flsgpu::device::CROSSRLEColumn<T>              crossrle;
+		flsgpu::device::RLEColumn<T, uint8_t>          rle_u8;
+		flsgpu::device::RLEColumn<T, uint16_t>         rle_u16;
 	} col;
 };
 
@@ -173,7 +175,9 @@ inline PlanKind plan_for_ops(const std::vector<expr::OperatorKind>& ops) {
 		return PlanKind::CROSS_RLE;
 	}
 	if (ops_match(ops, {UNFFOR, RSUM, RLE})) {
-		return PlanKind::RLE;
+		// Operator-only plan inference cannot derive RLE index width.
+		// The real execution path should prefer plan_for_host_col<>.
+		return PlanKind::RLE_U16;
 	}
 	if (ops_match(ops, {UNFFOR, DICT})) {
 		return PlanKind::DICT_FFOR_U16;

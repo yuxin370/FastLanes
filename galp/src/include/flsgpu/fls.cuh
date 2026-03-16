@@ -11,5 +11,6 @@
 #include "flsgpu/fls/functors.cuh"
 #include "flsgpu/fls/patchers.cuh"
 #include "flsgpu/fls/unpackers.cuh"
+#include "flsgpu/fls/untransposers.cuh"
 
 #endif // FLS_CUH

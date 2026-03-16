@@ -28,9 +28,9 @@ template <typename>
 inline constexpr bool always_false_v = false;
 
 struct Config {
-	unsigned unpack_n_vectors = 1;
-	unsigned unpack_n_values  = 1;
-	uint32_t n_samples        = 1;
+	unsigned unpack_n_vectors    = 1;
+	unsigned unpack_n_values     = 1;
+	uint32_t n_samples           = 1;
 	bool     gpu_dispatch_kernel = true;
 
 	constexpr DecodeChunk chunk() const {
@@ -184,7 +184,7 @@ struct host_plan_kind<flsgpu::host::CROSSRLEColumn<T>> {
 };
 template <typename T, typename IndexT>
 struct host_plan_kind<flsgpu::host::RLEColumn<T, IndexT>> {
-	static constexpr PlanKind value = PlanKind::RLE;
+	static constexpr PlanKind value = std::is_same_v<IndexT, uint8_t> ? PlanKind::RLE_U8 : PlanKind::RLE_U16;
 };
 
 template <typename HostColT>
@@ -206,8 +206,7 @@ bool should_use_freq_extended(const flsgpu::host::FREQColumn<T>& host_col,
 	if (host_col.get_n_vecs() == 0) {
 		return false;
 	}
-	const double exc_per_vec =
-	    static_cast<double>(host_col.n_exceptions) / static_cast<double>(host_col.get_n_vecs());
+	const double exc_per_vec = static_cast<double>(host_col.n_exceptions) / static_cast<double>(host_col.get_n_vecs());
 	return exc_per_vec >= static_cast<double>(freq_branchless_threshold);
 }
 
@@ -215,7 +214,7 @@ template <typename T, typename HostColT>
 void fill_device_expr(DeviceExpression<T>& expr,
                       const HostColT&      host_col,
                       const PlanKind       plan,
-                      const bool           freq_use_extended            = false) {
+                      const bool           freq_use_extended = false) {
 	switch (plan) {
 	case PlanKind::UNCOMPRESSED:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::BPColumn<T>>) {
@@ -285,9 +284,15 @@ void fill_device_expr(DeviceExpression<T>& expr,
 			return;
 		}
 		break;
-	case PlanKind::RLE:
+	case PlanKind::RLE_U8:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::RLEColumn<T, uint8_t>>) {
+			expr.col.rle_u8 = host_col.copy_to_device();
+			return;
+		}
+		break;
+	case PlanKind::RLE_U16:
 		if constexpr (std::is_same_v<HostColT, flsgpu::host::RLEColumn<T, uint16_t>>) {
-			expr.col.rle = host_col.copy_to_device();
+			expr.col.rle_u16 = host_col.copy_to_device();
 			return;
 		}
 		break;
@@ -334,8 +339,11 @@ void free_device_expr(const DeviceExpression<T>& expr) {
 	case PlanKind::CROSS_RLE:
 		flsgpu::host::free_column(expr.col.crossrle);
 		break;
-	case PlanKind::RLE:
-		flsgpu::host::free_column(expr.col.rle);
+	case PlanKind::RLE_U8:
+		flsgpu::host::free_column(expr.col.rle_u8);
+		break;
+	case PlanKind::RLE_U16:
+		flsgpu::host::free_column(expr.col.rle_u16);
 		break;
 	default:
 		break;

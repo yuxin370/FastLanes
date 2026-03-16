@@ -8,6 +8,7 @@
 
 #include "flsgpu/device-types.cuh"
 #include "flsgpu/fls/functors.cuh"
+#include "flsgpu/fls/untransposers.cuh"
 #include "flsgpu/old-fls.cuh"
 #include "flsgpu/structs.cuh"
 #include "flsgpu/utils.cuh"
@@ -16,29 +17,38 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu {
-namespace device {
+namespace flsgpu { namespace device {
 
 template <typename ValueT, typename CodeT>
 struct RLEExpanderBase {
 public:
 	__device__ __forceinline__ void expand_run_into([[maybe_unused]] ValueT* out) {
 	}
+	__device__ __forceinline__ void expand_codes_untransposed_into([[maybe_unused]] const CodeT* __restrict codes,
+	                                                               [[maybe_unused]] ValueT* __restrict out,
+	                                                               [[maybe_unused]] const si_t index_offset) {
+	}
 	__device__ ~RLEExpanderBase() = default;
 };
-
 
 template <typename ValueT,
           typename CodeT,
           unsigned UNPACK_N_VECTORS,
-          unsigned UNPACK_N_VALUES>
+          unsigned UNPACK_N_VALUES,
+          typename UntransposerT = flsgpu::device::IdentityUntransposer>
 struct DummyRLEExpander : flsgpu::device::RLEExpanderBase<ValueT, CodeT> {
 private:
-	const ValueT* rle_values;
-	const size_t* rle_offsets;
-	const vi_t    base_vector_index;
+	const ValueT*            rle_values;
+	const size_t*            rle_offsets;
+	const vi_t               base_vector_index;
+	const lane_t             lane;
+	static constexpr int32_t N_LANES = utils::get_n_lanes<CodeT>();
 
 public:
+	__device__ __forceinline__ ValueT decode_value(const size_t base_offset, const CodeT code) const {
+		return static_cast<ValueT>(rle_values[base_offset + static_cast<size_t>(code)]);
+	}
+
 	__device__ __forceinline__ void expand_codes_into(const CodeT* __restrict codes, ValueT* __restrict out) {
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
@@ -46,7 +56,24 @@ public:
 #pragma unroll
 			for (unsigned i = 0; i < UNPACK_N_VALUES; ++i) {
 				const unsigned idx = i + v * UNPACK_N_VALUES;
-				out[idx] = static_cast<ValueT>(rle_values[base_offset + static_cast<size_t>(codes[idx])]);
+				out[idx]           = decode_value(base_offset, codes[idx]);
+			}
+		}
+	}
+
+	__device__ __forceinline__ void
+	expand_codes_untransposed_into(const CodeT* __restrict codes, ValueT* __restrict out, const si_t index_offset) {
+#pragma unroll
+		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
+			const size_t base_offset = rle_offsets[base_vector_index + v];
+#pragma unroll
+			for (unsigned i = 0; i < UNPACK_N_VALUES; ++i) {
+				const unsigned idx = i + v * UNPACK_N_VALUES;
+				const ValueT   val = decode_value(base_offset, codes[idx]);
+				const uint32_t in_idx =
+				    static_cast<uint32_t>(lane) + static_cast<uint32_t>(index_offset + static_cast<si_t>(i)) * N_LANES;
+				const uint32_t out_idx                       = UntransposerT::map_index(in_idx);
+				out[v * consts::VALUES_PER_VECTOR + out_idx] = val;
 			}
 		}
 	}
@@ -62,21 +89,19 @@ public:
 
 	__device__ __forceinline__
 	DummyRLEExpander(const flsgpu::device::RLEColumn<ValueT, CodeT> column, const vi_t vector_index, const lane_t lane)
-		: rle_values(column.rle_values)
+	    : rle_values(column.rle_values)
 	    , rle_offsets(column.rle_offsets)
-	    , base_vector_index(vector_index) {
-		(void)lane;
+	    , base_vector_index(vector_index)
+	    , lane(lane) {
 	}
 };
-
-
 
 template <typename T>
 struct CROSSRLEExpanderBase {
 public:
 	__device__ __forceinline__ void expand_run_into([[maybe_unused]] T* out) {
 	}
-	__device__ ~CROSSRLEExpanderBase()                 = default;
+	__device__ ~CROSSRLEExpanderBase() = default;
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
@@ -160,13 +185,13 @@ public:
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
 			// Local aliases (encourage register caching)
-			UINT_T* __restrict__ values   = vec_values[v];
+			UINT_T* __restrict__ values    = vec_values[v];
 			uint32_t* __restrict__ lengths = vec_lengths[v];
 
 			// Load persistent state into locals
 			uint32_t run_index  = vec_run_index[v];
 			uint32_t run_length = vec_run_length[v];
-			uint32_t run_end    = vec_run_end[v];   // exclusive end of current run
+			uint32_t run_end    = vec_run_end[v]; // exclusive end of current run
 			UINT_T   value      = vec_run_value[v];
 
 			// First output position for this vector in this call
@@ -220,8 +245,8 @@ public:
 	}
 
 	__device__ __forceinline__ StatefulCacheCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
-	                                                    const vi_t                              vector_index,
-	                                                    const lane_t                            lane) {
+	                                                         const vi_t                              vector_index,
+	                                                         const lane_t                            lane) {
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
 			auto vec_index = vector_index + v;
@@ -245,7 +270,6 @@ public:
 		}
 	}
 };
-
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct StatefulCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
@@ -938,7 +962,6 @@ struct PrefetchBranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase
 	}
 };
 
-} // namespace device
-} // namespace flsgpu
+}} // namespace flsgpu::device
 
 #endif // FLSGPU_FLS_EXPANDERS_CUH

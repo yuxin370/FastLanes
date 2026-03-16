@@ -6,12 +6,12 @@
 #ifndef FLSGPU_FLS_DECOMPRESSORS_CUH
 #define FLSGPU_FLS_DECOMPRESSORS_CUH
 
-#include "flsgpu/fls/functors.cuh"
-#include "flsgpu/fls/unpackers.cuh"
-#include "flsgpu/fls/patchers.cuh"
-#include "flsgpu/fls/expanders.cuh"
-#include "flsgpu/fls/unsumer.cuh"
 #include "flsgpu/device-types.cuh"
+#include "flsgpu/fls/expanders.cuh"
+#include "flsgpu/fls/functors.cuh"
+#include "flsgpu/fls/patchers.cuh"
+#include "flsgpu/fls/unpackers.cuh"
+#include "flsgpu/fls/unsumer.cuh"
 #include "flsgpu/old-fls.cuh"
 #include "flsgpu/structs.cuh"
 #include "flsgpu/utils.cuh"
@@ -19,8 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 
-namespace flsgpu {
-namespace device {
+namespace flsgpu { namespace device {
 template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
 struct BPDecompressor : DecompressorBase<T> {
 	UnpackerT                  unpacker;
@@ -193,14 +192,13 @@ template <typename ValueT,
           unsigned UNPACK_N_VECTORS,
           unsigned UNPACK_N_VALUES,
           typename UnpackerT,
-		  typename ExpanderT,
+          typename ExpanderT,
           typename ColumnT>
 struct RLEDecompressor : DecompressorBase<ValueT> {
-	static constexpr unsigned N_VALUES = UNPACK_N_VECTORS * UNPACK_N_VALUES;
-	UnpackerT unpacker;
-	DummyRLEUnsumer<ValueT, CodeT, UNPACK_N_VECTORS, UNPACK_N_VALUES> unsumer;
-	ExpanderT expander;
-
+	static constexpr unsigned                                    N_VALUES = UNPACK_N_VECTORS * UNPACK_N_VALUES;
+	UnpackerT                                                    unpacker;
+	RLEUnsumer<ValueT, CodeT, UNPACK_N_VECTORS, UNPACK_N_VALUES> unsumer;
+	ExpanderT                                                    expander;
 
 	__device__ __forceinline__ RLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
@@ -208,7 +206,7 @@ struct RLEDecompressor : DecompressorBase<ValueT> {
 	               column.ffor.bp.bit_widths[vector_index],
 	               FFORFunctor<CodeT, UNPACK_N_VECTORS>(column.ffor.bases + vector_index))
 	    , unsumer(column, vector_index, lane)
-	    , expander(column,vector_index,lane) {
+	    , expander(column, vector_index, lane) {
 	}
 
 	void __device__ unpack_next_into(ValueT* __restrict out) {
@@ -217,9 +215,15 @@ struct RLEDecompressor : DecompressorBase<ValueT> {
 		unsumer.unsum_inplace(codes);
 		expander.expand_codes_into(codes, out);
 	}
+
+	void __device__ unpack_next_untransposed_into(ValueT* __restrict out, const si_t index_offset) {
+		CodeT codes[N_VALUES];
+		unpacker.unpack_next_into(codes);
+		unsumer.unsum_inplace(codes);
+		expander.expand_codes_untransposed_into(codes, out, index_offset);
+	}
 };
 
-} // namespace device
-} // namespace flsgpu
+}} // namespace flsgpu::device
 
 #endif // FLSGPU_FLS_DECOMPRESSORS_CUH
