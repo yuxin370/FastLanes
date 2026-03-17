@@ -167,9 +167,6 @@ execute_plan(const dispatch::DeviceExpression<T>& expr, const vi_t vector_index,
 	case dispatch::PlanKind::RLE_U8: {
 		using IndexT                       = uint8_t;
 		constexpr int RLE_UNPACK_N_VALUES = utils::get_values_per_lane<IndexT>();
-		if (lane >= static_cast<lane_t>(utils::get_n_lanes<IndexT>())) {
-			return;
-		}
 		using UnpackerT =
 		    flsgpu::device::BitUnpackerStatefulBranchless<IndexT,
 		                                                  UNPACK_N_VECTORS,
@@ -195,9 +192,6 @@ execute_plan(const dispatch::DeviceExpression<T>& expr, const vi_t vector_index,
 	case dispatch::PlanKind::RLE_U16: {
 		using IndexT                       = uint16_t;
 		constexpr int RLE_UNPACK_N_VALUES = utils::get_values_per_lane<IndexT>();
-		if (lane >= static_cast<lane_t>(utils::get_n_lanes<IndexT>())) {
-			return;
-		}
 		using UnpackerT =
 		    flsgpu::device::BitUnpackerStatefulBranchless<IndexT,
 		                                                  UNPACK_N_VECTORS,
