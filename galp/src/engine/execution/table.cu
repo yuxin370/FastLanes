@@ -277,16 +277,14 @@ double run_kernel(BenchmarkWorkset& workset,
 		}
 		return 0.0;
 	}
-	constexpr uint32_t lanes_i8   = utils::get_n_lanes<int8_t>();
-	constexpr uint32_t lanes_i16  = utils::get_n_lanes<int16_t>();
-	constexpr uint32_t warp_lanes = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
+	const MixedSlotMapping mixed_mapping(n_slots);
 
 	const size_t mega_launches_per_sample = gpu_dispatch_kernel ? 1 : launches_per_sample;
 
 	if (out_grid) {
-		*out_grid = gpu_dispatch_kernel
-		                ? ((n_slots * static_cast<size_t>(warp_lanes) + 255) / 256)
-		                : (launches_per_sample > 0 ? typed_total_items_per_sample / launches_per_sample : 0);
+		*out_grid =
+		    gpu_dispatch_kernel ? mixed_mapping.n_blocks()
+		                        : (launches_per_sample > 0 ? typed_total_items_per_sample / launches_per_sample : 0);
 	}
 	if (out_launches) {
 		*out_launches =
@@ -325,10 +323,8 @@ double run_kernel(BenchmarkWorkset& workset,
 		const auto*        exprs_i16     = workset.device_batches.template get<int16_t>().d_exprs.has_value()
 		                                       ? workset.device_batches.template get<int16_t>().d_exprs->get()
 		                                       : nullptr;
-		constexpr uint32_t block_threads = 256;
-		const dim3         block(block_threads);
-		const size_t       n_threads = n_slots * static_cast<size_t>(warp_lanes);
-		const dim3         grid(static_cast<unsigned>((n_threads + block_threads - 1) / block_threads));
+		const dim3         block(MixedSlotMapping::N_THREADS_PER_BLOCK);
+		const dim3         grid(mixed_mapping.n_blocks());
 		launch_mixed(exprs_i8, exprs_i16, grid, block);
 	} else {
 		dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
@@ -359,10 +355,8 @@ double run_kernel(BenchmarkWorkset& workset,
 			const auto*        exprs_i16     = workset.device_batches.template get<int16_t>().d_exprs.has_value()
 			                                       ? workset.device_batches.template get<int16_t>().d_exprs->get()
 			                                       : nullptr;
-			constexpr uint32_t block_threads = 256;
-			const dim3         block(block_threads);
-			const size_t       n_threads = n_slots * static_cast<size_t>(warp_lanes);
-			const dim3         grid(static_cast<unsigned>((n_threads + block_threads - 1) / block_threads));
+			const dim3         block(MixedSlotMapping::N_THREADS_PER_BLOCK);
+			const dim3         grid(mixed_mapping.n_blocks());
 			launch_mixed(exprs_i8, exprs_i16, grid, block);
 			continue;
 		}

@@ -272,12 +272,9 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
                                           const dispatch::DeviceExpression<int16_t>* exprs_i16,
                                           const dispatch::MixedWorkSlot*             slots,
                                           const size_t                               n_slots) {
-	constexpr uint32_t warp_lanes = dispatch::lane_count_for_type(dispatch::TypeTag::I8);
-	constexpr uint32_t half_lanes = dispatch::lane_count_for_type(dispatch::TypeTag::I16);
-
-	const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
-	const uint32_t slot_idx      = global_thread / warp_lanes;
-	const uint32_t lane          = global_thread - slot_idx * warp_lanes;
+	const MixedSlotMapping mapping(n_slots);
+	const uint32_t         slot_idx = mapping.slot_index();
+	const uint32_t         lane     = mapping.slot_lane();
 	if (slot_idx >= n_slots || slots == nullptr) {
 		return;
 	}
@@ -300,10 +297,10 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 	};
 
 	if (dispatch::is_valid_work_item(slot.second)) {
-		if (lane < half_lanes) {
+		if (mapping.is_first_half(lane)) {
 			run_work_item(slot.first, static_cast<lane_t>(lane));
 		} else {
-			run_work_item(slot.second, static_cast<lane_t>(lane - half_lanes));
+			run_work_item(slot.second, static_cast<lane_t>(lane - MixedSlotMapping::HALF_SLOT_LANES));
 		}
 		return;
 	}

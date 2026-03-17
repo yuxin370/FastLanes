@@ -24,20 +24,6 @@ struct ValueLanePolicy {
 	static constexpr uint32_t values_per_lane = static_cast<uint32_t>(utils::get_values_per_lane<T>());
 };
 
-// Dict policy intentionally separates output type and index-code type.
-// This is used to reason about semantic lanes (index stream) vs scheduling lanes.
-template <typename ValueT, typename IndexT>
-struct DictLanePolicy {
-	static constexpr uint32_t value_lanes    = ValueLanePolicy<ValueT>::semantic_lanes;
-	static constexpr uint32_t index_lanes    = ValueLanePolicy<IndexT>::semantic_lanes;
-	static constexpr uint32_t semantic_lanes = index_lanes;
-	static constexpr uint32_t scheduling_lanes =
-	    (ValueLanePolicy<ValueT>::scheduling_lanes > ValueLanePolicy<IndexT>::scheduling_lanes)
-	        ? ValueLanePolicy<ValueT>::scheduling_lanes
-	        : ValueLanePolicy<IndexT>::scheduling_lanes;
-	static constexpr uint32_t values_per_lane = static_cast<uint32_t>(consts::VALUES_PER_VECTOR / semantic_lanes);
-};
-
 } // namespace lane_policy
 
 template <typename T>
@@ -83,23 +69,18 @@ template <typename T>
 using ThreadblockMapping = FillWarpThreadblockMapping<T>;
 #endif
 
-struct VectorToWarpMappingBase {
-	virtual __device__ __forceinline__ lane_t get_lane() const;
-	virtual __device__ __forceinline__ vi_t   get_vector_index() const;
-};
-
 template <typename T, unsigned UNPACK_N_VECTORS>
-struct SingleVectorPerWarpMapping : VectorToWarpMappingBase {
+struct SingleVectorPerWarpMapping {
 	using Policy = lane_policy::ValueLanePolicy<T>;
 
 	static constexpr uint32_t N_LANES          = Policy::semantic_lanes;
 	static constexpr uint32_t N_VALUES_IN_LANE = Policy::values_per_lane;
 
-	__device__ __forceinline__ lane_t get_lane() const override {
+	__device__ __forceinline__ lane_t get_lane() const {
 		return threadIdx.x % N_LANES;
 	}
 
-	__device__ __forceinline__ vi_t get_vector_index() const override {
+	__device__ __forceinline__ vi_t get_vector_index() const {
 		// Concurrent vectors per block: how many vectors can be processed
 		// by the block simultaneously, assuming that each thread is 1 lane
 
@@ -115,17 +96,17 @@ struct SingleVectorPerWarpMapping : VectorToWarpMappingBase {
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS>
-struct FillWarpMapping : VectorToWarpMappingBase {
+struct FillWarpMapping {
 	using Policy = lane_policy::ValueLanePolicy<T>;
 
 	static constexpr uint32_t N_LANES          = Policy::semantic_lanes;
 	static constexpr uint32_t N_VALUES_IN_LANE = Policy::values_per_lane;
 
-	__device__ __forceinline__ lane_t get_lane() const override {
+	__device__ __forceinline__ lane_t get_lane() const {
 		return threadIdx.x % N_LANES;
 	}
 
-	__device__ __forceinline__ vi_t get_vector_index() const override {
+	__device__ __forceinline__ vi_t get_vector_index() const {
 		// Concurrent vectors per block: how many vectors can be processed
 		// by the block simultaneously, assuming that each thread is 1 lane
 
@@ -146,6 +127,42 @@ using VectorToWarpMapping = SingleVectorPerWarpMapping<T, UNPACK_N_VECTORS>;
 template <typename T, unsigned UNPACK_N_VECTORS>
 using VectorToWarpMapping = FillWarpMapping<T, UNPACK_N_VECTORS>;
 #endif
+
+struct MixedSlotMapping {
+	static constexpr uint32_t SLOT_LANES        = static_cast<uint32_t>(utils::get_n_lanes<int8_t>());
+	static constexpr uint32_t HALF_SLOT_LANES   = static_cast<uint32_t>(utils::get_n_lanes<int16_t>());
+	static constexpr uint32_t N_THREADS_PER_BLOCK = 256;
+
+	size_t n_slots = 0;
+
+	__host__ __device__ explicit constexpr MixedSlotMapping(const size_t slot_count = 0)
+	    : n_slots(slot_count) {
+	}
+
+	__host__ __device__ constexpr size_t n_threads() const {
+		return n_slots * static_cast<size_t>(SLOT_LANES);
+	}
+
+	__host__ __device__ constexpr unsigned n_blocks() const {
+		return static_cast<unsigned>((n_threads() + N_THREADS_PER_BLOCK - 1) / N_THREADS_PER_BLOCK);
+	}
+
+	__device__ __forceinline__ uint32_t global_thread() const {
+		return blockIdx.x * blockDim.x + threadIdx.x;
+	}
+
+	__device__ __forceinline__ uint32_t slot_index() const {
+		return global_thread() / SLOT_LANES;
+	}
+
+	__device__ __forceinline__ uint32_t slot_lane() const {
+		return global_thread() % SLOT_LANES;
+	}
+
+	__host__ __device__ constexpr bool is_first_half(const uint32_t lane) const {
+		return lane < HALF_SLOT_LANES;
+	}
+};
 
 template <typename T,
           unsigned UNPACK_N_VECTORS,
