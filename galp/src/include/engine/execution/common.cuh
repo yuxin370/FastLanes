@@ -10,6 +10,7 @@
 #include "engine/data/value-store.cuh"
 #include "engine/device-utils.cuh"
 #include "engine/expression.cuh"
+#include "engine/lane-policy.cuh"
 #include "engine/kernels.cuh"
 #include "engine/types.cuh"
 #include "flsgpu/host-utils.cuh"
@@ -457,7 +458,10 @@ void launch_batch_no_sync(const dispatch::Batch<T>&  batch,
 	}
 	constexpr unsigned UNPACK_N_VECTORS = 1;
 	constexpr unsigned UNPACK_N_VALUES  = 1;
-	const int          threads          = utils::get_n_lanes<T>();
+	uint32_t           threads          = static_cast<uint32_t>(utils::get_n_lanes<T>());
+	for (const auto& work : batch.work_items) {
+		threads = std::max(threads, dispatch::semantic_lane_count(type_tag_for<T>(), batch.device_exprs[work.expr_index].plan));
+	}
 	const dim3         block(static_cast<unsigned>(threads));
 	const dim3         grid(static_cast<unsigned>(n_items));
 

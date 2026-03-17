@@ -4,6 +4,7 @@
 // galp/src/include/engine/device-utils.cuh
 // ────────────────────────────────────────────────────────
 #include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/fls/untransposers.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -146,15 +147,20 @@ template <typename T, unsigned UNPACK_N_VECTORS>
 using VectorToWarpMapping = FillWarpMapping<T, UNPACK_N_VECTORS>;
 #endif
 
-template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, unsigned N_LANES>
+template <typename T,
+          unsigned UNPACK_N_VECTORS,
+          unsigned UNPACK_N_VALUES,
+          unsigned N_LANES,
+          typename UntransposerT = flsgpu::device::IdentityUntransposer>
 __device__ __forceinline__ void write_registers_to_global(const lane_t lane,
                                                           const si_t   index_offset,
                                                           const T* __restrict registers,
                                                           T* __restrict out) {
 	for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 		for (int w {0}; w < UNPACK_N_VALUES; ++w) {
-			out[lane + (index_offset + w) * N_LANES + v * consts::VALUES_PER_VECTOR] =
-			    registers[w + v * UNPACK_N_VALUES];
+			const uint32_t in_idx =
+			    static_cast<uint32_t>(lane) + static_cast<uint32_t>(index_offset + w) * N_LANES;
+			out[v * consts::VALUES_PER_VECTOR + UntransposerT::map_index(in_idx)] = registers[w + v * UNPACK_N_VALUES];
 		}
 	}
 }

@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -105,16 +106,31 @@ struct WorkItemAny {
 	TypeTag  type;
 };
 
+inline constexpr uint32_t kInvalidExprIndex = std::numeric_limits<uint32_t>::max();
+
+struct MixedWorkSlot {
+	WorkItemAny first;
+	WorkItemAny second;
+};
+
+__host__ __device__ constexpr inline WorkItemAny invalid_work_item() {
+	return WorkItemAny {kInvalidExprIndex, 0, TypeTag::I8};
+}
+
+__host__ __device__ constexpr inline bool is_valid_work_item(const WorkItemAny& work) {
+	return work.expr_index != kInvalidExprIndex;
+}
+
 template <typename T>
 constexpr TypeTag type_tag_for();
 
 template <>
-constexpr TypeTag type_tag_for<int8_t>() {
+__host__ __device__ constexpr TypeTag type_tag_for<int8_t>() {
 	return TypeTag::I8;
 }
 
 template <>
-constexpr TypeTag type_tag_for<int16_t>() {
+__host__ __device__ constexpr TypeTag type_tag_for<int16_t>() {
 	return TypeTag::I16;
 }
 

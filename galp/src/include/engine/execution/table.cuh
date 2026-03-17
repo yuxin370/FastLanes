@@ -20,10 +20,10 @@ namespace dispatch {
 struct BenchmarkWorkset {
 	using HostBatches   = typename dispatch::BatchSetFromList<dispatch::SupportedTypes>::type;
 	using DeviceBatches = typename dispatch::DeviceBatchSetFromList<dispatch::SupportedTypes>::type;
-	HostBatches                                    host_batches;
-	DeviceBatches                                  device_batches;
-	std::vector<dispatch::WorkItemAny>             work_items;
-	std::optional<GPUArray<dispatch::WorkItemAny>> d_items;
+	HostBatches                                      host_batches;
+	DeviceBatches                                    device_batches;
+	std::vector<dispatch::MixedWorkSlot>              mixed_slots;
+	std::optional<GPUArray<dispatch::MixedWorkSlot>> d_slots;
 	bool                                           freq_prefetch_all_branchless = false;
 	bool                                           freq_hybrid_patcher          = false;
 	float                                          freq_branchless_threshold    = 6.0f;
@@ -62,7 +62,7 @@ double append_expressions(BenchmarkWorkset&              workset,
                           size_t*                        out_total_bytes = nullptr,
                           size_t*                        out_n_exprs     = nullptr);
 
-// Prepare dispatch-side device buffers (d_exprs + d_items). Returns elapsed ms.
+// Prepare dispatch-side device buffers (typed d_exprs/d_items + mixed d_slots). Returns elapsed ms.
 double prepare_dispatch_buffers(BenchmarkWorkset& workset);
 
 // Run kernels on the whole workset. Returns kernel ms.

@@ -101,15 +101,74 @@ void check_rowgroup_index(const size_t n_rowgroups, const std::optional<size_t>&
 	}
 }
 
-void validate_unique_work_items(const std::vector<dispatch::WorkItemAny>& items) {
-	std::unordered_set<uint64_t> seen;
-	seen.reserve(items.size() * 2 + 1);
-	for (const auto& w : items) {
-		const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(w.type)) << 56) |
-		                     (static_cast<uint64_t>(w.expr_index) << 28) | static_cast<uint64_t>(w.vector_index);
-		if (!seen.insert(key).second) {
-			throw std::runtime_error("duplicate work item detected (type,expr_index,vector_index)");
+void validate_unique_work_item(std::unordered_set<uint64_t>& seen, const dispatch::WorkItemAny& w) {
+	const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(w.type)) << 56) |
+	                     (static_cast<uint64_t>(w.expr_index) << 28) | static_cast<uint64_t>(w.vector_index);
+	if (!seen.insert(key).second) {
+		throw std::runtime_error("duplicate work item detected (type,expr_index,vector_index)");
+	}
+}
+
+dispatch::PlanKind plan_for_work_item(const dispatch::BenchmarkWorkset& workset, const dispatch::WorkItemAny& work) {
+	switch (work.type) {
+	case dispatch::TypeTag::I8:
+		return workset.host_batches.template get<int8_t>().device_exprs[work.expr_index].plan;
+	case dispatch::TypeTag::I16:
+		return workset.host_batches.template get<int16_t>().device_exprs[work.expr_index].plan;
+	default:
+		throw std::runtime_error("unsupported work item type");
+	}
+}
+
+uint32_t semantic_lanes_for_work_item(const dispatch::BenchmarkWorkset& workset, const dispatch::WorkItemAny& work) {
+	return dispatch::semantic_lane_count(work.type, plan_for_work_item(workset, work));
+}
+
+void build_mixed_slots(dispatch::BenchmarkWorkset& workset) {
+	workset.mixed_slots.clear();
+	workset.d_slots.reset();
+
+	size_t total_items = 0;
+	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+		using T = typename decltype(tag)::type;
+		total_items += workset.host_batches.template get<T>().work_items.size();
+	});
+	if (total_items == 0) {
+		return;
+	}
+
+	std::unordered_set<uint64_t>      seen;
+	seen.reserve(total_items * 2 + 1);
+	std::optional<dispatch::WorkItemAny> pending_half;
+	const auto append_work = [&](const dispatch::WorkItemAny& work) {
+		validate_unique_work_item(seen, work);
+		const uint32_t semantic_lanes = semantic_lanes_for_work_item(workset, work);
+		if (semantic_lanes == dispatch::lane_count_for_type(dispatch::TypeTag::I8)) {
+			if (pending_half.has_value()) {
+				workset.mixed_slots.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
+				pending_half.reset();
+			}
+			workset.mixed_slots.push_back(dispatch::MixedWorkSlot {work, dispatch::invalid_work_item()});
+			return;
 		}
+		if (pending_half.has_value()) {
+			workset.mixed_slots.push_back(dispatch::MixedWorkSlot {*pending_half, work});
+			pending_half.reset();
+		} else {
+			pending_half = work;
+		}
+	};
+	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+		using T = typename decltype(tag)::type;
+		for (const auto& work : workset.host_batches.template get<T>().work_items) {
+			append_work(work);
+		}
+	});
+	if (pending_half.has_value()) {
+		workset.mixed_slots.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
+	}
+	if (!workset.mixed_slots.empty()) {
+		workset.d_slots.emplace(workset.mixed_slots.size(), workset.mixed_slots.data());
 	}
 }
 
@@ -163,27 +222,24 @@ double append_expressions(BenchmarkWorkset&              workset,
 double prepare_dispatch_buffers(BenchmarkWorkset& workset) {
 	const auto start = std::chrono::steady_clock::now();
 
-	workset.d_items.reset();
-	workset.work_items.clear();
+	workset.d_slots.reset();
+	workset.mixed_slots.clear();
 
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
 		auto& host_batch = workset.host_batches.template get<T>();
+		auto& dev_batch  = workset.device_batches.template get<T>();
+		dev_batch.d_exprs.reset();
+		dev_batch.d_items.reset();
+		dev_batch.n_items = 0;
 		if (!host_batch.device_exprs.empty() && !host_batch.work_items.empty()) {
-			auto& dev_batch = workset.device_batches.template get<T>();
 			dev_batch.d_exprs.emplace(host_batch.device_exprs.size(), host_batch.device_exprs.data());
 			dev_batch.d_items.emplace(host_batch.work_items.size(), host_batch.work_items.data());
 			dev_batch.n_items = host_batch.work_items.size();
-			workset.work_items.reserve(workset.work_items.size() + host_batch.work_items.size());
-			workset.work_items.insert(
-			    workset.work_items.end(), host_batch.work_items.begin(), host_batch.work_items.end());
 		}
 	});
 
-	if (!workset.work_items.empty()) {
-		validate_unique_work_items(workset.work_items);
-		workset.d_items.emplace(workset.work_items.size(), workset.work_items.data());
-	}
+	build_mixed_slots(workset);
 
 	const auto end = std::chrono::steady_clock::now();
 	return std::chrono::duration<double, std::milli>(end - start).count();
@@ -195,13 +251,7 @@ double run_kernel(BenchmarkWorkset& workset,
                   const bool        write_out,
                   size_t*           out_grid,
                   size_t*           out_launches) {
-	const size_t n_items = workset.work_items.size();
-	if (n_items == 0) {
-		return 0.0;
-	}
-	if (gpu_dispatch_kernel && !workset.d_items.has_value()) {
-		return 0.0;
-	}
+	const size_t n_slots = workset.mixed_slots.size();
 
 	bool   has_any_expr                 = false;
 	size_t launches_per_sample          = 0;
@@ -221,6 +271,12 @@ double run_kernel(BenchmarkWorkset& workset,
 		}
 		return 0.0;
 	}
+	if (gpu_dispatch_kernel && (!workset.d_slots.has_value() || n_slots == 0)) {
+		if (out_launches) {
+			*out_launches = 0;
+		}
+		return 0.0;
+	}
 	constexpr uint32_t lanes_i8   = utils::get_n_lanes<int8_t>();
 	constexpr uint32_t lanes_i16  = utils::get_n_lanes<int16_t>();
 	constexpr uint32_t warp_lanes = (lanes_i8 > lanes_i16) ? lanes_i8 : lanes_i16;
@@ -229,7 +285,7 @@ double run_kernel(BenchmarkWorkset& workset,
 
 	if (out_grid) {
 		*out_grid = gpu_dispatch_kernel
-		                ? ((n_items + 255) / 256)
+		                ? ((n_slots * static_cast<size_t>(warp_lanes) + 255) / 256)
 		                : (launches_per_sample > 0 ? typed_total_items_per_sample / launches_per_sample : 0);
 	}
 	if (out_launches) {
@@ -251,13 +307,12 @@ double run_kernel(BenchmarkWorkset& workset,
 	                              const dispatch::DeviceExpression<int16_t>* exprs_i16,
 	                              const dim3&                                grid,
 	                              const dim3&                                block) {
-		const uint32_t i16_start_index = static_cast<uint32_t>(workset.device_batches.template get<int8_t>().n_items);
 		if (write_out) {
 			kernels::device::decompress_dispatch_mixed<1, 1, true>
-			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_items->get(), n_items, i16_start_index);
+			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_slots->get(), n_slots);
 		} else {
 			kernels::device::decompress_dispatch_mixed<1, 1, false>
-			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_items->get(), n_items, i16_start_index);
+			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.d_slots->get(), n_slots);
 		}
 		CUDA_SAFE_CALL(cudaGetLastError());
 	};
@@ -272,7 +327,7 @@ double run_kernel(BenchmarkWorkset& workset,
 		                                       : nullptr;
 		constexpr uint32_t block_threads = 256;
 		const dim3         block(block_threads);
-		const size_t       n_threads = n_items * static_cast<size_t>(warp_lanes);
+		const size_t       n_threads = n_slots * static_cast<size_t>(warp_lanes);
 		const dim3         grid(static_cast<unsigned>((n_threads + block_threads - 1) / block_threads));
 		launch_mixed(exprs_i8, exprs_i16, grid, block);
 	} else {
@@ -306,7 +361,7 @@ double run_kernel(BenchmarkWorkset& workset,
 			                                       : nullptr;
 			constexpr uint32_t block_threads = 256;
 			const dim3         block(block_threads);
-			const size_t       n_threads = n_items * static_cast<size_t>(warp_lanes);
+			const size_t       n_threads = n_slots * static_cast<size_t>(warp_lanes);
 			const dim3         grid(static_cast<unsigned>((n_threads + block_threads - 1) / block_threads));
 			launch_mixed(exprs_i8, exprs_i16, grid, block);
 			continue;
@@ -472,14 +527,14 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	size_t launch_count = 0;
 	out.kernel_ms =
 	    dispatch::run_kernel(workset, cfg.samples, cfg.gpu_dispatch_kernel, cfg.write_out, &launch_grid, &launch_count);
-	if (!workset.work_items.empty()) {
+	if (launch_count > 0) {
 		out.total_launches    = launch_count;
 		out.total_launch_grid = launch_grid * launch_count;
 	}
 
 	const auto teardown_start = std::chrono::steady_clock::now();
 	dispatch::free_batches(workset);
-	workset.d_items.reset();
+	workset.d_slots.reset();
 	const auto teardown_end = std::chrono::steady_clock::now();
 	out.teardown_ms += std::chrono::duration<double, std::milli>(teardown_end - teardown_start).count();
 

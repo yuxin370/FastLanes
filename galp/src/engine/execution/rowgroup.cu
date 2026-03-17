@@ -175,7 +175,6 @@ inline BenchmarkResult run_benchmark(PreparedBatches&& prepared, const Config& c
 	WorksetCleanupGuard guard(workset);
 
 	prepare_dispatch_buffers(workset);
-	bench.n_work_items = workset.work_items.size();
 	bench.total_ms     = run_kernel(workset, cfg.n_samples, false, false);
 	bench.avg_us       = (cfg.n_samples > 0) ? (bench.total_ms * 1000.0 / static_cast<double>(cfg.n_samples)) : 0.0;
 
