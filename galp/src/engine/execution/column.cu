@@ -149,26 +149,22 @@ auto decompress_device(const ColumnT& column, const Config& cfg) -> typename col
 		    column, cfg.n_samples);
 	} else if constexpr (std::is_same_v<ColumnT, flsgpu::device::RLEColumn<T, uint8_t>> ||
 	                     std::is_same_v<ColumnT, flsgpu::device::RLEColumn<T, uint16_t>>) {
-		using CodeT =
+		using IndexT =
 		    std::conditional_t<std::is_same_v<ColumnT, flsgpu::device::RLEColumn<T, uint8_t>>, uint8_t, uint16_t>;
-		constexpr unsigned RLE_UNPACK_N_VALUES = utils::get_values_per_lane<CodeT>();
+		constexpr unsigned RLE_UNPACK_N_VALUES = utils::get_values_per_lane<IndexT>();
 		using UnpackerT =
-		    flsgpu::device::BitUnpackerStatefulBranchless<CodeT,
+		    flsgpu::device::BitUnpackerStatefulBranchless<IndexT,
 		                                                  UNPACK_N_VECTORS,
 		                                                  RLE_UNPACK_N_VALUES,
-		                                                  flsgpu::device::FFORFunctor<CodeT, UNPACK_N_VECTORS>>;
-		using ExpanderT     = flsgpu::device::DummyRLEExpander<T,
-		                                                       CodeT,
-		                                                       UNPACK_N_VECTORS,
-		                                                       RLE_UNPACK_N_VALUES,
-		                                                       flsgpu::device::FastLanes1024Untransposer>;
+		                                                  flsgpu::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
+		using ExpanderT     = flsgpu::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
 		using DecompressorT = flsgpu::device::RLEDecompressor<T,
-		                                                      CodeT,
+		                                                      IndexT,
 		                                                      UNPACK_N_VECTORS,
 		                                                      RLE_UNPACK_N_VALUES,
 		                                                      UnpackerT,
 		                                                      ExpanderT,
-		                                                      flsgpu::device::RLEColumn<T, CodeT>>;
+		                                                      flsgpu::device::RLEColumn<T, IndexT>>;
 		return kernels::host::decompress_column<T, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, cfg.n_samples);
 	} else {

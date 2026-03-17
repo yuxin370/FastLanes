@@ -14,7 +14,7 @@
 
 namespace flsgpu { namespace device {
 
-template <typename CodeT, unsigned UNPACK_N_VALUES>
+template <typename IndexT, unsigned UNPACK_N_VALUES>
 struct RLEUnsumOrder {
 	__device__ __forceinline__ static unsigned code_index(const unsigned logical_pos) {
 		return logical_pos;
@@ -30,29 +30,29 @@ struct RLEUnsumOrder<uint16_t, 16> {
 	}
 };
 
-template <typename ValueT, typename CodeT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+template <typename ValueT, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct RLEUnsumer {
 private:
-	CodeT                    prefix[UNPACK_N_VECTORS];
-	static constexpr int32_t N_LANES = utils::get_n_lanes<CodeT>();
+	IndexT                    prefix[UNPACK_N_VECTORS];
+	static constexpr int32_t N_LANES = utils::get_n_lanes<IndexT>();
 
 public:
 	__device__ __forceinline__
-	RLEUnsumer(const flsgpu::device::RLEColumn<ValueT, CodeT> column, const vi_t vector_index, const lane_t lane) {
+	RLEUnsumer(const flsgpu::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane) {
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
-			const CodeT* base_ptr = column.rsum_bases + (vector_index + v) * N_LANES;
+			const IndexT* base_ptr = column.rsum_bases + (vector_index + v) * N_LANES;
 			prefix[v]             = base_ptr[lane];
 		}
 	}
 
-	__device__ __forceinline__ void unsum_inplace(CodeT* __restrict codes) {
+	__device__ __forceinline__ void unsum_inplace(IndexT* __restrict codes) {
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
-			CodeT cur = prefix[v];
+			IndexT cur = prefix[v];
 #pragma unroll
 			for (unsigned logical_pos = 0; logical_pos < UNPACK_N_VALUES; ++logical_pos) {
-				const unsigned in_lane_pos = RLEUnsumOrder<CodeT, UNPACK_N_VALUES>::code_index(logical_pos);
+				const unsigned in_lane_pos = RLEUnsumOrder<IndexT, UNPACK_N_VALUES>::code_index(logical_pos);
 				const unsigned idx         = in_lane_pos + v * UNPACK_N_VALUES;
 				cur += codes[idx];
 				codes[idx] = cur;

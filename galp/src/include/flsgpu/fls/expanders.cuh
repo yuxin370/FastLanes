@@ -8,7 +8,6 @@
 
 #include "flsgpu/device-types.cuh"
 #include "flsgpu/fls/functors.cuh"
-#include "flsgpu/fls/untransposers.cuh"
 #include "flsgpu/old-fls.cuh"
 #include "flsgpu/structs.cuh"
 #include "flsgpu/utils.cuh"
@@ -19,37 +18,30 @@
 
 namespace flsgpu { namespace device {
 
-template <typename ValueT, typename CodeT>
+template <typename ValueT, typename IndexT>
 struct RLEExpanderBase {
 public:
 	__device__ __forceinline__ void expand_run_into([[maybe_unused]] ValueT* out) {
-	}
-	__device__ __forceinline__ void expand_codes_untransposed_into([[maybe_unused]] const CodeT* __restrict codes,
-	                                                               [[maybe_unused]] ValueT* __restrict out,
-	                                                               [[maybe_unused]] const si_t index_offset) {
 	}
 	__device__ ~RLEExpanderBase() = default;
 };
 
 template <typename ValueT,
-          typename CodeT,
+          typename IndexT,
           unsigned UNPACK_N_VECTORS,
-          unsigned UNPACK_N_VALUES,
-          typename UntransposerT = flsgpu::device::IdentityUntransposer>
-struct DummyRLEExpander : flsgpu::device::RLEExpanderBase<ValueT, CodeT> {
+          unsigned UNPACK_N_VALUES>
+struct DummyRLEExpander : flsgpu::device::RLEExpanderBase<ValueT, IndexT> {
 private:
 	const ValueT*            rle_values;
 	const size_t*            rle_offsets;
 	const vi_t               base_vector_index;
-	const lane_t             lane;
-	static constexpr int32_t N_LANES = utils::get_n_lanes<CodeT>();
 
 public:
-	__device__ __forceinline__ ValueT decode_value(const size_t base_offset, const CodeT code) const {
+	__device__ __forceinline__ ValueT decode_value(const size_t base_offset, const IndexT code) const {
 		return static_cast<ValueT>(rle_values[base_offset + static_cast<size_t>(code)]);
 	}
 
-	__device__ __forceinline__ void expand_codes_into(const CodeT* __restrict codes, ValueT* __restrict out) {
+	__device__ __forceinline__ void expand_codes_into(const IndexT* __restrict codes, ValueT* __restrict out) {
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
 			const size_t base_offset = rle_offsets[base_vector_index + v];
@@ -61,38 +53,21 @@ public:
 		}
 	}
 
-	__device__ __forceinline__ void
-	expand_codes_untransposed_into(const CodeT* __restrict codes, ValueT* __restrict out, const si_t index_offset) {
-#pragma unroll
-		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
-			const size_t base_offset = rle_offsets[base_vector_index + v];
-#pragma unroll
-			for (unsigned i = 0; i < UNPACK_N_VALUES; ++i) {
-				const unsigned idx = i + v * UNPACK_N_VALUES;
-				const ValueT   val = decode_value(base_offset, codes[idx]);
-				const uint32_t in_idx =
-				    static_cast<uint32_t>(lane) + static_cast<uint32_t>(index_offset + static_cast<si_t>(i)) * N_LANES;
-				const uint32_t out_idx                       = UntransposerT::map_index(in_idx);
-				out[v * consts::VALUES_PER_VECTOR + out_idx] = val;
-			}
-		}
-	}
-
 	void __device__ __forceinline__ expand_run_into(ValueT* out) {
-		CodeT codes[UNPACK_N_VECTORS * UNPACK_N_VALUES];
+		IndexT codes[UNPACK_N_VECTORS * UNPACK_N_VALUES];
 #pragma unroll
 		for (unsigned i = 0; i < UNPACK_N_VECTORS * UNPACK_N_VALUES; ++i) {
-			codes[i] = static_cast<CodeT>(out[i]);
+			codes[i] = static_cast<IndexT>(out[i]);
 		}
 		expand_codes_into(codes, out);
 	}
 
 	__device__ __forceinline__
-	DummyRLEExpander(const flsgpu::device::RLEColumn<ValueT, CodeT> column, const vi_t vector_index, const lane_t lane)
+	DummyRLEExpander(const flsgpu::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane)
 	    : rle_values(column.rle_values)
 	    , rle_offsets(column.rle_offsets)
-	    , base_vector_index(vector_index)
-	    , lane(lane) {
+	    , base_vector_index(vector_index) {
+		(void)lane;
 	}
 };
 
