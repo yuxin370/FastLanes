@@ -188,7 +188,7 @@ struct CROSSRLEDecompressor : DecompressorBase<T> {
 };
 
 template <typename ValueT,
-          typename CodeT,
+          typename IndexT,
           unsigned UNPACK_N_VECTORS,
           unsigned UNPACK_N_VALUES,
           typename UnpackerT,
@@ -197,31 +197,25 @@ template <typename ValueT,
 struct RLEDecompressor : DecompressorBase<ValueT> {
 	static constexpr unsigned                                    N_VALUES = UNPACK_N_VECTORS * UNPACK_N_VALUES;
 	UnpackerT                                                    unpacker;
-	RLEUnsumer<ValueT, CodeT, UNPACK_N_VECTORS, UNPACK_N_VALUES> unsumer;
+	RLEUnsumer<ValueT, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES> unsumer;
 	ExpanderT                                                    expander;
 
 	__device__ __forceinline__ RLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,
 	               column.ffor.bp.bit_widths[vector_index],
-	               FFORFunctor<CodeT, UNPACK_N_VECTORS>(column.ffor.bases + vector_index))
+	               FFORFunctor<IndexT, UNPACK_N_VECTORS>(column.ffor.bases + vector_index))
 	    , unsumer(column, vector_index, lane)
 	    , expander(column, vector_index, lane) {
 	}
 
 	void __device__ unpack_next_into(ValueT* __restrict out) {
-		CodeT codes[N_VALUES];
+		IndexT codes[N_VALUES];
 		unpacker.unpack_next_into(codes);
 		unsumer.unsum_inplace(codes);
 		expander.expand_codes_into(codes, out);
 	}
 
-	void __device__ unpack_next_untransposed_into(ValueT* __restrict out, const si_t index_offset) {
-		CodeT codes[N_VALUES];
-		unpacker.unpack_next_into(codes);
-		unsumer.unsum_inplace(codes);
-		expander.expand_codes_untransposed_into(codes, out, index_offset);
-	}
 };
 
 }} // namespace flsgpu::device
