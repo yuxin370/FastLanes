@@ -598,8 +598,6 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 	}
 };
 
-
-} // namespace device
-} // namespace flsgpu
+}} // namespace flsgpu::device
 
 #endif // FLSGPU_FLS_UNPACKERS_CUH

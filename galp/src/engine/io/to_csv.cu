@@ -5,6 +5,7 @@
 // ────────────────────────────────────────────────────────
 #include "engine/io/to_csv.cuh"
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -61,51 +62,57 @@ size_t resolve_value_index(const std::vector<expr::Expression>& expressions, con
 
 } // namespace
 
-void read_rowgroups_to_csv(reader::reader&         rdr,
-                           std::ostream&           out,
-                           const size_t            start_rowgroup,
-                           const size_t            end_rowgroup,
-                           const bool              write_header,
-                           const dispatch::Config& decode_cfg) {
-	bool header_written = false;
-
-	for (size_t rg_idx = start_rowgroup; rg_idx < end_rowgroup; ++rg_idx) {
-		auto rowgroup    = rdr.read_rowgroup(rg_idx);
-		auto expressions = expr::assemble(rowgroup);
-		auto result      = dispatch::decompress_rowgroup(expressions, decode_cfg);
-
-		std::vector<size_t>      value_indices;
-		std::vector<std::string> col_names;
-		for (size_t i = 0; i < expressions.size(); ++i) {
-			const auto& expression = expressions[i];
-			if (!expression.column) {
-				continue;
-			}
-			value_indices.push_back(resolve_value_index(expressions, i));
-			auto name = expression.column->name;
-			if (name.empty()) {
-				name = "col_" + std::to_string(i);
-			}
-			col_names.push_back(std::move(name));
+void read_table_to_csv(const std::filesystem::path&              fls_path,
+                       std::ostream&                             out,
+                       const bool                                write_header,
+                       const dispatch::TableDecompressionConfig& table_cfg,
+                       const std::optional<size_t>&              rowgroup) {
+	if (rowgroup.has_value()) {
+		reader::reader rdr(fls_path);
+		if (*rowgroup >= rdr.rowgroup_count()) {
+			throw std::out_of_range("rowgroup index out of range");
 		}
-
-		if (write_header && !header_written) {
-			for (size_t i = 0; i < col_names.size(); ++i) {
-				if (i > 0) {
-					out << ",";
-				}
-				out << col_names[i];
-			}
-			out << "\n";
-			header_written = true;
-		}
-
-		for (size_t row = 0; row < rowgroup.n_tuples; ++row) {
-			write_row(out, value_indices, result, row);
-		}
-
-		dispatch::free_rowgroup(rowgroup);
 	}
+
+	bool header_written = false;
+	dispatch::decompress_table(
+	    fls_path,
+	    table_cfg,
+	    [rowgroup](const size_t rg_idx) { return !rowgroup.has_value() || *rowgroup == rg_idx; },
+	    [&](size_t,
+	        reader::Rowgroup&                    rowgroup,
+	        const std::vector<expr::Expression>& expressions,
+	        const dispatch::RowgroupData&        result) {
+		    std::vector<size_t>      value_indices;
+		    std::vector<std::string> col_names;
+		    for (size_t i = 0; i < expressions.size(); ++i) {
+			    const auto& expression = expressions[i];
+			    if (!expression.column) {
+				    continue;
+			    }
+			    value_indices.push_back(resolve_value_index(expressions, i));
+			    auto name = expression.column->name;
+			    if (name.empty()) {
+				    name = "col_" + std::to_string(i);
+			    }
+			    col_names.push_back(std::move(name));
+		    }
+
+		    if (write_header && !header_written) {
+			    for (size_t i = 0; i < col_names.size(); ++i) {
+				    if (i > 0) {
+					    out << ",";
+				    }
+				    out << col_names[i];
+			    }
+			    out << "\n";
+			    header_written = true;
+		    }
+
+		    for (size_t row = 0; row < rowgroup.n_tuples; ++row) {
+			    write_row(out, value_indices, result, row);
+		    }
+	    });
 }
 
 } // namespace io

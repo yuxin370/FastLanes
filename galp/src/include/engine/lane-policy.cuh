@@ -1,3 +1,8 @@
+// ────────────────────────────────────────────────────────
+// |                      FastLanes                       |
+// ────────────────────────────────────────────────────────
+// galp/src/include/engine/lane-policy.cuh
+// ────────────────────────────────────────────────────────
 #ifndef ENGINE_LANE_POLICY_CUH
 #define ENGINE_LANE_POLICY_CUH
 
@@ -17,7 +22,7 @@ __host__ __device__ __forceinline__ constexpr uint32_t lane_count_for_type(const
 	}
 }
 
-__host__ __device__ __forceinline__ constexpr TypeTag semantic_lane_type(const TypeTag value_type,
+__host__ __device__ __forceinline__ constexpr TypeTag semantic_lane_type(const TypeTag  value_type,
                                                                          const PlanKind plan) {
 	switch (plan) {
 	case PlanKind::DICT_FFOR_U8:
@@ -33,7 +38,7 @@ __host__ __device__ __forceinline__ constexpr TypeTag semantic_lane_type(const T
 	}
 }
 
-__host__ __device__ __forceinline__ constexpr uint32_t semantic_lane_count(const TypeTag value_type,
+__host__ __device__ __forceinline__ constexpr uint32_t semantic_lane_count(const TypeTag  value_type,
                                                                            const PlanKind plan) {
 	return lane_count_for_type(semantic_lane_type(value_type, plan));
 }

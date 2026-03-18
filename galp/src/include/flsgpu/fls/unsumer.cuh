@@ -33,7 +33,7 @@ struct RLEUnsumOrder<uint16_t, 16> {
 template <typename ValueT, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct RLEUnsumer {
 private:
-	IndexT                    prefix[UNPACK_N_VECTORS];
+	IndexT                   prefix[UNPACK_N_VECTORS];
 	static constexpr int32_t N_LANES = utils::get_n_lanes<IndexT>();
 
 public:
@@ -42,7 +42,7 @@ public:
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
 			const IndexT* base_ptr = column.rsum_bases + (vector_index + v) * N_LANES;
-			prefix[v]             = base_ptr[lane];
+			prefix[v]              = base_ptr[lane];
 		}
 	}
 

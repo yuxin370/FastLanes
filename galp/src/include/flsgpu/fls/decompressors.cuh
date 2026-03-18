@@ -195,10 +195,10 @@ template <typename ValueT,
           typename ExpanderT,
           typename ColumnT>
 struct RLEDecompressor : DecompressorBase<ValueT> {
-	static constexpr unsigned                                    N_VALUES = UNPACK_N_VECTORS * UNPACK_N_VALUES;
-	UnpackerT                                                    unpacker;
+	static constexpr unsigned                                     N_VALUES = UNPACK_N_VECTORS * UNPACK_N_VALUES;
+	UnpackerT                                                     unpacker;
 	RLEUnsumer<ValueT, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES> unsumer;
-	ExpanderT                                                    expander;
+	ExpanderT                                                     expander;
 
 	__device__ __forceinline__ RLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
@@ -215,7 +215,6 @@ struct RLEDecompressor : DecompressorBase<ValueT> {
 		unsumer.unsum_inplace(codes);
 		expander.expand_codes_into(codes, out);
 	}
-
 };
 
 }} // namespace flsgpu::device

@@ -1,6 +1,7 @@
 set(GALP_CORE_SOURCES
         alp/alp-bindings.cu
         engine/enums.cu
+        engine/benchmark/table.cu
         engine/execution/column.cu
         engine/execution/rowgroup.cu
         engine/execution/table.cu

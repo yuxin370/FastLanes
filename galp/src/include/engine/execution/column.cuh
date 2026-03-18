@@ -10,7 +10,7 @@
 
 namespace dispatch {
 
-ValueStore decompress(const expr::Expression& expression, const Config& cfg = {});
+ValueStore decompress(const expr::Expression& expression, const ExecutionConfig& cfg = {});
 
 } // namespace dispatch
 

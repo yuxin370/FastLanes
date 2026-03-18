@@ -6,20 +6,19 @@
 #ifndef ENGINE_IO_TO_CSV_CUH
 #define ENGINE_IO_TO_CSV_CUH
 
-#include "engine/execution/common.cuh"
-#include "engine/execution/rowgroup.cuh"
+#include "engine/execution/table.cuh"
 #include "engine/expression.cuh"
-#include "engine/reader.cuh"
+#include <filesystem>
+#include <optional>
 #include <ostream>
 
 namespace io {
 
-void read_rowgroups_to_csv(reader::reader&         rdr,
-                           std::ostream&           out,
-                           size_t                  start_rowgroup,
-                           size_t                  end_rowgroup,
-                           bool                    write_header,
-                           const dispatch::Config& decode_cfg);
+void read_table_to_csv(const std::filesystem::path&              fls_path,
+                       std::ostream&                             out,
+                       bool                                      write_header,
+                       const dispatch::TableDecompressionConfig& table_cfg = {},
+                       const std::optional<size_t>&              rowgroup  = std::nullopt);
 
 } // namespace io
 

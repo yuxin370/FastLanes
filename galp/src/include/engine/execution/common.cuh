@@ -10,8 +10,8 @@
 #include "engine/data/value-store.cuh"
 #include "engine/device-utils.cuh"
 #include "engine/expression.cuh"
-#include "engine/lane-policy.cuh"
 #include "engine/kernels.cuh"
+#include "engine/lane-policy.cuh"
 #include "engine/types.cuh"
 #include "flsgpu/host-utils.cuh"
 #include "flsgpu/structs.cuh"
@@ -28,29 +28,23 @@ namespace dispatch {
 template <typename>
 inline constexpr bool always_false_v = false;
 
-struct Config {
-	unsigned unpack_n_vectors    = 1;
-	unsigned unpack_n_values     = 1;
-	uint32_t n_samples           = 1;
-	bool     gpu_dispatch_kernel = true;
+enum class LaunchStrategy {
+	TypedBatches,
+	MixedDispatch,
+};
+
+struct ExecutionConfig {
+	unsigned       unpack_n_vectors             = 1;
+	unsigned       unpack_n_values              = 1;
+	LaunchStrategy launch_strategy              = LaunchStrategy::MixedDispatch;
+	bool           write_out                    = true;
+	bool           freq_prefetch_all_branchless = false;
+	bool           freq_hybrid_patcher          = false;
+	float          freq_branchless_threshold    = 6.0f;
 
 	constexpr DecodeChunk chunk() const {
 		return DecodeChunk {unpack_n_vectors, unpack_n_values};
 	}
-};
-
-enum class ExecuteMode {
-	Materialize,
-	BenchmarkOnly,
-};
-
-struct BenchmarkResult {
-	double   total_ms;
-	double   avg_us;
-	uint32_t n_samples;
-	size_t   n_expressions;
-	size_t   n_work_items;
-	size_t   total_bytes;
 };
 
 template <typename ColumnT>
@@ -139,7 +133,7 @@ struct host_value_type<flsgpu::host::RLEColumn<T, IndexT>> {
 namespace detail {
 
 template <typename HostColT>
-ValueStore decompress_host(const HostColT& host_col, const PlanKind plan, const Config& cfg);
+ValueStore decompress_host(const HostColT& host_col, const PlanKind plan, const ExecutionConfig& cfg);
 
 template <typename HostColT>
 struct host_plan_kind;
@@ -460,10 +454,11 @@ void launch_batch_no_sync(const dispatch::Batch<T>&  batch,
 	constexpr unsigned UNPACK_N_VALUES  = 1;
 	uint32_t           threads          = static_cast<uint32_t>(utils::get_n_lanes<T>());
 	for (const auto& work : batch.work_items) {
-		threads = std::max(threads, dispatch::semantic_lane_count(type_tag_for<T>(), batch.device_exprs[work.expr_index].plan));
+		threads = std::max(threads,
+		                   dispatch::semantic_lane_count(type_tag_for<T>(), batch.device_exprs[work.expr_index].plan));
 	}
-	const dim3         block(static_cast<unsigned>(threads));
-	const dim3         grid(static_cast<unsigned>(n_items));
+	const dim3 block(static_cast<unsigned>(threads));
+	const dim3 grid(static_cast<unsigned>(n_items));
 
 	kernels::device::decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
 	    <<<grid, block, 0, stream>>>(d_exprs, d_items, n_items);

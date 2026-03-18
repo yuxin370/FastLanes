@@ -3,8 +3,8 @@
 // ────────────────────────────────────────────────────────
 // galp/src/include/engine/device-utils.cuh
 // ────────────────────────────────────────────────────────
-#include "flsgpu/flsgpu-api.cuh"
 #include "flsgpu/fls/untransposers.cuh"
+#include "flsgpu/flsgpu-api.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -129,9 +129,9 @@ using VectorToWarpMapping = FillWarpMapping<T, UNPACK_N_VECTORS>;
 #endif
 
 struct MixedSlotMapping {
-	static constexpr uint32_t SLOT_LANES        = static_cast<uint32_t>(utils::get_n_lanes<int8_t>());
-	static constexpr uint32_t HALF_SLOT_LANES   = static_cast<uint32_t>(utils::get_n_lanes<int16_t>());
-	static constexpr uint32_t N_THREADS_PER_BLOCK = 256;
+	static constexpr uint32_t SLOT_LANES          = static_cast<uint32_t>(utils::get_n_lanes<int8_t>());
+	static constexpr uint32_t HALF_SLOT_LANES     = static_cast<uint32_t>(utils::get_n_lanes<int16_t>());
+	static constexpr uint32_t N_THREADS_PER_BLOCK = 128;
 
 	size_t n_slots = 0;
 
@@ -175,8 +175,7 @@ __device__ __forceinline__ void write_registers_to_global(const lane_t lane,
                                                           T* __restrict out) {
 	for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 		for (int w {0}; w < UNPACK_N_VALUES; ++w) {
-			const uint32_t in_idx =
-			    static_cast<uint32_t>(lane) + static_cast<uint32_t>(index_offset + w) * N_LANES;
+			const uint32_t in_idx = static_cast<uint32_t>(lane) + static_cast<uint32_t>(index_offset + w) * N_LANES;
 			out[v * consts::VALUES_PER_VECTOR + UntransposerT::map_index(in_idx)] = registers[w + v * UNPACK_N_VALUES];
 		}
 	}

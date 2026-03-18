@@ -37,9 +37,7 @@ __device__ __forceinline__ constexpr uint32_t bit_reverse6(const uint32_t value)
 
 } // namespace detail
 
-template <uint32_t ValuesPerVector,
-          FastLanesUntransposeKind Kind,
-          typename LayoutTag = FastLanesScalarAAVUF1LayoutTag>
+template <uint32_t ValuesPerVector, FastLanesUntransposeKind Kind, typename LayoutTag = FastLanesScalarAAVUF1LayoutTag>
 struct FastLanesUntransposer;
 
 template <>

@@ -3,6 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/tools/galp_cli.cu
 // ────────────────────────────────────────────────────────
+#include "engine/benchmark/table.cuh"
 #include "engine/execution/common.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/execution/table.cuh"
@@ -63,7 +64,8 @@ std::string format_bytes(double bytes) {
 
 void print_usage(const char* prog) {
 	std::cerr << "Usage:\n"
-	          << "  " << prog << " read_table <input.fls> [output.csv] [--rowgroup N] [--no-header]\n"
+	          << "  " << prog
+	          << " read_table <input.fls> [output.csv] [--rowgroup N] [--no-header] [--no-mega-kernel]\n"
 	          << "  " << prog << " benchmark <input.fls> [--rowgroup N] [--samples N]\n"
 	          << "  " << prog << " measure_launch [--iters N] [--grid N] [--block N]\n"
 	          << "\n"
@@ -77,8 +79,8 @@ void print_usage(const char* prog) {
 	          << "  --block N      Launch block size for measurement (default: 1)\n"
 	          << "  --estimate-launch  Estimate launch overhead during benchmark\n"
 	          << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n"
-	          << "  --no-mega-kernel   Benchmark full table using per-rowgroup kernels\n"
-	          << "  --gpu-dispatch-kernel  Use one mixed-type kernel launch per sample in mega mode\n"
+	          << "  --no-mega-kernel   Use per-rowgroup execution instead of whole-table aggregation\n"
+	          << "  --gpu-dispatch-kernel  Use mixed-dispatch kernel execution instead of typed-batch launches\n"
 	          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
 	          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
 	          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
@@ -259,19 +261,6 @@ int main(int argc, char** argv) {
 			return 0;
 		}
 
-		reader::reader rdr(opt.input);
-		const size_t   n_rowgroups = rdr.rowgroup_count();
-
-		size_t start = 0;
-		size_t end   = n_rowgroups;
-		if (opt.rowgroup.has_value()) {
-			if (*opt.rowgroup >= n_rowgroups) {
-				throw std::out_of_range("rowgroup index out of range");
-			}
-			start = *opt.rowgroup;
-			end   = start + 1;
-		}
-
 		if (opt.mode == Mode::ReadTable) {
 			std::ofstream out_file;
 			std::ostream* out = &std::cout;
@@ -283,23 +272,31 @@ int main(int argc, char** argv) {
 				out = &out_file;
 			}
 
-			dispatch::Config decode_cfg {};
-			decode_cfg.gpu_dispatch_kernel = opt.gpu_dispatch_kernel;
-			io::read_rowgroups_to_csv(rdr, *out, start, end, opt.header, decode_cfg);
+			dispatch::TableDecompressionConfig decode_cfg {};
+			decode_cfg.scope                     = opt.mega_kernel ? dispatch::TableDecompressionScope::WholeTable
+			                                                       : dispatch::TableDecompressionScope::PerRowgroup;
+			decode_cfg.execution.launch_strategy = opt.gpu_dispatch_kernel ? dispatch::LaunchStrategy::MixedDispatch
+			                                                               : dispatch::LaunchStrategy::TypedBatches;
+			decode_cfg.execution.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
+			decode_cfg.execution.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
+			decode_cfg.execution.freq_branchless_threshold    = opt.freq_branchless_threshold;
+			io::read_table_to_csv(opt.input, *out, opt.header, decode_cfg, opt.rowgroup);
 			return 0;
 		}
 
 		if (opt.mode == Mode::Benchmark) {
 			dispatch::TableBenchmarkConfig bench_cfg {};
-			bench_cfg.samples                      = opt.samples;
-			bench_cfg.mega_kernel                  = opt.mega_kernel;
-			bench_cfg.gpu_dispatch_kernel          = opt.gpu_dispatch_kernel;
-			bench_cfg.write_out                    = opt.write_back;
-			bench_cfg.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
-			bench_cfg.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
-			bench_cfg.freq_branchless_threshold    = opt.freq_branchless_threshold;
-			bench_cfg.rowgroup                     = opt.rowgroup;
-			const auto result                      = dispatch::benchmark_table(opt.input, bench_cfg);
+			bench_cfg.samples = opt.samples;
+			bench_cfg.aggregation_scope =
+			    opt.mega_kernel ? dispatch::AggregationScope::WholeTable : dispatch::AggregationScope::PerRowgroup;
+			bench_cfg.execution.launch_strategy = opt.gpu_dispatch_kernel ? dispatch::LaunchStrategy::MixedDispatch
+			                                                              : dispatch::LaunchStrategy::TypedBatches;
+			bench_cfg.execution.write_out       = opt.write_back;
+			bench_cfg.execution.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
+			bench_cfg.execution.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
+			bench_cfg.execution.freq_branchless_threshold    = opt.freq_branchless_threshold;
+			bench_cfg.rowgroup                               = opt.rowgroup;
+			const auto result                                = dispatch::benchmark_table(opt.input, bench_cfg);
 
 			const double end_to_end_ms     = result.end_to_end_ms;
 			const double kernel_ms         = result.kernel_ms;

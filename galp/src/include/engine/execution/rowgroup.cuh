@@ -23,21 +23,8 @@ inline void free_rowgroup(reader::Rowgroup& rowgroup) {
 	}
 }
 
-struct RowgroupExecuteResult {
-	std::optional<RowgroupData>    materialized;
-	std::optional<BenchmarkResult> benchmark;
-};
-
-RowgroupExecuteResult execute_rowgroup(std::vector<expr::Expression>& expressions,
-                                       const Config&                  cfg  = {},
-                                       const ExecuteMode              mode = ExecuteMode::Materialize);
-RowgroupExecuteResult execute_rowgroup(const std::vector<expr::Expression>& expressions,
-                                       const Config&                        cfg  = {},
-                                       const ExecuteMode                    mode = ExecuteMode::Materialize);
-RowgroupData          decompress_rowgroup(std::vector<expr::Expression>& expressions, const Config& cfg = {});
-RowgroupData          decompress_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
-BenchmarkResult       benchmark_rowgroup(std::vector<expr::Expression>& expressions, const Config& cfg = {});
-BenchmarkResult       benchmark_rowgroup(const std::vector<expr::Expression>& expressions, const Config& cfg = {});
+RowgroupData decompress_rowgroup(std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg = {});
+RowgroupData decompress_rowgroup(const std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg = {});
 
 } // namespace dispatch
 

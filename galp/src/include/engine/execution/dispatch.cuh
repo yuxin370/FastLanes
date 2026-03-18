@@ -17,8 +17,8 @@ namespace device_exec {
 template <typename T,
           int  UNPACK_N_VECTORS,
           int  UNPACK_N_VALUES,
-          bool WRITE_OUT    = true,
-          typename MappingT = T,
+          bool WRITE_OUT         = true,
+          typename MappingT      = T,
           typename UntransposerT = flsgpu::device::IdentityUntransposer,
           typename DecompressorT>
 __device__ __forceinline__ void run_decompressor(DecompressorT&& iterator, const lane_t lane, T* __restrict out) {
@@ -165,7 +165,7 @@ execute_plan(const dispatch::DeviceExpression<T>& expr, const vi_t vector_index,
 		break;
 	}
 	case dispatch::PlanKind::RLE_U8: {
-		using IndexT                       = uint8_t;
+		using IndexT                      = uint8_t;
 		constexpr int RLE_UNPACK_N_VALUES = utils::get_values_per_lane<IndexT>();
 		using UnpackerT =
 		    flsgpu::device::BitUnpackerStatefulBranchless<IndexT,
@@ -190,7 +190,7 @@ execute_plan(const dispatch::DeviceExpression<T>& expr, const vi_t vector_index,
 		break;
 	}
 	case dispatch::PlanKind::RLE_U16: {
-		using IndexT                       = uint16_t;
+		using IndexT                      = uint16_t;
 		constexpr int RLE_UNPACK_N_VALUES = utils::get_values_per_lane<IndexT>();
 		using UnpackerT =
 		    flsgpu::device::BitUnpackerStatefulBranchless<IndexT,
@@ -279,7 +279,7 @@ __global__ void decompress_dispatch_mixed(const dispatch::DeviceExpression<int8_
 		return;
 	}
 
-	const auto slot = slots[slot_idx];
+	const auto slot          = slots[slot_idx];
 	const auto run_work_item = [&](const dispatch::WorkItemAny work, const lane_t work_lane) {
 		if (!dispatch::is_valid_work_item(work)) {
 			return;

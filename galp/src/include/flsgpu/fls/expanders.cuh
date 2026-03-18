@@ -26,15 +26,12 @@ public:
 	__device__ ~RLEExpanderBase() = default;
 };
 
-template <typename ValueT,
-          typename IndexT,
-          unsigned UNPACK_N_VECTORS,
-          unsigned UNPACK_N_VALUES>
+template <typename ValueT, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct DummyRLEExpander : flsgpu::device::RLEExpanderBase<ValueT, IndexT> {
 private:
-	const ValueT*            rle_values;
-	const size_t*            rle_offsets;
-	const vi_t               base_vector_index;
+	const ValueT* rle_values;
+	const size_t* rle_offsets;
+	const vi_t    base_vector_index;
 
 public:
 	__device__ __forceinline__ ValueT decode_value(const size_t base_offset, const IndexT code) const {

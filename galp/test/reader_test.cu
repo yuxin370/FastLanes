@@ -443,7 +443,6 @@ TEST(Reader, DecompressTable) {
 		return true;
 	};
 
-	size_t total_compared         = 0;
 	size_t expected_total_columns = 0;
 	for (uint32_t rg_idx = 0; rg_idx < td->m_rowgroup_descriptors()->size(); ++rg_idx) {
 		if (!should_decompress(rg_idx)) {
@@ -454,31 +453,41 @@ TEST(Reader, DecompressTable) {
 		expected_total_columns += rg->m_column_descriptors()->size();
 	}
 
-	const auto table_result = dispatch::decompress_table(
-	    fls_path,
-	    {},
-	    should_decompress,
-	    [&](size_t                               rg_idx,
-	        reader::Rowgroup&                    rowgroup,
-	        const std::vector<expr::Expression>& expressions,
-	        const dispatch::RowgroupData&        result) {
-		    const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
-		    ASSERT_NE(rg, nullptr);
+	bool compared_any = false;
+	for (const auto scope :
+	     {dispatch::TableDecompressionScope::PerRowgroup, dispatch::TableDecompressionScope::WholeTable}) {
+		SCOPED_TRACE(scope == dispatch::TableDecompressionScope::PerRowgroup ? "PerRowgroup" : "WholeTable");
+		size_t                             total_compared = 0;
+		dispatch::TableDecompressionConfig cfg {};
+		cfg.scope = scope;
 
-		    auto rowgroup_reader = table_reader->get_rowgroup_reader(static_cast<fastlanes::n_t>(rg_idx));
-		    ASSERT_TRUE(rowgroup_reader != nullptr);
-		    auto expected_rowgroup = rowgroup_reader->materialize();
-		    ASSERT_NE(expected_rowgroup.get(), nullptr);
+		const auto table_result = dispatch::decompress_table(
+		    fls_path,
+		    cfg,
+		    should_decompress,
+		    [&](size_t                               rg_idx,
+		        reader::Rowgroup&                    rowgroup,
+		        const std::vector<expr::Expression>& expressions,
+		        const dispatch::RowgroupData&        result) {
+			    const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
+			    ASSERT_NE(rg, nullptr);
 
-		    size_t compared_columns = 0;
-		    compare_rowgroup_outputs(
-		        rowgroup, *expected_rowgroup, rg, expressions, false, &compared_columns, &result, false);
-		    total_compared += compared_columns;
-	    });
-	ASSERT_GT(table_result.total_columns, 0U);
-	ASSERT_EQ(table_result.total_columns, expected_total_columns);
+			    auto rowgroup_reader = table_reader->get_rowgroup_reader(static_cast<fastlanes::n_t>(rg_idx));
+			    ASSERT_TRUE(rowgroup_reader != nullptr);
+			    auto expected_rowgroup = rowgroup_reader->materialize();
+			    ASSERT_NE(expected_rowgroup.get(), nullptr);
 
-	if (total_compared == 0) {
+			    size_t compared_columns = 0;
+			    compare_rowgroup_outputs(
+			        rowgroup, *expected_rowgroup, rg, expressions, false, &compared_columns, &result, false);
+			    total_compared += compared_columns;
+		    });
+		ASSERT_GT(table_result.total_columns, 0U);
+		ASSERT_EQ(table_result.total_columns, expected_total_columns);
+		compared_any = compared_any || (total_compared > 0);
+	}
+
+	if (!compared_any) {
 		GTEST_SKIP() << "No comparable columns across table for reader validation.";
 	}
 }
