@@ -302,6 +302,12 @@ int main(int argc, char** argv) {
 			const double kernel_ms         = result.kernel_ms;
 			const double setup_ms          = result.setup_ms;
 			const double h2d_ms            = result.h2d_ms;
+			const double pure_h2d_ms       = result.pure_h2d_ms;
+			const double payload_h2d_ms    = result.payload_h2d_ms;
+			const double dispatch_h2d_ms   = result.dispatch_h2d_ms;
+			const double resolve_cpu_ms    = result.resolve_cpu_ms;
+			const double cpu_dispatch_ms   = result.cpu_dispatch_ms;
+			const double cpu_dispatch_resolve_ms = result.cpu_dispatch_resolve_ms;
 			const double teardown_ms       = result.teardown_ms;
 			const size_t total_launches    = result.total_launches;
 			const size_t total_launch_grid = result.total_launch_grid;
@@ -358,6 +364,12 @@ int main(int argc, char** argv) {
 			std::cout << "  kernel_ms:     " << kernel_ms << "\n";
 			std::cout << "  setup_ms:      " << setup_ms << "\n";
 			std::cout << "  h2d_ms:        " << h2d_ms << "\n";
+			std::cout << "  pure_h2d_ms:   " << pure_h2d_ms << "\n";
+			std::cout << "  payload_h2d_ms: " << payload_h2d_ms << "\n";
+			std::cout << "  dispatch_h2d_ms: " << dispatch_h2d_ms << "\n";
+			std::cout << "  resolve_cpu_ms: " << resolve_cpu_ms << "\n";
+			std::cout << "  cpu_dispatch_ms: " << cpu_dispatch_ms << "\n";
+			std::cout << "  cpu_dispatch_resolve_ms: " << cpu_dispatch_resolve_ms << "\n";
 			std::cout
 			    << "  teardown_ms:   " << teardown_ms
 			    << "\n"; //  cudaFree on device buffers, any implicit synchronization caused by freeing those buffers

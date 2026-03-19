@@ -89,7 +89,8 @@ inline double run_workset(ExecutionWorkset&      workset,
                           const uint32_t         samples,
                           const ExecutionConfig& cfg,
                           size_t*                out_grid     = nullptr,
-                          size_t*                out_launches = nullptr) {
+                          size_t*                out_launches = nullptr,
+                          const bool             warmup       = false) {
 	if (!has_any_expr(workset)) {
 		if (out_launches) {
 			*out_launches = 0;
@@ -130,20 +131,22 @@ inline double run_workset(ExecutionWorkset&      workset,
 	CUDA_SAFE_CALL(cudaEventCreate(&start));
 	CUDA_SAFE_CALL(cudaEventCreate(&stop));
 
-	if (mixed_dispatch) {
-		if (cfg.write_out) {
-			launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, stream);
+	if (warmup) {
+		if (mixed_dispatch) {
+			if (cfg.write_out) {
+				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, stream);
+			} else {
+				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, stream);
+			}
 		} else {
-			launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, stream);
+			if (cfg.write_out) {
+				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, stream);
+			} else {
+				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, stream);
+			}
 		}
-	} else {
-		if (cfg.write_out) {
-			launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, stream);
-		} else {
-			launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, stream);
-		}
+		CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
 	}
-	CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
 
 	CUDA_SAFE_CALL(cudaEventRecord(start, stream));
 

@@ -8,7 +8,6 @@
 
 #include "engine/execution/common.cuh"
 #include "engine/execution/dict_ref_resolver.cuh"
-#include <chrono>
 #include <unordered_set>
 
 namespace dispatch::runtime {
@@ -112,17 +111,16 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 	}
 }
 
-inline double append_expressions(ExecutionWorkset&              workset,
-                                 std::vector<expr::Expression>& expressions,
-                                 const ExecutionConfig&         cfg,
-                                 size_t*                        out_total_bytes       = nullptr,
-                                 size_t*                        out_n_exprs           = nullptr,
-                                 const size_t                   expr_index_base       = 0,
-                                 const bool                     use_global_expr_index = false) {
+inline void append_expressions(ExecutionWorkset&              workset,
+                               std::vector<expr::Expression>& expressions,
+                               const ExecutionConfig&         cfg,
+                               size_t*                        out_total_bytes       = nullptr,
+                               size_t*                        out_n_exprs           = nullptr,
+                               const size_t                   expr_index_base       = 0,
+                               const bool                     use_global_expr_index = false) {
 	using namespace dispatch;
 	using namespace dispatch::detail;
 
-	const auto start = std::chrono::steady_clock::now();
 	dispatch::resolve_dict_refs(expressions);
 	size_t active_expr_count = 0;
 
@@ -159,13 +157,9 @@ inline double append_expressions(ExecutionWorkset&              workset,
 		    expr.column->host);
 	}
 
-	const auto end = std::chrono::steady_clock::now();
-	return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-inline double upload_workset(ExecutionWorkset& workset) {
-	const auto start = std::chrono::steady_clock::now();
-
+inline void upload_workset(ExecutionWorkset& workset) {
 	workset.d_slots.reset();
 	workset.mixed_slots.clear();
 
@@ -184,9 +178,6 @@ inline double upload_workset(ExecutionWorkset& workset) {
 	});
 
 	build_mixed_slots(workset);
-
-	const auto end = std::chrono::steady_clock::now();
-	return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 } // namespace dispatch::runtime

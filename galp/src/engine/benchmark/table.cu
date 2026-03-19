@@ -107,21 +107,119 @@ size_t count_active_columns(const std::vector<expr::Expression>& expressions) {
 	return runtime::count_active_columns(expressions);
 }
 
+struct AppendExpressionsProfile {
+	double total_ms        = 0.0;
+	double resolve_cpu_ms  = 0.0;
+	double dispatch_cpu_ms = 0.0;
+	double payload_h2d_ms  = 0.0;
+};
+
+template <typename T, typename HostColT>
+void add_expression_to_batch_profiled(const size_t    expr_index,
+                                      const HostColT& host_col,
+                                      const PlanKind  plan,
+                                      Batch<T>&       batch,
+                                      const ExecutionConfig& cfg,
+                                      AppendExpressionsProfile& profile) {
+	const auto expr_start = std::chrono::steady_clock::now();
+	DeviceExpression<T> expr {};
+	expr.plan     = plan;
+	expr.n_values = host_col.get_n_values();
+	batch.device_outputs.emplace_back(expr.n_values);
+	expr.out = batch.device_outputs.back().get();
+
+	bool use_freq_extended = false;
+	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
+		use_freq_extended = detail::should_use_freq_extended(
+		    host_col, cfg.freq_prefetch_all_branchless, cfg.freq_hybrid_patcher, cfg.freq_branchless_threshold);
+	}
+
+	const auto payload_start = std::chrono::steady_clock::now();
+	detail::fill_device_expr(expr, host_col, plan, use_freq_extended);
+	const auto payload_end = std::chrono::steady_clock::now();
+	const auto payload_ms = std::chrono::duration<double, std::milli>(payload_end - payload_start).count();
+	profile.payload_h2d_ms += payload_ms;
+
+	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size());
+	batch.device_exprs.push_back(expr);
+	batch.expr_indices.push_back(expr_index);
+
+	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
+	for (size_t vec = 0; vec < n_vecs; ++vec) {
+		batch.work_items.push_back(WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>()});
+	}
+
+	const auto expr_end = std::chrono::steady_clock::now();
+	const auto expr_total_ms = std::chrono::duration<double, std::milli>(expr_end - expr_start).count();
+	const auto dispatch_cpu_ms = expr_total_ms - payload_ms;
+	if (dispatch_cpu_ms > 0.0) {
+		profile.dispatch_cpu_ms += dispatch_cpu_ms;
+	}
+}
+
+AppendExpressionsProfile append_expressions_profiled(runtime::ExecutionWorkset&      workset,
+                                                     std::vector<expr::Expression>& expressions,
+                                                     const ExecutionConfig&         cfg,
+                                                     size_t*                        out_total_bytes = nullptr,
+                                                     size_t*                        out_n_exprs     = nullptr) {
+	AppendExpressionsProfile profile {};
+	const auto               start = std::chrono::steady_clock::now();
+
+	const auto resolve_start = std::chrono::steady_clock::now();
+	resolve_dict_refs(expressions);
+	const auto resolve_end = std::chrono::steady_clock::now();
+	profile.resolve_cpu_ms += std::chrono::duration<double, std::milli>(resolve_end - resolve_start).count();
+
+	for (size_t i = 0; i < expressions.size(); ++i) {
+		const auto& expr = expressions[i];
+		if (!expr.column || expr.column->skip_decompress) {
+			continue;
+		}
+		if (out_n_exprs) {
+			++(*out_n_exprs);
+		}
+
+		std::visit(
+		    [&](auto&& host_col) {
+			    using HostColT      = std::decay_t<decltype(host_col)>;
+			    using T             = typename host_value_type<HostColT>::type;
+			    constexpr auto plan = detail::plan_for_host_col<HostColT>();
+			    if constexpr (is_supported_type_v<T>) {
+				    if (out_total_bytes) {
+					    *out_total_bytes += host_col.get_n_values() * sizeof(T);
+				    }
+				    add_expression_to_batch_profiled<T>(i, host_col, plan, workset.host_batches.template get<T>(), cfg, profile);
+			    }
+		    },
+		    expr.column->host);
+	}
+
+	const auto end = std::chrono::steady_clock::now();
+	profile.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+	return profile;
+}
+
 void accumulate_rowgroup_stats(TableBenchmarkResult& result,
                                const size_t          rg_columns,
                                const size_t          rg_vectors,
                                const size_t          bytes,
                                const double          setup_ms,
-                               const double          h2d_ms,
-                               const double          finalize_ms,
+                               const AppendExpressionsProfile& append_profile,
+                               const double          upload_h2d_ms,
                                const double          kernel_ms,
                                const double          teardown_ms,
                                const size_t          launch_grid,
                                const size_t          launches) {
-	result.end_to_end_ms += setup_ms + h2d_ms + finalize_ms + kernel_ms;
+	result.end_to_end_ms += setup_ms + append_profile.total_ms + upload_h2d_ms + kernel_ms;
 	result.kernel_ms += kernel_ms;
 	result.setup_ms += setup_ms;
-	result.h2d_ms += h2d_ms + finalize_ms;
+	result.h2d_ms += append_profile.total_ms + upload_h2d_ms;
+	result.pure_h2d_ms += append_profile.payload_h2d_ms + upload_h2d_ms;
+	result.payload_h2d_ms += append_profile.payload_h2d_ms;
+	result.dispatch_h2d_ms += upload_h2d_ms;
+	result.resolve_cpu_ms += append_profile.resolve_cpu_ms;
+	result.cpu_dispatch_ms += append_profile.dispatch_cpu_ms;
+	result.cpu_dispatch_resolve_ms += append_profile.resolve_cpu_ms + append_profile.dispatch_cpu_ms;
 	result.teardown_ms += teardown_ms;
 	result.total_launches += launches;
 	result.total_launch_grid += launch_grid * launches;
@@ -177,12 +275,15 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 
 			runtime::ExecutionWorkset      workset {};
 			runtime::ExecutionWorksetGuard guard(workset);
-			const double                   h2d_ms = runtime::append_expressions(workset, expressions, cfg.execution);
-			const double                   finalize_ms    = runtime::upload_workset(workset);
+			const auto                     append_profile = append_expressions_profiled(workset, expressions, cfg.execution);
+			const auto                     upload_start   = std::chrono::steady_clock::now();
+			runtime::upload_workset(workset);
+			const auto   upload_end    = std::chrono::steady_clock::now();
+			const double upload_h2d_ms = std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
 			size_t                         rg_launch_grid = 0;
 			size_t                         rg_launches    = 0;
 			const double                   kernel_ms =
-			    runtime::run_workset(workset, cfg.samples, cfg.execution, &rg_launch_grid, &rg_launches);
+			    runtime::run_workset(workset, cfg.samples, cfg.execution, &rg_launch_grid, &rg_launches, true);
 			const auto teardown_start = std::chrono::steady_clock::now();
 			guard.dismiss();
 			runtime::release_workset(workset);
@@ -194,8 +295,8 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			                          rg_vectors,
 			                          bytes,
 			                          setup_ms,
-			                          h2d_ms,
-			                          finalize_ms,
+			                          append_profile,
+			                          upload_h2d_ms,
 			                          kernel_ms,
 			                          teardown_ms,
 			                          rg_launch_grid,
@@ -225,8 +326,14 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 
 		const size_t rg_columns = count_active_columns(expressions);
 		const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
+		const auto   append_profile = append_expressions_profiled(workset, expressions, cfg.execution);
 		out.setup_ms += setup_ms;
-		out.h2d_ms += runtime::append_expressions(workset, expressions, cfg.execution);
+		out.h2d_ms += append_profile.total_ms;
+		out.pure_h2d_ms += append_profile.payload_h2d_ms;
+		out.payload_h2d_ms += append_profile.payload_h2d_ms;
+		out.resolve_cpu_ms += append_profile.resolve_cpu_ms;
+		out.cpu_dispatch_ms += append_profile.dispatch_cpu_ms;
+		out.cpu_dispatch_resolve_ms += append_profile.resolve_cpu_ms + append_profile.dispatch_cpu_ms;
 		out.total_columns += rg_columns;
 		out.total_items += rg_vectors;
 		out.total_bytes += bytes;
@@ -234,10 +341,16 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		free_rowgroup(rowgroup);
 	}
 
-	out.h2d_ms += runtime::upload_workset(workset);
+	const auto upload_start = std::chrono::steady_clock::now();
+	runtime::upload_workset(workset);
+	const auto   upload_end    = std::chrono::steady_clock::now();
+	const double upload_h2d_ms = std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+	out.h2d_ms += upload_h2d_ms;
+	out.pure_h2d_ms += upload_h2d_ms;
+	out.dispatch_h2d_ms += upload_h2d_ms;
 	size_t launch_grid  = 0;
 	size_t launch_count = 0;
-	out.kernel_ms       = runtime::run_workset(workset, cfg.samples, cfg.execution, &launch_grid, &launch_count);
+	out.kernel_ms       = runtime::run_workset(workset, cfg.samples, cfg.execution, &launch_grid, &launch_count, true);
 	if (launch_count > 0) {
 		out.total_launches    = launch_count;
 		out.total_launch_grid = launch_grid * launch_count;

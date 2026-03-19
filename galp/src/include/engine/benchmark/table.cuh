@@ -33,6 +33,12 @@ struct TableBenchmarkResult {
 	double kernel_ms     = 0.0;
 	double setup_ms      = 0.0;
 	double h2d_ms        = 0.0;
+	double pure_h2d_ms    = 0.0;
+	double payload_h2d_ms = 0.0;
+	double dispatch_h2d_ms = 0.0;
+	double resolve_cpu_ms = 0.0;
+	double cpu_dispatch_ms = 0.0;
+	double cpu_dispatch_resolve_ms = 0.0;
 	double teardown_ms   = 0.0;
 
 	size_t   total_launches    = 0;
