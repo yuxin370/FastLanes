@@ -19,6 +19,7 @@
 #include "nvcomp.h"
 #include "nvcomp.hpp"
 #include "nvcomp/benchmark-compressors.cuh"
+#include "nvcomp/bitcomp.hpp"
 #include "nvcomp/deflate.h"
 #include "nvcomp/deflate.hpp"
 #include "nvcomp/gdeflate.h"
@@ -26,6 +27,7 @@
 #include "nvcomp/lz4.hpp"
 #include "nvcomp/nvcompManager.hpp"
 #include "nvcomp/nvcompManagerFactory.hpp"
+#include "nvcomp/snappy.h"
 #include "nvcomp/zstd.h"
 #include "nvcomp/zstd.hpp"
 

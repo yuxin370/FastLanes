@@ -16,31 +16,31 @@ nvcompCompressionManager* get_compressor_manager(const enums_nvcomp::Compression
                                                  const size_t                        chunk_size) {
 	switch (compression_type) {
 	case enums_nvcomp::CompressionType::BITCOMP: {
-		nvcompBatchedBitcompCompressOpts_t format_opts {0, data_type};
+		nvcompBatchedBitcompOpts_t format_opts {0, data_type};
 		return new nvcomp::BitcompManager {chunk_size, format_opts};
 	} break;
 	case enums_nvcomp::CompressionType::BITCOMP_SPARSE: {
-		nvcompBatchedBitcompCompressOpts_t format_opts {1, data_type};
+		nvcompBatchedBitcompOpts_t format_opts {1, data_type};
 		return new nvcomp::BitcompManager {chunk_size, format_opts};
 	} break;
 	case enums_nvcomp::CompressionType::LZ4: {
-		nvcompBatchedLZ4CompressOpts_t format_opts {data_type};
+		nvcompBatchedLZ4Opts_t format_opts {data_type};
 		return new nvcomp::LZ4Manager {chunk_size, format_opts};
 	} break;
 	case enums_nvcomp::CompressionType::ZSTD: {
-		nvcompBatchedZstdCompressOpts_t format_opts {data_type};
+		nvcompBatchedZstdOpts_t format_opts {data_type};
 		return new nvcomp::ZstdManager {chunk_size, format_opts};
 	} break;
 	case enums_nvcomp::CompressionType::DEFLATE: {
-		nvcompBatchedDeflateCompressOpts_t format_opts {data_type};
+		nvcompBatchedDeflateOpts_t format_opts {data_type};
 		return new nvcomp::DeflateManager {chunk_size, format_opts};
 	} break;
 	case enums_nvcomp::CompressionType::GDEFLATE: {
-		nvcompBatchedGdeflateCompressOpts_t format_opts {data_type};
+		nvcompBatchedGdeflateOpts_t format_opts {data_type};
 		return new nvcomp::GdeflateManager {chunk_size, format_opts};
 	} break;
 	case enums_nvcomp::CompressionType::SNAPPY: {
-		nvcompBatchedSnappyCompressOpts_t format_opts {data_type};
+		nvcompBatchedSnappyOpts_t format_opts {data_type};
 		return new nvcomp::SnappyManager {chunk_size, format_opts};
 	} break;
 	default:
