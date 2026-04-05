@@ -4,8 +4,11 @@
 // galp/src/engine/execution/table.cu
 // ────────────────────────────────────────────────────────
 #include "engine/execution/internal/materialize.cuh"
+#include "engine/execution/internal/streaming_pipeline.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/execution/table.cuh"
+#include <array>
+#include <memory>
 
 namespace dispatch {
 namespace {
@@ -21,6 +24,33 @@ struct PendingRowgroup {
 	std::vector<expr::Expression> expressions;
 	RowgroupData                  materialized;
 };
+
+struct StreamingChunkState {
+	runtime::ExecutionWorkset       workset {};
+	runtime::AsyncWorksetRun        run {};
+	std::vector<PendingRowgroup>    rowgroups;
+	std::vector<GlobalExprLocation> expr_locations;
+	size_t                          global_expr_base = 0;
+	size_t                          work_items       = 0;
+	bool                            submitted        = false;
+};
+
+void reset_streaming_chunk(StreamingChunkState& chunk) {
+	chunk.rowgroups.clear();
+	chunk.expr_locations.clear();
+	chunk.global_expr_base = 0;
+	chunk.work_items       = 0;
+	chunk.submitted        = false;
+}
+
+void submit_streaming_chunk(StreamingChunkState& chunk, const TableDecompressionConfig& cfg) {
+	if (chunk.rowgroups.empty()) {
+		return;
+	}
+	runtime::upload_workset(chunk.workset);
+	chunk.run = runtime::run_workset_async(chunk.workset, 1, cfg.execution);
+	chunk.submitted = true;
+}
 
 template <typename T>
 void materialize_table_batch(Batch<T>&                              batch,
@@ -93,7 +123,8 @@ TableData decompress_table_per_rowgroup(const std::filesystem::path&    fls_path
 			continue;
 		}
 
-		auto rowgroup    = rdr.read_rowgroup(rg_idx);
+		auto rowgroup    = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
+		                                           : rdr.read_rowgroup(rg_idx);
 		auto expressions = expr::assemble(rowgroup);
 		auto result      = decompress_rowgroup(expressions, cfg.execution);
 
@@ -110,58 +141,63 @@ TableData decompress_table_whole_table(const std::filesystem::path&    fls_path,
                                        const TableDecompressionConfig& cfg,
                                        const TableRowgroupPredicate&   should_decompress,
                                        const TableRowgroupCallback&    on_rowgroup) {
-	reader::reader                  rdr(fls_path);
-	TableData                       out {};
-	runtime::ExecutionWorkset       workset {};
-	runtime::ExecutionWorksetGuard  guard(workset);
-	std::vector<PendingRowgroup>    rowgroups;
-	std::vector<GlobalExprLocation> expr_locations;
+	reader::reader                       rdr(fls_path);
+	TableData                            out {};
+	runtime::StreamingDoubleBuffer<StreamingChunkState> pipeline {};
 
-	size_t global_expr_base = 0;
+	const auto consume_chunk = [&](StreamingChunkState& chunk) {
+		if (!chunk.submitted || chunk.rowgroups.empty()) {
+			return;
+		}
+		runtime::wait_workset_async(chunk.run);
+		materialize_table_workset(chunk.workset, chunk.rowgroups, chunk.expr_locations, cfg.execution);
+		runtime::release_workset(chunk.workset);
+
+		for (auto& pending : chunk.rowgroups) {
+			on_rowgroup(pending.rowgroup_index, pending.rowgroup, pending.expressions, pending.materialized);
+			free_rowgroup(pending.rowgroup);
+		}
+		reset_streaming_chunk(chunk);
+	};
+
 	for (size_t rg_idx = 0; rg_idx < rdr.rowgroup_count(); ++rg_idx) {
 		if (!should_decompress(rg_idx)) {
 			continue;
 		}
 
-		rowgroups.emplace_back();
-		auto& pending          = rowgroups.back();
+		auto& chunk = pipeline.build_chunk();
+		chunk.rowgroups.emplace_back();
+		auto& pending          = chunk.rowgroups.back();
 		pending.rowgroup_index = rg_idx;
-		pending.rowgroup       = rdr.read_rowgroup(rg_idx);
+		pending.rowgroup       = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
+		                                                 : rdr.read_rowgroup(rg_idx);
 		pending.expressions    = expr::assemble(pending.rowgroup);
 		pending.materialized.columns.resize(pending.expressions.size());
 
 		const size_t active_columns = runtime::count_active_columns(pending.expressions);
-		expr_locations.reserve(expr_locations.size() + active_columns);
+		chunk.expr_locations.reserve(chunk.expr_locations.size() + active_columns);
 		for (size_t expr_idx = 0; expr_idx < pending.expressions.size(); ++expr_idx) {
 			const auto& expr = pending.expressions[expr_idx];
 			if (expr.column && !expr.column->skip_decompress) {
-				expr_locations.push_back(GlobalExprLocation {rowgroups.size() - 1, expr_idx});
+				chunk.expr_locations.push_back(GlobalExprLocation {chunk.rowgroups.size() - 1, expr_idx});
 			}
 		}
 
 		runtime::append_expressions(
-		    workset, pending.expressions, cfg.execution, nullptr, nullptr, global_expr_base, true);
-		global_expr_base += active_columns;
+		    chunk.workset, pending.expressions, cfg.execution, nullptr, nullptr, chunk.global_expr_base, true);
+		chunk.global_expr_base += active_columns;
+		chunk.work_items += active_columns * pending.rowgroup.n_vecs;
 
 		++out.rowgroups;
 		out.total_columns += pending.rowgroup.columns.size();
+
+		if (chunk.work_items >= runtime::kStreamingTargetWorkItems) {
+			pipeline.submit_build_and_rotate(
+			    [&](StreamingChunkState& target) { submit_streaming_chunk(target, cfg); }, consume_chunk);
+		}
 	}
 
-	if (rowgroups.empty()) {
-		return out;
-	}
-
-	runtime::upload_workset(workset);
-	runtime::run_workset(workset, 1, cfg.execution);
-	materialize_table_workset(workset, rowgroups, expr_locations, cfg.execution);
-
-	guard.dismiss();
-	runtime::release_workset(workset);
-
-	for (auto& pending : rowgroups) {
-		on_rowgroup(pending.rowgroup_index, pending.rowgroup, pending.expressions, pending.materialized);
-		free_rowgroup(pending.rowgroup);
-	}
+	pipeline.flush([&](StreamingChunkState& chunk) { submit_streaming_chunk(chunk, cfg); }, consume_chunk);
 
 	return out;
 }

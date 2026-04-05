@@ -5,6 +5,7 @@
 // ────────────────────────────────────────────────────────
 #include "engine/benchmark/table.cuh"
 #include "engine/execution/internal/materialize.cuh"
+#include "engine/execution/internal/streaming_pipeline.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/expression.cuh"
 #include "engine/reader.cuh"
@@ -13,9 +14,9 @@
 #include "fls/file/file_header.hpp"
 #include "fls/footer/datatype_generated.h"
 #include "fls/footer/table_descriptor.hpp"
-#include "fls/io/file.hpp"
-#include "fls/io/io.hpp"
+#include <array>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 
 namespace dispatch {
@@ -62,19 +63,6 @@ fastlanes::TableDescriptorHandle load_table_descriptor(const std::filesystem::pa
 	                                                  /*verify=*/true);
 }
 
-double measure_rowgroup_io_ms(const std::filesystem::path& file_path, const fastlanes::RowgroupDescriptor* rg) {
-	if (!rg) {
-		return 0.0;
-	}
-	using Clock = std::chrono::steady_clock;
-	fastlanes::Buf buf(rg->m_size());
-	fastlanes::io  io    = fastlanes::make_unique<fastlanes::File>(file_path);
-	const auto     start = Clock::now();
-	fastlanes::IO::range_read(io, buf, rg->m_offset(), rg->m_size());
-	const auto end = Clock::now();
-	return std::chrono::duration<double, std::milli>(end - start).count();
-}
-
 size_t rowgroup_bytes(const fastlanes::RowgroupDescriptor* rg) {
 	if (!rg) {
 		return 0;
@@ -107,120 +95,46 @@ size_t count_active_columns(const std::vector<expr::Expression>& expressions) {
 	return runtime::count_active_columns(expressions);
 }
 
-struct AppendExpressionsProfile {
-	double total_ms        = 0.0;
-	double resolve_cpu_ms  = 0.0;
-	double dispatch_cpu_ms = 0.0;
-	double payload_h2d_ms  = 0.0;
+struct StreamingBenchmarkChunk {
+	runtime::ExecutionWorkset  workset {};
+	runtime::AsyncWorksetRun   run {};
+	std::vector<reader::Rowgroup> pending_rowgroups;
+	size_t                     work_items  = 0;
+	size_t                     rowgroups   = 0;
+	size_t                     launch_grid = 0;
+	size_t                     launches    = 0;
+	bool                       submitted   = false;
 };
 
-template <typename T, typename HostColT>
-void add_expression_to_batch_profiled(const size_t    expr_index,
-                                      const HostColT& host_col,
-                                      const PlanKind  plan,
-                                      Batch<T>&       batch,
-                                      const ExecutionConfig& cfg,
-                                      AppendExpressionsProfile& profile) {
-	const auto expr_start = std::chrono::steady_clock::now();
-	DeviceExpression<T> expr {};
-	expr.plan     = plan;
-	expr.n_values = host_col.get_n_values();
-	batch.device_outputs.emplace_back(expr.n_values);
-	expr.out = batch.device_outputs.back().get();
-
-	bool use_freq_extended = false;
-	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
-		use_freq_extended = detail::should_use_freq_extended(
-		    host_col, cfg.freq_prefetch_all_branchless, cfg.freq_hybrid_patcher, cfg.freq_branchless_threshold);
-	}
-
-	const auto payload_start = std::chrono::steady_clock::now();
-	detail::fill_device_expr(expr, host_col, plan, use_freq_extended);
-	const auto payload_end = std::chrono::steady_clock::now();
-	const auto payload_ms = std::chrono::duration<double, std::milli>(payload_end - payload_start).count();
-	profile.payload_h2d_ms += payload_ms;
-
-	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size());
-	batch.device_exprs.push_back(expr);
-	batch.expr_indices.push_back(expr_index);
-
-	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
-	for (size_t vec = 0; vec < n_vecs; ++vec) {
-		batch.work_items.push_back(WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>()});
-	}
-
-	const auto expr_end = std::chrono::steady_clock::now();
-	const auto expr_total_ms = std::chrono::duration<double, std::milli>(expr_end - expr_start).count();
-	const auto dispatch_cpu_ms = expr_total_ms - payload_ms;
-	if (dispatch_cpu_ms > 0.0) {
-		profile.dispatch_cpu_ms += dispatch_cpu_ms;
-	}
-}
-
-AppendExpressionsProfile append_expressions_profiled(runtime::ExecutionWorkset&      workset,
-                                                     std::vector<expr::Expression>& expressions,
-                                                     const ExecutionConfig&         cfg,
-                                                     size_t*                        out_total_bytes = nullptr,
-                                                     size_t*                        out_n_exprs     = nullptr) {
-	AppendExpressionsProfile profile {};
-	const auto               start = std::chrono::steady_clock::now();
-
-	const auto resolve_start = std::chrono::steady_clock::now();
-	resolve_dict_refs(expressions);
-	const auto resolve_end = std::chrono::steady_clock::now();
-	profile.resolve_cpu_ms += std::chrono::duration<double, std::milli>(resolve_end - resolve_start).count();
-
-	for (size_t i = 0; i < expressions.size(); ++i) {
-		const auto& expr = expressions[i];
-		if (!expr.column || expr.column->skip_decompress) {
-			continue;
-		}
-		if (out_n_exprs) {
-			++(*out_n_exprs);
-		}
-
-		std::visit(
-		    [&](auto&& host_col) {
-			    using HostColT      = std::decay_t<decltype(host_col)>;
-			    using T             = typename host_value_type<HostColT>::type;
-			    constexpr auto plan = detail::plan_for_host_col<HostColT>();
-			    if constexpr (is_supported_type_v<T>) {
-				    if (out_total_bytes) {
-					    *out_total_bytes += host_col.get_n_values() * sizeof(T);
-				    }
-				    add_expression_to_batch_profiled<T>(i, host_col, plan, workset.host_batches.template get<T>(), cfg, profile);
-			    }
-		    },
-		    expr.column->host);
-	}
-
-	const auto end = std::chrono::steady_clock::now();
-	profile.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
-	return profile;
+void reset_streaming_chunk(StreamingBenchmarkChunk& chunk) {
+	chunk.pending_rowgroups.clear();
+	chunk.work_items  = 0;
+	chunk.rowgroups   = 0;
+	chunk.launch_grid = 0;
+	chunk.launches    = 0;
+	chunk.submitted   = false;
 }
 
 void accumulate_rowgroup_stats(TableBenchmarkResult& result,
                                const size_t          rg_columns,
                                const size_t          rg_vectors,
                                const size_t          bytes,
-                               const double          setup_ms,
-                               const AppendExpressionsProfile& append_profile,
-                               const double          upload_h2d_ms,
+                               const double          read_rowgroup_ms,
+                               const double          assemble_expr_ms,
+                               const double          append_expr_ms,
+                               const double          upload_workset_ms,
                                const double          kernel_ms,
-                               const double          teardown_ms,
+                               const double          release_device_ms,
+                               const double          free_rowgroup_ms,
                                const size_t          launch_grid,
                                const size_t          launches) {
-	result.end_to_end_ms += setup_ms + append_profile.total_ms + upload_h2d_ms + kernel_ms;
+	result.read_rowgroup_ms += read_rowgroup_ms;
+	result.assemble_expr_ms += assemble_expr_ms;
+	result.append_expr_ms += append_expr_ms;
+	result.upload_workset_ms += upload_workset_ms;
 	result.kernel_ms += kernel_ms;
-	result.setup_ms += setup_ms;
-	result.h2d_ms += append_profile.total_ms + upload_h2d_ms;
-	result.pure_h2d_ms += append_profile.payload_h2d_ms + upload_h2d_ms;
-	result.payload_h2d_ms += append_profile.payload_h2d_ms;
-	result.dispatch_h2d_ms += upload_h2d_ms;
-	result.resolve_cpu_ms += append_profile.resolve_cpu_ms;
-	result.cpu_dispatch_ms += append_profile.dispatch_cpu_ms;
-	result.cpu_dispatch_resolve_ms += append_profile.resolve_cpu_ms + append_profile.dispatch_cpu_ms;
-	result.teardown_ms += teardown_ms;
+	result.release_device_ms += release_device_ms;
+	result.free_rowgroup_ms += free_rowgroup_ms;
 	result.total_launches += launches;
 	result.total_launch_grid += launch_grid * launches;
 	result.total_columns += rg_columns;
@@ -252,117 +166,259 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		throw std::runtime_error("failed to load table descriptor");
 	}
 
+	const auto wall_start = std::chrono::steady_clock::now();
 	const bool whole_table = !cfg.rowgroup.has_value() && cfg.aggregation_scope == AggregationScope::WholeTable;
+	if (cfg.streaming_target_work_items == 0) {
+		throw std::invalid_argument("streaming_target_work_items must be > 0");
+	}
+	const size_t stream_target_work_items = cfg.streaming_target_work_items;
+	const size_t stream_target_rowgroups  = cfg.streaming_target_rowgroups;
+
 	if (!whole_table) {
 		for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
-			const auto*  rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
-			const double io_ms = measure_rowgroup_io_ms(fls_path, rg);
+			const auto* rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
 			const size_t bytes = rowgroup_bytes(rg);
 
-			const auto setup_start = std::chrono::steady_clock::now();
-			auto       rowgroup    = rdr.read_rowgroup(rg_idx);
-			auto       expressions = expr::assemble(rowgroup);
-			const auto setup_end   = std::chrono::steady_clock::now();
+			const auto read_start = std::chrono::steady_clock::now();
+			auto       rowgroup   = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
+			                                                : rdr.read_rowgroup(rg_idx);
+			const auto read_end = std::chrono::steady_clock::now();
+			const double read_rowgroup_ms = std::chrono::duration<double, std::milli>(read_end - read_start).count();
 
-			const double setup_total_ms = std::chrono::duration<double, std::milli>(setup_end - setup_start).count();
-			double       setup_ms       = setup_total_ms - io_ms;
-			if (setup_ms < 0.0) {
-				setup_ms = 0.0;
-			}
+			const auto assemble_start = std::chrono::steady_clock::now();
+			auto       expressions    = expr::assemble(rowgroup);
+			const auto assemble_end   = std::chrono::steady_clock::now();
+			const double assemble_expr_ms =
+			    std::chrono::duration<double, std::milli>(assemble_end - assemble_start).count();
 
 			const size_t rg_columns = count_active_columns(expressions);
 			const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
 
 			runtime::ExecutionWorkset      workset {};
 			runtime::ExecutionWorksetGuard guard(workset);
-			const auto                     append_profile = append_expressions_profiled(workset, expressions, cfg.execution);
-			const auto                     upload_start   = std::chrono::steady_clock::now();
+			const auto append_start = std::chrono::steady_clock::now();
+			runtime::append_expressions(workset, expressions, cfg.execution);
+			const auto append_end     = std::chrono::steady_clock::now();
+			const double append_expr_ms = std::chrono::duration<double, std::milli>(append_end - append_start).count();
+
+			const auto upload_start = std::chrono::steady_clock::now();
 			runtime::upload_workset(workset);
-			const auto   upload_end    = std::chrono::steady_clock::now();
-			const double upload_h2d_ms = std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
-			size_t                         rg_launch_grid = 0;
-			size_t                         rg_launches    = 0;
-			const double                   kernel_ms =
+			const auto upload_end       = std::chrono::steady_clock::now();
+			const double upload_workset_ms =
+			    std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+
+			size_t       rg_launch_grid = 0;
+			size_t       rg_launches    = 0;
+			const double kernel_ms =
 			    runtime::run_workset(workset, cfg.samples, cfg.execution, &rg_launch_grid, &rg_launches, true);
-			const auto teardown_start = std::chrono::steady_clock::now();
+
+			const auto release_start = std::chrono::steady_clock::now();
 			guard.dismiss();
 			runtime::release_workset(workset);
-			const auto   teardown_end = std::chrono::steady_clock::now();
-			const double teardown_ms = std::chrono::duration<double, std::milli>(teardown_end - teardown_start).count();
+			const auto release_end = std::chrono::steady_clock::now();
+			const double release_device_ms = std::chrono::duration<double, std::milli>(release_end - release_start).count();
+
+			const auto free_start = std::chrono::steady_clock::now();
+			free_rowgroup(rowgroup);
+			const auto free_end = std::chrono::steady_clock::now();
+			const double free_rowgroup_ms = std::chrono::duration<double, std::milli>(free_end - free_start).count();
 
 			accumulate_rowgroup_stats(out,
 			                          rg_columns,
 			                          rg_vectors,
 			                          bytes,
-			                          setup_ms,
-			                          append_profile,
-			                          upload_h2d_ms,
+			                          read_rowgroup_ms,
+			                          assemble_expr_ms,
+			                          append_expr_ms,
+			                          upload_workset_ms,
 			                          kernel_ms,
-			                          teardown_ms,
+			                          release_device_ms,
+			                          free_rowgroup_ms,
 			                          rg_launch_grid,
 			                          rg_launches);
-			free_rowgroup(rowgroup);
 		}
+		const auto wall_end = std::chrono::steady_clock::now();
+		out.end_to_end_ms   = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
 		return out;
 	}
 
-	runtime::ExecutionWorkset      workset {};
-	runtime::ExecutionWorksetGuard guard(workset);
-	for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
-		const auto*  rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
-		const double io_ms = measure_rowgroup_io_ms(fls_path, rg);
-		const size_t bytes = rowgroup_bytes(rg);
+	if (!cfg.enable_streaming) {
+		runtime::ExecutionWorkset   workset {};
+		std::vector<reader::Rowgroup> pending_rowgroups;
+		size_t                      chunk_work_items = 0;
+		size_t                      chunk_rowgroups  = 0;
+		bool                        did_warmup       = false;
 
-		const auto setup_start = std::chrono::steady_clock::now();
-		auto       rowgroup    = rdr.read_rowgroup(rg_idx);
-		auto       expressions = expr::assemble(rowgroup);
-		const auto setup_end   = std::chrono::steady_clock::now();
+		const auto run_sync_chunk = [&]() {
+			if (chunk_rowgroups == 0) {
+				return;
+			}
 
-		const double setup_total_ms = std::chrono::duration<double, std::milli>(setup_end - setup_start).count();
-		double       setup_ms       = setup_total_ms - io_ms;
-		if (setup_ms < 0.0) {
-			setup_ms = 0.0;
+			const auto upload_start = std::chrono::steady_clock::now();
+			runtime::upload_workset(workset);
+			const auto upload_end = std::chrono::steady_clock::now();
+			out.upload_workset_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+
+			size_t chunk_launch_grid = 0;
+			size_t chunk_launches    = 0;
+			const bool warmup_once   = !did_warmup;
+			out.kernel_ms += runtime::run_workset(
+			    workset, cfg.samples, cfg.execution, &chunk_launch_grid, &chunk_launches, warmup_once);
+			did_warmup = true;
+			out.total_launches += chunk_launches;
+			out.total_launch_grid += chunk_launch_grid * chunk_launches;
+
+			const auto release_start = std::chrono::steady_clock::now();
+			runtime::release_workset(workset);
+			const auto release_end = std::chrono::steady_clock::now();
+			out.release_device_ms += std::chrono::duration<double, std::milli>(release_end - release_start).count();
+
+			for (auto& rowgroup : pending_rowgroups) {
+				const auto free_start = std::chrono::steady_clock::now();
+				free_rowgroup(rowgroup);
+				const auto free_end = std::chrono::steady_clock::now();
+				out.free_rowgroup_ms += std::chrono::duration<double, std::milli>(free_end - free_start).count();
+			}
+			pending_rowgroups.clear();
+			chunk_work_items = 0;
+			chunk_rowgroups  = 0;
+		};
+
+		for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
+			const auto* rg     = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
+			const size_t bytes = rowgroup_bytes(rg);
+
+			const auto read_start = std::chrono::steady_clock::now();
+			auto       rowgroup   = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
+			                                                : rdr.read_rowgroup(rg_idx);
+			const auto read_end = std::chrono::steady_clock::now();
+			out.read_rowgroup_ms += std::chrono::duration<double, std::milli>(read_end - read_start).count();
+
+			const auto assemble_start = std::chrono::steady_clock::now();
+			auto       expressions    = expr::assemble(rowgroup);
+			const auto assemble_end   = std::chrono::steady_clock::now();
+			out.assemble_expr_ms += std::chrono::duration<double, std::milli>(assemble_end - assemble_start).count();
+
+			const size_t rg_columns = count_active_columns(expressions);
+			const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
+
+			const auto append_start = std::chrono::steady_clock::now();
+			runtime::append_expressions(workset, expressions, cfg.execution);
+			const auto append_end = std::chrono::steady_clock::now();
+			out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
+
+			chunk_work_items += rg_vectors;
+			++chunk_rowgroups;
+			pending_rowgroups.push_back(std::move(rowgroup));
+
+			out.total_columns += rg_columns;
+			out.total_items += rg_vectors;
+			out.total_bytes += bytes;
+			++out.total_rgs;
+
+			const bool reach_items     = chunk_work_items >= stream_target_work_items;
+			const bool reach_rowgroups = (stream_target_rowgroups > 0) && (chunk_rowgroups >= stream_target_rowgroups);
+			if (reach_items || reach_rowgroups) {
+				run_sync_chunk();
+			}
+			}
+
+		run_sync_chunk();
+
+		const auto wall_end = std::chrono::steady_clock::now();
+		out.end_to_end_ms   = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
+		return out;
+	}
+
+	runtime::StreamingDoubleBuffer<StreamingBenchmarkChunk> pipeline {};
+	bool                                                    did_warmup = false;
+
+	const auto submit_chunk = [&](StreamingBenchmarkChunk& chunk) {
+		if (chunk.rowgroups == 0) {
+			return;
+		}
+		const auto upload_start = std::chrono::steady_clock::now();
+		runtime::upload_workset(chunk.workset);
+		const auto upload_end = std::chrono::steady_clock::now();
+		out.upload_workset_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+
+		const bool warmup_once = !did_warmup;
+		chunk.run = runtime::run_workset_async(
+		    chunk.workset, cfg.samples, cfg.execution, &chunk.launch_grid, &chunk.launches, warmup_once);
+		chunk.submitted = true;
+		did_warmup = true;
+	};
+
+	const auto consume_chunk = [&](StreamingBenchmarkChunk& chunk) {
+		if (chunk.rowgroups == 0) {
+			return;
+		}
+		if (chunk.submitted) {
+			runtime::wait_workset_async(chunk.run);
+			out.kernel_ms += chunk.run.elapsed_ms;
+			out.total_launches += chunk.launches;
+			out.total_launch_grid += chunk.launch_grid * chunk.launches;
 		}
 
+		const auto release_start = std::chrono::steady_clock::now();
+		runtime::release_workset(chunk.workset);
+		const auto release_end = std::chrono::steady_clock::now();
+		out.release_device_ms += std::chrono::duration<double, std::milli>(release_end - release_start).count();
+
+		for (auto& rowgroup : chunk.pending_rowgroups) {
+			const auto free_start = std::chrono::steady_clock::now();
+			free_rowgroup(rowgroup);
+			const auto free_end = std::chrono::steady_clock::now();
+			out.free_rowgroup_ms += std::chrono::duration<double, std::milli>(free_end - free_start).count();
+		}
+
+		reset_streaming_chunk(chunk);
+	};
+
+	for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
+		const auto* rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
+		const size_t bytes = rowgroup_bytes(rg);
+
+		const auto read_start = std::chrono::steady_clock::now();
+		auto       rowgroup   = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
+		                                                : rdr.read_rowgroup(rg_idx);
+		const auto read_end = std::chrono::steady_clock::now();
+		out.read_rowgroup_ms += std::chrono::duration<double, std::milli>(read_end - read_start).count();
+
+		const auto assemble_start = std::chrono::steady_clock::now();
+		auto       expressions    = expr::assemble(rowgroup);
+		const auto assemble_end   = std::chrono::steady_clock::now();
+		out.assemble_expr_ms += std::chrono::duration<double, std::milli>(assemble_end - assemble_start).count();
+
+		auto&        chunk      = pipeline.build_chunk();
 		const size_t rg_columns = count_active_columns(expressions);
 		const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
-		const auto   append_profile = append_expressions_profiled(workset, expressions, cfg.execution);
-		out.setup_ms += setup_ms;
-		out.h2d_ms += append_profile.total_ms;
-		out.pure_h2d_ms += append_profile.payload_h2d_ms;
-		out.payload_h2d_ms += append_profile.payload_h2d_ms;
-		out.resolve_cpu_ms += append_profile.resolve_cpu_ms;
-		out.cpu_dispatch_ms += append_profile.dispatch_cpu_ms;
-		out.cpu_dispatch_resolve_ms += append_profile.resolve_cpu_ms + append_profile.dispatch_cpu_ms;
+
+		const auto append_start = std::chrono::steady_clock::now();
+		runtime::append_expressions(chunk.workset, expressions, cfg.execution);
+		const auto append_end = std::chrono::steady_clock::now();
+		out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
+
+		chunk.work_items += rg_vectors;
+		++chunk.rowgroups;
+
 		out.total_columns += rg_columns;
 		out.total_items += rg_vectors;
 		out.total_bytes += bytes;
 		++out.total_rgs;
-		free_rowgroup(rowgroup);
+		chunk.pending_rowgroups.push_back(std::move(rowgroup));
+
+		const bool reach_items     = chunk.work_items >= stream_target_work_items;
+		const bool reach_rowgroups = (stream_target_rowgroups > 0) && (chunk.rowgroups >= stream_target_rowgroups);
+		if (reach_items || reach_rowgroups) {
+			pipeline.submit_build_and_rotate(submit_chunk, consume_chunk);
+		}
 	}
 
-	const auto upload_start = std::chrono::steady_clock::now();
-	runtime::upload_workset(workset);
-	const auto   upload_end    = std::chrono::steady_clock::now();
-	const double upload_h2d_ms = std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
-	out.h2d_ms += upload_h2d_ms;
-	out.pure_h2d_ms += upload_h2d_ms;
-	out.dispatch_h2d_ms += upload_h2d_ms;
-	size_t launch_grid  = 0;
-	size_t launch_count = 0;
-	out.kernel_ms       = runtime::run_workset(workset, cfg.samples, cfg.execution, &launch_grid, &launch_count, true);
-	if (launch_count > 0) {
-		out.total_launches    = launch_count;
-		out.total_launch_grid = launch_grid * launch_count;
-	}
+	pipeline.flush(submit_chunk, consume_chunk);
 
-	const auto teardown_start = std::chrono::steady_clock::now();
-	guard.dismiss();
-	runtime::release_workset(workset);
-	const auto teardown_end = std::chrono::steady_clock::now();
-	out.teardown_ms += std::chrono::duration<double, std::milli>(teardown_end - teardown_start).count();
-
-	out.end_to_end_ms = out.setup_ms + out.h2d_ms + out.kernel_ms;
+	const auto wall_end = std::chrono::steady_clock::now();
+	out.end_to_end_ms    = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
 	return out;
 }
 

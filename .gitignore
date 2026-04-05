@@ -10,6 +10,7 @@ build/
 Testing/
 build-support/boost_*
 galp/benchmark/generated-bindings/dictshfl32*
+scripts/my_tool/
 
 # Build directories created by Clion
 cmake-build-*/

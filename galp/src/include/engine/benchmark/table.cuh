@@ -21,25 +21,26 @@ struct TableBenchmarkConfig {
 	uint32_t         samples           = 1;
 	AggregationScope aggregation_scope = AggregationScope::WholeTable;
 	ExecutionConfig  execution         = [] {
-        ExecutionConfig cfg {};
-        cfg.write_out = false;
-        return cfg;
+	        ExecutionConfig cfg {};
+	        cfg.write_out = false;
+	        return cfg;
 	}();
+	bool                  use_zero_copy_parse = false;
+	bool                  enable_streaming    = true;
+	size_t                streaming_target_work_items = 1u << 18;
+	size_t                streaming_target_rowgroups  = 8; // 0 means disable rowgroup-cap flushing.
 	std::optional<size_t> rowgroup;
 };
 
 struct TableBenchmarkResult {
-	double end_to_end_ms = 0.0; // excludes teardown
-	double kernel_ms     = 0.0;
-	double setup_ms      = 0.0;
-	double h2d_ms        = 0.0;
-	double pure_h2d_ms    = 0.0;
-	double payload_h2d_ms = 0.0;
-	double dispatch_h2d_ms = 0.0;
-	double resolve_cpu_ms = 0.0;
-	double cpu_dispatch_ms = 0.0;
-	double cpu_dispatch_resolve_ms = 0.0;
-	double teardown_ms   = 0.0;
+	double end_to_end_ms       = 0.0; // wall clock of the whole benchmark run
+	double read_rowgroup_ms    = 0.0; // reader::read_rowgroup* stage
+	double assemble_expr_ms    = 0.0; // expr::assemble stage
+	double append_expr_ms      = 0.0; // runtime::append_expressions stage
+	double upload_workset_ms   = 0.0; // runtime::upload_workset stage
+	double kernel_ms           = 0.0; // kernel event time returned by run_workset*
+	double release_device_ms   = 0.0; // runtime::release_workset stage
+	double free_rowgroup_ms    = 0.0; // free_rowgroup stage
 
 	size_t   total_launches    = 0;
 	size_t   total_launch_grid = 0;

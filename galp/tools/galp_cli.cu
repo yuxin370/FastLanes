@@ -43,11 +43,15 @@ struct Options {
 	bool                                 estimate_launch              = false;
 	uint32_t                             estimate_iters               = 10000;
 	bool                                 mega_kernel                  = true;
+	bool                                 benchmark_streaming          = true;
 	bool                                 gpu_dispatch_kernel          = false;
 	bool                                 write_back                   = false;
 	bool                                 freq_prefetch_all_branchless = false;
 	bool                                 freq_hybrid_patcher          = false;
 	float                                freq_branchless_threshold    = 6.0f;
+	bool                                 use_zero_copy_parse          = false;
+	size_t                               stream_target_work_items     = 1u << 18;
+	size_t                               stream_max_rowgroups         = 8;
 };
 
 std::string format_bytes(double bytes) {
@@ -80,8 +84,12 @@ void print_usage(const char* prog) {
 	          << "  --estimate-launch  Estimate launch overhead during benchmark\n"
 	          << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n"
 	          << "  --no-mega-kernel   Use per-rowgroup execution instead of whole-table aggregation\n"
+	          << "  --mega-kernel-no-stream  Keep whole-table aggregation but disable streaming pipeline\n"
 	          << "  --gpu-dispatch-kernel  Use mixed-dispatch kernel execution instead of typed-batch launches\n"
 	          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
+	          << "  --zero-copy-parse  Use read_rowgroup_zero_copy materialization path when supported\n"
+	          << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table benchmark (default: 262144)\n"
+	          << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table benchmark (default: 8, 0 disables)\n"
 	          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
 	          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
 	          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n";
@@ -127,12 +135,29 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			opt.mega_kernel = false;
 			continue;
 		}
+		if (arg == "--mega-kernel-no-stream") {
+			opt.mega_kernel         = true;
+			opt.benchmark_streaming = false;
+			continue;
+		}
 		if (arg == "--gpu-dispatch-kernel") {
 			opt.gpu_dispatch_kernel = true;
 			continue;
 		}
 		if (arg == "--write-back") {
 			opt.write_back = true;
+			continue;
+		}
+		if (arg == "--zero-copy-parse") {
+			opt.use_zero_copy_parse = true;
+			continue;
+		}
+		if (arg == "--stream-target-work-items" && i + 1 < argc) {
+			opt.stream_target_work_items = static_cast<size_t>(std::stoull(argv[++i]));
+			continue;
+		}
+		if (arg == "--stream-max-rowgroups" && i + 1 < argc) {
+			opt.stream_max_rowgroups = static_cast<size_t>(std::stoull(argv[++i]));
 			continue;
 		}
 		if (arg == "--freq-prefetch-all-branchless") {
@@ -280,6 +305,7 @@ int main(int argc, char** argv) {
 			decode_cfg.execution.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
 			decode_cfg.execution.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
 			decode_cfg.execution.freq_branchless_threshold    = opt.freq_branchless_threshold;
+			decode_cfg.use_zero_copy_parse                    = opt.use_zero_copy_parse;
 			io::read_table_to_csv(opt.input, *out, opt.header, decode_cfg, opt.rowgroup);
 			return 0;
 		}
@@ -295,111 +321,57 @@ int main(int argc, char** argv) {
 			bench_cfg.execution.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
 			bench_cfg.execution.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
 			bench_cfg.execution.freq_branchless_threshold    = opt.freq_branchless_threshold;
+			bench_cfg.use_zero_copy_parse                    = opt.use_zero_copy_parse;
+			bench_cfg.enable_streaming                       = opt.benchmark_streaming;
+			bench_cfg.streaming_target_work_items            = opt.stream_target_work_items;
+			bench_cfg.streaming_target_rowgroups             = opt.stream_max_rowgroups;
 			bench_cfg.rowgroup                               = opt.rowgroup;
 			const auto result                                = dispatch::benchmark_table(opt.input, bench_cfg);
 
-			const double end_to_end_ms     = result.end_to_end_ms;
-			const double kernel_ms         = result.kernel_ms;
-			const double setup_ms          = result.setup_ms;
-			const double h2d_ms            = result.h2d_ms;
-			const double pure_h2d_ms       = result.pure_h2d_ms;
-			const double payload_h2d_ms    = result.payload_h2d_ms;
-			const double dispatch_h2d_ms   = result.dispatch_h2d_ms;
-			const double resolve_cpu_ms    = result.resolve_cpu_ms;
-			const double cpu_dispatch_ms   = result.cpu_dispatch_ms;
-			const double cpu_dispatch_resolve_ms = result.cpu_dispatch_resolve_ms;
-			const double teardown_ms       = result.teardown_ms;
-			const size_t total_launches    = result.total_launches;
-			const size_t total_launch_grid = result.total_launch_grid;
-			const size_t total_columns     = result.total_columns;
-			const size_t total_items       = result.total_items;
-			const size_t total_bytes       = result.total_bytes;
-			const size_t total_rgs         = result.total_rgs;
-
-			const double total_samples = (total_rgs > 0) ? (static_cast<double>(opt.samples) * total_rgs) : 0.0;
-			const double avg_us        = (total_samples > 0.0) ? (kernel_ms * 1000.0 / total_samples) : 0.0;
-			const double total_bytes_processed =
-			    (total_rgs > 0) ? (static_cast<double>(total_bytes) * static_cast<double>(opt.samples)) : 0.0;
-			const double kernel_seconds = kernel_ms / 1000.0;
-			const double kernel_throughput_bps =
-			    (kernel_seconds > 0.0) ? (total_bytes_processed / kernel_seconds) : 0.0;
-			const double kernel_throughput_gbps = kernel_throughput_bps / 1e9;
-			const double kernel_throughput_gibps =
-			    (kernel_seconds > 0.0) ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * kernel_seconds)) : 0.0;
-			const double e2e_no_teardown_seconds = end_to_end_ms / 1000.0;
-			const double e2e_no_teardown_bps =
-			    (e2e_no_teardown_seconds > 0.0) ? (total_bytes_processed / e2e_no_teardown_seconds) : 0.0;
-			const double e2e_no_teardown_gbps = e2e_no_teardown_bps / 1e9;
-			const double e2e_no_teardown_gibps =
-			    (e2e_no_teardown_seconds > 0.0)
-			        ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_no_teardown_seconds))
-			        : 0.0;
-
-			const double end_to_end_with_teardown_ms = end_to_end_ms + teardown_ms;
-			const double e2e_with_teardown_seconds   = end_to_end_with_teardown_ms / 1000.0;
-			const double e2e_with_teardown_bps =
-			    (e2e_with_teardown_seconds > 0.0) ? (total_bytes_processed / e2e_with_teardown_seconds) : 0.0;
-			const double e2e_with_teardown_gbps = e2e_with_teardown_bps / 1e9;
-			const double e2e_with_teardown_gibps =
-			    (e2e_with_teardown_seconds > 0.0)
-			        ? (total_bytes_processed / (1024.0 * 1024.0 * 1024.0 * e2e_with_teardown_seconds))
-			        : 0.0;
-			const double cols_per_rg =
-			    (total_rgs > 0) ? (static_cast<double>(total_columns) / static_cast<double>(total_rgs)) : 0.0;
-			const double vectors_per_rg =
-			    (total_rgs > 0) ? (static_cast<double>(total_items) / static_cast<double>(total_rgs)) : 0.0;
+			const double end_to_end_ms      = result.end_to_end_ms;
+			const double read_rowgroup_ms   = result.read_rowgroup_ms;
+			const double assemble_expr_ms   = result.assemble_expr_ms;
+			const double append_expr_ms     = result.append_expr_ms;
+			const double upload_workset_ms  = result.upload_workset_ms;
+			const double kernel_ms          = result.kernel_ms;
+			const double release_device_ms  = result.release_device_ms;
+			const double free_rowgroup_ms   = result.free_rowgroup_ms;
+			const size_t total_launches     = result.total_launches;
+			const size_t total_launch_grid  = result.total_launch_grid;
+			const size_t total_columns      = result.total_columns;
+			const size_t total_items        = result.total_items;
+			const size_t total_bytes        = result.total_bytes;
+			const size_t total_rgs          = result.total_rgs;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
 			                         : 0.0;
 
 			std::cout << "Benchmark results:\n";
 			std::cout << "  rowgroups: " << total_rgs << "\n";
-			std::cout << "  columns:   " << total_columns << " (avg " << cols_per_rg << " per rowgroup)\n";
-			std::cout << "  vectors: " << total_items << " (avg " << vectors_per_rg << " per rowgroup)\n";
-			std::cout << "  samples:   " << opt.samples << "\n";
-			std::cout << "  bytes:     " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes))
-			          << ")\n";
-			std::cout << "  end_to_end_ms: " << end_to_end_with_teardown_ms << "\n";
-			std::cout << "  end_to_end_ms (no teardown): " << end_to_end_ms << "\n";
-			std::cout << "  kernel_ms:     " << kernel_ms << "\n";
-			std::cout << "  setup_ms:      " << setup_ms << "\n";
-			std::cout << "  h2d_ms:        " << h2d_ms << "\n";
-			std::cout << "  pure_h2d_ms:   " << pure_h2d_ms << "\n";
-			std::cout << "  payload_h2d_ms: " << payload_h2d_ms << "\n";
-			std::cout << "  dispatch_h2d_ms: " << dispatch_h2d_ms << "\n";
-			std::cout << "  resolve_cpu_ms: " << resolve_cpu_ms << "\n";
-			std::cout << "  cpu_dispatch_ms: " << cpu_dispatch_ms << "\n";
-			std::cout << "  cpu_dispatch_resolve_ms: " << cpu_dispatch_resolve_ms << "\n";
-			std::cout
-			    << "  teardown_ms:   " << teardown_ms
-			    << "\n"; //  cudaFree on device buffers, any implicit synchronization caused by freeing those buffers
-			std::cout << "  avg_us:    " << avg_us << " (per rowgroup per sample)\n";
-			std::cout << "  kernel_throughput: " << kernel_throughput_gbps << " (GB/s), " << kernel_throughput_gibps
-			          << " (GiB/s)\n";
-			std::cout << "  end_to_end_throughput: " << e2e_with_teardown_gbps << " (GB/s), " << e2e_with_teardown_gibps
-			          << " (GiB/s)\n";
-			std::cout << "  end_to_end_throughput (no teardown): " << e2e_no_teardown_gbps << " (GB/s), "
-			          << e2e_no_teardown_gibps << " (GiB/s)\n";
+			std::cout << "  columns: " << total_columns << "\n";
+			std::cout << "  vectors: " << total_items << "\n";
+			std::cout << "  samples: " << opt.samples << "\n";
+			std::cout << "  bytes: " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
+			std::cout << "  end_to_end_ms: " << end_to_end_ms << "\n";
+			std::cout << "  read_rowgroup_ms: " << read_rowgroup_ms << "\n";
+			std::cout << "  assemble_expr_ms: " << assemble_expr_ms << "\n";
+			std::cout << "  append_expr_ms: " << append_expr_ms << "\n";
+			std::cout << "  upload_workset_ms: " << upload_workset_ms << "\n";
+			std::cout << "  kernel_ms: " << kernel_ms << "\n";
+			std::cout << "  release_device_ms: " << release_device_ms << "\n";
+			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";
 			std::cout << "  kernel_launches: " << total_launches << "\n";
 			std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
 			std::cout << "  gpu_dispatch_kernel: " << (opt.gpu_dispatch_kernel ? 1 : 0) << "\n";
+			std::cout << "  benchmark_streaming: "
+			          << ((opt.mega_kernel && opt.benchmark_streaming && !opt.rowgroup.has_value()) ? 1 : 0) << "\n";
+			std::cout << "  stream_target_work_items: " << opt.stream_target_work_items << "\n";
+			std::cout << "  stream_max_rowgroups: " << opt.stream_max_rowgroups << "\n";
 			std::cout << "  write_back: " << (opt.write_back ? 1 : 0) << "\n";
+			std::cout << "  zero_copy_parse: " << (opt.use_zero_copy_parse ? 1 : 0) << "\n";
 			std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";
 			std::cout << "  freq_hybrid_patcher: " << (opt.freq_hybrid_patcher ? 1 : 0) << "\n";
 			std::cout << "  freq_branchless_threshold: " << opt.freq_branchless_threshold << "\n";
-			if (opt.estimate_launch && total_launches > 0) {
-				const uint32_t block = utils::get_n_lanes<int8_t>();
-				uint32_t       grid  = static_cast<uint32_t>(avg_grid_per_launch);
-				if (grid == 0) {
-					grid = 1;
-				}
-				const double launch_us          = measure_gpu_launch_us(opt.estimate_iters, dim3(grid), dim3(block));
-				const double launch_overhead_ms = (launch_us * static_cast<double>(total_launches)) / 1000.0;
-				const double launch_pct         = (kernel_ms > 0.0) ? (launch_overhead_ms * 100.0 / kernel_ms) : 0.0;
-				std::cout << "  launch_overhead_ms (est): " << launch_overhead_ms << "\n";
-				std::cout << "  launch_overhead_pct (est): " << launch_pct << "%\n";
-				std::cout << "  launch_overhead_us (per kernel, est): " << launch_us << "\n";
-			}
 			return 0;
 		}
 

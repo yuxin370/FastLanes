@@ -25,6 +25,7 @@ enum class TableDecompressionScope {
 struct TableDecompressionConfig {
 	ExecutionConfig         execution = {};
 	TableDecompressionScope scope     = TableDecompressionScope::PerRowgroup;
+	bool                    use_zero_copy_parse = false;
 };
 
 using TableRowgroupPredicate = std::function<bool(size_t)>;
