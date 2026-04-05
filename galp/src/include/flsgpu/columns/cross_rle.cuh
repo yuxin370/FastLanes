@@ -70,6 +70,22 @@ struct CROSSRLEColumn {
 		};
 	}
 
+	device::CROSSRLEColumn<T> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		const size_t n_vecs = get_n_vecs();
+		return device::CROSSRLEColumn<T> {
+		    get_n_values(),
+		    n_vecs,
+		    n_runs,
+		    GPUArray<UINT_T>(n_runs, values, stream).release(),
+		    GPUArray<uint32_t>(n_runs, lengths, stream).release(),
+		    GPUArray<uint32_t>(n_vecs + 1, offsets, stream).release(),
+		    GPUArray<uint32_t>(n_runs, run_positions, stream).release(),
+		};
+	}
+
 	CROSSRLELaneMaskColumn<T> create_lane_mask_column() const {
 		constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
 		constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();

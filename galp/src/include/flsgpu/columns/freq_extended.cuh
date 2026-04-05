@@ -70,6 +70,23 @@ struct FREQExtendedColumn {
 		    GPUArray<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts).release(),
 		};
 	}
+
+	device::FREQExtendedColumn<T> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		return device::FREQExtendedColumn<T> {
+		    n_values,
+		    n_vecs,
+		    GPUArray<T>(n_vecs, frequent_value, stream).release(),
+		    n_exceptions,
+		    GPUArray<size_t>(n_vecs, exceptions_offsets, stream).release(),
+		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions, stream).release(),
+		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions, stream).release(),
+		    GPUArray<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts, stream).release(),
+		};
+	}
 };
 
 template <typename T>

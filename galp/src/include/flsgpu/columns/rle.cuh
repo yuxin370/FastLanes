@@ -57,6 +57,20 @@ struct RLEColumn {
 		    GPUArray<size_t>(n_vecs, rle_offsets).release(),
 		    n_rle_values};
 	}
+
+	device::RLEColumn<T, IndexT> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		return device::RLEColumn<T, IndexT> {
+		    n_values,
+		    n_vecs,
+		    ffor.copy_to_device(stream),
+		    GPUArray<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases, stream).release(),
+		    GPUArray<T>(n_rle_values, rle_values, stream).release(),
+		    GPUArray<size_t>(n_vecs, rle_offsets, stream).release(),
+		    n_rle_values};
+	}
 };
 
 template <typename T, typename IndexT>

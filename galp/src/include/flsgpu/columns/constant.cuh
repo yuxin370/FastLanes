@@ -41,6 +41,11 @@ struct CONSTANTColumn {
 	device::CONSTANTColumn<T> copy_to_device() const {
 		return device::CONSTANTColumn<T> {n_values, value};
 	}
+
+	device::CONSTANTColumn<T> copy_to_device(cudaStream_t stream) const {
+		(void)stream;
+		return copy_to_device();
+	}
 };
 
 template <typename T>

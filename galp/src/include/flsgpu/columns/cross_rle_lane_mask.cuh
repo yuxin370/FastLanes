@@ -62,6 +62,22 @@ struct CROSSRLELaneMaskColumn {
 		    GPUArray<uint64_t>(total_runs, lane_boundary_mask).release(),
 		};
 	}
+
+	device::CROSSRLELaneMaskColumn<T> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		const size_t n_vecs     = get_n_vecs();
+		const size_t total_runs = n_vecs * utils::get_n_lanes<T>();
+		return device::CROSSRLELaneMaskColumn<T> {
+		    get_n_values(),
+		    n_vecs,
+		    n_lane_runs,
+		    GPUArray<uint32_t>(total_runs + 1, lane_run_base, stream).release(),
+		    GPUArray<UINT_T>(n_lane_runs, lane_run_values, stream).release(),
+		    GPUArray<uint64_t>(total_runs, lane_boundary_mask, stream).release(),
+		};
+	}
 };
 
 template <typename T>

@@ -65,6 +65,22 @@ struct CROSSRLEExtendedColumn {
 		    GPUArray<uint32_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts).release(),
 		};
 	}
+
+	device::CROSSRLEExtendedColumn<T> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		const size_t n_vecs = get_n_vecs();
+		return device::CROSSRLEExtendedColumn<T> {
+		    n_values,
+		    n_vecs,
+		    n_lane_runs,
+		    GPUArray<size_t>(n_vecs + 1, lane_runs_offsets, stream).release(),
+		    GPUArray<UINT_T>(n_lane_runs, lane_values, stream).release(),
+		    GPUArray<uint16_t>(n_lane_runs, lane_lengths, stream).release(),
+		    GPUArray<uint32_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts, stream).release(),
+		};
+	}
 };
 
 template <typename T>

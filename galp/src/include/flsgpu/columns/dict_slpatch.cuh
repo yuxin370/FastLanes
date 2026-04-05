@@ -50,6 +50,14 @@ struct DICTSLPATCHColumn {
 		return device::DICTSLPATCHColumn<T, IndexT> {
 		    get_n_values(), index.copy_to_device(), GPUArray<KEY_T>(key_count, keys).release(), key_count};
 	}
+
+	device::DICTSLPATCHColumn<T, IndexT> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		return device::DICTSLPATCHColumn<T, IndexT> {
+		    get_n_values(), index.copy_to_device(stream), GPUArray<KEY_T>(key_count, keys, stream).release(), key_count};
+	}
 };
 
 template <typename T, typename IndexT>

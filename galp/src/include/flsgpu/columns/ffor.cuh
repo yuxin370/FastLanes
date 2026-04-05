@@ -43,6 +43,14 @@ struct FFORColumn {
 		return device::FFORColumn<T> {
 		    get_n_values(), bp.copy_to_device(), GPUArray<UINT_T>(bp.get_n_vecs(), bases).release()};
 	}
+
+	device::FFORColumn<T> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		return device::FFORColumn<T> {
+		    get_n_values(), bp.copy_to_device(stream), GPUArray<UINT_T>(bp.get_n_vecs(), bases, stream).release()};
+	}
 };
 
 template <typename T>

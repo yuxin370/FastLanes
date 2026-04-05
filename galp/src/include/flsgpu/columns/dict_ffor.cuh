@@ -50,6 +50,14 @@ struct DICTFFORColumn {
 		return device::DICTFFORColumn<T, IndexT> {
 		    get_n_values(), ffor.copy_to_device(), GPUArray<KEY_T>(key_count, keys).release(), key_count};
 	}
+
+	device::DICTFFORColumn<T, IndexT> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		return device::DICTFFORColumn<T, IndexT> {
+		    get_n_values(), ffor.copy_to_device(stream), GPUArray<KEY_T>(key_count, keys, stream).release(), key_count};
+	}
 };
 
 template <typename T, typename IndexT>

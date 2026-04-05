@@ -58,6 +58,19 @@ struct BPColumn {
 		    GPUArray<vbw_t>(get_n_vecs(), bit_widths).release(),
 		    GPUArray<size_t>(get_n_vecs(), vector_offsets).release()};
 	}
+
+	device::BPColumn<T> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		const size_t branchless_extra_access_buffer = sizeof(T) * utils::get_n_lanes<T>() * 4;
+		return device::BPColumn<T> {
+		    n_values,
+		    get_n_vecs(),
+		    GPUArray<UINT_T>(n_packed_values, branchless_extra_access_buffer, packed_array, stream).release(),
+		    GPUArray<vbw_t>(get_n_vecs(), bit_widths, stream).release(),
+		    GPUArray<size_t>(get_n_vecs(), vector_offsets, stream).release()};
+	}
 };
 
 template <typename T>

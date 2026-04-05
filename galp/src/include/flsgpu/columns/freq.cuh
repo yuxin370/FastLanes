@@ -76,6 +76,24 @@ struct FREQColumn {
 		};
 	}
 
+	device::FREQColumn<T> copy_to_device(cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return copy_to_device();
+		}
+		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		return device::FREQColumn<T> {
+		    n_values,
+		    n_vecs,
+		    GPUArray<T>(n_vecs, frequent_value, stream).release(),
+		    n_exceptions,
+		    GPUArray<size_t>(n_vecs, exceptions_offsets, stream).release(),
+		    GPUArray<size_t>(n_vecs, positions_offsets, stream).release(),
+		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions, stream).release(),
+		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions, stream).release(),
+		    GPUArray<uint16_t>(n_vecs, counts, stream).release(),
+		};
+	}
+
 	std::tuple<T*, uint16_t*, uint16_t*> convert_exceptions_to_lane_divided_format() const {
 		constexpr auto N_LANES         = utils::get_n_lanes<T>();
 		constexpr auto VALUES_PER_LANE = utils::get_values_per_lane<T>();
