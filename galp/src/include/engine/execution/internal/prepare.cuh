@@ -25,7 +25,15 @@ struct ExecutionWorkset {
 	cudaStream_t                                     h2d_stream = nullptr;
 };
 
+inline bool use_async_h2d() {
+	static const bool enabled = (std::getenv("GALP_DISABLE_ASYNC_H2D") == nullptr);
+	return enabled;
+}
+
 inline cudaStream_t ensure_workset_h2d_stream(ExecutionWorkset& workset) {
+	if (!use_async_h2d()) {
+		return nullptr;
+	}
 	if (workset.h2d_stream == nullptr) {
 		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.h2d_stream, cudaStreamNonBlocking));
 	}
@@ -136,9 +144,9 @@ inline void append_expressions(ExecutionWorkset&              workset,
 	using namespace dispatch::detail;
 
 	dispatch::resolve_dict_refs(expressions);
-	const auto h2d_stream = ensure_workset_h2d_stream(workset);
-	static const bool kEnableBatchUploader = (std::getenv("GALP_DISABLE_BATCH_UPLOADER") == nullptr);
-	const bool        enable_batch_uploader = kEnableBatchUploader;
+	const auto        h2d_stream            = ensure_workset_h2d_stream(workset);
+	static const bool kEnableBatchUploader  = (std::getenv("GALP_DISABLE_BATCH_UPLOADER") == nullptr);
+	const bool        enable_batch_uploader = kEnableBatchUploader && (h2d_stream != nullptr);
 	std::optional<flsgpu::memory::BatchUploader> batch_uploader;
 	if (enable_batch_uploader) {
 		batch_uploader.emplace(h2d_stream);
@@ -181,7 +189,6 @@ inline void append_expressions(ExecutionWorkset&              workset,
 	if (batch_uploader.has_value()) {
 		batch_uploader->flush();
 	}
-
 }
 
 inline void upload_workset(ExecutionWorkset& workset) {
@@ -197,8 +204,13 @@ inline void upload_workset(ExecutionWorkset& workset) {
 		dev_batch.d_items.reset();
 		dev_batch.n_items = 0;
 		if (!host_batch.device_exprs.empty() && !host_batch.work_items.empty()) {
-			dev_batch.d_exprs.emplace(host_batch.device_exprs.size(), host_batch.device_exprs.data(), h2d_stream);
-			dev_batch.d_items.emplace(host_batch.work_items.size(), host_batch.work_items.data(), h2d_stream);
+			if (h2d_stream != nullptr) {
+				dev_batch.d_exprs.emplace(host_batch.device_exprs.size(), host_batch.device_exprs.data(), h2d_stream);
+				dev_batch.d_items.emplace(host_batch.work_items.size(), host_batch.work_items.data(), h2d_stream);
+			} else {
+				dev_batch.d_exprs.emplace(host_batch.device_exprs.size(), host_batch.device_exprs.data());
+				dev_batch.d_items.emplace(host_batch.work_items.size(), host_batch.work_items.data());
+			}
 			dev_batch.n_items = host_batch.work_items.size();
 		}
 	});

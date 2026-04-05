@@ -44,12 +44,12 @@ struct Options {
 	uint32_t                             estimate_iters               = 10000;
 	bool                                 mega_kernel                  = true;
 	bool                                 benchmark_streaming          = true;
-	bool                                 gpu_dispatch_kernel          = false;
+	bool                                 gpu_dispatch_kernel          = true;
 	bool                                 write_back                   = false;
 	bool                                 freq_prefetch_all_branchless = false;
 	bool                                 freq_hybrid_patcher          = false;
 	float                                freq_branchless_threshold    = 6.0f;
-	bool                                 use_zero_copy_parse          = false;
+	bool                                 use_zero_copy_parse          = true;
 	size_t                               stream_target_work_items     = 1u << 18;
 	size_t                               stream_max_rowgroups         = 8;
 };
@@ -84,12 +84,14 @@ void print_usage(const char* prog) {
 	          << "  --estimate-launch  Estimate launch overhead during benchmark\n"
 	          << "  --launch-iters N   Iterations for launch estimate (default: 10000)\n"
 	          << "  --no-mega-kernel   Use per-rowgroup execution instead of whole-table aggregation\n"
-	          << "  --mega-kernel-no-stream  Keep whole-table aggregation but disable streaming pipeline\n"
-	          << "  --gpu-dispatch-kernel  Use mixed-dispatch kernel execution instead of typed-batch launches\n"
+	          << "  --no-streaming     Keep whole-table aggregation but disable streaming pipeline\n"
+	          << "  --no-mixed-dispatch  Use typed-batch launches instead of mixed-dispatch (default: mixed)\n"
 	          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
-	          << "  --zero-copy-parse  Use read_rowgroup_zero_copy materialization path when supported\n"
-	          << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table benchmark (default: 262144)\n"
-	          << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table benchmark (default: 8, 0 disables)\n"
+	          << "  --no-zero-copy     Disable zero-copy rowgroup parsing (default: enabled)\n"
+	          << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table benchmark "
+	             "(default: 262144)\n"
+	          << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table benchmark (default: 8, "
+	             "0 disables)\n"
 	          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
 	          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
 	          << "  --freq-branchless-threshold N  Hybrid threshold: avg exceptions per vec (default: 6)\n";
@@ -102,8 +104,7 @@ bool parse_args(int argc, char** argv, Options& opt) {
 
 	std::string_view mode_arg = argv[1];
 	if (mode_arg == "read_table" || mode_arg == "read") {
-		opt.mode                = Mode::ReadTable;
-		opt.gpu_dispatch_kernel = true;
+		opt.mode = Mode::ReadTable;
 	} else if (mode_arg == "benchmark" || mode_arg == "bench") {
 		opt.mode = Mode::Benchmark;
 	} else if (mode_arg == "measure_launch" || mode_arg == "launch") {
@@ -135,9 +136,13 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			opt.mega_kernel = false;
 			continue;
 		}
-		if (arg == "--mega-kernel-no-stream") {
+		if (arg == "--no-streaming" || arg == "--mega-kernel-no-stream") {
 			opt.mega_kernel         = true;
 			opt.benchmark_streaming = false;
+			continue;
+		}
+		if (arg == "--no-mixed-dispatch") {
+			opt.gpu_dispatch_kernel = false;
 			continue;
 		}
 		if (arg == "--gpu-dispatch-kernel") {
@@ -146,6 +151,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--write-back") {
 			opt.write_back = true;
+			continue;
+		}
+		if (arg == "--no-zero-copy") {
+			opt.use_zero_copy_parse = false;
 			continue;
 		}
 		if (arg == "--zero-copy-parse") {
@@ -328,20 +337,20 @@ int main(int argc, char** argv) {
 			bench_cfg.rowgroup                               = opt.rowgroup;
 			const auto result                                = dispatch::benchmark_table(opt.input, bench_cfg);
 
-			const double end_to_end_ms      = result.end_to_end_ms;
-			const double read_rowgroup_ms   = result.read_rowgroup_ms;
-			const double assemble_expr_ms   = result.assemble_expr_ms;
-			const double append_expr_ms     = result.append_expr_ms;
-			const double upload_workset_ms  = result.upload_workset_ms;
-			const double kernel_ms          = result.kernel_ms;
-			const double release_device_ms  = result.release_device_ms;
-			const double free_rowgroup_ms   = result.free_rowgroup_ms;
-			const size_t total_launches     = result.total_launches;
-			const size_t total_launch_grid  = result.total_launch_grid;
-			const size_t total_columns      = result.total_columns;
-			const size_t total_items        = result.total_items;
-			const size_t total_bytes        = result.total_bytes;
-			const size_t total_rgs          = result.total_rgs;
+			const double end_to_end_ms     = result.end_to_end_ms;
+			const double read_rowgroup_ms  = result.read_rowgroup_ms;
+			const double assemble_expr_ms  = result.assemble_expr_ms;
+			const double append_expr_ms    = result.append_expr_ms;
+			const double upload_workset_ms = result.upload_workset_ms;
+			const double kernel_ms         = result.kernel_ms;
+			const double release_device_ms = result.release_device_ms;
+			const double free_rowgroup_ms  = result.free_rowgroup_ms;
+			const size_t total_launches    = result.total_launches;
+			const size_t total_launch_grid = result.total_launch_grid;
+			const size_t total_columns     = result.total_columns;
+			const size_t total_items       = result.total_items;
+			const size_t total_bytes       = result.total_bytes;
+			const size_t total_rgs         = result.total_rgs;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
 			                         : 0.0;
