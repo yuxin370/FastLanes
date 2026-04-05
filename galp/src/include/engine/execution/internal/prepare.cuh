@@ -8,6 +8,8 @@
 
 #include "engine/execution/common.cuh"
 #include "engine/execution/dict_ref_resolver.cuh"
+#include <cstdlib>
+#include <optional>
 #include <unordered_set>
 
 namespace dispatch::runtime {
@@ -20,7 +22,15 @@ struct ExecutionWorkset {
 	DeviceBatches                                    device_batches;
 	std::vector<dispatch::MixedWorkSlot>             mixed_slots;
 	std::optional<GPUArray<dispatch::MixedWorkSlot>> d_slots;
+	cudaStream_t                                     h2d_stream = nullptr;
 };
+
+inline cudaStream_t ensure_workset_h2d_stream(ExecutionWorkset& workset) {
+	if (workset.h2d_stream == nullptr) {
+		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.h2d_stream, cudaStreamNonBlocking));
+	}
+	return workset.h2d_stream;
+}
 
 inline size_t count_work_items(const ExecutionWorkset& workset) {
 	size_t total = 0;
@@ -64,7 +74,7 @@ inline uint32_t semantic_lanes_for_work_item(const ExecutionWorkset& workset, co
 	return dispatch::semantic_lane_count(work.type, plan_for_work_item(workset, work));
 }
 
-inline void build_mixed_slots(ExecutionWorkset& workset) {
+inline void build_mixed_slots(ExecutionWorkset& workset, cudaStream_t stream = nullptr) {
 	workset.mixed_slots.clear();
 	workset.d_slots.reset();
 
@@ -107,7 +117,11 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 		workset.mixed_slots.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
 	}
 	if (!workset.mixed_slots.empty()) {
-		workset.d_slots.emplace(workset.mixed_slots.size(), workset.mixed_slots.data());
+		if (stream != nullptr) {
+			workset.d_slots.emplace(workset.mixed_slots.size(), workset.mixed_slots.data(), stream);
+		} else {
+			workset.d_slots.emplace(workset.mixed_slots.size(), workset.mixed_slots.data());
+		}
 	}
 }
 
@@ -122,6 +136,13 @@ inline void append_expressions(ExecutionWorkset&              workset,
 	using namespace dispatch::detail;
 
 	dispatch::resolve_dict_refs(expressions);
+	const auto h2d_stream = ensure_workset_h2d_stream(workset);
+	static const bool kEnableBatchUploader = (std::getenv("GALP_DISABLE_BATCH_UPLOADER") == nullptr);
+	const bool        enable_batch_uploader = kEnableBatchUploader;
+	std::optional<flsgpu::memory::BatchUploader> batch_uploader;
+	if (enable_batch_uploader) {
+		batch_uploader.emplace(h2d_stream);
+	}
 	size_t active_expr_count = 0;
 
 	for (size_t i = 0; i < expressions.size(); ++i) {
@@ -151,15 +172,20 @@ inline void append_expressions(ExecutionWorkset&              workset,
 				                               workset.host_batches.template get<T>(),
 				                               cfg.freq_prefetch_all_branchless,
 				                               cfg.freq_hybrid_patcher,
-				                               cfg.freq_branchless_threshold);
+				                               cfg.freq_branchless_threshold,
+				                               h2d_stream);
 			    }
 		    },
 		    expr.column->host);
+	}
+	if (batch_uploader.has_value()) {
+		batch_uploader->flush();
 	}
 
 }
 
 inline void upload_workset(ExecutionWorkset& workset) {
+	const auto h2d_stream = ensure_workset_h2d_stream(workset);
 	workset.d_slots.reset();
 	workset.mixed_slots.clear();
 
@@ -171,13 +197,13 @@ inline void upload_workset(ExecutionWorkset& workset) {
 		dev_batch.d_items.reset();
 		dev_batch.n_items = 0;
 		if (!host_batch.device_exprs.empty() && !host_batch.work_items.empty()) {
-			dev_batch.d_exprs.emplace(host_batch.device_exprs.size(), host_batch.device_exprs.data());
-			dev_batch.d_items.emplace(host_batch.work_items.size(), host_batch.work_items.data());
+			dev_batch.d_exprs.emplace(host_batch.device_exprs.size(), host_batch.device_exprs.data(), h2d_stream);
+			dev_batch.d_items.emplace(host_batch.work_items.size(), host_batch.work_items.data(), h2d_stream);
 			dev_batch.n_items = host_batch.work_items.size();
 		}
 	});
 
-	build_mixed_slots(workset);
+	build_mixed_slots(workset, h2d_stream);
 }
 
 } // namespace dispatch::runtime

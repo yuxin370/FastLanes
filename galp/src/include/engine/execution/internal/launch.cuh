@@ -85,17 +85,26 @@ inline bool has_any_expr(const ExecutionWorkset& workset) {
 	return has_any;
 }
 
-inline double run_workset(ExecutionWorkset&      workset,
-                          const uint32_t         samples,
-                          const ExecutionConfig& cfg,
-                          size_t*                out_grid     = nullptr,
-                          size_t*                out_launches = nullptr,
-                          const bool             warmup       = false) {
+struct AsyncWorksetRun {
+	cudaStream_t stream = nullptr;
+	cudaEvent_t  start  = nullptr;
+	cudaEvent_t  stop   = nullptr;
+	double       elapsed_ms = 0.0;
+	bool         active = false;
+};
+
+inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
+                                         const uint32_t         samples,
+                                         const ExecutionConfig& cfg,
+                                         size_t*                out_grid     = nullptr,
+                                         size_t*                out_launches = nullptr,
+                                         const bool             warmup       = false) {
+	AsyncWorksetRun handle {};
 	if (!has_any_expr(workset)) {
 		if (out_launches) {
 			*out_launches = 0;
 		}
-		return 0.0;
+		return handle;
 	}
 
 	const size_t launches_per_sample = typed_launches_per_sample(workset);
@@ -106,7 +115,7 @@ inline double run_workset(ExecutionWorkset&      workset,
 		if (out_launches) {
 			*out_launches = 0;
 		}
-		return 0.0;
+		return handle;
 	}
 
 	if (out_grid) {
@@ -121,61 +130,81 @@ inline double run_workset(ExecutionWorkset&      workset,
 		*out_launches = (mixed_dispatch ? 1 : launches_per_sample) * static_cast<size_t>(samples);
 	}
 
-	flsgpu::memory::sync_h2d();
-
-	cudaStream_t stream {};
-	CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-	cudaEvent_t start {};
-	cudaEvent_t stop {};
-	CUDA_SAFE_CALL(cudaEventCreate(&start));
-	CUDA_SAFE_CALL(cudaEventCreate(&stop));
+	if (workset.h2d_stream != nullptr) {
+		flsgpu::memory::sync_h2d(workset.h2d_stream);
+	} else {
+		flsgpu::memory::sync_h2d();
+	}
+	CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&handle.stream, cudaStreamNonBlocking));
+	CUDA_SAFE_CALL(cudaEventCreate(&handle.start));
+	CUDA_SAFE_CALL(cudaEventCreate(&handle.stop));
+	handle.active = true;
 
 	if (warmup) {
 		if (mixed_dispatch) {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, handle.stream);
 			}
 		} else {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, handle.stream);
 			}
 		}
-		CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
+		CUDA_SAFE_CALL(cudaStreamSynchronize(handle.stream));
 	}
 
-	CUDA_SAFE_CALL(cudaEventRecord(start, stream));
+	CUDA_SAFE_CALL(cudaEventRecord(handle.start, handle.stream));
 
 	for (uint32_t sample = 0; sample < samples; ++sample) {
 		if (mixed_dispatch) {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, handle.stream);
 			}
 		} else {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, handle.stream);
 			}
 		}
 	}
+	CUDA_SAFE_CALL(cudaEventRecord(handle.stop, handle.stream));
 
-	CUDA_SAFE_CALL(cudaEventRecord(stop, stream));
-	CUDA_SAFE_CALL(cudaEventSynchronize(stop));
+	return handle;
+}
 
+inline void wait_workset_async(AsyncWorksetRun& handle) {
+	if (!handle.active) {
+		return;
+	}
+	CUDA_SAFE_CALL(cudaEventSynchronize(handle.stop));
 	float ms = 0.0f;
-	CUDA_SAFE_CALL(cudaEventElapsedTime(&ms, start, stop));
-	CUDA_SAFE_CALL(cudaEventDestroy(start));
-	CUDA_SAFE_CALL(cudaEventDestroy(stop));
-	CUDA_SAFE_CALL(cudaStreamDestroy(stream));
+	CUDA_SAFE_CALL(cudaEventElapsedTime(&ms, handle.start, handle.stop));
+	handle.elapsed_ms = static_cast<double>(ms);
+	CUDA_SAFE_CALL(cudaEventDestroy(handle.start));
+	CUDA_SAFE_CALL(cudaEventDestroy(handle.stop));
+	handle.start = nullptr;
+	handle.stop  = nullptr;
+	CUDA_SAFE_CALL(cudaStreamDestroy(handle.stream));
+	handle.stream = nullptr;
+	handle.active = false;
+}
 
-	return static_cast<double>(ms);
+inline double run_workset(ExecutionWorkset&      workset,
+                          const uint32_t         samples,
+                          const ExecutionConfig& cfg,
+                          size_t*                out_grid     = nullptr,
+                          size_t*                out_launches = nullptr,
+                          const bool             warmup       = false) {
+	auto handle = run_workset_async(workset, samples, cfg, out_grid, out_launches, warmup);
+	wait_workset_async(handle);
+	return handle.elapsed_ms;
 }
 
 } // namespace dispatch::runtime

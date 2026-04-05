@@ -19,7 +19,15 @@ inline void free_rowgroup(reader::Rowgroup& rowgroup) {
 			// Skip freeing to avoid double-free.
 			continue;
 		}
+		if (rowgroup.backing_storage && col.host_owned_by_backing) {
+			// Zero-copy-backed columns are released via rowgroup.backing_storage lifetime.
+			continue;
+		}
 		std::visit([](auto& host_col) { flsgpu::host::free_column(host_col); }, col.host);
+	}
+	rowgroup.columns.clear();
+	if (rowgroup.backing_storage) {
+		rowgroup.backing_storage.reset();
 	}
 }
 

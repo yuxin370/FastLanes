@@ -131,6 +131,11 @@ inline void release_workset(ExecutionWorkset& workset) {
 	});
 	workset.d_slots.reset();
 	workset.mixed_slots.clear();
+	if (workset.h2d_stream != nullptr) {
+		flsgpu::memory::sync_h2d(workset.h2d_stream);
+		CUDA_SAFE_CALL(cudaStreamDestroy(workset.h2d_stream));
+		workset.h2d_stream = nullptr;
+	}
 }
 
 struct ExecutionWorksetGuard {

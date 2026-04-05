@@ -11,6 +11,7 @@
 #include "fls/footer/operator_token_generated.h"
 #include "flsgpu/columns/all.cuh"
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -65,6 +66,7 @@ struct Column {
 	EncodedPayload           host;
 	bool                     skip_decompress = false;
 	std::optional<size_t>    alias_of;
+	bool                     host_owned_by_backing = false;
 };
 
 struct MaterializedColumn {
@@ -77,6 +79,7 @@ struct Rowgroup {
 	size_t              n_vecs   = 0;
 	size_t              n_tuples = 0;
 	std::vector<Column> columns;
+	std::shared_ptr<void> backing_storage;
 };
 
 struct Table {
