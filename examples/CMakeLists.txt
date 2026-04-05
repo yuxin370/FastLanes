@@ -8,6 +8,9 @@ target_link_libraries(cpp_csv_to_fls PUBLIC FastLanes)
 add_executable(cpp_decompress_bench ${CMAKE_CURRENT_SOURCE_DIR}/cpp_decompress_bench.cpp)
 target_link_libraries(cpp_decompress_bench PUBLIC FastLanes)
 
+add_executable(cpp_fls_to_csv ${CMAKE_CURRENT_SOURCE_DIR}/cpp_fls_to_csv.cpp)
+target_link_libraries(cpp_fls_to_csv PUBLIC FastLanes)
+
 if (WIN32 AND FLS_BUILD_SHARED_LIBS)
     add_custom_command(
             TARGET cpp_example
@@ -32,5 +35,13 @@ if (WIN32 AND FLS_BUILD_SHARED_LIBS)
             -E copy_if_different
             $<TARGET_RUNTIME_DLLS:cpp_decompress_bench>
             $<TARGET_FILE_DIR:cpp_decompress_bench>
+    )
+    add_custom_command(
+            TARGET cpp_fls_to_csv
+            POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+            -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:cpp_fls_to_csv>
+            $<TARGET_FILE_DIR:cpp_fls_to_csv>
     )
 endif ()
