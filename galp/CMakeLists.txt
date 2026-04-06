@@ -76,6 +76,7 @@ set(CLANG_ONLY_WARNINGS
 
 macro(apply_warnings tgt)
     target_compile_options(${tgt} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo -src-in-ptx>
             $<$<COMPILE_LANGUAGE:CXX>:${COMMON_WARNINGS}>
             $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:${CLANG_ONLY_WARNINGS}>
             $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_WARNINGS}>)

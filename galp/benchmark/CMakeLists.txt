@@ -63,7 +63,7 @@ if(GALP_ENABLE_MULTI_COLUMN)
 endif()
 
 add_library(generated-bindings STATIC ${GALP_GENERATED_BINDINGS_SOURCES})
-target_compile_options(generated-bindings PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr>)
+target_compile_options(generated-bindings PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo -src-in-ptx>)
 # target_compile_options(generated-bindings PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_ANALYZE_FLAGS}>)
 target_include_directories(generated-bindings PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
