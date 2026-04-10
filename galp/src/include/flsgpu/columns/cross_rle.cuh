@@ -74,16 +74,37 @@ struct CROSSRLEColumn {
 		if (stream == nullptr) {
 			return copy_to_device();
 		}
-		const size_t n_vecs = get_n_vecs();
+		const size_t nv = get_n_vecs();
+		flsgpu::memory::DeviceArena arena(stream);
+		auto i_vals = arena.template add<UINT_T>(n_runs, values);
+		auto i_lens = arena.template add<uint32_t>(n_runs, lengths);
+		auto i_offs = arena.template add<uint32_t>(nv + 1, offsets);
+		auto i_rpos = arena.template add<uint32_t>(n_runs, run_positions);
+		arena.upload();
 		return device::CROSSRLEColumn<T> {
-		    get_n_values(),
-		    n_vecs,
-		    n_runs,
-		    GPUArray<UINT_T>(n_runs, values, stream).release(),
-		    GPUArray<uint32_t>(n_runs, lengths, stream).release(),
-		    GPUArray<uint32_t>(n_vecs + 1, offsets, stream).release(),
-		    GPUArray<uint32_t>(n_runs, run_positions, stream).release(),
+		    get_n_values(), nv, n_runs,
+		    arena.template get<UINT_T>(i_vals),
+		    arena.get<uint32_t>(i_lens),
+		    arena.get<uint32_t>(i_offs),
+		    arena.get<uint32_t>(i_rpos),
 		};
+	}
+
+	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::CROSSRLEColumn<T>& out) const {
+		const size_t nv = get_n_vecs();
+		auto i_vals = arena.template add<UINT_T>(n_runs, values);
+		auto i_lens = arena.template add<uint32_t>(n_runs, lengths);
+		auto i_offs = arena.template add<uint32_t>(nv + 1, offsets);
+		auto i_rpos = arena.template add<uint32_t>(n_runs, run_positions);
+		out.n_values = get_n_values();
+		out.n_vecs   = nv;
+		out.n_runs   = n_runs;
+		arena.add_resolver([&arena, &out, i_vals, i_lens, i_offs, i_rpos]() {
+			out.values        = arena.template get<UINT_T>(i_vals);
+			out.lengths       = arena.get<uint32_t>(i_lens);
+			out.offsets       = arena.get<uint32_t>(i_offs);
+			out.run_positions = arena.get<uint32_t>(i_rpos);
+		});
 	}
 
 	CROSSRLELaneMaskColumn<T> create_lane_mask_column() const {
@@ -109,32 +130,9 @@ struct CROSSRLEColumn {
 
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			UINT_T tmp[VEC_VALUES];
-#pragma unroll
-			for (uint32_t i = 0; i < VEC_VALUES; ++i)
-				tmp[i] = (UINT_T)0;
-
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			const uint32_t r0       = offsets[vec];
-			const uint32_t r1       = offsets[vec + 1];
-
-			for (uint32_t r = r0; r < r1; ++r) {
-				const uint32_t run_start_g = run_positions[r];
-				const uint32_t run_len     = lengths[r];
-
-				if (run_start_g + run_len <= vec_base)
-					continue;
-				if (run_start_g >= vec_base + VEC_VALUES)
-					continue;
-
-				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
-				uint32_t local_end   = run_start_g + run_len - vec_base;
-				if (local_end > VEC_VALUES)
-					local_end = VEC_VALUES;
-
-				const UINT_T v = values[r];
-				for (uint32_t p = local_start; p < local_end; ++p)
-					tmp[p] = v;
-			}
+			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
 				uint64_t mask    = 0ull;
@@ -170,32 +168,9 @@ struct CROSSRLEColumn {
 
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			UINT_T tmp[VEC_VALUES];
-#pragma unroll
-			for (uint32_t i = 0; i < VEC_VALUES; ++i)
-				tmp[i] = (UINT_T)0;
-
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			const uint32_t r0       = offsets[vec];
-			const uint32_t r1       = offsets[vec + 1];
-
-			for (uint32_t r = r0; r < r1; ++r) {
-				const uint32_t run_start_g = run_positions[r];
-				const uint32_t run_len     = lengths[r];
-
-				if (run_start_g + run_len <= vec_base)
-					continue;
-				if (run_start_g >= vec_base + VEC_VALUES)
-					continue;
-
-				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
-				uint32_t local_end   = run_start_g + run_len - vec_base;
-				if (local_end > VEC_VALUES)
-					local_end = VEC_VALUES;
-
-				const UINT_T v = values[r];
-				for (uint32_t p = local_start; p < local_end; ++p)
-					tmp[p] = v;
-			}
+			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
 				const size_t   id      = vec * (size_t)N_LANES + (size_t)lane;
@@ -246,31 +221,10 @@ struct CROSSRLEColumn {
 		auto* vec_total_runs  = reinterpret_cast<size_t*>(malloc(sizeof(size_t) * n_vecs));
 
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
-
 			UINT_T tmp[VEC_VALUES];
-
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			const uint32_t r0       = offsets[vec];
-			const uint32_t r1       = offsets[vec + 1];
-
-			for (uint32_t r = r0; r < r1; ++r) {
-				const uint32_t run_start_g = run_positions[r];
-				const uint32_t run_len     = lengths[r];
-
-				if (run_start_g + run_len <= vec_base)
-					continue;
-				if (run_start_g >= vec_base + VEC_VALUES)
-					continue;
-
-				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
-				uint32_t local_end   = run_start_g + run_len - vec_base;
-				if (local_end > VEC_VALUES)
-					local_end = VEC_VALUES;
-
-				const UINT_T v = values[r];
-				for (uint32_t p = local_start; p < local_end; ++p)
-					tmp[p] = v;
-			}
+			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			size_t vec_runs = 0;
 
@@ -308,31 +262,9 @@ struct CROSSRLEColumn {
 		// second round: write lane-run stream + offsets_counts
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			UINT_T tmp[VEC_VALUES];
-			for (uint32_t i = 0; i < VEC_VALUES; ++i)
-				tmp[i] = (UINT_T)0;
-
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			const uint32_t r0       = offsets[vec];
-			const uint32_t r1       = offsets[vec + 1];
-
-			for (uint32_t r = r0; r < r1; ++r) {
-				const uint32_t run_start_g = run_positions[r];
-				const uint32_t run_len     = lengths[r];
-
-				if (run_start_g + run_len <= vec_base)
-					continue;
-				if (run_start_g >= vec_base + VEC_VALUES)
-					continue;
-
-				uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
-				uint32_t local_end   = run_start_g + run_len - vec_base;
-				if (local_end > VEC_VALUES)
-					local_end = VEC_VALUES;
-
-				const UINT_T v = values[r];
-				for (uint32_t p = local_start; p < local_end; ++p)
-					tmp[p] = v;
-			}
+			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			const size_t vec_out_base = lane_runs_offsets[vec];
 			size_t       cursor       = vec_out_base;
@@ -399,39 +331,9 @@ namespace reader::columns {
 
 template <typename T>
 inline ParseResultT<flsgpu::host::CROSSRLEColumn<T>> parse_cross_rle(const ParseContext& ctx) {
-	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 2) {
-		throw std::runtime_error("EXP_CROSS_RLE: missing operand tokens");
-	}
-	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto   seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto   seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
-
-	const size_t n_runs        = seg_lens.data_span.size() / sizeof(uint32_t);
-	auto*        values        = detail::copy_segment_array<typename utils::same_width_uint<T>::type>(seg_vals);
-	auto*        lengths       = detail::copy_segment_array<uint32_t>(seg_lens);
-	auto*        run_positions = new uint32_t[n_runs];
-
-	uint32_t pos = 0;
-	for (size_t i = 0; i < n_runs; ++i) {
-		run_positions[i] = pos;
-		pos += lengths[i];
-	}
-
-	auto*    offsets = new uint32_t[ctx.n_vecs + 1];
-	uint32_t cur     = 0;
-	uint32_t idx_run = 0;
-	for (size_t v = 0; v < ctx.n_vecs; ++v) {
-		const size_t target_start = v * detail::kVecSize;
-		while (idx_run < n_runs && cur + lengths[idx_run] <= target_start) {
-			cur += lengths[idx_run];
-			++idx_run;
-		}
-		offsets[v] = idx_run;
-	}
-	offsets[ctx.n_vecs] = static_cast<uint32_t>(n_runs);
-
-	return ParseResultT<flsgpu::host::CROSSRLEColumn<T>> {
-	    flsgpu::host::CROSSRLEColumn<T> {ctx.n_values, n_runs, values, lengths, offsets, run_positions}};
+	auto raw = flsgpu::host::detail::parse_cross_rle_raw_runs<T>(ctx);
+	return ParseResultT<flsgpu::host::CROSSRLEColumn<T>> {flsgpu::host::CROSSRLEColumn<T> {
+	    ctx.n_values, raw.n_runs, raw.values, raw.lengths, raw.offsets, raw.run_positions}};
 }
 
 } // namespace reader::columns

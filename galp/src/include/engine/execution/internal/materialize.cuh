@@ -131,10 +131,22 @@ inline void release_workset(ExecutionWorkset& workset) {
 	});
 	workset.d_slots.reset();
 	workset.mixed_slots.clear();
+	workset.chunk_arena.reset();
 	if (workset.h2d_stream != nullptr) {
 		flsgpu::memory::sync_h2d(workset.h2d_stream);
+		if (workset.h2d_ready_event != nullptr) {
+			CUDA_SAFE_CALL(cudaEventDestroy(workset.h2d_ready_event));
+			workset.h2d_ready_event = nullptr;
+		}
 		CUDA_SAFE_CALL(cudaStreamDestroy(workset.h2d_stream));
 		workset.h2d_stream = nullptr;
+	} else if (workset.h2d_ready_event != nullptr) {
+		CUDA_SAFE_CALL(cudaEventDestroy(workset.h2d_ready_event));
+		workset.h2d_ready_event = nullptr;
+	}
+	if (workset.compute_stream != nullptr) {
+		CUDA_SAFE_CALL(cudaStreamDestroy(workset.compute_stream));
+		workset.compute_stream = nullptr;
 	}
 }
 

@@ -130,15 +130,19 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 		*out_launches = (mixed_dispatch ? 1 : launches_per_sample) * static_cast<size_t>(samples);
 	}
 
-	if (workset.h2d_stream != nullptr) {
-		flsgpu::memory::sync_h2d(workset.h2d_stream);
-	} else {
+	if (workset.h2d_stream == nullptr) {
 		flsgpu::memory::sync_h2d();
+	} else if (!use_async_h2d()) {
+		flsgpu::memory::sync_h2d(workset.h2d_stream);
 	}
-	CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&handle.stream, cudaStreamNonBlocking));
+	handle.stream = ensure_workset_compute_stream(workset);
 	CUDA_SAFE_CALL(cudaEventCreate(&handle.start));
 	CUDA_SAFE_CALL(cudaEventCreate(&handle.stop));
 	handle.active = true;
+
+	if (use_async_h2d() && workset.h2d_stream != nullptr && workset.h2d_ready_event != nullptr) {
+		CUDA_SAFE_CALL(cudaStreamWaitEvent(handle.stream, workset.h2d_ready_event, 0));
+	}
 
 	if (warmup) {
 		if (mixed_dispatch) {
@@ -191,8 +195,6 @@ inline void wait_workset_async(AsyncWorksetRun& handle) {
 	CUDA_SAFE_CALL(cudaEventDestroy(handle.stop));
 	handle.start = nullptr;
 	handle.stop  = nullptr;
-	CUDA_SAFE_CALL(cudaStreamDestroy(handle.stream));
-	handle.stream = nullptr;
 	handle.active = false;
 }
 

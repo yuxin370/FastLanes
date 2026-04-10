@@ -38,7 +38,7 @@ struct TableBenchmarkResult {
 	double assemble_expr_ms  = 0.0; // expr::assemble stage
 	double append_expr_ms    = 0.0; // runtime::append_expressions stage
 	double upload_workset_ms = 0.0; // runtime::upload_workset stage
-	double kernel_ms         = 0.0; // kernel event time returned by run_workset*
+	double kernel_ms         = 0.0; // accumulated GPU event time returned by run_workset*
 	double release_device_ms = 0.0; // runtime::release_workset stage
 	double free_rowgroup_ms  = 0.0; // free_rowgroup stage
 

@@ -75,17 +75,43 @@ struct FREQExtendedColumn {
 		if (stream == nullptr) {
 			return copy_to_device();
 		}
-		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		const size_t buf = consts::MAX_UNPACK_N_VECS;
+		flsgpu::memory::DeviceArena arena(stream);
+		auto i_fv      = arena.template add<T>(n_vecs, frequent_value);
+		auto i_exc_off = arena.template add<size_t>(n_vecs, exceptions_offsets);
+		auto i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
+		auto i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
+		auto i_oc      = arena.template add<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts);
+		arena.upload();
 		return device::FREQExtendedColumn<T> {
 		    n_values,
 		    n_vecs,
-		    GPUArray<T>(n_vecs, frequent_value, stream).release(),
+		    arena.template get<T>(i_fv),
 		    n_exceptions,
-		    GPUArray<size_t>(n_vecs, exceptions_offsets, stream).release(),
-		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions, stream).release(),
-		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions, stream).release(),
-		    GPUArray<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts, stream).release(),
+		    arena.template get<size_t>(i_exc_off),
+		    arena.template get<T>(i_exc),
+		    arena.template get<uint16_t>(i_pos),
+		    arena.template get<uint16_t>(i_oc),
 		};
+	}
+
+	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FREQExtendedColumn<T>& out) const {
+		const size_t buf = consts::MAX_UNPACK_N_VECS;
+		auto i_fv      = arena.template add<T>(n_vecs, frequent_value);
+		auto i_exc_off = arena.template add<size_t>(n_vecs, exceptions_offsets);
+		auto i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
+		auto i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
+		auto i_oc      = arena.template add<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts);
+		out.n_values     = n_values;
+		out.n_vecs       = n_vecs;
+		out.n_exceptions = n_exceptions;
+		arena.add_resolver([&arena, &out, i_fv, i_exc_off, i_exc, i_pos, i_oc]() {
+			out.frequent_value     = arena.template get<T>(i_fv);
+			out.exceptions_offsets = arena.template get<size_t>(i_exc_off);
+			out.exceptions         = arena.template get<T>(i_exc);
+			out.positions          = arena.template get<uint16_t>(i_pos);
+			out.offsets_counts     = arena.template get<uint16_t>(i_oc);
+		});
 	}
 };
 

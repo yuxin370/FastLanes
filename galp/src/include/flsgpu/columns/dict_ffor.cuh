@@ -55,8 +55,46 @@ struct DICTFFORColumn {
 		if (stream == nullptr) {
 			return copy_to_device();
 		}
-		return device::DICTFFORColumn<T, IndexT> {
-		    get_n_values(), ffor.copy_to_device(stream), GPUArray<KEY_T>(key_count, keys, stream).release(), key_count};
+		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
+
+		flsgpu::memory::DeviceArena arena(stream);
+		// FFOR = BP + bases (inlined)
+		auto i_packed  = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw      = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
+		auto i_bp_off  = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bases   = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
+		auto i_keys    = arena.template add<KEY_T>(key_count, keys);
+		arena.upload();
+
+		device::BPColumn<IndexT> d_bp {
+		    ffor.bp.n_values, ffor.bp.get_n_vecs(),
+		    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
+		device::FFORColumn<IndexT> d_ffor {ffor.get_n_values(), d_bp, arena.get<UINT_IDX>(i_bases)};
+		return device::DICTFFORColumn<T, IndexT> {get_n_values(), d_ffor, arena.get<KEY_T>(i_keys), key_count};
+	}
+
+	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::DICTFFORColumn<T, IndexT>& out) const {
+		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
+		auto i_packed  = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw      = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
+		auto i_bp_off  = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bases   = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
+		auto i_keys    = arena.template add<KEY_T>(key_count, keys);
+		const size_t bp_nv   = ffor.bp.n_values;
+		const size_t bp_nvec = ffor.bp.get_n_vecs();
+		const size_t ffor_nv = ffor.get_n_values();
+		out.n_values  = get_n_values();
+		out.key_count = key_count;
+		arena.add_resolver([&arena, &out, i_packed, i_bw, i_bp_off, i_bases, i_keys,
+		                     bp_nv, bp_nvec, ffor_nv]() {
+			device::BPColumn<IndexT> d_bp {
+			    bp_nv, bp_nvec,
+			    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
+			out.ffor = device::FFORColumn<IndexT> {ffor_nv, d_bp, arena.get<UINT_IDX>(i_bases)};
+			out.keys = arena.get<KEY_T>(i_keys);
+		});
 	}
 };
 

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <stdio.h>
@@ -47,6 +48,7 @@ struct DeviceAllocInfo {
 	size_t       size         = 0;
 	bool         async_alloc  = false;
 	cudaStream_t alloc_stream = nullptr;
+	bool         sub_alloc    = false; // true for arena sub-pointers (no-op on free)
 };
 
 struct PendingCopyEvent {
@@ -121,6 +123,23 @@ public:
 		return ptr;
 	}
 
+	void register_sub_allocation(void* ptr) {
+		if (ptr == nullptr) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto                        it = in_use_.find(ptr);
+		if (it != in_use_.end()) {
+			// Preserve the real arena-base allocation record when a zero-sized entry
+			// aliases offset 0. Re-registering an existing sub-allocation is harmless.
+			if (!it->second.sub_alloc) {
+				return;
+			}
+		}
+		in_use_[ptr] = DeviceAllocInfo {0, false, nullptr, true};
+	}
+
+
 	void free(void* ptr) {
 		if (ptr == nullptr) {
 			return;
@@ -128,6 +147,10 @@ public:
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto                        it = in_use_.find(ptr);
 		if (it != in_use_.end()) {
+			if (it->second.sub_alloc) {
+				in_use_.erase(it);
+				return; // arena sub-pointer: no actual free
+			}
 			const auto info = it->second;
 			in_use_.erase(it);
 			if (enabled_) {
@@ -155,6 +178,29 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(mutex_);
 		return alloc_pinned_locked(bytes);
+	}
+
+	// Queue a single H2D transfer from an already-pinned buffer.
+	// When batch is active, queued as one entry; pinned is freed after batch event.
+	// When batch is not active, issued directly with its own event.
+	void queue_staged_h2d(void* dst, void* pinned_src, size_t bytes, cudaStream_t stream) {
+		if (bytes == 0) {
+			return;
+		}
+		const auto use_stream = stream != nullptr ? stream : stream_;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (batch_active_ && use_stream == batch_stream_) {
+				batched_copies_.push_back(BatchedCopy {dst, pinned_src, bytes, pinned_src});
+				return;
+			}
+		}
+		CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned_src, bytes, cudaMemcpyHostToDevice, use_stream));
+		cudaEvent_t event {};
+		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+		CUDA_SAFE_CALL(cudaEventRecord(event, use_stream));
+		std::lock_guard<std::mutex> lock(mutex_);
+		pending_copy_events_[stream_key(use_stream)].push_back(PendingCopyEvent {event, pinned_src});
 	}
 
 	void copy_h2d(void* dst, const void* src, size_t bytes) {
@@ -364,7 +410,7 @@ public:
 			fprintf(stderr, "DevicePool warning: %zu in-use device allocations at shutdown; forcing free.\n", in_use_.size());
 		}
 		for (auto& [ptr, info] : in_use_) {
-			(void)info;
+			if (info.sub_alloc) continue; // skip arena sub-pointers
 			cudaFree(ptr);
 		}
 		in_use_.clear();
@@ -580,6 +626,159 @@ inline void begin_h2d_batch(cudaStream_t stream = nullptr) {
 inline void flush_h2d_batch() {
 	DevicePool::instance().flush_h2d_batch();
 }
+
+// ── DeviceArena: single-malloc + single-H2D ─────────────────────────
+// Supports two usage modes:
+//
+// 1. Per-column (standalone): create arena, add(), upload(), get().
+//
+// 2. Chunk-level (shared): create ONE arena, multiple columns call add(),
+//    register resolvers, then ONE upload() at the end.
+//
+// Host data must remain valid until upload() in both modes.
+// For temporary host columns, use defer_free() to extend their lifetime.
+//
+// Usage (standalone):
+//   DeviceArena arena(stream);
+//   auto i0 = arena.add<T>(count, host_ptr);
+//   arena.upload();
+//   T* d0 = arena.get<T>(i0);
+//
+// Usage (shared / chunk-level):
+//   DeviceArena arena(stream);
+//   auto i0 = arena.add<T>(count_a, host_a);
+//   arena.add_resolver([&]() { out_a.ptr = arena.get<T>(i0); });
+//   arena.upload();  // packs from host ptrs → pinned → device, then calls resolvers
+class DeviceArena {
+	struct Entry {
+		size_t      offset     = 0;
+		size_t      copy_bytes = 0;
+		const void* host_src   = nullptr;
+	};
+
+public:
+	explicit DeviceArena(cudaStream_t stream) : stream_(stream) {}
+	~DeviceArena() {
+		run_deferred_frees();
+	}
+
+	DeviceArena(const DeviceArena&)            = delete;
+	DeviceArena& operator=(const DeviceArena&) = delete;
+
+	template <typename T>
+	size_t add(size_t count, const T* host_src, size_t buffer_elements = 0) {
+		const size_t copy_bytes  = count * sizeof(T);
+		const size_t alloc_bytes = copy_bytes + buffer_elements * sizeof(T);
+		// Align offset to 256 bytes for coalesced access
+		total_bytes_ = (total_bytes_ + 255U) & ~size_t(255U);
+		const size_t idx = entries_.size();
+		entries_.push_back(Entry {total_bytes_, copy_bytes, host_src});
+		total_bytes_ += alloc_bytes;
+		return idx;
+	}
+
+	/// Register a callback to be invoked after upload() sets device_base_.
+	/// Use this in shared/chunk-level mode to populate device column pointers.
+	void add_resolver(std::function<void()> fn) {
+		resolvers_.push_back(std::move(fn));
+	}
+
+	/// Defer a cleanup action until after upload() completes.
+	/// Use this to extend the lifetime of temporary host columns whose data
+	/// must remain valid until upload() packs it into the pinned buffer.
+	void defer_free(std::function<void()> fn) {
+		deferred_frees_.push_back(std::move(fn));
+	}
+
+	void upload() {
+		if (total_bytes_ == 0 || entries_.empty()) {
+			for (auto& fn : resolvers_) {
+				fn();
+			}
+			resolvers_.clear();
+			run_deferred_frees();
+			return;
+		}
+		auto& pool = DevicePool::instance();
+
+		// Round up to power-of-2 buckets (min 64KB) to improve DevicePool cache hits.
+		// Without this, each chunk's unique total_bytes_ misses the size-keyed free-list,
+		// causing expensive cudaMallocAsync/cudaMallocHost on every chunk.
+		const size_t alloc_bytes = round_up_pow2(total_bytes_, 65536U);
+
+		// Single device allocation (arena)
+		device_base_ = reinterpret_cast<char*>(pool.alloc_on_stream(alloc_bytes, stream_));
+
+		// Pack all sub-arrays into a single pinned buffer, then queue ONE H2D copy.
+		void* pinned = pool.alloc_pinned(alloc_bytes);
+		for (const auto& e : entries_) {
+			if (e.host_src != nullptr && e.copy_bytes > 0) {
+				std::memcpy(reinterpret_cast<char*>(pinned) + e.offset, e.host_src, e.copy_bytes);
+			}
+		}
+		pool.queue_staged_h2d(device_base_, pinned, total_bytes_, stream_);
+
+		// Register sub-pointers so that free_device_pointer on them is a no-op.
+		// The first entry is at the arena base and keeps the real allocation.
+		for (size_t i = 1; i < entries_.size(); ++i) {
+			void* sub_ptr = device_base_ + entries_[i].offset;
+			pool.register_sub_allocation(sub_ptr);
+		}
+
+		// Invoke resolver callbacks to populate device column pointers.
+		for (auto& fn : resolvers_) {
+			fn();
+		}
+		resolvers_.clear();
+
+		// Release temporary host data that was kept alive for deferred packing.
+		run_deferred_frees();
+	}
+
+	template <typename T>
+	T* get(size_t idx) const {
+		return reinterpret_cast<T*>(device_base_ + entries_[idx].offset);
+	}
+
+	size_t total_bytes() const {
+		return total_bytes_;
+	}
+
+	size_t entry_count() const {
+		return entries_.size();
+	}
+
+private:
+	void run_deferred_frees() {
+		for (auto& fn : deferred_frees_) {
+			fn();
+		}
+		deferred_frees_.clear();
+	}
+
+	/// Round up to the next power of 2 that is >= min_bucket.
+	static size_t round_up_pow2(size_t bytes, size_t min_bucket) {
+		if (bytes <= min_bucket) {
+			return min_bucket;
+		}
+		// Next power of 2 >= bytes
+		size_t v = bytes - 1;
+		v |= v >> 1;
+		v |= v >> 2;
+		v |= v >> 4;
+		v |= v >> 8;
+		v |= v >> 16;
+		v |= v >> 32;
+		return v + 1;
+	}
+
+	cudaStream_t                       stream_      = nullptr;
+	char*                              device_base_ = nullptr;
+	size_t                             total_bytes_ = 0;
+	std::vector<Entry>                 entries_;
+	std::vector<std::function<void()>> resolvers_;
+	std::vector<std::function<void()>> deferred_frees_;
+};
 
 class BatchUploader {
 public:

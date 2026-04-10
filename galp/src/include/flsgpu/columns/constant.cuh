@@ -46,6 +46,10 @@ struct CONSTANTColumn {
 		(void)stream;
 		return copy_to_device();
 	}
+
+	void copy_to_device(flsgpu::memory::DeviceArena& /*arena*/, device::CONSTANTColumn<T>& out) const {
+		out = copy_to_device();
+	}
 };
 
 template <typename T>

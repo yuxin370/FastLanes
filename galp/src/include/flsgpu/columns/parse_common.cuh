@@ -147,4 +147,90 @@ inline ExceptionOffsets build_exception_offsets_from_segment(const fastlanes::Se
 } // namespace detail
 } // namespace reader::columns
 
+namespace flsgpu::host::detail {
+
+/// Expand global runs into a per-vector decompressed tmp array.
+/// Shared by cross_rle, cross_rle_extended, and cross_rle_lane_mask.
+template <typename UINT_T, uint32_t VEC_VALUES>
+inline void expand_runs_into_vector(UINT_T*          tmp,
+                                    const uint32_t   vec_base,
+                                    const UINT_T*    values,
+                                    const uint32_t*  lengths,
+                                    const uint32_t*  run_positions,
+                                    const uint32_t   r0,
+                                    const uint32_t   r1) {
+	for (uint32_t i = 0; i < VEC_VALUES; ++i)
+		tmp[i] = UINT_T {};
+
+	for (uint32_t r = r0; r < r1; ++r) {
+		const uint32_t run_start_g = run_positions[r];
+		const uint32_t run_len     = lengths[r];
+
+		if (run_start_g + run_len <= vec_base)
+			continue;
+		if (run_start_g >= vec_base + VEC_VALUES)
+			continue;
+
+		uint32_t local_start = (run_start_g > vec_base) ? (run_start_g - vec_base) : 0u;
+		uint32_t local_end   = run_start_g + run_len - vec_base;
+		if (local_end > VEC_VALUES)
+			local_end = VEC_VALUES;
+
+		const UINT_T v = values[r];
+		for (uint32_t p = local_start; p < local_end; ++p)
+			tmp[p] = v;
+	}
+}
+
+/// Parse raw cross-RLE segments (values + lengths) into run_positions + per-vector offsets.
+/// Returns {values, lengths, run_positions, offsets} — caller owns all allocations.
+template <typename T>
+struct CrossRLERawRuns {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	UINT_T*   values;
+	uint32_t* lengths;
+	uint32_t* run_positions;
+	uint32_t* offsets;
+	size_t    n_runs;
+};
+
+template <typename T>
+inline CrossRLERawRuns<T> parse_cross_rle_raw_runs(const reader::columns::ParseContext& ctx) {
+	using UINT_T = typename utils::same_width_uint<T>::type;
+	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 2) {
+		throw std::runtime_error("CROSS_RLE: missing operand tokens");
+	}
+	const size_t base_idx = ctx.operand_tokens->size() - 1;
+	const auto   seg_vals = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
+	const auto   seg_lens = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
+
+	const size_t n_runs  = seg_lens.data_span.size() / sizeof(uint32_t);
+	auto*        values  = reader::columns::detail::copy_segment_array<UINT_T>(seg_vals);
+	auto*        lengths = reader::columns::detail::copy_segment_array<uint32_t>(seg_lens);
+
+	auto*    run_positions = new uint32_t[n_runs];
+	uint32_t pos           = 0;
+	for (size_t i = 0; i < n_runs; ++i) {
+		run_positions[i] = pos;
+		pos += lengths[i];
+	}
+
+	auto*    offsets = new uint32_t[ctx.n_vecs + 1];
+	uint32_t cur     = 0;
+	uint32_t idx_run = 0;
+	for (size_t v = 0; v < ctx.n_vecs; ++v) {
+		const size_t target_start = v * reader::columns::detail::kVecSize;
+		while (idx_run < n_runs && cur + lengths[idx_run] <= target_start) {
+			cur += lengths[idx_run];
+			++idx_run;
+		}
+		offsets[v] = idx_run;
+	}
+	offsets[ctx.n_vecs] = static_cast<uint32_t>(n_runs);
+
+	return CrossRLERawRuns<T> {values, lengths, run_positions, offsets, n_runs};
+}
+
+} // namespace flsgpu::host::detail
+
 #endif // FLSGPU_COLUMNS_PARSE_COMMON_CUH

@@ -98,9 +98,15 @@ size_t count_active_columns(const std::vector<expr::Expression>& expressions) {
 struct StreamingBenchmarkChunk {
 	runtime::ExecutionWorkset  workset {};
 	runtime::AsyncWorksetRun   run {};
-	std::vector<reader::Rowgroup> pending_rowgroups;
+	struct PendingRowgroup {
+		reader::Rowgroup              rowgroup {};
+		std::vector<expr::Expression> expressions;
+		size_t                        active_columns = 0;
+	};
+	std::vector<PendingRowgroup> pending_rowgroups;
 	size_t                     work_items  = 0;
 	size_t                     rowgroups   = 0;
+	size_t                     active_columns = 0;
 	size_t                     launch_grid = 0;
 	size_t                     launches    = 0;
 	bool                       submitted   = false;
@@ -110,6 +116,7 @@ void reset_streaming_chunk(StreamingBenchmarkChunk& chunk) {
 	chunk.pending_rowgroups.clear();
 	chunk.work_items  = 0;
 	chunk.rowgroups   = 0;
+	chunk.active_columns = 0;
 	chunk.launch_grid = 0;
 	chunk.launches    = 0;
 	chunk.submitted   = false;
@@ -244,15 +251,24 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 
 	if (!cfg.enable_streaming) {
 		runtime::ExecutionWorkset   workset {};
-		std::vector<reader::Rowgroup> pending_rowgroups;
+		std::vector<StreamingBenchmarkChunk::PendingRowgroup> pending_rowgroups;
 		size_t                      chunk_work_items = 0;
 		size_t                      chunk_rowgroups  = 0;
+		size_t                      chunk_active_columns = 0;
 		bool                        did_warmup       = false;
 
 		const auto run_sync_chunk = [&]() {
 			if (chunk_rowgroups == 0) {
 				return;
 			}
+
+			runtime::begin_workset_chunk_arena(workset, chunk_active_columns);
+			const auto append_start = std::chrono::steady_clock::now();
+			for (auto& pending : pending_rowgroups) {
+				runtime::append_expressions(workset, pending.expressions, cfg.execution);
+			}
+			const auto append_end = std::chrono::steady_clock::now();
+			out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
 
 			const auto upload_start = std::chrono::steady_clock::now();
 			runtime::upload_workset(workset);
@@ -273,15 +289,16 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			const auto release_end = std::chrono::steady_clock::now();
 			out.release_device_ms += std::chrono::duration<double, std::milli>(release_end - release_start).count();
 
-			for (auto& rowgroup : pending_rowgroups) {
+			for (auto& pending : pending_rowgroups) {
 				const auto free_start = std::chrono::steady_clock::now();
-				free_rowgroup(rowgroup);
+				free_rowgroup(pending.rowgroup);
 				const auto free_end = std::chrono::steady_clock::now();
 				out.free_rowgroup_ms += std::chrono::duration<double, std::milli>(free_end - free_start).count();
 			}
 			pending_rowgroups.clear();
 			chunk_work_items = 0;
 			chunk_rowgroups  = 0;
+			chunk_active_columns = 0;
 		};
 
 		for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
@@ -302,14 +319,11 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			const size_t rg_columns = count_active_columns(expressions);
 			const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
 
-			const auto append_start = std::chrono::steady_clock::now();
-			runtime::append_expressions(workset, expressions, cfg.execution);
-			const auto append_end = std::chrono::steady_clock::now();
-			out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
-
 			chunk_work_items += rg_vectors;
 			++chunk_rowgroups;
-			pending_rowgroups.push_back(std::move(rowgroup));
+			chunk_active_columns += rg_columns;
+			pending_rowgroups.push_back(
+			    StreamingBenchmarkChunk::PendingRowgroup {std::move(rowgroup), std::move(expressions), rg_columns});
 
 			out.total_columns += rg_columns;
 			out.total_items += rg_vectors;
@@ -317,10 +331,10 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			++out.total_rgs;
 
 			const bool reach_items     = chunk_work_items >= stream_target_work_items;
-			const bool reach_rowgroups = (stream_target_rowgroups > 0) && (chunk_rowgroups >= stream_target_rowgroups);
-			if (reach_items || reach_rowgroups) {
-				run_sync_chunk();
-			}
+				const bool reach_rowgroups = (stream_target_rowgroups > 0) && (chunk_rowgroups >= stream_target_rowgroups);
+				if (reach_items || reach_rowgroups) {
+					run_sync_chunk();
+				}
 			}
 
 		run_sync_chunk();
@@ -337,6 +351,14 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		if (chunk.rowgroups == 0) {
 			return;
 		}
+		runtime::begin_workset_chunk_arena(chunk.workset, chunk.active_columns);
+		const auto append_start = std::chrono::steady_clock::now();
+		for (auto& pending : chunk.pending_rowgroups) {
+			runtime::append_expressions(chunk.workset, pending.expressions, cfg.execution);
+		}
+		const auto append_end = std::chrono::steady_clock::now();
+		out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
+
 		const auto upload_start = std::chrono::steady_clock::now();
 		runtime::upload_workset(chunk.workset);
 		const auto upload_end = std::chrono::steady_clock::now();
@@ -365,9 +387,9 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		const auto release_end = std::chrono::steady_clock::now();
 		out.release_device_ms += std::chrono::duration<double, std::milli>(release_end - release_start).count();
 
-		for (auto& rowgroup : chunk.pending_rowgroups) {
+		for (auto& pending : chunk.pending_rowgroups) {
 			const auto free_start = std::chrono::steady_clock::now();
-			free_rowgroup(rowgroup);
+			free_rowgroup(pending.rowgroup);
 			const auto free_end = std::chrono::steady_clock::now();
 			out.free_rowgroup_ms += std::chrono::duration<double, std::milli>(free_end - free_start).count();
 		}
@@ -394,19 +416,16 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		const size_t rg_columns = count_active_columns(expressions);
 		const size_t rg_vectors = rg_columns * rowgroup.n_vecs;
 
-		const auto append_start = std::chrono::steady_clock::now();
-		runtime::append_expressions(chunk.workset, expressions, cfg.execution);
-		const auto append_end = std::chrono::steady_clock::now();
-		out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
-
 		chunk.work_items += rg_vectors;
 		++chunk.rowgroups;
+		chunk.active_columns += rg_columns;
 
 		out.total_columns += rg_columns;
 		out.total_items += rg_vectors;
 		out.total_bytes += bytes;
 		++out.total_rgs;
-		chunk.pending_rowgroups.push_back(std::move(rowgroup));
+		chunk.pending_rowgroups.push_back(
+		    StreamingBenchmarkChunk::PendingRowgroup {std::move(rowgroup), std::move(expressions), rg_columns});
 
 		const bool reach_items     = chunk.work_items >= stream_target_work_items;
 		const bool reach_rowgroups = (stream_target_rowgroups > 0) && (chunk.rowgroups >= stream_target_rowgroups);

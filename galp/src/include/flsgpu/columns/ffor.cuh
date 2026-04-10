@@ -48,8 +48,37 @@ struct FFORColumn {
 		if (stream == nullptr) {
 			return copy_to_device();
 		}
-		return device::FFORColumn<T> {
-		    get_n_values(), bp.copy_to_device(stream), GPUArray<UINT_T>(bp.get_n_vecs(), bases, stream).release()};
+		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;
+		flsgpu::memory::DeviceArena arena(stream);
+		auto i_packed  = arena.template add<UINT_T>(bp.n_packed_values, bp.packed_array, bp_buffer_elems);
+		auto i_bw      = arena.template add<vbw_t>(bp.get_n_vecs(), bp.bit_widths);
+		auto i_offsets = arena.template add<size_t>(bp.get_n_vecs(), bp.vector_offsets);
+		auto i_bases   = arena.template add<UINT_T>(bp.get_n_vecs(), bases);
+		arena.upload();
+		device::BPColumn<T> d_bp {
+		    bp.n_values,
+		    bp.get_n_vecs(),
+		    arena.get<UINT_T>(i_packed),
+		    arena.get<vbw_t>(i_bw),
+		    arena.get<size_t>(i_offsets)};
+		return device::FFORColumn<T> {get_n_values(), d_bp, arena.get<UINT_T>(i_bases)};
+	}
+
+	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FFORColumn<T>& out) const {
+		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;
+		auto i_packed  = arena.template add<UINT_T>(bp.n_packed_values, bp.packed_array, bp_buffer_elems);
+		auto i_bw      = arena.template add<vbw_t>(bp.get_n_vecs(), bp.bit_widths);
+		auto i_offsets = arena.template add<size_t>(bp.get_n_vecs(), bp.vector_offsets);
+		auto i_bases   = arena.template add<UINT_T>(bp.get_n_vecs(), bases);
+		const size_t bp_nv   = bp.n_values;
+		const size_t bp_nvec = bp.get_n_vecs();
+		out.n_values = get_n_values();
+		arena.add_resolver([&arena, &out, i_packed, i_bw, i_offsets, i_bases, bp_nv, bp_nvec]() {
+			out.bp = device::BPColumn<T> {
+			    bp_nv, bp_nvec,
+			    arena.get<UINT_T>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_offsets)};
+			out.bases = arena.get<UINT_T>(i_bases);
+		});
 	}
 };
 

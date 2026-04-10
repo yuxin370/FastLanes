@@ -62,14 +62,57 @@ struct RLEColumn {
 		if (stream == nullptr) {
 			return copy_to_device();
 		}
+		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
+
+		flsgpu::memory::DeviceArena arena(stream);
+		// FFOR = BP + bases (inlined)
+		auto i_packed   = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw       = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
+		auto i_bp_off   = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bases    = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
+		// RLE own fields
+		auto i_rsum     = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
+		auto i_vals     = arena.template add<T>(n_rle_values, rle_values);
+		auto i_offs     = arena.template add<size_t>(n_vecs, rle_offsets);
+		arena.upload();
+
+		device::BPColumn<IndexT> d_bp {
+		    ffor.bp.n_values, ffor.bp.get_n_vecs(),
+		    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
+		device::FFORColumn<IndexT> d_ffor {ffor.get_n_values(), d_bp, arena.get<UINT_IDX>(i_bases)};
 		return device::RLEColumn<T, IndexT> {
-		    n_values,
-		    n_vecs,
-		    ffor.copy_to_device(stream),
-		    GPUArray<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases, stream).release(),
-		    GPUArray<T>(n_rle_values, rle_values, stream).release(),
-		    GPUArray<size_t>(n_vecs, rle_offsets, stream).release(),
+		    n_values, n_vecs, d_ffor,
+		    arena.get<IndexT>(i_rsum), arena.get<T>(i_vals), arena.get<size_t>(i_offs),
 		    n_rle_values};
+	}
+
+	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::RLEColumn<T, IndexT>& out) const {
+		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
+		auto i_packed   = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw       = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
+		auto i_bp_off   = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bases    = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
+		auto i_rsum     = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
+		auto i_vals     = arena.template add<T>(n_rle_values, rle_values);
+		auto i_offs     = arena.template add<size_t>(n_vecs, rle_offsets);
+		const size_t bp_nv   = ffor.bp.n_values;
+		const size_t bp_nvec = ffor.bp.get_n_vecs();
+		const size_t ffor_nv = ffor.get_n_values();
+		out.n_values     = n_values;
+		out.n_vecs       = n_vecs;
+		out.n_rle_values = n_rle_values;
+		arena.add_resolver([&arena, &out, i_packed, i_bw, i_bp_off, i_bases,
+		                     i_rsum, i_vals, i_offs, bp_nv, bp_nvec, ffor_nv]() {
+			device::BPColumn<IndexT> d_bp {
+			    bp_nv, bp_nvec,
+			    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
+			out.ffor = device::FFORColumn<IndexT> {ffor_nv, d_bp, arena.get<UINT_IDX>(i_bases)};
+			out.rsum_bases  = arena.get<IndexT>(i_rsum);
+			out.rle_values  = arena.get<T>(i_vals);
+			out.rle_offsets = arena.get<size_t>(i_offs);
+		});
 	}
 };
 

@@ -9,6 +9,7 @@
 #include "engine/execution/common.cuh"
 #include "engine/execution/dict_ref_resolver.cuh"
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <unordered_set>
 
@@ -22,7 +23,10 @@ struct ExecutionWorkset {
 	DeviceBatches                                    device_batches;
 	std::vector<dispatch::MixedWorkSlot>             mixed_slots;
 	std::optional<GPUArray<dispatch::MixedWorkSlot>> d_slots;
+	std::unique_ptr<flsgpu::memory::DeviceArena>     chunk_arena;
 	cudaStream_t                                     h2d_stream = nullptr;
+	cudaStream_t                                     compute_stream = nullptr;
+	cudaEvent_t                                      h2d_ready_event = nullptr;
 };
 
 inline bool use_async_h2d() {
@@ -30,14 +34,63 @@ inline bool use_async_h2d() {
 	return enabled;
 }
 
+inline bool force_h2d_stream_for_sync() {
+	static const bool enabled = (std::getenv("GALP_FORCE_H2D_STREAM") != nullptr);
+	return enabled;
+}
+
 inline cudaStream_t ensure_workset_h2d_stream(ExecutionWorkset& workset) {
-	if (!use_async_h2d()) {
+	if (!use_async_h2d() && !force_h2d_stream_for_sync()) {
 		return nullptr;
 	}
 	if (workset.h2d_stream == nullptr) {
 		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.h2d_stream, cudaStreamNonBlocking));
 	}
 	return workset.h2d_stream;
+}
+
+inline cudaStream_t ensure_workset_compute_stream(ExecutionWorkset& workset) {
+	if (workset.compute_stream == nullptr) {
+		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.compute_stream, cudaStreamNonBlocking));
+	}
+	return workset.compute_stream;
+}
+
+inline cudaEvent_t ensure_workset_h2d_ready_event(ExecutionWorkset& workset) {
+	if (workset.h2d_ready_event == nullptr) {
+		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&workset.h2d_ready_event, cudaEventDisableTiming));
+	}
+	return workset.h2d_ready_event;
+}
+
+inline bool chunk_arena_enabled() {
+	static const bool enabled = (std::getenv("GALP_DISABLE_CHUNK_ARENA") == nullptr);
+	return enabled;
+}
+
+inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t additional_exprs) {
+	if (additional_exprs == 0) {
+		return;
+	}
+	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+		using T = typename decltype(tag)::type;
+		auto& batch = workset.host_batches.template get<T>();
+		batch.device_exprs.reserve(batch.device_exprs.size() + additional_exprs);
+		batch.device_outputs.reserve(batch.device_outputs.size() + additional_exprs);
+	});
+}
+
+inline bool begin_workset_chunk_arena(ExecutionWorkset& workset, const size_t additional_exprs) {
+	if (workset.chunk_arena || !chunk_arena_enabled()) {
+		return workset.chunk_arena != nullptr;
+	}
+	const auto h2d_stream = ensure_workset_h2d_stream(workset);
+	if (h2d_stream == nullptr) {
+		return false;
+	}
+	reserve_batch_expr_storage(workset, additional_exprs);
+	workset.chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(h2d_stream);
+	return true;
 }
 
 inline size_t count_work_items(const ExecutionWorkset& workset) {
@@ -144,13 +197,25 @@ inline void append_expressions(ExecutionWorkset&              workset,
 	using namespace dispatch::detail;
 
 	dispatch::resolve_dict_refs(expressions);
-	const auto        h2d_stream            = ensure_workset_h2d_stream(workset);
-	static const bool kEnableBatchUploader  = (std::getenv("GALP_DISABLE_BATCH_UPLOADER") == nullptr);
-	const bool        enable_batch_uploader = kEnableBatchUploader && (h2d_stream != nullptr);
+	const auto h2d_stream = ensure_workset_h2d_stream(workset);
+	const bool use_workset_chunk_arena = (workset.chunk_arena != nullptr);
+	std::unique_ptr<flsgpu::memory::DeviceArena> local_chunk_arena;
+	flsgpu::memory::DeviceArena*                 active_chunk_arena = nullptr;
+	if (use_workset_chunk_arena) {
+		active_chunk_arena = workset.chunk_arena.get();
+	} else if (chunk_arena_enabled() && (h2d_stream != nullptr)) {
+		reserve_batch_expr_storage(workset, expressions.size());
+		local_chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(h2d_stream);
+		active_chunk_arena = local_chunk_arena.get();
+	}
+
+	// Fallback: BatchUploader for per-column arenas (when chunk arena disabled)
+	static const bool kEnableBatchUploader = (std::getenv("GALP_DISABLE_BATCH_UPLOADER") == nullptr);
 	std::optional<flsgpu::memory::BatchUploader> batch_uploader;
-	if (enable_batch_uploader) {
+	if (active_chunk_arena == nullptr && kEnableBatchUploader && (h2d_stream != nullptr)) {
 		batch_uploader.emplace(h2d_stream);
 	}
+
 	size_t active_expr_count = 0;
 
 	for (size_t i = 0; i < expressions.size(); ++i) {
@@ -174,17 +239,33 @@ inline void append_expressions(ExecutionWorkset&              workset,
 				    }
 				    const size_t materialize_expr_index =
 				        use_global_expr_index ? (expr_index_base + active_expr_count - 1U) : i;
-				    add_expression_to_batch<T>(materialize_expr_index,
-				                               host_col,
-				                               plan,
-				                               workset.host_batches.template get<T>(),
-				                               cfg.freq_prefetch_all_branchless,
-				                               cfg.freq_hybrid_patcher,
-				                               cfg.freq_branchless_threshold,
-				                               h2d_stream);
+				    if (active_chunk_arena != nullptr) {
+					    add_expression_to_batch<T>(materialize_expr_index,
+					                               host_col,
+					                               plan,
+					                               workset.host_batches.template get<T>(),
+					                               cfg.freq_prefetch_all_branchless,
+					                               cfg.freq_hybrid_patcher,
+					                               cfg.freq_branchless_threshold,
+					                               h2d_stream,
+					                               *active_chunk_arena);
+				    } else {
+					    add_expression_to_batch<T>(materialize_expr_index,
+					                               host_col,
+					                               plan,
+					                               workset.host_batches.template get<T>(),
+					                               cfg.freq_prefetch_all_branchless,
+					                               cfg.freq_hybrid_patcher,
+					                               cfg.freq_branchless_threshold,
+					                               h2d_stream);
+				    }
 			    }
 		    },
 		    expr.column->host);
+	}
+
+	if (local_chunk_arena) {
+		local_chunk_arena->upload(); // Single malloc + single H2D + resolve all pointers
 	}
 	if (batch_uploader.has_value()) {
 		batch_uploader->flush();
@@ -195,6 +276,11 @@ inline void upload_workset(ExecutionWorkset& workset) {
 	const auto h2d_stream = ensure_workset_h2d_stream(workset);
 	workset.d_slots.reset();
 	workset.mixed_slots.clear();
+
+	if (workset.chunk_arena) {
+		workset.chunk_arena->upload();
+		workset.chunk_arena.reset();
+	}
 
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
@@ -216,6 +302,10 @@ inline void upload_workset(ExecutionWorkset& workset) {
 	});
 
 	build_mixed_slots(workset, h2d_stream);
+
+	if (h2d_stream != nullptr) {
+		CUDA_SAFE_CALL(cudaEventRecord(ensure_workset_h2d_ready_event(workset), h2d_stream));
+	}
 }
 
 } // namespace dispatch::runtime

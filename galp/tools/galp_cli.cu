@@ -337,12 +337,12 @@ int main(int argc, char** argv) {
 			bench_cfg.rowgroup                               = opt.rowgroup;
 			const auto result                                = dispatch::benchmark_table(opt.input, bench_cfg);
 
-			const double end_to_end_ms     = result.end_to_end_ms;
+			const double benchmark_wall_ms = result.end_to_end_ms;
 			const double read_rowgroup_ms  = result.read_rowgroup_ms;
 			const double assemble_expr_ms  = result.assemble_expr_ms;
 			const double append_expr_ms    = result.append_expr_ms;
 			const double upload_workset_ms = result.upload_workset_ms;
-			const double kernel_ms         = result.kernel_ms;
+			const double kernel_event_ms   = result.kernel_ms;
 			const double release_device_ms = result.release_device_ms;
 			const double free_rowgroup_ms  = result.free_rowgroup_ms;
 			const size_t total_launches    = result.total_launches;
@@ -361,14 +361,17 @@ int main(int argc, char** argv) {
 			std::cout << "  vectors: " << total_items << "\n";
 			std::cout << "  samples: " << opt.samples << "\n";
 			std::cout << "  bytes: " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
-			std::cout << "  end_to_end_ms: " << end_to_end_ms << "\n";
+			std::cout << "  benchmark_wall_ms: " << benchmark_wall_ms << "\n";
 			std::cout << "  read_rowgroup_ms: " << read_rowgroup_ms << "\n";
 			std::cout << "  assemble_expr_ms: " << assemble_expr_ms << "\n";
 			std::cout << "  append_expr_ms: " << append_expr_ms << "\n";
 			std::cout << "  upload_workset_ms: " << upload_workset_ms << "\n";
-			std::cout << "  kernel_ms: " << kernel_ms << "\n";
+			std::cout << "  kernel_event_ms: " << kernel_event_ms << "\n";
 			std::cout << "  release_device_ms: " << release_device_ms << "\n";
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";
+			// Backward-compatible aliases for existing scripts.
+			std::cout << "  end_to_end_ms: " << benchmark_wall_ms << "\n";
+			std::cout << "  kernel_ms: " << kernel_event_ms << "\n";
 			std::cout << "  kernel_launches: " << total_launches << "\n";
 			std::cout << "  avg_grid_per_launch: " << avg_grid_per_launch << "\n";
 			std::cout << "  gpu_dispatch_kernel: " << (opt.gpu_dispatch_kernel ? 1 : 0) << "\n";

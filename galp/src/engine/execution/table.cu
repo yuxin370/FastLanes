@@ -47,6 +47,13 @@ void submit_streaming_chunk(StreamingChunkState& chunk, const TableDecompression
 	if (chunk.rowgroups.empty()) {
 		return;
 	}
+	runtime::begin_workset_chunk_arena(chunk.workset, chunk.global_expr_base);
+	size_t expr_index_base = 0;
+	for (auto& pending : chunk.rowgroups) {
+		runtime::append_expressions(
+		    chunk.workset, pending.expressions, cfg.execution, nullptr, nullptr, expr_index_base, true);
+		expr_index_base += runtime::count_active_columns(pending.expressions);
+	}
 	runtime::upload_workset(chunk.workset);
 	chunk.run = runtime::run_workset_async(chunk.workset, 1, cfg.execution);
 	chunk.submitted = true;
@@ -183,8 +190,6 @@ TableData decompress_table_whole_table(const std::filesystem::path&    fls_path,
 			}
 		}
 
-		runtime::append_expressions(
-		    chunk.workset, pending.expressions, cfg.execution, nullptr, nullptr, chunk.global_expr_base, true);
 		chunk.global_expr_base += active_columns;
 		chunk.work_items += active_columns * pending.rowgroup.n_vecs;
 

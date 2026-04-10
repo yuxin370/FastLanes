@@ -55,8 +55,73 @@ struct DICTSLPATCHColumn {
 		if (stream == nullptr) {
 			return copy_to_device();
 		}
-		return device::DICTSLPATCHColumn<T, IndexT> {
-		    get_n_values(), index.copy_to_device(stream), GPUArray<KEY_T>(key_count, keys, stream).release(), key_count};
+		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
+		const size_t buf = consts::MAX_UNPACK_N_VECS;
+		const size_t sl_nvecs = index.n_vecs;
+
+		flsgpu::memory::DeviceArena arena(stream);
+		// FFOR = BP + bases (inlined from index.ffor)
+		auto i_packed  = arena.template add<UINT_IDX>(index.ffor.bp.n_packed_values, index.ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw      = arena.template add<vbw_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.bit_widths);
+		auto i_bp_off  = arena.template add<size_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.vector_offsets);
+		auto i_bases   = arena.template add<UINT_IDX>(index.ffor.bp.get_n_vecs(), index.ffor.bases);
+		// SLPATCH own fields
+		auto i_exc_off = arena.template add<size_t>(sl_nvecs, index.exceptions_offsets);
+		auto i_pos_off = arena.template add<size_t>(sl_nvecs, index.positions_offsets);
+		auto i_exc     = arena.template add<IndexT>(index.n_exceptions, index.exceptions, buf);
+		auto i_pos     = arena.template add<uint16_t>(index.n_exceptions, index.positions, buf);
+		auto i_cnt     = arena.template add<uint16_t>(sl_nvecs, index.counts);
+		// DICT keys
+		auto i_keys    = arena.template add<KEY_T>(key_count, keys);
+		arena.upload();
+
+		device::BPColumn<IndexT> d_bp {
+		    index.ffor.bp.n_values, index.ffor.bp.get_n_vecs(),
+		    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
+		device::FFORColumn<IndexT> d_ffor {index.ffor.get_n_values(), d_bp, arena.get<UINT_IDX>(i_bases)};
+		device::SLPATCHColumn<IndexT> d_slpatch {
+		    index.n_values, sl_nvecs, d_ffor, index.n_exceptions,
+		    arena.get<size_t>(i_exc_off), arena.get<size_t>(i_pos_off),
+		    arena.get<IndexT>(i_exc), arena.get<uint16_t>(i_pos), arena.get<uint16_t>(i_cnt)};
+		return device::DICTSLPATCHColumn<T, IndexT> {get_n_values(), d_slpatch, arena.get<KEY_T>(i_keys), key_count};
+	}
+
+	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::DICTSLPATCHColumn<T, IndexT>& out) const {
+		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
+		const size_t buf = consts::MAX_UNPACK_N_VECS;
+		const size_t sl_nvecs = index.n_vecs;
+		auto i_packed  = arena.template add<UINT_IDX>(index.ffor.bp.n_packed_values, index.ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw      = arena.template add<vbw_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.bit_widths);
+		auto i_bp_off  = arena.template add<size_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.vector_offsets);
+		auto i_bases   = arena.template add<UINT_IDX>(index.ffor.bp.get_n_vecs(), index.ffor.bases);
+		auto i_exc_off = arena.template add<size_t>(sl_nvecs, index.exceptions_offsets);
+		auto i_pos_off = arena.template add<size_t>(sl_nvecs, index.positions_offsets);
+		auto i_exc     = arena.template add<IndexT>(index.n_exceptions, index.exceptions, buf);
+		auto i_pos     = arena.template add<uint16_t>(index.n_exceptions, index.positions, buf);
+		auto i_cnt     = arena.template add<uint16_t>(sl_nvecs, index.counts);
+		auto i_keys    = arena.template add<KEY_T>(key_count, keys);
+		const size_t bp_nv     = index.ffor.bp.n_values;
+		const size_t bp_nvec   = index.ffor.bp.get_n_vecs();
+		const size_t ffor_nv   = index.ffor.get_n_values();
+		const size_t idx_nv    = index.n_values;
+		const size_t idx_nexc  = index.n_exceptions;
+		out.n_values  = get_n_values();
+		out.key_count = key_count;
+		arena.add_resolver([&arena, &out, i_packed, i_bw, i_bp_off, i_bases,
+		                     i_exc_off, i_pos_off, i_exc, i_pos, i_cnt, i_keys,
+		                     bp_nv, bp_nvec, ffor_nv, idx_nv, sl_nvecs, idx_nexc]() {
+			device::BPColumn<IndexT> d_bp {
+			    bp_nv, bp_nvec,
+			    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
+			device::FFORColumn<IndexT> d_ffor {ffor_nv, d_bp, arena.get<UINT_IDX>(i_bases)};
+			out.index = device::SLPATCHColumn<IndexT> {
+			    idx_nv, sl_nvecs, d_ffor, idx_nexc,
+			    arena.get<size_t>(i_exc_off), arena.get<size_t>(i_pos_off),
+			    arena.get<IndexT>(i_exc), arena.get<uint16_t>(i_pos), arena.get<uint16_t>(i_cnt)};
+			out.keys = arena.get<KEY_T>(i_keys);
+		});
 	}
 };
 

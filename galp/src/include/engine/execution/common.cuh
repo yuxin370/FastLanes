@@ -300,6 +300,106 @@ void fill_device_expr(DeviceExpression<T>& expr,
 	                         std::to_string(static_cast<int>(plan)));
 }
 
+// Arena-based overload: packs column data into shared arena; pointers resolved on arena.upload().
+template <typename T, typename HostColT>
+void fill_device_expr(DeviceExpression<T>& expr,
+                      const HostColT&      host_col,
+                      const PlanKind       plan,
+                      const bool           freq_use_extended,
+                      flsgpu::memory::DeviceArena& arena) {
+	switch (plan) {
+	case PlanKind::UNCOMPRESSED:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::BPColumn<T>>) {
+			host_col.copy_to_device(arena, expr.col.bp);
+			return;
+		}
+		break;
+	case PlanKind::CONSTANT:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::CONSTANTColumn<T>>) {
+			host_col.copy_to_device(arena, expr.col.constant);
+			return;
+		}
+		break;
+	case PlanKind::FREQUENCY:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
+			if (freq_use_extended) {
+				// Extended column is a temporary — capture by value in the defer_free
+				// lambda to keep its arrays alive until arena.upload() packs them.
+				// Value-capture avoids a separate heap allocation for the wrapper struct.
+				auto extended = host_col.create_extended_column();
+				extended.copy_to_device(arena, expr.col.freq_extended);
+				expr.freq_use_extended = true;
+				arena.defer_free([ext = extended]() {
+					flsgpu::host::free_column(ext);
+				});
+				return;
+			}
+			host_col.copy_to_device(arena, expr.col.freq);
+			expr.freq_use_extended = false;
+			return;
+		}
+		break;
+	case PlanKind::UNFFOR:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::FFORColumn<T>>) {
+			host_col.copy_to_device(arena, expr.col.ffor);
+			return;
+		}
+		break;
+	case PlanKind::UNFFOR_SLPATCH:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::SLPATCHColumn<T>>) {
+			host_col.copy_to_device(arena, expr.col.slpatch);
+			return;
+		}
+		break;
+	case PlanKind::DICT_FFOR_U8:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint8_t>>) {
+			host_col.copy_to_device(arena, expr.col.dictffor_u8);
+			return;
+		}
+		break;
+	case PlanKind::DICT_FFOR_U16:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint16_t>>) {
+			host_col.copy_to_device(arena, expr.col.dictffor_u16);
+			return;
+		}
+		break;
+	case PlanKind::DICT_FFOR_SLPATCH_U8:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint8_t>>) {
+			host_col.copy_to_device(arena, expr.col.dictslpatch_u8);
+			return;
+		}
+		break;
+	case PlanKind::DICT_FFOR_SLPATCH_U16:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint16_t>>) {
+			host_col.copy_to_device(arena, expr.col.dictslpatch_u16);
+			return;
+		}
+		break;
+	case PlanKind::CROSS_RLE:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::CROSSRLEColumn<T>>) {
+			host_col.copy_to_device(arena, expr.col.crossrle);
+			return;
+		}
+		break;
+	case PlanKind::RLE_U8:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::RLEColumn<T, uint8_t>>) {
+			host_col.copy_to_device(arena, expr.col.rle_u8);
+			return;
+		}
+		break;
+	case PlanKind::RLE_U16:
+		if constexpr (std::is_same_v<HostColT, flsgpu::host::RLEColumn<T, uint16_t>>) {
+			host_col.copy_to_device(arena, expr.col.rle_u16);
+			return;
+		}
+		break;
+	default:
+		break;
+	}
+	throw std::runtime_error("fill_device_expr(arena): plan/column type mismatch, plan=" +
+	                         std::to_string(static_cast<int>(plan)));
+}
+
 template <typename T>
 void free_device_expr(const DeviceExpression<T>& expr) {
 	switch (expr.plan) {
@@ -435,6 +535,42 @@ void add_expression_to_batch(const size_t    expr_index,
 
 	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size());
 	batch.device_exprs.push_back(expr);
+	batch.expr_indices.push_back(expr_index);
+
+	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
+	for (size_t vec = 0; vec < n_vecs; ++vec) {
+		batch.work_items.push_back(WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>()});
+	}
+}
+
+// Arena-based overload: emplaces expr into pre-reserved batch, packs column data into shared arena.
+// batch.device_exprs MUST be pre-reserved to avoid reallocation (resolver callbacks capture &out).
+template <typename T, typename HostColT>
+void add_expression_to_batch(const size_t    expr_index,
+                             const HostColT& host_col,
+                             const PlanKind  plan,
+                             Batch<T>&       batch,
+                             const bool      freq_prefetch_all_branchless,
+                             const bool      freq_hybrid_patcher,
+                             const float     freq_branchless_threshold,
+                             const cudaStream_t stream,
+                             flsgpu::memory::DeviceArena& arena) {
+	// Emplace into pre-reserved vector — address is stable.
+	batch.device_exprs.emplace_back();
+	auto& expr    = batch.device_exprs.back();
+	expr.plan     = plan;
+	expr.n_values = host_col.get_n_values();
+	batch.device_outputs.emplace_back(expr.n_values, stream);
+	expr.out = batch.device_outputs.back().get();
+
+	bool use_freq_extended = false;
+	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
+		use_freq_extended = detail::should_use_freq_extended(
+		    host_col, freq_prefetch_all_branchless, freq_hybrid_patcher, freq_branchless_threshold);
+	}
+	detail::fill_device_expr(expr, host_col, plan, use_freq_extended, arena);
+
+	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size() - 1);
 	batch.expr_indices.push_back(expr_index);
 
 	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
