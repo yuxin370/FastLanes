@@ -63,25 +63,6 @@ struct CROSSRLELaneMaskColumn {
 		};
 	}
 
-	device::CROSSRLELaneMaskColumn<T> copy_to_device(cudaStream_t stream) const {
-		if (stream == nullptr) {
-			return copy_to_device();
-		}
-		const size_t nv         = get_n_vecs();
-		const size_t total_runs = nv * utils::get_n_lanes<T>();
-		flsgpu::memory::DeviceArena arena(stream);
-		auto i_base = arena.template add<uint32_t>(total_runs + 1, lane_run_base);
-		auto i_vals = arena.template add<UINT_T>(n_lane_runs, lane_run_values);
-		auto i_mask = arena.template add<uint64_t>(total_runs, lane_boundary_mask);
-		arena.upload();
-		return device::CROSSRLELaneMaskColumn<T> {
-		    get_n_values(), nv, n_lane_runs,
-		    arena.get<uint32_t>(i_base),
-		    arena.template get<UINT_T>(i_vals),
-		    arena.get<uint64_t>(i_mask),
-		};
-	}
-
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::CROSSRLELaneMaskColumn<T>& out) const {
 		const size_t nv         = get_n_vecs();
 		const size_t total_runs = nv * utils::get_n_lanes<T>();

@@ -42,11 +42,6 @@ struct CONSTANTColumn {
 		return device::CONSTANTColumn<T> {n_values, value};
 	}
 
-	device::CONSTANTColumn<T> copy_to_device(cudaStream_t stream) const {
-		(void)stream;
-		return copy_to_device();
-	}
-
 	void copy_to_device(flsgpu::memory::DeviceArena& /*arena*/, device::CONSTANTColumn<T>& out) const {
 		out = copy_to_device();
 	}

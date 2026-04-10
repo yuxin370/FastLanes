@@ -71,30 +71,6 @@ struct FREQExtendedColumn {
 		};
 	}
 
-	device::FREQExtendedColumn<T> copy_to_device(cudaStream_t stream) const {
-		if (stream == nullptr) {
-			return copy_to_device();
-		}
-		const size_t buf = consts::MAX_UNPACK_N_VECS;
-		flsgpu::memory::DeviceArena arena(stream);
-		auto i_fv      = arena.template add<T>(n_vecs, frequent_value);
-		auto i_exc_off = arena.template add<size_t>(n_vecs, exceptions_offsets);
-		auto i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
-		auto i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
-		auto i_oc      = arena.template add<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts);
-		arena.upload();
-		return device::FREQExtendedColumn<T> {
-		    n_values,
-		    n_vecs,
-		    arena.template get<T>(i_fv),
-		    n_exceptions,
-		    arena.template get<size_t>(i_exc_off),
-		    arena.template get<T>(i_exc),
-		    arena.template get<uint16_t>(i_pos),
-		    arena.template get<uint16_t>(i_oc),
-		};
-	}
-
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FREQExtendedColumn<T>& out) const {
 		const size_t buf = consts::MAX_UNPACK_N_VECS;
 		auto i_fv      = arena.template add<T>(n_vecs, frequent_value);

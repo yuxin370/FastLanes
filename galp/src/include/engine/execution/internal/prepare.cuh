@@ -63,11 +63,6 @@ inline cudaEvent_t ensure_workset_h2d_ready_event(ExecutionWorkset& workset) {
 	return workset.h2d_ready_event;
 }
 
-inline bool chunk_arena_enabled() {
-	static const bool enabled = (std::getenv("GALP_DISABLE_CHUNK_ARENA") == nullptr);
-	return enabled;
-}
-
 inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t additional_exprs) {
 	if (additional_exprs == 0) {
 		return;
@@ -81,15 +76,11 @@ inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t a
 }
 
 inline bool begin_workset_chunk_arena(ExecutionWorkset& workset, const size_t additional_exprs) {
-	if (workset.chunk_arena || !chunk_arena_enabled()) {
+	if (workset.chunk_arena) {
 		return workset.chunk_arena != nullptr;
 	}
-	const auto h2d_stream = ensure_workset_h2d_stream(workset);
-	if (h2d_stream == nullptr) {
-		return false;
-	}
 	reserve_batch_expr_storage(workset, additional_exprs);
-	workset.chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(h2d_stream);
+	workset.chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(ensure_workset_h2d_stream(workset));
 	return true;
 }
 
@@ -198,22 +189,12 @@ inline void append_expressions(ExecutionWorkset&              workset,
 
 	dispatch::resolve_dict_refs(expressions);
 	const auto h2d_stream = ensure_workset_h2d_stream(workset);
-	const bool use_workset_chunk_arena = (workset.chunk_arena != nullptr);
 	std::unique_ptr<flsgpu::memory::DeviceArena> local_chunk_arena;
-	flsgpu::memory::DeviceArena*                 active_chunk_arena = nullptr;
-	if (use_workset_chunk_arena) {
-		active_chunk_arena = workset.chunk_arena.get();
-	} else if (chunk_arena_enabled() && (h2d_stream != nullptr)) {
+	flsgpu::memory::DeviceArena*                 active_chunk_arena = workset.chunk_arena.get();
+	if (active_chunk_arena == nullptr) {
 		reserve_batch_expr_storage(workset, expressions.size());
 		local_chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(h2d_stream);
 		active_chunk_arena = local_chunk_arena.get();
-	}
-
-	// Fallback: BatchUploader for per-column arenas (when chunk arena disabled)
-	static const bool kEnableBatchUploader = (std::getenv("GALP_DISABLE_BATCH_UPLOADER") == nullptr);
-	std::optional<flsgpu::memory::BatchUploader> batch_uploader;
-	if (active_chunk_arena == nullptr && kEnableBatchUploader && (h2d_stream != nullptr)) {
-		batch_uploader.emplace(h2d_stream);
 	}
 
 	size_t active_expr_count = 0;
@@ -239,36 +220,22 @@ inline void append_expressions(ExecutionWorkset&              workset,
 				    }
 				    const size_t materialize_expr_index =
 				        use_global_expr_index ? (expr_index_base + active_expr_count - 1U) : i;
-				    if (active_chunk_arena != nullptr) {
-					    add_expression_to_batch<T>(materialize_expr_index,
-					                               host_col,
-					                               plan,
-					                               workset.host_batches.template get<T>(),
-					                               cfg.freq_prefetch_all_branchless,
-					                               cfg.freq_hybrid_patcher,
-					                               cfg.freq_branchless_threshold,
-					                               h2d_stream,
-					                               *active_chunk_arena);
-				    } else {
-					    add_expression_to_batch<T>(materialize_expr_index,
-					                               host_col,
-					                               plan,
-					                               workset.host_batches.template get<T>(),
-					                               cfg.freq_prefetch_all_branchless,
-					                               cfg.freq_hybrid_patcher,
-					                               cfg.freq_branchless_threshold,
-					                               h2d_stream);
-				    }
+				    add_expression_to_batch<T>(materialize_expr_index,
+				                               host_col,
+				                               plan,
+				                               workset.host_batches.template get<T>(),
+				                               cfg.freq_prefetch_all_branchless,
+				                               cfg.freq_hybrid_patcher,
+				                               cfg.freq_branchless_threshold,
+				                               h2d_stream,
+				                               *active_chunk_arena);
 			    }
 		    },
 		    expr.column->host);
 	}
 
 	if (local_chunk_arena) {
-		local_chunk_arena->upload(); // Single malloc + single H2D + resolve all pointers
-	}
-	if (batch_uploader.has_value()) {
-		batch_uploader->flush();
+		local_chunk_arena->upload();
 	}
 }
 

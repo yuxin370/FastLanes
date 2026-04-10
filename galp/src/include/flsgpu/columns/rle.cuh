@@ -58,35 +58,6 @@ struct RLEColumn {
 		    n_rle_values};
 	}
 
-	device::RLEColumn<T, IndexT> copy_to_device(cudaStream_t stream) const {
-		if (stream == nullptr) {
-			return copy_to_device();
-		}
-		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
-		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
-
-		flsgpu::memory::DeviceArena arena(stream);
-		// FFOR = BP + bases (inlined)
-		auto i_packed   = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
-		auto i_bw       = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
-		auto i_bp_off   = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
-		auto i_bases    = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
-		// RLE own fields
-		auto i_rsum     = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
-		auto i_vals     = arena.template add<T>(n_rle_values, rle_values);
-		auto i_offs     = arena.template add<size_t>(n_vecs, rle_offsets);
-		arena.upload();
-
-		device::BPColumn<IndexT> d_bp {
-		    ffor.bp.n_values, ffor.bp.get_n_vecs(),
-		    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
-		device::FFORColumn<IndexT> d_ffor {ffor.get_n_values(), d_bp, arena.get<UINT_IDX>(i_bases)};
-		return device::RLEColumn<T, IndexT> {
-		    n_values, n_vecs, d_ffor,
-		    arena.get<IndexT>(i_rsum), arena.get<T>(i_vals), arena.get<size_t>(i_offs),
-		    n_rle_values};
-	}
-
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::RLEColumn<T, IndexT>& out) const {
 		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
 		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;

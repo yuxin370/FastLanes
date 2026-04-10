@@ -73,39 +73,6 @@ struct SLPATCHColumn {
 		};
 	}
 
-	device::SLPATCHColumn<T> copy_to_device(cudaStream_t stream) const {
-		if (stream == nullptr) {
-			return copy_to_device();
-		}
-		const size_t buf = consts::MAX_UNPACK_N_VECS;
-		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;
-		using UINT_T_BP = typename utils::same_width_uint<T>::type;
-
-		flsgpu::memory::DeviceArena arena(stream);
-		// FFOR = BP + bases (inlined)
-		auto i_packed   = arena.template add<UINT_T_BP>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
-		auto i_bw       = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
-		auto i_bp_off   = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
-		auto i_bases    = arena.template add<UINT_T_BP>(ffor.bp.get_n_vecs(), ffor.bases);
-		// SLPATCH own fields
-		auto i_exc_off  = arena.template add<size_t>(n_vecs, exceptions_offsets);
-		auto i_pos_off  = arena.template add<size_t>(n_vecs, positions_offsets);
-		auto i_exc      = arena.template add<T>(n_exceptions, exceptions, buf);
-		auto i_pos      = arena.template add<uint16_t>(n_exceptions, positions, buf);
-		auto i_cnt      = arena.template add<uint16_t>(n_vecs, counts);
-		arena.upload();
-
-		device::BPColumn<T> d_bp {
-		    ffor.bp.n_values, ffor.bp.get_n_vecs(),
-		    arena.get<UINT_T_BP>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
-		device::FFORColumn<T> d_ffor {ffor.get_n_values(), d_bp, arena.get<UINT_T_BP>(i_bases)};
-		return device::SLPATCHColumn<T> {
-		    n_values, n_vecs, d_ffor, n_exceptions,
-		    arena.get<size_t>(i_exc_off), arena.get<size_t>(i_pos_off),
-		    arena.get<T>(i_exc), arena.get<uint16_t>(i_pos), arena.get<uint16_t>(i_cnt),
-		};
-	}
-
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::SLPATCHColumn<T>& out) const {
 		const size_t buf = consts::MAX_UNPACK_N_VECS;
 		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;

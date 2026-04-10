@@ -56,18 +56,6 @@ struct PendingCopyEvent {
 	void*       pinned = nullptr;
 };
 
-struct PendingCopyBatchEvent {
-	cudaEvent_t        event = nullptr;
-	std::vector<void*> pinned_list;
-};
-
-struct BatchedCopy {
-	void*       dst   = nullptr;
-	const void* src   = nullptr;
-	size_t      bytes = 0;
-	void*       pinned = nullptr;
-};
-
 class DevicePool {
 public:
 	static DevicePool& instance() {
@@ -188,13 +176,6 @@ public:
 			return;
 		}
 		const auto use_stream = stream != nullptr ? stream : stream_;
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			if (batch_active_ && use_stream == batch_stream_) {
-				batched_copies_.push_back(BatchedCopy {dst, pinned_src, bytes, pinned_src});
-				return;
-			}
-		}
 		CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned_src, bytes, cudaMemcpyHostToDevice, use_stream));
 		cudaEvent_t event {};
 		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
@@ -212,20 +193,6 @@ public:
 			return;
 		}
 		const auto use_stream = stream != nullptr ? stream : stream_;
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			if (batch_active_ && use_stream == batch_stream_) {
-				void*       pinned     = nullptr;
-				const void* queued_src = src;
-				if (use_pinned_ && bytes > small_copy_threshold_) {
-					pinned     = alloc_pinned_locked(bytes);
-					std::memcpy(pinned, src, bytes);
-					queued_src = pinned;
-				}
-				batched_copies_.push_back(BatchedCopy {dst, queued_src, bytes, pinned});
-				return;
-			}
-		}
 
 		void* pinned = nullptr;
 		if (use_pinned_ && bytes > small_copy_threshold_) {
@@ -243,57 +210,6 @@ public:
 		pending_copy_events_[stream_key(use_stream)].push_back(PendingCopyEvent {event, pinned});
 	}
 
-	void begin_h2d_batch(cudaStream_t stream) {
-		const auto use_stream = stream != nullptr ? stream : stream_;
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (batch_active_) {
-			throw std::runtime_error("DevicePool::begin_h2d_batch called while another batch is active");
-		}
-		batch_active_ = true;
-		batch_stream_ = use_stream;
-		batched_copies_.clear();
-	}
-
-	void flush_h2d_batch() {
-		std::vector<BatchedCopy> copies;
-		cudaStream_t             batch_stream = nullptr;
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			if (!batch_active_) {
-				return;
-			}
-			batch_stream = batch_stream_;
-			copies       = std::move(batched_copies_);
-			batched_copies_.clear();
-			batch_active_ = false;
-			batch_stream_ = nullptr;
-		}
-
-		for (const auto& copy : copies) {
-			if (copy.bytes == 0) {
-				continue;
-			}
-			CUDA_SAFE_CALL(cudaMemcpyAsync(copy.dst, copy.src, copy.bytes, cudaMemcpyHostToDevice, batch_stream));
-		}
-
-		if (!copies.empty()) {
-			std::vector<void*> pinned_list;
-			pinned_list.reserve(copies.size());
-			for (auto& copy : copies) {
-				if (copy.pinned != nullptr) {
-					pinned_list.push_back(copy.pinned);
-					copy.pinned = nullptr;
-				}
-			}
-			cudaEvent_t event {};
-			CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-			CUDA_SAFE_CALL(cudaEventRecord(event, batch_stream));
-			std::lock_guard<std::mutex> lock(mutex_);
-			pending_copy_batch_events_[stream_key(batch_stream)].push_back(
-			    PendingCopyBatchEvent {event, std::move(pinned_list)});
-		}
-	}
-
 	void sync_h2d() {
 		// Collect streams to synchronize while holding the lock, then release
 		// the lock before calling cudaStreamSynchronize (which may block).
@@ -301,10 +217,6 @@ public:
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			for (const auto& [stream_id, events] : pending_copy_events_) {
-				(void)events;
-				streams_to_sync.push_back(stream_from_key(stream_id));
-			}
-			for (const auto& [stream_id, events] : pending_copy_batch_events_) {
 				(void)events;
 				streams_to_sync.push_back(stream_from_key(stream_id));
 			}
@@ -327,20 +239,6 @@ public:
 			}
 		}
 		pending_copy_events_.clear();
-		for (auto& [stream_id, events] : pending_copy_batch_events_) {
-			(void)stream_id;
-			for (auto& pending : events) {
-				if (pending.event != nullptr) {
-					CUDA_SAFE_CALL(cudaEventDestroy(pending.event));
-					pending.event = nullptr;
-				}
-				for (void*& pinned : pending.pinned_list) {
-					release_pinned_locked(pinned);
-				}
-				pending.pinned_list.clear();
-			}
-		}
-		pending_copy_batch_events_.clear();
 	}
 
 	void sync_h2d(cudaStream_t source_stream) {
@@ -362,20 +260,6 @@ public:
 			pending_copy_events_.erase(it);
 		}
 
-		auto bit = pending_copy_batch_events_.find(stream_key(src_stream));
-		if (bit != pending_copy_batch_events_.end()) {
-			for (auto& pending : bit->second) {
-				if (pending.event != nullptr) {
-					CUDA_SAFE_CALL(cudaEventDestroy(pending.event));
-					pending.event = nullptr;
-				}
-				for (void*& pinned : pending.pinned_list) {
-					release_pinned_locked(pinned);
-				}
-				pending.pinned_list.clear();
-			}
-			pending_copy_batch_events_.erase(bit);
-		}
 	}
 
 	cudaStream_t stream() const {
@@ -502,8 +386,7 @@ private:
 
 	void assert_idle_for_reconfiguration_locked(const char* api_name) {
 		reclaim_finished_locked();
-		if (!pending_copy_events_.empty() || !pending_copy_batch_events_.empty() || batch_active_ ||
-		    !batched_copies_.empty() || !in_use_.empty() || !pinned_in_use_.empty()) {
+		if (!pending_copy_events_.empty() || !in_use_.empty() || !pinned_in_use_.empty()) {
 			throw std::runtime_error(std::string("DevicePool::") + api_name +
 			                         " requires idle pool (no in-flight copies or live allocations)");
 		}
@@ -536,39 +419,6 @@ private:
 				++it;
 			}
 		}
-		for (auto it = pending_copy_batch_events_.begin(); it != pending_copy_batch_events_.end();) {
-			auto& events = it->second;
-			for (auto event_it = events.begin(); event_it != events.end();) {
-				auto& pending = *event_it;
-				if (pending.event == nullptr) {
-					for (void*& pinned : pending.pinned_list) {
-						release_pinned_locked(pinned);
-					}
-					pending.pinned_list.clear();
-					event_it = events.erase(event_it);
-					continue;
-				}
-				auto status = cudaEventQuery(pending.event);
-				if (status == cudaSuccess) {
-					CUDA_SAFE_CALL(cudaEventDestroy(pending.event));
-					pending.event = nullptr;
-					for (void*& pinned : pending.pinned_list) {
-						release_pinned_locked(pinned);
-					}
-					pending.pinned_list.clear();
-					event_it = events.erase(event_it);
-				} else if (status == cudaErrorNotReady) {
-					++event_it;
-				} else {
-					CUDA_SAFE_CALL(status);
-				}
-			}
-			if (events.empty()) {
-				it = pending_copy_batch_events_.erase(it);
-			} else {
-				++it;
-			}
-		}
 	}
 
 	DevicePool() {
@@ -581,9 +431,6 @@ private:
 	bool         use_pinned_           = true;
 	size_t       small_copy_threshold_ = 256 * 1024;
 	cudaStream_t stream_               = nullptr;
-	bool         batch_active_         = false;
-	cudaStream_t batch_stream_         = nullptr;
-	std::vector<BatchedCopy> batched_copies_;
 
 	std::unordered_map<size_t, std::vector<void*>>                                      free_sync_by_size_;
 	std::unordered_map<StreamKey, std::unordered_map<size_t, std::vector<void*>>> free_async_by_stream_size_;
@@ -592,7 +439,6 @@ private:
 	std::unordered_map<size_t, std::vector<void*>> pinned_free_by_size_;
 	std::unordered_map<void*, size_t>              pinned_in_use_;
 	std::unordered_map<StreamKey, std::vector<PendingCopyEvent>> pending_copy_events_;
-	std::unordered_map<StreamKey, std::vector<PendingCopyBatchEvent>> pending_copy_batch_events_;
 };
 
 inline void* device_malloc(size_t bytes) {
@@ -619,36 +465,18 @@ inline void sync_h2d(cudaStream_t source_stream) {
 	DevicePool::instance().sync_h2d(source_stream);
 }
 
-inline void begin_h2d_batch(cudaStream_t stream = nullptr) {
-	DevicePool::instance().begin_h2d_batch(stream);
-}
-
-inline void flush_h2d_batch() {
-	DevicePool::instance().flush_h2d_batch();
-}
-
-// ── DeviceArena: single-malloc + single-H2D ─────────────────────────
-// Supports two usage modes:
+// ── DeviceArena: aggregated device allocation + staged H2D ──────────
+// A workset can append many column sub-arrays into one arena, then perform one
+// upload() to allocate/copy the aggregated payload and resolve device pointers.
 //
-// 1. Per-column (standalone): create arena, add(), upload(), get().
-//
-// 2. Chunk-level (shared): create ONE arena, multiple columns call add(),
-//    register resolvers, then ONE upload() at the end.
-//
-// Host data must remain valid until upload() in both modes.
+// Host data must remain valid until upload().
 // For temporary host columns, use defer_free() to extend their lifetime.
 //
-// Usage (standalone):
+// Usage:
 //   DeviceArena arena(stream);
 //   auto i0 = arena.add<T>(count, host_ptr);
 //   arena.upload();
 //   T* d0 = arena.get<T>(i0);
-//
-// Usage (shared / chunk-level):
-//   DeviceArena arena(stream);
-//   auto i0 = arena.add<T>(count_a, host_a);
-//   arena.add_resolver([&]() { out_a.ptr = arena.get<T>(i0); });
-//   arena.upload();  // packs from host ptrs → pinned → device, then calls resolvers
 class DeviceArena {
 	struct Entry {
 		size_t      offset     = 0;
@@ -678,7 +506,7 @@ public:
 	}
 
 	/// Register a callback to be invoked after upload() sets device_base_.
-	/// Use this in shared/chunk-level mode to populate device column pointers.
+	/// Use this to populate device column pointers after the aggregated upload.
 	void add_resolver(std::function<void()> fn) {
 		resolvers_.push_back(std::move(fn));
 	}
@@ -778,50 +606,6 @@ private:
 	std::vector<Entry>                 entries_;
 	std::vector<std::function<void()>> resolvers_;
 	std::vector<std::function<void()>> deferred_frees_;
-};
-
-class BatchUploader {
-public:
-	explicit BatchUploader(cudaStream_t stream = nullptr) {
-		DevicePool::instance().begin_h2d_batch(stream);
-		active_ = true;
-	}
-
-	BatchUploader(const BatchUploader&)            = delete;
-	BatchUploader& operator=(const BatchUploader&) = delete;
-
-	BatchUploader(BatchUploader&& other) noexcept
-	    : active_(other.active_) {
-		other.active_ = false;
-	}
-
-	BatchUploader& operator=(BatchUploader&& other) noexcept {
-		if (this != &other) {
-			if (active_) {
-				DevicePool::instance().flush_h2d_batch();
-			}
-			active_       = other.active_;
-			other.active_ = false;
-		}
-		return *this;
-	}
-
-	~BatchUploader() {
-		if (active_) {
-			DevicePool::instance().flush_h2d_batch();
-		}
-	}
-
-	void flush() {
-		if (!active_) {
-			return;
-		}
-		DevicePool::instance().flush_h2d_batch();
-		active_ = false;
-	}
-
-private:
-	bool active_ = false;
 };
 
 inline void device_memcpy_h2d_async(void* dst, const void* src, size_t bytes, cudaStream_t stream) {

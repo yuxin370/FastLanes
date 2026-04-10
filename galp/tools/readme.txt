@@ -37,9 +37,9 @@ Replace the placeholders below:
 11) Benchmark with custom streaming chunk thresholds
 <GALP_CLI> benchmark <FLS_FILE> --samples 100 --stream-target-work-items 131072 --stream-max-rowgroups 4
 
-12) Baseline: all optimizations disabled
+12) Baseline: disable overlap-heavy execution features
 <GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-streaming --no-zero-copy
-(with env: GALP_DISABLE_ASYNC_H2D=1 GALP_DISABLE_BATCH_UPLOADER=1)
+(with env: GALP_DISABLE_ASYNC_H2D=1)
 
 13) Frequency: branchless patcher (extended + PrefetchAllBranchless)
 <GALP_CLI> benchmark <FLS_FILE> --samples 100 --freq-prefetch-all-branchless
@@ -87,32 +87,20 @@ Options
   --freq-branchless-threshold N     Hybrid cutoff: average exceptions per vector (default: 6).
                                     Requires both --freq-prefetch-all-branchless and --freq-hybrid-patcher.
 
-Environment Variables (A/B testing)
-  GALP_DISABLE_CHUNK_ARENA=1        Disable chunk-level super-arena; fall back to per-column
-                                    DeviceArena + BatchUploader.
-  GALP_DISABLE_BATCH_UPLOADER=1     Disable batched H2D copy coalescing; each column is copied
-                                    individually via cudaMemcpyAsync on the h2d_stream.
-  GALP_DISABLE_ASYNC_H2D=1          Disable dedicated h2d_stream entirely; all GPU allocation and
-                                    H2D transfers fall back to synchronous calls on the default
-                                    stream.  Also implicitly disables BatchUploader.
-
-  A/B test matrix:
-    (default)                       → chunk-level super-arena (1 malloc + 1 memcpy per chunk)
-    GALP_DISABLE_CHUNK_ARENA=1      → per-column arena + BatchUploader
-    GALP_DISABLE_BATCH_UPLOADER=1   → per-column arena, no batching
-    GALP_DISABLE_ASYNC_H2D=1        → sync default stream, no batching
-    both ASYNC_H2D + BATCH set      → same as GALP_DISABLE_ASYNC_H2D=1
+Environment Variables
+  GALP_DISABLE_ASYNC_H2D=1          Disable dedicated h2d_stream entirely; GPU allocation and
+                                    H2D transfers fall back to the default stream.
 
 Defaults
   All optimizations are enabled by default:
   - Mixed-dispatch (single kernel launch per sample per chunk)
   - Streaming double-buffer pipeline (async overlap of H2D and kernel)
   - Zero-copy rowgroup parsing (host columns point into backing buffer)
-  - Chunk-level super-arena (single cudaMalloc + single cudaMemcpy per streaming chunk), per-column DeviceArena as fallback (single cudaMalloc + single cudaMemcpy per column)
-  - Async h2d_stream with BatchUploader (coalesced pinned H2D copies, used with per-column arena)
+  - Shared DeviceArena per workset / chunk (single staged allocation and upload for appended expressions)
+  - Async h2d_stream for overlapping uploads with compute
 
   To run a pure baseline, disable everything:
-    GALP_DISABLE_ASYNC_H2D=1 GALP_DISABLE_BATCH_UPLOADER=1 \
+    GALP_DISABLE_ASYNC_H2D=1 \
     <GALP_CLI> benchmark <FLS_FILE> --samples 100 \
       --no-streaming --no-zero-copy --no-mixed-dispatch
 
@@ -126,31 +114,8 @@ Notes
   exception density vs `--freq-branchless-threshold`.
 
 H2D Transfer Architecture
-  Three tiers of H2D coalescing (highest to lowest):
-
-  1. Chunk-level super-arena (default, GALP_DISABLE_CHUNK_ARENA unset):
-     All columns in a streaming chunk share ONE DeviceArena. append_expressions()
-     creates a single arena, each column packs its sub-arrays via copy_to_device(arena, out),
-     and arena.upload() performs ONE cudaMallocAsync + ONE cudaMemcpyAsync for the
-     entire chunk. Resolver callbacks populate device column pointers after upload.
-     Allocation sizes are rounded to power-of-2 buckets (min 64KB) for DevicePool
-     cache efficiency. batch.device_exprs is pre-reserved to guarantee stable
-     addresses for resolver callbacks.
-
-  2. Per-column DeviceArena (fallback, GALP_DISABLE_CHUNK_ARENA=1):
-     Each column's copy_to_device(stream) creates a local DeviceArena to consolidate
-     its sub-arrays (packed data, bit-widths, offsets, exceptions, etc.) into a single
-     cudaMallocAsync + single cudaMemcpyAsync per column. Host data is packed into a
-     contiguous pinned buffer before transfer. Sub-pointers within the arena are tagged
-     as sub-allocations (no-op on cudaFree). Composed column types (FFOR, SLPATCH, RLE,
-     DICT*) inline their child columns into the same arena.
-     The BatchUploader coalesces per-column H2D calls and shares a single CUDA event.
-
-  3. Raw GPUArray (GALP_DISABLE_BATCH_UPLOADER=1):
-     Each sub-array is individually allocated and transferred.
-
-  celebA 1-sample nsys comparison (chunk vs per-column):
-    cudaMemcpyAsync:  479 calls / 3.3ms  vs  19,001 calls / 46ms  (-97.5% / -93%)
-    cudaMallocAsync:  18,778 / 27ms      vs  37,817 / 45ms        (-50% / -40%)
-    cudaMallocHost:   34 / 26ms          vs  537 / 29ms           (-94%)
-    End-to-end:       ~522ms             vs  ~585ms               (-11%)
+  A workset uses a shared DeviceArena to aggregate all appended expressions into one
+  staged upload. Each column packs its sub-arrays via copy_to_device(arena, out), and
+  arena.upload() performs one aggregated allocation/upload for the workset. Resolver
+  callbacks populate device column pointers after upload. Allocation sizes are rounded
+  to power-of-2 buckets (min 64KB) for DevicePool cache efficiency.

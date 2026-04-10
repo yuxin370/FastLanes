@@ -66,26 +66,6 @@ struct CROSSRLEExtendedColumn {
 		};
 	}
 
-	device::CROSSRLEExtendedColumn<T> copy_to_device(cudaStream_t stream) const {
-		if (stream == nullptr) {
-			return copy_to_device();
-		}
-		const size_t nv = get_n_vecs();
-		flsgpu::memory::DeviceArena arena(stream);
-		auto i_offs = arena.template add<size_t>(nv + 1, lane_runs_offsets);
-		auto i_vals = arena.template add<UINT_T>(n_lane_runs, lane_values);
-		auto i_lens = arena.template add<uint16_t>(n_lane_runs, lane_lengths);
-		auto i_oc   = arena.template add<uint32_t>(nv * utils::get_n_lanes<T>(), offsets_counts);
-		arena.upload();
-		return device::CROSSRLEExtendedColumn<T> {
-		    n_values, nv, n_lane_runs,
-		    arena.get<size_t>(i_offs),
-		    arena.template get<UINT_T>(i_vals),
-		    arena.get<uint16_t>(i_lens),
-		    arena.get<uint32_t>(i_oc),
-		};
-	}
-
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::CROSSRLEExtendedColumn<T>& out) const {
 		const size_t nv = get_n_vecs();
 		auto i_offs = arena.template add<size_t>(nv + 1, lane_runs_offsets);

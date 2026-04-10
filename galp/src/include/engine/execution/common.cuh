@@ -206,100 +206,6 @@ bool should_use_freq_extended(const flsgpu::host::FREQColumn<T>& host_col,
 	return exc_per_vec >= static_cast<double>(freq_branchless_threshold);
 }
 
-template <typename T, typename HostColT>
-void fill_device_expr(DeviceExpression<T>& expr,
-                      const HostColT&      host_col,
-                      const PlanKind       plan,
-                      const bool           freq_use_extended = false,
-                      const cudaStream_t   stream            = nullptr) {
-	switch (plan) {
-	case PlanKind::UNCOMPRESSED:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::BPColumn<T>>) {
-			expr.col.bp = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::CONSTANT:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::CONSTANTColumn<T>>) {
-			expr.col.constant = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::FREQUENCY:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
-			if (freq_use_extended) {
-				auto extended          = host_col.create_extended_column();
-				expr.col.freq_extended = extended.copy_to_device(stream);
-				expr.freq_use_extended = true;
-				flsgpu::host::free_column(extended);
-				return;
-			}
-			expr.col.freq          = host_col.copy_to_device(stream);
-			expr.freq_use_extended = false;
-			return;
-		}
-		break;
-	case PlanKind::UNFFOR:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::FFORColumn<T>>) {
-			expr.col.ffor = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::UNFFOR_SLPATCH:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::SLPATCHColumn<T>>) {
-			expr.col.slpatch = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::DICT_FFOR_U8:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint8_t>>) {
-			expr.col.dictffor_u8 = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::DICT_FFOR_U16:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTFFORColumn<T, uint16_t>>) {
-			expr.col.dictffor_u16 = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::DICT_FFOR_SLPATCH_U8:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint8_t>>) {
-			expr.col.dictslpatch_u8 = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::DICT_FFOR_SLPATCH_U16:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::DICTSLPATCHColumn<T, uint16_t>>) {
-			expr.col.dictslpatch_u16 = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::CROSS_RLE:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::CROSSRLEColumn<T>>) {
-			expr.col.crossrle = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::RLE_U8:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::RLEColumn<T, uint8_t>>) {
-			expr.col.rle_u8 = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	case PlanKind::RLE_U16:
-		if constexpr (std::is_same_v<HostColT, flsgpu::host::RLEColumn<T, uint16_t>>) {
-			expr.col.rle_u16 = host_col.copy_to_device(stream);
-			return;
-		}
-		break;
-	default:
-		break;
-	}
-	throw std::runtime_error("fill_device_expr: plan/column type mismatch, plan=" +
-	                         std::to_string(static_cast<int>(plan)));
-}
-
 // Arena-based overload: packs column data into shared arena; pointers resolved on arena.upload().
 template <typename T, typename HostColT>
 void fill_device_expr(DeviceExpression<T>& expr,
@@ -510,38 +416,6 @@ template <typename... Ts>
 struct DeviceBatchSetFromList<dispatch::TypeList<Ts...>> {
 	using type = DeviceBatchSet<Ts...>;
 };
-
-template <typename T, typename HostColT>
-void add_expression_to_batch(const size_t    expr_index,
-                             const HostColT& host_col,
-                             const PlanKind  plan,
-                             Batch<T>&       batch,
-                             const bool      freq_prefetch_all_branchless = false,
-                             const bool      freq_hybrid_patcher          = false,
-                             const float     freq_branchless_threshold    = 6.0f,
-                             const cudaStream_t stream                    = nullptr) {
-	DeviceExpression<T> expr {};
-	expr.plan     = plan;
-	expr.n_values = host_col.get_n_values();
-	batch.device_outputs.emplace_back(expr.n_values, stream);
-	expr.out = batch.device_outputs.back().get();
-
-	bool use_freq_extended = false;
-	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
-		use_freq_extended = detail::should_use_freq_extended(
-		    host_col, freq_prefetch_all_branchless, freq_hybrid_patcher, freq_branchless_threshold);
-	}
-	detail::fill_device_expr(expr, host_col, plan, use_freq_extended, stream);
-
-	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size());
-	batch.device_exprs.push_back(expr);
-	batch.expr_indices.push_back(expr_index);
-
-	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
-	for (size_t vec = 0; vec < n_vecs; ++vec) {
-		batch.work_items.push_back(WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>()});
-	}
-}
 
 // Arena-based overload: emplaces expr into pre-reserved batch, packs column data into shared arena.
 // batch.device_exprs MUST be pre-reserved to avoid reallocation (resolver callbacks capture &out).
