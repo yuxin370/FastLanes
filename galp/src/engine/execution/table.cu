@@ -105,11 +105,14 @@ void materialize_table_workset(runtime::ExecutionWorkset&             workset,
 		using T = typename decltype(tag)::type;
 		materialize_table_batch(workset.host_batches.template get<T>(), rowgroups, expr_locations);
 		auto& device_batch = workset.device_batches.template get<T>();
-		device_batch.d_exprs.reset();
-		device_batch.d_items.reset();
+		device_batch.owned_exprs.reset();
+		device_batch.owned_items.reset();
+		device_batch.d_exprs = nullptr;
+		device_batch.d_items = nullptr;
 		device_batch.n_items = 0;
 	});
-	workset.d_slots.reset();
+	workset.owned_slots.reset();
+	workset.d_slots = nullptr;
 	workset.mixed_slots.clear();
 
 	for (auto& rowgroup : rowgroups) {

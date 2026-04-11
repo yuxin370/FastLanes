@@ -100,11 +100,14 @@ inline RowgroupData materialize_workset(ExecutionWorkset&                    wor
 		auto& batch = workset.host_batches.template get<T>();
 		dispatch::detail::finalize_batch(batch, result);
 		auto& device_batch = workset.device_batches.template get<T>();
-		device_batch.d_exprs.reset();
-		device_batch.d_items.reset();
+		device_batch.owned_exprs.reset();
+		device_batch.owned_items.reset();
+		device_batch.d_exprs = nullptr;
+		device_batch.d_items = nullptr;
 		device_batch.n_items = 0;
 	});
-	workset.d_slots.reset();
+	workset.owned_slots.reset();
+	workset.d_slots = nullptr;
 	workset.mixed_slots.clear();
 
 	apply_aliases(result, expressions, cfg);
@@ -125,11 +128,14 @@ inline void release_workset(ExecutionWorkset& workset) {
 		host_batch.expr_indices.clear();
 
 		auto& device_batch = workset.device_batches.template get<T>();
-		device_batch.d_exprs.reset();
-		device_batch.d_items.reset();
+		device_batch.owned_exprs.reset();
+		device_batch.owned_items.reset();
+		device_batch.d_exprs = nullptr;
+		device_batch.d_items = nullptr;
 		device_batch.n_items = 0;
 	});
-	workset.d_slots.reset();
+	workset.owned_slots.reset();
+	workset.d_slots = nullptr;
 	workset.mixed_slots.clear();
 	workset.chunk_arena.reset();
 	if (workset.h2d_stream != nullptr) {

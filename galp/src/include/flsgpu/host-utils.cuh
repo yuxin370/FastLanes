@@ -64,22 +64,21 @@ public:
 	}
 
 	void* alloc(size_t bytes) {
-		return alloc_on_stream(bytes, stream_);
+		return alloc_on_stream(bytes, nullptr);
 	}
 
 	void* alloc_on_stream(size_t bytes, cudaStream_t stream) {
 		if (bytes == 0) {
 			return nullptr;
 		}
-		const auto use_stream = stream != nullptr ? stream : stream_;
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (enabled_) {
 			if (use_async_) {
-				auto& free_list = free_async_by_stream_size_[stream_key(use_stream)][bytes];
+				auto& free_list = free_async_by_stream_size_[stream_key(stream)][bytes];
 				if (!free_list.empty()) {
 					void* ptr = free_list.back();
 					free_list.pop_back();
-					in_use_[ptr] = DeviceAllocInfo {bytes, true, use_stream};
+					in_use_[ptr] = DeviceAllocInfo {bytes, true, stream};
 					return ptr;
 				}
 			} else {
@@ -96,7 +95,7 @@ public:
 		void* ptr         = nullptr;
 		bool  async_alloc = false;
 		if (use_async_) {
-			auto status = cudaMallocAsync(&ptr, bytes, use_stream);
+			auto status = cudaMallocAsync(&ptr, bytes, stream);
 			if (status == cudaSuccess) {
 				async_alloc = true;
 			} else {
@@ -107,7 +106,7 @@ public:
 			CUDA_SAFE_CALL(cudaMalloc(&ptr, bytes));
 			async_alloc = false;
 		}
-		in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? use_stream : nullptr};
+		in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? stream : nullptr};
 		return ptr;
 	}
 
@@ -128,37 +127,13 @@ public:
 	}
 
 
-	void free(void* ptr) {
-		if (ptr == nullptr) {
-			return;
-		}
-		std::lock_guard<std::mutex> lock(mutex_);
-		auto                        it = in_use_.find(ptr);
-		if (it != in_use_.end()) {
-			if (it->second.sub_alloc) {
-				in_use_.erase(it);
-				return; // arena sub-pointer: no actual free
-			}
-			const auto info = it->second;
-			in_use_.erase(it);
-			if (enabled_) {
-				if (info.async_alloc) {
-					free_async_by_stream_size_[stream_key(info.alloc_stream)][info.size].push_back(ptr);
-				} else {
-					free_sync_by_size_[info.size].push_back(ptr);
-				}
-				return;
-			}
-			if (info.async_alloc) {
-				CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream != nullptr ? info.alloc_stream : stream_));
-				return;
-			}
-			CUDA_SAFE_CALL(cudaFree(ptr));
-			return;
-		}
-
-		CUDA_SAFE_CALL(cudaFree(ptr));
-	}
+	// free() calls cudaFree if ptr is not tracked (legacy non-pool pointer fallback).
+	// release_arena_ptr() silently no-ops instead — used by DeviceArena destructor
+	// so that sub-pointers and device_base_ already cleaned up by free_device_expr()
+	// don't crash via cudaFree on an interior address (cudaErrorInvalidValue) or
+	// double-free device_base_ out of the pool free-list.
+	void free(void* ptr)              { do_free(ptr, /*fallback_cudafree=*/true);  }
+	void release_arena_ptr(void* ptr) { do_free(ptr, /*fallback_cudafree=*/false); }
 
 	void* alloc_pinned(size_t bytes) {
 		if (bytes == 0) {
@@ -175,39 +150,35 @@ public:
 		if (bytes == 0) {
 			return;
 		}
-		const auto use_stream = stream != nullptr ? stream : stream_;
-		CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned_src, bytes, cudaMemcpyHostToDevice, use_stream));
+		CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned_src, bytes, cudaMemcpyHostToDevice, stream));
 		cudaEvent_t event {};
 		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-		CUDA_SAFE_CALL(cudaEventRecord(event, use_stream));
+		CUDA_SAFE_CALL(cudaEventRecord(event, stream));
 		std::lock_guard<std::mutex> lock(mutex_);
-		pending_copy_events_[stream_key(use_stream)].push_back(PendingCopyEvent {event, pinned_src});
+		pending_copy_events_[stream_key(stream)].push_back(PendingCopyEvent {event, pinned_src});
 	}
 
 	void copy_h2d(void* dst, const void* src, size_t bytes) {
-		copy_h2d_on_stream(dst, src, bytes, stream_);
+		copy_h2d_on_stream(dst, src, bytes, nullptr);
 	}
 
 	void copy_h2d_on_stream(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
 		if (bytes == 0) {
 			return;
 		}
-		const auto use_stream = stream != nullptr ? stream : stream_;
-
 		void* pinned = nullptr;
 		if (use_pinned_ && bytes > small_copy_threshold_) {
 			pinned = alloc_pinned(bytes);
 			std::memcpy(pinned, src, bytes);
-			CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned, bytes, cudaMemcpyHostToDevice, use_stream));
+			CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned, bytes, cudaMemcpyHostToDevice, stream));
 		} else {
-			CUDA_SAFE_CALL(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, use_stream));
+			CUDA_SAFE_CALL(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
 		}
-
 		cudaEvent_t event {};
 		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-		CUDA_SAFE_CALL(cudaEventRecord(event, use_stream));
+		CUDA_SAFE_CALL(cudaEventRecord(event, stream));
 		std::lock_guard<std::mutex> lock(mutex_);
-		pending_copy_events_[stream_key(use_stream)].push_back(PendingCopyEvent {event, pinned});
+		pending_copy_events_[stream_key(stream)].push_back(PendingCopyEvent {event, pinned});
 	}
 
 	void sync_h2d() {
@@ -242,13 +213,12 @@ public:
 	}
 
 	void sync_h2d(cudaStream_t source_stream) {
-		const auto src_stream = source_stream != nullptr ? source_stream : stream_;
-		CUDA_SAFE_CALL(cudaStreamSynchronize(src_stream));
+		CUDA_SAFE_CALL(cudaStreamSynchronize(source_stream));
 
 		// Erase all pending records keyed by this stream before the caller destroys it.
 		// This prevents stale-key reuse if CUDA later recycles the same stream handle value.
 		std::lock_guard<std::mutex> lock(mutex_);
-		auto it = pending_copy_events_.find(stream_key(src_stream));
+		auto it = pending_copy_events_.find(stream_key(source_stream));
 		if (it != pending_copy_events_.end()) {
 			for (auto& pending : it->second) {
 				if (pending.event != nullptr) {
@@ -259,11 +229,6 @@ public:
 			}
 			pending_copy_events_.erase(it);
 		}
-
-	}
-
-	cudaStream_t stream() const {
-		return stream_;
 	}
 
 	void set_enabled(bool enabled) {
@@ -290,11 +255,19 @@ public:
 	~DevicePool() {
 		sync_h2d();
 
-		if (!in_use_.empty()) {
-			fprintf(stderr, "DevicePool warning: %zu in-use device allocations at shutdown; forcing free.\n", in_use_.size());
+		{
+			size_t real_leaks = 0;
+			for (auto& [ptr, info] : in_use_) {
+				(void)ptr;
+				if (!info.sub_alloc) ++real_leaks;
+			}
+			if (real_leaks > 0) {
+				fprintf(stderr, "DevicePool warning: %zu in-use device allocations at shutdown; forcing free.\n",
+				        real_leaks);
+			}
 		}
 		for (auto& [ptr, info] : in_use_) {
-			if (info.sub_alloc) continue; // skip arena sub-pointers
+			if (info.sub_alloc) continue; // interior arena pointer — no standalone cudaFree
 			cudaFree(ptr);
 		}
 		in_use_.clear();
@@ -348,6 +321,39 @@ private:
 		return reinterpret_cast<cudaStream_t>(key);
 	}
 
+	void do_free(void* ptr, bool fallback_cudafree) {
+		if (ptr == nullptr) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto                        it = in_use_.find(ptr);
+		if (it == in_use_.end()) {
+			if (fallback_cudafree) {
+				CUDA_SAFE_CALL(cudaFree(ptr));
+			}
+			return;
+		}
+		if (it->second.sub_alloc) {
+			in_use_.erase(it);
+			return; // arena sub-pointer: no actual GPU free
+		}
+		const auto info = it->second;
+		in_use_.erase(it);
+		if (enabled_) {
+			if (info.async_alloc) {
+				free_async_by_stream_size_[stream_key(info.alloc_stream)][info.size].push_back(ptr);
+			} else {
+				free_sync_by_size_[info.size].push_back(ptr);
+			}
+			return;
+		}
+		if (info.async_alloc) {
+			CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream));
+			return;
+		}
+		CUDA_SAFE_CALL(cudaFree(ptr));
+	}
+
 	void release_pinned_locked(void*& pinned) {
 		if (pinned == nullptr) {
 			return;
@@ -386,7 +392,14 @@ private:
 
 	void assert_idle_for_reconfiguration_locked(const char* api_name) {
 		reclaim_finished_locked();
-		if (!pending_copy_events_.empty() || !in_use_.empty() || !pinned_in_use_.empty()) {
+		// sub_alloc entries are phantom bookkeeping entries for arena interior pointers
+		// and do not represent actual live GPU allocations — exclude them from the check.
+		bool has_real_allocs = false;
+		for (auto& [ptr, info] : in_use_) {
+			(void)ptr;
+			if (!info.sub_alloc) { has_real_allocs = true; break; }
+		}
+		if (!pending_copy_events_.empty() || has_real_allocs || !pinned_in_use_.empty()) {
 			throw std::runtime_error(std::string("DevicePool::") + api_name +
 			                         " requires idle pool (no in-flight copies or live allocations)");
 		}
@@ -421,16 +434,13 @@ private:
 		}
 	}
 
-	DevicePool() {
-		stream_ = 0;
-	}
+	DevicePool() = default;
 
 	std::mutex   mutex_;
 	bool         enabled_              = true;
 	bool         use_async_            = true;
 	bool         use_pinned_           = true;
 	size_t       small_copy_threshold_ = 256 * 1024;
-	cudaStream_t stream_               = nullptr;
 
 	std::unordered_map<size_t, std::vector<void*>>                                      free_sync_by_size_;
 	std::unordered_map<StreamKey, std::unordered_map<size_t, std::vector<void*>>> free_async_by_stream_size_;
@@ -487,6 +497,18 @@ class DeviceArena {
 public:
 	explicit DeviceArena(cudaStream_t stream) : stream_(stream) {}
 	~DeviceArena() {
+		if (device_base_ != nullptr) {
+			// release_arena_ptr silently no-ops when a pointer is no longer in
+			// DevicePool::in_use_ (e.g. already cleaned by free_device_expr()).
+			// This prevents cudaFree on interior sub-pointers (cudaErrorInvalidValue)
+			// and double-frees of device_base_ that would corrupt the pool free-list.
+			auto& pool = DevicePool::instance();
+			for (size_t i = 1; i < entries_.size(); ++i) {
+				pool.release_arena_ptr(device_base_ + entries_[i].offset);
+			}
+			pool.release_arena_ptr(device_base_);
+			device_base_ = nullptr;
+		}
 		run_deferred_frees();
 	}
 
@@ -518,7 +540,10 @@ public:
 		deferred_frees_.push_back(std::move(fn));
 	}
 
-	void upload() {
+	void upload(bool resolve_before_pack = false) {
+		if (device_base_ != nullptr) {
+			throw std::runtime_error("DeviceArena::upload() called more than once on the same arena");
+		}
 		if (total_bytes_ == 0 || entries_.empty()) {
 			for (auto& fn : resolvers_) {
 				fn();
@@ -537,6 +562,13 @@ public:
 		// Single device allocation (arena)
 		device_base_ = reinterpret_cast<char*>(pool.alloc_on_stream(alloc_bytes, stream_));
 
+		if (resolve_before_pack) {
+			for (auto& fn : resolvers_) {
+				fn();
+			}
+			resolvers_.clear();
+		}
+
 		// Pack all sub-arrays into a single pinned buffer, then queue ONE H2D copy.
 		void* pinned = pool.alloc_pinned(alloc_bytes);
 		for (const auto& e : entries_) {
@@ -547,13 +579,17 @@ public:
 		pool.queue_staged_h2d(device_base_, pinned, total_bytes_, stream_);
 
 		// Register sub-pointers so that free_device_pointer on them is a no-op.
-		// The first entry is at the arena base and keeps the real allocation.
+		// Entry 0 is at offset 0 (= device_base_) and keeps the real allocation;
+		// entries 1..n-1 are interior offsets and must be no-ops on individual free.
+		// register_sub_allocation guards against re-registering device_base_ itself
+		// in the degenerate case where a zero-sized entry aliases offset 0.
 		for (size_t i = 1; i < entries_.size(); ++i) {
-			void* sub_ptr = device_base_ + entries_[i].offset;
-			pool.register_sub_allocation(sub_ptr);
+			pool.register_sub_allocation(device_base_ + entries_[i].offset);
 		}
 
-		// Invoke resolver callbacks to populate device column pointers.
+		// Invoke resolver callbacks to populate device pointers unless they were
+		// already executed before packing (needed when metadata in the packed
+		// host buffer depends on arena-resolved device addresses).
 		for (auto& fn : resolvers_) {
 			fn();
 		}

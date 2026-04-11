@@ -126,6 +126,7 @@ void accumulate_rowgroup_stats(TableBenchmarkResult& result,
                                const size_t          rg_columns,
                                const size_t          rg_vectors,
                                const size_t          bytes,
+                               const size_t          payload_arena_bytes,
                                const double          read_rowgroup_ms,
                                const double          assemble_expr_ms,
                                const double          append_expr_ms,
@@ -147,6 +148,7 @@ void accumulate_rowgroup_stats(TableBenchmarkResult& result,
 	result.total_columns += rg_columns;
 	result.total_items += rg_vectors;
 	result.total_bytes += bytes;
+	result.total_payload_arena_bytes += payload_arena_bytes;
 	++result.total_rgs;
 }
 
@@ -234,6 +236,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			                          rg_columns,
 			                          rg_vectors,
 			                          bytes,
+			                          workset.payload_arena_bytes,
 			                          read_rowgroup_ms,
 			                          assemble_expr_ms,
 			                          append_expr_ms,
@@ -274,6 +277,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			runtime::upload_workset(workset);
 			const auto upload_end = std::chrono::steady_clock::now();
 			out.upload_workset_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+			out.total_payload_arena_bytes += workset.payload_arena_bytes;
 
 			size_t chunk_launch_grid = 0;
 			size_t chunk_launches    = 0;
@@ -363,6 +367,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		runtime::upload_workset(chunk.workset);
 		const auto upload_end = std::chrono::steady_clock::now();
 		out.upload_workset_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+		out.total_payload_arena_bytes += chunk.workset.payload_arena_bytes;
 
 		const bool warmup_once = !did_warmup;
 		chunk.run = runtime::run_workset_async(

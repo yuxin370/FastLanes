@@ -350,6 +350,7 @@ int main(int argc, char** argv) {
 			const size_t total_columns     = result.total_columns;
 			const size_t total_items       = result.total_items;
 			const size_t total_bytes       = result.total_bytes;
+			const size_t total_payload_arena_bytes  = result.total_payload_arena_bytes;
 			const size_t total_rgs         = result.total_rgs;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
@@ -366,6 +367,7 @@ int main(int argc, char** argv) {
 			std::cout << "  assemble_expr_ms: " << assemble_expr_ms << "\n";
 			std::cout << "  append_expr_ms: " << append_expr_ms << "\n";
 			std::cout << "  upload_workset_ms: " << upload_workset_ms << "\n";
+			std::cout << "  payload_arena_bytes: " << total_payload_arena_bytes << "\n";
 			std::cout << "  kernel_event_ms: " << kernel_event_ms << "\n";
 			std::cout << "  release_device_ms: " << release_device_ms << "\n";
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";

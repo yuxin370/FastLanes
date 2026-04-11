@@ -389,9 +389,11 @@ struct BatchSetFromList<dispatch::TypeList<Ts...>> {
 
 template <typename T>
 struct DeviceBatch {
-	std::optional<GPUArray<DeviceExpression<T>>> d_exprs;
-	std::optional<GPUArray<WorkItemAny>>         d_items;
-	size_t                                       n_items = 0;
+	std::optional<GPUArray<DeviceExpression<T>>> owned_exprs;
+	std::optional<GPUArray<WorkItemAny>>         owned_items;
+	DeviceExpression<T>* d_exprs = nullptr;
+	WorkItemAny*         d_items = nullptr;
+	size_t               n_items = 0;
 };
 
 template <typename... Ts>

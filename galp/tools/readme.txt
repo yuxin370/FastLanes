@@ -86,7 +86,6 @@ Options
                                     patcher. Requires --freq-prefetch-all-branchless.
   --freq-branchless-threshold N     Hybrid cutoff: average exceptions per vector (default: 6).
                                     Requires both --freq-prefetch-all-branchless and --freq-hybrid-patcher.
-
 Environment Variables
   GALP_DISABLE_ASYNC_H2D=1          Disable dedicated h2d_stream entirely; GPU allocation and
                                     H2D transfers fall back to the default stream.
@@ -116,6 +115,7 @@ Notes
 H2D Transfer Architecture
   A workset uses a shared DeviceArena to aggregate all appended expressions into one
   staged upload. Each column packs its sub-arrays via copy_to_device(arena, out), and
-  arena.upload() performs one aggregated allocation/upload for the workset. Resolver
-  callbacks populate device column pointers after upload. Allocation sizes are rounded
+  arena.upload() performs one aggregated allocation/upload for the workset. Execution
+  metadata (DeviceExpression arrays, work items, mixed slots) is packed into the same
+  arena so the entire workset is transferred in a single H2D operation. Allocation sizes are rounded
   to power-of-2 buckets (min 64KB) for DevicePool cache efficiency.

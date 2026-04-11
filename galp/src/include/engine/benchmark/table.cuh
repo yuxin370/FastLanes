@@ -47,6 +47,7 @@ struct TableBenchmarkResult {
 	size_t   total_columns     = 0;
 	size_t   total_items       = 0;
 	size_t   total_bytes       = 0;
+	size_t   total_payload_arena_bytes = 0;
 	size_t   total_rgs         = 0;
 	uint32_t samples           = 1;
 };
