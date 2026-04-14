@@ -497,18 +497,8 @@ class DeviceArena {
 public:
 	explicit DeviceArena(cudaStream_t stream) : stream_(stream) {}
 	~DeviceArena() {
-		if (device_base_ != nullptr) {
-			// release_arena_ptr silently no-ops when a pointer is no longer in
-			// DevicePool::in_use_ (e.g. already cleaned by free_device_expr()).
-			// This prevents cudaFree on interior sub-pointers (cudaErrorInvalidValue)
-			// and double-frees of device_base_ that would corrupt the pool free-list.
-			auto& pool = DevicePool::instance();
-			for (size_t i = 1; i < entries_.size(); ++i) {
-				pool.release_arena_ptr(device_base_ + entries_[i].offset);
-			}
-			pool.release_arena_ptr(device_base_);
-			device_base_ = nullptr;
-		}
+		release_registered_sub_allocations();
+		release_device_base();
 		run_deferred_frees();
 	}
 
@@ -540,10 +530,16 @@ public:
 		deferred_frees_.push_back(std::move(fn));
 	}
 
+	void reset() {
+		release_registered_sub_allocations();
+		release_device_base();
+		run_deferred_frees();
+		total_bytes_ = 0;
+		entries_.clear();
+		resolvers_.clear();
+	}
+
 	void upload(bool resolve_before_pack = false) {
-		if (device_base_ != nullptr) {
-			throw std::runtime_error("DeviceArena::upload() called more than once on the same arena");
-		}
 		if (total_bytes_ == 0 || entries_.empty()) {
 			for (auto& fn : resolvers_) {
 				fn();
@@ -559,8 +555,7 @@ public:
 		// causing expensive cudaMallocAsync/cudaMallocHost on every chunk.
 		const size_t alloc_bytes = round_up_pow2(total_bytes_, 65536U);
 
-		// Single device allocation (arena)
-		device_base_ = reinterpret_cast<char*>(pool.alloc_on_stream(alloc_bytes, stream_));
+		ensure_capacity(alloc_bytes);
 
 		if (resolve_before_pack) {
 			for (auto& fn : resolvers_) {
@@ -578,13 +573,17 @@ public:
 		}
 		pool.queue_staged_h2d(device_base_, pinned, total_bytes_, stream_);
 
+		release_registered_sub_allocations();
+
 		// Register sub-pointers so that free_device_pointer on them is a no-op.
 		// Entry 0 is at offset 0 (= device_base_) and keeps the real allocation;
 		// entries 1..n-1 are interior offsets and must be no-ops on individual free.
 		// register_sub_allocation guards against re-registering device_base_ itself
 		// in the degenerate case where a zero-sized entry aliases offset 0.
 		for (size_t i = 1; i < entries_.size(); ++i) {
-			pool.register_sub_allocation(device_base_ + entries_[i].offset);
+			auto* sub_ptr = device_base_ + entries_[i].offset;
+			pool.register_sub_allocation(sub_ptr);
+			registered_sub_allocations_.push_back(sub_ptr);
 		}
 
 		// Invoke resolver callbacks to populate device pointers unless they were
@@ -613,6 +612,38 @@ public:
 	}
 
 private:
+	void ensure_capacity(const size_t alloc_bytes) {
+		if (device_base_ != nullptr && capacity_bytes_ >= alloc_bytes) {
+			return;
+		}
+		release_registered_sub_allocations();
+		release_device_base();
+		auto& pool  = DevicePool::instance();
+		device_base_ = reinterpret_cast<char*>(pool.alloc_on_stream(alloc_bytes, stream_));
+		capacity_bytes_ = alloc_bytes;
+	}
+
+	void release_registered_sub_allocations() {
+		if (registered_sub_allocations_.empty()) {
+			return;
+		}
+		auto& pool = DevicePool::instance();
+		for (auto* ptr : registered_sub_allocations_) {
+			pool.release_arena_ptr(ptr);
+		}
+		registered_sub_allocations_.clear();
+	}
+
+	void release_device_base() {
+		if (device_base_ == nullptr) {
+			return;
+		}
+		auto& pool = DevicePool::instance();
+		pool.release_arena_ptr(device_base_);
+		device_base_    = nullptr;
+		capacity_bytes_ = 0;
+	}
+
 	void run_deferred_frees() {
 		for (auto& fn : deferred_frees_) {
 			fn();
@@ -638,8 +669,10 @@ private:
 
 	cudaStream_t                       stream_      = nullptr;
 	char*                              device_base_ = nullptr;
+	size_t                             capacity_bytes_ = 0;
 	size_t                             total_bytes_ = 0;
 	std::vector<Entry>                 entries_;
+	std::vector<char*>                 registered_sub_allocations_;
 	std::vector<std::function<void()>> resolvers_;
 	std::vector<std::function<void()>> deferred_frees_;
 };

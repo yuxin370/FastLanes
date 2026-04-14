@@ -27,6 +27,8 @@ struct TableBenchmarkConfig {
 	}();
 	bool                  use_zero_copy_parse         = true;
 	bool                  enable_streaming            = true;
+	bool                  enable_rowgroup_prefetch    = true;
+	size_t                prefetch_depth              = 2;
 	size_t                streaming_target_work_items = 1u << 18;
 	size_t                streaming_target_rowgroups  = 8; // 0 means disable rowgroup-cap flushing.
 	std::optional<size_t> rowgroup;
@@ -41,6 +43,7 @@ struct TableBenchmarkResult {
 	double kernel_ms         = 0.0; // accumulated GPU event time returned by run_workset*
 	double release_device_ms = 0.0; // runtime::release_workset stage
 	double free_rowgroup_ms  = 0.0; // free_rowgroup stage
+	double prefetch_wait_ms  = 0.0; // time waiting for prefetched rowgroups to become available
 
 	size_t   total_launches    = 0;
 	size_t   total_launch_grid = 0;
@@ -48,6 +51,7 @@ struct TableBenchmarkResult {
 	size_t   total_items       = 0;
 	size_t   total_bytes       = 0;
 	size_t   total_payload_arena_bytes = 0;
+	size_t   prefetched_rowgroups      = 0;
 	size_t   total_rgs         = 0;
 	uint32_t samples           = 1;
 };

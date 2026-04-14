@@ -50,6 +50,8 @@ struct Options {
 	bool                                 freq_hybrid_patcher          = false;
 	float                                freq_branchless_threshold    = 6.0f;
 	bool                                 use_zero_copy_parse          = true;
+	bool                                 enable_rowgroup_prefetch     = true;
+	size_t                               prefetch_depth               = 2;
 	size_t                               stream_target_work_items     = 1u << 18;
 	size_t                               stream_max_rowgroups         = 8;
 };
@@ -88,6 +90,8 @@ void print_usage(const char* prog) {
 	          << "  --no-mixed-dispatch  Use typed-batch launches instead of mixed-dispatch (default: mixed)\n"
 	          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
 	          << "  --no-zero-copy     Disable zero-copy rowgroup parsing (default: enabled)\n"
+	          << "  --no-rowgroup-prefetch  Disable background rowgroup prefetch in whole-table benchmark\n"
+	          << "  --prefetch-depth N  Number of prefetched rowgroups to queue ahead (default: 2)\n"
 	          << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table benchmark "
 	             "(default: 262144)\n"
 	          << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table benchmark (default: 8, "
@@ -159,6 +163,14 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--zero-copy-parse") {
 			opt.use_zero_copy_parse = true;
+			continue;
+		}
+		if (arg == "--no-rowgroup-prefetch") {
+			opt.enable_rowgroup_prefetch = false;
+			continue;
+		}
+		if (arg == "--prefetch-depth" && i + 1 < argc) {
+			opt.prefetch_depth = static_cast<size_t>(std::stoull(argv[++i]));
 			continue;
 		}
 		if (arg == "--stream-target-work-items" && i + 1 < argc) {
@@ -332,6 +344,8 @@ int main(int argc, char** argv) {
 			bench_cfg.execution.freq_branchless_threshold    = opt.freq_branchless_threshold;
 			bench_cfg.use_zero_copy_parse                    = opt.use_zero_copy_parse;
 			bench_cfg.enable_streaming                       = opt.benchmark_streaming;
+			bench_cfg.enable_rowgroup_prefetch               = opt.enable_rowgroup_prefetch;
+			bench_cfg.prefetch_depth                         = opt.prefetch_depth;
 			bench_cfg.streaming_target_work_items            = opt.stream_target_work_items;
 			bench_cfg.streaming_target_rowgroups             = opt.stream_max_rowgroups;
 			bench_cfg.rowgroup                               = opt.rowgroup;
@@ -345,12 +359,14 @@ int main(int argc, char** argv) {
 			const double kernel_event_ms   = result.kernel_ms;
 			const double release_device_ms = result.release_device_ms;
 			const double free_rowgroup_ms  = result.free_rowgroup_ms;
+			const double prefetch_wait_ms  = result.prefetch_wait_ms;
 			const size_t total_launches    = result.total_launches;
 			const size_t total_launch_grid = result.total_launch_grid;
 			const size_t total_columns     = result.total_columns;
 			const size_t total_items       = result.total_items;
 			const size_t total_bytes       = result.total_bytes;
 			const size_t total_payload_arena_bytes  = result.total_payload_arena_bytes;
+			const size_t prefetched_rowgroups       = result.prefetched_rowgroups;
 			const size_t total_rgs         = result.total_rgs;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
@@ -371,6 +387,8 @@ int main(int argc, char** argv) {
 			std::cout << "  kernel_event_ms: " << kernel_event_ms << "\n";
 			std::cout << "  release_device_ms: " << release_device_ms << "\n";
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";
+			std::cout << "  prefetch_wait_ms: " << prefetch_wait_ms << "\n";
+			std::cout << "  prefetched_rowgroups: " << prefetched_rowgroups << "\n";
 			// Backward-compatible aliases for existing scripts.
 			std::cout << "  end_to_end_ms: " << benchmark_wall_ms << "\n";
 			std::cout << "  kernel_ms: " << kernel_event_ms << "\n";
@@ -381,6 +399,8 @@ int main(int argc, char** argv) {
 			          << ((opt.mega_kernel && opt.benchmark_streaming && !opt.rowgroup.has_value()) ? 1 : 0) << "\n";
 			std::cout << "  stream_target_work_items: " << opt.stream_target_work_items << "\n";
 			std::cout << "  stream_max_rowgroups: " << opt.stream_max_rowgroups << "\n";
+			std::cout << "  rowgroup_prefetch: " << (opt.enable_rowgroup_prefetch ? 1 : 0) << "\n";
+			std::cout << "  prefetch_depth: " << opt.prefetch_depth << "\n";
 			std::cout << "  write_back: " << (opt.write_back ? 1 : 0) << "\n";
 			std::cout << "  zero_copy_parse: " << (opt.use_zero_copy_parse ? 1 : 0) << "\n";
 			std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";

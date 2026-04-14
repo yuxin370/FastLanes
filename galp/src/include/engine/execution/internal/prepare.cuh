@@ -78,14 +78,13 @@ inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t a
 }
 
 inline bool begin_workset_chunk_arena(ExecutionWorkset& workset, const size_t additional_exprs) {
+	reserve_batch_expr_storage(workset, additional_exprs);
 	if (workset.chunk_arena) {
 		return true;
 	}
 	// Resolver callbacks created while appending expressions may capture references
-	// into batch.device_exprs. Reserve only before the arena exists so later
-	// append_expressions() calls cannot relocate those vectors out from under
-	// already-registered callbacks.
-	reserve_batch_expr_storage(workset, additional_exprs);
+	// into batch.device_exprs. Reserve before append_expressions() starts for each
+	// new chunk/workset so vector growth cannot relocate those references mid-build.
 	workset.chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(ensure_workset_h2d_stream(workset));
 	return true;
 }

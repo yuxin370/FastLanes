@@ -52,6 +52,7 @@ Benchmark output metrics
   kernel_event_ms                  Accumulated GPU event time spent inside benchmark kernel launches.
   read_rowgroup_ms / append_expr_ms / upload_workset_ms / ...
                                    Host-side stage timings accumulated by stage.
+  prefetch_wait_ms                 Time the consumer waited for background rowgroup prefetch.
   Notes:
   - In streaming mode, host stages and GPU execution can overlap, so the stage sums may exceed
     benchmark_wall_ms.
@@ -76,6 +77,8 @@ Options
                                     instead of mixed-dispatch (default: mixed-dispatch, one launch).
   --no-zero-copy                    Disable zero-copy rowgroup parsing; use the traditional
                                     parse-and-copy path (default: zero-copy enabled).
+  --no-rowgroup-prefetch           Disable background rowgroup prefetch in whole-table benchmark.
+  --prefetch-depth N               Number of rowgroups to prefetch ahead (default: 2).
   --write-back                      Force benchmark kernels to write decompressed outputs to global memory.
   --stream-target-work-items N      Chunk flush threshold by work_items in whole-table streaming
                                     benchmark (default: 262144).
@@ -94,6 +97,7 @@ Defaults
   All optimizations are enabled by default:
   - Mixed-dispatch (single kernel launch per sample per chunk)
   - Streaming double-buffer pipeline (async overlap of H2D and kernel)
+  - Background rowgroup prefetch in whole-table benchmark mode
   - Zero-copy rowgroup parsing (host columns point into backing buffer)
   - Shared DeviceArena per workset / chunk (single staged allocation and upload for appended expressions)
   - Async h2d_stream for overlapping uploads with compute

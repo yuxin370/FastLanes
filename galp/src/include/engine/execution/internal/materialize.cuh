@@ -115,7 +115,7 @@ inline RowgroupData materialize_workset(ExecutionWorkset&                    wor
 	return result;
 }
 
-inline void release_workset(ExecutionWorkset& workset) {
+inline void release_workset(ExecutionWorkset& workset, const bool preserve_resources = false) {
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
 		auto& host_batch = workset.host_batches.template get<T>();
@@ -137,20 +137,28 @@ inline void release_workset(ExecutionWorkset& workset) {
 	workset.owned_slots.reset();
 	workset.d_slots = nullptr;
 	workset.mixed_slots.clear();
-	workset.chunk_arena.reset();
 	if (workset.h2d_stream != nullptr) {
 		flsgpu::memory::sync_h2d(workset.h2d_stream);
+	}
+	if (workset.chunk_arena != nullptr) {
+		if (preserve_resources) {
+			workset.chunk_arena->reset();
+		} else {
+			workset.chunk_arena.reset();
+		}
+	}
+	if (!preserve_resources && workset.h2d_stream != nullptr) {
 		if (workset.h2d_ready_event != nullptr) {
 			CUDA_SAFE_CALL(cudaEventDestroy(workset.h2d_ready_event));
 			workset.h2d_ready_event = nullptr;
 		}
 		CUDA_SAFE_CALL(cudaStreamDestroy(workset.h2d_stream));
 		workset.h2d_stream = nullptr;
-	} else if (workset.h2d_ready_event != nullptr) {
+	} else if (!preserve_resources && workset.h2d_ready_event != nullptr) {
 		CUDA_SAFE_CALL(cudaEventDestroy(workset.h2d_ready_event));
 		workset.h2d_ready_event = nullptr;
 	}
-	if (workset.compute_stream != nullptr) {
+	if (!preserve_resources && workset.compute_stream != nullptr) {
 		CUDA_SAFE_CALL(cudaStreamDestroy(workset.compute_stream));
 		workset.compute_stream = nullptr;
 	}

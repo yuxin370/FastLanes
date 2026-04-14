@@ -14,10 +14,16 @@
 #include "fls/file/file_header.hpp"
 #include "fls/footer/datatype_generated.h"
 #include "fls/footer/table_descriptor.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace dispatch {
 namespace {
@@ -112,6 +118,117 @@ struct StreamingBenchmarkChunk {
 	bool                       submitted   = false;
 };
 
+struct RowgroupReadResult {
+	reader::Rowgroup rowgroup {};
+	double           read_ms = 0.0;
+};
+
+class RowgroupPrefetchQueue {
+public:
+	RowgroupPrefetchQueue(const std::filesystem::path& file_path,
+	                      const size_t                start,
+	                      const size_t                end,
+	                      const bool                  use_zero_copy_parse,
+	                      const size_t                depth)
+	    : depth_(std::max<size_t>(1, depth))
+	    , worker_([this, file_path, start, end, use_zero_copy_parse]() {
+		    try {
+			    reader::reader rdr(file_path);
+			    for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
+				    const auto read_start = std::chrono::steady_clock::now();
+				    auto       rowgroup   = use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
+				                                                : rdr.read_rowgroup(rg_idx);
+				    const auto read_end = std::chrono::steady_clock::now();
+				    Prefetched prefetched {
+				        std::move(rowgroup),
+				        std::chrono::duration<double, std::milli>(read_end - read_start).count(),
+				    };
+
+				    std::unique_lock<std::mutex> lock(mutex_);
+				    cv_not_full_.wait(lock, [&]() { return stop_ || queue_.size() < depth_; });
+				    if (stop_) {
+					    return;
+				    }
+				    queue_.push_back(std::move(prefetched));
+				    cv_not_empty_.notify_one();
+			    }
+		    } catch (...) {
+			    std::lock_guard<std::mutex> lock(mutex_);
+			    error_ = std::current_exception();
+		    }
+
+		    std::lock_guard<std::mutex> lock(mutex_);
+		    done_ = true;
+		    cv_not_empty_.notify_all();
+	    }) {
+	}
+
+	~RowgroupPrefetchQueue() {
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			stop_ = true;
+		}
+		cv_not_full_.notify_all();
+		cv_not_empty_.notify_all();
+		if (worker_.joinable()) {
+			worker_.join();
+		}
+	}
+
+	RowgroupReadResult pop() {
+		const auto         wait_start = std::chrono::steady_clock::now();
+		std::exception_ptr pending_error;
+		Prefetched         item;
+		bool               underflow = false;
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			cv_not_empty_.wait(lock, [&]() { return stop_ || !queue_.empty() || done_ || error_ != nullptr; });
+			const auto wait_end = std::chrono::steady_clock::now();
+			wait_ms_ += std::chrono::duration<double, std::milli>(wait_end - wait_start).count();
+
+			if (error_ != nullptr) {
+				pending_error = error_;
+			} else if (queue_.empty()) {
+				underflow = true;
+			} else {
+				item = std::move(queue_.front());
+				queue_.pop_front();
+			}
+		}
+		cv_not_full_.notify_one();
+
+		if (pending_error) {
+			std::rethrow_exception(pending_error);
+		}
+		if (underflow) {
+			throw std::runtime_error("rowgroup prefetch queue underflow");
+		}
+		return RowgroupReadResult {std::move(item.rowgroup), item.read_ms};
+	}
+
+	// Only safe to call from the consumer thread (the one that owns pop()).
+	double wait_ms() const {
+		return wait_ms_;
+	}
+
+private:
+	struct Prefetched {
+		reader::Rowgroup rowgroup {};
+		double           read_ms = 0.0;
+	};
+
+	size_t                      depth_     = 1;
+	std::thread                 worker_;
+	mutable std::mutex          mutex_;
+	std::condition_variable     cv_not_empty_;
+	std::condition_variable     cv_not_full_;
+	std::deque<Prefetched>      queue_;
+	std::exception_ptr          error_;
+	bool                        done_      = false;
+	bool                        stop_      = false;
+	double                      wait_ms_ = 0.0;
+};
+
 void reset_streaming_chunk(StreamingBenchmarkChunk& chunk) {
 	chunk.pending_rowgroups.clear();
 	chunk.work_items  = 0;
@@ -180,8 +297,12 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	if (cfg.streaming_target_work_items == 0) {
 		throw std::invalid_argument("streaming_target_work_items must be > 0");
 	}
+	if (cfg.prefetch_depth == 0) {
+		throw std::invalid_argument("prefetch_depth must be > 0");
+	}
 	const size_t stream_target_work_items = cfg.streaming_target_work_items;
 	const size_t stream_target_rowgroups  = cfg.streaming_target_rowgroups;
+	const bool   use_rowgroup_prefetch    = whole_table && cfg.enable_rowgroup_prefetch;
 
 	if (!whole_table) {
 		for (size_t rg_idx = start; rg_idx < end; ++rg_idx) {
@@ -252,6 +373,28 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		return out;
 	}
 
+	std::unique_ptr<RowgroupPrefetchQueue> prefetch_queue;
+	if (use_rowgroup_prefetch) {
+		prefetch_queue = std::make_unique<RowgroupPrefetchQueue>(
+		    fls_path, start, end, cfg.use_zero_copy_parse, cfg.prefetch_depth);
+	}
+
+	const auto fetch_rowgroup = [&](const size_t rg_idx) -> reader::Rowgroup {
+		RowgroupReadResult result {};
+		if (prefetch_queue) {
+			result = prefetch_queue->pop();
+			++out.prefetched_rowgroups;
+		} else {
+			const auto read_start = std::chrono::steady_clock::now();
+			result.rowgroup       = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
+			                                                : rdr.read_rowgroup(rg_idx);
+			const auto read_end = std::chrono::steady_clock::now();
+			result.read_ms      = std::chrono::duration<double, std::milli>(read_end - read_start).count();
+		}
+		out.read_rowgroup_ms += result.read_ms;
+		return std::move(result.rowgroup);
+	};
+
 	if (!cfg.enable_streaming) {
 		runtime::ExecutionWorkset   workset {};
 		std::vector<StreamingBenchmarkChunk::PendingRowgroup> pending_rowgroups;
@@ -309,11 +452,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			const auto* rg     = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
 			const size_t bytes = rowgroup_bytes(rg);
 
-			const auto read_start = std::chrono::steady_clock::now();
-			auto       rowgroup   = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
-			                                                : rdr.read_rowgroup(rg_idx);
-			const auto read_end = std::chrono::steady_clock::now();
-			out.read_rowgroup_ms += std::chrono::duration<double, std::milli>(read_end - read_start).count();
+			auto rowgroup = fetch_rowgroup(rg_idx);
 
 			const auto assemble_start = std::chrono::steady_clock::now();
 			auto       expressions    = expr::assemble(rowgroup);
@@ -342,6 +481,9 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			}
 
 		run_sync_chunk();
+		if (prefetch_queue) {
+			out.prefetch_wait_ms += prefetch_queue->wait_ms();
+		}
 
 		const auto wall_end = std::chrono::steady_clock::now();
 		out.end_to_end_ms   = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
@@ -388,7 +530,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		}
 
 		const auto release_start = std::chrono::steady_clock::now();
-		runtime::release_workset(chunk.workset);
+		runtime::release_workset(chunk.workset, /*preserve_resources=*/true);
 		const auto release_end = std::chrono::steady_clock::now();
 		out.release_device_ms += std::chrono::duration<double, std::milli>(release_end - release_start).count();
 
@@ -406,11 +548,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		const auto* rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
 		const size_t bytes = rowgroup_bytes(rg);
 
-		const auto read_start = std::chrono::steady_clock::now();
-		auto       rowgroup   = cfg.use_zero_copy_parse ? rdr.read_rowgroup_zero_copy_materialized(rg_idx)
-		                                                : rdr.read_rowgroup(rg_idx);
-		const auto read_end = std::chrono::steady_clock::now();
-		out.read_rowgroup_ms += std::chrono::duration<double, std::milli>(read_end - read_start).count();
+		auto rowgroup = fetch_rowgroup(rg_idx);
 
 		const auto assemble_start = std::chrono::steady_clock::now();
 		auto       expressions    = expr::assemble(rowgroup);
@@ -440,6 +578,9 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	}
 
 	pipeline.flush(submit_chunk, consume_chunk);
+	if (prefetch_queue) {
+		out.prefetch_wait_ms += prefetch_queue->wait_ms();
+	}
 
 	const auto wall_end = std::chrono::steady_clock::now();
 	out.end_to_end_ms    = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
