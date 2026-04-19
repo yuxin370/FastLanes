@@ -59,19 +59,16 @@ struct DICTFFORColumn {
 		auto i_bp_off  = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
 		auto i_bases   = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
 		auto i_keys    = arena.template add<KEY_T>(key_count, keys);
-		const size_t bp_nv   = ffor.bp.n_values;
-		const size_t bp_nvec = ffor.bp.get_n_vecs();
-		const size_t ffor_nv = ffor.get_n_values();
-		out.n_values  = get_n_values();
-		out.key_count = key_count;
-		arena.add_resolver([&arena, &out, i_packed, i_bw, i_bp_off, i_bases, i_keys,
-		                     bp_nv, bp_nvec, ffor_nv]() {
-			device::BPColumn<IndexT> d_bp {
-			    bp_nv, bp_nvec,
-			    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
-			out.ffor = device::FFORColumn<IndexT> {ffor_nv, d_bp, arena.get<UINT_IDX>(i_bases)};
-			out.keys = arena.get<KEY_T>(i_keys);
-		});
+		out.n_values         = get_n_values();
+		out.key_count        = key_count;
+		out.ffor.n_values    = ffor.get_n_values();
+		out.ffor.bp.n_values = ffor.bp.n_values;
+		out.ffor.bp.n_vecs   = ffor.bp.get_n_vecs();
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.packed_array), i_packed);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.bit_widths), i_bw);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.vector_offsets), i_bp_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bases), i_bases);
+		arena.resolve_to(reinterpret_cast<void**>(&out.keys), i_keys);
 	}
 };
 

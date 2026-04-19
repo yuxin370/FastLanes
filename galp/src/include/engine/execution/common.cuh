@@ -360,7 +360,7 @@ template <typename T>
 struct Batch {
 	std::vector<size_t>              expr_indices;
 	std::vector<DeviceExpression<T>> device_exprs;
-	std::vector<GPUArray<T>>         device_outputs;
+	std::vector<size_t>              output_offsets;
 	std::vector<WorkItemAny>         work_items;
 };
 
@@ -426,18 +426,18 @@ void add_expression_to_batch(const size_t    expr_index,
                              const HostColT& host_col,
                              const PlanKind  plan,
                              Batch<T>&       batch,
+                             const size_t    output_offset,
                              const bool      freq_prefetch_all_branchless,
                              const bool      freq_hybrid_patcher,
                              const float     freq_branchless_threshold,
-                             const cudaStream_t stream,
                              flsgpu::memory::DeviceArena& arena) {
 	// Emplace into pre-reserved vector — address is stable.
 	batch.device_exprs.emplace_back();
 	auto& expr    = batch.device_exprs.back();
 	expr.plan     = plan;
 	expr.n_values = host_col.get_n_values();
-	batch.device_outputs.emplace_back(expr.n_values, stream);
-	expr.out = batch.device_outputs.back().get();
+	expr.out      = nullptr;
+	batch.output_offsets.push_back(output_offset);
 
 	bool use_freq_extended = false;
 	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
@@ -450,6 +450,7 @@ void add_expression_to_batch(const size_t    expr_index,
 	batch.expr_indices.push_back(expr_index);
 
 	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
+	batch.work_items.reserve(batch.work_items.size() + n_vecs);
 	for (size_t vec = 0; vec < n_vecs; ++vec) {
 		batch.work_items.push_back(WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>()});
 	}
@@ -498,7 +499,12 @@ void finalize_batch(Batch<T>& batch, RowgroupData& result) {
 	for (size_t idx = 0; idx < batch.device_exprs.size(); ++idx) {
 		auto& expr = batch.device_exprs[idx];
 		auto  host = std::shared_ptr<T[]>(new T[expr.n_values], std::default_delete<T[]>());
-		batch.device_outputs[idx].copy_to_host(host.get());
+		if (expr.n_values > 0) {
+			if (expr.out == nullptr) {
+				throw std::runtime_error("device output pointer not initialized");
+			}
+			CUDA_SAFE_CALL(cudaMemcpy(host.get(), expr.out, expr.n_values * sizeof(T), cudaMemcpyDeviceToHost));
+		}
 		MaterializedColumn out {};
 		out.values                              = ValueStore {std::move(host)};
 		out.meta.column_index                   = batch.expr_indices[idx];
@@ -506,10 +512,11 @@ void finalize_batch(Batch<T>& batch, RowgroupData& result) {
 		out.meta.value_type                     = types::ToDataType<T>::value;
 		out.meta.values_per_step                = 1;
 		result.columns[batch.expr_indices[idx]] = std::move(out);
-		free_device_expr(expr);
+		// Arena mode: column pointers live in chunk_arena device_base_; per-expr
+		// free_device_expr would cudaFree interior offsets. Arena teardown frees them.
 	}
 	batch.device_exprs.clear();
-	batch.device_outputs.clear();
+	batch.output_offsets.clear();
 	batch.work_items.clear();
 	batch.expr_indices.clear();
 }

@@ -50,8 +50,12 @@ Replace the placeholders below:
 Benchmark output metrics
   benchmark_wall_ms                End-to-end wall clock of the whole benchmark run.
   kernel_event_ms                  Accumulated GPU event time spent inside benchmark kernel launches.
-  read_rowgroup_ms / append_expr_ms / upload_workset_ms / ...
-                                   Host-side stage timings accumulated by stage.
+  read_rowgroup_ms                 Aggregated host-side rowgroup load time.
+  file_read_ms                    File IO time only.
+  rowgroup_build_ms               Host-side rowgroup/column build time after IO.
+  append_expr_ms / upload_workset_ms / ...
+                                   Remaining host-side stage timings accumulated by stage.
+  output_arena_bytes              Total device output bytes reserved across chunks/worksets.
   prefetch_wait_ms                 Time the consumer waited for background rowgroup prefetch.
   Notes:
   - In streaming mode, host stages and GPU execution can overlap, so the stage sums may exceed

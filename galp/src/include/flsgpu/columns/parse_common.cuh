@@ -129,11 +129,12 @@ inline ExceptionOffsets build_exception_offsets_from_segment(const fastlanes::Se
 		throw std::runtime_error("exception segment entrypoint count mismatch");
 	}
 
-	auto*  offsets    = new size_t[n_vecs];
-	size_t prev_bytes = 0;
+	const size_t segment_bytes = seg.data_span.size();
+	auto*        offsets       = new size_t[n_vecs];
+	size_t       prev_bytes    = 0;
 	for (size_t i = 0; i < n_vecs; ++i) {
 		const size_t cur_bytes = static_cast<size_t>(entry[i]);
-		if (cur_bytes < prev_bytes || (cur_bytes % sizeof(T)) != 0) {
+		if (cur_bytes < prev_bytes || (cur_bytes % sizeof(T)) != 0 || cur_bytes > segment_bytes) {
 			delete[] offsets;
 			throw std::runtime_error("invalid exception segment entrypoints");
 		}

@@ -61,32 +61,50 @@ inline fastlanes::TableDescriptorHandle load_table_descriptor(const std::filesys
 }
 
 struct ZeroCopyHostStorage {
-	// Destruction order matters: owned_arrays first (frees allocated copies),
-	// then rowgroup_view (references backing_buffer), then backing_buffer last.
-	std::shared_ptr<fastlanes::Buf>          backing_buffer;
-	std::shared_ptr<fastlanes::RowgroupView> rowgroup_view;
-	std::vector<std::function<void()>>       owned_arrays;
+	struct ScratchBlock {
+		std::unique_ptr<std::byte[]> data;
+		size_t                       capacity = 0;
+		size_t                       used     = 0;
+	};
 
-	~ZeroCopyHostStorage() {
-		// Explicit teardown in safe order.
-		owned_arrays.clear();
-		rowgroup_view.reset();
-		backing_buffer.reset();
-	}
+	static constexpr size_t kScratchBlockBytes = 64U * 1024U;
+
+	// Destruction order matters: scratch blocks first, then rowgroup_view
+	// (references backing_owner), then backing_owner last.
+	std::shared_ptr<void>                    backing_owner;
+	std::shared_ptr<fastlanes::RowgroupView> rowgroup_view;
+	std::vector<ScratchBlock>                scratch_blocks;
 
 	template <typename T>
 	T* allocate_array(const size_t n) {
-		auto* ptr = new T[n];
-		owned_arrays.emplace_back([ptr]() { delete[] ptr; });
-		return ptr;
-	}
-
-	template <typename T>
-	T* own_array(T* ptr) {
-		if (ptr != nullptr) {
-			owned_arrays.emplace_back([ptr]() { delete[] ptr; });
+		if (n == 0) {
+			return nullptr;
 		}
-		return ptr;
+
+		const size_t bytes     = n * sizeof(T);
+		const size_t alignment = std::max<size_t>(alignof(T), alignof(std::max_align_t));
+
+		for (auto& block : scratch_blocks) {
+			const uintptr_t base    = reinterpret_cast<uintptr_t>(block.data.get());
+			const uintptr_t current = base + block.used;
+			const uintptr_t aligned = (current + alignment - 1U) & ~(alignment - 1U);
+			const size_t    next    = static_cast<size_t>(aligned - base) + bytes;
+			if (next <= block.capacity) {
+				block.used = next;
+				return reinterpret_cast<T*>(aligned);
+			}
+		}
+
+		const size_t capacity = std::max(kScratchBlockBytes, bytes + alignment);
+		auto&        block    = scratch_blocks.emplace_back();
+		block.data            = std::make_unique<std::byte[]>(capacity);
+		block.capacity        = capacity;
+		block.used            = 0;
+
+		const uintptr_t base    = reinterpret_cast<uintptr_t>(block.data.get());
+		const uintptr_t aligned = (base + alignment - 1U) & ~(alignment - 1U);
+		block.used              = static_cast<size_t>(aligned - base) + bytes;
+		return reinterpret_cast<T*>(aligned);
 	}
 };
 
@@ -150,6 +168,35 @@ inline flsgpu::host::FFORColumn<T> make_ffor_zero_copy(const fastlanes::SegmentV
 	return flsgpu::host::FFORColumn<T> {bp, bases};
 }
 
+// Shared helper: parse a segment's entrypoints into per-vector element offsets,
+// validating monotonicity, alignment against the element size, and that the
+// final cumulative byte count fits within the segment payload. Offsets are
+// carved from the zero-copy scratch arena rather than heap-allocated. The
+// segment_tag prefixes thrown error messages so operators can identify which
+// segment (e.g. "exception segment", "EXP_RLE values") is malformed.
+inline columns::detail::ExceptionOffsets build_entrypoint_offsets(const fastlanes::SegmentView& seg,
+                                                                   const size_t                  n_vecs,
+                                                                   const size_t                  elem_bytes,
+                                                                   ZeroCopyHostStorage&          storage,
+                                                                   const char*                   segment_tag = "exception segment") {
+	const auto entry = columns::detail::extract_entrypoints(seg);
+	if (entry.size() != n_vecs) {
+		throw std::runtime_error(std::string(segment_tag) + " entrypoint count mismatch");
+	}
+	const size_t segment_bytes = seg.data_span.size();
+	auto*        offsets       = storage.allocate_array<size_t>(n_vecs);
+	size_t       prev_bytes    = 0;
+	for (size_t i = 0; i < n_vecs; ++i) {
+		const size_t cur_bytes = static_cast<size_t>(entry[i]);
+		if (cur_bytes < prev_bytes || (cur_bytes % elem_bytes) != 0 || cur_bytes > segment_bytes) {
+			throw std::runtime_error(std::string("invalid ") + segment_tag + " entrypoints");
+		}
+		offsets[i] = prev_bytes / elem_bytes;
+		prev_bytes = cur_bytes;
+	}
+	return columns::detail::ExceptionOffsets {offsets, prev_bytes / elem_bytes};
+}
+
 template <typename T>
 inline flsgpu::host::SLPATCHColumn<T> make_slpatch_zero_copy(const fastlanes::SegmentView& seg_exc,
                                                              const fastlanes::SegmentView& seg_pos,
@@ -162,10 +209,8 @@ inline flsgpu::host::SLPATCHColumn<T> make_slpatch_zero_copy(const fastlanes::Se
                                                              ZeroCopyHostStorage&          storage) {
 	auto ffor = make_ffor_zero_copy<T>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
 
-	auto exc = columns::detail::build_exception_offsets_from_segment<T>(seg_exc, n_vecs);
-	auto pos = columns::detail::build_exception_offsets_from_segment<uint16_t>(seg_pos, n_vecs);
-	storage.own_array(exc.offsets);
-	storage.own_array(pos.offsets);
+	auto exc = build_entrypoint_offsets(seg_exc, n_vecs, sizeof(T), storage);
+	auto pos = build_entrypoint_offsets(seg_pos, n_vecs, sizeof(uint16_t), storage);
 
 	auto* counts     = segment_ptr_or_copy<uint16_t>(seg_cnt, storage);
 	auto* positions  = segment_ptr_or_copy<uint16_t>(seg_pos, storage);
@@ -186,16 +231,15 @@ inline flsgpu::host::FREQColumn<T> make_frequency_zero_copy(const fastlanes::Seg
 	if (seg_fv.data_span.size() != sizeof(T)) {
 		throw std::runtime_error("EXP_FREQUENCY: invalid frequent value size");
 	}
-	const auto fv     = *reinterpret_cast<const T*>(seg_fv.data_span.data());
+	T fv;
+	std::memcpy(&fv, seg_fv.data_span.data(), sizeof(T));
 	auto*      fv_arr = storage.allocate_array<T>(n_vecs);
 	for (size_t i = 0; i < n_vecs; ++i) {
 		fv_arr[i] = fv;
 	}
 
-	auto exc = columns::detail::build_exception_offsets_from_segment<T>(seg_exc, n_vecs);
-	auto pos = columns::detail::build_exception_offsets_from_segment<uint16_t>(seg_pos, n_vecs);
-	storage.own_array(exc.offsets);
-	storage.own_array(pos.offsets);
+	auto exc = build_entrypoint_offsets(seg_exc, n_vecs, sizeof(T), storage);
+	auto pos = build_entrypoint_offsets(seg_pos, n_vecs, sizeof(uint16_t), storage);
 
 	auto* counts     = segment_ptr_or_copy<uint16_t>(seg_cnt, storage);
 	auto* positions  = segment_ptr_or_copy<uint16_t>(seg_pos, storage);
@@ -239,6 +283,59 @@ inline flsgpu::host::CROSSRLEColumn<T> make_cross_rle_zero_copy(const fastlanes:
 	return flsgpu::host::CROSSRLEColumn<T> {n_values, n_runs, values, lengths, offsets, run_positions};
 }
 
+template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
+inline flsgpu::host::DICTFFORColumn<T, IndexT> make_dict_ffor_zero_copy(const fastlanes::SegmentView& seg_keys,
+                                                                        const fastlanes::SegmentView& seg_bitpacked,
+                                                                        const fastlanes::SegmentView& seg_bw,
+                                                                        const fastlanes::SegmentView& seg_base,
+                                                                        const size_t                  n_values,
+                                                                        const size_t                  n_vecs,
+                                                                        ZeroCopyHostStorage&          storage) {
+	using KeyT = typename utils::same_width_uint<T>::type;
+	auto  ffor = make_ffor_zero_copy<IndexT>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
+	auto* keys = segment_ptr_or_copy<KeyT>(seg_keys, storage);
+	return flsgpu::host::DICTFFORColumn<T, IndexT> {
+	    std::move(ffor), keys, seg_keys.data_span.size() / sizeof(KeyT)};
+}
+
+template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
+inline flsgpu::host::DICTREFColumn<T, IndexT> make_dict_ref_zero_copy(const fastlanes::SegmentView& seg_keys,
+                                                                      const uint32_t                index_col_idx,
+                                                                      const size_t                  n_values,
+                                                                      ZeroCopyHostStorage&          storage) {
+	using KeyT = typename utils::same_width_uint<T>::type;
+	auto* keys = segment_ptr_or_copy<KeyT>(seg_keys, storage);
+	return flsgpu::host::DICTREFColumn<T, IndexT> {
+	    n_values, index_col_idx, keys, seg_keys.data_span.size() / sizeof(KeyT)};
+}
+
+template <typename T, typename IndexT>
+inline flsgpu::host::RLEColumn<T, IndexT> make_rle_zero_copy(const fastlanes::SegmentView& seg_vals,
+                                                             const fastlanes::SegmentView& seg_rsum,
+                                                             const fastlanes::SegmentView& seg_bitpacked,
+                                                             const fastlanes::SegmentView& seg_bw,
+                                                             const fastlanes::SegmentView& seg_base,
+                                                             const size_t                  n_values,
+                                                             const size_t                  n_vecs,
+                                                             ZeroCopyHostStorage&          storage) {
+	auto ffor = make_ffor_zero_copy<IndexT>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
+
+	const size_t expected_bases = n_vecs * utils::get_n_lanes<IndexT>();
+	if (seg_rsum.data_span.size() / sizeof(IndexT) != expected_bases) {
+		throw std::runtime_error("EXP_RLE: rsum bases size mismatch");
+	}
+
+	const auto rle_offsets_info = build_entrypoint_offsets(seg_vals, n_vecs, sizeof(T), storage, "EXP_RLE values segment");
+	auto* const offsets         = rle_offsets_info.offsets;
+
+	auto* rsum_bases = segment_ptr_or_copy<IndexT>(seg_rsum, storage);
+	auto* values     = segment_ptr_or_copy<T>(seg_vals, storage);
+	const size_t n_rle_values = seg_vals.data_span.size() / sizeof(T);
+
+	return flsgpu::host::RLEColumn<T, IndexT> {
+	    n_values, n_vecs, std::move(ffor), rsum_bases, values, offsets, n_rle_values};
+}
+
 } // namespace detail
 
 using HostColumnVariant = dispatch::EncodedPayload;
@@ -260,7 +357,13 @@ struct ZeroCopyRowgroup {
 	size_t                                   n_values = 0;
 	size_t                                   n_vecs   = 0;
 	size_t                                   n_tuples = 0;
-	std::shared_ptr<fastlanes::Buf>          backing_buffer;
+	std::shared_ptr<void>                    backing_owner;
+	fastlanes::span<std::byte>               backing_span;
+	// True only if backing_span points into CUDA-pinned memory. Controls
+	// whether DeviceArena may issue direct cudaMemcpyAsync from it; registering
+	// a pageable buffer as a direct backing forces the async copy to fall back
+	// to a synchronous staged transfer internally.
+	bool                                     backing_is_pinned = false;
 	std::shared_ptr<fastlanes::RowgroupView> rowgroup_view;
 	std::vector<ZeroCopyColumn>              columns;
 };
@@ -280,7 +383,24 @@ public:
 		return static_cast<size_t>(td->m_rowgroup_descriptors()->size());
 	}
 
-	ZeroCopyRowgroup read_rowgroup_zero_copy(const size_t rowgroup_idx = 0) {
+	size_t rowgroup_storage_bytes(const size_t rowgroup_idx) const {
+		const auto* td = m_table_descriptor.Get();
+		if (!td) {
+			throw std::runtime_error("TableDescriptor not loaded");
+		}
+		const auto n_rgs = td->m_rowgroup_descriptors()->size();
+		if (rowgroup_idx >= n_rgs) {
+			throw std::out_of_range("rowgroup_idx out of range");
+		}
+		const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
+		return static_cast<size_t>(rg->m_size());
+	}
+
+	ZeroCopyRowgroup read_rowgroup_zero_copy_into(const size_t                rowgroup_idx,
+	                                              std::shared_ptr<void>       backing_owner,
+	                                              std::byte* const            backing_data,
+	                                              const size_t                backing_capacity,
+	                                              const bool                  backing_is_pinned = false) {
 		const auto* td = m_table_descriptor.Get();
 		if (!td) {
 			throw std::runtime_error("TableDescriptor not loaded");
@@ -291,22 +411,29 @@ public:
 		}
 
 		const auto*  rg       = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
+		const size_t rg_bytes = static_cast<size_t>(rg->m_size());
+		if (backing_data == nullptr || backing_capacity < rg_bytes) {
+			throw std::runtime_error("external rowgroup backing is null or too small");
+		}
+
 		const size_t n_vecs   = static_cast<size_t>(rg->m_n_vec());
 		const size_t n_values = n_vecs * consts::VALUES_PER_VECTOR;
 		const size_t n_tuples = static_cast<size_t>(rg->m_n_tuples());
 
-		auto          backing = std::make_shared<fastlanes::Buf>(rg->m_size());
-		fastlanes::io io      = fastlanes::make_unique<fastlanes::File>(m_file_path);
-		fastlanes::IO::range_read(io, *backing, rg->m_offset(), rg->m_size());
-		auto view = std::make_shared<fastlanes::RowgroupView>(backing->Span(), *rg);
+		fastlanes::io io = fastlanes::make_unique<fastlanes::File>(m_file_path);
+		fastlanes::IO::range_read(io, backing_data, rg->m_offset(), rg->m_size());
+		auto backing_span = fastlanes::span<std::byte> {backing_data, rg_bytes};
+		auto view         = std::make_shared<fastlanes::RowgroupView>(backing_span, *rg);
 
 		const auto&      col_descs = *rg->m_column_descriptors();
 		ZeroCopyRowgroup out {};
-		out.n_values       = n_values;
-		out.n_vecs         = n_vecs;
-		out.n_tuples       = n_tuples;
-		out.backing_buffer = backing;
-		out.rowgroup_view  = view;
+		out.n_values      = n_values;
+		out.n_vecs        = n_vecs;
+		out.n_tuples      = n_tuples;
+		out.backing_owner     = std::move(backing_owner);
+		out.backing_span      = backing_span;
+		out.backing_is_pinned = backing_is_pinned;
+		out.rowgroup_view     = view;
 		out.columns.reserve(col_descs.size());
 
 		for (size_t col_idx = 0; col_idx < col_descs.size(); ++col_idx) {
@@ -346,10 +473,17 @@ public:
 		return out;
 	}
 
-	Rowgroup read_rowgroup_zero_copy_materialized(const size_t rowgroup_idx = 0) {
-		const auto zero_copy    = read_rowgroup_zero_copy(rowgroup_idx);
+	ZeroCopyRowgroup read_rowgroup_zero_copy(const size_t rowgroup_idx = 0) {
+		auto backing = std::make_shared<fastlanes::Buf>(rowgroup_storage_bytes(rowgroup_idx));
+		return read_rowgroup_zero_copy_into(rowgroup_idx,
+		                                    std::static_pointer_cast<void>(backing),
+		                                    reinterpret_cast<std::byte*>(backing->mutable_data()),
+		                                    backing->Capacity());
+	}
+
+	Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) const {
 		auto       storage      = std::make_shared<detail::ZeroCopyHostStorage>();
-		storage->backing_buffer = zero_copy.backing_buffer;
+		storage->backing_owner  = zero_copy.backing_owner;
 		storage->rowgroup_view  = zero_copy.rowgroup_view;
 
 		std::vector<std::optional<Column>> built(zero_copy.columns.size());
@@ -382,6 +516,9 @@ public:
 				result.skip_decompress       = true;
 				result.alias_of              = src_col_idx;
 				result.host_owned_by_backing = src_col.host_owned_by_backing;
+				result.backing_base          = src_col.backing_base;
+				result.backing_bytes         = src_col.backing_bytes;
+				result.backing_is_pinned     = src_col.backing_is_pinned;
 			} else {
 				if (!zcol.column_view || !zcol.column_descriptor) {
 					std::ostringstream msg;
@@ -661,6 +798,70 @@ public:
 					result.host_owned_by_backing = true;
 					break;
 				}
+				case EXP_DICT_I08_FFOR_U08: {
+					if (!zcol.operand_tokens || zcol.operand_tokens->size() < 4) {
+						throw std::runtime_error("EXP_DICT_I08_FFOR_U08: missing operand tokens");
+					}
+					const auto seg_keys =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(0)));
+					const auto seg_bitpacked =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(1)));
+					const auto seg_bw =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(2)));
+					const auto seg_base =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(3)));
+					result.host = detail::make_dict_ffor_zero_copy<int8_t, uint8_t>(
+					    seg_keys, seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
+					result.host_owned_by_backing = true;
+					break;
+				}
+				case EXP_DICT_I16_FFOR_U16: {
+					if (!zcol.operand_tokens || zcol.operand_tokens->size() < 4) {
+						throw std::runtime_error("EXP_DICT_I16_FFOR_U16: missing operand tokens");
+					}
+					const auto seg_keys =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(0)));
+					const auto seg_bitpacked =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(1)));
+					const auto seg_bw =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(2)));
+					const auto seg_base =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(3)));
+					result.host = detail::make_dict_ffor_zero_copy<int16_t, uint16_t>(
+					    seg_keys, seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
+					result.host_owned_by_backing = true;
+					break;
+				}
+				case EXP_DICT_I16_FFOR_U08: {
+					if (!zcol.operand_tokens || zcol.operand_tokens->size() < 4) {
+						throw std::runtime_error("EXP_DICT_I16_FFOR_U08: missing operand tokens");
+					}
+					const auto seg_keys =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(0)));
+					const auto seg_bitpacked =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(1)));
+					const auto seg_bw =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(2)));
+					const auto seg_base =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(3)));
+					result.host = detail::make_dict_ffor_zero_copy<int16_t, uint8_t>(
+					    seg_keys, seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
+					result.host_owned_by_backing = true;
+					break;
+				}
+				case EXP_DICT_I08_U08: {
+					if (!zcol.operand_tokens || zcol.operand_tokens->size() < 2) {
+						throw std::runtime_error("EXP_DICT_I08_U08: missing operand tokens");
+					}
+					const auto index_col_idx = static_cast<uint32_t>(zcol.operand_tokens->Get(0));
+					const auto seg_keys =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(
+					        zcol.operand_tokens->Get(zcol.operand_tokens->size() - 1)));
+					result.host =
+					    detail::make_dict_ref_zero_copy<int8_t, uint8_t>(seg_keys, index_col_idx, zero_copy.n_values, *storage);
+					result.host_owned_by_backing = true;
+					break;
+				}
 				case EXP_DICT_I16_FFOR_SLPATCH_U16: {
 					if (!zcol.operand_tokens || zcol.operand_tokens->size() < 7) {
 						throw std::runtime_error("EXP_DICT_I16_FFOR_SLPATCH_U16: missing operand tokens");
@@ -743,9 +944,71 @@ public:
 					result.host_owned_by_backing = true;
 					break;
 				}
+				case EXP_RLE_I08_U16: {
+					if (!zcol.operand_tokens || zcol.operand_tokens->size() < 5) {
+						throw std::runtime_error("EXP_RLE_I08_U16: missing operand tokens");
+					}
+					const size_t base_idx = zcol.operand_tokens->size() - 1;
+					const auto seg_vals =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 4)));
+					const auto seg_rsum =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 3)));
+					const auto seg_bitpacked =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 2)));
+					const auto seg_bw =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 1)));
+					const auto seg_base =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 0)));
+					result.host = detail::make_rle_zero_copy<int8_t, uint16_t>(
+					    seg_vals, seg_rsum, seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
+					result.host_owned_by_backing = true;
+					break;
+				}
+				case EXP_RLE_I16_U16: {
+					if (!zcol.operand_tokens || zcol.operand_tokens->size() < 5) {
+						throw std::runtime_error("EXP_RLE_I16_U16: missing operand tokens");
+					}
+					const size_t base_idx = zcol.operand_tokens->size() - 1;
+					const auto seg_vals =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 4)));
+					const auto seg_rsum =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 3)));
+					const auto seg_bitpacked =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 2)));
+					const auto seg_bw =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 1)));
+					const auto seg_base =
+					    zcol.column_view->GetSegment(static_cast<uint32_t>(zcol.operand_tokens->Get(base_idx - 0)));
+					result.host = detail::make_rle_zero_copy<int16_t, uint16_t>(
+					    seg_vals, seg_rsum, seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
+					result.host_owned_by_backing = true;
+					break;
+				}
 				default:
 					parse_with_copy_fallback();
 					break;
+				}
+
+				if (result.host_owned_by_backing && zero_copy.backing_is_pinned) {
+					// Only publish a backing slice when the buffer is CUDA-pinned —
+					// DeviceArena's direct cudaMemcpyAsync path requires that.
+					// For pageable backings (the default read_rowgroup_zero_copy
+					// path, which allocates via fastlanes::Buf / new[]), leave
+					// backing_base null so append_expressions() falls back to the
+					// staged-pinned copy instead of losing async H2D overlap.
+					//
+					// Record only this column's slice — using the full rowgroup
+					// span would force DeviceArena::upload() to reserve device
+					// memory and DMA every column's bytes even under narrow
+					// projections.
+					if (zcol.column_view != nullptr && !zcol.column_view->column_span.empty()) {
+						result.backing_base  = zcol.column_view->column_span.data();
+						result.backing_bytes = zcol.column_view->column_span.size();
+					} else {
+						result.backing_base  = zero_copy.backing_span.data();
+						result.backing_bytes = zero_copy.backing_span.size();
+					}
+					result.backing_is_pinned = true;
 				}
 			}
 
@@ -761,6 +1024,10 @@ public:
 		}
 		out.backing_storage = std::move(storage);
 		return out;
+	}
+
+	Rowgroup read_rowgroup_zero_copy_materialized(const size_t rowgroup_idx = 0) {
+		return materialize_zero_copy_rowgroup(read_rowgroup_zero_copy(rowgroup_idx));
 	}
 
 	Rowgroup read_rowgroup(const size_t rowgroup_idx = 0) {

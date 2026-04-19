@@ -66,6 +66,18 @@ void File::ReadRange(Buf& buf, const n_t offset, const n_t size) {
 	m_if_stream->read(reinterpret_cast<char*>(buf.mutable_data()), static_cast<std::streamsize>(size));
 }
 
+void File::ReadRange(void* dst, const n_t offset, const n_t size) {
+	if (m_if_stream == nullptr) {
+		m_if_stream = make_unique<std::ifstream>(FileSystem::open_r_binary(m_path));
+	}
+
+	[[maybe_unused]] auto file_size = fs::file_size(m_path);
+	FLS_ASSERT_LE(offset + size, file_size);
+
+	m_if_stream->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+	m_if_stream->read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(size));
+}
+
 n_t File::Size() const {
 	if (!exists(m_path)) {
 		throw std::runtime_error("File does not exist");

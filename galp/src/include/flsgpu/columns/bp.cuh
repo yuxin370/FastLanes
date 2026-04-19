@@ -66,11 +66,9 @@ struct BPColumn {
 		auto i_offsets = arena.template add<size_t>(get_n_vecs(), vector_offsets);
 		out.n_values = n_values;
 		out.n_vecs   = get_n_vecs();
-		arena.add_resolver([&arena, &out, i_packed, i_bw, i_offsets]() {
-			out.packed_array   = arena.get<UINT_T>(i_packed);
-			out.bit_widths     = arena.get<vbw_t>(i_bw);
-			out.vector_offsets = arena.get<size_t>(i_offsets);
-		});
+		arena.resolve_to(reinterpret_cast<void**>(&out.packed_array), i_packed);
+		arena.resolve_to(reinterpret_cast<void**>(&out.bit_widths), i_bw);
+		arena.resolve_to(reinterpret_cast<void**>(&out.vector_offsets), i_offsets);
 	}
 };
 

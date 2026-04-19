@@ -179,6 +179,7 @@ int main(int argc, char** argv) {
 		double setup_ms      = 0.0;
 		double h2d_ms        = 0.0;
 		double teardown_ms   = 0.0;
+		double file_read_ms  = 0.0;
 		size_t total_columns = 0;
 		size_t total_items   = 0;
 		size_t total_bytes   = 0;
@@ -233,6 +234,7 @@ int main(int argc, char** argv) {
 			setup_ms += build_ms;
 			h2d_ms += 0.0;
 			teardown_ms += 0.0;
+			file_read_ms += io_ms;
 
 			total_columns += rg_columns;
 			total_items += rg_vectors;
@@ -281,12 +283,16 @@ int main(int argc, char** argv) {
 		std::cout << "  vectors: " << total_items << " (avg " << vectors_per_rg << " per rowgroup)\n";
 		std::cout << "  samples:   " << opt.samples << "\n";
 		std::cout << "  bytes:     " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
+		// benchmark_wall_ms mirrors galp_cli's semantics (file I/O + build + decode),
+		// so the shared CSV column compares apples-to-apples across tools.
+		std::cout << "  benchmark_wall_ms: " << (end_to_end_with_teardown_ms + file_read_ms) << "\n";
 		std::cout << "  end_to_end_ms: " << end_to_end_with_teardown_ms << "\n";
 		std::cout << "  end_to_end_ms (no teardown): " << end_to_end_ms << "\n";
 		std::cout << "  kernel_ms:     " << kernel_ms << "\n";
 		std::cout << "  setup_ms:      " << setup_ms << "\n";
 		std::cout << "  h2d_ms:        " << h2d_ms << "\n";
 		std::cout << "  teardown_ms:   " << teardown_ms << "\n";
+		std::cout << "  file_read_ms:  " << file_read_ms << "\n";
 		std::cout << "  avg_us:    " << avg_us << " (per rowgroup per sample)\n";
 		std::cout << "  kernel_throughput: " << kernel_throughput_gbps << " (GB/s), " << kernel_throughput_gibps
 		          << " (GiB/s)\n";

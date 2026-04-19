@@ -10,6 +10,7 @@
 #include "engine/types.cuh"
 #include "fls/footer/operator_token_generated.h"
 #include "flsgpu/columns/all.cuh"
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -67,6 +68,12 @@ struct Column {
 	bool                     skip_decompress = false;
 	std::optional<size_t>    alias_of;
 	bool                     host_owned_by_backing = false;
+	const std::byte*         backing_base          = nullptr;
+	size_t                   backing_bytes         = 0;
+	// Only set when backing_base points into CUDA-pinned memory. DeviceArena
+	// may issue direct cudaMemcpyAsync from the backing region only when true;
+	// otherwise the pageable copy silently falls back to internal staging.
+	bool                     backing_is_pinned = false;
 };
 
 struct MaterializedColumn {

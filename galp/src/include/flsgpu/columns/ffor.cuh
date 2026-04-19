@@ -50,15 +50,13 @@ struct FFORColumn {
 		auto i_bw      = arena.template add<vbw_t>(bp.get_n_vecs(), bp.bit_widths);
 		auto i_offsets = arena.template add<size_t>(bp.get_n_vecs(), bp.vector_offsets);
 		auto i_bases   = arena.template add<UINT_T>(bp.get_n_vecs(), bases);
-		const size_t bp_nv   = bp.n_values;
-		const size_t bp_nvec = bp.get_n_vecs();
-		out.n_values = get_n_values();
-		arena.add_resolver([&arena, &out, i_packed, i_bw, i_offsets, i_bases, bp_nv, bp_nvec]() {
-			out.bp = device::BPColumn<T> {
-			    bp_nv, bp_nvec,
-			    arena.get<UINT_T>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_offsets)};
-			out.bases = arena.get<UINT_T>(i_bases);
-		});
+		out.n_values   = get_n_values();
+		out.bp.n_values = bp.n_values;
+		out.bp.n_vecs  = bp.get_n_vecs();
+		arena.resolve_to(reinterpret_cast<void**>(&out.bp.packed_array), i_packed);
+		arena.resolve_to(reinterpret_cast<void**>(&out.bp.bit_widths), i_bw);
+		arena.resolve_to(reinterpret_cast<void**>(&out.bp.vector_offsets), i_offsets);
+		arena.resolve_to(reinterpret_cast<void**>(&out.bases), i_bases);
 	}
 };
 

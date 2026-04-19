@@ -58,6 +58,8 @@ public:
 	///
 	static void range_read(const io& io, Buf& buf, n_t offset, n_t size);
 	///
+	static void range_read(const io& io, void* dst, n_t offset, n_t size);
+	///
 	template <typename PT>
 	static span<PT> read(const io& io);
 	///

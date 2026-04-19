@@ -52,6 +52,7 @@ struct Options {
 	bool                                 use_zero_copy_parse          = true;
 	bool                                 enable_rowgroup_prefetch     = true;
 	size_t                               prefetch_depth               = 2;
+	size_t                               prefetch_workers             = 2;
 	size_t                               stream_target_work_items     = 1u << 18;
 	size_t                               stream_max_rowgroups         = 8;
 };
@@ -92,6 +93,7 @@ void print_usage(const char* prog) {
 	          << "  --no-zero-copy     Disable zero-copy rowgroup parsing (default: enabled)\n"
 	          << "  --no-rowgroup-prefetch  Disable background rowgroup prefetch in whole-table benchmark\n"
 	          << "  --prefetch-depth N  Number of prefetched rowgroups to queue ahead (default: 2)\n"
+	          << "  --prefetch-workers N  Number of parallel prefetch threads (default: 2)\n"
 	          << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table benchmark "
 	             "(default: 262144)\n"
 	          << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table benchmark (default: 8, "
@@ -171,6 +173,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--prefetch-depth" && i + 1 < argc) {
 			opt.prefetch_depth = static_cast<size_t>(std::stoull(argv[++i]));
+			continue;
+		}
+		if (arg == "--prefetch-workers" && i + 1 < argc) {
+			opt.prefetch_workers = static_cast<size_t>(std::stoull(argv[++i]));
 			continue;
 		}
 		if (arg == "--stream-target-work-items" && i + 1 < argc) {
@@ -346,6 +352,7 @@ int main(int argc, char** argv) {
 			bench_cfg.enable_streaming                       = opt.benchmark_streaming;
 			bench_cfg.enable_rowgroup_prefetch               = opt.enable_rowgroup_prefetch;
 			bench_cfg.prefetch_depth                         = opt.prefetch_depth;
+			bench_cfg.prefetch_workers                       = opt.prefetch_workers;
 			bench_cfg.streaming_target_work_items            = opt.stream_target_work_items;
 			bench_cfg.streaming_target_rowgroups             = opt.stream_max_rowgroups;
 			bench_cfg.rowgroup                               = opt.rowgroup;
@@ -353,6 +360,8 @@ int main(int argc, char** argv) {
 
 			const double benchmark_wall_ms = result.end_to_end_ms;
 			const double read_rowgroup_ms  = result.read_rowgroup_ms;
+			const double file_read_ms      = result.file_read_ms;
+			const double rowgroup_build_ms = result.rowgroup_build_ms;
 			const double assemble_expr_ms  = result.assemble_expr_ms;
 			const double append_expr_ms    = result.append_expr_ms;
 			const double upload_workset_ms = result.upload_workset_ms;
@@ -366,6 +375,7 @@ int main(int argc, char** argv) {
 			const size_t total_items       = result.total_items;
 			const size_t total_bytes       = result.total_bytes;
 			const size_t total_payload_arena_bytes  = result.total_payload_arena_bytes;
+			const size_t total_output_arena_bytes   = result.total_output_arena_bytes;
 			const size_t prefetched_rowgroups       = result.prefetched_rowgroups;
 			const size_t total_rgs         = result.total_rgs;
 			const double avg_grid_per_launch =
@@ -380,10 +390,25 @@ int main(int argc, char** argv) {
 			std::cout << "  bytes: " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
 			std::cout << "  benchmark_wall_ms: " << benchmark_wall_ms << "\n";
 			std::cout << "  read_rowgroup_ms: " << read_rowgroup_ms << "\n";
+			std::cout << "  file_read_ms: " << file_read_ms << "\n";
+			std::cout << "  rowgroup_build_ms: " << rowgroup_build_ms << "\n";
 			std::cout << "  assemble_expr_ms: " << assemble_expr_ms << "\n";
 			std::cout << "  append_expr_ms: " << append_expr_ms << "\n";
 			std::cout << "  upload_workset_ms: " << upload_workset_ms << "\n";
+			std::cout << "    upload_prep_ms: " << result.upload_prep_ms << "\n";
+			std::cout << "      upload_prep_reset_ms: " << result.upload_prep_reset_ms << "\n";
+			std::cout << "      upload_prep_output_arena_ms: " << result.upload_prep_output_arena_ms << "\n";
+			std::cout << "      upload_prep_bind_ms: " << result.upload_prep_bind_ms << "\n";
+			std::cout << "      upload_prep_slots_ms: " << result.upload_prep_slots_ms << "\n";
+			std::cout << "    upload_arena_pack_ms: " << result.upload_arena_pack_ms << "\n";
+			std::cout << "    upload_layout_ms: " << result.upload_layout_ms << "\n";
+			std::cout << "    upload_alloc_ms: " << result.upload_alloc_ms << "\n";
+			std::cout << "    upload_resolve_ms: " << result.upload_resolve_ms << "\n";
+			std::cout << "    upload_pack_ms: " << result.upload_pack_ms << "\n";
+			std::cout << "    upload_dma_issue_ms: " << result.upload_dma_issue_ms << "\n";
+			std::cout << "    upload_event_ms: " << result.upload_event_ms << "\n";
 			std::cout << "  payload_arena_bytes: " << total_payload_arena_bytes << "\n";
+			std::cout << "  output_arena_bytes: " << total_output_arena_bytes << "\n";
 			std::cout << "  kernel_event_ms: " << kernel_event_ms << "\n";
 			std::cout << "  release_device_ms: " << release_device_ms << "\n";
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";

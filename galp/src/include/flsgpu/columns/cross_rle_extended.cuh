@@ -75,12 +75,10 @@ struct CROSSRLEExtendedColumn {
 		out.n_values    = n_values;
 		out.n_vecs      = nv;
 		out.n_lane_runs = n_lane_runs;
-		arena.add_resolver([&arena, &out, i_offs, i_vals, i_lens, i_oc]() {
-			out.lane_runs_offsets = arena.get<size_t>(i_offs);
-			out.lane_values       = arena.template get<UINT_T>(i_vals);
-			out.lane_lengths      = arena.get<uint16_t>(i_lens);
-			out.offsets_counts    = arena.get<uint32_t>(i_oc);
-		});
+		arena.resolve_to(reinterpret_cast<void**>(&out.lane_runs_offsets), i_offs);
+		arena.resolve_to(reinterpret_cast<void**>(&out.lane_values), i_vals);
+		arena.resolve_to(reinterpret_cast<void**>(&out.lane_lengths), i_lens);
+		arena.resolve_to(reinterpret_cast<void**>(&out.offsets_counts), i_oc);
 	}
 };
 

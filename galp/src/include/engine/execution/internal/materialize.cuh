@@ -116,14 +116,15 @@ inline RowgroupData materialize_workset(ExecutionWorkset&                    wor
 }
 
 inline void release_workset(ExecutionWorkset& workset, const bool preserve_resources = false) {
+	// Arena mode: all device column pointers are interior offsets into
+	// workset.chunk_arena->device_base_, freed wholesale by chunk_arena.reset()
+	// below. Per-expression free_device_expr() would attempt cudaFree on
+	// interior pointers (invalid) and walk a DevicePool mutex for every column.
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
 		auto& host_batch = workset.host_batches.template get<T>();
-		for (auto& expr : host_batch.device_exprs) {
-			dispatch::detail::free_device_expr(expr);
-		}
 		host_batch.device_exprs.clear();
-		host_batch.device_outputs.clear();
+		host_batch.output_offsets.clear();
 		host_batch.work_items.clear();
 		host_batch.expr_indices.clear();
 
@@ -137,6 +138,7 @@ inline void release_workset(ExecutionWorkset& workset, const bool preserve_resou
 	workset.owned_slots.reset();
 	workset.d_slots = nullptr;
 	workset.mixed_slots.clear();
+	workset.output_arena_used_bytes = 0;
 	if (workset.h2d_stream != nullptr) {
 		flsgpu::memory::sync_h2d(workset.h2d_stream);
 	}
@@ -146,6 +148,10 @@ inline void release_workset(ExecutionWorkset& workset, const bool preserve_resou
 		} else {
 			workset.chunk_arena.reset();
 		}
+	}
+	if (!preserve_resources) {
+		workset.output_arena.reset();
+		workset.output_arena_capacity_bytes = 0;
 	}
 	if (!preserve_resources && workset.h2d_stream != nullptr) {
 		if (workset.h2d_ready_event != nullptr) {

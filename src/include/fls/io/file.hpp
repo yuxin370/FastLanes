@@ -31,6 +31,8 @@ public:
 	void Append(const char* pointer, n_t size);
 	//
 	void ReadRange(Buf& buf, n_t offset, n_t size);
+	//
+	void ReadRange(void* dst, n_t offset, n_t size);
 	// get file size
 	[[nodiscard]] n_t Size() const;
 

@@ -79,12 +79,10 @@ struct CROSSRLEColumn {
 		out.n_values = get_n_values();
 		out.n_vecs   = nv;
 		out.n_runs   = n_runs;
-		arena.add_resolver([&arena, &out, i_vals, i_lens, i_offs, i_rpos]() {
-			out.values        = arena.template get<UINT_T>(i_vals);
-			out.lengths       = arena.get<uint32_t>(i_lens);
-			out.offsets       = arena.get<uint32_t>(i_offs);
-			out.run_positions = arena.get<uint32_t>(i_rpos);
-		});
+		arena.resolve_to(reinterpret_cast<void**>(&out.values), i_vals);
+		arena.resolve_to(reinterpret_cast<void**>(&out.lengths), i_lens);
+		arena.resolve_to(reinterpret_cast<void**>(&out.offsets), i_offs);
+		arena.resolve_to(reinterpret_cast<void**>(&out.run_positions), i_rpos);
 	}
 
 	CROSSRLELaneMaskColumn<T> create_lane_mask_column() const {

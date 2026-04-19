@@ -29,6 +29,7 @@ struct TableBenchmarkConfig {
 	bool                  enable_streaming            = true;
 	bool                  enable_rowgroup_prefetch    = true;
 	size_t                prefetch_depth              = 2;
+	size_t                prefetch_workers            = 2;
 	size_t                streaming_target_work_items = 1u << 18;
 	size_t                streaming_target_rowgroups  = 8; // 0 means disable rowgroup-cap flushing.
 	std::optional<size_t> rowgroup;
@@ -37,9 +38,24 @@ struct TableBenchmarkConfig {
 struct TableBenchmarkResult {
 	double end_to_end_ms     = 0.0; // wall clock of the whole benchmark run
 	double read_rowgroup_ms  = 0.0; // reader::read_rowgroup* stage
+	double file_read_ms      = 0.0; // file IO only
+	double rowgroup_build_ms = 0.0; // rowgroup/column construction after file IO
 	double assemble_expr_ms  = 0.0; // expr::assemble stage
 	double append_expr_ms    = 0.0; // runtime::append_expressions stage
 	double upload_workset_ms = 0.0; // runtime::upload_workset stage
+	// Sub-stage breakdown of upload_workset_ms (sums to ~upload_workset_ms).
+	double upload_prep_ms               = 0.0; // output arena, bind pointers, build mixed slots
+	double upload_prep_reset_ms         = 0.0; // workset + device-batch reset loop
+	double upload_prep_output_arena_ms  = 0.0; // ensure_workset_output_arena
+	double upload_prep_bind_ms          = 0.0; // bind_workset_output_pointers per-type loop
+	double upload_prep_slots_ms         = 0.0; // build_mixed_slots
+	double upload_arena_pack_ms         = 0.0; // arena.add + resolve_to for metadata
+	double upload_layout_ms             = 0.0; // arena layout pass
+	double upload_alloc_ms              = 0.0; // ensure_capacity + ensure_pinned_capacity
+	double upload_resolve_ms            = 0.0; // resolver targets + legacy resolvers
+	double upload_pack_ms               = 0.0; // std::memcpy into pinned
+	double upload_dma_issue_ms          = 0.0; // cudaMemcpyAsync for regions + staged
+	double upload_event_ms              = 0.0; // cudaEventRecord for h2d ready
 	double kernel_ms         = 0.0; // accumulated GPU event time returned by run_workset*
 	double release_device_ms = 0.0; // runtime::release_workset stage
 	double free_rowgroup_ms  = 0.0; // free_rowgroup stage
@@ -51,6 +67,7 @@ struct TableBenchmarkResult {
 	size_t   total_items       = 0;
 	size_t   total_bytes       = 0;
 	size_t   total_payload_arena_bytes = 0;
+	size_t   total_output_arena_bytes  = 0;
 	size_t   prefetched_rowgroups      = 0;
 	size_t   total_rgs         = 0;
 	uint32_t samples           = 1;

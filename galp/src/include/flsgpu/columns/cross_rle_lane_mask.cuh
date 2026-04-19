@@ -72,11 +72,9 @@ struct CROSSRLELaneMaskColumn {
 		out.n_values    = get_n_values();
 		out.n_vecs      = nv;
 		out.n_lane_runs = n_lane_runs;
-		arena.add_resolver([&arena, &out, i_base, i_vals, i_mask]() {
-			out.lane_run_base      = arena.get<uint32_t>(i_base);
-			out.lane_run_values    = arena.template get<UINT_T>(i_vals);
-			out.lane_boundary_mask = arena.get<uint64_t>(i_mask);
-		});
+		arena.resolve_to(reinterpret_cast<void**>(&out.lane_run_base), i_base);
+		arena.resolve_to(reinterpret_cast<void**>(&out.lane_run_values), i_vals);
+		arena.resolve_to(reinterpret_cast<void**>(&out.lane_boundary_mask), i_mask);
 	}
 };
 

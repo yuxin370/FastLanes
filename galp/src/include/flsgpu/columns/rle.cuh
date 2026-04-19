@@ -68,22 +68,19 @@ struct RLEColumn {
 		auto i_rsum     = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
 		auto i_vals     = arena.template add<T>(n_rle_values, rle_values);
 		auto i_offs     = arena.template add<size_t>(n_vecs, rle_offsets);
-		const size_t bp_nv   = ffor.bp.n_values;
-		const size_t bp_nvec = ffor.bp.get_n_vecs();
-		const size_t ffor_nv = ffor.get_n_values();
-		out.n_values     = n_values;
-		out.n_vecs       = n_vecs;
-		out.n_rle_values = n_rle_values;
-		arena.add_resolver([&arena, &out, i_packed, i_bw, i_bp_off, i_bases,
-		                     i_rsum, i_vals, i_offs, bp_nv, bp_nvec, ffor_nv]() {
-			device::BPColumn<IndexT> d_bp {
-			    bp_nv, bp_nvec,
-			    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
-			out.ffor = device::FFORColumn<IndexT> {ffor_nv, d_bp, arena.get<UINT_IDX>(i_bases)};
-			out.rsum_bases  = arena.get<IndexT>(i_rsum);
-			out.rle_values  = arena.get<T>(i_vals);
-			out.rle_offsets = arena.get<size_t>(i_offs);
-		});
+		out.n_values         = n_values;
+		out.n_vecs           = n_vecs;
+		out.n_rle_values     = n_rle_values;
+		out.ffor.n_values    = ffor.get_n_values();
+		out.ffor.bp.n_values = ffor.bp.n_values;
+		out.ffor.bp.n_vecs   = ffor.bp.get_n_vecs();
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.packed_array), i_packed);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.bit_widths), i_bw);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.vector_offsets), i_bp_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bases), i_bases);
+		arena.resolve_to(reinterpret_cast<void**>(&out.rsum_bases), i_rsum);
+		arena.resolve_to(reinterpret_cast<void**>(&out.rle_values), i_vals);
+		arena.resolve_to(reinterpret_cast<void**>(&out.rle_offsets), i_offs);
 	}
 };
 

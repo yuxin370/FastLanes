@@ -87,14 +87,12 @@ struct FREQColumn {
 		out.n_values     = n_values;
 		out.n_vecs       = n_vecs;
 		out.n_exceptions = n_exceptions;
-		arena.add_resolver([&arena, &out, i_fv, i_exc_off, i_pos_off, i_exc, i_pos, i_cnt]() {
-			out.frequent_value     = arena.template get<T>(i_fv);
-			out.exceptions_offsets = arena.template get<size_t>(i_exc_off);
-			out.positions_offsets  = arena.template get<size_t>(i_pos_off);
-			out.exceptions         = arena.template get<T>(i_exc);
-			out.positions          = arena.template get<uint16_t>(i_pos);
-			out.counts             = arena.template get<uint16_t>(i_cnt);
-		});
+		arena.resolve_to(reinterpret_cast<void**>(&out.frequent_value), i_fv);
+		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions_offsets), i_exc_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.positions_offsets), i_pos_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions), i_exc);
+		arena.resolve_to(reinterpret_cast<void**>(&out.positions), i_pos);
+		arena.resolve_to(reinterpret_cast<void**>(&out.counts), i_cnt);
 	}
 
 	std::tuple<T*, uint16_t*, uint16_t*> convert_exceptions_to_lane_divided_format() const {

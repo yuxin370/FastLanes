@@ -66,7 +66,12 @@ void materialize_table_batch(Batch<T>&                              batch,
 	for (size_t idx = 0; idx < batch.device_exprs.size(); ++idx) {
 		auto& expr = batch.device_exprs[idx];
 		auto  host = std::shared_ptr<T[]>(new T[expr.n_values], std::default_delete<T[]>());
-		batch.device_outputs[idx].copy_to_host(host.get());
+		if (expr.n_values > 0) {
+			if (expr.out == nullptr) {
+				throw std::runtime_error("table materialization device output pointer not initialized");
+			}
+			CUDA_SAFE_CALL(cudaMemcpy(host.get(), expr.out, expr.n_values * sizeof(T), cudaMemcpyDeviceToHost));
+		}
 
 		const size_t global_expr_index = batch.expr_indices[idx];
 		if (global_expr_index >= expr_locations.size()) {
@@ -88,11 +93,12 @@ void materialize_table_batch(Batch<T>&                              batch,
 		out.meta.value_type                                      = types::ToDataType<T>::value;
 		out.meta.values_per_step                                 = 1;
 		rowgroup.materialized.columns[location.local_expr_index] = std::move(out);
-		detail::free_device_expr(expr);
+		// Arena mode: column pointers live in chunk_arena device_base_; per-expr
+		// free_device_expr would cudaFree interior offsets. Arena teardown frees them.
 	}
 
 	batch.device_exprs.clear();
-	batch.device_outputs.clear();
+	batch.output_offsets.clear();
 	batch.work_items.clear();
 	batch.expr_indices.clear();
 }

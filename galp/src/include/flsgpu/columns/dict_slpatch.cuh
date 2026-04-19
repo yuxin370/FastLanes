@@ -66,26 +66,24 @@ struct DICTSLPATCHColumn {
 		auto i_pos     = arena.template add<uint16_t>(index.n_exceptions, index.positions, buf);
 		auto i_cnt     = arena.template add<uint16_t>(sl_nvecs, index.counts);
 		auto i_keys    = arena.template add<KEY_T>(key_count, keys);
-		const size_t bp_nv     = index.ffor.bp.n_values;
-		const size_t bp_nvec   = index.ffor.bp.get_n_vecs();
-		const size_t ffor_nv   = index.ffor.get_n_values();
-		const size_t idx_nv    = index.n_values;
-		const size_t idx_nexc  = index.n_exceptions;
-		out.n_values  = get_n_values();
-		out.key_count = key_count;
-		arena.add_resolver([&arena, &out, i_packed, i_bw, i_bp_off, i_bases,
-		                     i_exc_off, i_pos_off, i_exc, i_pos, i_cnt, i_keys,
-		                     bp_nv, bp_nvec, ffor_nv, idx_nv, sl_nvecs, idx_nexc]() {
-			device::BPColumn<IndexT> d_bp {
-			    bp_nv, bp_nvec,
-			    arena.get<UINT_IDX>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
-			device::FFORColumn<IndexT> d_ffor {ffor_nv, d_bp, arena.get<UINT_IDX>(i_bases)};
-			out.index = device::SLPATCHColumn<IndexT> {
-			    idx_nv, sl_nvecs, d_ffor, idx_nexc,
-			    arena.get<size_t>(i_exc_off), arena.get<size_t>(i_pos_off),
-			    arena.get<IndexT>(i_exc), arena.get<uint16_t>(i_pos), arena.get<uint16_t>(i_cnt)};
-			out.keys = arena.get<KEY_T>(i_keys);
-		});
+		out.n_values                   = get_n_values();
+		out.key_count                  = key_count;
+		out.index.n_values             = index.n_values;
+		out.index.n_vecs               = sl_nvecs;
+		out.index.n_exceptions         = index.n_exceptions;
+		out.index.ffor.n_values        = index.ffor.get_n_values();
+		out.index.ffor.bp.n_values     = index.ffor.bp.n_values;
+		out.index.ffor.bp.n_vecs       = index.ffor.bp.get_n_vecs();
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bp.packed_array), i_packed);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bp.bit_widths), i_bw);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bp.vector_offsets), i_bp_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bases), i_bases);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.exceptions_offsets), i_exc_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.positions_offsets), i_pos_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.exceptions), i_exc);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.positions), i_pos);
+		arena.resolve_to(reinterpret_cast<void**>(&out.index.counts), i_cnt);
+		arena.resolve_to(reinterpret_cast<void**>(&out.keys), i_keys);
 	}
 };
 

@@ -55,6 +55,14 @@ void IO::range_read(const io& io, Buf& buf, const n_t offset, const n_t size) {
 	      io);
 }
 
+void IO::range_read(const io& io, void* dst, const n_t offset, const n_t size) {
+	visit(overloaded {
+	          [&](const up<File>& file) { file->ReadRange(dst, offset, size); },
+	          [](auto&) { FLS_UNREACHABLE() },
+	      },
+	      io);
+}
+
 n_t IO::get_size(const io& io) {
 	n_t size = 0;
 	visit(overloaded {

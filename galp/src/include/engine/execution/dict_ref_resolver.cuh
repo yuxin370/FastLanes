@@ -126,9 +126,17 @@ inline void resolve_dict_refs(std::vector<expr::Expression>& expressions) {
                 throw std::runtime_error("DICTREF: referenced index column is null");
             }
             auto resolved = detail::resolve_dictref_i8_u8_from_index(dict_ref, src_col->host);
-            flsgpu::host::free_column(dict_ref);
+            if (!col->host_owned_by_backing) {
+                flsgpu::host::free_column(dict_ref);
+            }
             col->host  = std::move(resolved.payload);
             col->token = resolved.token;
+            // Resolved payload owns its keys/ffor buffers (via copy_array), no longer
+            // borrows the rowgroup backing. Clear ownership state so free_rowgroup
+            // frees the new payload instead of skipping it as borrowed.
+            col->host_owned_by_backing = false;
+            col->backing_base          = nullptr;
+            col->backing_bytes         = 0;
         }
         state[idx] = VisitState::Done;
 	};

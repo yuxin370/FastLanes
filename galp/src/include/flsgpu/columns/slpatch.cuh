@@ -86,25 +86,21 @@ struct SLPATCHColumn {
 		auto i_exc      = arena.template add<T>(n_exceptions, exceptions, buf);
 		auto i_pos      = arena.template add<uint16_t>(n_exceptions, positions, buf);
 		auto i_cnt      = arena.template add<uint16_t>(n_vecs, counts);
-		const size_t bp_nv   = ffor.bp.n_values;
-		const size_t bp_nvec = ffor.bp.get_n_vecs();
-		const size_t ffor_nv = ffor.get_n_values();
-		out.n_values    = n_values;
-		out.n_vecs      = n_vecs;
-		out.n_exceptions = n_exceptions;
-		arena.add_resolver([&arena, &out, i_packed, i_bw, i_bp_off, i_bases,
-		                     i_exc_off, i_pos_off, i_exc, i_pos, i_cnt,
-		                     bp_nv, bp_nvec, ffor_nv]() {
-			device::BPColumn<T> d_bp {
-			    bp_nv, bp_nvec,
-			    arena.get<UINT_T_BP>(i_packed), arena.get<vbw_t>(i_bw), arena.get<size_t>(i_bp_off)};
-			out.ffor = device::FFORColumn<T> {ffor_nv, d_bp, arena.get<UINT_T_BP>(i_bases)};
-			out.exceptions_offsets = arena.get<size_t>(i_exc_off);
-			out.positions_offsets  = arena.get<size_t>(i_pos_off);
-			out.exceptions         = arena.get<T>(i_exc);
-			out.positions          = arena.get<uint16_t>(i_pos);
-			out.counts             = arena.get<uint16_t>(i_cnt);
-		});
+		out.n_values        = n_values;
+		out.n_vecs          = n_vecs;
+		out.n_exceptions    = n_exceptions;
+		out.ffor.n_values   = ffor.get_n_values();
+		out.ffor.bp.n_values = ffor.bp.n_values;
+		out.ffor.bp.n_vecs  = ffor.bp.get_n_vecs();
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.packed_array), i_packed);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.bit_widths), i_bw);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.vector_offsets), i_bp_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bases), i_bases);
+		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions_offsets), i_exc_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.positions_offsets), i_pos_off);
+		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions), i_exc);
+		arena.resolve_to(reinterpret_cast<void**>(&out.positions), i_pos);
+		arena.resolve_to(reinterpret_cast<void**>(&out.counts), i_cnt);
 	}
 };
 
