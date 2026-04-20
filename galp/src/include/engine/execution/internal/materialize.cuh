@@ -7,6 +7,8 @@
 #define ENGINE_EXECUTION_INTERNAL_MATERIALIZE_CUH
 
 #include "engine/execution/internal/launch.cuh"
+#include <cstdio>
+#include <exception>
 
 namespace dispatch::runtime {
 
@@ -155,17 +157,17 @@ inline void release_workset(ExecutionWorkset& workset, const bool preserve_resou
 	}
 	if (!preserve_resources && workset.h2d_stream != nullptr) {
 		if (workset.h2d_ready_event != nullptr) {
-			CUDA_SAFE_CALL(cudaEventDestroy(workset.h2d_ready_event));
+			CUDA_LOG_CALL(cudaEventDestroy(workset.h2d_ready_event));
 			workset.h2d_ready_event = nullptr;
 		}
-		CUDA_SAFE_CALL(cudaStreamDestroy(workset.h2d_stream));
+		CUDA_LOG_CALL(cudaStreamDestroy(workset.h2d_stream));
 		workset.h2d_stream = nullptr;
 	} else if (!preserve_resources && workset.h2d_ready_event != nullptr) {
-		CUDA_SAFE_CALL(cudaEventDestroy(workset.h2d_ready_event));
+		CUDA_LOG_CALL(cudaEventDestroy(workset.h2d_ready_event));
 		workset.h2d_ready_event = nullptr;
 	}
 	if (!preserve_resources && workset.compute_stream != nullptr) {
-		CUDA_SAFE_CALL(cudaStreamDestroy(workset.compute_stream));
+		CUDA_LOG_CALL(cudaStreamDestroy(workset.compute_stream));
 		workset.compute_stream = nullptr;
 	}
 }
@@ -178,9 +180,15 @@ struct ExecutionWorksetGuard {
 	    : workset(&ws) {
 	}
 
-	~ExecutionWorksetGuard() {
+	~ExecutionWorksetGuard() noexcept {
 		if (active && workset) {
-			release_workset(*workset);
+			try {
+				release_workset(*workset);
+			} catch (const std::exception& ex) {
+				std::fprintf(stderr, "ExecutionWorksetGuard cleanup suppressed exception: %s\n", ex.what());
+			} catch (...) {
+				std::fprintf(stderr, "ExecutionWorksetGuard cleanup suppressed unknown exception\n");
+			}
 		}
 	}
 

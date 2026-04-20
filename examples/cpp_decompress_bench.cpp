@@ -283,8 +283,6 @@ int main(int argc, char** argv) {
 		std::cout << "  vectors: " << total_items << " (avg " << vectors_per_rg << " per rowgroup)\n";
 		std::cout << "  samples:   " << opt.samples << "\n";
 		std::cout << "  bytes:     " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
-		// benchmark_wall_ms mirrors galp_cli's semantics (file I/O + build + decode),
-		// so the shared CSV column compares apples-to-apples across tools.
 		std::cout << "  benchmark_wall_ms: " << (end_to_end_with_teardown_ms + file_read_ms) << "\n";
 		std::cout << "  end_to_end_ms: " << end_to_end_with_teardown_ms << "\n";
 		std::cout << "  end_to_end_ms (no teardown): " << end_to_end_ms << "\n";

@@ -52,7 +52,7 @@ struct TableBenchmarkResult {
 	double upload_arena_pack_ms         = 0.0; // arena.add + resolve_to for metadata
 	double upload_layout_ms             = 0.0; // arena layout pass
 	double upload_alloc_ms              = 0.0; // ensure_capacity + ensure_pinned_capacity
-	double upload_resolve_ms            = 0.0; // resolver targets + legacy resolvers
+	double upload_resolve_ms            = 0.0; // resolver targets + callback resolvers
 	double upload_pack_ms               = 0.0; // std::memcpy into pinned
 	double upload_dma_issue_ms          = 0.0; // cudaMemcpyAsync for regions + staged
 	double upload_event_ms              = 0.0; // cudaEventRecord for h2d ready

@@ -4,12 +4,11 @@
 # scripts/show_image.py
 # ────────────────────────────────────────────────────────
 #!/usr/bin/env python3
-"""show_image.py – Preview a JPEG stored in a **pipe‑delimited** CSV.
+"""show_image.py – Preview a JPEG stored in a **pipe-delimited** CSV.
 
-This script now aligns with the updated *jpeg_generator* output:
 • CSV delimiter is a **vertical bar ("|")**.
-• Base64 image lives in **column index 2** (after ``id`` and ``filename``).
-• Works as PyTest test (`pytest -s show_image.py`) and as a CLI utility.
+• Base64 image lives in **column index 2** (after ``id`` and ``filename``).
+• Works as a PyTest test (`pytest -s show_image.py`) and as a CLI utility.
 
 By default it loads the sample dataset generated under
 ``../data/generated/single_columns/jpeg/data.csv`` but you can point it to any

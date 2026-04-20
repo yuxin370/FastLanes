@@ -3,16 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/benchmark/compressors-benchmarks.cu
 // ────────────────────────────────────────────────────────
-// =============================================================================
-// benchmark_runner.cpp  —  single-file driver that mirrors test-scripts/run.sh
-//
-// * Builds with any C++17+ host compiler + NVCC.
-// * Host-only code (filesystem, main, etc.) is hidden from the device pass
-//   via `#if !defined(__CUDA_ARCH__)` guards, so NVCC no longer chokes.
-//
-// Compile example:
-//   g++ -std=c++17 benchmark_runner.cpp -o compressors-benchmarks $(CUDA_LIBS) ...
-// =============================================================================
+// Host-only includes are guarded from the CUDA device pass.
 #include "engine/enums.cuh"
 #include "engine/types.cuh"
 #include "flsgpu/consts.cuh"

@@ -9,6 +9,7 @@ set(GALP_CORE_SOURCES
         engine/expression.cu
 )
 add_library(galp_core STATIC ${GALP_CORE_SOURCES})
+add_library(Galp::core ALIAS galp_core)
 target_compile_options(galp_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo -src-in-ptx>)
 # target_compile_options(galp_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_ANALYZE_FLAGS}>)
 target_include_directories(galp_core PUBLIC
@@ -16,4 +17,3 @@ target_include_directories(galp_core PUBLIC
         ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(galp_core PUBLIC CUDA::cudart nvcomp::nvcomp Thrust::Thrust FastLanes::core)
 apply_warnings(galp_core)
-set_target_properties(galp_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

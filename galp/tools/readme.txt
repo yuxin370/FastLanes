@@ -62,7 +62,7 @@ Benchmark output metrics
     benchmark_wall_ms.
   - samples scales kernel_event_ms, but does not multiply the host build/upload/release stages,
     because the workset is built once and the kernel is replayed samples times.
-  - Backward-compatible aliases end_to_end_ms and kernel_ms are still printed for older scripts.
+  - Aliases end_to_end_ms and kernel_ms are also printed.
 
 Options
   --rowgroup N                      Only process the given rowgroup.
@@ -115,7 +115,7 @@ Notes
 - `--no-zero-copy` only affects host-side parsing; the H2D transfer to GPU is unchanged.
 - `--no-streaming` disables the streaming overlap but still groups rowgroups into chunks.
 - `--no-mega-kernel` processes each rowgroup as an independent workset (no cross-rowgroup batching).
-- Backward-compatible aliases: --gpu-dispatch-kernel, --zero-copy-parse, --mega-kernel-no-stream.
+- Additional accepted aliases: --gpu-dispatch-kernel, --zero-copy-parse, --mega-kernel-no-stream.
 - Frequency patcher defaults to the stateful path. Pass `--freq-prefetch-all-branchless` to switch to
   branchless, and additionally `--freq-hybrid-patcher` to let the engine pick per-column based on
   exception density vs `--freq-branchless-threshold`.

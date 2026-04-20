@@ -12,6 +12,8 @@ target_link_libraries(galp_tests PRIVATE
         FastLanes::core
 )
 
+target_compile_definitions(galp_tests PRIVATE FLS_GALP_SOURCE_DIR="${GALP_DATA_ROOT}")
+
 apply_warnings(galp_tests)
 
 gtest_discover_tests(galp_tests

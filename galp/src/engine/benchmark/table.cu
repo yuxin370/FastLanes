@@ -5,6 +5,8 @@
 // ────────────────────────────────────────────────────────
 #include "engine/benchmark/table.cuh"
 #include "engine/execution/internal/materialize.cuh"
+#include "engine/execution/internal/pinned_rowgroup_pool.cuh"
+#include "engine/execution/internal/rowgroup_prefetch_queue.cuh"
 #include "engine/execution/internal/streaming_pipeline.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/expression.cuh"
@@ -146,305 +148,6 @@ struct StreamingBenchmarkChunk {
 	bool                       submitted   = false;
 };
 
-struct RowgroupReadResult {
-	reader::Rowgroup rowgroup          {};
-	double           read_ms           = 0.0;
-	double           file_read_ms      = 0.0;
-	double           rowgroup_build_ms = 0.0;
-};
-
-class PinnedRowgroupBufferPool : public std::enable_shared_from_this<PinnedRowgroupBufferPool> {
-public:
-	struct Lease {
-		std::shared_ptr<void> owner;
-		std::byte*            data     = nullptr;
-		size_t                capacity = 0;
-	};
-
-	// Construct only via create() — enable_shared_from_this requires the
-	// instance be owned by a shared_ptr before shared_from_this() is called.
-	static std::shared_ptr<PinnedRowgroupBufferPool> create(const size_t slots) {
-		return std::shared_ptr<PinnedRowgroupBufferPool>(new PinnedRowgroupBufferPool(slots));
-	}
-
-	~PinnedRowgroupBufferPool() {
-		for (auto& slot : slots_) {
-			if (slot.ptr != nullptr) {
-				flsgpu::memory::DevicePool::instance().release_pinned(slot.ptr);
-			}
-		}
-	}
-
-	// Wake any thread currently blocked in acquire() so it can exit with an
-	// exception instead of deadlocking during teardown (e.g. if a prefetch
-	// worker filled the pool and another worker errored before it drained).
-	void request_stop() {
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			stopping_ = true;
-		}
-		cv_.notify_all();
-	}
-
-	Lease acquire(const size_t min_bytes) {
-		std::unique_lock<std::mutex> lock(mutex_);
-		cv_.wait(lock, [&]() {
-			return stopping_ || std::any_of(slots_.begin(), slots_.end(), [](const Slot& slot) { return !slot.in_use; });
-		});
-		if (stopping_) {
-			throw std::runtime_error("pinned rowgroup buffer pool stopped");
-		}
-
-		for (size_t idx = 0; idx < slots_.size(); ++idx) {
-			auto& slot = slots_[idx];
-			if (slot.in_use) {
-				continue;
-			}
-			if (slot.capacity < min_bytes) {
-				if (slot.ptr != nullptr) {
-					flsgpu::memory::DevicePool::instance().release_pinned(slot.ptr);
-				}
-				const size_t alloc_bytes = round_up_capacity(min_bytes);
-				slot.ptr                 = flsgpu::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
-				slot.capacity            = alloc_bytes;
-			}
-			slot.in_use = true;
-			// Capture a weak_ptr in the deleter so a lease that outlives the
-			// pool (during abnormal teardown) skips release() on a destroyed
-			// object instead of dereferencing a dangling `this`. Under normal
-			// shutdown the pool is alive until all leases drop.
-			std::weak_ptr<PinnedRowgroupBufferPool> weak_self = weak_from_this();
-			return Lease {
-			    std::shared_ptr<void>(slot.ptr,
-			                          [weak_self, idx](void*) {
-				                          if (auto self = weak_self.lock()) {
-					                          self->release(idx);
-				                          }
-			                          }),
-			    reinterpret_cast<std::byte*>(slot.ptr),
-			    slot.capacity,
-			};
-		}
-
-		throw std::runtime_error("pinned rowgroup buffer pool exhausted");
-	}
-
-private:
-	explicit PinnedRowgroupBufferPool(const size_t slots) : slots_(std::max<size_t>(1, slots)) {}
-	struct Slot {
-		void*  ptr      = nullptr;
-		size_t capacity = 0;
-		bool   in_use   = false;
-	};
-
-	static size_t round_up_capacity(const size_t bytes) {
-		constexpr size_t kAlign = 64U * 1024U;
-		if (bytes == 0) {
-			return kAlign;
-		}
-		return ((bytes + kAlign - 1U) / kAlign) * kAlign;
-	}
-
-	void release(const size_t idx) {
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			slots_[idx].in_use = false;
-		}
-		cv_.notify_one();
-	}
-
-	std::mutex                  mutex_;
-	std::condition_variable     cv_;
-	std::vector<Slot>           slots_;
-	bool                        stopping_ = false;
-};
-
-class RowgroupPrefetchQueue {
-public:
-	RowgroupPrefetchQueue(const std::filesystem::path& file_path,
-	                      const size_t                start,
-	                      const size_t                end,
-	                      const bool                  use_zero_copy_parse,
-	                      const size_t                depth,
-	                      const size_t                num_workers,
-	                      std::shared_ptr<PinnedRowgroupBufferPool> pinned_pool = {})
-	    : start_(start)
-	    , end_(end)
-	    , depth_(std::max<size_t>(1, depth))
-	    , next_claim_(start)
-	    , next_out_(start)
-	    // Ring buffer sized to the configured depth — not the full table.
-	    // cv_not_full_ gates a worker from writing a slot until the consumer
-	    // has drained the previous occupant (rg_idx - next_out < depth), so
-	    // each slot index (rg_idx % depth) is exclusive at any moment.
-	    , slots_(std::max<size_t>(1, depth))
-	    , pinned_pool_(pinned_pool) {
-		worker_count_ = std::max<size_t>(1, std::min<size_t>(num_workers, end > start ? end - start : 1));
-		workers_.reserve(worker_count_);
-		for (size_t w = 0; w < worker_count_; ++w) {
-			workers_.emplace_back(
-			    [this, file_path, use_zero_copy_parse, pinned_pool]() {
-				    try {
-					    reader::reader rdr(file_path);
-					    while (true) {
-						    const size_t rg_idx = next_claim_.fetch_add(1, std::memory_order_relaxed);
-						    if (rg_idx >= end_) {
-							    break;
-						    }
-						    {
-							    std::unique_lock<std::mutex> lock(mutex_);
-							    cv_not_full_.wait(lock, [&]() {
-								    return stop_ || (rg_idx - next_out_.load(std::memory_order_relaxed) < depth_);
-							    });
-							    if (stop_) {
-								    return;
-							    }
-						    }
-
-						    Prefetched prefetched {};
-						    if (use_zero_copy_parse) {
-							    const auto file_read_start = std::chrono::steady_clock::now();
-							    reader::ZeroCopyRowgroup zero_copy {};
-							    if (pinned_pool) {
-								    auto lease = pinned_pool->acquire(rdr.rowgroup_storage_bytes(rg_idx));
-								    zero_copy  = rdr.read_rowgroup_zero_copy_into(
-								        rg_idx, std::move(lease.owner), lease.data, lease.capacity,
-								        /*backing_is_pinned=*/true);
-							    } else {
-								    zero_copy = rdr.read_rowgroup_zero_copy(rg_idx);
-							    }
-							    const auto file_read_end = std::chrono::steady_clock::now();
-							    const auto build_start   = std::chrono::steady_clock::now();
-							    prefetched.rowgroup      = rdr.materialize_zero_copy_rowgroup(std::move(zero_copy));
-							    const auto build_end     = std::chrono::steady_clock::now();
-							    prefetched.file_read_ms =
-							        std::chrono::duration<double, std::milli>(file_read_end - file_read_start).count();
-							    prefetched.rowgroup_build_ms =
-							        std::chrono::duration<double, std::milli>(build_end - build_start).count();
-							    prefetched.read_ms = prefetched.file_read_ms + prefetched.rowgroup_build_ms;
-						    } else {
-							    const auto read_start    = std::chrono::steady_clock::now();
-							    prefetched.rowgroup      = rdr.read_rowgroup(rg_idx);
-							    const auto read_end      = std::chrono::steady_clock::now();
-							    prefetched.rowgroup_build_ms =
-							        std::chrono::duration<double, std::milli>(read_end - read_start).count();
-							    prefetched.read_ms = prefetched.rowgroup_build_ms;
-						    }
-
-						    {
-							    std::lock_guard<std::mutex> lock(mutex_);
-							    if (stop_) {
-								    return;
-							    }
-							    slots_[(rg_idx - start_) % depth_] = std::move(prefetched);
-							    ++ready_count_;
-							    cv_not_empty_.notify_all();
-						    }
-					    }
-				    } catch (...) {
-					    std::lock_guard<std::mutex> lock(mutex_);
-					    if (!error_) {
-						    error_ = std::current_exception();
-					    }
-					    cv_not_empty_.notify_all();
-				    }
-
-				    std::lock_guard<std::mutex> lock(mutex_);
-				    if (++workers_finished_ == worker_count_) {
-					    done_ = true;
-					    cv_not_empty_.notify_all();
-				    }
-			    });
-		}
-	}
-
-	~RowgroupPrefetchQueue() {
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			stop_ = true;
-		}
-		cv_not_full_.notify_all();
-		cv_not_empty_.notify_all();
-		// Wake any worker blocked inside pinned_pool_->acquire() so shutdown can
-		// proceed instead of deadlocking on a lease that will never return.
-		if (pinned_pool_) {
-			pinned_pool_->request_stop();
-		}
-		for (auto& w : workers_) {
-			if (w.joinable()) {
-				w.join();
-			}
-		}
-	}
-
-	RowgroupReadResult pop() {
-		const auto         wait_start = std::chrono::steady_clock::now();
-		std::exception_ptr pending_error;
-		Prefetched         item;
-		bool               underflow = false;
-		const size_t       slot      = (next_out_.load(std::memory_order_relaxed) - start_) % depth_;
-		{
-			std::unique_lock<std::mutex> lock(mutex_);
-			cv_not_empty_.wait(lock, [&]() {
-				return stop_ || error_ != nullptr || slots_[slot].has_value() || done_;
-			});
-			const auto wait_end = std::chrono::steady_clock::now();
-			wait_ms_ += std::chrono::duration<double, std::milli>(wait_end - wait_start).count();
-
-			if (error_ != nullptr) {
-				pending_error = error_;
-			} else if (!slots_[slot].has_value()) {
-				underflow = true;
-			} else {
-				item = std::move(*slots_[slot]);
-				slots_[slot].reset();
-				--ready_count_;
-				next_out_.fetch_add(1, std::memory_order_relaxed);
-			}
-		}
-		cv_not_full_.notify_all();
-
-		if (pending_error) {
-			std::rethrow_exception(pending_error);
-		}
-		if (underflow) {
-			throw std::runtime_error("rowgroup prefetch queue underflow");
-		}
-		return RowgroupReadResult {std::move(item.rowgroup), item.read_ms, item.file_read_ms, item.rowgroup_build_ms};
-	}
-
-	// Only safe to call from the consumer thread (the one that owns pop()).
-	double wait_ms() const {
-		return wait_ms_;
-	}
-
-private:
-	struct Prefetched {
-		reader::Rowgroup rowgroup          {};
-		double           read_ms           = 0.0;
-		double           file_read_ms      = 0.0;
-		double           rowgroup_build_ms = 0.0;
-	};
-
-	const size_t                           start_     = 0;
-	const size_t                           end_       = 0;
-	const size_t                           depth_     = 1;
-	std::atomic<size_t>                    next_claim_;
-	std::atomic<size_t>                    next_out_;
-	std::vector<std::thread>               workers_;
-	size_t                                 worker_count_ = 0;
-	mutable std::mutex                     mutex_;
-	std::condition_variable                cv_not_empty_;
-	std::condition_variable                cv_not_full_;
-	std::vector<std::optional<Prefetched>> slots_;
-	size_t                                 ready_count_      = 0;
-	size_t                                 workers_finished_ = 0;
-	std::exception_ptr                     error_;
-	bool                                   done_    = false;
-	bool                                   stop_    = false;
-	double                                 wait_ms_ = 0.0;
-	std::shared_ptr<PinnedRowgroupBufferPool> pinned_pool_;
-};
 
 void reset_streaming_chunk(StreamingBenchmarkChunk& chunk) {
 	chunk.pending_rowgroups.clear();
@@ -553,12 +256,12 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	const size_t max_rowgroups_per_chunk = (stream_target_rowgroups > 0)
 	                                           ? stream_target_rowgroups
 	                                           : (n_rowgroups > 0 ? n_rowgroups : 1U);
-	std::shared_ptr<PinnedRowgroupBufferPool> pinned_rowgroup_pool;
+	std::shared_ptr<runtime::PinnedRowgroupBufferPool> pinned_rowgroup_pool;
 	if (whole_table && cfg.use_zero_copy_parse) {
 		const size_t pooled_slots =
 		    (cfg.enable_streaming ? (2U * max_rowgroups_per_chunk) : max_rowgroups_per_chunk)
 		    + cfg.prefetch_depth + std::max<size_t>(1, cfg.prefetch_workers) + 2U;
-		pinned_rowgroup_pool = PinnedRowgroupBufferPool::create(pooled_slots);
+		pinned_rowgroup_pool = runtime::PinnedRowgroupBufferPool::create(pooled_slots);
 	}
 
 	if (!whole_table) {
@@ -566,7 +269,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			const auto* rg    = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rg_idx));
 			const size_t bytes = rowgroup_bytes(rg);
 
-			RowgroupReadResult read_result {};
+			runtime::RowgroupReadResult read_result {};
 			if (cfg.use_zero_copy_parse) {
 				const auto file_read_start = std::chrono::steady_clock::now();
 				auto       zero_copy       = rdr.read_rowgroup_zero_copy(rg_idx);
@@ -651,15 +354,15 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		return out;
 	}
 
-	std::unique_ptr<RowgroupPrefetchQueue> prefetch_queue;
+	std::unique_ptr<runtime::RowgroupPrefetchQueue> prefetch_queue;
 	if (use_rowgroup_prefetch) {
-		prefetch_queue = std::make_unique<RowgroupPrefetchQueue>(
+		prefetch_queue = std::make_unique<runtime::RowgroupPrefetchQueue>(
 		    fls_path, start, end, cfg.use_zero_copy_parse, cfg.prefetch_depth,
 		    cfg.prefetch_workers, pinned_rowgroup_pool);
 	}
 
-	const auto fetch_rowgroup = [&](const size_t rg_idx) -> RowgroupReadResult {
-		RowgroupReadResult result {};
+	const auto fetch_rowgroup = [&](const size_t rg_idx) -> runtime::RowgroupReadResult {
+		runtime::RowgroupReadResult result {};
 		if (prefetch_queue) {
 			result = prefetch_queue->pop();
 			++out.prefetched_rowgroups;

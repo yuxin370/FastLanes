@@ -44,7 +44,6 @@ target_include_directories(Thrust::Thrust INTERFACE ${THRUST_INCLUDE_DIR})
 # ────────────────────────────────────────────────
 # 4. User-tunable options & warnings
 # ────────────────────────────────────────────────
-option(USE_CLANG_FOR_HOST "Use clang++-14 for all .cpp files" ON)
 option(GALP_VERBOSE_BUILD "Print every compile/link command" OFF)
 if (GALP_VERBOSE_BUILD)
     set(CMAKE_VERBOSE_MAKEFILE ON)
@@ -82,7 +81,11 @@ macro(apply_warnings tgt)
             $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_WARNINGS}>)
 endmacro()
 
-add_compile_definitions(FLS_GALP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+# Sample data root for tests and benchmarks. Attach the definition to those
+# targets instead of the core library to keep source paths out of installed
+# artifacts.
+set(GALP_DATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH
+    "Root directory containing data/floats and data/doubles for galp tests and benchmarks")
 
 # ────────────────────────────────────────────────
 # 5. GALP core static library

@@ -414,7 +414,7 @@ int main(int argc, char** argv) {
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";
 			std::cout << "  prefetch_wait_ms: " << prefetch_wait_ms << "\n";
 			std::cout << "  prefetched_rowgroups: " << prefetched_rowgroups << "\n";
-			// Backward-compatible aliases for existing scripts.
+			// Alias metrics used by existing scripts.
 			std::cout << "  end_to_end_ms: " << benchmark_wall_ms << "\n";
 			std::cout << "  kernel_ms: " << kernel_event_ms << "\n";
 			std::cout << "  kernel_launches: " << total_launches << "\n";

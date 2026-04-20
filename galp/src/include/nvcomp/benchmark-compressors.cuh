@@ -45,8 +45,8 @@ public:
 	}
 
 	~CudaStopwatch() {
-		CUDA_SAFE_CALL(cudaEventDestroy(startEvent));
-		CUDA_SAFE_CALL(cudaEventDestroy(stopEvent));
+		CUDA_LOG_CALL(cudaEventDestroy(startEvent));
+		CUDA_LOG_CALL(cudaEventDestroy(stopEvent));
 	}
 
 	void start() {

@@ -110,7 +110,7 @@ if (FLS_ENABLE_INSTALL)
             DESTINATION ${CMAKE_INSTALL_LIBDIR}/FLS
     )
 
-    # Export file to the build tree for downstream projects
+    # Build-tree export for find_package(FLS)
     export(
             EXPORT FLSTargets
             FILE "${CMAKE_BINARY_DIR}/FLSTargets.cmake"

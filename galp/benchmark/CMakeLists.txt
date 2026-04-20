@@ -77,6 +77,7 @@ add_executable(compressors-benchmarks compressors-benchmarks.cu nvcomp/benchmark
 apply_warnings(compressors-benchmarks)
 target_include_directories(compressors-benchmarks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(compressors-benchmarks PRIVATE galp_core)
+target_compile_definitions(compressors-benchmarks PRIVATE FLS_GALP_SOURCE_DIR="${GALP_DATA_ROOT}")
 
 add_executable(micro-benchmarks micro-benchmarks.cu nvcomp/benchmark-compressors.cu nvcomp/nvcomp-compressors.cu)
 apply_warnings(micro-benchmarks)

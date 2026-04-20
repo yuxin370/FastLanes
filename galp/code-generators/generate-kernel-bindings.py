@@ -11,7 +11,8 @@ import sys
 import argparse
 import logging
 
-GENERATED_BINDINGS_DIR = "/home/tangyuxin/cleanFastlanes/FastLanes/galp/benchmark/generated-bindings-tp"
+# Resolved from argparse at startup; see __main__ block.
+GENERATED_BINDINGS_DIR: str = ""
 
 FILE_HEADER = """
 #include "engine/kernels.cuh"
@@ -828,8 +829,16 @@ if __name__ == "__main__":
         help=f"logging level to use: {logging.CRITICAL}=CRITICAL, {logging.ERROR}=ERROR, {logging.INFO}=INFO, "
         + f"{logging.DEBUG}=DEBUG, higher number means less output",
     )
+    parser.add_argument(
+        "-o",
+        "--out-dir",
+        required=True,
+        help="Directory to write the generated binding .cu files into.",
+    )
 
     args = parser.parse_args()
+    GENERATED_BINDINGS_DIR = os.path.abspath(args.out_dir)
+    os.makedirs(GENERATED_BINDINGS_DIR, exist_ok=True)
     logging.basicConfig(level=args.logging_level)  # filename='program.log',
     logging.info(
         f"Started {os.path.basename(sys.argv[0])} with the following args: {args}"
