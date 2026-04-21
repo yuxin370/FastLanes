@@ -16,9 +16,9 @@
 
 namespace dispatch::runtime {
 
-// Per-call breakdown of upload_workset sub-stages. Populated by upload_workset()
-// and accumulated by the benchmark loop to surface which phase dominates the
-// upload_workset_ms metric (see table.cu consumer site).
+// Per-call breakdown of upload_workset sub-stages. Returned by upload_workset()
+// so benchmark code can observe upload costs without storing profiling state on
+// the workset itself.
 struct UploadBreakdown {
 	double prep_ms               = 0.0; // output arena, bind pointers, build mixed slots
 	double prep_reset_ms         = 0.0; // workset + device-batch reset loop
@@ -28,26 +28,47 @@ struct UploadBreakdown {
 	double arena_pack_ms         = 0.0; // arena.add + resolve_to for metadata
 	double arena_upload_ms       = 0.0; // DeviceArena::upload (capacity + pack + DMA issue)
 	double event_record_ms       = 0.0; // cudaEventRecord for h2d ready
+	flsgpu::memory::ArenaUploadMetrics arena {};
 };
 
-struct ExecutionWorkset {
+// Host/device batch payload + the single chunk arena that carries every
+// device-visible column buffer for this workset.
+struct WorksetBuffers {
 	using HostBatches   = typename dispatch::BatchSetFromList<dispatch::SupportedTypes>::type;
 	using DeviceBatches = typename dispatch::DeviceBatchSetFromList<dispatch::SupportedTypes>::type;
 
-	HostBatches                                      host_batches;
-	DeviceBatches                                    device_batches;
-	std::vector<dispatch::MixedWorkSlot>             mixed_slots;
-	std::unique_ptr<flsgpu::memory::DeviceArena>     chunk_arena;
-	std::optional<GPUArray<uint8_t>>                 output_arena;
-	std::optional<GPUArray<dispatch::MixedWorkSlot>> owned_slots;
-	dispatch::MixedWorkSlot*                         d_slots = nullptr;
-	size_t                                           payload_arena_bytes = 0;
-	size_t                                           output_arena_capacity_bytes = 0;
-	size_t                                           output_arena_used_bytes = 0;
-	cudaStream_t                                     h2d_stream = nullptr;
-	cudaStream_t                                     compute_stream = nullptr;
-	cudaEvent_t                                      h2d_ready_event = nullptr;
-	UploadBreakdown                                  last_upload_breakdown {};
+	HostBatches                                  host_batches;
+	DeviceBatches                                device_batches;
+	std::unique_ptr<flsgpu::memory::DeviceArena> chunk_arena;
+	size_t                                       payload_arena_bytes = 0;
+};
+
+// Device-side output buffer shared by every expression in the workset.
+struct WorksetOutputs {
+	std::optional<GPUArray<uint8_t>> arena;
+	size_t                           capacity_bytes = 0;
+	size_t                           used_bytes     = 0;
+};
+
+// Mixed-dispatch slot layout: host-side work list plus the matching device copy.
+struct WorksetSlots {
+	std::vector<dispatch::MixedWorkSlot>             mixed;
+	std::optional<GPUArray<dispatch::MixedWorkSlot>> owned;
+	dispatch::MixedWorkSlot*                         d = nullptr;
+};
+
+// CUDA streams + cross-stream synchronisation used to drive H2D and compute.
+struct WorksetTransfer {
+	cudaStream_t h2d_stream      = nullptr;
+	cudaStream_t compute_stream  = nullptr;
+	cudaEvent_t  h2d_ready_event = nullptr;
+};
+
+struct ExecutionWorkset {
+	WorksetBuffers  buffers;
+	WorksetOutputs  outputs;
+	WorksetSlots    slots;
+	WorksetTransfer transfer;
 };
 
 inline bool use_async_h2d() {
@@ -64,24 +85,24 @@ inline cudaStream_t ensure_workset_h2d_stream(ExecutionWorkset& workset) {
 	if (!use_async_h2d() && !force_h2d_stream_for_sync()) {
 		return nullptr;
 	}
-	if (workset.h2d_stream == nullptr) {
-		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.h2d_stream, cudaStreamNonBlocking));
+	if (workset.transfer.h2d_stream == nullptr) {
+		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.transfer.h2d_stream, cudaStreamNonBlocking));
 	}
-	return workset.h2d_stream;
+	return workset.transfer.h2d_stream;
 }
 
 inline cudaStream_t ensure_workset_compute_stream(ExecutionWorkset& workset) {
-	if (workset.compute_stream == nullptr) {
-		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.compute_stream, cudaStreamNonBlocking));
+	if (workset.transfer.compute_stream == nullptr) {
+		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.transfer.compute_stream, cudaStreamNonBlocking));
 	}
-	return workset.compute_stream;
+	return workset.transfer.compute_stream;
 }
 
 inline cudaEvent_t ensure_workset_h2d_ready_event(ExecutionWorkset& workset) {
-	if (workset.h2d_ready_event == nullptr) {
-		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&workset.h2d_ready_event, cudaEventDisableTiming));
+	if (workset.transfer.h2d_ready_event == nullptr) {
+		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&workset.transfer.h2d_ready_event, cudaEventDisableTiming));
 	}
-	return workset.h2d_ready_event;
+	return workset.transfer.h2d_ready_event;
 }
 
 inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t additional_exprs) {
@@ -90,7 +111,7 @@ inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t a
 	}
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		auto& batch = workset.host_batches.template get<T>();
+		auto& batch = workset.buffers.host_batches.template get<T>();
 		batch.device_exprs.reserve(batch.device_exprs.size() + additional_exprs);
 		batch.output_offsets.reserve(batch.output_offsets.size() + additional_exprs);
 		batch.expr_indices.reserve(batch.expr_indices.size() + additional_exprs);
@@ -101,7 +122,7 @@ inline bool any_batch_has_device_exprs(const ExecutionWorkset& workset) {
 	bool has = false;
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		if (!workset.host_batches.template get<T>().device_exprs.empty()) {
+		if (!workset.buffers.host_batches.template get<T>().device_exprs.empty()) {
 			has = true;
 		}
 	});
@@ -116,7 +137,7 @@ inline size_t round_up_capacity_bytes(const size_t bytes, const size_t alignment
 }
 
 inline bool begin_workset_chunk_arena(ExecutionWorkset& workset, const size_t additional_exprs) {
-	if (workset.chunk_arena) {
+	if (workset.buffers.chunk_arena) {
 		// Mid-chunk reentry. Two shapes reach here:
 		//   1. Streaming/table path: an outer begin_workset_chunk_arena already
 		//      reserved cumulative capacity for this chunk and prior rowgroups'
@@ -137,39 +158,39 @@ inline bool begin_workset_chunk_arena(ExecutionWorkset& workset, const size_t ad
 	// into batch.device_exprs. Reserve before append_expressions() starts for each
 	// new chunk/workset so vector growth cannot relocate those references mid-build.
 	reserve_batch_expr_storage(workset, additional_exprs);
-	workset.chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(ensure_workset_h2d_stream(workset));
+	workset.buffers.chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(ensure_workset_h2d_stream(workset));
 	return true;
 }
 
 template <typename T>
 inline size_t reserve_workset_output_bytes(ExecutionWorkset& workset, const size_t n_values) {
 	if (n_values == 0) {
-		return workset.output_arena_used_bytes;
+		return workset.outputs.used_bytes;
 	}
 	constexpr size_t kAlign = alignof(T) > 16 ? alignof(T) : 16U;
-	workset.output_arena_used_bytes = (workset.output_arena_used_bytes + (kAlign - 1U)) & ~(kAlign - 1U);
-	const size_t offset = workset.output_arena_used_bytes;
-	workset.output_arena_used_bytes += n_values * sizeof(T);
+	workset.outputs.used_bytes = (workset.outputs.used_bytes + (kAlign - 1U)) & ~(kAlign - 1U);
+	const size_t offset = workset.outputs.used_bytes;
+	workset.outputs.used_bytes += n_values * sizeof(T);
 	return offset;
 }
 
 inline void ensure_workset_output_arena(ExecutionWorkset& workset) {
-	if (workset.output_arena_used_bytes == 0) {
-		workset.output_arena.reset();
-		workset.output_arena_capacity_bytes = 0;
+	if (workset.outputs.used_bytes == 0) {
+		workset.outputs.arena.reset();
+		workset.outputs.capacity_bytes = 0;
 		return;
 	}
-	if (workset.output_arena.has_value() && workset.output_arena_capacity_bytes >= workset.output_arena_used_bytes) {
+	if (workset.outputs.arena.has_value() && workset.outputs.capacity_bytes >= workset.outputs.used_bytes) {
 		return;
 	}
-	const size_t alloc_bytes = round_up_capacity_bytes(workset.output_arena_used_bytes);
-	workset.output_arena.emplace(alloc_bytes, ensure_workset_h2d_stream(workset));
-	workset.output_arena_capacity_bytes = alloc_bytes;
+	const size_t alloc_bytes = round_up_capacity_bytes(workset.outputs.used_bytes);
+	workset.outputs.arena.emplace(alloc_bytes, ensure_workset_h2d_stream(workset));
+	workset.outputs.capacity_bytes = alloc_bytes;
 }
 
 template <typename T>
 inline void bind_workset_output_pointers(ExecutionWorkset& workset) {
-	auto& batch = workset.host_batches.template get<T>();
+	auto& batch = workset.buffers.host_batches.template get<T>();
 	if (batch.device_exprs.empty()) {
 		return;
 	}
@@ -177,7 +198,7 @@ inline void bind_workset_output_pointers(ExecutionWorkset& workset) {
 	// allocated (nothing to write). Leave each device_expr.out null — the
 	// kernel dispatch has no work to issue for a zero-length expression, so
 	// the pointer is never dereferenced.
-	auto* base = workset.output_arena.has_value() ? workset.output_arena->get() : nullptr;
+	auto* base = workset.outputs.arena.has_value() ? workset.outputs.arena->get() : nullptr;
 	for (size_t idx = 0; idx < batch.device_exprs.size(); ++idx) {
 		if (batch.device_exprs[idx].n_values == 0) {
 			batch.device_exprs[idx].out = nullptr;
@@ -194,7 +215,7 @@ inline size_t count_work_items(const ExecutionWorkset& workset) {
 	size_t total = 0;
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		total += workset.host_batches.template get<T>().work_items.size();
+		total += workset.buffers.host_batches.template get<T>().work_items.size();
 	});
 	return total;
 }
@@ -222,9 +243,9 @@ inline void validate_unique_work_item(std::unordered_set<uint64_t>& seen, const 
 inline dispatch::PlanKind plan_for_work_item(const ExecutionWorkset& workset, const dispatch::WorkItemAny& work) {
 	switch (work.type) {
 	case dispatch::TypeTag::I8:
-		return workset.host_batches.template get<int8_t>().device_exprs[work.expr_index].plan;
+		return workset.buffers.host_batches.template get<int8_t>().device_exprs[work.expr_index].plan;
 	case dispatch::TypeTag::I16:
-		return workset.host_batches.template get<int16_t>().device_exprs[work.expr_index].plan;
+		return workset.buffers.host_batches.template get<int16_t>().device_exprs[work.expr_index].plan;
 	default:
 		throw std::runtime_error("unsupported work item type");
 	}
@@ -235,15 +256,15 @@ inline uint32_t semantic_lanes_for_work_item(const ExecutionWorkset& workset, co
 }
 
 inline void build_mixed_slots(ExecutionWorkset& workset) {
-	workset.mixed_slots.clear();
-	workset.owned_slots.reset();
-	workset.d_slots = nullptr;
+	workset.slots.mixed.clear();
+	workset.slots.owned.reset();
+	workset.slots.d = nullptr;
 
 	const size_t total_items = count_work_items(workset);
 	if (total_items == 0) {
 		return;
 	}
-	workset.mixed_slots.reserve((total_items + 1U) / 2U);
+	workset.slots.mixed.reserve((total_items + 1U) / 2U);
 
 	std::optional<dispatch::WorkItemAny> pending_half;
 #ifndef NDEBUG
@@ -258,14 +279,14 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 		const uint32_t semantic_lanes = semantic_lanes_for_work_item(workset, work);
 		if (semantic_lanes == dispatch::lane_count_for_type(dispatch::TypeTag::I8)) {
 			if (pending_half.has_value()) {
-				workset.mixed_slots.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
+				workset.slots.mixed.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
 				pending_half.reset();
 			}
-			workset.mixed_slots.push_back(dispatch::MixedWorkSlot {work, dispatch::invalid_work_item()});
+			workset.slots.mixed.push_back(dispatch::MixedWorkSlot {work, dispatch::invalid_work_item()});
 			return;
 		}
 		if (pending_half.has_value()) {
-			workset.mixed_slots.push_back(dispatch::MixedWorkSlot {*pending_half, work});
+			workset.slots.mixed.push_back(dispatch::MixedWorkSlot {*pending_half, work});
 			pending_half.reset();
 		} else {
 			pending_half = work;
@@ -274,13 +295,13 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		for (const auto& work : workset.host_batches.template get<T>().work_items) {
+		for (const auto& work : workset.buffers.host_batches.template get<T>().work_items) {
 			append_work(work);
 		}
 	});
 
 	if (pending_half.has_value()) {
-		workset.mixed_slots.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
+		workset.slots.mixed.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
 	}
 }
 
@@ -296,7 +317,7 @@ inline void append_expressions(ExecutionWorkset&              workset,
 
 	dispatch::resolve_dict_refs(expressions);
 	begin_workset_chunk_arena(workset, expressions.size());
-	flsgpu::memory::DeviceArena* active_chunk_arena = workset.chunk_arena.get();
+	flsgpu::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
 
 	size_t active_expr_count = 0;
 
@@ -321,7 +342,7 @@ inline void append_expressions(ExecutionWorkset&              workset,
 		std::visit(
 		    [&](auto&& host_col) {
 			    using HostColT      = std::decay_t<decltype(host_col)>;
-			    using T             = typename dispatch::host_value_type<HostColT>::type;
+			    using T             = typename dispatch::ColumnKindTraits<HostColT>::value_type;
 			    constexpr auto plan = dispatch::detail::plan_for_host_col<HostColT>();
 			    if constexpr (dispatch::is_supported_type_v<T>) {
 				    if (out_total_bytes) {
@@ -333,7 +354,7 @@ inline void append_expressions(ExecutionWorkset&              workset,
 				    add_expression_to_batch<T>(materialize_expr_index,
 				                               host_col,
 				                               plan,
-				                               workset.host_batches.template get<T>(),
+				                               workset.buffers.host_batches.template get<T>(),
 				                               output_offset,
 				                               cfg.freq_prefetch_all_branchless,
 				                               cfg.freq_hybrid_patcher,
@@ -346,23 +367,23 @@ inline void append_expressions(ExecutionWorkset&              workset,
 
 }
 
-inline void upload_workset(ExecutionWorkset& workset) {
+inline UploadBreakdown upload_workset(ExecutionWorkset& workset) {
 	using clock   = std::chrono::steady_clock;
 	const auto ms = [](auto a, auto b) {
 		return std::chrono::duration<double, std::milli>(b - a).count();
 	};
-	workset.last_upload_breakdown = {};
+	UploadBreakdown breakdown {};
 
 	const auto t0 = clock::now();
 	const auto h2d_stream = ensure_workset_h2d_stream(workset);
-	workset.owned_slots.reset();
-	workset.d_slots = nullptr;
-	workset.mixed_slots.clear();
-	workset.payload_arena_bytes = 0;
+	workset.slots.owned.reset();
+	workset.slots.d = nullptr;
+	workset.slots.mixed.clear();
+	workset.buffers.payload_arena_bytes = 0;
 
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
-		auto& dev_batch  = workset.device_batches.template get<T>();
+		auto& dev_batch  = workset.buffers.device_batches.template get<T>();
 		dev_batch.owned_exprs.reset();
 		dev_batch.owned_items.reset();
 		dev_batch.d_exprs = nullptr;
@@ -370,36 +391,36 @@ inline void upload_workset(ExecutionWorkset& workset) {
 		dev_batch.n_items = 0;
 	});
 	const auto t0a = clock::now();
-	workset.last_upload_breakdown.prep_reset_ms = ms(t0, t0a);
+	breakdown.prep_reset_ms = ms(t0, t0a);
 
 	ensure_workset_output_arena(workset);
 	const auto t0b = clock::now();
-	workset.last_upload_breakdown.prep_output_arena_ms = ms(t0a, t0b);
+	breakdown.prep_output_arena_ms = ms(t0a, t0b);
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		bind_workset_output_pointers<T>(workset);
 	});
 	const auto t0c = clock::now();
-	workset.last_upload_breakdown.prep_bind_ms = ms(t0b, t0c);
+	breakdown.prep_bind_ms = ms(t0b, t0c);
 
 	build_mixed_slots(workset);
 	const auto t1 = clock::now();
-	workset.last_upload_breakdown.prep_slots_ms = ms(t0c, t1);
-	workset.last_upload_breakdown.prep_ms = ms(t0, t1);
+	breakdown.prep_slots_ms = ms(t0c, t1);
+	breakdown.prep_ms = ms(t0, t1);
 
 	// Unified arena: pack payload + metadata into the single chunk_arena,
 	// then upload with resolve_before_pack=true so device addresses are embedded
 	// in the metadata before the pinned H2D copy.
-	if (workset.chunk_arena) {
+	if (workset.buffers.chunk_arena) {
 		// append_expressions() has already appended all column payload buffers to
 		// the arena. Snapshot the size before metadata packing so the benchmark
 		// metric continues to report payload-only bytes.
-		workset.payload_arena_bytes = workset.chunk_arena->total_bytes();
+		workset.buffers.payload_arena_bytes = workset.buffers.chunk_arena->total_bytes();
 		dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 			using T          = typename decltype(tag)::type;
-			auto& host_batch = workset.host_batches.template get<T>();
-			auto& dev_batch  = workset.device_batches.template get<T>();
-			auto& arena      = *workset.chunk_arena;
+			auto& host_batch = workset.buffers.host_batches.template get<T>();
+			auto& dev_batch  = workset.buffers.device_batches.template get<T>();
+			auto& arena      = *workset.buffers.chunk_arena;
 			if (!host_batch.device_exprs.empty()) {
 				const auto expr_idx = arena.template add<dispatch::DeviceExpression<T>>(
 				    host_batch.device_exprs.size(), host_batch.device_exprs.data());
@@ -412,17 +433,17 @@ inline void upload_workset(ExecutionWorkset& workset) {
 				arena.resolve_to(reinterpret_cast<void**>(&dev_batch.d_items), item_idx);
 			}
 		});
-		if (!workset.mixed_slots.empty()) {
-			auto& arena         = *workset.chunk_arena;
+		if (!workset.slots.mixed.empty()) {
+			auto& arena         = *workset.buffers.chunk_arena;
 			const auto slot_idx = arena.template add<dispatch::MixedWorkSlot>(
-			    workset.mixed_slots.size(), workset.mixed_slots.data());
-			arena.resolve_to(reinterpret_cast<void**>(&workset.d_slots), slot_idx);
+			    workset.slots.mixed.size(), workset.slots.mixed.data());
+			arena.resolve_to(reinterpret_cast<void**>(&workset.slots.d), slot_idx);
 		}
 		const auto t2 = clock::now();
-		workset.last_upload_breakdown.arena_pack_ms = ms(t1, t2);
-		workset.chunk_arena->upload(/*resolve_before_pack=*/true);
+		breakdown.arena_pack_ms = ms(t1, t2);
+		breakdown.arena = workset.buffers.chunk_arena->upload(/*resolve_before_pack=*/true);
 		const auto t3 = clock::now();
-		workset.last_upload_breakdown.arena_upload_ms = ms(t2, t3);
+		breakdown.arena_upload_ms = ms(t2, t3);
 	}
 
 	const auto t4 = clock::now();
@@ -430,7 +451,8 @@ inline void upload_workset(ExecutionWorkset& workset) {
 		CUDA_SAFE_CALL(cudaEventRecord(ensure_workset_h2d_ready_event(workset), h2d_stream));
 	}
 	const auto t5 = clock::now();
-	workset.last_upload_breakdown.event_record_ms = ms(t4, t5);
+	breakdown.event_record_ms = ms(t4, t5);
+	return breakdown;
 }
 
 } // namespace dispatch::runtime

@@ -109,17 +109,17 @@ void materialize_table_workset(runtime::ExecutionWorkset&             workset,
                                const ExecutionConfig&                 cfg) {
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		materialize_table_batch(workset.host_batches.template get<T>(), rowgroups, expr_locations);
-		auto& device_batch = workset.device_batches.template get<T>();
+		materialize_table_batch(workset.buffers.host_batches.template get<T>(), rowgroups, expr_locations);
+		auto& device_batch = workset.buffers.device_batches.template get<T>();
 		device_batch.owned_exprs.reset();
 		device_batch.owned_items.reset();
 		device_batch.d_exprs = nullptr;
 		device_batch.d_items = nullptr;
 		device_batch.n_items = 0;
 	});
-	workset.owned_slots.reset();
-	workset.d_slots = nullptr;
-	workset.mixed_slots.clear();
+	workset.slots.owned.reset();
+	workset.slots.d = nullptr;
+	workset.slots.mixed.clear();
 
 	for (auto& rowgroup : rowgroups) {
 		runtime::apply_aliases(rowgroup.materialized, rowgroup.expressions, cfg);

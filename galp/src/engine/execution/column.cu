@@ -176,7 +176,7 @@ auto decompress_device(const ColumnT& column, const ExecutionConfig& cfg) ->
 
 template <typename HostColT>
 ValueStore decompress_common(const HostColT& host_col, const ExecutionConfig& cfg) {
-	using T = typename host_value_type<HostColT>::type;
+	using T = typename ColumnKindTraits<HostColT>::value_type;
 
 	auto device_col = host_col.copy_to_device();
 	flsgpu::memory::sync_h2d();
@@ -188,7 +188,7 @@ ValueStore decompress_common(const HostColT& host_col, const ExecutionConfig& cf
 
 template <typename HostColT>
 ValueStore decompress_host(const HostColT& host_col, const PlanKind plan, const ExecutionConfig& cfg) {
-	using T = typename host_value_type<HostColT>::type;
+	using T = typename ColumnKindTraits<HostColT>::value_type;
 	static_assert(is_supported_type_v<T>, "dispatch::decompress only supports int8_t and int16_t columns");
 
 	auto fail = []() -> ValueStore {

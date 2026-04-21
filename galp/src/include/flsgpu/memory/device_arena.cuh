@@ -8,6 +8,7 @@
 
 #include "flsgpu/memory/cuda_macros.cuh"
 #include "flsgpu/memory/device_pool.cuh"
+#include "flsgpu/memory/upload_metrics.cuh"
 
 #include <chrono>
 #include <cstddef>
@@ -154,33 +155,13 @@ public:
 		resolver_targets_.clear();
 	}
 
-	struct UploadPhaseMs {
-		double layout_ms    = 0.0;
-		double alloc_ms     = 0.0; // ensure_capacity + ensure_pinned_capacity
-		double resolve_ms   = 0.0;
-		double pack_ms      = 0.0; // std::memcpy into pinned
-		double dma_issue_ms = 0.0; // cudaMemcpyAsync for regions + staged
-	};
-	UploadPhaseMs last_upload_phase_ms {};
-
-	void upload(bool resolve_before_pack = false) {
+	ArenaUploadMetrics upload(bool resolve_before_pack = false) {
 		using clock   = std::chrono::steady_clock;
 		const auto ms = [](auto a, auto b) {
 			return std::chrono::duration<double, std::milli>(b - a).count();
 		};
-		last_upload_phase_ms = {};
+		ArenaUploadMetrics metrics {};
 
-		// Resolve flat pointer targets without std::function dispatch.
-		const auto run_resolvers = [&]() {
-			for (const auto& t : resolver_targets_) {
-				*t.dst = device_base_ + entries_[t.entry_idx].device_offset;
-			}
-			resolver_targets_.clear();
-			for (auto& fn : resolvers_) {
-				fn();
-			}
-			resolvers_.clear();
-		};
 		const auto finalize = [&]() {
 			run_deferred_frees();
 			regions_.clear();
@@ -189,92 +170,46 @@ public:
 		if (entries_.empty()) {
 			run_resolvers();
 			finalize();
-			return;
+			return metrics;
 		}
 
-		const auto t0 = clock::now();
-		// Layout pass: each backing region gets a 256B-aligned device slab in
-		// registration order; the staged area tails them. Then resolve every
-		// entry to its final device offset against this layout.
-		size_t cursor = 0;
-		for (auto& region : regions_) {
-			cursor               = (cursor + 255U) & ~size_t(255U);
-			region.device_offset = cursor;
-			cursor              += region.slab_bytes;
-		}
-		cursor                          = (cursor + 255U) & ~size_t(255U);
-		const size_t staged_device_base = cursor;
-		cursor                         += staged_bytes_;
-
-		for (auto& e : entries_) {
-			e.device_offset = (e.region_idx >= 0)
-			                      ? regions_[e.region_idx].device_offset + e.region_offset
-			                      : staged_device_base + e.staged_offset;
-		}
-
-		const size_t total_bytes = cursor;
-		if (total_bytes == 0) {
+		const auto t0   = clock::now();
+		const auto plan = plan_layout();
+		if (plan.total_bytes == 0) {
 			run_resolvers();
 			finalize();
-			return;
+			return metrics;
 		}
-		const auto t1 = clock::now();
-		last_upload_phase_ms.layout_ms = ms(t0, t1);
+		const auto t1     = clock::now();
+		metrics.layout_ms = ms(t0, t1);
 
 		// Round up to power-of-2 buckets (min 64KB) to improve DevicePool cache hits.
-		ensure_capacity(round_up_pow2(total_bytes, 65536U));
+		ensure_capacity(round_up_pow2(plan.total_bytes, 65536U));
 		if (staged_bytes_ > 0) {
 			ensure_pinned_capacity(round_up_pow2(staged_bytes_, 65536U));
 		}
-		const auto t2 = clock::now();
-		last_upload_phase_ms.alloc_ms = ms(t1, t2);
+		const auto t2    = clock::now();
+		metrics.alloc_ms = ms(t1, t2);
 
 		if (resolve_before_pack) {
 			run_resolvers();
 		}
-		const auto t3 = clock::now();
-		last_upload_phase_ms.resolve_ms = ms(t2, t3);
+		const auto t3      = clock::now();
+		metrics.resolve_ms = ms(t2, t3);
 
-		// Pack staged entries (metadata + fallback scratch) into the pinned
-		// buffer — one host pass feeds one aggregated DMA.
-		if (staged_bytes_ > 0) {
-			for (const auto& e : entries_) {
-				if (e.region_idx < 0 && e.host_src != nullptr && e.copy_bytes > 0) {
-					std::memcpy(pinned_base_ + e.staged_offset, e.host_src, e.copy_bytes);
-				}
-			}
-		}
-		const auto t4 = clock::now();
-		last_upload_phase_ms.pack_ms = ms(t3, t4);
+		pack_staged_area();
+		const auto t4   = clock::now();
+		metrics.pack_ms = ms(t3, t4);
 
-		// Unified DMA issue: one cudaMemcpyAsync per backing region (direct
-		// from slot-owned pinned memory, zero host pack) plus one for the
-		// staged area. Each DMA targets the device slab reserved above.
-		for (const auto& region : regions_) {
-			if (region.bytes == 0) {
-				continue;
-			}
-			CUDA_SAFE_CALL(cudaMemcpyAsync(
-			    device_base_ + region.device_offset, region.base, region.bytes,
-			    cudaMemcpyHostToDevice, stream_));
-		}
-		if (staged_bytes_ > 0) {
-			CUDA_SAFE_CALL(cudaMemcpyAsync(
-			    device_base_ + staged_device_base, pinned_base_, staged_bytes_,
-			    cudaMemcpyHostToDevice, stream_));
-		}
-		// Register a single stream event with DevicePool so sync_h2d() drains
-		// these raw copies before the arena's pinned_base_/device_base_ are
-		// freed or reused. One event covers all DMAs issued above because they
-		// serialize on stream_.
-		DevicePool::instance().register_external_h2d(stream_);
-		const auto t5 = clock::now();
-		last_upload_phase_ms.dma_issue_ms = ms(t4, t5);
+		issue_dma(plan.staged_device_base);
+		const auto t5        = clock::now();
+		metrics.dma_issue_ms = ms(t4, t5);
 
 		if (!resolve_before_pack) {
 			run_resolvers();
 		}
 		finalize();
+		return metrics;
 	}
 
 	template <typename T>
@@ -297,6 +232,83 @@ public:
 	}
 
 private:
+	struct LayoutPlan {
+		size_t staged_device_base = 0;
+		size_t total_bytes        = 0;
+	};
+
+	// Layout pass: each backing region gets a 256B-aligned device slab in
+	// registration order; the staged area tails them. Mutates region/entry
+	// device_offsets so later passes can use them directly.
+	LayoutPlan plan_layout() {
+		size_t cursor = 0;
+		for (auto& region : regions_) {
+			cursor               = (cursor + 255U) & ~size_t(255U);
+			region.device_offset = cursor;
+			cursor              += region.slab_bytes;
+		}
+		cursor                          = (cursor + 255U) & ~size_t(255U);
+		const size_t staged_device_base = cursor;
+		cursor                         += staged_bytes_;
+
+		for (auto& e : entries_) {
+			e.device_offset = (e.region_idx >= 0)
+			                      ? regions_[e.region_idx].device_offset + e.region_offset
+			                      : staged_device_base + e.staged_offset;
+		}
+		return LayoutPlan {staged_device_base, cursor};
+	}
+
+	// Pack staged entries (metadata + fallback scratch) into the pinned
+	// buffer — one host pass feeds one aggregated DMA.
+	void pack_staged_area() {
+		if (staged_bytes_ == 0) {
+			return;
+		}
+		for (const auto& e : entries_) {
+			if (e.region_idx < 0 && e.host_src != nullptr && e.copy_bytes > 0) {
+				std::memcpy(pinned_base_ + e.staged_offset, e.host_src, e.copy_bytes);
+			}
+		}
+	}
+
+	// Unified DMA issue: one cudaMemcpyAsync per backing region (direct from
+	// slot-owned pinned memory, zero host pack) plus one for the staged area.
+	// A single tracker event covers all DMAs since they serialize on stream_.
+	void issue_dma(size_t staged_device_base) {
+		for (const auto& region : regions_) {
+			if (region.bytes == 0) {
+				continue;
+			}
+			CUDA_SAFE_CALL(cudaMemcpyAsync(device_base_ + region.device_offset,
+			                               region.base,
+			                               region.bytes,
+			                               cudaMemcpyHostToDevice,
+			                               stream_));
+		}
+		if (staged_bytes_ > 0) {
+			CUDA_SAFE_CALL(cudaMemcpyAsync(device_base_ + staged_device_base,
+			                               pinned_base_,
+			                               staged_bytes_,
+			                               cudaMemcpyHostToDevice,
+			                               stream_));
+		}
+		DevicePool::instance().register_external_h2d(stream_);
+	}
+
+	// Resolve flat pointer targets without std::function dispatch, then fire
+	// any std::function resolvers the caller registered.
+	void run_resolvers() {
+		for (const auto& t : resolver_targets_) {
+			*t.dst = device_base_ + entries_[t.entry_idx].device_offset;
+		}
+		resolver_targets_.clear();
+		for (auto& fn : resolvers_) {
+			fn();
+		}
+		resolvers_.clear();
+	}
+
 	int find_region(const void* host_src, size_t bytes) const {
 		if (host_src == nullptr || bytes == 0 || regions_.empty()) {
 			return -1;

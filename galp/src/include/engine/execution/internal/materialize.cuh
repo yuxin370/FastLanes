@@ -99,18 +99,18 @@ inline RowgroupData materialize_workset(ExecutionWorkset&                    wor
 	result.columns.resize(expressions.size());
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T     = typename decltype(tag)::type;
-		auto& batch = workset.host_batches.template get<T>();
+		auto& batch = workset.buffers.host_batches.template get<T>();
 		dispatch::detail::finalize_batch(batch, result);
-		auto& device_batch = workset.device_batches.template get<T>();
+		auto& device_batch = workset.buffers.device_batches.template get<T>();
 		device_batch.owned_exprs.reset();
 		device_batch.owned_items.reset();
 		device_batch.d_exprs = nullptr;
 		device_batch.d_items = nullptr;
 		device_batch.n_items = 0;
 	});
-	workset.owned_slots.reset();
-	workset.d_slots = nullptr;
-	workset.mixed_slots.clear();
+	workset.slots.owned.reset();
+	workset.slots.d = nullptr;
+	workset.slots.mixed.clear();
 
 	apply_aliases(result, expressions, cfg);
 	populate_materialized_metadata(result, expressions, cfg);
@@ -119,56 +119,56 @@ inline RowgroupData materialize_workset(ExecutionWorkset&                    wor
 
 inline void release_workset(ExecutionWorkset& workset, const bool preserve_resources = false) {
 	// Arena mode: all device column pointers are interior offsets into
-	// workset.chunk_arena->device_base_, freed wholesale by chunk_arena.reset()
+	// workset.buffers.chunk_arena->device_base_, freed wholesale by chunk_arena.reset()
 	// below. Per-expression free_device_expr() would attempt cudaFree on
 	// interior pointers (invalid) and walk a DevicePool mutex for every column.
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
-		auto& host_batch = workset.host_batches.template get<T>();
+		auto& host_batch = workset.buffers.host_batches.template get<T>();
 		host_batch.device_exprs.clear();
 		host_batch.output_offsets.clear();
 		host_batch.work_items.clear();
 		host_batch.expr_indices.clear();
 
-		auto& device_batch = workset.device_batches.template get<T>();
+		auto& device_batch = workset.buffers.device_batches.template get<T>();
 		device_batch.owned_exprs.reset();
 		device_batch.owned_items.reset();
 		device_batch.d_exprs = nullptr;
 		device_batch.d_items = nullptr;
 		device_batch.n_items = 0;
 	});
-	workset.owned_slots.reset();
-	workset.d_slots = nullptr;
-	workset.mixed_slots.clear();
-	workset.output_arena_used_bytes = 0;
-	if (workset.h2d_stream != nullptr) {
-		flsgpu::memory::sync_h2d(workset.h2d_stream);
+	workset.slots.owned.reset();
+	workset.slots.d = nullptr;
+	workset.slots.mixed.clear();
+	workset.outputs.used_bytes = 0;
+	if (workset.transfer.h2d_stream != nullptr) {
+		flsgpu::memory::sync_h2d(workset.transfer.h2d_stream);
 	}
-	if (workset.chunk_arena != nullptr) {
+	if (workset.buffers.chunk_arena != nullptr) {
 		if (preserve_resources) {
-			workset.chunk_arena->reset();
+			workset.buffers.chunk_arena->reset();
 		} else {
-			workset.chunk_arena.reset();
+			workset.buffers.chunk_arena.reset();
 		}
 	}
 	if (!preserve_resources) {
-		workset.output_arena.reset();
-		workset.output_arena_capacity_bytes = 0;
+		workset.outputs.arena.reset();
+		workset.outputs.capacity_bytes = 0;
 	}
-	if (!preserve_resources && workset.h2d_stream != nullptr) {
-		if (workset.h2d_ready_event != nullptr) {
-			CUDA_LOG_CALL(cudaEventDestroy(workset.h2d_ready_event));
-			workset.h2d_ready_event = nullptr;
+	if (!preserve_resources && workset.transfer.h2d_stream != nullptr) {
+		if (workset.transfer.h2d_ready_event != nullptr) {
+			CUDA_LOG_CALL(cudaEventDestroy(workset.transfer.h2d_ready_event));
+			workset.transfer.h2d_ready_event = nullptr;
 		}
-		CUDA_LOG_CALL(cudaStreamDestroy(workset.h2d_stream));
-		workset.h2d_stream = nullptr;
-	} else if (!preserve_resources && workset.h2d_ready_event != nullptr) {
-		CUDA_LOG_CALL(cudaEventDestroy(workset.h2d_ready_event));
-		workset.h2d_ready_event = nullptr;
+		CUDA_LOG_CALL(cudaStreamDestroy(workset.transfer.h2d_stream));
+		workset.transfer.h2d_stream = nullptr;
+	} else if (!preserve_resources && workset.transfer.h2d_ready_event != nullptr) {
+		CUDA_LOG_CALL(cudaEventDestroy(workset.transfer.h2d_ready_event));
+		workset.transfer.h2d_ready_event = nullptr;
 	}
-	if (!preserve_resources && workset.compute_stream != nullptr) {
-		CUDA_LOG_CALL(cudaStreamDestroy(workset.compute_stream));
-		workset.compute_stream = nullptr;
+	if (!preserve_resources && workset.transfer.compute_stream != nullptr) {
+		CUDA_LOG_CALL(cudaStreamDestroy(workset.transfer.compute_stream));
+		workset.transfer.compute_stream = nullptr;
 	}
 }
 
