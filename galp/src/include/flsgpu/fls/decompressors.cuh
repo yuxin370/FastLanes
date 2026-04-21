@@ -12,7 +12,6 @@
 #include "flsgpu/fls/patchers.cuh"
 #include "flsgpu/fls/unpackers.cuh"
 #include "flsgpu/fls/unsumer.cuh"
-#include "flsgpu/old-fls.cuh"
 #include "flsgpu/structs.cuh"
 #include "flsgpu/utils.cuh"
 #include <assert.h>

@@ -11,7 +11,7 @@
 #include "fls/unffor.hpp"
 #include "fls_gen/pack/pack.hpp"
 #include "fls_gen/unpack/unpack.hpp"
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include <algorithm>
 #include <bit>
 #include <cstddef>

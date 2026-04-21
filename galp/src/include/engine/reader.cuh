@@ -20,7 +20,7 @@
 #include "fls/reader/rowgroup_view.hpp"
 #include "fls/reader/segment.hpp"
 #include "flsgpu/columns/all.cuh"
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include "flsgpu/utils.cuh"
 #include <algorithm>
 #include <cstddef>

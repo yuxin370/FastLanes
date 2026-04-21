@@ -4,7 +4,7 @@
 // galp/src/include/engine/device-utils.cuh
 // ────────────────────────────────────────────────────────
 #include "flsgpu/fls/untransposers.cuh"
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>

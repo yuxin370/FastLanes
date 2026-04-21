@@ -12,7 +12,7 @@ import argparse
 import logging
 
 FILE_HEADER = """
-#include "../flsgpu/flsgpu-api.cuh"
+#include "../flsgpu/flsgpu.cuh"
 #include "../engine/device-utils.cuh"
 
 #ifndef MULTI_COLUMN_DEVICE_KERNELS_CUH

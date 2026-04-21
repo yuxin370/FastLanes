@@ -7,7 +7,7 @@
 #define ALP_BINDINGS_CUH
 
 #include "alp.hpp"
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <exception>

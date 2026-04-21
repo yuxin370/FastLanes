@@ -7,7 +7,6 @@
 #define FLSGPU_FLS_FUNCTORS_CUH
 
 #include "flsgpu/device-types.cuh"
-#include "flsgpu/old-fls.cuh"
 #include "flsgpu/structs.cuh"
 #include "flsgpu/utils.cuh"
 #include <assert.h>

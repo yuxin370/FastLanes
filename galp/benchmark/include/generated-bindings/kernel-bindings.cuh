@@ -7,7 +7,7 @@
 #define GENERATED_KERNEL_BINDINGS_CUH
 
 #include "engine/enums.cuh"
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include <cstdint>
 
 namespace bindings {

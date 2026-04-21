@@ -8,7 +8,7 @@
 
 #include "flsgpu/columns/base.cuh"
 #include "flsgpu/columns/parse_common.cuh"
-#include "flsgpu/host-utils.cuh"
+#include "flsgpu/memory/device_arena.cuh"
 #include <cstddef>
 #include <cstdint>
 

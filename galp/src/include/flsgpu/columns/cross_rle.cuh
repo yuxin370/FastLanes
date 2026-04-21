@@ -11,7 +11,8 @@
 #include "flsgpu/columns/cross_rle_lane_mask.cuh"
 #include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/consts.cuh"
-#include "flsgpu/host-utils.cuh"
+#include "flsgpu/memory/device_arena.cuh"
+#include "flsgpu/memory/gpu_array.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>

@@ -10,7 +10,7 @@
 #include "flsgpu/columns/alp_extended.cuh"
 #include "flsgpu/columns/ffor.cuh"
 #include "flsgpu/consts.cuh"
-#include "flsgpu/host-utils.cuh"
+#include "flsgpu/memory/gpu_array.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>

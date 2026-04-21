@@ -6,7 +6,7 @@
 #ifndef VERIFICATION_H
 #define VERIFICATION_H
 
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <type_traits>

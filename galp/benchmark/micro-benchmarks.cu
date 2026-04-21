@@ -7,8 +7,8 @@
 #include "engine/enums.cuh"
 #include "engine/kernels.cuh"
 #include "engine/types.cuh"
-#include "flsgpu/flsgpu-api.cuh"
-#include "flsgpu/host-utils.cuh"
+#include "flsgpu/flsgpu.cuh"
+#include "flsgpu/memory/device_pool.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
 #include "verification.cuh"
 #include <chrono>

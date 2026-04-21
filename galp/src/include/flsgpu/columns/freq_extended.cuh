@@ -9,7 +9,8 @@
 #include "flsgpu/columns/base.cuh"
 #include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/consts.cuh"
-#include "flsgpu/host-utils.cuh"
+#include "flsgpu/memory/device_arena.cuh"
+#include "flsgpu/memory/gpu_array.cuh"
 #include <limits>
 
 namespace flsgpu {

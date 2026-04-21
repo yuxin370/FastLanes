@@ -15,7 +15,7 @@
 #define NVCOMP_COMPRESSORS_H
 
 #include "engine/enums.cuh"
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include "nvcomp.h"
 #include "nvcomp.hpp"
 #include "nvcomp/benchmark-compressors.cuh"

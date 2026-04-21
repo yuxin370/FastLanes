@@ -7,7 +7,7 @@
 #define FLSGPU_FLS_UNPACKERS_CUH
 
 #include "flsgpu/device-types.cuh"
-#include "flsgpu/old-fls.cuh"
+#include "flsgpu/old_fls.cuh"
 #include "flsgpu/structs.cuh"
 #include "flsgpu/utils.cuh"
 #include <assert.h>

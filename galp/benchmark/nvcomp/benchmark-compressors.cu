@@ -7,7 +7,7 @@
 #include "data.cuh"
 #include "engine/device-utils.cuh"
 #include "engine/kernels.cuh"
-#include "flsgpu/flsgpu-api.cuh"
+#include "flsgpu/flsgpu.cuh"
 #include "nvcomp/benchmark-compressors.cuh"
 #include "nvcomp/nvcomp-compressors.cuh"
 #include <cstdint>

@@ -4,7 +4,7 @@
 // galp/src/include/nvcomp/benchmark-compressors.cuh
 // ────────────────────────────────────────────────────────
 #include "../engine/enums.cuh"
-#include "../flsgpu/flsgpu-api.cuh"
+#include "../flsgpu/flsgpu.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
