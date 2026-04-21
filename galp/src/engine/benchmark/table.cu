@@ -16,7 +16,7 @@
 #include "fls/file/file_header.hpp"
 #include "fls/footer/datatype_generated.h"
 #include "fls/footer/table_descriptor.hpp"
-#include "flsgpu/host-utils.cuh"
+#include "flsgpu/memory/cuda_macros.cuh"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -195,8 +195,7 @@ void accumulate_rowgroup_stats(TableBenchmarkResult& result,
 	++result.total_rgs;
 }
 
-void accumulate_upload_breakdown(TableBenchmarkResult& out, const runtime::ExecutionWorkset& workset) {
-	const auto& ub = workset.last_upload_breakdown;
+void accumulate_upload_breakdown(TableBenchmarkResult& out, const runtime::UploadBreakdown& ub) {
 	out.upload_prep_ms               += ub.prep_ms;
 	out.upload_prep_reset_ms         += ub.prep_reset_ms;
 	out.upload_prep_output_arena_ms  += ub.prep_output_arena_ms;
@@ -204,14 +203,11 @@ void accumulate_upload_breakdown(TableBenchmarkResult& out, const runtime::Execu
 	out.upload_prep_slots_ms         += ub.prep_slots_ms;
 	out.upload_arena_pack_ms         += ub.arena_pack_ms;
 	out.upload_event_ms              += ub.event_record_ms;
-	if (workset.chunk_arena) {
-		const auto& phase = workset.chunk_arena->last_upload_phase_ms;
-		out.upload_layout_ms    += phase.layout_ms;
-		out.upload_alloc_ms     += phase.alloc_ms;
-		out.upload_resolve_ms   += phase.resolve_ms;
-		out.upload_pack_ms      += phase.pack_ms;
-		out.upload_dma_issue_ms += phase.dma_issue_ms;
-	}
+	out.upload_layout_ms             += ub.arena.layout_ms;
+	out.upload_alloc_ms              += ub.arena.alloc_ms;
+	out.upload_resolve_ms            += ub.arena.resolve_ms;
+	out.upload_pack_ms               += ub.arena.pack_ms;
+	out.upload_dma_issue_ms          += ub.arena.dma_issue_ms;
 }
 
 } // namespace
@@ -306,12 +302,12 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			const auto append_end     = std::chrono::steady_clock::now();
 			const double append_expr_ms = std::chrono::duration<double, std::milli>(append_end - append_start).count();
 
-			const auto upload_start = std::chrono::steady_clock::now();
-			runtime::upload_workset(workset);
+			const auto upload_start     = std::chrono::steady_clock::now();
+			const auto upload_breakdown = runtime::upload_workset(workset);
 			const auto upload_end       = std::chrono::steady_clock::now();
 			const double upload_workset_ms =
 			    std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
-			accumulate_upload_breakdown(out, workset);
+			accumulate_upload_breakdown(out, upload_breakdown);
 
 			size_t       rg_launch_grid = 0;
 			size_t       rg_launches    = 0;
@@ -319,7 +315,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			    runtime::run_workset(workset, cfg.samples, cfg.execution, &rg_launch_grid, &rg_launches, true);
 
 			// release_workset() clears output_arena_used_bytes; snapshot before.
-			const size_t output_arena_bytes_snapshot = workset.output_arena_used_bytes;
+			const size_t output_arena_bytes_snapshot = workset.outputs.used_bytes;
 			const auto release_start = std::chrono::steady_clock::now();
 			guard.dismiss();
 			runtime::release_workset(workset);
@@ -335,7 +331,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			                          rg_columns,
 			                          rg_vectors,
 			                          bytes,
-			                          workset.payload_arena_bytes,
+			                          workset.buffers.payload_arena_bytes,
 			                          output_arena_bytes_snapshot,
 			                          read_result.read_ms,
 			                          read_result.file_read_ms,
@@ -423,12 +419,12 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 			out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
 
 			const auto upload_start = std::chrono::steady_clock::now();
-			runtime::upload_workset(workset);
+			const auto upload_breakdown = runtime::upload_workset(workset);
 			const auto upload_end = std::chrono::steady_clock::now();
 			out.upload_workset_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
-			accumulate_upload_breakdown(out, workset);
-			out.total_payload_arena_bytes += workset.payload_arena_bytes;
-			out.total_output_arena_bytes += workset.output_arena_used_bytes;
+			accumulate_upload_breakdown(out, upload_breakdown);
+			out.total_payload_arena_bytes += workset.buffers.payload_arena_bytes;
+			out.total_output_arena_bytes += workset.outputs.used_bytes;
 
 			size_t chunk_launch_grid = 0;
 			size_t chunk_launches    = 0;
@@ -514,19 +510,19 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		const auto append_end = std::chrono::steady_clock::now();
 		out.append_expr_ms += std::chrono::duration<double, std::milli>(append_end - append_start).count();
 
-		const auto upload_start = std::chrono::steady_clock::now();
-		runtime::upload_workset(chunk.workset);
-		const auto upload_end = std::chrono::steady_clock::now();
+		const auto upload_start     = std::chrono::steady_clock::now();
+		const auto upload_breakdown = runtime::upload_workset(chunk.workset);
+		const auto upload_end       = std::chrono::steady_clock::now();
 		out.upload_workset_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
-		accumulate_upload_breakdown(out, chunk.workset);
-		out.total_payload_arena_bytes += chunk.workset.payload_arena_bytes;
-		out.total_output_arena_bytes += chunk.workset.output_arena_used_bytes;
+		accumulate_upload_breakdown(out, upload_breakdown);
+		out.total_payload_arena_bytes += chunk.workset.buffers.payload_arena_bytes;
+		out.total_output_arena_bytes += chunk.workset.outputs.used_bytes;
 
 		const bool warmup_once = !did_warmup;
-		chunk.run = runtime::run_workset_async(
-		    chunk.workset, cfg.samples, cfg.execution, &chunk.launch_grid, &chunk.launches, warmup_once);
+		chunk.run              = runtime::run_workset_async(
+            chunk.workset, cfg.samples, cfg.execution, &chunk.launch_grid, &chunk.launches, warmup_once);
 		chunk.submitted = true;
-		did_warmup = true;
+		did_warmup      = true;
 	};
 
 	const auto consume_chunk = [&](StreamingBenchmarkChunk& chunk) {
