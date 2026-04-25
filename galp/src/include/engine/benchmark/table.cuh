@@ -6,33 +6,23 @@
 #ifndef ENGINE_BENCHMARK_TABLE_CUH
 #define ENGINE_BENCHMARK_TABLE_CUH
 
-#include "engine/execution/common.cuh"
+#include "engine/execution/table.cuh"
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 
 namespace dispatch {
 
-enum class AggregationScope {
-	PerRowgroup,
-	WholeTable,
-};
+using AggregationScope = TableDecompressionScope;
 
-struct TableBenchmarkConfig {
+struct TableBenchmarkConfig : TableDecompressionConfig {
 	uint32_t         samples           = 1;
-	AggregationScope aggregation_scope = AggregationScope::WholeTable;
-	ExecutionConfig  execution         = [] {
-        ExecutionConfig cfg {};
-        cfg.write_out = false;
-        return cfg;
-	}();
-	bool                  use_zero_copy_parse         = true;
-	bool                  enable_streaming            = true;
-	bool                  enable_rowgroup_prefetch    = true;
-	size_t                prefetch_depth              = 2;
-	size_t                prefetch_workers            = 2;
-	size_t                streaming_target_work_items = 1u << 18;
-	size_t                streaming_target_rowgroups  = 8; // 0 means disable rowgroup-cap flushing.
 	std::optional<size_t> rowgroup;
+
+	TableBenchmarkConfig() {
+		scope               = TableDecompressionScope::WholeTable;
+		execution.write_out = false;
+	}
 };
 
 struct TableBenchmarkResult {

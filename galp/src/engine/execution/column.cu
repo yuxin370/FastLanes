@@ -5,6 +5,7 @@
 // ────────────────────────────────────────────────────────
 #include "engine/data/value-store.cuh"
 #include "engine/execution/column.cuh"
+#include "engine/execution/internal/unpack_dispatch.cuh"
 #include "engine/reader.cuh"
 #include "flsgpu/fls.cuh"
 #include <cstring>
@@ -41,15 +42,10 @@ using DefaultFREQPatcher = flsgpu::device::StatefulFREQExceptionPatcher<T, UNPAC
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 using DefaultCROSSRLEExpander = flsgpu::device::StatefulCROSSRLEExpander<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 
-template <typename ColumnT>
-auto decompress_device(const ColumnT& column, const ExecutionConfig& cfg) ->
+template <typename ColumnT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
+auto decompress_device_tiled(const ColumnT& column) ->
     typename column_value_type<ColumnT>::type* {
 	using T = typename column_value_type<ColumnT>::type;
-
-	// For now we only expose a single default configuration.
-	constexpr unsigned UNPACK_N_VECTORS = 1;
-	constexpr unsigned UNPACK_N_VALUES  = 1;
-	(void)cfg;
 
 	if constexpr (std::is_same_v<ColumnT, flsgpu::device::BPColumn<T>>) {
 		using DecompressorT = flsgpu::device::BPDecompressor<T,
@@ -172,6 +168,16 @@ auto decompress_device(const ColumnT& column, const ExecutionConfig& cfg) ->
 		static_assert(always_false_v<ColumnT>, "Unsupported column type for dispatch");
 		return nullptr;
 	}
+}
+
+template <typename ColumnT>
+auto decompress_device(const ColumnT& column, const ExecutionConfig& cfg) ->
+    typename column_value_type<ColumnT>::type* {
+	return runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, auto unpack_n_values) {
+		return decompress_device_tiled<ColumnT,
+		                               decltype(unpack_n_vectors)::value,
+		                               decltype(unpack_n_values)::value>(column);
+	});
 }
 
 template <typename HostColT>

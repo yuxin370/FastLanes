@@ -7,6 +7,7 @@
 #define ENGINE_EXECUTION_INTERNAL_LAUNCH_CUH
 
 #include "engine/execution/internal/prepare.cuh"
+#include "engine/execution/internal/unpack_dispatch.cuh"
 
 namespace dispatch::runtime {
 
@@ -15,7 +16,7 @@ inline bool uses_mixed_dispatch(const LaunchStrategy strategy) {
 }
 
 template <bool WRITE_OUT>
-inline void launch_typed_batches(ExecutionWorkset& workset, cudaStream_t stream) {
+inline void launch_typed_batches(ExecutionWorkset& workset, const ExecutionConfig& cfg, cudaStream_t stream) {
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T            = typename decltype(tag)::type;
 		auto& host_batch   = workset.buffers.host_batches.template get<T>();
@@ -24,29 +25,33 @@ inline void launch_typed_batches(ExecutionWorkset& workset, cudaStream_t stream)
 			return;
 		}
 		dispatch::detail::launch_batch_no_sync<T, WRITE_OUT>(
-		    host_batch, device_batch.d_exprs, device_batch.d_items, device_batch.n_items, stream);
+		    host_batch, device_batch.d_exprs, device_batch.d_items, device_batch.n_items, cfg, stream);
 	});
 }
 
 template <bool WRITE_OUT>
-inline void launch_mixed_dispatch(ExecutionWorkset& workset, cudaStream_t stream) {
+inline void launch_mixed_dispatch(ExecutionWorkset& workset, const ExecutionConfig& cfg, cudaStream_t stream) {
 	const auto*            exprs_i8  = workset.buffers.device_batches.template get<int8_t>().d_exprs;
 	const auto*            exprs_i16 = workset.buffers.device_batches.template get<int16_t>().d_exprs;
 	const MixedSlotMapping mapping(workset.slots.mixed.size());
 	const dim3             block(MixedSlotMapping::N_THREADS_PER_BLOCK);
 	const dim3             grid(mapping.n_blocks());
 
-	kernels::device::decompress_dispatch_mixed<1, 1, WRITE_OUT>
-	    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.slots.d, workset.slots.mixed.size());
-	CUDA_SAFE_CALL(cudaGetLastError());
+	runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, auto unpack_n_values) {
+		constexpr unsigned UNPACK_N_VECTORS = decltype(unpack_n_vectors)::value;
+		constexpr unsigned UNPACK_N_VALUES  = decltype(unpack_n_values)::value;
+		kernels::device::decompress_dispatch_mixed<UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
+		    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.slots.d, workset.slots.mixed.size());
+		CUDA_SAFE_CALL(cudaGetLastError());
+	});
 }
 
 template <LaunchStrategy Strategy, bool WRITE_OUT>
-inline void launch_strategy_once(ExecutionWorkset& workset, cudaStream_t stream) {
+inline void launch_strategy_once(ExecutionWorkset& workset, const ExecutionConfig& cfg, cudaStream_t stream) {
 	if constexpr (Strategy == LaunchStrategy::MixedDispatch) {
-		launch_mixed_dispatch<WRITE_OUT>(workset, stream);
+		launch_mixed_dispatch<WRITE_OUT>(workset, cfg, stream);
 	} else {
-		launch_typed_batches<WRITE_OUT>(workset, stream);
+		launch_typed_batches<WRITE_OUT>(workset, cfg, stream);
 	}
 }
 
@@ -143,15 +148,15 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 	if (warmup) {
 		if (mixed_dispatch) {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, cfg, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, cfg, handle.stream);
 			}
 		} else {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, cfg, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, cfg, handle.stream);
 			}
 		}
 		CUDA_SAFE_CALL(cudaStreamSynchronize(handle.stream));
@@ -162,15 +167,15 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 	for (uint32_t sample = 0; sample < samples; ++sample) {
 		if (mixed_dispatch) {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, true>(workset, cfg, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::MixedDispatch, false>(workset, cfg, handle.stream);
 			}
 		} else {
 			if (cfg.write_out) {
-				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, true>(workset, cfg, handle.stream);
 			} else {
-				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, handle.stream);
+				launch_strategy_once<LaunchStrategy::TypedBatches, false>(workset, cfg, handle.stream);
 			}
 		}
 	}

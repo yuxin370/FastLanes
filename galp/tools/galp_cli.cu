@@ -46,6 +46,8 @@ struct Options {
 	bool                                 benchmark_streaming          = true;
 	bool                                 gpu_dispatch_kernel          = true;
 	bool                                 write_back                   = false;
+	uint32_t                             unpack_n_vectors             = 1;
+	uint32_t                             unpack_n_values              = 1;
 	bool                                 freq_prefetch_all_branchless = false;
 	bool                                 freq_hybrid_patcher          = false;
 	float                                freq_branchless_threshold    = 6.0f;
@@ -90,13 +92,15 @@ void print_usage(const char* prog) {
 	          << "  --no-streaming     Keep whole-table aggregation but disable streaming pipeline\n"
 	          << "  --no-mixed-dispatch  Use typed-batch launches instead of mixed-dispatch (default: mixed)\n"
 	          << "  --write-back   Enable global write-back during benchmark kernel execution\n"
+	          << "  --unpack-n-vectors N  Runtime decode tile size in vectors (supported: 1 or 4)\n"
+	          << "  --unpack-n-values N   Runtime decode tile size in values (currently only 1)\n"
 	          << "  --no-zero-copy     Disable zero-copy rowgroup parsing (default: enabled)\n"
-	          << "  --no-rowgroup-prefetch  Disable background rowgroup prefetch in whole-table benchmark\n"
+	          << "  --no-rowgroup-prefetch  Disable background rowgroup prefetch in whole-table execution\n"
 	          << "  --prefetch-depth N  Number of prefetched rowgroups to queue ahead (default: 2)\n"
 	          << "  --prefetch-workers N  Number of parallel prefetch threads (default: 2)\n"
-	          << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table benchmark "
+	          << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table execution "
 	             "(default: 262144)\n"
-	          << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table benchmark (default: 8, "
+	          << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table execution (default: 8, "
 	             "0 disables)\n"
 	          << "  --freq-prefetch-all-branchless  Use FREQ extended format + PrefetchAllBranchless patcher\n"
 	          << "  --freq-hybrid-patcher  Use hybrid FREQ patcher selection by exception density\n"
@@ -157,6 +161,14 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--write-back") {
 			opt.write_back = true;
+			continue;
+		}
+		if (arg == "--unpack-n-vectors" && i + 1 < argc) {
+			opt.unpack_n_vectors = static_cast<uint32_t>(std::stoul(argv[++i]));
+			continue;
+		}
+		if (arg == "--unpack-n-values" && i + 1 < argc) {
+			opt.unpack_n_values = static_cast<uint32_t>(std::stoul(argv[++i]));
 			continue;
 		}
 		if (arg == "--no-zero-copy") {
@@ -327,12 +339,20 @@ int main(int argc, char** argv) {
 			dispatch::TableDecompressionConfig decode_cfg {};
 			decode_cfg.scope                     = opt.mega_kernel ? dispatch::TableDecompressionScope::WholeTable
 			                                                       : dispatch::TableDecompressionScope::PerRowgroup;
+			decode_cfg.execution.unpack_n_vectors = opt.unpack_n_vectors;
+			decode_cfg.execution.unpack_n_values  = opt.unpack_n_values;
 			decode_cfg.execution.launch_strategy = opt.gpu_dispatch_kernel ? dispatch::LaunchStrategy::MixedDispatch
 			                                                               : dispatch::LaunchStrategy::TypedBatches;
 			decode_cfg.execution.freq_prefetch_all_branchless = opt.freq_prefetch_all_branchless;
 			decode_cfg.execution.freq_hybrid_patcher          = opt.freq_hybrid_patcher;
 			decode_cfg.execution.freq_branchless_threshold    = opt.freq_branchless_threshold;
 			decode_cfg.use_zero_copy_parse                    = opt.use_zero_copy_parse;
+			decode_cfg.enable_streaming                       = opt.benchmark_streaming;
+			decode_cfg.enable_rowgroup_prefetch               = opt.enable_rowgroup_prefetch;
+			decode_cfg.prefetch_depth                         = opt.prefetch_depth;
+			decode_cfg.prefetch_workers                       = opt.prefetch_workers;
+			decode_cfg.streaming_target_work_items            = opt.stream_target_work_items;
+			decode_cfg.streaming_target_rowgroups             = opt.stream_max_rowgroups;
 			io::read_table_to_csv(opt.input, *out, opt.header, decode_cfg, opt.rowgroup);
 			return 0;
 		}
@@ -340,8 +360,10 @@ int main(int argc, char** argv) {
 		if (opt.mode == Mode::Benchmark) {
 			dispatch::TableBenchmarkConfig bench_cfg {};
 			bench_cfg.samples = opt.samples;
-			bench_cfg.aggregation_scope =
-			    opt.mega_kernel ? dispatch::AggregationScope::WholeTable : dispatch::AggregationScope::PerRowgroup;
+			bench_cfg.scope = opt.mega_kernel ? dispatch::TableDecompressionScope::WholeTable
+			                                  : dispatch::TableDecompressionScope::PerRowgroup;
+			bench_cfg.execution.unpack_n_vectors = opt.unpack_n_vectors;
+			bench_cfg.execution.unpack_n_values  = opt.unpack_n_values;
 			bench_cfg.execution.launch_strategy = opt.gpu_dispatch_kernel ? dispatch::LaunchStrategy::MixedDispatch
 			                                                              : dispatch::LaunchStrategy::TypedBatches;
 			bench_cfg.execution.write_out       = opt.write_back;
@@ -426,6 +448,8 @@ int main(int argc, char** argv) {
 			std::cout << "  stream_max_rowgroups: " << opt.stream_max_rowgroups << "\n";
 			std::cout << "  rowgroup_prefetch: " << (opt.enable_rowgroup_prefetch ? 1 : 0) << "\n";
 			std::cout << "  prefetch_depth: " << opt.prefetch_depth << "\n";
+			std::cout << "  unpack_n_vectors: " << opt.unpack_n_vectors << "\n";
+			std::cout << "  unpack_n_values: " << opt.unpack_n_values << "\n";
 			std::cout << "  write_back: " << (opt.write_back ? 1 : 0) << "\n";
 			std::cout << "  zero_copy_parse: " << (opt.use_zero_copy_parse ? 1 : 0) << "\n";
 			std::cout << "  freq_prefetch_all_branchless: " << (opt.freq_prefetch_all_branchless ? 1 : 0) << "\n";

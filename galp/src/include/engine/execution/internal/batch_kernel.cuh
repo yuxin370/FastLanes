@@ -12,6 +12,8 @@
 #include "engine/data/model.cuh"
 #include "engine/data/value-store.cuh"
 #include "engine/execution/batch.cuh"
+#include "engine/execution/config.cuh"
+#include "engine/execution/internal/unpack_dispatch.cuh"
 #include "engine/expression.cuh"
 #include "engine/kernels.cuh"
 #include "engine/lane-policy.cuh"
@@ -31,12 +33,11 @@ void launch_batch_no_sync(const dispatch::Batch<T>&  batch,
                           const DeviceExpression<T>* d_exprs,
                           const WorkItemAny*         d_items,
                           const size_t               n_items,
+                          const ExecutionConfig&     cfg,
                           cudaStream_t               stream = 0) {
 	if (batch.device_exprs.empty() || !d_exprs || !d_items || n_items == 0) {
 		return;
 	}
-	constexpr unsigned UNPACK_N_VECTORS = 1;
-	constexpr unsigned UNPACK_N_VALUES  = 1;
 	uint32_t           threads          = static_cast<uint32_t>(utils::get_n_lanes<T>());
 	for (const auto& work : batch.work_items) {
 		threads = std::max(threads,
@@ -45,20 +46,24 @@ void launch_batch_no_sync(const dispatch::Batch<T>&  batch,
 	const dim3 block(static_cast<unsigned>(threads));
 	const dim3 grid(static_cast<unsigned>(n_items));
 
-	kernels::device::decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
-	    <<<grid, block, 0, stream>>>(d_exprs, d_items, n_items);
-	CUDA_SAFE_CALL(cudaGetLastError());
+	runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, auto unpack_n_values) {
+		constexpr unsigned UNPACK_N_VECTORS = decltype(unpack_n_vectors)::value;
+		constexpr unsigned UNPACK_N_VALUES  = decltype(unpack_n_values)::value;
+		kernels::device::decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
+		    <<<grid, block, 0, stream>>>(d_exprs, d_items, n_items);
+		CUDA_SAFE_CALL(cudaGetLastError());
+	});
 }
 
 template <typename T>
-void launch_batch(const Batch<T>& batch) {
+void launch_batch(const Batch<T>& batch, const ExecutionConfig& cfg = {}) {
 	if (batch.device_exprs.empty() || batch.work_items.empty()) {
 		return;
 	}
 	GPUArray<DeviceExpression<T>> d_exprs(batch.device_exprs.size(), batch.device_exprs.data());
 	GPUArray<WorkItemAny>         d_items(batch.work_items.size(), batch.work_items.data());
 	flsgpu::memory::sync_h2d();
-	launch_batch_no_sync<T>(batch, d_exprs.get(), d_items.get(), batch.work_items.size());
+	launch_batch_no_sync<T>(batch, d_exprs.get(), d_items.get(), batch.work_items.size(), cfg);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 }
 

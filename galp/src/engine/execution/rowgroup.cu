@@ -4,12 +4,14 @@
 // galp/src/engine/execution/rowgroup.cu
 // ────────────────────────────────────────────────────────
 #include "engine/execution/internal/materialize.cuh"
+#include "engine/execution/internal/unpack_dispatch.cuh"
 #include "engine/execution/rowgroup.cuh"
 
 namespace dispatch {
 namespace {
 
 RowgroupData decompress_rowgroup_impl(std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg) {
+	runtime::validate_unpack_config(cfg);
 	runtime::ExecutionWorkset      workset {};
 	runtime::ExecutionWorksetGuard guard(workset);
 	runtime::append_expressions(workset, expressions, cfg);
