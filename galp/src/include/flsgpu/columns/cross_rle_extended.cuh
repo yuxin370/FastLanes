@@ -22,7 +22,7 @@ struct CROSSRLEExtendedColumn {
 	size_t n_vecs;
 
 	size_t    n_lane_runs;       // total runs after lane-projection
-	size_t*   lane_runs_offsets; // [n_vecs+1], global offset into lane_values/lane_lengths
+	uint32_t* lane_runs_offsets; // [n_vecs+1], global offset into lane_values/lane_lengths
 	UINT_T*   lane_values;       // [n_lane_runs]
 	uint16_t* lane_lengths;      // [n_lane_runs], length in k-space (stride index)
 	uint32_t* offsets_counts;    // [n_vecs * N_LANES], packed per-lane (offset,count) within vector slice
@@ -40,7 +40,7 @@ struct CROSSRLEExtendedColumn {
 	size_t n_values;
 
 	size_t    n_lane_runs;       // total runs after lane-projection
-	size_t*   lane_runs_offsets; // [n_vecs+1]
+	uint32_t* lane_runs_offsets; // [n_vecs+1]
 	UINT_T*   lane_values;       // [n_lane_runs]
 	uint16_t* lane_lengths;      // [n_lane_runs]
 	uint32_t* offsets_counts;    // [n_vecs * N_LANES]
@@ -59,7 +59,7 @@ struct CROSSRLEExtendedColumn {
 		    n_values,
 		    n_vecs,
 		    n_lane_runs,
-		    GPUArray<size_t>(n_vecs + 1, lane_runs_offsets).release(),
+		    GPUArray<uint32_t>(n_vecs + 1, lane_runs_offsets).release(),
 		    GPUArray<UINT_T>(n_lane_runs, lane_values).release(),
 		    GPUArray<uint16_t>(n_lane_runs, lane_lengths).release(),
 		    GPUArray<uint32_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts).release(),
@@ -68,7 +68,7 @@ struct CROSSRLEExtendedColumn {
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::CROSSRLEExtendedColumn<T>& out) const {
 		const size_t nv     = get_n_vecs();
-		auto         i_offs = arena.template add<size_t>(nv + 1, lane_runs_offsets);
+		auto         i_offs = arena.template add<uint32_t>(nv + 1, lane_runs_offsets);
 		auto         i_vals = arena.template add<UINT_T>(n_lane_runs, lane_values);
 		auto         i_lens = arena.template add<uint16_t>(n_lane_runs, lane_lengths);
 		auto         i_oc   = arena.template add<uint32_t>(nv * utils::get_n_lanes<T>(), offsets_counts);

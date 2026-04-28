@@ -58,10 +58,9 @@ struct DICTSLPATCHColumn {
 		auto         i_packed =
 		    arena.template add<UINT_IDX>(index.ffor.bp.n_packed_values, index.ffor.bp.packed_array, bp_buffer_elems);
 		auto i_bw               = arena.template add<vbw_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.bit_widths);
-		auto i_bp_off           = arena.template add<size_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.vector_offsets);
+		auto i_bp_off           = arena.template add<uint32_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.vector_offsets);
 		auto i_bases            = arena.template add<UINT_IDX>(index.ffor.bp.get_n_vecs(), index.ffor.bases);
-		auto i_exc_off          = arena.template add<size_t>(sl_nvecs, index.exceptions_offsets);
-		auto i_pos_off          = arena.template add<size_t>(sl_nvecs, index.positions_offsets);
+		auto i_exc_off          = arena.template add<uint32_t>(sl_nvecs, index.exceptions_offsets);
 		auto i_exc              = arena.template add<IndexT>(index.n_exceptions, index.exceptions, buf);
 		auto i_pos              = arena.template add<uint16_t>(index.n_exceptions, index.positions, buf);
 		auto i_cnt              = arena.template add<uint16_t>(sl_nvecs, index.counts);
@@ -79,7 +78,6 @@ struct DICTSLPATCHColumn {
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bp.vector_offsets), i_bp_off);
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bases), i_bases);
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.exceptions_offsets), i_exc_off);
-		arena.resolve_to(reinterpret_cast<void**>(&out.index.positions_offsets), i_pos_off);
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.exceptions), i_exc);
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.positions), i_pos);
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.counts), i_cnt);
@@ -106,7 +104,6 @@ make_slpatch_u8_from_slpatch_i8(const flsgpu::host::SLPATCHColumn<int8_t>& col) 
 	auto index_ffor = detail::make_ffor_u8_from_ffor_i8(col.ffor);
 
 	auto* offsets     = utils::copy_array(col.exceptions_offsets, col.n_vecs);
-	auto* pos_offsets = utils::copy_array(col.positions_offsets, col.n_vecs);
 	auto* pos         = utils::copy_array(col.positions, col.n_exceptions);
 	auto* cnt         = utils::copy_array(col.counts, col.n_vecs);
 	auto* exc         = new uint8_t[col.n_exceptions];
@@ -115,7 +112,7 @@ make_slpatch_u8_from_slpatch_i8(const flsgpu::host::SLPATCHColumn<int8_t>& col) 
 	}
 
 	return flsgpu::host::SLPATCHColumn<uint8_t> {
-	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, pos_offsets, exc, pos, cnt};
+	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, exc, pos, cnt};
 }
 
 } // namespace detail

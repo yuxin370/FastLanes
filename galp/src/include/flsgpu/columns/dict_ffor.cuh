@@ -56,7 +56,7 @@ struct DICTFFORColumn {
 		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
 		auto i_packed = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
 		auto i_bw     = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
-		auto i_bp_off = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bp_off = arena.template add<uint32_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
 		auto i_bases  = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
 		auto i_keys   = arena.template add<KEY_T>(key_count, keys);
 		out.n_values  = get_n_values();

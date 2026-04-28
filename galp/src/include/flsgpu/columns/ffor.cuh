@@ -47,7 +47,7 @@ struct FFORColumn {
 		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;
 		auto         i_packed        = arena.template add<UINT_T>(bp.n_packed_values, bp.packed_array, bp_buffer_elems);
 		auto         i_bw            = arena.template add<vbw_t>(bp.get_n_vecs(), bp.bit_widths);
-		auto         i_offsets       = arena.template add<size_t>(bp.get_n_vecs(), bp.vector_offsets);
+		auto         i_offsets       = arena.template add<uint32_t>(bp.get_n_vecs(), bp.vector_offsets);
 		auto         i_bases         = arena.template add<UINT_T>(bp.get_n_vecs(), bases);
 		out.n_values                 = get_n_values();
 		out.bp.n_values              = bp.n_values;

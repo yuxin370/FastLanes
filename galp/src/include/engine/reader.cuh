@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <filesystem>
@@ -47,9 +48,18 @@ namespace detail {
 inline constexpr size_t kVecSize = consts::VALUES_PER_VECTOR;
 
 struct SegmentOffsets {
-	size_t* offsets;
-	size_t  total;
+	uint32_t* offsets;
+	size_t    total;
 };
+
+inline uint32_t checked_u32_offset(const size_t value, const char* field) {
+	if (value > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+		std::ostringstream msg;
+		msg << field << " exceeds uint32_t range: " << value;
+		throw std::runtime_error(msg.str());
+	}
+	return static_cast<uint32_t>(value);
+}
 
 inline fastlanes::TableDescriptorHandle load_table_descriptor(fastlanes::File&             file,
                                                               const std::filesystem::path& file_path) {
@@ -206,13 +216,13 @@ inline flsgpu::host::BPColumn<T> make_bp_zero_copy(const fastlanes::SegmentView&
                                                    ZeroCopyHostStorage&          storage) {
 	using PackedT = typename utils::same_width_uint<T>::type;
 
-	auto*  vector_offsets = storage.allocate_array<size_t>(n_vecs);
+	auto*  vector_offsets = storage.allocate_array<uint32_t>(n_vecs);
 	size_t prev_bytes     = 0;
 	for_each_entrypoint(seg_bitpacked, n_vecs, "bitpacked segment", [&](const size_t i, const size_t cur_bytes) {
 		if (cur_bytes < prev_bytes || (cur_bytes % sizeof(PackedT)) != 0) {
 			throw std::runtime_error("invalid bitpacked segment entrypoints");
 		}
-		vector_offsets[i] = prev_bytes / sizeof(PackedT);
+		vector_offsets[i] = checked_u32_offset(prev_bytes / sizeof(PackedT), "bitpacked vector offset");
 		prev_bytes        = cur_bytes;
 	});
 
@@ -249,11 +259,11 @@ make_uncompressed_zero_copy(const fastlanes::SegmentView& seg, const size_t n_va
 	}
 
 	auto*      bit_widths     = storage.allocate_array<vbw_t>(n_vecs);
-	auto*      vector_offsets = storage.allocate_array<size_t>(n_vecs);
+	auto*      vector_offsets = storage.allocate_array<uint32_t>(n_vecs);
 	const auto bw             = static_cast<vbw_t>(sizeof(T) * 8);
 	for (size_t vi = 0; vi < n_vecs; ++vi) {
 		bit_widths[vi]     = bw;
-		vector_offsets[vi] = vi * kVecSize;
+		vector_offsets[vi] = checked_u32_offset(vi * kVecSize, "uncompressed vector offset");
 	}
 
 	return flsgpu::host::BPColumn<T> {n_values, n_packed_values, packed, bit_widths, vector_offsets};
@@ -284,16 +294,50 @@ inline SegmentOffsets build_entrypoint_offsets(const fastlanes::SegmentView& seg
                                                ZeroCopyHostStorage&          storage,
                                                const char*                   segment_tag = "exception segment") {
 	const size_t segment_bytes = seg.data_span.size();
-	auto*        offsets       = storage.allocate_array<size_t>(n_vecs);
+	auto*        offsets       = storage.allocate_array<uint32_t>(n_vecs);
 	size_t       prev_bytes    = 0;
 	for_each_entrypoint(seg, n_vecs, segment_tag, [&](const size_t i, const size_t cur_bytes) {
 		if (cur_bytes < prev_bytes || (cur_bytes % elem_bytes) != 0 || cur_bytes > segment_bytes) {
 			throw std::runtime_error(std::string("invalid ") + segment_tag + " entrypoints");
 		}
-		offsets[i] = prev_bytes / elem_bytes;
+		offsets[i] = checked_u32_offset(prev_bytes / elem_bytes, segment_tag);
 		prev_bytes = cur_bytes;
 	});
+	(void)checked_u32_offset(prev_bytes / elem_bytes, segment_tag);
 	return SegmentOffsets {offsets, prev_bytes / elem_bytes};
+}
+
+inline bool validate_shared_position_offsets_enabled() {
+	const char* env = std::getenv("GALP_VALIDATE_SHARED_POSITION_OFFSETS");
+	return env != nullptr && std::strcmp(env, "0") != 0;
+}
+
+inline void validate_matching_entrypoint_offsets(const fastlanes::SegmentView& seg,
+                                                 const uint32_t*               expected_offsets,
+                                                 const size_t                  n_vecs,
+                                                 const size_t                  elem_bytes,
+                                                 const size_t                  expected_total,
+                                                 const char*                   segment_tag) {
+	if (!validate_shared_position_offsets_enabled()) {
+		return;
+	}
+
+	const size_t segment_bytes = seg.data_span.size();
+	size_t       prev_bytes    = 0;
+	for_each_entrypoint(seg, n_vecs, segment_tag, [&](const size_t i, const size_t cur_bytes) {
+		if (cur_bytes < prev_bytes || (cur_bytes % elem_bytes) != 0 || cur_bytes > segment_bytes) {
+			throw std::runtime_error(std::string("invalid ") + segment_tag + " entrypoints");
+		}
+		const size_t offset = prev_bytes / elem_bytes;
+		if (checked_u32_offset(offset, segment_tag) != expected_offsets[i]) {
+			throw std::runtime_error(std::string(segment_tag) + " offsets do not match exception offsets");
+		}
+		prev_bytes = cur_bytes;
+	});
+	const size_t total = prev_bytes / elem_bytes;
+	if (total != expected_total) {
+		throw std::runtime_error(std::string(segment_tag) + " total does not match exception total");
+	}
 }
 
 template <typename T>
@@ -309,14 +353,15 @@ inline flsgpu::host::SLPATCHColumn<T> make_slpatch_zero_copy(const fastlanes::Se
 	auto ffor = make_ffor_zero_copy<T>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
 
 	auto exc = build_entrypoint_offsets(seg_exc, n_vecs, sizeof(T), storage);
-	auto pos = build_entrypoint_offsets(seg_pos, n_vecs, sizeof(uint16_t), storage);
+	validate_matching_entrypoint_offsets(
+	    seg_pos, exc.offsets, n_vecs, sizeof(uint16_t), exc.total, "SLPATCH positions segment");
 
 	auto* counts     = segment_ptr_or_copy<uint16_t>(seg_cnt, storage);
 	auto* positions  = segment_ptr_or_copy<uint16_t>(seg_pos, storage);
 	auto* exceptions = segment_ptr_or_copy<T>(seg_exc, storage);
 
 	return flsgpu::host::SLPATCHColumn<T> {
-	    n_values, n_vecs, ffor, exc.total, exc.offsets, pos.offsets, exceptions, positions, counts};
+	    n_values, n_vecs, ffor, exc.total, exc.offsets, exceptions, positions, counts};
 }
 
 template <typename T>
@@ -332,20 +377,17 @@ inline flsgpu::host::FREQColumn<T> make_frequency_zero_copy(const fastlanes::Seg
 	}
 	T fv;
 	std::memcpy(&fv, seg_fv.data_span.data(), sizeof(T));
-	auto* fv_arr = storage.allocate_array<T>(n_vecs);
-	for (size_t i = 0; i < n_vecs; ++i) {
-		fv_arr[i] = fv;
-	}
 
 	auto exc = build_entrypoint_offsets(seg_exc, n_vecs, sizeof(T), storage);
-	auto pos = build_entrypoint_offsets(seg_pos, n_vecs, sizeof(uint16_t), storage);
+	validate_matching_entrypoint_offsets(
+	    seg_pos, exc.offsets, n_vecs, sizeof(uint16_t), exc.total, "EXP_FREQUENCY positions segment");
 
 	auto* counts     = segment_ptr_or_copy<uint16_t>(seg_cnt, storage);
 	auto* positions  = segment_ptr_or_copy<uint16_t>(seg_pos, storage);
 	auto* exceptions = segment_ptr_or_copy<T>(seg_exc, storage);
 
 	return flsgpu::host::FREQColumn<T> {
-	    n_values, n_vecs, fv_arr, exc.total, exc.offsets, pos.offsets, exceptions, positions, counts};
+	    n_values, n_vecs, fv, exc.total, exc.offsets, exceptions, positions, counts};
 }
 
 template <typename T>
@@ -471,10 +513,9 @@ template <typename T>
 inline flsgpu::host::FREQColumn<T> clone_column(const flsgpu::host::FREQColumn<T>& col) {
 	return flsgpu::host::FREQColumn<T> {col.n_values,
 	                                    col.n_vecs,
-	                                    clone_array(col.frequent_value, col.n_vecs),
+	                                    col.frequent_value,
 	                                    col.n_exceptions,
 	                                    clone_array(col.exceptions_offsets, col.n_vecs),
-	                                    clone_array(col.positions_offsets, col.n_vecs),
 	                                    clone_array(col.exceptions, col.n_exceptions),
 	                                    clone_array(col.positions, col.n_exceptions),
 	                                    clone_array(col.counts, col.n_vecs)};
@@ -487,7 +528,6 @@ inline flsgpu::host::SLPATCHColumn<T> clone_column(const flsgpu::host::SLPATCHCo
 	                                       clone_column(col.ffor),
 	                                       col.n_exceptions,
 	                                       clone_array(col.exceptions_offsets, col.n_vecs),
-	                                       clone_array(col.positions_offsets, col.n_vecs),
 	                                       clone_array(col.exceptions, col.n_exceptions),
 	                                       clone_array(col.positions, col.n_exceptions),
 	                                       clone_array(col.counts, col.n_vecs)};

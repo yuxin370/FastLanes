@@ -30,7 +30,7 @@ struct ALPExtendedColumn {
 	uint8_t* fraction_indices;
 
 	size_t    n_exceptions;
-	size_t*   exceptions_offsets;
+	uint32_t* exceptions_offsets;
 	T*        exceptions;
 	uint16_t* positions;
 	uint16_t* offsets_counts;
@@ -52,7 +52,7 @@ struct ALPExtendedColumn {
 	uint8_t* fraction_indices;
 
 	size_t    n_exceptions;
-	size_t*   exceptions_offsets;
+	uint32_t* exceptions_offsets;
 	T*        exceptions;
 	uint16_t* positions;
 	uint16_t* offsets_counts;
@@ -81,7 +81,7 @@ struct ALPExtendedColumn {
 		    GPUArray<uint8_t>(ffor.bp.get_n_vecs(), factor_indices).release(),
 		    GPUArray<uint8_t>(ffor.bp.get_n_vecs(), fraction_indices).release(),
 		    n_exceptions,
-		    GPUArray<size_t>(ffor.bp.get_n_vecs(), exceptions_offsets).release(),
+		    GPUArray<uint32_t>(ffor.bp.get_n_vecs(), exceptions_offsets).release(),
 		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
 		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
 		    GPUArray<uint16_t>(ffor.bp.get_n_vecs() * utils::get_n_lanes<T>(), offsets_counts).release(),

@@ -32,7 +32,7 @@ struct ALPColumn {
 	uint8_t* fraction_indices;
 
 	size_t    n_exceptions;
-	size_t*   exceptions_offsets;
+	uint32_t* exceptions_offsets;
 	T*        exceptions;
 	uint16_t* positions;
 	uint16_t* counts;
@@ -54,7 +54,7 @@ struct ALPColumn {
 	uint8_t* fraction_indices;
 
 	size_t    n_exceptions;
-	size_t*   exceptions_offsets;
+	uint32_t* exceptions_offsets;
 	T*        exceptions;
 	uint16_t* positions;
 	uint16_t* counts;
@@ -82,7 +82,7 @@ struct ALPColumn {
 		    GPUArray<uint8_t>(ffor.bp.get_n_vecs(), factor_indices).release(),
 		    GPUArray<uint8_t>(ffor.bp.get_n_vecs(), fraction_indices).release(),
 		    n_exceptions,
-		    GPUArray<size_t>(ffor.bp.get_n_vecs(), exceptions_offsets).release(),
+		    GPUArray<uint32_t>(ffor.bp.get_n_vecs(), exceptions_offsets).release(),
 		    GPUArray<T>(n_exceptions, exceptions).release(),
 		    GPUArray<uint16_t>(n_exceptions, positions).release(),
 		    GPUArray<uint16_t>(ffor.bp.get_n_vecs(), counts).release(),

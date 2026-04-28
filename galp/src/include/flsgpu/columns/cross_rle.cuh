@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
+#include <stdexcept>
 #include <tuple>
 
 namespace flsgpu {
@@ -224,7 +226,7 @@ struct CROSSRLEColumn {
 		    n_values, e_total_runs, e_lane_runs_offsets, e_values, e_lengths, e_offsets_counts};
 	}
 
-	std::tuple<size_t*, UINT_T*, uint16_t*, uint32_t*, size_t> convert_runs_to_lane_divided_format() const {
+	std::tuple<uint32_t*, UINT_T*, uint16_t*, uint32_t*, size_t> convert_runs_to_lane_divided_format() const {
 		constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
 		constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
 		constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
@@ -262,12 +264,15 @@ struct CROSSRLEColumn {
 		}
 
 		// get lane_runs_offsets, and calculate total runs
-		auto*  lane_runs_offsets = reinterpret_cast<size_t*>(malloc(sizeof(size_t) * (n_vecs + 1)));
+		auto*  lane_runs_offsets = reinterpret_cast<uint32_t*>(malloc(sizeof(uint32_t) * (n_vecs + 1)));
 		size_t total_runs        = 0;
 		lane_runs_offsets[0]     = 0;
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			total_runs += vec_total_runs[vec];
-			lane_runs_offsets[vec + 1] = total_runs;
+			if (total_runs > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+				throw std::overflow_error("CROSSRLE lane run offset exceeds uint32_t range");
+			}
+			lane_runs_offsets[vec + 1] = static_cast<uint32_t>(total_runs);
 		}
 
 		auto* out_values         = reinterpret_cast<UINT_T*>(malloc(sizeof(UINT_T) * total_runs));

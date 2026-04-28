@@ -102,10 +102,10 @@ public:
 			exceptions_count[v] = column.counts[vec_index]; // exceotions count in this vector
 			vec_exceptions_positions[v] =
 			    column.positions +
-			    column.positions_offsets[vec_index]; // position offsets correspond to positions segment layout
+			    column.exceptions_offsets[vec_index]; // positions share the exception segment layout
 			vec_exceptions[v] = column.exceptions +
 			                    column.exceptions_offsets[vec_index]; // get the first position/exception in this vector
-			frequent_value[v] = column.frequent_value[vec_index];     // also the first values in this vector
+			frequent_value[v] = column.frequent_value;                // also the first values in this vector
 		}
 	}
 };
@@ -166,9 +166,9 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index              = first_vector_index + v;
 			exceptions_count[v]         = column.counts[vec_index];
-			vec_exceptions_positions[v] = column.positions + column.positions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
-			frequent_value[v]           = column.frequent_value[vec_index];
+			frequent_value[v]           = column.frequent_value;
 		}
 	}
 };
@@ -218,7 +218,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index              = first_vector_index + v;
 			exceptions_count[v]         = column.counts[vec_index];
-			vec_exceptions_positions[v] = column.positions + column.positions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
 		}
 	}
@@ -273,7 +273,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index              = first_vector_index + v;
 			exceptions_count[v]         = column.index.counts[vec_index];
-			vec_exceptions_positions[v] = column.index.positions + column.index.positions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.index.positions + column.index.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.index.exceptions + column.index.exceptions_offsets[vec_index];
 		}
 	}
@@ -315,7 +315,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			const auto vec_index        = first_vector_index + v;
 			exceptions_count[v]         = column.counts[vec_index];
-			vec_exceptions_positions[v] = column.positions + column.positions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.positions + column.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.exceptions + column.exceptions_offsets[vec_index];
 		}
 	}
@@ -361,7 +361,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			const auto vec_index        = first_vector_index + v;
 			exceptions_count[v]         = column.index.counts[vec_index];
-			vec_exceptions_positions[v] = column.index.positions + column.index.positions_offsets[vec_index];
+			vec_exceptions_positions[v] = column.index.positions + column.index.exceptions_offsets[vec_index];
 			vec_exceptions[v]           = column.index.exceptions + column.index.exceptions_offsets[vec_index];
 		}
 	}
@@ -390,7 +390,7 @@ public:
 			const auto offset = (offset_count & 0x3FF);
 			positions[v]      = column.positions + column.exceptions_offsets[current_vector_index] + offset;
 			exceptions[v]     = column.exceptions + column.exceptions_offsets[current_vector_index] + offset;
-			frequent_value[v] = column.frequent_value[current_vector_index];
+			frequent_value[v] = column.frequent_value;
 		}
 	}
 
@@ -466,7 +466,7 @@ public:
 
 			positions[v]      = column.positions + exceptions_offset + lane_offset;
 			exceptions[v]     = column.exceptions + exceptions_offset + lane_offset;
-			frequent_value[v] = column.frequent_value[current_vector_index];
+			frequent_value[v] = column.frequent_value;
 		}
 	}
 
@@ -514,7 +514,7 @@ public:
 			exceptions[v]                = column.exceptions + exceptions_offset + lane_offset;
 
 			next_position[v]  = *positions[v];
-			frequent_value[v] = column.frequent_value[vector_index];
+			frequent_value[v] = column.frequent_value;
 		}
 	}
 
@@ -584,7 +584,7 @@ public:
 
 			// This might be avoided to avoid a branch
 			read_next_exception(v);
-			frequent_value[v] = column.frequent_value[vector_index];
+			frequent_value[v] = column.frequent_value;
 		}
 	}
 
@@ -641,7 +641,7 @@ public:
 
 			bool comparison = count[v] > 0;
 			next_position[v] += (!comparison) * consts::VALUES_PER_VECTOR;
-			frequent_value[v] = column.frequent_value[vector_index];
+			frequent_value[v] = column.frequent_value;
 		}
 	}
 

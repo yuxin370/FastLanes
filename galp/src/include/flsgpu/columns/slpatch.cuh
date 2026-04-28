@@ -21,8 +21,7 @@ struct SLPATCHColumn {
 	FFORColumn<T> ffor; // base values
 
 	size_t    n_exceptions;       // total number of exceptions
-	size_t*   exceptions_offsets; // exception offsets in exception array
-	size_t*   positions_offsets;  // position offsets in position array
+	uint32_t* exceptions_offsets; // exception offsets in exception array
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -43,8 +42,7 @@ struct SLPATCHColumn {
 	FFORColumn<T> ffor; // base values
 
 	size_t    n_exceptions;       // total number of exceptions
-	size_t*   exceptions_offsets; // exception values
-	size_t*   positions_offsets;  // position offsets
+	uint32_t* exceptions_offsets; // exception values
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -64,8 +62,7 @@ struct SLPATCHColumn {
 		    n_vecs,
 		    ffor.copy_to_device(),
 		    n_exceptions,
-		    GPUArray<size_t>(n_vecs, exceptions_offsets).release(),
-		    GPUArray<size_t>(n_vecs, positions_offsets).release(),
+		    GPUArray<uint32_t>(n_vecs, exceptions_offsets).release(),
 		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
 		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
 		    GPUArray<uint16_t>(n_vecs, counts).release(),
@@ -78,10 +75,9 @@ struct SLPATCHColumn {
 		using UINT_T_BP              = typename utils::same_width_uint<T>::type;
 		auto i_packed  = arena.template add<UINT_T_BP>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
 		auto i_bw      = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
-		auto i_bp_off  = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bp_off  = arena.template add<uint32_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
 		auto i_bases   = arena.template add<UINT_T_BP>(ffor.bp.get_n_vecs(), ffor.bases);
-		auto i_exc_off = arena.template add<size_t>(n_vecs, exceptions_offsets);
-		auto i_pos_off = arena.template add<size_t>(n_vecs, positions_offsets);
+		auto i_exc_off = arena.template add<uint32_t>(n_vecs, exceptions_offsets);
 		auto i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
 		auto i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
 		auto i_cnt     = arena.template add<uint16_t>(n_vecs, counts);
@@ -96,7 +92,6 @@ struct SLPATCHColumn {
 		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bp.vector_offsets), i_bp_off);
 		arena.resolve_to(reinterpret_cast<void**>(&out.ffor.bases), i_bases);
 		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions_offsets), i_exc_off);
-		arena.resolve_to(reinterpret_cast<void**>(&out.positions_offsets), i_pos_off);
 		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions), i_exc);
 		arena.resolve_to(reinterpret_cast<void**>(&out.positions), i_pos);
 		arena.resolve_to(reinterpret_cast<void**>(&out.counts), i_cnt);
@@ -107,7 +102,6 @@ template <typename T>
 void free_column(SLPATCHColumn<T> column) {
 	free_column(column.ffor);
 	delete[] column.exceptions_offsets;
-	delete[] column.positions_offsets;
 	delete[] column.exceptions;
 	delete[] column.positions;
 	delete[] column.counts;
@@ -117,7 +111,6 @@ template <typename T>
 void free_column(device::SLPATCHColumn<T> column) {
 	free_column(column.ffor);
 	free_device_pointer(column.exceptions_offsets);
-	free_device_pointer(column.positions_offsets);
 	free_device_pointer(column.exceptions);
 	free_device_pointer(column.positions);
 	free_device_pointer(column.counts);

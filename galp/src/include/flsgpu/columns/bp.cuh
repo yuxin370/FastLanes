@@ -23,7 +23,7 @@ struct BPColumn {
 
 	UINT_T* packed_array;
 	vbw_t*  bit_widths;
-	size_t* vector_offsets;
+	uint32_t* vector_offsets;
 };
 
 } // namespace device
@@ -47,7 +47,7 @@ struct BPColumn {
 
 	UINT_T* packed_array;
 	vbw_t*  bit_widths;
-	size_t* vector_offsets;
+	uint32_t* vector_offsets;
 
 	device::BPColumn<T> copy_to_device() const {
 		const size_t branchless_extra_access_buffer = sizeof(T) * utils::get_n_lanes<T>() * 4;
@@ -56,14 +56,14 @@ struct BPColumn {
 		    get_n_vecs(),
 		    GPUArray<UINT_T>(n_packed_values, branchless_extra_access_buffer, packed_array).release(),
 		    GPUArray<vbw_t>(get_n_vecs(), bit_widths).release(),
-		    GPUArray<size_t>(get_n_vecs(), vector_offsets).release()};
+		    GPUArray<uint32_t>(get_n_vecs(), vector_offsets).release()};
 	}
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::BPColumn<T>& out) const {
 		const size_t buffer_elems = utils::get_n_lanes<T>() * 4;
 		auto         i_packed     = arena.template add<UINT_T>(n_packed_values, packed_array, buffer_elems);
 		auto         i_bw         = arena.template add<vbw_t>(get_n_vecs(), bit_widths);
-		auto         i_offsets    = arena.template add<size_t>(get_n_vecs(), vector_offsets);
+		auto         i_offsets    = arena.template add<uint32_t>(get_n_vecs(), vector_offsets);
 		out.n_values              = n_values;
 		out.n_vecs                = get_n_vecs();
 		arena.resolve_to(reinterpret_cast<void**>(&out.packed_array), i_packed);

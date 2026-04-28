@@ -12,6 +12,7 @@
 #include "flsgpu/memory/device_arena.cuh"
 #include "flsgpu/memory/gpu_array.cuh"
 #include <limits>
+#include <stdexcept>
 
 namespace flsgpu {
 namespace device {
@@ -22,11 +23,10 @@ struct FREQColumn {
 	size_t n_values;
 	size_t n_vecs;
 
-	T* frequent_value; // frequent values
+	T frequent_value; // per-column frequent value
 
 	size_t    n_exceptions;       // total number of exceptions
-	size_t*   exceptions_offsets; // expection offsets in exception array
-	size_t*   positions_offsets;  // position offsets in position array
+	uint32_t* exceptions_offsets; // expection offsets in exception array
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -44,11 +44,10 @@ struct FREQColumn {
 	size_t n_values;
 	size_t n_vecs;
 
-	T* frequent_value; // frequent values
+	T frequent_value; // per-column frequent value
 
 	size_t    n_exceptions;       // total number of exceptions
-	size_t*   exceptions_offsets; // expection offsets in exception array
-	size_t*   positions_offsets;  // position offsets
+	uint32_t* exceptions_offsets; // expection offsets in exception array
 	T*        exceptions;         // exception values
 	uint16_t* positions;          // exception positions in vectors
 	uint16_t* counts;             // number of exceptions per vector
@@ -66,10 +65,9 @@ struct FREQColumn {
 		return device::FREQColumn<T> {
 		    n_values,
 		    n_vecs,
-		    GPUArray<T>(n_vecs, frequent_value).release(),
+		    frequent_value,
 		    n_exceptions,
-		    GPUArray<size_t>(n_vecs, exceptions_offsets).release(),
-		    GPUArray<size_t>(n_vecs, positions_offsets).release(),
+		    GPUArray<uint32_t>(n_vecs, exceptions_offsets).release(),
 		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
 		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
 		    GPUArray<uint16_t>(n_vecs, counts).release(),
@@ -78,18 +76,15 @@ struct FREQColumn {
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FREQColumn<T>& out) const {
 		const size_t buf       = consts::MAX_UNPACK_N_VECS;
-		auto         i_fv      = arena.template add<T>(n_vecs, frequent_value);
-		auto         i_exc_off = arena.template add<size_t>(n_vecs, exceptions_offsets);
-		auto         i_pos_off = arena.template add<size_t>(n_vecs, positions_offsets);
+		auto         i_exc_off = arena.template add<uint32_t>(n_vecs, exceptions_offsets);
 		auto         i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
 		auto         i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
 		auto         i_cnt     = arena.template add<uint16_t>(n_vecs, counts);
 		out.n_values           = n_values;
 		out.n_vecs             = n_vecs;
+		out.frequent_value     = frequent_value;
 		out.n_exceptions       = n_exceptions;
-		arena.resolve_to(reinterpret_cast<void**>(&out.frequent_value), i_fv);
 		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions_offsets), i_exc_off);
-		arena.resolve_to(reinterpret_cast<void**>(&out.positions_offsets), i_pos_off);
 		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions), i_exc);
 		arena.resolve_to(reinterpret_cast<void**>(&out.positions), i_pos);
 		arena.resolve_to(reinterpret_cast<void**>(&out.counts), i_cnt);
@@ -119,7 +114,6 @@ struct FREQColumn {
 		for (size_t vec_index {0}; vec_index < get_n_vecs(); ++vec_index) {
 			uint32_t     vec_exception_count = counts[vec_index];
 			const size_t exc_base            = exceptions_offsets[vec_index];
-			const size_t pos_base            = positions_offsets[vec_index];
 
 			// Reset counts
 			for (size_t j {0}; j < N_LANES; ++j) {
@@ -129,7 +123,7 @@ struct FREQColumn {
 			// Split all exceptions into lanes
 			for (size_t exception_index {0}; exception_index < vec_exception_count; ++exception_index) {
 				T        exception = exceptions[exc_base + exception_index];
-				uint16_t position  = positions[pos_base + exception_index];
+				uint16_t position  = positions[exc_base + exception_index];
 
 				uint32_t lane                 = position % N_LANES;
 				uint32_t lane_exception_count = lane_counts[lane];
@@ -162,15 +156,18 @@ struct FREQColumn {
 
 	FREQExtendedColumn<T> create_extended_column() const {
 		auto [e_exceptions, e_positions, e_offsets_counts] = convert_exceptions_to_lane_divided_format();
-		auto*  e_offsets                                   = new size_t[get_n_vecs()];
+		auto*  e_offsets                                   = new uint32_t[get_n_vecs()];
 		size_t acc                                         = 0;
 		for (size_t i = 0; i < get_n_vecs(); ++i) {
-			e_offsets[i] = acc;
+			if (acc > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+				throw std::overflow_error("FREQ exception offset exceeds uint32_t range");
+			}
+			e_offsets[i] = static_cast<uint32_t>(acc);
 			acc += static_cast<size_t>(counts[i]);
 		}
 		return FREQExtendedColumn<T> {n_values,
 		                              get_n_vecs(),
-		                              utils::copy_array(frequent_value, get_n_vecs()),
+		                              frequent_value,
 		                              n_exceptions,
 		                              e_offsets,
 		                              e_exceptions,
@@ -181,9 +178,7 @@ struct FREQColumn {
 
 template <typename T>
 void free_column(FREQColumn<T> column) {
-	delete[] column.frequent_value;
 	delete[] column.exceptions_offsets;
-	delete[] column.positions_offsets;
 	delete[] column.exceptions;
 	delete[] column.positions;
 	delete[] column.counts;
@@ -191,9 +186,7 @@ void free_column(FREQColumn<T> column) {
 
 template <typename T>
 void free_column(device::FREQColumn<T> column) {
-	free_device_pointer(column.frequent_value);
 	free_device_pointer(column.exceptions_offsets);
-	free_device_pointer(column.positions_offsets);
 	free_device_pointer(column.exceptions);
 	free_device_pointer(column.positions);
 	free_device_pointer(column.counts);

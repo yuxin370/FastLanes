@@ -10,10 +10,19 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace alp {
 constexpr int MAX_ATTEMPTS_TO_ENCODE = 10000;
+
+inline uint32_t checked_u32_offset(const size_t value, const char* field) {
+	if (value > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+		throw std::overflow_error(std::string(field) + " exceeds uint32_t range");
+	}
+	return static_cast<uint32_t>(value);
+}
 
 template <typename T>
 size_t get_bytes_overhead_size_per_alp_vector() {
@@ -98,11 +107,11 @@ flsgpu::host::ALPColumn<T> encode(const T* input_array, const size_t n_values, c
 
 	// Final arrays
 	vbw_t*    bit_widths         = new vbw_t[n_vecs];
-	size_t*   vector_offsets     = new size_t[n_vecs];
+	uint32_t* vector_offsets     = new uint32_t[n_vecs];
 	UINT_T*   bases              = new UINT_T[n_vecs];
 	uint8_t*  factor_indices     = new uint8_t[n_vecs];
 	uint8_t*  fraction_indices   = new uint8_t[n_vecs];
-	size_t*   exceptions_offsets = new size_t[n_vecs];
+	uint32_t* exceptions_offsets = new uint32_t[n_vecs];
 	uint16_t* counts             = new uint16_t[n_vecs];
 
 	size_t compressed_vector_sizes = 0;
@@ -130,9 +139,9 @@ flsgpu::host::ALPColumn<T> encode(const T* input_array, const size_t n_values, c
 
 		factor_indices[vi]     = alpstate.fac;
 		fraction_indices[vi]   = alpstate.exp;
-		exceptions_offsets[vi] = exceptions_offset;
+		exceptions_offsets[vi] = checked_u32_offset(exceptions_offset, "ALP exception offset");
 		exceptions_offset += counts[vi];
-		vector_offsets[vi] = vector_offset;
+		vector_offsets[vi] = checked_u32_offset(vector_offset, "ALP vector offset");
 		vector_offset += compressed_values_size;
 
 		compressed_vector_sizes +=

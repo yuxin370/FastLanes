@@ -23,7 +23,7 @@ struct RLEColumn {
 	FFORColumn<IndexT> ffor;
 	IndexT*            rsum_bases;   // n_vecs * n_lanes(IndexT)
 	T*                 rle_values;   // concatenated per-vector values
-	size_t*            rle_offsets;  // per-vector base offset into rle_values
+	uint32_t*          rle_offsets;  // per-vector base offset into rle_values
 	size_t             n_rle_values; // total values length
 };
 
@@ -40,7 +40,7 @@ struct RLEColumn {
 	FFORColumn<IndexT> ffor;
 	IndexT*            rsum_bases;
 	T*                 rle_values;
-	size_t*            rle_offsets;
+	uint32_t*          rle_offsets;
 	size_t             n_rle_values;
 
 	size_t get_n_values() const {
@@ -54,7 +54,7 @@ struct RLEColumn {
 		    ffor.copy_to_device(),
 		    GPUArray<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases).release(),
 		    GPUArray<T>(n_rle_values, rle_values).release(),
-		    GPUArray<size_t>(n_vecs, rle_offsets).release(),
+		    GPUArray<uint32_t>(n_vecs, rle_offsets).release(),
 		    n_rle_values};
 	}
 
@@ -63,11 +63,11 @@ struct RLEColumn {
 		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
 		auto i_packed    = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
 		auto i_bw        = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
-		auto i_bp_off    = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bp_off    = arena.template add<uint32_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
 		auto i_bases     = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
 		auto i_rsum      = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
 		auto i_vals      = arena.template add<T>(n_rle_values, rle_values);
-		auto i_offs      = arena.template add<size_t>(n_vecs, rle_offsets);
+		auto i_offs      = arena.template add<uint32_t>(n_vecs, rle_offsets);
 		out.n_values     = n_values;
 		out.n_vecs       = n_vecs;
 		out.n_rle_values = n_rle_values;

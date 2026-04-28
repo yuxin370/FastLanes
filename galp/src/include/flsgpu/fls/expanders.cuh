@@ -29,7 +29,7 @@ template <typename ValueT, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned 
 struct DummyRLEExpander : flsgpu::device::RLEExpanderBase<ValueT, IndexT> {
 private:
 	const ValueT* rle_values;
-	const size_t* rle_offsets;
+	const uint32_t* rle_offsets;
 	const vi_t    base_vector_index;
 
 public:
