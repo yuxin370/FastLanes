@@ -16,8 +16,14 @@ namespace dispatch {
 using AggregationScope = TableDecompressionScope;
 
 struct TableBenchmarkConfig : TableDecompressionConfig {
-	uint32_t         samples           = 1;
+	uint32_t              samples             = 1;
 	std::optional<size_t> rowgroup;
+	// When true, the benchmark also materializes results back to host pinned
+	// memory (one cudaMemcpyAsync(D2H) per chunk via the pinned-D2H path) so
+	// the wall clock reflects the full output-producing decompression cost.
+	// Off by default because the tuning scripts track the GPU-consume/discard
+	// path separately and record include_materialize/write_back in the CSV.
+	bool                  include_materialize = false;
 
 	TableBenchmarkConfig() {
 		scope               = TableDecompressionScope::WholeTable;
@@ -45,6 +51,7 @@ struct TableBenchmarkResult {
 	double upload_resolve_ms            = 0.0; // resolver targets + callback resolvers
 	double upload_pack_ms               = 0.0; // std::memcpy into pinned
 	double upload_dma_issue_ms          = 0.0; // cudaMemcpyAsync for regions + staged
+	double upload_dma_gpu_ms            = 0.0; // optional GPU-event H2D duration (GALP_MEASURE_H2D=1)
 	double upload_event_ms              = 0.0; // cudaEventRecord for h2d ready
 	double kernel_ms         = 0.0; // accumulated GPU event time returned by run_workset*
 	double release_device_ms = 0.0; // runtime::release_workset stage
@@ -58,6 +65,8 @@ struct TableBenchmarkResult {
 	size_t   total_bytes       = 0;
 	size_t   total_payload_arena_bytes = 0;
 	size_t   total_output_arena_bytes  = 0;
+	size_t   total_h2d_bytes           = 0;
+	size_t   total_h2d_copies          = 0;
 	size_t   prefetched_rowgroups      = 0;
 	size_t   total_rgs         = 0;
 	uint32_t samples           = 1;

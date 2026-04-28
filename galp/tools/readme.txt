@@ -10,42 +10,26 @@ Replace the placeholders below:
 2) Decompress one rowgroup only
 <GALP_CLI> read_table <FLS_FILE> /tmp/out.csv --rowgroup 0
 
-3) Benchmark (default: streaming + mixed-dispatch + zero-copy)
+3) Benchmark (default: streaming + mixed-dispatch + zero-copy rowgroup materialization)
 <GALP_CLI> benchmark <FLS_FILE> --samples 100
 
-4) Benchmark per-rowgroup (non-mega path)
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-mega-kernel
+4) Benchmark per-rowgroup worksets
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --per-rowgroup-workset
 
-5) Benchmark without streaming (synchronous chunked execution)
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-streaming
-
-6) Benchmark with typed-batch launches instead of mixed-dispatch
+5) Benchmark with typed-batch launches instead of mixed-dispatch
 <GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-mixed-dispatch
 
-7) Benchmark without zero-copy parsing
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-zero-copy
-
-8) Benchmark with global write-back enabled
+6) Benchmark with global write-back enabled
 <GALP_CLI> benchmark <FLS_FILE> --samples 100 --write-back
 
-9) Benchmark with launch-overhead estimate
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --estimate-launch --launch-iters 10000
-
-10) Benchmark one rowgroup with launch-overhead estimate
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --estimate-launch --launch-iters 10000 --rowgroup 0
-
-11) Benchmark with custom streaming chunk thresholds
+7) Benchmark with custom streaming chunk thresholds
 <GALP_CLI> benchmark <FLS_FILE> --samples 100 --stream-target-work-items 131072 --stream-max-rowgroups 4
 
-12) Baseline: disable overlap-heavy execution features
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-streaming --no-zero-copy
-(with env: GALP_DISABLE_ASYNC_H2D=1)
+8) Frequency: branchless patcher (extended + PrefetchAllBranchless)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --freq-patcher branchless
 
-13) Frequency: branchless patcher (extended + PrefetchAllBranchless)
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --freq-prefetch-all-branchless
-
-14) Frequency: hybrid selection (stateful/branchless by exception density)
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --freq-prefetch-all-branchless --freq-hybrid-patcher --freq-branchless-threshold 6
+9) Frequency: hybrid selection (stateful/branchless by exception density)
+<GALP_CLI> benchmark <FLS_FILE> --samples 100 --freq-patcher hybrid:6
 
 Benchmark output metrics
   benchmark_wall_ms                End-to-end wall clock of the whole benchmark run.
@@ -72,27 +56,18 @@ Options
   --iters N                         Launch measurement iterations (default: 100000).
   --grid N                          Launch grid size for measurement (default: 1).
   --block N                         Launch block size for measurement (default: 1).
-  --estimate-launch                 Estimate launch overhead during benchmark.
-  --launch-iters N                  Iterations for launch estimate (default: 10000).
-  --no-mega-kernel                  Use per-rowgroup worksets instead of whole-table aggregation.
-  --no-streaming                    Keep whole-table aggregation but use synchronous chunked execution
-                                    instead of the default double-buffered streaming pipeline.
+  --per-rowgroup-workset            Use one independent workset per rowgroup.
   --no-mixed-dispatch               Use typed-batch launches (one kernel per active type per sample)
                                     instead of mixed-dispatch (default: mixed-dispatch, one launch).
-  --no-zero-copy                    Disable zero-copy rowgroup parsing; use the traditional
-                                    parse-and-copy path (default: zero-copy enabled).
   --no-rowgroup-prefetch           Disable background rowgroup prefetch in whole-table benchmark.
   --prefetch-depth N               Number of rowgroups to prefetch ahead (default: 2).
+  --prefetch-workers N             Number of background rowgroup prefetch workers (default: 2).
   --write-back                      Force benchmark kernels to write decompressed outputs to global memory.
   --stream-target-work-items N      Chunk flush threshold by work_items in whole-table streaming
                                     benchmark (default: 262144).
   --stream-max-rowgroups N          Chunk flush threshold by rowgroup count in whole-table streaming
                                     benchmark (default: 8, 0 disables rowgroup-cap flushing).
-  --freq-prefetch-all-branchless    Use FREQ extended format with PrefetchAllBranchless patcher.
-  --freq-hybrid-patcher             Enable per-column selection between stateful and branchless FREQ
-                                    patcher. Requires --freq-prefetch-all-branchless.
-  --freq-branchless-threshold N     Hybrid cutoff: average exceptions per vector (default: 6).
-                                    Requires both --freq-prefetch-all-branchless and --freq-hybrid-patcher.
+  --freq-patcher MODE               FREQ patcher mode: stateful, branchless, or hybrid[:threshold].
 Environment Variables
   GALP_DISABLE_ASYNC_H2D=1          Disable dedicated h2d_stream entirely; GPU allocation and
                                     H2D transfers fall back to the default stream.
@@ -106,19 +81,19 @@ Defaults
   - Shared DeviceArena per workset / chunk (single staged allocation and upload for appended expressions)
   - Async h2d_stream for overlapping uploads with compute
 
-  To run a pure baseline, disable everything:
+  To run a launch-heavy baseline:
     GALP_DISABLE_ASYNC_H2D=1 \
     <GALP_CLI> benchmark <FLS_FILE> --samples 100 \
-      --no-streaming --no-zero-copy --no-mixed-dispatch
+      --per-rowgroup-workset --no-mixed-dispatch
 
 Notes
-- `--no-zero-copy` only affects host-side parsing; the H2D transfer to GPU is unchanged.
-- `--no-streaming` disables the streaming overlap but still groups rowgroups into chunks.
-- `--no-mega-kernel` processes each rowgroup as an independent workset (no cross-rowgroup batching).
-- Additional accepted aliases: --gpu-dispatch-kernel, --zero-copy-parse, --mega-kernel-no-stream.
-- Frequency patcher defaults to the stateful path. Pass `--freq-prefetch-all-branchless` to switch to
-  branchless, and additionally `--freq-hybrid-patcher` to let the engine pick per-column based on
-  exception density vs `--freq-branchless-threshold`.
+- `--per-rowgroup-workset` processes each rowgroup as an independent workset (no cross-rowgroup batching).
+- Frequency patcher defaults to the stateful path. Use `--freq-patcher branchless` for the branchless
+  path, or `--freq-patcher hybrid[:threshold]` to select per-column by exception density.
+- Set GALP_MEASURE_H2D=1 to synchronously measure upload_dma_gpu_ms with CUDA events. This is a
+  diagnostic mode and disables some H2D/compute overlap while measuring.
+- GALP_PINNED_ROWGROUP_PREWARM_BYTES caps rowgroup pinned-buffer prewarming (default: 536870912).
+  Set it to 0 to disable startup prewarming. The pipeline prewarms only active prefetch slots.
 
 H2D Transfer Architecture
   A workset uses a shared DeviceArena to aggregate all appended expressions into one

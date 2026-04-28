@@ -25,6 +25,18 @@ void warmup_cuda_runtime_once() {
 		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
 
+		for (const size_t bytes : {1ULL << 20, 4ULL << 20, 16ULL << 20, 64ULL << 20}) {
+			void* ptr    = nullptr;
+			auto  status = cudaMallocAsync(&ptr, bytes, stream);
+			if (status == cudaSuccess) {
+				CUDA_SAFE_CALL(cudaFreeAsync(ptr, stream));
+			} else {
+				ptr = nullptr;
+				CUDA_SAFE_CALL(cudaMalloc(&ptr, bytes));
+				CUDA_SAFE_CALL(cudaFree(ptr));
+			}
+		}
+
 		for (int i = 0; i < 32; ++i) {
 			benchmark_warmup_kernel<<<1, 1, 0, stream>>>();
 		}
@@ -79,9 +91,12 @@ struct BenchmarkObserver {
 		out.upload_resolve_ms += breakdown.arena.resolve_ms;
 		out.upload_pack_ms += breakdown.arena.pack_ms;
 		out.upload_dma_issue_ms += breakdown.arena.dma_issue_ms;
+		out.upload_dma_gpu_ms += breakdown.arena.dma_gpu_ms;
 		out.upload_event_ms += breakdown.event_record_ms;
 		out.total_payload_arena_bytes += payload_arena_bytes;
 		out.total_output_arena_bytes += output_arena_bytes;
+		out.total_h2d_bytes += breakdown.arena.dma_bytes;
+		out.total_h2d_copies += breakdown.arena.dma_count;
 	}
 
 	void on_kernel(const double ms, const size_t launch_grid, const size_t launches) {
@@ -115,8 +130,14 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	request.config              = cfg;
 	request.samples             = cfg.samples;
 	request.rowgroup            = cfg.rowgroup;
-	request.materialize_results = false;
+	request.materialize_results = cfg.include_materialize;
+	request.direct_append_no_materialize = !cfg.include_materialize;
 	request.warmup_first_run    = true;
+	request.load_column_names   = false;
+	if (cfg.include_materialize) {
+		// materialize_results requires write_out so kernels emit decoded values.
+		request.config.execution.write_out = true;
+	}
 
 	BenchmarkObserver observer {out};
 	const auto        wall_start = std::chrono::steady_clock::now();

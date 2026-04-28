@@ -4,6 +4,7 @@
 // galp/test/reader_test.cu
 // ────────────────────────────────────────────────────────
 #include "engine/execution/rowgroup.cuh"
+#include "engine/execution/internal/materialize.cuh"
 #include "engine/execution/table.cuh"
 #include "engine/reader.cuh"
 #include "fls/connection.hpp"
@@ -45,37 +46,6 @@ std::filesystem::path pick_fls_file() {
 
 size_t get_n_values(const reader::HostColumnVariant& host) {
 	return std::visit([](auto&& col) { return col.get_n_values(); }, host);
-}
-
-const char* op_kind_to_string(const expr::OperatorKind kind) {
-	switch (kind) {
-	case expr::OperatorKind::UNCOMPRESSED:
-		return "UNCOMPRESSED";
-	case expr::OperatorKind::UNFFOR:
-		return "UNFFOR";
-	case expr::OperatorKind::SLPATCH:
-		return "SLPATCH";
-	case expr::OperatorKind::FREQUENCY:
-		return "FREQUENCY";
-	case expr::OperatorKind::CROSS_RLE:
-		return "CROSS_RLE";
-	case expr::OperatorKind::DICT:
-		return "DICT";
-	case expr::OperatorKind::CONSTANT:
-		return "CONSTANT";
-	}
-	return "UNKNOWN";
-}
-
-std::string ops_to_string(const expr::Expression& expression) {
-	std::ostringstream os;
-	for (size_t i = 0; i < expression.ops.size(); ++i) {
-		if (i > 0) {
-			os << "->";
-		}
-		os << op_kind_to_string(expression.ops[i]);
-	}
-	return os.str();
 }
 
 template <typename T>
@@ -120,6 +90,46 @@ std::unordered_set<fastlanes::OperatorToken> supported_tokens() {
 	    fastlanes::OperatorToken::EXP_FFOR_I16,
 	    fastlanes::OperatorToken::EXP_DICT_I08_U08,
 	};
+}
+
+TEST(Materialize, KickPinnedD2HPreservesZeroLengthEntries) {
+	dispatch::runtime::ExecutionWorkset workset {};
+	auto& batch = workset.buffers.host_batches.get<int8_t>();
+	batch.device_exprs.emplace_back();
+	batch.device_exprs.back().plan     = dispatch::PlanKind::UNCOMPRESSED;
+	batch.device_exprs.back().n_values = 0;
+	batch.device_exprs.back().out      = nullptr;
+	batch.output_offsets.push_back(0);
+	batch.expr_indices.push_back(0);
+
+	auto pending = dispatch::runtime::kick_pinned_d2h_materialize(workset);
+	EXPECT_TRUE(batch.device_exprs.empty());
+	ASSERT_TRUE(pending.active);
+	ASSERT_EQ(pending.entries.size(), 1U);
+	EXPECT_EQ(pending.entries[0].global_expr_index, 0U);
+	EXPECT_EQ(pending.entries[0].n_values, 0U);
+
+	dispatch::RowgroupData result {};
+	result.columns.resize(1);
+	dispatch::runtime::finalize_pinned_d2h_materialize(
+	    pending, [&](const size_t global_expr_index) -> dispatch::MaterializedColumn* {
+		    if (global_expr_index >= result.columns.size()) {
+			    return nullptr;
+		    }
+		    auto& slot = result.columns[global_expr_index];
+		    if (!slot.has_value()) {
+			    slot.emplace();
+		    }
+		    return &(*slot);
+	    });
+
+	ASSERT_TRUE(result.columns[0].has_value());
+	EXPECT_EQ(result.columns[0]->meta.column_index, 0U);
+	EXPECT_EQ(result.columns[0]->meta.value_count, 0U);
+	EXPECT_EQ(result.columns[0]->meta.value_type, types::DataType::I8);
+	std::visit([](const auto& ptr) { EXPECT_NE(ptr.get(), nullptr); }, result.columns[0]->values);
+	EXPECT_FALSE(pending.active);
+	EXPECT_TRUE(pending.entries.empty());
 }
 
 bool rowgroup_supported(const fastlanes::RowgroupDescriptor*                rg,
@@ -189,13 +199,11 @@ void compare_rowgroup_outputs(const reader::Rowgroup&              rowgroup,
 		const auto  col_name   = name_ptr ? name_ptr->str() : std::string("<unnamed>");
 		const auto  dtype_name = fastlanes::ToStr(col_desc.data_type());
 		const auto  token_str  = fastlanes::token_to_string(expected_token);
-		const auto  ops_str    = ops_to_string(expressions[i]);
 		const auto  n_values   = get_n_values(rowgroup.columns[i].host);
 
 		std::ostringstream trace;
 		trace << "col=" << i << " name=" << col_name << " dtype=" << dtype_name << " token=" << token_str
-		      << " ops=" << ops_str << " n_values=" << n_values << " n_vecs=" << rowgroup.n_vecs
-		      << " expected_rows=" << expected_rows;
+		      << " n_values=" << n_values << " n_vecs=" << rowgroup.n_vecs << " expected_rows=" << expected_rows;
 		if (rowgroup.columns[i].skip_decompress) {
 			trace << " skip_decompress=1";
 		}
