@@ -7,7 +7,6 @@
 #define FLSGPU_COLUMNS_CONSTANT_CUH
 
 #include "flsgpu/columns/base.cuh"
-#include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/memory/device_arena.cuh"
 #include <cstddef>
 #include <cstdint>
@@ -59,22 +58,5 @@ void free_column(device::CONSTANTColumn<T> column) {
 
 } // namespace host
 } // namespace flsgpu
-
-namespace reader::columns {
-
-template <typename T>
-inline ParseResultT<flsgpu::host::CONSTANTColumn<T>> parse_constant(const ParseContext& ctx) {
-	if (!ctx.col_desc.max()) {
-		throw std::runtime_error("EXP_CONSTANT: missing max value");
-	}
-	const auto* bin = ctx.col_desc.max()->binary_data();
-	if (!bin || bin->size() != sizeof(T)) {
-		throw std::runtime_error("EXP_CONSTANT: invalid constant size");
-	}
-	const auto value = *reinterpret_cast<const T*>(bin->data());
-	return ParseResultT<flsgpu::host::CONSTANTColumn<T>> {flsgpu::host::CONSTANTColumn<T> {ctx.n_values, value}};
-}
-
-} // namespace reader::columns
 
 #endif // FLSGPU_COLUMNS_CONSTANT_CUH

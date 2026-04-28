@@ -7,7 +7,6 @@
 #define FLSGPU_COLUMNS_FFOR_CUH
 
 #include "flsgpu/columns/bp.cuh"
-#include "flsgpu/columns/parse_common.cuh"
 
 namespace flsgpu {
 namespace device {
@@ -46,13 +45,13 @@ struct FFORColumn {
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FFORColumn<T>& out) const {
 		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;
-		auto i_packed  = arena.template add<UINT_T>(bp.n_packed_values, bp.packed_array, bp_buffer_elems);
-		auto i_bw      = arena.template add<vbw_t>(bp.get_n_vecs(), bp.bit_widths);
-		auto i_offsets = arena.template add<size_t>(bp.get_n_vecs(), bp.vector_offsets);
-		auto i_bases   = arena.template add<UINT_T>(bp.get_n_vecs(), bases);
-		out.n_values   = get_n_values();
-		out.bp.n_values = bp.n_values;
-		out.bp.n_vecs  = bp.get_n_vecs();
+		auto         i_packed        = arena.template add<UINT_T>(bp.n_packed_values, bp.packed_array, bp_buffer_elems);
+		auto         i_bw            = arena.template add<vbw_t>(bp.get_n_vecs(), bp.bit_widths);
+		auto         i_offsets       = arena.template add<size_t>(bp.get_n_vecs(), bp.vector_offsets);
+		auto         i_bases         = arena.template add<UINT_T>(bp.get_n_vecs(), bases);
+		out.n_values                 = get_n_values();
+		out.bp.n_values              = bp.n_values;
+		out.bp.n_vecs                = bp.get_n_vecs();
 		arena.resolve_to(reinterpret_cast<void**>(&out.bp.packed_array), i_packed);
 		arena.resolve_to(reinterpret_cast<void**>(&out.bp.bit_widths), i_bw);
 		arena.resolve_to(reinterpret_cast<void**>(&out.bp.vector_offsets), i_offsets);
@@ -74,29 +73,5 @@ void free_column(device::FFORColumn<T> column) {
 
 } // namespace host
 } // namespace flsgpu
-
-namespace reader::columns {
-
-template <typename T>
-inline ParseResultT<flsgpu::host::FFORColumn<T>> parse_ffor(const ParseContext& ctx) {
-	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 3) {
-		throw std::runtime_error("EXP_FFOR: missing operand tokens");
-	}
-	const size_t base_idx    = ctx.operand_tokens->size() - 1;
-	const auto seg_bitpacked = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
-	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
-
-	auto bp_parts =
-	    detail::parse_bp_segments<typename utils::same_width_uint<T>::type>(seg_bitpacked, seg_bw, ctx.n_vecs);
-	auto* bases = detail::copy_segment_array<typename utils::same_width_uint<T>::type>(seg_base);
-
-	flsgpu::host::BPColumn<T> bp {
-	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
-
-	return ParseResultT<flsgpu::host::FFORColumn<T>> {flsgpu::host::FFORColumn<T> {bp, bases}};
-}
-
-} // namespace reader::columns
 
 #endif // FLSGPU_COLUMNS_FFOR_CUH

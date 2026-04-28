@@ -7,7 +7,6 @@
 #define FLSGPU_COLUMNS_BP_CUH
 
 #include "flsgpu/columns/base.cuh"
-#include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/memory/device_arena.cuh"
 #include "flsgpu/memory/gpu_array.cuh"
 #include <cstddef>
@@ -62,11 +61,11 @@ struct BPColumn {
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::BPColumn<T>& out) const {
 		const size_t buffer_elems = utils::get_n_lanes<T>() * 4;
-		auto i_packed  = arena.template add<UINT_T>(n_packed_values, packed_array, buffer_elems);
-		auto i_bw      = arena.template add<vbw_t>(get_n_vecs(), bit_widths);
-		auto i_offsets = arena.template add<size_t>(get_n_vecs(), vector_offsets);
-		out.n_values = n_values;
-		out.n_vecs   = get_n_vecs();
+		auto         i_packed     = arena.template add<UINT_T>(n_packed_values, packed_array, buffer_elems);
+		auto         i_bw         = arena.template add<vbw_t>(get_n_vecs(), bit_widths);
+		auto         i_offsets    = arena.template add<size_t>(get_n_vecs(), vector_offsets);
+		out.n_values              = n_values;
+		out.n_vecs                = get_n_vecs();
 		arena.resolve_to(reinterpret_cast<void**>(&out.packed_array), i_packed);
 		arena.resolve_to(reinterpret_cast<void**>(&out.bit_widths), i_bw);
 		arena.resolve_to(reinterpret_cast<void**>(&out.vector_offsets), i_offsets);
@@ -89,46 +88,5 @@ void free_column(device::BPColumn<T> column) {
 
 } // namespace host
 } // namespace flsgpu
-
-namespace reader::columns {
-namespace detail {
-
-template <typename T>
-inline flsgpu::host::BPColumn<T> make_bp_from_raw(const T* raw, const size_t n_values) {
-	using UINT_T                 = typename utils::same_width_uint<T>::type;
-	const size_t n_vecs          = utils::get_n_vecs_from_size(n_values);
-	const size_t n_packed_values = n_vecs * kVecSize;
-	const vbw_t  bw              = static_cast<vbw_t>(sizeof(T) * 8);
-	UINT_T*      packed_array    = new UINT_T[n_packed_values];
-	vbw_t*       bit_widths      = new vbw_t[n_vecs];
-	size_t*      vector_offsets  = new size_t[n_vecs];
-
-	std::memset(packed_array, 0, n_packed_values * sizeof(UINT_T));
-	std::memcpy(packed_array, raw, std::min(n_values, n_packed_values) * sizeof(UINT_T));
-
-	for (size_t vi = 0; vi < n_vecs; ++vi) {
-		bit_widths[vi]     = bw;
-		vector_offsets[vi] = vi * kVecSize;
-	}
-
-	return flsgpu::host::BPColumn<T> {n_values, n_packed_values, packed_array, bit_widths, vector_offsets};
-}
-
-} // namespace detail
-
-template <typename T>
-inline ParseResultT<flsgpu::host::BPColumn<T>> parse_uncompressed(const ParseContext& ctx) {
-	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 1) {
-		throw std::runtime_error("EXP_UNCOMPRESSED: missing operand tokens");
-	}
-	const auto seg_idx = static_cast<uint32_t>(ctx.operand_tokens->Get(ctx.operand_tokens->size() - 1));
-	auto       seg     = ctx.column_view.GetSegment(seg_idx);
-	auto*      raw     = detail::copy_segment_array<T>(seg);
-	auto       host    = detail::make_bp_from_raw<T>(raw, ctx.n_values);
-	delete[] raw;
-	return ParseResultT<flsgpu::host::BPColumn<T>> {std::move(host)};
-}
-
-} // namespace reader::columns
 
 #endif // FLSGPU_COLUMNS_BP_CUH

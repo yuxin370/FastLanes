@@ -8,7 +8,6 @@
 
 #include "flsgpu/columns/base.cuh"
 #include "flsgpu/columns/freq_extended.cuh"
-#include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/consts.cuh"
 #include "flsgpu/memory/device_arena.cuh"
 #include "flsgpu/memory/gpu_array.cuh"
@@ -78,16 +77,16 @@ struct FREQColumn {
 	}
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FREQColumn<T>& out) const {
-		const size_t buf = consts::MAX_UNPACK_N_VECS;
-		auto i_fv       = arena.template add<T>(n_vecs, frequent_value);
-		auto i_exc_off  = arena.template add<size_t>(n_vecs, exceptions_offsets);
-		auto i_pos_off  = arena.template add<size_t>(n_vecs, positions_offsets);
-		auto i_exc      = arena.template add<T>(n_exceptions, exceptions, buf);
-		auto i_pos      = arena.template add<uint16_t>(n_exceptions, positions, buf);
-		auto i_cnt      = arena.template add<uint16_t>(n_vecs, counts);
-		out.n_values     = n_values;
-		out.n_vecs       = n_vecs;
-		out.n_exceptions = n_exceptions;
+		const size_t buf       = consts::MAX_UNPACK_N_VECS;
+		auto         i_fv      = arena.template add<T>(n_vecs, frequent_value);
+		auto         i_exc_off = arena.template add<size_t>(n_vecs, exceptions_offsets);
+		auto         i_pos_off = arena.template add<size_t>(n_vecs, positions_offsets);
+		auto         i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
+		auto         i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
+		auto         i_cnt     = arena.template add<uint16_t>(n_vecs, counts);
+		out.n_values           = n_values;
+		out.n_vecs             = n_vecs;
+		out.n_exceptions       = n_exceptions;
 		arena.resolve_to(reinterpret_cast<void**>(&out.frequent_value), i_fv);
 		arena.resolve_to(reinterpret_cast<void**>(&out.exceptions_offsets), i_exc_off);
 		arena.resolve_to(reinterpret_cast<void**>(&out.positions_offsets), i_pos_off);
@@ -202,40 +201,5 @@ void free_column(device::FREQColumn<T> column) {
 
 } // namespace host
 } // namespace flsgpu
-
-namespace reader::columns {
-
-template <typename T>
-inline ParseResultT<flsgpu::host::FREQColumn<T>> parse_frequency(const ParseContext& ctx) {
-	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 4) {
-		throw std::runtime_error("EXP_FREQUENCY: missing operand tokens");
-	}
-	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	const auto   seg_fv   = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
-	const auto   seg_exc  = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
-	const auto   seg_pos  = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto   seg_cnt  = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
-
-	if (seg_fv.data_span.size() != sizeof(T)) {
-		throw std::runtime_error("EXP_FREQUENCY: invalid frequent value size");
-	}
-	const auto fv     = *reinterpret_cast<const T*>(seg_fv.data_span.data());
-	auto*      fv_arr = new T[ctx.n_vecs];
-	for (size_t i = 0; i < ctx.n_vecs; ++i) {
-		fv_arr[i] = fv;
-	}
-
-	auto* counts = detail::copy_segment_array<uint16_t>(seg_cnt);
-	auto  exc    = detail::build_exception_offsets_from_segment<T>(seg_exc, ctx.n_vecs);
-	auto  pos    = detail::build_exception_offsets_from_segment<uint16_t>(seg_pos, ctx.n_vecs);
-
-	auto* positions  = detail::copy_segment_array<uint16_t>(seg_pos);
-	auto* exceptions = detail::copy_segment_array<T>(seg_exc);
-
-	return ParseResultT<flsgpu::host::FREQColumn<T>> {flsgpu::host::FREQColumn<T> {
-	    ctx.n_values, ctx.n_vecs, fv_arr, exc.total, exc.offsets, pos.offsets, exceptions, positions, counts}};
-}
-
-} // namespace reader::columns
 
 #endif // FLSGPU_COLUMNS_FREQ_CUH

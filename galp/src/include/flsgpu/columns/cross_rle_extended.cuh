@@ -7,7 +7,6 @@
 #define FLSGPU_COLUMNS_CROSS_RLE_EXTENDED_CUH
 
 #include "flsgpu/columns/base.cuh"
-#include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/consts.cuh"
 #include "flsgpu/memory/device_arena.cuh"
 #include "flsgpu/memory/gpu_array.cuh"
@@ -68,14 +67,14 @@ struct CROSSRLEExtendedColumn {
 	}
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::CROSSRLEExtendedColumn<T>& out) const {
-		const size_t nv = get_n_vecs();
-		auto i_offs = arena.template add<size_t>(nv + 1, lane_runs_offsets);
-		auto i_vals = arena.template add<UINT_T>(n_lane_runs, lane_values);
-		auto i_lens = arena.template add<uint16_t>(n_lane_runs, lane_lengths);
-		auto i_oc   = arena.template add<uint32_t>(nv * utils::get_n_lanes<T>(), offsets_counts);
-		out.n_values    = n_values;
-		out.n_vecs      = nv;
-		out.n_lane_runs = n_lane_runs;
+		const size_t nv     = get_n_vecs();
+		auto         i_offs = arena.template add<size_t>(nv + 1, lane_runs_offsets);
+		auto         i_vals = arena.template add<UINT_T>(n_lane_runs, lane_values);
+		auto         i_lens = arena.template add<uint16_t>(n_lane_runs, lane_lengths);
+		auto         i_oc   = arena.template add<uint32_t>(nv * utils::get_n_lanes<T>(), offsets_counts);
+		out.n_values        = n_values;
+		out.n_vecs          = nv;
+		out.n_lane_runs     = n_lane_runs;
 		arena.resolve_to(reinterpret_cast<void**>(&out.lane_runs_offsets), i_offs);
 		arena.resolve_to(reinterpret_cast<void**>(&out.lane_values), i_vals);
 		arena.resolve_to(reinterpret_cast<void**>(&out.lane_lengths), i_lens);
@@ -101,103 +100,5 @@ void free_column(device::CROSSRLEExtendedColumn<T> column) {
 
 } // namespace host
 } // namespace flsgpu
-
-namespace reader::columns {
-
-template <typename T>
-inline ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> parse_cross_rle_extended(const ParseContext& ctx) {
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	auto raw = flsgpu::host::detail::parse_cross_rle_raw_runs<T>(ctx);
-
-	constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
-	constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
-	constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
-
-	auto* lane_run_counts = new uint16_t[ctx.n_vecs * N_LANES];
-	auto* vec_total_runs  = new size_t[ctx.n_vecs];
-
-	for (size_t vec = 0; vec < ctx.n_vecs; ++vec) {
-		UINT_T tmp[VEC_VALUES];
-		const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-		flsgpu::host::detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
-		    tmp, vec_base, raw.values, raw.lengths, raw.run_positions, raw.offsets[vec], raw.offsets[vec + 1]);
-
-		size_t vec_runs = 0;
-		for (uint32_t lane = 0; lane < N_LANES; ++lane) {
-			UINT_T   prev    = tmp[lane];
-			uint16_t run_cnt = 1;
-
-			for (uint32_t k = 1; k < VALUES_PER_LANE; ++k) {
-				const UINT_T cur = tmp[lane + k * N_LANES];
-				run_cnt += (cur != prev);
-				prev = cur;
-			}
-
-			lane_run_counts[vec * N_LANES + lane] = run_cnt;
-			vec_runs += (size_t)run_cnt;
-		}
-		vec_total_runs[vec] = vec_runs;
-	}
-
-	auto*  lane_runs_offsets = new size_t[ctx.n_vecs + 1];
-	size_t total_runs        = 0;
-	lane_runs_offsets[0]     = 0;
-	for (size_t vec = 0; vec < ctx.n_vecs; ++vec) {
-		total_runs += vec_total_runs[vec];
-		lane_runs_offsets[vec + 1] = total_runs;
-	}
-
-	auto* lane_values    = (total_runs ? new UINT_T[total_runs] : nullptr);
-	auto* lane_lengths   = (total_runs ? new uint16_t[total_runs] : nullptr);
-	auto* offsets_counts = new uint32_t[ctx.n_vecs * N_LANES];
-
-	for (size_t vec = 0; vec < ctx.n_vecs; ++vec) {
-		UINT_T tmp[VEC_VALUES];
-		const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-		flsgpu::host::detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
-		    tmp, vec_base, raw.values, raw.lengths, raw.run_positions, raw.offsets[vec], raw.offsets[vec + 1]);
-
-		const size_t vec_out_base = lane_runs_offsets[vec];
-		size_t       cursor       = vec_out_base;
-
-		for (uint32_t lane = 0; lane < N_LANES; ++lane) {
-			const uint16_t run_cnt  = lane_run_counts[vec * N_LANES + lane];
-			const uint16_t lane_off = (uint16_t)(cursor - vec_out_base);
-
-			offsets_counts[vec * N_LANES + lane] = (uint32_t(run_cnt) << 16) | uint32_t(lane_off);
-
-			UINT_T   cur_val = tmp[lane];
-			uint16_t cur_len = 1;
-
-			for (uint32_t k = 1; k < VALUES_PER_LANE; ++k) {
-				const UINT_T v = tmp[lane + k * N_LANES];
-				if (v == cur_val) {
-					++cur_len;
-				} else {
-					lane_values[cursor]  = cur_val;
-					lane_lengths[cursor] = cur_len;
-					++cursor;
-					cur_val = v;
-					cur_len = 1;
-				}
-			}
-			lane_values[cursor]  = cur_val;
-			lane_lengths[cursor] = cur_len;
-			++cursor;
-		}
-	}
-
-	delete[] lane_run_counts;
-	delete[] vec_total_runs;
-	delete[] raw.values;
-	delete[] raw.lengths;
-	delete[] raw.offsets;
-	delete[] raw.run_positions;
-
-	return ParseResultT<flsgpu::host::CROSSRLEExtendedColumn<T>> {flsgpu::host::CROSSRLEExtendedColumn<T> {
-	    ctx.n_values, total_runs, lane_runs_offsets, lane_values, lane_lengths, offsets_counts}};
-}
-
-} // namespace reader::columns
 
 #endif // FLSGPU_COLUMNS_CROSS_RLE_EXTENDED_CUH

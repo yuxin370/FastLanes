@@ -7,7 +7,6 @@
 #define FLSGPU_COLUMNS_RLE_CUH
 
 #include "flsgpu/columns/ffor.cuh"
-#include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/memory/device_arena.cuh"
 #include "flsgpu/memory/gpu_array.cuh"
 #include <cstddef>
@@ -60,18 +59,18 @@ struct RLEColumn {
 	}
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::RLEColumn<T, IndexT>& out) const {
-		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		using UINT_IDX               = typename utils::same_width_uint<IndexT>::type;
 		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
-		auto i_packed   = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
-		auto i_bw       = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
-		auto i_bp_off   = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
-		auto i_bases    = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
-		auto i_rsum     = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
-		auto i_vals     = arena.template add<T>(n_rle_values, rle_values);
-		auto i_offs     = arena.template add<size_t>(n_vecs, rle_offsets);
-		out.n_values         = n_values;
-		out.n_vecs           = n_vecs;
-		out.n_rle_values     = n_rle_values;
+		auto i_packed    = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw        = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
+		auto i_bp_off    = arena.template add<size_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
+		auto i_bases     = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
+		auto i_rsum      = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
+		auto i_vals      = arena.template add<T>(n_rle_values, rle_values);
+		auto i_offs      = arena.template add<size_t>(n_vecs, rle_offsets);
+		out.n_values     = n_values;
+		out.n_vecs       = n_vecs;
+		out.n_rle_values = n_rle_values;
 		out.ffor.n_values    = ffor.get_n_values();
 		out.ffor.bp.n_values = ffor.bp.n_values;
 		out.ffor.bp.n_vecs   = ffor.bp.get_n_vecs();
@@ -103,57 +102,5 @@ void free_column(device::RLEColumn<T, IndexT> column) {
 
 } // namespace host
 } // namespace flsgpu
-
-namespace reader::columns {
-
-template <typename T, typename IndexT>
-inline ParseResultT<flsgpu::host::RLEColumn<T, IndexT>> parse_rle(const ParseContext& ctx) {
-	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 5) {
-		throw std::runtime_error("EXP_RLE: missing operand tokens");
-	}
-
-	const size_t base_idx = ctx.operand_tokens->size() - 1;
-	// FastLanes decode consumes tokens from the tail as:
-	// dec_unffor(bitpacked,bw,base) -> dec_rsum(rsum_bases) -> dec_rle_map(rle_values)
-	// so operand order in the RPN token vector is:
-	// [rle_values, rsum_bases, bitpacked, bw, base]
-	const auto seg_vals      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 4)));
-	const auto seg_rsum      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 3)));
-	const auto seg_bitpacked = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 2)));
-	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 1)));
-	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(base_idx - 0)));
-
-	auto bp_parts =
-	    detail::parse_bp_segments<typename utils::same_width_uint<IndexT>::type>(seg_bitpacked, seg_bw, ctx.n_vecs);
-
-	auto* bases_ffor = detail::copy_segment_array<typename utils::same_width_uint<IndexT>::type>(seg_base);
-	flsgpu::host::BPColumn<IndexT> bp {
-	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
-	flsgpu::host::FFORColumn<IndexT> ffor {bp, bases_ffor};
-
-	const size_t expected_bases = ctx.n_vecs * utils::get_n_lanes<IndexT>();
-	auto*        rsum_bases     = detail::copy_segment_array<IndexT>(seg_rsum);
-	if (seg_rsum.data_span.size() / sizeof(IndexT) != expected_bases) {
-		throw std::runtime_error("EXP_RLE: rsum bases size mismatch");
-	}
-
-	auto entrypoints = detail::extract_entrypoints(seg_vals);
-	if (entrypoints.size() != ctx.n_vecs) {
-		throw std::runtime_error("EXP_RLE: values entrypoint count mismatch");
-	}
-	auto  offsets_vec = detail::build_vector_offsets<T>(entrypoints);
-	auto* offsets     = new size_t[ctx.n_vecs];
-	for (size_t i = 0; i < ctx.n_vecs; ++i) {
-		offsets[i] = offsets_vec[i];
-	}
-
-	auto*        values = detail::copy_segment_array<T>(seg_vals);
-	const size_t n_vals = seg_vals.data_span.size() / sizeof(T);
-
-	flsgpu::host::RLEColumn<T, IndexT> host {ctx.n_values, ctx.n_vecs, ffor, rsum_bases, values, offsets, n_vals};
-	return ParseResultT<flsgpu::host::RLEColumn<T, IndexT>> {std::move(host)};
-}
-
-} // namespace reader::columns
 
 #endif // FLSGPU_COLUMNS_RLE_CUH

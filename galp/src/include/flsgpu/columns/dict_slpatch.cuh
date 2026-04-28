@@ -7,7 +7,6 @@
 #define FLSGPU_COLUMNS_DICT_SLPATCH_CUH
 
 #include "flsgpu/columns/dict_ffor.cuh"
-#include "flsgpu/columns/parse_common.cuh"
 #include "flsgpu/columns/slpatch.cuh"
 
 namespace flsgpu {
@@ -52,28 +51,29 @@ struct DICTSLPATCHColumn {
 	}
 
 	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::DICTSLPATCHColumn<T, IndexT>& out) const {
-		using UINT_IDX = typename utils::same_width_uint<IndexT>::type;
+		using UINT_IDX               = typename utils::same_width_uint<IndexT>::type;
 		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
-		const size_t buf = consts::MAX_UNPACK_N_VECS;
-		const size_t sl_nvecs = index.n_vecs;
-		auto i_packed  = arena.template add<UINT_IDX>(index.ffor.bp.n_packed_values, index.ffor.bp.packed_array, bp_buffer_elems);
-		auto i_bw      = arena.template add<vbw_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.bit_widths);
-		auto i_bp_off  = arena.template add<size_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.vector_offsets);
-		auto i_bases   = arena.template add<UINT_IDX>(index.ffor.bp.get_n_vecs(), index.ffor.bases);
-		auto i_exc_off = arena.template add<size_t>(sl_nvecs, index.exceptions_offsets);
-		auto i_pos_off = arena.template add<size_t>(sl_nvecs, index.positions_offsets);
-		auto i_exc     = arena.template add<IndexT>(index.n_exceptions, index.exceptions, buf);
-		auto i_pos     = arena.template add<uint16_t>(index.n_exceptions, index.positions, buf);
-		auto i_cnt     = arena.template add<uint16_t>(sl_nvecs, index.counts);
-		auto i_keys    = arena.template add<KEY_T>(key_count, keys);
-		out.n_values                   = get_n_values();
-		out.key_count                  = key_count;
-		out.index.n_values             = index.n_values;
-		out.index.n_vecs               = sl_nvecs;
-		out.index.n_exceptions         = index.n_exceptions;
-		out.index.ffor.n_values        = index.ffor.get_n_values();
-		out.index.ffor.bp.n_values     = index.ffor.bp.n_values;
-		out.index.ffor.bp.n_vecs       = index.ffor.bp.get_n_vecs();
+		const size_t buf             = consts::MAX_UNPACK_N_VECS;
+		const size_t sl_nvecs        = index.n_vecs;
+		auto         i_packed =
+		    arena.template add<UINT_IDX>(index.ffor.bp.n_packed_values, index.ffor.bp.packed_array, bp_buffer_elems);
+		auto i_bw               = arena.template add<vbw_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.bit_widths);
+		auto i_bp_off           = arena.template add<size_t>(index.ffor.bp.get_n_vecs(), index.ffor.bp.vector_offsets);
+		auto i_bases            = arena.template add<UINT_IDX>(index.ffor.bp.get_n_vecs(), index.ffor.bases);
+		auto i_exc_off          = arena.template add<size_t>(sl_nvecs, index.exceptions_offsets);
+		auto i_pos_off          = arena.template add<size_t>(sl_nvecs, index.positions_offsets);
+		auto i_exc              = arena.template add<IndexT>(index.n_exceptions, index.exceptions, buf);
+		auto i_pos              = arena.template add<uint16_t>(index.n_exceptions, index.positions, buf);
+		auto i_cnt              = arena.template add<uint16_t>(sl_nvecs, index.counts);
+		auto i_keys             = arena.template add<KEY_T>(key_count, keys);
+		out.n_values            = get_n_values();
+		out.key_count           = key_count;
+		out.index.n_values      = index.n_values;
+		out.index.n_vecs        = sl_nvecs;
+		out.index.n_exceptions  = index.n_exceptions;
+		out.index.ffor.n_values = index.ffor.get_n_values();
+		out.index.ffor.bp.n_values = index.ffor.bp.n_values;
+		out.index.ffor.bp.n_vecs   = index.ffor.bp.get_n_vecs();
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bp.packed_array), i_packed);
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bp.bit_widths), i_bw);
 		arena.resolve_to(reinterpret_cast<void**>(&out.index.ffor.bp.vector_offsets), i_bp_off);
@@ -99,14 +99,11 @@ void free_column(device::DICTSLPATCHColumn<T, IndexT> column) {
 	free_device_pointer(column.keys);
 }
 
-} // namespace host
-} // namespace flsgpu
-
-namespace reader::columns {
+namespace detail {
 
 inline flsgpu::host::SLPATCHColumn<uint8_t>
 make_slpatch_u8_from_slpatch_i8(const flsgpu::host::SLPATCHColumn<int8_t>& col) {
-	auto index_ffor = make_ffor_u8_from_ffor_i8(col.ffor);
+	auto index_ffor = detail::make_ffor_u8_from_ffor_i8(col.ffor);
 
 	auto* offsets     = utils::copy_array(col.exceptions_offsets, col.n_vecs);
 	auto* pos_offsets = utils::copy_array(col.positions_offsets, col.n_vecs);
@@ -121,61 +118,9 @@ make_slpatch_u8_from_slpatch_i8(const flsgpu::host::SLPATCHColumn<int8_t>& col) 
 	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, pos_offsets, exc, pos, cnt};
 }
 
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
-inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> parse_dict_slpatch(const ParseContext& ctx) {
-	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 7) {
-		throw std::runtime_error("EXP_DICT_FFOR_SLPATCH: missing operand tokens");
-	}
-	const auto key_seg_idx = static_cast<uint32_t>(ctx.operand_tokens->Get(0));
-	const auto seg_keys    = ctx.column_view.GetSegment(key_seg_idx);
-	using KEY_T            = typename utils::same_width_uint<T>::type;
-	const size_t key_count = seg_keys.data_span.size() / sizeof(KEY_T);
-	auto*        keys      = detail::copy_segment_array<KEY_T>(seg_keys);
+} // namespace detail
 
-	const auto seg_exc       = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(1)));
-	const auto seg_pos       = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(2)));
-	const auto seg_cnt       = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(3)));
-	const auto seg_bitpacked = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(4)));
-	const auto seg_bw        = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(5)));
-	const auto seg_base      = ctx.column_view.GetSegment(static_cast<uint32_t>(ctx.operand_tokens->Get(6)));
-
-	auto  bp_parts = detail::parse_bp_segments<IndexT>(seg_bitpacked, seg_bw, ctx.n_vecs);
-	auto* bases    = detail::copy_segment_array<IndexT>(seg_base);
-
-	flsgpu::host::BPColumn<IndexT> bp_idx {
-	    ctx.n_values, bp_parts.n_packed, bp_parts.packed, bp_parts.bit_widths, bp_parts.vector_offsets};
-	flsgpu::host::FFORColumn<IndexT> ffor_idx {bp_idx, bases};
-
-	auto* counts     = detail::copy_segment_array<uint16_t>(seg_cnt);
-	auto* positions  = detail::copy_segment_array<uint16_t>(seg_pos);
-	auto* exceptions = detail::copy_segment_array<IndexT>(seg_exc);
-
-	auto exc     = detail::build_exception_offsets_from_segment<IndexT>(seg_exc, ctx.n_vecs);
-	auto pos_off = detail::build_exception_offsets_from_segment<uint16_t>(seg_pos, ctx.n_vecs);
-
-	flsgpu::host::SLPATCHColumn<IndexT> slpatch_idx {
-	    ctx.n_values, ctx.n_vecs, ffor_idx, exc.total, exc.offsets, pos_off.offsets, exceptions, positions, counts};
-
-	return ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
-	    flsgpu::host::DICTSLPATCHColumn<T, IndexT> {slpatch_idx, keys, key_count}};
-}
-
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
-inline ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>>
-parse_dict_slpatch_with_index(const ParseContext& ctx, flsgpu::host::SLPATCHColumn<IndexT> index_slpatch) {
-	if (!ctx.operand_tokens || ctx.operand_tokens->size() < 2) {
-		throw std::runtime_error("EXP_DICT: missing operand tokens");
-	}
-	const auto key_seg_idx = static_cast<uint32_t>(ctx.operand_tokens->Get(ctx.operand_tokens->size() - 1));
-	const auto seg_keys    = ctx.column_view.GetSegment(key_seg_idx);
-	using KEY_T            = typename utils::same_width_uint<T>::type;
-	const size_t key_count = seg_keys.data_span.size() / sizeof(KEY_T);
-	auto*        keys      = detail::copy_segment_array<KEY_T>(seg_keys);
-
-	return ParseResultT<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
-	    flsgpu::host::DICTSLPATCHColumn<T, IndexT> {std::move(index_slpatch), keys, key_count}};
-}
-
-} // namespace reader::columns
+} // namespace host
+} // namespace flsgpu
 
 #endif // FLSGPU_COLUMNS_DICT_SLPATCH_CUH
