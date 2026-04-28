@@ -13,6 +13,7 @@
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
 class Connection;
+class File;
 /*--------------------------------------------------------------------------------------------------------------------*/
 
 class Setting {
@@ -33,6 +34,7 @@ class FileHeader {
 public:
 	static void   Write(const Connection& connection, const path& dir_path);
 	static Status Load(FileHeader& file_footer, const path& file_path);
+	static Status Load(FileHeader& file_footer, File& file);
 
 public:
 	uint64_t magic_bytes;

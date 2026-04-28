@@ -12,8 +12,6 @@
 #include "fls/io/file.hpp"
 #include "fls/io/io.hpp"
 #include "fls/std/filesystem.hpp"
-#include <fstream> // for std::ifstream
-#include <ios>     // for std::ios
 
 namespace fastlanes {
 
@@ -29,16 +27,15 @@ void FileHeader::Write(const Connection& connection, const path& file_path) {
 }
 
 Status FileHeader::Load(FileHeader& file_header, const path& file_path) {
-	const io io = make_unique<File>(file_path); // todo[IO]
+	File file(file_path);
+	return Load(file_header, file);
+}
 
-	if (const auto file_size = IO::get_size(io); file_size < sizeof(FileHeader) + sizeof(FileFooter)) {
+Status FileHeader::Load(FileHeader& file_header, File& file) {
+	if (const auto file_size = file.Size(); file_size < sizeof(FileHeader) + sizeof(FileFooter)) {
 		return Status::Error(Status::ErrorCode::ERR_1_SMALL_FILE_SIZE);
 	}
-
-	std::ifstream file(file_path, std::ios::binary);
-
-	// Read first 24 bytes
-	file.read(reinterpret_cast<char*>(&file_header), sizeof(FileHeader));
+	file.ReadRange(&file_header, 0, sizeof(FileHeader));
 
 	return Status::Ok();
 }

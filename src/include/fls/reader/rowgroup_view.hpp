@@ -31,7 +31,7 @@ public:
 	const ColumnView& operator[](n_t col_idx) const;
 
 public:
-	vector<up<ColumnView>> columns;
+	vector<ColumnView> columns;
 };
 
 } // namespace fastlanes

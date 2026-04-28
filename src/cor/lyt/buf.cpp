@@ -191,6 +191,7 @@ void Buf::Resize(const sz_t new_sz) {
 
 	delete[] m_owned_p;
 	m_owned_p = tmp_p;
+	m_capacity = new_sz;
 }
 
 sz_t Buf::Size() const {

@@ -25,6 +25,7 @@ ColumnView::ColumnView(const span<std::byte>     column_span,
 	}
 	FLS_ASSERT_NOT_NULL_POINTER(column_descriptor.children())
 
+	children.reserve(column_descriptor.children()->size());
 	for (n_t child_col_idx {0}; child_col_idx < column_descriptor.children()->size(); ++child_col_idx) {
 
 		auto& child_column_descriptor = *(*column_descriptor.children())[static_cast<uint32_t>(child_col_idx)];

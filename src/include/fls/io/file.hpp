@@ -9,6 +9,8 @@
 #include "fls/common/common.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/std/string.hpp"
+#include <cstdint>
+#include <mutex>
 
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
@@ -33,6 +35,8 @@ public:
 	void ReadRange(Buf& buf, n_t offset, n_t size);
 	//
 	void ReadRange(void* dst, n_t offset, n_t size);
+	//
+	void ReadRangeUnchecked(void* dst, n_t offset, n_t size);
 	// get file size
 	[[nodiscard]] n_t Size() const;
 
@@ -45,9 +49,19 @@ public:
 	static void append(const path& file_path, const string& dump);
 
 private:
-	path              m_path;
-	up<std::ofstream> m_of_stream;
-	up<std::ifstream> m_if_stream;
+	void open_read_handle() const;
+	void close_read_handle() const;
+	void invalidate_size_cache();
+
+private:
+	path                      m_path;
+	up<std::ofstream>         m_of_stream;
+	mutable std::mutex        m_read_mutex;
+#if !defined(_WIN32)
+	mutable int               m_fd               = -1;
+#endif
+	mutable n_t               m_cached_size      = 0;
+	mutable bool              m_has_cached_size  = false;
 };
 } // namespace fastlanes
 

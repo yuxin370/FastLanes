@@ -18,6 +18,7 @@
 namespace fastlanes {
 
 class Table;
+class File;
 
 class FLS_API TableDescriptorHandle {
 public:
@@ -28,9 +29,11 @@ public:
 
 	// Read whole file and own the bytes.
 	static TableDescriptorHandle FromFile(const path& file_path, bool verify = true);
+	static TableDescriptorHandle FromFile(File& file, bool verify = true);
 
 	// Read a slice [offset, offset+size) from file and own the bytes.
 	static TableDescriptorHandle FromFileSlice(const path& file_path, n_t offset, n_t size, bool verify = true);
+	static TableDescriptorHandle FromFileSlice(File& file, n_t offset, n_t size, bool verify = true);
 
 	// Pack native T -> bytes and expose a view.
 	static TableDescriptorHandle FromNative(const TableDescriptorT& native);
