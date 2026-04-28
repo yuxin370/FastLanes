@@ -38,9 +38,8 @@ __device__ __forceinline__ void run_decompressor(DecompressorT&& iterator, const
 		}
 	}
 	if constexpr (!WRITE_OUT) {
-		if (acc == 0u) {
-			out[0] = static_cast<T>(acc);
-		}
+		(void)out;
+		asm volatile("" : : "r"(acc) : "memory");
 	}
 }
 
@@ -240,7 +239,10 @@ __device__ __forceinline__ void execute_typed_work_item(const dispatch::DeviceEx
 		return;
 	}
 
-	T* out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
+	T* out = nullptr;
+	if constexpr (WRITE_OUT) {
+		out = expr->out + vector_index * consts::VALUES_PER_VECTOR;
+	}
 	device_exec::execute_plan<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(*expr, vector_index, lane, out);
 }
 

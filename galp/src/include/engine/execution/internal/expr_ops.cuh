@@ -39,30 +39,32 @@ constexpr PlanKind plan_for_host_col() {
 
 template <typename T>
 bool should_use_freq_extended(const flsgpu::host::FREQColumn<T>& host_col,
-                              const bool                         freq_prefetch_all_branchless,
-                              const bool                         freq_hybrid_patcher,
-                              const float                        freq_branchless_threshold) {
-	if (!freq_prefetch_all_branchless) {
+                              const FreqPatcher                  mode,
+                              const float                        branchless_threshold) {
+	switch (mode) {
+	case FreqPatcher::Stateful:
 		return false;
-	}
-	if (!freq_hybrid_patcher) {
+	case FreqPatcher::Branchless:
 		return true;
+	case FreqPatcher::Hybrid:
+		if (host_col.get_n_vecs() == 0) {
+			return false;
+		}
+		const double exc_per_vec =
+		    static_cast<double>(host_col.n_exceptions) / static_cast<double>(host_col.get_n_vecs());
+		return exc_per_vec >= static_cast<double>(branchless_threshold);
 	}
-	if (host_col.get_n_vecs() == 0) {
-		return false;
-	}
-	const double exc_per_vec = static_cast<double>(host_col.n_exceptions) / static_cast<double>(host_col.get_n_vecs());
-	return exc_per_vec >= static_cast<double>(freq_branchless_threshold);
+	return false;
 }
 
 // Arena-based overload: packs column data into shared arena; pointers resolved on arena.upload().
 // The runtime `plan` argument is redundant with the trait's compile-time `plan_kind`,
 // but is still checked to catch mismatches arising from type-erased call paths.
 template <typename T, typename HostColT>
-void fill_device_expr(DeviceExpression<T>& expr,
-                      const HostColT&      host_col,
-                      const PlanKind       plan,
-                      const bool           freq_use_extended,
+void fill_device_expr(DeviceExpression<T>&         expr,
+                      const HostColT&              host_col,
+                      const PlanKind               plan,
+                      const bool                   freq_use_extended,
                       flsgpu::memory::DeviceArena& arena) {
 	if (plan != ColumnKindTraits<HostColT>::plan_kind) {
 		throw std::runtime_error("fill_device_expr(arena): plan/column type mismatch, plan=" +
@@ -124,14 +126,14 @@ void free_device_expr(const DeviceExpression<T>& expr) {
 // Arena-based overload: emplaces expr into pre-reserved batch, packs column data into shared arena.
 // batch.device_exprs MUST be pre-reserved to avoid reallocation (resolver callbacks capture &out).
 template <typename T, typename HostColT>
-void add_expression_to_batch(const size_t    expr_index,
-                             const HostColT& host_col,
-                             const PlanKind  plan,
-                             Batch<T>&       batch,
-                             const size_t    output_offset,
-                             const bool      freq_prefetch_all_branchless,
-                             const bool      freq_hybrid_patcher,
-                             const float     freq_branchless_threshold,
+void add_expression_to_batch(const size_t                 expr_index,
+                             const HostColT&              host_col,
+                             const PlanKind               plan,
+                             Batch<T>&                    batch,
+                             const size_t                 output_offset,
+                             const FreqPatcher            freq_patcher,
+                             const float                  freq_branchless_threshold,
+                             const bool                   emit_typed_work_items,
                              flsgpu::memory::DeviceArena& arena) {
 	// Emplace into pre-reserved vector — address is stable.
 	batch.device_exprs.emplace_back();
@@ -143,14 +145,16 @@ void add_expression_to_batch(const size_t    expr_index,
 
 	bool use_freq_extended = false;
 	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
-		use_freq_extended = detail::should_use_freq_extended(
-		    host_col, freq_prefetch_all_branchless, freq_hybrid_patcher, freq_branchless_threshold);
+		use_freq_extended = detail::should_use_freq_extended(host_col, freq_patcher, freq_branchless_threshold);
 	}
 	detail::fill_device_expr(expr, host_col, plan, use_freq_extended, arena);
 
 	const auto device_idx = static_cast<uint32_t>(batch.device_exprs.size() - 1);
 	batch.expr_indices.push_back(expr_index);
 
+	if (!emit_typed_work_items) {
+		return;
+	}
 	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
 	batch.work_items.reserve(batch.work_items.size() + n_vecs);
 	for (size_t vec = 0; vec < n_vecs; ++vec) {

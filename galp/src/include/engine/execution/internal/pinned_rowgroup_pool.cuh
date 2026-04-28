@@ -12,8 +12,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -104,8 +106,48 @@ public:
 		throw std::runtime_error("pinned rowgroup buffer pool exhausted");
 	}
 
+	size_t prewarm(const size_t min_bytes, const size_t requested_slots) {
+		if (min_bytes == 0 || requested_slots == 0) {
+			return 0;
+		}
+		std::unique_lock<std::mutex> lock(mutex_);
+		if (stopping_) {
+			throw std::runtime_error("pinned rowgroup buffer pool stopped");
+		}
+
+		const size_t alloc_bytes = round_up_capacity(min_bytes);
+		const size_t byte_budget = prewarm_byte_budget();
+		if (byte_budget == 0) {
+			return 0;
+		}
+		const size_t max_slots = std::min({slots_.size(), requested_slots, byte_budget / alloc_bytes});
+		if (max_slots == 0) {
+			return 0;
+		}
+
+		size_t warmed = 0;
+		for (auto& slot : slots_) {
+			if (warmed >= max_slots) {
+				break;
+			}
+			if (slot.in_use) {
+				continue;
+			}
+			if (slot.capacity < min_bytes) {
+				if (slot.ptr != nullptr) {
+					flsgpu::memory::DevicePool::instance().release_pinned(slot.ptr);
+				}
+				slot.ptr      = flsgpu::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
+				slot.capacity = alloc_bytes;
+			}
+			++warmed;
+		}
+		return warmed;
+	}
+
 private:
 	explicit PinnedRowgroupBufferPool(const size_t slots) : slots_(std::max<size_t>(1, slots)) {}
+
 	struct Slot {
 		void*  ptr      = nullptr;
 		size_t capacity = 0;
@@ -118,6 +160,22 @@ private:
 			return kAlign;
 		}
 		return ((bytes + kAlign - 1U) / kAlign) * kAlign;
+	}
+
+	static size_t prewarm_byte_budget() {
+		const char* env = std::getenv("GALP_PINNED_ROWGROUP_PREWARM_BYTES");
+		if (env == nullptr || *env == '\0') {
+			return 512ULL * 1024ULL * 1024ULL;
+		}
+		char*                    end   = nullptr;
+		const unsigned long long value = std::strtoull(env, &end, 10);
+		if (end == env) {
+			return 512ULL * 1024ULL * 1024ULL;
+		}
+		if (value > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+			return std::numeric_limits<size_t>::max();
+		}
+		return static_cast<size_t>(value);
 	}
 
 	void release(const size_t idx) {

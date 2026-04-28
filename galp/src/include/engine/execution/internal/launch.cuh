@@ -81,7 +81,7 @@ inline bool has_any_expr(const ExecutionWorkset& workset) {
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		auto& d = workset.buffers.device_batches.template get<T>();
-		has_any = has_any || (d.d_exprs != nullptr && d.d_items != nullptr);
+		has_any = has_any || (d.d_exprs != nullptr);
 	});
 	return has_any;
 }

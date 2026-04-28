@@ -11,66 +11,40 @@
 #include "flsgpu/structs.cuh"
 #include <cstddef>
 #include <cstdint>
-#include <initializer_list>
 #include <limits>
-#include <stdexcept>
 #include <vector>
 
 namespace expr {
 
-enum class OperatorKind {
-	UNCOMPRESSED,
-	UNFFOR,
-	SLPATCH,
-	RSUM,
-	RLE,
-	FREQUENCY,
-	CROSS_RLE,
-	DICT,
-	CONSTANT,
-	EQUAL,
-};
-
 struct Expression {
-	dispatch::Column*         column; // non-owning
-	std::vector<OperatorKind> ops;    // logical operator chain
+	dispatch::Column* column; // non-owning
 };
 
-inline std::vector<OperatorKind> ops_for_token(const fastlanes::OperatorToken token) {
+inline bool is_supported_token(const fastlanes::OperatorToken token) {
 	using enum fastlanes::OperatorToken;
 	switch (token) {
 	case EXP_UNCOMPRESSED_I08:
-		return {OperatorKind::UNCOMPRESSED};
 	case EXP_CONSTANT_I08:
-		return {OperatorKind::CONSTANT};
 	case EXP_FFOR_I08:
 	case EXP_FFOR_I16:
-		return {OperatorKind::UNFFOR};
 	case EXP_FFOR_SLPATCH_I08:
 	case EXP_FFOR_SLPATCH_I16:
-		return {OperatorKind::UNFFOR, OperatorKind::SLPATCH};
 	case EXP_FREQUENCY_I08:
 	case EXP_FREQUENCY_I16:
-		return {OperatorKind::FREQUENCY};
 	case EXP_CROSS_RLE_I08:
-		return {OperatorKind::CROSS_RLE};
 	case EXP_RLE_I08_U16:
 	case EXP_RLE_I16_U16:
-		return {OperatorKind::UNFFOR, OperatorKind::RSUM, OperatorKind::RLE};
 	case EXP_EQUAL:
-		return {OperatorKind::EQUAL};
 	case EXP_DICT_I08_FFOR_SLPATCH_U08:
 	case EXP_DICT_I16_FFOR_SLPATCH_U08:
 	case EXP_DICT_I16_FFOR_SLPATCH_U16:
-		return {OperatorKind::UNFFOR, OperatorKind::SLPATCH, OperatorKind::DICT};
 	case EXP_DICT_I08_FFOR_U08:
 	case EXP_DICT_I16_FFOR_U16:
 	case EXP_DICT_I16_FFOR_U08:
-		return {OperatorKind::UNFFOR, OperatorKind::DICT};
 	case EXP_DICT_I08_U08:
-		return {OperatorKind::UNFFOR, OperatorKind::DICT};
+		return true;
 	default:
-		return {};
+		return false;
 	}
 }
 
@@ -156,53 +130,6 @@ struct DeviceExpression {
 		flsgpu::device::RLEColumn<T, uint16_t>         rle_u16;
 	} col;
 };
-
-inline bool ops_match(const std::vector<expr::OperatorKind>& ops, std::initializer_list<expr::OperatorKind> expected) {
-	if (ops.size() != expected.size()) {
-		return false;
-	}
-	size_t idx = 0;
-	for (auto kind : expected) {
-		if (ops[idx++] != kind) {
-			return false;
-		}
-	}
-	return true;
-}
-
-inline PlanKind plan_for_ops(const std::vector<expr::OperatorKind>& ops) {
-	using enum expr::OperatorKind;
-	if (ops_match(ops, {UNCOMPRESSED})) {
-		return PlanKind::UNCOMPRESSED;
-	}
-	if (ops_match(ops, {CONSTANT})) {
-		return PlanKind::CONSTANT;
-	}
-	if (ops_match(ops, {UNFFOR})) {
-		return PlanKind::UNFFOR;
-	}
-	if (ops_match(ops, {UNFFOR, SLPATCH})) {
-		return PlanKind::UNFFOR_SLPATCH;
-	}
-	if (ops_match(ops, {FREQUENCY})) {
-		return PlanKind::FREQUENCY;
-	}
-	if (ops_match(ops, {CROSS_RLE})) {
-		return PlanKind::CROSS_RLE;
-	}
-	if (ops_match(ops, {UNFFOR, RSUM, RLE})) {
-		// Operator-only plan inference cannot derive RLE index width.
-		// The real execution path should prefer plan_for_host_col<>.
-		return PlanKind::RLE_U16;
-	}
-	if (ops_match(ops, {UNFFOR, DICT})) {
-		return PlanKind::DICT_FFOR_U16;
-	}
-	if (ops_match(ops, {UNFFOR, SLPATCH, DICT})) {
-		return PlanKind::DICT_FFOR_SLPATCH_U16;
-	}
-	throw std::runtime_error("unsupported operator chain in dispatch");
-}
 
 } // namespace dispatch
 

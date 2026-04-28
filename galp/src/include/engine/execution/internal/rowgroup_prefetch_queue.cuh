@@ -8,14 +8,12 @@
 
 #include "engine/execution/internal/pinned_rowgroup_pool.cuh"
 #include "engine/reader.cuh"
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
-#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,7 +25,7 @@
 namespace dispatch::runtime {
 
 struct RowgroupReadResult {
-	reader::Rowgroup rowgroup          {};
+	reader::Rowgroup rowgroup {};
 	double           read_ms           = 0.0;
 	double           file_read_ms      = 0.0;
 	double           rowgroup_build_ms = 0.0;
@@ -38,12 +36,11 @@ struct RowgroupReadResult {
 // so the producer never runs more than `depth` rowgroups ahead.
 class RowgroupPrefetchQueue {
 public:
-	RowgroupPrefetchQueue(const std::filesystem::path&             file_path,
-	                      const size_t                             start,
-	                      const size_t                             end,
-	                      const bool                               use_zero_copy_parse,
-	                      const size_t                             depth,
-	                      const size_t                             num_workers,
+	RowgroupPrefetchQueue(std::shared_ptr<reader::reader>           shared_reader,
+	                      const size_t                              start,
+	                      const size_t                              end,
+	                      const size_t                              depth,
+	                      const size_t                              num_workers,
 	                      std::shared_ptr<PinnedRowgroupBufferPool> pinned_pool = {})
 	    : start_(start)
 	    , end_(end)
@@ -55,83 +52,85 @@ public:
 	    // has drained the previous occupant (rg_idx - next_out < depth), so
 	    // each slot index (rg_idx % depth) is exclusive at any moment.
 	    , slots_(std::max<size_t>(1, depth))
-	    , pinned_pool_(pinned_pool) {
+	    , pinned_pool_(pinned_pool)
+	    , shared_reader_(std::move(shared_reader)) {
+		if (!shared_reader_) {
+			throw std::runtime_error("RowgroupPrefetchQueue: shared reader is null");
+		}
 		worker_count_ = std::max<size_t>(1, std::min<size_t>(num_workers, end > start ? end - start : 1));
 		workers_.reserve(worker_count_);
+		// Pre-touch the file fd & TableDescriptor on the calling thread so each
+		// worker sees a fully-initialised reader on its first read; pread() is
+		// thread-safe over a shared fd and the descriptor view is read-only,
+		// so per-worker reader construction (one fd + one FlatBuffers parse
+		// each) is no longer needed.
+		(void)shared_reader_->rowgroup_count();
 		for (size_t w = 0; w < worker_count_; ++w) {
-			workers_.emplace_back(
-			    [this, file_path, use_zero_copy_parse, pinned_pool]() {
-				    try {
-					    reader::reader rdr(file_path);
-					    while (true) {
-						    const size_t rg_idx = next_claim_.fetch_add(1, std::memory_order_relaxed);
-						    if (rg_idx >= end_) {
-							    break;
-						    }
-						    {
-							    std::unique_lock<std::mutex> lock(mutex_);
-							    cv_not_full_.wait(lock, [&]() {
-								    return stop_ || (rg_idx - next_out_.load(std::memory_order_relaxed) < depth_);
-							    });
-							    if (stop_) {
-								    return;
-							    }
-						    }
+			workers_.emplace_back([this, pinned_pool]() {
+				try {
+					reader::reader& rdr = *shared_reader_;
+					while (true) {
+						const size_t rg_idx = next_claim_.fetch_add(1, std::memory_order_relaxed);
+						if (rg_idx >= end_) {
+							break;
+						}
+						{
+							std::unique_lock<std::mutex> lock(mutex_);
+							cv_not_full_.wait(lock, [&]() {
+								return stop_ || (rg_idx - next_out_.load(std::memory_order_relaxed) < depth_);
+							});
+							if (stop_) {
+								return;
+							}
+						}
 
-						    Prefetched prefetched {};
-						    if (use_zero_copy_parse) {
-							    const auto file_read_start = std::chrono::steady_clock::now();
-							    reader::ZeroCopyRowgroup zero_copy {};
-							    if (pinned_pool) {
-								    auto lease = pinned_pool->acquire(rdr.rowgroup_storage_bytes(rg_idx));
-								    zero_copy  = rdr.read_rowgroup_zero_copy_into(
-								        rg_idx, std::move(lease.owner), lease.data, lease.capacity,
-								        /*backing_is_pinned=*/true);
-							    } else {
-								    zero_copy = rdr.read_rowgroup_zero_copy(rg_idx);
-							    }
-							    const auto file_read_end = std::chrono::steady_clock::now();
-							    const auto build_start   = std::chrono::steady_clock::now();
-							    prefetched.rowgroup      = rdr.materialize_zero_copy_rowgroup(std::move(zero_copy));
-							    const auto build_end     = std::chrono::steady_clock::now();
-							    prefetched.file_read_ms =
-							        std::chrono::duration<double, std::milli>(file_read_end - file_read_start).count();
-							    prefetched.rowgroup_build_ms =
-							        std::chrono::duration<double, std::milli>(build_end - build_start).count();
-							    prefetched.read_ms = prefetched.file_read_ms + prefetched.rowgroup_build_ms;
-						    } else {
-							    const auto read_start        = std::chrono::steady_clock::now();
-							    prefetched.rowgroup          = rdr.read_rowgroup(rg_idx);
-							    const auto read_end          = std::chrono::steady_clock::now();
-							    prefetched.rowgroup_build_ms =
-							        std::chrono::duration<double, std::milli>(read_end - read_start).count();
-							    prefetched.read_ms = prefetched.rowgroup_build_ms;
-						    }
+						Prefetched               prefetched {};
+						const auto               file_read_start = std::chrono::steady_clock::now();
+						reader::ZeroCopyRowgroup zero_copy {};
+						if (pinned_pool) {
+							auto lease = pinned_pool->acquire(rdr.rowgroup_storage_bytes(rg_idx));
+							zero_copy  = rdr.read_rowgroup_zero_copy_into(rg_idx,
+                                                                         std::move(lease.owner),
+                                                                         lease.data,
+                                                                         lease.capacity,
+                                                                         /*backing_is_pinned=*/true);
+						} else {
+							zero_copy = rdr.read_rowgroup_zero_copy(rg_idx);
+						}
+						const auto file_read_end = std::chrono::steady_clock::now();
+						const auto build_start   = std::chrono::steady_clock::now();
+						prefetched.rowgroup      = rdr.materialize_zero_copy_rowgroup(std::move(zero_copy));
+						const auto build_end     = std::chrono::steady_clock::now();
+						prefetched.file_read_ms =
+						    std::chrono::duration<double, std::milli>(file_read_end - file_read_start).count();
+						prefetched.rowgroup_build_ms =
+						    std::chrono::duration<double, std::milli>(build_end - build_start).count();
+						prefetched.read_ms = prefetched.file_read_ms + prefetched.rowgroup_build_ms;
 
-						    {
-							    std::lock_guard<std::mutex> lock(mutex_);
-							    if (stop_) {
-								    return;
-							    }
-							    slots_[(rg_idx - start_) % depth_] = std::move(prefetched);
-							    ++ready_count_;
-							    cv_not_empty_.notify_all();
-						    }
-					    }
-				    } catch (...) {
-					    std::lock_guard<std::mutex> lock(mutex_);
-					    if (!error_) {
-						    error_ = std::current_exception();
-					    }
-					    cv_not_empty_.notify_all();
-				    }
+						{
+							std::lock_guard<std::mutex> lock(mutex_);
+							if (stop_) {
+								return;
+							}
+							slots_[(rg_idx - start_) % depth_] = std::move(prefetched);
+							++ready_count_;
+							cv_not_empty_.notify_all();
+						}
+					}
+				} catch (...) {
+					std::lock_guard<std::mutex> lock(mutex_);
+					if (!error_) {
+						error_ = std::current_exception();
+					}
+					cv_not_empty_.notify_all();
+				}
 
-				    std::lock_guard<std::mutex> lock(mutex_);
-				    if (++workers_finished_ == worker_count_) {
-					    done_ = true;
-					    cv_not_empty_.notify_all();
-				    }
-			    });
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (++workers_finished_ == worker_count_) {
+					done_ = true;
+					cv_not_empty_.notify_all();
+				}
+			});
 		}
 	}
 
@@ -162,9 +161,7 @@ public:
 		const size_t       slot      = (next_out_.load(std::memory_order_relaxed) - start_) % depth_;
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			cv_not_empty_.wait(lock, [&]() {
-				return stop_ || error_ != nullptr || slots_[slot].has_value() || done_;
-			});
+			cv_not_empty_.wait(lock, [&]() { return stop_ || error_ != nullptr || slots_[slot].has_value() || done_; });
 			const auto wait_end = std::chrono::steady_clock::now();
 			wait_ms_ += std::chrono::duration<double, std::milli>(wait_end - wait_start).count();
 
@@ -197,15 +194,15 @@ public:
 
 private:
 	struct Prefetched {
-		reader::Rowgroup rowgroup          {};
+		reader::Rowgroup rowgroup {};
 		double           read_ms           = 0.0;
 		double           file_read_ms      = 0.0;
 		double           rowgroup_build_ms = 0.0;
 	};
 
-	const size_t                              start_     = 0;
-	const size_t                              end_       = 0;
-	const size_t                              depth_     = 1;
+	const size_t                              start_ = 0;
+	const size_t                              end_   = 0;
+	const size_t                              depth_ = 1;
 	std::atomic<size_t>                       next_claim_;
 	std::atomic<size_t>                       next_out_;
 	std::vector<std::thread>                  workers_;
@@ -221,6 +218,7 @@ private:
 	bool                                      stop_    = false;
 	double                                    wait_ms_ = 0.0;
 	std::shared_ptr<PinnedRowgroupBufferPool> pinned_pool_;
+	std::shared_ptr<reader::reader>           shared_reader_;
 };
 
 } // namespace dispatch::runtime

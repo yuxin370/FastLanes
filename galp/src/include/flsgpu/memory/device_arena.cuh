@@ -10,9 +10,11 @@
 #include "flsgpu/memory/device_pool.cuh"
 #include "flsgpu/memory/upload_metrics.cuh"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <functional>
@@ -89,6 +91,57 @@ public:
 		regions_.push_back(BackingRegion {b, bytes, bytes, 0});
 	}
 
+	void coalesce_backing_regions() {
+		if (regions_.size() <= 1) {
+			return;
+		}
+
+		std::sort(regions_.begin(), regions_.end(), [](const BackingRegion& a, const BackingRegion& b) {
+			return reinterpret_cast<std::uintptr_t>(a.base) < reinterpret_cast<std::uintptr_t>(b.base);
+		});
+
+		std::vector<BackingRegion> merged;
+		merged.reserve(regions_.size());
+		for (const auto& region : regions_) {
+			if (merged.empty()) {
+				merged.push_back(BackingRegion {region.base, region.bytes, region.bytes, 0});
+				continue;
+			}
+
+			auto&        cur          = merged.back();
+			const auto   cur_begin    = reinterpret_cast<std::uintptr_t>(cur.base);
+			const auto   cur_end      = cur_begin + cur.bytes;
+			const auto   region_begin = reinterpret_cast<std::uintptr_t>(region.base);
+			const auto   region_end   = region_begin + region.bytes;
+			if (region_begin <= cur_end) {
+				if (region_end > cur_end) {
+					cur.bytes = static_cast<size_t>(region_end - cur_begin);
+				}
+				cur.slab_bytes = cur.bytes;
+				continue;
+			}
+			merged.push_back(BackingRegion {region.base, region.bytes, region.bytes, 0});
+		}
+
+		regions_ = std::move(merged);
+		for (auto& e : entries_) {
+			if (e.region_idx < 0) {
+				continue;
+			}
+			e.region_idx = find_region(e.host_src, e.copy_bytes);
+			if (e.region_idx < 0) {
+				continue;
+			}
+			auto&       region = regions_[e.region_idx];
+			const auto* src    = reinterpret_cast<const std::byte*>(e.host_src);
+			e.region_offset    = static_cast<size_t>(src - region.base);
+			const size_t end_offset = e.region_offset + e.alloc_bytes;
+			if (end_offset > region.slab_bytes) {
+				region.slab_bytes = end_offset;
+			}
+		}
+	}
+
 	template <typename T>
 	size_t add(size_t count, const T* host_src, size_t buffer_elements = 0) {
 		const size_t copy_bytes  = count * sizeof(T);
@@ -145,8 +198,11 @@ public:
 		deferred_frees_.push_back(std::move(fn));
 	}
 
-	void reset() {
-		release_device_base();
+	void reset(const bool preserve_capacity = false) {
+		if (!preserve_capacity) {
+			release_device_base();
+			release_pinned_base();
+		}
 		run_deferred_frees();
 		staged_bytes_ = 0;
 		entries_.clear();
@@ -174,6 +230,7 @@ public:
 		}
 
 		const auto t0   = clock::now();
+		coalesce_backing_regions();
 		const auto plan = plan_layout();
 		if (plan.total_bytes == 0) {
 			run_resolvers();
@@ -201,9 +258,28 @@ public:
 		const auto t4   = clock::now();
 		metrics.pack_ms = ms(t3, t4);
 
-		issue_dma(plan.staged_device_base);
+		cudaEvent_t dma_start {};
+		cudaEvent_t dma_stop {};
+		const bool  measure_h2d = should_measure_h2d();
+		if (measure_h2d) {
+			CUDA_SAFE_CALL(cudaEventCreate(&dma_start));
+			CUDA_SAFE_CALL(cudaEventCreate(&dma_stop));
+			CUDA_SAFE_CALL(cudaEventRecord(dma_start, stream_));
+		}
+		const auto dma_stats = issue_dma(plan.staged_device_base);
+		if (measure_h2d) {
+			CUDA_SAFE_CALL(cudaEventRecord(dma_stop, stream_));
+			CUDA_SAFE_CALL(cudaEventSynchronize(dma_stop));
+			float gpu_ms = 0.0f;
+			CUDA_SAFE_CALL(cudaEventElapsedTime(&gpu_ms, dma_start, dma_stop));
+			metrics.dma_gpu_ms = static_cast<double>(gpu_ms);
+			CUDA_SAFE_CALL(cudaEventDestroy(dma_start));
+			CUDA_SAFE_CALL(cudaEventDestroy(dma_stop));
+		}
 		const auto t5        = clock::now();
 		metrics.dma_issue_ms = ms(t4, t5);
+		metrics.dma_bytes    = dma_stats.bytes;
+		metrics.dma_count    = dma_stats.count;
 
 		if (!resolve_before_pack) {
 			run_resolvers();
@@ -232,6 +308,11 @@ public:
 	}
 
 private:
+	struct DmaIssueStats {
+		size_t bytes = 0;
+		size_t count = 0;
+	};
+
 	struct LayoutPlan {
 		size_t staged_device_base = 0;
 		size_t total_bytes        = 0;
@@ -275,11 +356,14 @@ private:
 	// Unified DMA issue: one cudaMemcpyAsync per backing region (direct from
 	// slot-owned pinned memory, zero host pack) plus one for the staged area.
 	// A single tracker event covers all DMAs since they serialize on stream_.
-	void issue_dma(size_t staged_device_base) {
+	DmaIssueStats issue_dma(size_t staged_device_base) {
+		DmaIssueStats stats {};
 		for (const auto& region : regions_) {
 			if (region.bytes == 0) {
 				continue;
 			}
+			stats.bytes += region.bytes;
+			++stats.count;
 			CUDA_SAFE_CALL(cudaMemcpyAsync(device_base_ + region.device_offset,
 			                               region.base,
 			                               region.bytes,
@@ -287,6 +371,8 @@ private:
 			                               stream_));
 		}
 		if (staged_bytes_ > 0) {
+			stats.bytes += staged_bytes_;
+			++stats.count;
 			CUDA_SAFE_CALL(cudaMemcpyAsync(device_base_ + staged_device_base,
 			                               pinned_base_,
 			                               staged_bytes_,
@@ -294,6 +380,7 @@ private:
 			                               stream_));
 		}
 		DevicePool::instance().register_external_h2d(stream_);
+		return stats;
 	}
 
 	// Resolve flat pointer targets without std::function dispatch, then fire
@@ -313,10 +400,11 @@ private:
 		if (host_src == nullptr || bytes == 0 || regions_.empty()) {
 			return -1;
 		}
-		const auto* src = reinterpret_cast<const std::byte*>(host_src);
+		const auto src = reinterpret_cast<std::uintptr_t>(host_src);
 		for (size_t i = 0; i < regions_.size(); ++i) {
 			const auto& r = regions_[i];
-			if (src >= r.base && src + bytes <= r.base + r.bytes) {
+			const auto  base = reinterpret_cast<std::uintptr_t>(r.base);
+			if (src >= base && src + bytes <= base + r.bytes) {
 				return static_cast<int>(i);
 			}
 		}
@@ -384,6 +472,11 @@ private:
 		v |= v >> 16;
 		v |= v >> 32;
 		return v + 1;
+	}
+
+	static bool should_measure_h2d() {
+		static const bool enabled = (std::getenv("GALP_MEASURE_H2D") != nullptr);
+		return enabled;
 	}
 
 	cudaStream_t                       stream_      = nullptr;

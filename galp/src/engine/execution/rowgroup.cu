@@ -15,7 +15,7 @@ RowgroupData decompress_rowgroup_impl(std::vector<expr::Expression>& expressions
 	runtime::ExecutionWorkset      workset {};
 	runtime::ExecutionWorksetGuard guard(workset);
 	runtime::append_expressions(workset, expressions, cfg);
-	runtime::upload_workset(workset);
+	runtime::upload_workset(workset, cfg);
 	runtime::run_workset(workset, 1, cfg);
 	return runtime::materialize_workset(workset, expressions, cfg);
 }

@@ -4,7 +4,7 @@
 // galp/src/include/engine/execution/config.cuh
 // ────────────────────────────────────────────────────────
 // Dispatch-layer knobs: launch strategy, unpack tile sizes, FREQ-patcher
-// thresholds. Kept in its own header so consumers that only need the config
+// mode. Kept in its own header so consumers that only need the config
 // struct don't pull in batch/expression/CUDA types.
 #ifndef ENGINE_EXECUTION_CONFIG_CUH
 #define ENGINE_EXECUTION_CONFIG_CUH
@@ -21,14 +21,22 @@ enum class LaunchStrategy {
 	MixedDispatch,
 };
 
+enum class FreqPatcher {
+	Stateful,   // default: stateful patcher
+	Branchless, // FREQ extended format + PrefetchAllBranchless
+	Hybrid,     // per-column choice between Stateful/Branchless by exception density
+};
+
+// Hybrid threshold: avg exceptions per vector at which we switch to branchless.
+inline constexpr float kFreqHybridBranchlessThreshold = 6.0f;
+
 struct ExecutionConfig {
-	unsigned       unpack_n_vectors             = 1;
-	unsigned       unpack_n_values              = 1;
-	LaunchStrategy launch_strategy              = LaunchStrategy::MixedDispatch;
-	bool           write_out                    = true;
-	bool           freq_prefetch_all_branchless = false;
-	bool           freq_hybrid_patcher          = false;
-	float          freq_branchless_threshold    = 6.0f;
+	unsigned       unpack_n_vectors          = 1;
+	unsigned       unpack_n_values           = 1;
+	LaunchStrategy launch_strategy           = LaunchStrategy::MixedDispatch;
+	bool           write_out                 = true;
+	FreqPatcher    freq_patcher              = FreqPatcher::Stateful;
+	float          freq_branchless_threshold = kFreqHybridBranchlessThreshold;
 
 	constexpr DecodeChunk chunk() const {
 		return DecodeChunk {unpack_n_vectors, unpack_n_values};
