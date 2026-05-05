@@ -290,6 +290,11 @@ inline size_t count_active_columns(const dispatch::Rowgroup& rowgroup) {
 	return total;
 }
 
+inline bool has_pinned_backing(const dispatch::Column& column) {
+	return column.host_owned_by_backing && column.backing_is_pinned && column.backing_base != nullptr &&
+	       column.backing_bytes > 0;
+}
+
 #ifndef NDEBUG
 inline void validate_unique_work_item(std::unordered_set<uint64_t>& seen, const dispatch::WorkItemAny& work) {
 	const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(work.type)) << 56) |
@@ -315,10 +320,14 @@ inline uint32_t semantic_lanes_for_work_item(const ExecutionWorkset& workset, co
 	return dispatch::semantic_lane_count(work.type, plan_for_work_item(workset, work));
 }
 
+inline void clear_mixed_slots(WorksetSlots& slots) {
+	slots.mixed.clear();
+	slots.owned.reset();
+	slots.d = nullptr;
+}
+
 inline void build_mixed_slots(ExecutionWorkset& workset) {
-	workset.slots.mixed.clear();
-	workset.slots.owned.reset();
-	workset.slots.d = nullptr;
+	clear_mixed_slots(workset.slots);
 
 	const size_t total_items = count_expr_work_items(workset);
 	if (total_items == 0) {
@@ -326,22 +335,24 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 	}
 	workset.slots.mixed.reserve((total_items + 1U) / 2U);
 
-	std::optional<dispatch::WorkItemAny> pending_half;
+	dispatch::WorkItemAny pending_half {};
+	bool                  has_pending_half = false;
 
 	const auto append_work = [&](const dispatch::WorkItemAny& work, const uint32_t semantic_lanes) {
 		if (semantic_lanes == dispatch::lane_count_for_type(dispatch::TypeTag::I8)) {
-			if (pending_half.has_value()) {
-				workset.slots.mixed.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
-				pending_half.reset();
+			if (has_pending_half) {
+				workset.slots.mixed.push_back(dispatch::MixedWorkSlot {pending_half, dispatch::invalid_work_item()});
+				has_pending_half = false;
 			}
 			workset.slots.mixed.push_back(dispatch::MixedWorkSlot {work, dispatch::invalid_work_item()});
 			return;
 		}
-		if (pending_half.has_value()) {
-			workset.slots.mixed.push_back(dispatch::MixedWorkSlot {*pending_half, work});
-			pending_half.reset();
+		if (has_pending_half) {
+			workset.slots.mixed.push_back(dispatch::MixedWorkSlot {pending_half, work});
+			has_pending_half = false;
 		} else {
-			pending_half = work;
+			pending_half     = work;
+			has_pending_half = true;
 		}
 	};
 
@@ -359,8 +370,8 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 		}
 	});
 
-	if (pending_half.has_value()) {
-		workset.slots.mixed.push_back(dispatch::MixedWorkSlot {*pending_half, dispatch::invalid_work_item()});
+	if (has_pending_half) {
+		workset.slots.mixed.push_back(dispatch::MixedWorkSlot {pending_half, dispatch::invalid_work_item()});
 	}
 }
 
@@ -380,6 +391,8 @@ inline void append_expressions(ExecutionWorkset&              workset,
 	flsgpu::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
 
 	size_t active_expr_count = 0;
+	const void* last_backing_base  = nullptr;
+	size_t      last_backing_bytes = 0;
 
 	for (size_t i = 0; i < expressions.size(); ++i) {
 		const auto& expr = expressions[i];
@@ -389,9 +402,11 @@ inline void append_expressions(ExecutionWorkset&              workset,
 		// Direct-DMA backing is only valid from CUDA-pinned memory; a pageable
 		// source would force cudaMemcpyAsync into synchronous internal staging,
 		// erasing the zero-copy win and stalling the h2d stream.
-		if (expr.column->host_owned_by_backing && expr.column->backing_is_pinned &&
-		    expr.column->backing_base != nullptr && expr.column->backing_bytes > 0) {
+		if (has_pinned_backing(*expr.column) &&
+		    (expr.column->backing_base != last_backing_base || expr.column->backing_bytes != last_backing_bytes)) {
 			active_chunk_arena->register_backing(expr.column->backing_base, expr.column->backing_bytes);
+			last_backing_base  = expr.column->backing_base;
+			last_backing_bytes = expr.column->backing_bytes;
 		}
 		++active_expr_count;
 		if (out_n_exprs) {
@@ -432,15 +447,15 @@ inline void append_column_to_workset(ExecutionWorkset&                 workset,
                                      const size_t                      materialize_expr_index,
                                      flsgpu::memory::DeviceArena&      active_chunk_arena,
                                      size_t*                           out_total_bytes = nullptr,
-                                     const bool                        emit_typed_work_items = true) {
+                                     const bool                        emit_typed_work_items = true,
+                                     const bool                        register_backing = true) {
 	using namespace dispatch;
 	using namespace dispatch::detail;
 
 	if (column.skip_decompress) {
 		return;
 	}
-	if (column.host_owned_by_backing && column.backing_is_pinned && column.backing_base != nullptr &&
-	    column.backing_bytes > 0) {
+	if (register_backing && has_pinned_backing(column)) {
 		active_chunk_arena.register_backing(column.backing_base, column.backing_bytes);
 	}
 
@@ -479,10 +494,18 @@ inline void append_rowgroup_columns(ExecutionWorkset&         workset,
 	flsgpu::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
 
 	size_t active_expr_count = 0;
+	const void* last_backing_base  = nullptr;
+	size_t      last_backing_bytes = 0;
 	for (size_t i = 0; i < rowgroup.columns.size(); ++i) {
 		const auto& column = rowgroup.columns[i];
 		if (column.skip_decompress) {
 			continue;
+		}
+		if (has_pinned_backing(column) &&
+		    (column.backing_base != last_backing_base || column.backing_bytes != last_backing_bytes)) {
+			active_chunk_arena->register_backing(column.backing_base, column.backing_bytes);
+			last_backing_base  = column.backing_base;
+			last_backing_bytes = column.backing_bytes;
 		}
 		++active_expr_count;
 		const size_t materialize_expr_index =
@@ -493,7 +516,8 @@ inline void append_rowgroup_columns(ExecutionWorkset&         workset,
 		                         materialize_expr_index,
 		                         *active_chunk_arena,
 		                         nullptr,
-		                         cfg.launch_strategy != dispatch::LaunchStrategy::MixedDispatch);
+		                         cfg.launch_strategy != dispatch::LaunchStrategy::MixedDispatch,
+		                         false);
 	}
 }
 
@@ -508,7 +532,10 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 	const auto h2d_stream = ensure_workset_h2d_stream(workset);
 	workset.slots.owned.reset();
 	workset.slots.d = nullptr;
-	workset.slots.mixed.clear();
+	const bool mixed_dispatch = cfg.launch_strategy == dispatch::LaunchStrategy::MixedDispatch;
+	if (!mixed_dispatch) {
+		clear_mixed_slots(workset.slots);
+	}
 	workset.buffers.payload_arena_bytes = 0;
 
 	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
@@ -533,7 +560,6 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 	const auto t0c         = clock::now();
 	breakdown.prep_bind_ms = ms(t0b, t0c);
 
-	const bool mixed_dispatch = cfg.launch_strategy == dispatch::LaunchStrategy::MixedDispatch;
 	if (mixed_dispatch) {
 		build_mixed_slots(workset);
 	}
@@ -575,7 +601,8 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 		}
 		const auto t2             = clock::now();
 		breakdown.arena_pack_ms   = ms(t1, t2);
-		breakdown.arena           = workset.buffers.chunk_arena->upload(/*resolve_before_pack=*/true);
+		breakdown.arena           = workset.buffers.chunk_arena->upload(/*resolve_before_pack=*/true,
+		                                                                 /*backing_regions_coalesced=*/true);
 		const auto t3             = clock::now();
 		breakdown.arena_upload_ms = ms(t2, t3);
 	}

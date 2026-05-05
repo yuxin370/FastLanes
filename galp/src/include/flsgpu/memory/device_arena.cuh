@@ -158,6 +158,7 @@ public:
 			staged_bytes_    = (staged_bytes_ + 255U) & ~size_t(255U);
 			e.staged_offset  = staged_bytes_;
 			staged_bytes_   += alloc_bytes;
+			staged_entry_indices_.push_back(idx);
 		} else {
 			auto&       region = regions_[e.region_idx];
 			const auto* src    = reinterpret_cast<const std::byte*>(host_src);
@@ -206,12 +207,13 @@ public:
 		run_deferred_frees();
 		staged_bytes_ = 0;
 		entries_.clear();
+		staged_entry_indices_.clear();
 		regions_.clear();
 		resolvers_.clear();
 		resolver_targets_.clear();
 	}
 
-	ArenaUploadMetrics upload(bool resolve_before_pack = false) {
+	ArenaUploadMetrics upload(bool resolve_before_pack = false, bool backing_regions_coalesced = false) {
 		using clock   = std::chrono::steady_clock;
 		const auto ms = [](auto a, auto b) {
 			return std::chrono::duration<double, std::milli>(b - a).count();
@@ -230,7 +232,9 @@ public:
 		}
 
 		const auto t0   = clock::now();
-		coalesce_backing_regions();
+		if (!backing_regions_coalesced) {
+			coalesce_backing_regions();
+		}
 		const auto plan = plan_layout();
 		if (plan.total_bytes == 0) {
 			run_resolvers();
@@ -240,10 +244,14 @@ public:
 		const auto t1     = clock::now();
 		metrics.layout_ms = ms(t0, t1);
 
-		// Round up to power-of-2 buckets (min 64KB) to improve DevicePool cache hits.
+		// Round up to power-of-2 buckets to improve DevicePool cache hits.
 		ensure_capacity(round_up_pow2(plan.total_bytes, 65536U));
 		if (staged_bytes_ > 0) {
-			ensure_pinned_capacity(round_up_pow2(staged_bytes_, 65536U));
+			// Keep small staged metadata cheap, but avoid mid-query
+			// cudaMallocHost growth on image datasets whose metadata hovers
+			// around the 256 KiB bucket boundary.
+			const size_t staged_floor = staged_bytes_ >= 192U * 1024U ? 512U * 1024U : 65536U;
+			ensure_pinned_capacity(round_up_pow2(staged_bytes_, staged_floor));
 		}
 		const auto t2    = clock::now();
 		metrics.alloc_ms = ms(t1, t2);
@@ -346,8 +354,12 @@ private:
 		if (staged_bytes_ == 0) {
 			return;
 		}
-		for (const auto& e : entries_) {
-			if (e.region_idx < 0 && e.host_src != nullptr && e.copy_bytes > 0) {
+		for (const size_t entry_idx : staged_entry_indices_) {
+			if (entry_idx >= entries_.size()) {
+				continue;
+			}
+			const auto& e = entries_[entry_idx];
+			if (e.host_src != nullptr && e.copy_bytes > 0) {
 				std::memcpy(pinned_base_ + e.staged_offset, e.host_src, e.copy_bytes);
 			}
 		}
@@ -486,6 +498,7 @@ private:
 	size_t                             pinned_capacity_bytes_ = 0;
 	size_t                             staged_bytes_ = 0;
 	std::vector<Entry>                 entries_;
+	std::vector<size_t>                staged_entry_indices_;
 	std::vector<BackingRegion>         regions_;
 	std::vector<ResolverTarget>        resolver_targets_;
 	std::vector<std::function<void()>> resolvers_;

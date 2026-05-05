@@ -24,6 +24,7 @@
 #include "flsgpu/utils.cuh"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -386,8 +387,7 @@ inline flsgpu::host::FREQColumn<T> make_frequency_zero_copy(const fastlanes::Seg
 	auto* positions  = segment_ptr_or_copy<uint16_t>(seg_pos, storage);
 	auto* exceptions = segment_ptr_or_copy<T>(seg_exc, storage);
 
-	return flsgpu::host::FREQColumn<T> {
-	    n_values, n_vecs, fv, exc.total, exc.offsets, exceptions, positions, counts};
+	return flsgpu::host::FREQColumn<T> {n_values, n_vecs, fv, exc.total, exc.offsets, exceptions, positions, counts};
 }
 
 template <typename T>
@@ -557,8 +557,7 @@ inline flsgpu::host::DICTREFColumn<T, IndexT> clone_column(const flsgpu::host::D
 }
 
 template <typename T, typename IndexT>
-inline flsgpu::host::DICTSLPATCHColumn<T, IndexT> clone_column(
-    const flsgpu::host::DICTSLPATCHColumn<T, IndexT>& col) {
+inline flsgpu::host::DICTSLPATCHColumn<T, IndexT> clone_column(const flsgpu::host::DICTSLPATCHColumn<T, IndexT>& col) {
 	return flsgpu::host::DICTSLPATCHColumn<T, IndexT> {
 	    clone_column(col.index), clone_array(col.keys, col.key_count), col.key_count};
 }
@@ -568,8 +567,7 @@ inline flsgpu::host::RLEColumn<T, IndexT> clone_column(const flsgpu::host::RLECo
 	return flsgpu::host::RLEColumn<T, IndexT> {col.n_values,
 	                                           col.n_vecs,
 	                                           clone_column(col.ffor),
-	                                           clone_array(col.rsum_bases,
-	                                                       col.n_vecs * utils::get_n_lanes<IndexT>()),
+	                                           clone_array(col.rsum_bases, col.n_vecs * utils::get_n_lanes<IndexT>()),
 	                                           clone_array(col.rle_values, col.n_rle_values),
 	                                           clone_array(col.rle_offsets, col.n_vecs),
 	                                           col.n_rle_values};
@@ -672,6 +670,14 @@ struct ZeroCopyRowgroup {
 	std::vector<ZeroCopyColumn>              columns;
 };
 
+struct ZeroCopyReadTiming {
+	size_t                                storage_bytes           = 0;
+	double                                pread_ms                = 0.0;
+	double                                zero_copy_view_setup_ms = 0.0;
+	std::chrono::steady_clock::time_point pread_start {};
+	std::chrono::steady_clock::time_point pread_end {};
+};
+
 inline ZeroCopyColumn make_zero_copy_column_from_plan(const ZeroCopyRowgroup&   rowgroup,
                                                       const ZeroCopyColumnPlan& plan_col) {
 	if (rowgroup.rowgroup_descriptor == nullptr) {
@@ -707,11 +713,16 @@ public:
 		m_zero_copy_schema_plan = std::make_shared<ZeroCopySchemaPlan>(build_shared_zero_copy_schema_plan());
 	}
 
-	size_t rowgroup_count() const {
+	const fastlanes::TableDescriptor* table_descriptor() const {
 		const auto* td = m_table_descriptor->Get();
 		if (!td) {
 			throw std::runtime_error("TableDescriptor not loaded");
 		}
+		return td;
+	}
+
+	size_t rowgroup_count() const {
+		const auto* td = table_descriptor();
 		return static_cast<size_t>(td->m_rowgroup_descriptors()->size());
 	}
 
@@ -728,12 +739,48 @@ public:
 		return static_cast<size_t>(rg->m_size());
 	}
 
-	ZeroCopyRowgroup read_rowgroup_zero_copy_into(const size_t          rowgroup_idx,
-	                                              std::shared_ptr<void> backing_owner,
-	                                              std::byte* const      backing_data,
-	                                              const size_t          backing_capacity,
-	                                              const bool            backing_is_pinned = false) {
+	void read_rowgroup_bytes_into(const size_t        rowgroup_idx,
+	                              std::byte* const    backing_data,
+	                              const size_t        backing_capacity,
+	                              ZeroCopyReadTiming* timing = nullptr) {
 		const auto* td = m_table_descriptor->Get();
+		if (!td) {
+			throw std::runtime_error("TableDescriptor not loaded");
+		}
+		const auto n_rgs = td->m_rowgroup_descriptors()->size();
+		if (rowgroup_idx >= n_rgs) {
+			throw std::out_of_range("rowgroup_idx out of range");
+		}
+
+		const auto*  rg       = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
+		const size_t rg_bytes = static_cast<size_t>(rg->m_size());
+		if (backing_data == nullptr || backing_capacity < rg_bytes) {
+			throw std::runtime_error("external rowgroup backing is null or too small");
+		}
+
+		const auto pread_start = std::chrono::steady_clock::now();
+		m_file->ReadRangeUnchecked(backing_data, rg->m_offset(), rg->m_size());
+		const auto pread_end = std::chrono::steady_clock::now();
+		if (timing != nullptr) {
+			timing->storage_bytes = rg_bytes;
+			timing->pread_ms += std::chrono::duration<double, std::milli>(pread_end - pread_start).count();
+			if (timing->pread_start == std::chrono::steady_clock::time_point {} || pread_start < timing->pread_start) {
+				timing->pread_start = pread_start;
+			}
+			if (pread_end > timing->pread_end) {
+				timing->pread_end = pread_end;
+			}
+		}
+	}
+
+	ZeroCopyRowgroup make_zero_copy_rowgroup_from_backing(const size_t          rowgroup_idx,
+	                                                      std::shared_ptr<void> backing_owner,
+	                                                      std::byte* const      backing_data,
+	                                                      const size_t          backing_capacity,
+	                                                      const bool            backing_is_pinned = false,
+	                                                      ZeroCopyReadTiming*   timing            = nullptr) {
+		const auto  setup_start = std::chrono::steady_clock::now();
+		const auto* td          = m_table_descriptor->Get();
 		if (!td) {
 			throw std::runtime_error("TableDescriptor not loaded");
 		}
@@ -752,11 +799,11 @@ public:
 		const size_t n_values = n_vecs * consts::VALUES_PER_VECTOR;
 		const size_t n_tuples = static_cast<size_t>(rg->m_n_tuples());
 
-		m_file->ReadRangeUnchecked(backing_data, rg->m_offset(), rg->m_size());
 		auto        backing_span    = fastlanes::span<std::byte> {backing_data, rg_bytes};
 		const auto& col_descs       = *rg->m_column_descriptors();
 		const bool  use_schema_plan = m_zero_copy_schema_plan && m_zero_copy_schema_plan->enabled &&
 		                             m_zero_copy_schema_plan->columns.size() == col_descs.size();
+
 		std::shared_ptr<fastlanes::RowgroupView> view;
 		if (!use_schema_plan) {
 			view = std::make_shared<fastlanes::RowgroupView>(backing_span, *rg);
@@ -774,14 +821,23 @@ public:
 		out.backing_is_pinned      = backing_is_pinned;
 		out.rowgroup_view          = view;
 
+		const auto record_timing = [&](const std::chrono::steady_clock::time_point setup_end) {
+			if (timing == nullptr) {
+				return;
+			}
+			timing->storage_bytes = rg_bytes;
+			timing->zero_copy_view_setup_ms +=
+			    std::chrono::duration<double, std::milli>(setup_end - setup_start).count();
+		};
+
 		if (use_schema_plan) {
 			out.schema_plan_owner = m_zero_copy_schema_plan;
 			out.schema_plan       = out.schema_plan_owner.get();
+			record_timing(std::chrono::steady_clock::now());
 			return out;
 		}
 
 		out.columns.reserve(col_descs.size());
-
 		for (size_t col_idx = 0; col_idx < col_descs.size(); ++col_idx) {
 			const auto& col_desc = *col_descs.Get(static_cast<flatbuffers::uoffset_t>(col_idx));
 			const auto* rpn      = col_desc.encoding_rpn();
@@ -817,15 +873,30 @@ public:
 			}
 			out.columns.push_back(col);
 		}
+
+		record_timing(std::chrono::steady_clock::now());
 		return out;
 	}
 
-	ZeroCopyRowgroup read_rowgroup_zero_copy(const size_t rowgroup_idx = 0) {
+	ZeroCopyRowgroup read_rowgroup_zero_copy_into(const size_t          rowgroup_idx,
+	                                              std::shared_ptr<void> backing_owner,
+	                                              std::byte* const      backing_data,
+	                                              const size_t          backing_capacity,
+	                                              const bool            backing_is_pinned = false,
+	                                              ZeroCopyReadTiming*   timing            = nullptr) {
+		read_rowgroup_bytes_into(rowgroup_idx, backing_data, backing_capacity, timing);
+		return make_zero_copy_rowgroup_from_backing(
+		    rowgroup_idx, std::move(backing_owner), backing_data, backing_capacity, backing_is_pinned, timing);
+	}
+
+	ZeroCopyRowgroup read_rowgroup_zero_copy(const size_t rowgroup_idx = 0, ZeroCopyReadTiming* timing = nullptr) {
 		auto backing = std::make_shared<fastlanes::Buf>(rowgroup_storage_bytes(rowgroup_idx));
 		return read_rowgroup_zero_copy_into(rowgroup_idx,
 		                                    std::static_pointer_cast<void>(backing),
 		                                    reinterpret_cast<std::byte*>(backing->mutable_data()),
-		                                    backing->Capacity());
+		                                    backing->Capacity(),
+		                                    /*backing_is_pinned=*/false,
+		                                    timing);
 	}
 
 	Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) const {
@@ -1328,41 +1399,40 @@ private:
 		out.columns.resize(rowgroup.columns.size());
 
 		detail::SmallBuildState build_state(rowgroup.columns.size());
-		auto clone_column = [&](auto&& self, const size_t col_idx) -> Column& {
-			if (col_idx >= rowgroup.columns.size()) {
-				throw std::out_of_range("column index out of range");
-			}
-			if (build_state[col_idx] == 2) {
-				return out.columns[col_idx];
-			}
-			if (build_state[col_idx] == 1) {
-				throw std::runtime_error("cycle detected in column dependencies");
-			}
-			build_state[col_idx] = 1;
+		auto                    clone_column = [&](auto&& self, const size_t col_idx) -> Column& {
+            if (col_idx >= rowgroup.columns.size()) {
+                throw std::out_of_range("column index out of range");
+            }
+            if (build_state[col_idx] == 2) {
+                return out.columns[col_idx];
+            }
+            if (build_state[col_idx] == 1) {
+                throw std::runtime_error("cycle detected in column dependencies");
+            }
+            build_state[col_idx] = 1;
 
-			const auto& src = rowgroup.columns[col_idx];
-			auto&       dst = out.columns[col_idx];
-			dst.name        = src.name;
-			dst.token       = src.token;
+            const auto& src = rowgroup.columns[col_idx];
+            auto&       dst = out.columns[col_idx];
+            dst.name        = src.name;
+            dst.token       = src.token;
 
-			if (src.alias_of.has_value()) {
-				const size_t src_col_idx = *src.alias_of;
-				auto&        src_col     = self(self, src_col_idx);
-				dst.host                 = src_col.host;
-				dst.skip_decompress      = true;
-				dst.alias_of             = src_col_idx;
-			} else {
-				dst.host = std::visit(
-				    [](const auto& host_col) -> HostColumnVariant { return detail::clone_column(host_col); },
-				    src.host);
-			}
+            if (src.alias_of.has_value()) {
+                const size_t src_col_idx = *src.alias_of;
+                auto&        src_col     = self(self, src_col_idx);
+                dst.host                 = src_col.host;
+                dst.skip_decompress      = true;
+                dst.alias_of             = src_col_idx;
+            } else {
+                dst.host = std::visit(
+                    [](const auto& host_col) -> HostColumnVariant { return detail::clone_column(host_col); }, src.host);
+            }
 
-			dst.host_owned_by_backing = false;
-			dst.backing_base          = nullptr;
-			dst.backing_bytes         = 0;
-			dst.backing_is_pinned     = false;
-			build_state[col_idx]      = 2;
-			return dst;
+            dst.host_owned_by_backing = false;
+            dst.backing_base          = nullptr;
+            dst.backing_bytes         = 0;
+            dst.backing_is_pinned     = false;
+            build_state[col_idx]      = 2;
+            return dst;
 		};
 
 		for (size_t i = 0; i < rowgroup.columns.size(); ++i) {

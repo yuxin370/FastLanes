@@ -35,24 +35,26 @@ struct Options {
 	std::filesystem::path                input;
 	std::optional<std::filesystem::path> output;
 	std::optional<size_t>                rowgroup;
-	uint32_t                             samples                   = 1;
-	bool                                 header                    = true;
-	uint32_t                             launch_iters              = 100000;
-	uint32_t                             launch_grid               = 1;
-	uint32_t                             launch_block              = 1;
-	bool                                 per_rowgroup_workset      = false;
-	bool                                 mixed_dispatch            = true;
-	bool                                 write_back                = false;
-	uint32_t                             unpack_n_vectors          = 1;
-	uint32_t                             unpack_n_values           = 1;
-	dispatch::FreqPatcher                freq_patcher              = dispatch::FreqPatcher::Stateful;
-	float                                freq_branchless_threshold = dispatch::kFreqHybridBranchlessThreshold;
-	bool                                 enable_rowgroup_prefetch  = true;
-	bool                                 include_materialize       = false;
-	size_t                               prefetch_depth            = 2;
-	size_t                               prefetch_workers          = 2;
-	size_t                               stream_target_work_items  = 1u << 18;
-	size_t                               stream_max_rowgroups      = 8;
+	uint32_t                             samples                      = 1;
+	bool                                 header                       = true;
+	uint32_t                             launch_iters                 = 100000;
+	uint32_t                             launch_grid                  = 1;
+	uint32_t                             launch_block                 = 1;
+	bool                                 per_rowgroup_workset         = false;
+	bool                                 mixed_dispatch               = true;
+	bool                                 write_back                   = false;
+	uint32_t                             unpack_n_vectors             = 1;
+	uint32_t                             unpack_n_values              = 1;
+	dispatch::FreqPatcher                freq_patcher                 = dispatch::FreqPatcher::Stateful;
+	float                                freq_branchless_threshold    = dispatch::kFreqHybridBranchlessThreshold;
+	bool                                 enable_rowgroup_prefetch     = true;
+	bool                                 include_materialize          = false;
+	bool                                 reuse_table_resources        = false;
+	size_t                               prefetch_depth               = 4;
+	size_t                               prefetch_workers             = 0;
+	size_t                               max_prefetch_storage_bytes   = 0;
+	size_t                               stream_target_work_items     = 1u << 18;
+	size_t                               stream_max_rowgroups         = 1;
 };
 
 std::string format_bytes(double bytes) {
@@ -77,6 +79,19 @@ const char* freq_patcher_name(const dispatch::FreqPatcher patcher) {
 		return "hybrid";
 	}
 	return "unknown";
+}
+
+size_t effective_prefetch_workers(const size_t requested, const size_t rowgroups) {
+	if (requested != 0) {
+		return std::max<size_t>(1, requested);
+	}
+	if (rowgroups >= 128) {
+		return 4;
+	}
+	if (rowgroups >= 32) {
+		return 3;
+	}
+	return 2;
 }
 
 bool parse_freq_patcher(std::string_view value, Options& opt) {
@@ -130,13 +145,16 @@ void print_usage(const char* prog) {
 	    << "  --unpack-n-vectors N  Runtime decode tile size in vectors (supported: 1 or 4)\n"
 	    << "  --unpack-n-values N   Runtime decode tile size in values (currently only 1)\n"
 	    << "  --no-rowgroup-prefetch  Disable background rowgroup prefetch in whole-table execution\n"
-	    << "  --prefetch-depth N  Number of prefetched rowgroups to queue ahead (default: 2)\n"
-	    << "  --prefetch-workers N  Number of parallel prefetch threads (default: 2)\n"
+	    << "  --prefetch-depth N  Number of prefetched rowgroups to queue ahead (default: 4)\n"
+	    << "  --prefetch-workers N  Number of parallel prefetch threads (default: 0=auto)\n"
+	    << "  --max-prefetch-storage-bytes N  Fused prefetch compressed-byte budget "
+	       "(default: prefetch_depth * max rowgroup bytes)\n"
 	    << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table execution "
 	       "(default: 262144)\n"
-	    << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table execution (default: 8, "
+	    << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table execution (default: 1, "
 	       "0 disables)\n"
 	    << "  --include-materialize  Benchmark also materializes results to host pinned memory (D2H included)\n"
+	    << "  --reuse-table-resources  Benchmark steady-state query after reader/pinned-pool prepare\n"
 	    << "  --freq-patcher MODE  FREQ patcher: stateful, branchless, or hybrid[:threshold] (default: stateful)\n";
 }
 
@@ -203,6 +221,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			opt.prefetch_workers = static_cast<size_t>(std::stoull(argv[++i]));
 			continue;
 		}
+		if (arg == "--max-prefetch-storage-bytes" && i + 1 < argc) {
+			opt.max_prefetch_storage_bytes = static_cast<size_t>(std::stoull(argv[++i]));
+			continue;
+		}
 		if (arg == "--stream-target-work-items" && i + 1 < argc) {
 			opt.stream_target_work_items = static_cast<size_t>(std::stoull(argv[++i]));
 			continue;
@@ -213,6 +235,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		}
 		if (arg == "--include-materialize") {
 			opt.include_materialize = true;
+			continue;
+		}
+		if (arg == "--reuse-table-resources") {
+			opt.reuse_table_resources = true;
 			continue;
 		}
 		if (arg == "--freq-patcher" && i + 1 < argc) {
@@ -354,6 +380,7 @@ int main(int argc, char** argv) {
 			decode_cfg.enable_rowgroup_prefetch            = opt.enable_rowgroup_prefetch;
 			decode_cfg.prefetch_depth                      = opt.prefetch_depth;
 			decode_cfg.prefetch_workers                    = opt.prefetch_workers;
+			decode_cfg.max_prefetch_storage_bytes          = opt.max_prefetch_storage_bytes;
 			decode_cfg.streaming_target_work_items         = opt.stream_target_work_items;
 			decode_cfg.streaming_target_rowgroups          = opt.stream_max_rowgroups;
 			io::read_table_to_csv(opt.input, *out, opt.header, decode_cfg, opt.rowgroup);
@@ -375,19 +402,32 @@ int main(int argc, char** argv) {
 			bench_cfg.enable_rowgroup_prefetch            = opt.enable_rowgroup_prefetch;
 			bench_cfg.prefetch_depth                      = opt.prefetch_depth;
 			bench_cfg.prefetch_workers                    = opt.prefetch_workers;
+			bench_cfg.max_prefetch_storage_bytes          = opt.max_prefetch_storage_bytes;
 			bench_cfg.streaming_target_work_items         = opt.stream_target_work_items;
 			bench_cfg.streaming_target_rowgroups          = opt.stream_max_rowgroups;
 			bench_cfg.rowgroup                            = opt.rowgroup;
 			bench_cfg.include_materialize                 = opt.include_materialize;
+			bench_cfg.reuse_table_resources              = opt.reuse_table_resources;
 			if (bench_cfg.include_materialize) {
 				bench_cfg.execution.write_out = true;
 			}
 			const auto result = dispatch::benchmark_table(opt.input, bench_cfg);
 
 			const double benchmark_wall_ms         = result.end_to_end_ms;
+			const double resource_prepare_ms       = result.resource_prepare_ms;
+			const double query_wall_ms             = result.query_wall_ms;
+			const double pipeline_active_ms        = result.pipeline_active_ms;
 			const double read_rowgroup_ms          = result.read_rowgroup_ms;
 			const double file_read_ms              = result.file_read_ms;
 			const double rowgroup_build_ms         = result.rowgroup_build_ms;
+			const double pinned_acquire_ms         = result.pinned_acquire_ms;
+			const double pread_ms                  = result.pread_ms;
+			const double zero_copy_view_setup_ms   = result.zero_copy_view_setup_ms;
+			const double prefetch_depth_block_ms   = result.prefetch_depth_block_ms;
+			const double prefetch_byte_block_ms    = result.prefetch_byte_block_ms;
+			const double read_wall_ms              = result.read_wall_ms;
+			const double pread_wall_ms             = result.pread_wall_ms;
+			const double file_read_wall_ms         = result.file_read_wall_ms;
 			const double assemble_expr_ms          = result.assemble_expr_ms;
 			const double append_expr_ms            = result.append_expr_ms;
 			const double upload_workset_ms         = result.upload_workset_ms;
@@ -395,20 +435,36 @@ int main(int argc, char** argv) {
 			const double release_device_ms         = result.release_device_ms;
 			const double free_rowgroup_ms          = result.free_rowgroup_ms;
 			const double prefetch_wait_ms          = result.prefetch_wait_ms;
+			const double reader_open_ms            = result.reader_open_ms;
+			const double descriptor_load_ms        = result.descriptor_load_ms;
+			const double pinned_pool_create_ms     = result.pinned_pool_create_ms;
+			const double max_storage_scan_ms       = result.max_storage_scan_ms;
+			const double pinned_pool_prewarm_ms    = result.pinned_pool_prewarm_ms;
+			const double prefetch_queue_start_ms   = result.prefetch_queue_start_ms;
+			const double pipeline_setup_total_ms   = result.pipeline_setup_total_ms;
 			const size_t total_launches            = result.total_launches;
 			const size_t total_launch_grid         = result.total_launch_grid;
 			const size_t total_columns             = result.total_columns;
 			const size_t total_items               = result.total_items;
 			const size_t total_bytes               = result.total_bytes;
+			const size_t total_storage_bytes       = result.total_storage_bytes;
 			const size_t total_payload_arena_bytes = result.total_payload_arena_bytes;
 			const size_t total_output_arena_bytes  = result.total_output_arena_bytes;
 			const size_t total_h2d_bytes           = result.total_h2d_bytes;
 			const size_t total_h2d_copies          = result.total_h2d_copies;
 			const size_t prefetched_rowgroups      = result.prefetched_rowgroups;
 			const size_t total_rgs                 = result.total_rgs;
+			const bool   whole_table_prefetch = opt.enable_rowgroup_prefetch &&
+			                                  bench_cfg.scope == dispatch::TableDecompressionScope::WholeTable &&
+			                                  !opt.rowgroup.has_value() && total_rgs != 0;
+			const size_t actual_prefetch_workers =
+			    whole_table_prefetch ? std::min(effective_prefetch_workers(opt.prefetch_workers, total_rgs), total_rgs) : 0;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
 			                         : 0.0;
+			const double storage_read_gbps =
+			    (pread_wall_ms > 0.0) ? (static_cast<double>(total_storage_bytes) / (pread_wall_ms / 1000.0) / 1.0e9)
+			                          : 0.0;
 
 			std::cout << "Benchmark results:\n";
 			std::cout << "  rowgroups: " << total_rgs << "\n";
@@ -416,10 +472,22 @@ int main(int argc, char** argv) {
 			std::cout << "  vectors: " << total_items << "\n";
 			std::cout << "  samples: " << opt.samples << "\n";
 			std::cout << "  bytes: " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
+			std::cout << "  storage_bytes: " << total_storage_bytes << " ("
+			          << format_bytes(static_cast<double>(total_storage_bytes)) << ")\n";
 			std::cout << "  benchmark_wall_ms: " << benchmark_wall_ms << "\n";
+			std::cout << "  resource_prepare_ms: " << resource_prepare_ms << "\n";
+			std::cout << "  query_wall_ms: " << query_wall_ms << "\n";
+			std::cout << "  pipeline_active_ms: " << pipeline_active_ms << "\n";
 			std::cout << "  read_rowgroup_ms: " << read_rowgroup_ms << "\n";
 			std::cout << "  file_read_ms: " << file_read_ms << "\n";
 			std::cout << "  rowgroup_build_ms: " << rowgroup_build_ms << "\n";
+			std::cout << "  pinned_acquire_ms: " << pinned_acquire_ms << "\n";
+			std::cout << "  pread_ms: " << pread_ms << "\n";
+			std::cout << "  pread_wall_ms: " << pread_wall_ms << "\n";
+			std::cout << "  zero_copy_view_setup_ms: " << zero_copy_view_setup_ms << "\n";
+			std::cout << "  read_wall_ms: " << read_wall_ms << "\n";
+			std::cout << "  file_read_wall_ms: " << file_read_wall_ms << "\n";
+			std::cout << "  storage_read_gbps: " << storage_read_gbps << "\n";
 			std::cout << "  assemble_expr_ms: " << assemble_expr_ms << "\n";
 			std::cout << "  append_expr_ms: " << append_expr_ms << "\n";
 			std::cout << "  upload_workset_ms: " << upload_workset_ms << "\n";
@@ -444,6 +512,20 @@ int main(int argc, char** argv) {
 			std::cout << "  release_device_ms: " << release_device_ms << "\n";
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";
 			std::cout << "  prefetch_wait_ms: " << prefetch_wait_ms << "\n";
+			std::cout << "  prefetch_depth_block_ms: " << prefetch_depth_block_ms << "\n";
+			std::cout << "  prefetch_byte_block_ms: " << prefetch_byte_block_ms << "\n";
+			std::cout << "  prefetch_pool_owner_reuses: " << result.prefetch_pool_owner_reuses << "\n";
+			std::cout << "  prefetch_pool_owner_migrations: " << result.prefetch_pool_owner_migrations << "\n";
+			std::cout << "  prefetch_pool_allocations: " << result.prefetch_pool_allocations << "\n";
+			std::cout << "  reader_open_ms: " << reader_open_ms << "\n";
+			std::cout << "  descriptor_load_ms: " << descriptor_load_ms << "\n";
+			std::cout << "  pinned_pool_create_ms: " << pinned_pool_create_ms << "\n";
+			std::cout << "  max_storage_scan_ms: " << max_storage_scan_ms << "\n";
+			std::cout << "  pinned_pool_prewarm_ms: " << pinned_pool_prewarm_ms << "\n";
+			std::cout << "  prefetch_queue_start_ms: " << prefetch_queue_start_ms << "\n";
+			std::cout << "  pipeline_setup_total_ms: " << pipeline_setup_total_ms << "\n";
+			std::cout << "  first_rowgroup_read_start_ms: " << result.first_rowgroup_read_start_ms << "\n";
+			std::cout << "  first_rowgroup_ready_ms: " << result.first_rowgroup_ready_ms << "\n";
 			std::cout << "  prefetched_rowgroups: " << prefetched_rowgroups << "\n";
 			// Alias metrics used by existing scripts.
 			std::cout << "  end_to_end_ms: " << benchmark_wall_ms << "\n";
@@ -456,11 +538,14 @@ int main(int argc, char** argv) {
 			std::cout << "  stream_max_rowgroups: " << opt.stream_max_rowgroups << "\n";
 			std::cout << "  rowgroup_prefetch: " << (opt.enable_rowgroup_prefetch ? 1 : 0) << "\n";
 			std::cout << "  prefetch_depth: " << opt.prefetch_depth << "\n";
-			std::cout << "  prefetch_workers: " << opt.prefetch_workers << "\n";
+			std::cout << "  prefetch_workers: " << actual_prefetch_workers << "\n";
+			std::cout << "  prefetch_workers_requested: " << opt.prefetch_workers << "\n";
+			std::cout << "  max_prefetch_storage_bytes: " << opt.max_prefetch_storage_bytes << "\n";
 			std::cout << "  unpack_n_vectors: " << opt.unpack_n_vectors << "\n";
 			std::cout << "  unpack_n_values: " << opt.unpack_n_values << "\n";
 			std::cout << "  write_back: " << (bench_cfg.execution.write_out ? 1 : 0) << "\n";
 			std::cout << "  include_materialize: " << (opt.include_materialize ? 1 : 0) << "\n";
+			std::cout << "  reuse_table_resources: " << (opt.reuse_table_resources ? 1 : 0) << "\n";
 			std::cout << "  freq_patcher: " << freq_patcher_name(opt.freq_patcher) << "\n";
 			std::cout << "  freq_hybrid_threshold: " << opt.freq_branchless_threshold << "\n";
 			return 0;

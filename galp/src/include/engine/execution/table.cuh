@@ -27,15 +27,17 @@ struct TableDecompressionConfig {
 	ExecutionConfig         execution                = {};
 	TableDecompressionScope scope                    = TableDecompressionScope::PerRowgroup;
 	bool                    enable_rowgroup_prefetch = true;
-	size_t                  prefetch_depth           = 2;
-	// Two workers is optimal when the file is already in page cache (the
-	// repeated-benchmark regime): more threads add memcpy contention without
-	// extra disk-side throughput, since cache reads run at ~30 GB/s and a
-	// single rowgroup is only ~2.5 MiB. Cold-disk runs over the Gen5 NVMe
-	// benefit from --prefetch-workers 4 to push drive-level QD towards 8.
-	size_t prefetch_workers            = 2;
-	size_t streaming_target_work_items = 1u << 18;
-	size_t streaming_target_rowgroups  = 8;
+	size_t                  prefetch_depth           = 4;
+	// Zero selects a rowgroup-count based default in the table pipeline. The
+	// current warm path favors more fused workers on large tables after
+	// owner-affine buffer reuse, while small tables still avoid extra CPU/cache
+	// contention.
+	size_t prefetch_workers = 0;
+	// Zero derives a byte budget from prefetch_depth * max rowgroup storage
+	// bytes. Non-zero caps compressed bytes reserved by fused prefetch workers.
+	size_t max_prefetch_storage_bytes   = 0;
+	size_t streaming_target_work_items  = 1u << 18;
+	size_t streaming_target_rowgroups   = 1;
 };
 
 using TableRowgroupPredicate = std::function<bool(size_t)>;
