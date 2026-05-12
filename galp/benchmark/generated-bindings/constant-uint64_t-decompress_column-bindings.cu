@@ -8,34 +8,34 @@
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 
-namespace bindings {
+namespace galp::bench::bindings {
 
 template <>
-uint64_t* decompress_column<uint64_t, flsgpu::device::CONSTANTColumn<uint64_t>>(
-    const flsgpu::device::CONSTANTColumn<uint64_t> column,
+uint64_t* decompress_column<uint64_t, galp::codec::device::CONSTANTColumn<uint64_t>>(
+    const galp::codec::device::CONSTANTColumn<uint64_t> column,
     const unsigned                                 unpack_n_vectors,
     const unsigned                                 unpack_n_values,
-    const enums::Unpacker                          unpacker,
-    const enums::Patcher                           patcher,
-    const enums::Expander                          expander,
+    const galp::format::Unpacker                          unpacker,
+    const galp::format::Patcher                           patcher,
+    const galp::format::Expander                          expander,
     const uint32_t                                 n_samples) {
 	if (unpack_n_vectors == 1 && unpack_n_values == 1) {
-		return kernels::host::decompress_column<
+		return galp::kernels::host::decompress_column<
 		    uint64_t,
 		    1,
 		    1,
-		    flsgpu::device::CONSTANTDecompressor<uint64_t, 1, 1, flsgpu::device::CONSTANTColumn<uint64_t>>,
-		    flsgpu::device::CONSTANTColumn<uint64_t>>(column, n_samples);
+		    galp::codec::device::CONSTANTDecompressor<uint64_t, 1, 1, galp::codec::device::CONSTANTColumn<uint64_t>>,
+		    galp::codec::device::CONSTANTColumn<uint64_t>>(column, n_samples);
 	}
 	if (unpack_n_vectors == 4 && unpack_n_values == 1) {
-		return kernels::host::decompress_column<
+		return galp::kernels::host::decompress_column<
 		    uint64_t,
 		    4,
 		    1,
-		    flsgpu::device::CONSTANTDecompressor<uint64_t, 4, 1, flsgpu::device::CONSTANTColumn<uint64_t>>,
-		    flsgpu::device::CONSTANTColumn<uint64_t>>(column, n_samples);
+		    galp::codec::device::CONSTANTDecompressor<uint64_t, 4, 1, galp::codec::device::CONSTANTColumn<uint64_t>>,
+		    galp::codec::device::CONSTANTColumn<uint64_t>>(column, n_samples);
 	}
 	throw std::invalid_argument("Could not find correct binding in decompress_column CONSTANT<uint64_t>");
 }
 
-} // namespace bindings
+} // namespace galp::bench::bindings

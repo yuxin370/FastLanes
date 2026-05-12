@@ -12,52 +12,55 @@
 #ifndef GPU_DEVICE_UTILS_CUH
 #define GPU_DEVICE_UTILS_CUH
 
-namespace lane_policy {
+namespace galp::lane_policy {
 
 // Value-lane policy keeps FastLanes semantics:
 // logical lanes are derived from the encoded value type width.
 template <typename T>
 struct ValueLanePolicy {
-	static constexpr uint32_t semantic_lanes = static_cast<uint32_t>(utils::get_n_lanes<T>());
-	static constexpr uint32_t scheduling_lanes =
-	    (semantic_lanes < uint32_t {consts::THREADS_PER_WARP}) ? uint32_t {consts::THREADS_PER_WARP} : semantic_lanes;
-	static constexpr uint32_t values_per_lane = static_cast<uint32_t>(utils::get_values_per_lane<T>());
+	static constexpr uint32_t semantic_lanes   = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<T>());
+	static constexpr uint32_t scheduling_lanes = (semantic_lanes < uint32_t {galp::codec::consts::THREADS_PER_WARP})
+	                                                 ? uint32_t {galp::codec::consts::THREADS_PER_WARP}
+	                                                 : semantic_lanes;
+	static constexpr uint32_t values_per_lane  = static_cast<uint32_t>(galp::codec::utils::get_values_per_lane<T>());
 };
 
-} // namespace lane_policy
+} // namespace galp::lane_policy
 
 template <typename T>
 struct SingleVectorPerWarpThreadblockMapping {
-	using Policy = lane_policy::ValueLanePolicy<T>;
+	using Policy = galp::lane_policy::ValueLanePolicy<T>;
 
 	static constexpr unsigned N_WARPS_PER_BLOCK =
-	    std::max(Policy::semantic_lanes / uint32_t {consts::THREADS_PER_WARP},
+	    std::max(Policy::semantic_lanes / uint32_t {galp::codec::consts::THREADS_PER_WARP},
 	             8u); // at least 8 warps per block to ensure enough parallelism for latency hiding
-	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
+	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * galp::codec::consts::THREADS_PER_WARP;
 	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK =
-	    N_THREADS_PER_BLOCK / std::max(Policy::semantic_lanes, uint32_t {consts::THREADS_PER_WARP});
+	    N_THREADS_PER_BLOCK / std::max(Policy::semantic_lanes, uint32_t {galp::codec::consts::THREADS_PER_WARP});
 
 	const unsigned n_blocks;
 
-	// to cover all the vectors, we need at least n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK) blocks
 	SingleVectorPerWarpThreadblockMapping(const size_t unpack_n_vecs, const size_t n_vecs)
-	    : n_blocks(std::max(static_cast<unsigned long>(1), n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK))) {
+	    : n_blocks(std::max<size_t>(1,
+	                                (n_vecs + (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK) - 1) /
+	                                    (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK))) {
 	}
 };
 template <typename T>
 struct FillWarpThreadblockMapping {
-	using Policy = lane_policy::ValueLanePolicy<T>;
+	using Policy = galp::lane_policy::ValueLanePolicy<T>;
 
 	static constexpr unsigned N_WARPS_PER_BLOCK =
-	    std::max(Policy::semantic_lanes / uint32_t {consts::THREADS_PER_WARP}, 8u);
-	static constexpr unsigned N_THREADS_PER_BLOCK            = N_WARPS_PER_BLOCK * consts::THREADS_PER_WARP;
+	    std::max(Policy::semantic_lanes / uint32_t {galp::codec::consts::THREADS_PER_WARP}, 8u);
+	static constexpr unsigned N_THREADS_PER_BLOCK = N_WARPS_PER_BLOCK * galp::codec::consts::THREADS_PER_WARP;
 	static constexpr unsigned N_CONCURRENT_VECTORS_PER_BLOCK = N_THREADS_PER_BLOCK / Policy::semantic_lanes;
 
 	const unsigned n_blocks;
 
 	FillWarpThreadblockMapping(const size_t unpack_n_vecs, const size_t n_vecs)
-	    : n_blocks(
-	          (std::max(static_cast<unsigned long>(1), n_vecs / (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK)))) {
+	    : n_blocks(std::max<size_t>(1,
+	                                (n_vecs + (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK) - 1) /
+	                                    (unpack_n_vecs * N_CONCURRENT_VECTORS_PER_BLOCK))) {
 	}
 };
 
@@ -71,7 +74,7 @@ using ThreadblockMapping = FillWarpThreadblockMapping<T>;
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct SingleVectorPerWarpMapping {
-	using Policy = lane_policy::ValueLanePolicy<T>;
+	using Policy = galp::lane_policy::ValueLanePolicy<T>;
 
 	static constexpr uint32_t N_LANES          = Policy::semantic_lanes;
 	static constexpr uint32_t N_VALUES_IN_LANE = Policy::values_per_lane;
@@ -85,7 +88,7 @@ struct SingleVectorPerWarpMapping {
 		// by the block simultaneously, assuming that each thread is 1 lane
 
 		const int32_t concurrent_vectors_per_block =
-		    blockDim.x / std::max(N_LANES, uint32_t {consts::THREADS_PER_WARP});
+		    blockDim.x / std::max(N_LANES, uint32_t {galp::codec::consts::THREADS_PER_WARP});
 		const int32_t vectors_per_block = concurrent_vectors_per_block * UNPACK_N_VECTORS;
 
 		const int32_t concurrent_vector_index = threadIdx.x / N_LANES;
@@ -97,7 +100,7 @@ struct SingleVectorPerWarpMapping {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct FillWarpMapping {
-	using Policy = lane_policy::ValueLanePolicy<T>;
+	using Policy = galp::lane_policy::ValueLanePolicy<T>;
 
 	static constexpr uint32_t N_LANES          = Policy::semantic_lanes;
 	static constexpr uint32_t N_VALUES_IN_LANE = Policy::values_per_lane;
@@ -129,8 +132,8 @@ using VectorToWarpMapping = FillWarpMapping<T, UNPACK_N_VECTORS>;
 #endif
 
 struct MixedSlotMapping {
-	static constexpr uint32_t SLOT_LANES          = static_cast<uint32_t>(utils::get_n_lanes<int8_t>());
-	static constexpr uint32_t HALF_SLOT_LANES     = static_cast<uint32_t>(utils::get_n_lanes<int16_t>());
+	static constexpr uint32_t SLOT_LANES          = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<int8_t>());
+	static constexpr uint32_t HALF_SLOT_LANES     = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<int16_t>());
 	static constexpr uint32_t N_THREADS_PER_BLOCK = 128;
 
 	size_t n_slots = 0;
@@ -168,7 +171,7 @@ template <typename T,
           unsigned UNPACK_N_VECTORS,
           unsigned UNPACK_N_VALUES,
           unsigned N_LANES,
-          typename UntransposerT = flsgpu::device::IdentityUntransposer>
+          typename UntransposerT = galp::codec::device::IdentityUntransposer>
 __device__ __forceinline__ void write_registers_to_global(const lane_t lane,
                                                           const si_t   index_offset,
                                                           const T* __restrict registers,
@@ -176,7 +179,8 @@ __device__ __forceinline__ void write_registers_to_global(const lane_t lane,
 	for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 		for (int w {0}; w < UNPACK_N_VALUES; ++w) {
 			const uint32_t in_idx = static_cast<uint32_t>(lane) + static_cast<uint32_t>(index_offset + w) * N_LANES;
-			out[v * consts::VALUES_PER_VECTOR + UntransposerT::map_index(in_idx)] = registers[w + v * UNPACK_N_VALUES];
+			out[v * galp::codec::consts::VALUES_PER_VECTOR + UntransposerT::map_index(in_idx)] =
+			    registers[w + v * UNPACK_N_VALUES];
 		}
 	}
 }

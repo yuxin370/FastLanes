@@ -9,7 +9,7 @@
 #include "engine/device-utils.cuh"
 #include "flsgpu/flsgpu.cuh"
 
-namespace multi_column {
+namespace galp::bench::multi_column {
 
 template <typename T, unsigned UNPACK_N_VECS, unsigned UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
 __global__ void query_multi_column(const ColumnT column_0, const T value, bool* out) {
@@ -528,5 +528,5 @@ __global__ void query_multi_column(const ColumnT column_0,
 	}
 }
 
-} // namespace multi_column
+} // namespace galp::bench::multi_column
 #endif // MULTI_COLUMN_DEVICE_KERNELS_CUH

@@ -8,187 +8,187 @@
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 
-namespace bindings {
+namespace galp::bench::bindings {
 
 template <>
-bool query_column<float, flsgpu::device::ALPExtendedColumn<float>>(
-    const flsgpu::device::ALPExtendedColumn<float> column,
+bool query_column<float, galp::codec::device::ALPExtendedColumn<float>>(
+    const galp::codec::device::ALPExtendedColumn<float> column,
     const unsigned                                 unpack_n_vectors,
     const unsigned                                 unpack_n_values,
-    const enums::Unpacker                          unpacker,
-    const enums::Patcher                           patcher,
+    const galp::format::Unpacker                          unpacker,
+    const galp::format::Patcher                           patcher,
     const float                                    magic_value,
     const uint32_t                                 n_samples) {
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == enums::Unpacker::OldFls &&
-	    patcher == enums::Patcher::Naive) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == galp::format::Unpacker::OldFls &&
+	    patcher == galp::format::Patcher::Naive) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    32,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerOldFls<float, 1, 32, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::NaiveALPExceptionPatcher<float, 1, 32>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerOldFls<float, 1, 32, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::NaiveALPExceptionPatcher<float, 1, 32>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == enums::Unpacker::OldFls &&
-	    patcher == enums::Patcher::NaiveBranchless) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == galp::format::Unpacker::OldFls &&
+	    patcher == galp::format::Patcher::NaiveBranchless) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    32,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerOldFls<float, 1, 32, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::NaiveBranchlessALPExceptionPatcher<float, 1, 32>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerOldFls<float, 1, 32, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::NaiveBranchlessALPExceptionPatcher<float, 1, 32>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == enums::Unpacker::OldFls &&
-	    patcher == enums::Patcher::PrefetchAll) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == galp::format::Unpacker::OldFls &&
+	    patcher == galp::format::Patcher::PrefetchAll) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    32,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerOldFls<float, 1, 32, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::PrefetchAllALPExceptionPatcher<float, 1, 32>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerOldFls<float, 1, 32, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::PrefetchAllALPExceptionPatcher<float, 1, 32>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == enums::Unpacker::OldFls &&
-	    patcher == enums::Patcher::PrefetchAllBranchless) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == galp::format::Unpacker::OldFls &&
+	    patcher == galp::format::Patcher::PrefetchAllBranchless) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    32,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerOldFls<float, 1, 32, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::PrefetchAllBranchlessALPExceptionPatcher<float, 1, 32>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerOldFls<float, 1, 32, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::PrefetchAllBranchlessALPExceptionPatcher<float, 1, 32>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::Naive) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::Naive) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 1, 1, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::NaiveALPExceptionPatcher<float, 1, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 1, 1, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::NaiveALPExceptionPatcher<float, 1, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::NaiveBranchless) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::NaiveBranchless) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 1, 1, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::NaiveBranchlessALPExceptionPatcher<float, 1, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 1, 1, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::NaiveBranchlessALPExceptionPatcher<float, 1, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::PrefetchAll) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::PrefetchAll) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 1, 1, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::PrefetchAllALPExceptionPatcher<float, 1, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 1, 1, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::PrefetchAllALPExceptionPatcher<float, 1, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::PrefetchAllBranchless) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::PrefetchAllBranchless) {
+		return galp::kernels::host::query_column<
 		    float,
 		    1,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 1, 1, flsgpu::device::ALPFunctor<float, 1>>,
-		        flsgpu::device::PrefetchAllBranchlessALPExceptionPatcher<float, 1, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 1, 1, galp::codec::device::ALPFunctor<float, 1>>,
+		        galp::codec::device::PrefetchAllBranchlessALPExceptionPatcher<float, 1, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
 
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::Naive) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::Naive) {
+		return galp::kernels::host::query_column<
 		    float,
 		    4,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 4, 1, flsgpu::device::ALPFunctor<float, 4>>,
-		        flsgpu::device::NaiveALPExceptionPatcher<float, 4, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 4, 1, galp::codec::device::ALPFunctor<float, 4>>,
+		        galp::codec::device::NaiveALPExceptionPatcher<float, 4, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::NaiveBranchless) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::NaiveBranchless) {
+		return galp::kernels::host::query_column<
 		    float,
 		    4,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 4, 1, flsgpu::device::ALPFunctor<float, 4>>,
-		        flsgpu::device::NaiveBranchlessALPExceptionPatcher<float, 4, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 4, 1, galp::codec::device::ALPFunctor<float, 4>>,
+		        galp::codec::device::NaiveBranchlessALPExceptionPatcher<float, 4, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::PrefetchAll) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::PrefetchAll) {
+		return galp::kernels::host::query_column<
 		    float,
 		    4,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 4, 1, flsgpu::device::ALPFunctor<float, 4>>,
-		        flsgpu::device::PrefetchAllALPExceptionPatcher<float, 4, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 4, 1, galp::codec::device::ALPFunctor<float, 4>>,
+		        galp::codec::device::PrefetchAllALPExceptionPatcher<float, 4, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::PrefetchAllBranchless) {
-		return kernels::host::query_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::PrefetchAllBranchless) {
+		return galp::kernels::host::query_column<
 		    float,
 		    4,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        float,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<float, 4, 1, flsgpu::device::ALPFunctor<float, 4>>,
-		        flsgpu::device::PrefetchAllBranchlessALPExceptionPatcher<float, 4, 1>,
-		        flsgpu::device::ALPExtendedColumn<float>>,
-		    flsgpu::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<float, 4, 1, galp::codec::device::ALPFunctor<float, 4>>,
+		        galp::codec::device::PrefetchAllBranchlessALPExceptionPatcher<float, 4, 1>,
+		        galp::codec::device::ALPExtendedColumn<float>>,
+		    galp::codec::device::ALPExtendedColumn<float>>(column, magic_value, n_samples);
 	}
 	throw std::invalid_argument("Could not find correct binding in query_column ALPExtended<float>");
 }
 
-} // namespace bindings
+} // namespace galp::bench::bindings

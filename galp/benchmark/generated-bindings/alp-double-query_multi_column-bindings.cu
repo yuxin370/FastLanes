@@ -8,47 +8,47 @@
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 
-namespace bindings {
+namespace galp::bench::bindings {
 
 template <>
-bool query_multi_column<double, flsgpu::host::ALPColumn<double>>(const flsgpu::host::ALPColumn<double> column,
+bool query_multi_column<double, galp::codec::host::ALPColumn<double>>(const galp::codec::host::ALPColumn<double>& column,
                                                                  const unsigned                        unpack_n_vectors,
                                                                  const unsigned                        unpack_n_values,
-                                                                 const enums::Unpacker                 unpacker,
-                                                                 const enums::Patcher                  patcher,
+                                                                 const galp::format::Unpacker                 unpacker,
+                                                                 const galp::format::Patcher                  patcher,
                                                                  const double                          magic_value,
                                                                  const uint32_t                        n_samples) {
 
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::Stateful) {
-		return kernels::host::query_multi_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::Stateful) {
+		return galp::kernels::host::query_multi_column<
 		    double,
 		    1,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        double,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<double, 1, 1, flsgpu::device::ALPFunctor<double, 1>>,
-		        flsgpu::device::StatefulALPExceptionPatcher<double, 1, 1>,
-		        flsgpu::device::ALPColumn<double>>,
-		    flsgpu::host::ALPColumn<double>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<double, 1, 1, galp::codec::device::ALPFunctor<double, 1>>,
+		        galp::codec::device::StatefulALPExceptionPatcher<double, 1, 1>,
+		        galp::codec::device::ALPColumn<double>>,
+		    galp::codec::host::ALPColumn<double>>(column, magic_value, n_samples);
 	}
 
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::Stateful) {
-		return kernels::host::query_multi_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::Stateful) {
+		return galp::kernels::host::query_multi_column<
 		    double,
 		    4,
 		    1,
-		    flsgpu::device::ALPDecompressor<
+		    galp::codec::device::ALPDecompressor<
 		        double,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<double, 4, 1, flsgpu::device::ALPFunctor<double, 4>>,
-		        flsgpu::device::StatefulALPExceptionPatcher<double, 4, 1>,
-		        flsgpu::device::ALPColumn<double>>,
-		    flsgpu::host::ALPColumn<double>>(column, magic_value, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<double, 4, 1, galp::codec::device::ALPFunctor<double, 4>>,
+		        galp::codec::device::StatefulALPExceptionPatcher<double, 4, 1>,
+		        galp::codec::device::ALPColumn<double>>,
+		    galp::codec::host::ALPColumn<double>>(column, magic_value, n_samples);
 	}
 	throw std::invalid_argument("Could not find correct binding in query_multi_column ALP<double>");
 }
 
-} // namespace bindings
+} // namespace galp::bench::bindings

@@ -18,7 +18,7 @@ FILE_HEADER = """
 #ifndef MULTI_COLUMN_DEVICE_KERNELS_CUH
 #define MULTI_COLUMN_DEVICE_KERNELS_CUH
 
-namespace multi_column {
+namespace galp::bench::multi_column {
 """
 
 FILE_FOOTER = """

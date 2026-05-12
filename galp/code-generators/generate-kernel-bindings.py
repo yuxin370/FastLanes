@@ -20,7 +20,7 @@ FILE_HEADER = """
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 
-namespace bindings{
+namespace galp::bench::bindings {
 """
 
 FILE_FOOTER = """
@@ -152,9 +152,9 @@ def get_column_t(
     elif "CONSTANT" in encoding:
         column_t = f"CONSTANTColumn<{data_type}>"
     return (
-        "flsgpu::device::"
+        "galp::codec::device::"
         if function != "query_multi_column" or for_decompressor
-        else "flsgpu::host::"
+        else "galp::codec::host::"
     ) + column_t
 
 
@@ -177,25 +177,25 @@ def get_decompressor_type(
         functor = f"FFORFunctor<{data_type}, {n_vec}>"
     elif "SLPATCH" in encoding and "DICTSLPATCH" not in encoding:
         functor = f"FFORFunctor<{data_type}, {n_vec}>"
-        patcher_t = f"flsgpu::device::{patcher}SLPATCHExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+        patcher_t = f"galp::codec::device::{patcher}SLPATCHExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
         decompressor_t = "SLPATCHDecompressor"
     elif "ALPExtended" in encoding:
         functor = f"ALPFunctor<{data_type}, {n_vec}>"
-        patcher_t = f"flsgpu::device::{patcher}ALPExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+        patcher_t = f"galp::codec::device::{patcher}ALPExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
         decompressor_t = "ALPDecompressor"
     elif "ALP" in encoding:
         functor = f"ALPFunctor<{data_type}, {n_vec}>"
-        patcher_t = f"flsgpu::device::{patcher}ALPExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+        patcher_t = f"galp::codec::device::{patcher}ALPExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
     elif "FREQExtended" in encoding:
-        patcher_t = f"flsgpu::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+        patcher_t = f"galp::codec::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
         decompressor_t = "FREQDecompressor"
     elif "FREQ" in encoding:
-        patcher_t = f"flsgpu::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
+        patcher_t = f"galp::codec::device::{patcher}FREQExceptionPatcher<{data_type}, {n_vec}, {n_val}>,"
     elif "DICTSLPATCH" in encoding:
         functor = f"DICTFunctor<{data_type}, {n_vec}>"
-        index_t = f"utils::same_width_uint<{data_type}>::type"
+        index_t = f"galp::codec::utils::same_width_uint<{data_type}>::type"
         patcher_t = (
-            f"flsgpu::device::{patcher}SLPATCHDictExceptionPatcher<"
+            f"galp::codec::device::{patcher}SLPATCHDictExceptionPatcher<"
             f"{data_type}, {index_t}, {n_vec}, {n_val}>,"
         )
         decompressor_t = "DICTSLPATCHDecompressor"
@@ -211,17 +211,17 @@ def get_decompressor_type(
     elif "CONSTANT" in encoding:
         decompressor_t = "CONSTANTDecompressor"
     elif "CROSSRLEExtended" in encoding:
-        expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
+        expander_t = f"galp::codec::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
         decompressor_t = "CROSSRLEDecompressor"
     elif "CROSSRLELaneMask" in encoding:
-        expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
+        expander_t = f"galp::codec::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
         decompressor_t = "CROSSRLEDecompressor"
     elif "CROSSRLE" in encoding:
-        expander_t = f"flsgpu::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
+        expander_t = f"galp::codec::device::{expander}CROSSRLEExpander<{data_type}, {n_vec}, {n_val}>,"
 
     loader_t = ""
     if "Stateful" in unpacker and "StatefulBranchless" not in unpacker:
-        loader_t = ", flsgpu::device::"
+        loader_t = ", galp::codec::device::"
         if "Cache" in unpacker:
             loader_t += f"CacheLoader<{data_type}, {n_vec}>"
         elif "Local" in unpacker:
@@ -236,21 +236,21 @@ def get_decompressor_type(
             loader_t += f"RegisterLoader<{data_type}, {n_vec}, {unpacker[-1]}>"
         unpacker = "Stateful"
 
-    unpacker_t = f"flsgpu::device::BitUnpacker{unpacker}<{data_type}, {n_vec}, {n_val},  flsgpu::device::{functor} {loader_t}>,"
+    unpacker_t = f"galp::codec::device::BitUnpacker{unpacker}<{data_type}, {n_vec}, {n_val},  galp::codec::device::{functor} {loader_t}>,"
 
     if "FREQ" in encoding or "FREQExtended" in encoding or "CROSSRLE" in encoding or "CROSSRLEExtended" in encoding or "CROSSRLELaneMask" in encoding:
         unpacker_t = f""
     if "CONSTANT" in encoding:
-        return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {n_val}, {column_t}>"
+        return f"galp::codec::device::{decompressor_t}<{data_type}, {n_vec}, {n_val}, {column_t}>"
     if encoding == "RLE":
         rle_expander_t = (
-            f"flsgpu::device::{expander_name}RLEExpander<"
+            f"galp::codec::device::{expander_name}RLEExpander<"
             f"{data_type}, {code_t}, {n_vec}, {n_val}>,"
         )
-        return f"flsgpu::device::{decompressor_t}<{data_type}, {code_t}, {n_vec}, {n_val}, {unpacker_t} {rle_expander_t} {column_t}>"
+        return f"galp::codec::device::{decompressor_t}<{data_type}, {code_t}, {n_vec}, {n_val}, {unpacker_t} {rle_expander_t} {column_t}>"
     if "DICTSLPATCH" in encoding:
-        return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {n_val}, {unpacker_t} {patcher_t} {column_t}>"
-    return f"flsgpu::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {expander_t} {column_t}>"
+        return f"galp::codec::device::{decompressor_t}<{data_type}, {n_vec}, {n_val}, {unpacker_t} {patcher_t} {column_t}>"
+    return f"galp::codec::device::{decompressor_t}<{data_type}, {n_vec}, {unpacker_t} {patcher_t} {expander_t} {column_t}>"
 
 
 def get_if_statement(
@@ -287,29 +287,29 @@ def get_if_statement(
 
     if encoding == "CROSSRLE" or encoding == "CROSSRLEExtended" or encoding == "CROSSRLELaneMask":
         return (
-            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == enums::Expander::{expander} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == galp::format::Expander::{expander} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
             + "{"  # }
-            f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+            f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
         )
     if encoding == "CONSTANT":
         return (
             f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
             + "{"  # }
-            f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+            f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
         )
     if encoding == "FREQ" or encoding == "FREQExtended":
         return (
-            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && patcher == enums::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && patcher == galp::format::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
             + "{"  # }
-            f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+            f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
         )
     return (
-        f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && unpacker == enums::Unpacker::{unpacker} && patcher == enums::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+        f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && unpacker == galp::format::Unpacker::{unpacker} && patcher == galp::format::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
         + "{"  # }
-        f"return kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+        f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
         "}"
     )
 
@@ -326,9 +326,10 @@ def get_function(
 ) -> str:
     assert not (is_multi_column and is_compute_column)
     column_t = get_column_t(encoding, data_type, function)
+    column_param_t = f"const {column_t}&" if is_multi_column else f"const {column_t}"
     return (
-        # f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values{', const enums::Expander expander' if encoding == "CROSSRLE" else ', const enums::Unpacker unpacker, const enums::Patcher patcher '}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
-        f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values, const enums::Unpacker unpacker, const enums::Patcher patcher{', const enums::Expander expander' if function == "decompress_column" else ''}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
+        # f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values{', const galp::format::Expander expander' if encoding == "CROSSRLE" else ', const galp::format::Unpacker unpacker, const galp::format::Patcher patcher '}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
+        f"template<> {return_type} {function}<{data_type},{column_t}>({column_param_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values, const galp::format::Unpacker unpacker, const galp::format::Patcher patcher{', const galp::format::Expander expander' if function == "decompress_column" else ''}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
         + "{"
         + "\n".join(content)
         + f'throw std::invalid_argument("Could not find correct binding in {function} {encoding}<{data_type}>");'

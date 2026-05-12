@@ -8,84 +8,84 @@
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 
-namespace bindings {
+namespace galp::bench::bindings {
 
 template <>
 uint32_t*
-decompress_column<uint32_t, flsgpu::device::BPColumn<uint32_t>>(const flsgpu::device::BPColumn<uint32_t> column,
+decompress_column<uint32_t, galp::codec::device::BPColumn<uint32_t>>(const galp::codec::device::BPColumn<uint32_t> column,
                                                                 const unsigned        unpack_n_vectors,
                                                                 const unsigned        unpack_n_values,
-                                                                const enums::Unpacker unpacker,
-                                                                const enums::Patcher  patcher,
-                                                                const enums::Expander expander,
+                                                                const galp::format::Unpacker unpacker,
+                                                                const galp::format::Patcher  patcher,
+                                                                const galp::format::Expander expander,
                                                                 const uint32_t        n_samples) {
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
-	    patcher == enums::Patcher::None) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::Dummy &&
+	    patcher == galp::format::Patcher::None) {
+		return galp::kernels::host::decompress_column<
 		    uint32_t,
 		    1,
 		    1,
-		    flsgpu::device::BPDecompressor<
+		    galp::codec::device::BPDecompressor<
 		        uint32_t,
 		        1,
-		        flsgpu::device::BitUnpackerDummy<uint32_t, 1, 1, flsgpu::device::BPFunctor<uint32_t>>,
-		        flsgpu::device::BPColumn<uint32_t>>,
-		    flsgpu::device::BPColumn<uint32_t>>(column, n_samples);
+		        galp::codec::device::BitUnpackerDummy<uint32_t, 1, 1, galp::codec::device::BPFunctor<uint32_t>>,
+		        galp::codec::device::BPColumn<uint32_t>>,
+		    galp::codec::device::BPColumn<uint32_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == enums::Unpacker::OldFls &&
-	    patcher == enums::Patcher::None) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 32 && unpacker == galp::format::Unpacker::OldFls &&
+	    patcher == galp::format::Patcher::None) {
+		return galp::kernels::host::decompress_column<
 		    uint32_t,
 		    1,
 		    32,
-		    flsgpu::device::BPDecompressor<
+		    galp::codec::device::BPDecompressor<
 		        uint32_t,
 		        1,
-		        flsgpu::device::BitUnpackerOldFls<uint32_t, 1, 32, flsgpu::device::BPFunctor<uint32_t>>,
-		        flsgpu::device::BPColumn<uint32_t>>,
-		    flsgpu::device::BPColumn<uint32_t>>(column, n_samples);
+		        galp::codec::device::BitUnpackerOldFls<uint32_t, 1, 32, galp::codec::device::BPFunctor<uint32_t>>,
+		        galp::codec::device::BPColumn<uint32_t>>,
+		    galp::codec::device::BPColumn<uint32_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::None) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::None) {
+		return galp::kernels::host::decompress_column<
 		    uint32_t,
 		    1,
 		    1,
-		    flsgpu::device::BPDecompressor<
+		    galp::codec::device::BPDecompressor<
 		        uint32_t,
 		        1,
-		        flsgpu::device::BitUnpackerStatefulBranchless<uint32_t, 1, 1, flsgpu::device::BPFunctor<uint32_t>>,
-		        flsgpu::device::BPColumn<uint32_t>>,
-		    flsgpu::device::BPColumn<uint32_t>>(column, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<uint32_t, 1, 1, galp::codec::device::BPFunctor<uint32_t>>,
+		        galp::codec::device::BPColumn<uint32_t>>,
+		    galp::codec::device::BPColumn<uint32_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::Dummy &&
-	    patcher == enums::Patcher::None) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::Dummy &&
+	    patcher == galp::format::Patcher::None) {
+		return galp::kernels::host::decompress_column<
 		    uint32_t,
 		    4,
 		    1,
-		    flsgpu::device::BPDecompressor<
+		    galp::codec::device::BPDecompressor<
 		        uint32_t,
 		        4,
-		        flsgpu::device::BitUnpackerDummy<uint32_t, 4, 1, flsgpu::device::BPFunctor<uint32_t>>,
-		        flsgpu::device::BPColumn<uint32_t>>,
-		    flsgpu::device::BPColumn<uint32_t>>(column, n_samples);
+		        galp::codec::device::BitUnpackerDummy<uint32_t, 4, 1, galp::codec::device::BPFunctor<uint32_t>>,
+		        galp::codec::device::BPColumn<uint32_t>>,
+		    galp::codec::device::BPColumn<uint32_t>>(column, n_samples);
 	}
 
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == enums::Unpacker::StatefulBranchless &&
-	    patcher == enums::Patcher::None) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && unpacker == galp::format::Unpacker::StatefulBranchless &&
+	    patcher == galp::format::Patcher::None) {
+		return galp::kernels::host::decompress_column<
 		    uint32_t,
 		    4,
 		    1,
-		    flsgpu::device::BPDecompressor<
+		    galp::codec::device::BPDecompressor<
 		        uint32_t,
 		        4,
-		        flsgpu::device::BitUnpackerStatefulBranchless<uint32_t, 4, 1, flsgpu::device::BPFunctor<uint32_t>>,
-		        flsgpu::device::BPColumn<uint32_t>>,
-		    flsgpu::device::BPColumn<uint32_t>>(column, n_samples);
+		        galp::codec::device::BitUnpackerStatefulBranchless<uint32_t, 4, 1, galp::codec::device::BPFunctor<uint32_t>>,
+		        galp::codec::device::BPColumn<uint32_t>>,
+		    galp::codec::device::BPColumn<uint32_t>>(column, n_samples);
 	}
 	throw std::invalid_argument("Could not find correct binding in decompress_column BP<uint32_t>");
 }
 
-} // namespace bindings
+} // namespace galp::bench::bindings

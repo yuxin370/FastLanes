@@ -8,106 +8,106 @@
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 
-namespace bindings {
+namespace galp::bench::bindings {
 
 template <>
-int16_t* decompress_column<int16_t, flsgpu::device::FREQExtendedColumn<int16_t>>(
-    const flsgpu::device::FREQExtendedColumn<int16_t> column,
+int16_t* decompress_column<int16_t, galp::codec::device::FREQExtendedColumn<int16_t>>(
+    const galp::codec::device::FREQExtendedColumn<int16_t> column,
     const unsigned                                    unpack_n_vectors,
     const unsigned                                    unpack_n_values,
-    const enums::Unpacker                             unpacker,
-    const enums::Patcher                              patcher,
-    const enums::Expander                             expander,
+    const galp::format::Unpacker                             unpacker,
+    const galp::format::Patcher                              patcher,
+    const galp::format::Expander                             expander,
     const uint32_t                                    n_samples) {
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == enums::Patcher::Naive) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == galp::format::Patcher::Naive) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    1,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     1,
-		                                     flsgpu::device::NaiveFREQExceptionPatcher<int16_t, 1, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::NaiveFREQExceptionPatcher<int16_t, 1, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == enums::Patcher::NaiveBranchless) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == galp::format::Patcher::NaiveBranchless) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    1,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     1,
-		                                     flsgpu::device::NaiveBranchlessFREQExceptionPatcher<int16_t, 1, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::NaiveBranchlessFREQExceptionPatcher<int16_t, 1, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == enums::Patcher::PrefetchAll) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == galp::format::Patcher::PrefetchAll) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    1,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     1,
-		                                     flsgpu::device::PrefetchAllFREQExceptionPatcher<int16_t, 1, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::PrefetchAllFREQExceptionPatcher<int16_t, 1, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == enums::Patcher::PrefetchAllBranchless) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 1 && unpack_n_values == 1 && patcher == galp::format::Patcher::PrefetchAllBranchless) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    1,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     1,
-		                                     flsgpu::device::PrefetchAllBranchlessFREQExceptionPatcher<int16_t, 1, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::PrefetchAllBranchlessFREQExceptionPatcher<int16_t, 1, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == enums::Patcher::Naive) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == galp::format::Patcher::Naive) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    4,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     4,
-		                                     flsgpu::device::NaiveFREQExceptionPatcher<int16_t, 4, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::NaiveFREQExceptionPatcher<int16_t, 4, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == enums::Patcher::NaiveBranchless) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == galp::format::Patcher::NaiveBranchless) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    4,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     4,
-		                                     flsgpu::device::NaiveBranchlessFREQExceptionPatcher<int16_t, 4, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::NaiveBranchlessFREQExceptionPatcher<int16_t, 4, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == enums::Patcher::PrefetchAll) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == galp::format::Patcher::PrefetchAll) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    4,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     4,
-		                                     flsgpu::device::PrefetchAllFREQExceptionPatcher<int16_t, 4, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::PrefetchAllFREQExceptionPatcher<int16_t, 4, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
-	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == enums::Patcher::PrefetchAllBranchless) {
-		return kernels::host::decompress_column<
+	if (unpack_n_vectors == 4 && unpack_n_values == 1 && patcher == galp::format::Patcher::PrefetchAllBranchless) {
+		return galp::kernels::host::decompress_column<
 		    int16_t,
 		    4,
 		    1,
-		    flsgpu::device::FREQDecompressor<int16_t,
+		    galp::codec::device::FREQDecompressor<int16_t,
 		                                     4,
-		                                     flsgpu::device::PrefetchAllBranchlessFREQExceptionPatcher<int16_t, 4, 1>,
-		                                     flsgpu::device::FREQExtendedColumn<int16_t>>,
-		    flsgpu::device::FREQExtendedColumn<int16_t>>(column, n_samples);
+		                                     galp::codec::device::PrefetchAllBranchlessFREQExceptionPatcher<int16_t, 4, 1>,
+		                                     galp::codec::device::FREQExtendedColumn<int16_t>>,
+		    galp::codec::device::FREQExtendedColumn<int16_t>>(column, n_samples);
 	}
 	throw std::invalid_argument("Could not find correct binding in decompress_column FREQExtended<int16_t>");
 }
 
-} // namespace bindings
+} // namespace galp::bench::bindings
