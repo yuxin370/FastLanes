@@ -22,6 +22,7 @@
 #include "flsgpu/columns/all.cuh"
 #include "flsgpu/flsgpu.cuh"
 #include "flsgpu/utils.cuh"
+#include "galp/errors.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -43,10 +44,10 @@
 #include <variant>
 #include <vector>
 
-namespace reader {
+namespace galp::format {
 
 namespace detail {
-inline constexpr size_t kVecSize = consts::VALUES_PER_VECTOR;
+inline constexpr size_t kVecSize = galp::codec::consts::VALUES_PER_VECTOR;
 
 struct SegmentOffsets {
 	uint32_t* offsets;
@@ -60,6 +61,15 @@ inline uint32_t checked_u32_offset(const size_t value, const char* field) {
 		throw std::runtime_error(msg.str());
 	}
 	return static_cast<uint32_t>(value);
+}
+
+inline size_t checked_add_size(const size_t a, const size_t b, const char* field) {
+	if (b > std::numeric_limits<size_t>::max() - a) {
+		std::ostringstream msg;
+		msg << field << " exceeds size_t range";
+		throw std::runtime_error(msg.str());
+	}
+	return a + b;
 }
 
 inline fastlanes::TableDescriptorHandle load_table_descriptor(fastlanes::File&             file,
@@ -210,12 +220,12 @@ inline void for_each_entrypoint(const fastlanes::SegmentView& seg,
 }
 
 template <typename T>
-inline flsgpu::host::BPColumn<T> make_bp_zero_copy(const fastlanes::SegmentView& seg_bitpacked,
-                                                   const fastlanes::SegmentView& seg_bw,
-                                                   const size_t                  n_values,
-                                                   const size_t                  n_vecs,
-                                                   ZeroCopyHostStorage&          storage) {
-	using PackedT = typename utils::same_width_uint<T>::type;
+inline galp::codec::host::BPColumn<T> make_bp_zero_copy(const fastlanes::SegmentView& seg_bitpacked,
+                                                        const fastlanes::SegmentView& seg_bw,
+                                                        const size_t                  n_values,
+                                                        const size_t                  n_vecs,
+                                                        ZeroCopyHostStorage&          storage) {
+	using PackedT = typename galp::codec::utils::same_width_uint<T>::type;
 
 	auto*  vector_offsets = storage.allocate_array<uint32_t>(n_vecs);
 	size_t prev_bytes     = 0;
@@ -230,14 +240,18 @@ inline flsgpu::host::BPColumn<T> make_bp_zero_copy(const fastlanes::SegmentView&
 	auto*        packed     = segment_ptr_or_copy<PackedT>(seg_bitpacked, storage);
 	auto*        bit_widths = segment_ptr_or_copy<vbw_t>(seg_bw, storage);
 	const size_t n_bp       = seg_bitpacked.data_span.size() / sizeof(PackedT);
-	return flsgpu::host::BPColumn<T> {n_values, n_bp, packed, bit_widths, vector_offsets};
+	return galp::codec::host::BPColumn<T> {n_values,
+	                                       n_bp,
+	                                       galp::codec::host::borrow_array(packed),
+	                                       galp::codec::host::borrow_array(bit_widths),
+	                                       galp::codec::host::borrow_array(vector_offsets)};
 }
 
 template <typename T>
-inline flsgpu::host::BPColumn<T>
+inline galp::codec::host::BPColumn<T>
 make_uncompressed_zero_copy(const fastlanes::SegmentView& seg, const size_t n_values, ZeroCopyHostStorage& storage) {
-	using UINT_T                  = typename utils::same_width_uint<T>::type;
-	const size_t n_vecs           = utils::get_n_vecs_from_size(n_values);
+	using UINT_T                  = typename galp::codec::utils::same_width_uint<T>::type;
+	const size_t n_vecs           = galp::codec::utils::get_n_vecs_from_size(n_values);
 	const size_t n_packed_values  = n_vecs * kVecSize;
 	const size_t required_bytes   = n_packed_values * sizeof(UINT_T);
 	const auto*  segment_data     = seg.data_span.data();
@@ -267,20 +281,24 @@ make_uncompressed_zero_copy(const fastlanes::SegmentView& seg, const size_t n_va
 		vector_offsets[vi] = checked_u32_offset(vi * kVecSize, "uncompressed vector offset");
 	}
 
-	return flsgpu::host::BPColumn<T> {n_values, n_packed_values, packed, bit_widths, vector_offsets};
+	return galp::codec::host::BPColumn<T> {n_values,
+	                                       n_packed_values,
+	                                       galp::codec::host::borrow_array(packed),
+	                                       galp::codec::host::borrow_array(bit_widths),
+	                                       galp::codec::host::borrow_array(vector_offsets)};
 }
 
 template <typename T>
-inline flsgpu::host::FFORColumn<T> make_ffor_zero_copy(const fastlanes::SegmentView& seg_bitpacked,
-                                                       const fastlanes::SegmentView& seg_bw,
-                                                       const fastlanes::SegmentView& seg_base,
-                                                       const size_t                  n_values,
-                                                       const size_t                  n_vecs,
-                                                       ZeroCopyHostStorage&          storage) {
-	using BaseT = typename utils::same_width_uint<T>::type;
+inline galp::codec::host::FFORColumn<T> make_ffor_zero_copy(const fastlanes::SegmentView& seg_bitpacked,
+                                                            const fastlanes::SegmentView& seg_bw,
+                                                            const fastlanes::SegmentView& seg_base,
+                                                            const size_t                  n_values,
+                                                            const size_t                  n_vecs,
+                                                            ZeroCopyHostStorage&          storage) {
+	using BaseT = typename galp::codec::utils::same_width_uint<T>::type;
 	auto  bp    = make_bp_zero_copy<T>(seg_bitpacked, seg_bw, n_values, n_vecs, storage);
 	auto* bases = segment_ptr_or_copy<BaseT>(seg_base, storage);
-	return flsgpu::host::FFORColumn<T> {bp, bases};
+	return galp::codec::host::FFORColumn<T> {std::move(bp), galp::codec::host::borrow_array(bases)};
 }
 
 // Shared helper: parse a segment's entrypoints into per-vector element offsets,
@@ -342,15 +360,15 @@ inline void validate_matching_entrypoint_offsets(const fastlanes::SegmentView& s
 }
 
 template <typename T>
-inline flsgpu::host::SLPATCHColumn<T> make_slpatch_zero_copy(const fastlanes::SegmentView& seg_exc,
-                                                             const fastlanes::SegmentView& seg_pos,
-                                                             const fastlanes::SegmentView& seg_cnt,
-                                                             const fastlanes::SegmentView& seg_bitpacked,
-                                                             const fastlanes::SegmentView& seg_bw,
-                                                             const fastlanes::SegmentView& seg_base,
-                                                             const size_t                  n_values,
-                                                             const size_t                  n_vecs,
-                                                             ZeroCopyHostStorage&          storage) {
+inline galp::codec::host::SLPATCHColumn<T> make_slpatch_zero_copy(const fastlanes::SegmentView& seg_exc,
+                                                                  const fastlanes::SegmentView& seg_pos,
+                                                                  const fastlanes::SegmentView& seg_cnt,
+                                                                  const fastlanes::SegmentView& seg_bitpacked,
+                                                                  const fastlanes::SegmentView& seg_bw,
+                                                                  const fastlanes::SegmentView& seg_base,
+                                                                  const size_t                  n_values,
+                                                                  const size_t                  n_vecs,
+                                                                  ZeroCopyHostStorage&          storage) {
 	auto ffor = make_ffor_zero_copy<T>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
 
 	auto exc = build_entrypoint_offsets(seg_exc, n_vecs, sizeof(T), storage);
@@ -361,18 +379,24 @@ inline flsgpu::host::SLPATCHColumn<T> make_slpatch_zero_copy(const fastlanes::Se
 	auto* positions  = segment_ptr_or_copy<uint16_t>(seg_pos, storage);
 	auto* exceptions = segment_ptr_or_copy<T>(seg_exc, storage);
 
-	return flsgpu::host::SLPATCHColumn<T> {
-	    n_values, n_vecs, ffor, exc.total, exc.offsets, exceptions, positions, counts};
+	return galp::codec::host::SLPATCHColumn<T> {n_values,
+	                                            n_vecs,
+	                                            std::move(ffor),
+	                                            exc.total,
+	                                            galp::codec::host::borrow_array(exc.offsets),
+	                                            galp::codec::host::borrow_array(exceptions),
+	                                            galp::codec::host::borrow_array(positions),
+	                                            galp::codec::host::borrow_array(counts)};
 }
 
 template <typename T>
-inline flsgpu::host::FREQColumn<T> make_frequency_zero_copy(const fastlanes::SegmentView& seg_fv,
-                                                            const fastlanes::SegmentView& seg_exc,
-                                                            const fastlanes::SegmentView& seg_pos,
-                                                            const fastlanes::SegmentView& seg_cnt,
-                                                            const size_t                  n_values,
-                                                            const size_t                  n_vecs,
-                                                            ZeroCopyHostStorage&          storage) {
+inline galp::codec::host::FREQColumn<T> make_frequency_zero_copy(const fastlanes::SegmentView& seg_fv,
+                                                                 const fastlanes::SegmentView& seg_exc,
+                                                                 const fastlanes::SegmentView& seg_pos,
+                                                                 const fastlanes::SegmentView& seg_cnt,
+                                                                 const size_t                  n_values,
+                                                                 const size_t                  n_vecs,
+                                                                 ZeroCopyHostStorage&          storage) {
 	if (seg_fv.data_span.size() != sizeof(T)) {
 		throw std::runtime_error("EXP_FREQUENCY: invalid frequent value size");
 	}
@@ -387,80 +411,125 @@ inline flsgpu::host::FREQColumn<T> make_frequency_zero_copy(const fastlanes::Seg
 	auto* positions  = segment_ptr_or_copy<uint16_t>(seg_pos, storage);
 	auto* exceptions = segment_ptr_or_copy<T>(seg_exc, storage);
 
-	return flsgpu::host::FREQColumn<T> {n_values, n_vecs, fv, exc.total, exc.offsets, exceptions, positions, counts};
+	return galp::codec::host::FREQColumn<T> {n_values,
+	                                         n_vecs,
+	                                         fv,
+	                                         exc.total,
+	                                         galp::codec::host::borrow_array(exc.offsets),
+	                                         galp::codec::host::borrow_array(exceptions),
+	                                         galp::codec::host::borrow_array(positions),
+	                                         galp::codec::host::borrow_array(counts)};
 }
 
 template <typename T>
-inline flsgpu::host::CROSSRLEColumn<T> make_cross_rle_zero_copy(const fastlanes::SegmentView& seg_vals,
-                                                                const fastlanes::SegmentView& seg_lens,
-                                                                const size_t                  n_values,
-                                                                const size_t                  n_vecs,
-                                                                ZeroCopyHostStorage&          storage) {
-	using ValueT         = typename utils::same_width_uint<T>::type;
-	const size_t n_runs  = seg_lens.data_span.size() / sizeof(uint32_t);
-	auto*        values  = segment_ptr_or_copy<ValueT>(seg_vals, storage);
-	auto*        lengths = segment_ptr_or_copy<uint32_t>(seg_lens, storage);
+inline galp::codec::host::CROSSRLEColumn<T> make_cross_rle_zero_copy(const fastlanes::SegmentView& seg_vals,
+                                                                     const fastlanes::SegmentView& seg_lens,
+                                                                     const size_t                  n_values,
+                                                                     const size_t                  n_vecs,
+                                                                     ZeroCopyHostStorage&          storage) {
+	using ValueT = typename galp::codec::utils::same_width_uint<T>::type;
+	if ((seg_lens.data_span.size() % sizeof(uint32_t)) != 0) {
+		throw std::runtime_error("EXP_CROSS_RLE lengths segment byte size is not uint32_t-aligned");
+	}
+	if ((seg_vals.data_span.size() % sizeof(ValueT)) != 0) {
+		throw std::runtime_error("EXP_CROSS_RLE values segment byte size is not value-aligned");
+	}
+	const size_t n_runs = seg_lens.data_span.size() / sizeof(uint32_t);
+	const size_t n_vals = seg_vals.data_span.size() / sizeof(ValueT);
+	if (n_runs == 0 && n_values > 0) {
+		throw std::runtime_error("EXP_CROSS_RLE has no runs for a non-empty column");
+	}
+	if (n_vals < n_runs) {
+		std::ostringstream msg;
+		msg << "EXP_CROSS_RLE values segment too short: values=" << n_vals << " runs=" << n_runs;
+		throw std::runtime_error(msg.str());
+	}
+	if (n_runs > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+		throw std::runtime_error("EXP_CROSS_RLE run count exceeds uint32_t range");
+	}
+	if (n_vecs > std::numeric_limits<size_t>::max() / kVecSize) {
+		throw std::runtime_error("EXP_CROSS_RLE vector count exceeds size_t range");
+	}
+	auto* values  = segment_ptr_or_copy<ValueT>(seg_vals, storage);
+	auto* lengths = segment_ptr_or_copy<uint32_t>(seg_lens, storage);
 
-	auto*    run_positions = storage.allocate_array<uint32_t>(n_runs);
-	uint32_t pos           = 0;
+	auto*  run_positions = storage.allocate_array<uint32_t>(n_runs);
+	size_t pos           = 0;
 	for (size_t i = 0; i < n_runs; ++i) {
-		run_positions[i] = pos;
-		pos += lengths[i];
+		if (lengths[i] == 0) {
+			throw std::runtime_error("EXP_CROSS_RLE contains a zero-length run");
+		}
+		run_positions[i] = checked_u32_offset(pos, "EXP_CROSS_RLE run position");
+		pos              = checked_add_size(pos, static_cast<size_t>(lengths[i]), "EXP_CROSS_RLE run length total");
+	}
+	if (pos < n_values) {
+		std::ostringstream msg;
+		msg << "EXP_CROSS_RLE run lengths cover " << pos << " values, expected at least " << n_values;
+		throw std::runtime_error(msg.str());
 	}
 
-	auto*    offsets = storage.allocate_array<uint32_t>(n_vecs + 1);
-	uint32_t cur     = 0;
-	uint32_t idx_run = 0;
+	auto*  offsets = storage.allocate_array<uint32_t>(n_vecs + 1);
+	size_t cur     = 0;
+	size_t idx_run = 0;
 	for (size_t v = 0; v < n_vecs; ++v) {
 		const size_t target_start = v * kVecSize;
-		while (idx_run < n_runs && cur + lengths[idx_run] <= target_start) {
-			cur += lengths[idx_run];
+		while (idx_run < n_runs &&
+		       checked_add_size(cur, static_cast<size_t>(lengths[idx_run]), "EXP_CROSS_RLE vector offset") <=
+		           target_start) {
+			cur = checked_add_size(cur, static_cast<size_t>(lengths[idx_run]), "EXP_CROSS_RLE vector offset");
 			++idx_run;
 		}
-		offsets[v] = idx_run;
+		offsets[v] = checked_u32_offset(idx_run, "EXP_CROSS_RLE vector run offset");
 	}
-	offsets[n_vecs] = static_cast<uint32_t>(n_runs);
+	offsets[n_vecs] = checked_u32_offset(n_runs, "EXP_CROSS_RLE final run offset");
 
-	return flsgpu::host::CROSSRLEColumn<T> {n_values, n_runs, values, lengths, offsets, run_positions};
+	return galp::codec::host::CROSSRLEColumn<T> {n_values,
+	                                             n_runs,
+	                                             galp::codec::host::borrow_array(values),
+	                                             galp::codec::host::borrow_array(lengths),
+	                                             galp::codec::host::borrow_array(offsets),
+	                                             galp::codec::host::borrow_array(run_positions)};
 }
 
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
-inline flsgpu::host::DICTFFORColumn<T, IndexT> make_dict_ffor_zero_copy(const fastlanes::SegmentView& seg_keys,
-                                                                        const fastlanes::SegmentView& seg_bitpacked,
-                                                                        const fastlanes::SegmentView& seg_bw,
-                                                                        const fastlanes::SegmentView& seg_base,
-                                                                        const size_t                  n_values,
-                                                                        const size_t                  n_vecs,
-                                                                        ZeroCopyHostStorage&          storage) {
-	using KeyT = typename utils::same_width_uint<T>::type;
+template <typename T, typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
+inline galp::codec::host::DICTFFORColumn<T, IndexT>
+make_dict_ffor_zero_copy(const fastlanes::SegmentView& seg_keys,
+                         const fastlanes::SegmentView& seg_bitpacked,
+                         const fastlanes::SegmentView& seg_bw,
+                         const fastlanes::SegmentView& seg_base,
+                         const size_t                  n_values,
+                         const size_t                  n_vecs,
+                         ZeroCopyHostStorage&          storage) {
+	using KeyT = typename galp::codec::utils::same_width_uint<T>::type;
 	auto  ffor = make_ffor_zero_copy<IndexT>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
 	auto* keys = segment_ptr_or_copy<KeyT>(seg_keys, storage);
-	return flsgpu::host::DICTFFORColumn<T, IndexT> {std::move(ffor), keys, seg_keys.data_span.size() / sizeof(KeyT)};
+	return galp::codec::host::DICTFFORColumn<T, IndexT> {
+	    std::move(ffor), galp::codec::host::borrow_array(keys), seg_keys.data_span.size() / sizeof(KeyT)};
 }
 
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
-inline flsgpu::host::DICTREFColumn<T, IndexT> make_dict_ref_zero_copy(const fastlanes::SegmentView& seg_keys,
-                                                                      const uint32_t                index_col_idx,
-                                                                      const size_t                  n_values,
-                                                                      ZeroCopyHostStorage&          storage) {
-	using KeyT = typename utils::same_width_uint<T>::type;
+template <typename T, typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
+inline galp::codec::host::DICTREFColumn<T, IndexT> make_dict_ref_zero_copy(const fastlanes::SegmentView& seg_keys,
+                                                                           const uint32_t                index_col_idx,
+                                                                           const size_t                  n_values,
+                                                                           ZeroCopyHostStorage&          storage) {
+	using KeyT = typename galp::codec::utils::same_width_uint<T>::type;
 	auto* keys = segment_ptr_or_copy<KeyT>(seg_keys, storage);
-	return flsgpu::host::DICTREFColumn<T, IndexT> {
-	    n_values, index_col_idx, keys, seg_keys.data_span.size() / sizeof(KeyT)};
+	return galp::codec::host::DICTREFColumn<T, IndexT> {
+	    n_values, index_col_idx, galp::codec::host::borrow_array(keys), seg_keys.data_span.size() / sizeof(KeyT)};
 }
 
 template <typename T, typename IndexT>
-inline flsgpu::host::RLEColumn<T, IndexT> make_rle_zero_copy(const fastlanes::SegmentView& seg_vals,
-                                                             const fastlanes::SegmentView& seg_rsum,
-                                                             const fastlanes::SegmentView& seg_bitpacked,
-                                                             const fastlanes::SegmentView& seg_bw,
-                                                             const fastlanes::SegmentView& seg_base,
-                                                             const size_t                  n_values,
-                                                             const size_t                  n_vecs,
-                                                             ZeroCopyHostStorage&          storage) {
+inline galp::codec::host::RLEColumn<T, IndexT> make_rle_zero_copy(const fastlanes::SegmentView& seg_vals,
+                                                                  const fastlanes::SegmentView& seg_rsum,
+                                                                  const fastlanes::SegmentView& seg_bitpacked,
+                                                                  const fastlanes::SegmentView& seg_bw,
+                                                                  const fastlanes::SegmentView& seg_base,
+                                                                  const size_t                  n_values,
+                                                                  const size_t                  n_vecs,
+                                                                  ZeroCopyHostStorage&          storage) {
 	auto ffor = make_ffor_zero_copy<IndexT>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
 
-	const size_t expected_bases = n_vecs * utils::get_n_lanes<IndexT>();
+	const size_t expected_bases = n_vecs * galp::codec::utils::get_n_lanes<IndexT>();
 	if (seg_rsum.data_span.size() / sizeof(IndexT) != expected_bases) {
 		throw std::runtime_error("EXP_RLE: rsum bases size mismatch");
 	}
@@ -473,8 +542,13 @@ inline flsgpu::host::RLEColumn<T, IndexT> make_rle_zero_copy(const fastlanes::Se
 	auto*        values       = segment_ptr_or_copy<T>(seg_vals, storage);
 	const size_t n_rle_values = seg_vals.data_span.size() / sizeof(T);
 
-	return flsgpu::host::RLEColumn<T, IndexT> {
-	    n_values, n_vecs, std::move(ffor), rsum_bases, values, offsets, n_rle_values};
+	return galp::codec::host::RLEColumn<T, IndexT> {n_values,
+	                                                n_vecs,
+	                                                std::move(ffor),
+	                                                galp::codec::host::borrow_array(rsum_bases),
+	                                                galp::codec::host::borrow_array(values),
+	                                                galp::codec::host::borrow_array(offsets),
+	                                                n_rle_values};
 }
 
 template <typename T>
@@ -491,93 +565,97 @@ inline T* clone_array(const T* in, const size_t n_elements) {
 }
 
 template <typename T>
-inline flsgpu::host::BPColumn<T> clone_column(const flsgpu::host::BPColumn<T>& col) {
-	return flsgpu::host::BPColumn<T> {col.n_values,
-	                                  col.n_packed_values,
-	                                  clone_array(col.packed_array, col.n_packed_values),
-	                                  clone_array(col.bit_widths, col.get_n_vecs()),
-	                                  clone_array(col.vector_offsets, col.get_n_vecs())};
+inline galp::codec::host::BPColumn<T> clone_column(const galp::codec::host::BPColumn<T>& col) {
+	return galp::codec::host::BPColumn<T> {col.n_values,
+	                                       col.n_packed_values,
+	                                       clone_array(col.packed_array.get(), col.n_packed_values),
+	                                       clone_array(col.bit_widths.get(), col.get_n_vecs()),
+	                                       clone_array(col.vector_offsets.get(), col.get_n_vecs())};
 }
 
 template <typename T>
-inline flsgpu::host::FFORColumn<T> clone_column(const flsgpu::host::FFORColumn<T>& col) {
-	return flsgpu::host::FFORColumn<T> {clone_column(col.bp), clone_array(col.bases, col.get_n_vecs())};
+inline galp::codec::host::FFORColumn<T> clone_column(const galp::codec::host::FFORColumn<T>& col) {
+	return galp::codec::host::FFORColumn<T> {clone_column(col.bp), clone_array(col.bases.get(), col.get_n_vecs())};
 }
 
 template <typename T>
-inline flsgpu::host::CONSTANTColumn<T> clone_column(const flsgpu::host::CONSTANTColumn<T>& col) {
+inline galp::codec::host::CONSTANTColumn<T> clone_column(const galp::codec::host::CONSTANTColumn<T>& col) {
 	return col;
 }
 
 template <typename T>
-inline flsgpu::host::FREQColumn<T> clone_column(const flsgpu::host::FREQColumn<T>& col) {
-	return flsgpu::host::FREQColumn<T> {col.n_values,
-	                                    col.n_vecs,
-	                                    col.frequent_value,
-	                                    col.n_exceptions,
-	                                    clone_array(col.exceptions_offsets, col.n_vecs),
-	                                    clone_array(col.exceptions, col.n_exceptions),
-	                                    clone_array(col.positions, col.n_exceptions),
-	                                    clone_array(col.counts, col.n_vecs)};
+inline galp::codec::host::FREQColumn<T> clone_column(const galp::codec::host::FREQColumn<T>& col) {
+	return galp::codec::host::FREQColumn<T> {col.n_values,
+	                                         col.n_vecs,
+	                                         col.frequent_value,
+	                                         col.n_exceptions,
+	                                         clone_array(col.exceptions_offsets.get(), col.n_vecs),
+	                                         clone_array(col.exceptions.get(), col.n_exceptions),
+	                                         clone_array(col.positions.get(), col.n_exceptions),
+	                                         clone_array(col.counts.get(), col.n_vecs)};
 }
 
 template <typename T>
-inline flsgpu::host::SLPATCHColumn<T> clone_column(const flsgpu::host::SLPATCHColumn<T>& col) {
-	return flsgpu::host::SLPATCHColumn<T> {col.n_values,
-	                                       col.n_vecs,
-	                                       clone_column(col.ffor),
-	                                       col.n_exceptions,
-	                                       clone_array(col.exceptions_offsets, col.n_vecs),
-	                                       clone_array(col.exceptions, col.n_exceptions),
-	                                       clone_array(col.positions, col.n_exceptions),
-	                                       clone_array(col.counts, col.n_vecs)};
+inline galp::codec::host::SLPATCHColumn<T> clone_column(const galp::codec::host::SLPATCHColumn<T>& col) {
+	return galp::codec::host::SLPATCHColumn<T> {col.n_values,
+	                                            col.n_vecs,
+	                                            clone_column(col.ffor),
+	                                            col.n_exceptions,
+	                                            clone_array(col.exceptions_offsets.get(), col.n_vecs),
+	                                            clone_array(col.exceptions.get(), col.n_exceptions),
+	                                            clone_array(col.positions.get(), col.n_exceptions),
+	                                            clone_array(col.counts.get(), col.n_vecs)};
 }
 
 template <typename T>
-inline flsgpu::host::CROSSRLEColumn<T> clone_column(const flsgpu::host::CROSSRLEColumn<T>& col) {
+inline galp::codec::host::CROSSRLEColumn<T> clone_column(const galp::codec::host::CROSSRLEColumn<T>& col) {
 	const size_t n_vecs = col.get_n_vecs();
-	return flsgpu::host::CROSSRLEColumn<T> {col.n_values,
-	                                        col.n_runs,
-	                                        clone_array(col.values, col.n_runs),
-	                                        clone_array(col.lengths, col.n_runs),
-	                                        clone_array(col.offsets, n_vecs + 1),
-	                                        clone_array(col.run_positions, col.n_runs)};
+	return galp::codec::host::CROSSRLEColumn<T> {col.n_values,
+	                                             col.n_runs,
+	                                             clone_array(col.values.get(), col.n_runs),
+	                                             clone_array(col.lengths.get(), col.n_runs),
+	                                             clone_array(col.offsets.get(), n_vecs + 1),
+	                                             clone_array(col.run_positions.get(), col.n_runs)};
 }
 
 template <typename T, typename IndexT>
-inline flsgpu::host::DICTFFORColumn<T, IndexT> clone_column(const flsgpu::host::DICTFFORColumn<T, IndexT>& col) {
-	return flsgpu::host::DICTFFORColumn<T, IndexT> {
-	    clone_column(col.ffor), clone_array(col.keys, col.key_count), col.key_count};
+inline galp::codec::host::DICTFFORColumn<T, IndexT>
+clone_column(const galp::codec::host::DICTFFORColumn<T, IndexT>& col) {
+	return galp::codec::host::DICTFFORColumn<T, IndexT> {
+	    clone_column(col.ffor), clone_array(col.keys.get(), col.key_count), col.key_count};
 }
 
 template <typename T, typename IndexT>
-inline flsgpu::host::DICTREFColumn<T, IndexT> clone_column(const flsgpu::host::DICTREFColumn<T, IndexT>& col) {
-	return flsgpu::host::DICTREFColumn<T, IndexT> {
-	    col.n_values, col.index_column_index, clone_array(col.keys, col.key_count), col.key_count};
+inline galp::codec::host::DICTREFColumn<T, IndexT>
+clone_column(const galp::codec::host::DICTREFColumn<T, IndexT>& col) {
+	return galp::codec::host::DICTREFColumn<T, IndexT> {
+	    col.n_values, col.index_column_index, clone_array(col.keys.get(), col.key_count), col.key_count};
 }
 
 template <typename T, typename IndexT>
-inline flsgpu::host::DICTSLPATCHColumn<T, IndexT> clone_column(const flsgpu::host::DICTSLPATCHColumn<T, IndexT>& col) {
-	return flsgpu::host::DICTSLPATCHColumn<T, IndexT> {
-	    clone_column(col.index), clone_array(col.keys, col.key_count), col.key_count};
+inline galp::codec::host::DICTSLPATCHColumn<T, IndexT>
+clone_column(const galp::codec::host::DICTSLPATCHColumn<T, IndexT>& col) {
+	return galp::codec::host::DICTSLPATCHColumn<T, IndexT> {
+	    clone_column(col.index), clone_array(col.keys.get(), col.key_count), col.key_count};
 }
 
 template <typename T, typename IndexT>
-inline flsgpu::host::RLEColumn<T, IndexT> clone_column(const flsgpu::host::RLEColumn<T, IndexT>& col) {
-	return flsgpu::host::RLEColumn<T, IndexT> {col.n_values,
-	                                           col.n_vecs,
-	                                           clone_column(col.ffor),
-	                                           clone_array(col.rsum_bases, col.n_vecs * utils::get_n_lanes<IndexT>()),
-	                                           clone_array(col.rle_values, col.n_rle_values),
-	                                           clone_array(col.rle_offsets, col.n_vecs),
-	                                           col.n_rle_values};
+inline galp::codec::host::RLEColumn<T, IndexT> clone_column(const galp::codec::host::RLEColumn<T, IndexT>& col) {
+	return galp::codec::host::RLEColumn<T, IndexT> {
+	    col.n_values,
+	    col.n_vecs,
+	    clone_column(col.ffor),
+	    clone_array(col.rsum_bases.get(), col.n_vecs * galp::codec::utils::get_n_lanes<IndexT>()),
+	    clone_array(col.rle_values.get(), col.n_rle_values),
+	    clone_array(col.rle_offsets.get(), col.n_vecs),
+	    col.n_rle_values};
 }
 
 } // namespace detail
 
-using HostColumnVariant = dispatch::EncodedPayload;
-using Column            = dispatch::Column;
-using Rowgroup          = dispatch::Rowgroup;
+using HostColumnVariant = galp::execution::EncodedPayload;
+using Column            = galp::execution::Column;
+using Rowgroup          = galp::execution::Rowgroup;
 
 struct ZeroCopyColumnPlan {
 	size_t                   column_index = 0;
@@ -633,6 +711,13 @@ inline const std::string& zero_copy_column_name(const ZeroCopyColumn& col) {
 		return *col.name_ref;
 	}
 	return col.name;
+}
+
+[[noreturn]] inline void throw_unsupported_zero_copy_token(const fastlanes::OperatorToken token,
+                                                           const size_t                   rowgroup_index,
+                                                           const size_t                   column_index,
+                                                           const std::string&             column_name) {
+	throw galp::UnsupportedFormatError(fastlanes::token_to_string(token), rowgroup_index, column_index, column_name);
 }
 
 inline fastlanes::SegmentView zero_copy_segment(const ZeroCopyColumn& col, const uint32_t segment_idx) {
@@ -703,9 +788,9 @@ inline ZeroCopyColumn make_zero_copy_column_from_plan(const ZeroCopyRowgroup&   
 	return col;
 }
 
-class reader {
+class FlsReader {
 public:
-	explicit reader(const std::filesystem::path& file_path, const bool load_column_names = true)
+	explicit FlsReader(const std::filesystem::path& file_path, const bool load_column_names = true)
 	    : m_file(std::make_shared<fastlanes::File>(file_path))
 	    , m_table_descriptor(
 	          std::make_shared<fastlanes::TableDescriptorHandle>(detail::load_table_descriptor(*m_file, file_path)))
@@ -796,7 +881,7 @@ public:
 		}
 
 		const size_t n_vecs   = static_cast<size_t>(rg->m_n_vec());
-		const size_t n_values = n_vecs * consts::VALUES_PER_VECTOR;
+		const size_t n_values = n_vecs * galp::codec::consts::VALUES_PER_VECTOR;
 		const size_t n_tuples = static_cast<size_t>(rg->m_n_tuples());
 
 		auto        backing_span    = fastlanes::span<std::byte> {backing_data, rg_bytes};
@@ -855,7 +940,9 @@ public:
 					msg << fastlanes::token_to_string(ops->Get(static_cast<flatbuffers::uoffset_t>(i)));
 				}
 				msg << "]";
-				throw std::runtime_error(msg.str());
+				const std::string col_name =
+				    (m_load_column_names && col_desc.name()) ? col_desc.name()->str() : std::string {};
+				throw galp::UnsupportedFormatError(msg.str(), rowgroup_idx, col_idx, col_name);
 			}
 
 			ZeroCopyColumn col {};
@@ -940,15 +1027,17 @@ public:
 				if (!zcol.alias_of.has_value()) {
 					throw std::runtime_error("zero-copy alias column missing source");
 				}
-				const size_t src_col_idx     = *zcol.alias_of;
-				auto&        src_col         = self(self, src_col_idx);
-				result.host                  = src_col.host;
+				const size_t src_col_idx = *zcol.alias_of;
+				auto&        src_col     = self(self, src_col_idx);
+				result.host =
+				    std::visit([](const auto& host_col) -> HostColumnVariant { return detail::clone_column(host_col); },
+				               src_col.host);
 				result.skip_decompress       = true;
 				result.alias_of              = src_col_idx;
-				result.host_owned_by_backing = src_col.host_owned_by_backing;
-				result.backing_base          = src_col.backing_base;
-				result.backing_bytes         = src_col.backing_bytes;
-				result.backing_is_pinned     = src_col.backing_is_pinned;
+				result.host_owned_by_backing = false;
+				result.backing_base          = nullptr;
+				result.backing_bytes         = 0;
+				result.backing_is_pinned     = false;
 			} else {
 				if (zcol.column_descriptor == nullptr) {
 					std::ostringstream msg;
@@ -977,8 +1066,8 @@ public:
 					if (bin == nullptr || bin->size() != sizeof(int8_t)) {
 						throw std::runtime_error("EXP_CONSTANT_I08: invalid constant size");
 					}
-					const auto value             = *reinterpret_cast<const int8_t*>(bin->data());
-					result.host                  = flsgpu::host::CONSTANTColumn<int8_t> {zero_copy.n_values, value};
+					const auto value = *reinterpret_cast<const int8_t*>(bin->data());
+					result.host      = galp::codec::host::CONSTANTColumn<int8_t> {zero_copy.n_values, value};
 					result.host_owned_by_backing = false;
 					break;
 				}
@@ -1129,10 +1218,11 @@ public:
                                                                                  zero_copy.n_values,
                                                                                  zero_copy.n_vecs,
                                                                                  *storage);
-					using KeyT               = typename utils::same_width_uint<int8_t>::type;
+					using KeyT               = typename galp::codec::utils::same_width_uint<int8_t>::type;
 					const size_t key_count   = seg_keys.data_span.size() / sizeof(KeyT);
 					auto*        keys        = detail::segment_ptr_or_copy<KeyT>(seg_keys, *storage);
-					result.host = flsgpu::host::DICTSLPATCHColumn<int8_t, uint8_t> {index_slpatch, keys, key_count};
+					result.host              = galp::codec::host::DICTSLPATCHColumn<int8_t, uint8_t> {
+                        std::move(index_slpatch), galp::codec::host::borrow_array(keys), key_count};
 					result.host_owned_by_backing = true;
 					break;
 				}
@@ -1211,10 +1301,11 @@ public:
                                                                                   zero_copy.n_values,
                                                                                   zero_copy.n_vecs,
                                                                                   *storage);
-					using KeyT               = typename utils::same_width_uint<int16_t>::type;
+					using KeyT               = typename galp::codec::utils::same_width_uint<int16_t>::type;
 					const size_t key_count   = seg_keys.data_span.size() / sizeof(KeyT);
 					auto*        keys        = detail::segment_ptr_or_copy<KeyT>(seg_keys, *storage);
-					result.host = flsgpu::host::DICTSLPATCHColumn<int16_t, uint16_t> {index_slpatch, keys, key_count};
+					result.host              = galp::codec::host::DICTSLPATCHColumn<int16_t, uint16_t> {
+                        std::move(index_slpatch), galp::codec::host::borrow_array(keys), key_count};
 					result.host_owned_by_backing = true;
 					break;
 				}
@@ -1239,10 +1330,11 @@ public:
                                                                                  zero_copy.n_values,
                                                                                  zero_copy.n_vecs,
                                                                                  *storage);
-					using KeyT               = typename utils::same_width_uint<int16_t>::type;
+					using KeyT               = typename galp::codec::utils::same_width_uint<int16_t>::type;
 					const size_t key_count   = seg_keys.data_span.size() / sizeof(KeyT);
 					auto*        keys        = detail::segment_ptr_or_copy<KeyT>(seg_keys, *storage);
-					result.host = flsgpu::host::DICTSLPATCHColumn<int16_t, uint8_t> {index_slpatch, keys, key_count};
+					result.host              = galp::codec::host::DICTSLPATCHColumn<int16_t, uint8_t> {
+                        std::move(index_slpatch), galp::codec::host::borrow_array(keys), key_count};
 					result.host_owned_by_backing = true;
 					break;
 				}
@@ -1313,11 +1405,8 @@ public:
 					break;
 				}
 				default:
-					std::ostringstream msg;
-					msg << "unsupported operator token for zero-copy materialization: "
-					    << fastlanes::token_to_string(zcol.token) << " (col_index=" << zcol.column_index
-					    << ", name=" << zero_copy_column_name(zcol) << ")";
-					throw std::runtime_error(msg.str());
+					throw_unsupported_zero_copy_token(
+					    zcol.token, zero_copy.rowgroup_index, zcol.column_index, zero_copy_column_name(zcol));
 				}
 
 				if (result.host_owned_by_backing && zero_copy.backing_is_pinned) {
@@ -1388,7 +1477,7 @@ private:
 			if (rowgroup.backing_storage && col.host_owned_by_backing) {
 				continue;
 			}
-			std::visit([](auto& host_col) { flsgpu::host::free_column(host_col); }, col.host);
+			std::visit([](auto& host_col) { galp::codec::host::free_column(host_col); }, col.host);
 		}
 		rowgroup.columns.clear();
 		rowgroup.backing_storage.reset();
@@ -1419,9 +1508,11 @@ private:
             if (src.alias_of.has_value()) {
                 const size_t src_col_idx = *src.alias_of;
                 auto&        src_col     = self(self, src_col_idx);
-                dst.host                 = src_col.host;
-                dst.skip_decompress      = true;
-                dst.alias_of             = src_col_idx;
+                dst.host =
+                    std::visit([](const auto& host_col) -> HostColumnVariant { return detail::clone_column(host_col); },
+                               src_col.host);
+                dst.skip_decompress = true;
+                dst.alias_of        = src_col_idx;
             } else {
                 dst.host = std::visit(
                     [](const auto& host_col) -> HostColumnVariant { return detail::clone_column(host_col); }, src.host);
@@ -1594,6 +1685,6 @@ private:
 	std::shared_ptr<const ZeroCopySchemaPlan>               m_zero_copy_schema_plan;
 };
 
-} // namespace reader
+} // namespace galp::format
 
 #endif // FLS_READER_CUH
