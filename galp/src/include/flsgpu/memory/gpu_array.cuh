@@ -15,7 +15,7 @@
 template <typename T>
 void free_device_pointer(T*& device_ptr) {
 	if (device_ptr != nullptr) {
-		flsgpu::memory::device_free(device_ptr);
+		galp::memory::device_free(device_ptr);
 	}
 	device_ptr = nullptr;
 }
@@ -28,10 +28,10 @@ private:
 	T*     device_ptr = nullptr;
 
 	void allocate() {
-		device_ptr = reinterpret_cast<T*>(flsgpu::memory::device_malloc(allocation_size));
+		device_ptr = reinterpret_cast<T*>(galp::memory::device_malloc(allocation_size));
 	}
 	void allocate(cudaStream_t stream) {
-		device_ptr = reinterpret_cast<T*>(flsgpu::memory::device_malloc_on_stream(allocation_size, stream));
+		device_ptr = reinterpret_cast<T*>(galp::memory::device_malloc_on_stream(allocation_size, stream));
 	}
 
 public:
@@ -55,28 +55,28 @@ public:
 		memory_size     = count * sizeof(T);
 		allocation_size = memory_size;
 		allocate();
-		flsgpu::memory::device_memcpy_h2d(device_ptr, host_p, memory_size);
+		galp::memory::device_memcpy_h2d(device_ptr, host_p, memory_size);
 	}
 
 	GPUArray(const size_t count, const T* host_p, cudaStream_t stream) {
 		memory_size     = count * sizeof(T);
 		allocation_size = memory_size;
 		allocate(stream);
-		flsgpu::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
+		galp::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
 	}
 
 	GPUArray(const size_t count, const size_t buffer, const T* host_p) {
 		memory_size     = count * sizeof(T);
 		allocation_size = memory_size + buffer * sizeof(T);
 		allocate();
-		flsgpu::memory::device_memcpy_h2d(device_ptr, host_p, memory_size);
+		galp::memory::device_memcpy_h2d(device_ptr, host_p, memory_size);
 	}
 
 	GPUArray(const size_t count, const size_t buffer, const T* host_p, cudaStream_t stream) {
 		memory_size     = count * sizeof(T);
 		allocation_size = memory_size + buffer * sizeof(T);
 		allocate(stream);
-		flsgpu::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
+		galp::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
 	}
 
 	GPUArray(const GPUArray&)            = delete;

@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace flsgpu { namespace memory {
+namespace galp::memory {
 
 // Manages pinned host staging buffers used to speed up H2D copies. Owned by
 // DevicePool but kept as a separate class so pinned lifecycle does not get
@@ -27,25 +27,30 @@ public:
 		if (bytes == 0) {
 			return nullptr;
 		}
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (use_pinned_) {
-			// Best-fit: reuse the smallest free buffer >= bytes. Exact-size
-			// matching forced fresh cudaMallocHost when staged_bytes variance
-			// pushed a chunk into a nearby size bucket.
-			for (auto it = free_by_size_.lower_bound(bytes); it != free_by_size_.end(); ++it) {
-				if (!it->second.empty()) {
-					const size_t bucket_size = it->first;
-					void*        ptr         = it->second.back();
-					it->second.pop_back();
-					in_use_[ptr] = bucket_size;
-					return ptr;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (use_pinned_) {
+				// Best-fit: reuse the smallest free buffer >= bytes. Exact-size
+				// matching forced fresh cudaMallocHost when staged_bytes variance
+				// pushed a chunk into a nearby size bucket.
+				for (auto it = free_by_size_.lower_bound(bytes); it != free_by_size_.end(); ++it) {
+					if (!it->second.empty()) {
+						const size_t bucket_size = it->first;
+						void*        ptr         = it->second.back();
+						it->second.pop_back();
+						in_use_[ptr] = bucket_size;
+						return ptr;
+					}
 				}
 			}
 		}
 
 		void* ptr = nullptr;
 		CUDA_SAFE_CALL(cudaMallocHost(&ptr, bytes));
-		in_use_[ptr] = bytes;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			in_use_[ptr] = bytes;
+		}
 		return ptr;
 	}
 
@@ -108,6 +113,6 @@ private:
 	std::unordered_map<void*, size_t>    in_use_;
 };
 
-}} // namespace flsgpu::memory
+} // namespace galp::memory
 
 #endif // FLSGPU_MEMORY_PINNED_HOST_POOL_CUH

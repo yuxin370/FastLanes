@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace flsgpu { namespace memory {
+namespace galp::memory {
 
 // Tracks in-flight H2D transfers per stream so a caller can drain them before
 // tearing down streams or pinned buffers. The tracker does not own pinned
@@ -157,6 +157,6 @@ private:
 	std::unordered_map<StreamKey, std::vector<PendingEntry>> pending_;
 };
 
-}} // namespace flsgpu::memory
+} // namespace galp::memory
 
 #endif // FLSGPU_MEMORY_TRANSFER_TRACKER_CUH

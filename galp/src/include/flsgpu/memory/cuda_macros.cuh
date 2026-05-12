@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace flsgpu {
+namespace galp::memory {
 
 // Exception type raised by CUDA_SAFE_CALL when a CUDA Runtime API call fails.
 // Carries the raw cudaError_t so callers can distinguish recoverable
@@ -40,15 +40,15 @@ private:
 	cudaError_t code_;
 };
 
-} // namespace flsgpu
+} // namespace galp::memory
 
-// CUDA_SAFE_CALL throws flsgpu::CudaError on failure.
+// CUDA_SAFE_CALL throws galp::memory::CudaError on failure.
 // Use CUDA_LOG_CALL in destructors and other noexcept cleanup paths.
 #define CUDA_SAFE_CALL(call)                                                                                           \
 	do {                                                                                                               \
 		cudaError_t _galp_cuda_err = (call);                                                                           \
 		if (_galp_cuda_err != cudaSuccess) {                                                                           \
-			throw ::flsgpu::CudaError(_galp_cuda_err, #call, __FILE__, __LINE__);                                      \
+			throw ::galp::memory::CudaError(_galp_cuda_err, #call, __FILE__, __LINE__);                                      \
 		}                                                                                                              \
 	} while (0)
 

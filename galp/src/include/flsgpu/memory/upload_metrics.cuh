@@ -8,7 +8,7 @@
 
 #include <cstddef>
 
-namespace flsgpu { namespace memory {
+namespace galp::memory {
 
 struct ArenaUploadMetrics {
 	double layout_ms    = 0.0;
@@ -21,6 +21,6 @@ struct ArenaUploadMetrics {
 	size_t dma_count    = 0;
 };
 
-}} // namespace flsgpu::memory
+} // namespace galp::memory
 
 #endif // FLSGPU_MEMORY_UPLOAD_METRICS_CUH

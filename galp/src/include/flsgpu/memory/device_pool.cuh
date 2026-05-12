@@ -20,7 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace flsgpu { namespace memory {
+namespace galp::memory {
 
 struct DeviceAllocInfo {
 	size_t       size         = 0;
@@ -44,30 +44,34 @@ public:
 		if (bytes == 0) {
 			return nullptr;
 		}
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (enabled_) {
-			if (use_async_) {
-				auto& free_list = free_async_by_stream_size_[stream_key(stream)][bytes];
-				if (!free_list.empty()) {
-					void* ptr = free_list.back();
-					free_list.pop_back();
-					in_use_[ptr] = DeviceAllocInfo {bytes, true, stream};
-					return ptr;
-				}
-			} else {
-				auto& free_list = free_sync_by_size_[bytes];
-				if (!free_list.empty()) {
-					void* ptr = free_list.back();
-					free_list.pop_back();
-					in_use_[ptr] = DeviceAllocInfo {bytes, false, nullptr};
-					return ptr;
+		bool use_async = false;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			use_async = use_async_;
+			if (enabled_) {
+				if (use_async_) {
+					auto& free_list = free_async_by_stream_size_[stream_key(stream)][bytes];
+					if (!free_list.empty()) {
+						void* ptr = free_list.back();
+						free_list.pop_back();
+						in_use_[ptr] = DeviceAllocInfo {bytes, true, stream};
+						return ptr;
+					}
+				} else {
+					auto& free_list = free_sync_by_size_[bytes];
+					if (!free_list.empty()) {
+						void* ptr = free_list.back();
+						free_list.pop_back();
+						in_use_[ptr] = DeviceAllocInfo {bytes, false, nullptr};
+						return ptr;
+					}
 				}
 			}
 		}
 
 		void* ptr         = nullptr;
 		bool  async_alloc = false;
-		if (use_async_) {
+		if (use_async) {
 			auto status = cudaMallocAsync(&ptr, bytes, stream);
 			if (status == cudaSuccess) {
 				async_alloc = true;
@@ -79,7 +83,10 @@ public:
 			CUDA_SAFE_CALL(cudaMalloc(&ptr, bytes));
 			async_alloc = false;
 		}
-		in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? stream : nullptr};
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? stream : nullptr};
+		}
 		return ptr;
 	}
 
@@ -333,6 +340,6 @@ inline void sync_h2d(cudaStream_t source_stream) {
 	DevicePool::instance().sync_h2d(source_stream);
 }
 
-}} // namespace flsgpu::memory
+} // namespace galp::memory
 
 #endif // FLSGPU_MEMORY_DEVICE_POOL_CUH

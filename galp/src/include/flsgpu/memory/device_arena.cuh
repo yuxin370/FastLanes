@@ -18,10 +18,12 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <functional>
+#include <limits>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
-namespace flsgpu { namespace memory {
+namespace galp::memory {
 
 // ── DeviceArena: aggregated device allocation + staged H2D ──────────
 // A workset can append many column sub-arrays into one arena, then perform one
@@ -59,6 +61,31 @@ class DeviceArena {
 		size_t entry_idx = 0;
 	};
 
+	static size_t checked_add(const size_t a, const size_t b, const char* field) {
+		if (b > std::numeric_limits<size_t>::max() - a) {
+			throw std::overflow_error(field);
+		}
+		return a + b;
+	}
+
+	static size_t checked_mul(const size_t a, const size_t b, const char* field) {
+		if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+			throw std::overflow_error(field);
+		}
+		return a * b;
+	}
+
+	static std::uintptr_t checked_ptr_end(const std::uintptr_t begin, const size_t bytes, const char* field) {
+		if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+			throw std::overflow_error(field);
+		}
+		return begin + bytes;
+	}
+
+	static size_t align_staged_offset(const size_t value) {
+		return checked_add(value, 255U, "DeviceArena staged offset overflow") & ~size_t(255U);
+	}
+
 public:
 	explicit DeviceArena(cudaStream_t stream) : stream_(stream) {}
 	~DeviceArena() {
@@ -82,6 +109,7 @@ public:
 		if (base == nullptr || bytes == 0) {
 			return;
 		}
+		(void)checked_ptr_end(reinterpret_cast<std::uintptr_t>(base), bytes, "DeviceArena backing range overflow");
 		const auto* b = reinterpret_cast<const std::byte*>(base);
 		for (const auto& r : regions_) {
 			if (r.base == b && r.bytes == bytes) {
@@ -110,9 +138,9 @@ public:
 
 			auto&        cur          = merged.back();
 			const auto   cur_begin    = reinterpret_cast<std::uintptr_t>(cur.base);
-			const auto   cur_end      = cur_begin + cur.bytes;
+			const auto   cur_end      = checked_ptr_end(cur_begin, cur.bytes, "DeviceArena coalesced range overflow");
 			const auto   region_begin = reinterpret_cast<std::uintptr_t>(region.base);
-			const auto   region_end   = region_begin + region.bytes;
+			const auto   region_end   = checked_ptr_end(region_begin, region.bytes, "DeviceArena backing range overflow");
 			if (region_begin <= cur_end) {
 				if (region_end > cur_end) {
 					cur.bytes = static_cast<size_t>(region_end - cur_begin);
@@ -135,7 +163,7 @@ public:
 			auto&       region = regions_[e.region_idx];
 			const auto* src    = reinterpret_cast<const std::byte*>(e.host_src);
 			e.region_offset    = static_cast<size_t>(src - region.base);
-			const size_t end_offset = e.region_offset + e.alloc_bytes;
+			const size_t end_offset = checked_add(e.region_offset, e.alloc_bytes, "DeviceArena region slab overflow");
 			if (end_offset > region.slab_bytes) {
 				region.slab_bytes = end_offset;
 			}
@@ -144,9 +172,14 @@ public:
 
 	template <typename T>
 	size_t add(size_t count, const T* host_src, size_t buffer_elements = 0) {
-		const size_t copy_bytes  = count * sizeof(T);
-		const size_t alloc_bytes = copy_bytes + buffer_elements * sizeof(T);
+		const size_t copy_bytes   = checked_mul(count, sizeof(T), "DeviceArena copy size overflow");
+		const size_t buffer_bytes = checked_mul(buffer_elements, sizeof(T), "DeviceArena padding size overflow");
+		const size_t alloc_bytes  = checked_add(copy_bytes, buffer_bytes, "DeviceArena allocation size overflow");
 		const size_t idx         = entries_.size();
+
+		if (host_src == nullptr && copy_bytes > 0) {
+			throw std::invalid_argument("DeviceArena::add requires a non-null host source when copy_bytes > 0");
+		}
 
 		Entry e {};
 		e.alloc_bytes = alloc_bytes;
@@ -155,9 +188,9 @@ public:
 		e.region_idx  = find_region(host_src, copy_bytes);
 
 		if (e.region_idx < 0) {
-			staged_bytes_    = (staged_bytes_ + 255U) & ~size_t(255U);
+			staged_bytes_    = align_staged_offset(staged_bytes_);
 			e.staged_offset  = staged_bytes_;
-			staged_bytes_   += alloc_bytes;
+			staged_bytes_    = checked_add(staged_bytes_, alloc_bytes, "DeviceArena staged area overflow");
 			staged_entry_indices_.push_back(idx);
 		} else {
 			auto&       region = regions_[e.region_idx];
@@ -168,7 +201,7 @@ public:
 			// extra slab tail is uninitialized device memory reserved so padded
 			// SIMD tail reads stay within the region's allocation instead of
 			// spilling into the next region or staged area.
-			const size_t end_offset = e.region_offset + alloc_bytes;
+			const size_t end_offset = checked_add(e.region_offset, alloc_bytes, "DeviceArena region slab overflow");
 			if (end_offset > region.slab_bytes) {
 				region.slab_bytes = end_offset;
 			}
@@ -332,18 +365,22 @@ private:
 	LayoutPlan plan_layout() {
 		size_t cursor = 0;
 		for (auto& region : regions_) {
-			cursor               = (cursor + 255U) & ~size_t(255U);
+			cursor               = align_staged_offset(cursor);
 			region.device_offset = cursor;
-			cursor              += region.slab_bytes;
+			cursor               = checked_add(cursor, region.slab_bytes, "DeviceArena layout overflow");
 		}
-		cursor                          = (cursor + 255U) & ~size_t(255U);
+		cursor                          = align_staged_offset(cursor);
 		const size_t staged_device_base = cursor;
-		cursor                         += staged_bytes_;
+		cursor                          = checked_add(cursor, staged_bytes_, "DeviceArena layout overflow");
 
 		for (auto& e : entries_) {
 			e.device_offset = (e.region_idx >= 0)
-			                      ? regions_[e.region_idx].device_offset + e.region_offset
-			                      : staged_device_base + e.staged_offset;
+			                      ? checked_add(regions_[e.region_idx].device_offset,
+			                                    e.region_offset,
+			                                    "DeviceArena resolved region offset overflow")
+			                      : checked_add(staged_device_base,
+			                                    e.staged_offset,
+			                                    "DeviceArena resolved staged offset overflow");
 		}
 		return LayoutPlan {staged_device_base, cursor};
 	}
@@ -413,10 +450,12 @@ private:
 			return -1;
 		}
 		const auto src = reinterpret_cast<std::uintptr_t>(host_src);
+		const auto src_end = checked_ptr_end(src, bytes, "DeviceArena source range overflow");
 		for (size_t i = 0; i < regions_.size(); ++i) {
 			const auto& r = regions_[i];
 			const auto  base = reinterpret_cast<std::uintptr_t>(r.base);
-			if (src >= base && src + bytes <= base + r.bytes) {
+			const auto  base_end = checked_ptr_end(base, r.bytes, "DeviceArena backing range overflow");
+			if (src >= base && src_end <= base_end) {
 				return static_cast<int>(i);
 			}
 		}
@@ -505,6 +544,6 @@ private:
 	std::vector<std::function<void()>> deferred_frees_;
 };
 
-}} // namespace flsgpu::memory
+} // namespace galp::memory
 
 #endif // FLSGPU_MEMORY_DEVICE_ARENA_CUH
