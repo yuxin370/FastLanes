@@ -18,7 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dispatch {
+namespace galp::execution {
 namespace {
 
 __global__ void benchmark_warmup_kernel() {
@@ -356,16 +356,13 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 
 	runtime::TableExecutionRequest request {};
 	request.config                       = cfg;
+	request.config.execution.write_out   = cfg.include_materialize || cfg.execution.write_out;
 	request.samples                      = cfg.samples;
 	request.rowgroup                     = cfg.rowgroup;
 	request.materialize_results          = cfg.include_materialize;
 	request.direct_append_no_materialize = !cfg.include_materialize;
 	request.warmup_first_run             = true;
 	request.load_column_names            = false;
-	if (cfg.include_materialize) {
-		// materialize_results requires write_out so kernels emit decoded values.
-		request.config.execution.write_out = true;
-	}
 
 	BenchmarkObserver observer {out};
 	const auto        wall_start = std::chrono::steady_clock::now();
@@ -381,7 +378,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		    resources,
 		    request,
 		    [](size_t) { return true; },
-		    [](size_t, reader::Rowgroup&, const std::vector<expr::Expression>&, const RowgroupData*) {},
+		    [](size_t, galp::format::Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData*) {},
 		    observer,
 		    query_start);
 		const auto query_end = std::chrono::steady_clock::now();
@@ -392,7 +389,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		    fls_path,
 		    request,
 		    [](size_t) { return true; },
-		    [](size_t, reader::Rowgroup&, const std::vector<expr::Expression>&, const RowgroupData*) {},
+		    [](size_t, galp::format::Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData*) {},
 		    observer);
 		const auto query_end = std::chrono::steady_clock::now();
 		out.query_wall_ms = std::chrono::duration<double, std::milli>(query_end - wall_start).count();
@@ -405,4 +402,4 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	return out;
 }
 
-} // namespace dispatch
+} // namespace galp::execution

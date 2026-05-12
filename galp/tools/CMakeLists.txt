@@ -3,7 +3,9 @@ add_executable(galp_cli
 )
 
 target_link_libraries(galp_cli PRIVATE
-        galp_core
+        galp_benchmark_support
 )
+target_include_directories(galp_cli PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/include)
 
 apply_warnings(galp_cli)

@@ -11,7 +11,7 @@
 #include <filesystem>
 #include <optional>
 
-namespace dispatch {
+namespace galp::execution {
 
 using AggregationScope = TableDecompressionScope;
 
@@ -19,10 +19,9 @@ struct TableBenchmarkConfig : TableDecompressionConfig {
 	uint32_t              samples = 1;
 	std::optional<size_t> rowgroup;
 	// When true, the benchmark also materializes results back to host pinned
-	// memory (one cudaMemcpyAsync(D2H) per chunk via the pinned-D2H path) so
-	// the wall clock reflects the full output-producing decompression cost.
-	// Off by default because the tuning scripts track the GPU-consume/discard
-	// path separately and record include_materialize/write_back in the CSV.
+	// memory (one D2H materialize per chunk) so the wall clock reflects the
+	// output-producing decompression path. Off by default for consume-only
+	// pipeline measurements.
 	bool include_materialize = false;
 	// When true, reader construction and pinned rowgroup pool prewarm happen
 	// before the query wall-clock timer. benchmark_wall_ms still includes both.
@@ -30,6 +29,8 @@ struct TableBenchmarkConfig : TableDecompressionConfig {
 
 	TableBenchmarkConfig() {
 		scope               = TableDecompressionScope::WholeTable;
+		// The default benchmark path is consume-only; include_materialize flips
+		// write_out on for full output-producing timings.
 		execution.write_out = false;
 	}
 };
@@ -39,7 +40,7 @@ struct TableBenchmarkResult {
 	double resource_prepare_ms     = 0.0; // reusable reader/pinned-pool setup before steady-state query
 	double query_wall_ms           = 0.0; // wall clock of the query run after optional resource prepare
 	double pipeline_active_ms      = 0.0; // query wall minus pipeline setup
-	double read_rowgroup_ms        = 0.0; // reader::read_rowgroup* stage
+	double read_rowgroup_ms        = 0.0; // galp::format::read_rowgroup* stage
 	double file_read_ms            = 0.0; // legacy rowgroup read/setup stage before rowgroup build
 	double rowgroup_build_ms       = 0.0; // rowgroup/column construction after file IO
 	double pinned_acquire_ms       = 0.0; // pinned rowgroup buffer lease time before file IO
@@ -50,7 +51,7 @@ struct TableBenchmarkResult {
 	double read_wall_ms            = 0.0; // wall span from first rowgroup read start to last rowgroup build end
 	double pread_wall_ms           = 0.0; // wall span from first pread start to last pread end
 	double file_read_wall_ms       = 0.0; // wall span of the legacy file_read_ms stage
-	double assemble_expr_ms        = 0.0; // expr::assemble stage
+	double assemble_expr_ms        = 0.0; // galp::expression::assemble stage
 	double append_expr_ms          = 0.0; // runtime::append_expressions stage
 	double upload_workset_ms       = 0.0; // runtime::upload_workset stage
 	// Sub-stage breakdown of upload_workset_ms (sums to ~upload_workset_ms).
@@ -101,6 +102,6 @@ struct TableBenchmarkResult {
 
 TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, const TableBenchmarkConfig& cfg = {});
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_BENCHMARK_TABLE_CUH

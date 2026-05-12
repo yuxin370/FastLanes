@@ -6,7 +6,7 @@
 #include "engine/benchmark/table.cuh"
 #include "engine/execution/common.cuh"
 #include "engine/execution/rowgroup.cuh"
-#include "engine/execution/table.cuh"
+#include "engine/execution/table_options.cuh"
 #include "engine/expression.cuh"
 #include "engine/io/to_csv.cuh"
 #include "engine/reader.cuh"
@@ -35,26 +35,26 @@ struct Options {
 	std::filesystem::path                input;
 	std::optional<std::filesystem::path> output;
 	std::optional<size_t>                rowgroup;
-	uint32_t                             samples                      = 1;
-	bool                                 header                       = true;
-	uint32_t                             launch_iters                 = 100000;
-	uint32_t                             launch_grid                  = 1;
-	uint32_t                             launch_block                 = 1;
-	bool                                 per_rowgroup_workset         = false;
-	bool                                 mixed_dispatch               = true;
-	bool                                 write_back                   = false;
-	uint32_t                             unpack_n_vectors             = 1;
-	uint32_t                             unpack_n_values              = 1;
-	dispatch::FreqPatcher                freq_patcher                 = dispatch::FreqPatcher::Stateful;
-	float                                freq_branchless_threshold    = dispatch::kFreqHybridBranchlessThreshold;
-	bool                                 enable_rowgroup_prefetch     = true;
-	bool                                 include_materialize          = false;
-	bool                                 reuse_table_resources        = false;
-	size_t                               prefetch_depth               = 4;
-	size_t                               prefetch_workers             = 0;
-	size_t                               max_prefetch_storage_bytes   = 0;
-	size_t                               stream_target_work_items     = 1u << 18;
-	size_t                               stream_max_rowgroups         = 1;
+	uint32_t                             samples                    = 5;
+	uint32_t                             kernel_samples             = 1;
+	bool                                 header                     = true;
+	uint32_t                             launch_iters               = 100000;
+	uint32_t                             launch_grid                = 1;
+	uint32_t                             launch_block               = 1;
+	bool                                 per_rowgroup_workset       = false;
+	bool                                 mixed_dispatch             = true;
+	uint32_t                             unpack_n_vectors           = 1;
+	uint32_t                             unpack_n_values            = 1;
+	galp::execution::FreqPatcher         freq_patcher               = galp::execution::FreqPatcher::Stateful;
+	float                                freq_branchless_threshold  = galp::execution::kFreqHybridBranchlessThreshold;
+	bool                                 enable_rowgroup_prefetch   = true;
+	bool                                 include_materialize        = false;
+	bool                                 reuse_table_resources      = false;
+	size_t                               prefetch_depth             = 4;
+	size_t                               prefetch_workers           = 0;
+	size_t                               max_prefetch_storage_bytes = 0;
+	size_t                               stream_target_work_items   = 1u << 18;
+	size_t                               stream_max_rowgroups       = 1;
 };
 
 std::string format_bytes(double bytes) {
@@ -69,13 +69,13 @@ std::string format_bytes(double bytes) {
 	return oss.str();
 }
 
-const char* freq_patcher_name(const dispatch::FreqPatcher patcher) {
+const char* freq_patcher_name(const galp::execution::FreqPatcher patcher) {
 	switch (patcher) {
-	case dispatch::FreqPatcher::Stateful:
+	case galp::execution::FreqPatcher::Stateful:
 		return "stateful";
-	case dispatch::FreqPatcher::Branchless:
+	case galp::execution::FreqPatcher::Branchless:
 		return "branchless";
-	case dispatch::FreqPatcher::Hybrid:
+	case galp::execution::FreqPatcher::Hybrid:
 		return "hybrid";
 	}
 	return "unknown";
@@ -94,6 +94,47 @@ size_t effective_prefetch_workers(const size_t requested, const size_t rowgroups
 	return 2;
 }
 
+struct MetricStats {
+	double min    = 0.0;
+	double median = 0.0;
+	double mean   = 0.0;
+};
+
+template <typename Getter>
+MetricStats summarize_metric(const std::vector<galp::execution::TableBenchmarkResult>& results, Getter getter) {
+	if (results.empty()) {
+		return {};
+	}
+	std::vector<double> values;
+	values.reserve(results.size());
+	double sum = 0.0;
+	for (const auto& result : results) {
+		const double value = getter(result);
+		values.push_back(value);
+		sum += value;
+	}
+	std::sort(values.begin(), values.end());
+	return MetricStats {
+	    values.front(),
+	    values[values.size() / 2],
+	    sum / static_cast<double>(values.size()),
+	};
+}
+
+size_t median_result_index(const std::vector<galp::execution::TableBenchmarkResult>& results) {
+	if (results.empty()) {
+		return 0;
+	}
+	std::vector<size_t> indices(results.size());
+	for (size_t i = 0; i < indices.size(); ++i) {
+		indices[i] = i;
+	}
+	std::sort(indices.begin(), indices.end(), [&](const size_t lhs, const size_t rhs) {
+		return results[lhs].end_to_end_ms < results[rhs].end_to_end_ms;
+	});
+	return indices[indices.size() / 2];
+}
+
 bool parse_freq_patcher(std::string_view value, Options& opt) {
 	std::optional<float> threshold;
 	const auto           colon = value.find(':');
@@ -105,17 +146,17 @@ bool parse_freq_patcher(std::string_view value, Options& opt) {
 	}
 
 	if (value == "stateful") {
-		opt.freq_patcher = dispatch::FreqPatcher::Stateful;
+		opt.freq_patcher = galp::execution::FreqPatcher::Stateful;
 	} else if (value == "branchless") {
-		opt.freq_patcher = dispatch::FreqPatcher::Branchless;
+		opt.freq_patcher = galp::execution::FreqPatcher::Branchless;
 	} else if (value == "hybrid") {
-		opt.freq_patcher = dispatch::FreqPatcher::Hybrid;
+		opt.freq_patcher = galp::execution::FreqPatcher::Hybrid;
 	} else {
 		return false;
 	}
 
 	if (threshold.has_value()) {
-		if (opt.freq_patcher != dispatch::FreqPatcher::Hybrid) {
+		if (opt.freq_patcher != galp::execution::FreqPatcher::Hybrid) {
 			return false;
 		}
 		opt.freq_branchless_threshold = *threshold;
@@ -128,12 +169,14 @@ void print_usage(const char* prog) {
 	    << "Usage:\n"
 	    << "  " << prog
 	    << " read_table <input.fls> [output.csv] [--rowgroup N] [--no-header] [--per-rowgroup-workset]\n"
-	    << "  " << prog << " benchmark <input.fls> [--rowgroup N] [--samples N]\n"
+	    << "  " << prog
+	    << " benchmark <input.fls> [--rowgroup N] [--samples N] [--kernel-samples N] [--include-materialize]\n"
 	    << "  " << prog << " measure_launch [--iters N] [--grid N] [--block N]\n"
 	    << "\n"
 	    << "Options:\n"
 	    << "  --rowgroup N   Only process the given rowgroup\n"
-	    << "  --samples N    Number of benchmark repetitions (default: 1)\n"
+	    << "  --samples N    Number of independent benchmark samples for min/median/mean (default: 5)\n"
+	    << "  --kernel-samples N  Kernel replays inside each benchmark sample (default: 1)\n"
 	    << "  --no-header    Skip CSV header\n"
 	    << "  --out PATH     Output CSV path (read_table mode)\n"
 	    << "  --iters N      Launch measurement iterations (default: 100000)\n"
@@ -141,7 +184,6 @@ void print_usage(const char* prog) {
 	    << "  --block N      Launch block size for measurement (default: 1)\n"
 	    << "  --per-rowgroup-workset  Process each rowgroup as an independent workset\n"
 	    << "  --no-mixed-dispatch  Use typed-batch launches instead of mixed-dispatch (default: mixed)\n"
-	    << "  --write-back   Enable global write-back during benchmark kernel execution\n"
 	    << "  --unpack-n-vectors N  Runtime decode tile size in vectors (supported: 1 or 4)\n"
 	    << "  --unpack-n-values N   Runtime decode tile size in values (currently only 1)\n"
 	    << "  --no-rowgroup-prefetch  Disable background rowgroup prefetch in whole-table execution\n"
@@ -189,16 +231,16 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			opt.samples = static_cast<uint32_t>(std::stoul(argv[++i]));
 			continue;
 		}
+		if (arg == "--kernel-samples" && i + 1 < argc) {
+			opt.kernel_samples = static_cast<uint32_t>(std::stoul(argv[++i]));
+			continue;
+		}
 		if (arg == "--per-rowgroup-workset") {
 			opt.per_rowgroup_workset = true;
 			continue;
 		}
 		if (arg == "--no-mixed-dispatch") {
 			opt.mixed_dispatch = false;
-			continue;
-		}
-		if (arg == "--write-back") {
-			opt.write_back = true;
 			continue;
 		}
 		if (arg == "--unpack-n-vectors" && i + 1 < argc) {
@@ -287,6 +329,29 @@ bool parse_args(int argc, char** argv, Options& opt) {
 	return !opt.input.empty();
 }
 
+galp::execution::TableDecompressionScope table_scope_from_options(const Options& opt) {
+	return opt.per_rowgroup_workset ? galp::execution::TableDecompressionScope::PerRowgroup
+	                                : galp::execution::TableDecompressionScope::WholeTable;
+}
+
+template <typename Config>
+void apply_table_options(Config& cfg, const Options& opt) {
+	cfg.scope                               = table_scope_from_options(opt);
+	cfg.execution.unpack_n_vectors          = opt.unpack_n_vectors;
+	cfg.execution.unpack_n_values           = opt.unpack_n_values;
+	cfg.execution.launch_strategy           = opt.mixed_dispatch ? galp::execution::LaunchStrategy::MixedDispatch
+	                                                             : galp::execution::LaunchStrategy::TypedBatches;
+	cfg.execution.freq_patcher              = opt.freq_patcher;
+	cfg.execution.freq_branchless_threshold = opt.freq_branchless_threshold;
+	galp::execution::apply_table_streaming_options(cfg,
+	                                               opt.enable_rowgroup_prefetch,
+	                                               opt.prefetch_depth,
+	                                               opt.prefetch_workers,
+	                                               opt.max_prefetch_storage_bytes,
+	                                               opt.stream_target_work_items,
+	                                               opt.stream_max_rowgroups);
+}
+
 __global__ void empty_kernel() {
 }
 
@@ -368,50 +433,33 @@ int main(int argc, char** argv) {
 				out = &out_file;
 			}
 
-			dispatch::TableDecompressionConfig decode_cfg {};
-			decode_cfg.scope = opt.per_rowgroup_workset ? dispatch::TableDecompressionScope::PerRowgroup
-			                                            : dispatch::TableDecompressionScope::WholeTable;
-			decode_cfg.execution.unpack_n_vectors = opt.unpack_n_vectors;
-			decode_cfg.execution.unpack_n_values  = opt.unpack_n_values;
-			decode_cfg.execution.launch_strategy =
-			    opt.mixed_dispatch ? dispatch::LaunchStrategy::MixedDispatch : dispatch::LaunchStrategy::TypedBatches;
-			decode_cfg.execution.freq_patcher              = opt.freq_patcher;
-			decode_cfg.execution.freq_branchless_threshold = opt.freq_branchless_threshold;
-			decode_cfg.enable_rowgroup_prefetch            = opt.enable_rowgroup_prefetch;
-			decode_cfg.prefetch_depth                      = opt.prefetch_depth;
-			decode_cfg.prefetch_workers                    = opt.prefetch_workers;
-			decode_cfg.max_prefetch_storage_bytes          = opt.max_prefetch_storage_bytes;
-			decode_cfg.streaming_target_work_items         = opt.stream_target_work_items;
-			decode_cfg.streaming_target_rowgroups          = opt.stream_max_rowgroups;
-			io::read_table_to_csv(opt.input, *out, opt.header, decode_cfg, opt.rowgroup);
+			galp::execution::TableDecompressionConfig decode_cfg {};
+			apply_table_options(decode_cfg, opt);
+			galp::io::read_table_to_csv(opt.input, *out, opt.header, decode_cfg, opt.rowgroup);
 			return 0;
 		}
 
 		if (opt.mode == Mode::Benchmark) {
-			dispatch::TableBenchmarkConfig bench_cfg {};
-			bench_cfg.samples = opt.samples;
-			bench_cfg.scope   = opt.per_rowgroup_workset ? dispatch::TableDecompressionScope::PerRowgroup
-			                                             : dispatch::TableDecompressionScope::WholeTable;
-			bench_cfg.execution.unpack_n_vectors = opt.unpack_n_vectors;
-			bench_cfg.execution.unpack_n_values  = opt.unpack_n_values;
-			bench_cfg.execution.launch_strategy =
-			    opt.mixed_dispatch ? dispatch::LaunchStrategy::MixedDispatch : dispatch::LaunchStrategy::TypedBatches;
-			bench_cfg.execution.write_out                 = opt.write_back;
-			bench_cfg.execution.freq_patcher              = opt.freq_patcher;
-			bench_cfg.execution.freq_branchless_threshold = opt.freq_branchless_threshold;
-			bench_cfg.enable_rowgroup_prefetch            = opt.enable_rowgroup_prefetch;
-			bench_cfg.prefetch_depth                      = opt.prefetch_depth;
-			bench_cfg.prefetch_workers                    = opt.prefetch_workers;
-			bench_cfg.max_prefetch_storage_bytes          = opt.max_prefetch_storage_bytes;
-			bench_cfg.streaming_target_work_items         = opt.stream_target_work_items;
-			bench_cfg.streaming_target_rowgroups          = opt.stream_max_rowgroups;
-			bench_cfg.rowgroup                            = opt.rowgroup;
-			bench_cfg.include_materialize                 = opt.include_materialize;
-			bench_cfg.reuse_table_resources              = opt.reuse_table_resources;
-			if (bench_cfg.include_materialize) {
-				bench_cfg.execution.write_out = true;
+			const uint32_t                        benchmark_samples = std::max<uint32_t>(1, opt.samples);
+			const uint32_t                        kernel_samples    = std::max<uint32_t>(1, opt.kernel_samples);
+			galp::execution::TableBenchmarkConfig bench_cfg {};
+			bench_cfg.samples = kernel_samples;
+			apply_table_options(bench_cfg, opt);
+			bench_cfg.execution.write_out   = opt.include_materialize;
+			bench_cfg.rowgroup              = opt.rowgroup;
+			bench_cfg.include_materialize   = opt.include_materialize;
+			bench_cfg.reuse_table_resources = opt.reuse_table_resources;
+
+			std::vector<galp::execution::TableBenchmarkResult> results;
+			results.reserve(benchmark_samples);
+			for (uint32_t sample_idx = 0; sample_idx < benchmark_samples; ++sample_idx) {
+				results.push_back(galp::execution::benchmark_table(opt.input, bench_cfg));
 			}
-			const auto result = dispatch::benchmark_table(opt.input, bench_cfg);
+
+			const auto& result          = results[median_result_index(results)];
+			const auto  benchmark_stats = summarize_metric(results, [](const auto& r) { return r.end_to_end_ms; });
+			const auto  query_stats     = summarize_metric(results, [](const auto& r) { return r.query_wall_ms; });
+			const auto  kernel_stats    = summarize_metric(results, [](const auto& r) { return r.kernel_ms; });
 
 			const double benchmark_wall_ms         = result.end_to_end_ms;
 			const double resource_prepare_ms       = result.resource_prepare_ms;
@@ -454,11 +502,12 @@ int main(int argc, char** argv) {
 			const size_t total_h2d_copies          = result.total_h2d_copies;
 			const size_t prefetched_rowgroups      = result.prefetched_rowgroups;
 			const size_t total_rgs                 = result.total_rgs;
-			const bool   whole_table_prefetch = opt.enable_rowgroup_prefetch &&
-			                                  bench_cfg.scope == dispatch::TableDecompressionScope::WholeTable &&
+			const bool   whole_table_prefetch      = opt.enable_rowgroup_prefetch &&
+			                                  bench_cfg.scope == galp::execution::TableDecompressionScope::WholeTable &&
 			                                  !opt.rowgroup.has_value() && total_rgs != 0;
 			const size_t actual_prefetch_workers =
-			    whole_table_prefetch ? std::min(effective_prefetch_workers(opt.prefetch_workers, total_rgs), total_rgs) : 0;
+			    whole_table_prefetch ? std::min(effective_prefetch_workers(opt.prefetch_workers, total_rgs), total_rgs)
+			                         : 0;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
 			                         : 0.0;
@@ -470,13 +519,20 @@ int main(int argc, char** argv) {
 			std::cout << "  rowgroups: " << total_rgs << "\n";
 			std::cout << "  columns: " << total_columns << "\n";
 			std::cout << "  vectors: " << total_items << "\n";
-			std::cout << "  samples: " << opt.samples << "\n";
+			std::cout << "  samples: " << benchmark_samples << "\n";
+			std::cout << "  kernel_samples: " << kernel_samples << "\n";
 			std::cout << "  bytes: " << total_bytes << " (" << format_bytes(static_cast<double>(total_bytes)) << ")\n";
 			std::cout << "  storage_bytes: " << total_storage_bytes << " ("
 			          << format_bytes(static_cast<double>(total_storage_bytes)) << ")\n";
 			std::cout << "  benchmark_wall_ms: " << benchmark_wall_ms << "\n";
+			std::cout << "  benchmark_wall_ms_min: " << benchmark_stats.min << "\n";
+			std::cout << "  benchmark_wall_ms_median: " << benchmark_stats.median << "\n";
+			std::cout << "  benchmark_wall_ms_mean: " << benchmark_stats.mean << "\n";
 			std::cout << "  resource_prepare_ms: " << resource_prepare_ms << "\n";
 			std::cout << "  query_wall_ms: " << query_wall_ms << "\n";
+			std::cout << "  query_wall_ms_min: " << query_stats.min << "\n";
+			std::cout << "  query_wall_ms_median: " << query_stats.median << "\n";
+			std::cout << "  query_wall_ms_mean: " << query_stats.mean << "\n";
 			std::cout << "  pipeline_active_ms: " << pipeline_active_ms << "\n";
 			std::cout << "  read_rowgroup_ms: " << read_rowgroup_ms << "\n";
 			std::cout << "  file_read_ms: " << file_read_ms << "\n";
@@ -509,6 +565,9 @@ int main(int argc, char** argv) {
 			std::cout << "  h2d_bytes: " << total_h2d_bytes << "\n";
 			std::cout << "  h2d_copies: " << total_h2d_copies << "\n";
 			std::cout << "  kernel_event_ms: " << kernel_event_ms << "\n";
+			std::cout << "  kernel_event_ms_min: " << kernel_stats.min << "\n";
+			std::cout << "  kernel_event_ms_median: " << kernel_stats.median << "\n";
+			std::cout << "  kernel_event_ms_mean: " << kernel_stats.mean << "\n";
 			std::cout << "  release_device_ms: " << release_device_ms << "\n";
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";
 			std::cout << "  prefetch_wait_ms: " << prefetch_wait_ms << "\n";
@@ -544,7 +603,9 @@ int main(int argc, char** argv) {
 			std::cout << "  unpack_n_vectors: " << opt.unpack_n_vectors << "\n";
 			std::cout << "  unpack_n_values: " << opt.unpack_n_values << "\n";
 			std::cout << "  write_back: " << (bench_cfg.execution.write_out ? 1 : 0) << "\n";
-			std::cout << "  include_materialize: " << (opt.include_materialize ? 1 : 0) << "\n";
+			std::cout << "  include_materialize: " << (bench_cfg.include_materialize ? 1 : 0) << "\n";
+			std::cout << "  consume_only: " << (bench_cfg.include_materialize ? 0 : 1) << "\n";
+			std::cout << "  write_back_free: " << (bench_cfg.execution.write_out ? 0 : 1) << "\n";
 			std::cout << "  reuse_table_resources: " << (opt.reuse_table_resources ? 1 : 0) << "\n";
 			std::cout << "  freq_patcher: " << freq_patcher_name(opt.freq_patcher) << "\n";
 			std::cout << "  freq_hybrid_threshold: " << opt.freq_branchless_threshold << "\n";
