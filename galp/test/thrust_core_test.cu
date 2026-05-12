@@ -3,7 +3,9 @@
 // ────────────────────────────────────────────────────────
 // galp/test/thrust_core_test.cu
 // ────────────────────────────────────────────────────────
+#include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <string>
 #include <thrust/device_vector.h>
 #include <thrust/equal.h>
 #include <thrust/fill.h>
@@ -20,6 +22,20 @@
 #include <thrust/tuple.h>
 #include <thrust/unique.h>
 
+namespace {
+std::string cuda_unavailable_reason() {
+	int        device_count = 0;
+	const auto status       = cudaGetDeviceCount(&device_count);
+	if (status != cudaSuccess) {
+		return std::string("CUDA device not available for Thrust test: ") + cudaGetErrorString(status);
+	}
+	if (device_count <= 0) {
+		return "CUDA device not available for Thrust test: device count is zero";
+	}
+	return {};
+}
+} // namespace
+
 // --------------------------------------------------------------------
 // Custom functor for zip transform
 // --------------------------------------------------------------------
@@ -33,6 +49,10 @@ struct SumTuple {
 // 1. Containers & element-wise algorithms
 // --------------------------------------------------------------------
 TEST(ThrustCore, TransformAdd) {
+	if (const auto reason = cuda_unavailable_reason(); !reason.empty()) {
+		GTEST_SKIP() << reason;
+	}
+
 	const int                  N = 128;
 	thrust::device_vector<int> a(N);
 	thrust::device_vector<int> b(N);
@@ -52,6 +72,10 @@ TEST(ThrustCore, TransformAdd) {
 // 2. Reductions & scans
 // --------------------------------------------------------------------
 TEST(ThrustCore, ReduceAndInclusiveScan) {
+	if (const auto reason = cuda_unavailable_reason(); !reason.empty()) {
+		GTEST_SKIP() << reason;
+	}
+
 	const int                  N = 256;
 	thrust::device_vector<int> d(N);
 	thrust::sequence(d.begin(), d.end(), 1); // 1..N
@@ -70,6 +94,10 @@ TEST(ThrustCore, ReduceAndInclusiveScan) {
 // 3. Sorting & uniquing
 // --------------------------------------------------------------------
 TEST(ThrustCore, SortAndUnique) {
+	if (const auto reason = cuda_unavailable_reason(); !reason.empty()) {
+		GTEST_SKIP() << reason;
+	}
+
 	std::vector<int>           temp = {5, 1, 4, 4, 3, 2, 1};
 	thrust::host_vector<int>   h(temp.begin(), temp.end());
 	thrust::device_vector<int> d = h;
@@ -88,6 +116,10 @@ TEST(ThrustCore, SortAndUnique) {
 // 4. Zip iterator, counting iterator & transform iterator
 // --------------------------------------------------------------------
 TEST(ThrustCore, CountingAndZipIter) {
+	if (const auto reason = cuda_unavailable_reason(); !reason.empty()) {
+		GTEST_SKIP() << reason;
+	}
+
 	const int N      = 64;
 	auto      first  = thrust::make_counting_iterator<int>(0);
 	auto      second = thrust::make_counting_iterator<int>(0);
@@ -108,6 +140,10 @@ TEST(ThrustCore, CountingAndZipIter) {
 // 5. Set difference (requires sorted ranges)
 // --------------------------------------------------------------------
 TEST(ThrustCore, SetDifference) {
+	if (const auto reason = cuda_unavailable_reason(); !reason.empty()) {
+		GTEST_SKIP() << reason;
+	}
+
 	std::vector<int> tempA = {0, 1, 2, 3, 4, 5};
 	std::vector<int> tempB = {1, 3, 5};
 
