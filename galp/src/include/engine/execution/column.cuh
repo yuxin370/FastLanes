@@ -8,10 +8,10 @@
 
 #include "engine/execution/common.cuh"
 
-namespace dispatch {
+namespace galp::execution {
 
-ValueStore decompress(const expr::Expression& expression, const ExecutionConfig& cfg = {});
+ValueStore decompress(const galp::expression::Expression& expression, const ExecutionConfig& cfg = {});
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_COLUMN_CUH

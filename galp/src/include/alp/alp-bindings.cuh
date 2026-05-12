@@ -13,7 +13,7 @@
 #include <exception>
 #include <type_traits>
 
-namespace alp {
+namespace galp::codec::alp {
 
 class EncodingException : public std::exception {
 public:
@@ -27,16 +27,16 @@ public:
 template <typename T>
 bool is_compressable(const T* input_array, const size_t n_elements);
 
-template <typename T>
-flsgpu::host::ALPColumn<T>
+	template <typename T>
+	galp::codec::host::ALPColumn<T>
 encode(const T* input_array, const size_t n_elements, const bool print_compression_info = false);
 
 template <typename T>
-T* decode(const flsgpu::host::ALPColumn<T> column, T* output_array);
+T* decode(const galp::codec::host::ALPColumn<T>& column, T* output_array);
 
 template <typename T>
-T* decode(const flsgpu::host::ALPExtendedColumn<T> column, T* output_array);
+T* decode(const galp::codec::host::ALPExtendedColumn<T>& column, T* output_array);
 
-} // namespace alp
+} // namespace galp::codec::alp
 
 #endif // ALP_BINDINGS_CUH

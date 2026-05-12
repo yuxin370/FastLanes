@@ -14,10 +14,10 @@
 #include <limits>
 #include <vector>
 
-namespace expr {
+namespace galp::expression {
 
 struct Expression {
-	dispatch::Column* column; // non-owning
+	galp::execution::Column* column; // non-owning
 };
 
 inline bool is_supported_token(const fastlanes::OperatorToken token) {
@@ -48,11 +48,11 @@ inline bool is_supported_token(const fastlanes::OperatorToken token) {
 	}
 }
 
-std::vector<Expression> assemble(dispatch::Rowgroup& rowgroup);
+std::vector<Expression> assemble(galp::execution::Rowgroup& rowgroup);
 
-} // namespace expr
+} // namespace galp::expression
 
-namespace dispatch {
+namespace galp::execution {
 
 enum class PlanKind : uint8_t {
 	UNCOMPRESSED,
@@ -115,22 +115,22 @@ struct DeviceExpression {
 	bool     freq_use_extended = false;
 	T*       out;
 	union {
-		flsgpu::device::BPColumn<T>                    bp;
-		flsgpu::device::CONSTANTColumn<T>              constant;
-		flsgpu::device::FFORColumn<T>                  ffor;
-		flsgpu::device::SLPATCHColumn<T>               slpatch;
-		flsgpu::device::DICTFFORColumn<T, uint16_t>    dictffor_u16;
-		flsgpu::device::DICTFFORColumn<T, uint8_t>     dictffor_u8;
-		flsgpu::device::DICTSLPATCHColumn<T, uint16_t> dictslpatch_u16;
-		flsgpu::device::DICTSLPATCHColumn<T, uint8_t>  dictslpatch_u8;
-		flsgpu::device::FREQColumn<T>                  freq;
-		flsgpu::device::FREQExtendedColumn<T>          freq_extended;
-		flsgpu::device::CROSSRLEColumn<T>              crossrle;
-		flsgpu::device::RLEColumn<T, uint8_t>          rle_u8;
-		flsgpu::device::RLEColumn<T, uint16_t>         rle_u16;
+		galp::codec::device::BPColumn<T>                    bp;
+		galp::codec::device::CONSTANTColumn<T>              constant;
+		galp::codec::device::FFORColumn<T>                  ffor;
+		galp::codec::device::SLPATCHColumn<T>               slpatch;
+		galp::codec::device::DICTFFORColumn<T, uint16_t>    dictffor_u16;
+		galp::codec::device::DICTFFORColumn<T, uint8_t>     dictffor_u8;
+		galp::codec::device::DICTSLPATCHColumn<T, uint16_t> dictslpatch_u16;
+		galp::codec::device::DICTSLPATCHColumn<T, uint8_t>  dictslpatch_u8;
+		galp::codec::device::FREQColumn<T>                  freq;
+		galp::codec::device::FREQExtendedColumn<T>          freq_extended;
+		galp::codec::device::CROSSRLEColumn<T>              crossrle;
+		galp::codec::device::RLEColumn<T, uint8_t>          rle_u8;
+		galp::codec::device::RLEColumn<T, uint16_t>         rle_u16;
 	} col;
 };
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXPRESSION_CUH

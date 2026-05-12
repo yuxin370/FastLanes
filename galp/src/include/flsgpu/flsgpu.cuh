@@ -14,4 +14,6 @@
 #include "fls.cuh"
 #include "structs.cuh"
 
+namespace galp::codec::alp {}
+
 #endif // FLSGPU_FLSGPU_CUH

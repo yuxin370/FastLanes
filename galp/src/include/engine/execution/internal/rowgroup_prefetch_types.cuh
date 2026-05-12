@@ -11,7 +11,7 @@
 #include <chrono>
 #include <cstddef>
 
-namespace dispatch::runtime {
+namespace galp::runtime {
 
 struct RowgroupReadTimeline {
 	std::chrono::steady_clock::time_point read_submit {};
@@ -64,12 +64,12 @@ struct RowgroupPrefetchTiming {
 
 struct RowgroupReadResult {
 	size_t                 rowgroup_index = 0;
-	reader::Rowgroup       rowgroup {};
+	galp::format::Rowgroup       rowgroup {};
 	size_t                 storage_bytes = 0;
 	RowgroupReadTiming     timing {};
 	RowgroupPrefetchTiming prefetch {};
 };
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_ROWGROUP_PREFETCH_TYPES_CUH

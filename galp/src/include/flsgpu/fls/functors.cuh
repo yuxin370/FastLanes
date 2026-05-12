@@ -14,10 +14,10 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu { namespace device {
+namespace galp::codec::device {
 template <typename T>
 struct BPFunctor : FunctorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	__device__ __forceinline__   BPFunctor() {};
 	__device__ __forceinline__ T operator()(const UINT_T value, [[maybe_unused]] const vi_t vector_index) {
 		return value;
@@ -26,7 +26,7 @@ struct BPFunctor : FunctorBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct FFORFunctor : FunctorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UINT_T                     bases[UNPACK_N_VECTORS];
 	__device__ __forceinline__ FFORFunctor(const UINT_T* a_bases) {
 #pragma unroll
@@ -40,9 +40,9 @@ struct FFORFunctor : FunctorBase<T> {
 	}
 };
 
-template <typename T, unsigned UNPACK_N_VECTORS, typename IndexT = typename utils::same_width_uint<T>::type>
+template <typename T, unsigned UNPACK_N_VECTORS, typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
 struct DICTFunctor : FunctorBase<T> {
-	using KEY_T = typename utils::same_width_uint<T>::type;
+	using KEY_T = typename galp::codec::utils::same_width_uint<T>::type;
 	const KEY_T* __restrict__ keys;
 	IndexT bases[UNPACK_N_VECTORS];
 
@@ -74,7 +74,7 @@ struct DICTIndexFunctor {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct DICTShfl32Functor : FunctorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	UINT_T k_lane; // key of this lane
 	UINT_T bases[UNPACK_N_VECTORS];
@@ -103,7 +103,7 @@ struct DICTShfl32Functor : FunctorBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct DICTAdaptiveFunctor : FunctorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	const UINT_T* __restrict__ keys;
 	int32_t key_count;
@@ -141,6 +141,6 @@ struct DICTAdaptiveFunctor : FunctorBase<T> {
 	}
 };
 
-}} // namespace flsgpu::device
+} // namespace galp::codec::device
 
 #endif // FLSGPU_FLS_FUNCTORS_CUH

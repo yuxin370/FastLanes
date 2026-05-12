@@ -11,7 +11,7 @@
 
 #include "engine/types.cuh"
 
-namespace dispatch {
+namespace galp::execution {
 
 template <typename>
 inline constexpr bool always_false_v = false;
@@ -43,6 +43,6 @@ struct ExecutionConfig {
 	}
 };
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_CONFIG_CUH

@@ -73,16 +73,16 @@ struct BenchmarkResult {
 	double execution_time_ms;
 	double compression_ratio;
 
-	void log_result(const enums_nvcomp::ComparisonType  comparison_type,
-	                const enums_nvcomp::CompressionType compression_type,
+	void log_result(const galp::bench::nvcomp::ComparisonType  comparison_type,
+	                const galp::bench::nvcomp::CompressionType compression_type,
 	                const size_t                        n_bytes,
 	                const std::string                   data_name) const {
 
 		const char* is_valid = results_match ? "valid" : "wrong";
 
 		printf("%s,%s,%s,%s,%lu,%f,%f\n",
-		       enums_nvcomp::comparison_type_to_string(comparison_type).c_str(),
-		       enums_nvcomp::compression_type_to_string(compression_type).c_str(),
+		       galp::bench::nvcomp::comparison_type_to_string(comparison_type).c_str(),
+		       galp::bench::nvcomp::compression_type_to_string(compression_type).c_str(),
 		       data_name.c_str(),
 		       is_valid,
 		       n_bytes,
@@ -106,39 +106,39 @@ template <typename T>
 BenchmarkResult benchmark_thrust(const T* input, const size_t value_count, const T value_to_search_for);
 
 template <typename T>
-BenchmarkResult benchmark_alp(const enums_nvcomp::ComparisonType  comparison_type,
-                              const enums_nvcomp::CompressionType decompressor_enum,
+BenchmarkResult benchmark_alp(const galp::bench::nvcomp::ComparisonType  comparison_type,
+                              const galp::bench::nvcomp::CompressionType decompressor_enum,
                               const T*                            input,
                               const size_t                        value_count,
                               const T                             value_to_search_for);
 
 template <typename T>
-BenchmarkResult benchmark_hwc(const enums_nvcomp::ComparisonType  comparison_type,
-                              const enums_nvcomp::CompressionType compression_type,
+BenchmarkResult benchmark_hwc(const galp::bench::nvcomp::ComparisonType  comparison_type,
+                              const galp::bench::nvcomp::CompressionType compression_type,
                               const T*                            input,
                               const size_t                        value_count,
                               const T                             value_to_search_for);
 
 BenchmarkResult benchmark_thrust(const float* input, const size_t value_count, const float value_to_search_for);
-BenchmarkResult benchmark_alp(const enums_nvcomp::ComparisonType  comparison_type,
-                              const enums_nvcomp::CompressionType decompressor_enum,
+BenchmarkResult benchmark_alp(const galp::bench::nvcomp::ComparisonType  comparison_type,
+                              const galp::bench::nvcomp::CompressionType decompressor_enum,
                               const float*                        input,
                               const size_t                        value_count,
                               const float                         value_to_search_for);
-BenchmarkResult benchmark_hwc(const enums_nvcomp::ComparisonType  comparison_type,
-                              const enums_nvcomp::CompressionType compression_type,
+BenchmarkResult benchmark_hwc(const galp::bench::nvcomp::ComparisonType  comparison_type,
+                              const galp::bench::nvcomp::CompressionType compression_type,
                               const float*                        input,
                               const size_t                        value_count,
                               const float                         value_to_search_for);
 
 BenchmarkResult benchmark_thrust(const double* input, const size_t value_count, const double value_to_search_for);
-BenchmarkResult benchmark_alp(const enums_nvcomp::ComparisonType  comparison_type,
-                              const enums_nvcomp::CompressionType decompressor_enum,
+BenchmarkResult benchmark_alp(const galp::bench::nvcomp::ComparisonType  comparison_type,
+                              const galp::bench::nvcomp::CompressionType decompressor_enum,
                               const double*                       input,
                               const size_t                        value_count,
                               const double                        value_to_search_for);
-BenchmarkResult benchmark_hwc(const enums_nvcomp::ComparisonType  comparison_type,
-                              const enums_nvcomp::CompressionType compression_type,
+BenchmarkResult benchmark_hwc(const galp::bench::nvcomp::ComparisonType  comparison_type,
+                              const galp::bench::nvcomp::CompressionType compression_type,
                               const double*                       input,
                               const size_t                        value_count,
                               const double                        value_to_search_for);

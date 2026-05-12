@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 
-namespace flsgpu { namespace device {
+namespace galp::codec::device {
 template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
 struct BPDecompressor : DecompressorBase<T> {
 	UnpackerT                  unpacker;
@@ -105,7 +105,7 @@ template <typename T,
           typename ColumnT,
           typename ProcessorT = DICTFunctor<T, UNPACK_N_VECTORS>>
 struct DICTSLPATCHDecompressor : DecompressorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	PatcherT  patcher;
 	UnpackerT unpacker;
 
@@ -129,7 +129,7 @@ template <typename T,
           typename ColumnT,
           typename ProcessorT = DICTFunctor<T, UNPACK_N_VECTORS>>
 struct DICTDecompressor : DecompressorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UnpackerT                  unpacker;
 	__device__ __forceinline__ DICTDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
@@ -157,7 +157,7 @@ struct DICTDecompressor : DecompressorBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
 struct DICTShfl32Decompressor : DecompressorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UnpackerT unpacker;
 
 	__device__ __forceinline__
@@ -165,8 +165,8 @@ struct DICTShfl32Decompressor : DecompressorBase<T> {
 	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
 	               lane,
 	               column.ffor.bp.bit_widths[vector_index],
-	               DICTShfl32Functor<T, UNPACK_N_VECTORS>(
-	                   column.ffor.bases + vector_index, (const UINT_T* __restrict__)column.keys, column.key_count)) {
+		               DICTShfl32Functor<T, UNPACK_N_VECTORS>(
+		                   column.ffor.bases + vector_index, reinterpret_cast<const UINT_T*>(column.keys), column.key_count)) {
 	}
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		unpacker.unpack_next_into(out);
@@ -175,7 +175,7 @@ struct DICTShfl32Decompressor : DecompressorBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, typename ExpanderT, typename ColumnT>
 struct CROSSRLEDecompressor : DecompressorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	ExpanderT                  expander;
 	__device__ __forceinline__ CROSSRLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : expander(column, vector_index, lane) {
@@ -216,6 +216,6 @@ struct RLEDecompressor : DecompressorBase<ValueT> {
 	}
 };
 
-}} // namespace flsgpu::device
+} // namespace galp::codec::device
 
 #endif // FLSGPU_FLS_DECOMPRESSORS_CUH

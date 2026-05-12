@@ -23,19 +23,19 @@
 #include <utility>
 #include <vector>
 
-namespace dispatch::runtime {
+namespace galp::runtime {
 
 // Bounded ring-buffer prefetcher: worker threads read rowgroups ahead of the
 // consumer while slots_[(idx - start) % depth] provides back-pressure.
 class RowgroupPrefetchQueue {
 public:
-	RowgroupPrefetchQueue(std::shared_ptr<reader::reader>           shared_reader,
-	                      const size_t                              start,
-	                      const size_t                              end,
-	                      const size_t                              depth,
-	                      const size_t                              num_workers,
-	                      std::shared_ptr<PinnedRowgroupBufferPool> pinned_pool = {},
-	                      const size_t                              max_inflight_storage_bytes = 0)
+	RowgroupPrefetchQueue(std::shared_ptr<galp::format::FlsReader> shared_reader,
+	                      const size_t                                       start,
+	                      const size_t                                       end,
+	                      const size_t                                       depth,
+	                      const size_t                                       num_workers,
+	                      std::shared_ptr<PinnedRowgroupBufferPool>          pinned_pool = {},
+	                      const size_t                                       max_inflight_storage_bytes = 0)
 	    : start_(start)
 	    , end_(end)
 	    , depth_(std::max<size_t>(1, depth))
@@ -55,16 +55,16 @@ public:
 		for (size_t w = 0; w < worker_count_; ++w) {
 			workers_.emplace_back([this, pinned_pool, w]() {
 				try {
-					reader::reader& rdr = *shared_reader_;
+					galp::format::FlsReader& rdr = *shared_reader_;
 					while (true) {
 						const size_t rg_idx = next_claim_.fetch_add(1, std::memory_order_relaxed);
 						if (rg_idx >= end_) {
 							break;
 						}
 
-						const size_t storage_bytes       = rdr.rowgroup_storage_bytes(rg_idx);
-						const auto   depth_block_start   = std::chrono::steady_clock::now();
-						bool         blocked_by_bytes    = false;
+						const size_t storage_bytes     = rdr.rowgroup_storage_bytes(rg_idx);
+						const auto   depth_block_start  = std::chrono::steady_clock::now();
+						bool         blocked_by_bytes   = false;
 						bool         budget_order_advanced = false;
 						{
 							std::unique_lock<std::mutex> lock(mutex_);
@@ -99,11 +99,11 @@ public:
 
 						RowgroupReadResult                    prefetched {};
 						const auto                            read_start = std::chrono::steady_clock::now();
-						reader::ZeroCopyRowgroup              zero_copy {};
-						reader::ZeroCopyReadTiming            io_timing {};
+						galp::format::ZeroCopyRowgroup zero_copy {};
+						galp::format::ZeroCopyReadTiming io_timing {};
 						std::chrono::steady_clock::time_point file_read_start {};
-						prefetched.rowgroup_index           = rg_idx;
-						prefetched.storage_bytes            = storage_bytes;
+						prefetched.rowgroup_index             = rg_idx;
+						prefetched.storage_bytes              = storage_bytes;
 						prefetched.prefetch.depth_block_ms =
 						    std::chrono::duration<double, std::milli>(depth_block_end - depth_block_start).count();
 						if (blocked_by_bytes) {
@@ -269,9 +269,9 @@ private:
 	bool                                           stop_    = false;
 	double                                         wait_ms_ = 0.0;
 	std::shared_ptr<PinnedRowgroupBufferPool>      pinned_pool_;
-	std::shared_ptr<reader::reader>                shared_reader_;
+	std::shared_ptr<galp::format::FlsReader> shared_reader_;
 };
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_ROWGROUP_PREFETCH_QUEUE_CUH

@@ -4,7 +4,7 @@
 // galp/src/include/flsgpu/old_fls.cuh
 // ────────────────────────────────────────────────────────
 // Legacy 32-bit fixed-width unpack path. Exposes a single entry point:
-//   oldfls::adjusted::unpack(in, out, value_bit_width)
+//   galp::oldfls::adjusted::unpack(in, out, value_bit_width)
 // which dispatches to 33 bit-width-specific kernels (bw=0..32). Only consumed
 // by BitUnpackerOldFls in fls/unpackers.cuh for the 32ow/32crw/1uf layout —
 // new code should prefer the templated flsgpu::device::BitUnpacker* pipeline.
@@ -15,7 +15,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-namespace oldfls {
+namespace galp::oldfls {
 
 namespace adjusted {
 
@@ -3479,6 +3479,6 @@ __device__ __forceinline__ void unpack(const uint32_t* __restrict a_in_p, uint32
 }
 
 } // namespace adjusted
-} // namespace oldfls
+} // namespace galp::oldfls
 
 #endif // FLSGPU_OLD_FLS_CUH

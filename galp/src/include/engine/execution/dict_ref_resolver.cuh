@@ -10,11 +10,11 @@
 #include <stdexcept>
 #include <vector>
 
-namespace dispatch {
+namespace galp::execution {
 
 namespace detail {
 
-inline size_t resolve_alias_index(const std::vector<expr::Expression>& expressions, const size_t idx) {
+inline size_t resolve_alias_index(const std::vector<galp::expression::Expression>& expressions, const size_t idx) {
 	if (idx >= expressions.size()) {
 		throw std::out_of_range("alias index out of range");
 	}
@@ -33,38 +33,38 @@ inline size_t resolve_alias_index(const std::vector<expr::Expression>& expressio
 }
 
 struct DictRefResolveResult {
-	dispatch::EncodedPayload payload;
+	galp::execution::EncodedPayload payload;
 	fastlanes::OperatorToken token;
 };
 
 inline DictRefResolveResult
-resolve_dictref_i8_u8_from_index(const flsgpu::host::DICTREFColumn<int8_t, uint8_t>& dict_ref,
-                                 const dispatch::EncodedPayload&                     index_payload) {
+resolve_dictref_i8_u8_from_index(const galp::codec::host::DICTREFColumn<int8_t, uint8_t>& dict_ref,
+                                 const galp::execution::EncodedPayload&                     index_payload) {
 	DictRefResolveResult out {};
 	bool                 handled = false;
 
 	std::visit(
 	    [&](auto&& index_col) {
 		    using IndexHostT = std::decay_t<decltype(index_col)>;
-		    if constexpr (std::is_same_v<IndexHostT, flsgpu::host::FFORColumn<int8_t>>) {
-			    auto  idx_ffor = flsgpu::host::detail::make_ffor_u8_from_ffor_i8(index_col);
-			    auto* keys     = utils::copy_array(dict_ref.keys, dict_ref.key_count);
+		    if constexpr (std::is_same_v<IndexHostT, galp::codec::host::FFORColumn<int8_t>>) {
+			    auto  idx_ffor = galp::codec::host::make_ffor_u8_from_ffor_i8(index_col);
+				    auto* keys     = galp::codec::utils::copy_array(dict_ref.keys.get(), dict_ref.key_count);
 			    out.payload =
-			        flsgpu::host::DICTFFORColumn<int8_t, uint8_t> {std::move(idx_ffor), keys, dict_ref.key_count};
+			        galp::codec::host::DICTFFORColumn<int8_t, uint8_t> {std::move(idx_ffor), keys, dict_ref.key_count};
 			    out.token = fastlanes::OperatorToken::EXP_DICT_I08_FFOR_U08;
 			    handled   = true;
-		    } else if constexpr (std::is_same_v<IndexHostT, flsgpu::host::BPColumn<int8_t>>) {
-			    auto  idx_ffor = flsgpu::host::detail::make_ffor_u8_from_bp_i8(index_col);
-			    auto* keys     = utils::copy_array(dict_ref.keys, dict_ref.key_count);
+		    } else if constexpr (std::is_same_v<IndexHostT, galp::codec::host::BPColumn<int8_t>>) {
+			    auto  idx_ffor = galp::codec::host::make_ffor_u8_from_bp_i8(index_col);
+				    auto* keys     = galp::codec::utils::copy_array(dict_ref.keys.get(), dict_ref.key_count);
 			    out.payload =
-			        flsgpu::host::DICTFFORColumn<int8_t, uint8_t> {std::move(idx_ffor), keys, dict_ref.key_count};
+			        galp::codec::host::DICTFFORColumn<int8_t, uint8_t> {std::move(idx_ffor), keys, dict_ref.key_count};
 			    out.token = fastlanes::OperatorToken::EXP_DICT_I08_FFOR_U08;
 			    handled   = true;
-		    } else if constexpr (std::is_same_v<IndexHostT, flsgpu::host::SLPATCHColumn<int8_t>>) {
-			    auto  idx_slpatch = flsgpu::host::detail::make_slpatch_u8_from_slpatch_i8(index_col);
-			    auto* keys        = utils::copy_array(dict_ref.keys, dict_ref.key_count);
+		    } else if constexpr (std::is_same_v<IndexHostT, galp::codec::host::SLPATCHColumn<int8_t>>) {
+			    auto  idx_slpatch = galp::codec::host::make_slpatch_u8_from_slpatch_i8(index_col);
+				    auto* keys        = galp::codec::utils::copy_array(dict_ref.keys.get(), dict_ref.key_count);
 			    out.payload =
-			        flsgpu::host::DICTSLPATCHColumn<int8_t, uint8_t> {std::move(idx_slpatch), keys, dict_ref.key_count};
+			        galp::codec::host::DICTSLPATCHColumn<int8_t, uint8_t> {std::move(idx_slpatch), keys, dict_ref.key_count};
 			    out.token = fastlanes::OperatorToken::EXP_DICT_I08_FFOR_SLPATCH_U08;
 			    handled   = true;
 		    }
@@ -79,11 +79,11 @@ resolve_dictref_i8_u8_from_index(const flsgpu::host::DICTREFColumn<int8_t, uint8
 
 } // namespace detail
 
-inline void resolve_dict_refs(std::vector<expr::Expression>& expressions) {
+inline void resolve_dict_refs(std::vector<galp::expression::Expression>& expressions) {
 	bool has_dict_ref = false;
 	for (const auto& expression : expressions) {
 		const auto* col = expression.column;
-		if (col != nullptr && std::holds_alternative<flsgpu::host::DICTREFColumn<int8_t, uint8_t>>(col->host)) {
+		if (col != nullptr && std::holds_alternative<galp::codec::host::DICTREFColumn<int8_t, uint8_t>>(col->host)) {
 			has_dict_ref = true;
 			break;
 		}
@@ -112,8 +112,8 @@ inline void resolve_dict_refs(std::vector<expr::Expression>& expressions) {
 
         state[idx] = VisitState::Visiting;
         auto* col  = expressions[idx].column;
-        if (col != nullptr && std::holds_alternative<flsgpu::host::DICTREFColumn<int8_t, uint8_t>>(col->host)) {
-            const auto dict_ref = std::get<flsgpu::host::DICTREFColumn<int8_t, uint8_t>>(col->host);
+        if (col != nullptr && std::holds_alternative<galp::codec::host::DICTREFColumn<int8_t, uint8_t>>(col->host)) {
+            const auto& dict_ref = std::get<galp::codec::host::DICTREFColumn<int8_t, uint8_t>>(col->host);
             const auto src_idx = detail::resolve_alias_index(expressions, dict_ref.index_column_index);
             self(self, src_idx);
             auto* src_col = expressions[src_idx].column;
@@ -121,9 +121,6 @@ inline void resolve_dict_refs(std::vector<expr::Expression>& expressions) {
                 throw std::runtime_error("DICTREF: referenced index column is null");
             }
             auto resolved = detail::resolve_dictref_i8_u8_from_index(dict_ref, src_col->host);
-            if (!col->host_owned_by_backing) {
-                flsgpu::host::free_column(dict_ref);
-            }
             col->host  = std::move(resolved.payload);
             col->token = resolved.token;
             // The resolved payload owns its buffers. Clear the borrowed-backing
@@ -140,6 +137,6 @@ inline void resolve_dict_refs(std::vector<expr::Expression>& expressions) {
 	}
 }
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_DICT_REF_RESOLVER_CUH

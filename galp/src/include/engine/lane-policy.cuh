@@ -9,14 +9,14 @@
 #include "engine/expression.cuh"
 #include "flsgpu/utils.cuh"
 
-namespace dispatch {
+namespace galp::execution {
 
 __host__ __device__ __forceinline__ constexpr uint32_t lane_count_for_type(const TypeTag type) {
 	switch (type) {
 	case TypeTag::I8:
-		return static_cast<uint32_t>(utils::get_n_lanes<int8_t>());
+		return static_cast<uint32_t>(galp::codec::utils::get_n_lanes<int8_t>());
 	case TypeTag::I16:
-		return static_cast<uint32_t>(utils::get_n_lanes<int16_t>());
+		return static_cast<uint32_t>(galp::codec::utils::get_n_lanes<int16_t>());
 	default:
 		return 0;
 	}
@@ -48,6 +48,6 @@ __host__ __device__ __forceinline__ constexpr uint32_t semantic_lane_count(const
 	return semantic_lane_count(type_tag_for<T>(), expr.plan);
 }
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_LANE_POLICY_CUH

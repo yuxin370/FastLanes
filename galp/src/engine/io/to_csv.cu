@@ -4,13 +4,14 @@
 // galp/src/engine/io/to_csv.cu
 // ────────────────────────────────────────────────────────
 #include "engine/io/to_csv.cuh"
+#include "engine/reader.cuh"
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <type_traits>
 #include <vector>
 
-namespace io {
+namespace galp::io {
 namespace {
 
 template <typename PtrT>
@@ -23,10 +24,10 @@ void write_cell(std::ostream& out, const PtrT& ptr, size_t row) {
 	}
 }
 
-void write_row(std::ostream&                 out,
-               const std::vector<size_t>&    value_indices,
-               const dispatch::RowgroupData& rowgroup_data,
-               const size_t                  row) {
+void write_row(std::ostream&                        out,
+               const std::vector<size_t>&           value_indices,
+               const galp::execution::RowgroupData& rowgroup_data,
+               const size_t                         row) {
 	for (size_t ci = 0; ci < value_indices.size(); ++ci) {
 		if (ci > 0) {
 			out << "|";
@@ -41,7 +42,7 @@ void write_row(std::ostream&                 out,
 	out << "\n";
 }
 
-size_t resolve_value_index(const std::vector<expr::Expression>& expressions, const size_t idx) {
+size_t resolve_value_index(const std::vector<galp::expression::Expression>& expressions, const size_t idx) {
 	size_t cur = idx;
 	for (size_t step = 0; step < expressions.size(); ++step) {
 		if (cur >= expressions.size()) {
@@ -62,27 +63,27 @@ size_t resolve_value_index(const std::vector<expr::Expression>& expressions, con
 
 } // namespace
 
-void read_table_to_csv(const std::filesystem::path&              fls_path,
-                       std::ostream&                             out,
-                       const bool                                write_header,
-                       const dispatch::TableDecompressionConfig& table_cfg,
-                       const std::optional<size_t>&              rowgroup) {
+void read_table_to_csv(const std::filesystem::path&                     fls_path,
+                       std::ostream&                                    out,
+                       const bool                                       write_header,
+                       const galp::execution::TableDecompressionConfig& table_cfg,
+                       const std::optional<size_t>&                     rowgroup) {
 	if (rowgroup.has_value()) {
-		reader::reader rdr(fls_path);
+		galp::format::FlsReader rdr(fls_path);
 		if (*rowgroup >= rdr.rowgroup_count()) {
 			throw std::out_of_range("rowgroup index out of range");
 		}
 	}
 
 	bool header_written = false;
-	dispatch::decompress_table(
+	galp::execution::decompress_table(
 	    fls_path,
 	    table_cfg,
 	    [rowgroup](const size_t rg_idx) { return !rowgroup.has_value() || *rowgroup == rg_idx; },
 	    [&](size_t,
-	        reader::Rowgroup&                    rowgroup,
-	        const std::vector<expr::Expression>& expressions,
-	        const dispatch::RowgroupData&        result) {
+	        galp::execution::Rowgroup&                       rowgroup,
+	        const std::vector<galp::expression::Expression>& expressions,
+	        const galp::execution::RowgroupData&             result) {
 		    std::vector<size_t>      value_indices;
 		    std::vector<std::string> col_names;
 		    for (size_t i = 0; i < expressions.size(); ++i) {
@@ -115,4 +116,4 @@ void read_table_to_csv(const std::filesystem::path&              fls_path,
 	    });
 }
 
-} // namespace io
+} // namespace galp::io

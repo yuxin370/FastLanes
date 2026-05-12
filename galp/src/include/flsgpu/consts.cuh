@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace consts {
+namespace galp::codec::consts {
 
 constexpr int32_t  REGISTER_WIDTH        = 1024;
 constexpr int32_t  VALUES_PER_VECTOR     = 1024;
@@ -34,6 +34,6 @@ struct as<double> {
 	static inline constexpr int32_t FACT_ARR_COUNT = 19;
 	static inline constexpr int32_t FRAC_ARR_COUNT = 21;
 };
-} // namespace consts
+} // namespace galp::codec::consts
 
 #endif // CONSTS_H

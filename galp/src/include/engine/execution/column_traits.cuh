@@ -16,79 +16,77 @@
 #include "engine/expression.cuh"
 #include "flsgpu/memory/device_arena.cuh"
 #include "flsgpu/structs.cuh"
+#include <memory>
 #include <stdexcept>
 #include <type_traits>
 
-namespace dispatch {
+namespace galp::execution {
 
 template <typename HostColT>
 struct ColumnKindTraits;
 
 template <typename T>
-struct ColumnKindTraits<flsgpu::host::BPColumn<T>> {
+struct ColumnKindTraits<galp::codec::host::BPColumn<T>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind = PlanKind::UNCOMPRESSED;
 	static void fill(DeviceExpression<T>&                expr,
-	                 const flsgpu::host::BPColumn<T>&    host_col,
-	                 flsgpu::memory::DeviceArena&        arena,
+	                 const galp::codec::host::BPColumn<T>&    host_col,
+	                 galp::memory::DeviceArena&        arena,
 	                 [[maybe_unused]] bool               freq_use_extended) {
 		host_col.copy_to_device(arena, expr.col.bp);
 	}
 };
 
 template <typename T>
-struct ColumnKindTraits<flsgpu::host::CONSTANTColumn<T>> {
+struct ColumnKindTraits<galp::codec::host::CONSTANTColumn<T>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind = PlanKind::CONSTANT;
 	static void fill(DeviceExpression<T>&                   expr,
-	                 const flsgpu::host::CONSTANTColumn<T>& host_col,
-	                 flsgpu::memory::DeviceArena&           arena,
+	                 const galp::codec::host::CONSTANTColumn<T>& host_col,
+	                 galp::memory::DeviceArena&           arena,
 	                 [[maybe_unused]] bool                  freq_use_extended) {
 		host_col.copy_to_device(arena, expr.col.constant);
 	}
 };
 
 template <typename T>
-struct ColumnKindTraits<flsgpu::host::FFORColumn<T>> {
+struct ColumnKindTraits<galp::codec::host::FFORColumn<T>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind = PlanKind::UNFFOR;
 	static void fill(DeviceExpression<T>&                expr,
-	                 const flsgpu::host::FFORColumn<T>&  host_col,
-	                 flsgpu::memory::DeviceArena&        arena,
+	                 const galp::codec::host::FFORColumn<T>&  host_col,
+	                 galp::memory::DeviceArena&        arena,
 	                 [[maybe_unused]] bool               freq_use_extended) {
 		host_col.copy_to_device(arena, expr.col.ffor);
 	}
 };
 
 template <typename T>
-struct ColumnKindTraits<flsgpu::host::SLPATCHColumn<T>> {
+struct ColumnKindTraits<galp::codec::host::SLPATCHColumn<T>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind = PlanKind::UNFFOR_SLPATCH;
 	static void fill(DeviceExpression<T>&                  expr,
-	                 const flsgpu::host::SLPATCHColumn<T>& host_col,
-	                 flsgpu::memory::DeviceArena&          arena,
+	                 const galp::codec::host::SLPATCHColumn<T>& host_col,
+	                 galp::memory::DeviceArena&          arena,
 	                 [[maybe_unused]] bool                 freq_use_extended) {
 		host_col.copy_to_device(arena, expr.col.slpatch);
 	}
 };
 
 template <typename T>
-struct ColumnKindTraits<flsgpu::host::FREQColumn<T>> {
+struct ColumnKindTraits<galp::codec::host::FREQColumn<T>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind = PlanKind::FREQUENCY;
 	static void fill(DeviceExpression<T>&                expr,
-	                 const flsgpu::host::FREQColumn<T>&  host_col,
-	                 flsgpu::memory::DeviceArena&        arena,
+	                 const galp::codec::host::FREQColumn<T>&  host_col,
+	                 galp::memory::DeviceArena&        arena,
 	                 bool                                freq_use_extended) {
 		if (freq_use_extended) {
-			// Extended column is a temporary — capture by value in defer_free so its
-			// arrays stay alive until arena.upload() finishes the DMA.
 			auto extended = host_col.create_extended_column();
-			extended.copy_to_device(arena, expr.col.freq_extended);
+			auto owned_extended = std::make_shared<decltype(extended)>(std::move(extended));
+			owned_extended->copy_to_device(arena, expr.col.freq_extended);
 			expr.freq_use_extended = true;
-			arena.defer_free([ext = extended]() {
-				flsgpu::host::free_column(ext);
-			});
+			arena.defer_free([owned_extended]() {});
 			return;
 		}
 		host_col.copy_to_device(arena, expr.col.freq);
@@ -97,25 +95,25 @@ struct ColumnKindTraits<flsgpu::host::FREQColumn<T>> {
 };
 
 template <typename T>
-struct ColumnKindTraits<flsgpu::host::CROSSRLEColumn<T>> {
+struct ColumnKindTraits<galp::codec::host::CROSSRLEColumn<T>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind = PlanKind::CROSS_RLE;
 	static void fill(DeviceExpression<T>&                    expr,
-	                 const flsgpu::host::CROSSRLEColumn<T>&  host_col,
-	                 flsgpu::memory::DeviceArena&            arena,
+	                 const galp::codec::host::CROSSRLEColumn<T>&  host_col,
+	                 galp::memory::DeviceArena&            arena,
 	                 [[maybe_unused]] bool                   freq_use_extended) {
 		host_col.copy_to_device(arena, expr.col.crossrle);
 	}
 };
 
 template <typename T, typename IndexT>
-struct ColumnKindTraits<flsgpu::host::DICTFFORColumn<T, IndexT>> {
+struct ColumnKindTraits<galp::codec::host::DICTFFORColumn<T, IndexT>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind =
 	    std::is_same_v<IndexT, uint8_t> ? PlanKind::DICT_FFOR_U8 : PlanKind::DICT_FFOR_U16;
 	static void fill(DeviceExpression<T>&                               expr,
-	                 const flsgpu::host::DICTFFORColumn<T, IndexT>&     host_col,
-	                 flsgpu::memory::DeviceArena&                       arena,
+	                 const galp::codec::host::DICTFFORColumn<T, IndexT>&     host_col,
+	                 galp::memory::DeviceArena&                       arena,
 	                 [[maybe_unused]] bool                              freq_use_extended) {
 		if constexpr (std::is_same_v<IndexT, uint8_t>) {
 			host_col.copy_to_device(arena, expr.col.dictffor_u8);
@@ -126,13 +124,13 @@ struct ColumnKindTraits<flsgpu::host::DICTFFORColumn<T, IndexT>> {
 };
 
 template <typename T, typename IndexT>
-struct ColumnKindTraits<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
+struct ColumnKindTraits<galp::codec::host::DICTSLPATCHColumn<T, IndexT>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind =
 	    std::is_same_v<IndexT, uint8_t> ? PlanKind::DICT_FFOR_SLPATCH_U8 : PlanKind::DICT_FFOR_SLPATCH_U16;
 	static void fill(DeviceExpression<T>&                                  expr,
-	                 const flsgpu::host::DICTSLPATCHColumn<T, IndexT>&     host_col,
-	                 flsgpu::memory::DeviceArena&                          arena,
+	                 const galp::codec::host::DICTSLPATCHColumn<T, IndexT>&     host_col,
+	                 galp::memory::DeviceArena&                          arena,
 	                 [[maybe_unused]] bool                                 freq_use_extended) {
 		if constexpr (std::is_same_v<IndexT, uint8_t>) {
 			host_col.copy_to_device(arena, expr.col.dictslpatch_u8);
@@ -143,13 +141,13 @@ struct ColumnKindTraits<flsgpu::host::DICTSLPATCHColumn<T, IndexT>> {
 };
 
 template <typename T, typename IndexT>
-struct ColumnKindTraits<flsgpu::host::RLEColumn<T, IndexT>> {
+struct ColumnKindTraits<galp::codec::host::RLEColumn<T, IndexT>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind =
 	    std::is_same_v<IndexT, uint8_t> ? PlanKind::RLE_U8 : PlanKind::RLE_U16;
 	static void fill(DeviceExpression<T>&                          expr,
-	                 const flsgpu::host::RLEColumn<T, IndexT>&     host_col,
-	                 flsgpu::memory::DeviceArena&                  arena,
+	                 const galp::codec::host::RLEColumn<T, IndexT>&     host_col,
+	                 galp::memory::DeviceArena&                  arena,
 	                 [[maybe_unused]] bool                         freq_use_extended) {
 		if constexpr (std::is_same_v<IndexT, uint8_t>) {
 			host_col.copy_to_device(arena, expr.col.rle_u8);
@@ -163,13 +161,13 @@ struct ColumnKindTraits<flsgpu::host::RLEColumn<T, IndexT>> {
 // reaching fill_device_expr. Trait exists so the visitor template instantiates
 // cleanly; fill() throws to match the prior runtime "plan/column mismatch".
 template <typename T, typename IndexT>
-struct ColumnKindTraits<flsgpu::host::DICTREFColumn<T, IndexT>> {
+struct ColumnKindTraits<galp::codec::host::DICTREFColumn<T, IndexT>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind =
 	    std::is_same_v<IndexT, uint8_t> ? PlanKind::DICT_FFOR_U8 : PlanKind::DICT_FFOR_U16;
 	static void fill(DeviceExpression<T>&,
-	                 const flsgpu::host::DICTREFColumn<T, IndexT>&,
-	                 flsgpu::memory::DeviceArena&,
+	                 const galp::codec::host::DICTREFColumn<T, IndexT>&,
+	                 galp::memory::DeviceArena&,
 	                 bool) {
 		throw std::runtime_error("ColumnKindTraits<DICTREFColumn>::fill: must resolve_dict_refs before dispatch");
 	}
@@ -181,42 +179,42 @@ struct ColumnKindTraits<flsgpu::host::DICTREFColumn<T, IndexT>> {
 template <typename ColumnT>
 struct column_value_type;
 template <typename T>
-struct column_value_type<flsgpu::device::BPColumn<T>> {
+struct column_value_type<galp::codec::device::BPColumn<T>> {
 	using type = T;
 };
 template <typename T>
-struct column_value_type<flsgpu::device::CONSTANTColumn<T>> {
+struct column_value_type<galp::codec::device::CONSTANTColumn<T>> {
 	using type = T;
 };
 template <typename T>
-struct column_value_type<flsgpu::device::FFORColumn<T>> {
+struct column_value_type<galp::codec::device::FFORColumn<T>> {
 	using type = T;
 };
 template <typename T, typename IndexT>
-struct column_value_type<flsgpu::device::DICTFFORColumn<T, IndexT>> {
+struct column_value_type<galp::codec::device::DICTFFORColumn<T, IndexT>> {
 	using type = T;
 };
 template <typename T, typename IndexT>
-struct column_value_type<flsgpu::device::DICTSLPATCHColumn<T, IndexT>> {
+struct column_value_type<galp::codec::device::DICTSLPATCHColumn<T, IndexT>> {
 	using type = T;
 };
 template <typename T>
-struct column_value_type<flsgpu::device::FREQColumn<T>> {
+struct column_value_type<galp::codec::device::FREQColumn<T>> {
 	using type = T;
 };
 template <typename T>
-struct column_value_type<flsgpu::device::CROSSRLEColumn<T>> {
+struct column_value_type<galp::codec::device::CROSSRLEColumn<T>> {
 	using type = T;
 };
 template <typename T>
-struct column_value_type<flsgpu::device::SLPATCHColumn<T>> {
+struct column_value_type<galp::codec::device::SLPATCHColumn<T>> {
 	using type = T;
 };
 template <typename T, typename IndexT>
-struct column_value_type<flsgpu::device::RLEColumn<T, IndexT>> {
+struct column_value_type<galp::codec::device::RLEColumn<T, IndexT>> {
 	using type = T;
 };
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_COLUMN_TRAITS_CUH

@@ -12,13 +12,13 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu { namespace device {
+namespace galp::codec::device {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct ALPFunctor : FunctorBase<T> {
 private:
-	using INT_T  = typename utils::same_width_int<T>::type;
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	UINT_T bases[UNPACK_N_VECTORS];
 	INT_T  factor[UNPACK_N_VECTORS];
@@ -51,20 +51,20 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct DummyALPExceptionPatcher : flsgpu::device::ALPExceptionPatcherBase<T> {
+struct DummyALPExceptionPatcher : galp::codec::device::ALPExceptionPatcherBase<T> {
 
 public:
 	void __device__ __forceinline__ patch_if_needed(T* out) override {
 	}
 
 	__device__ __forceinline__
-	DummyALPExceptionPatcher(const flsgpu::device::ALPColumn<T> column, const vi_t vector_index, const lane_t lane) {
+	DummyALPExceptionPatcher(const galp::codec::device::ALPColumn<T> column, const vi_t vector_index, const lane_t lane) {
 	}
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct StatelessALPExceptionPatcher : ALPExceptionPatcherBase<T> {
-	using INT_T = typename utils::same_width_int<T>::type;
+	using INT_T = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t         start_index = 0;
 	uint16_t     exceptions_count[UNPACK_N_VECTORS];
@@ -74,7 +74,7 @@ struct StatelessALPExceptionPatcher : ALPExceptionPatcherBase<T> {
 
 public:
 	void __device__ __forceinline__ patch_if_needed(T* out) override {
-		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr auto N_LANES = galp::codec::utils::get_n_lanes<INT_T>();
 
 		const int first_pos = start_index * N_LANES + lane;
 		const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
@@ -114,7 +114,7 @@ public:
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct StatefulALPExceptionPatcher : ALPExceptionPatcherBase<T> {
-	using INT_T = typename utils::same_width_int<T>::type;
+	using INT_T = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t         start_index = 0;
 	uint16_t     exceptions_count[UNPACK_N_VECTORS];
@@ -125,7 +125,7 @@ struct StatefulALPExceptionPatcher : ALPExceptionPatcherBase<T> {
 
 public:
 	void __device__ __forceinline__ patch_if_needed(T* out) override {
-		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr auto N_LANES = galp::codec::utils::get_n_lanes<INT_T>();
 
 		const int first_pos = start_index * N_LANES + lane;
 		const int last_pos  = first_pos + N_LANES * (UNPACK_N_VALUES - 1);
@@ -178,7 +178,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			const vi_t current_vector_index = vector_index + v;
 
-			const auto offset_count = column.offsets_counts[current_vector_index * utils::get_n_lanes<T>() + lane];
+			const auto offset_count = column.offsets_counts[current_vector_index * galp::codec::utils::get_n_lanes<T>() + lane];
 			count[v]                = offset_count >> 10;
 
 			const auto offset = (offset_count & 0x3FF);
@@ -199,7 +199,7 @@ public:
 					--(count[v]);
 				}
 			}
-			current_position += utils::get_n_lanes<T>();
+			current_position += galp::codec::utils::get_n_lanes<T>();
 		}
 	}
 };
@@ -207,7 +207,7 @@ public:
 template <typename T>
 constexpr void __device__ __forceinline__
 overwrite_if_true(T* __restrict buffer, const T* __restrict new_value, const bool condition) {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	*buffer      = reinterpret_as<T>((reinterpret_as<UINT_T>(*buffer) * (!condition)) |
                                 (reinterpret_as<UINT_T>(*new_value) * condition));
 }
@@ -215,7 +215,7 @@ overwrite_if_true(T* __restrict buffer, const T* __restrict new_value, const boo
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 struct NaiveBranchlessALPExceptionPatcher : ALPExceptionPatcherBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	uint16_t  count[UNPACK_N_VECTORS];
 	uint16_t* positions[UNPACK_N_VECTORS];
 	T*        exceptions[UNPACK_N_VECTORS];
@@ -230,7 +230,7 @@ public:
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			const vi_t current_vector_index = vector_index + v;
 
-			const auto offset_count = column.offsets_counts[current_vector_index * utils::get_n_lanes<T>() + lane];
+			const auto offset_count = column.offsets_counts[current_vector_index * galp::codec::utils::get_n_lanes<T>() + lane];
 			count[v]                = offset_count >> 10;
 
 			const auto exceptions_offset = column.exceptions_offsets[current_vector_index];
@@ -253,7 +253,7 @@ public:
 				exceptions[v] += comp;
 				count[v] -= comp;
 			}
-			current_position += utils::get_n_lanes<T>();
+			current_position += galp::codec::utils::get_n_lanes<T>();
 		}
 	}
 };
@@ -275,7 +275,7 @@ public:
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			const vi_t vector_index = first_vector_index + v;
-			const auto offset_count = column.offsets_counts[vector_index * utils::get_n_lanes<T>() + lane];
+			const auto offset_count = column.offsets_counts[vector_index * galp::codec::utils::get_n_lanes<T>() + lane];
 			count[v]                = offset_count >> 10;
 
 			const auto exceptions_offset = column.exceptions_offsets[vector_index];
@@ -300,7 +300,7 @@ public:
 					next_position[v] = *positions[v];
 				}
 			}
-			position += utils::get_n_lanes<T>();
+			position += galp::codec::utils::get_n_lanes<T>();
 		}
 	}
 };
@@ -326,7 +326,7 @@ public:
 			++exceptions[v];
 			++index[v];
 		} else {
-			next_position[v] = consts::VALUES_PER_VECTOR;
+			next_position[v] = galp::codec::consts::VALUES_PER_VECTOR;
 		}
 	}
 
@@ -337,7 +337,7 @@ public:
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			const auto vector_index = first_vector_index + v;
-			const auto offset_count = column.offsets_counts[vector_index * utils::get_n_lanes<T>() + lane];
+			const auto offset_count = column.offsets_counts[vector_index * galp::codec::utils::get_n_lanes<T>() + lane];
 			count[v]                = offset_count >> 10;
 
 			const auto exceptions_offset = column.exceptions_offsets[vector_index];
@@ -363,7 +363,7 @@ public:
 					read_next_exception(v);
 				}
 			}
-			current_position += utils::get_n_lanes<T>();
+			current_position += galp::codec::utils::get_n_lanes<T>();
 		}
 	}
 };
@@ -391,7 +391,7 @@ public:
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			const vi_t vector_index = first_vector_index + v;
-			const auto offset_count = column.offsets_counts[vector_index * utils::get_n_lanes<T>() + lane];
+			const auto offset_count = column.offsets_counts[vector_index * galp::codec::utils::get_n_lanes<T>() + lane];
 			count[v]                = offset_count >> 10;
 
 			const auto exceptions_offset = column.exceptions_offsets[vector_index];
@@ -403,7 +403,7 @@ public:
 			next_exception[v] = *exceptions[v];
 
 			bool comparison = count[v] > 0;
-			next_position[v] += (!comparison) * consts::VALUES_PER_VECTOR;
+			next_position[v] += (!comparison) * galp::codec::consts::VALUES_PER_VECTOR;
 		}
 	}
 
@@ -426,9 +426,9 @@ public:
 				index[v] += comparison;
 
 				comparison = index[v] < count[v];
-				next_position[v] += (!comparison) * consts::VALUES_PER_VECTOR;
+				next_position[v] += (!comparison) * galp::codec::consts::VALUES_PER_VECTOR;
 			}
-			current_position += utils::get_n_lanes<T>();
+			current_position += galp::codec::utils::get_n_lanes<T>();
 		}
 	}
 };
@@ -456,5 +456,5 @@ struct ALPDecompressor : DecompressorBase<T> {
 	}
 };
 
-}} // namespace flsgpu::device
+} // namespace galp::codec::device
 #endif // ALP_CUH

@@ -12,14 +12,14 @@
 #include <optional>
 #include <ostream>
 
-namespace io {
+namespace galp::io {
 
 void read_table_to_csv(const std::filesystem::path&              fls_path,
                        std::ostream&                             out,
                        bool                                      write_header,
-                       const dispatch::TableDecompressionConfig& table_cfg = {},
+                       const galp::execution::TableDecompressionConfig& table_cfg = {},
                        const std::optional<size_t>&              rowgroup  = std::nullopt);
 
-} // namespace io
+} // namespace galp::io
 
 #endif // ENGINE_IO_TO_CSV_CUH

@@ -31,20 +31,20 @@
 #include "nvcomp/zstd.h"
 #include "nvcomp/zstd.hpp"
 
-namespace hwc {
-using nvcompCompressionManager = nvcomp::nvcompManagerBase;
+namespace galp::bench::hwc {
+using nvcompCompressionManager = ::nvcomp::nvcompManagerBase;
 
-nvcompCompressionManager* get_compressor_manager(const enums_nvcomp::CompressionType compression_type,
+nvcompCompressionManager* get_compressor_manager(const galp::bench::nvcomp::CompressionType compression_type,
                                                  const nvcompType_t                  data_type  = NVCOMP_TYPE_CHAR,
                                                  const size_t                        chunk_size = 1 << 16);
 
 struct CompressedBuffer {
-	nvcomp::CompressionConfig compression_config;
+	::nvcomp::CompressionConfig compression_config;
 	uint8_t*                  compressed_buffer;
 	size_t                    decompressed_size;
 	size_t                    compressed_size;
 
-	CompressedBuffer(nvcomp::CompressionConfig compression_config)
+	CompressedBuffer(::nvcomp::CompressionConfig compression_config)
 	    : compression_config(compression_config) {
 
 		CUDA_SAFE_CALL(cudaMalloc(&compressed_buffer, compression_config.max_compressed_buffer_size));
@@ -68,7 +68,7 @@ struct CompressedBuffer {
 struct Compressor {
 	nvcompCompressionManager* manager;
 
-	Compressor(const enums_nvcomp::CompressionType compression_type) {
+	Compressor(const galp::bench::nvcomp::CompressionType compression_type) {
 		manager = get_compressor_manager(compression_type);
 	}
 
@@ -81,7 +81,7 @@ struct Compressor {
 	}
 
 	uint8_t* decompress(const CompressedBuffer compressed_buffer, CudaStopwatch& stopwatch) {
-		nvcomp::DecompressionConfig decomp_config =
+		::nvcomp::DecompressionConfig decomp_config =
 		    manager->configure_decompression(compressed_buffer.compressed_buffer);
 		uint8_t* decompressed_buffer;
 		CUDA_SAFE_CALL(cudaMalloc(&decompressed_buffer, decomp_config.decomp_data_size));
@@ -110,16 +110,16 @@ struct DummyColumn {
 };
 
 template <typename T>
-struct DummyDecompressor : flsgpu::device::DecompressorBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	flsgpu::device::BitUnpackerDummy<T, 1, 1, flsgpu::device::BPFunctor<T>> unpacker;
+struct DummyDecompressor : galp::codec::device::DecompressorBase<T> {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	galp::codec::device::BitUnpackerDummy<T, 1, 1, galp::codec::device::BPFunctor<T>> unpacker;
 
 	__device__ __forceinline__
 	DummyDecompressor(const DummyColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(reinterpret_cast<UINT_T*>(column.in + vector_index * consts::VALUES_PER_VECTOR),
+	    : unpacker(reinterpret_cast<UINT_T*>(column.in + vector_index * galp::codec::consts::VALUES_PER_VECTOR),
 	               lane,
-	               utils::sizeof_in_bits<T>(),
-	               flsgpu::device::BPFunctor<T>()) {
+	               galp::codec::utils::sizeof_in_bits<T>(),
+	               galp::codec::device::BPFunctor<T>()) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
@@ -127,6 +127,6 @@ struct DummyDecompressor : flsgpu::device::DecompressorBase<T> {
 	}
 };
 
-} // namespace hwc
+} // namespace galp::bench::hwc
 
 #endif // NVCOMP_COMPRESSORS_H

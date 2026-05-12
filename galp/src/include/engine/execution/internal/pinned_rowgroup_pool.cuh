@@ -22,7 +22,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace dispatch::runtime {
+namespace galp::runtime {
 
 // Slot-based pool of CUDA pinned host buffers used to stage rowgroup reads.
 // Leases reference-count the slot via a shared_ptr; the weak_from_this deleter
@@ -38,11 +38,11 @@ public:
 	};
 
 	struct AcquireStats {
-		size_t slot_index      = kNoOwner;
-		size_t previous_owner  = kNoOwner;
-		bool   owner_reused    = false;
-		bool   owner_migrated  = false;
-		bool   allocated       = false;
+		size_t slot_index     = kNoOwner;
+		size_t previous_owner = kNoOwner;
+		bool   owner_reused   = false;
+		bool   owner_migrated = false;
+		bool   allocated      = false;
 	};
 
 	// Construct only via create() — enable_shared_from_this requires the
@@ -55,11 +55,11 @@ public:
 		try {
 			for (auto& slot : slots_) {
 				if (slot.ptr != nullptr && !slot.from_slab) {
-					flsgpu::memory::DevicePool::instance().release_pinned(slot.ptr);
+					galp::memory::DevicePool::instance().release_pinned(slot.ptr);
 				}
 			}
 			if (slab_ptr_ != nullptr) {
-				flsgpu::memory::DevicePool::instance().release_pinned(slab_ptr_);
+				galp::memory::DevicePool::instance().release_pinned(slab_ptr_);
 			}
 		} catch (const std::exception& e) {
 			std::fprintf(stderr, "PinnedRowgroupBufferPool destructor: %s\n", e.what());
@@ -89,9 +89,9 @@ public:
 		return acquire_for_owner_cancelable(owner, min_bytes, stats, nullptr);
 	}
 
-	Lease acquire_for_owner_cancelable(const size_t         owner,
-	                                   const size_t         min_bytes,
-	                                   AcquireStats*        stats,
+	Lease acquire_for_owner_cancelable(const size_t           owner,
+	                                   const size_t           min_bytes,
+	                                   AcquireStats*          stats,
 	                                   const std::atomic<bool>* cancel_requested) {
 		std::unique_lock<std::mutex> lock(mutex_);
 		const auto cancelled = [&]() {
@@ -121,7 +121,7 @@ public:
 			if (slot.capacity < min_bytes) {
 				release_slot_allocation(slot);
 				const size_t alloc_bytes = round_up_capacity(min_bytes);
-				slot.ptr                 = flsgpu::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
+				slot.ptr                 = galp::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
 				slot.capacity            = alloc_bytes;
 				slot.from_slab           = false;
 				slot.slab_index          = kNoOwner;
@@ -160,7 +160,7 @@ public:
 		}
 
 		const size_t alloc_bytes = round_up_capacity(min_bytes);
-		const size_t byte_budget = prewarm_byte_budget();
+		const size_t byte_budget  = prewarm_byte_budget();
 		if (byte_budget == 0) {
 			return 0;
 		}
@@ -204,7 +204,7 @@ public:
 
 			if (!assigned_from_slab && slot.capacity < min_bytes) {
 				release_slot_allocation(slot);
-				slot.ptr        = flsgpu::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
+				slot.ptr        = galp::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
 				slot.capacity   = alloc_bytes;
 				slot.from_slab  = false;
 				slot.slab_index = kNoOwner;
@@ -221,17 +221,17 @@ private:
 	explicit PinnedRowgroupBufferPool(const size_t slots) : slots_(std::max<size_t>(1, slots)) {}
 
 	struct Slot {
-		void*  ptr      = nullptr;
-		size_t capacity = 0;
-		bool   in_use   = false;
-		size_t owner    = kNoOwner;
+		void*  ptr       = nullptr;
+		size_t capacity   = 0;
+		bool   in_use    = false;
+		size_t owner     = kNoOwner;
 		bool   from_slab = false;
 		size_t slab_index = kNoOwner;
 	};
 
 	void release_slot_allocation(Slot& slot) {
 		if (slot.ptr != nullptr && !slot.from_slab) {
-			flsgpu::memory::DevicePool::instance().release_pinned(slot.ptr);
+			galp::memory::DevicePool::instance().release_pinned(slot.ptr);
 		}
 		slot.ptr        = nullptr;
 		slot.capacity   = 0;
@@ -250,10 +250,10 @@ private:
 			return false;
 		}
 		const size_t slab_bytes = slot_bytes * slot_count;
-		slab_ptr_              = flsgpu::memory::DevicePool::instance().alloc_pinned(slab_bytes);
-		slab_slot_capacity_    = slot_bytes;
-		slab_slot_count_       = slot_count;
-		slab_bytes_            = slab_bytes;
+		slab_ptr_               = galp::memory::DevicePool::instance().alloc_pinned(slab_bytes);
+		slab_slot_capacity_     = slot_bytes;
+		slab_slot_count_        = slot_count;
+		slab_bytes_             = slab_bytes;
 		return true;
 	}
 
@@ -337,6 +337,6 @@ private:
 	bool                    stopping_ = false;
 };
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_PINNED_ROWGROUP_POOL_CUH

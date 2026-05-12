@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace verification {
+namespace galp::bench::verification {
 
 constexpr size_t LOG_N_MISTAKES = 5;
 
@@ -32,7 +32,7 @@ struct Difference {
 
 	template <typename U, std::enable_if_t<std::is_floating_point<U>::value, bool> = true>
 	void log() {
-		using UINT_T = typename utils::same_width_uint<T>::type;
+		using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 		UINT_T* original_c = reinterpret_cast<UINT_T*>(&original);
 		UINT_T* other_c    = reinterpret_cast<UINT_T*>(&other);
@@ -65,7 +65,7 @@ struct ExecutionResult {
 
 template <typename T>
 bool byte_compare(const T a, const T b) {
-	using UINT_T      = typename utils::same_width_uint<T>::type;
+	using UINT_T      = typename galp::codec::utils::same_width_uint<T>::type;
 	const UINT_T* a_c = reinterpret_cast<const UINT_T*>(&a);
 	const UINT_T* b_c = reinterpret_cast<const UINT_T*>(&b);
 
@@ -117,6 +117,6 @@ int32_t process_results(std::vector<ExecutionResult<T>> results, bool print_debu
 	return runs_failed;
 }
 
-} // namespace verification
+} // namespace galp::bench::verification
 
 #endif // VERIFICATION_H

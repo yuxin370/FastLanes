@@ -6,7 +6,7 @@
 #include "engine/enums.cuh"
 #include <unordered_map>
 
-namespace enums {
+namespace galp::format {
 
 Kernel string_to_kernel(const std::string& str) {
 	static const std::unordered_map<std::string, Kernel> mapping = {
@@ -146,9 +146,9 @@ std::string encoding_to_string(const Encoding type) {
 	}
 }
 
-} // namespace enums
+} // namespace galp::format
 
-namespace enums_nvcomp {
+namespace galp::bench::nvcomp {
 ComparisonType string_to_comparison_type(const std::string& str) {
 	static const std::unordered_map<std::string, ComparisonType> mapping = {
 	    {"decompression", ComparisonType::DECOMPRESSION},
@@ -222,4 +222,4 @@ std::string compression_type_to_string(const CompressionType type) {
 		throw std::invalid_argument("Could not parse decompresor");
 	}
 }
-} // namespace enums_nvcomp
+} // namespace galp::bench::nvcomp

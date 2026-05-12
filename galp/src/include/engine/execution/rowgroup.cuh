@@ -10,9 +10,9 @@
 #include "engine/reader.cuh"
 #include "flsgpu/structs.cuh"
 
-namespace dispatch {
+namespace galp::execution {
 
-inline void free_rowgroup(reader::Rowgroup& rowgroup) {
+inline void free_rowgroup(galp::format::Rowgroup& rowgroup) {
 	for (auto& col : rowgroup.columns) {
 		if (col.alias_of.has_value()) {
 			// Alias columns (e.g. EXP_EQUAL) share storage with source columns.
@@ -23,7 +23,7 @@ inline void free_rowgroup(reader::Rowgroup& rowgroup) {
 			// Zero-copy-backed columns are released via rowgroup.backing_storage lifetime.
 			continue;
 		}
-		std::visit([](auto& host_col) { flsgpu::host::free_column(host_col); }, col.host);
+		std::visit([](auto& host_col) { galp::codec::host::free_column(host_col); }, col.host);
 	}
 	rowgroup.columns.clear();
 	if (rowgroup.backing_storage) {
@@ -31,9 +31,9 @@ inline void free_rowgroup(reader::Rowgroup& rowgroup) {
 	}
 }
 
-RowgroupData decompress_rowgroup(std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg = {});
-RowgroupData decompress_rowgroup(const std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg = {});
+RowgroupData decompress_rowgroup(std::vector<galp::expression::Expression>& expressions, const ExecutionConfig& cfg = {});
+RowgroupData decompress_rowgroup(const std::vector<galp::expression::Expression>& expressions, const ExecutionConfig& cfg = {});
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_ROWGROUP_CUH

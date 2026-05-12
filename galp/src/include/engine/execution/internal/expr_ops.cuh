@@ -25,7 +25,7 @@
 #include <string>
 #include <type_traits>
 
-namespace dispatch {
+namespace galp::execution {
 
 namespace detail {
 
@@ -38,7 +38,7 @@ constexpr PlanKind plan_for_host_col() {
 }
 
 template <typename T>
-bool should_use_freq_extended(const flsgpu::host::FREQColumn<T>& host_col,
+bool should_use_freq_extended(const galp::codec::host::FREQColumn<T>& host_col,
                               const FreqPatcher                  mode,
                               const float                        branchless_threshold) {
 	switch (mode) {
@@ -65,7 +65,7 @@ void fill_device_expr(DeviceExpression<T>&         expr,
                       const HostColT&              host_col,
                       const PlanKind               plan,
                       const bool                   freq_use_extended,
-                      flsgpu::memory::DeviceArena& arena) {
+                      galp::memory::DeviceArena& arena) {
 	if (plan != ColumnKindTraits<HostColT>::plan_kind) {
 		throw std::runtime_error("fill_device_expr(arena): plan/column type mismatch, plan=" +
 		                         std::to_string(static_cast<int>(plan)));
@@ -77,44 +77,44 @@ template <typename T>
 void free_device_expr(const DeviceExpression<T>& expr) {
 	switch (expr.plan) {
 	case PlanKind::UNCOMPRESSED:
-		flsgpu::host::free_column(expr.col.bp);
+		galp::codec::host::free_column(expr.col.bp);
 		break;
 	case PlanKind::CONSTANT:
-		flsgpu::host::free_column(expr.col.constant);
+		galp::codec::host::free_column(expr.col.constant);
 		break;
 	case PlanKind::FREQUENCY:
 		if (expr.freq_use_extended) {
-			flsgpu::host::free_column(expr.col.freq_extended);
+			galp::codec::host::free_column(expr.col.freq_extended);
 		} else {
-			flsgpu::host::free_column(expr.col.freq);
+			galp::codec::host::free_column(expr.col.freq);
 		}
 		break;
 	case PlanKind::UNFFOR:
-		flsgpu::host::free_column(expr.col.ffor);
+		galp::codec::host::free_column(expr.col.ffor);
 		break;
 	case PlanKind::UNFFOR_SLPATCH:
-		flsgpu::host::free_column(expr.col.slpatch);
+		galp::codec::host::free_column(expr.col.slpatch);
 		break;
 	case PlanKind::DICT_FFOR_U8:
-		flsgpu::host::free_column(expr.col.dictffor_u8);
+		galp::codec::host::free_column(expr.col.dictffor_u8);
 		break;
 	case PlanKind::DICT_FFOR_U16:
-		flsgpu::host::free_column(expr.col.dictffor_u16);
+		galp::codec::host::free_column(expr.col.dictffor_u16);
 		break;
 	case PlanKind::DICT_FFOR_SLPATCH_U8:
-		flsgpu::host::free_column(expr.col.dictslpatch_u8);
+		galp::codec::host::free_column(expr.col.dictslpatch_u8);
 		break;
 	case PlanKind::DICT_FFOR_SLPATCH_U16:
-		flsgpu::host::free_column(expr.col.dictslpatch_u16);
+		galp::codec::host::free_column(expr.col.dictslpatch_u16);
 		break;
 	case PlanKind::CROSS_RLE:
-		flsgpu::host::free_column(expr.col.crossrle);
+		galp::codec::host::free_column(expr.col.crossrle);
 		break;
 	case PlanKind::RLE_U8:
-		flsgpu::host::free_column(expr.col.rle_u8);
+		galp::codec::host::free_column(expr.col.rle_u8);
 		break;
 	case PlanKind::RLE_U16:
-		flsgpu::host::free_column(expr.col.rle_u16);
+		galp::codec::host::free_column(expr.col.rle_u16);
 		break;
 	default:
 		break;
@@ -134,7 +134,7 @@ void add_expression_to_batch(const size_t                 expr_index,
                              const FreqPatcher            freq_patcher,
                              const float                  freq_branchless_threshold,
                              const bool                   emit_typed_work_items,
-                             flsgpu::memory::DeviceArena& arena) {
+                             galp::memory::DeviceArena& arena) {
 	// Emplace into pre-reserved vector — address is stable.
 	batch.device_exprs.emplace_back();
 	auto& expr    = batch.device_exprs.back();
@@ -144,7 +144,7 @@ void add_expression_to_batch(const size_t                 expr_index,
 	batch.output_offsets.push_back(output_offset);
 
 	bool use_freq_extended = false;
-	if constexpr (std::is_same_v<HostColT, flsgpu::host::FREQColumn<T>>) {
+	if constexpr (std::is_same_v<HostColT, galp::codec::host::FREQColumn<T>>) {
 		use_freq_extended = detail::should_use_freq_extended(host_col, freq_patcher, freq_branchless_threshold);
 	}
 	detail::fill_device_expr(expr, host_col, plan, use_freq_extended, arena);
@@ -155,13 +155,13 @@ void add_expression_to_batch(const size_t                 expr_index,
 	if (!emit_typed_work_items) {
 		return;
 	}
-	const size_t n_vecs = utils::get_n_vecs_from_size(expr.n_values);
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(expr.n_values);
 	batch.work_items.reserve(batch.work_items.size() + n_vecs);
 	for (size_t vec = 0; vec < n_vecs; ++vec) {
 		batch.work_items.push_back(WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>()});
 	}
 }
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_INTERNAL_EXPR_OPS_CUH

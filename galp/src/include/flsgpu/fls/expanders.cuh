@@ -15,7 +15,7 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu { namespace device {
+namespace galp::codec::device {
 
 template <typename ValueT, typename IndexT>
 struct RLEExpanderBase {
@@ -26,7 +26,7 @@ public:
 };
 
 template <typename ValueT, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct DummyRLEExpander : flsgpu::device::RLEExpanderBase<ValueT, IndexT> {
+struct DummyRLEExpander : galp::codec::device::RLEExpanderBase<ValueT, IndexT> {
 private:
 	const ValueT* rle_values;
 	const uint32_t* rle_offsets;
@@ -59,7 +59,7 @@ public:
 	}
 
 	__device__ __forceinline__
-	DummyRLEExpander(const flsgpu::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane)
+	DummyRLEExpander(const galp::codec::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane)
 	    : rle_values(column.rle_values)
 	    , rle_offsets(column.rle_offsets)
 	    , base_vector_index(vector_index) {
@@ -76,10 +76,10 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct DummyCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+struct DummyCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t      start_index = 0;
 	uint32_t  vec_base[UNPACK_N_VECTORS];
@@ -90,7 +90,7 @@ private:
 
 public:
 	void __device__ __forceinline__ expand_run_into(T* out) {
-		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr auto N_LANES = galp::codec::utils::get_n_lanes<INT_T>();
 
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
@@ -117,23 +117,23 @@ public:
 	}
 
 	__device__ __forceinline__
-	DummyCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane) {
+	DummyCROSSRLEExpander(const galp::codec::device::CROSSRLEColumn<T> column, const vi_t vector_index, const lane_t lane) {
 #pragma unroll
 		for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 			auto vec_index        = vector_index + v;
 			vec_values[v]         = column.values + column.offsets[vec_index];
 			vec_lengths[v]        = column.lengths + column.offsets[vec_index];
-			vec_base[v]           = static_cast<int32_t>(vec_index * consts::VALUES_PER_VECTOR) + lane;
+			vec_base[v]           = static_cast<int32_t>(vec_index * galp::codec::consts::VALUES_PER_VECTOR) + lane;
 			vec_runs_positions[v] = column.run_positions[column.offsets[vec_index]];
 		}
 	}
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct StatefulCacheCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+struct StatefulCacheCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t      start_index = 0;
 	uint32_t  vec_base[UNPACK_N_VECTORS];
@@ -148,7 +148,7 @@ private:
 
 public:
 	void __device__ __forceinline__ expand_run_into(T* out) {
-		constexpr uint32_t N_LANES_U32 = static_cast<uint32_t>(utils::get_n_lanes<INT_T>());
+		constexpr uint32_t N_LANES_U32 = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<INT_T>());
 
 		// Hoist call-invariant base offset (monotonic across calls)
 		const uint32_t call_start_offset = static_cast<uint32_t>(start_index) * N_LANES_U32;
@@ -215,7 +215,7 @@ public:
 		start_index += UNPACK_N_VALUES;
 	}
 
-	__device__ __forceinline__ StatefulCacheCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	__device__ __forceinline__ StatefulCacheCROSSRLEExpander(const galp::codec::device::CROSSRLEColumn<T> column,
 	                                                         const vi_t                              vector_index,
 	                                                         const lane_t                            lane) {
 #pragma unroll
@@ -226,7 +226,7 @@ public:
 			vec_values[v]  = column.values + off;
 			vec_lengths[v] = column.lengths + off;
 
-			vec_base[v] = static_cast<uint32_t>(vec_index * consts::VALUES_PER_VECTOR) + static_cast<uint32_t>(lane);
+			vec_base[v] = static_cast<uint32_t>(vec_index * galp::codec::consts::VALUES_PER_VECTOR) + static_cast<uint32_t>(lane);
 
 			// init cursor state at first run
 			vec_run_index[v] = 0;
@@ -243,10 +243,10 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct StatefulCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+struct StatefulCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t      start_index = 0;
 	uint32_t  vec_base[UNPACK_N_VECTORS];
@@ -261,7 +261,7 @@ private:
 
 public:
 	void __device__ __forceinline__ expand_run_into(T* out) {
-		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr auto N_LANES = galp::codec::utils::get_n_lanes<INT_T>();
 
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
@@ -300,7 +300,7 @@ public:
 		start_index += UNPACK_N_VALUES;
 	}
 
-	__device__ __forceinline__ StatefulCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	__device__ __forceinline__ StatefulCROSSRLEExpander(const galp::codec::device::CROSSRLEColumn<T> column,
 	                                                    const vi_t                              vector_index,
 	                                                    const lane_t                            lane) {
 #pragma unroll
@@ -310,7 +310,7 @@ public:
 			vec_values[v]  = column.values + column.offsets[vec_index];
 			vec_lengths[v] = column.lengths + column.offsets[vec_index];
 
-			vec_base[v] = static_cast<uint32_t>(vec_index * consts::VALUES_PER_VECTOR) + (uint32_t)lane;
+			vec_base[v] = static_cast<uint32_t>(vec_index * galp::codec::consts::VALUES_PER_VECTOR) + (uint32_t)lane;
 
 			// init cursor state at first run
 			vec_run_index[v]  = 0;
@@ -322,10 +322,10 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct PrefetchStatefulCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+struct PrefetchStatefulCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t      start_index = 0;
 	uint32_t  vec_base[UNPACK_N_VECTORS];
@@ -362,7 +362,7 @@ private:
 	}
 
 public:
-	__device__ __forceinline__ PrefetchStatefulCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	__device__ __forceinline__ PrefetchStatefulCROSSRLEExpander(const galp::codec::device::CROSSRLEColumn<T> column,
 	                                                            const vi_t                              vector_index,
 	                                                            const lane_t                            lane) {
 #pragma unroll
@@ -376,7 +376,7 @@ public:
 			vec_lengths[v]   = column.lengths + off0;
 			vec_run_count[v] = off1 - off0; // >=1
 
-			vec_base[v] = static_cast<uint32_t>(vec_index * consts::VALUES_PER_VECTOR) + (uint32_t)lane;
+			vec_base[v] = static_cast<uint32_t>(vec_index * galp::codec::consts::VALUES_PER_VECTOR) + (uint32_t)lane;
 
 			// init at first run
 			vec_run_index[v] = 0;
@@ -392,7 +392,7 @@ public:
 	}
 
 	void __device__ __forceinline__ expand_run_into(T* out) {
-		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+		constexpr uint32_t N_LANES = (uint32_t)galp::codec::utils::get_n_lanes<INT_T>();
 
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
@@ -444,10 +444,10 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct StatefulAdvanceCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+struct StatefulAdvanceCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t      start_index = 0;
 	uint32_t  vec_base[UNPACK_N_VECTORS];
@@ -487,7 +487,7 @@ private:
 
 public:
 	__device__ __forceinline__ void expand_run_into(T* out) {
-		constexpr auto N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr auto N_LANES = galp::codec::utils::get_n_lanes<INT_T>();
 
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
@@ -528,7 +528,7 @@ public:
 		start_index += UNPACK_N_VALUES;
 	}
 
-	__device__ __forceinline__ StatefulAdvanceCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	__device__ __forceinline__ StatefulAdvanceCROSSRLEExpander(const galp::codec::device::CROSSRLEColumn<T> column,
 	                                                           const vi_t                              vector_index,
 	                                                           const lane_t                            lane) {
 #pragma unroll
@@ -538,7 +538,7 @@ public:
 			vec_values[v]  = column.values + column.offsets[vec_index];
 			vec_lengths[v] = column.lengths + column.offsets[vec_index];
 
-			vec_base[v] = static_cast<uint32_t>(vec_index * consts::VALUES_PER_VECTOR) + (uint32_t)lane;
+			vec_base[v] = static_cast<uint32_t>(vec_index * galp::codec::consts::VALUES_PER_VECTOR) + (uint32_t)lane;
 
 			// init cursor state at first run
 			vec_run_index[v]  = 0;
@@ -550,10 +550,10 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct StatefulShuffleCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+struct StatefulShuffleCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	si_t   start_index = 0;
 	lane_t lane_;
@@ -582,7 +582,7 @@ private:
 
 public:
 	__device__ __forceinline__ void expand_run_into(T* __restrict__ out) {
-		constexpr int  N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr int  N_LANES = galp::codec::utils::get_n_lanes<INT_T>();
 		const unsigned mask    = __activemask();
 		const int      lane    = (int)lane_;
 
@@ -683,11 +683,11 @@ public:
 		start_index += UNPACK_N_VALUES;
 	}
 
-	__device__ __forceinline__ StatefulShuffleCROSSRLEExpander(const flsgpu::device::CROSSRLEColumn<T> column,
+	__device__ __forceinline__ StatefulShuffleCROSSRLEExpander(const galp::codec::device::CROSSRLEColumn<T> column,
 	                                                           const vi_t                              vector_index,
 	                                                           const lane_t                            lane)
 	    : lane_(lane) {
-		constexpr int N_LANES = utils::get_n_lanes<INT_T>();
+		constexpr int N_LANES = galp::codec::utils::get_n_lanes<INT_T>();
 
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
@@ -703,7 +703,7 @@ public:
 			rp             = __shfl_sync(0xFFFFFFFFu, rp, 0, N_LANES);
 			vec_run_pos[v] = rp;
 
-			vec_base0[v]      = (uint32_t)(vec_index * consts::VALUES_PER_VECTOR);
+			vec_base0[v]      = (uint32_t)(vec_index * galp::codec::consts::VALUES_PER_VECTOR);
 			vec_run_index[v]  = 0;
 			vec_run_length[v] = vec_lengths[v][0];
 			vec_run_value[v]  = vec_values[v][0];
@@ -712,10 +712,10 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct StatefulExtendedCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
+struct StatefulExtendedCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
 private:
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	// k-space cursor: UNPACK_N_VALUES k each time
 	uint16_t start_k_ = 0;
@@ -733,11 +733,11 @@ private:
 	UINT_T   run_val_[UNPACK_N_VECTORS];
 
 public:
-	__device__ __forceinline__ StatefulExtendedCROSSRLEExpander(const flsgpu::device::CROSSRLEExtendedColumn<T> col,
+	__device__ __forceinline__ StatefulExtendedCROSSRLEExpander(const galp::codec::device::CROSSRLEExtendedColumn<T> col,
 	                                                            const vi_t   vec_index,
 	                                                            const lane_t lane)
 	    : lane_(lane) {
-		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+		constexpr uint32_t N_LANES = (uint32_t)galp::codec::utils::get_n_lanes<INT_T>();
 
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
@@ -807,9 +807,9 @@ public:
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct BranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+struct BranchlessCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	uint16_t start_k_ = 0;
 	lane_t   lane_;
@@ -820,7 +820,7 @@ struct BranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
 	__device__ __forceinline__
 	BranchlessCROSSRLEExpander(const device::CROSSRLELaneMaskColumn<T> col, vi_t first_vec, lane_t lane)
 	    : lane_(lane) {
-		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+		constexpr uint32_t N_LANES = (uint32_t)galp::codec::utils::get_n_lanes<INT_T>();
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
 			const uint32_t vec  = (uint32_t)(first_vec + v);
@@ -856,9 +856,9 @@ struct BranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-struct PrefetchBranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	using INT_T  = typename utils::same_width_int<T>::type;
+struct PrefetchBranchlessCROSSRLEExpander : galp::codec::device::CROSSRLEExpanderBase<T> {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
 
 	uint16_t start_k_ = 0;
 	lane_t   lane_;
@@ -870,7 +870,7 @@ struct PrefetchBranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase
 	__device__ __forceinline__
 	PrefetchBranchlessCROSSRLEExpander(const device::CROSSRLELaneMaskColumn<T> col, vi_t first_vec, lane_t lane)
 	    : lane_(lane) {
-		constexpr uint32_t N_LANES = (uint32_t)utils::get_n_lanes<INT_T>();
+		constexpr uint32_t N_LANES = (uint32_t)galp::codec::utils::get_n_lanes<INT_T>();
 #pragma unroll
 		for (int v = 0; v < (int)UNPACK_N_VECTORS; ++v) {
 			const uint32_t vec = (uint32_t)(first_vec + v);
@@ -933,6 +933,6 @@ struct PrefetchBranchlessCROSSRLEExpander : flsgpu::device::CROSSRLEExpanderBase
 	}
 };
 
-}} // namespace flsgpu::device
+} // namespace galp::codec::device
 
 #endif // FLSGPU_FLS_EXPANDERS_CUH

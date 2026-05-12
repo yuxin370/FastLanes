@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <variant>
 
-namespace dispatch {
+namespace galp::execution {
 
 template <typename... Ts>
 struct TypeList {};
@@ -47,6 +47,6 @@ inline void for_each_type(TypeList<Ts...>, F&& f) {
 	(f(std::type_identity<Ts> {}), ...);
 }
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_DATA_VALUE_STORE_CUH

@@ -11,7 +11,7 @@
 #include <optional>
 #include <utility>
 
-namespace dispatch::runtime {
+namespace galp::runtime {
 
 inline constexpr size_t kStreamingTargetWorkItems = 1u << 18;
 
@@ -59,6 +59,6 @@ private:
 	std::optional<size_t>  inflight_idx_;
 };
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_STREAMING_PIPELINE_CUH

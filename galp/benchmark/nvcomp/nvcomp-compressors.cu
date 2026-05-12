@@ -10,38 +10,38 @@
 #include <cstdlib>
 #include <stdexcept>
 
-namespace hwc {
-nvcompCompressionManager* get_compressor_manager(const enums_nvcomp::CompressionType compression_type,
+namespace galp::bench::hwc {
+nvcompCompressionManager* get_compressor_manager(const galp::bench::nvcomp::CompressionType compression_type,
                                                  const nvcompType_t                  data_type,
                                                  const size_t                        chunk_size) {
 	switch (compression_type) {
-	case enums_nvcomp::CompressionType::BITCOMP: {
+	case galp::bench::nvcomp::CompressionType::BITCOMP: {
 		nvcompBatchedBitcompOpts_t format_opts {0, data_type};
-		return new nvcomp::BitcompManager {chunk_size, format_opts};
+			return new ::nvcomp::BitcompManager {chunk_size, format_opts};
 	} break;
-	case enums_nvcomp::CompressionType::BITCOMP_SPARSE: {
+	case galp::bench::nvcomp::CompressionType::BITCOMP_SPARSE: {
 		nvcompBatchedBitcompOpts_t format_opts {1, data_type};
-		return new nvcomp::BitcompManager {chunk_size, format_opts};
+			return new ::nvcomp::BitcompManager {chunk_size, format_opts};
 	} break;
-	case enums_nvcomp::CompressionType::LZ4: {
+	case galp::bench::nvcomp::CompressionType::LZ4: {
 		nvcompBatchedLZ4Opts_t format_opts {data_type};
-		return new nvcomp::LZ4Manager {chunk_size, format_opts};
+			return new ::nvcomp::LZ4Manager {chunk_size, format_opts};
 	} break;
-	case enums_nvcomp::CompressionType::ZSTD: {
+	case galp::bench::nvcomp::CompressionType::ZSTD: {
 		nvcompBatchedZstdOpts_t format_opts {data_type};
-		return new nvcomp::ZstdManager {chunk_size, format_opts};
+			return new ::nvcomp::ZstdManager {chunk_size, format_opts};
 	} break;
-	case enums_nvcomp::CompressionType::DEFLATE: {
+	case galp::bench::nvcomp::CompressionType::DEFLATE: {
 		nvcompBatchedDeflateOpts_t format_opts {data_type};
-		return new nvcomp::DeflateManager {chunk_size, format_opts};
+			return new ::nvcomp::DeflateManager {chunk_size, format_opts};
 	} break;
-	case enums_nvcomp::CompressionType::GDEFLATE: {
+	case galp::bench::nvcomp::CompressionType::GDEFLATE: {
 		nvcompBatchedGdeflateOpts_t format_opts {data_type};
-		return new nvcomp::GdeflateManager {chunk_size, format_opts};
+			return new ::nvcomp::GdeflateManager {chunk_size, format_opts};
 	} break;
-	case enums_nvcomp::CompressionType::SNAPPY: {
+	case galp::bench::nvcomp::CompressionType::SNAPPY: {
 		nvcompBatchedSnappyOpts_t format_opts {data_type};
-		return new nvcomp::SnappyManager {chunk_size, format_opts};
+			return new ::nvcomp::SnappyManager {chunk_size, format_opts};
 	} break;
 	default:
 		throw std::invalid_argument("Compression type is not supported");
@@ -82,4 +82,4 @@ bool compare_d_buffers(const uint8_t* buffer_a, const uint8_t* buffer_b, const s
 	return result;
 }
 
-} // namespace hwc
+} // namespace galp::bench::hwc

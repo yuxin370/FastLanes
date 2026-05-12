@@ -17,7 +17,7 @@
 #include <tuple>
 #include <vector>
 
-namespace dispatch {
+namespace galp::execution {
 
 template <typename T>
 struct Batch {
@@ -46,7 +46,7 @@ template <typename List>
 struct BatchSetFromList;
 
 template <typename... Ts>
-struct BatchSetFromList<dispatch::TypeList<Ts...>> {
+struct BatchSetFromList<galp::execution::TypeList<Ts...>> {
 	using type = BatchSet<Ts...>;
 };
 
@@ -78,10 +78,10 @@ template <typename List>
 struct DeviceBatchSetFromList;
 
 template <typename... Ts>
-struct DeviceBatchSetFromList<dispatch::TypeList<Ts...>> {
+struct DeviceBatchSetFromList<galp::execution::TypeList<Ts...>> {
 	using type = DeviceBatchSet<Ts...>;
 };
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_BATCH_CUH

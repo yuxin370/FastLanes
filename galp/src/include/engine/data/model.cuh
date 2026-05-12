@@ -18,7 +18,7 @@
 #include <variant>
 #include <vector>
 
-namespace dispatch {
+namespace galp::execution {
 
 // Runtime data model for decoded outputs and streaming decode granularity.
 struct DecodeChunk {
@@ -37,29 +37,29 @@ struct ColumnMeta {
 	size_t          column_index    = std::numeric_limits<size_t>::max();
 	std::string     column_name     = {};
 	size_t          value_count     = 0;
-	types::DataType value_type      = types::DataType::I8;
+	galp::format::DataType value_type      = galp::format::DataType::I8;
 	unsigned        values_per_step = 1;
 };
 
-using EncodedPayload = std::variant<flsgpu::host::BPColumn<int8_t>,
-                                    flsgpu::host::FFORColumn<int8_t>,
-                                    flsgpu::host::DICTREFColumn<int8_t, uint8_t>,
-                                    flsgpu::host::DICTFFORColumn<int8_t>,
-                                    flsgpu::host::DICTSLPATCHColumn<int8_t>,
-                                    flsgpu::host::CONSTANTColumn<int8_t>,
-                                    flsgpu::host::FREQColumn<int8_t>,
-                                    flsgpu::host::SLPATCHColumn<int8_t>,
-                                    flsgpu::host::CROSSRLEColumn<int8_t>,
-                                    flsgpu::host::RLEColumn<int8_t, uint16_t>,
-                                    flsgpu::host::BPColumn<int16_t>,
-                                    flsgpu::host::FFORColumn<int16_t>,
-                                    flsgpu::host::DICTFFORColumn<int16_t>,
-                                    flsgpu::host::DICTFFORColumn<int16_t, uint8_t>,
-                                    flsgpu::host::DICTSLPATCHColumn<int16_t>,
-                                    flsgpu::host::DICTSLPATCHColumn<int16_t, uint8_t>,
-                                    flsgpu::host::SLPATCHColumn<int16_t>,
-                                    flsgpu::host::FREQColumn<int16_t>,
-                                    flsgpu::host::RLEColumn<int16_t, uint16_t>>;
+using EncodedPayload = std::variant<galp::codec::host::BPColumn<int8_t>,
+                                    galp::codec::host::FFORColumn<int8_t>,
+                                    galp::codec::host::DICTREFColumn<int8_t, uint8_t>,
+                                    galp::codec::host::DICTFFORColumn<int8_t>,
+                                    galp::codec::host::DICTSLPATCHColumn<int8_t>,
+                                    galp::codec::host::CONSTANTColumn<int8_t>,
+                                    galp::codec::host::FREQColumn<int8_t>,
+                                    galp::codec::host::SLPATCHColumn<int8_t>,
+                                    galp::codec::host::CROSSRLEColumn<int8_t>,
+                                    galp::codec::host::RLEColumn<int8_t, uint16_t>,
+                                    galp::codec::host::BPColumn<int16_t>,
+                                    galp::codec::host::FFORColumn<int16_t>,
+                                    galp::codec::host::DICTFFORColumn<int16_t>,
+                                    galp::codec::host::DICTFFORColumn<int16_t, uint8_t>,
+                                    galp::codec::host::DICTSLPATCHColumn<int16_t>,
+                                    galp::codec::host::DICTSLPATCHColumn<int16_t, uint8_t>,
+                                    galp::codec::host::SLPATCHColumn<int16_t>,
+                                    galp::codec::host::FREQColumn<int16_t>,
+                                    galp::codec::host::RLEColumn<int16_t, uint16_t>>;
 
 struct Column {
 	std::string              name;
@@ -98,10 +98,11 @@ struct RowgroupData {
 };
 
 struct TableData {
-	size_t rowgroups     = 0;
-	size_t total_columns = 0;
+	size_t              rowgroups     = 0;
+	size_t              total_columns = 0;
+	std::vector<size_t> column_counts;
 };
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_DATA_MODEL_CUH

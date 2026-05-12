@@ -6,9 +6,9 @@
 #include "engine/expression.cuh"
 #include <stdexcept>
 
-namespace expr {
+namespace galp::expression {
 
-std::vector<Expression> assemble(dispatch::Rowgroup& rowgroup) {
+std::vector<Expression> assemble(galp::execution::Rowgroup& rowgroup) {
 	std::vector<Expression> out;
 	out.reserve(rowgroup.columns.size());
 	for (auto& col : rowgroup.columns) {
@@ -20,4 +20,4 @@ std::vector<Expression> assemble(dispatch::Rowgroup& rowgroup) {
 	return out;
 }
 
-} // namespace expr
+} // namespace galp::expression

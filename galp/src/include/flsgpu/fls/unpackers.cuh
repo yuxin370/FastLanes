@@ -15,7 +15,7 @@
 #include <cstdio>
 #include <type_traits>
 
-namespace flsgpu { namespace device {
+namespace galp::codec::device {
 template <typename T>
 struct BitUnpackerBase {
 	/* Constructor, but cannot be enforced
@@ -28,8 +28,8 @@ struct BitUnpackerBase {
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor>
-struct BitUnpackerDummy : flsgpu::device::BitUnpackerBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+struct BitUnpackerDummy : galp::codec::device::BitUnpackerBase<T> {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	const UINT_T*   in;
 	OutputProcessor processor;
@@ -42,13 +42,13 @@ struct BitUnpackerDummy : flsgpu::device::BitUnpackerBase<T> {
 	    , processor(processor) {};
 
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
-		constexpr int32_t N_LANES = utils::get_n_lanes<UINT_T>();
+		constexpr int32_t N_LANES = galp::codec::utils::get_n_lanes<UINT_T>();
 
 #pragma unroll
 		for (int v = 0; v < UNPACK_N_VECTORS; ++v) {
 #pragma unroll
 			for (int j = 0; j < UNPACK_N_VALUES; ++j) {
-				out[v * UNPACK_N_VALUES + j] = processor(in[v * consts::VALUES_PER_VECTOR + j * N_LANES], v);
+				out[v * UNPACK_N_VALUES + j] = processor(in[v * galp::codec::consts::VALUES_PER_VECTOR + j * N_LANES], v);
 			}
 		}
 
@@ -57,8 +57,8 @@ struct BitUnpackerDummy : flsgpu::device::BitUnpackerBase<T> {
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor>
-struct BitUnpackerOldFls : flsgpu::device::BitUnpackerBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+struct BitUnpackerOldFls : galp::codec::device::BitUnpackerBase<T> {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	const UINT_T*   in;
 	const vbw_t     value_bit_width;
@@ -72,12 +72,12 @@ struct BitUnpackerOldFls : flsgpu::device::BitUnpackerBase<T> {
 	    , value_bit_width(a_value_bit_width)
 	    , processor(processor) {
 		static_assert(UNPACK_N_VECTORS == 1, "Old FLS can only unpack 1 at a time");
-		static_assert(UNPACK_N_VALUES == utils::get_values_per_lane<T>(), "Old FLS can only unpack entire lanes");
+		static_assert(UNPACK_N_VALUES == galp::codec::utils::get_values_per_lane<T>(), "Old FLS can only unpack entire lanes");
 	};
 
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		UINT_T* u_out = reinterpret_cast<UINT_T*>(out);
-		oldfls::adjusted::unpack(in, u_out, value_bit_width);
+		galp::oldfls::adjusted::unpack(in, u_out, value_bit_width);
 
 		for (int32_t i {0}; i < UNPACK_N_VALUES; ++i) {
 			out[i] = processor(u_out[i], 0);
@@ -87,7 +87,7 @@ struct BitUnpackerOldFls : flsgpu::device::BitUnpackerBase<T> {
 
 template <typename T>
 struct LoaderBase {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	__device__ __forceinline__ void load_next_into([[maybe_unused]] UINT_T* out) {
 	}
@@ -97,7 +97,7 @@ struct LoaderBase {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct CacheLoader : LoaderBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	const UINT_T* in;
 	int32_t       vector_offset;
@@ -114,13 +114,13 @@ struct CacheLoader : LoaderBase<T> {
 	}
 
 	__device__ __forceinline__ void next_line() {
-		in += utils::get_n_lanes<T>();
+		in += galp::codec::utils::get_n_lanes<T>();
 	}
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned BUFFER_SIZE>
 struct LocalMemoryLoader : LoaderBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UINT_T        buffers[UNPACK_N_VECTORS * BUFFER_SIZE];
 	const UINT_T* in;
 	int32_t       vector_offset;
@@ -145,10 +145,10 @@ struct LocalMemoryLoader : LoaderBase<T> {
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 #pragma unroll
 				for (int b {0}; b < BUFFER_SIZE; ++b) {
-					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * utils::get_n_lanes<T>());
+					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * galp::codec::utils::get_n_lanes<T>());
 				}
 			}
-			in += BUFFER_SIZE * utils::get_n_lanes<T>();
+			in += BUFFER_SIZE * galp::codec::utils::get_n_lanes<T>();
 			buffer_index = 0;
 		} else {
 			++buffer_index;
@@ -158,7 +158,7 @@ struct LocalMemoryLoader : LoaderBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned BUFFER_SIZE>
 struct SharedMemoryLoader : LoaderBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	// No syncthreads are needed as threads only read and write their own section
 	// Shared memory is allocated per block, so this also depends on block config
 	// 4 divide by 32 bits/lanes, multiply by number of warps per block
@@ -170,7 +170,7 @@ struct SharedMemoryLoader : LoaderBase<T> {
 	__device__ __forceinline__ SharedMemoryLoader(const UINT_T* in, const int32_t vector_offset)
 	    : in(in)
 	    , vector_offset(vector_offset) {
-		constexpr uint32_t N_LANES = utils::get_n_lanes<T>();
+		constexpr uint32_t N_LANES = galp::codec::utils::get_n_lanes<T>();
 		__shared__ UINT_T  shared_ptr[N_LANES * BUFFER_SIZE * UNPACK_N_VECTORS * (sizeof(T) / 4 * 2)];
 		buffers = shared_ptr + threadIdx.x * BUFFER_SIZE * UNPACK_N_VECTORS;
 		next_line();
@@ -189,10 +189,10 @@ struct SharedMemoryLoader : LoaderBase<T> {
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 #pragma unroll
 				for (int b {0}; b < BUFFER_SIZE; ++b) {
-					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * utils::get_n_lanes<T>());
+					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * galp::codec::utils::get_n_lanes<T>());
 				}
 			}
-			in += BUFFER_SIZE * utils::get_n_lanes<T>();
+			in += BUFFER_SIZE * galp::codec::utils::get_n_lanes<T>();
 			buffer_index = 0;
 		} else {
 			++buffer_index;
@@ -202,7 +202,7 @@ struct SharedMemoryLoader : LoaderBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned BUFFER_SIZE>
 struct RegisterLoader : LoaderBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UINT_T        buffers[UNPACK_N_VECTORS * BUFFER_SIZE];
 	const UINT_T* in;
 	int32_t       vector_offset;
@@ -259,10 +259,10 @@ struct RegisterLoader : LoaderBase<T> {
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 #pragma unroll
 				for (int b {0}; b < BUFFER_SIZE; ++b) {
-					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * utils::get_n_lanes<T>());
+					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * galp::codec::utils::get_n_lanes<T>());
 				}
 			}
-			in += BUFFER_SIZE * utils::get_n_lanes<T>();
+			in += BUFFER_SIZE * galp::codec::utils::get_n_lanes<T>();
 			buffer_index = 0;
 		} else {
 			++buffer_index;
@@ -272,7 +272,7 @@ struct RegisterLoader : LoaderBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned BUFFER_SIZE>
 struct RegisterBranchlessLoader : LoaderBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UINT_T        buffers[UNPACK_N_VECTORS * BUFFER_SIZE];
 	const UINT_T* in;
 	int32_t       vector_offset;
@@ -297,10 +297,10 @@ struct RegisterBranchlessLoader : LoaderBase<T> {
 			for (int v {0}; v < UNPACK_N_VECTORS; ++v) {
 #pragma unroll
 				for (int b {0}; b < BUFFER_SIZE; ++b) {
-					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * utils::get_n_lanes<T>());
+					buffers[v * BUFFER_SIZE + b] = *(in + v * vector_offset + b * galp::codec::utils::get_n_lanes<T>());
 				}
 			}
-			in += BUFFER_SIZE * utils::get_n_lanes<T>();
+			in += BUFFER_SIZE * galp::codec::utils::get_n_lanes<T>();
 			buffer_index = 0;
 		} else {
 #pragma unroll
@@ -317,19 +317,19 @@ struct RegisterBranchlessLoader : LoaderBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS>
 struct Masker {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	const vbw_t value_bit_width;
 	const T     value_mask;
 	uint16_t    buffer_offset = 0;
 
 	__device__ __forceinline__ Masker(const vbw_t value_bit_width)
 	    : value_bit_width(value_bit_width)
-	    , value_mask(utils::set_first_n_bits<UINT_T>(value_bit_width)) {};
+	    , value_mask(galp::codec::utils::set_first_n_bits<UINT_T>(value_bit_width)) {};
 
 	__device__ __forceinline__ Masker(const uint16_t buffer_offset, const vbw_t value_bit_width)
 	    : buffer_offset(buffer_offset)
 	    , value_bit_width(value_bit_width)
-	    , value_mask(utils::set_first_n_bits<UINT_T>(value_bit_width)) {};
+	    , value_mask(galp::codec::utils::set_first_n_bits<UINT_T>(value_bit_width)) {};
 
 	__device__ __forceinline__ void mask_and_increment(T* values, const T* buffers) {
 #pragma unroll
@@ -340,14 +340,14 @@ struct Masker {
 	}
 
 	__device__ __forceinline__ void next_line() {
-		buffer_offset -= utils::get_lane_bitwidth<T>();
+		buffer_offset -= galp::codec::utils::get_lane_bitwidth<T>();
 	}
 	__device__ __forceinline__ bool is_buffer_empty() const {
-		return buffer_offset == utils::get_lane_bitwidth<T>();
+		return buffer_offset == galp::codec::utils::get_lane_bitwidth<T>();
 	}
 
 	__device__ __forceinline__ bool continues_on_next_line() const {
-		return buffer_offset > utils::get_lane_bitwidth<T>();
+		return buffer_offset > galp::codec::utils::get_lane_bitwidth<T>();
 	}
 
 	__device__ __forceinline__ void mask_and_insert_remaining_value(T* values, const T* buffers) const {
@@ -361,16 +361,16 @@ struct Masker {
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename processor_T, typename LoaderT>
-__device__ void unpack_vector_stateless(const typename utils::same_width_uint<T>::type* __restrict in,
+__device__ void unpack_vector_stateless(const typename galp::codec::utils::same_width_uint<T>::type* __restrict in,
                                         T* __restrict out,
                                         const lane_t lane,
                                         const vbw_t  value_bit_width,
                                         const si_t   start_index,
                                         processor_T  processor,
                                         int32_t      vector_offset) {
-	using UINT_T                      = typename utils::same_width_uint<T>::type;
-	constexpr uint8_t  LANE_BIT_WIDTH = utils::get_lane_bitwidth<UINT_T>();
-	constexpr uint32_t N_LANES        = utils::get_n_lanes<UINT_T>();
+	using UINT_T                      = typename galp::codec::utils::same_width_uint<T>::type;
+	constexpr uint8_t  LANE_BIT_WIDTH = galp::codec::utils::get_lane_bitwidth<UINT_T>();
+	constexpr uint32_t N_LANES        = galp::codec::utils::get_n_lanes<UINT_T>();
 	uint16_t           preceding_bits = (start_index * value_bit_width);
 	uint16_t           buffer_offset  = preceding_bits % LANE_BIT_WIDTH;
 	uint16_t           n_input_line   = preceding_bits / LANE_BIT_WIDTH;
@@ -407,7 +407,7 @@ __device__ void unpack_vector_stateless(const typename utils::same_width_uint<T>
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor>
 struct BitUnpackerStateless : BitUnpackerBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	const UINT_T* __restrict in;
 	const lane_t    lane;
@@ -425,7 +425,7 @@ struct BitUnpackerStateless : BitUnpackerBase<T> {
 	    , lane(lane)
 	    , value_bit_width(value_bit_width)
 	    , processor(processor)
-	    , vector_offset(utils::get_compressed_vector_size<UINT_T>(value_bit_width)) {
+	    , vector_offset(galp::codec::utils::get_compressed_vector_size<UINT_T>(value_bit_width)) {
 	}
 
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
@@ -440,23 +440,23 @@ struct BitUnpackerStateless : BitUnpackerBase<T> {
 };
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename processor_T>
-__device__ void unpack_vector_stateless_branchless(const typename utils::same_width_uint<T>::type* __restrict in,
+__device__ void unpack_vector_stateless_branchless(const typename galp::codec::utils::same_width_uint<T>::type* __restrict in,
                                                    T* __restrict out,
                                                    const lane_t  lane,
                                                    const vbw_t   value_bit_width,
                                                    const si_t    start_index,
                                                    processor_T   processor,
                                                    const int32_t vector_offset) {
-	using UINT_T                     = typename utils::same_width_uint<T>::type;
-	constexpr int32_t LANE_BIT_WIDTH = utils::get_lane_bitwidth<UINT_T>();
-	constexpr int32_t N_LANES        = utils::get_n_lanes<UINT_T>();
-	constexpr int32_t BIT_COUNT      = utils::sizeof_in_bits<T>();
+	using UINT_T                     = typename galp::codec::utils::same_width_uint<T>::type;
+	constexpr int32_t LANE_BIT_WIDTH = galp::codec::utils::get_lane_bitwidth<UINT_T>();
+	constexpr int32_t N_LANES        = galp::codec::utils::get_n_lanes<UINT_T>();
+	constexpr int32_t BIT_COUNT      = galp::codec::utils::sizeof_in_bits<T>();
 
 	int32_t preceding_bits_first = (start_index * value_bit_width);
 	int32_t n_input_line         = preceding_bits_first / LANE_BIT_WIDTH;
 	int32_t offset_first         = preceding_bits_first % LANE_BIT_WIDTH;
 	int32_t offset_second        = BIT_COUNT - offset_first;
-	UINT_T  value_mask           = utils::set_first_n_bits<UINT_T>(value_bit_width);
+	UINT_T  value_mask           = galp::codec::utils::set_first_n_bits<UINT_T>(value_bit_width);
 
 	UINT_T values[UNPACK_N_VECTORS] = {0};
 
@@ -472,7 +472,7 @@ __device__ void unpack_vector_stateless_branchless(const typename utils::same_wi
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor>
 struct BitUnpackerStatelessBranchless : BitUnpackerBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	const UINT_T* __restrict in;
 	const lane_t    lane;
@@ -490,7 +490,7 @@ struct BitUnpackerStatelessBranchless : BitUnpackerBase<T> {
 	    , lane(lane)
 	    , value_bit_width(value_bit_width)
 	    , processor(processor)
-	    , vector_offset(utils::get_compressed_vector_size<UINT_T>(value_bit_width)) {
+	    , vector_offset(galp::codec::utils::get_compressed_vector_size<UINT_T>(value_bit_width)) {
 	}
 
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
@@ -505,7 +505,7 @@ struct BitUnpackerStatelessBranchless : BitUnpackerBase<T> {
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor, typename LoaderT>
 struct BitUnpackerStateful : BitUnpackerBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	LoaderT                          loader;
 	Masker<UINT_T, UNPACK_N_VECTORS> masker;
 	OutputProcessor                  processor;
@@ -514,7 +514,7 @@ struct BitUnpackerStateful : BitUnpackerBase<T> {
 	                                               const lane_t    lane,
 	                                               const vbw_t     value_bit_width,
 	                                               OutputProcessor processor)
-	    : loader(in + lane, utils::get_compressed_vector_size<UINT_T>(value_bit_width))
+	    : loader(in + lane, galp::codec::utils::get_compressed_vector_size<UINT_T>(value_bit_width))
 	    , masker(value_bit_width)
 	    , processor(processor) {
 	}
@@ -554,7 +554,7 @@ template <typename OutT,
           typename OutputProcessor,
           typename InT = OutT>
 struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
-	using UINT_T = typename utils::same_width_uint<InT>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<InT>::type;
 	OutputProcessor processor;
 
 	const UINT_T* in;
@@ -570,15 +570,15 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 	                                                         OutputProcessor processor)
 	    : in(a_in + lane)
 	    , value_bit_width(value_bit_width)
-	    , value_mask(utils::set_first_n_bits<UINT_T>(value_bit_width))
-	    , vector_offset(utils::get_compressed_vector_size<InT>(value_bit_width))
+	    , value_mask(galp::codec::utils::set_first_n_bits<UINT_T>(value_bit_width))
+	    , vector_offset(galp::codec::utils::get_compressed_vector_size<InT>(value_bit_width))
 	    , processor(processor) {
 	}
 
 	__device__ __forceinline__ void unpack_next_into(OutT* __restrict out) {
-		constexpr int32_t N_LANES        = utils::get_n_lanes<UINT_T>();
-		constexpr int32_t BIT_COUNT      = utils::sizeof_in_bits<InT>();
-		constexpr int32_t LANE_BIT_WIDTH = utils::get_lane_bitwidth<UINT_T>();
+		constexpr int32_t N_LANES        = galp::codec::utils::get_n_lanes<UINT_T>();
+		constexpr int32_t BIT_COUNT      = galp::codec::utils::sizeof_in_bits<InT>();
+		constexpr int32_t LANE_BIT_WIDTH = galp::codec::utils::get_lane_bitwidth<UINT_T>();
 
 #pragma unroll
 		for (int32_t i {0}; i < UNPACK_N_VALUES; i++) {
@@ -598,6 +598,6 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 	}
 };
 
-}} // namespace flsgpu::device
+} // namespace galp::codec::device
 
 #endif // FLSGPU_FLS_UNPACKERS_CUH

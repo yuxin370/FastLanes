@@ -15,17 +15,19 @@
 #define GENERATE_BINARIES_HPP
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Host-only implementation (skipped entirely for __CUDA_ARCH__)
 // ──────────────────────────────────────────────────────────────────────────────
-namespace bin {
+namespace galp::testdata {
 namespace detail {
 
 // compile-time endian test (uses compiler macros, no UB in constexpr)
@@ -68,6 +70,12 @@ generate_and_write(const std::string& out32, const std::string& out64, size_t to
 
 	std::ofstream f32(out32, std::ios::binary);
 	std::ofstream f64(out64, std::ios::binary);
+	if (!f32) {
+		throw std::runtime_error("Could not open generated float binary for writing: " + out32);
+	}
+	if (!f64) {
+		throw std::runtime_error("Could not open generated double binary for writing: " + out64);
+	}
 
 	for (size_t i = 0; i < total; ++i) {
 		double val = std::round(dist(rng) * 100.0) / 100.0;
@@ -76,6 +84,9 @@ generate_and_write(const std::string& out32, const std::string& out64, size_t to
 
 		write_little_endian(f32, static_cast<float>(val));
 		write_little_endian(f64, val);
+	}
+	if (!f32 || !f64) {
+		throw std::runtime_error("Error writing generated binary files");
 	}
 	return head;
 }
@@ -97,6 +108,8 @@ inline GenResult generate_write_and_scan(const std::filesystem::path& floats_dir
                                          size_t                       total,
                                          size_t                       head_count) {
 	GenResult res;
+	std::filesystem::create_directories(floats_dir);
+	std::filesystem::create_directories(doubles_dir);
 
 	// (1) produce "1.bin" in each directory
 	res.head = generate_and_write(
@@ -117,5 +130,5 @@ inline GenResult generate_write_and_scan(const std::filesystem::path& floats_dir
 	return res;
 }
 
-} // namespace bin
+} // namespace galp::testdata
 #endif // !__CUDA_ARCH__

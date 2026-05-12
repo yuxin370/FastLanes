@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace enums {
+namespace galp::format {
 
 enum class Kernel {
 	Decompress,
@@ -91,9 +91,9 @@ Expander    string_to_expander(const std::string& str);
 Encoding    string_to_encoding(const std::string& str);
 std::string encoding_to_string(const Encoding type);
 
-} // namespace enums
+} // namespace galp::format
 
-namespace enums_nvcomp {
+namespace galp::bench::nvcomp {
 enum ComparisonType {
 	DECOMPRESSION,
 	DECOMPRESSION_QUERY,
@@ -117,6 +117,6 @@ enum CompressionType {
 
 CompressionType string_to_compression_type(const std::string& str);
 std::string     compression_type_to_string(const CompressionType type);
-} // namespace enums_nvcomp
+} // namespace galp::bench::nvcomp
 
 #endif // ENUMS_CUH

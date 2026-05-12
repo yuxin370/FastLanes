@@ -8,7 +8,7 @@
 
 #include "fls.cuh"
 
-namespace flsgpu { namespace device {
+namespace galp::codec::device {
 
 template <typename T,
           unsigned UNPACK_N_VECTORS,
@@ -18,17 +18,17 @@ template <typename T,
           vbw_t    VALUE_BIT_WIDTH,
           unsigned START_INDEX>
 __device__ void
-switch_leaf(const typename utils::same_width_uint<T>::type* __restrict in, T* __restrict out, processor_T processor) {
-	using UINT_T                      = typename utils::same_width_uint<T>::type;
-	constexpr uint8_t  LANE_BIT_WIDTH = utils::get_lane_bitwidth<UINT_T>();
-	constexpr uint32_t N_LANES        = utils::get_n_lanes<UINT_T>();
+switch_leaf(const typename galp::codec::utils::same_width_uint<T>::type* __restrict in, T* __restrict out, processor_T processor) {
+	using UINT_T                      = typename galp::codec::utils::same_width_uint<T>::type;
+	constexpr uint8_t  LANE_BIT_WIDTH = galp::codec::utils::get_lane_bitwidth<UINT_T>();
+	constexpr uint32_t N_LANES        = galp::codec::utils::get_n_lanes<UINT_T>();
 	constexpr uint16_t PRECEDING_BITS = (START_INDEX * VALUE_BIT_WIDTH);
 	constexpr uint16_t BUFFER_OFFSET  = PRECEDING_BITS % LANE_BIT_WIDTH;
 	constexpr uint16_t N_INPUT_LINE   = PRECEDING_BITS / LANE_BIT_WIDTH;
 
-	LoaderT loader(in + N_INPUT_LINE * N_LANES, utils::get_compressed_vector_size<UINT_T>(VALUE_BIT_WIDTH));
+	LoaderT loader(in + N_INPUT_LINE * N_LANES, galp::codec::utils::get_compressed_vector_size<UINT_T>(VALUE_BIT_WIDTH));
 
-	constexpr T VALUE_MASK = utils::h_set_first_n_bits<UINT_T>(VALUE_BIT_WIDTH);
+	constexpr T VALUE_MASK = galp::codec::utils::h_set_first_n_bits<UINT_T>(VALUE_BIT_WIDTH);
 
 	Masker<UINT_T, UNPACK_N_VECTORS> masker(BUFFER_OFFSET, VALUE_BIT_WIDTH);
 
@@ -70,11 +70,11 @@ template <typename T,
           typename processor_T,
           typename LoaderT,
           vbw_t VALUE_BIT_WIDTH>
-__device__ void switch_start_index(const typename utils::same_width_uint<T>::type* __restrict in,
+__device__ void switch_start_index(const typename galp::codec::utils::same_width_uint<T>::type* __restrict in,
                                    T* __restrict out,
                                    processor_T processor,
                                    const si_t  start_index) {
-	constexpr int N_VALUES_IN_LANE = utils::get_values_per_lane<T>();
+	constexpr int N_VALUES_IN_LANE = galp::codec::utils::get_values_per_lane<T>();
 
 	switch (start_index) {
 	case 0:
@@ -465,12 +465,12 @@ __device__ void switch_start_index(const typename utils::same_width_uint<T>::typ
 }
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename processor_T, typename LoaderT>
-__device__ void switch_value_bit_width(const typename utils::same_width_uint<T>::type* __restrict in,
+__device__ void switch_value_bit_width(const typename galp::codec::utils::same_width_uint<T>::type* __restrict in,
                                        T* __restrict out,
                                        processor_T processor,
                                        const vbw_t value_bit_width,
                                        const si_t  start_index) {
-	constexpr int N_BITS = utils::sizeof_in_bits<T>();
+	constexpr int N_BITS = galp::codec::utils::sizeof_in_bits<T>();
 
 	switch (value_bit_width) {
 	case 0:
@@ -868,7 +868,7 @@ __device__ void switch_value_bit_width(const typename utils::same_width_uint<T>:
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename OutputProcessor>
 struct BitUnpackerSwitchCase : BitUnpackerBase<T> {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	const UINT_T* __restrict in;
 	const vbw_t     value_bit_width;
@@ -891,6 +891,6 @@ struct BitUnpackerSwitchCase : BitUnpackerBase<T> {
 	}
 };
 
-}} // namespace flsgpu::device
+} // namespace galp::codec::device
 
 #endif // FLS_SWITCH_CASE_CUH

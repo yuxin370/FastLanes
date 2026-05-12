@@ -12,7 +12,7 @@
 #include <string_view>
 #include <type_traits>
 
-namespace types {
+namespace galp::format {
 
 enum class DataType {
 	I8,
@@ -119,6 +119,6 @@ inline DataType string_to_data_type(std::string_view str) {
 	throw std::invalid_argument("Unknown data type");
 }
 
-} // namespace types
+} // namespace galp::format
 
 #endif // ENGINE_TYPES_CUH

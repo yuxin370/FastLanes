@@ -7,10 +7,10 @@
 #include "engine/execution/internal/unpack_dispatch.cuh"
 #include "engine/execution/rowgroup.cuh"
 
-namespace dispatch {
+namespace galp::execution {
 namespace {
 
-RowgroupData decompress_rowgroup_impl(std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg) {
+RowgroupData decompress_rowgroup_impl(std::vector<galp::expression::Expression>& expressions, const ExecutionConfig& cfg) {
 	runtime::validate_unpack_config(cfg);
 	runtime::ExecutionWorkset      workset {};
 	runtime::ExecutionWorksetGuard guard(workset);
@@ -21,12 +21,12 @@ RowgroupData decompress_rowgroup_impl(std::vector<expr::Expression>& expressions
 }
 } // namespace
 
-RowgroupData decompress_rowgroup(std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg) {
+RowgroupData decompress_rowgroup(std::vector<galp::expression::Expression>& expressions, const ExecutionConfig& cfg) {
 	return decompress_rowgroup_impl(expressions, cfg);
 }
 
-RowgroupData decompress_rowgroup(const std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg) {
+RowgroupData decompress_rowgroup(const std::vector<galp::expression::Expression>& expressions, const ExecutionConfig& cfg) {
 	auto mutable_expressions = expressions;
 	return decompress_rowgroup_impl(mutable_expressions, cfg);
 }
-} // namespace dispatch
+} // namespace galp::execution

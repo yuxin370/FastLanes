@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace flsgpu { namespace device {
+namespace galp::codec::device {
 
 template <typename IndexT, unsigned UNPACK_N_VALUES>
 struct RLEUnsumOrder {
@@ -34,11 +34,11 @@ template <typename ValueT, typename IndexT, unsigned UNPACK_N_VECTORS, unsigned 
 struct RLEUnsumer {
 private:
 	IndexT                   prefix[UNPACK_N_VECTORS];
-	static constexpr int32_t N_LANES = utils::get_n_lanes<IndexT>();
+	static constexpr int32_t N_LANES = galp::codec::utils::get_n_lanes<IndexT>();
 
 public:
 	__device__ __forceinline__
-	RLEUnsumer(const flsgpu::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane) {
+	RLEUnsumer(const galp::codec::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane) {
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
 			const IndexT* base_ptr = column.rsum_bases + (vector_index + v) * N_LANES;
@@ -62,6 +62,6 @@ public:
 	}
 };
 
-}} // namespace flsgpu::device
+} // namespace galp::codec::device
 
 #endif // FLSGPU_FLS_UNSUMER_CUH
