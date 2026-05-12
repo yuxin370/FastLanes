@@ -12,22 +12,22 @@
 #include "flsgpu/memory/gpu_array.cuh"
 #include <limits>
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
 struct FREQExtendedColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	size_t n_values;
 	size_t n_vecs;
 
-	T frequent_value; // per-column frequent value
+		T frequent_value; // per-column frequent value
 
-	size_t    n_exceptions;       // total number of exceptions
-	uint32_t* exceptions_offsets; // expection offsets in exception array
-	T*        exceptions;         // exception values
-	uint16_t* positions;          // exception positions in vectors
-	uint16_t* offsets_counts;     // offsets and counts per lane
+		size_t    n_exceptions;       // total number of exceptions
+		uint32_t* exceptions_offsets; // expection offsets in exception array
+		T*        exceptions;         // exception values
+		uint16_t* positions;          // exception positions in vectors
+		uint16_t* offsets_counts;     // offsets and counts per lane
 };
 
 } // namespace device
@@ -36,19 +36,19 @@ namespace host {
 
 template <typename T>
 struct FREQExtendedColumn {
-	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename galp::codec::utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::FREQExtendedColumn<T>;
 
 	size_t n_values;
 	size_t n_vecs;
 
-	T frequent_value; // per-column frequent value
+		T frequent_value; // per-column frequent value
 
-	size_t    n_exceptions;       // total number of exceptions
-	uint32_t* exceptions_offsets; // expection offsets in exception array
-	T*        exceptions;         // exception values
-	uint16_t* positions;          // exception positions in vectors
-	uint16_t* offsets_counts;     // offsets and counts per lane
+		size_t    n_exceptions;       // total number of exceptions
+		HostArray<uint32_t> exceptions_offsets; // expection offsets in exception array
+		HostArray<T>        exceptions;         // exception values
+		HostArray<uint16_t> positions;          // exception positions in vectors
+		HostArray<uint16_t> offsets_counts;     // offsets and counts per lane
 
 	size_t get_n_values() const {
 		return n_values;
@@ -58,7 +58,7 @@ struct FREQExtendedColumn {
 	}
 
 	device::FREQExtendedColumn<T> copy_to_device() const {
-		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		size_t branchless_and_prefetch_buffer = galp::codec::consts::MAX_UNPACK_N_VECS;
 		return device::FREQExtendedColumn<T> {
 		    n_values,
 		    n_vecs,
@@ -67,16 +67,16 @@ struct FREQExtendedColumn {
 		    GPUArray<uint32_t>(n_vecs, exceptions_offsets).release(),
 		    GPUArray<T>(n_exceptions, branchless_and_prefetch_buffer, exceptions).release(),
 		    GPUArray<uint16_t>(n_exceptions, branchless_and_prefetch_buffer, positions).release(),
-		    GPUArray<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts).release(),
+		    GPUArray<uint16_t>(n_vecs * galp::codec::utils::get_n_lanes<T>(), offsets_counts).release(),
 		};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FREQExtendedColumn<T>& out) const {
-		const size_t buf       = consts::MAX_UNPACK_N_VECS;
+	void copy_to_device(galp::memory::DeviceArena& arena, device::FREQExtendedColumn<T>& out) const {
+		const size_t buf       = galp::codec::consts::MAX_UNPACK_N_VECS;
 		auto         i_exc_off = arena.template add<uint32_t>(n_vecs, exceptions_offsets);
 		auto         i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
 		auto         i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
-		auto         i_oc      = arena.template add<uint16_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts);
+		auto         i_oc      = arena.template add<uint16_t>(n_vecs * galp::codec::utils::get_n_lanes<T>(), offsets_counts);
 		out.n_values           = n_values;
 		out.n_vecs             = n_vecs;
 		out.frequent_value     = frequent_value;
@@ -89,11 +89,11 @@ struct FREQExtendedColumn {
 };
 
 template <typename T>
-void free_column(FREQExtendedColumn<T> column) {
-	delete[] column.exceptions_offsets;
-	delete[] column.exceptions;
-	delete[] column.positions;
-	delete[] column.offsets_counts;
+void free_column(FREQExtendedColumn<T>& column) {
+	column.exceptions_offsets.reset();
+	column.exceptions.reset();
+	column.positions.reset();
+	column.offsets_counts.reset();
 }
 
 template <typename T>
@@ -105,6 +105,6 @@ void free_column(device::FREQExtendedColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_FREQ_EXTENDED_CUH

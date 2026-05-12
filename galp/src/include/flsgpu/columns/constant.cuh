@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
@@ -34,20 +34,20 @@ struct CONSTANTColumn {
 		return n_values;
 	}
 	size_t get_n_vecs() const {
-		return utils::get_n_vecs_from_size(n_values);
+		return galp::codec::utils::get_n_vecs_from_size(n_values);
 	}
 
 	device::CONSTANTColumn<T> copy_to_device() const {
 		return device::CONSTANTColumn<T> {n_values, value};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& /*arena*/, device::CONSTANTColumn<T>& out) const {
+	void copy_to_device(galp::memory::DeviceArena& /*arena*/, device::CONSTANTColumn<T>& out) const {
 		out = copy_to_device();
 	}
 };
 
 template <typename T>
-void free_column(CONSTANTColumn<T> column) {
+void free_column(CONSTANTColumn<T>& column) {
 	(void)column;
 }
 
@@ -57,6 +57,6 @@ void free_column(device::CONSTANTColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_CONSTANT_CUH

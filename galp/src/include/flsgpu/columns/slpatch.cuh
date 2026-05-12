@@ -9,12 +9,12 @@
 #include "flsgpu/columns/ffor.cuh"
 #include "flsgpu/consts.cuh"
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
 struct SLPATCHColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	size_t n_values;
 	size_t n_vecs;
 
@@ -33,7 +33,7 @@ namespace host {
 
 template <typename T>
 struct SLPATCHColumn {
-	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename galp::codec::utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::SLPATCHColumn<T>;
 
 	size_t n_values;
@@ -42,10 +42,10 @@ struct SLPATCHColumn {
 	FFORColumn<T> ffor; // base values
 
 	size_t    n_exceptions;       // total number of exceptions
-	uint32_t* exceptions_offsets; // exception values
-	T*        exceptions;         // exception values
-	uint16_t* positions;          // exception positions in vectors
-	uint16_t* counts;             // number of exceptions per vector
+	HostArray<uint32_t> exceptions_offsets; // exception values
+	HostArray<T>        exceptions;         // exception values
+	HostArray<uint16_t> positions;          // exception positions in vectors
+	HostArray<uint16_t> counts;             // number of exceptions per vector
 
 	size_t get_n_values() const {
 		return n_values;
@@ -56,7 +56,7 @@ struct SLPATCHColumn {
 	}
 
 	device::SLPATCHColumn<T> copy_to_device() const {
-		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		size_t branchless_and_prefetch_buffer = galp::codec::consts::MAX_UNPACK_N_VECS;
 		return device::SLPATCHColumn<T> {
 		    n_values,
 		    n_vecs,
@@ -69,10 +69,10 @@ struct SLPATCHColumn {
 		};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::SLPATCHColumn<T>& out) const {
-		const size_t buf             = consts::MAX_UNPACK_N_VECS;
-		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;
-		using UINT_T_BP              = typename utils::same_width_uint<T>::type;
+	void copy_to_device(galp::memory::DeviceArena& arena, device::SLPATCHColumn<T>& out) const {
+		const size_t buf             = galp::codec::consts::MAX_UNPACK_N_VECS;
+		const size_t bp_buffer_elems = galp::codec::utils::get_n_lanes<T>() * 4;
+		using UINT_T_BP              = typename galp::codec::utils::same_width_uint<T>::type;
 		auto i_packed  = arena.template add<UINT_T_BP>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
 		auto i_bw      = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
 		auto i_bp_off  = arena.template add<uint32_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
@@ -99,12 +99,12 @@ struct SLPATCHColumn {
 };
 
 template <typename T>
-void free_column(SLPATCHColumn<T> column) {
+void free_column(SLPATCHColumn<T>& column) {
 	free_column(column.ffor);
-	delete[] column.exceptions_offsets;
-	delete[] column.exceptions;
-	delete[] column.positions;
-	delete[] column.counts;
+	column.exceptions_offsets.reset();
+	column.exceptions.reset();
+	column.positions.reset();
+	column.counts.reset();
 }
 
 template <typename T>
@@ -117,6 +117,6 @@ void free_column(device::SLPATCHColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_SLPATCH_CUH

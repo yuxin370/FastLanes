@@ -16,26 +16,26 @@
 #include <cstdlib>
 #include <tuple>
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
 struct ALPColumn {
-	using INT_T  = typename utils::same_width_int<T>::type;
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using INT_T  = typename galp::codec::utils::same_width_int<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	size_t             n_values;
 	FFORColumn<UINT_T> ffor;
 
-	INT_T*   factors;
-	T*       fractions;
-	uint8_t* factor_indices;
-	uint8_t* fraction_indices;
+		INT_T*   factors;
+		T*       fractions;
+		uint8_t* factor_indices;
+		uint8_t* fraction_indices;
 
-	size_t    n_exceptions;
-	uint32_t* exceptions_offsets;
-	T*        exceptions;
-	uint16_t* positions;
-	uint16_t* counts;
+		size_t              n_exceptions;
+		uint32_t*           exceptions_offsets;
+		T*                  exceptions;
+		uint16_t*           positions;
+		uint16_t*           counts;
 };
 
 } // namespace device
@@ -44,20 +44,20 @@ namespace host {
 
 template <typename T>
 struct ALPColumn {
-	using INT_T         = typename utils::same_width_int<T>::type;
-	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using INT_T         = typename galp::codec::utils::same_width_int<T>::type;
+	using UINT_T        = typename galp::codec::utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::ALPColumn<T>;
 
 	FFORColumn<UINT_T> ffor;
 
-	uint8_t* factor_indices;
-	uint8_t* fraction_indices;
+		HostArray<uint8_t> factor_indices;
+		HostArray<uint8_t> fraction_indices;
 
-	size_t    n_exceptions;
-	uint32_t* exceptions_offsets;
-	T*        exceptions;
-	uint16_t* positions;
-	uint16_t* counts;
+		size_t    n_exceptions;
+		HostArray<uint32_t> exceptions_offsets;
+		HostArray<T>        exceptions;
+		HostArray<uint16_t> positions;
+		HostArray<uint16_t> counts;
 
 	size_t compressed_size_bytes_alp;
 	size_t compressed_size_bytes_alp_extended;
@@ -77,8 +77,8 @@ struct ALPColumn {
 		return device::ALPColumn<T> {
 		    get_n_values(),
 		    ffor.copy_to_device(),
-		    GPUArray<INT_T>(consts::as<T>::FACT_ARR_COUNT, alp::Constants<T>::FACT_ARR.data()).release(),
-		    GPUArray<T>(consts::as<T>::FRAC_ARR_COUNT, alp::Constants<T>::FRAC_ARR.data()).release(),
+		    GPUArray<INT_T>(galp::codec::consts::as<T>::FACT_ARR_COUNT, alp::Constants<T>::FACT_ARR.data()).release(),
+		    GPUArray<T>(galp::codec::consts::as<T>::FRAC_ARR_COUNT, alp::Constants<T>::FRAC_ARR.data()).release(),
 		    GPUArray<uint8_t>(ffor.bp.get_n_vecs(), factor_indices).release(),
 		    GPUArray<uint8_t>(ffor.bp.get_n_vecs(), fraction_indices).release(),
 		    n_exceptions,
@@ -90,18 +90,18 @@ struct ALPColumn {
 	}
 
 	std::tuple<T*, uint16_t*, uint16_t*> convert_exceptions_to_lane_divided_format() const {
-		constexpr auto N_LANES         = utils::get_n_lanes<T>();
-		constexpr auto VALUES_PER_LANE = utils::get_values_per_lane<T>();
+		constexpr auto N_LANES         = galp::codec::utils::get_n_lanes<T>();
+		constexpr auto VALUES_PER_LANE = galp::codec::utils::get_values_per_lane<T>();
 
 		// New exception allocations
-		T*        out_exceptions = reinterpret_cast<T*>(malloc(sizeof(T) * n_exceptions));
-		uint16_t* out_positions  = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * n_exceptions));
+		T*        out_exceptions = new T[n_exceptions];
+		uint16_t* out_positions  = new uint16_t[n_exceptions];
 		uint16_t* out_offsets_counts =
-		    reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * ffor.get_n_vecs() * N_LANES));
+		    new uint16_t[ffor.get_n_vecs() * N_LANES];
 
 		// Intermediate arrays for reordering positions and exceptions
-		T        vec_exceptions[consts::VALUES_PER_VECTOR];
-		T        vec_exceptions_positions[consts::VALUES_PER_VECTOR];
+		T        vec_exceptions[galp::codec::consts::VALUES_PER_VECTOR];
+		T        vec_exceptions_positions[galp::codec::consts::VALUES_PER_VECTOR];
 		uint16_t lane_counts[N_LANES];
 
 		// Copies of pointers for pointer arithmetic
@@ -151,7 +151,7 @@ struct ALPColumn {
 			c_positions += vec_exception_count;
 			c_out_exceptions += vec_exception_count;
 			c_out_positions += vec_exception_count;
-			c_out_offsets_counts += utils::get_n_lanes<T>();
+			c_out_offsets_counts += galp::codec::utils::get_n_lanes<T>();
 		}
 
 		return std::make_tuple(out_exceptions, out_positions, out_offsets_counts);
@@ -163,16 +163,16 @@ struct ALPColumn {
 		                                 BPColumn<UINT_T> {
 		                                     ffor.bp.n_values,
 		                                     ffor.bp.n_packed_values,
-		                                     utils::copy_array(ffor.bp.packed_array, ffor.bp.n_packed_values),
-		                                     utils::copy_array(ffor.bp.bit_widths, get_n_vecs()),
-		                                     utils::copy_array(ffor.bp.vector_offsets, get_n_vecs()),
+		                                     galp::codec::utils::copy_array(ffor.bp.packed_array.get(), ffor.bp.n_packed_values),
+		                                     galp::codec::utils::copy_array(ffor.bp.bit_widths.get(), get_n_vecs()),
+		                                     galp::codec::utils::copy_array(ffor.bp.vector_offsets.get(), get_n_vecs()),
 		                                 },
-		                                 utils::copy_array(ffor.bases, get_n_vecs()),
+		                                 galp::codec::utils::copy_array(ffor.bases.get(), get_n_vecs()),
 		                             },
-		                             utils::copy_array(factor_indices, get_n_vecs()),
-		                             utils::copy_array(fraction_indices, get_n_vecs()),
+		                             galp::codec::utils::copy_array(factor_indices.get(), get_n_vecs()),
+		                             galp::codec::utils::copy_array(fraction_indices.get(), get_n_vecs()),
 		                             n_exceptions,
-		                             utils::copy_array(exceptions_offsets, get_n_vecs()),
+		                             galp::codec::utils::copy_array(exceptions_offsets.get(), get_n_vecs()),
 		                             e_exceptions,
 		                             e_positions,
 		                             e_offsets_counts,
@@ -181,14 +181,14 @@ struct ALPColumn {
 };
 
 template <typename T>
-void free_column(ALPColumn<T> column) {
+void free_column(ALPColumn<T>& column) {
 	free_column(column.ffor);
-	delete[] column.factor_indices;
-	delete[] column.fraction_indices;
-	delete[] column.exceptions_offsets;
-	delete[] column.exceptions;
-	delete[] column.positions;
-	delete[] column.counts;
+	column.factor_indices.reset();
+	column.fraction_indices.reset();
+	column.exceptions_offsets.reset();
+	column.exceptions.reset();
+	column.positions.reset();
+	column.counts.reset();
 }
 
 template <typename T>
@@ -205,6 +205,6 @@ void free_column(device::ALPColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_ALP_CUH

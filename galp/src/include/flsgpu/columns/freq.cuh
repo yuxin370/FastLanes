@@ -14,22 +14,22 @@
 #include <limits>
 #include <stdexcept>
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
 struct FREQColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	size_t n_values;
 	size_t n_vecs;
 
-	T frequent_value; // per-column frequent value
+		T frequent_value; // per-column frequent value
 
-	size_t    n_exceptions;       // total number of exceptions
-	uint32_t* exceptions_offsets; // expection offsets in exception array
-	T*        exceptions;         // exception values
-	uint16_t* positions;          // exception positions in vectors
-	uint16_t* counts;             // number of exceptions per vector
+		size_t    n_exceptions;       // total number of exceptions
+		uint32_t* exceptions_offsets; // expection offsets in exception array
+		T*        exceptions;         // exception values
+		uint16_t* positions;          // exception positions in vectors
+		uint16_t* counts;             // number of exceptions per vector
 };
 
 } // namespace device
@@ -38,19 +38,19 @@ namespace host {
 
 template <typename T>
 struct FREQColumn {
-	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename galp::codec::utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::FREQColumn<T>;
 
 	size_t n_values;
 	size_t n_vecs;
 
-	T frequent_value; // per-column frequent value
+		T frequent_value; // per-column frequent value
 
-	size_t    n_exceptions;       // total number of exceptions
-	uint32_t* exceptions_offsets; // expection offsets in exception array
-	T*        exceptions;         // exception values
-	uint16_t* positions;          // exception positions in vectors
-	uint16_t* counts;             // number of exceptions per vector
+		size_t    n_exceptions;       // total number of exceptions
+		HostArray<uint32_t> exceptions_offsets; // expection offsets in exception array
+		HostArray<T>        exceptions;         // exception values
+		HostArray<uint16_t> positions;          // exception positions in vectors
+		HostArray<uint16_t> counts;             // number of exceptions per vector
 
 	size_t get_n_values() const {
 		return n_values;
@@ -61,7 +61,7 @@ struct FREQColumn {
 	}
 
 	device::FREQColumn<T> copy_to_device() const {
-		size_t branchless_and_prefetch_buffer = consts::MAX_UNPACK_N_VECS;
+		size_t branchless_and_prefetch_buffer = galp::codec::consts::MAX_UNPACK_N_VECS;
 		return device::FREQColumn<T> {
 		    n_values,
 		    n_vecs,
@@ -74,8 +74,8 @@ struct FREQColumn {
 		};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FREQColumn<T>& out) const {
-		const size_t buf       = consts::MAX_UNPACK_N_VECS;
+	void copy_to_device(galp::memory::DeviceArena& arena, device::FREQColumn<T>& out) const {
+		const size_t buf       = galp::codec::consts::MAX_UNPACK_N_VECS;
 		auto         i_exc_off = arena.template add<uint32_t>(n_vecs, exceptions_offsets);
 		auto         i_exc     = arena.template add<T>(n_exceptions, exceptions, buf);
 		auto         i_pos     = arena.template add<uint16_t>(n_exceptions, positions, buf);
@@ -91,19 +91,19 @@ struct FREQColumn {
 	}
 
 	std::tuple<T*, uint16_t*, uint16_t*> convert_exceptions_to_lane_divided_format() const {
-		constexpr auto N_LANES         = utils::get_n_lanes<T>();
-		constexpr auto VALUES_PER_LANE = utils::get_values_per_lane<T>();
+		constexpr auto N_LANES         = galp::codec::utils::get_n_lanes<T>();
+		constexpr auto VALUES_PER_LANE = galp::codec::utils::get_values_per_lane<T>();
 
 		// New exception allocations
-		T*        out_exceptions     = reinterpret_cast<T*>(malloc(sizeof(T) * n_exceptions));
-		uint16_t* out_positions      = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * n_exceptions));
-		uint16_t* out_offsets_counts = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * get_n_vecs() * N_LANES));
+		T*        out_exceptions     = new T[n_exceptions];
+		uint16_t* out_positions      = new uint16_t[n_exceptions];
+		uint16_t* out_offsets_counts = new uint16_t[get_n_vecs() * N_LANES];
 
 		// Intermediate arrays for reordering positions and exceptions
-		T        vec_exceptions[consts::VALUES_PER_VECTOR];
-		uint16_t vec_exceptions_positions[consts::VALUES_PER_VECTOR];
+		T        vec_exceptions[galp::codec::consts::VALUES_PER_VECTOR];
+		uint16_t vec_exceptions_positions[galp::codec::consts::VALUES_PER_VECTOR];
 		uint16_t lane_counts[N_LANES];
-		static_assert(consts::VALUES_PER_VECTOR <= std::numeric_limits<uint16_t>::max(),
+		static_assert(galp::codec::consts::VALUES_PER_VECTOR <= std::numeric_limits<uint16_t>::max(),
 		              "FREQ position storage requires uint16_t-capable vector size");
 
 		// Copies of pointers for pointer arithmetic
@@ -148,7 +148,7 @@ struct FREQColumn {
 
 			c_out_exceptions += vec_exception_count;
 			c_out_positions += vec_exception_count;
-			c_out_offsets_counts += utils::get_n_lanes<T>();
+			c_out_offsets_counts += galp::codec::utils::get_n_lanes<T>();
 		}
 
 		return std::make_tuple(out_exceptions, out_positions, out_offsets_counts);
@@ -177,11 +177,11 @@ struct FREQColumn {
 };
 
 template <typename T>
-void free_column(FREQColumn<T> column) {
-	delete[] column.exceptions_offsets;
-	delete[] column.exceptions;
-	delete[] column.positions;
-	delete[] column.counts;
+void free_column(FREQColumn<T>& column) {
+	column.exceptions_offsets.reset();
+	column.exceptions.reset();
+	column.positions.reset();
+	column.counts.reset();
 }
 
 template <typename T>
@@ -193,6 +193,6 @@ void free_column(device::FREQColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_FREQ_CUH

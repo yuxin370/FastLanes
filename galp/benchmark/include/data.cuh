@@ -27,7 +27,7 @@
 #include <stdexcept>
 #include <tuple>
 
-namespace data {
+namespace galp::bench {
 
 namespace primitives {
 
@@ -52,7 +52,7 @@ T* fill_array_with_constant(T* array, const size_t n_values, const T value) {
 template <typename T>
 T* fill_array_with_random_bytes(T* array, const size_t n_values, const unsigned repeat = 1) {
 	// WARNING Does not check if n_values % REPEAT == 0
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UINT_T* out  = reinterpret_cast<UINT_T*>(array);
 	auto    generator =
 	    get_random_number_generator<UINT_T>(std::numeric_limits<UINT_T>::min(), std::numeric_limits<UINT_T>::max());
@@ -72,7 +72,7 @@ template <typename T>
 T* fill_array_with_sequence(
     T* array, const size_t n_values, const T start, const T step = 1, const unsigned repeat = 1) {
 	// WARNING Does not check if n_values % REPEAT == 0
-	using UINT_T  = typename utils::same_width_uint<T>::type;
+	using UINT_T  = typename galp::codec::utils::same_width_uint<T>::type;
 	UINT_T* out   = reinterpret_cast<UINT_T*>(array);
 	T       value = start;
 
@@ -94,7 +94,7 @@ T* fill_array_with_random_data(T*             array,
                                const T        min    = std::numeric_limits<T>::min(),
                                const T        max    = std::numeric_limits<T>::max()) {
 	// WARNING Does not check if n_values % REPEAT == 0
-	using UINT_T      = typename utils::same_width_uint<T>::type;
+	using UINT_T      = typename galp::codec::utils::same_width_uint<T>::type;
 	UINT_T* out       = reinterpret_cast<UINT_T*>(array);
 	auto    generator = get_random_number_generator<UINT_T>(min, max);
 
@@ -188,8 +188,8 @@ std::tuple<T*, bool> make_column_magic(T* data, const size_t n_values) {
 template <typename T>
 T* generate_positions(T* positions, const T* counts, const size_t n_vecs) {
 	// INFO Not really a primitive ...
-	T* indices = new T[consts::VALUES_PER_VECTOR];
-	for (size_t i {0}; i < consts::VALUES_PER_VECTOR; ++i) {
+	T* indices = new T[galp::codec::consts::VALUES_PER_VECTOR];
+	for (size_t i {0}; i < galp::codec::consts::VALUES_PER_VECTOR; ++i) {
 		indices[i] = i;
 	}
 
@@ -198,7 +198,7 @@ T* generate_positions(T* positions, const T* counts, const size_t n_vecs) {
 	auto               rng         = std::default_random_engine(random_device());
 	T*                 c_positions = positions;
 	for (size_t vi {0}; vi < n_vecs; ++vi) {
-		std::shuffle(indices, indices + consts::VALUES_PER_VECTOR, rng);
+		std::shuffle(indices, indices + galp::codec::consts::VALUES_PER_VECTOR, rng);
 		std::memcpy(c_positions, indices, sizeof(T) * counts[vi]);
 		std::sort(c_positions, c_positions + counts[vi]);
 		c_positions += counts[vi];
@@ -254,7 +254,7 @@ std::pair<T*, size_t> read_file_as(const std::string path, const size_t input_co
 
 	const size_t values_in_file = static_cast<size_t>(file_size) / sizeof(T);
 	size_t       count          = input_count == 0 ? values_in_file : input_count;
-	count                       = count - (count % consts::VALUES_PER_VECTOR);
+	count                       = count - (count % galp::codec::consts::VALUES_PER_VECTOR);
 	auto column                 = new T[count];
 
 	// Read either the file size, or the total number of values needed,
@@ -283,7 +283,7 @@ std::pair<T*, size_t> read_file_as(const std::string path, const size_t input_co
 
 template <typename T>
 T* generate_index_array(const size_t n_values, const vbw_t value_bit_width) {
-	T  mask  = utils::h_set_first_n_bits<T>(value_bit_width);
+	T  mask  = galp::codec::utils::h_set_first_n_bits<T>(value_bit_width);
 	T* array = new T[n_values];
 
 	for (size_t i {0}; i < n_values; i++) {
@@ -295,19 +295,21 @@ T* generate_index_array(const size_t n_values, const vbw_t value_bit_width) {
 
 template <typename T>
 T* generate_random_array(const size_t n_values, const vbw_t value_bit_width) {
-	T max_value = utils::h_set_first_n_bits<T>(value_bit_width);
+	T max_value = galp::codec::utils::h_set_first_n_bits<T>(value_bit_width);
 	return primitives::fill_array_with_random_data(new T[n_values], n_values, 1, T {0}, max_value);
 }
 
 } // namespace arrays
 
-namespace bindings {
+} // namespace galp::bench
+
+namespace galp::bench::bindings {
 
 template <typename T>
-flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const vbw_t value_bit_width) {
-	using UINT_T                  = typename flsgpu::host::BPColumn<T>::UINT_T;
-	size_t n_vecs                 = utils::get_n_vecs_from_size(n_values);
-	size_t compressed_vector_size = utils::get_compressed_vector_size<T>(value_bit_width);
+galp::codec::host::BPColumn<T> compress(const T* array, const size_t n_values, const vbw_t value_bit_width) {
+	using UINT_T                  = typename galp::codec::host::BPColumn<T>::UINT_T;
+	size_t n_vecs                 = galp::codec::utils::get_n_vecs_from_size(n_values);
+	size_t compressed_vector_size = galp::codec::utils::get_compressed_vector_size<T>(value_bit_width);
 	if (compressed_vector_size != 0 && n_vecs > std::numeric_limits<size_t>::max() / compressed_vector_size) {
 		throw std::overflow_error("BP packed value count exceeds size_t");
 	}
@@ -319,11 +321,11 @@ flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const 
 
 	for (size_t vi {0}; vi < n_vecs; ++vi) {
 		generated::pack::fallback::scalar::pack(array, c_packed_array, value_bit_width);
-		array += consts::VALUES_PER_VECTOR;
+		array += galp::codec::consts::VALUES_PER_VECTOR;
 		c_packed_array += compressed_vector_size;
 	}
 
-	return flsgpu::host::BPColumn<T> {
+	return galp::codec::host::BPColumn<T> {
 	    n_values,
 	    n_packed_values,
 	    reinterpret_cast<UINT_T*>(packed_array),
@@ -333,8 +335,8 @@ flsgpu::host::BPColumn<T> compress(const T* array, const size_t n_values, const 
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::BPColumn<T> column) {
-	using UINT_T            = typename flsgpu::host::BPColumn<T>::UINT_T;
+T* decompress(const galp::codec::host::BPColumn<T>& column) {
+	using UINT_T            = typename galp::codec::host::BPColumn<T>::UINT_T;
 	T*      out_array       = new T[column.get_n_values()];
 	T*      c_out_array     = out_array;
 	UINT_T* c_packed_arrayu = column.packed_array;
@@ -343,15 +345,15 @@ T* decompress(const flsgpu::host::BPColumn<T> column) {
 		c_packed_arrayu = column.packed_array + column.vector_offsets[vi];
 		generated::unpack::fallback::scalar::unpack(
 		    reinterpret_cast<T*>(c_packed_arrayu), c_out_array, column.bit_widths[vi]);
-		c_out_array += consts::VALUES_PER_VECTOR;
+		c_out_array += galp::codec::consts::VALUES_PER_VECTOR;
 	}
 
 	return out_array;
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::FFORColumn<T> column) {
-	using UINT_T           = typename flsgpu::host::FFORColumn<T>::UINT_T;
+T* decompress(const galp::codec::host::FFORColumn<T>& column) {
+	using UINT_T           = typename galp::codec::host::FFORColumn<T>::UINT_T;
 	T*      out_array      = new T[column.get_n_values()];
 	T*      c_out_array    = out_array;
 	UINT_T* c_packed_array = column.bp.packed_array + column.bp.vector_offsets[0];
@@ -362,25 +364,25 @@ T* decompress(const flsgpu::host::FFORColumn<T> column) {
 		std::memcpy(&base, &column.bases[vi], sizeof(T));
 		fastlanes::generated::unffor::fallback::scalar::unffor(
 		    reinterpret_cast<const T*>(c_packed_array), c_out_array, column.bp.bit_widths[vi], &base);
-		c_out_array += consts::VALUES_PER_VECTOR;
+		c_out_array += galp::codec::consts::VALUES_PER_VECTOR;
 	}
 
 	return out_array;
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::ALPColumn<T> column) {
-	return alp::decode<T>(column, new T[column.get_n_values()]);
+T* decompress(const galp::codec::host::ALPColumn<T>& column) {
+	return galp::codec::alp::decode<T>(column, new T[column.get_n_values()]);
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::ALPExtendedColumn<T> column) {
-	return alp::decode(column, new T[column.get_n_values()]);
+T* decompress(const galp::codec::host::ALPExtendedColumn<T>& column) {
+	return galp::codec::alp::decode(column, new T[column.get_n_values()]);
 }
 
-template <typename T, typename IndexT = typename flsgpu::host::DICTFFORColumn<T>::INDEX_T>
-T* decompress(const flsgpu::host::DICTFFORColumn<T, IndexT> column) {
-	using KEY_T = typename flsgpu::host::DICTFFORColumn<T, IndexT>::KEY_T;
+template <typename T, typename IndexT = typename galp::codec::host::DICTFFORColumn<T>::INDEX_T>
+T* decompress(const galp::codec::host::DICTFFORColumn<T, IndexT>& column) {
+	using KEY_T = typename galp::codec::host::DICTFFORColumn<T, IndexT>::KEY_T;
 
 	const size_t n_values = column.get_n_values();
 
@@ -409,14 +411,14 @@ T* decompress(const flsgpu::host::DICTFFORColumn<T, IndexT> column) {
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::CONSTANTColumn<T> column) {
+T* decompress(const galp::codec::host::CONSTANTColumn<T>& column) {
 	T* out_array = new T[column.get_n_values()];
 	primitives::fill_array_with_constant(out_array, column.get_n_values(), column.value);
 	return out_array;
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
+T* decompress(const galp::codec::host::SLPATCHColumn<T>& column) {
 	const size_t n_values = column.get_n_values();
 	const size_t n_vecs   = column.get_n_vecs();
 
@@ -442,8 +444,8 @@ T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
 
 	running_off = 0;
 	for (size_t vi = 0; vi < n_vecs; ++vi) {
-		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
-		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+		const size_t out_base = vi * galp::codec::consts::VALUES_PER_VECTOR;
+		const size_t vec_n    = std::min<size_t>(galp::codec::consts::VALUES_PER_VECTOR, n_values - out_base);
 
 		const uint16_t cnt = column.counts[vi];
 		const size_t   off = running_off;
@@ -464,8 +466,8 @@ T* decompress(const flsgpu::host::SLPATCHColumn<T> column) {
 }
 
 template <typename T, typename IndexT>
-T* decompress(const flsgpu::host::DICTSLPATCHColumn<T, IndexT> column) {
-	using KEY_T           = typename flsgpu::host::DICTSLPATCHColumn<T, IndexT>::KEY_T;
+T* decompress(const galp::codec::host::DICTSLPATCHColumn<T, IndexT>& column) {
+	using KEY_T           = typename galp::codec::host::DICTSLPATCHColumn<T, IndexT>::KEY_T;
 	const size_t n_values = column.get_n_values();
 
 	IndexT* indices   = decompress(column.index);
@@ -489,11 +491,11 @@ T* decompress(const flsgpu::host::DICTSLPATCHColumn<T, IndexT> column) {
 }
 
 template <typename T, typename IndexT>
-T* decompress(const flsgpu::host::RLEColumn<T, IndexT> column) {
+T* decompress(const galp::codec::host::RLEColumn<T, IndexT>& column) {
 	const size_t n_values        = column.n_values;
 	const size_t n_vecs          = column.n_vecs;
-	const size_t n_lanes         = utils::get_n_lanes<IndexT>();
-	const size_t values_per_lane = utils::get_values_per_lane<IndexT>();
+	const size_t n_lanes         = galp::codec::utils::get_n_lanes<IndexT>();
+	const size_t values_per_lane = galp::codec::utils::get_values_per_lane<IndexT>();
 
 	T* out_array = new T[n_values];
 	if (n_values == 0) {
@@ -503,7 +505,7 @@ T* decompress(const flsgpu::host::RLEColumn<T, IndexT> column) {
 	IndexT* deltas = decompress(column.ffor);
 
 	for (size_t v = 0; v < n_vecs; ++v) {
-		const size_t out_base = v * consts::VALUES_PER_VECTOR;
+		const size_t out_base = v * galp::codec::consts::VALUES_PER_VECTOR;
 		const size_t base_off = column.rle_offsets[v];
 
 		for (size_t lane = 0; lane < n_lanes; ++lane) {
@@ -528,8 +530,8 @@ T* decompress(const flsgpu::host::RLEColumn<T, IndexT> column) {
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::CROSSRLEColumn<T> column) {
-	using UINT_T = typename flsgpu::host::CROSSRLEColumn<T>::UINT_T;
+T* decompress(const galp::codec::host::CROSSRLEColumn<T>& column) {
+	using UINT_T = typename galp::codec::host::CROSSRLEColumn<T>::UINT_T;
 
 	const size_t n_values = column.get_n_values();
 	T*           out      = new T[n_values];
@@ -562,8 +564,8 @@ T* decompress(const flsgpu::host::CROSSRLEColumn<T> column) {
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::CROSSRLEExtendedColumn<T> column) {
-	using UINT_T = typename flsgpu::host::CROSSRLEExtendedColumn<T>::UINT_T;
+T* decompress(const galp::codec::host::CROSSRLEExtendedColumn<T>& column) {
+	using UINT_T = typename galp::codec::host::CROSSRLEExtendedColumn<T>::UINT_T;
 
 	const size_t n_values = column.get_n_values();
 	const size_t n_vecs   = column.get_n_vecs();
@@ -572,9 +574,9 @@ T* decompress(const flsgpu::host::CROSSRLEExtendedColumn<T> column) {
 	if (n_values == 0)
 		return out_array;
 
-	constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
-	constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
-	constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+	constexpr uint32_t N_LANES         = (uint32_t)galp::codec::utils::get_n_lanes<T>();
+	constexpr uint32_t VALUES_PER_LANE = (uint32_t)galp::codec::utils::get_values_per_lane<T>();
+	constexpr uint32_t VEC_VALUES      = (uint32_t)galp::codec::consts::VALUES_PER_VECTOR;
 
 	for (size_t vi = 0; vi < n_vecs; ++vi) {
 		const size_t out_base = vi * (size_t)VEC_VALUES;
@@ -629,8 +631,8 @@ T* decompress(const flsgpu::host::CROSSRLEExtendedColumn<T> column) {
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::CROSSRLELaneMaskColumn<T> column) {
-	using UINT_T = typename flsgpu::host::CROSSRLELaneMaskColumn<T>::UINT_T;
+T* decompress(const galp::codec::host::CROSSRLELaneMaskColumn<T>& column) {
+	using UINT_T = typename galp::codec::host::CROSSRLELaneMaskColumn<T>::UINT_T;
 
 	const size_t n_values = column.n_values;
 	const size_t n_vecs   = column.get_n_vecs();
@@ -639,9 +641,9 @@ T* decompress(const flsgpu::host::CROSSRLELaneMaskColumn<T> column) {
 	if (n_values == 0)
 		return out_array;
 
-	constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
-	constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
-	constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+	constexpr uint32_t N_LANES         = (uint32_t)galp::codec::utils::get_n_lanes<T>();
+	constexpr uint32_t VALUES_PER_LANE = (uint32_t)galp::codec::utils::get_values_per_lane<T>();
+	constexpr uint32_t VEC_VALUES      = (uint32_t)galp::codec::consts::VALUES_PER_VECTOR;
 
 	static_assert(VALUES_PER_LANE <= 64, "lane_boundary_mask is uint64_t; extend if VALUES_PER_LANE>64");
 	static_assert(VEC_VALUES == N_LANES * VALUES_PER_LANE, "expect VALUES_PER_VECTOR == N_LANES*VALUES_PER_LANE");
@@ -695,15 +697,15 @@ T* decompress(const flsgpu::host::CROSSRLELaneMaskColumn<T> column) {
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::FREQColumn<T> column) {
+T* decompress(const galp::codec::host::FREQColumn<T>& column) {
 	const size_t n_values = column.get_n_values();
 	const size_t n_vecs   = column.get_n_vecs();
 
 	T* out_array = new T[n_values];
 
 	for (size_t vi = 0; vi < n_vecs; ++vi) {
-		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
-		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+		const size_t out_base = vi * galp::codec::consts::VALUES_PER_VECTOR;
+		const size_t vec_n    = std::min<size_t>(galp::codec::consts::VALUES_PER_VECTOR, n_values - out_base);
 
 		// 1) fill with frequent value
 		const T fv = column.frequent_value;
@@ -728,17 +730,17 @@ T* decompress(const flsgpu::host::FREQColumn<T> column) {
 }
 
 template <typename T>
-T* decompress(const flsgpu::host::FREQExtendedColumn<T> column) {
+T* decompress(const galp::codec::host::FREQExtendedColumn<T>& column) {
 	const size_t n_values = column.get_n_values();
 	const size_t n_vecs   = column.get_n_vecs();
 
-	constexpr size_t N_LANES = utils::get_n_lanes<T>();
+	constexpr size_t N_LANES = galp::codec::utils::get_n_lanes<T>();
 
 	T* out_array = new T[n_values];
 
 	for (size_t vi = 0; vi < n_vecs; ++vi) {
-		const size_t out_base = vi * consts::VALUES_PER_VECTOR;
-		const size_t vec_n    = std::min<size_t>(consts::VALUES_PER_VECTOR, n_values - out_base);
+		const size_t out_base = vi * galp::codec::consts::VALUES_PER_VECTOR;
+		const size_t vec_n    = std::min<size_t>(galp::codec::consts::VALUES_PER_VECTOR, n_values - out_base);
 
 		// 1) fill with frequent value
 		const T fv = column.frequent_value;
@@ -767,7 +769,9 @@ T* decompress(const flsgpu::host::FREQExtendedColumn<T> column) {
 	return out_array;
 }
 
-} // namespace bindings
+} // namespace galp::bench::bindings
+
+namespace galp::bench {
 
 namespace columns {
 
@@ -782,44 +786,44 @@ inline vbw_t bit_width_for_max_value(const size_t max_value) {
 }
 
 template <typename T>
-flsgpu::host::FFORColumn<T> make_ffor_from_values(const T* values, const size_t n_values, const vbw_t bit_width) {
-	using UINT_T        = typename flsgpu::host::FFORColumn<T>::UINT_T;
-	auto         bp     = bindings::compress(values, n_values, bit_width);
-	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+galp::codec::host::FFORColumn<T> make_ffor_from_values(const T* values, const size_t n_values, const vbw_t bit_width) {
+	using UINT_T        = typename galp::codec::host::FFORColumn<T>::UINT_T;
+	auto         bp     = galp::bench::bindings::compress(values, n_values, bit_width);
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
 	auto*        bases  = primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0});
-	return flsgpu::host::FFORColumn<T> {bp, bases};
+	return galp::codec::host::FFORColumn<T> {std::move(bp), bases};
 }
 
 template <typename T>
-flsgpu::host::BPColumn<T> generate_index_bp_column(const size_t n_values, const vbw_t value_bit_width) {
-	size_t n_vecs          = utils::get_n_vecs_from_size(n_values);
-	size_t n_packed_values = n_vecs * utils::get_compressed_vector_size<T>(value_bit_width);
+galp::codec::host::BPColumn<T> generate_index_bp_column(const size_t n_values, const vbw_t value_bit_width) {
+	size_t n_vecs          = galp::codec::utils::get_n_vecs_from_size(n_values);
+	size_t n_packed_values = n_vecs * galp::codec::utils::get_compressed_vector_size<T>(value_bit_width);
 	T*     array           = arrays::generate_index_array<T>(n_values, value_bit_width);
 
-	auto column = bindings::compress<T>(array, n_values, value_bit_width);
+	auto column = galp::bench::bindings::compress<T>(array, n_values, value_bit_width);
 	delete[] array;
 	return column;
 }
 
 template <typename T>
-flsgpu::host::FFORColumn<T> generate_index_ffor_column(const size_t n_values, const vbw_t value_bit_width) {
-	using UINT_T  = typename flsgpu::host::FFORColumn<T>::UINT_T;
-	size_t n_vecs = utils::get_n_vecs_from_size(n_values);
-	return flsgpu::host::FFORColumn<T> {
+galp::codec::host::FFORColumn<T> generate_index_ffor_column(const size_t n_values, const vbw_t value_bit_width) {
+	using UINT_T  = typename galp::codec::host::FFORColumn<T>::UINT_T;
+	size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
+	return galp::codec::host::FFORColumn<T> {
 	    generate_index_bp_column<T>(n_values, value_bit_width),
 	    primitives::fill_array_with_random_data<UINT_T>(new UINT_T[n_vecs], n_vecs, 1, UINT_T {0}, UINT_T {64}),
 	};
 }
 
 template <typename T>
-flsgpu::host::BPColumn<T>
+galp::codec::host::BPColumn<T>
 generate_random_bp_column(const size_t n_values, const ValueRange<vbw_t> value_bit_width, const int32_t repeat = 1) {
-	size_t n_vecs     = utils::get_n_vecs_from_size(n_values);
+	size_t n_vecs     = galp::codec::utils::get_n_vecs_from_size(n_values);
 	vbw_t* bit_widths = primitives::fill_array_with_random_data<vbw_t>(
 	    new vbw_t[n_vecs], n_vecs, repeat, value_bit_width.min, value_bit_width.max);
-	size_t n_packed_values = primitives::sum_array<vbw_t, size_t>(bit_widths, n_vecs) * utils::get_n_lanes<T>();
+	size_t n_packed_values = primitives::sum_array<vbw_t, size_t>(bit_widths, n_vecs) * galp::codec::utils::get_n_lanes<T>();
 
-	return flsgpu::host::BPColumn<T> {
+	return galp::codec::host::BPColumn<T> {
 	    n_values,
 	    n_packed_values,
 	    primitives::fill_array_with_random_bytes<T>(new T[n_packed_values], n_packed_values),
@@ -827,7 +831,7 @@ generate_random_bp_column(const size_t n_values, const ValueRange<vbw_t> value_b
 	    primitives::map<uint32_t>(
 	        [](const uint32_t value) {
 		        return primitives::checked_u32_offset(
-		            static_cast<size_t>(value) * utils::get_n_lanes<T>(), "BP vector offset exceeds uint32_t");
+		            static_cast<size_t>(value) * galp::codec::utils::get_n_lanes<T>(), "BP vector offset exceeds uint32_t");
 	        },
 	        primitives::prefix_sum_array_u32(bit_widths, new uint32_t[n_vecs], n_vecs),
 	        n_vecs),
@@ -835,21 +839,21 @@ generate_random_bp_column(const size_t n_values, const ValueRange<vbw_t> value_b
 }
 
 template <typename T>
-flsgpu::host::FFORColumn<T> generate_random_ffor_column(const size_t            n_values,
+galp::codec::host::FFORColumn<T> generate_random_ffor_column(const size_t            n_values,
                                                         const ValueRange<vbw_t> value_bit_width,
                                                         const ValueRange<T>     bases,
                                                         const int32_t           repeat = 1) {
-	using UINT_T  = typename flsgpu::host::FFORColumn<T>::UINT_T;
-	size_t n_vecs = utils::get_n_vecs_from_size(n_values);
-	return flsgpu::host::FFORColumn<T> {
-	    generate_random_bp_column<T>(n_values, value_bit_width, repeat),
+	using UINT_T  = typename galp::codec::host::FFORColumn<T>::UINT_T;
+	size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
+	return galp::codec::host::FFORColumn<T> {
+	    std::move(generate_random_bp_column<T>(n_values, value_bit_width, repeat)),
 	    primitives::fill_array_with_random_data<UINT_T>(
 	        new UINT_T[n_vecs], n_vecs, 1, static_cast<UINT_T>(bases.min), static_cast<UINT_T>(bases.max)),
 	};
 }
 
 template <typename T>
-std::tuple<bool, flsgpu::host::BPColumn<T>>
+std::tuple<bool, galp::codec::host::BPColumn<T>>
 generate_binary_bp_column(const size_t n_values, const ValueRange<vbw_t> value_bit_width, const int32_t repeat = 1) {
 	T* data = primitives::fill_array_with_constant<T>(new T[n_values], n_values, 0);
 
@@ -857,20 +861,20 @@ generate_binary_bp_column(const size_t n_values, const ValueRange<vbw_t> value_b
 	bool contains_magic_value = false; // generate_presence() < 50;
 	if (contains_magic_value) {
 		auto index_generator    = primitives::get_random_number_generator<size_t>(0, n_values - 1);
-		data[index_generator()] = consts::as<T>::MAGIC_NUMBER;
+		data[index_generator()] = galp::codec::consts::as<T>::MAGIC_NUMBER;
 	}
 
-	auto column = bindings::compress(data, n_values, value_bit_width.max);
+	auto column = galp::bench::bindings::compress(data, n_values, value_bit_width.max);
 	delete data;
 
-	return std::make_tuple(contains_magic_value, column);
+	return std::make_tuple(contains_magic_value, std::move(column));
 }
 
 template <typename T>
-std::tuple<bool, flsgpu::host::FFORColumn<T>>
+std::tuple<bool, galp::codec::host::FFORColumn<T>>
 generate_binary_ffor_column(const size_t n_values, const ValueRange<vbw_t> value_bit_width, const int32_t repeat = 1) {
-	using UINT_T                           = typename flsgpu::host::FFORColumn<T>::UINT_T;
-	size_t n_vecs                          = utils::get_n_vecs_from_size(n_values);
+	using UINT_T                           = typename galp::codec::host::FFORColumn<T>::UINT_T;
+	size_t n_vecs                          = galp::codec::utils::get_n_vecs_from_size(n_values);
 	auto [contains_magic_value, bp_column] = generate_binary_bp_column<T>(n_values, value_bit_width, repeat);
 	UINT_T base                            = 0;
 
@@ -879,8 +883,8 @@ generate_binary_ffor_column(const size_t n_values, const ValueRange<vbw_t> value
 	}
 
 	return std::make_tuple(contains_magic_value,
-	                       flsgpu::host::FFORColumn<T> {
-	                           bp_column,
+	                       galp::codec::host::FFORColumn<T> {
+	                           std::move(bp_column),
 	                           primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, base),
 	                       });
 }
@@ -893,18 +897,18 @@ static inline size_t key_count_from_bits(vbw_t bw) {
 }
 
 template <typename T>
-flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
+galp::codec::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
                                                           const vbw_t  value_bit_width, // bit-width of values (UINT_T)
                                                           const unsigned repeat = 1) {
-	using UINT_T       = typename utils::same_width_uint<T>::type;
-	const uint32_t VPV = consts::VALUES_PER_VECTOR;
+	using UINT_T       = typename galp::codec::utils::same_width_uint<T>::type;
+	const uint32_t VPV = galp::codec::consts::VALUES_PER_VECTOR;
 
-	auto column         = flsgpu::host::CROSSRLEColumn<T>();
+	auto column         = galp::codec::host::CROSSRLEColumn<T>();
 	column.n_values     = n_values;
-	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
 
 	// values range: 0 .. mask(value_bit_width)
-	const UINT_T max_value = utils::h_set_first_n_bits<UINT_T>(value_bit_width);
+	const UINT_T max_value = galp::codec::utils::h_set_first_n_bits<UINT_T>(value_bit_width);
 	auto gen_value = primitives::get_random_number_generator<UINT_T>(UINT_T {0}, 30); // for debug, make it small
 
 	// run length generat：repeat higher -> run longer -> run count less)
@@ -960,12 +964,12 @@ flsgpu::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_values,
 }
 
 template <typename T>
-flsgpu::host::DICTFFORColumn<T> generate_random_dict_column(const size_t   n_values,
+galp::codec::host::DICTFFORColumn<T> generate_random_dict_column(const size_t   n_values,
                                                             const vbw_t    value_bit_width, // bit-width of indices
                                                             const unsigned repeat = 1) {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
-	auto column = flsgpu::host::DICTFFORColumn<T>();
+	auto column = galp::codec::host::DICTFFORColumn<T>();
 
 	// 1) key_count = 2^bw
 	column.key_count = std::min(key_count_from_bits(value_bit_width), size_t {32}); // limit to 8192 keys
@@ -978,23 +982,23 @@ flsgpu::host::DICTFFORColumn<T> generate_random_dict_column(const size_t   n_val
 	    new UINT_T[n_values], n_values, repeat, UINT_T {0}, UINT_T(column.key_count - 1));
 
 	// 4) BP compress indices
-	auto bp = bindings::compress<UINT_T>(indices, n_values, value_bit_width);
+	auto bp = galp::bench::bindings::compress<UINT_T>(indices, n_values, value_bit_width);
 	delete[] indices;
 
 	// 5) set FFOR bases all to 0（idx = value + base）
 	const size_t n_vecs = bp.get_n_vecs();
-	column.ffor         = flsgpu::host::FFORColumn<UINT_T> {
-        bp,
-        primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0}),
-    };
+	column.ffor         = galp::codec::host::FFORColumn<UINT_T> {
+	    std::move(bp),
+	    primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0}),
+	};
 
 	return column;
 }
 
 template <typename T>
-flsgpu::host::FREQColumn<T> generate_freq_column(const size_t n_values, const ValueRange<uint16_t> exceptions_per_vec) {
-	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
-	auto         column = flsgpu::host::FREQColumn<T>();
+galp::codec::host::FREQColumn<T> generate_freq_column(const size_t n_values, const ValueRange<uint16_t> exceptions_per_vec) {
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
+	auto         column = galp::codec::host::FREQColumn<T>();
 
 	column.n_values       = n_values;
 	column.n_vecs         = n_vecs;
@@ -1006,7 +1010,7 @@ flsgpu::host::FREQColumn<T> generate_freq_column(const size_t n_values, const Va
 	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
 
 	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
-	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts, new uint32_t[n_vecs], n_vecs);
+	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts.get(), new uint32_t[n_vecs], n_vecs);
 	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
 	column.positions =
 	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
@@ -1015,11 +1019,11 @@ flsgpu::host::FREQColumn<T> generate_freq_column(const size_t n_values, const Va
 }
 
 template <typename T>
-flsgpu::host::SLPATCHColumn<T> generate_slpatch_column(const size_t               n_values,
+galp::codec::host::SLPATCHColumn<T> generate_slpatch_column(const size_t               n_values,
                                                        const ValueRange<vbw_t>    bit_width_range,
                                                        const ValueRange<uint16_t> exceptions_per_vec,
                                                        const unsigned             repeat = 1) {
-	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
 
 	const vbw_t bit_width = std::max<vbw_t>(1, bit_width_range.max);
 	T*          base_vals = arrays::generate_random_array<T>(n_values, bit_width);
@@ -1034,16 +1038,16 @@ flsgpu::host::SLPATCHColumn<T> generate_slpatch_column(const size_t             
 	auto*        exceptions         = primitives::fill_array_with_random_bytes(new T[n_exceptions], n_exceptions);
 	auto*        positions = primitives::generate_positions<uint16_t>(new uint16_t[n_exceptions], counts, n_vecs);
 
-	return flsgpu::host::SLPATCHColumn<T> {
-	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, exceptions, positions, counts};
+	return galp::codec::host::SLPATCHColumn<T> {
+	    n_values, n_vecs, std::move(ffor), n_exceptions, exceptions_offsets, exceptions, positions, counts};
 }
 
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
-flsgpu::host::DICTSLPATCHColumn<T, IndexT> generate_dict_slpatch_column(const size_t               n_values,
+template <typename T, typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
+galp::codec::host::DICTSLPATCHColumn<T, IndexT> generate_dict_slpatch_column(const size_t               n_values,
                                                                         const ValueRange<vbw_t>    bit_width_range,
                                                                         const ValueRange<uint16_t> exceptions_per_vec,
                                                                         const size_t               key_count) {
-	const size_t n_vecs    = utils::get_n_vecs_from_size(n_values);
+	const size_t n_vecs    = galp::codec::utils::get_n_vecs_from_size(n_values);
 	const vbw_t  needed_bw = bit_width_for_max_value(key_count > 0 ? key_count - 1 : 0);
 	const vbw_t  bit_width = std::max<vbw_t>(1, std::min(bit_width_range.max, needed_bw));
 
@@ -1061,21 +1065,21 @@ flsgpu::host::DICTSLPATCHColumn<T, IndexT> generate_dict_slpatch_column(const si
         new IndexT[n_exceptions], n_exceptions, 1, IndexT {0}, static_cast<IndexT>(key_count > 0 ? key_count - 1 : 0));
 	auto* positions = primitives::generate_positions<uint16_t>(new uint16_t[n_exceptions], counts, n_vecs);
 
-	flsgpu::host::SLPATCHColumn<IndexT> slpatch_idx {
-	    n_values, n_vecs, ffor, n_exceptions, exceptions_offsets, exceptions, positions, counts};
+	galp::codec::host::SLPATCHColumn<IndexT> slpatch_idx {
+	    n_values, n_vecs, std::move(ffor), n_exceptions, exceptions_offsets, exceptions, positions, counts};
 
-	using KEY_T = typename flsgpu::host::DICTSLPATCHColumn<T, IndexT>::KEY_T;
+	using KEY_T = typename galp::codec::host::DICTSLPATCHColumn<T, IndexT>::KEY_T;
 	auto* keys  = primitives::fill_array_with_random_bytes(new KEY_T[key_count], key_count);
 
-	return flsgpu::host::DICTSLPATCHColumn<T, IndexT> {slpatch_idx, keys, key_count};
+	return galp::codec::host::DICTSLPATCHColumn<T, IndexT> {std::move(slpatch_idx), keys, key_count};
 }
 
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
-flsgpu::host::RLEColumn<T, IndexT> generate_rle_column(const size_t n_values) {
-	const size_t n_vecs          = utils::get_n_vecs_from_size(n_values);
-	const size_t n_lanes         = utils::get_n_lanes<IndexT>();
-	const size_t values_per_lane = utils::get_values_per_lane<IndexT>();
-	const size_t vec_values      = consts::VALUES_PER_VECTOR;
+template <typename T, typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
+galp::codec::host::RLEColumn<T, IndexT> generate_rle_column(const size_t n_values) {
+	const size_t n_vecs          = galp::codec::utils::get_n_vecs_from_size(n_values);
+	const size_t n_lanes         = galp::codec::utils::get_n_lanes<IndexT>();
+	const size_t values_per_lane = galp::codec::utils::get_values_per_lane<IndexT>();
+	const size_t vec_values      = galp::codec::consts::VALUES_PER_VECTOR;
 	const size_t rle_len         = values_per_lane + 1;
 	const size_t n_rle_values    = n_vecs * rle_len;
 
@@ -1105,35 +1109,35 @@ flsgpu::host::RLEColumn<T, IndexT> generate_rle_column(const size_t n_values) {
 	auto ffor = make_ffor_from_values(deltas, n_values, vbw_t {1});
 	delete[] deltas;
 
-	return flsgpu::host::RLEColumn<T, IndexT> {
-	    n_values, n_vecs, ffor, rsum_bases, rle_values, rle_offsets, n_rle_values};
+	return galp::codec::host::RLEColumn<T, IndexT> {
+	    n_values, n_vecs, std::move(ffor), rsum_bases, rle_values, rle_offsets, n_rle_values};
 }
 
 template <typename T>
-flsgpu::host::CONSTANTColumn<T> generate_constant_column(const size_t n_values) {
+galp::codec::host::CONSTANTColumn<T> generate_constant_column(const size_t n_values) {
 	auto*   tmp   = primitives::fill_array_with_random_bytes(new T[1], 1);
 	const T value = tmp[0];
 	delete[] tmp;
-	return flsgpu::host::CONSTANTColumn<T> {n_values, value};
+	return galp::codec::host::CONSTANTColumn<T> {n_values, value};
 }
 
 template <typename T>
-flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn<T> column,
+galp::codec::host::FREQColumn<T> modify_freq_exception_count(galp::codec::host::FREQColumn<T> column,
                                                         const ValueRange<uint16_t>  exceptions_per_vec) {
 	const size_t n_values = column.n_values;
-	const size_t n_vecs   = utils::get_n_vecs_from_size(n_values);
+	const size_t n_vecs   = galp::codec::utils::get_n_vecs_from_size(n_values);
 	column.n_vecs         = n_vecs;
 
-	delete[] column.counts;
-	delete[] column.exceptions_offsets;
-	delete[] column.exceptions;
-	delete[] column.positions;
+	column.counts.reset();
+	column.exceptions_offsets.reset();
+	column.exceptions.reset();
+	column.positions.reset();
 
 	// Copied from generate_alp_column
 	column.counts = primitives::fill_array_with_random_data<uint16_t>(
 	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
 	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
-	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts, new uint32_t[n_vecs], n_vecs);
+	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts.get(), new uint32_t[n_vecs], n_vecs);
 	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
 	column.positions =
 	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
@@ -1142,30 +1146,30 @@ flsgpu::host::FREQColumn<T> modify_freq_exception_count(flsgpu::host::FREQColumn
 }
 
 template <typename T>
-flsgpu::host::ALPColumn<T> generate_alp_column(const size_t               n_values,
+galp::codec::host::ALPColumn<T> generate_alp_column(const size_t               n_values,
                                                const ValueRange<vbw_t>    bit_width_range,
                                                const ValueRange<uint16_t> exceptions_per_vec,
                                                const unsigned             repeat = 1) {
 	static_assert(std::is_floating_point<T>::value, "T should be a floating point type.");
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
-	const size_t n_vecs = utils::get_n_vecs_from_size(n_values);
-	auto         column = flsgpu::host::ALPColumn<T>();
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
+	auto         column = galp::codec::host::ALPColumn<T>();
 	column.ffor = generate_random_ffor_column<UINT_T>(n_values, bit_width_range, ValueRange<UINT_T>(2, 20), repeat);
 
 	// Note we halve the frac and fact because otherwise you
 	// are more likely to have integer overflow in the decoding for some
 	// combinations of compression parameters
 	column.factor_indices = primitives::fill_array_with_random_data<uint8_t>(
-	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(consts::as<T>::FACT_ARR_COUNT / 2));
+	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(galp::codec::consts::as<T>::FACT_ARR_COUNT / 2));
 	column.fraction_indices = primitives::fill_array_with_random_data<uint8_t>(
-	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(consts::as<T>::FRAC_ARR_COUNT / 2));
+	    new uint8_t[n_vecs], n_vecs, 1, 0, static_cast<uint8_t>(galp::codec::consts::as<T>::FRAC_ARR_COUNT / 2));
 
 	column.counts = primitives::fill_array_with_random_data<uint16_t>(
 	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
 
 	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
-	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts, new uint32_t[n_vecs], n_vecs);
+	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts.get(), new uint32_t[n_vecs], n_vecs);
 	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
 	column.positions =
 	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
@@ -1178,21 +1182,21 @@ flsgpu::host::ALPColumn<T> generate_alp_column(const size_t               n_valu
 }
 
 template <typename T>
-flsgpu::host::ALPColumn<T> modify_alp_exception_count(flsgpu::host::ALPColumn<T> column,
+galp::codec::host::ALPColumn<T> modify_alp_exception_count(galp::codec::host::ALPColumn<T> column,
                                                       const ValueRange<uint16_t> exceptions_per_vec) {
 	const size_t n_values = column.ffor.bp.n_values;
-	const size_t n_vecs   = utils::get_n_vecs_from_size(n_values);
+	const size_t n_vecs   = galp::codec::utils::get_n_vecs_from_size(n_values);
 
-	delete[] column.counts;
-	delete[] column.exceptions_offsets;
-	delete[] column.exceptions;
-	delete[] column.positions;
+	column.counts.reset();
+	column.exceptions_offsets.reset();
+	column.exceptions.reset();
+	column.positions.reset();
 
 	// Copied from generate_alp_column
 	column.counts = primitives::fill_array_with_random_data<uint16_t>(
 	    new uint16_t[n_vecs], n_vecs, 1, exceptions_per_vec.min, exceptions_per_vec.max);
 	column.n_exceptions       = primitives::sum_array<uint16_t, size_t>(column.counts, n_vecs);
-	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts, new uint32_t[n_vecs], n_vecs);
+	column.exceptions_offsets = primitives::prefix_sum_array_u32(column.counts.get(), new uint32_t[n_vecs], n_vecs);
 	column.exceptions = primitives::fill_array_with_random_bytes(new T[column.n_exceptions], column.n_exceptions);
 	column.positions =
 	    primitives::generate_positions<uint16_t>(new uint16_t[column.n_exceptions], column.counts, n_vecs);
@@ -1201,55 +1205,55 @@ flsgpu::host::ALPColumn<T> modify_alp_exception_count(flsgpu::host::ALPColumn<T>
 }
 
 template <typename T>
-flsgpu::host::ALPColumn<T> modify_alp_value_bit_width(flsgpu::host::ALPColumn<T> column,
+galp::codec::host::ALPColumn<T> modify_alp_value_bit_width(galp::codec::host::ALPColumn<T> column,
                                                       const ValueRange<vbw_t>    bit_width_range,
                                                       const unsigned             repeat = 1) {
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	flsgpu::host::free_column(column.ffor);
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	galp::codec::host::free_column(column.ffor);
 	column.ffor = generate_random_ffor_column<UINT_T>(
 	    column.ffor.bp.n_values, bit_width_range, repeat, ValueRange<UINT_T>(2, 20));
 	return column;
 }
 
 template <typename T>
-void shuffle_bit_widths(flsgpu::host::BPColumn<T> column) {
+void shuffle_bit_widths(const galp::codec::host::BPColumn<T>& column) {
 	std::random_device random_device;
 	auto               rng = std::default_random_engine(random_device());
-	std::shuffle(column.bit_widths, column.bit_widths + column.get_n_vecs(), rng);
+	std::shuffle(column.bit_widths.get(), column.bit_widths.get() + column.get_n_vecs(), rng);
 
-	column.vector_offsets = primitives::map<uint32_t>(
+	primitives::map<uint32_t>(
 	    [](const uint32_t value) {
 		    return primitives::checked_u32_offset(
-		        static_cast<size_t>(value) * utils::get_n_lanes<T>(), "BP vector offset exceeds uint32_t");
+		        static_cast<size_t>(value) * galp::codec::utils::get_n_lanes<T>(), "BP vector offset exceeds uint32_t");
 	    },
-	    primitives::prefix_sum_array_u32(column.bit_widths, column.vector_offsets, column.get_n_vecs()),
+	    primitives::prefix_sum_array_u32(column.bit_widths.get(), column.vector_offsets.get(), column.get_n_vecs()),
 	    column.get_n_vecs());
 }
 
 template <typename T>
-void shuffle_bit_widths(flsgpu::host::FFORColumn<T> column) {
+void shuffle_bit_widths(const galp::codec::host::FFORColumn<T>& column) {
 	shuffle_bit_widths(column.bp);
 }
 
 template <typename T>
-void shuffle_bit_widths(flsgpu::host::ALPColumn<T> column) {
+void shuffle_bit_widths(const galp::codec::host::ALPColumn<T>& column) {
 	shuffle_bit_widths(column.ffor.bp);
 }
 
 template <typename T>
-void shuffle_bit_widths(flsgpu::host::ALPExtendedColumn<T> column) {
+void shuffle_bit_widths(const galp::codec::host::ALPExtendedColumn<T>& column) {
 	shuffle_bit_widths(column.ffor.bp);
 }
 
 template <typename T, typename ColumnT>
-std::tuple<bool, T> get_value_to_query(const ColumnT column) {
+std::tuple<bool, T> get_value_to_query(const ColumnT& column) {
 	// Returns: <column_contains_value, value>
 	// The chance is 50% that the column contains the value.
 	// To find a suitable value:
 	// 		50%) pick random value from column
 	// 		50%) use constant, check whether it exists in the column
-	T*   decompressed                  = bindings::decompress(column);
-	T    value                         = consts::as<T>::MAGIC_NUMBER;
+	T*   decompressed                  = galp::bench::bindings::decompress(column);
+	T    value                         = galp::codec::consts::as<T>::MAGIC_NUMBER;
 	bool column_does_not_contain_value = true;
 
 	auto generate_presence            = primitives::get_random_number_generator<size_t>(0, 100);
@@ -1270,6 +1274,6 @@ std::tuple<bool, T> get_value_to_query(const ColumnT column) {
 
 } // namespace columns
 
-} // namespace data
+} // namespace galp::bench
 
 #endif // DATA_CUH

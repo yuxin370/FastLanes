@@ -11,12 +11,12 @@
 #include "flsgpu/memory/device_arena.cuh"
 #include "flsgpu/memory/gpu_array.cuh"
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
 struct CROSSRLEExtendedColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 
 	size_t n_values;
 	size_t n_vecs;
@@ -34,22 +34,22 @@ namespace host {
 
 template <typename T>
 struct CROSSRLEExtendedColumn {
-	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename galp::codec::utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::CROSSRLEExtendedColumn<T>;
 
 	size_t n_values;
 
 	size_t    n_lane_runs;       // total runs after lane-projection
-	uint32_t* lane_runs_offsets; // [n_vecs+1]
-	UINT_T*   lane_values;       // [n_lane_runs]
-	uint16_t* lane_lengths;      // [n_lane_runs]
-	uint32_t* offsets_counts;    // [n_vecs * N_LANES]
+	HostArray<uint32_t> lane_runs_offsets; // [n_vecs+1]
+	HostArray<UINT_T>   lane_values;       // [n_lane_runs]
+	HostArray<uint16_t> lane_lengths;      // [n_lane_runs]
+	HostArray<uint32_t> offsets_counts;    // [n_vecs * N_LANES]
 
 	size_t get_n_values() const {
 		return n_values;
 	}
 	size_t get_n_vecs() const {
-		return utils::get_n_vecs_from_size(n_values);
+		return galp::codec::utils::get_n_vecs_from_size(n_values);
 	}
 
 	device::CROSSRLEExtendedColumn<T> copy_to_device() const {
@@ -62,16 +62,16 @@ struct CROSSRLEExtendedColumn {
 		    GPUArray<uint32_t>(n_vecs + 1, lane_runs_offsets).release(),
 		    GPUArray<UINT_T>(n_lane_runs, lane_values).release(),
 		    GPUArray<uint16_t>(n_lane_runs, lane_lengths).release(),
-		    GPUArray<uint32_t>(n_vecs * utils::get_n_lanes<T>(), offsets_counts).release(),
+		    GPUArray<uint32_t>(n_vecs * galp::codec::utils::get_n_lanes<T>(), offsets_counts).release(),
 		};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::CROSSRLEExtendedColumn<T>& out) const {
+	void copy_to_device(galp::memory::DeviceArena& arena, device::CROSSRLEExtendedColumn<T>& out) const {
 		const size_t nv     = get_n_vecs();
 		auto         i_offs = arena.template add<uint32_t>(nv + 1, lane_runs_offsets);
 		auto         i_vals = arena.template add<UINT_T>(n_lane_runs, lane_values);
 		auto         i_lens = arena.template add<uint16_t>(n_lane_runs, lane_lengths);
-		auto         i_oc   = arena.template add<uint32_t>(nv * utils::get_n_lanes<T>(), offsets_counts);
+		auto         i_oc   = arena.template add<uint32_t>(nv * galp::codec::utils::get_n_lanes<T>(), offsets_counts);
 		out.n_values        = n_values;
 		out.n_vecs          = nv;
 		out.n_lane_runs     = n_lane_runs;
@@ -83,11 +83,11 @@ struct CROSSRLEExtendedColumn {
 };
 
 template <typename T>
-void free_column(CROSSRLEExtendedColumn<T> column) {
-	delete[] column.lane_runs_offsets;
-	delete[] column.lane_values;
-	delete[] column.lane_lengths;
-	delete[] column.offsets_counts;
+void free_column(CROSSRLEExtendedColumn<T>& column) {
+	column.lane_runs_offsets.reset();
+	column.lane_values.reset();
+	column.lane_lengths.reset();
+	column.offsets_counts.reset();
 }
 
 template <typename T>
@@ -99,6 +99,6 @@ void free_column(device::CROSSRLEExtendedColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_CROSS_RLE_EXTENDED_CUH

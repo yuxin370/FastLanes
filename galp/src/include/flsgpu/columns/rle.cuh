@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T, typename IndexT>
@@ -38,9 +38,9 @@ struct RLEColumn {
 	size_t             n_values;
 	size_t             n_vecs;
 	FFORColumn<IndexT> ffor;
-	IndexT*            rsum_bases;
-	T*                 rle_values;
-	uint32_t*          rle_offsets;
+	HostArray<IndexT>  rsum_bases;
+	HostArray<T>       rle_values;
+	HostArray<uint32_t> rle_offsets;
 	size_t             n_rle_values;
 
 	size_t get_n_values() const {
@@ -52,20 +52,20 @@ struct RLEColumn {
 		    n_values,
 		    n_vecs,
 		    ffor.copy_to_device(),
-		    GPUArray<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases).release(),
+		    GPUArray<IndexT>(n_vecs * galp::codec::utils::get_n_lanes<IndexT>(), rsum_bases).release(),
 		    GPUArray<T>(n_rle_values, rle_values).release(),
 		    GPUArray<uint32_t>(n_vecs, rle_offsets).release(),
 		    n_rle_values};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::RLEColumn<T, IndexT>& out) const {
-		using UINT_IDX               = typename utils::same_width_uint<IndexT>::type;
-		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
+	void copy_to_device(galp::memory::DeviceArena& arena, device::RLEColumn<T, IndexT>& out) const {
+		using UINT_IDX               = typename galp::codec::utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = galp::codec::utils::get_n_lanes<IndexT>() * 4;
 		auto i_packed    = arena.template add<UINT_IDX>(ffor.bp.n_packed_values, ffor.bp.packed_array, bp_buffer_elems);
 		auto i_bw        = arena.template add<vbw_t>(ffor.bp.get_n_vecs(), ffor.bp.bit_widths);
 		auto i_bp_off    = arena.template add<uint32_t>(ffor.bp.get_n_vecs(), ffor.bp.vector_offsets);
 		auto i_bases     = arena.template add<UINT_IDX>(ffor.bp.get_n_vecs(), ffor.bases);
-		auto i_rsum      = arena.template add<IndexT>(n_vecs * utils::get_n_lanes<IndexT>(), rsum_bases);
+		auto i_rsum      = arena.template add<IndexT>(n_vecs * galp::codec::utils::get_n_lanes<IndexT>(), rsum_bases);
 		auto i_vals      = arena.template add<T>(n_rle_values, rle_values);
 		auto i_offs      = arena.template add<uint32_t>(n_vecs, rle_offsets);
 		out.n_values     = n_values;
@@ -85,11 +85,11 @@ struct RLEColumn {
 };
 
 template <typename T, typename IndexT>
-void free_column(RLEColumn<T, IndexT> column) {
+void free_column(RLEColumn<T, IndexT>& column) {
 	free_column(column.ffor);
-	delete[] column.rsum_bases;
-	delete[] column.rle_values;
-	delete[] column.rle_offsets;
+	column.rsum_bases.reset();
+	column.rle_values.reset();
+	column.rle_offsets.reset();
 }
 
 template <typename T, typename IndexT>
@@ -101,6 +101,6 @@ void free_column(device::RLEColumn<T, IndexT> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_RLE_CUH

@@ -9,12 +9,12 @@
 #include "flsgpu/columns/dict_ffor.cuh"
 #include "flsgpu/columns/slpatch.cuh"
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
+template <typename T, typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
 struct DICTSLPATCHColumn {
-	using KEY_T   = typename utils::same_width_uint<T>::type;
+	using KEY_T   = typename galp::codec::utils::same_width_uint<T>::type;
 	using INDEX_T = IndexT;
 	using UINT_T  = KEY_T;
 	size_t                n_values;
@@ -27,15 +27,15 @@ struct DICTSLPATCHColumn {
 
 namespace host {
 
-template <typename T, typename IndexT = typename utils::same_width_uint<T>::type>
+template <typename T, typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
 struct DICTSLPATCHColumn {
-	using KEY_T         = typename utils::same_width_uint<T>::type;
+	using KEY_T         = typename galp::codec::utils::same_width_uint<T>::type;
 	using INDEX_T       = IndexT;
 	using UINT_T        = KEY_T;
 	using DeviceColumnT = typename device::DICTSLPATCHColumn<T, IndexT>;
 
 	SLPATCHColumn<IndexT> index;     // index stream (FFOR+SLPATCH)
-	KEY_T*                keys;      // host dictionary keys
+	HostArray<KEY_T>      keys;      // host dictionary keys
 	size_t                key_count; // number of keys
 
 	size_t get_n_values() const {
@@ -50,10 +50,10 @@ struct DICTSLPATCHColumn {
 		    get_n_values(), index.copy_to_device(), GPUArray<KEY_T>(key_count, keys).release(), key_count};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::DICTSLPATCHColumn<T, IndexT>& out) const {
-		using UINT_IDX               = typename utils::same_width_uint<IndexT>::type;
-		const size_t bp_buffer_elems = utils::get_n_lanes<IndexT>() * 4;
-		const size_t buf             = consts::MAX_UNPACK_N_VECS;
+	void copy_to_device(galp::memory::DeviceArena& arena, device::DICTSLPATCHColumn<T, IndexT>& out) const {
+		using UINT_IDX               = typename galp::codec::utils::same_width_uint<IndexT>::type;
+		const size_t bp_buffer_elems = galp::codec::utils::get_n_lanes<IndexT>() * 4;
+		const size_t buf             = galp::codec::consts::MAX_UNPACK_N_VECS;
 		const size_t sl_nvecs        = index.n_vecs;
 		auto         i_packed =
 		    arena.template add<UINT_IDX>(index.ffor.bp.n_packed_values, index.ffor.bp.packed_array, bp_buffer_elems);
@@ -86,38 +86,34 @@ struct DICTSLPATCHColumn {
 };
 
 template <typename T, typename IndexT>
-void free_column(DICTSLPATCHColumn<T, IndexT> column) {
-	flsgpu::host::free_column(column.index);
-	delete[] column.keys;
+void free_column(DICTSLPATCHColumn<T, IndexT>& column) {
+	galp::codec::host::free_column(column.index);
+	column.keys.reset();
 }
 
 template <typename T, typename IndexT>
 void free_column(device::DICTSLPATCHColumn<T, IndexT> column) {
-	flsgpu::host::free_column(column.index);
+	galp::codec::host::free_column(column.index);
 	free_device_pointer(column.keys);
 }
 
-namespace detail {
+inline galp::codec::host::SLPATCHColumn<uint8_t>
+make_slpatch_u8_from_slpatch_i8(const galp::codec::host::SLPATCHColumn<int8_t>& col) {
+	auto index_ffor = make_ffor_u8_from_ffor_i8(col.ffor);
 
-inline flsgpu::host::SLPATCHColumn<uint8_t>
-make_slpatch_u8_from_slpatch_i8(const flsgpu::host::SLPATCHColumn<int8_t>& col) {
-	auto index_ffor = detail::make_ffor_u8_from_ffor_i8(col.ffor);
-
-	auto* offsets     = utils::copy_array(col.exceptions_offsets, col.n_vecs);
-	auto* pos         = utils::copy_array(col.positions, col.n_exceptions);
-	auto* cnt         = utils::copy_array(col.counts, col.n_vecs);
+		auto* offsets     = galp::codec::utils::copy_array(col.exceptions_offsets.get(), col.n_vecs);
+		auto* pos         = galp::codec::utils::copy_array(col.positions.get(), col.n_exceptions);
+		auto* cnt         = galp::codec::utils::copy_array(col.counts.get(), col.n_vecs);
 	auto* exc         = new uint8_t[col.n_exceptions];
 	for (size_t i = 0; i < col.n_exceptions; ++i) {
 		exc[i] = static_cast<uint8_t>(col.exceptions[i]);
 	}
 
-	return flsgpu::host::SLPATCHColumn<uint8_t> {
+	return galp::codec::host::SLPATCHColumn<uint8_t> {
 	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, exc, pos, cnt};
 }
 
-} // namespace detail
-
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_DICT_SLPATCH_CUH

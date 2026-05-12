@@ -8,15 +8,15 @@
 
 #include "flsgpu/columns/bp.cuh"
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
 struct FFORColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
-	size_t      n_values;
-	BPColumn<T> bp;
-	UINT_T*     bases;
+		using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+		size_t      n_values;
+		BPColumn<T>        bp;
+		UINT_T*            bases;
 };
 
 } // namespace device
@@ -25,11 +25,11 @@ namespace host {
 
 template <typename T>
 struct FFORColumn {
-	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename galp::codec::utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::FFORColumn<T>;
 
-	BPColumn<T> bp;
-	UINT_T*     bases;
+		BPColumn<T> bp;
+		HostArray<UINT_T> bases;
 
 	size_t get_n_values() const {
 		return bp.n_values;
@@ -43,8 +43,8 @@ struct FFORColumn {
 		    get_n_values(), bp.copy_to_device(), GPUArray<UINT_T>(bp.get_n_vecs(), bases).release()};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::FFORColumn<T>& out) const {
-		const size_t bp_buffer_elems = utils::get_n_lanes<T>() * 4;
+	void copy_to_device(galp::memory::DeviceArena& arena, device::FFORColumn<T>& out) const {
+		const size_t bp_buffer_elems = galp::codec::utils::get_n_lanes<T>() * 4;
 		auto         i_packed        = arena.template add<UINT_T>(bp.n_packed_values, bp.packed_array, bp_buffer_elems);
 		auto         i_bw            = arena.template add<vbw_t>(bp.get_n_vecs(), bp.bit_widths);
 		auto         i_offsets       = arena.template add<uint32_t>(bp.get_n_vecs(), bp.vector_offsets);
@@ -60,9 +60,9 @@ struct FFORColumn {
 };
 
 template <typename T>
-void free_column(FFORColumn<T> column) {
+void free_column(FFORColumn<T>& column) {
 	free_column(column.bp);
-	delete[] column.bases;
+	column.bases.reset();
 }
 
 template <typename T>
@@ -72,6 +72,6 @@ void free_column(device::FFORColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_FFOR_CUH

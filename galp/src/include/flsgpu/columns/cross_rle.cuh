@@ -18,28 +18,27 @@
 #include <limits>
 #include <stdexcept>
 #include <tuple>
+#include <vector>
 
-namespace flsgpu {
+namespace galp::codec {
 namespace device {
 
 template <typename T>
 struct CROSSRLEColumn {
-	using UINT_T = typename utils::same_width_uint<T>::type;
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	size_t n_values;
-	size_t n_vecs;
+		size_t n_vecs;
 
-	size_t    n_runs; // number of runs : is this needed?
-	UINT_T*   values;
-	uint32_t* lengths;
-	uint32_t* offsets;       //  each vector's start run idx
-	uint32_t* run_positions; // runs' start position (offset) in decompressed array
+		size_t    n_runs; // number of runs : is this needed?
+		UINT_T*   values;
+		uint32_t* lengths;
+		uint32_t* offsets;       //  each vector's start run idx
+		uint32_t* run_positions; // runs' start position (offset) in decompressed array
 };
 
 } // namespace device
 
 namespace host {
-
-namespace detail {
 
 template <typename UINT_T, uint32_t VEC_VALUES>
 inline void expand_runs_into_vector(UINT_T*         tmp,
@@ -74,25 +73,23 @@ inline void expand_runs_into_vector(UINT_T*         tmp,
 	}
 }
 
-} // namespace detail
-
 template <typename T>
 struct CROSSRLEColumn {
-	using UINT_T        = typename utils::same_width_uint<T>::type;
+	using UINT_T        = typename galp::codec::utils::same_width_uint<T>::type;
 	using DeviceColumnT = typename device::CROSSRLEColumn<T>;
-	size_t n_values;
+		size_t n_values;
 
-	size_t    n_runs; // number of runs : is this needed?
-	UINT_T*   values;
-	uint32_t* lengths;
-	uint32_t* offsets;       //  each vector's start run idx
-	uint32_t* run_positions; // runs' start position (offset) in decompressed array
+		size_t    n_runs; // number of runs : is this needed?
+		HostArray<UINT_T>   values;
+		HostArray<uint32_t> lengths;
+		HostArray<uint32_t> offsets;       //  each vector's start run idx
+		HostArray<uint32_t> run_positions; // runs' start position (offset) in decompressed array
 
 	size_t get_n_values() const {
 		return n_values;
 	}
 	size_t get_n_vecs() const {
-		return utils::get_n_vecs_from_size(n_values);
+		return galp::codec::utils::get_n_vecs_from_size(n_values);
 	}
 
 	device::CROSSRLEColumn<T> copy_to_device() const {
@@ -109,7 +106,7 @@ struct CROSSRLEColumn {
 		};
 	}
 
-	void copy_to_device(flsgpu::memory::DeviceArena& arena, device::CROSSRLEColumn<T>& out) const {
+	void copy_to_device(galp::memory::DeviceArena& arena, device::CROSSRLEColumn<T>& out) const {
 		const size_t nv     = get_n_vecs();
 		auto         i_vals = arena.template add<UINT_T>(n_runs, values);
 		auto         i_lens = arena.template add<uint32_t>(n_runs, lengths);
@@ -125,9 +122,9 @@ struct CROSSRLEColumn {
 	}
 
 	CROSSRLELaneMaskColumn<T> create_lane_mask_column() const {
-		constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
-		constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
-		constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+		constexpr uint32_t N_LANES         = (uint32_t)galp::codec::utils::get_n_lanes<T>();
+		constexpr uint32_t VALUES_PER_LANE = (uint32_t)galp::codec::utils::get_values_per_lane<T>();
+		constexpr uint32_t VEC_VALUES      = (uint32_t)galp::codec::consts::VALUES_PER_VECTOR;
 
 		static_assert(VALUES_PER_LANE <= 64, "lane_boundary_mask uses uint64_t; extend if >64");
 		static_assert(VEC_VALUES == N_LANES * VALUES_PER_LANE, "expect VALUES_PER_VECTOR == N_LANES*VALUES_PER_LANE");
@@ -136,7 +133,7 @@ struct CROSSRLEColumn {
 		const size_t n_blocks = n_vecs * (size_t)N_LANES;
 
 		// 第一遍：统计 run_cnt 并生成 CSR base
-		auto* lane_run_cnt       = new uint16_t[n_blocks];
+		std::vector<uint16_t> lane_run_cnt(n_blocks);
 		auto* lane_run_base      = new uint32_t[n_blocks + 1];
 		auto* lane_boundary_mask = new uint64_t[n_blocks];
 
@@ -148,7 +145,7 @@ struct CROSSRLEColumn {
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			UINT_T         tmp[VEC_VALUES];
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			expand_runs_into_vector<UINT_T, VEC_VALUES>(
 			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
@@ -186,7 +183,7 @@ struct CROSSRLEColumn {
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			UINT_T         tmp[VEC_VALUES];
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			expand_runs_into_vector<UINT_T, VEC_VALUES>(
 			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			for (uint32_t lane = 0; lane < N_LANES; ++lane) {
@@ -210,8 +207,6 @@ struct CROSSRLEColumn {
 			}
 		}
 
-		delete[] lane_run_cnt;
-
 		return CROSSRLELaneMaskColumn<T> {n_values,
 		                                  (size_t)total_runs, // n_lane_runs
 		                                  lane_run_base,
@@ -227,20 +222,20 @@ struct CROSSRLEColumn {
 	}
 
 	std::tuple<uint32_t*, UINT_T*, uint16_t*, uint32_t*, size_t> convert_runs_to_lane_divided_format() const {
-		constexpr uint32_t N_LANES         = (uint32_t)utils::get_n_lanes<T>();
-		constexpr uint32_t VALUES_PER_LANE = (uint32_t)utils::get_values_per_lane<T>();
-		constexpr uint32_t VEC_VALUES      = (uint32_t)consts::VALUES_PER_VECTOR;
+		constexpr uint32_t N_LANES         = (uint32_t)galp::codec::utils::get_n_lanes<T>();
+		constexpr uint32_t VALUES_PER_LANE = (uint32_t)galp::codec::utils::get_values_per_lane<T>();
+		constexpr uint32_t VEC_VALUES      = (uint32_t)galp::codec::consts::VALUES_PER_VECTOR;
 
 		const size_t n_vecs = get_n_vecs();
 
 		// count run counts of each (vec,lane), also, count the total vec count
-		auto* lane_run_counts = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * n_vecs * N_LANES));
-		auto* vec_total_runs  = reinterpret_cast<size_t*>(malloc(sizeof(size_t) * n_vecs));
+		std::vector<uint16_t> lane_run_counts(n_vecs * N_LANES);
+		std::vector<size_t>   vec_total_runs(n_vecs);
 
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			UINT_T         tmp[VEC_VALUES];
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			expand_runs_into_vector<UINT_T, VEC_VALUES>(
 			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			size_t vec_runs = 0;
@@ -264,7 +259,7 @@ struct CROSSRLEColumn {
 		}
 
 		// get lane_runs_offsets, and calculate total runs
-		auto*  lane_runs_offsets = reinterpret_cast<uint32_t*>(malloc(sizeof(uint32_t) * (n_vecs + 1)));
+		auto*  lane_runs_offsets = new uint32_t[n_vecs + 1];
 		size_t total_runs        = 0;
 		lane_runs_offsets[0]     = 0;
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
@@ -275,15 +270,15 @@ struct CROSSRLEColumn {
 			lane_runs_offsets[vec + 1] = static_cast<uint32_t>(total_runs);
 		}
 
-		auto* out_values         = reinterpret_cast<UINT_T*>(malloc(sizeof(UINT_T) * total_runs));
-		auto* out_lengths        = reinterpret_cast<uint16_t*>(malloc(sizeof(uint16_t) * total_runs));
-		auto* out_offsets_counts = reinterpret_cast<uint32_t*>(malloc(sizeof(uint32_t) * n_vecs * N_LANES));
+		auto* out_values         = new UINT_T[total_runs];
+		auto* out_lengths        = new uint16_t[total_runs];
+		auto* out_offsets_counts = new uint32_t[n_vecs * N_LANES];
 
 		// second round: write lane-run stream + offsets_counts
 		for (size_t vec = 0; vec < n_vecs; ++vec) {
 			UINT_T         tmp[VEC_VALUES];
 			const uint32_t vec_base = (uint32_t)(vec * (size_t)VEC_VALUES);
-			detail::expand_runs_into_vector<UINT_T, VEC_VALUES>(
+			expand_runs_into_vector<UINT_T, VEC_VALUES>(
 			    tmp, vec_base, values, lengths, run_positions, offsets[vec], offsets[vec + 1]);
 
 			const size_t vec_out_base = lane_runs_offsets[vec];
@@ -321,19 +316,16 @@ struct CROSSRLEColumn {
 			// if (cursor != lane_runs_offsets[vec + 1]) { /* error */ }
 		}
 
-		free(lane_run_counts);
-		free(vec_total_runs);
-
 		return std::make_tuple(lane_runs_offsets, out_values, out_lengths, out_offsets_counts, total_runs);
 	}
 };
 
 template <typename T>
-void free_column(CROSSRLEColumn<T> column) {
-	delete[] column.values;
-	delete[] column.lengths;
-	delete[] column.run_positions;
-	delete[] column.offsets;
+void free_column(CROSSRLEColumn<T>& column) {
+	column.values.reset();
+	column.lengths.reset();
+	column.run_positions.reset();
+	column.offsets.reset();
 }
 
 template <typename T>
@@ -345,6 +337,6 @@ void free_column(device::CROSSRLEColumn<T> column) {
 }
 
 } // namespace host
-} // namespace flsgpu
+} // namespace galp::codec
 
 #endif // FLSGPU_COLUMNS_CROSS_RLE_CUH
