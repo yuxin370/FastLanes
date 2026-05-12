@@ -14,6 +14,7 @@
 #include "engine/execution/table.cuh"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -25,7 +26,15 @@
 #include <utility>
 #include <vector>
 
-namespace dispatch::runtime {
+namespace galp::runtime {
+
+using galp::execution::ExecutionConfig;
+using galp::execution::MaterializedColumn;
+using galp::execution::RowgroupData;
+using galp::execution::TableData;
+using galp::execution::TableDecompressionConfig;
+using galp::execution::TableDecompressionScope;
+using galp::execution::free_rowgroup;
 
 struct TableExecutionRequest {
 	TableDecompressionConfig config {};
@@ -38,7 +47,7 @@ struct TableExecutionRequest {
 };
 
 struct PreparedTableResources {
-	std::shared_ptr<reader::reader>              shared_rdr;
+	std::shared_ptr<galp::format::FlsReader>              shared_rdr;
 	size_t                                       n_rowgroups                   = 0;
 	size_t                                       start                         = 0;
 	size_t                                       end                           = 0;
@@ -118,8 +127,8 @@ struct PendingRowgroup {
 	size_t                        rowgroup_index = 0;
 	size_t                        logical_bytes  = 0;
 	size_t                        active_columns = 0;
-	reader::Rowgroup              rowgroup {};
-	std::vector<expr::Expression> expressions;
+	galp::format::Rowgroup              rowgroup {};
+	std::vector<galp::expression::Expression> expressions;
 	RowgroupData                  materialized;
 	bool                          direct_append = false;
 };
@@ -138,6 +147,40 @@ struct TableChunkState {
 	// at submit time when materialize_results=true so the D2H runs in parallel
 	// with the next chunk's H2D + kernel; consumed at the consume-phase.
 	runtime::PendingMaterialize pending_materialize {};
+
+	TableChunkState() = default;
+	TableChunkState(const TableChunkState&)            = delete;
+	TableChunkState& operator=(const TableChunkState&) = delete;
+
+	~TableChunkState() noexcept {
+		cleanup_noexcept();
+	}
+
+	void cleanup_noexcept() noexcept {
+		try {
+			if (run.active) {
+				runtime::wait_workset_async(run);
+			}
+		} catch (const std::exception& e) {
+			std::fprintf(stderr, "TableChunkState cleanup: wait_workset_async failed: %s\n", e.what());
+		}
+		runtime::discard_pinned_d2h_materialize(pending_materialize);
+		try {
+			runtime::release_workset(workset);
+		} catch (const std::exception& e) {
+			std::fprintf(stderr, "TableChunkState cleanup: release_workset failed: %s\n", e.what());
+		}
+		for (auto& pending : rowgroups) {
+			try {
+				galp::execution::free_rowgroup(pending.rowgroup);
+			} catch (const std::exception& e) {
+				std::fprintf(stderr, "TableChunkState cleanup: free_rowgroup failed: %s\n", e.what());
+			}
+		}
+		rowgroups.clear();
+		expr_locations.clear();
+		submitted = false;
+	}
 };
 
 inline size_t data_type_size(const fastlanes::DataType dt) {
@@ -189,11 +232,11 @@ inline size_t rowgroup_logical_bytes(const fastlanes::RowgroupDescriptor* rg) {
 	return bytes;
 }
 
-inline size_t count_active_columns(const std::vector<expr::Expression>& expressions) {
+inline size_t count_active_columns(const std::vector<galp::expression::Expression>& expressions) {
 	return runtime::count_active_columns(expressions);
 }
 
-inline size_t max_rowgroup_storage_bytes(reader::reader& rdr, const size_t start, const size_t end) {
+inline size_t max_rowgroup_storage_bytes(galp::format::FlsReader& rdr, const size_t start, const size_t end) {
 	size_t max_bytes = 0;
 	for (size_t rowgroup_index = start; rowgroup_index < end; ++rowgroup_index) {
 		max_bytes = std::max(max_bytes, rdr.rowgroup_storage_bytes(rowgroup_index));
@@ -321,13 +364,13 @@ inline size_t choose_direct_pinned_prewarm_slots(const size_t pooled_slots,
 	return live_slots;
 }
 
-inline RowgroupReadResult read_rowgroup(reader::reader&                                  rdr,
+inline RowgroupReadResult read_rowgroup(galp::format::FlsReader&                                  rdr,
                                         const size_t                                     rowgroup_index,
                                         const std::shared_ptr<PinnedRowgroupBufferPool>& pinned_pool = {}) {
 	RowgroupReadResult                    result {};
 	const auto                            read_start = std::chrono::steady_clock::now();
-	reader::ZeroCopyRowgroup              zero_copy {};
-	reader::ZeroCopyReadTiming            io_timing {};
+	galp::format::ZeroCopyRowgroup              zero_copy {};
+	galp::format::ZeroCopyReadTiming            io_timing {};
 	std::chrono::steady_clock::time_point file_read_start {};
 	const size_t                          storage_bytes = rdr.rowgroup_storage_bytes(rowgroup_index);
 	result.rowgroup_index                               = rowgroup_index;
@@ -572,6 +615,7 @@ inline void add_rowgroup_to_chunk(TableChunkState&             chunk,
 
 	out.rowgroups += 1;
 	out.total_columns += pending.rowgroup.columns.size();
+	out.column_counts.push_back(pending.rowgroup.columns.size());
 
 	observer.on_rowgroup_stats(active_columns, active_columns * pending.rowgroup.n_vecs, pending.logical_bytes);
 	chunk.rowgroups.push_back(std::move(pending));
@@ -592,8 +636,8 @@ inline PreparedTableResources prepare_table_resources(const std::filesystem::pat
 
 	PreparedTableResources resources {};
 	const auto reader_open_start = std::chrono::steady_clock::now();
-	resources.shared_rdr        = std::make_shared<reader::reader>(fls_path, request.load_column_names);
-	reader::reader& rdr         = *resources.shared_rdr;
+	resources.shared_rdr        = std::make_shared<galp::format::FlsReader>(fls_path, request.load_column_names);
+	galp::format::FlsReader& rdr         = *resources.shared_rdr;
 	resources.n_rowgroups       = rdr.rowgroup_count();
 	const auto reader_open_end = std::chrono::steady_clock::now();
 	observer.on_reader_open(std::chrono::duration<double, std::milli>(reader_open_end - reader_open_start).count());
@@ -691,7 +735,7 @@ inline TableData execute_prepared_table_pipeline(PreparedTableResources&        
 	runtime::validate_unpack_config(request.config.execution);
 	detail::check_rowgroup_index(resources.n_rowgroups, request.rowgroup);
 
-	reader::reader& rdr = *resources.shared_rdr;
+	galp::format::FlsReader& rdr = *resources.shared_rdr;
 	constexpr bool collect_logical_bytes = !std::is_same_v<std::decay_t<Observer>, NoopTableExecutionObserver>;
 	if constexpr (collect_logical_bytes) {
 		if (resources.table_descriptor == nullptr) {
@@ -743,7 +787,7 @@ inline TableData execute_prepared_table_pipeline(PreparedTableResources&        
 		}
 
 		const auto assemble_start = std::chrono::steady_clock::now();
-		auto       expressions    = expr::assemble(pending.rowgroup);
+		auto       expressions    = galp::expression::assemble(pending.rowgroup);
 		const auto assemble_end   = std::chrono::steady_clock::now();
 		observer.on_assemble_expr(std::chrono::duration<double, std::milli>(assemble_end - assemble_start).count());
 
@@ -862,6 +906,6 @@ inline TableData execute_table_pipeline(const std::filesystem::path& fls_path,
 	                                       setup_start);
 }
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_TABLE_PIPELINE_CUH

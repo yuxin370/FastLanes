@@ -9,7 +9,10 @@
 #include "engine/execution/internal/prepare.cuh"
 #include "engine/execution/internal/unpack_dispatch.cuh"
 
-namespace dispatch::runtime {
+namespace galp::runtime {
+
+using galp::execution::ExecutionConfig;
+using galp::execution::LaunchStrategy;
 
 inline bool uses_mixed_dispatch(const LaunchStrategy strategy) {
 	return strategy == LaunchStrategy::MixedDispatch;
@@ -17,14 +20,14 @@ inline bool uses_mixed_dispatch(const LaunchStrategy strategy) {
 
 template <bool WRITE_OUT>
 inline void launch_typed_batches(ExecutionWorkset& workset, const ExecutionConfig& cfg, cudaStream_t stream) {
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T            = typename decltype(tag)::type;
 		auto& host_batch   = workset.buffers.host_batches.template get<T>();
 		auto& device_batch = workset.buffers.device_batches.template get<T>();
 		if (device_batch.d_exprs == nullptr || device_batch.d_items == nullptr) {
 			return;
 		}
-		dispatch::detail::launch_batch_no_sync<T, WRITE_OUT>(
+		galp::execution::detail::launch_batch_no_sync<T, WRITE_OUT>(
 		    host_batch, device_batch.d_exprs, device_batch.d_items, device_batch.n_items, cfg, stream);
 	});
 }
@@ -40,7 +43,7 @@ inline void launch_mixed_dispatch(ExecutionWorkset& workset, const ExecutionConf
 	runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, auto unpack_n_values) {
 		constexpr unsigned UNPACK_N_VECTORS = decltype(unpack_n_vectors)::value;
 		constexpr unsigned UNPACK_N_VALUES  = decltype(unpack_n_values)::value;
-		kernels::device::decompress_dispatch_mixed<UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
+		galp::kernels::device::decompress_dispatch_mixed<UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
 		    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.slots.d, workset.slots.mixed.size());
 		CUDA_SAFE_CALL(cudaGetLastError());
 	});
@@ -57,7 +60,7 @@ inline void launch_strategy_once(ExecutionWorkset& workset, const ExecutionConfi
 
 inline size_t typed_launches_per_sample(const ExecutionWorkset& workset) {
 	size_t launches = 0;
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		auto& d = workset.buffers.device_batches.template get<T>();
 		if (d.d_exprs != nullptr && d.d_items != nullptr) {
@@ -69,7 +72,7 @@ inline size_t typed_launches_per_sample(const ExecutionWorkset& workset) {
 
 inline size_t typed_total_items_per_sample(const ExecutionWorkset& workset) {
 	size_t items = 0;
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		items += workset.buffers.device_batches.template get<T>().n_items;
 	});
@@ -78,7 +81,7 @@ inline size_t typed_total_items_per_sample(const ExecutionWorkset& workset) {
 
 inline bool has_any_expr(const ExecutionWorkset& workset) {
 	bool has_any = false;
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		auto& d = workset.buffers.device_batches.template get<T>();
 		has_any = has_any || (d.d_exprs != nullptr);
@@ -87,9 +90,9 @@ inline bool has_any_expr(const ExecutionWorkset& workset) {
 }
 
 struct AsyncWorksetRun {
-	cudaStream_t stream = nullptr;
-	cudaEvent_t  start  = nullptr;
-	cudaEvent_t  stop   = nullptr;
+	cudaStream_t                         stream = nullptr;
+	galp::memory::CudaEvent    start;
+	galp::memory::CudaEvent    stop;
 	double       elapsed_ms = 0.0;
 	bool         active = false;
 };
@@ -131,18 +134,18 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 		*out_launches = (mixed_dispatch ? 1 : launches_per_sample) * static_cast<size_t>(samples);
 	}
 
-	if (workset.transfer.h2d_stream == nullptr) {
-		flsgpu::memory::sync_h2d();
+	if (!workset.transfer.h2d_stream) {
+		galp::memory::sync_h2d();
 	} else if (!use_async_h2d()) {
-		flsgpu::memory::sync_h2d(workset.transfer.h2d_stream);
+		galp::memory::sync_h2d(workset.transfer.h2d_stream.get());
 	}
 	handle.stream = ensure_workset_compute_stream(workset);
-	CUDA_SAFE_CALL(cudaEventCreate(&handle.start));
-	CUDA_SAFE_CALL(cudaEventCreate(&handle.stop));
+	handle.start.create();
+	handle.stop.create();
 	handle.active = true;
 
-	if (use_async_h2d() && workset.transfer.h2d_stream != nullptr && workset.transfer.h2d_ready_event != nullptr) {
-		CUDA_SAFE_CALL(cudaStreamWaitEvent(handle.stream, workset.transfer.h2d_ready_event, 0));
+	if (use_async_h2d() && workset.transfer.h2d_stream && workset.transfer.h2d_ready_event) {
+		CUDA_SAFE_CALL(cudaStreamWaitEvent(handle.stream, workset.transfer.h2d_ready_event.get(), 0));
 	}
 
 	if (warmup) {
@@ -162,7 +165,7 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 		CUDA_SAFE_CALL(cudaStreamSynchronize(handle.stream));
 	}
 
-	CUDA_SAFE_CALL(cudaEventRecord(handle.start, handle.stream));
+	handle.start.record(handle.stream);
 
 	for (uint32_t sample = 0; sample < samples; ++sample) {
 		if (mixed_dispatch) {
@@ -179,7 +182,7 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 			}
 		}
 	}
-	CUDA_SAFE_CALL(cudaEventRecord(handle.stop, handle.stream));
+	handle.stop.record(handle.stream);
 
 	return handle;
 }
@@ -188,14 +191,10 @@ inline void wait_workset_async(AsyncWorksetRun& handle) {
 	if (!handle.active) {
 		return;
 	}
-	CUDA_SAFE_CALL(cudaEventSynchronize(handle.stop));
-	float ms = 0.0f;
-	CUDA_SAFE_CALL(cudaEventElapsedTime(&ms, handle.start, handle.stop));
-	handle.elapsed_ms = static_cast<double>(ms);
-	CUDA_SAFE_CALL(cudaEventDestroy(handle.start));
-	CUDA_SAFE_CALL(cudaEventDestroy(handle.stop));
-	handle.start = nullptr;
-	handle.stop  = nullptr;
+	handle.stop.synchronize();
+	handle.elapsed_ms = static_cast<double>(handle.stop.elapsed_since(handle.start));
+	handle.start.reset();
+	handle.stop.reset();
 	handle.active = false;
 }
 
@@ -210,6 +209,6 @@ inline double run_workset(ExecutionWorkset&      workset,
 	return handle.elapsed_ms;
 }
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_LAUNCH_CUH

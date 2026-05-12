@@ -17,7 +17,12 @@
 #include <stdexcept>
 #include <utility>
 
-namespace dispatch::runtime {
+namespace galp::runtime {
+
+using galp::execution::ExecutionConfig;
+using galp::execution::MaterializedColumn;
+using galp::execution::RowgroupData;
+using galp::execution::ValueStore;
 
 // Single-DMA, pinned-buffer D2H materialization.
 //
@@ -45,13 +50,13 @@ struct PendingMaterialize {
 		size_t              n_values          = 0;
 		size_t              output_offset     = 0;
 		size_t              elem_size         = 0; // sizeof(T)
-		types::DataType     value_type        = types::DataType::I8;
+		galp::format::DataType     value_type        = galp::format::DataType::I8;
 	};
 
 	std::shared_ptr<void>            pinned_owner;
 	size_t                           total_bytes = 0;
 	cudaStream_t                     d2h_stream  = nullptr;
-	cudaEvent_t                      d2h_event   = nullptr;
+	galp::memory::CudaEvent d2h_event;
 	std::vector<Entry>               entries;
 	bool                             active      = false;
 };
@@ -74,7 +79,7 @@ inline void validate_output_view_bounds(const size_t offset,
 }
 
 inline void clear_materialize_workset_state(ExecutionWorkset& workset) {
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T     = typename decltype(tag)::type;
 		auto& batch = workset.buffers.host_batches.template get<T>();
 		batch.device_exprs.clear();
@@ -95,7 +100,7 @@ inline void clear_materialize_workset_state(ExecutionWorkset& workset) {
 }
 
 inline void snapshot_materialize_entries(ExecutionWorkset& workset, PendingMaterialize& pending) {
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T     = typename decltype(tag)::type;
 		auto& batch = workset.buffers.host_batches.template get<T>();
 		pending.entries.reserve(pending.entries.size() + batch.device_exprs.size());
@@ -106,7 +111,7 @@ inline void snapshot_materialize_entries(ExecutionWorkset& workset, PendingMater
 			entry.n_values          = dev_expr.n_values;
 			entry.output_offset     = batch.output_offsets[idx];
 			entry.elem_size         = sizeof(T);
-			entry.value_type        = types::ToDataType<T>::value;
+			entry.value_type        = galp::format::ToDataType<T>::value;
 			pending.entries.push_back(entry);
 		}
 	});
@@ -146,14 +151,14 @@ inline PendingMaterialize kick_pinned_d2h_materialize(ExecutionWorkset& workset)
 	// the run); with it, the pool converges to O(few) buckets after warm-up.
 	constexpr size_t kPinnedBucket = 2U * 1024U * 1024U;
 	const size_t     alloc_bytes   = ((total_bytes + kPinnedBucket - 1U) / kPinnedBucket) * kPinnedBucket;
-	void* pinned_raw = flsgpu::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
+	void* pinned_raw = galp::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
 	if (pinned_raw == nullptr) {
 		throw std::runtime_error("kick_pinned_d2h_materialize: pinned alloc returned null");
 	}
 	pending.pinned_owner = std::shared_ptr<void>(pinned_raw, [](void* p) {
 		if (p != nullptr) {
 			try {
-				flsgpu::memory::DevicePool::instance().release_pinned(p);
+				galp::memory::DevicePool::instance().release_pinned(p);
 			} catch (const std::exception& e) {
 				std::fprintf(stderr, "pinned-D2H slot release failed: %s\n", e.what());
 			}
@@ -165,12 +170,10 @@ inline PendingMaterialize kick_pinned_d2h_materialize(ExecutionWorkset& workset)
 	// d2h_stream must wait for the chunk's kernel to finish before starting
 	// the copy. The kernel was launched on compute_stream; we publish a
 	// stop event there and have d2h_stream wait on it.
-	if (workset.transfer.compute_stream != nullptr) {
-		cudaEvent_t kernel_done {};
-		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&kernel_done, cudaEventDisableTiming));
-		CUDA_SAFE_CALL(cudaEventRecord(kernel_done, workset.transfer.compute_stream));
-		CUDA_SAFE_CALL(cudaStreamWaitEvent(pending.d2h_stream, kernel_done, 0));
-		CUDA_SAFE_CALL(cudaEventDestroy(kernel_done));
+	if (workset.transfer.compute_stream) {
+		galp::memory::CudaEvent kernel_done(cudaEventDisableTiming);
+		kernel_done.record(workset.transfer.compute_stream.get());
+		CUDA_SAFE_CALL(cudaStreamWaitEvent(pending.d2h_stream, kernel_done.get(), 0));
 	}
 
 	CUDA_SAFE_CALL(cudaMemcpyAsync(pinned_raw,
@@ -178,8 +181,8 @@ inline PendingMaterialize kick_pinned_d2h_materialize(ExecutionWorkset& workset)
 	                               total_bytes,
 	                               cudaMemcpyDeviceToHost,
 	                               pending.d2h_stream));
-	CUDA_SAFE_CALL(cudaEventCreateWithFlags(&pending.d2h_event, cudaEventDisableTiming));
-	CUDA_SAFE_CALL(cudaEventRecord(pending.d2h_event, pending.d2h_stream));
+	pending.d2h_event.create_with_flags(cudaEventDisableTiming);
+	pending.d2h_event.record(pending.d2h_stream);
 	pending.active = true;
 
 	clear_materialize_workset_state(workset);
@@ -192,10 +195,9 @@ inline void finalize_pinned_d2h_materialize(PendingMaterialize& pending, TargetR
 		return;
 	}
 
-	if (pending.d2h_event != nullptr) {
-		CUDA_SAFE_CALL(cudaEventSynchronize(pending.d2h_event));
-		CUDA_SAFE_CALL(cudaEventDestroy(pending.d2h_event));
-		pending.d2h_event = nullptr;
+	if (pending.d2h_event) {
+		pending.d2h_event.synchronize();
+		pending.d2h_event.reset();
 	}
 
 	auto* pinned_bytes = reinterpret_cast<std::byte*>(pending.pinned_owner.get());
@@ -208,7 +210,7 @@ inline void finalize_pinned_d2h_materialize(PendingMaterialize& pending, TargetR
 
 		auto build_view = [&](auto type_tag) -> bool {
 			using T = typename decltype(type_tag)::type;
-			if (entry.value_type != types::ToDataType<T>::value) {
+			if (entry.value_type != galp::format::ToDataType<T>::value) {
 				return false;
 			}
 			std::shared_ptr<T[]> column_view {};
@@ -235,7 +237,7 @@ inline void finalize_pinned_d2h_materialize(PendingMaterialize& pending, TargetR
 		};
 
 		bool matched = false;
-		dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+		galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 			if (!matched) {
 				matched = build_view(tag);
 			}
@@ -249,6 +251,22 @@ inline void finalize_pinned_d2h_materialize(PendingMaterialize& pending, TargetR
 	pending.pinned_owner.reset();
 	pending.total_bytes = 0;
 	pending.active = false;
+}
+
+inline void discard_pinned_d2h_materialize(PendingMaterialize& pending) noexcept {
+	try {
+		if (pending.d2h_event) {
+			pending.d2h_event.synchronize();
+			pending.d2h_event.reset();
+		}
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "discard_pinned_d2h_materialize: %s\n", e.what());
+	}
+	pending.entries.clear();
+	pending.pinned_owner.reset();
+	pending.total_bytes = 0;
+	pending.d2h_stream  = nullptr;
+	pending.active      = false;
 }
 
 // resolve_target(global_expr_index) -> MaterializedColumn* selects the slot to
@@ -287,14 +305,14 @@ inline void materialize_outputs_via_pinned_d2h(ExecutionWorkset& workset,
 
 	constexpr size_t kPinnedBucket = 2U * 1024U * 1024U;
 	const size_t     alloc_bytes   = ((total_bytes + kPinnedBucket - 1U) / kPinnedBucket) * kPinnedBucket;
-	void*            pinned_raw    = flsgpu::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
+	void*            pinned_raw    = galp::memory::DevicePool::instance().alloc_pinned(alloc_bytes);
 	if (pinned_raw == nullptr) {
 		throw std::runtime_error("materialize_outputs_via_pinned_d2h: pinned alloc returned null");
 	}
 	auto pinned_owner = std::shared_ptr<void>(pinned_raw, [](void* p) {
 		if (p != nullptr) {
 			try {
-				flsgpu::memory::DevicePool::instance().release_pinned(p);
+				galp::memory::DevicePool::instance().release_pinned(p);
 			} catch (const std::exception& e) {
 				std::fprintf(stderr, "pinned-D2H slot release failed: %s\n", e.what());
 			}
@@ -315,14 +333,14 @@ inline void materialize_outputs_via_pinned_d2h(ExecutionWorkset& workset,
 	clear_materialize_workset_state(workset);
 }
 
-inline size_t column_n_values(const expr::Expression& expression) {
+inline size_t column_n_values(const galp::expression::Expression& expression) {
 	if (!expression.column) {
 		throw std::runtime_error("null expression column");
 	}
 	return std::visit([](auto&& host_col) -> size_t { return host_col.get_n_values(); }, expression.column->host);
 }
 
-inline size_t resolve_alias(const std::vector<expr::Expression>& expressions, const size_t idx) {
+inline size_t resolve_alias(const std::vector<galp::expression::Expression>& expressions, const size_t idx) {
 	if (idx >= expressions.size()) {
 		throw std::out_of_range("alias index out of range");
 	}
@@ -352,7 +370,7 @@ inline size_t resolve_alias(const std::vector<expr::Expression>& expressions, co
 }
 
 inline void
-apply_aliases(RowgroupData& data, const std::vector<expr::Expression>& expressions, const ExecutionConfig& cfg) {
+apply_aliases(RowgroupData& data, const std::vector<galp::expression::Expression>& expressions, const ExecutionConfig& cfg) {
 	for (size_t i = 0; i < expressions.size(); ++i) {
 		const auto* col = expressions[i].column;
 		if (!col || !col->alias_of.has_value()) {
@@ -382,7 +400,7 @@ apply_aliases(RowgroupData& data, const std::vector<expr::Expression>& expressio
 }
 
 inline void populate_materialized_metadata(RowgroupData&                        data,
-                                           const std::vector<expr::Expression>& expressions,
+                                           const std::vector<galp::expression::Expression>& expressions,
                                            const ExecutionConfig&               cfg) {
 	for (size_t i = 0; i < expressions.size(); ++i) {
 		const auto* col = expressions[i].column;
@@ -396,7 +414,7 @@ inline void populate_materialized_metadata(RowgroupData&                        
 }
 
 inline RowgroupData materialize_workset(ExecutionWorkset&                    workset,
-                                        const std::vector<expr::Expression>& expressions,
+                                        const std::vector<galp::expression::Expression>& expressions,
                                         const ExecutionConfig&               cfg) {
 	RowgroupData result {};
 	result.columns.resize(expressions.size());
@@ -423,7 +441,7 @@ inline void release_workset(ExecutionWorkset& workset, const bool preserve_resou
 	// workset.buffers.chunk_arena->device_base_, freed wholesale by chunk_arena.reset()
 	// below. Per-expression free_device_expr() would attempt cudaFree on
 	// interior pointers (invalid) and walk a DevicePool mutex for every column.
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
 		auto& host_batch = workset.buffers.host_batches.template get<T>();
 		host_batch.device_exprs.clear();
@@ -443,8 +461,8 @@ inline void release_workset(ExecutionWorkset& workset, const bool preserve_resou
 	workset.slots.mixed.clear();
 	workset.outputs.used_bytes = 0;
 	workset.outputs.required = false;
-	if (workset.transfer.h2d_stream != nullptr) {
-		flsgpu::memory::sync_h2d(workset.transfer.h2d_stream);
+	if (workset.transfer.h2d_stream) {
+		galp::memory::sync_h2d(workset.transfer.h2d_stream.get());
 	}
 	if (workset.buffers.chunk_arena != nullptr) {
 		if (preserve_resources) {
@@ -457,24 +475,11 @@ inline void release_workset(ExecutionWorkset& workset, const bool preserve_resou
 		workset.outputs.arena.reset();
 		workset.outputs.capacity_bytes = 0;
 	}
-	if (!preserve_resources && workset.transfer.h2d_stream != nullptr) {
-		if (workset.transfer.h2d_ready_event != nullptr) {
-			CUDA_LOG_CALL(cudaEventDestroy(workset.transfer.h2d_ready_event));
-			workset.transfer.h2d_ready_event = nullptr;
-		}
-		CUDA_LOG_CALL(cudaStreamDestroy(workset.transfer.h2d_stream));
-		workset.transfer.h2d_stream = nullptr;
-	} else if (!preserve_resources && workset.transfer.h2d_ready_event != nullptr) {
-		CUDA_LOG_CALL(cudaEventDestroy(workset.transfer.h2d_ready_event));
-		workset.transfer.h2d_ready_event = nullptr;
-	}
-	if (!preserve_resources && workset.transfer.compute_stream != nullptr) {
-		CUDA_LOG_CALL(cudaStreamDestroy(workset.transfer.compute_stream));
-		workset.transfer.compute_stream = nullptr;
-	}
-	if (!preserve_resources && workset.transfer.d2h_stream != nullptr) {
-		CUDA_LOG_CALL(cudaStreamDestroy(workset.transfer.d2h_stream));
-		workset.transfer.d2h_stream = nullptr;
+	if (!preserve_resources) {
+		workset.transfer.h2d_ready_event.reset();
+		workset.transfer.h2d_stream.reset();
+		workset.transfer.compute_stream.reset();
+		workset.transfer.d2h_stream.reset();
 	}
 }
 
@@ -503,6 +508,6 @@ struct ExecutionWorksetGuard {
 	}
 };
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_MATERIALIZE_CUH

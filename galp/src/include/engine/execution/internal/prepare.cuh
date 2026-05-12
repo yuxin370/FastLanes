@@ -8,6 +8,7 @@
 
 #include "engine/execution/common.cuh"
 #include "engine/execution/dict_ref_resolver.cuh"
+#include "flsgpu/memory/cuda_raii.cuh"
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -15,7 +16,10 @@
 #include <unordered_set>
 #include <variant>
 
-namespace dispatch::runtime {
+namespace galp::runtime {
+
+using galp::execution::ExecutionConfig;
+using galp::execution::add_expression_to_batch;
 
 // Per-call breakdown of upload_workset sub-stages. Returned by upload_workset()
 // so benchmark code can observe upload costs without storing profiling state on
@@ -29,18 +33,18 @@ struct UploadBreakdown {
 	double                             arena_pack_ms        = 0.0; // arena.add + resolve_to for metadata
 	double                             arena_upload_ms      = 0.0; // DeviceArena::upload (capacity + pack + DMA issue)
 	double                             event_record_ms      = 0.0; // cudaEventRecord for h2d ready
-	flsgpu::memory::ArenaUploadMetrics arena {};
+	galp::memory::ArenaUploadMetrics arena {};
 };
 
 // Host/device batch payload + the single chunk arena that carries every
 // device-visible column buffer for this workset.
 struct WorksetBuffers {
-	using HostBatches   = typename dispatch::BatchSetFromList<dispatch::SupportedTypes>::type;
-	using DeviceBatches = typename dispatch::DeviceBatchSetFromList<dispatch::SupportedTypes>::type;
+	using HostBatches   = typename galp::execution::BatchSetFromList<galp::execution::SupportedTypes>::type;
+	using DeviceBatches = typename galp::execution::DeviceBatchSetFromList<galp::execution::SupportedTypes>::type;
 
 	HostBatches                                  host_batches;
 	DeviceBatches                                device_batches;
-	std::unique_ptr<flsgpu::memory::DeviceArena> chunk_arena;
+	std::unique_ptr<galp::memory::DeviceArena> chunk_arena;
 	size_t                                       payload_arena_bytes = 0;
 };
 
@@ -54,9 +58,9 @@ struct WorksetOutputs {
 
 // Mixed-dispatch slot layout: host-side work list plus the matching device copy.
 struct WorksetSlots {
-	std::vector<dispatch::MixedWorkSlot>             mixed;
-	std::optional<GPUArray<dispatch::MixedWorkSlot>> owned;
-	dispatch::MixedWorkSlot*                         d = nullptr;
+	std::vector<galp::execution::MixedWorkSlot>             mixed;
+	std::optional<GPUArray<galp::execution::MixedWorkSlot>> owned;
+	galp::execution::MixedWorkSlot*                         d = nullptr;
 };
 
 // CUDA streams + cross-stream synchronisation used to drive H2D and compute.
@@ -65,10 +69,10 @@ struct WorksetSlots {
 // chunk's single result DMA runs out of band from compute_stream and can
 // overlap with the *next* chunk's H2D upload + kernel launch.
 struct WorksetTransfer {
-	cudaStream_t h2d_stream      = nullptr;
-	cudaStream_t compute_stream  = nullptr;
-	cudaStream_t d2h_stream      = nullptr;
-	cudaEvent_t  h2d_ready_event = nullptr;
+	galp::memory::CudaStream h2d_stream;
+	galp::memory::CudaStream compute_stream;
+	galp::memory::CudaStream d2h_stream;
+	galp::memory::CudaEvent  h2d_ready_event;
 };
 
 struct ExecutionWorkset {
@@ -92,38 +96,38 @@ inline cudaStream_t ensure_workset_h2d_stream(ExecutionWorkset& workset) {
 	if (!use_async_h2d() && !force_h2d_stream_for_sync()) {
 		return nullptr;
 	}
-	if (workset.transfer.h2d_stream == nullptr) {
-		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.transfer.h2d_stream, cudaStreamNonBlocking));
+	if (!workset.transfer.h2d_stream) {
+		workset.transfer.h2d_stream.create(cudaStreamNonBlocking);
 	}
-	return workset.transfer.h2d_stream;
+	return workset.transfer.h2d_stream.get();
 }
 
 inline cudaStream_t ensure_workset_compute_stream(ExecutionWorkset& workset) {
-	if (workset.transfer.compute_stream == nullptr) {
-		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.transfer.compute_stream, cudaStreamNonBlocking));
+	if (!workset.transfer.compute_stream) {
+		workset.transfer.compute_stream.create(cudaStreamNonBlocking);
 	}
-	return workset.transfer.compute_stream;
+	return workset.transfer.compute_stream.get();
 }
 
 inline cudaStream_t ensure_workset_d2h_stream(ExecutionWorkset& workset) {
-	if (workset.transfer.d2h_stream == nullptr) {
-		CUDA_SAFE_CALL(cudaStreamCreateWithFlags(&workset.transfer.d2h_stream, cudaStreamNonBlocking));
+	if (!workset.transfer.d2h_stream) {
+		workset.transfer.d2h_stream.create(cudaStreamNonBlocking);
 	}
-	return workset.transfer.d2h_stream;
+	return workset.transfer.d2h_stream.get();
 }
 
 inline cudaEvent_t ensure_workset_h2d_ready_event(ExecutionWorkset& workset) {
-	if (workset.transfer.h2d_ready_event == nullptr) {
-		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&workset.transfer.h2d_ready_event, cudaEventDisableTiming));
+	if (!workset.transfer.h2d_ready_event) {
+		workset.transfer.h2d_ready_event.create_with_flags(cudaEventDisableTiming);
 	}
-	return workset.transfer.h2d_ready_event;
+	return workset.transfer.h2d_ready_event.get();
 }
 
 inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t additional_exprs) {
 	if (additional_exprs == 0) {
 		return;
 	}
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T     = typename decltype(tag)::type;
 		auto& batch = workset.buffers.host_batches.template get<T>();
 		batch.device_exprs.reserve(batch.device_exprs.size() + additional_exprs);
@@ -134,7 +138,7 @@ inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t a
 
 inline bool any_batch_has_device_exprs(const ExecutionWorkset& workset) {
 	bool has = false;
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		if (!workset.buffers.host_batches.template get<T>().device_exprs.empty()) {
 			has = true;
@@ -172,7 +176,7 @@ inline bool begin_workset_chunk_arena(ExecutionWorkset& workset, const size_t ad
 	// into batch.device_exprs. Reserve before append_expressions() starts for each
 	// new chunk/workset so vector growth cannot relocate those references mid-build.
 	reserve_batch_expr_storage(workset, additional_exprs);
-	workset.buffers.chunk_arena = std::make_unique<flsgpu::memory::DeviceArena>(ensure_workset_h2d_stream(workset));
+	workset.buffers.chunk_arena = std::make_unique<galp::memory::DeviceArena>(ensure_workset_h2d_stream(workset));
 	return true;
 }
 
@@ -236,7 +240,7 @@ inline void bind_workset_output_pointers(ExecutionWorkset& workset) {
 
 inline size_t count_work_items(const ExecutionWorkset& workset) {
 	size_t total = 0;
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		total += workset.buffers.host_batches.template get<T>().work_items.size();
 	});
@@ -245,16 +249,16 @@ inline size_t count_work_items(const ExecutionWorkset& workset) {
 
 inline size_t count_expr_work_items(const ExecutionWorkset& workset) {
 	size_t total = 0;
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		for (const auto& expr : workset.buffers.host_batches.template get<T>().device_exprs) {
-			total += utils::get_n_vecs_from_size(expr.n_values);
+			total += galp::codec::utils::get_n_vecs_from_size(expr.n_values);
 		}
 	});
 	return total;
 }
 
-inline size_t count_active_columns(const std::vector<expr::Expression>& expressions) {
+inline size_t count_active_columns(const std::vector<galp::expression::Expression>& expressions) {
 	size_t total = 0;
 	for (const auto& expr : expressions) {
 		if (expr.column && !expr.column->skip_decompress) {
@@ -264,14 +268,14 @@ inline size_t count_active_columns(const std::vector<expr::Expression>& expressi
 	return total;
 }
 
-inline bool can_direct_append_column(const dispatch::Column& column) {
+inline bool can_direct_append_column(const galp::execution::Column& column) {
 	if (column.skip_decompress) {
 		return true;
 	}
-	return !std::holds_alternative<flsgpu::host::DICTREFColumn<int8_t, uint8_t>>(column.host);
+	return !std::holds_alternative<galp::codec::host::DICTREFColumn<int8_t, uint8_t>>(column.host);
 }
 
-inline bool can_direct_append_rowgroup(const dispatch::Rowgroup& rowgroup) {
+inline bool can_direct_append_rowgroup(const galp::execution::Rowgroup& rowgroup) {
 	for (const auto& column : rowgroup.columns) {
 		if (!can_direct_append_column(column)) {
 			return false;
@@ -280,7 +284,7 @@ inline bool can_direct_append_rowgroup(const dispatch::Rowgroup& rowgroup) {
 	return true;
 }
 
-inline size_t count_active_columns(const dispatch::Rowgroup& rowgroup) {
+inline size_t count_active_columns(const galp::execution::Rowgroup& rowgroup) {
 	size_t total = 0;
 	for (const auto& column : rowgroup.columns) {
 		if (!column.skip_decompress) {
@@ -290,13 +294,13 @@ inline size_t count_active_columns(const dispatch::Rowgroup& rowgroup) {
 	return total;
 }
 
-inline bool has_pinned_backing(const dispatch::Column& column) {
+inline bool has_pinned_backing(const galp::execution::Column& column) {
 	return column.host_owned_by_backing && column.backing_is_pinned && column.backing_base != nullptr &&
 	       column.backing_bytes > 0;
 }
 
 #ifndef NDEBUG
-inline void validate_unique_work_item(std::unordered_set<uint64_t>& seen, const dispatch::WorkItemAny& work) {
+inline void validate_unique_work_item(std::unordered_set<uint64_t>& seen, const galp::execution::WorkItemAny& work) {
 	const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(work.type)) << 56) |
 	                     (static_cast<uint64_t>(work.expr_index) << 28) | static_cast<uint64_t>(work.vector_index);
 	if (!seen.insert(key).second) {
@@ -305,19 +309,19 @@ inline void validate_unique_work_item(std::unordered_set<uint64_t>& seen, const 
 }
 #endif
 
-inline dispatch::PlanKind plan_for_work_item(const ExecutionWorkset& workset, const dispatch::WorkItemAny& work) {
+inline galp::execution::PlanKind plan_for_work_item(const ExecutionWorkset& workset, const galp::execution::WorkItemAny& work) {
 	switch (work.type) {
-	case dispatch::TypeTag::I8:
+	case galp::execution::TypeTag::I8:
 		return workset.buffers.host_batches.template get<int8_t>().device_exprs[work.expr_index].plan;
-	case dispatch::TypeTag::I16:
+	case galp::execution::TypeTag::I16:
 		return workset.buffers.host_batches.template get<int16_t>().device_exprs[work.expr_index].plan;
 	default:
 		throw std::runtime_error("unsupported work item type");
 	}
 }
 
-inline uint32_t semantic_lanes_for_work_item(const ExecutionWorkset& workset, const dispatch::WorkItemAny& work) {
-	return dispatch::semantic_lane_count(work.type, plan_for_work_item(workset, work));
+inline uint32_t semantic_lanes_for_work_item(const ExecutionWorkset& workset, const galp::execution::WorkItemAny& work) {
+	return galp::execution::semantic_lane_count(work.type, plan_for_work_item(workset, work));
 }
 
 inline void clear_mixed_slots(WorksetSlots& slots) {
@@ -335,20 +339,20 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 	}
 	workset.slots.mixed.reserve((total_items + 1U) / 2U);
 
-	dispatch::WorkItemAny pending_half {};
+	galp::execution::WorkItemAny pending_half {};
 	bool                  has_pending_half = false;
 
-	const auto append_work = [&](const dispatch::WorkItemAny& work, const uint32_t semantic_lanes) {
-		if (semantic_lanes == dispatch::lane_count_for_type(dispatch::TypeTag::I8)) {
+	const auto append_work = [&](const galp::execution::WorkItemAny& work, const uint32_t semantic_lanes) {
+		if (semantic_lanes == galp::execution::lane_count_for_type(galp::execution::TypeTag::I8)) {
 			if (has_pending_half) {
-				workset.slots.mixed.push_back(dispatch::MixedWorkSlot {pending_half, dispatch::invalid_work_item()});
+				workset.slots.mixed.push_back(galp::execution::MixedWorkSlot {pending_half, galp::execution::invalid_work_item()});
 				has_pending_half = false;
 			}
-			workset.slots.mixed.push_back(dispatch::MixedWorkSlot {work, dispatch::invalid_work_item()});
+			workset.slots.mixed.push_back(galp::execution::MixedWorkSlot {work, galp::execution::invalid_work_item()});
 			return;
 		}
 		if (has_pending_half) {
-			workset.slots.mixed.push_back(dispatch::MixedWorkSlot {pending_half, work});
+			workset.slots.mixed.push_back(galp::execution::MixedWorkSlot {pending_half, work});
 			has_pending_half = false;
 		} else {
 			pending_half     = work;
@@ -356,39 +360,36 @@ inline void build_mixed_slots(ExecutionWorkset& workset) {
 		}
 	};
 
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		constexpr auto type = dispatch::type_tag_for<T>();
+		constexpr auto type = galp::execution::type_tag_for<T>();
 		const auto&    batch = workset.buffers.host_batches.template get<T>();
 		for (uint32_t expr_idx = 0; expr_idx < batch.device_exprs.size(); ++expr_idx) {
 			const auto& expr = batch.device_exprs[expr_idx];
-			const auto  semantic_lanes = dispatch::semantic_lane_count(type, expr.plan);
-			const auto  n_vecs         = utils::get_n_vecs_from_size(expr.n_values);
+			const auto  semantic_lanes = galp::execution::semantic_lane_count(type, expr.plan);
+			const auto  n_vecs         = galp::codec::utils::get_n_vecs_from_size(expr.n_values);
 			for (uint32_t vec = 0; vec < n_vecs; ++vec) {
-				append_work(dispatch::WorkItemAny {expr_idx, vec, type}, semantic_lanes);
+				append_work(galp::execution::WorkItemAny {expr_idx, vec, type}, semantic_lanes);
 			}
 		}
 	});
 
 	if (has_pending_half) {
-		workset.slots.mixed.push_back(dispatch::MixedWorkSlot {pending_half, dispatch::invalid_work_item()});
+		workset.slots.mixed.push_back(galp::execution::MixedWorkSlot {pending_half, galp::execution::invalid_work_item()});
 	}
 }
 
 inline void append_expressions(ExecutionWorkset&              workset,
-                               std::vector<expr::Expression>& expressions,
+                               std::vector<galp::expression::Expression>& expressions,
                                const ExecutionConfig&         cfg,
                                size_t*                        out_total_bytes       = nullptr,
                                size_t*                        out_n_exprs           = nullptr,
                                const size_t                   expr_index_base       = 0,
                                const bool                     use_global_expr_index = false) {
-	using namespace dispatch;
-	using namespace dispatch::detail;
-
-	dispatch::resolve_dict_refs(expressions);
+	galp::execution::resolve_dict_refs(expressions);
 	workset.outputs.required = workset.outputs.required || cfg.write_out;
 	begin_workset_chunk_arena(workset, expressions.size());
-	flsgpu::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
+	galp::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
 
 	size_t active_expr_count = 0;
 	const void* last_backing_base  = nullptr;
@@ -416,9 +417,9 @@ inline void append_expressions(ExecutionWorkset&              workset,
 		std::visit(
 		    [&](auto&& host_col) {
 			    using HostColT      = std::decay_t<decltype(host_col)>;
-			    using T             = typename dispatch::ColumnKindTraits<HostColT>::value_type;
-			    constexpr auto plan = dispatch::detail::plan_for_host_col<HostColT>();
-			    if constexpr (dispatch::is_supported_type_v<T>) {
+			    using T             = typename galp::execution::ColumnKindTraits<HostColT>::value_type;
+			    constexpr auto plan = galp::execution::detail::plan_for_host_col<HostColT>();
+			    if constexpr (galp::execution::is_supported_type_v<T>) {
 				    if (out_total_bytes) {
 					    *out_total_bytes += host_col.get_n_values() * sizeof(T);
 				    }
@@ -433,7 +434,7 @@ inline void append_expressions(ExecutionWorkset&              workset,
 				                               output_offset,
 				                               cfg.freq_patcher,
 				                               cfg.freq_branchless_threshold,
-				                               cfg.launch_strategy != dispatch::LaunchStrategy::MixedDispatch,
+				                               cfg.launch_strategy != galp::execution::LaunchStrategy::MixedDispatch,
 				                               *active_chunk_arena);
 			    }
 		    },
@@ -442,16 +443,13 @@ inline void append_expressions(ExecutionWorkset&              workset,
 }
 
 inline void append_column_to_workset(ExecutionWorkset&                 workset,
-                                     const dispatch::Column&           column,
+                                     const galp::execution::Column&           column,
                                      const ExecutionConfig&            cfg,
                                      const size_t                      materialize_expr_index,
-                                     flsgpu::memory::DeviceArena&      active_chunk_arena,
+                                     galp::memory::DeviceArena&      active_chunk_arena,
                                      size_t*                           out_total_bytes = nullptr,
                                      const bool                        emit_typed_work_items = true,
                                      const bool                        register_backing = true) {
-	using namespace dispatch;
-	using namespace dispatch::detail;
-
 	if (column.skip_decompress) {
 		return;
 	}
@@ -462,9 +460,9 @@ inline void append_column_to_workset(ExecutionWorkset&                 workset,
 	std::visit(
 	    [&](auto&& host_col) {
 		    using HostColT      = std::decay_t<decltype(host_col)>;
-		    using T             = typename dispatch::ColumnKindTraits<HostColT>::value_type;
-		    constexpr auto plan = dispatch::detail::plan_for_host_col<HostColT>();
-		    if constexpr (dispatch::is_supported_type_v<T>) {
+		    using T             = typename galp::execution::ColumnKindTraits<HostColT>::value_type;
+		    constexpr auto plan = galp::execution::detail::plan_for_host_col<HostColT>();
+		    if constexpr (galp::execution::is_supported_type_v<T>) {
 			    if (out_total_bytes) {
 				    *out_total_bytes += host_col.get_n_values() * sizeof(T);
 			    }
@@ -485,13 +483,13 @@ inline void append_column_to_workset(ExecutionWorkset&                 workset,
 }
 
 inline void append_rowgroup_columns(ExecutionWorkset&         workset,
-                                    const dispatch::Rowgroup& rowgroup,
+                                    const galp::execution::Rowgroup& rowgroup,
                                     const ExecutionConfig&    cfg,
                                     const size_t              expr_index_base       = 0,
                                     const bool                use_global_expr_index = false) {
 	workset.outputs.required = workset.outputs.required || cfg.write_out;
 	begin_workset_chunk_arena(workset, rowgroup.columns.size());
-	flsgpu::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
+	galp::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
 
 	size_t active_expr_count = 0;
 	const void* last_backing_base  = nullptr;
@@ -516,7 +514,7 @@ inline void append_rowgroup_columns(ExecutionWorkset&         workset,
 		                         materialize_expr_index,
 		                         *active_chunk_arena,
 		                         nullptr,
-		                         cfg.launch_strategy != dispatch::LaunchStrategy::MixedDispatch,
+		                         cfg.launch_strategy != galp::execution::LaunchStrategy::MixedDispatch,
 		                         false);
 	}
 }
@@ -532,13 +530,13 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 	const auto h2d_stream = ensure_workset_h2d_stream(workset);
 	workset.slots.owned.reset();
 	workset.slots.d = nullptr;
-	const bool mixed_dispatch = cfg.launch_strategy == dispatch::LaunchStrategy::MixedDispatch;
+	const bool mixed_dispatch = cfg.launch_strategy == galp::execution::LaunchStrategy::MixedDispatch;
 	if (!mixed_dispatch) {
 		clear_mixed_slots(workset.slots);
 	}
 	workset.buffers.payload_arena_bytes = 0;
 
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T         = typename decltype(tag)::type;
 		auto& dev_batch = workset.buffers.device_batches.template get<T>();
 		dev_batch.owned_exprs.reset();
@@ -553,7 +551,7 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 	ensure_workset_output_arena(workset);
 	const auto t0b                 = clock::now();
 	breakdown.prep_output_arena_ms = ms(t0a, t0b);
-	dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
 		bind_workset_output_pointers<T>(workset);
 	});
@@ -576,18 +574,18 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 		// metric continues to report payload-only bytes.
 		workset.buffers.chunk_arena->coalesce_backing_regions();
 		workset.buffers.payload_arena_bytes = workset.buffers.chunk_arena->total_bytes();
-		dispatch::for_each_type(dispatch::SupportedTypes {}, [&](auto tag) {
+		galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 			using T          = typename decltype(tag)::type;
 			auto& host_batch = workset.buffers.host_batches.template get<T>();
 			auto& dev_batch  = workset.buffers.device_batches.template get<T>();
 			auto& arena      = *workset.buffers.chunk_arena;
 			if (!host_batch.device_exprs.empty()) {
-				const auto expr_idx = arena.template add<dispatch::DeviceExpression<T>>(host_batch.device_exprs.size(),
+				const auto expr_idx = arena.template add<galp::execution::DeviceExpression<T>>(host_batch.device_exprs.size(),
 				                                                                        host_batch.device_exprs.data());
 				arena.resolve_to(reinterpret_cast<void**>(&dev_batch.d_exprs), expr_idx);
 			}
 			if (!mixed_dispatch && !host_batch.work_items.empty()) {
-				const auto item_idx = arena.template add<dispatch::WorkItemAny>(host_batch.work_items.size(),
+				const auto item_idx = arena.template add<galp::execution::WorkItemAny>(host_batch.work_items.size(),
 				                                                                host_batch.work_items.data());
 				dev_batch.n_items   = host_batch.work_items.size();
 				arena.resolve_to(reinterpret_cast<void**>(&dev_batch.d_items), item_idx);
@@ -596,7 +594,7 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 		if (!workset.slots.mixed.empty()) {
 			auto&      arena = *workset.buffers.chunk_arena;
 			const auto slot_idx =
-			    arena.template add<dispatch::MixedWorkSlot>(workset.slots.mixed.size(), workset.slots.mixed.data());
+			    arena.template add<galp::execution::MixedWorkSlot>(workset.slots.mixed.size(), workset.slots.mixed.data());
 			arena.resolve_to(reinterpret_cast<void**>(&workset.slots.d), slot_idx);
 		}
 		const auto t2             = clock::now();
@@ -616,6 +614,6 @@ inline UploadBreakdown upload_workset(ExecutionWorkset& workset, const Execution
 	return breakdown;
 }
 
-} // namespace dispatch::runtime
+} // namespace galp::runtime
 
 #endif // ENGINE_EXECUTION_INTERNAL_PREPARE_CUH
