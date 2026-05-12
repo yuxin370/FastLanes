@@ -10,26 +10,26 @@ Replace the placeholders below:
 2) Decompress one rowgroup only
 <GALP_CLI> read_table <FLS_FILE> /tmp/out.csv --rowgroup 0
 
-3) Benchmark (default: streaming + mixed-dispatch + zero-copy rowgroup materialization)
-<GALP_CLI> benchmark <FLS_FILE> --samples 100
+3) Benchmark (default: write-back-free streaming + mixed-dispatch + zero-copy rowgroup parsing)
+<GALP_CLI> benchmark <FLS_FILE> --samples 5
 
 4) Benchmark per-rowgroup worksets
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --per-rowgroup-workset
+<GALP_CLI> benchmark <FLS_FILE> --samples 5 --per-rowgroup-workset
 
 5) Benchmark with typed-batch launches instead of mixed-dispatch
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --no-mixed-dispatch
+<GALP_CLI> benchmark <FLS_FILE> --samples 5 --no-mixed-dispatch
 
-6) Benchmark with global write-back enabled
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --write-back
+6) Benchmark including host materialization
+<GALP_CLI> benchmark <FLS_FILE> --samples 5 --include-materialize
 
 7) Benchmark with custom streaming chunk thresholds
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --stream-target-work-items 131072 --stream-max-rowgroups 4
+<GALP_CLI> benchmark <FLS_FILE> --samples 5 --stream-target-work-items 131072 --stream-max-rowgroups 4
 
 8) Frequency: branchless patcher (extended + PrefetchAllBranchless)
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --freq-patcher branchless
+<GALP_CLI> benchmark <FLS_FILE> --samples 5 --freq-patcher branchless
 
 9) Frequency: hybrid selection (stateful/branchless by exception density)
-<GALP_CLI> benchmark <FLS_FILE> --samples 100 --freq-patcher hybrid:6
+<GALP_CLI> benchmark <FLS_FILE> --samples 5 --freq-patcher hybrid:6
 
 10) Write per-rowgroup pipeline timeline while benchmarking
   GALP_ROWGROUP_TIMELINE_CSV=/tmp/galp_timeline.csv \
@@ -37,11 +37,15 @@ Replace the placeholders below:
 
 Benchmark output metrics
   benchmark_wall_ms                End-to-end wall clock of the whole benchmark run.
+  benchmark_wall_ms_min/median/mean
+                                   Summary over independent benchmark samples.
   resource_prepare_ms              Reader/pinned-pool setup time before a steady-state query
                                    when --reuse-table-resources is enabled.
   query_wall_ms                    Query wall clock; excludes resource_prepare_ms in reuse mode.
+  query_wall_ms_min/median/mean    Summary over independent benchmark samples.
   pipeline_active_ms               query_wall_ms minus pipeline setup inside the query.
   kernel_event_ms                  Accumulated GPU event time spent inside benchmark kernel launches.
+  kernel_event_ms_min/median/mean  Summary over independent benchmark samples.
   read_rowgroup_ms                 Aggregated host-side rowgroup load time.
   file_read_ms                    Aggregated legacy read/setup stage before rowgroup build.
   rowgroup_build_ms               Aggregated host-side rowgroup/column build time after IO.
@@ -56,19 +60,26 @@ Benchmark output metrics
   append_expr_ms / upload_workset_ms / ...
                                    Remaining host-side stage timings accumulated by stage.
   output_arena_bytes              Total device output bytes reserved across chunks/worksets.
+  write_back / include_materialize
+                                  1 when --include-materialize is enabled.
+  consume_only / write_back_free  1 only for the default no-materialize benchmark path.
   prefetch_wait_ms                 Time the consumer waited for background rowgroup prefetch.
   prefetch_depth_block_ms          Time prefetch workers spent blocked by prefetch_depth back-pressure.
   Notes:
   - In streaming mode, host stages and GPU execution can overlap, so the stage sums may exceed
     benchmark_wall_ms.
   - storage_read_gbps uses pread_wall_ms so it excludes pageable allocation and zero-copy setup.
-  - samples scales kernel_event_ms, but does not multiply the host build/upload/release stages,
-    because the workset is built once and the kernel is replayed samples times.
+  - samples is the number of independent benchmark samples used for min/median/mean.
+  - kernel_samples scales kernel_event_ms within each sample, but does not multiply the host
+    build/upload/release stages, because the workset is built once and the kernel is replayed
+    kernel_samples times.
   - Aliases end_to_end_ms and kernel_ms are also printed.
 
 Options
   --rowgroup N                      Only process the given rowgroup.
-  --samples N                       Number of benchmark repetitions (default: 1).
+  --samples N                       Number of independent benchmark samples for min/median/mean
+                                    (default: 5).
+  --kernel-samples N                Kernel replays inside each benchmark sample (default: 1).
   --no-header                       Skip CSV header (read_table mode).
   --out PATH                        Output CSV path (read_table mode).
   --iters N                         Launch measurement iterations (default: 100000).
@@ -83,7 +94,8 @@ Options
                                     (default: 0=auto by rowgroup count).
   --max-prefetch-storage-bytes N    Fused prefetch compressed-byte budget
                                     (default: prefetch_depth * max rowgroup bytes).
-  --write-back                      Force benchmark kernels to write decompressed outputs to global memory.
+  --include-materialize             Benchmark the output-producing path by enabling device
+                                    write-out and pinned D2H result materialization.
   --reuse-table-resources           Prepare reader and pinned rowgroup pool before the query timer;
                                     useful for steady-state measurements.
   --stream-target-work-items N      Chunk flush threshold by work_items in whole-table streaming
@@ -101,12 +113,13 @@ Defaults
   - Streaming double-buffer pipeline (async overlap of H2D and kernel)
   - Background rowgroup prefetch in whole-table benchmark mode
   - Zero-copy rowgroup parsing (host columns point into backing buffer)
+  - Write-back-free benchmark kernels (decoded registers are consumed, not written to global output)
   - Shared DeviceArena per workset / chunk (single staged allocation and upload for appended expressions)
   - Async h2d_stream for overlapping uploads with compute
 
   To run a launch-heavy baseline:
     GALP_DISABLE_ASYNC_H2D=1 \
-    <GALP_CLI> benchmark <FLS_FILE> --samples 100 \
+    <GALP_CLI> benchmark <FLS_FILE> --samples 5 --kernel-samples 100 \
       --per-rowgroup-workset --no-mixed-dispatch
 
 Notes
