@@ -5,15 +5,12 @@
 // ────────────────────────────────────────────────────────
 #include "engine/execution/internal/table_pipeline.cuh"
 #include "engine/execution/table.cuh"
+#include <optional>
 
-namespace dispatch {
+namespace galp::execution {
 
 TableData decompress_table(const std::filesystem::path& fls_path, const TableDecompressionConfig& cfg) {
-	return decompress_table(
-	    fls_path,
-	    cfg,
-	    [](size_t) { return true; },
-	    [](size_t, reader::Rowgroup&, const std::vector<expr::Expression>&, const RowgroupData&) {});
+	return decompress_table(fls_path, cfg, std::nullopt);
 }
 
 TableData decompress_table(const std::filesystem::path&    fls_path,
@@ -23,7 +20,7 @@ TableData decompress_table(const std::filesystem::path&    fls_path,
 	request.config              = cfg;
 	request.samples             = 1;
 	request.rowgroup            = rowgroup;
-	request.materialize_results = true;
+	request.materialize_results = cfg.execution.write_out;
 	request.warmup_first_run    = false;
 	runtime::NoopTableExecutionObserver observer {};
 
@@ -31,7 +28,7 @@ TableData decompress_table(const std::filesystem::path&    fls_path,
 	    fls_path,
 	    request,
 	    [](size_t) { return true; },
-	    [](size_t, reader::Rowgroup&, const std::vector<expr::Expression>&, const RowgroupData*) {},
+	    [](size_t, Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData*) {},
 	    observer);
 }
 
@@ -50,10 +47,10 @@ TableData decompress_table(const std::filesystem::path&    fls_path,
 	    fls_path,
 	    request,
 	    should_decompress,
-	    [&](const size_t                        rowgroup_index,
-	        reader::Rowgroup&                   rowgroup,
-	        const std::vector<expr::Expression>& expressions,
-	        const RowgroupData*                materialized) {
+	    [&](const size_t                                     rowgroup_index,
+	        Rowgroup&                                        rowgroup,
+	        const std::vector<galp::expression::Expression>& expressions,
+	        const RowgroupData*                              materialized) {
 		    if (materialized == nullptr) {
 			    throw std::runtime_error("table pipeline did not materialize rowgroup output");
 		    }
@@ -62,4 +59,4 @@ TableData decompress_table(const std::filesystem::path&    fls_path,
 	    observer);
 }
 
-} // namespace dispatch
+} // namespace galp::execution

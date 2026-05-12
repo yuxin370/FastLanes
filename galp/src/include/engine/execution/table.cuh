@@ -7,16 +7,18 @@
 #define ENGINE_EXECUTION_TABLE_CUH
 
 #include "engine/data/model.cuh"
-#include "engine/execution/common.cuh"
-#include "engine/expression.cuh"
-#include "engine/reader.cuh"
+#include "engine/execution/config.cuh"
 #include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <optional>
 #include <vector>
 
-namespace dispatch {
+namespace galp::expression {
+struct Expression;
+}
+
+namespace galp::execution {
 
 enum class TableDecompressionScope {
 	PerRowgroup,
@@ -35,14 +37,14 @@ struct TableDecompressionConfig {
 	size_t prefetch_workers = 0;
 	// Zero derives a byte budget from prefetch_depth * max rowgroup storage
 	// bytes. Non-zero caps compressed bytes reserved by fused prefetch workers.
-	size_t max_prefetch_storage_bytes   = 0;
-	size_t streaming_target_work_items  = 1u << 18;
-	size_t streaming_target_rowgroups   = 1;
+	size_t max_prefetch_storage_bytes  = 0;
+	size_t streaming_target_work_items = 1u << 18;
+	size_t streaming_target_rowgroups  = 1;
 };
 
 using TableRowgroupPredicate = std::function<bool(size_t)>;
 using TableRowgroupCallback =
-    std::function<void(size_t, reader::Rowgroup&, const std::vector<expr::Expression>&, const RowgroupData&)>;
+    std::function<void(size_t, Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData&)>;
 
 TableData decompress_table(const std::filesystem::path& fls_path, const TableDecompressionConfig& cfg = {});
 TableData decompress_table(const std::filesystem::path&    fls_path,
@@ -53,6 +55,6 @@ TableData decompress_table(const std::filesystem::path&    fls_path,
                            const TableRowgroupPredicate&   should_decompress,
                            const TableRowgroupCallback&    on_rowgroup);
 
-} // namespace dispatch
+} // namespace galp::execution
 
 #endif // ENGINE_EXECUTION_TABLE_CUH
