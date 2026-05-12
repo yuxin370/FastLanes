@@ -1,0 +1,56 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(CUDAToolkit)
+
+if (NOT TARGET FLS::FastLanes)
+    find_package(FLS CONFIG QUIET)
+endif ()
+
+# Compatibility fallback for the current FastLanes build/install layout, which
+# exports FLSTargets.cmake but does not yet install a standard FLSConfig.cmake.
+if (NOT TARGET FLS::FastLanes)
+    set(_galp_fls_targets_candidates
+            "${PACKAGE_PREFIX_DIR}/FLSTargets.cmake"
+            "${CMAKE_CURRENT_LIST_DIR}/../FLS/FLSTargets.cmake")
+    foreach (_galp_fls_targets IN LISTS _galp_fls_targets_candidates)
+        if (NOT TARGET FLS::FastLanes AND EXISTS "${_galp_fls_targets}")
+            include("${_galp_fls_targets}")
+        endif ()
+    endforeach ()
+    unset(_galp_fls_targets)
+    unset(_galp_fls_targets_candidates)
+endif ()
+
+if (NOT TARGET FLS::FastLanes)
+    set(Galp_FOUND FALSE)
+    set(Galp_NOT_FOUND_MESSAGE "Galp requires the FLS::FastLanes target.")
+    return()
+endif ()
+
+if (NOT TARGET Thrust::Thrust)
+    find_package(Thrust CONFIG QUIET)
+endif ()
+
+if (NOT TARGET Thrust::Thrust)
+    # CUDA Toolkit installations used by this project provide Thrust headers
+    # without a CMake package target, so create the imported target expected by
+    # GalpTargets.cmake as a compatibility fallback.
+    find_path(GALP_THRUST_INCLUDE_DIR
+            NAMES thrust/version.h thrust/device_uvector.h
+            HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    if (NOT GALP_THRUST_INCLUDE_DIR)
+        set(Galp_FOUND FALSE)
+        set(Galp_NOT_FOUND_MESSAGE
+                "Galp requires Thrust with device_uvector.h, but it was not found.")
+        return()
+    endif ()
+    add_library(Thrust::Thrust INTERFACE IMPORTED)
+    set_target_properties(Thrust::Thrust PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${GALP_THRUST_INCLUDE_DIR}")
+endif ()
+
+include("${CMAKE_CURRENT_LIST_DIR}/GalpTargets.cmake")
+
+check_required_components(Galp)

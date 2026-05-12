@@ -1,4 +1,6 @@
 enable_language(CUDA)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 # ────────────────────────────────────────────────
 # 0. Global settings
@@ -6,7 +8,24 @@ enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr") #todo FIX ME
+
+option(GALP_BUILD_TESTS "Build GALP tests" ${BUILD_TESTING})
+option(GALP_BUILD_BENCHMARKS "Build GALP benchmarks" OFF)
+option(GALP_BUILD_TOOLS "Build GALP command-line tools" ON)
+option(GALP_WITH_NVCOMP "Build nvCOMP compressor comparison targets" OFF)
+option(GALP_ENABLE_MULTI_COLUMN "Reserved; experimental multi-column generated bindings are currently disabled" OFF)
+if (GALP_ENABLE_MULTI_COLUMN)
+    message(FATAL_ERROR
+            "GALP_ENABLE_MULTI_COLUMN is currently disabled because query_multi_column generated CUDA sources "
+            "have prohibitive compile time. Leave GALP_ENABLE_MULTI_COLUMN=OFF; multi-column benchmarks are "
+            "not part of the supported GALP build.")
+endif ()
+if (DEFINED FLS_ENABLE_INSTALL)
+    set(GALP_ENABLE_INSTALL_DEFAULT ${FLS_ENABLE_INSTALL})
+else ()
+    set(GALP_ENABLE_INSTALL_DEFAULT ON)
+endif ()
+option(GALP_ENABLE_INSTALL "Generate GALP install and package targets" ${GALP_ENABLE_INSTALL_DEFAULT})
 
 # ────────────────────────────────────────────────
 # 1. CUDA Toolkit
@@ -14,17 +33,19 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr") #todo FIX M
 find_package(CUDAToolkit REQUIRED)
 
 # ────────────────────────────────────────────────
-# 2. nvCOMP (required)
+# 2. nvCOMP (optional; required only for compressor comparison targets)
 # ────────────────────────────────────────────────
-find_package(nvcomp CONFIG REQUIRED)
+if (GALP_WITH_NVCOMP)
+    find_package(nvcomp CONFIG REQUIRED)
 
-get_target_property(NVCOMP_VERSION nvcomp::nvcomp VERSION)
-get_target_property(NVCOMP_INC_DIRS nvcomp::nvcomp INTERFACE_INCLUDE_DIRECTORIES)
-get_target_property(NVCOMP_LIBS nvcomp::nvcomp INTERFACE_LINK_LIBRARIES)
+    get_target_property(NVCOMP_VERSION nvcomp::nvcomp VERSION)
+    get_target_property(NVCOMP_INC_DIRS nvcomp::nvcomp INTERFACE_INCLUDE_DIRECTORIES)
+    get_target_property(NVCOMP_LIBS nvcomp::nvcomp INTERFACE_LINK_LIBRARIES)
 
-message(STATUS "nvCOMP version ..........: ${NVCOMP_VERSION}")
-message(STATUS "nvCOMP include dirs .....: ${NVCOMP_INC_DIRS}")
-message(STATUS "nvCOMP libs .............: ${NVCOMP_LIBS}")
+    message(STATUS "nvCOMP version ..........: ${NVCOMP_VERSION}")
+    message(STATUS "nvCOMP include dirs .....: ${NVCOMP_INC_DIRS}")
+    message(STATUS "nvCOMP libs .............: ${NVCOMP_LIBS}")
+endif ()
 
 # ────────────────────────────────────────────────
 # 3. Thrust / CCCL – prefer toolkit copy, fall back to CCCL ≥ 2.3
@@ -74,11 +95,11 @@ set(CLANG_ONLY_WARNINGS
 
 
 macro(apply_warnings tgt)
-    target_compile_options(${tgt} PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo -src-in-ptx>
-            $<$<COMPILE_LANGUAGE:CXX>:${COMMON_WARNINGS}>
-            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:${CLANG_ONLY_WARNINGS}>
-            $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_WARNINGS}>)
+	    target_compile_options(${tgt} PRIVATE
+	            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo -src-in-ptx --diag-suppress=550>
+	            $<$<COMPILE_LANGUAGE:CXX>:${COMMON_WARNINGS}>
+	            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:${CLANG_ONLY_WARNINGS}>
+	            $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_WARNINGS}>)
 endmacro()
 
 # Sample data root for tests and benchmarks. Attach the definition to those
@@ -86,6 +107,13 @@ endmacro()
 # artifacts.
 set(GALP_DATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH
     "Root directory containing data/floats and data/doubles for galp tests and benchmarks")
+
+add_custom_target(galp_api_boundary_checks
+	COMMAND ${CMAKE_COMMAND}
+	        -DGALP_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+	        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GalpPublicApiBoundaryCheck.cmake
+        COMMENT "Checking GALP public API include and namespace boundaries"
+        VERBATIM)
 
 # ────────────────────────────────────────────────
 # 5. GALP core static library
@@ -95,14 +123,20 @@ add_subdirectory(src)
 # ────────────────────────────────────────────────
 # 8. tests
 # ────────────────────────────────────────────────
-add_subdirectory(test)
+if (GALP_BUILD_TESTS)
+    add_subdirectory(test)
+endif ()
 
 ## ────────────────────────────────────────────────
 ## 7. Benchmarks
 ## ────────────────────────────────────────────────
-add_subdirectory(benchmark)
+if (GALP_BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
+endif ()
 
 ## ────────────────────────────────────────────────
 ## 8. Tools
 ## ────────────────────────────────────────────────
-add_subdirectory(tools)
+if (GALP_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif ()

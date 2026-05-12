@@ -12,15 +12,61 @@ run-name: >-
   — ${{ github.event.pull_request.title || github.event.head_commit.message }}
 
 on:
+  pull_request:
   push:
 
 permissions:
   contents: read
 
 jobs:
-  president-build-test:
-    if: ${{ github.actor == 'azimafroozeh' }}
-    name: CMake CI on president
+  pr-public-api:
+    if: >-
+      ${{
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    name: GALP public API and package smoke
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - president
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: CMake configure
+        run: |
+          set -x
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
+            -DGALP_BUILD_TESTS=ON \
+            -DGALP_BUILD_TOOLS=ON \
+            -DGALP_BUILD_BENCHMARKS=OFF \
+            -DGALP_WITH_NVCOMP=OFF
+
+      - name: Build public smoke targets
+        run: >
+          cmake --build build --parallel
+          --target
+          galp_core
+          galp_public_api_smoke
+          galp_api_boundary_checks
+          galp_cli
+
+      - name: Public API tests
+        run: ctest --test-dir build -L public-api --output-on-failure
+
+      - name: Package consumer smoke
+        run: ctest --test-dir build -R GalpPackageConsumerSmoke --output-on-failure
+
+  gpu-build-test:
+    if: ${{ github.event_name == 'push'}}
+    name: GALP GPU build and tests
     runs-on:
       - self-hosted
       - Linux
@@ -45,7 +91,7 @@ jobs:
       # ────────────────────────────────────────────────
       # 1. Quick sanity of the runner
       # ────────────────────────────────────────────────
-      - name: 🔎 Env dump
+      - name: Env dump
         run: |
           set -x
           hostname
@@ -53,67 +99,53 @@ jobs:
           echo "CUDA path: $CUDA_LIBRARY_PATH"
           echo "NVCOMP_INC: $NVCOMP_INC"
           echo "NVCOMP_LIB: $NVCOMP_LIB"
-          which nvidia-smi || true
-          which nvcc       || true
-          which clang++    || true
-          which g++        || true
-          which cmake      || true
-          which make       || true
+          nvidia-smi
+          nvcc --version
+          clang++ --version
+          g++ --version
+          cmake --version
+          make --version
 
-      # ────────────────────────────────────────────────
-      # 2. Verify required tools
-      # ────────────────────────────────────────────────
-      - name: ✅ Verify tools
+      - name: Verify tools
         run: |
           for cmd in nvidia-smi nvcc clang++ g++ cmake make; do
             command -v "$cmd" >/dev/null || { echo "::error::$cmd missing"; exit 127; }
           done
 
-      - name: Version outputs
+      - name: CMake configure
         run: |
-          nvidia-smi
-          nvcc     --version
-          clang++  --version
-          g++      --version
-          cmake    --version
-          make     --version
-
-      # ────────────────────────────────────────────────
-      # 3. Configure with CMake
-      # ────────────────────────────────────────────────
-      - name: 🔄 CMake configure
-        run: |
+          set -x
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON
+            -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
+            -DGALP_BUILD_TESTS=ON \
+            -DGALP_BUILD_TOOLS=ON \
+            -DGALP_BUILD_BENCHMARKS=OFF \
+            -DGALP_WITH_NVCOMP=OFF
+          cmake -LA -N build | grep -E '^(CMAKE_BUILD_TYPE|GALP_BUILD_TESTS|GALP_BUILD_TOOLS|GALP_BUILD_BENCHMARKS|GALP_WITH_NVCOMP|FLS_ENABLE_GALP_TESTING_AND_BENCHMARKING):'
 
-      # ────────────────────────────────────────────────
-      # 4. Build (all targets)
-      # ────────────────────────────────────────────────
-      - name: 🏗️ Build
-        run: cmake --build build --parallel
+      - name: Build GALP targets
+        run: >
+          cmake --build build --parallel
+          --target
+          galp_core
+          galp_tests
+          galp_public_api_smoke
+          galp_api_boundary_checks
+          galp_cli
 
-      # ────────────────────────────────────────────────
-      # 5. Run unit tests
-      # ────────────────────────────────────────────────
-      - name: 🧪 Run tests
-        run: |
-          cd build
-          ctest --output-on-failure
+      - name: Public API tests
+        run: ctest --test-dir build -L public-api --output-on-failure
 
-      # ────────────────────────────────────────────────
-      # 6. Run benchmarks (no label filter)
-      # ────────────────────────────────────────────────
-      - name: ⚡ Run benchmarks
-        run: |
-          cd build
-          ctest --output-on-failure || true
+      - name: GPU tests
+        run: ctest --test-dir build -L gpu --output-on-failure
 
-      # ────────────────────────────────────────────────
-      # 7. Smoke‑test helper binaries
-      # ────────────────────────────────────────────────
-      - name: 🚀 Smoke‑test binaries
-        run: |
-          ./build/galp/benchmark/micro-benchmarks       --help || true
-          ./build/galp/benchmark/compressors-benchmarks --help || true
-        shell: bash
+      - name: Upload CTest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: galp-ctest-logs
+          path: |
+            build/Testing/**/*.log
+            build/Testing/Temporary/*
+          if-no-files-found: ignore
