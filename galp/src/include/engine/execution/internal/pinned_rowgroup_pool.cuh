@@ -6,7 +6,7 @@
 #ifndef ENGINE_EXECUTION_INTERNAL_PINNED_ROWGROUP_POOL_CUH
 #define ENGINE_EXECUTION_INTERNAL_PINNED_ROWGROUP_POOL_CUH
 
-#include "flsgpu/memory/device_pool.cuh"
+#include "memory/device_pool.cuh"
 
 #include <algorithm>
 #include <atomic>

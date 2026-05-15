@@ -6,9 +6,10 @@
 #ifndef ENGINE_EXECUTION_ROWGROUP_CUH
 #define ENGINE_EXECUTION_ROWGROUP_CUH
 
-#include "engine/execution/common.cuh"
+#include "compression/columns/all.cuh"
+#include "engine/data/model.cuh"
+#include "engine/execution/config.cuh"
 #include "engine/reader.cuh"
-#include "flsgpu/structs.cuh"
 
 namespace galp::execution {
 

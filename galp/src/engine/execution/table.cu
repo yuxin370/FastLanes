@@ -3,7 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/execution/table.cu
 // ────────────────────────────────────────────────────────
-#include "engine/execution/internal/table_pipeline.cuh"
+#include "engine/runtime/pipeline.cuh"
 #include "engine/execution/table.cuh"
 #include <optional>
 

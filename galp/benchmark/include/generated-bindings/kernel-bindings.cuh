@@ -7,7 +7,7 @@
 #define GENERATED_KERNEL_BINDINGS_CUH
 
 #include "engine/enums.cuh"
-#include "flsgpu/flsgpu.cuh"
+#include "decompression/alp.cuh"
 #include <cstdint>
 
 namespace galp::bench::bindings {

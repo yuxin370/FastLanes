@@ -7,7 +7,7 @@
 #define ENGINE_EXECUTION_INTERNAL_UNPACK_DISPATCH_CUH
 
 #include "engine/execution/config.cuh"
-#include "flsgpu/consts.cuh"
+#include "compression/consts.cuh"
 #include <stdexcept>
 #include <type_traits>
 

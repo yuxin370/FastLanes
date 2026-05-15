@@ -6,9 +6,10 @@
 // Host-only includes are guarded from the CUDA device pass.
 #include "engine/enums.cuh"
 #include "engine/types.cuh"
-#include "flsgpu/consts.cuh"
-#include "generator/generate_binaries.hpp"
-#include "nvcomp/benchmark-compressors.cuh"
+#include "compression/consts.cuh"
+#include "galp_support/data/generate_binaries.hpp"
+#include "galp_bench/nvcomp/benchmark_compressors.cuh"
+#include "galp_bench/nvcomp/types.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>

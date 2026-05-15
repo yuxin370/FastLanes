@@ -6,10 +6,10 @@
 #include "alp/alp-bindings.cuh"
 #include "data/fastlanes_data.hpp"
 #include "engine/device-utils.cuh"
-#include "engine/kernels.cuh"
-#include "flsgpu/alp.cuh"
-#include "flsgpu/structs.cuh"
-#include "generator/generate_binaries.hpp"
+#include "engine/kernels/dispatch.cuh"
+#include "decompression/alp.cuh"
+#include "compression/columns/all.cuh"
+#include "galp_support/data/generate_binaries.hpp"
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>

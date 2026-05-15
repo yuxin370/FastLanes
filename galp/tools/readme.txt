@@ -47,14 +47,14 @@ Benchmark output metrics
   kernel_event_ms                  Accumulated GPU event time spent inside benchmark kernel launches.
   kernel_event_ms_min/median/mean  Summary over independent benchmark samples.
   read_rowgroup_ms                 Aggregated host-side rowgroup load time.
-  file_read_ms                    Aggregated legacy read/setup stage before rowgroup build.
+  file_read_ms                    Aggregated read/setup stage before rowgroup build.
   rowgroup_build_ms               Aggregated host-side rowgroup/column build time after IO.
   pinned_acquire_ms               Pinned rowgroup buffer lease time before file IO.
   pread_ms                        Time spent in File::ReadRangeUnchecked / pread.
   pread_wall_ms                   Wall span from first pread start to last pread end.
   zero_copy_view_setup_ms         Zero-copy RowgroupView/descriptor setup after pread.
   read_wall_ms                    Wall span from first rowgroup load start to last rowgroup build end.
-  file_read_wall_ms               Wall span of the legacy file_read_ms stage.
+  file_read_wall_ms               Wall span of the file_read_ms stage.
   storage_bytes                   Sum of rowgroup descriptor m_size bytes read from the FLS file.
   storage_read_gbps               storage_bytes / pread_wall_ms, using decimal GB/s.
   append_expr_ms / upload_workset_ms / ...

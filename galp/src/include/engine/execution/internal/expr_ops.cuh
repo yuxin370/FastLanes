@@ -17,8 +17,8 @@
 #include "engine/execution/config.cuh"
 #include "engine/expression.cuh"
 #include "engine/lane-policy.cuh"
-#include "flsgpu/memory/device_arena.cuh"
-#include "flsgpu/structs.cuh"
+#include "memory/device_arena.cuh"
+#include "compression/columns/all.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>

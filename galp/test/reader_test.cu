@@ -3,7 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/test/reader_test.cu
 // ────────────────────────────────────────────────────────
-#include "engine/execution/internal/materialize.cuh"
+#include "engine/runtime/materialize/pinned_d2h.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/execution/table.cuh"
 #include "engine/reader.cuh"
@@ -12,7 +12,7 @@
 #include "fls/expression/rpn.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/table/rowgroup.hpp"
-#include "flsgpu/structs.cuh"
+#include "compression/columns/all.cuh"
 #include "galp/galp.hpp"
 #include <algorithm>
 #include <cstdlib>

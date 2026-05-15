@@ -11,7 +11,7 @@
 
 #include "engine/expression.cuh"
 #include "engine/lane-policy.cuh"
-#include "flsgpu/memory/gpu_array.cuh"
+#include "memory/gpu_array.cuh"
 #include <cstddef>
 #include <optional>
 #include <tuple>

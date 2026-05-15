@@ -6,7 +6,9 @@
 #ifndef ENGINE_EXECUTION_COLUMN_CUH
 #define ENGINE_EXECUTION_COLUMN_CUH
 
-#include "engine/execution/common.cuh"
+#include "engine/data/value-store.cuh"
+#include "engine/execution/config.cuh"
+#include "engine/expression.cuh"
 
 namespace galp::execution {
 

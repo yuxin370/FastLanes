@@ -3,9 +3,12 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/execution/rowgroup.cu
 // ────────────────────────────────────────────────────────
-#include "engine/execution/internal/materialize.cuh"
+#include "engine/runtime/materialize/metadata.cuh"
 #include "engine/execution/internal/unpack_dispatch.cuh"
+#include "engine/execution/internal/launch.cuh"
 #include "engine/execution/rowgroup.cuh"
+#include "engine/runtime/workset/append.cuh"
+#include "engine/runtime/workset/upload.cuh"
 
 namespace galp::execution {
 namespace {

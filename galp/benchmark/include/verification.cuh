@@ -6,10 +6,12 @@
 #ifndef VERIFICATION_H
 #define VERIFICATION_H
 
-#include "flsgpu/flsgpu.cuh"
+#include "decompression/alp.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace galp::bench::verification {
 
@@ -85,7 +87,8 @@ ExecutionResult<T> compare_data(const T* a, const T* b, const size_t size) {
 		}
 	}
 
-	return ExecutionResult<T> {differences.size() == 0, differences};
+	const bool success = differences.empty();
+	return ExecutionResult<T> {success, std::move(differences)};
 }
 
 template <typename T>

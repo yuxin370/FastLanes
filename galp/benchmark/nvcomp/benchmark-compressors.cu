@@ -6,10 +6,10 @@
 #include "alp/alp-bindings.cuh"
 #include "data.cuh"
 #include "engine/device-utils.cuh"
-#include "engine/kernels.cuh"
-#include "flsgpu/flsgpu.cuh"
-#include "nvcomp/benchmark-compressors.cuh"
-#include "nvcomp/nvcomp-compressors.cuh"
+#include "engine/kernels/dispatch.cuh"
+#include "decompression/alp.cuh"
+#include "galp_bench/nvcomp/benchmark_compressors.cuh"
+#include "galp_bench/nvcomp/nvcomp_compressors.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

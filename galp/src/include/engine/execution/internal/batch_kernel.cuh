@@ -15,12 +15,12 @@
 #include "engine/execution/config.cuh"
 #include "engine/execution/internal/unpack_dispatch.cuh"
 #include "engine/expression.cuh"
-#include "engine/kernels.cuh"
+#include "engine/kernels/dispatch.cuh"
 #include "engine/lane-policy.cuh"
 #include "engine/types.cuh"
-#include "flsgpu/memory/cuda_macros.cuh"
-#include "flsgpu/memory/device_pool.cuh"
-#include "flsgpu/memory/gpu_array.cuh"
+#include "memory/cuda_macros.cuh"
+#include "memory/device_pool.cuh"
+#include "memory/gpu_array.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <memory>

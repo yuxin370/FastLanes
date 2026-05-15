@@ -12,8 +12,8 @@ import argparse
 import logging
 
 FILE_HEADER = """
-#include "../flsgpu/flsgpu.cuh"
-#include "../engine/device-utils.cuh"
+#include "decompression/alp.cuh"
+#include "engine/device-utils.cuh"
 
 #ifndef MULTI_COLUMN_DEVICE_KERNELS_CUH
 #define MULTI_COLUMN_DEVICE_KERNELS_CUH

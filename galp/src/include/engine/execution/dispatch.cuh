@@ -9,8 +9,8 @@
 #include "engine/device-utils.cuh"
 #include "engine/expression.cuh"
 #include "engine/lane-policy.cuh"
-#include "flsgpu/consts.cuh"
-#include "flsgpu/fls.cuh"
+#include "compression/consts.cuh"
+#include "decompression/primitives.cuh"
 
 namespace galp::kernels::detail {
 

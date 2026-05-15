@@ -14,8 +14,8 @@
 #define ENGINE_EXECUTION_COLUMN_TRAITS_CUH
 
 #include "engine/expression.cuh"
-#include "flsgpu/memory/device_arena.cuh"
-#include "flsgpu/structs.cuh"
+#include "memory/device_arena.cuh"
+#include "compression/columns/all.cuh"
 #include <memory>
 #include <stdexcept>
 #include <type_traits>

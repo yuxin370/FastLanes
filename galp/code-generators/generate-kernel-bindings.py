@@ -15,8 +15,8 @@ import logging
 GENERATED_BINDINGS_DIR: str = ""
 
 FILE_HEADER = """
-#include "engine/kernels.cuh"
-#include "engine/multi-column-host-kernels.cuh"
+#include "engine/kernels/dispatch.cuh"
+#include "galp_bench/generated/multi_column_host_kernels.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 
@@ -384,14 +384,14 @@ def get_if_statement_check_wrapper(
         or patcher not in MULTI_COLUMN_PATCHERS
         or args.disable_multi_column
     )
-    old_fls_filter = unpacker == "OldFls" and (
+    legacy_fastlanes_filter = unpacker == "OldFls" and (
         n_vec != 1 or data_type not in ["uint32_t", "float"]
     )
     is_filtered = (
         unnessary_filter
         or switch_case_filter
         or multi_column_filter
-        or old_fls_filter
+        or legacy_fastlanes_filter
     )
     if is_filtered:
         return ""

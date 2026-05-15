@@ -5,9 +5,12 @@
 // ────────────────────────────────────────────────────────
 #include "engine/data/value-store.cuh"
 #include "engine/execution/column.cuh"
+#include "engine/execution/column_traits.cuh"
+#include "engine/execution/internal/expr_ops.cuh"
 #include "engine/execution/internal/unpack_dispatch.cuh"
+#include "engine/kernels/dispatch.cuh"
 #include "engine/reader.cuh"
-#include "flsgpu/fls.cuh"
+#include "decompression/primitives.cuh"
 #include <cstring>
 #include <memory>
 #include <type_traits>

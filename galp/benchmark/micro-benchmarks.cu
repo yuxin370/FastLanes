@@ -5,10 +5,10 @@
 // ────────────────────────────────────────────────────────
 #include "data.cuh"
 #include "engine/enums.cuh"
-#include "engine/kernels.cuh"
+#include "engine/kernels/dispatch.cuh"
 #include "engine/types.cuh"
-#include "flsgpu/flsgpu.cuh"
-#include "flsgpu/memory/device_pool.cuh"
+#include "decompression/alp.cuh"
+#include "memory/device_pool.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
 #include "verification.cuh"
 #include <chrono>
@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
+[[maybe_unused]] static inline void CUDA_CHECK(cudaError_t e, const char* msg) {
 	if (e != cudaSuccess) {
 		fprintf(stderr, "[CUDA] %s: %s\n", msg, cudaGetErrorString(e));
 		throw std::runtime_error(msg);

@@ -11,7 +11,7 @@
 #include "fls/unffor.hpp"
 #include "fls_gen/pack/pack.hpp"
 #include "fls_gen/unpack/unpack.hpp"
-#include "flsgpu/flsgpu.cuh"
+#include "decompression/alp.cuh"
 #include <algorithm>
 #include <bit>
 #include <cstddef>
@@ -911,7 +911,7 @@ galp::codec::host::CROSSRLEColumn<T> generate_cross_rle_column(const size_t n_va
 	const UINT_T max_value = galp::codec::utils::h_set_first_n_bits<UINT_T>(value_bit_width);
 	auto gen_value = primitives::get_random_number_generator<UINT_T>(UINT_T {0}, 30); // for debug, make it small
 
-	// run length generat：repeat higher -> run longer -> run count less)
+	// Run length generator: higher repeat -> longer runs -> fewer runs.
 	// max_run_len = min(VPV, 4*repeat)
 	const uint32_t max_run_len =
 	    std::max<uint32_t>(1, std::min<uint32_t>(VPV, uint32_t {4} * std::max<unsigned>(1, repeat)));
@@ -973,11 +973,11 @@ galp::codec::host::DICTFFORColumn<T> generate_random_dict_column(const size_t   
 
 	// 1) key_count = 2^bw
 	column.key_count = std::min(key_count_from_bits(value_bit_width), size_t {32}); // limit to 8192 keys
-	// 2) keys: 0,1,2,...,key_count-1（for debug）
+	// 2) keys: 0,1,2,...,key_count-1 (for debug)
 	column.keys = primitives::fill_array_with_sequence<UINT_T>(
 	    new UINT_T[column.key_count], column.key_count, UINT_T {0}, UINT_T {1});
 
-	// 3) indices ∈ [0, key_count-1]
+	// 3) indices in [0, key_count-1]
 	UINT_T* indices = primitives::fill_array_with_random_data<UINT_T>(
 	    new UINT_T[n_values], n_values, repeat, UINT_T {0}, UINT_T(column.key_count - 1));
 
@@ -985,7 +985,7 @@ galp::codec::host::DICTFFORColumn<T> generate_random_dict_column(const size_t   
 	auto bp = galp::bench::bindings::compress<UINT_T>(indices, n_values, value_bit_width);
 	delete[] indices;
 
-	// 5) set FFOR bases all to 0（idx = value + base）
+	// 5) set FFOR bases all to 0 (idx = value + base)
 	const size_t n_vecs = bp.get_n_vecs();
 	column.ffor         = galp::codec::host::FFORColumn<UINT_T> {
 	    std::move(bp),

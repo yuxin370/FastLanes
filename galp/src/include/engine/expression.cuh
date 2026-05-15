@@ -8,7 +8,7 @@
 
 #include "engine/data/model.cuh"
 #include "fls/footer/operator_token_generated.h"
-#include "flsgpu/structs.cuh"
+#include "compression/columns/all.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <limits>

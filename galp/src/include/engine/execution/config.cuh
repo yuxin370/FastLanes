@@ -9,6 +9,7 @@
 #ifndef ENGINE_EXECUTION_CONFIG_CUH
 #define ENGINE_EXECUTION_CONFIG_CUH
 
+#include "engine/data/model.cuh"
 #include "engine/types.cuh"
 
 namespace galp::execution {

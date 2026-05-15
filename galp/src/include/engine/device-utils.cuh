@@ -3,8 +3,9 @@
 // ────────────────────────────────────────────────────────
 // galp/src/include/engine/device-utils.cuh
 // ────────────────────────────────────────────────────────
-#include "flsgpu/fls/untransposers.cuh"
-#include "flsgpu/flsgpu.cuh"
+#include "compression/device-types.cuh"
+#include "compression/utils.cuh"
+#include "decompression/primitives/untransposers.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>

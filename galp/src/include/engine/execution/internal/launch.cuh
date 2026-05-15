@@ -6,8 +6,11 @@
 #ifndef ENGINE_EXECUTION_INTERNAL_LAUNCH_CUH
 #define ENGINE_EXECUTION_INTERNAL_LAUNCH_CUH
 
-#include "engine/execution/internal/prepare.cuh"
+#include "engine/execution/dispatch.cuh"
+#include "engine/execution/internal/batch_kernel.cuh"
 #include "engine/execution/internal/unpack_dispatch.cuh"
+#include "engine/runtime/workset/model.cuh"
+#include "engine/runtime/workset/streams.cuh"
 
 namespace galp::runtime {
 

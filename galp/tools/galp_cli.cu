@@ -4,7 +4,7 @@
 // galp/tools/galp_cli.cu
 // ────────────────────────────────────────────────────────
 #include "engine/benchmark/table.cuh"
-#include "engine/execution/common.cuh"
+#include "engine/execution/config.cuh"
 #include "engine/execution/rowgroup.cuh"
 #include "engine/execution/table_options.cuh"
 #include "engine/expression.cuh"

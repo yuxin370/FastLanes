@@ -66,11 +66,16 @@ set_target_properties(generated-bindings PROPERTIES CUDA_SEPARABLE_COMPILATION O
 
 
 if (GALP_WITH_NVCOMP)
-        add_executable(compressors-benchmarks compressors-benchmarks.cu nvcomp/benchmark-compressors.cu nvcomp/nvcomp-compressors.cu)
+        add_executable(compressors-benchmarks
+                compressors-benchmarks.cu
+                nvcomp/benchmark-compressors.cu
+                nvcomp/nvcomp-compressors.cu
+                nvcomp/types.cu)
         apply_warnings(compressors-benchmarks)
         target_include_directories(compressors-benchmarks PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
-                ${CMAKE_CURRENT_SOURCE_DIR}/../src/include)
+                ${CMAKE_CURRENT_SOURCE_DIR}/../src/include
+                ${CMAKE_CURRENT_SOURCE_DIR}/../support/include)
         target_link_libraries(compressors-benchmarks PRIVATE galp_core nvcomp::nvcomp)
         target_compile_definitions(compressors-benchmarks PRIVATE FLS_GALP_SOURCE_DIR="${GALP_DATA_ROOT}")
 endif ()

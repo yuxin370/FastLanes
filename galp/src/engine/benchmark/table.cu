@@ -4,8 +4,8 @@
 // galp/src/engine/benchmark/table.cu
 // ────────────────────────────────────────────────────────
 #include "engine/benchmark/table.cuh"
-#include "engine/execution/internal/table_pipeline.cuh"
-#include "flsgpu/memory/cuda_macros.cuh"
+#include "engine/runtime/pipeline.cuh"
+#include "memory/cuda_macros.cuh"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>

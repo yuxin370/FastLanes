@@ -7,7 +7,7 @@
 #define MULTI_COLUMN_DEVICE_KERNELS_CUH
 
 #include "engine/device-utils.cuh"
-#include "flsgpu/flsgpu.cuh"
+#include "decompression/alp.cuh"
 
 namespace galp::bench::multi_column {
 

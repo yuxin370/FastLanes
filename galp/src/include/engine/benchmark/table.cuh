@@ -41,7 +41,7 @@ struct TableBenchmarkResult {
 	double query_wall_ms           = 0.0; // wall clock of the query run after optional resource prepare
 	double pipeline_active_ms      = 0.0; // query wall minus pipeline setup
 	double read_rowgroup_ms        = 0.0; // galp::format::read_rowgroup* stage
-	double file_read_ms            = 0.0; // legacy rowgroup read/setup stage before rowgroup build
+	double file_read_ms            = 0.0; // rowgroup read/setup stage before rowgroup build
 	double rowgroup_build_ms       = 0.0; // rowgroup/column construction after file IO
 	double pinned_acquire_ms       = 0.0; // pinned rowgroup buffer lease time before file IO
 	double pread_ms                = 0.0; // time spent in File::ReadRangeUnchecked / pread
@@ -50,7 +50,7 @@ struct TableBenchmarkResult {
 	double prefetch_byte_block_ms  = 0.0; // worker time blocked by byte-level prefetch budget
 	double read_wall_ms            = 0.0; // wall span from first rowgroup read start to last rowgroup build end
 	double pread_wall_ms           = 0.0; // wall span from first pread start to last pread end
-	double file_read_wall_ms       = 0.0; // wall span of the legacy file_read_ms stage
+	double file_read_wall_ms       = 0.0; // wall span of the file_read_ms stage
 	double assemble_expr_ms        = 0.0; // galp::expression::assemble stage
 	double append_expr_ms          = 0.0; // runtime::append_expressions stage
 	double upload_workset_ms       = 0.0; // runtime::upload_workset stage

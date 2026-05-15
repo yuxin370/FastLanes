@@ -9,7 +9,7 @@
 #include "engine/data/value-store.cuh"
 #include "engine/types.cuh"
 #include "fls/footer/operator_token_generated.h"
-#include "flsgpu/columns/all.cuh"
+#include "compression/columns/all.cuh"
 #include <cstddef>
 #include <limits>
 #include <memory>

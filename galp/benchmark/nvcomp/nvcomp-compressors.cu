@@ -3,7 +3,7 @@
 // ────────────────────────────────────────────────────────
 // galp/benchmark/nvcomp/nvcomp-compressors.cu
 // ────────────────────────────────────────────────────────
-#include "nvcomp/nvcomp-compressors.cuh"
+#include "galp_bench/nvcomp/nvcomp_compressors.cuh"
 #include <assert.h>
 #include <cstddef>
 #include <cstdint>

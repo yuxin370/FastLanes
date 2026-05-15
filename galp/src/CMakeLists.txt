@@ -1,8 +1,18 @@
 set(GALP_CORE_SOURCES
         api/table.cu
         alp/alp-bindings.cu
+        memory/device_arena.cu
         engine/enums.cu
+        engine/format/reader.cu
+        engine/format/rowgroup_io.cu
+        engine/format/schema_plan.cu
+        engine/format/zero_copy_materializer.cu
         engine/execution/column.cu
+        engine/runtime/materialize/metadata.cu
+        engine/runtime/materialize/pinned_d2h.cu
+        engine/runtime/table/helpers.cu
+        engine/runtime/workset/streams.cu
+        engine/runtime/workset/upload.cu
         engine/execution/rowgroup.cu
         engine/execution/table.cu
         engine/io/to_csv.cu

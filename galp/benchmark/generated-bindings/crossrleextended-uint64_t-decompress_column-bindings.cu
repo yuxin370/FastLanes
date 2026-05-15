@@ -3,8 +3,8 @@
 // ────────────────────────────────────────────────────────
 // galp/benchmark/generated-bindings/crossrleextended-uint64_t-decompress_column-bindings.cu
 // ────────────────────────────────────────────────────────
-#include "engine/kernels.cuh"
-#include "engine/multi-column-host-kernels.cuh"
+#include "engine/kernels/dispatch.cuh"
+#include "galp_bench/generated/multi_column_host_kernels.cuh"
 #include "generated-bindings/kernel-bindings.cuh"
 #include <stdexcept>
 

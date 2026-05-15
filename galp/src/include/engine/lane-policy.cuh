@@ -7,7 +7,7 @@
 #define ENGINE_LANE_POLICY_CUH
 
 #include "engine/expression.cuh"
-#include "flsgpu/utils.cuh"
+#include "compression/utils.cuh"
 
 namespace galp::execution {
 

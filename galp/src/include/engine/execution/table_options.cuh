@@ -37,11 +37,11 @@ inline TableDecompressionConfig make_table_decompression_config(const galp::Deco
 	cfg.execution.write_out = options.write_output;
 	cfg.scope               = to_table_scope(options.scope);
 	const galp::AdvancedOptions defaults {};
-	const auto choose_bool = [](const bool legacy_value, const bool advanced_value, const bool default_value) {
-		return legacy_value != default_value ? legacy_value : advanced_value;
+	const auto choose_bool = [](const bool top_level_value, const bool advanced_value, const bool default_value) {
+		return top_level_value != default_value ? top_level_value : advanced_value;
 	};
-	const auto choose_size = [](const size_t legacy_value, const size_t advanced_value, const size_t default_value) {
-		return legacy_value != default_value ? legacy_value : advanced_value;
+	const auto choose_size = [](const size_t top_level_value, const size_t advanced_value, const size_t default_value) {
+		return top_level_value != default_value ? top_level_value : advanced_value;
 	};
 	apply_table_streaming_options(
 	    cfg,

@@ -8,6 +8,7 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 option(GALP_BUILD_TESTS "Build GALP tests" ${BUILD_TESTING})
 option(GALP_BUILD_BENCHMARKS "Build GALP benchmarks" OFF)
@@ -107,6 +108,19 @@ endmacro()
 # artifacts.
 set(GALP_DATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH
     "Root directory containing data/floats and data/doubles for galp tests and benchmarks")
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+        add_custom_target(galp_include_boundary_checks
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check_include_boundaries.py
+                        --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/..
+                        --galp-root ${CMAKE_CURRENT_SOURCE_DIR}
+                COMMENT "Checking GALP include boundaries"
+                VERBATIM)
+else ()
+        message(STATUS "Python3 interpreter not found; galp_include_boundary_checks target is unavailable")
+endif ()
 
 add_custom_target(galp_api_boundary_checks
 	COMMAND ${CMAKE_COMMAND}
