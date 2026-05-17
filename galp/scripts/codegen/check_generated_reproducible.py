@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+import argparse
+import difflib
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+GALP_ROOT = REPO_ROOT / "galp"
+CODEGEN_DIR = GALP_ROOT / "scripts" / "codegen"
+
+EXPECTED_BINDING_FILES = [
+    "alp-double-decompress_column-bindings.cu",
+    "alp-double-query_column-bindings.cu",
+    "alp-double-query_multi_column-bindings.cu",
+    "alp-float-decompress_column-bindings.cu",
+    "alp-float-query_column-bindings.cu",
+    "alp-float-query_multi_column-bindings.cu",
+    "alpextended-double-decompress_column-bindings.cu",
+    "alpextended-double-query_column-bindings.cu",
+    "alpextended-double-query_multi_column-bindings.cu",
+    "alpextended-float-decompress_column-bindings.cu",
+    "alpextended-float-query_column-bindings.cu",
+    "alpextended-float-query_multi_column-bindings.cu",
+    "bp-uint32_t-decompress_column-bindings.cu",
+    "bp-uint32_t-query_column-bindings.cu",
+    "bp-uint64_t-decompress_column-bindings.cu",
+    "bp-uint64_t-query_column-bindings.cu",
+    "constant-uint32_t-decompress_column-bindings.cu",
+    "constant-uint64_t-decompress_column-bindings.cu",
+    "crossrle-uint32_t-decompress_column-bindings.cu",
+    "crossrle-uint64_t-decompress_column-bindings.cu",
+    "crossrleextended-uint32_t-decompress_column-bindings.cu",
+    "crossrleextended-uint64_t-decompress_column-bindings.cu",
+    "crossrlelanemask-uint32_t-decompress_column-bindings.cu",
+    "crossrlelanemask-uint64_t-decompress_column-bindings.cu",
+    "dict-uint32_t-decompress_column-bindings.cu",
+    "dict-uint64_t-decompress_column-bindings.cu",
+    "dictslpatch-uint32_t-decompress_column-bindings.cu",
+    "dictslpatch-uint64_t-decompress_column-bindings.cu",
+    "ffor-uint32_t-compute_column-bindings.cu",
+    "ffor-uint32_t-decompress_column-bindings.cu",
+    "ffor-uint32_t-query_column-bindings.cu",
+    "ffor-uint32_t-query_multi_column-bindings.cu",
+    "ffor-uint64_t-compute_column-bindings.cu",
+    "ffor-uint64_t-decompress_column-bindings.cu",
+    "ffor-uint64_t-query_column-bindings.cu",
+    "ffor-uint64_t-query_multi_column-bindings.cu",
+    "freq-int16_t-decompress_column-bindings.cu",
+    "freq-int8_t-decompress_column-bindings.cu",
+    "freq-uint32_t-decompress_column-bindings.cu",
+    "freq-uint64_t-decompress_column-bindings.cu",
+    "freqextended-int16_t-decompress_column-bindings.cu",
+    "freqextended-int8_t-decompress_column-bindings.cu",
+    "freqextended-uint32_t-decompress_column-bindings.cu",
+    "freqextended-uint64_t-decompress_column-bindings.cu",
+    "rle-uint32_t-decompress_column-bindings.cu",
+    "rle-uint64_t-decompress_column-bindings.cu",
+    "slpatch-int16_t-decompress_column-bindings.cu",
+    "slpatch-uint32_t-decompress_column-bindings.cu",
+    "slpatch-uint64_t-decompress_column-bindings.cu",
+]
+
+EXPECTED_HEADER_FILES = [
+    "kernel_bindings.cuh",
+    "multi_column_device_kernels.cuh",
+    "multi_column_host_kernels.cuh",
+]
+
+
+def relative_files(root: Path, suffix: str) -> list[str]:
+    return sorted(str(path.relative_to(root)) for path in root.rglob(f"*{suffix}") if path.is_file())
+
+
+def print_list_diff(label: str, expected: list[str], generated: list[str]) -> bool:
+    if expected == generated:
+        return False
+    print(f"{label} generated file list differs from expected manifest", file=sys.stderr)
+    for line in difflib.unified_diff(
+        expected,
+        generated,
+        fromfile=f"expected {label}",
+        tofile=f"generated {label}",
+        lineterm="",
+    ):
+        print(line, file=sys.stderr)
+    return True
+
+
+def run_codegen(tmp_dir: Path) -> tuple[Path, Path]:
+    bindings_dir = tmp_dir / "bindings"
+    headers_dir = tmp_dir / "include" / "galp_bench" / "generated"
+    bindings_dir.mkdir(parents=True, exist_ok=True)
+    headers_dir.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(CODEGEN_DIR / "generate_kernel_bindings.py"),
+            "--out-dir",
+            str(bindings_dir),
+            "--header-out-dir",
+            str(headers_dir),
+            "--logging-level",
+            "40",
+        ],
+        check=True,
+        cwd=REPO_ROOT,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(CODEGEN_DIR / "generate_multicolumn_kernels.py"),
+            "--out-dir",
+            str(headers_dir),
+            "--logging-level",
+            "40",
+        ],
+        check=True,
+        cwd=REPO_ROOT,
+    )
+    return bindings_dir, headers_dir
+
+
+def check(tmp_dir: Path) -> int:
+    generated_bindings_dir, generated_headers_dir = run_codegen(tmp_dir)
+
+    generated_cu = relative_files(generated_bindings_dir, ".cu")
+    generated_cuh = relative_files(generated_headers_dir, ".cuh")
+
+    failed = False
+    failed |= print_list_diff(".cu", sorted(EXPECTED_BINDING_FILES), generated_cu)
+    failed |= print_list_diff(".cuh", sorted(EXPECTED_HEADER_FILES), generated_cuh)
+
+    dictshfl32 = [name for name in generated_cu if name.startswith("dictshfl32-")]
+    if dictshfl32:
+        failed = True
+        print("dictshfl32 bindings are generated by default:", file=sys.stderr)
+        for name in dictshfl32:
+            print(f"  {name}", file=sys.stderr)
+
+    if failed:
+        print(f"generated output does not match the expected manifest; temporary output: {tmp_dir}", file=sys.stderr)
+        return 1
+
+    print("generated output matches the expected manifest")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tmp-dir", help="Use this temporary directory instead of creating one.")
+    parser.add_argument("--keep-tmp", action="store_true", help="Keep the generated temporary output.")
+    args = parser.parse_args()
+
+    if args.tmp_dir:
+        tmp_dir = Path(args.tmp_dir).resolve()
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
+        return check(tmp_dir)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="galp_codegen_check_"))
+    try:
+        return check(tmp_dir)
+    finally:
+        if args.keep_tmp:
+            print(f"kept temporary output: {tmp_dir}")
+        else:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

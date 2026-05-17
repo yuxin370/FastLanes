@@ -9,7 +9,6 @@ build/
 *-build/
 Testing/
 build-support/boost_*
-galp/benchmark/generated-bindings/dictshfl32*
 scripts/my_tool/
 
 # Build directories created by Clion
@@ -18,8 +17,6 @@ cmake-build-*/
 #test 
 python/tests/
 build*/
-galp/benchmark/generated-bindings-tp/
-galp/benchmark/generated-bindings-original/
 scripts/my_tool/*_result
 *.all
 *.ncu-rep
