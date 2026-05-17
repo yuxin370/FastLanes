@@ -4,7 +4,7 @@ G-ALP is the GPU decompression component for FastLanes. This subtree is being
 shaped into a repository-local library component with a small public facade.
 
 The stable external surface is intentionally narrow. Most implementation
-headers under `src/include` are private and may change without compatibility
+headers under `src` are private and may change without compatibility
 guarantees.
 
 ## Status
@@ -13,8 +13,9 @@ guarantees.
   rowgroups.
 - Public API: `galp/include/galp` exposes `galp::Reader`, `galp::Table`,
   `galp::RowgroupView`, `galp::ColumnView`, and `galp::DecompressOptions`.
-- Private implementation: `engine/*`, `compression/*`, `decompression/*`,
-  `memory/*`, generated bindings, benchmark headers, and nvCOMP support.
+- Private implementation: `core/*`, `storage/*`, `execution/*`, `runtime/*`,
+  `cuda/*`, `codecs/*`, generated bindings, benchmark headers, and nvCOMP
+  support.
 - CUDA is required for runtime behavior and GPU correctness tests. Tests that
   need a CUDA device or local sample data should skip when those inputs are not
   available.
@@ -52,19 +53,21 @@ FLS rowgroup
 | Area | Path | Responsibility |
 |---|---|---|
 | Public facade | `include/galp`, `src/api` | Stable external API |
-| Format/reader | `src/include/engine/format`, `src/include/engine/reader.cuh` | FLS descriptors, schema plans, rowgroup IO, zero-copy rowgroups |
-| Expression | `src/include/engine/expression.cuh` | Convert rowgroup columns into execution expressions |
-| Execution | `src/include/engine/execution/*` | Decode configuration, rowgroup/table data models, public engine entry points |
-| Runtime | `src/include/engine/runtime/*` | Worksets, H2D upload, streaming table pipeline, materialization |
-| Execution internals | `src/include/engine/execution/internal/*` | Prefetch queues, launch glue, batch/unpack dispatch |
-| Compression formats | `src/include/compression/columns`, `src/include/compression/*.cuh` | Compressed column descriptors, shared constants, format utilities |
-| Decompression primitives | `src/include/decompression/primitives.cuh`, `src/include/decompression/primitives` | Vector-layout unpackers, patchers, expanders, decompressors, ALP helpers |
-| Memory | `src/include/memory`, `src/memory` | CUDA RAII, DeviceArena, DevicePool, pinned host pools |
-| Kernels | `src/include/engine/kernels/*` | CUDA kernel wrappers and host launch helpers |
-| CLI | `tools/galp_cli.cu` | `read_table`, `benchmark`, launch measurement |
-| Benchmarks | `benchmark` | Generated bindings, microbenchmarks, nvCOMP comparisons |
-| Code generation | `code-generators` | Benchmark binding generation |
-| Tests | `test` | Public API smoke tests, reader tests, GPU/internal tests |
+| Format/reader | `src/storage` | FLS descriptors, schema plans, rowgroup IO, zero-copy rowgroups |
+| Expression/core | `src/core` | Data model, enums, type helpers, expression assembly |
+| Execution | `src/execution` | Decode configuration, rowgroup/table data models, execution entry points |
+| Runtime | `src/runtime` | Worksets, H2D upload, streaming table pipeline, materialization |
+| Execution internals | `src/execution/internal` | Prefetch queues, launch glue, batch/unpack dispatch |
+| Compression formats | `src/codecs/columns`, `src/codecs/*.cuh` | Compressed column descriptors, shared constants, format utilities |
+| Decompression primitives | `src/codecs/decode`, `src/codecs/decode/primitives` | Vector-layout unpackers, patchers, expanders, decompressors, ALP helpers |
+| Memory | `src/cuda/memory` | CUDA RAII, DeviceArena, DevicePool, pinned host pools |
+| Kernels | `src/cuda/kernels` | CUDA kernel wrappers and host launch helpers |
+| CLI | `tools/galp_cli/galp_cli.cu` | `read_table`, `benchmark`, launch measurement |
+| ALP extension | `extensions/alp` | CPU ALP encode/decode support for tests and benchmarks |
+| Tool support | `tools/benchmark_support`, `tools/data` | CLI benchmark support and data helpers |
+| Benchmarks | `benchmarks` | Generated bindings, microbenchmarks, nvCOMP comparisons |
+| Code generation | `scripts/codegen` | Benchmark binding generation |
+| Tests | `tests` | Public API smoke tests, reader tests, GPU/internal tests |
 
 ## Public API
 
@@ -129,19 +132,20 @@ FFOR+SLPATCH i8/i16, dictionary i8/i16, cross-RLE i8, RLE i8/i16, and
 context.
 
 Public headers must not include private implementation prefixes such as
-`engine/`, `compression/`, `decompression/`, `memory/`, `benchmark/`, `alp/`,
-`nvcomp/`, or `generator/`. Check the boundary with:
+`core/`, `storage/`, `execution/`, `runtime/`, `cuda/`, `codecs/`, benchmark,
+extension, or tool-support implementation paths. Check the boundary with:
 
 ```bash
-cmake --build build --target galp_api_boundary_checks
+cmake --build build-galp-ninja --target galp_api_boundary_checks
 ```
 
 ## Build
 
-Configure from the repository root:
+Configure from the repository root. The examples below use `build-galp-ninja`
+for the normal development build:
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build-galp-ninja -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
   -DGALP_BUILD_TESTS=ON \
   -DGALP_BUILD_TOOLS=ON \
@@ -149,10 +153,19 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DGALP_WITH_NVCOMP=OFF
 ```
 
-Common development targets:
+Build the core library, public API smoke target, tests, and CLI:
 
 ```bash
-cmake --build build --target galp_core galp_public_api_smoke galp_tests galp_cli -j
+cmake --build build-galp-ninja --target galp_core galp_public_api_smoke galp_tests galp_cli -j
+```
+
+Run the usual validation set:
+
+```bash
+ctest --test-dir build-galp-ninja -L public-api --output-on-failure
+ctest --test-dir build-galp-ninja -L gpu --output-on-failure
+ctest --test-dir build-galp-ninja -R GalpPackageConsumerSmoke --output-on-failure
+cmake --build build-galp-ninja --target galp_api_boundary_checks
 ```
 
 Common CMake options:
@@ -160,20 +173,38 @@ Common CMake options:
 ```text
 GALP_BUILD_TESTS        Build GALP tests
 GALP_BUILD_TOOLS        Build galp_cli
-GALP_BUILD_BENCHMARKS   Build generated bindings and micro-benchmarks
+GALP_BUILD_EXAMPLES     Build GALP examples
+GALP_BUILD_BENCHMARKS   Build generated bindings and microbenchmarks
 GALP_WITH_NVCOMP        Build nvCOMP compressor comparison targets
 GALP_ENABLE_MULTI_COLUMN Reserved; keep OFF, ON fails configure by design
 GALP_ENABLE_INSTALL     Generate install/export/package targets
 ```
 
-Keep benchmarks and nvCOMP disabled by default. Enable them only when generated
-microbenchmarks or nvCOMP comparisons are part of the task:
+With `GALP_BUILD_BENCHMARKS=OFF`, CMake does not run benchmark code generation
+and does not create benchmark generated outputs. Use a separate benchmark build
+tree when working on generated bindings or `micro_bench`:
 
 ```bash
-cmake -S . -B build \
+cmake -S . -B build-galp-bench -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
+  -DGALP_BUILD_TESTS=ON \
+  -DGALP_BUILD_TOOLS=ON \
+  -DGALP_BUILD_BENCHMARKS=ON \
+  -DGALP_WITH_NVCOMP=OFF
+
+cmake --build build-galp-bench --target generated-bindings micro_bench -j
+```
+
+Enable `GALP_WITH_NVCOMP=ON` only when building nvCOMP compressor comparison
+targets:
+
+```bash
+cmake -S . -B build-galp-bench-nvcomp -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
   -DGALP_BUILD_BENCHMARKS=ON \
   -DGALP_WITH_NVCOMP=ON
+
+cmake --build build-galp-bench-nvcomp --target compressor_bench -j
 ```
 
 ## Package Consumers
@@ -188,7 +219,7 @@ target_link_libraries(my_app PRIVATE Galp::core)
 Verify the build-tree package consumer with:
 
 ```bash
-ctest --test-dir build -R GalpPackageConsumerSmoke --output-on-failure
+ctest --test-dir build-galp-ninja -R GalpPackageConsumerSmoke --output-on-failure
 ```
 
 `galp_core` is a CUDA static library. Device symbols are resolved during the
@@ -197,24 +228,38 @@ build so C++ consumers can link `Galp::core` without missing
 
 Minimal examples:
 
-- `galp/examples/public_api_reader.cpp`: includes only `<galp/galp.hpp>`, prints
+- `galp/examples/public_api_reader/public_api_reader.cpp`: includes only `<galp/galp.hpp>`, prints
   rowgroup/column metadata, and reads the first column span.
-- `galp/examples/cmake-consumer/CMakeLists.txt`: demonstrates
+- `galp/examples/cmake_consumer/CMakeLists.txt`: demonstrates
   `find_package(Galp CONFIG REQUIRED)` and `target_link_libraries(... Galp::core)`.
+
+Build repository examples with:
+
+```bash
+cmake -S . -B build-galp-examples -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
+  -DGALP_BUILD_EXAMPLES=ON \
+  -DGALP_BUILD_TOOLS=ON \
+  -DGALP_BUILD_TESTS=OFF \
+  -DGALP_BUILD_BENCHMARKS=OFF
+
+cmake --build build-galp-examples --target galp_public_api_reader -j
+./build-galp-examples/galp/examples/public_api_reader/galp_public_api_reader data/fls/galp-test/data.fls
+```
 
 ## Tests
 
 Run all tests:
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --test-dir build-galp-ninja --output-on-failure
 ```
 
 Common focused subsets:
 
 ```bash
-ctest --test-dir build -L public-api --output-on-failure
-ctest --test-dir build -L gpu --output-on-failure
+ctest --test-dir build-galp-ninja -L public-api --output-on-failure
+ctest --test-dir build-galp-ninja -L gpu --output-on-failure
 ```
 
 Reader tests use `FLS_READER_TEST_FILE` when set. Otherwise they use:
@@ -231,14 +276,14 @@ available locally.
 `galp_cli` provides two main commands:
 
 ```bash
-./build/galp/tools/galp_cli read_table data/fls/galp-test/data.fls /tmp/galp_out.csv
-./build/galp/tools/galp_cli benchmark data/fls/galp-test/data.fls --samples 5
+./build-galp-ninja/galp/tools/galp_cli read_table data/fls/galp-test/data.fls /tmp/galp_out.csv
+./build-galp-ninja/galp/tools/galp_cli benchmark data/fls/galp-test/data.fls --samples 5
 ```
 
 Read one rowgroup:
 
 ```bash
-./build/galp/tools/galp_cli read_table data/fls/galp-test/data.fls /tmp/galp_out.csv --rowgroup 0
+./build-galp-ninja/galp/tools/galp_cli read_table data/fls/galp-test/data.fls /tmp/galp_out.csv --rowgroup 0
 ```
 
 The default benchmark mode is write-back-free and consume-only: decoded
@@ -246,7 +291,7 @@ registers are consumed without writing global output. Add `--include-materialize
 to measure the output-producing path:
 
 ```bash
-./build/galp/tools/galp_cli benchmark data/fls/galp-test/data.fls --samples 5 --include-materialize
+./build-galp-ninja/galp/tools/galp_cli benchmark data/fls/galp-test/data.fls --samples 5 --include-materialize
 ```
 
 Common benchmark options:
@@ -266,6 +311,25 @@ Common benchmark options:
 --include-materialize
 --reuse-table-resources
 --freq-patcher stateful|branchless|hybrid[:threshold]
+```
+
+## Microbenchmarks
+
+`micro_bench` is generated-binding driven and is built only when
+`GALP_BUILD_BENCHMARKS=ON`:
+
+```bash
+cmake --build build-galp-bench --target generated-bindings micro_bench -j
+./build-galp-bench/galp/benchmarks/micro_bench --help
+```
+
+The CLI uses normalized enum strings, not C++ type or enum names. For example,
+use `u32`, `bit-packing`, `dummy`, and `none`, not `uint32_t`, `BP`, `Dummy`,
+or `None`:
+
+```bash
+./build-galp-bench/galp/benchmarks/micro_bench \
+  u32 bit-packing decompress 1 1 dummy none none 1 8 0 0 1024 1 0
 ```
 
 ## Benchmark Semantics
@@ -346,27 +410,41 @@ GALP_VALIDATE_SHARED_POSITION_OFFSETS=1
 
 ## Generated Bindings
 
-`galp/benchmark/generated-bindings` contains generated outputs. When changing
-generated kernel bindings, edit the generators under `galp/code-generators` and
-commit the regenerated outputs in the same change.
+Generated benchmark outputs are not committed. When `GALP_BUILD_BENCHMARKS=ON`,
+CMake runs the generators under `galp/scripts/codegen` and writes outputs under
+the build tree:
+
+```text
+${CMAKE_BINARY_DIR}/generated/galp/benchmarks/bindings/
+${CMAKE_BINARY_DIR}/generated/galp/benchmarks/include/galp_bench/generated/
+```
+
+When changing generated kernel bindings, edit the generators and validate the
+expected generated file manifest with:
+
+```bash
+python3 galp/scripts/codegen/check_generated_reproducible.py \
+  --tmp-dir /tmp/galp_codegen_checker
+```
 
 `GALP_ENABLE_MULTI_COLUMN=ON` intentionally fails during configure.
 Multi-column generated `query_multi_column` translation units compile too slowly
-for the supported GALP benchmark build. Those generated files remain in the tree
-temporarily for later redesign or removal.
+for the supported GALP benchmark build. Those files are still generated in the
+build tree for reproducibility checks, but they are not compiled into the
+supported benchmark binding target.
 
 ## Development Rules
 
 - Public consumers should depend only on `<galp/galp.hpp>` and `Galp::core`.
-- `src/include` is a private include surface.
-- Public headers must not leak `engine`, `compression`, `decompression`,
-  `memory`, `benchmark`, or `nvcomp` implementation paths.
+- `src` is a private include surface.
+- Public headers must not leak `core`, `storage`, `execution`, `runtime`,
+  `cuda`, `codecs`, benchmark, extension, or tool-support implementation paths.
 - For execution/runtime/memory changes, build `galp_core` and `galp_cli`, then
   run the public API tests.
 - For public API or package changes, run `GalpPublicApiSmoke`,
   `GalpPublicApiBoundaries`, and `GalpPackageConsumerSmoke`.
-- For generated binding changes, keep generator edits and regenerated outputs in
-  the same change.
+- For generated binding changes, keep generator edits and expected-manifest
+  checks in the same change; generated outputs are build artifacts.
 
 ## Direction
 
@@ -380,7 +458,7 @@ decompression algorithms:
 - CUDA resources are moving toward RAII stream/event/pool/workset ownership.
 - The default benchmark path is write-back-free for pipeline tuning.
 
-Further modularization should keep shrinking `engine/reader.cuh` and
-`engine/runtime/pipeline.cuh`, while hardening the boundaries between reader,
+Further modularization should keep shrinking `storage/reader.cuh` and
+`runtime/pipeline.cuh`, while hardening the boundaries between reader,
 zero-copy planning, compression column construction, resource preparation,
 prefetch integration, and chunk execution.

@@ -13,6 +13,7 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 option(GALP_BUILD_TESTS "Build GALP tests" ${BUILD_TESTING})
 option(GALP_BUILD_BENCHMARKS "Build GALP benchmarks" OFF)
 option(GALP_BUILD_TOOLS "Build GALP command-line tools" ON)
+option(GALP_BUILD_EXAMPLES "Build GALP examples" OFF)
 option(GALP_WITH_NVCOMP "Build nvCOMP compressor comparison targets" OFF)
 option(GALP_ENABLE_MULTI_COLUMN "Reserved; experimental multi-column generated bindings are currently disabled" OFF)
 if (GALP_ENABLE_MULTI_COLUMN)
@@ -111,14 +112,17 @@ set(GALP_DATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
-        add_custom_target(galp_include_boundary_checks
+        set(GALP_INCLUDE_BOUNDARY_CHECK_COMMAND
                 COMMAND ${Python3_EXECUTABLE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check_include_boundaries.py
                         --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/..
-                        --galp-root ${CMAKE_CURRENT_SOURCE_DIR}
+                        --galp-root ${CMAKE_CURRENT_SOURCE_DIR})
+        add_custom_target(galp_include_boundary_checks
+                ${GALP_INCLUDE_BOUNDARY_CHECK_COMMAND}
                 COMMENT "Checking GALP include boundaries"
                 VERBATIM)
 else ()
+        set(GALP_INCLUDE_BOUNDARY_CHECK_COMMAND)
         message(STATUS "Python3 interpreter not found; galp_include_boundary_checks target is unavailable")
 endif ()
 
@@ -126,7 +130,8 @@ add_custom_target(galp_api_boundary_checks
 	COMMAND ${CMAKE_COMMAND}
 	        -DGALP_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
 	        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GalpPublicApiBoundaryCheck.cmake
-        COMMENT "Checking GALP public API include and namespace boundaries"
+        ${GALP_INCLUDE_BOUNDARY_CHECK_COMMAND}
+        COMMENT "Checking GALP public API and include boundaries"
         VERBATIM)
 
 # ────────────────────────────────────────────────
@@ -135,22 +140,34 @@ add_custom_target(galp_api_boundary_checks
 add_subdirectory(src)
 
 # ────────────────────────────────────────────────
-# 8. tests
+# 6. Optional extension libraries
+# ────────────────────────────────────────────────
+add_subdirectory(extensions/alp)
+
+# ────────────────────────────────────────────────
+# 7. Tests
 # ────────────────────────────────────────────────
 if (GALP_BUILD_TESTS)
-    add_subdirectory(test)
+    add_subdirectory(tests)
 endif ()
 
 ## ────────────────────────────────────────────────
-## 7. Benchmarks
+## 8. Benchmarks
 ## ────────────────────────────────────────────────
 if (GALP_BUILD_BENCHMARKS)
-    add_subdirectory(benchmark)
+    add_subdirectory(benchmarks)
 endif ()
 
 ## ────────────────────────────────────────────────
-## 8. Tools
+## 9. Tools
 ## ────────────────────────────────────────────────
 if (GALP_BUILD_TOOLS)
     add_subdirectory(tools)
+endif ()
+
+## ────────────────────────────────────────────────
+## 10. Examples
+## ────────────────────────────────────────────────
+if (GALP_BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif ()
