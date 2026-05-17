@@ -1,7 +1,7 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/test/thrust_core_test.cu
+// galp/tests/thrust_core_test.cu
 // ────────────────────────────────────────────────────────
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>

@@ -1,9 +1,9 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/test/thrust_memcpy_test.cu
+// galp/tests/thrust_memcpy_test.cu
 // ────────────────────────────────────────────────────────
-// test/test_thrust_memcpy.cu
+// tests/test_thrust_memcpy.cu
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>

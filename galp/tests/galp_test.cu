@@ -1,15 +1,15 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/test/galp_test.cu
+// galp/tests/galp_test.cu
 // ────────────────────────────────────────────────────────
-#include "alp/alp-bindings.cuh"
+#include "galp_extensions/alp/alp_bindings.cuh"
 #include "data/fastlanes_data.hpp"
-#include "engine/device-utils.cuh"
-#include "engine/kernels/dispatch.cuh"
-#include "decompression/alp.cuh"
-#include "compression/columns/all.cuh"
-#include "galp_support/data/generate_binaries.hpp"
+#include "cuda/device_utils.cuh"
+#include "cuda/kernels/dispatch.cuh"
+#include "codecs/decode/alp.cuh"
+#include "codecs/columns/all.cuh"
+#include "galp_tools/data/generate_binaries.hpp"
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>

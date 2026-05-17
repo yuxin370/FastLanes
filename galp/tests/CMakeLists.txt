@@ -16,12 +16,13 @@ file(MAKE_DIRECTORY
 
 target_link_libraries(galp_tests PRIVATE
         galp_core
+        galp_alp_support
         GTest::gtest_main
         FastLanes::core
 )
 target_include_directories(galp_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../support/include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/data/include)
 
 target_compile_definitions(galp_tests PRIVATE
         FLS_GALP_SOURCE_DIR="${GALP_DATA_ROOT}"

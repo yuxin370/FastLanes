@@ -1,18 +1,18 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/test/reader_test.cu
+// galp/tests/reader_test.cu
 // ────────────────────────────────────────────────────────
-#include "engine/runtime/materialize/pinned_d2h.cuh"
-#include "engine/execution/rowgroup.cuh"
-#include "engine/execution/table.cuh"
-#include "engine/reader.cuh"
+#include "runtime/materialize/pinned_d2h.cuh"
+#include "execution/rowgroup.cuh"
+#include "execution/table.cuh"
+#include "storage/reader.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/table/rowgroup.hpp"
-#include "compression/columns/all.cuh"
+#include "codecs/columns/all.cuh"
 #include "galp/galp.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -62,7 +62,7 @@ std::filesystem::path make_partial_rowgroup_fls_fixture() {
 
 	{
 		std::ofstream schema(schema_path);
-		schema << R"({"columns":[{"name":"value","type":"integer"}]})";
+		schema << R"({"columns":[{"name":"value","type":"FLS_I08"}]})";
 	}
 	{
 		std::ofstream csv(csv_path);
