@@ -3,6 +3,7 @@ add_executable(unit_test
         csv_reader_test.cpp
         double_test.cpp
         json_test.cpp
+        memory_table_test.cpp
         decimal_test.cpp
         parse_integer_test.cpp
         parse_timestamp_test.cpp

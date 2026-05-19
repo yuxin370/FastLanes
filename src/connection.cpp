@@ -20,6 +20,7 @@
 #include "fls/std/filesystem.hpp"      // for std::filesystem::directory_iterator, begin, path
 #include "fls/std/string.hpp"          // for std::string
 #include "fls/std/vector.hpp"          // for fastlanes::vector
+#include "fls/table/memory_table.hpp"  // for MemoryTable
 #include "fls/table/rowgroup.hpp"      // for Rowgroup
 #include "fls/table/table.hpp"         // for Table
 #include "fls/wizard/wizard.hpp"       // for Wizard
@@ -48,6 +49,11 @@ Connection& Connection::read_csv(const path& dir_path) {
 Connection& Connection::read_json(const path& dir_path) {
 	m_table = JsonReader::Read(dir_path, *this);
 
+	return *this;
+}
+
+Connection& Connection::read_memory(const MemoryTable& table, const MemoryTableOptions& options) {
+	load_memory_table(*this, table, options);
 	return *this;
 }
 
@@ -191,6 +197,13 @@ bool Connection::is_forced_schema() const {
 const vector<OperatorToken>& Connection::get_forced_schema_pool() const {
 	//
 	return m_config->forced_schema_pool;
+}
+
+void Connection::clear_forced_schema_state() {
+	m_config->is_forced_schema = false;
+	m_config->forced_schema.clear();
+	m_config->is_forced_schema_pool = false;
+	m_config->forced_schema_pool.clear();
 }
 
 Connection& Connection::force_schema_pool(const vector<OperatorToken>& operator_token) {

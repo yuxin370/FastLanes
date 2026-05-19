@@ -62,6 +62,8 @@ col_pt init_logical_columns(const ColumnDescriptorT& col_descriptor) {
 	}
 	case DataType::UINT8:
 		return make_unique<u08_col_t>();
+	case DataType::UINT16:
+		return make_unique<u16_col_t>();
 	case DataType::UINT32:
 		return make_unique<u32_col_t>();
 	case DataType::UINT64:

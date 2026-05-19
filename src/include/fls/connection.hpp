@@ -18,12 +18,14 @@
 #include "fls/reader/table_reader.hpp"
 #include "fls/std/filesystem.hpp" // for path
 #include "fls/std/vector.hpp"     // for vector
+#include "fls/table/memory_table.hpp"
 #include "fls/table/rowgroup.hpp" // for Rowgroup
 #include "fls/table/table.hpp"    // for Reader
 
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
 class Dir;
+class MemoryTableLoader;
 /*--------------------------------------------------------------------------------------------------------------------*/
 /*--------------------------------------------------------------------------------------------------------------------*\
  * Config
@@ -57,6 +59,7 @@ public:
 	friend class Encoder;
 	friend class CsvReader;
 	friend class Rowgroup;
+	friend class MemoryTableLoader;
 
 public:
 	Connection();
@@ -72,6 +75,8 @@ public:
 	Connection& read_csv(const path& dir_path);
 	/// READ CSV
 	Connection& read_json(const path& dir_path);
+	/// READ IN-MEMORY FIXED-WIDTH COLUMNS
+	Connection& read_memory(const MemoryTable& table, const MemoryTableOptions& options = {});
 	///! read a fls file return a reader
 	up<TableReader> read_fls(const path& file_path);
 	///!
@@ -128,6 +133,7 @@ public:
 private:
 	void prepare_table() const;
 	void write_footer(const path& dir_path) const;
+	void clear_forced_schema_state();
 
 private:
 	up<Config>           m_config;

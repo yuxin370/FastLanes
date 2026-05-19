@@ -4,6 +4,7 @@ add_library(fls_table
         chunk.cpp
         #[[]]
         column.cpp
+        memory_table.cpp
         rowgroup.cpp
         stats.cpp
         table.cpp
