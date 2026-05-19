@@ -59,6 +59,7 @@ using EncodedPayload = std::variant<galp::codec::host::BPColumn<int8_t>,
                                     galp::codec::host::DICTSLPATCHColumn<int16_t, uint8_t>,
                                     galp::codec::host::SLPATCHColumn<int16_t>,
                                     galp::codec::host::FREQColumn<int16_t>,
+                                    galp::codec::host::CROSSRLEColumn<int16_t>,
                                     galp::codec::host::RLEColumn<int16_t, uint16_t>>;
 
 struct Column {

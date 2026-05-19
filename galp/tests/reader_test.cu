@@ -15,12 +15,14 @@
 #include "codecs/encodings/all.cuh"
 #include "galp/galp.hpp"
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -118,6 +120,7 @@ std::unordered_set<fastlanes::OperatorToken> supported_tokens() {
 	    fastlanes::OperatorToken::EXP_FREQUENCY_I08,
 	    fastlanes::OperatorToken::EXP_FREQUENCY_I16,
 	    fastlanes::OperatorToken::EXP_CROSS_RLE_I08,
+	    fastlanes::OperatorToken::EXP_CROSS_RLE_I16,
 	    fastlanes::OperatorToken::EXP_FFOR_SLPATCH_I16,
 	    fastlanes::OperatorToken::EXP_CONSTANT_I08,
 	    fastlanes::OperatorToken::EXP_DICT_I08_FFOR_SLPATCH_U08,
@@ -133,6 +136,134 @@ std::unordered_set<fastlanes::OperatorToken> supported_tokens() {
 	    fastlanes::OperatorToken::EXP_RLE_I08_U16,
 	    fastlanes::OperatorToken::EXP_RLE_I16_U16,
 	};
+}
+
+bool cuda_available_for_reader_tests() {
+	int        device_count = 0;
+	const auto cuda_status  = cudaGetDeviceCount(&device_count);
+	return cuda_status == cudaSuccess && device_count > 0;
+}
+
+template <typename T>
+typename galp::codec::utils::same_width_uint<T>::type to_column_bits(const T value) {
+	typename galp::codec::utils::same_width_uint<T>::type out {};
+	std::memcpy(&out, &value, sizeof(T));
+	return out;
+}
+
+template <typename T>
+galp::codec::host::CROSSRLEColumn<T> make_test_cross_rle_column(const std::vector<T>&        values,
+                                                                const std::vector<uint32_t>& lengths,
+                                                                const size_t                n_values) {
+	using UIntT = typename galp::codec::utils::same_width_uint<T>::type;
+	if (values.size() != lengths.size()) {
+		throw std::runtime_error("test CROSS_RLE values/lengths mismatch");
+	}
+
+	const size_t n_runs = values.size();
+	auto*        raw_values = n_runs == 0 ? nullptr : new UIntT[n_runs];
+	auto*        raw_lengths = n_runs == 0 ? nullptr : new uint32_t[n_runs];
+	auto*        raw_positions = n_runs == 0 ? nullptr : new uint32_t[n_runs];
+
+	uint32_t pos = 0;
+	for (size_t i = 0; i < n_runs; ++i) {
+		raw_values[i]    = to_column_bits(values[i]);
+		raw_lengths[i]   = lengths[i];
+		raw_positions[i] = pos;
+		pos += lengths[i];
+	}
+
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
+	auto*        offsets = new uint32_t[n_vecs + 1];
+	size_t       cur = 0;
+	size_t       run = 0;
+	for (size_t vec = 0; vec < n_vecs; ++vec) {
+		const size_t target_start = vec * galp::codec::consts::VALUES_PER_VECTOR;
+		while (run < n_runs && cur + lengths[run] <= target_start) {
+			cur += lengths[run];
+			++run;
+		}
+		offsets[vec] = static_cast<uint32_t>(run);
+	}
+	offsets[n_vecs] = static_cast<uint32_t>(n_runs);
+
+	return galp::codec::host::CROSSRLEColumn<T> {n_values,
+	                                             n_runs,
+	                                             raw_values,
+	                                             raw_lengths,
+	                                             offsets,
+	                                             raw_positions};
+}
+
+template <typename T>
+void expect_cross_rle_decompresses(const std::vector<T>&        run_values,
+                                   const std::vector<uint32_t>& run_lengths,
+                                   const std::vector<T>&        expected) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for CROSS_RLE dispatch test.";
+	}
+
+	galp::execution::Rowgroup rowgroup {};
+	rowgroup.n_values = expected.size();
+	rowgroup.n_vecs   = galp::codec::utils::get_n_vecs_from_size(expected.size());
+	rowgroup.n_tuples = expected.size();
+	rowgroup.columns.push_back(galp::execution::Column {
+	    "value",
+	    std::is_same_v<T, int8_t> ? fastlanes::OperatorToken::EXP_CROSS_RLE_I08
+	                              : fastlanes::OperatorToken::EXP_CROSS_RLE_I16,
+	    make_test_cross_rle_column(run_values, run_lengths, expected.size())});
+
+	auto expressions = galp::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 1U);
+	const auto result = galp::execution::decompress_rowgroup(expressions);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+
+	const auto& values = result.columns[0]->values;
+	ASSERT_TRUE(std::holds_alternative<std::shared_ptr<T[]>>(values));
+	const auto out = std::get<std::shared_ptr<T[]>>(values);
+	ASSERT_NE(out, nullptr);
+	for (size_t i = 0; i < expected.size(); ++i) {
+		EXPECT_EQ(out[i], expected[i]) << "row=" << i;
+	}
+}
+
+std::filesystem::path make_cross_rle_i16_fls_fixture() {
+	const std::filesystem::path root = std::filesystem::path {GALP_TEST_DATA_DIR} / "cross_rle_i16";
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+
+	const auto csv_path    = root / "generated.csv";
+	const auto schema_path = root / "schema.json";
+	const auto fls_path    = root / "data.fls";
+
+	{
+		std::ofstream schema(schema_path);
+		schema << R"({"columns":[{"name":"value","type":"FLS_I16"}]})";
+	}
+	{
+		std::ofstream csv(csv_path);
+		for (int row = 0; row < 1536; ++row) {
+			int value = 0;
+			if (row < 256) {
+				value = -32768;
+			} else if (row < 512) {
+				value = -7;
+			} else if (row < 1024) {
+				value = 4096;
+			} else {
+				value = 32767;
+			}
+			csv << value << '\n';
+		}
+	}
+
+	fastlanes::Connection writer;
+	writer.set_n_vectors_per_rowgroup(2)
+	    .force_schema_pool({fastlanes::OperatorToken::EXP_CROSS_RLE_I16})
+	    .read_csv(root)
+	    .to_fls(fls_path);
+	return fls_path;
 }
 
 TEST(Materialize, KickPinnedD2HPreservesZeroLengthEntries) {
@@ -194,6 +325,74 @@ TEST(Materialize, KickPinnedD2HCanDeferWorksetStateClear) {
 	galp::runtime::discard_pinned_d2h_materialize(pending);
 	EXPECT_TRUE(batch.device_exprs.empty());
 	EXPECT_FALSE(pending.active);
+}
+
+TEST(Reader, CrossRleI16TokenMaterializesAsI16Column) {
+	const auto fls_path = make_cross_rle_i16_fls_fixture();
+
+	const auto  td_handle = galp::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	ASSERT_NE(td->m_rowgroup_descriptors(), nullptr);
+	ASSERT_GT(td->m_rowgroup_descriptors()->size(), 0U);
+	const auto* rg = td->m_rowgroup_descriptors()->Get(0);
+	ASSERT_NE(rg, nullptr);
+	ASSERT_NE(rg->m_column_descriptors(), nullptr);
+	ASSERT_EQ(rg->m_column_descriptors()->size(), 1U);
+	const auto* col_desc = rg->m_column_descriptors()->Get(0);
+	ASSERT_NE(col_desc, nullptr);
+	ASSERT_NE(col_desc->encoding_rpn(), nullptr);
+	ASSERT_NE(col_desc->encoding_rpn()->operator_tokens(), nullptr);
+	ASSERT_EQ(col_desc->encoding_rpn()->operator_tokens()->Get(0), fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+
+	galp::format::FlsReader rdr(fls_path);
+	auto                    rowgroup = rdr.read_rowgroup(0);
+	ASSERT_EQ(rowgroup.columns.size(), 1U);
+	EXPECT_EQ(rowgroup.columns[0].token, fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+	EXPECT_TRUE((std::holds_alternative<galp::codec::host::CROSSRLEColumn<int16_t>>(rowgroup.columns[0].host)));
+	EXPECT_TRUE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_CROSS_RLE_I16));
+	EXPECT_NO_THROW({
+		auto expressions = galp::expression::assemble(rowgroup);
+		EXPECT_EQ(expressions.size(), 1U);
+	});
+}
+
+TEST(Reader, CrossRleI16DispatchMatchesI08EquivalentRuns) {
+	const std::vector<uint32_t> lengths {3, 5, 2, 6};
+	expect_cross_rle_decompresses<int8_t>(
+	    {1, -2, -2, 7}, lengths, {1, 1, 1, -2, -2, -2, -2, -2, -2, -2, 7, 7, 7, 7, 7, 7});
+	expect_cross_rle_decompresses<int16_t>(
+	    {1, -2, -2, 7}, lengths, {1, 1, 1, -2, -2, -2, -2, -2, -2, -2, 7, 7, 7, 7, 7, 7});
+}
+
+TEST(Reader, CrossRleI16DispatchHandlesBoundaryValuesAndMultipleRuns) {
+	expect_cross_rle_decompresses<int16_t>(
+	    {std::numeric_limits<int16_t>::min(), -1, 0, std::numeric_limits<int16_t>::max()},
+	    {2, 3, 4, 7},
+	    {std::numeric_limits<int16_t>::min(),
+	     std::numeric_limits<int16_t>::min(),
+	     -1,
+	     -1,
+	     -1,
+	     0,
+	     0,
+	     0,
+	     0,
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max()});
+}
+
+TEST(Reader, CrossRleI16DispatchHandlesSingleRun) {
+	expect_cross_rle_decompresses<int16_t>({-12345}, {16}, std::vector<int16_t>(16, -12345));
+}
+
+TEST(Reader, CrossRleI16DispatchHandlesEmptyInput) {
+	expect_cross_rle_decompresses<int16_t>({}, {}, {});
 }
 
 bool rowgroup_supported(const fastlanes::RowgroupDescriptor*                rg,

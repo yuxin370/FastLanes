@@ -321,6 +321,8 @@ detail::decompress_host(const galp::codec::host::SLPATCHColumn<int16_t>&, const 
 template ValueStore
 detail::decompress_host(const galp::codec::host::FREQColumn<int16_t>&, const PlanKind, const ExecutionConfig&);
 template ValueStore
+detail::decompress_host(const galp::codec::host::CROSSRLEColumn<int16_t>&, const PlanKind, const ExecutionConfig&);
+template ValueStore
 detail::decompress_host(const galp::codec::host::RLEColumn<int16_t, uint16_t>&, const PlanKind, const ExecutionConfig&);
 template ValueStore
 detail::decompress_host(const galp::codec::host::RLEColumn<int16_t, uint8_t>&, const PlanKind, const ExecutionConfig&);

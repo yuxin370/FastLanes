@@ -32,6 +32,7 @@ inline bool is_supported_token(const fastlanes::OperatorToken token) {
 	case EXP_FREQUENCY_I08:
 	case EXP_FREQUENCY_I16:
 	case EXP_CROSS_RLE_I08:
+	case EXP_CROSS_RLE_I16:
 	case EXP_RLE_I08_U16:
 	case EXP_RLE_I16_U16:
 	case EXP_EQUAL:

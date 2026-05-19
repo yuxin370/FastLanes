@@ -373,6 +373,20 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				result.host_owned_by_backing = true;
 				break;
 			}
+			case EXP_CROSS_RLE_I16: {
+				if (zero_copy_operand_count(zcol) < 2) {
+					throw std::runtime_error("EXP_CROSS_RLE_I16: missing operand tokens");
+				}
+				const size_t base_idx = zero_copy_operand_count(zcol) - 1;
+				const auto   seg_vals =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 1)));
+				const auto seg_lens =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 0)));
+				result.host = make_cross_rle_zero_copy<int16_t>(
+				    seg_vals, seg_lens, zero_copy.n_values, zero_copy.n_vecs, *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
 			case EXP_RLE_I08_U16: {
 				if (zero_copy_operand_count(zcol) < 5) {
 					throw std::runtime_error("EXP_RLE_I08_U16: missing operand tokens");
