@@ -6,8 +6,8 @@
 #ifndef GALP_DECOMPRESSION_ALP_CUH
 #define GALP_DECOMPRESSION_ALP_CUH
 
-#include "codecs/columns/all.cuh"
-#include "codecs/decode/primitives.cuh"
+#include "codecs/encodings/all.cuh"
+#include "codecs/device_ops.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <type_traits>

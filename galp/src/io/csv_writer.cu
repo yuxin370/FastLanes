@@ -4,7 +4,7 @@
 // galp/src/io/csv_writer.cu
 // ────────────────────────────────────────────────────────
 #include "io/csv_writer.cuh"
-#include "storage/reader.cuh"
+#include "format/reader.cuh"
 #include <cstdint>
 #include <filesystem>
 #include <string>

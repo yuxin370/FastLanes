@@ -6,7 +6,7 @@
 #ifndef GALP_MEMORY_TRANSFER_TRACKER_CUH
 #define GALP_MEMORY_TRANSFER_TRACKER_CUH
 
-#include "cuda/memory/cuda_macros.cuh"
+#include "cuda/cuda_macros.cuh"
 
 #include <cstdint>
 #include <cuda_runtime.h>

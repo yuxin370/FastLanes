@@ -1,28 +1,42 @@
+set(GALP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/config.hpp.in
+        ${GALP_GENERATED_INCLUDE_DIR}/galp/config.hpp
+        @ONLY
+)
+
 set(GALP_CORE_SOURCES
         api/table.cu
         core/enums.cu
         core/expression.cu
         cuda/memory/device_arena.cu
-        execution/column.cu
-        execution/rowgroup.cu
-        execution/table.cu
+        engine/operators/column.cu
+        engine/operators/rowgroup.cu
+        engine/table/table.cu
         io/csv_writer.cu
-        runtime/materialize/metadata.cu
-        runtime/materialize/pinned_d2h.cu
-        runtime/table/helpers.cu
-        runtime/workset/streams.cu
-        runtime/workset/upload.cu
-        storage/reader.cu
-        storage/rowgroup_io.cu
-        storage/schema_plan.cu
-        storage/zero_copy_materializer.cu
+        engine/materialization/metadata.cu
+        engine/materialization/pinned_d2h.cu
+        engine/table/pipeline_state.cu
+        engine/workset/streams.cu
+        engine/workset/upload.cu
+        format/reader.cu
+        format/rowgroup_io.cu
+        format/schema_plan.cu
+        engine/materialization/zero_copy_materializer.cu
+        jpeg/jpeg_dct_order.cpp
 )
+if (GALP_WITH_JPEG_DCT)
+        list(APPEND GALP_CORE_SOURCES
+                jpeg/jpeg_dct.cpp
+        )
+endif ()
 add_library(galp_core STATIC ${GALP_CORE_SOURCES})
 add_library(Galp::core ALIAS galp_core)
 set_target_properties(galp_core PROPERTIES
         EXPORT_NAME core
         CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(galp_core PUBLIC
+        $<BUILD_INTERFACE:${GALP_GENERATED_INCLUDE_DIR}>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_include_directories(galp_core PRIVATE
@@ -33,6 +47,10 @@ target_link_libraries(galp_core PUBLIC
         Thrust::Thrust
         $<BUILD_INTERFACE:FastLanes::core>
         $<INSTALL_INTERFACE:FLS::FastLanes>)
+if (GALP_WITH_JPEG_DCT)
+        target_link_libraries(galp_core PRIVATE JPEG::JPEG)
+        target_compile_definitions(galp_core PRIVATE GALP_WITH_JPEG_DCT=1)
+endif ()
 apply_warnings(galp_core)
 
 if (GALP_ENABLE_INSTALL)
@@ -52,6 +70,10 @@ if (GALP_ENABLE_INSTALL)
                 PATTERN "*.h"
                 PATTERN "*.hpp"
                 PATTERN "*.cuh"
+        )
+        install(
+                FILES ${GALP_GENERATED_INCLUDE_DIR}/galp/config.hpp
+                DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/galp
         )
 
         install(

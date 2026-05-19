@@ -3,7 +3,13 @@ add_executable(galp_tests
         thrust_core_test.cu
         galp_test.cu
         reader_test.cu
+        jpeg_dct_order_test.cpp
 )
+if (GALP_WITH_JPEG_DCT)
+        target_sources(galp_tests PRIVATE
+                jpeg_dct_test.cpp
+        )
+endif ()
 
 add_executable(galp_public_api_smoke
         public_api_smoke.cpp
@@ -28,6 +34,9 @@ target_compile_definitions(galp_tests PRIVATE
         FLS_GALP_SOURCE_DIR="${GALP_DATA_ROOT}"
         GALP_TEST_DATA_DIR="${GALP_TEST_DATA_DIR}"
 )
+if (GALP_WITH_JPEG_DCT)
+        target_link_libraries(galp_tests PRIVATE JPEG::JPEG)
+endif ()
 
 apply_warnings(galp_tests)
 
@@ -58,6 +67,17 @@ if (GALP_ENABLE_INSTALL)
 endif ()
 
 gtest_discover_tests(galp_tests
+        TEST_FILTER "ThrustMemcpy.*:ThrustCore.*:DeviceUtils.*:JpegDct.*:JpegDctOrder.*"
         DISCOVERY_TIMEOUT 60
-        PROPERTIES LABELS "galp-gpu"
+        PROPERTIES LABELS "galp-gpu-cuda"
+)
+gtest_discover_tests(galp_tests
+        TEST_FILTER "Materialize.*:Reader.*"
+        DISCOVERY_TIMEOUT 60
+        PROPERTIES LABELS "galp-gpu-reader"
+)
+gtest_discover_tests(galp_tests
+        TEST_FILTER "ALP.*:GALP.*"
+        DISCOVERY_TIMEOUT 60
+        PROPERTIES LABELS "galp-gpu-integration"
 )

@@ -6,7 +6,7 @@
 #ifndef GALP_MEMORY_DEVICE_ARENA_CUH
 #define GALP_MEMORY_DEVICE_ARENA_CUH
 
-#include "cuda/memory/cuda_macros.cuh"
+#include "cuda/cuda_macros.cuh"
 #include "cuda/memory/device_pool.cuh"
 #include "cuda/memory/upload_metrics.cuh"
 #include <cstddef>

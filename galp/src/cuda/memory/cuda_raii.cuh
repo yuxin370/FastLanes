@@ -6,7 +6,7 @@
 #ifndef GALP_MEMORY_CUDA_RAII_CUH
 #define GALP_MEMORY_CUDA_RAII_CUH
 
-#include "cuda/memory/cuda_macros.cuh"
+#include "cuda/cuda_macros.cuh"
 #include <cuda_runtime.h>
 #include <utility>
 

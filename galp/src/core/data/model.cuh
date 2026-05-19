@@ -9,7 +9,7 @@
 #include "core/data/value_store.cuh"
 #include "core/types.cuh"
 #include "fls/footer/operator_token_generated.h"
-#include "codecs/columns/all.cuh"
+#include "codecs/encodings/all.cuh"
 #include <cstddef>
 #include <limits>
 #include <memory>

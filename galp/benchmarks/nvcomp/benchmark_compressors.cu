@@ -6,7 +6,7 @@
 #include "galp_extensions/alp/alp_bindings.cuh"
 #include "galp_bench/data.cuh"
 #include "cuda/device_utils.cuh"
-#include "cuda/kernels/dispatch.cuh"
+#include "cuda/launch/dispatch.cuh"
 #include "codecs/decode/alp.cuh"
 #include "galp_bench/nvcomp/benchmark_compressors.cuh"
 #include "galp_bench/nvcomp/nvcomp_compressors.cuh"

@@ -5,7 +5,7 @@ endif ()
 set(GALP_PUBLIC_INCLUDE_DIR "${GALP_ROOT}/include")
 # Public GALP headers are installed from include/galp. Includes that reach into
 # these project-private prefixes leak implementation layout to consumers.
-set(GALP_PUBLIC_HEADER_INCLUDE_PATTERN "#[ \t]*include[ \t]*[<\"](engine|compression|decompression|memory|benchmark|alp|nvcomp|generator)/")
+set(GALP_PUBLIC_HEADER_INCLUDE_PATTERN "#[ \t]*include[ \t]*[<\"](api|core|codecs|cuda|engine|format|io|compression|decompression|memory|benchmark|benchmarks|test|tests|tool|tools|extension|extensions|alp|nvcomp|generator|generated)/")
 set(GALP_HEADER_USING_NAMESPACE_PATTERN "(^|\n)[ \t]*using[ \t]+namespace[ \t]+[^;\n]+;")
 
 if (NOT EXISTS "${GALP_PUBLIC_INCLUDE_DIR}")

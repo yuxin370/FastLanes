@@ -36,15 +36,16 @@ PRIVATE_IMPLEMENTATION_PREFIXES = (
     "codecs/",
     "core/",
     "cuda/",
-    "execution/",
+    "engine/",
+    "format/",
     "io/",
+    # Legacy private prefixes must not leak into public headers either.
+    "execution/",
     "runtime/",
     "storage/",
-    # Legacy private prefixes must not leak into public headers either.
     "alp/",
     "compression/",
     "decompression/",
-    "engine/",
     "galp/internal/",
     "memory/",
 )
@@ -125,6 +126,21 @@ FORBIDDEN_EXPOSED_INCLUDE_PARTS = (
     "src/include",
     "tools/benchmark_support",
     "tools/data",
+)
+FORBIDDEN_LEGACY_ROOTS = (
+    "src/execution",
+    "src/runtime",
+    "src/storage",
+    "src/include",
+    "src/memory",
+    "benchmark",
+    "test",
+    "code-generators",
+    "support",
+)
+LEGACY_ALIAS_MARKERS = (
+    "MIGRATION_COMPATIBILITY_ALIAS",
+    ".migration_compatibility_alias",
 )
 
 
@@ -419,6 +435,26 @@ def check_cmake_boundaries(galp_root: Path, repo_root: Path) -> list[tuple[str, 
     return violations
 
 
+def check_legacy_roots(galp_root: Path, repo_root: Path) -> list[tuple[str, int, str, str, str]]:
+    violations: list[tuple[str, int, str, str, str]] = []
+    for root_name in FORBIDDEN_LEGACY_ROOTS:
+        root = galp_root / root_name
+        if not root.exists():
+            continue
+        if any((root / marker).exists() for marker in LEGACY_ALIAS_MARKERS):
+            continue
+        violations.append(
+            (
+                rel_to_repo(root, repo_root),
+                1,
+                rel_to_repo(root, repo_root),
+                "legacy GALP root must not be reintroduced unless explicitly marked as a migration compatibility alias",
+                "references",
+            )
+        )
+    return violations
+
+
 def is_public_header(path: Path, galp_root: Path) -> bool:
     public_root = galp_root / "include" / "galp"
     return path.resolve().is_relative_to(public_root.resolve()) and path.suffix in {".h", ".hh", ".hpp", ".hxx", ".cuh"}
@@ -476,6 +512,7 @@ def main() -> int:
                 violations.append((file_rel, line_number, header, reason, "includes"))
 
     violations.extend(check_cmake_boundaries(galp_root, repo_root))
+    violations.extend(check_legacy_roots(galp_root, repo_root))
 
     for file_rel, line_number, item, reason, verb in violations:
         print(f"{file_rel}:{line_number}: {verb} {item} -- {reason}")

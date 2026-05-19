@@ -6,7 +6,7 @@
 #ifndef GALP_DECOMPRESSION_FASTLANES_SWITCH_DISPATCH_CUH
 #define GALP_DECOMPRESSION_FASTLANES_SWITCH_DISPATCH_CUH
 
-#include "codecs/decode/primitives.cuh"
+#include "codecs/device_ops.cuh"
 
 namespace galp::codec::device {
 

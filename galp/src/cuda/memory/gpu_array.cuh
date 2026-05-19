@@ -6,7 +6,7 @@
 #ifndef GALP_MEMORY_GPU_ARRAY_CUH
 #define GALP_MEMORY_GPU_ARRAY_CUH
 
-#include "cuda/memory/cuda_macros.cuh"
+#include "cuda/cuda_macros.cuh"
 #include "cuda/memory/device_pool.cuh"
 
 #include <cstddef>

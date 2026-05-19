@@ -6,9 +6,9 @@
 #include "galp_extensions/alp/alp_bindings.cuh"
 #include "data/fastlanes_data.hpp"
 #include "cuda/device_utils.cuh"
-#include "cuda/kernels/dispatch.cuh"
+#include "cuda/launch/dispatch.cuh"
 #include "codecs/decode/alp.cuh"
-#include "codecs/columns/all.cuh"
+#include "codecs/encodings/all.cuh"
 #include "galp_tools/data/generate_binaries.hpp"
 #include <cuda_runtime.h>
 #include <filesystem>

@@ -6,7 +6,7 @@
 #ifndef ENGINE_IO_TO_CSV_CUH
 #define ENGINE_IO_TO_CSV_CUH
 
-#include "execution/table.cuh"
+#include "engine/table/table.cuh"
 #include "core/expression.cuh"
 #include <filesystem>
 #include <optional>

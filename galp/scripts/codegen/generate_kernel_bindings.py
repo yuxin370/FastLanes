@@ -16,7 +16,7 @@ GENERATED_BINDINGS_DIR: str = ""
 GENERATED_HEADERS_DIR: str | None = None
 
 FILE_HEADER = """
-#include "cuda/kernels/dispatch.cuh"
+#include "cuda/launch/dispatch.cuh"
 #include "galp_bench/generated/multi_column_host_kernels.cuh"
 #include "galp_bench/generated/kernel_bindings.cuh"
 #include <stdexcept>

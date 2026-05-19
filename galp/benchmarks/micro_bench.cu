@@ -5,7 +5,7 @@
 // ────────────────────────────────────────────────────────
 #include "galp_bench/data.cuh"
 #include "core/enums.cuh"
-#include "cuda/kernels/dispatch.cuh"
+#include "cuda/launch/dispatch.cuh"
 #include "core/types.cuh"
 #include "codecs/decode/alp.cuh"
 #include "cuda/memory/device_pool.cuh"

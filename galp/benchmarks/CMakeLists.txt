@@ -137,11 +137,11 @@ add_custom_target(generated_bindings DEPENDS galp_generated_bindings)
 
 
 if (GALP_WITH_NVCOMP)
-        add_executable(compressor_bench
-                compressor_bench.cu
-                nvcomp/benchmark_compressors.cu
-                nvcomp/nvcomp_compressors.cu
-                nvcomp/types.cu)
+	add_executable(compressor_bench
+		compressor_bench.cu
+		nvcomp/benchmark_compressors.cu
+		nvcomp/nvcomp_compressors.cu
+		nvcomp/types.cu)
         apply_warnings(compressor_bench)
         target_include_directories(compressor_bench PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/include

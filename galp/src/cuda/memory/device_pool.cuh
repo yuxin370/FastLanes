@@ -6,7 +6,7 @@
 #ifndef GALP_MEMORY_DEVICE_POOL_CUH
 #define GALP_MEMORY_DEVICE_POOL_CUH
 
-#include "cuda/memory/cuda_macros.cuh"
+#include "cuda/cuda_macros.cuh"
 #include "cuda/memory/pinned_host_pool.cuh"
 #include "cuda/memory/transfer_tracker.cuh"
 

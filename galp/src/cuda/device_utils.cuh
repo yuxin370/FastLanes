@@ -1,17 +1,17 @@
 // ────────────────────────────────────────────────────────
 // |                      FastLanes                       |
 // ────────────────────────────────────────────────────────
-// galp/src/device_utils.cuh
+// galp/src/cuda/device_utils.cuh
 // ────────────────────────────────────────────────────────
 #include "codecs/device_types.cuh"
 #include "codecs/utils.cuh"
-#include "codecs/decode/primitives/untransposers.cuh"
+#include "codecs/device_ops/untransposers.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#ifndef GPU_DEVICE_UTILS_CUH
-#define GPU_DEVICE_UTILS_CUH
+#ifndef GALP_CUDA_DEVICE_UTILS_CUH
+#define GALP_CUDA_DEVICE_UTILS_CUH
 
 namespace galp::lane_policy {
 
@@ -211,4 +211,4 @@ struct MagicChecker {
 	}
 };
 
-#endif // GPU_DEVICE_UTILS_CUH
+#endif // GALP_CUDA_DEVICE_UTILS_CUH

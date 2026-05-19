@@ -6,7 +6,7 @@
 #ifndef GALP_MEMORY_PINNED_HOST_POOL_CUH
 #define GALP_MEMORY_PINNED_HOST_POOL_CUH
 
-#include "cuda/memory/cuda_macros.cuh"
+#include "cuda/cuda_macros.cuh"
 
 #include <cstddef>
 #include <cstdio>

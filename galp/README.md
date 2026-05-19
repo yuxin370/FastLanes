@@ -13,9 +13,8 @@ guarantees.
   rowgroups.
 - Public API: `galp/include/galp` exposes `galp::Reader`, `galp::Table`,
   `galp::RowgroupView`, `galp::ColumnView`, and `galp::DecompressOptions`.
-- Private implementation: `core/*`, `storage/*`, `execution/*`, `runtime/*`,
-  `cuda/*`, `codecs/*`, generated bindings, benchmark headers, and nvCOMP
-  support.
+- Private implementation: `core/*`, `format/*`, `engine/*`, `cuda/*`,
+  `codecs/*`, generated bindings, benchmark headers, and nvCOMP support.
 - CUDA is required for runtime behavior and GPU correctness tests. Tests that
   need a CUDA device or local sample data should skip when those inputs are not
   available.
@@ -53,21 +52,23 @@ FLS rowgroup
 | Area | Path | Responsibility |
 |---|---|---|
 | Public facade | `include/galp`, `src/api` | Stable external API |
-| Format/reader | `src/storage` | FLS descriptors, schema plans, rowgroup IO, zero-copy rowgroups |
+| Format/reader | `src/format` | FLS descriptors, schema plans, rowgroup IO |
 | Expression/core | `src/core` | Data model, enums, type helpers, expression assembly |
-| Execution | `src/execution` | Decode configuration, rowgroup/table data models, execution entry points |
-| Runtime | `src/runtime` | Worksets, H2D upload, streaming table pipeline, materialization |
-| Execution internals | `src/execution/internal` | Prefetch queues, launch glue, batch/unpack dispatch |
-| Compression formats | `src/codecs/columns`, `src/codecs/*.cuh` | Compressed column descriptors, shared constants, format utilities |
-| Decompression primitives | `src/codecs/decode`, `src/codecs/decode/primitives` | Vector-layout unpackers, patchers, expanders, decompressors, ALP helpers |
+| Engine operators | `src/engine/operators` | Decode configuration, batch, column, and rowgroup operators |
+| Engine table | `src/engine/table` | Table execution, runners, resources, request/pipeline state |
+| Engine pipeline | `src/engine/pipeline` | Streaming pipeline, prefetch queues, pinned rowgroup pools |
+| Engine materialization | `src/engine/materialization` | Metadata, zero-copy materialization, pinned D2H |
+| Engine worksets | `src/engine/workset` | Workset model, streams, append, upload |
+| Compression formats | `src/codecs/encodings`, `src/codecs/*.cuh` | Compressed column descriptors, shared constants, format utilities |
+| Decompression primitives | `src/codecs/decode`, `src/codecs/device_ops` | Vector-layout unpackers, patchers, expanders, decompressors, ALP helpers |
 | Memory | `src/cuda/memory` | CUDA RAII, DeviceArena, DevicePool, pinned host pools |
-| Kernels | `src/cuda/kernels` | CUDA kernel wrappers and host launch helpers |
+| CUDA support | `src/cuda`, `src/cuda/launch`, `src/cuda/memory` | Device helpers, launch infrastructure, memory support, kernel implementations |
 | CLI | `tools/galp_cli/galp_cli.cu` | `read_table`, `benchmark`, launch measurement |
 | ALP extension | `extensions/alp` | CPU ALP encode/decode support for tests and benchmarks |
 | Tool support | `tools/benchmark_support`, `tools/data` | CLI benchmark support and data helpers |
-| Benchmarks | `benchmarks` | Generated bindings, microbenchmarks, nvCOMP comparisons |
+| Benchmarks | `benchmarks`, `benchmarks/nvcomp` | Generated bindings, microbenchmarks, nvCOMP comparisons |
 | Code generation | `scripts/codegen` | Benchmark binding generation |
-| Tests | `tests` | Public API smoke tests, reader tests, GPU/internal tests |
+| Tests | `tests` | Public API smoke tests, reader tests, CUDA/internal/integration tests; CTest labels carry test categories |
 
 ## Public API
 
@@ -132,7 +133,7 @@ FFOR+SLPATCH i8/i16, dictionary i8/i16, cross-RLE i8, RLE i8/i16, and
 context.
 
 Public headers must not include private implementation prefixes such as
-`core/`, `storage/`, `execution/`, `runtime/`, `cuda/`, `codecs/`, benchmark,
+`core/`, `format/`, `engine/`, `cuda/`, `codecs/`, benchmark,
 extension, or tool-support implementation paths. Check the boundary with:
 
 ```bash
@@ -437,9 +438,9 @@ supported benchmark binding target.
 
 - Public consumers should depend only on `<galp/galp.hpp>` and `Galp::core`.
 - `src` is a private include surface.
-- Public headers must not leak `core`, `storage`, `execution`, `runtime`,
-  `cuda`, `codecs`, benchmark, extension, or tool-support implementation paths.
-- For execution/runtime/memory changes, build `galp_core` and `galp_cli`, then
+- Public headers must not leak `core`, `format`, `engine`, `cuda`, `codecs`,
+  benchmark, extension, or tool-support implementation paths.
+- For engine/format/codecs/cuda changes, build `galp_core` and `galp_cli`, then
   run the public API tests.
 - For public API or package changes, run `GalpPublicApiSmoke`,
   `GalpPublicApiBoundaries`, and `GalpPackageConsumerSmoke`.
@@ -458,7 +459,7 @@ decompression algorithms:
 - CUDA resources are moving toward RAII stream/event/pool/workset ownership.
 - The default benchmark path is write-back-free for pipeline tuning.
 
-Further modularization should keep shrinking `storage/reader.cuh` and
-`runtime/pipeline.cuh`, while hardening the boundaries between reader,
+Further modularization should keep shrinking `format/reader.cuh` and
+`engine/pipeline/pipeline.cuh`, while hardening the boundaries between reader,
 zero-copy planning, compression column construction, resource preparation,
 prefetch integration, and chunk execution.

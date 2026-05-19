@@ -1,5 +1,5 @@
-#include "execution/table_options.cuh"
-#include "storage/reader.cuh"
+#include "engine/table/table_options.cuh"
+#include "format/reader.cuh"
 #include "galp/reader.hpp"
 #include "galp/table.hpp"
 #include <memory>
