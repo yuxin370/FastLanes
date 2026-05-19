@@ -1,0 +1,6 @@
+#ifndef GALP_CONFIG_HPP
+#define GALP_CONFIG_HPP
+
+#cmakedefine01 GALP_WITH_JPEG_DCT
+
+#endif // GALP_CONFIG_HPP

@@ -4,6 +4,26 @@ include(CMakeFindDependencyMacro)
 
 find_dependency(CUDAToolkit)
 
+if (@GALP_WITH_JPEG_DCT@ AND NOT TARGET JPEG::JPEG)
+    find_package(JPEG QUIET)
+    if (NOT TARGET JPEG::JPEG)
+        find_path(GALP_JPEG_INCLUDE_DIR NAMES jpeglib.h)
+        find_library(GALP_JPEG_LIBRARY NAMES jpeg)
+        if (GALP_JPEG_INCLUDE_DIR AND GALP_JPEG_LIBRARY)
+            add_library(JPEG::JPEG UNKNOWN IMPORTED)
+            set_target_properties(JPEG::JPEG PROPERTIES
+                    IMPORTED_LOCATION "${GALP_JPEG_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${GALP_JPEG_INCLUDE_DIR}")
+        endif ()
+    endif ()
+    if (NOT TARGET JPEG::JPEG)
+        set(Galp_FOUND FALSE)
+        set(Galp_NOT_FOUND_MESSAGE
+                "Galp was built with JPEG DCT support and requires the JPEG::JPEG target.")
+        return()
+    endif ()
+endif ()
+
 if (NOT TARGET FLS::FastLanes)
     find_package(FLS CONFIG QUIET)
 endif ()

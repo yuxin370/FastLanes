@@ -22,7 +22,9 @@ target_link_libraries(galp_consumer_smoke PRIVATE Galp::core)
 ]=])
 
 file(WRITE "${GALP_CONSUMER_SOURCE_DIR}/main.cpp" [=[
+#include <galp/config.hpp>
 #include <galp/galp.hpp>
+#include <galp/jpeg_dct.hpp>
 
 #include <filesystem>
 
@@ -42,6 +44,11 @@ int main() {
 	if (!table.empty()) {
 		return 3;
 	}
+#if GALP_WITH_JPEG_DCT
+	static_assert(GALP_WITH_JPEG_DCT == 1);
+#else
+	static_assert(GALP_WITH_JPEG_DCT == 0);
+#endif
 	return table.rowgroup_count() == 0 && table.total_columns() == 0 ? 0 : 4;
 }
 ]=])
