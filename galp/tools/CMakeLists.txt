@@ -1,5 +1,9 @@
 add_subdirectory(benchmark_support)
 
+if (GALP_WITH_JPEG_DCT)
+        add_subdirectory(jpeg_dct)
+endif ()
+
 add_executable(galp_cli
         galp_cli/galp_cli.cu
 )

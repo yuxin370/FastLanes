@@ -15,6 +15,7 @@ option(GALP_BUILD_BENCHMARKS "Build GALP benchmarks" OFF)
 option(GALP_BUILD_TOOLS "Build GALP command-line tools" ON)
 option(GALP_BUILD_EXAMPLES "Build GALP examples" OFF)
 option(GALP_WITH_NVCOMP "Build nvCOMP compressor comparison targets" OFF)
+option(GALP_WITH_JPEG_DCT "Build JPEG DCT dataset reader/compressor" ON)
 option(GALP_ENABLE_MULTI_COLUMN "Reserved; experimental multi-column generated bindings are currently disabled" OFF)
 if (GALP_ENABLE_MULTI_COLUMN)
     message(FATAL_ERROR
@@ -33,6 +34,30 @@ option(GALP_ENABLE_INSTALL "Generate GALP install and package targets" ${GALP_EN
 # 1. CUDA Toolkit
 # ────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
+
+if (GALP_WITH_JPEG_DCT)
+    find_package(JPEG QUIET)
+    if (NOT JPEG_FOUND)
+        find_path(GALP_JPEG_INCLUDE_DIR NAMES jpeglib.h)
+        find_library(GALP_JPEG_LIBRARY NAMES jpeg)
+        if (GALP_JPEG_INCLUDE_DIR AND GALP_JPEG_LIBRARY)
+            add_library(JPEG::JPEG UNKNOWN IMPORTED)
+            set_target_properties(JPEG::JPEG PROPERTIES
+                    IMPORTED_LOCATION "${GALP_JPEG_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${GALP_JPEG_INCLUDE_DIR}")
+            set(JPEG_FOUND ON)
+        endif ()
+    endif ()
+    if (NOT JPEG_FOUND)
+        message(WARNING
+                "GALP_WITH_JPEG_DCT=ON but CMake could not find the libjpeg-compatible API "
+                "(jpeglib.h and libjpeg.so). Disabling the JPEG DCT reader/compressor. "
+                "The libturbojpeg0-dev package provides the TurboJPEG API only and is not sufficient for "
+                "jpeg_read_coefficients. Install libjpeg-turbo8-dev or libjpeg-dev, or pass "
+                "-DJPEG_INCLUDE_DIR=/path/to/include -DJPEG_LIBRARY=/path/to/libjpeg.so.")
+        set(GALP_WITH_JPEG_DCT OFF)
+    endif ()
+endif ()
 
 # ────────────────────────────────────────────────
 # 2. nvCOMP (optional; required only for compressor comparison targets)
