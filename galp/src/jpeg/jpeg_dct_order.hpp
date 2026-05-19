@@ -1,5 +1,5 @@
-#ifndef GALP_JPEG_DCT_ORDER_CUH
-#define GALP_JPEG_DCT_ORDER_CUH
+#ifndef GALP_JPEG_DCT_ORDER_HPP
+#define GALP_JPEG_DCT_ORDER_HPP
 
 #include <array>
 #include <cstdint>
@@ -32,4 +32,4 @@ std::vector<MortonBlockCoord> make_block_order(uint32_t width_in_blocks,
 
 } // namespace galp::jpeg::detail
 
-#endif // GALP_JPEG_DCT_ORDER_CUH
+#endif // GALP_JPEG_DCT_ORDER_HPP

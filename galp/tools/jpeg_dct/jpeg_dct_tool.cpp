@@ -11,21 +11,30 @@
 namespace {
 
 struct Options {
-	std::filesystem::path              output_fls;
-	std::filesystem::path              output_metadata;
-	std::vector<std::filesystem::path> inputs;
-	galp::jpeg::JpegDatasetValidationMode policy =
-	    galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	std::filesystem::path                 output_fls;
+	std::filesystem::path                 output_metadata;
+	std::vector<std::filesystem::path>    inputs;
+	galp::jpeg::JpegDatasetValidationMode policy           = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegMetadataProfile       metadata_profile = galp::jpeg::JpegMetadataProfile::kDctDatasetOnly;
+	bool                                  metadata_profile_specified = false;
 };
 
 void print_usage(const char* prog) {
-	std::cerr << "Usage:\n"
-	          << "  " << prog << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] input.jpg\n"
-	          << "  " << prog << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] input_dir\n"
-	          << "  " << prog
-	          << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] input0.jpg [input1.jpg ...]\n"
-	          << "Default: --policy ragged. Use --policy pad only when a dense layout with fixed num_images rows per "
-	             "block group is required.\n";
+	std::cerr
+	    << "Usage:\n"
+	    << "  " << prog
+	    << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] "
+	       "[--metadata-profile dct|reconstruct|preserve] input.jpg\n"
+	    << "  " << prog
+	    << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] "
+	       "[--metadata-profile dct|reconstruct|preserve] input_dir\n"
+	    << "  " << prog
+	    << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] "
+	       "[--metadata-profile dct|reconstruct|preserve] input0.jpg [input1.jpg ...]\n"
+	    << "Default: --policy ragged and the legacy metadata format.\n"
+	    << "  --policy pad is a dense-layout mode for callers that require fixed num_images rows per block group.\n"
+	    << "  --metadata-profile writes the sectioned metadata format; use reconstruct to persist image dimensions "
+	       "and quantization tables.\n";
 }
 
 bool is_jpeg_path(const std::filesystem::path& path) {
@@ -81,6 +90,20 @@ bool parse_args(const int argc, char** argv, Options& options) {
 			}
 			continue;
 		}
+		if (arg == "--metadata-profile" && i + 1 < argc) {
+			const std::string_view profile     = argv[++i];
+			options.metadata_profile_specified = true;
+			if (profile == "dct") {
+				options.metadata_profile = galp::jpeg::JpegMetadataProfile::kDctDatasetOnly;
+			} else if (profile == "reconstruct") {
+				options.metadata_profile = galp::jpeg::JpegMetadataProfile::kReconstructableJpeg;
+			} else if (profile == "preserve") {
+				options.metadata_profile = galp::jpeg::JpegMetadataProfile::kPreserveOriginalMarkers;
+			} else {
+				throw std::runtime_error("unknown --metadata-profile value; expected dct, reconstruct, or preserve");
+			}
+			continue;
+		}
 		if (arg == "--help" || arg == "-h") {
 			return false;
 		}
@@ -104,12 +127,16 @@ int main(const int argc, char** argv) {
 
 		galp::jpeg::JpegDctReaderOptions reader_options;
 		reader_options.validation_mode = options.policy;
-		if (options.inputs.size() == 1) {
-			galp::jpeg::compress_jpeg_dct_file_to_fls(
-			    options.inputs.front(), options.output_fls, options.output_metadata, reader_options);
+		reader_options.capture_metadata_markers =
+		    options.metadata_profile == galp::jpeg::JpegMetadataProfile::kPreserveOriginalMarkers;
+		galp::jpeg::JpegDctMetadataWriterOptions writer_options;
+		writer_options.profile = options.metadata_profile;
+		auto table = options.inputs.size() == 1 ? galp::jpeg::read_jpeg_dct_file(options.inputs.front(), reader_options)
+		                                        : galp::jpeg::read_jpeg_dct_dataset(options.inputs, reader_options);
+		if (options.metadata_profile_specified) {
+			galp::jpeg::compress_jpeg_dct_to_fls(table, options.output_fls, options.output_metadata, writer_options);
 		} else {
-			galp::jpeg::compress_jpeg_dct_dataset_to_fls(
-			    options.inputs, options.output_fls, options.output_metadata, reader_options);
+			galp::jpeg::compress_jpeg_dct_to_fls(table, options.output_fls, options.output_metadata);
 		}
 		return 0;
 	} catch (const std::exception& e) {

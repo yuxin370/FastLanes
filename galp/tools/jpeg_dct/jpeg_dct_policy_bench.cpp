@@ -30,16 +30,18 @@ struct PolicyResult {
 	uintmax_t   compressed_data_size = 0;
 	uintmax_t   metadata_size = 0;
 	uintmax_t   total_output_size = 0;
+	uintmax_t   source_jpeg_size = 0;
 	size_t      real_row_count = 0;
 	size_t      padding_row_count = 0;
 	size_t      physical_row_count = 0;
 	size_t      estimated_block_group_index_size = 0;
 	double      physical_compression_ratio = 0.0;
 	double      semantic_compression_ratio = 0.0;
+	double      expansion_vs_jpeg = 0.0;
 	double      encode_ms = 0.0;
-	double      decode_ms = 0.0;
-	bool        decode_supported = true;
-	std::string decode_error;
+	double      galp_decode_ms = 0.0;
+	bool        galp_decode_supported = true;
+	std::string galp_decode_error;
 	double      in_memory_first_block_group_scan_ns = 0.0;
 };
 
@@ -150,7 +152,15 @@ std::string format_ratio(const double value) {
 }
 
 size_t estimate_block_group_index_size(const galp::jpeg::JpegDctTable& table) {
-	return table.block_group_count * sizeof(uint64_t) * 2;
+	return table.metadata.block_group_index.size() * (sizeof(uint32_t) * 5 + sizeof(uint64_t));
+}
+
+uintmax_t total_source_jpeg_size(const std::vector<std::filesystem::path>& paths) {
+	uintmax_t total = 0;
+	for (const auto& path : paths) {
+		total += std::filesystem::file_size(path);
+	}
+	return total;
 }
 
 double measure_in_memory_first_block_group_scan_ns(const galp::jpeg::JpegDctTable& table, const size_t image_count) {
@@ -200,6 +210,7 @@ PolicyResult run_policy(const std::vector<std::filesystem::path>& paths,
 	result.compressed_data_size = std::filesystem::file_size(fls_path);
 	result.metadata_size = std::filesystem::file_size(meta_path);
 	result.total_output_size = result.compressed_data_size + result.metadata_size;
+	result.source_jpeg_size = total_source_jpeg_size(paths);
 	result.real_row_count = table.real_row_count;
 	result.padding_row_count = table.padding_row_count;
 	result.physical_row_count = table.row_count;
@@ -211,12 +222,12 @@ PolicyResult run_policy(const std::vector<std::filesystem::path>& paths,
 		auto decoded = galp::decompress_table(fls_path);
 		(void)decoded;
 		const auto decode_end = Clock::now();
-		result.decode_ms = elapsed_ms(decode_start, decode_end);
+		result.galp_decode_ms = elapsed_ms(decode_start, decode_end);
 	} catch (const std::exception& e) {
 		const auto decode_end = Clock::now();
-		result.decode_ms = elapsed_ms(decode_start, decode_end);
-		result.decode_supported = false;
-		result.decode_error = e.what();
+		result.galp_decode_ms = elapsed_ms(decode_start, decode_end);
+		result.galp_decode_supported = false;
+		result.galp_decode_error = e.what();
 	}
 
 	result.in_memory_first_block_group_scan_ns = measure_in_memory_first_block_group_scan_ns(table, paths.size());
@@ -227,23 +238,28 @@ PolicyResult run_policy(const std::vector<std::filesystem::path>& paths,
 		result.physical_compression_ratio = physical_uncompressed / static_cast<double>(result.compressed_data_size);
 		result.semantic_compression_ratio = semantic_uncompressed / static_cast<double>(result.compressed_data_size);
 	}
+	if (result.source_jpeg_size != 0) {
+		result.expansion_vs_jpeg = static_cast<double>(result.total_output_size) / static_cast<double>(result.source_jpeg_size);
+	}
 	return result;
 }
 
 void print_csv_header() {
-	std::cout << "policy,total_output_size,semantic_compression_ratio,encode_ms,decode_ms,"
+	std::cout << "policy,total_output_size,semantic_compression_ratio,encode_ms,galp_decode_ms,"
 	             "in_memory_first_block_group_scan_ns,"
-	             "compressed_data_size,metadata_size,real_row_count,padding_row_count,physical_row_count,"
-	             "estimated_block_group_index_size,physical_compression_ratio,decode_supported,decode_error\n";
+	             "compressed_data_size,metadata_size,source_jpeg_size,expansion_vs_jpeg,"
+	             "real_row_count,padding_row_count,physical_row_count,"
+	             "estimated_block_group_index_size,physical_compression_ratio,galp_decode_supported,galp_decode_error\n";
 }
 
 void print_csv_row(const PolicyResult& r) {
 	std::cout << r.policy << ',' << r.total_output_size << ',' << r.semantic_compression_ratio << ','
-	          << r.encode_ms << ',' << r.decode_ms << ',' << r.in_memory_first_block_group_scan_ns << ','
-	          << r.compressed_data_size << ',' << r.metadata_size << ',' << r.real_row_count << ','
+	          << r.encode_ms << ',' << r.galp_decode_ms << ',' << r.in_memory_first_block_group_scan_ns << ','
+	          << r.compressed_data_size << ',' << r.metadata_size << ',' << r.source_jpeg_size << ','
+	          << r.expansion_vs_jpeg << ',' << r.real_row_count << ','
 	          << r.padding_row_count << ',' << r.physical_row_count << ',' << r.estimated_block_group_index_size << ','
-	          << r.physical_compression_ratio << ',' << (r.decode_supported ? "true" : "false") << ','
-	          << '"' << r.decode_error << '"' << '\n';
+	          << r.physical_compression_ratio << ',' << (r.galp_decode_supported ? "true" : "false") << ','
+	          << '"' << r.galp_decode_error << '"' << '\n';
 }
 
 void print_human_metric(const char* name, const std::string& pad, const std::string& ragged) {
@@ -264,13 +280,15 @@ void print_human_report(const std::vector<std::filesystem::path>& paths,
 	print_human_metric("total output", format_bytes(pad.total_output_size), format_bytes(ragged.total_output_size));
 	print_human_metric("compressed data", format_bytes(pad.compressed_data_size), format_bytes(ragged.compressed_data_size));
 	print_human_metric("metadata", format_bytes(pad.metadata_size), format_bytes(ragged.metadata_size));
+	print_human_metric("source JPEG", format_bytes(pad.source_jpeg_size), format_bytes(ragged.source_jpeg_size));
+	print_human_metric("expansion vs JPEG", format_ratio(pad.expansion_vs_jpeg), format_ratio(ragged.expansion_vs_jpeg));
 	print_human_metric("semantic ratio",
 	                   format_ratio(pad.semantic_compression_ratio),
 	                   format_ratio(ragged.semantic_compression_ratio));
 	print_human_metric("encode", format_ms(pad.encode_ms), format_ms(ragged.encode_ms));
-	print_human_metric("decode",
-	                   pad.decode_supported ? format_ms(pad.decode_ms) : "unsupported",
-	                   ragged.decode_supported ? format_ms(ragged.decode_ms) : "unsupported");
+	print_human_metric("GALP decode",
+	                   pad.galp_decode_supported ? format_ms(pad.galp_decode_ms) : "unsupported",
+	                   ragged.galp_decode_supported ? format_ms(ragged.galp_decode_ms) : "unsupported");
 	print_human_metric("in-memory group scan",
 	                   format_ns(pad.in_memory_first_block_group_scan_ns),
 	                   format_ns(ragged.in_memory_first_block_group_scan_ns));
@@ -283,13 +301,13 @@ void print_human_report(const std::vector<std::filesystem::path>& paths,
 	print_human_metric("physical ratio",
 	                   format_ratio(pad.physical_compression_ratio),
 	                   format_ratio(ragged.physical_compression_ratio));
-	if (!pad.decode_supported || !ragged.decode_supported) {
-		std::cout << "\nDecode note:\n";
-		if (!pad.decode_supported) {
-			std::cout << "  pad: " << pad.decode_error << '\n';
+	if (!pad.galp_decode_supported || !ragged.galp_decode_supported) {
+		std::cout << "\nGALP decode note:\n";
+		if (!pad.galp_decode_supported) {
+			std::cout << "  pad: " << pad.galp_decode_error << '\n';
 		}
-		if (!ragged.decode_supported) {
-			std::cout << "  ragged: " << ragged.decode_error << '\n';
+		if (!ragged.galp_decode_supported) {
+			std::cout << "  ragged: " << ragged.galp_decode_error << '\n';
 		}
 	}
 }
