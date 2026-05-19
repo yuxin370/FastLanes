@@ -3,16 +3,16 @@
 // ────────────────────────────────────────────────────────
 // galp/tests/reader_test.cu
 // ────────────────────────────────────────────────────────
-#include "runtime/materialize/pinned_d2h.cuh"
-#include "execution/rowgroup.cuh"
-#include "execution/table.cuh"
-#include "storage/reader.cuh"
+#include "engine/materialization/pinned_d2h.cuh"
+#include "engine/operators/rowgroup.cuh"
+#include "engine/table/table.cuh"
+#include "format/reader.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/table/rowgroup.hpp"
-#include "codecs/columns/all.cuh"
+#include "codecs/encodings/all.cuh"
 #include "galp/galp.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -173,6 +173,27 @@ TEST(Materialize, KickPinnedD2HPreservesZeroLengthEntries) {
 	std::visit([](const auto& ptr) { EXPECT_NE(ptr.get(), nullptr); }, result.columns[0]->values);
 	EXPECT_FALSE(pending.active);
 	EXPECT_TRUE(pending.entries.empty());
+}
+
+TEST(Materialize, KickPinnedD2HCanDeferWorksetStateClear) {
+	galp::runtime::ExecutionWorkset workset {};
+	auto&                           batch = workset.buffers.host_batches.get<int8_t>();
+	batch.device_exprs.emplace_back();
+	batch.device_exprs.back().plan     = galp::execution::PlanKind::UNCOMPRESSED;
+	batch.device_exprs.back().n_values = 0;
+	batch.device_exprs.back().out      = nullptr;
+	batch.output_offsets.push_back(0);
+	batch.expr_indices.push_back(0);
+
+	auto pending = galp::runtime::kick_pinned_d2h_materialize(workset, /*clear_workset_state=*/false);
+	EXPECT_FALSE(batch.device_exprs.empty());
+	ASSERT_TRUE(pending.active);
+	ASSERT_EQ(pending.entries.size(), 1U);
+
+	galp::runtime::clear_materialize_workset_state(workset);
+	galp::runtime::discard_pinned_d2h_materialize(pending);
+	EXPECT_TRUE(batch.device_exprs.empty());
+	EXPECT_FALSE(pending.active);
 }
 
 bool rowgroup_supported(const fastlanes::RowgroupDescriptor*                rg,

@@ -3,13 +3,13 @@
 // ────────────────────────────────────────────────────────
 // galp/tools/galp_cli/galp_cli.cu
 // ────────────────────────────────────────────────────────
-#include "execution/config.cuh"
 #include "core/expression.cuh"
-#include "execution/rowgroup.cuh"
-#include "execution/table_options.cuh"
-#include "io/csv_writer.cuh"
-#include "storage/reader.cuh"
+#include "engine/config.cuh"
+#include "engine/operators/rowgroup.cuh"
+#include "engine/table/table_options.cuh"
+#include "format/reader.cuh"
 #include "galp_tools/benchmark_support/table.cuh"
+#include "io/csv_writer.cuh"
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -54,7 +54,8 @@ struct Options {
 	size_t                               prefetch_workers           = 0;
 	size_t                               max_prefetch_storage_bytes = 0;
 	size_t                               stream_target_work_items   = 1u << 18;
-	size_t                               stream_max_rowgroups       = 1;
+	size_t                               stream_max_rowgroups       = 4;
+	size_t                               compute_inflight_chunks    = 0;
 };
 
 std::string format_bytes(double bytes) {
@@ -81,9 +82,12 @@ const char* freq_patcher_name(const galp::execution::FreqPatcher patcher) {
 	return "unknown";
 }
 
-size_t effective_prefetch_workers(const size_t requested, const size_t rowgroups) {
+size_t effective_prefetch_workers(const size_t requested, const size_t rowgroups, const size_t max_rowgroups_per_chunk) {
 	if (requested != 0) {
 		return std::max<size_t>(1, requested);
+	}
+	if (max_rowgroups_per_chunk >= 4) {
+		return 2;
 	}
 	if (rowgroups >= 128) {
 		return 4;
@@ -193,8 +197,9 @@ void print_usage(const char* prog) {
 	       "(default: prefetch_depth * max rowgroup bytes)\n"
 	    << "  --stream-target-work-items N  Chunk flush threshold by work_items in whole-table execution "
 	       "(default: 262144)\n"
-	    << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table execution (default: 1, "
+	    << "  --stream-max-rowgroups N  Chunk flush threshold by rowgroups in whole-table execution (default: 4, "
 	       "0 disables)\n"
+	    << "  --compute-inflight-chunks N  Whole-table compute chunks allowed in flight (default: 0=auto, max: 8)\n"
 	    << "  --include-materialize  Benchmark also materializes results to host pinned memory (D2H included)\n"
 	    << "  --reuse-table-resources  Benchmark steady-state query after reader/pinned-pool prepare\n"
 	    << "  --freq-patcher MODE  FREQ patcher: stateful, branchless, or hybrid[:threshold] (default: stateful)\n";
@@ -275,6 +280,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			opt.stream_max_rowgroups = static_cast<size_t>(std::stoull(argv[++i]));
 			continue;
 		}
+		if (arg == "--compute-inflight-chunks" && i + 1 < argc) {
+			opt.compute_inflight_chunks = static_cast<size_t>(std::stoull(argv[++i]));
+			continue;
+		}
 		if (arg == "--include-materialize") {
 			opt.include_materialize = true;
 			continue;
@@ -349,7 +358,8 @@ void apply_table_options(Config& cfg, const Options& opt) {
 	                                               opt.prefetch_workers,
 	                                               opt.max_prefetch_storage_bytes,
 	                                               opt.stream_target_work_items,
-	                                               opt.stream_max_rowgroups);
+	                                               opt.stream_max_rowgroups,
+	                                               opt.compute_inflight_chunks);
 }
 
 __global__ void empty_kernel() {
@@ -479,6 +489,13 @@ int main(int argc, char** argv) {
 			const double assemble_expr_ms          = result.assemble_expr_ms;
 			const double append_expr_ms            = result.append_expr_ms;
 			const double upload_workset_ms         = result.upload_workset_ms;
+			const double run_submit_wall_ms        = result.run_submit_wall_ms;
+			const double wait_workset_wall_ms      = result.wait_workset_wall_ms;
+			const double event_sync_wall_ms        = result.event_sync_wall_ms;
+			const double pre_kernel_event_ms       = result.pre_kernel_event_ms;
+			const double warmup_wall_ms            = result.warmup_wall_ms;
+			const double timing_event_create_ms    = result.timing_event_create_ms;
+			const double timing_event_destroy_ms   = result.timing_event_destroy_ms;
 			const double kernel_event_ms           = result.kernel_ms;
 			const double release_device_ms         = result.release_device_ms;
 			const double free_rowgroup_ms          = result.free_rowgroup_ms;
@@ -501,13 +518,22 @@ int main(int argc, char** argv) {
 			const size_t total_h2d_bytes           = result.total_h2d_bytes;
 			const size_t total_h2d_copies          = result.total_h2d_copies;
 			const size_t prefetched_rowgroups      = result.prefetched_rowgroups;
+			const size_t compute_inflight_chunks   = result.compute_inflight_chunks;
+			const size_t rowgroup_prefetch_depth   = result.rowgroup_prefetch_depth;
+			const size_t wait_ready_chunks         = result.wait_ready_chunks;
+			const size_t wait_blocking_chunks      = result.wait_blocking_chunks;
 			const size_t total_rgs                 = result.total_rgs;
 			const bool   whole_table_prefetch      = opt.enable_rowgroup_prefetch &&
 			                                  bench_cfg.scope == galp::execution::TableDecompressionScope::WholeTable &&
 			                                  !opt.rowgroup.has_value() && total_rgs != 0;
+			const size_t effective_stream_max_rowgroups =
+			    opt.stream_max_rowgroups > 0 ? opt.stream_max_rowgroups : std::max<size_t>(1, total_rgs);
 			const size_t actual_prefetch_workers =
-			    whole_table_prefetch ? std::min(effective_prefetch_workers(opt.prefetch_workers, total_rgs), total_rgs)
-			                         : 0;
+			    whole_table_prefetch
+			        ? std::min(
+			              effective_prefetch_workers(opt.prefetch_workers, total_rgs, effective_stream_max_rowgroups),
+			              total_rgs)
+			        : 0;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
 			                         : 0.0;
@@ -560,6 +586,14 @@ int main(int argc, char** argv) {
 			std::cout << "    upload_dma_issue_ms: " << result.upload_dma_issue_ms << "\n";
 			std::cout << "    upload_dma_gpu_ms: " << result.upload_dma_gpu_ms << "\n";
 			std::cout << "    upload_event_ms: " << result.upload_event_ms << "\n";
+			std::cout << "  run_submit_wall_ms: " << run_submit_wall_ms << "\n";
+			std::cout << "    timing_event_create_ms: " << timing_event_create_ms << "\n";
+			std::cout << "    warmup_wall_ms: " << warmup_wall_ms << "\n";
+			std::cout << "  wait_workset_wall_ms: " << wait_workset_wall_ms << "\n";
+			std::cout << "    event_sync_wall_ms: " << event_sync_wall_ms << "\n";
+			std::cout << "    pre_kernel_event_ms: " << pre_kernel_event_ms << "\n";
+			std::cout << "    wait_ready_chunks: " << wait_ready_chunks << "\n";
+			std::cout << "    wait_blocking_chunks: " << wait_blocking_chunks << "\n";
 			std::cout << "  payload_arena_bytes: " << total_payload_arena_bytes << "\n";
 			std::cout << "  output_arena_bytes: " << total_output_arena_bytes << "\n";
 			std::cout << "  h2d_bytes: " << total_h2d_bytes << "\n";
@@ -569,6 +603,7 @@ int main(int argc, char** argv) {
 			std::cout << "  kernel_event_ms_median: " << kernel_stats.median << "\n";
 			std::cout << "  kernel_event_ms_mean: " << kernel_stats.mean << "\n";
 			std::cout << "  release_device_ms: " << release_device_ms << "\n";
+			std::cout << "    timing_event_destroy_ms: " << timing_event_destroy_ms << "\n";
 			std::cout << "  free_rowgroup_ms: " << free_rowgroup_ms << "\n";
 			std::cout << "  prefetch_wait_ms: " << prefetch_wait_ms << "\n";
 			std::cout << "  prefetch_depth_block_ms: " << prefetch_depth_block_ms << "\n";
@@ -595,6 +630,9 @@ int main(int argc, char** argv) {
 			std::cout << "  per_rowgroup_workset: " << (opt.per_rowgroup_workset ? 1 : 0) << "\n";
 			std::cout << "  stream_target_work_items: " << opt.stream_target_work_items << "\n";
 			std::cout << "  stream_max_rowgroups: " << opt.stream_max_rowgroups << "\n";
+			std::cout << "  compute_inflight_chunks: " << compute_inflight_chunks << "\n";
+			std::cout << "  compute_inflight_chunks_requested: " << opt.compute_inflight_chunks << "\n";
+			std::cout << "  prefetch_depth_effective: " << rowgroup_prefetch_depth << "\n";
 			std::cout << "  rowgroup_prefetch: " << (opt.enable_rowgroup_prefetch ? 1 : 0) << "\n";
 			std::cout << "  prefetch_depth: " << opt.prefetch_depth << "\n";
 			std::cout << "  prefetch_workers: " << actual_prefetch_workers << "\n";

@@ -3,9 +3,9 @@
 // ────────────────────────────────────────────────────────
 // galp/tools/benchmark_support/table.cu
 // ────────────────────────────────────────────────────────
+#include "cuda/cuda_macros.cuh"
+#include "engine/pipeline/pipeline.cuh"
 #include "galp_tools/benchmark_support/table.cuh"
-#include "runtime/pipeline.cuh"
-#include "cuda/memory/cuda_macros.cuh"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -58,20 +58,20 @@ void warmup_cuda_runtime_once() {
 }
 
 struct BenchmarkObserver {
-	TableBenchmarkResult&                 out;
+	TableBenchmarkResult& out;
 	struct TimelineRow {
-		size_t                         rowgroup_index = 0;
-		bool                           from_prefetch  = false;
-		size_t                         storage_bytes  = 0;
+		size_t                          rowgroup_index = 0;
+		bool                            from_prefetch  = false;
+		size_t                          storage_bytes  = 0;
 		runtime::RowgroupReadTiming     timing {};
 		runtime::RowgroupPrefetchTiming prefetch {};
 	};
 
-	bool                                  have_read_times  = false;
-	bool                                  have_pread_times = false;
+	bool                                  have_read_times                = false;
+	bool                                  have_pread_times               = false;
 	bool                                  have_first_rowgroup_read_start = false;
 	bool                                  have_first_rowgroup_ready      = false;
-	bool                                  timeline_enabled = false;
+	bool                                  timeline_enabled               = false;
 	std::filesystem::path                 timeline_path {};
 	std::chrono::steady_clock::time_point timeline_base {};
 	std::chrono::steady_clock::time_point first_read_start {};
@@ -81,10 +81,10 @@ struct BenchmarkObserver {
 	std::chrono::steady_clock::time_point last_file_read_end {};
 	std::chrono::steady_clock::time_point last_read_end {};
 	std::vector<TimelineRow>              timeline_rows;
-	std::unordered_map<size_t, size_t>     timeline_row_by_rg;
+	std::unordered_map<size_t, size_t>    timeline_row_by_rg;
 
 	void configure_timeline(const std::chrono::steady_clock::time_point base) {
-		timeline_base = base;
+		timeline_base    = base;
 		const char* path = std::getenv("GALP_ROWGROUP_TIMELINE_CSV");
 		if (path != nullptr && path[0] != '\0') {
 			timeline_enabled = true;
@@ -221,15 +221,43 @@ struct BenchmarkObserver {
 		out.total_h2d_copies += breakdown.arena.dma_count;
 	}
 
-	void on_rowgroup_upload(const size_t                                      rowgroup_index,
+	void on_rowgroup_upload(const size_t                                 rowgroup_index,
 	                        const std::chrono::steady_clock::time_point& upload_start,
 	                        const std::chrono::steady_clock::time_point& upload_end) {
 		if (!timeline_enabled) {
 			return;
 		}
-		auto& row                       = timeline_row_for(rowgroup_index);
+		auto& row                        = timeline_row_for(rowgroup_index);
 		row.timing.timeline.upload_start = upload_start;
 		row.timing.timeline.upload_end   = upload_end;
+	}
+
+	void on_compute_inflight_chunks(const size_t chunks) {
+		out.compute_inflight_chunks = chunks;
+	}
+
+	void on_rowgroup_prefetch_depth(const size_t depth) {
+		out.rowgroup_prefetch_depth = depth;
+	}
+
+	void on_run_submit(const double ms, const double timing_event_create_ms, const double warmup_wall_ms) {
+		out.run_submit_wall_ms += ms;
+		out.timing_event_create_ms += timing_event_create_ms;
+		out.warmup_wall_ms += warmup_wall_ms;
+	}
+
+	void on_wait_workset(const double ms,
+	                     const double event_sync_wall_ms,
+	                     const double pre_kernel_event_ms,
+	                     const bool   wait_ready) {
+		out.wait_workset_wall_ms += ms;
+		out.event_sync_wall_ms += event_sync_wall_ms;
+		out.pre_kernel_event_ms += pre_kernel_event_ms;
+		if (wait_ready) {
+			++out.wait_ready_chunks;
+		} else {
+			++out.wait_blocking_chunks;
+		}
 	}
 
 	void on_kernel(const double ms, const size_t launch_grid, const size_t launches) {
@@ -238,8 +266,9 @@ struct BenchmarkObserver {
 		out.total_launch_grid += launch_grid * launches;
 	}
 
-	void on_release_workset(const double ms) {
+	void on_release_workset(const double ms, const double timing_event_destroy_ms) {
 		out.release_device_ms += ms;
+		out.timing_event_destroy_ms += timing_event_destroy_ms;
 	}
 
 	void on_free_rowgroup(const double ms) {
@@ -292,18 +321,17 @@ struct BenchmarkObserver {
 			if (tp == std::chrono::steady_clock::time_point {}) {
 				return std::string {};
 			}
-			const double ms = std::chrono::duration<double, std::milli>(tp - timeline_base).count();
+			const double       ms = std::chrono::duration<double, std::milli>(tp - timeline_base).count();
 			std::ostringstream out;
 			out << std::fixed << std::setprecision(6) << ms;
 			return out.str();
 		};
 		const auto fmt_duration = [](const std::chrono::steady_clock::time_point start,
 		                             const std::chrono::steady_clock::time_point end) {
-			if (start == std::chrono::steady_clock::time_point {} ||
-			    end == std::chrono::steady_clock::time_point {}) {
+			if (start == std::chrono::steady_clock::time_point {} || end == std::chrono::steady_clock::time_point {}) {
 				return std::string {};
 			}
-			const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+			const double       ms = std::chrono::duration<double, std::milli>(end - start).count();
 			std::ostringstream out;
 			out << std::fixed << std::setprecision(6) << ms;
 			return out.str();
@@ -314,16 +342,16 @@ struct BenchmarkObserver {
 		       "read_submit_ms,read_start_ms,file_read_start_ms,pread_start_ms,pread_end_ms,file_read_end_ms,"
 		       "raw_ready_push_ms,raw_ready_pop_ms,build_start_ms,build_end_ms,ready_push_ms,consumer_pop_ms,"
 		       "consumer_wait_start_ms,consumer_wait_end_ms,upload_start_ms,upload_end_ms,read_end_ms,"
-		       "depth_block_ms,byte_block_ms,pinned_acquire_ms,pread_ms,zero_copy_view_setup_ms,rowgroup_build_ms,read_ms,"
+		       "depth_block_ms,byte_block_ms,pinned_acquire_ms,pread_ms,zero_copy_view_setup_ms,rowgroup_build_ms,read_"
+		       "ms,"
 		       "raw_queue_wait_ms,read_complete_to_build_start_ms,build_end_to_ready_push_ms,"
 		       "ready_to_consumer_pop_ms,consumer_wait_ms,consumer_pop_to_upload_start_ms,upload_ms\n";
 		for (const auto& row : timeline_rows) {
 			const auto& timeline = row.timing.timeline;
 			csv << row.rowgroup_index << ',' << (row.from_prefetch ? 1 : 0) << ',' << row.storage_bytes << ','
 			    << row.prefetch.worker_id << ',' << (row.prefetch.pool_slot_owner_reused ? 1 : 0) << ','
-			    << (row.prefetch.pool_slot_owner_migrated ? 1 : 0) << ','
-			    << (row.prefetch.pool_slot_allocated ? 1 : 0) << ','
-			    << fmt_time(timeline.read_submit) << ',' << fmt_time(timeline.read_start) << ','
+			    << (row.prefetch.pool_slot_owner_migrated ? 1 : 0) << ',' << (row.prefetch.pool_slot_allocated ? 1 : 0)
+			    << ',' << fmt_time(timeline.read_submit) << ',' << fmt_time(timeline.read_start) << ','
 			    << fmt_time(timeline.file_read_start) << ',' << fmt_time(timeline.pread_start) << ','
 			    << fmt_time(timeline.pread_end) << ',' << fmt_time(timeline.file_read_end) << ','
 			    << fmt_time(timeline.raw_ready_push) << ',' << fmt_time(timeline.raw_ready_pop) << ','
@@ -332,9 +360,8 @@ struct BenchmarkObserver {
 			    << fmt_time(timeline.consumer_wait_start) << ',' << fmt_time(timeline.consumer_wait_end) << ','
 			    << fmt_time(timeline.upload_start) << ',' << fmt_time(timeline.upload_end) << ','
 			    << fmt_time(timeline.read_end) << ',' << row.prefetch.depth_block_ms << ','
-			    << row.prefetch.byte_block_ms << ','
-			    << row.timing.pinned_acquire_ms << ',' << row.timing.pread_ms << ','
-			    << row.timing.zero_copy_view_setup_ms << ',' << row.timing.rowgroup_build_ms << ','
+			    << row.prefetch.byte_block_ms << ',' << row.timing.pinned_acquire_ms << ',' << row.timing.pread_ms
+			    << ',' << row.timing.zero_copy_view_setup_ms << ',' << row.timing.rowgroup_build_ms << ','
 			    << row.timing.read_ms << ',' << fmt_duration(timeline.raw_ready_push, timeline.raw_ready_pop) << ','
 			    << fmt_duration(timeline.file_read_end, timeline.build_start) << ','
 			    << fmt_duration(timeline.build_end, timeline.ready_push) << ','
@@ -361,7 +388,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 	request.rowgroup                     = cfg.rowgroup;
 	request.materialize_results          = cfg.include_materialize;
 	request.direct_append_no_materialize = !cfg.include_materialize;
-	request.warmup_first_run             = true;
+	request.warmup_first_run             = false;
 	request.load_column_names            = false;
 
 	BenchmarkObserver observer {out};
@@ -370,7 +397,7 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		const auto prepare_start = std::chrono::steady_clock::now();
 		auto       resources     = runtime::prepare_table_resources(fls_path, request, observer);
 		const auto prepare_end   = std::chrono::steady_clock::now();
-		out.resource_prepare_ms = std::chrono::duration<double, std::milli>(prepare_end - prepare_start).count();
+		out.resource_prepare_ms  = std::chrono::duration<double, std::milli>(prepare_end - prepare_start).count();
 
 		const auto query_start = std::chrono::steady_clock::now();
 		observer.configure_timeline(query_start);
@@ -378,27 +405,29 @@ TableBenchmarkResult benchmark_table(const std::filesystem::path& fls_path, cons
 		    resources,
 		    request,
 		    [](size_t) { return true; },
-		    [](size_t, galp::format::Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData*) {},
+		    [](size_t, galp::format::Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData*) {
+		    },
 		    observer,
 		    query_start);
 		const auto query_end = std::chrono::steady_clock::now();
-		out.query_wall_ms = std::chrono::duration<double, std::milli>(query_end - query_start).count();
+		out.query_wall_ms    = std::chrono::duration<double, std::milli>(query_end - query_start).count();
 	} else {
 		observer.configure_timeline(wall_start);
 		runtime::execute_table_pipeline(
 		    fls_path,
 		    request,
 		    [](size_t) { return true; },
-		    [](size_t, galp::format::Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData*) {},
+		    [](size_t, galp::format::Rowgroup&, const std::vector<galp::expression::Expression>&, const RowgroupData*) {
+		    },
 		    observer);
 		const auto query_end = std::chrono::steady_clock::now();
-		out.query_wall_ms = std::chrono::duration<double, std::milli>(query_end - wall_start).count();
+		out.query_wall_ms    = std::chrono::duration<double, std::milli>(query_end - wall_start).count();
 	}
 	const auto wall_end = std::chrono::steady_clock::now();
 	observer.write_timeline_csv();
-	out.end_to_end_ms   = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
-	out.pipeline_active_ms = out.query_wall_ms > out.pipeline_setup_total_ms ? out.query_wall_ms - out.pipeline_setup_total_ms
-	                                                                         : 0.0;
+	out.end_to_end_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
+	out.pipeline_active_ms =
+	    out.query_wall_ms > out.pipeline_setup_total_ms ? out.query_wall_ms - out.pipeline_setup_total_ms : 0.0;
 	return out;
 }
 
