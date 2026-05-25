@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace galp::jpeg {
@@ -117,12 +119,14 @@ enum class JpegDctRowOrdering {
 };
 
 struct JpegDctBlockGroupIndex {
-	uint32_t semantic_slot_id = 0;
-	uint32_t z_order_index    = 0;
-	uint32_t block_x          = 0;
-	uint32_t block_y          = 0;
-	uint64_t row_start        = 0;
-	uint32_t row_count        = 0;
+	uint32_t semantic_slot_id      = 0;
+	uint32_t z_order_index         = 0;
+	uint32_t block_x               = 0;
+	uint32_t block_y               = 0;
+	uint64_t row_start             = 0;
+	uint32_t row_count             = 0;
+	uint32_t fls_rowgroup_index    = 0;
+	uint32_t row_start_in_rowgroup = 0;
 };
 
 struct JpegDctDatasetMetadata {
@@ -146,6 +150,100 @@ struct JpegDctTable {
 	size_t                               block_group_count = 0;
 	std::array<std::vector<int16_t>, 64> columns;
 	JpegDctDatasetMetadata               metadata;
+	std::vector<uint64_t>                rowgroup_n_tuples;
+};
+
+enum class JpegDctShardPreset {
+	kCropLatency,
+	kBalanced,
+	kThroughput,
+};
+
+struct JpegDctShardOptions {
+	size_t             shard_images        = 8192;
+	uint32_t           rowgroup_vectors    = 128;
+	uint32_t           rowgroups_per_shard = 256;
+	JpegDctShardPreset preset              = JpegDctShardPreset::kBalanced;
+	bool               shard_images_specified        = false;
+	bool               rowgroup_vectors_specified    = false;
+	bool               rowgroups_per_shard_specified = false;
+};
+
+struct JpegDctShardManifestEntry {
+	uint32_t    shard_id                 = 0;
+	uint64_t    first_global_image_index = 0;
+	uint32_t    image_count              = 0;
+	uint64_t    real_row_count           = 0;
+	uint64_t    padding_row_count        = 0;
+	uint64_t    physical_row_count       = 0;
+	uint32_t    rowgroup_count           = 0;
+	uint32_t    block_group_count        = 0;
+	uint64_t    fls_file_size            = 0;
+	uint64_t    metadata_file_size       = 0;
+	std::string fls_file_name;
+	std::string metadata_file_name;
+};
+
+struct JpegDctShardManifest {
+	uint32_t                               version             = 1;
+	JpegDatasetValidationMode              policy              = JpegDatasetValidationMode::kRaggedBlockMajor;
+	uint32_t                               rowgroup_vectors    = 128;
+	uint32_t                               rowgroups_per_shard = 256;
+	uint64_t                               image_count         = 0;
+	std::vector<JpegDctShardManifestEntry> shards;
+};
+
+using JpegDctCoefficientRow = std::array<int16_t, 64>;
+
+struct JpegDctRowRef {
+	uint32_t shard_id                  = 0;
+	uint32_t local_image_index         = 0;
+	uint32_t semantic_slot_id          = 0;
+	uint32_t block_x                   = 0;
+	uint32_t block_y                   = 0;
+	uint64_t physical_row_index        = 0;
+	uint32_t fls_rowgroup_index        = 0;
+	uint32_t row_start_in_rowgroup     = 0;
+	uint32_t row_offset_in_block_group = 0;
+	bool     present                   = false;
+};
+
+struct JpegDctBlockGroup {
+	JpegDctBlockGroupIndex             index;
+	std::vector<JpegDctCoefficientRow> rows;
+};
+
+struct MaterializedJpegDctBlock {
+	uint32_t              semantic_slot_id = 0;
+	uint32_t              block_x          = 0;
+	uint32_t              block_y          = 0;
+	JpegDctCoefficientRow coefficients {};
+};
+
+struct MaterializedJpegDctImage {
+	uint32_t                              global_image_index = 0;
+	std::vector<MaterializedJpegDctBlock> blocks;
+};
+
+class JpegDctShardDatasetReader {
+public:
+	explicit JpegDctShardDatasetReader(const std::filesystem::path& manifest_path);
+	~JpegDctShardDatasetReader();
+
+	JpegDctShardDatasetReader(const JpegDctShardDatasetReader&)            = delete;
+	JpegDctShardDatasetReader& operator=(const JpegDctShardDatasetReader&) = delete;
+	JpegDctShardDatasetReader(JpegDctShardDatasetReader&&) noexcept;
+	JpegDctShardDatasetReader& operator=(JpegDctShardDatasetReader&&) noexcept;
+
+	MaterializedJpegDctImage MaterializeImageDct(uint32_t global_image_index);
+
+	JpegDctBlockGroup ReadBlockGroup(uint32_t shard_id, uint32_t semantic_slot_id, uint32_t block_x, uint32_t block_y);
+
+	JpegDctRowRef LocateRow(uint32_t global_image_index, uint32_t semantic_slot_id, uint32_t block_x, uint32_t block_y);
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> impl_;
 };
 
 JpegDctTable read_jpeg_dct_file(const std::filesystem::path& path, const JpegDctReaderOptions& options = {});
@@ -189,6 +287,15 @@ void compress_jpeg_dct_dataset_to_fls(const std::vector<std::filesystem::path>& 
                                       const std::filesystem::path&              metadata_output_path,
                                       const JpegDctReaderOptions&               options,
                                       const JpegDctMetadataWriterOptions&       metadata_options);
+
+void write_jpeg_dct_shard_manifest(const JpegDctShardManifest& manifest, const std::filesystem::path& output_path);
+
+JpegDctShardManifest
+compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<std::filesystem::path>& jpeg_paths,
+                                         const std::filesystem::path&              output_dir,
+                                         const JpegDctReaderOptions&               options          = {},
+                                         const JpegDctShardOptions&                shard_options    = {},
+                                         const JpegDctMetadataWriterOptions&       metadata_options = {});
 
 } // namespace galp::jpeg
 

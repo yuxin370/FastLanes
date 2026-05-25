@@ -10,7 +10,7 @@ build/
 Testing/
 build-support/boost_*
 scripts/my_tool/
-
+galp/docs
 # Build directories created by Clion
 cmake-build-*/
 
