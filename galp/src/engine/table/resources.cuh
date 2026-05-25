@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace galp::runtime {
 
@@ -33,6 +34,7 @@ struct TableExecutionRequest {
 	TableDecompressionConfig config {};
 	uint32_t                 samples = 1;
 	std::optional<size_t>    rowgroup;
+	std::vector<size_t>      rowgroup_schedule;
 	bool                     materialize_results          = true;
 	bool                     direct_append_no_materialize = false;
 	bool                     warmup_first_run             = false;

@@ -9,6 +9,7 @@
 #include "engine/pipeline/rowgroup_prefetch_types.cuh"
 #include "engine/table/chunk_state.cuh"
 #include <optional>
+#include <vector>
 
 namespace galp::runtime::detail {
 
@@ -16,7 +17,9 @@ size_t data_type_size(fastlanes::DataType dt);
 size_t rowgroup_logical_bytes(const fastlanes::RowgroupDescriptor* rg);
 size_t count_active_columns(const std::vector<galp::expression::Expression>& expressions);
 size_t max_rowgroup_storage_bytes(galp::format::FlsReader& rdr, size_t start, size_t end);
+size_t max_rowgroup_storage_bytes(galp::format::FlsReader& rdr, const std::vector<size_t>& rowgroups);
 void   check_rowgroup_index(size_t n_rowgroups, const std::optional<size_t>& rowgroup);
+void   check_rowgroup_schedule(size_t n_rowgroups, const std::vector<size_t>& rowgroups);
 void   validate_table_request(const TableExecutionRequest& request);
 bool   use_whole_table_pipeline(const TableExecutionRequest& request);
 size_t choose_prefetch_workers(size_t requested, size_t rowgroup_count, size_t max_rowgroups_per_chunk);

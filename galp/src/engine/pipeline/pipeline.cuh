@@ -15,8 +15,55 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace galp::runtime {
+
+namespace detail {
+
+template <typename RowgroupPredicate>
+inline std::vector<size_t> select_rowgroups_for_prefetch(const TableExecutionRequest&  request,
+                                                         const PreparedTableResources& resources,
+                                                         RowgroupPredicate&            should_process) {
+	std::vector<size_t> rowgroups;
+	const auto          append_if_selected = [&](const size_t rowgroup_index) {
+		if (should_process(rowgroup_index)) {
+			rowgroups.push_back(rowgroup_index);
+		}
+	};
+
+	if (!request.rowgroup_schedule.empty()) {
+		rowgroups.reserve(request.rowgroup_schedule.size());
+		for (const size_t rowgroup_index : request.rowgroup_schedule) {
+			append_if_selected(rowgroup_index);
+		}
+		return rowgroups;
+	}
+
+	rowgroups.reserve(resources.end > resources.start ? resources.end - resources.start : 0);
+	for (size_t rowgroup_index = resources.start; rowgroup_index < resources.end; ++rowgroup_index) {
+		append_if_selected(rowgroup_index);
+	}
+	return rowgroups;
+}
+
+template <typename ForEach>
+inline void for_each_requested_rowgroup(const TableExecutionRequest&  request,
+                                        const PreparedTableResources& resources,
+                                        ForEach&&                     for_each) {
+	if (!request.rowgroup_schedule.empty()) {
+		for (const size_t rowgroup_index : request.rowgroup_schedule) {
+			for_each(rowgroup_index);
+		}
+		return;
+	}
+
+	for (size_t rowgroup_index = resources.start; rowgroup_index < resources.end; ++rowgroup_index) {
+		for_each(rowgroup_index);
+	}
+}
+
+} // namespace detail
 
 template <typename Observer>
 inline PreparedTableResources prepare_table_resources(const std::filesystem::path& fls_path,
@@ -37,6 +84,7 @@ inline PreparedTableResources prepare_table_resources(const std::filesystem::pat
 	const auto reader_open_end   = std::chrono::steady_clock::now();
 	observer.on_reader_open(std::chrono::duration<double, std::milli>(reader_open_end - reader_open_start).count());
 	detail::check_rowgroup_index(resources.n_rowgroups, request.rowgroup);
+	detail::check_rowgroup_schedule(resources.n_rowgroups, request.rowgroup_schedule);
 
 	resources.start = 0;
 	resources.end   = resources.n_rowgroups;
@@ -59,8 +107,10 @@ inline PreparedTableResources prepare_table_resources(const std::filesystem::pat
 	resources.max_rowgroups_per_chunk = (request.config.streaming_target_rowgroups > 0)
 	                                        ? request.config.streaming_target_rowgroups
 	                                        : (resources.n_rowgroups > 0 ? resources.n_rowgroups : 1U);
+	const size_t requested_rowgroups =
+	    !request.rowgroup_schedule.empty() ? request.rowgroup_schedule.size() : resources.end - resources.start;
 	resources.prefetch_workers = detail::choose_prefetch_workers(
-	    request.config.prefetch_workers, resources.end - resources.start, resources.max_rowgroups_per_chunk);
+	    request.config.prefetch_workers, requested_rowgroups, resources.max_rowgroups_per_chunk);
 	resources.compute_inflight_chunks =
 	    resources.whole_table
 	        ? detail::choose_compute_inflight_chunks(request.config, resources.max_rowgroups_per_chunk)
@@ -92,7 +142,7 @@ inline PreparedTableResources prepare_table_resources(const std::filesystem::pat
 		const auto pool_create_end     = std::chrono::steady_clock::now();
 		observer.on_pinned_pool_create(
 		    std::chrono::duration<double, std::milli>(pool_create_end - pool_create_start).count());
-		const size_t total_rowgroups = resources.end - resources.start;
+		const size_t total_rowgroups = requested_rowgroups;
 		const size_t warm_slots      = resources.use_rowgroup_prefetch
 		                                   ? detail::choose_pinned_prewarm_slots(pooled_slots,
                                                                             total_rowgroups,
@@ -104,7 +154,9 @@ inline PreparedTableResources prepare_table_resources(const std::filesystem::pat
                                             pooled_slots, total_rowgroups, resources.max_rowgroups_per_chunk);
 		if (resources.use_rowgroup_prefetch || warm_slots != 0) {
 			const auto max_storage_scan_start = std::chrono::steady_clock::now();
-			resources.max_storage_bytes       = detail::max_rowgroup_storage_bytes(rdr, resources.start, resources.end);
+			resources.max_storage_bytes       = !request.rowgroup_schedule.empty()
+			                                        ? detail::max_rowgroup_storage_bytes(rdr, request.rowgroup_schedule)
+			                                        : detail::max_rowgroup_storage_bytes(rdr, resources.start, resources.end);
 			const auto max_storage_scan_end   = std::chrono::steady_clock::now();
 			observer.on_max_storage_scan(
 			    std::chrono::duration<double, std::milli>(max_storage_scan_end - max_storage_scan_start).count());
@@ -145,6 +197,7 @@ inline TableData execute_prepared_table_pipeline(PreparedTableResources&        
 	detail::validate_table_request(request);
 	runtime::validate_unpack_config(request.config.execution);
 	detail::check_rowgroup_index(resources.n_rowgroups, request.rowgroup);
+	detail::check_rowgroup_schedule(resources.n_rowgroups, request.rowgroup_schedule);
 
 	galp::format::FlsReader& rdr         = *resources.shared_rdr;
 	constexpr bool collect_logical_bytes = !std::is_same_v<std::decay_t<Observer>, NoopTableExecutionObserver>;
@@ -155,11 +208,14 @@ inline TableData execute_prepared_table_pipeline(PreparedTableResources&        
 	}
 
 	std::unique_ptr<RowgroupPrefetchQueue> prefetch_queue;
+	std::vector<size_t>                    prefetched_rowgroups;
 	if (resources.use_rowgroup_prefetch) {
+		prefetched_rowgroups = detail::select_rowgroups_for_prefetch(request, resources, should_process);
+	}
+	if (resources.use_rowgroup_prefetch && !prefetched_rowgroups.empty()) {
 		const auto prefetch_queue_start = std::chrono::steady_clock::now();
 		prefetch_queue                  = std::make_unique<RowgroupPrefetchQueue>(resources.shared_rdr,
-                                                                 resources.start,
-                                                                 resources.end,
+                                                                 prefetched_rowgroups,
                                                                  resources.rowgroup_prefetch_depth,
                                                                  resources.prefetch_workers,
                                                                  resources.pinned_rowgroup_pool,
@@ -176,7 +232,12 @@ inline TableData execute_prepared_table_pipeline(PreparedTableResources&        
 	};
 	const auto fetch_rowgroup = [&](const size_t rowgroup_index) -> RowgroupReadResult {
 		if (prefetch_queue) {
-			return prefetch_queue->pop();
+			auto result = prefetch_queue->pop();
+			if (result.rowgroup_index != rowgroup_index) {
+				free_rowgroup(result.rowgroup);
+				throw std::runtime_error("rowgroup prefetch queue returned an unexpected rowgroup");
+			}
+			return result;
 		}
 		return detail::read_rowgroup(rdr, rowgroup_index, resources.pinned_rowgroup_pool);
 	};
@@ -277,18 +338,10 @@ inline TableData execute_prepared_table_pipeline(PreparedTableResources&        
 		    consume_chunk);
 	};
 
-	for (size_t rowgroup_index = resources.start; rowgroup_index < resources.end; ++rowgroup_index) {
+	const auto read_and_stage_rowgroup = [&](const size_t rowgroup_index) {
 		drain_ready_chunks();
 
-		if (!from_prefetch() && !should_process(rowgroup_index)) {
-			continue;
-		}
-
 		auto read_result = fetch_rowgroup(rowgroup_index);
-		if (!should_process(rowgroup_index)) {
-			free_rowgroup(read_result.rowgroup);
-			continue;
-		}
 		observer.on_rowgroup_read(read_result, from_prefetch());
 
 		auto  pending = build_pending(rowgroup_index, std::move(read_result), logical_bytes_for(rowgroup_index));
@@ -303,11 +356,23 @@ inline TableData execute_prepared_table_pipeline(PreparedTableResources&        
 			pipeline.submit_build_and_rotate(submit_chunk, consume_chunk);
 			drain_ready_chunks();
 		}
+	};
+
+	if (resources.use_rowgroup_prefetch) {
+		for (const size_t rowgroup_index : prefetched_rowgroups) {
+			read_and_stage_rowgroup(rowgroup_index);
+		}
+	} else {
+		detail::for_each_requested_rowgroup(request, resources, [&](const size_t rowgroup_index) {
+			if (should_process(rowgroup_index)) {
+				read_and_stage_rowgroup(rowgroup_index);
+			}
+		});
 	}
 
 	pipeline.flush(submit_chunk, consume_chunk);
 	pipeline.for_each_chunk([&](detail::TableChunkState& chunk) {
-		const auto release_start = std::chrono::steady_clock::now();
+		const auto release_start           = std::chrono::steady_clock::now();
 		double     timing_event_destroy_ms = 0.0;
 		runtime::release_workset(chunk.workset, false, false, &timing_event_destroy_ms);
 		const auto release_end = std::chrono::steady_clock::now();

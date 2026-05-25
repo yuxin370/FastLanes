@@ -5,6 +5,7 @@
 // ────────────────────────────────────────────────────────
 #include "engine/materialization/pinned_d2h.cuh"
 #include "engine/operators/rowgroup.cuh"
+#include "engine/pipeline/pipeline.cuh"
 #include "engine/table/table.cuh"
 #include "format/reader.cuh"
 #include "fls/connection.hpp"
@@ -143,6 +144,16 @@ bool cuda_available_for_reader_tests() {
 	const auto cuda_status  = cudaGetDeviceCount(&device_count);
 	return cuda_status == cudaSuccess && device_count > 0;
 }
+
+struct RecordingTableExecutionObserver : galp::runtime::NoopTableExecutionObserver {
+	std::vector<size_t> read_rowgroups;
+	std::vector<bool>   read_from_prefetch;
+
+	void on_rowgroup_read(const galp::runtime::RowgroupReadResult& result, const bool from_prefetch) {
+		read_rowgroups.push_back(result.rowgroup_index);
+		read_from_prefetch.push_back(from_prefetch);
+	}
+};
 
 template <typename T>
 typename galp::codec::utils::same_width_uint<T>::type to_column_bits(const T value) {
@@ -1084,4 +1095,58 @@ TEST(Reader, PublicWriteOutputUsesLogicalTupleCountForPartialRowgroups) {
 	for (size_t row = 0; row < values.size(); ++row) {
 		EXPECT_EQ(values[row], static_cast<int8_t>((1024U + row) % 100U));
 	}
+}
+
+TEST(Reader, RowgroupPrefetchQueueHonorsExplicitSchedule) {
+	const auto fls_path = make_partial_rowgroup_fls_fixture();
+
+	auto reader = std::make_shared<galp::format::FlsReader>(fls_path, /*load_column_names=*/false);
+	ASSERT_EQ(reader->rowgroup_count(), 2U);
+
+	galp::runtime::RowgroupPrefetchQueue queue(reader,
+	                                           std::vector<size_t> {1U},
+	                                           /*depth=*/2,
+	                                           /*num_workers=*/1);
+	auto                                 result = queue.pop();
+	EXPECT_EQ(result.rowgroup_index, 1U);
+	EXPECT_EQ(result.rowgroup.n_tuples, 6U);
+	galp::execution::free_rowgroup(result.rowgroup);
+}
+
+TEST(Reader, WholeTablePrefetchBuildsPredicateScheduleBeforeRead) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for reader test.";
+	}
+
+	const auto fls_path = make_partial_rowgroup_fls_fixture();
+
+	galp::runtime::TableExecutionRequest request {};
+	request.config.scope                       = galp::execution::TableDecompressionScope::WholeTable;
+	request.config.enable_rowgroup_prefetch    = true;
+	request.config.prefetch_depth              = 2;
+	request.config.prefetch_workers            = 1;
+	request.config.streaming_target_rowgroups  = 1;
+	request.config.streaming_target_work_items = 1;
+	request.config.execution.write_out         = false;
+	request.materialize_results                = false;
+	request.load_column_names                  = false;
+
+	RecordingTableExecutionObserver observer {};
+	std::vector<size_t>             callbacks;
+	auto                            result = galp::runtime::execute_table_pipeline(
+        fls_path,
+        request,
+        [](const size_t rowgroup_index) { return rowgroup_index == 1U; },
+        [&](const size_t                                  rowgroup_index,
+            galp::format::Rowgroup&,
+            const std::vector<galp::expression::Expression>&,
+            const galp::execution::RowgroupData*) { callbacks.push_back(rowgroup_index); },
+        observer);
+
+	const std::vector<size_t> expected_rowgroups {1U};
+	const std::vector<bool>   expected_from_prefetch {true};
+	EXPECT_EQ(observer.read_rowgroups, expected_rowgroups);
+	EXPECT_EQ(observer.read_from_prefetch, expected_from_prefetch);
+	EXPECT_EQ(callbacks, expected_rowgroups);
+	EXPECT_EQ(result.rowgroups, 1U);
 }

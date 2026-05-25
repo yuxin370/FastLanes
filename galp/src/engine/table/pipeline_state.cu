@@ -120,9 +120,25 @@ size_t max_rowgroup_storage_bytes(galp::format::FlsReader& rdr, const size_t sta
 	return max_bytes;
 }
 
+size_t max_rowgroup_storage_bytes(galp::format::FlsReader& rdr, const std::vector<size_t>& rowgroups) {
+	size_t max_bytes = 0;
+	for (const size_t rowgroup_index : rowgroups) {
+		max_bytes = std::max(max_bytes, rdr.rowgroup_storage_bytes(rowgroup_index));
+	}
+	return max_bytes;
+}
+
 void check_rowgroup_index(const size_t n_rowgroups, const std::optional<size_t>& rowgroup) {
 	if (rowgroup.has_value() && *rowgroup >= n_rowgroups) {
 		throw std::out_of_range("rowgroup index out of range");
+	}
+}
+
+void check_rowgroup_schedule(const size_t n_rowgroups, const std::vector<size_t>& rowgroups) {
+	for (const size_t rowgroup_index : rowgroups) {
+		if (rowgroup_index >= n_rowgroups) {
+			throw std::out_of_range("rowgroup schedule index out of range");
+		}
 	}
 }
 
@@ -132,6 +148,12 @@ void validate_table_request(const TableExecutionRequest& request) {
 	}
 	if (request.config.prefetch_depth == 0) {
 		throw std::invalid_argument("prefetch_depth must be > 0");
+	}
+	if (!request.rowgroup_schedule.empty() && request.rowgroup.has_value()) {
+		throw std::invalid_argument("rowgroup_schedule cannot be combined with a single rowgroup request");
+	}
+	if (!request.rowgroup_schedule.empty() && request.config.scope != TableDecompressionScope::WholeTable) {
+		throw std::invalid_argument("rowgroup_schedule requires whole-table scope");
 	}
 }
 
