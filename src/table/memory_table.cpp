@@ -81,11 +81,13 @@ size_t column_size(const MemoryColumn& column) {
 }
 
 DataType column_data_type(const MemoryColumn& column) {
-	return std::visit([](const auto span) {
-		using SpanT = decltype(span);
-		using T     = std::remove_cv_t<typename SpanT::element_type>;
-		return data_type_for<T>();
-	}, column.data);
+	return std::visit(
+	    [](const auto span) {
+		    using SpanT = decltype(span);
+		    using T     = std::remove_cv_t<typename SpanT::element_type>;
+		    return data_type_for<T>();
+	    },
+	    column.data);
 }
 
 void validate_columns(std::span<const MemoryColumn> columns) {
@@ -120,9 +122,8 @@ void validate_default_cast_safety(std::span<const MemoryColumn> columns, const M
 		if (values == nullptr) {
 			continue;
 		}
-		const auto unsafe = std::find_if(values->begin(), values->end(), [](const uint64_t value) {
-			return value > kMaxSafeUint64ForDefaultCast;
-		});
+		const auto unsafe = std::find_if(
+		    values->begin(), values->end(), [](const uint64_t value) { return value > kMaxSafeUint64ForDefaultCast; });
 		if (unsafe != values->end()) {
 			std::ostringstream msg;
 			msg << "MemoryColumn '" << column.name
@@ -134,17 +135,17 @@ void validate_default_cast_safety(std::span<const MemoryColumn> columns, const M
 }
 
 std::unique_ptr<ColumnDescriptorT> make_column_descriptor(const MemoryColumn& column, const n_t idx) {
-	auto descriptor       = std::make_unique<ColumnDescriptorT>();
-	descriptor->idx      = idx;
-	descriptor->name     = column.name;
-	descriptor->data_type = column_data_type(column);
+	auto descriptor          = std::make_unique<ColumnDescriptorT>();
+	descriptor->idx          = idx;
+	descriptor->name         = column.name;
+	descriptor->data_type    = column_data_type(column);
 	descriptor->encoding_rpn = std::make_unique<RPNT>();
 	descriptor->max          = std::make_unique<BinaryValueT>();
 	return descriptor;
 }
 
 std::unique_ptr<RowgroupDescriptorT> make_rowgroup_descriptor(std::span<const MemoryColumn> columns,
-                                                             const n_t                     n_tuples) {
+                                                              const n_t                     n_tuples) {
 	auto descriptor        = std::make_unique<RowgroupDescriptorT>();
 	descriptor->m_n_tuples = n_tuples;
 	descriptor->m_n_vec    = (n_tuples + CFG::VEC_SZ - 1) / CFG::VEC_SZ;
@@ -157,7 +158,10 @@ std::unique_ptr<RowgroupDescriptorT> make_rowgroup_descriptor(std::span<const Me
 }
 
 template <typename T>
-void assign_typed_column(Rowgroup& rowgroup, const size_t col_idx, std::span<const T> values, const size_t padded_size) {
+void assign_typed_column(Rowgroup&          rowgroup,
+                         const size_t       col_idx,
+                         std::span<const T> values,
+                         const size_t       padded_size) {
 	auto* typed = std::get_if<up<TypedCol<T>>>(&rowgroup.internal_rowgroup[col_idx]);
 	if (typed == nullptr || !*typed) {
 		std::ostringstream msg;
@@ -173,12 +177,12 @@ void assign_typed_column(Rowgroup& rowgroup, const size_t col_idx, std::span<con
 	}
 }
 
-void assign_column_slice(Rowgroup&       rowgroup,
-                         const size_t    col_idx,
+void assign_column_slice(Rowgroup&           rowgroup,
+                         const size_t        col_idx,
                          const MemoryColumn& column,
-                         const size_t    offset,
-                         const size_t    n,
-                         const size_t    padded_size) {
+                         const size_t        offset,
+                         const size_t        n,
+                         const size_t        padded_size) {
 	std::visit(
 	    [&](const auto span) {
 		    using SpanT = decltype(span);
@@ -201,11 +205,28 @@ public:
 
 		const auto rowgroup_capacity = options.n_vectors_per_rowgroup * CFG::VEC_SZ;
 		const auto n_rows            = column_size(columns.front());
+		if (!options.rowgroup_n_tuples.empty()) {
+			n_t row_count_sum = 0;
+			for (size_t rowgroup_idx = 0; rowgroup_idx < options.rowgroup_n_tuples.size(); ++rowgroup_idx) {
+				const auto n_tuples = options.rowgroup_n_tuples[rowgroup_idx];
+				if (n_tuples == 0) {
+					std::ostringstream msg;
+					msg << "MemoryTableOptions::rowgroup_n_tuples[" << rowgroup_idx << "] must be greater than zero";
+					throw std::runtime_error(msg.str());
+				}
+				row_count_sum += n_tuples;
+			}
+			if (row_count_sum != n_rows) {
+				std::ostringstream msg;
+				msg << "MemoryTableOptions::rowgroup_n_tuples sum is " << row_count_sum << "; expected " << n_rows;
+				throw std::runtime_error(msg.str());
+			}
+		}
 
-			connection.reset();
-			connection.m_config->n_vector_per_rowgroup = options.n_vectors_per_rowgroup;
-			connection.clear_forced_schema_state();
-			if (options.force_schema) {
+		connection.reset();
+		connection.m_config->n_vector_per_rowgroup = options.n_vectors_per_rowgroup;
+		connection.clear_forced_schema_state();
+		if (options.force_schema) {
 			if (options.forced_schema.size() != columns.size()) {
 				std::ostringstream msg;
 				msg << "MemoryTableOptions::forced_schema has " << options.forced_schema.size()
@@ -217,17 +238,27 @@ public:
 		}
 		validate_default_cast_safety(columns, options);
 
-		connection.m_table = std::make_unique<Table>(connection);
-		for (size_t offset = 0; offset < n_rows; offset += rowgroup_capacity) {
-			const auto n_this = std::min(rowgroup_capacity, n_rows - offset);
-			auto       desc   = make_rowgroup_descriptor(columns, n_this);
-			auto       rg     = std::make_unique<Rowgroup>(*desc, connection);
+		connection.m_table      = std::make_unique<Table>(connection);
+		size_t     offset       = 0;
+		const auto add_rowgroup = [&](const n_t n_this) {
+			auto       desc        = make_rowgroup_descriptor(columns, n_this);
+			auto       rg          = std::make_unique<Rowgroup>(*desc, connection);
 			const auto padded_size = rg->m_descriptor.m_n_vec * CFG::VEC_SZ;
 
 			for (size_t col_idx = 0; col_idx < columns.size(); ++col_idx) {
 				assign_column_slice(*rg, col_idx, columns[col_idx], offset, n_this, padded_size);
 			}
 			connection.m_table->m_rowgroups.push_back(std::move(rg));
+			offset += n_this;
+		};
+		if (!options.rowgroup_n_tuples.empty()) {
+			for (const auto n_this : options.rowgroup_n_tuples) {
+				add_rowgroup(n_this);
+			}
+		} else {
+			while (offset < n_rows) {
+				add_rowgroup(std::min(rowgroup_capacity, static_cast<n_t>(n_rows - offset)));
+			}
 		}
 	}
 };
@@ -236,9 +267,7 @@ void load_memory_table(Connection& connection, const MemoryTable& table, const M
 	MemoryTableLoader::load(connection, table, options);
 }
 
-void write_memory_table_to_fls(const MemoryTable&             table,
-                               const path&                   output_path,
-                               const MemoryTableOptions&     options) {
+void write_memory_table_to_fls(const MemoryTable& table, const path& output_path, const MemoryTableOptions& options) {
 	Connection connection;
 	load_memory_table(connection, table, options);
 	connection.to_fls(output_path);

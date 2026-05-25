@@ -4,7 +4,6 @@
 // src/encoder/encoder.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/encoder/encoder.hpp"
-#include "fls/cfg/cfg.hpp"                        // for CFG
 #include "fls/common/alias.hpp"                   // for up, n_t
 #include "fls/connection.hpp"                     // for Connection
 #include "fls/cor/lyt/buf.hpp"                    // for Buf
@@ -33,11 +32,10 @@ void Encoder::encode(const Connection& connection, const path& file_path) {
 		[[maybe_unused]] auto& rowgroup_descriptor =
 		    connection.m_table_descriptor->m_rowgroup_descriptors[rowgroup_idx];
 		[[maybe_unused]] const auto& rowgroup = *connection.m_table->m_rowgroups[rowgroup_idx];
+		vector<uint8_t>              helper_buffer(sizeof(entry_point_t) * rowgroup_descriptor->m_n_vec);
 
 		// write each column
 		for (auto& column_descriptor : rowgroup_descriptor->m_column_descriptors) {
-			uint8_t helper_buffer[sizeof(entry_point_t) * (CFG::N_VEC_PER_RG)]; // todo [fix me]
-
 			// interpret
 			InterpreterState state;
 			auto             physical_expr_up =
@@ -50,7 +48,7 @@ void Encoder::encode(const Connection& connection, const path& file_path) {
 			}
 
 			physical_expr_up->Finalize();
-			physical_expr_up->Flush(buf, *column_descriptor, helper_buffer);
+			physical_expr_up->Flush(buf, *column_descriptor, helper_buffer.data());
 		}
 
 		IO::append(file_io, buf);

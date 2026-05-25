@@ -42,16 +42,17 @@ struct MemoryTable {
 };
 
 struct MemoryTableOptions {
-	n_t  n_vectors_per_rowgroup = CFG::N_VEC_PER_RG;
-	bool force_schema           = false;
+	n_t                   n_vectors_per_rowgroup = CFG::N_VEC_PER_RG;
+	bool                  force_schema           = false;
 	vector<OperatorToken> forced_schema {};
+	std::span<const n_t>  rowgroup_n_tuples {};
 };
 
-FLS_API void load_memory_table(Connection& connection, const MemoryTable& table, const MemoryTableOptions& options = {});
+FLS_API void
+load_memory_table(Connection& connection, const MemoryTable& table, const MemoryTableOptions& options = {});
 
-FLS_API void write_memory_table_to_fls(const MemoryTable&             table,
-                                       const path&                   output_path,
-                                       const MemoryTableOptions&     options = {});
+FLS_API void
+write_memory_table_to_fls(const MemoryTable& table, const path& output_path, const MemoryTableOptions& options = {});
 
 } // namespace fastlanes
 

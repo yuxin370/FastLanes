@@ -1,8 +1,8 @@
 #include "fls/connection.hpp"
 #include "fls/table/memory_table.hpp"
-#include <gtest/gtest.h>
 #include <array>
 #include <cstdint>
+#include <gtest/gtest.h>
 #include <limits>
 #include <stdexcept>
 
@@ -20,13 +20,13 @@ TEST(MemoryTable, RejectsUnsafeUint64UnderDefaultCast) {
 	    },
 	};
 
-	fastlanes::Connection connection;
+	fastlanes::Connection        connection;
 	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn> {columns}};
 	EXPECT_THROW(connection.read_memory(table), std::runtime_error);
 }
 
 TEST(MemoryTable, AcceptsUint16Columns) {
-	const std::array<uint16_t, 3> values {0, 1024, 65535};
+	const std::array<uint16_t, 3>                values {0, 1024, 65535};
 	const std::array<fastlanes::MemoryColumn, 1> columns {
 	    fastlanes::MemoryColumn {
 	        "u16",
@@ -34,13 +34,53 @@ TEST(MemoryTable, AcceptsUint16Columns) {
 	    },
 	};
 
-	fastlanes::Connection connection;
+	fastlanes::Connection        connection;
 	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn> {columns}};
 	EXPECT_NO_THROW(connection.read_memory(table));
 }
 
+TEST(MemoryTable, UsesExplicitRowgroupTupleCounts) {
+	const std::array<int32_t, 5>                 values {1, 2, 3, 4, 5};
+	const std::array<fastlanes::MemoryColumn, 1> columns {
+	    fastlanes::MemoryColumn {
+	        "i32",
+	        std::span<const int32_t> {values},
+	    },
+	};
+	const std::array<fastlanes::n_t, 3> rowgroups {2, 1, 2};
+	fastlanes::MemoryTableOptions       options;
+	options.rowgroup_n_tuples = std::span<const fastlanes::n_t> {rowgroups};
+
+	fastlanes::Connection connection;
+	connection.read_memory(fastlanes::MemoryTable {std::span<const fastlanes::MemoryColumn> {columns}}, options);
+
+	const auto& table = connection.get_table();
+	ASSERT_EQ(table.m_rowgroups.size(), rowgroups.size());
+	for (size_t rowgroup_idx = 0; rowgroup_idx < rowgroups.size(); ++rowgroup_idx) {
+		EXPECT_EQ(table.m_rowgroups[rowgroup_idx]->m_descriptor.m_n_tuples, rowgroups[rowgroup_idx]);
+	}
+}
+
+TEST(MemoryTable, RejectsExplicitRowgroupTupleCountMismatch) {
+	const std::array<int32_t, 3>                 values {1, 2, 3};
+	const std::array<fastlanes::MemoryColumn, 1> columns {
+	    fastlanes::MemoryColumn {
+	        "i32",
+	        std::span<const int32_t> {values},
+	    },
+	};
+	const std::array<fastlanes::n_t, 2> rowgroups {1, 1};
+	fastlanes::MemoryTableOptions       options;
+	options.rowgroup_n_tuples = std::span<const fastlanes::n_t> {rowgroups};
+
+	fastlanes::Connection connection;
+	EXPECT_THROW(
+	    connection.read_memory(fastlanes::MemoryTable {std::span<const fastlanes::MemoryColumn> {columns}}, options),
+	    std::runtime_error);
+}
+
 TEST(MemoryTable, ClearsForcedSchemaBetweenLoads) {
-	const std::array<int64_t, 2> first_values {1, 2};
+	const std::array<int64_t, 2>                 first_values {1, 2};
 	const std::array<fastlanes::MemoryColumn, 1> first_columns {
 	    fastlanes::MemoryColumn {
 	        "first",
@@ -63,8 +103,8 @@ TEST(MemoryTable, ClearsForcedSchemaBetweenLoads) {
 	ASSERT_FALSE(connection.is_forced_schema_pool());
 	ASSERT_TRUE(connection.get_forced_schema_pool().empty());
 
-	const std::array<int64_t, 2> second_values {3, 4};
-	const std::array<int32_t, 2> third_values {5, 6};
+	const std::array<int64_t, 2>                 second_values {3, 4};
+	const std::array<int32_t, 2>                 third_values {5, 6};
 	const std::array<fastlanes::MemoryColumn, 2> second_columns {
 	    fastlanes::MemoryColumn {
 	        "second",
