@@ -27,6 +27,10 @@ scripts/my_tool/*_result
 data/fls/
 data/dct_blocks/
 
+#galp/scripts
+/galp/scripts/*
+!/galp/scripts/codegen/
+!/galp/scripts/codegen/**
 #########################################
 # Editor temporary/working/backup files #
 .#*
