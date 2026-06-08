@@ -9,11 +9,13 @@
 #include "cuda/cuda_macros.cuh"
 #include "cuda/memory/pinned_host_pool.cuh"
 #include "cuda/memory/transfer_tracker.cuh"
-
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -49,22 +51,11 @@ public:
 			std::lock_guard<std::mutex> lock(mutex_);
 			use_async = use_async_;
 			if (enabled_) {
-				if (use_async_) {
-					auto& free_list = free_async_by_stream_size_[stream_key(stream)][bytes];
-					if (!free_list.empty()) {
-						void* ptr = free_list.back();
-						free_list.pop_back();
-						in_use_[ptr] = DeviceAllocInfo {bytes, true, stream};
-						return ptr;
-					}
-				} else {
-					auto& free_list = free_sync_by_size_[bytes];
-					if (!free_list.empty()) {
-						void* ptr = free_list.back();
-						free_list.pop_back();
-						in_use_[ptr] = DeviceAllocInfo {bytes, false, nullptr};
-						return ptr;
-					}
+				size_t actual_size = 0;
+				void*  cached_ptr  = take_cached_block_locked(bytes, stream, use_async_, actual_size);
+				if (cached_ptr != nullptr) {
+					in_use_[cached_ptr] = DeviceAllocInfo {actual_size, use_async_, use_async_ ? stream : nullptr};
+					return cached_ptr;
 				}
 			}
 		}
@@ -73,6 +64,11 @@ public:
 		bool  async_alloc = false;
 		if (use_async) {
 			auto status = cudaMallocAsync(&ptr, bytes, stream);
+			if (status != cudaSuccess) {
+				ptr = nullptr;
+				release_cached();
+				status = cudaMallocAsync(&ptr, bytes, stream);
+			}
 			if (status == cudaSuccess) {
 				async_alloc = true;
 			} else {
@@ -80,7 +76,13 @@ public:
 			}
 		}
 		if (!ptr) {
-			CUDA_SAFE_CALL(cudaMalloc(&ptr, bytes));
+			auto status = cudaMalloc(&ptr, bytes);
+			if (status != cudaSuccess) {
+				ptr = nullptr;
+				release_cached();
+				status = cudaMalloc(&ptr, bytes);
+			}
+			CUDA_SAFE_CALL(status);
 			async_alloc = false;
 		}
 		{
@@ -106,14 +108,17 @@ public:
 		in_use_[ptr] = DeviceAllocInfo {0, false, nullptr, true};
 	}
 
-
 	// free() calls cudaFree if ptr is not tracked.
 	// release_arena_ptr() silently no-ops instead — used by DeviceArena destructor
 	// so that sub-pointers and device_base_ already cleaned up by free_device_expr()
 	// don't crash via cudaFree on an interior address (cudaErrorInvalidValue) or
 	// double-free device_base_ out of the pool free-list.
-	void free(void* ptr)              { do_free(ptr, /*fallback_cudafree=*/true);  }
-	void release_arena_ptr(void* ptr) { do_free(ptr, /*fallback_cudafree=*/false); }
+	void free(void* ptr) {
+		do_free(ptr, /*fallback_cudafree=*/true);
+	}
+	void release_arena_ptr(void* ptr) {
+		do_free(ptr, /*fallback_cudafree=*/false);
+	}
 
 	void* alloc_pinned(size_t bytes) {
 		return pinned_pool_.alloc(bytes);
@@ -163,6 +168,35 @@ public:
 		tracker_.sync_stream(source_stream, make_release_pinned_fn());
 	}
 
+	void release_cached() {
+		sync_h2d();
+
+		std::map<size_t, std::vector<void*>>                                sync_free;
+		std::unordered_map<StreamKey, std::map<size_t, std::vector<void*>>> async_free;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			sync_free.swap(free_sync_by_size_);
+			async_free.swap(free_async_by_stream_size_);
+			free_cached_bytes_ = 0;
+		}
+
+		for (auto& [size, list] : sync_free) {
+			(void)size;
+			for (void* ptr : list) {
+				CUDA_SAFE_CALL(cudaFree(ptr));
+			}
+		}
+		for (auto& [stream_id, buckets] : async_free) {
+			const auto stream = stream_from_key(stream_id);
+			for (auto& [size, list] : buckets) {
+				(void)size;
+				for (void* ptr : list) {
+					CUDA_SAFE_CALL(cudaFreeAsync(ptr, stream));
+				}
+			}
+		}
+	}
+
 	void set_enabled(bool enabled) {
 		assert_idle_for_reconfiguration("set_enabled");
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -198,7 +232,8 @@ public:
 			size_t real_leaks = 0;
 			for (auto& [ptr, info] : in_use_) {
 				(void)ptr;
-				if (!info.sub_alloc) ++real_leaks;
+				if (!info.sub_alloc)
+					++real_leaks;
 			}
 			if (real_leaks > 0) {
 				std::fprintf(stderr,
@@ -207,7 +242,8 @@ public:
 			}
 		}
 		for (auto& [ptr, info] : in_use_) {
-			if (info.sub_alloc) continue; // interior arena pointer — no standalone cudaFree
+			if (info.sub_alloc)
+				continue; // interior arena pointer — no standalone cudaFree
 			cudaFree(ptr);
 		}
 		in_use_.clear();
@@ -221,11 +257,11 @@ public:
 		free_sync_by_size_.clear();
 
 		for (auto& [stream_id, buckets] : free_async_by_stream_size_) {
-			(void)stream_id;
+			const auto stream = stream_from_key(stream_id);
 			for (auto& [size, list] : buckets) {
 				(void)size;
 				for (void* ptr : list) {
-					cudaFree(ptr);
+					cudaFreeAsync(ptr, stream);
 				}
 			}
 		}
@@ -235,8 +271,26 @@ public:
 private:
 	using StreamKey = uintptr_t;
 
+	struct CachedBlock {
+		void*        ptr    = nullptr;
+		bool         async  = false;
+		cudaStream_t stream = nullptr;
+	};
+
 	static StreamKey stream_key(cudaStream_t stream) {
 		return reinterpret_cast<StreamKey>(stream);
+	}
+
+	static cudaStream_t stream_from_key(StreamKey key) {
+		return reinterpret_cast<cudaStream_t>(key);
+	}
+
+	static void free_cached_block(const CachedBlock& block) {
+		if (block.async) {
+			CUDA_SAFE_CALL(cudaFreeAsync(block.ptr, block.stream));
+			return;
+		}
+		CUDA_SAFE_CALL(cudaFree(block.ptr));
 	}
 
 	TransferTracker::ReleasePinnedFn make_release_pinned_fn() {
@@ -249,9 +303,10 @@ private:
 		if (ptr == nullptr) {
 			return;
 		}
-		std::lock_guard<std::mutex> lock(mutex_);
-		auto                        it = in_use_.find(ptr);
+		std::unique_lock<std::mutex> lock(mutex_);
+		auto                         it = in_use_.find(ptr);
 		if (it == in_use_.end()) {
+			lock.unlock();
 			if (fallback_cudafree) {
 				CUDA_SAFE_CALL(cudaFree(ptr));
 			}
@@ -264,18 +319,124 @@ private:
 		const auto info = it->second;
 		in_use_.erase(it);
 		if (enabled_) {
+			std::vector<CachedBlock> evicted_cached;
+			if (info.size <= free_cache_limit_bytes_) {
+				evict_cached_until_room_locked(info.size, evicted_cached);
+				if (info.async_alloc) {
+					free_async_by_stream_size_[stream_key(info.alloc_stream)][info.size].push_back(ptr);
+				} else {
+					free_sync_by_size_[info.size].push_back(ptr);
+				}
+				free_cached_bytes_ += info.size;
+				lock.unlock();
+				for (const CachedBlock& evicted : evicted_cached) {
+					free_cached_block(evicted);
+				}
+				return;
+			}
+			lock.unlock();
 			if (info.async_alloc) {
-				free_async_by_stream_size_[stream_key(info.alloc_stream)][info.size].push_back(ptr);
+				CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream));
 			} else {
-				free_sync_by_size_[info.size].push_back(ptr);
+				CUDA_SAFE_CALL(cudaFree(ptr));
 			}
 			return;
 		}
+		lock.unlock();
 		if (info.async_alloc) {
 			CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream));
 			return;
 		}
 		CUDA_SAFE_CALL(cudaFree(ptr));
+	}
+
+	void evict_cached_until_room_locked(size_t required_bytes, std::vector<CachedBlock>& evicted) {
+		while (free_cached_bytes_ + required_bytes > free_cache_limit_bytes_) {
+			if (!evict_largest_cached_locked(evicted)) {
+				return;
+			}
+		}
+	}
+
+	bool evict_largest_cached_locked(std::vector<CachedBlock>& evicted) {
+		size_t    best_size   = 0;
+		bool      best_async  = false;
+		StreamKey best_stream = 0;
+		if (!free_sync_by_size_.empty()) {
+			best_size = free_sync_by_size_.rbegin()->first;
+		}
+		for (const auto& [stream_id, buckets] : free_async_by_stream_size_) {
+			if (!buckets.empty() && buckets.rbegin()->first > best_size) {
+				best_size   = buckets.rbegin()->first;
+				best_async  = true;
+				best_stream = stream_id;
+			}
+		}
+		if (best_size == 0) {
+			return false;
+		}
+
+		if (best_async) {
+			auto  stream_it = free_async_by_stream_size_.find(best_stream);
+			auto  bucket_it = std::prev(stream_it->second.end());
+			auto& list      = bucket_it->second;
+			evicted.push_back(CachedBlock {list.back(), true, stream_from_key(best_stream)});
+			list.pop_back();
+			free_cached_bytes_ -= bucket_it->first;
+			if (list.empty()) {
+				stream_it->second.erase(bucket_it);
+			}
+			if (stream_it->second.empty()) {
+				free_async_by_stream_size_.erase(stream_it);
+			}
+			return true;
+		}
+
+		auto  bucket_it = std::prev(free_sync_by_size_.end());
+		auto& list      = bucket_it->second;
+		evicted.push_back(CachedBlock {list.back(), false, nullptr});
+		list.pop_back();
+		free_cached_bytes_ -= bucket_it->first;
+		if (list.empty()) {
+			free_sync_by_size_.erase(bucket_it);
+		}
+		return true;
+	}
+
+	bool reusable_size(size_t request_bytes, size_t cached_bytes) const {
+		if (cached_bytes < request_bytes) {
+			return false;
+		}
+		return max_reuse_slack_bytes_ == 0 || cached_bytes - request_bytes <= max_reuse_slack_bytes_;
+	}
+
+	void* take_cached_block_locked(size_t request_bytes, cudaStream_t stream, bool async, size_t& actual_size) {
+		if (async) {
+			auto streams_it = free_async_by_stream_size_.find(stream_key(stream));
+			if (streams_it == free_async_by_stream_size_.end()) {
+				return nullptr;
+			}
+			return take_cached_block_from_map_locked(streams_it->second, request_bytes, actual_size);
+		}
+		return take_cached_block_from_map_locked(free_sync_by_size_, request_bytes, actual_size);
+	}
+
+	void* take_cached_block_from_map_locked(std::map<size_t, std::vector<void*>>& buckets,
+	                                        size_t                                request_bytes,
+	                                        size_t&                               actual_size) {
+		auto it = buckets.lower_bound(request_bytes);
+		if (it == buckets.end() || !reusable_size(request_bytes, it->first)) {
+			return nullptr;
+		}
+		auto& list = it->second;
+		void* ptr  = list.back();
+		list.pop_back();
+		actual_size = it->first;
+		free_cached_bytes_ -= actual_size;
+		if (list.empty()) {
+			buckets.erase(it);
+		}
+		return ptr;
 	}
 
 	// Caller must NOT hold mutex_ — the tracker's release callback delegates
@@ -285,10 +446,13 @@ private:
 		tracker_.reclaim_finished(make_release_pinned_fn());
 
 		std::lock_guard<std::mutex> lock(mutex_);
-		bool has_real_allocs = false;
+		bool                        has_real_allocs = false;
 		for (auto& [ptr, info] : in_use_) {
 			(void)ptr;
-			if (!info.sub_alloc) { has_real_allocs = true; break; }
+			if (!info.sub_alloc) {
+				has_real_allocs = true;
+				break;
+			}
 		}
 		if (!tracker_.empty() || has_real_allocs || pinned_pool_.has_in_use()) {
 			throw std::runtime_error(std::string("DevicePool::") + api_name +
@@ -296,20 +460,39 @@ private:
 		}
 	}
 
-	DevicePool() = default;
+	static size_t read_size_env(const char* name, size_t fallback) {
+		const char* value = std::getenv(name);
+		if (value == nullptr || *value == '\0') {
+			return fallback;
+		}
+		char* end    = nullptr;
+		auto  parsed = std::strtoull(value, &end, 10);
+		if (end == value || *end != '\0') {
+			return fallback;
+		}
+		return static_cast<size_t>(parsed);
+	}
 
-	std::mutex   mutex_;
-	bool         enabled_              = true;
-	bool         use_async_            = true;
-	bool         use_pinned_           = true;
-	size_t       small_copy_threshold_ = 256 * 1024;
+	DevicePool()
+	    : free_cache_limit_bytes_(read_size_env("GALP_DEVICE_POOL_CACHE_LIMIT_BYTES", 1024ULL * 1024ULL * 1024ULL))
+	    , max_reuse_slack_bytes_(read_size_env("GALP_DEVICE_POOL_MAX_REUSE_SLACK_BYTES", 256ULL * 1024ULL * 1024ULL)) {
+	}
 
-	std::unordered_map<size_t, std::vector<void*>>                                free_sync_by_size_;
-	std::unordered_map<StreamKey, std::unordered_map<size_t, std::vector<void*>>> free_async_by_stream_size_;
-	std::unordered_map<void*, DeviceAllocInfo>                                    in_use_;
+	std::mutex mutex_;
+	bool       enabled_                = true;
+	bool       use_async_              = true;
+	bool       use_pinned_             = true;
+	size_t     small_copy_threshold_   = 256 * 1024;
+	size_t     free_cache_limit_bytes_ = 0;
+	size_t     max_reuse_slack_bytes_  = 0;
+	size_t     free_cached_bytes_      = 0;
 
-	PinnedHostPool                                                                pinned_pool_;
-	TransferTracker                                                               tracker_;
+	std::map<size_t, std::vector<void*>>                                free_sync_by_size_;
+	std::unordered_map<StreamKey, std::map<size_t, std::vector<void*>>> free_async_by_stream_size_;
+	std::unordered_map<void*, DeviceAllocInfo>                          in_use_;
+
+	PinnedHostPool  pinned_pool_;
+	TransferTracker tracker_;
 };
 
 inline void* device_malloc(size_t bytes) {
@@ -322,6 +505,10 @@ inline void* device_malloc_on_stream(size_t bytes, cudaStream_t stream) {
 
 inline void device_free(void* ptr) {
 	DevicePool::instance().free(ptr);
+}
+
+inline void device_release_cached() {
+	DevicePool::instance().release_cached();
 }
 
 inline void device_memcpy_h2d(void* dst, const void* src, size_t bytes) {
