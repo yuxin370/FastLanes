@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -299,6 +300,74 @@ TEST(JpegDct, ShardedDatasetWritesManifestAndShardFiles) {
 	std::filesystem::remove_all(dir);
 }
 
+TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
+	int        device_count  = 0;
+	const auto device_status = cudaGetDeviceCount(&device_count);
+	if (device_status != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
+	}
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir = std::filesystem::temp_directory_path() / ("galp_jpeg_dct_device_batch_" + std::to_string(suffix));
+	const auto path0 = dir / "input0.jpg";
+	const auto path1 = dir / "input1.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path0, 16, 16);
+	write_test_jpeg(path1, 16, 16);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 2;
+	shard_options.rowgroup_vectors    = 1;
+	shard_options.rowgroups_per_shard = 256;
+	const auto output_dir             = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
+
+	galp::jpeg::JpegDctShardDatasetReader                  reader(output_dir / "manifest.bin");
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
+	    galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}},
+	    galp::jpeg::JpegDctImageCropRequest {1, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}},
+	};
+	auto batch = reader.ReadDeviceDctBatch(requests);
+
+	ASSERT_EQ(batch.layout(), galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff);
+	ASSERT_EQ(batch.image_count(), requests.size());
+	ASSERT_NE(batch.device_coefficients(), nullptr);
+	ASSERT_EQ(batch.coefficient_count(), batch.block_count() * 64U);
+	ASSERT_EQ(batch.image_layouts().size(), requests.size());
+	ASSERT_EQ(batch.block_metadata().size(), batch.block_count());
+	ASSERT_EQ(batch.rowgroups().size(), batch.rowgroup_count());
+	EXPECT_GT(batch.rowgroup_count(), 0U);
+	EXPECT_EQ(batch.image_layouts()[0].block_offset, 0U);
+	EXPECT_GT(batch.image_layouts()[0].block_count, 0U);
+	EXPECT_EQ(batch.image_layouts()[1].block_offset, batch.image_layouts()[0].block_count);
+	EXPECT_GT(batch.image_layouts()[1].block_count, 0U);
+
+	std::vector<int16_t> host(batch.coefficient_count());
+	ASSERT_EQ(cudaMemcpy(host.data(), batch.device_coefficients(), batch.coefficient_bytes(), cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+
+	for (size_t output_block_idx = 0; output_block_idx < batch.block_metadata().size(); ++output_block_idx) {
+		const auto& meta         = batch.block_metadata()[output_block_idx];
+		const auto  materialized = reader.MaterializeImageDct(meta.global_image_index);
+		const auto* expected     = static_cast<const galp::jpeg::MaterializedJpegDctBlock*>(nullptr);
+		for (const auto& block : materialized.blocks) {
+			if (block.semantic_slot_id == meta.semantic_slot_id && block.block_x == meta.block_x &&
+			    block.block_y == meta.block_y) {
+				expected = &block;
+				break;
+			}
+		}
+		ASSERT_NE(expected, nullptr);
+		for (size_t coeff_idx = 0; coeff_idx < expected->coefficients.size(); ++coeff_idx) {
+			EXPECT_EQ(host[output_block_idx * 64U + coeff_idx], expected->coefficients[coeff_idx]);
+		}
+	}
+
+	std::filesystem::remove_all(dir);
+}
+
 TEST(JpegDct, ShardedStrictValidationUsesGlobalDatasetLayout) {
 	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto dir = std::filesystem::temp_directory_path() / ("galp_jpeg_dct_shards_strict_" + std::to_string(suffix));
@@ -408,8 +477,7 @@ TEST(JpegDct, ShardedRaggedMissingBlockReturnsAbsentRowRef) {
 
 TEST(JpegDct, PublicShardPresetAppliesWithoutCliExpansion) {
 	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
-	const auto dir =
-	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_shards_preset_" + std::to_string(suffix));
+	const auto dir = std::filesystem::temp_directory_path() / ("galp_jpeg_dct_shards_preset_" + std::to_string(suffix));
 	const auto path = dir / "input.jpg";
 	std::filesystem::create_directories(dir);
 	write_test_jpeg(path);
@@ -418,7 +486,7 @@ TEST(JpegDct, PublicShardPresetAppliesWithoutCliExpansion) {
 	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
 
 	galp::jpeg::JpegDctShardOptions throughput_options;
-	throughput_options.preset = galp::jpeg::JpegDctShardPreset::kThroughput;
+	throughput_options.preset      = galp::jpeg::JpegDctShardPreset::kThroughput;
 	const auto throughput_manifest = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
 	    {path}, dir / "throughput", reader_options, throughput_options);
 	EXPECT_EQ(throughput_manifest.rowgroup_vectors, 256U);
@@ -433,8 +501,8 @@ TEST(JpegDct, PublicShardPresetAppliesWithoutCliExpansion) {
 	override_options.preset                     = galp::jpeg::JpegDctShardPreset::kThroughput;
 	override_options.rowgroup_vectors           = 128;
 	override_options.rowgroup_vectors_specified = true;
-	const auto override_manifest = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
-	    {path}, dir / "override", reader_options, override_options);
+	const auto override_manifest                = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+        {path}, dir / "override", reader_options, override_options);
 	EXPECT_EQ(override_manifest.rowgroup_vectors, 128U);
 
 	std::filesystem::remove_all(dir);

@@ -28,6 +28,7 @@ set(GALP_CORE_SOURCES
 if (GALP_WITH_JPEG_DCT)
         list(APPEND GALP_CORE_SOURCES
                 jpeg/jpeg_dct.cpp
+                jpeg/jpeg_dct_device.cu
         )
 endif ()
 add_library(galp_core STATIC ${GALP_CORE_SOURCES})

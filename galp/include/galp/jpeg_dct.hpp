@@ -159,11 +159,15 @@ enum class JpegDctShardPreset {
 	kThroughput,
 };
 
+enum class JpegDctDeviceLayout {
+	kImageMajorComponentBlockCoeff,
+};
+
 struct JpegDctShardOptions {
-	size_t             shard_images        = 8192;
-	uint32_t           rowgroup_vectors    = 128;
-	uint32_t           rowgroups_per_shard = 256;
-	JpegDctShardPreset preset              = JpegDctShardPreset::kBalanced;
+	size_t             shard_images                  = 8192;
+	uint32_t           rowgroup_vectors              = 128;
+	uint32_t           rowgroups_per_shard           = 256;
+	JpegDctShardPreset preset                        = JpegDctShardPreset::kBalanced;
 	bool               shard_images_specified        = false;
 	bool               rowgroup_vectors_specified    = false;
 	bool               rowgroups_per_shard_specified = false;
@@ -225,6 +229,81 @@ struct MaterializedJpegDctImage {
 	std::vector<MaterializedJpegDctBlock> blocks;
 };
 
+struct JpegDctCropBox {
+	uint32_t x      = 0;
+	uint32_t y      = 0;
+	uint32_t width  = 0;
+	uint32_t height = 0;
+};
+
+struct JpegDctImageCropRequest {
+	uint32_t       global_image_index = 0;
+	JpegDctCropBox source_crop {};
+};
+
+struct JpegDctDeviceBatchOptions {
+	JpegDctDeviceLayout layout               = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+	size_t              cache_capacity_bytes = 0;
+};
+
+struct JpegDctDeviceImageLayout {
+	uint32_t global_image_index = 0;
+	uint64_t block_offset       = 0;
+	uint32_t block_count        = 0;
+};
+
+struct JpegDctDeviceBlockMetadata {
+	uint32_t request_index      = 0;
+	uint32_t global_image_index = 0;
+	uint32_t semantic_slot_id   = 0;
+	uint32_t block_x            = 0;
+	uint32_t block_y            = 0;
+};
+
+struct JpegDctDeviceRowgroupMetadata {
+	uint32_t shard_id       = 0;
+	uint32_t rowgroup_index = 0;
+};
+
+struct JpegDctDeviceCacheStats {
+	size_t capacity_bytes     = 0;
+	size_t resident_bytes     = 0;
+	size_t resident_rowgroups = 0;
+	size_t hits               = 0;
+	size_t misses             = 0;
+	size_t inserts            = 0;
+	size_t evictions          = 0;
+};
+
+class JpegDctDeviceBatch {
+public:
+	struct Impl;
+
+	JpegDctDeviceBatch() noexcept;
+	explicit JpegDctDeviceBatch(std::unique_ptr<Impl> impl) noexcept;
+	~JpegDctDeviceBatch();
+
+	JpegDctDeviceBatch(const JpegDctDeviceBatch&)            = delete;
+	JpegDctDeviceBatch& operator=(const JpegDctDeviceBatch&) = delete;
+	JpegDctDeviceBatch(JpegDctDeviceBatch&&) noexcept;
+	JpegDctDeviceBatch& operator=(JpegDctDeviceBatch&&) noexcept;
+
+	[[nodiscard]] const int16_t*                                    device_coefficients() const noexcept;
+	[[nodiscard]] size_t                                            coefficient_count() const noexcept;
+	[[nodiscard]] size_t                                            coefficient_bytes() const noexcept;
+	[[nodiscard]] size_t                                            block_count() const noexcept;
+	[[nodiscard]] size_t                                            image_count() const noexcept;
+	[[nodiscard]] size_t                                            rowgroup_count() const noexcept;
+	[[nodiscard]] JpegDctDeviceCacheStats                           cache_stats() const noexcept;
+	[[nodiscard]] JpegDctDeviceLayout                               layout() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&    block_metadata() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;
+
+private:
+	std::unique_ptr<Impl> impl_;
+};
+
 class JpegDctShardDatasetReader {
 public:
 	explicit JpegDctShardDatasetReader(const std::filesystem::path& manifest_path);
@@ -235,7 +314,12 @@ public:
 	JpegDctShardDatasetReader(JpegDctShardDatasetReader&&) noexcept;
 	JpegDctShardDatasetReader& operator=(JpegDctShardDatasetReader&&) noexcept;
 
+	[[nodiscard]] uint64_t image_count() const noexcept;
+
 	MaterializedJpegDctImage MaterializeImageDct(uint32_t global_image_index);
+
+	JpegDctDeviceBatch ReadDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
+	                                      const JpegDctDeviceBatchOptions&            options = {});
 
 	JpegDctBlockGroup ReadBlockGroup(uint32_t shard_id, uint32_t semantic_slot_id, uint32_t block_x, uint32_t block_y);
 
