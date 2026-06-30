@@ -16,6 +16,7 @@ galp/docs/*
 # Build directories created by Clion
 cmake-build-*/
 data/decompress*
+skills
 
 #test 
 python/tests/
