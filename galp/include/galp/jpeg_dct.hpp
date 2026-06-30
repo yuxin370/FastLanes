@@ -16,6 +16,8 @@
 
 namespace galp::jpeg {
 
+inline constexpr size_t kDefaultJpegDctDecodeBatchRowgroups = 64;
+
 enum class JpegComponentMode {
 	kAllComponents,
 	kSingleComponent,
@@ -244,6 +246,7 @@ struct JpegDctImageCropRequest {
 struct JpegDctDeviceBatchOptions {
 	JpegDctDeviceLayout layout               = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
 	size_t              cache_capacity_bytes = 0;
+	size_t              decode_batch_rowgroups = kDefaultJpegDctDecodeBatchRowgroups;
 };
 
 struct JpegDctDeviceImageLayout {
@@ -275,6 +278,91 @@ struct JpegDctDeviceCacheStats {
 	size_t evictions          = 0;
 };
 
+struct JpegDctDeviceExecutionStats {
+	size_t planned_selected_vector_count = 0;
+	size_t selected_vector_count      = 0;
+	size_t full_vector_count          = 0;
+	size_t planned_saved_vector_count = 0;
+	size_t actual_saved_vector_count  = 0;
+	size_t rowgroup_count             = 0;
+	size_t workset_count              = 0;
+	size_t decode_kernel_launch_count = 0;
+	size_t gather_kernel_launch_count = 0;
+	size_t cached_gather_kernel_launch_count = 0;
+	size_t materialize_kernel_launch_count = 0;
+	size_t gather_item_count          = 0;
+	size_t decoded_gather_item_count  = 0;
+	size_t cached_gather_item_count   = 0;
+	size_t workset_upload_count       = 0;
+	size_t scratch_upload_count       = 0;
+	size_t scratch_allocation_count   = 0;
+	size_t internal_sync_count        = 0;
+	size_t cached_gather_sync_count   = 0;
+	size_t decoded_batch_sync_count   = 0;
+	size_t cached_gather_event_handoff_count = 0;
+	size_t sparse_vector_cache_hits   = 0;
+	size_t sparse_vector_cache_misses = 0;
+	size_t runtime_policy_selected_rowgroups = 0;
+	size_t runtime_policy_full_rowgroups     = 0;
+	size_t runtime_policy_tail_full_rowgroups = 0;
+	size_t runtime_policy_ratio_full_rowgroups = 0;
+	size_t runtime_policy_low_saving_full_rowgroups = 0;
+	double planning_ms                = 0.0;
+	double workset_build_ms           = 0.0;
+	double workset_upload_ms          = 0.0;
+	double decode_ms                  = 0.0;
+	double gather_ms                  = 0.0;
+	std::string runtime_policy_decision;
+	std::string runtime_policy_reason;
+};
+
+struct JpegDctDeviceBatchPlanPreview {
+	JpegDctDeviceLayout                        layout = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+	std::vector<JpegDctDeviceImageLayout>      image_layouts;
+	std::vector<JpegDctDeviceBlockMetadata>    block_metadata;
+	std::vector<JpegDctDeviceRowgroupMetadata> rowgroups;
+	size_t                                     planned_selected_vector_count   = 0;
+	size_t                                     estimated_selected_vector_count = 0;
+	size_t                                     full_vector_count               = 0;
+	size_t                                     planned_saved_vector_count      = 0;
+	size_t                                     estimated_saved_vector_count    = 0;
+	double                                     planned_selected_vector_ratio   = 0.0;
+	double                                     estimated_selected_vector_ratio = 0.0;
+	double                                     planning_ms                     = 0.0;
+};
+
+class JpegDctDeviceBatchPreparedPlan {
+public:
+	struct Impl;
+
+	JpegDctDeviceBatchPreparedPlan() noexcept;
+	explicit JpegDctDeviceBatchPreparedPlan(std::unique_ptr<Impl> impl) noexcept;
+	~JpegDctDeviceBatchPreparedPlan();
+
+	JpegDctDeviceBatchPreparedPlan(const JpegDctDeviceBatchPreparedPlan&)            = delete;
+	JpegDctDeviceBatchPreparedPlan& operator=(const JpegDctDeviceBatchPreparedPlan&) = delete;
+	JpegDctDeviceBatchPreparedPlan(JpegDctDeviceBatchPreparedPlan&&) noexcept;
+	JpegDctDeviceBatchPreparedPlan& operator=(JpegDctDeviceBatchPreparedPlan&&) noexcept;
+
+	[[nodiscard]] bool                                             empty() const noexcept;
+	[[nodiscard]] JpegDctDeviceLayout                              layout() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&     image_layouts() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&   block_metadata() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;
+	[[nodiscard]] size_t                                           planned_selected_vector_count() const noexcept;
+	[[nodiscard]] size_t                                           estimated_selected_vector_count() const noexcept;
+	[[nodiscard]] size_t                                           full_vector_count() const noexcept;
+	[[nodiscard]] size_t                                           planned_saved_vector_count() const noexcept;
+	[[nodiscard]] size_t                                           estimated_saved_vector_count() const noexcept;
+	[[nodiscard]] double                                           planned_selected_vector_ratio() const noexcept;
+	[[nodiscard]] double                                           estimated_selected_vector_ratio() const noexcept;
+	[[nodiscard]] double                                           planning_ms() const noexcept;
+
+private:
+	friend class JpegDctShardDatasetReader;
+	std::unique_ptr<Impl> impl_;
+};
+
 class JpegDctDeviceBatch {
 public:
 	struct Impl;
@@ -295,6 +383,7 @@ public:
 	[[nodiscard]] size_t                                            image_count() const noexcept;
 	[[nodiscard]] size_t                                            rowgroup_count() const noexcept;
 	[[nodiscard]] JpegDctDeviceCacheStats                           cache_stats() const noexcept;
+	[[nodiscard]] JpegDctDeviceExecutionStats                       execution_stats() const noexcept;
 	[[nodiscard]] JpegDctDeviceLayout                               layout() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&    block_metadata() const noexcept;
@@ -315,8 +404,17 @@ public:
 	JpegDctShardDatasetReader& operator=(JpegDctShardDatasetReader&&) noexcept;
 
 	[[nodiscard]] uint64_t image_count() const noexcept;
+	[[nodiscard]] JpegImageMetadata ImageMetadata(uint32_t global_image_index) const;
 
 	MaterializedJpegDctImage MaterializeImageDct(uint32_t global_image_index);
+
+	JpegDctDeviceBatchPlanPreview PlanDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
+	                                                 const JpegDctDeviceBatchOptions&            options = {}) const;
+
+	JpegDctDeviceBatchPreparedPlan PrepareDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
+	                                                     const JpegDctDeviceBatchOptions&            options = {});
+
+	JpegDctDeviceBatch ReadPreparedDeviceDctBatch(JpegDctDeviceBatchPreparedPlan plan);
 
 	JpegDctDeviceBatch ReadDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
 	                                      const JpegDctDeviceBatchOptions&            options = {});
