@@ -216,6 +216,40 @@ struct RLEDecompressor : DecompressorBase<ValueT> {
 	}
 };
 
+template <typename ValueT,
+          typename IndexT,
+          unsigned UNPACK_N_VECTORS,
+          unsigned UNPACK_N_VALUES,
+          typename UnpackerT,
+          typename PatcherT,
+          typename ExpanderT,
+          typename ColumnT>
+struct RLESLPATCHDecompressor : DecompressorBase<ValueT> {
+	static constexpr unsigned                                     N_VALUES = UNPACK_N_VECTORS * UNPACK_N_VALUES;
+	UnpackerT                                                     unpacker;
+	PatcherT                                                      patcher;
+	RLEUnsumer<ValueT, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES> unsumer;
+	ExpanderT                                                     expander;
+
+	__device__ __forceinline__ RLESLPATCHDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
+	    : unpacker(column.index.ffor.bp.packed_array + column.index.ffor.bp.vector_offsets[vector_index],
+	               lane,
+	               column.index.ffor.bp.bit_widths[vector_index],
+	               FFORFunctor<IndexT, UNPACK_N_VECTORS>(column.index.ffor.bases + vector_index))
+	    , patcher(column.index, vector_index, lane)
+	    , unsumer(column, vector_index, lane)
+	    , expander(column, vector_index, lane) {
+	}
+
+	void __device__ unpack_next_into(ValueT* __restrict out) {
+		IndexT codes[N_VALUES];
+		unpacker.unpack_next_into(codes);
+		patcher.patch(codes);
+		unsumer.unsum_inplace(codes);
+		expander.expand_codes_into(codes, out);
+	}
+};
+
 } // namespace galp::codec::device
 
 #endif // GALP_DECOMPRESSION_PRIMITIVES_DECOMPRESSORS_CUH

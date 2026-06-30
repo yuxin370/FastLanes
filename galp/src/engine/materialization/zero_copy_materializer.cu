@@ -439,6 +439,58 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				result.host_owned_by_backing = true;
 				break;
 			}
+			case EXP_RLE_I08_SLPATCH_U16: {
+				if (zero_copy_operand_count(zcol) < 8) {
+					throw std::runtime_error("EXP_RLE_I08_SLPATCH_U16: missing operand tokens");
+				}
+				const auto seg_vals      = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 0)));
+				const auto seg_rsum      = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 1)));
+				const auto seg_exc       = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 2)));
+				const auto seg_pos       = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 3)));
+				const auto seg_cnt       = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 4)));
+				const auto seg_bitpacked = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 5)));
+				const auto seg_bw        = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 6)));
+				const auto seg_base      = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 7)));
+				result.host              = make_rle_slpatch_zero_copy<int8_t, uint16_t>(seg_vals,
+                                                                          seg_rsum,
+                                                                          seg_exc,
+                                                                          seg_pos,
+                                                                          seg_cnt,
+                                                                          seg_bitpacked,
+                                                                          seg_bw,
+                                                                          seg_base,
+                                                                          zero_copy.n_values,
+                                                                          zero_copy.n_vecs,
+                                                                          *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
+			case EXP_RLE_I16_SLPATCH_U16: {
+				if (zero_copy_operand_count(zcol) < 8) {
+					throw std::runtime_error("EXP_RLE_I16_SLPATCH_U16: missing operand tokens");
+				}
+				const auto seg_vals      = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 0)));
+				const auto seg_rsum      = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 1)));
+				const auto seg_exc       = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 2)));
+				const auto seg_pos       = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 3)));
+				const auto seg_cnt       = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 4)));
+				const auto seg_bitpacked = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 5)));
+				const auto seg_bw        = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 6)));
+				const auto seg_base      = zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, 7)));
+				result.host              = make_rle_slpatch_zero_copy<int16_t, uint16_t>(seg_vals,
+                                                                           seg_rsum,
+                                                                           seg_exc,
+                                                                           seg_pos,
+                                                                           seg_cnt,
+                                                                           seg_bitpacked,
+                                                                           seg_bw,
+                                                                           seg_base,
+                                                                           zero_copy.n_values,
+                                                                           zero_copy.n_vecs,
+                                                                           *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
 			default:
 				throw_unsupported_zero_copy_token(
 				    zcol.token, zero_copy.rowgroup_index, zcol.column_index, zero_copy_column_name(zcol));

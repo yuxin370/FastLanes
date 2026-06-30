@@ -3,10 +3,10 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/workset/upload.cu
 // ────────────────────────────────────────────────────────
+#include "cuda/cuda_macros.cuh"
 #include "engine/workset/append.cuh"
 #include "engine/workset/streams.cuh"
 #include "engine/workset/upload.cuh"
-#include "cuda/cuda_macros.cuh"
 #include <chrono>
 #include <stdexcept>
 
@@ -63,7 +63,7 @@ void bind_workset_output_pointers(ExecutionWorkset& workset) {
 	}
 }
 
-void build_mixed_slots(ExecutionWorkset& workset) {
+void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 	clear_mixed_slots(workset.slots);
 
 	const size_t total_items = count_expr_work_items(workset);
@@ -71,6 +71,12 @@ void build_mixed_slots(ExecutionWorkset& workset) {
 		return;
 	}
 	workset.slots.mixed.reserve((total_items + 1U) / 2U);
+
+	// Multi-vector unpack decodes `decode_vector_width` vectors per work item, so synthesized
+	// fallback items must step by that width — matching the chunked items add_expression_to_batch
+	// builds for typed dispatch. Per-vector items here would make each slot decode
+	// `unpack_n_vectors` vectors into overlapping (and tail out-of-bounds) outputs.
+	const uint32_t decode_vector_width = std::max(1U, cfg.unpack_n_vectors);
 
 	galp::execution::WorkItemAny pending_half {};
 	bool                         has_pending_half = false;
@@ -98,12 +104,23 @@ void build_mixed_slots(ExecutionWorkset& workset) {
 		using T              = typename decltype(tag)::type;
 		constexpr auto type  = galp::execution::type_tag_for<T>();
 		const auto&    batch = workset.buffers.host_batches.template get<T>();
+		if (batch.work_items_explicit) {
+			for (const auto& work : batch.work_items) {
+				const auto semantic_lanes =
+				    galp::execution::semantic_lane_count(type, batch.device_exprs[work.expr_index].plan);
+				append_work(work, semantic_lanes);
+			}
+			return;
+		}
 		for (uint32_t expr_idx = 0; expr_idx < batch.device_exprs.size(); ++expr_idx) {
 			const auto& expr           = batch.device_exprs[expr_idx];
 			const auto  semantic_lanes = galp::execution::semantic_lane_count(type, expr.plan);
 			const auto  n_vecs         = galp::codec::utils::get_n_vecs_from_size(expr.n_values);
-			for (uint32_t vec = 0; vec < n_vecs; ++vec) {
-				append_work(galp::execution::WorkItemAny {expr_idx, vec, type}, semantic_lanes);
+			for (uint32_t vec = 0; vec < n_vecs; vec += decode_vector_width) {
+				if (vec + decode_vector_width > n_vecs) {
+					throw std::out_of_range("FastLanes decode chunk extends past column vectors");
+				}
+				append_work(galp::execution::WorkItemAny {expr_idx, vec, type, vec}, semantic_lanes);
 			}
 		}
 	});
@@ -162,7 +179,7 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 	breakdown.prep_bind_ms = ms(t0b, t0c);
 
 	if (mixed_dispatch) {
-		build_mixed_slots(workset);
+		build_mixed_slots(workset, cfg);
 	}
 	const auto t1           = clock::now();
 	breakdown.prep_slots_ms = ms(t0c, t1);

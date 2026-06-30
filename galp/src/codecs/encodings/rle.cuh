@@ -7,6 +7,7 @@
 #define GALP_COMPRESSION_COLUMNS_RLE_CUH
 
 #include "codecs/encodings/ffor.cuh"
+#include "codecs/encodings/slpatch.cuh"
 #include "cuda/memory/device_arena.cuh"
 #include "cuda/memory/gpu_array.cuh"
 #include <cstddef>
@@ -25,6 +26,17 @@ struct RLEColumn {
 	T*                 rle_values;   // concatenated per-vector values
 	uint32_t*          rle_offsets;  // per-vector base offset into rle_values
 	size_t             n_rle_values; // total values length
+};
+
+template <typename T, typename IndexT>
+struct RLESLPATCHColumn {
+	size_t                n_values;
+	size_t                n_vecs;
+	SLPATCHColumn<IndexT> index;
+	IndexT*               rsum_bases;   // n_vecs * n_lanes(IndexT)
+	T*                    rle_values;   // concatenated per-vector values
+	uint32_t*             rle_offsets;  // per-vector base offset into rle_values
+	size_t                n_rle_values; // total values length
 };
 
 } // namespace device
@@ -85,6 +97,47 @@ struct RLEColumn {
 };
 
 template <typename T, typename IndexT>
+struct RLESLPATCHColumn {
+	using DeviceColumnT = typename device::RLESLPATCHColumn<T, IndexT>;
+
+	size_t             n_values;
+	size_t             n_vecs;
+	SLPATCHColumn<IndexT> index;
+	HostArray<IndexT>  rsum_bases;
+	HostArray<T>       rle_values;
+	HostArray<uint32_t> rle_offsets;
+	size_t             n_rle_values;
+
+	size_t get_n_values() const {
+		return n_values;
+	}
+
+	device::RLESLPATCHColumn<T, IndexT> copy_to_device() const {
+		return device::RLESLPATCHColumn<T, IndexT> {
+		    n_values,
+		    n_vecs,
+		    index.copy_to_device(),
+		    GPUArray<IndexT>(n_vecs * galp::codec::utils::get_n_lanes<IndexT>(), rsum_bases).release(),
+		    GPUArray<T>(n_rle_values, rle_values).release(),
+		    GPUArray<uint32_t>(n_vecs, rle_offsets).release(),
+		    n_rle_values};
+	}
+
+	void copy_to_device(galp::memory::DeviceArena& arena, device::RLESLPATCHColumn<T, IndexT>& out) const {
+		index.copy_to_device(arena, out.index);
+		auto i_rsum      = arena.template add<IndexT>(n_vecs * galp::codec::utils::get_n_lanes<IndexT>(), rsum_bases);
+		auto i_vals      = arena.template add<T>(n_rle_values, rle_values);
+		auto i_offs      = arena.template add<uint32_t>(n_vecs, rle_offsets);
+		out.n_values     = n_values;
+		out.n_vecs       = n_vecs;
+		out.n_rle_values = n_rle_values;
+		arena.resolve_to(reinterpret_cast<void**>(&out.rsum_bases), i_rsum);
+		arena.resolve_to(reinterpret_cast<void**>(&out.rle_values), i_vals);
+		arena.resolve_to(reinterpret_cast<void**>(&out.rle_offsets), i_offs);
+	}
+};
+
+template <typename T, typename IndexT>
 void free_column(RLEColumn<T, IndexT>& column) {
 	free_column(column.ffor);
 	column.rsum_bases.reset();
@@ -95,6 +148,22 @@ void free_column(RLEColumn<T, IndexT>& column) {
 template <typename T, typename IndexT>
 void free_column(device::RLEColumn<T, IndexT> column) {
 	free_column(column.ffor);
+	free_device_pointer(column.rsum_bases);
+	free_device_pointer(column.rle_values);
+	free_device_pointer(column.rle_offsets);
+}
+
+template <typename T, typename IndexT>
+void free_column(RLESLPATCHColumn<T, IndexT>& column) {
+	free_column(column.index);
+	column.rsum_bases.reset();
+	column.rle_values.reset();
+	column.rle_offsets.reset();
+}
+
+template <typename T, typename IndexT>
+void free_column(device::RLESLPATCHColumn<T, IndexT> column) {
+	free_column(column.index);
 	free_device_pointer(column.rsum_bases);
 	free_device_pointer(column.rle_values);
 	free_device_pointer(column.rle_offsets);

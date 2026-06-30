@@ -3,6 +3,7 @@ add_executable(galp_tests
         thrust_core_test.cu
         galp_test.cu
         reader_test.cu
+        workset_selected_vectors_test.cu
         jpeg_dct_order_test.cpp
 )
 if (GALP_WITH_JPEG_DCT)
@@ -28,6 +29,7 @@ target_link_libraries(galp_tests PRIVATE
 )
 target_include_directories(galp_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/benchmark_support/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../tools/data/include)
 
 target_compile_definitions(galp_tests PRIVATE
@@ -55,6 +57,16 @@ add_test(
 )
 set_tests_properties(GalpPublicApiBoundaries PROPERTIES LABELS "galp;public-api;boundaries")
 
+if (GALP_WITH_JPEG_DCT)
+        add_test(
+                NAME GalpJpegDctNoDeviceSynchronize
+                COMMAND ${CMAKE_COMMAND}
+	                -DGALP_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
+	                -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/GalpJpegDctNoDeviceSynchronize.cmake
+        )
+        set_tests_properties(GalpJpegDctNoDeviceSynchronize PROPERTIES LABELS "galp;jpeg-dct;static")
+endif ()
+
 if (GALP_ENABLE_INSTALL)
         add_test(
                 NAME GalpPackageConsumerSmoke
@@ -66,6 +78,11 @@ if (GALP_ENABLE_INSTALL)
         set_tests_properties(GalpPackageConsumerSmoke PROPERTIES LABELS "galp;public-api;package")
 endif ()
 
+gtest_discover_tests(galp_tests
+        TEST_FILTER "WorksetSelectedVectors.*"
+        DISCOVERY_TIMEOUT 60
+        PROPERTIES LABELS "galp-workset-cpu"
+)
 gtest_discover_tests(galp_tests
         TEST_FILTER "ThrustMemcpy.*:ThrustCore.*:DeviceUtils.*:JpegDct.*:JpegDctOrder.*"
         DISCOVERY_TIMEOUT 60

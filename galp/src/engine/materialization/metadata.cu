@@ -116,18 +116,16 @@ RowgroupData materialize_workset(ExecutionWorkset&                              
 }
 
 void release_workset(ExecutionWorkset& workset,
-	                     const bool        preserve_resources,
-	                     const bool        h2d_already_complete,
-	                     double*           timing_event_destroy_ms) {
-	// Even when compute has already waited on H2D, sync_h2d also drains the
-	// transfer tracker so its events and pinned staging buffers do not outlive the stream.
-	(void)h2d_already_complete;
+                     const bool        preserve_resources,
+                     const bool        h2d_already_complete,
+                     double*           timing_event_destroy_ms) {
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T          = typename decltype(tag)::type;
 		auto& host_batch = workset.buffers.host_batches.template get<T>();
 		host_batch.device_exprs.clear();
 		host_batch.output_offsets.clear();
 		host_batch.work_items.clear();
+		host_batch.work_items_explicit = false;
 		host_batch.expr_indices.clear();
 
 		auto& device_batch = workset.buffers.device_batches.template get<T>();
@@ -143,7 +141,11 @@ void release_workset(ExecutionWorkset& workset,
 	workset.outputs.used_bytes = 0;
 	workset.outputs.required   = false;
 	if (workset.transfer.h2d_stream) {
-		galp::memory::sync_h2d(workset.transfer.h2d_stream.get());
+		if (h2d_already_complete) {
+			galp::memory::complete_h2d(workset.transfer.h2d_stream.get());
+		} else {
+			galp::memory::sync_h2d(workset.transfer.h2d_stream.get());
+		}
 	}
 	if (workset.buffers.chunk_arena != nullptr) {
 		if (preserve_resources) {

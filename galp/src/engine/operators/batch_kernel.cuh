@@ -11,16 +11,16 @@
 
 #include "core/data/model.cuh"
 #include "core/data/value_store.cuh"
-#include "engine/operators/batch.cuh"
-#include "engine/config.cuh"
-#include "engine/unpack_dispatch.cuh"
 #include "core/expression.cuh"
-#include "cuda/launch/dispatch.cuh"
 #include "core/lane_policy.cuh"
 #include "core/types.cuh"
 #include "cuda/cuda_macros.cuh"
+#include "cuda/launch/dispatch.cuh"
 #include "cuda/memory/device_pool.cuh"
 #include "cuda/memory/gpu_array.cuh"
+#include "engine/config.cuh"
+#include "engine/operators/batch.cuh"
+#include "engine/unpack_dispatch.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -29,19 +29,19 @@
 namespace galp::execution::detail {
 
 template <typename T, bool WRITE_OUT = true>
-void launch_batch_no_sync(const galp::execution::Batch<T>&  batch,
-                          const DeviceExpression<T>* d_exprs,
-                          const WorkItemAny*         d_items,
-                          const size_t               n_items,
-                          const ExecutionConfig&     cfg,
-                          cudaStream_t               stream = 0) {
+void launch_batch_no_sync(const galp::execution::Batch<T>& batch,
+                          const DeviceExpression<T>*       d_exprs,
+                          const WorkItemAny*               d_items,
+                          const size_t                     n_items,
+                          const ExecutionConfig&           cfg,
+                          cudaStream_t                     stream = 0) {
 	if (batch.device_exprs.empty() || !d_exprs || !d_items || n_items == 0) {
 		return;
 	}
-	uint32_t           threads          = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<T>());
+	uint32_t threads = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<T>());
 	for (const auto& work : batch.work_items) {
-		threads = std::max(threads,
-		                   galp::execution::semantic_lane_count(type_tag_for<T>(), batch.device_exprs[work.expr_index].plan));
+		threads = std::max(
+		    threads, galp::execution::semantic_lane_count(type_tag_for<T>(), batch.device_exprs[work.expr_index].plan));
 	}
 	const dim3 block(static_cast<unsigned>(threads));
 	const dim3 grid(static_cast<unsigned>(n_items));
@@ -71,17 +71,17 @@ template <typename T>
 void finalize_batch(Batch<T>& batch, RowgroupData& result) {
 	for (size_t idx = 0; idx < batch.device_exprs.size(); ++idx) {
 		auto& expr = batch.device_exprs[idx];
-		auto  host = std::shared_ptr<T[]>(new T[expr.n_values], std::default_delete<T[]>());
-		if (expr.n_values > 0) {
+		auto  host = std::shared_ptr<T[]>(new T[expr.output_n_values], std::default_delete<T[]>());
+		if (expr.output_n_values > 0) {
 			if (expr.out == nullptr) {
 				throw std::runtime_error("device output pointer not initialized");
 			}
-			CUDA_SAFE_CALL(cudaMemcpy(host.get(), expr.out, expr.n_values * sizeof(T), cudaMemcpyDeviceToHost));
+			CUDA_SAFE_CALL(cudaMemcpy(host.get(), expr.out, expr.output_n_values * sizeof(T), cudaMemcpyDeviceToHost));
 		}
 		MaterializedColumn out {};
 		out.values                              = ValueStore {std::move(host)};
 		out.meta.column_index                   = batch.expr_indices[idx];
-		out.meta.value_count                    = expr.n_values;
+		out.meta.value_count                    = expr.output_n_values;
 		out.meta.value_type                     = galp::format::ToDataType<T>::value;
 		out.meta.values_per_step                = 1;
 		result.columns[batch.expr_indices[idx]] = std::move(out);
@@ -91,6 +91,7 @@ void finalize_batch(Batch<T>& batch, RowgroupData& result) {
 	batch.device_exprs.clear();
 	batch.output_offsets.clear();
 	batch.work_items.clear();
+	batch.work_items_explicit = false;
 	batch.expr_indices.clear();
 }
 

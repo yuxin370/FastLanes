@@ -157,6 +157,19 @@ struct ColumnKindTraits<galp::codec::host::RLEColumn<T, IndexT>> {
 	}
 };
 
+template <typename T, typename IndexT>
+struct ColumnKindTraits<galp::codec::host::RLESLPATCHColumn<T, IndexT>> {
+	using value_type                    = T;
+	static constexpr PlanKind plan_kind = PlanKind::RLE_SLPATCH_U16;
+	static void fill(DeviceExpression<T>&                                 expr,
+	                 const galp::codec::host::RLESLPATCHColumn<T, IndexT>&     host_col,
+	                 galp::memory::DeviceArena&                         arena,
+	                 [[maybe_unused]] bool                                freq_use_extended) {
+		static_assert(std::is_same_v<IndexT, uint16_t>, "RLESLPATCHColumn currently supports uint16_t indexes");
+		host_col.copy_to_device(arena, expr.col.rle_slpatch_u16);
+	}
+};
+
 // DICTREFColumn is resolved to DICTFFORColumn by resolve_dict_refs() before
 // reaching fill_device_expr. Trait exists so the visitor template instantiates
 // cleanly; fill() throws to match the prior runtime "plan/column mismatch".
@@ -212,6 +225,10 @@ struct column_value_type<galp::codec::device::SLPATCHColumn<T>> {
 };
 template <typename T, typename IndexT>
 struct column_value_type<galp::codec::device::RLEColumn<T, IndexT>> {
+	using type = T;
+};
+template <typename T, typename IndexT>
+struct column_value_type<galp::codec::device::RLESLPATCHColumn<T, IndexT>> {
 	using type = T;
 };
 

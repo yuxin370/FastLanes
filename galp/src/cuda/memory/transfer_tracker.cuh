@@ -87,6 +87,23 @@ public:
 		drain_entries(entries, release_pinned);
 	}
 
+	// Drop a stream's tracked entries without synchronizing the stream. Callers
+	// must only use this after a later dependency has proven that every tracked
+	// event on this stream has completed.
+	void complete_stream(cudaStream_t stream, const ReleasePinnedFn& release_pinned) {
+		std::vector<PendingEntry> entries;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			auto it = pending_.find(key(stream));
+			if (it == pending_.end()) {
+				return;
+			}
+			entries = std::move(it->second);
+			pending_.erase(it);
+		}
+		drain_entries(entries, release_pinned);
+	}
+
 	// Non-blocking sweep: for entries whose event has completed, invoke the
 	// release callback and drop them from tracking. Used by the pool's idle
 	// check so a reconfiguration doesn't reject on stale-but-done entries.

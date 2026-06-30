@@ -6,8 +6,10 @@
 #ifndef ENGINE_RUNTIME_WORKSET_APPEND_CUH
 #define ENGINE_RUNTIME_WORKSET_APPEND_CUH
 
+#include "codecs/consts.cuh"
 #include "engine/operators/dict_ref_resolver.cuh"
 #include "engine/workset/streams.cuh"
+#include <algorithm>
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_set>
@@ -75,8 +77,13 @@ inline size_t count_work_items(const ExecutionWorkset& workset) {
 inline size_t count_expr_work_items(const ExecutionWorkset& workset) {
 	size_t total = 0;
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
-		for (const auto& expr : workset.buffers.host_batches.template get<T>().device_exprs) {
+		using T           = typename decltype(tag)::type;
+		const auto& batch = workset.buffers.host_batches.template get<T>();
+		if (batch.work_items_explicit) {
+			total += batch.work_items.size();
+			return;
+		}
+		for (const auto& expr : batch.device_exprs) {
 			total += galp::codec::utils::get_n_vecs_from_size(expr.n_values);
 		}
 	});
@@ -201,7 +208,9 @@ inline void append_column_to_workset(ExecutionWorkset&              workset,
                                      galp::memory::DeviceArena&     active_chunk_arena,
                                      size_t*                        out_total_bytes       = nullptr,
                                      const bool                     emit_typed_work_items = true,
-                                     const bool                     register_backing      = true) {
+                                     const bool                     register_backing      = true,
+                                     const std::vector<uint32_t>*   selected_vectors      = nullptr,
+                                     const uint32_t                 selected_vector_width = 1) {
 	if (column.skip_decompress) {
 		return;
 	}
@@ -215,11 +224,19 @@ inline void append_column_to_workset(ExecutionWorkset&              workset,
 		    using T             = typename galp::execution::ColumnKindTraits<HostColT>::value_type;
 		    constexpr auto plan = galp::execution::detail::plan_for_host_col<HostColT>();
 		    if constexpr (galp::execution::is_supported_type_v<T>) {
+			    const uint32_t effective_vector_width =
+			        selected_vectors != nullptr ? selected_vector_width : std::max(1U, cfg.unpack_n_vectors);
+			    const size_t output_vector_width =
+			        effective_vector_width == 0 ? 1U : static_cast<size_t>(effective_vector_width);
+			    const size_t output_n_values = selected_vectors != nullptr
+			                                       ? selected_vectors->size() *
+			                                             output_vector_width * galp::codec::consts::VALUES_PER_VECTOR
+			                                       : host_col.get_n_values();
 			    if (out_total_bytes) {
-				    *out_total_bytes += host_col.get_n_values() * sizeof(T);
+				    *out_total_bytes += output_n_values * sizeof(T);
 			    }
 			    const size_t output_offset =
-			        cfg.write_out ? reserve_workset_output_bytes<T>(workset, host_col.get_n_values()) : 0U;
+			        cfg.write_out ? reserve_workset_output_bytes<T>(workset, output_n_values) : 0U;
 			    add_expression_to_batch<T>(materialize_expr_index,
 			                               host_col,
 			                               plan,
@@ -228,7 +245,9 @@ inline void append_column_to_workset(ExecutionWorkset&              workset,
 			                               cfg.freq_patcher,
 			                               cfg.freq_branchless_threshold,
 			                               emit_typed_work_items,
-			                               active_chunk_arena);
+			                               active_chunk_arena,
+			                               selected_vectors,
+			                               effective_vector_width);
 		    }
 	    },
 	    column.host);
@@ -267,6 +286,46 @@ inline void append_rowgroup_columns(ExecutionWorkset&                workset,
 		                         nullptr,
 		                         cfg.launch_strategy != galp::execution::LaunchStrategy::MixedDispatch,
 		                         false);
+	}
+}
+
+inline void append_rowgroup_columns_selected_vectors(ExecutionWorkset&                workset,
+                                                     const galp::execution::Rowgroup& rowgroup,
+                                                     const ExecutionConfig&           cfg,
+                                                     const std::vector<uint32_t>&     selected_vectors,
+                                                     const size_t                     expr_index_base       = 0,
+                                                     const bool                       use_global_expr_index = false) {
+	workset.outputs.required = workset.outputs.required || cfg.write_out;
+	begin_workset_chunk_arena(workset, rowgroup.columns.size());
+	galp::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
+
+	size_t      active_expr_count  = 0;
+	const void* last_backing_base  = nullptr;
+	size_t      last_backing_bytes = 0;
+	for (size_t i = 0; i < rowgroup.columns.size(); ++i) {
+		const auto& column = rowgroup.columns[i];
+		if (column.skip_decompress) {
+			continue;
+		}
+		if (has_pinned_backing(column) &&
+		    (column.backing_base != last_backing_base || column.backing_bytes != last_backing_bytes)) {
+			active_chunk_arena->register_backing(column.backing_base, column.backing_bytes);
+			last_backing_base  = column.backing_base;
+			last_backing_bytes = column.backing_bytes;
+		}
+		++active_expr_count;
+		const size_t   materialize_expr_index = use_global_expr_index ? (expr_index_base + active_expr_count - 1U) : i;
+		const uint32_t selected_vector_width  = std::max(1U, cfg.unpack_n_vectors);
+		append_column_to_workset(workset,
+		                         column,
+		                         cfg,
+		                         materialize_expr_index,
+		                         *active_chunk_arena,
+		                         nullptr,
+		                         /*emit_typed_work_items=*/true,
+		                         /*register_backing=*/false,
+		                         &selected_vectors,
+		                         selected_vector_width);
 	}
 }
 

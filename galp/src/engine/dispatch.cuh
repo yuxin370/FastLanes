@@ -6,11 +6,11 @@
 #ifndef GALP_ENGINE_DISPATCH_CUH
 #define GALP_ENGINE_DISPATCH_CUH
 
-#include "cuda/device_utils.cuh"
-#include "core/expression.cuh"
-#include "core/lane_policy.cuh"
 #include "codecs/consts.cuh"
 #include "codecs/device_ops.cuh"
+#include "core/expression.cuh"
+#include "core/lane_policy.cuh"
+#include "cuda/device_utils.cuh"
 
 namespace galp::kernels::detail {
 
@@ -44,8 +44,10 @@ __device__ __forceinline__ void run_decompressor(DecompressorT&& iterator, const
 }
 
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
-__device__ __forceinline__ void
-execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector_index, const lane_t lane, T* __restrict out) {
+__device__ __forceinline__ void execute_plan(const galp::execution::DeviceExpression<T>& expr,
+                                             const vi_t                                  vector_index,
+                                             const lane_t                                lane,
+                                             T* __restrict out) {
 	switch (expr.plan) {
 	case galp::execution::PlanKind::UNCOMPRESSED: {
 		using UnpackerT = galp::codec::device::
@@ -66,9 +68,9 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 	case galp::execution::PlanKind::UNFFOR: {
 		using UnpackerT =
 		    galp::codec::device::BitUnpackerStatefulBranchless<T,
-		                                                  UNPACK_N_VECTORS,
-		                                                  UNPACK_N_VALUES,
-		                                                  galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>;
+		                                                       UNPACK_N_VECTORS,
+		                                                       UNPACK_N_VALUES,
+		                                                       galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>;
 		using DecompressorT =
 		    galp::codec::device::FFORDecompressor<T, UNPACK_N_VECTORS, UnpackerT, galp::codec::device::FFORColumn<T>>;
 		auto iterator = DecompressorT(expr.col.ffor, vector_index, lane);
@@ -78,10 +80,10 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 	case galp::execution::PlanKind::UNFFOR_SLPATCH: {
 		using UnpackerT =
 		    galp::codec::device::BitUnpackerStatefulBranchless<T,
-		                                                  UNPACK_N_VECTORS,
-		                                                  UNPACK_N_VALUES,
-		                                                  galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>;
-		using PatcherT      = galp::codec::device::StatefulSLPATCHExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+		                                                       UNPACK_N_VECTORS,
+		                                                       UNPACK_N_VALUES,
+		                                                       galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>;
+		using PatcherT = galp::codec::device::StatefulSLPATCHExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 		using DecompressorT = galp::codec::device::
 		    SLPATCHDecompressor<T, UNPACK_N_VECTORS, UnpackerT, PatcherT, galp::codec::device::SLPATCHColumn<T>>;
 		auto iterator = DecompressorT(expr.col.slpatch, vector_index, lane);
@@ -92,10 +94,11 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 		using ColumnT    = galp::codec::device::DICTFFORColumn<T, uint8_t>;
 		using IndexT     = typename ColumnT::INDEX_T;
 		using ProcessorT = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
-		using DecompressorT = galp::codec::device::DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT, ProcessorT>;
-		auto iterator       = DecompressorT(expr.col.dictffor_u8, vector_index, lane);
+		using UnpackerT  = galp::codec::device::
+		    BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using DecompressorT =
+		    galp::codec::device::DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT, ProcessorT>;
+		auto iterator = DecompressorT(expr.col.dictffor_u8, vector_index, lane);
 		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, IndexT>(iterator, lane, out);
 		break;
 	}
@@ -103,10 +106,11 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 		using ColumnT    = galp::codec::device::DICTFFORColumn<T, uint16_t>;
 		using IndexT     = typename ColumnT::INDEX_T;
 		using ProcessorT = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
-		using DecompressorT = galp::codec::device::DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT, ProcessorT>;
-		auto iterator       = DecompressorT(expr.col.dictffor_u16, vector_index, lane);
+		using UnpackerT  = galp::codec::device::
+		    BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using DecompressorT =
+		    galp::codec::device::DICTDecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT, ProcessorT>;
+		auto iterator = DecompressorT(expr.col.dictffor_u16, vector_index, lane);
 		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
 		break;
 	}
@@ -114,8 +118,8 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 		using ColumnT    = galp::codec::device::DICTSLPATCHColumn<T, uint8_t>;
 		using IndexT     = typename ColumnT::INDEX_T;
 		using ProcessorT = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using UnpackerT  = galp::codec::device::
+		    BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
 		using PatcherT =
 		    galp::codec::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 		using DecompressorT = galp::codec::device::
@@ -128,8 +132,8 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 		using ColumnT    = galp::codec::device::DICTSLPATCHColumn<T, uint16_t>;
 		using IndexT     = typename ColumnT::INDEX_T;
 		using ProcessorT = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
+		using UnpackerT  = galp::codec::device::
+		    BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT, IndexT>;
 		using PatcherT =
 		    galp::codec::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 		using DecompressorT = galp::codec::device::
@@ -142,23 +146,23 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 		if (expr.freq_use_extended) {
 			using PatcherT =
 			    galp::codec::device::PrefetchAllBranchlessFREQExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-			using DecompressorT =
-			    galp::codec::device::FREQDecompressor<T, UNPACK_N_VECTORS, PatcherT, galp::codec::device::FREQExtendedColumn<T>>;
+			using DecompressorT = galp::codec::device::
+			    FREQDecompressor<T, UNPACK_N_VECTORS, PatcherT, galp::codec::device::FREQExtendedColumn<T>>;
 			auto iterator = DecompressorT(expr.col.freq_extended, vector_index, lane);
 			run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
 		} else {
 			using PatcherT = galp::codec::device::StatefulFREQExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-			using DecompressorT =
-			    galp::codec::device::FREQDecompressor<T, UNPACK_N_VECTORS, PatcherT, galp::codec::device::FREQColumn<T>>;
+			using DecompressorT = galp::codec::device::
+			    FREQDecompressor<T, UNPACK_N_VECTORS, PatcherT, galp::codec::device::FREQColumn<T>>;
 			auto iterator = DecompressorT(expr.col.freq, vector_index, lane);
 			run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
 		}
 		break;
 	}
 	case galp::execution::PlanKind::CROSS_RLE: {
-		using ExpanderT = galp::codec::device::StatefulCROSSRLEExpander<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-		using DecompressorT =
-		    galp::codec::device::CROSSRLEDecompressor<T, UNPACK_N_VECTORS, ExpanderT, galp::codec::device::CROSSRLEColumn<T>>;
+		using ExpanderT     = galp::codec::device::StatefulCROSSRLEExpander<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
+		using DecompressorT = galp::codec::device::
+		    CROSSRLEDecompressor<T, UNPACK_N_VECTORS, ExpanderT, galp::codec::device::CROSSRLEColumn<T>>;
 		auto iterator = DecompressorT(expr.col.crossrle, vector_index, lane);
 		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
 		break;
@@ -166,19 +170,19 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 	case galp::execution::PlanKind::RLE_U8: {
 		using IndexT                      = uint8_t;
 		constexpr int RLE_UNPACK_N_VALUES = galp::codec::utils::get_values_per_lane<IndexT>();
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<IndexT,
-		                                                  UNPACK_N_VECTORS,
-		                                                  RLE_UNPACK_N_VALUES,
-		                                                  galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
+		using UnpackerT                   = galp::codec::device::BitUnpackerStatefulBranchless<
+		                      IndexT,
+		                      UNPACK_N_VECTORS,
+		                      RLE_UNPACK_N_VALUES,
+		                      galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
 		using ExpanderT     = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
 		using DecompressorT = galp::codec::device::RLEDecompressor<T,
-		                                                      IndexT,
-		                                                      UNPACK_N_VECTORS,
-		                                                      RLE_UNPACK_N_VALUES,
-		                                                      UnpackerT,
-		                                                      ExpanderT,
-		                                                      galp::codec::device::RLEColumn<T, IndexT>>;
+		                                                           IndexT,
+		                                                           UNPACK_N_VECTORS,
+		                                                           RLE_UNPACK_N_VALUES,
+		                                                           UnpackerT,
+		                                                           ExpanderT,
+		                                                           galp::codec::device::RLEColumn<T, IndexT>>;
 		auto iterator       = DecompressorT(expr.col.rle_u8, vector_index, lane);
 		run_decompressor<T,
 		                 UNPACK_N_VECTORS,
@@ -191,20 +195,49 @@ execute_plan(const galp::execution::DeviceExpression<T>& expr, const vi_t vector
 	case galp::execution::PlanKind::RLE_U16: {
 		using IndexT                      = uint16_t;
 		constexpr int RLE_UNPACK_N_VALUES = galp::codec::utils::get_values_per_lane<IndexT>();
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<IndexT,
-		                                                  UNPACK_N_VECTORS,
-		                                                  RLE_UNPACK_N_VALUES,
-		                                                  galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
+		using UnpackerT                   = galp::codec::device::BitUnpackerStatefulBranchless<
+		                      IndexT,
+		                      UNPACK_N_VECTORS,
+		                      RLE_UNPACK_N_VALUES,
+		                      galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
 		using ExpanderT     = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
 		using DecompressorT = galp::codec::device::RLEDecompressor<T,
-		                                                      IndexT,
-		                                                      UNPACK_N_VECTORS,
-		                                                      RLE_UNPACK_N_VALUES,
-		                                                      UnpackerT,
-		                                                      ExpanderT,
-		                                                      galp::codec::device::RLEColumn<T, IndexT>>;
+		                                                           IndexT,
+		                                                           UNPACK_N_VECTORS,
+		                                                           RLE_UNPACK_N_VALUES,
+		                                                           UnpackerT,
+		                                                           ExpanderT,
+		                                                           galp::codec::device::RLEColumn<T, IndexT>>;
 		auto iterator       = DecompressorT(expr.col.rle_u16, vector_index, lane);
+		run_decompressor<T,
+		                 UNPACK_N_VECTORS,
+		                 RLE_UNPACK_N_VALUES,
+		                 WRITE_OUT,
+		                 IndexT,
+		                 galp::codec::device::FastLanes1024InputUntransposer>(iterator, lane, out);
+		break;
+	}
+	case galp::execution::PlanKind::RLE_SLPATCH_U16: {
+		using IndexT                      = uint16_t;
+		constexpr int RLE_UNPACK_N_VALUES = galp::codec::utils::get_values_per_lane<IndexT>();
+		using UnpackerT                   = galp::codec::device::BitUnpackerStatefulBranchless<
+		                      IndexT,
+		                      UNPACK_N_VECTORS,
+		                      RLE_UNPACK_N_VALUES,
+		                      galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
+		using PatcherT = galp::codec::device::
+		    StatefulSLPATCHExceptionPatcher<IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
+		using ExpanderT     = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
+		using DecompressorT = galp::codec::device::RLESLPATCHDecompressor<T,
+		                                                                  IndexT,
+		                                                                  UNPACK_N_VECTORS,
+		                                                                  RLE_UNPACK_N_VALUES,
+		                                                                  UnpackerT,
+		                                                                  PatcherT,
+		                                                                  ExpanderT,
+		                                                                  galp::codec::device::
+		                                                                      RLESLPATCHColumn<T, IndexT>>;
+		auto iterator       = DecompressorT(expr.col.rle_slpatch_u16, vector_index, lane);
 		run_decompressor<T,
 		                 UNPACK_N_VECTORS,
 		                 RLE_UNPACK_N_VALUES,
@@ -225,7 +258,7 @@ namespace galp::kernels { namespace device {
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
 __device__ __forceinline__ void execute_typed_work_item(const galp::execution::DeviceExpression<T>* exprs,
                                                         const galp::execution::WorkItemAny          work,
-                                                        const lane_t                         lane) {
+                                                        const lane_t                                lane) {
 	if (exprs == nullptr) {
 		return;
 	}
@@ -235,13 +268,14 @@ __device__ __forceinline__ void execute_typed_work_item(const galp::execution::D
 	if (static_cast<size_t>(vector_index) >= n_vecs) {
 		return;
 	}
-	if (static_cast<uint32_t>(lane) >= galp::execution::semantic_lane_count(galp::execution::type_tag_for<T>(), expr->plan)) {
+	if (static_cast<uint32_t>(lane) >=
+	    galp::execution::semantic_lane_count(galp::execution::type_tag_for<T>(), expr->plan)) {
 		return;
 	}
 
 	T* out = nullptr;
 	if constexpr (WRITE_OUT) {
-		out = expr->out + vector_index * galp::codec::consts::VALUES_PER_VECTOR;
+		out = expr->out + static_cast<size_t>(work.output_vector_index) * galp::codec::consts::VALUES_PER_VECTOR;
 	}
 	galp::kernels::detail::execute_plan<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(
 	    *expr, vector_index, lane, out);
@@ -250,7 +284,7 @@ __device__ __forceinline__ void execute_typed_work_item(const galp::execution::D
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
 __global__ void decompress_dispatch_typed(const galp::execution::DeviceExpression<T>* exprs,
                                           const galp::execution::WorkItemAny*         work_items,
-                                          const size_t                         n_items) {
+                                          const size_t                                n_items) {
 	const lane_t   lane     = static_cast<lane_t>(threadIdx.x);
 	const uint32_t item_idx = static_cast<uint32_t>(blockIdx.x);
 	if (item_idx >= n_items) {
@@ -274,7 +308,7 @@ template <int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
 __global__ void decompress_dispatch_mixed(const galp::execution::DeviceExpression<int8_t>*  exprs_i8,
                                           const galp::execution::DeviceExpression<int16_t>* exprs_i16,
                                           const galp::execution::MixedWorkSlot*             slots,
-                                          const size_t                               n_slots) {
+                                          const size_t                                      n_slots) {
 	const MixedSlotMapping mapping(n_slots);
 	const uint32_t         slot_idx = mapping.slot_index();
 	const uint32_t         lane     = mapping.slot_lane();

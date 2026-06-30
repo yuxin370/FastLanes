@@ -501,6 +501,44 @@ inline galp::codec::host::RLEColumn<T, IndexT> make_rle_zero_copy(const fastlane
 	                                                n_rle_values};
 }
 
+template <typename T, typename IndexT>
+inline galp::codec::host::RLESLPATCHColumn<T, IndexT>
+make_rle_slpatch_zero_copy(const fastlanes::SegmentView& seg_vals,
+                           const fastlanes::SegmentView& seg_rsum,
+                           const fastlanes::SegmentView& seg_exc,
+                           const fastlanes::SegmentView& seg_pos,
+                           const fastlanes::SegmentView& seg_cnt,
+                           const fastlanes::SegmentView& seg_bitpacked,
+                           const fastlanes::SegmentView& seg_bw,
+                           const fastlanes::SegmentView& seg_base,
+                           const size_t                  n_values,
+                           const size_t                  n_vecs,
+                           ZeroCopyHostStorage&          storage) {
+	auto index = make_slpatch_zero_copy<IndexT>(
+	    seg_exc, seg_pos, seg_cnt, seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
+
+	const size_t expected_bases = n_vecs * galp::codec::utils::get_n_lanes<IndexT>();
+	if (seg_rsum.data_span.size() / sizeof(IndexT) != expected_bases) {
+		throw std::runtime_error("EXP_RLE_SLPATCH: rsum bases size mismatch");
+	}
+
+	const auto rle_offsets_info =
+	    build_entrypoint_offsets(seg_vals, n_vecs, sizeof(T), storage, "EXP_RLE_SLPATCH values segment");
+	auto* const offsets = rle_offsets_info.offsets;
+
+	auto*        rsum_bases   = segment_ptr_or_copy<IndexT>(seg_rsum, storage);
+	auto*        values       = segment_ptr_or_copy<T>(seg_vals, storage);
+	const size_t n_rle_values = seg_vals.data_span.size() / sizeof(T);
+
+	return galp::codec::host::RLESLPATCHColumn<T, IndexT> {n_values,
+	                                                       n_vecs,
+	                                                       std::move(index),
+	                                                       galp::codec::host::borrow_array(rsum_bases),
+	                                                       galp::codec::host::borrow_array(values),
+	                                                       galp::codec::host::borrow_array(offsets),
+	                                                       n_rle_values};
+}
+
 template <typename T>
 inline T* clone_array(const T* in, const size_t n_elements) {
 	if (n_elements == 0) {
@@ -595,6 +633,19 @@ inline galp::codec::host::RLEColumn<T, IndexT> clone_column(const galp::codec::h
 	    col.n_values,
 	    col.n_vecs,
 	    clone_column(col.ffor),
+	    clone_array(col.rsum_bases.get(), col.n_vecs * galp::codec::utils::get_n_lanes<IndexT>()),
+	    clone_array(col.rle_values.get(), col.n_rle_values),
+	    clone_array(col.rle_offsets.get(), col.n_vecs),
+	    col.n_rle_values};
+}
+
+template <typename T, typename IndexT>
+inline galp::codec::host::RLESLPATCHColumn<T, IndexT>
+clone_column(const galp::codec::host::RLESLPATCHColumn<T, IndexT>& col) {
+	return galp::codec::host::RLESLPATCHColumn<T, IndexT> {
+	    col.n_values,
+	    col.n_vecs,
+	    clone_column(col.index),
 	    clone_array(col.rsum_bases.get(), col.n_vecs * galp::codec::utils::get_n_lanes<IndexT>()),
 	    clone_array(col.rle_values.get(), col.n_rle_values),
 	    clone_array(col.rle_offsets.get(), col.n_vecs),

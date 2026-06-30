@@ -290,6 +290,37 @@ struct RebindUnpackVectors<
 	                                         ColumnT>;
 };
 
+template <typename ValueT,
+          typename IndexT,
+          unsigned OLD_UNPACK_N_VECTORS,
+          unsigned UNPACK_N_VALUES,
+          typename UnpackerT,
+          typename PatcherT,
+          typename ExpanderT,
+          typename ColumnT,
+          unsigned NEW_UNPACK_N_VECTORS>
+struct RebindUnpackVectors<
+    galp::codec::device::
+        RLESLPATCHDecompressor<ValueT,
+                               IndexT,
+                               OLD_UNPACK_N_VECTORS,
+                               UNPACK_N_VALUES,
+                               UnpackerT,
+                               PatcherT,
+                               ExpanderT,
+                               ColumnT>,
+    NEW_UNPACK_N_VECTORS> {
+	using type =
+	    galp::codec::device::RLESLPATCHDecompressor<ValueT,
+	                                                IndexT,
+	                                                NEW_UNPACK_N_VECTORS,
+	                                                UNPACK_N_VALUES,
+	                                                typename RebindUnpackVectors<UnpackerT, NEW_UNPACK_N_VECTORS>::type,
+	                                                typename RebindUnpackVectors<PatcherT, NEW_UNPACK_N_VECTORS>::type,
+	                                                typename RebindUnpackVectors<ExpanderT, NEW_UNPACK_N_VECTORS>::type,
+	                                                ColumnT>;
+};
+
 template <typename T,
           unsigned OLD_UNPACK_N_VECTORS,
           typename UnpackerT,

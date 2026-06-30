@@ -49,12 +49,12 @@ public:
 		bool use_async = false;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
-			use_async = use_async_;
-			if (enabled_) {
+			use_async = use_async_ && stream != nullptr;
+			if (enabled_ && !use_async) {
 				size_t actual_size = 0;
-				void*  cached_ptr  = take_cached_block_locked(bytes, stream, use_async_, actual_size);
+				void*  cached_ptr  = take_cached_block_locked(bytes, actual_size);
 				if (cached_ptr != nullptr) {
-					in_use_[cached_ptr] = DeviceAllocInfo {actual_size, use_async_, use_async_ ? stream : nullptr};
+					in_use_[cached_ptr] = DeviceAllocInfo {actual_size, false, nullptr};
 					return cached_ptr;
 				}
 			}
@@ -168,15 +168,17 @@ public:
 		tracker_.sync_stream(source_stream, make_release_pinned_fn());
 	}
 
+	void complete_h2d(cudaStream_t source_stream) {
+		tracker_.complete_stream(source_stream, make_release_pinned_fn());
+	}
+
 	void release_cached() {
 		sync_h2d();
 
-		std::map<size_t, std::vector<void*>>                                sync_free;
-		std::unordered_map<StreamKey, std::map<size_t, std::vector<void*>>> async_free;
+		std::map<size_t, std::vector<void*>> sync_free;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			sync_free.swap(free_sync_by_size_);
-			async_free.swap(free_async_by_stream_size_);
 			free_cached_bytes_ = 0;
 		}
 
@@ -184,15 +186,6 @@ public:
 			(void)size;
 			for (void* ptr : list) {
 				CUDA_SAFE_CALL(cudaFree(ptr));
-			}
-		}
-		for (auto& [stream_id, buckets] : async_free) {
-			const auto stream = stream_from_key(stream_id);
-			for (auto& [size, list] : buckets) {
-				(void)size;
-				for (void* ptr : list) {
-					CUDA_SAFE_CALL(cudaFreeAsync(ptr, stream));
-				}
 			}
 		}
 	}
@@ -222,6 +215,17 @@ public:
 	}
 
 	~DevicePool() {
+		// Runs only at process exit (Meyers singleton). The CUDA runtime registers its
+		// own atexit handler to tear down the context/stream-ordered memory pool; if that
+		// runs first, any free here dereferences freed driver state and segfaults deep in
+		// libcuda (cudaFree on cudaMallocAsync memory routes to cuMemFreeAsync). Probe with
+		// a cheap call: once the runtime is unloading, skip all frees — the driver reclaims
+		// every device allocation when the context is destroyed.
+		int device = 0;
+		if (cudaGetDevice(&device) != cudaSuccess) {
+			return;
+		}
+
 		try {
 			sync_h2d();
 		} catch (const std::exception& e) {
@@ -243,7 +247,7 @@ public:
 		}
 		for (auto& [ptr, info] : in_use_) {
 			if (info.sub_alloc)
-				continue; // interior arena pointer — no standalone cudaFree
+				continue; // interior arena pointer - no standalone cudaFree
 			cudaFree(ptr);
 		}
 		in_use_.clear();
@@ -255,41 +259,14 @@ public:
 			}
 		}
 		free_sync_by_size_.clear();
-
-		for (auto& [stream_id, buckets] : free_async_by_stream_size_) {
-			const auto stream = stream_from_key(stream_id);
-			for (auto& [size, list] : buckets) {
-				(void)size;
-				for (void* ptr : list) {
-					cudaFreeAsync(ptr, stream);
-				}
-			}
-		}
-		free_async_by_stream_size_.clear();
 	}
 
 private:
-	using StreamKey = uintptr_t;
-
 	struct CachedBlock {
-		void*        ptr    = nullptr;
-		bool         async  = false;
-		cudaStream_t stream = nullptr;
+		void* ptr = nullptr;
 	};
 
-	static StreamKey stream_key(cudaStream_t stream) {
-		return reinterpret_cast<StreamKey>(stream);
-	}
-
-	static cudaStream_t stream_from_key(StreamKey key) {
-		return reinterpret_cast<cudaStream_t>(key);
-	}
-
 	static void free_cached_block(const CachedBlock& block) {
-		if (block.async) {
-			CUDA_SAFE_CALL(cudaFreeAsync(block.ptr, block.stream));
-			return;
-		}
 		CUDA_SAFE_CALL(cudaFree(block.ptr));
 	}
 
@@ -318,15 +295,11 @@ private:
 		}
 		const auto info = it->second;
 		in_use_.erase(it);
-		if (enabled_) {
+		if (enabled_ && !info.async_alloc) {
 			std::vector<CachedBlock> evicted_cached;
 			if (info.size <= free_cache_limit_bytes_) {
 				evict_cached_until_room_locked(info.size, evicted_cached);
-				if (info.async_alloc) {
-					free_async_by_stream_size_[stream_key(info.alloc_stream)][info.size].push_back(ptr);
-				} else {
-					free_sync_by_size_[info.size].push_back(ptr);
-				}
+				free_sync_by_size_[info.size].push_back(ptr);
 				free_cached_bytes_ += info.size;
 				lock.unlock();
 				for (const CachedBlock& evicted : evicted_cached) {
@@ -335,11 +308,7 @@ private:
 				return;
 			}
 			lock.unlock();
-			if (info.async_alloc) {
-				CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream));
-			} else {
-				CUDA_SAFE_CALL(cudaFree(ptr));
-			}
+			CUDA_SAFE_CALL(cudaFree(ptr));
 			return;
 		}
 		lock.unlock();
@@ -359,42 +328,13 @@ private:
 	}
 
 	bool evict_largest_cached_locked(std::vector<CachedBlock>& evicted) {
-		size_t    best_size   = 0;
-		bool      best_async  = false;
-		StreamKey best_stream = 0;
-		if (!free_sync_by_size_.empty()) {
-			best_size = free_sync_by_size_.rbegin()->first;
-		}
-		for (const auto& [stream_id, buckets] : free_async_by_stream_size_) {
-			if (!buckets.empty() && buckets.rbegin()->first > best_size) {
-				best_size   = buckets.rbegin()->first;
-				best_async  = true;
-				best_stream = stream_id;
-			}
-		}
-		if (best_size == 0) {
+		if (free_sync_by_size_.empty()) {
 			return false;
-		}
-
-		if (best_async) {
-			auto  stream_it = free_async_by_stream_size_.find(best_stream);
-			auto  bucket_it = std::prev(stream_it->second.end());
-			auto& list      = bucket_it->second;
-			evicted.push_back(CachedBlock {list.back(), true, stream_from_key(best_stream)});
-			list.pop_back();
-			free_cached_bytes_ -= bucket_it->first;
-			if (list.empty()) {
-				stream_it->second.erase(bucket_it);
-			}
-			if (stream_it->second.empty()) {
-				free_async_by_stream_size_.erase(stream_it);
-			}
-			return true;
 		}
 
 		auto  bucket_it = std::prev(free_sync_by_size_.end());
 		auto& list      = bucket_it->second;
-		evicted.push_back(CachedBlock {list.back(), false, nullptr});
+		evicted.push_back(CachedBlock {list.back()});
 		list.pop_back();
 		free_cached_bytes_ -= bucket_it->first;
 		if (list.empty()) {
@@ -410,14 +350,7 @@ private:
 		return max_reuse_slack_bytes_ == 0 || cached_bytes - request_bytes <= max_reuse_slack_bytes_;
 	}
 
-	void* take_cached_block_locked(size_t request_bytes, cudaStream_t stream, bool async, size_t& actual_size) {
-		if (async) {
-			auto streams_it = free_async_by_stream_size_.find(stream_key(stream));
-			if (streams_it == free_async_by_stream_size_.end()) {
-				return nullptr;
-			}
-			return take_cached_block_from_map_locked(streams_it->second, request_bytes, actual_size);
-		}
+	void* take_cached_block_locked(size_t request_bytes, size_t& actual_size) {
 		return take_cached_block_from_map_locked(free_sync_by_size_, request_bytes, actual_size);
 	}
 
@@ -439,7 +372,7 @@ private:
 		return ptr;
 	}
 
-	// Caller must NOT hold mutex_ — the tracker's release callback delegates
+	// Caller must NOT hold mutex_ - the tracker's release callback delegates
 	// into pinned_pool_ (its own mutex), so no cross-lock deadlock, but we
 	// still keep the sweep off-lock to keep the hot path simple.
 	void assert_idle_for_reconfiguration(const char* api_name) {
@@ -487,9 +420,8 @@ private:
 	size_t     max_reuse_slack_bytes_  = 0;
 	size_t     free_cached_bytes_      = 0;
 
-	std::map<size_t, std::vector<void*>>                                free_sync_by_size_;
-	std::unordered_map<StreamKey, std::map<size_t, std::vector<void*>>> free_async_by_stream_size_;
-	std::unordered_map<void*, DeviceAllocInfo>                          in_use_;
+	std::map<size_t, std::vector<void*>>       free_sync_by_size_;
+	std::unordered_map<void*, DeviceAllocInfo> in_use_;
 
 	PinnedHostPool  pinned_pool_;
 	TransferTracker tracker_;
@@ -525,6 +457,10 @@ inline void sync_h2d() {
 
 inline void sync_h2d(cudaStream_t source_stream) {
 	DevicePool::instance().sync_h2d(source_stream);
+}
+
+inline void complete_h2d(cudaStream_t source_stream) {
+	DevicePool::instance().complete_h2d(source_stream);
 }
 
 } // namespace galp::memory

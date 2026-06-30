@@ -37,8 +37,9 @@ private:
 	static constexpr int32_t N_LANES = galp::codec::utils::get_n_lanes<IndexT>();
 
 public:
+	template <typename ColumnT>
 	__device__ __forceinline__
-	RLEUnsumer(const galp::codec::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane) {
+	RLEUnsumer(const ColumnT column, const vi_t vector_index, const lane_t lane) {
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
 			const IndexT* base_ptr = column.rsum_bases + (vector_index + v) * N_LANES;

@@ -167,6 +167,27 @@ auto decompress_device_tiled(const ColumnT& column) ->
 		                                                      galp::codec::device::RLEColumn<T, IndexT>>;
 		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, 1);
+	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::RLESLPATCHColumn<T, uint16_t>>) {
+		using IndexT = uint16_t;
+		constexpr unsigned RLE_UNPACK_N_VALUES = galp::codec::utils::get_values_per_lane<IndexT>();
+		using UnpackerT =
+		    galp::codec::device::BitUnpackerStatefulBranchless<IndexT,
+		                                                  UNPACK_N_VECTORS,
+		                                                  RLE_UNPACK_N_VALUES,
+		                                                  galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
+		using PatcherT = galp::codec::device::
+		    StatefulSLPATCHExceptionPatcher<IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
+		using ExpanderT     = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
+		using DecompressorT = galp::codec::device::RLESLPATCHDecompressor<T,
+		                                                                  IndexT,
+		                                                                  UNPACK_N_VECTORS,
+		                                                                  RLE_UNPACK_N_VALUES,
+		                                                                  UnpackerT,
+		                                                                  PatcherT,
+		                                                                  ExpanderT,
+		                                                                  ColumnT>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else {
 		static_assert(always_false_v<ColumnT>, "Unsupported column type for dispatch");
 		return nullptr;
@@ -265,6 +286,12 @@ ValueStore decompress_host(const HostColT& host_col, const PlanKind plan, const 
 		}
 		return fail();
 	}
+	case PlanKind::RLE_SLPATCH_U16: {
+		if constexpr (std::is_same_v<HostColT, galp::codec::host::RLESLPATCHColumn<T, uint16_t>>) {
+			return decompress_common(host_col, cfg);
+		}
+		return fail();
+	}
 	default:
 		return fail();
 	}
@@ -303,6 +330,9 @@ template ValueStore
 detail::decompress_host(const galp::codec::host::RLEColumn<int8_t, uint16_t>&, const PlanKind, const ExecutionConfig&);
 template ValueStore
 detail::decompress_host(const galp::codec::host::RLEColumn<int8_t, uint8_t>&, const PlanKind, const ExecutionConfig&);
+template ValueStore detail::decompress_host(const galp::codec::host::RLESLPATCHColumn<int8_t, uint16_t>&,
+                                            const PlanKind,
+                                            const ExecutionConfig&);
 template ValueStore
 detail::decompress_host(const galp::codec::host::BPColumn<int16_t>&, const PlanKind, const ExecutionConfig&);
 template ValueStore
@@ -326,5 +356,8 @@ template ValueStore
 detail::decompress_host(const galp::codec::host::RLEColumn<int16_t, uint16_t>&, const PlanKind, const ExecutionConfig&);
 template ValueStore
 detail::decompress_host(const galp::codec::host::RLEColumn<int16_t, uint8_t>&, const PlanKind, const ExecutionConfig&);
+template ValueStore detail::decompress_host(const galp::codec::host::RLESLPATCHColumn<int16_t, uint16_t>&,
+                                            const PlanKind,
+                                            const ExecutionConfig&);
 
 } // namespace galp::execution

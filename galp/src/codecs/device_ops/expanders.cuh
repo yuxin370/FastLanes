@@ -58,8 +58,9 @@ public:
 		expand_codes_into(codes, out);
 	}
 
+	template <typename ColumnT>
 	__device__ __forceinline__
-	DummyRLEExpander(const galp::codec::device::RLEColumn<ValueT, IndexT> column, const vi_t vector_index, const lane_t lane)
+	DummyRLEExpander(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : rle_values(column.rle_values)
 	    , rle_offsets(column.rle_offsets)
 	    , base_vector_index(vector_index) {

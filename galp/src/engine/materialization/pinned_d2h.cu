@@ -3,8 +3,8 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/materialization/pinned_d2h.cu
 // ────────────────────────────────────────────────────────
-#include "engine/materialization/pinned_d2h.cuh"
 #include "cuda/memory/device_pool.cuh"
+#include "engine/materialization/pinned_d2h.cuh"
 #include <cstdio>
 #include <exception>
 #include <limits>
@@ -32,6 +32,7 @@ void clear_materialize_workset_state(ExecutionWorkset& workset) {
 		batch.device_exprs.clear();
 		batch.output_offsets.clear();
 		batch.work_items.clear();
+		batch.work_items_explicit = false;
 		batch.expr_indices.clear();
 
 		auto& dev = workset.buffers.device_batches.template get<T>();
@@ -55,7 +56,7 @@ void snapshot_materialize_entries(ExecutionWorkset& workset, PendingMaterialize&
 			const auto&               dev_expr = batch.device_exprs[idx];
 			PendingMaterialize::Entry entry {};
 			entry.global_expr_index = batch.expr_indices[idx];
-			entry.n_values          = dev_expr.n_values;
+			entry.n_values          = dev_expr.output_n_values;
 			entry.output_offset     = batch.output_offsets[idx];
 			entry.elem_size         = sizeof(T);
 			entry.value_type        = galp::format::ToDataType<T>::value;

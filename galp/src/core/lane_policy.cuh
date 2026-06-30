@@ -32,6 +32,7 @@ __host__ __device__ __forceinline__ constexpr TypeTag semantic_lane_type(const T
 	case PlanKind::DICT_FFOR_U16:
 	case PlanKind::DICT_FFOR_SLPATCH_U16:
 	case PlanKind::RLE_U16:
+	case PlanKind::RLE_SLPATCH_U16:
 		return TypeTag::I16;
 	default:
 		return value_type;

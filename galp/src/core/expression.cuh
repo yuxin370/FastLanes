@@ -6,9 +6,9 @@
 #ifndef ENGINE_EXPRESSION_CUH
 #define ENGINE_EXPRESSION_CUH
 
+#include "codecs/encodings/all.cuh"
 #include "core/data/model.cuh"
 #include "fls/footer/operator_token_generated.h"
-#include "codecs/encodings/all.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -35,6 +35,8 @@ inline bool is_supported_token(const fastlanes::OperatorToken token) {
 	case EXP_CROSS_RLE_I16:
 	case EXP_RLE_I08_U16:
 	case EXP_RLE_I16_U16:
+	case EXP_RLE_I08_SLPATCH_U16:
+	case EXP_RLE_I16_SLPATCH_U16:
 	case EXP_EQUAL:
 	case EXP_DICT_I08_FFOR_SLPATCH_U08:
 	case EXP_DICT_I16_FFOR_SLPATCH_U08:
@@ -62,6 +64,7 @@ enum class PlanKind : uint8_t {
 	UNFFOR_SLPATCH,
 	RLE_U8,
 	RLE_U16,
+	RLE_SLPATCH_U16,
 	FREQUENCY,
 	CROSS_RLE,
 	DICT_FFOR_U8,
@@ -79,6 +82,7 @@ struct WorkItemAny {
 	uint32_t expr_index;
 	uint32_t vector_index;
 	TypeTag  type;
+	uint32_t output_vector_index;
 };
 
 inline constexpr uint32_t kInvalidExprIndex = std::numeric_limits<uint32_t>::max();
@@ -89,7 +93,7 @@ struct MixedWorkSlot {
 };
 
 __host__ __device__ constexpr inline WorkItemAny invalid_work_item() {
-	return WorkItemAny {kInvalidExprIndex, 0, TypeTag::I8};
+	return WorkItemAny {kInvalidExprIndex, 0, TypeTag::I8, 0};
 }
 
 __host__ __device__ constexpr inline bool is_valid_work_item(const WorkItemAny& work) {
@@ -113,6 +117,7 @@ template <typename T>
 struct DeviceExpression {
 	PlanKind plan;
 	size_t   n_values;
+	size_t   output_n_values   = 0;
 	bool     freq_use_extended = false;
 	T*       out;
 	union {
@@ -129,6 +134,7 @@ struct DeviceExpression {
 		galp::codec::device::CROSSRLEColumn<T>              crossrle;
 		galp::codec::device::RLEColumn<T, uint8_t>          rle_u8;
 		galp::codec::device::RLEColumn<T, uint16_t>         rle_u16;
+		galp::codec::device::RLESLPATCHColumn<T, uint16_t>  rle_slpatch_u16;
 	} col;
 };
 
