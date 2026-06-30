@@ -208,6 +208,117 @@ cmake -S . -B build-galp-bench-nvcomp -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-galp-bench-nvcomp --target compressor_bench -j
 ```
 
+## JPEG DCT Pipeline Benchmark
+
+When `GALP_WITH_JPEG_DCT=ON`, `galp_cli pipeline_benchmark` measures JPEG DCT
+crop reads from a sharded DCT/FLS manifest:
+
+```bash
+./build-galp-ninja/galp/tools/galp_cli pipeline_benchmark /path/to/manifest.bin \
+  --crop 64 64 512 512 --window-images 256 --mode compare
+```
+
+The implementation and validation status is summarized in
+`galp/docs/jpeg_dct_crop_pushdown.md`.
+For GPU evidence collection, save raw `pipeline_benchmark` output and summarize
+it with:
+
+```bash
+./build-galp-ninja/galp/tools/galp_cli pipeline_benchmark /path/to/manifest.bin \
+  --crop 64 64 512 512 --window-images 256 --mode compare | tee pipeline_benchmark.log
+
+python3 scripts/my_tool/summarize_pipeline_benchmark.py \
+  --dataset <dataset> --image-size <width>x<height-or-varies> \
+  --require-match --require-default-fields \
+  pipeline_benchmark.log
+```
+
+The summarizer derives crop size and speedup fields and fails when correctness
+or required counters are missing. Pass `--image-size` for one result block, or
+`--image-sizes` with `--datasets` for logs containing multiple result blocks,
+because `pipeline_benchmark` output does not include image dimensions.
+
+The pipeline modes are:
+
+- `pushdown`: plan only the requested pixel crop, push the selected DCT blocks
+  into the JPEG DCT reader and the FastLanes workset schedule, and decode only
+  the selected FastLanes vector chunks.
+- `baseline` or `full-then-crop`: decode full images first, then select the DCT
+  blocks that intersect the same pixel crop from the decoded full output.
+- `compare`: run both paths and verify that the cropped DCT coefficients match.
+- `auto`: use CPU prepared plans for each window to choose pushdown or
+  full-then-crop from selected/full FastLanes vector ratio, crop/full block
+  ratio, touched-rowgroup ratio, average full blocks per rowgroup, and estimated
+  workset/gather item counts. The selected path executes the prepared plan
+  rather than planning a second time. When no crop is requested, auto prepares
+  only the full-image candidate. It keeps small windows on full-then-crop to
+  avoid fixed pushdown overhead, and also rejects pushdown
+  when cropped gather output is already close to full output, without
+  dataset-name special cases.
+
+`--crop x y width height` is a pixel-space crop in source-image coordinates.
+Omitting `--crop` benchmarks full-image output. The pushdown path currently
+pushes selection to FastLanes vector/chunk granularity; rows inside a selected
+FastLanes vector are still decoded as part of that vector.
+
+The benchmark prints pushdown and full-then-crop stage counters for selected
+vs. full vectors, workset uploads, decode/gather/materialize kernel launches,
+scratch metadata uploads, scratch allocation growth, internal stream-local
+syncs, dense cache hits/misses, cached-gather launch/event handoffs, and
+runtime-policy decisions. `*_plan_ms` includes prepared-plan construction with
+device planning counted once through `*_device_planning_ms`; `*_read_decode_ms`
+measures prepared-plan execution without rebuilding the plan. Newly decoded
+rowgroups are submitted in batches of
+up to `--decode-batch-rowgroups` per FastLanes workset (default 64), so
+`*_workset_count` tracks batch submissions rather than one workset per touched
+rowgroup. Sparse vector cache counters are
+reported as zero until a sparse decoded-vector cache is implemented.
+`*_planned_selected_vector_count` reports the crop-selected vectors before the
+runtime policy; `*_selected_vector_count` reports vectors actually submitted to
+FastLanes decode and therefore excludes dense-cache hits. As a result,
+`*_actual_saved_vector_count` includes both vector pushdown and dense-cache
+decode avoidance.
+In `auto` mode the output also reports chosen pushdown/full windows, auto policy
+prepared-planning/policy time, aggregate auto total time, the last policy
+reason, aggregate crop/full prepared-plan block and FastLanes vector counts and
+ratios, touched/full rowgroup counts and ratios, average full blocks per
+rowgroup, prepared-plan repeated rowgroup reuse candidates, and per-reason
+window counts. Reuse candidates are a cheap policy proxy; measured dense-cache
+hits and misses remain in the per-stage cache counters.
+JPEG DCT readers reuse host staging vectors and device scratch buffers across
+`ReadDeviceDctBatch()` windows. Scratch upload counters report device scratch
+metadata copies; decoded-gather coefficient pointers and source tags are packed
+into one binding array before upload. Scratch allocation counters report
+reusable device-buffer capacity growth rather than per-window allocation churn;
+host staging vectors, including pending rowgroup work, are reused but are not
+counted as device allocations. Metadata scratch starts from a small capacity
+floor and grows geometrically to avoid repeated tiny cudaMalloc/free. The JPEG
+scratch also owns the reusable decode
+workset, so its streams, timing events, output arena, and chunk arena capacity
+are preserved across decode batches. Increasing `--decode-batch-rowgroups`
+can reduce tiny worksets and batch-end syncs when the selected rowgroups are
+small enough for one larger workset; `*_workset_count` is therefore a submitted
+batch count, not a resource construction count. Dense-cache-hit gathers use CUDA
+events to hand off to the next decoded batch stream, so cache-hit gather
+synchronization is folded into an existing batch sync when a decode follows.
+Cached-hit gather items are queued at device-batch scope and flushed at
+decode/cache-eviction boundaries or at batch completion, instead of being forced
+out at every shard boundary. Consecutive cached gathers on the cache-hit stream
+reuse the cached-gather item scratch without a host wait unless the buffer needs
+to grow.
+
+`JpegDctShardDatasetReader::PlanDeviceDctBatch()` exposes the CPU-only crop
+planner metadata used by the device path. It returns image layouts, selected
+DCT block metadata, touched rowgroups, raw crop-selected vector counts,
+runtime-policy estimated scheduled vector counts, full vector counts, and
+planning time without launching GPU decode kernels or mutating the
+decoded-rowgroup cache. The prepared plan also carries the compact
+per-rowgroup selected-vector list, fit result, selected/full vector counts, and
+runtime-policy decision. For rowgroups that will run selected-vector decode it
+also carries the remapped gather items, so `ReadPreparedDeviceDctBatch()` can
+submit the workset without repeating selected-vector sort/unique or gather
+remapping.
+
 ## Package Consumers
 
 G-ALP exports `Galp::core`:

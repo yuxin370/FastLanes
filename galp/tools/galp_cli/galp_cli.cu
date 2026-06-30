@@ -8,7 +8,12 @@
 #include "engine/operators/rowgroup.cuh"
 #include "engine/table/table_options.cuh"
 #include "format/reader.cuh"
+#include "galp/config.hpp"
 #include "galp_tools/benchmark_support/table.cuh"
+#if GALP_WITH_JPEG_DCT
+#include "cuda/memory/device_pool.cuh"
+#include "galp_tools/benchmark_support/pipeline.cuh"
+#endif
 #include "io/csv_writer.cuh"
 #include <chrono>
 #include <cstdint>
@@ -16,6 +21,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -27,6 +33,7 @@ namespace {
 enum class Mode {
 	ReadTable,
 	Benchmark,
+	PipelineBenchmark,
 	MeasureLaunch,
 };
 
@@ -56,6 +63,17 @@ struct Options {
 	size_t                               stream_target_work_items   = 1u << 18;
 	size_t                               stream_max_rowgroups       = 4;
 	size_t                               compute_inflight_chunks    = 0;
+	bool                                 help_requested             = false;
+#if GALP_WITH_JPEG_DCT
+	galp::jpeg::JpegDctCropBox             pipeline_crop {};
+	bool                                   pipeline_crop_specified = false;
+	galp::execution::PipelineBenchmarkMode pipeline_mode           = galp::execution::PipelineBenchmarkMode::Compare;
+	size_t                                 pipeline_window_images  = 256;
+	size_t                                 pipeline_cache_capacity_bytes = 0;
+	size_t                                 pipeline_decode_batch_rowgroups = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
+	bool                                   pipeline_verify_outputs       = true;
+	std::vector<uint32_t>                  pipeline_image_ids;
+#endif
 };
 
 std::string format_bytes(double bytes) {
@@ -70,6 +88,28 @@ std::string format_bytes(double bytes) {
 	return oss.str();
 }
 
+#if GALP_WITH_JPEG_DCT
+uint32_t parse_u32_arg(const char* value, const char* label) {
+	try {
+		const auto parsed = std::stoull(value);
+		if (parsed > std::numeric_limits<uint32_t>::max()) {
+			throw std::out_of_range(label);
+		}
+		return static_cast<uint32_t>(parsed);
+	} catch (const std::exception&) { throw std::runtime_error(std::string("invalid ") + label + ": " + value); }
+}
+
+size_t parse_size_arg(const char* value, const char* label) {
+	try {
+		const auto parsed = std::stoull(value);
+		if (parsed > std::numeric_limits<size_t>::max()) {
+			throw std::out_of_range(label);
+		}
+		return static_cast<size_t>(parsed);
+	} catch (const std::exception&) { throw std::runtime_error(std::string("invalid ") + label + ": " + value); }
+}
+#endif
+
 const char* freq_patcher_name(const galp::execution::FreqPatcher patcher) {
 	switch (patcher) {
 	case galp::execution::FreqPatcher::Stateful:
@@ -82,7 +122,113 @@ const char* freq_patcher_name(const galp::execution::FreqPatcher patcher) {
 	return "unknown";
 }
 
-size_t effective_prefetch_workers(const size_t requested, const size_t rowgroups, const size_t max_rowgroups_per_chunk) {
+#if GALP_WITH_JPEG_DCT
+const char* pipeline_mode_name(const galp::execution::PipelineBenchmarkMode mode) {
+	switch (mode) {
+	case galp::execution::PipelineBenchmarkMode::Pushdown:
+		return "pushdown";
+	case galp::execution::PipelineBenchmarkMode::FullThenCrop:
+		return "full-then-crop";
+	case galp::execution::PipelineBenchmarkMode::Compare:
+		return "compare";
+	case galp::execution::PipelineBenchmarkMode::Auto:
+		return "auto";
+	}
+	return "unknown";
+}
+
+bool parse_pipeline_mode(const std::string_view value, galp::execution::PipelineBenchmarkMode& mode) {
+	if (value == "auto") {
+		mode = galp::execution::PipelineBenchmarkMode::Auto;
+		return true;
+	}
+	if (value == "compare") {
+		mode = galp::execution::PipelineBenchmarkMode::Compare;
+		return true;
+	}
+	if (value == "pushdown") {
+		mode = galp::execution::PipelineBenchmarkMode::Pushdown;
+		return true;
+	}
+	if (value == "full-then-crop" || value == "baseline") {
+		mode = galp::execution::PipelineBenchmarkMode::FullThenCrop;
+		return true;
+	}
+	return false;
+}
+
+void print_pipeline_stage(const char* label, const galp::execution::PipelineBenchmarkStageResult& stage) {
+	std::cout << label << "_windows: " << stage.windows << "\n";
+	std::cout << label << "_requests: " << stage.requests << "\n";
+	std::cout << label << "_input_blocks: " << stage.input_blocks << "\n";
+	std::cout << label << "_output_blocks: " << stage.output_blocks << "\n";
+	std::cout << label << "_output_coefficients: " << stage.output_coefficients << "\n";
+	std::cout << label << "_output_bytes: " << stage.output_bytes << "\n";
+	std::cout << label << "_rowgroup_visits: " << stage.rowgroup_visits << "\n";
+	std::cout << label << "_unique_rowgroups: " << stage.unique_rowgroups << "\n";
+	std::cout << label << "_repeated_rowgroups: " << stage.repeated_rowgroups << "\n";
+	std::cout << label << "_cache_hits: " << stage.cache_hits << "\n";
+	std::cout << label << "_cache_misses: " << stage.cache_misses << "\n";
+	std::cout << label << "_dense_cache_hits: " << stage.dense_cache_hits << "\n";
+	std::cout << label << "_dense_cache_misses: " << stage.dense_cache_misses << "\n";
+	std::cout << label << "_cache_inserts: " << stage.cache_inserts << "\n";
+	std::cout << label << "_cache_evictions: " << stage.cache_evictions << "\n";
+	std::cout << label << "_cache_resident_bytes: " << stage.cache_resident_bytes << "\n";
+	std::cout << label << "_cache_resident_rowgroups: " << stage.cache_resident_rowgroups << "\n";
+	std::cout << label << "_planned_selected_vector_count: " << stage.planned_selected_vector_count << "\n";
+	std::cout << label << "_selected_vector_count: " << stage.selected_vector_count << "\n";
+	std::cout << label << "_full_vector_count: " << stage.full_vector_count << "\n";
+	std::cout << label << "_planned_saved_vector_count: " << stage.planned_saved_vector_count << "\n";
+	std::cout << label << "_actual_saved_vector_count: " << stage.actual_saved_vector_count << "\n";
+	std::cout << label << "_rowgroup_count: " << stage.rowgroup_count << "\n";
+	std::cout << label << "_planned_selected_vector_ratio: " << stage.planned_selected_vector_ratio << "\n";
+	std::cout << label << "_selected_vector_ratio: " << stage.selected_vector_ratio << "\n";
+	std::cout << label << "_workset_count: " << stage.workset_count << "\n";
+	std::cout << label << "_decode_kernel_launch_count: " << stage.decode_kernel_launch_count << "\n";
+	std::cout << label << "_gather_kernel_launch_count: " << stage.gather_kernel_launch_count << "\n";
+	std::cout << label << "_cached_gather_kernel_launch_count: " << stage.cached_gather_kernel_launch_count << "\n";
+	std::cout << label << "_materialize_kernel_launch_count: " << stage.materialize_kernel_launch_count << "\n";
+	std::cout << label << "_gather_item_count: " << stage.gather_item_count << "\n";
+	std::cout << label << "_decoded_gather_item_count: " << stage.decoded_gather_item_count << "\n";
+	std::cout << label << "_cached_gather_item_count: " << stage.cached_gather_item_count << "\n";
+	std::cout << label << "_workset_upload_count: " << stage.workset_upload_count << "\n";
+	std::cout << label << "_scratch_upload_count: " << stage.scratch_upload_count << "\n";
+	std::cout << label << "_scratch_allocation_count: " << stage.scratch_allocation_count << "\n";
+	std::cout << label << "_internal_sync_count: " << stage.internal_sync_count << "\n";
+	std::cout << label << "_cached_gather_sync_count: " << stage.cached_gather_sync_count << "\n";
+	std::cout << label << "_decoded_batch_sync_count: " << stage.decoded_batch_sync_count << "\n";
+	std::cout << label << "_cached_gather_event_handoff_count: " << stage.cached_gather_event_handoff_count << "\n";
+	std::cout << label << "_sparse_vector_cache_hits: " << stage.sparse_vector_cache_hits << "\n";
+	std::cout << label << "_sparse_vector_cache_misses: " << stage.sparse_vector_cache_misses << "\n";
+	std::cout << label << "_runtime_policy_selected_rowgroups: " << stage.runtime_policy_selected_rowgroups << "\n";
+	std::cout << label << "_runtime_policy_full_rowgroups: " << stage.runtime_policy_full_rowgroups << "\n";
+	std::cout << label << "_runtime_policy_tail_full_rowgroups: " << stage.runtime_policy_tail_full_rowgroups << "\n";
+	std::cout << label << "_runtime_policy_ratio_full_rowgroups: " << stage.runtime_policy_ratio_full_rowgroups << "\n";
+	std::cout << label << "_runtime_policy_low_saving_full_rowgroups: "
+	          << stage.runtime_policy_low_saving_full_rowgroups << "\n";
+	std::cout << label << "_runtime_policy_decision: "
+	          << (stage.runtime_policy_decision.empty() ? "none" : stage.runtime_policy_decision) << "\n";
+	std::cout << label << "_runtime_policy_reason: "
+	          << (stage.runtime_policy_reason.empty() ? "none" : stage.runtime_policy_reason) << "\n";
+	std::cout << label << "_device_planning_ms: " << stage.device_planning_ms << "\n";
+	std::cout << label << "_workset_build_ms: " << stage.workset_build_ms << "\n";
+	std::cout << label << "_workset_upload_ms: " << stage.workset_upload_ms << "\n";
+	std::cout << label << "_decode_ms: " << stage.decode_ms << "\n";
+	std::cout << label << "_gather_ms: " << stage.gather_ms << "\n";
+	std::cout << label << "_peak_window_images: " << stage.peak_window_images << "\n";
+	std::cout << label << "_peak_window_input_blocks: " << stage.peak_window_input_blocks << "\n";
+	std::cout << label << "_peak_window_output_blocks: " << stage.peak_window_output_blocks << "\n";
+	std::cout << label << "_peak_window_output_bytes: " << stage.peak_window_output_bytes << "\n";
+	std::cout << label << "_plan_ms: " << stage.plan_ms << "\n";
+	std::cout << label << "_read_decode_ms: " << stage.read_decode_ms << "\n";
+	std::cout << label << "_transform_ms: " << stage.transform_ms << "\n";
+	std::cout << label << "_sink_ms: " << stage.sink_ms << "\n";
+	std::cout << label << "_total_ms: " << stage.total_ms << "\n";
+}
+#endif
+
+size_t
+effective_prefetch_workers(const size_t requested, const size_t rowgroups, const size_t max_rowgroups_per_chunk) {
 	if (requested != 0) {
 		return std::max<size_t>(1, requested);
 	}
@@ -175,6 +321,12 @@ void print_usage(const char* prog) {
 	    << " read_table <input.fls> [output.csv] [--rowgroup N] [--no-header] [--per-rowgroup-workset]\n"
 	    << "  " << prog
 	    << " benchmark <input.fls> [--rowgroup N] [--samples N] [--kernel-samples N] [--include-materialize]\n"
+#if GALP_WITH_JPEG_DCT
+	    << "  " << prog
+	    << " pipeline_benchmark <manifest.bin> [--crop x y width height] [--window-images N] "
+	       "[--cache-capacity-mib N] [--decode-batch-rowgroups N] "
+	       "[--mode compare|pushdown|baseline|auto] [--no-verify] [image_id ...]\n"
+#endif
 	    << "  " << prog << " measure_launch [--iters N] [--grid N] [--block N]\n"
 	    << "\n"
 	    << "Options:\n"
@@ -202,6 +354,17 @@ void print_usage(const char* prog) {
 	    << "  --compute-inflight-chunks N  Whole-table compute chunks allowed in flight (default: 0=auto, max: 8)\n"
 	    << "  --include-materialize  Benchmark also materializes results to host pinned memory (D2H included)\n"
 	    << "  --reuse-table-resources  Benchmark steady-state query after reader/pinned-pool prepare\n"
+#if GALP_WITH_JPEG_DCT
+	    << "  --crop x y w h  Pixel-space source crop for pipeline_benchmark; baseline/full-then-crop "
+	       "decodes full images then crops these blocks\n"
+	    << "  --window-images N  Images per pipeline_benchmark window (default: 256)\n"
+	    << "  --cache-capacity-mib N  Decoded rowgroup cache capacity for JPEG DCT pipeline\n"
+	    << "  --decode-batch-rowgroups N  Rowgroups per JPEG DCT decode workset (default: "
+	    << galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups << ")\n"
+	    << "  --mode MODE  pipeline_benchmark mode: compare, pushdown, baseline/full-then-crop, or auto. "
+	       "compare runs both and verifies matching cropped output\n"
+	    << "  --no-verify  Skip coefficient equality validation in compare mode\n"
+#endif
 	    << "  --freq-patcher MODE  FREQ patcher: stateful, branchless, or hybrid[:threshold] (default: stateful)\n";
 }
 
@@ -215,10 +378,13 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		opt.mode = Mode::ReadTable;
 	} else if (mode_arg == "benchmark") {
 		opt.mode = Mode::Benchmark;
+	} else if (mode_arg == "pipeline_benchmark") {
+		opt.mode = Mode::PipelineBenchmark;
 	} else if (mode_arg == "measure_launch") {
 		opt.mode = Mode::MeasureLaunch;
 	} else if (mode_arg == "--help" || mode_arg == "-h") {
-		return false;
+		opt.help_requested = true;
+		return true;
 	} else {
 		return false;
 	}
@@ -226,7 +392,8 @@ bool parse_args(int argc, char** argv, Options& opt) {
 	for (int i = 2; i < argc; ++i) {
 		std::string_view arg = argv[i];
 		if (arg == "--help" || arg == "-h") {
-			return false;
+			opt.help_requested = true;
+			return true;
 		}
 		if (arg == "--rowgroup" && i + 1 < argc) {
 			opt.rowgroup = static_cast<size_t>(std::stoul(argv[++i]));
@@ -298,6 +465,48 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			}
 			continue;
 		}
+#if GALP_WITH_JPEG_DCT
+		if (arg == "--crop" && i + 4 < argc) {
+			opt.pipeline_crop.x         = parse_u32_arg(argv[++i], "crop x");
+			opt.pipeline_crop.y         = parse_u32_arg(argv[++i], "crop y");
+			opt.pipeline_crop.width     = parse_u32_arg(argv[++i], "crop width");
+			opt.pipeline_crop.height    = parse_u32_arg(argv[++i], "crop height");
+			opt.pipeline_crop_specified = true;
+			continue;
+		}
+		if (arg == "--window-images" && i + 1 < argc) {
+			opt.pipeline_window_images = parse_size_arg(argv[++i], "window-images");
+			if (opt.pipeline_window_images == 0) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "--cache-capacity-mib" && i + 1 < argc) {
+			const auto mib = parse_size_arg(argv[++i], "cache-capacity-mib");
+			if (mib > std::numeric_limits<size_t>::max() / (1024U * 1024U)) {
+				return false;
+			}
+			opt.pipeline_cache_capacity_bytes = mib * 1024U * 1024U;
+			continue;
+		}
+		if (arg == "--decode-batch-rowgroups" && i + 1 < argc) {
+			opt.pipeline_decode_batch_rowgroups = parse_size_arg(argv[++i], "decode-batch-rowgroups");
+			if (opt.pipeline_decode_batch_rowgroups == 0) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "--mode" && i + 1 < argc) {
+			if (!parse_pipeline_mode(argv[++i], opt.pipeline_mode)) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "--no-verify") {
+			opt.pipeline_verify_outputs = false;
+			continue;
+		}
+#endif
 		if (arg == "--iters" && i + 1 < argc) {
 			opt.launch_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
 			continue;
@@ -324,6 +533,15 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			continue;
 		}
 
+		if (opt.mode == Mode::PipelineBenchmark) {
+#if GALP_WITH_JPEG_DCT
+			opt.pipeline_image_ids.push_back(parse_u32_arg(argv[i], "image_id"));
+			continue;
+#else
+			return false;
+#endif
+		}
+
 		if (opt.mode == Mode::ReadTable && !opt.output.has_value()) {
 			opt.output = std::filesystem::path(arg);
 			continue;
@@ -332,6 +550,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		return false;
 	}
 
+	if (opt.help_requested) {
+		return true;
+	}
 	if (opt.mode == Mode::MeasureLaunch) {
 		return true;
 	}
@@ -417,6 +638,10 @@ int main(int argc, char** argv) {
 		print_usage(argv[0]);
 		return 1;
 	}
+	if (opt.help_requested) {
+		print_usage(argv[0]);
+		return 0;
+	}
 
 	try {
 		if (opt.mode == Mode::MeasureLaunch) {
@@ -447,6 +672,135 @@ int main(int argc, char** argv) {
 			apply_table_options(decode_cfg, opt);
 			galp::io::read_table_to_csv(opt.input, *out, opt.header, decode_cfg, opt.rowgroup);
 			return 0;
+		}
+
+		if (opt.mode == Mode::PipelineBenchmark) {
+#if GALP_WITH_JPEG_DCT
+			galp::execution::PipelineBenchmarkConfig pipeline_cfg;
+			pipeline_cfg.image_ids            = opt.pipeline_image_ids;
+			pipeline_cfg.crop                 = opt.pipeline_crop;
+			pipeline_cfg.mode                 = opt.pipeline_mode;
+			pipeline_cfg.window_images        = opt.pipeline_window_images;
+			pipeline_cfg.cache_capacity_bytes = opt.pipeline_cache_capacity_bytes;
+			pipeline_cfg.decode_batch_rowgroups = opt.pipeline_decode_batch_rowgroups;
+			pipeline_cfg.verify_outputs       = opt.pipeline_verify_outputs;
+			const auto result                 = galp::execution::benchmark_jpeg_dct_pipeline(opt.input, pipeline_cfg);
+			galp::memory::sync_h2d();
+			CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+			std::cout << "Pipeline benchmark results:\n";
+			std::cout << "  dataset_images: " << result.dataset_images << "\n";
+			std::cout << "  requested_images: "
+			          << (opt.pipeline_image_ids.empty() ? result.dataset_images : opt.pipeline_image_ids.size())
+			          << "\n";
+			std::cout << "  mode: " << pipeline_mode_name(result.mode) << "\n";
+			// Only the stage(s) the chosen mode actually ran carry data; print just those so a
+			// single-mode run is readable. compare/auto print the full schema (both stages, the
+			// auto policy block, and the comparison fields) for cross-stage analysis and tooling.
+			using galp::execution::PipelineBenchmarkMode;
+			const bool show_pushdown = result.mode == PipelineBenchmarkMode::Pushdown ||
+			                           result.mode == PipelineBenchmarkMode::Compare ||
+			                           result.mode == PipelineBenchmarkMode::Auto;
+			const bool show_full = result.mode == PipelineBenchmarkMode::FullThenCrop ||
+			                       result.mode == PipelineBenchmarkMode::Compare ||
+			                       result.mode == PipelineBenchmarkMode::Auto;
+			const bool show_auto = result.mode == PipelineBenchmarkMode::Auto;
+			const bool show_comparison =
+			    result.mode == PipelineBenchmarkMode::Compare || result.mode == PipelineBenchmarkMode::Auto;
+			if (opt.pipeline_crop_specified) {
+				std::cout << "  crop: " << opt.pipeline_crop.x << "," << opt.pipeline_crop.y << ","
+				          << opt.pipeline_crop.width << "," << opt.pipeline_crop.height << "\n";
+			} else {
+				std::cout << "  crop: full-image\n";
+			}
+			std::cout << "  window_images: " << opt.pipeline_window_images << "\n";
+			std::cout << "  decode_batch_rowgroups: " << opt.pipeline_decode_batch_rowgroups << "\n";
+			std::cout << "  cache_capacity_bytes: " << opt.pipeline_cache_capacity_bytes << "\n";
+			std::cout << "  verify_outputs: " << (opt.pipeline_verify_outputs ? 1 : 0) << "\n";
+			if (show_comparison) {
+				std::cout << "  outputs_match: " << (result.outputs_match ? 1 : 0) << "\n";
+				std::cout << "  verify_ms: " << result.verify_ms << "\n";
+				const bool has_pushdown_comparison =
+				    result.pushdown.total_ms > 0.0 && result.full_then_crop.total_ms > 0.0;
+				std::cout << "  pushdown_speedup_vs_full_then_crop: "
+				          << (has_pushdown_comparison ? result.full_then_crop.total_ms / result.pushdown.total_ms : 0.0)
+				          << "\n";
+				std::cout << "  pushdown_saved_ms_vs_full_then_crop: "
+				          << (has_pushdown_comparison ? result.full_then_crop.total_ms - result.pushdown.total_ms : 0.0)
+				          << "\n";
+			}
+			if (show_auto) {
+				std::cout << "  auto_pushdown_windows: " << result.auto_pushdown_windows << "\n";
+				std::cout << "  auto_full_then_crop_windows: " << result.auto_full_then_crop_windows << "\n";
+				std::cout << "  auto_policy_ms: " << result.auto_policy_ms << "\n";
+				std::cout << "  auto_total_ms: " << result.auto_total_ms << "\n";
+				if (!result.auto_policy_reason.empty()) {
+					std::cout << "  auto_policy_reason: " << result.auto_policy_reason << "\n";
+				}
+				std::cout << "  auto_policy_selected_blocks: " << result.auto_policy_selected_blocks << "\n";
+				std::cout << "  auto_policy_full_blocks: " << result.auto_policy_full_blocks << "\n";
+				std::cout << "  auto_policy_selected_block_ratio: " << result.auto_policy_selected_block_ratio << "\n";
+				std::cout << "  auto_policy_selected_vectors: " << result.auto_policy_selected_vectors << "\n";
+				std::cout << "  auto_policy_full_vectors: " << result.auto_policy_full_vectors << "\n";
+				std::cout << "  auto_policy_selected_vector_ratio: " << result.auto_policy_selected_vector_ratio
+				          << "\n";
+				std::cout << "  auto_policy_touched_rowgroups: " << result.auto_policy_touched_rowgroups << "\n";
+				std::cout << "  auto_policy_full_rowgroups: " << result.auto_policy_full_rowgroups << "\n";
+				std::cout << "  auto_policy_estimated_pushdown_worksets: "
+				          << result.auto_policy_estimated_pushdown_worksets << "\n";
+				std::cout << "  auto_policy_estimated_full_worksets: " << result.auto_policy_estimated_full_worksets
+				          << "\n";
+				std::cout << "  auto_policy_estimated_pushdown_gather_items: "
+				          << result.auto_policy_estimated_pushdown_gather_items << "\n";
+				std::cout << "  auto_policy_estimated_full_gather_items: "
+				          << result.auto_policy_estimated_full_gather_items << "\n";
+				std::cout << "  auto_policy_pushdown_reuse_candidate_rowgroups: "
+				          << result.auto_policy_pushdown_reuse_candidate_rowgroups << "\n";
+				std::cout << "  auto_policy_full_reuse_candidate_rowgroups: "
+				          << result.auto_policy_full_reuse_candidate_rowgroups << "\n";
+				std::cout << "  auto_policy_touched_rowgroup_ratio: " << result.auto_policy_touched_rowgroup_ratio
+				          << "\n";
+				std::cout << "  auto_policy_pushdown_reuse_candidate_ratio: "
+				          << result.auto_policy_pushdown_reuse_candidate_ratio << "\n";
+				std::cout << "  auto_policy_full_reuse_candidate_ratio: "
+				          << result.auto_policy_full_reuse_candidate_ratio << "\n";
+				std::cout << "  auto_policy_avg_full_blocks_per_rowgroup: "
+				          << result.auto_policy_avg_full_blocks_per_rowgroup << "\n";
+				std::cout << "  auto_policy_empty_windows: " << result.auto_policy_empty_windows << "\n";
+				std::cout << "  auto_policy_crop_covers_full_windows: " << result.auto_policy_crop_covers_full_windows
+				          << "\n";
+				std::cout << "  auto_policy_very_small_crop_windows: " << result.auto_policy_very_small_crop_windows
+				          << "\n";
+				std::cout << "  auto_policy_small_window_full_windows: " << result.auto_policy_small_window_full_windows
+				          << "\n";
+				std::cout << "  auto_policy_large_window_pushdown_windows: "
+				          << result.auto_policy_large_window_pushdown_windows << "\n";
+				std::cout << "  auto_policy_workset_overhead_full_windows: "
+				          << result.auto_policy_workset_overhead_full_windows << "\n";
+				std::cout << "  auto_policy_tiny_rowgroups_full_windows: "
+				          << result.auto_policy_tiny_rowgroups_full_windows << "\n";
+				std::cout << "  auto_policy_touches_most_rowgroups_windows: "
+				          << result.auto_policy_touches_most_rowgroups_windows << "\n";
+				std::cout << "  auto_policy_gather_output_full_windows: "
+				          << result.auto_policy_gather_output_full_windows << "\n";
+				std::cout << "  auto_policy_saves_enough_blocks_windows: "
+				          << result.auto_policy_saves_enough_blocks_windows << "\n";
+				std::cout << "  auto_policy_savings_too_small_windows: " << result.auto_policy_savings_too_small_windows
+				          << "\n";
+			}
+			if (show_comparison && !result.mismatch.empty()) {
+				std::cout << "  mismatch: " << result.mismatch << "\n";
+			}
+			if (show_pushdown) {
+				print_pipeline_stage("pushdown", result.pushdown);
+			}
+			if (show_full) {
+				print_pipeline_stage("full_then_crop", result.full_then_crop);
+			}
+			return result.outputs_match ? 0 : 2;
+#else
+			throw std::runtime_error("pipeline_benchmark requires GALP_WITH_JPEG_DCT=ON");
+#endif
 		}
 
 		if (opt.mode == Mode::Benchmark) {
@@ -529,11 +883,10 @@ int main(int argc, char** argv) {
 			const size_t effective_stream_max_rowgroups =
 			    opt.stream_max_rowgroups > 0 ? opt.stream_max_rowgroups : std::max<size_t>(1, total_rgs);
 			const size_t actual_prefetch_workers =
-			    whole_table_prefetch
-			        ? std::min(
-			              effective_prefetch_workers(opt.prefetch_workers, total_rgs, effective_stream_max_rowgroups),
-			              total_rgs)
-			        : 0;
+			    whole_table_prefetch ? std::min(effective_prefetch_workers(
+			                                        opt.prefetch_workers, total_rgs, effective_stream_max_rowgroups),
+			                                    total_rgs)
+			                         : 0;
 			const double avg_grid_per_launch =
 			    (total_launches > 0) ? (static_cast<double>(total_launch_grid) / static_cast<double>(total_launches))
 			                         : 0.0;
@@ -652,6 +1005,14 @@ int main(int argc, char** argv) {
 
 		return 1;
 	} catch (const std::exception& ex) {
+#if GALP_WITH_JPEG_DCT
+		try {
+			galp::memory::sync_h2d();
+			CUDA_SAFE_CALL(cudaDeviceSynchronize());
+		} catch (const std::exception& cleanup_ex) {
+			std::cerr << "Cleanup warning: " << cleanup_ex.what() << "\n";
+		}
+#endif
 		std::cerr << "Error: " << ex.what() << "\n";
 		return 1;
 	}

@@ -35,6 +35,79 @@ Replace the placeholders below:
   GALP_ROWGROUP_TIMELINE_CSV=/tmp/galp_timeline.csv \
     <GALP_CLI> benchmark <FLS_FILE> --samples 1 --prefetch-workers 0 --prefetch-depth 4 --stream-max-rowgroups 1
 
+11) JPEG DCT pipeline benchmark, compare pushdown with full-decode-then-crop
+<GALP_CLI> pipeline_benchmark <manifest.bin> --crop 64 64 512 512 --mode compare
+
+12) JPEG DCT pushdown only
+<GALP_CLI> pipeline_benchmark <manifest.bin> --crop 64 64 512 512 --mode pushdown
+
+13) JPEG DCT baseline only: full decode, then crop the decoded DCT blocks
+<GALP_CLI> pipeline_benchmark <manifest.bin> --crop 64 64 512 512 --mode baseline
+
+14) JPEG DCT auto policy: choose pushdown or full-then-crop per window
+<GALP_CLI> pipeline_benchmark <manifest.bin> --crop 64 64 512 512 --mode auto
+
+JPEG DCT pushdown validation matrix
+
+Use `compare` for correctness: it runs vector-level crop pushdown and
+full-decode-then-crop over the same windows and returns a non-zero exit code
+only on coefficient mismatch. Keep verification enabled for correctness runs;
+use `--no-verify` only for timing-only sweeps after correctness has already
+been checked for the same dataset, crop, window size, and cache setting.
+
+Recommended GPU validation commands:
+
+```bash
+# Large-image or medium-image benefit check: pushdown should reduce decode work.
+<GALP_CLI> pipeline_benchmark <large-manifest.bin> \
+  --crop 30 40 224 224 \
+  --window-images 128 \
+  --cache-capacity-mib 1024 \
+  --mode compare
+
+# Small-image fixed-overhead pressure check: auto may choose full-then-crop.
+<GALP_CLI> pipeline_benchmark <small-manifest.bin> \
+  --crop 0 0 16 16 \
+  --window-images 128 \
+  --cache-capacity-mib 1024 \
+  --mode compare
+
+# Runtime policy check: verify the per-window decision is not dataset-name based.
+<GALP_CLI> pipeline_benchmark <manifest.bin> \
+  --crop 0 0 16 16 \
+  --window-images 128 \
+  --cache-capacity-mib 1024 \
+  --mode auto
+```
+
+Save raw output and generate the reporting table with:
+
+```bash
+<GALP_CLI> pipeline_benchmark <manifest.bin> \
+  --crop 30 40 224 224 \
+  --window-images 128 \
+  --cache-capacity-mib 1024 \
+  --mode compare | tee pipeline_benchmark.log
+
+python3 scripts/my_tool/summarize_pipeline_benchmark.py \
+  --dataset <dataset> --image-size <width>x<height-or-varies> \
+  --require-match --require-default-fields \
+  pipeline_benchmark.log
+```
+
+Record at least the following fields for every reported dataset/crop:
+
+| dataset | image size | crop size | mode | outputs_match | pushdown_selected_vector_ratio | full_then_crop_selected_vector_ratio | pushdown_total_ms | full_then_crop_total_ms | pushdown_speedup_vs_full_then_crop | pushdown_saved_ms_vs_full_then_crop | pushdown_plan_ms | pushdown_read_decode_ms | pushdown_decode_ms | pushdown_gather_ms | pushdown_workset_count | pushdown_decode_kernel_launch_count | pushdown_gather_kernel_launch_count | pushdown_scratch_allocation_count | pushdown_internal_sync_count | pushdown_runtime_policy_decision |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+For `auto` runs also report `auto_pushdown_windows`,
+`auto_full_then_crop_windows`, `auto_policy_selected_vector_ratio`,
+`auto_policy_estimated_pushdown_worksets`,
+`auto_policy_estimated_full_worksets`, and `auto_policy_reason`. The policy is
+expected to make decisions from selected/full vectors, block ratio, rowgroup
+ratio, estimated worksets, and estimated gather items; it should not depend on
+dataset names.
+
 Benchmark output metrics
   benchmark_wall_ms                End-to-end wall clock of the whole benchmark run.
   benchmark_wall_ms_min/median/mean
@@ -63,6 +136,114 @@ Benchmark output metrics
   write_back / include_materialize
                                   1 when --include-materialize is enabled.
   consume_only / write_back_free  1 only for the default no-materialize benchmark path.
+  *_planned_selected_vector_count FastLanes vectors selected by the crop before runtime policy.
+  *_selected_vector_count         FastLanes vectors actually scheduled by the JPEG DCT pipeline.
+                                  Dense-cache hits do not contribute here because they skip decode.
+  *_full_vector_count             Full-rowgroup vector count used as the denominator for pushdown.
+  *_planned_saved_vector_count    full_vector_count - planned_selected_vector_count.
+  *_actual_saved_vector_count     full_vector_count - selected_vector_count.
+                                  This includes both runtime pushdown fallback decisions and
+                                  dense-cache hits that skipped decode.
+  *_rowgroup_count                Touched rowgroups in the device batch windows.
+  *_planned_selected_vector_ratio planned_selected_vector_count / full_vector_count.
+  *_selected_vector_ratio         selected_vector_count / full_vector_count.
+                                  With a dense cache this is the scheduled decode ratio, not only
+                                  the crop-selected vector ratio.
+  *_workset_count                 Number of FastLanes worksets submitted by the JPEG DCT pipeline.
+                                  Newly decoded rowgroups are batched up to
+                                  --decode-batch-rowgroups per workset (default 64).
+                                  JPEG scratch preserves the decode workset's stream, events,
+                                  output arena, and chunk arena capacity across these submissions.
+  *_decode_kernel_launch_count    FastLanes decode kernel launches.
+  *_gather_kernel_launch_count    DCT block-major gather launches.
+  *_cached_gather_kernel_launch_count
+                                  Gather launches sourced only from dense decoded-rowgroup cache hits.
+  *_materialize_kernel_launch_count
+                                  Dense decoded-rowgroup cache materialization launches.
+  *_gather_item_count             DCT blocks handled by gather kernels.
+  *_decoded_gather_item_count     Gather items sourced from newly decoded FastLanes worksets.
+  *_cached_gather_item_count      Gather items sourced from dense decoded-rowgroup cache hits.
+  *_workset_upload_count          Workset metadata uploads.
+  *_scratch_upload_count          Device scratch metadata uploads. Decoded-gather coefficient
+                                  pointers and source tags are packed into one binding array.
+  *_scratch_allocation_count      Reader-owned reusable device scratch capacity growth events.
+                                  Host staging vectors, including pending rowgroup work, are
+                                  reused but not counted as device allocations. The reusable
+                                  decode workset has its own preserved arenas and is counted by
+                                  workset submissions rather than scratch allocation events.
+                                  JPEG DCT metadata scratch grows geometrically from a small
+                                  initial capacity floor to avoid repeated tiny cudaMalloc/free.
+  *_internal_sync_count           Stream-local synchronization points inside the JPEG DCT device path.
+                                  Dense-cache-hit gathers can hand off to a following decoded
+                                  batch via CUDA event instead of synchronizing immediately;
+                                  cached-hit gather items are queued across shard boundaries
+                                  within a device batch.
+  *_cached_gather_sync_count      Cached-gather completion waits that could not be handed off
+                                  to a following decoded batch stream. Consecutive cached gathers
+                                  on the cache-hit stream do not wait unless the reusable item
+                                  buffer must grow.
+  *_decoded_batch_sync_count      Decoded-batch completion waits before reusing rowgroup metadata,
+                                  workset arenas, and scratch buffers.
+  *_cached_gather_event_handoff_count
+                                  Cached gather completions waited by a following decoded batch stream.
+  *_sparse_vector_cache_hits/misses
+                                  Reserved for a future sparse vector cache; currently 0.
+  *_dense_cache_hits/misses       Aliases for the decoded dense rowgroup cache hit/miss counters.
+  *_runtime_policy_decision       selected-vector, full-rowgroup, mixed, or none.
+  *_runtime_policy_reason         Counts for selected/full/tail/ratio/low-saving policy outcomes.
+                                  The current policy uses selected/full ratio < 0.75 and at least
+                                  4 saved vectors to choose selected-vector decode.
+  *_device_planning_ms            Crop-to-rowgroup/vector planning time inside the JPEG DCT reader.
+  *_workset_build_ms / *_workset_upload_ms / *_decode_ms / *_gather_ms
+                                  Internal JPEG DCT device-stage timings.
+  *_plan_ms / *_read_decode_ms    Pipeline benchmark plan time and prepared-plan execution time.
+                                  Device planning is counted once through *_device_planning_ms;
+                                  read_decode excludes prepared-plan construction.
+  pushdown_speedup_vs_full_then_crop
+                                  full_then_crop_total_ms / pushdown_total_ms when both stages run;
+                                  0 for one-sided modes.
+  pushdown_saved_ms_vs_full_then_crop
+                                  full_then_crop_total_ms - pushdown_total_ms when both stages run;
+                                  0 for one-sided modes.
+  auto_pushdown_windows / auto_full_then_crop_windows
+                                  Window-level decisions made by pipeline_benchmark --mode auto.
+  auto_policy_ms / auto_total_ms   CPU prepared-plan policy time and aggregate selected-path time
+                                  in auto mode. The selected path reuses the prepared plan instead
+                                  of planning again; no-crop auto windows prepare only the full
+                                  candidate. auto_total_ms includes auto policy/planning time once.
+  auto_policy_reason               Last auto decision reason and its prepared-plan ratios.
+  auto_policy_selected_blocks / auto_policy_full_blocks
+                                  Aggregate crop/full prepared-plan block counts used by auto mode.
+  auto_policy_selected_block_ratio Aggregate selected/full prepared-plan block ratio.
+  auto_policy_selected_vectors / auto_policy_full_vectors
+                                  Aggregate runtime-policy estimated crop/full prepared-plan FastLanes
+                                  vector counts used by auto mode. This accounts for rowgroups that
+                                  the device runtime would decode fully because selected chunks are not
+                                  worth pushing down.
+  auto_policy_selected_vector_ratio
+                                  Aggregate estimated selected/full prepared-plan vector ratio. Auto mode
+                                  uses this ratio when available to estimate decode work saving.
+  auto_policy_touched_rowgroups / auto_policy_full_rowgroups
+                                  Aggregate crop/full prepared-plan rowgroup counts used by auto mode.
+  auto_policy_estimated_pushdown_worksets / auto_policy_estimated_full_worksets
+                                  Aggregate prepared-plan workset estimates grouped by shard and
+                                  the JPEG DCT decode batch rowgroup limit.
+  auto_policy_estimated_pushdown_gather_items / auto_policy_estimated_full_gather_items
+                                  Aggregate prepared-plan gather item estimates for cropped pushdown
+                                  output and full-image decode output.
+  auto_policy_pushdown_reuse_candidate_rowgroups / auto_policy_full_reuse_candidate_rowgroups
+                                  Prepared-plan rowgroups that appeared in earlier auto windows.
+                                  This is a cheap cache-reuse proxy, not a measured cache hit.
+  auto_policy_touched_rowgroup_ratio
+                                  Aggregate touched/full prepared-plan rowgroup ratio.
+  auto_policy_pushdown_reuse_candidate_ratio / auto_policy_full_reuse_candidate_ratio
+                                  Reuse-candidate rowgroups divided by prepared-plan rowgroups for each
+                                  auto candidate path.
+  auto_policy_avg_full_blocks_per_rowgroup
+                                  Aggregate full prepared-plan block density per rowgroup.
+  auto_policy_*_windows            Per-reason auto policy window counts, useful for checking
+                                  whether small-window, workset-overhead, touched-rowgroup,
+                                  or gather-output guards are active.
   prefetch_wait_ms                 Time the consumer waited for background rowgroup prefetch.
   prefetch_depth_block_ms          Time prefetch workers spent blocked by prefetch_depth back-pressure.
   Notes:
@@ -103,6 +284,26 @@ Options
   --stream-max-rowgroups N          Chunk flush threshold by rowgroup count in whole-table streaming
                                     benchmark (default: 1, 0 disables rowgroup-cap flushing).
   --freq-patcher MODE               FREQ patcher mode: stateful, branchless, or hybrid[:threshold].
+  --crop x y w h                    Pixel-space JPEG source crop for pipeline_benchmark. In
+                                    --mode pushdown, the crop is pushed into JPEG DCT/FastLanes
+                                    planning and workset scheduling. In --mode baseline
+                                    (full-then-crop), the benchmark decodes full images first and
+                                    then selects the same cropped DCT blocks from the full output.
+  --window-images N                 Images per pipeline_benchmark window (default: 256).
+  --cache-capacity-mib N            Decoded rowgroup cache capacity for JPEG DCT pipeline.
+  --decode-batch-rowgroups N        Rowgroups per JPEG DCT decode workset (default: 64).
+                                    Larger values can reduce small workset launches and batch-end
+                                    syncs when the window has many tiny touched rowgroups.
+  --mode MODE                       pipeline_benchmark mode:
+                                    compare runs pushdown and full-then-crop and verifies matching
+                                    cropped DCT coefficients;
+                                    pushdown runs only crop-pushed decode;
+                                    baseline/full-then-crop runs only full decode followed by
+                                    cropped block selection;
+                                    auto chooses pushdown or full-then-crop per window from
+                                    CPU crop/full prepared plans, keeping small windows on
+                                    full-then-crop to avoid fixed pushdown overhead.
+  --no-verify                       Skip coefficient equality validation in compare mode.
 Environment Variables
   GALP_DISABLE_ASYNC_H2D=1          Disable dedicated h2d_stream entirely; GPU allocation and
                                     H2D transfers fall back to the default stream.
@@ -135,6 +336,9 @@ Notes
 - GALP_ROWGROUP_TIMELINE_CSV writes a per-rowgroup CSV with read/build/ready/upload timestamps and queue gaps.
   By default the pipeline prewarms the stable working set: consumer-held rowgroups, active IO/build owners,
   and configured prefetch-depth slots.
+- `pipeline_benchmark --mode baseline --crop ...` is valid. It measures the
+  full-decode baseline while reporting cropped output cardinality and transform time. Use
+  `--mode compare` when you also want pushdown-vs-baseline coefficient validation.
 
 H2D Transfer Architecture
   A workset uses a shared DeviceArena to aggregate all appended expressions into one
