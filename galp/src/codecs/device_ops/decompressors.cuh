@@ -23,9 +23,11 @@ template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename Co
 struct BPDecompressor : DecompressorBase<T> {
 	UnpackerT                  unpacker;
 	__device__ __forceinline__ BPDecompressor(const BPColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.packed_array + column.vector_offsets[vector_index],
+	    : unpacker(column.packed_array,
+	               column.vector_offsets,
+	               column.bit_widths,
+	               vector_index,
 	               lane,
-	               column.bit_widths[vector_index],
 	               BPFunctor<T>()) {
 	}
 
@@ -38,9 +40,11 @@ template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename Co
 struct FFORDecompressor : DecompressorBase<T> {
 	UnpackerT                  unpacker;
 	__device__ __forceinline__ FFORDecompressor(const FFORColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.bp.packed_array + column.bp.vector_offsets[vector_index],
+	    : unpacker(column.bp.packed_array,
+	               column.bp.vector_offsets,
+	               column.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.bp.bit_widths[vector_index],
 	               FFORFunctor<T, UNPACK_N_VECTORS>(column.bases + vector_index)) {
 	}
 
@@ -85,9 +89,11 @@ struct SLPATCHDecompressor : DecompressorBase<T> {
 	UnpackerT                  unpacker;
 	__device__ __forceinline__ SLPATCHDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : patcher(column, vector_index, lane)
-	    , unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	    , unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.ffor.bp.bit_widths[vector_index],
 	               FFORFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index)) {
 	}
 
@@ -111,9 +117,11 @@ struct DICTSLPATCHDecompressor : DecompressorBase<T> {
 
 	__device__ __forceinline__ DICTSLPATCHDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : patcher(column, vector_index, lane)
-	    , unpacker(column.index.ffor.bp.packed_array + column.index.ffor.bp.vector_offsets[vector_index],
+	    , unpacker(column.index.ffor.bp.packed_array,
+	               column.index.ffor.bp.vector_offsets,
+	               column.index.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.index.ffor.bp.bit_widths[vector_index],
 	               ProcessorT(column.index.ffor.bases + vector_index, column.keys)) {
 	}
 
@@ -132,9 +140,11 @@ struct DICTDecompressor : DecompressorBase<T> {
 	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	UnpackerT                  unpacker;
 	__device__ __forceinline__ DICTDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	    : unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.ffor.bp.bit_widths[vector_index],
 	               ProcessorT(column.ffor.bases + vector_index,
 	                          column.keys)) { // column.keys at global memory
 	}
@@ -144,9 +154,11 @@ struct DICTDecompressor : DecompressorBase<T> {
 	                                            const vi_t    vector_index,
 	                                            const lane_t  lane,
 	                                            const typename ColumnT::KEY_T* __restrict keys_ptr)
-	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	    : unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.ffor.bp.bit_widths[vector_index],
 	               ProcessorT(column.ffor.bases + vector_index, keys_ptr)) {
 	}
 
@@ -162,9 +174,11 @@ struct DICTShfl32Decompressor : DecompressorBase<T> {
 
 	__device__ __forceinline__
 	DICTShfl32Decompressor(const DICTFFORColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	    : unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.ffor.bp.bit_widths[vector_index],
 		               DICTShfl32Functor<T, UNPACK_N_VECTORS>(
 		                   column.ffor.bases + vector_index, reinterpret_cast<const UINT_T*>(column.keys), column.key_count)) {
 	}
@@ -200,9 +214,11 @@ struct RLEDecompressor : DecompressorBase<ValueT> {
 	ExpanderT                                                     expander;
 
 	__device__ __forceinline__ RLEDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	    : unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.ffor.bp.bit_widths[vector_index],
 	               FFORFunctor<IndexT, UNPACK_N_VECTORS>(column.ffor.bases + vector_index))
 	    , unsumer(column, vector_index, lane)
 	    , expander(column, vector_index, lane) {
@@ -232,9 +248,11 @@ struct RLESLPATCHDecompressor : DecompressorBase<ValueT> {
 	ExpanderT                                                     expander;
 
 	__device__ __forceinline__ RLESLPATCHDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.index.ffor.bp.packed_array + column.index.ffor.bp.vector_offsets[vector_index],
+	    : unpacker(column.index.ffor.bp.packed_array,
+	               column.index.ffor.bp.vector_offsets,
+	               column.index.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.index.ffor.bp.bit_widths[vector_index],
 	               FFORFunctor<IndexT, UNPACK_N_VECTORS>(column.index.ffor.bases + vector_index))
 	    , patcher(column.index, vector_index, lane)
 	    , unsumer(column, vector_index, lane)

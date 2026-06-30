@@ -125,19 +125,26 @@ void release_workset(ExecutionWorkset& workset,
 		host_batch.device_exprs.clear();
 		host_batch.output_offsets.clear();
 		host_batch.work_items.clear();
+		host_batch.scalar_tail_work_items.clear();
 		host_batch.work_items_explicit = false;
 		host_batch.expr_indices.clear();
 
 		auto& device_batch = workset.buffers.device_batches.template get<T>();
 		device_batch.owned_exprs.reset();
 		device_batch.owned_items.reset();
+		device_batch.owned_scalar_tail_items.reset();
 		device_batch.d_exprs = nullptr;
 		device_batch.d_items = nullptr;
+		device_batch.d_scalar_tail_items = nullptr;
 		device_batch.n_items = 0;
+		device_batch.n_scalar_tail_items = 0;
 	});
 	workset.slots.owned.reset();
+	workset.slots.owned_scalar_tail.reset();
 	workset.slots.d = nullptr;
+	workset.slots.d_scalar_tail = nullptr;
 	workset.slots.mixed.clear();
+	workset.slots.scalar_tail_mixed.clear();
 	workset.outputs.used_bytes = 0;
 	workset.outputs.required   = false;
 	if (workset.transfer.h2d_stream) {

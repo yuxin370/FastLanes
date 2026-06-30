@@ -24,23 +24,41 @@ inline bool uses_mixed_dispatch(const LaunchStrategy strategy) {
 
 template <bool WRITE_OUT>
 inline void launch_typed_batches(ExecutionWorkset& workset, const ExecutionConfig& cfg, cudaStream_t stream) {
+	auto scalar_tail_cfg             = cfg;
+	scalar_tail_cfg.unpack_n_vectors = 1;
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T            = typename decltype(tag)::type;
 		auto& host_batch   = workset.buffers.host_batches.template get<T>();
 		auto& device_batch = workset.buffers.device_batches.template get<T>();
-		if (device_batch.d_exprs == nullptr || device_batch.d_items == nullptr) {
+		if (device_batch.d_exprs == nullptr) {
 			return;
 		}
-		galp::execution::detail::launch_batch_no_sync<T, WRITE_OUT>(
-		    host_batch, device_batch.d_exprs, device_batch.d_items, device_batch.n_items, cfg, stream);
+		if (device_batch.d_items != nullptr && device_batch.n_items != 0) {
+			galp::execution::detail::launch_batch_no_sync<T, WRITE_OUT>(
+			    host_batch, device_batch.d_exprs, device_batch.d_items, device_batch.n_items, cfg, stream);
+		}
+		if (device_batch.d_scalar_tail_items != nullptr && device_batch.n_scalar_tail_items != 0) {
+			galp::execution::detail::launch_batch_no_sync<T, WRITE_OUT>(host_batch,
+			                                                            device_batch.d_exprs,
+			                                                            device_batch.d_scalar_tail_items,
+			                                                            device_batch.n_scalar_tail_items,
+			                                                            scalar_tail_cfg,
+			                                                            stream);
+		}
 	});
 }
 
 template <bool WRITE_OUT>
-inline void launch_mixed_dispatch(ExecutionWorkset& workset, const ExecutionConfig& cfg, cudaStream_t stream) {
-	const auto*            exprs_i8  = workset.buffers.device_batches.template get<int8_t>().d_exprs;
-	const auto*            exprs_i16 = workset.buffers.device_batches.template get<int16_t>().d_exprs;
-	const MixedSlotMapping mapping(workset.slots.mixed.size());
+inline void launch_mixed_slots(const galp::execution::DeviceExpression<int8_t>*  exprs_i8,
+                               const galp::execution::DeviceExpression<int16_t>* exprs_i16,
+                               const galp::execution::MixedWorkSlot*             slots,
+                               const size_t                                      n_slots,
+                               const ExecutionConfig&                            cfg,
+                               cudaStream_t                                      stream) {
+	if (slots == nullptr || n_slots == 0) {
+		return;
+	}
+	const MixedSlotMapping mapping(n_slots);
 	const dim3             block(MixedSlotMapping::N_THREADS_PER_BLOCK);
 	const dim3             grid(mapping.n_blocks());
 
@@ -48,9 +66,24 @@ inline void launch_mixed_dispatch(ExecutionWorkset& workset, const ExecutionConf
 		constexpr unsigned UNPACK_N_VECTORS = decltype(unpack_n_vectors)::value;
 		constexpr unsigned UNPACK_N_VALUES  = decltype(unpack_n_values)::value;
 		galp::kernels::device::decompress_dispatch_mixed<UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
-		    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, workset.slots.d, workset.slots.mixed.size());
+		    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, slots, n_slots);
 		CUDA_SAFE_CALL(cudaGetLastError());
 	});
+}
+
+template <bool WRITE_OUT>
+inline void launch_mixed_dispatch(ExecutionWorkset& workset, const ExecutionConfig& cfg, cudaStream_t stream) {
+	const auto* exprs_i8  = workset.buffers.device_batches.template get<int8_t>().d_exprs;
+	const auto* exprs_i16 = workset.buffers.device_batches.template get<int16_t>().d_exprs;
+	launch_mixed_slots<WRITE_OUT>(exprs_i8, exprs_i16, workset.slots.d, workset.slots.mixed.size(), cfg, stream);
+	auto scalar_tail_cfg             = cfg;
+	scalar_tail_cfg.unpack_n_vectors = 1;
+	launch_mixed_slots<WRITE_OUT>(exprs_i8,
+	                               exprs_i16,
+	                               workset.slots.d_scalar_tail,
+	                               workset.slots.scalar_tail_mixed.size(),
+	                               scalar_tail_cfg,
+	                               stream);
 }
 
 template <LaunchStrategy Strategy, bool WRITE_OUT>
@@ -70,6 +103,9 @@ inline size_t typed_launches_per_sample(const ExecutionWorkset& workset) {
 		if (d.d_exprs != nullptr && d.d_items != nullptr) {
 			++launches;
 		}
+		if (d.d_exprs != nullptr && d.d_scalar_tail_items != nullptr) {
+			++launches;
+		}
 	});
 	return launches;
 }
@@ -78,7 +114,8 @@ inline size_t typed_total_items_per_sample(const ExecutionWorkset& workset) {
 	size_t items = 0;
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		items += workset.buffers.device_batches.template get<T>().n_items;
+		const auto& d = workset.buffers.device_batches.template get<T>();
+		items += d.n_items + d.n_scalar_tail_items;
 	});
 	return items;
 }
@@ -123,8 +160,13 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 	const size_t launches_per_sample = typed_launches_per_sample(workset);
 	const size_t total_items         = typed_total_items_per_sample(workset);
 	const bool   mixed_dispatch      = uses_mixed_dispatch(cfg.launch_strategy);
+	const bool   has_mixed_items =
+	    workset.slots.d != nullptr && !workset.slots.mixed.empty();
+	const bool has_mixed_tail_items =
+	    workset.slots.d_scalar_tail != nullptr && !workset.slots.scalar_tail_mixed.empty();
+	const size_t mixed_launches_per_sample = (has_mixed_items ? 1U : 0U) + (has_mixed_tail_items ? 1U : 0U);
 
-	if (mixed_dispatch && (workset.slots.d == nullptr || workset.slots.mixed.empty())) {
+	if (mixed_dispatch && mixed_launches_per_sample == 0) {
 		if (out_launches) {
 			*out_launches = 0;
 		}
@@ -133,14 +175,22 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 
 	if (out_grid) {
 		if (mixed_dispatch) {
-			const MixedSlotMapping mapping(workset.slots.mixed.size());
-			*out_grid = mapping.n_blocks();
+			size_t grid = 0;
+			if (has_mixed_items) {
+				const MixedSlotMapping mapping(workset.slots.mixed.size());
+				grid += mapping.n_blocks();
+			}
+			if (has_mixed_tail_items) {
+				const MixedSlotMapping mapping(workset.slots.scalar_tail_mixed.size());
+				grid += mapping.n_blocks();
+			}
+			*out_grid = grid;
 		} else {
 			*out_grid = (launches_per_sample > 0) ? (total_items / launches_per_sample) : 0;
 		}
 	}
 	if (out_launches) {
-		*out_launches = (mixed_dispatch ? 1 : launches_per_sample) * static_cast<size_t>(samples);
+		*out_launches = (mixed_dispatch ? mixed_launches_per_sample : launches_per_sample) * static_cast<size_t>(samples);
 	}
 
 	if (!workset.transfer.h2d_stream) {

@@ -39,9 +39,15 @@ void launch_batch_no_sync(const galp::execution::Batch<T>& batch,
 		return;
 	}
 	uint32_t threads = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<T>());
-	for (const auto& work : batch.work_items) {
+	const auto update_threads = [&](const WorkItemAny& work) {
 		threads = std::max(
 		    threads, galp::execution::semantic_lane_count(type_tag_for<T>(), batch.device_exprs[work.expr_index].plan));
+	};
+	for (const auto& work : batch.work_items) {
+		update_threads(work);
+	}
+	for (const auto& work : batch.scalar_tail_work_items) {
+		update_threads(work);
 	}
 	const dim3 block(static_cast<unsigned>(threads));
 	const dim3 grid(static_cast<unsigned>(n_items));
@@ -91,6 +97,7 @@ void finalize_batch(Batch<T>& batch, RowgroupData& result) {
 	batch.device_exprs.clear();
 	batch.output_offsets.clear();
 	batch.work_items.clear();
+	batch.scalar_tail_work_items.clear();
 	batch.work_items_explicit = false;
 	batch.expr_indices.clear();
 }

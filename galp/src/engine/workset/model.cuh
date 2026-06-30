@@ -50,8 +50,11 @@ struct WorksetOutputs {
 
 struct WorksetSlots {
 	std::vector<galp::execution::MixedWorkSlot>             mixed;
+	std::vector<galp::execution::MixedWorkSlot>             scalar_tail_mixed;
 	std::optional<GPUArray<galp::execution::MixedWorkSlot>> owned;
+	std::optional<GPUArray<galp::execution::MixedWorkSlot>> owned_scalar_tail;
 	galp::execution::MixedWorkSlot*                         d = nullptr;
+	galp::execution::MixedWorkSlot*                         d_scalar_tail = nullptr;
 };
 
 struct WorksetTransfer {

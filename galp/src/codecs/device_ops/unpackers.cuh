@@ -34,11 +34,13 @@ struct BitUnpackerDummy : galp::codec::device::BitUnpackerBase<T> {
 	const UINT_T*   in;
 	OutputProcessor processor;
 
-	__device__ __forceinline__ BitUnpackerDummy(const UINT_T* __restrict a_in,
+	__device__ __forceinline__ BitUnpackerDummy(const UINT_T* __restrict    packed_array,
+	                                            [[maybe_unused]] const uint32_t* vector_offsets,
+	                                            [[maybe_unused]] const vbw_t*    bit_widths,
+	                                            const vi_t                   vector_index,
 	                                            const lane_t                 lane,
-	                                            [[maybe_unused]] const vbw_t value_bit_width,
 	                                            OutputProcessor              processor)
-	    : in(a_in + lane)
+	    : in(packed_array + vector_offsets[vector_index] + lane)
 	    , processor(processor) {};
 
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
@@ -64,12 +66,14 @@ struct BitUnpackerOldFls : galp::codec::device::BitUnpackerBase<T> {
 	const vbw_t     value_bit_width;
 	OutputProcessor processor;
 
-	__device__ __forceinline__ BitUnpackerOldFls(const UINT_T* __restrict a_in,
-	                                             const lane_t    lane,
-	                                             const vbw_t     a_value_bit_width,
-	                                             OutputProcessor processor)
-	    : in(a_in + lane)
-	    , value_bit_width(a_value_bit_width)
+	__device__ __forceinline__ BitUnpackerOldFls(const UINT_T* __restrict    packed_array,
+	                                             const uint32_t*             vector_offsets,
+	                                             const vbw_t*                bit_widths,
+	                                             const vi_t                  vector_index,
+	                                             const lane_t                lane,
+	                                             OutputProcessor             processor)
+	    : in(packed_array + vector_offsets[vector_index] + lane)
+	    , value_bit_width(bit_widths[vector_index])
 	    , processor(processor) {
 		static_assert(UNPACK_N_VECTORS == 1, "Old FLS can only unpack 1 at a time");
 		static_assert(UNPACK_N_VALUES == galp::codec::utils::get_values_per_lane<T>(), "Old FLS can only unpack entire lanes");
@@ -557,22 +561,31 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 	using UINT_T = typename galp::codec::utils::same_width_uint<InT>::type;
 	OutputProcessor processor;
 
-	const UINT_T* in;
-	const int32_t vector_offset;
-	const vbw_t   value_bit_width;
+	// Per-vector decode state. FastLanes bit-packs every vector with its own minimal
+	// bit width, so the UNPACK_N_VECTORS vectors in a chunk are NOT at a uniform stride:
+	// each has an independent base pointer, width, value mask, and bit offset. A single
+	// shared stride (the previous design) only decoded the first vector of a chunk
+	// correctly and read past the buffer for the rest on variable-width columns.
+	const UINT_T* in[UNPACK_N_VECTORS];
+	vbw_t         value_bit_width[UNPACK_N_VECTORS];
+	UINT_T        value_mask[UNPACK_N_VECTORS];
+	int32_t       offset_first[UNPACK_N_VECTORS];
 
-	int32_t offset_first = 0;
-	UINT_T  value_mask;
-
-	__device__ __forceinline__ BitUnpackerStatefulBranchless(const UINT_T* __restrict a_in,
-	                                                         const lane_t    lane,
-	                                                         const vbw_t     value_bit_width,
-	                                                         OutputProcessor processor)
-	    : in(a_in + lane)
-	    , value_bit_width(value_bit_width)
-	    , value_mask(galp::codec::utils::set_first_n_bits<UINT_T>(value_bit_width))
-	    , vector_offset(galp::codec::utils::get_compressed_vector_size<InT>(value_bit_width))
-	    , processor(processor) {
+	__device__ __forceinline__ BitUnpackerStatefulBranchless(const UINT_T* __restrict packed_array,
+	                                                         const uint32_t* __restrict vector_offsets,
+	                                                         const vbw_t* __restrict    bit_widths,
+	                                                         const vi_t                 vector_index,
+	                                                         const lane_t               lane,
+	                                                         OutputProcessor            processor)
+	    : processor(processor) {
+#pragma unroll
+		for (int32_t v {0}; v < UNPACK_N_VECTORS; v++) {
+			const vbw_t bw     = bit_widths[vector_index + v];
+			in[v]              = packed_array + vector_offsets[vector_index + v] + lane;
+			value_bit_width[v] = bw;
+			value_mask[v]      = galp::codec::utils::set_first_n_bits<UINT_T>(bw);
+			offset_first[v]    = 0;
+		}
 	}
 
 	__device__ __forceinline__ void unpack_next_into(OutT* __restrict out) {
@@ -582,18 +595,16 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 
 #pragma unroll
 		for (int32_t i {0}; i < UNPACK_N_VALUES; i++) {
-			const auto offset_second = BIT_COUNT - offset_first;
-
 #pragma unroll
 			for (int32_t v {0}; v < UNPACK_N_VECTORS; v++) {
-				const auto v_in = in + v * vector_offset;
-				const auto raw  = ((v_in[0] >> offset_first) & value_mask) |
-				                 ((v_in[N_LANES] & (value_mask >> offset_second)) << offset_second);
+				const auto offset_second = BIT_COUNT - offset_first[v];
+				const auto raw           = ((in[v][0] >> offset_first[v]) & value_mask[v]) |
+				                 ((in[v][N_LANES] & (value_mask[v] >> offset_second)) << offset_second);
 				out[UNPACK_N_VALUES * v + i] = processor(static_cast<InT>(raw), v);
-			}
 
-			in += (offset_second <= value_bit_width) * N_LANES;
-			offset_first = (offset_first + value_bit_width) % LANE_BIT_WIDTH;
+				in[v] += (offset_second <= value_bit_width[v]) * N_LANES;
+				offset_first[v] = (offset_first[v] + value_bit_width[v]) % LANE_BIT_WIDTH;
+			}
 		}
 	}
 };

@@ -265,7 +265,10 @@ __device__ __forceinline__ void execute_typed_work_item(const galp::execution::D
 	const auto*  expr         = exprs + work.expr_index;
 	const vi_t   vector_index = static_cast<vi_t>(work.vector_index);
 	const size_t n_vecs       = galp::codec::utils::get_n_vecs_from_size(expr->n_values);
-	if (static_cast<size_t>(vector_index) >= n_vecs) {
+	// A multi-vector work item decodes UNPACK_N_VECTORS consecutive vectors starting at
+	// vector_index, so every vector in the chunk must be in range; guarding only the first
+	// lets the unpacker read vector_offsets/bit_widths past the column for a tail chunk.
+	if (static_cast<size_t>(vector_index) + static_cast<size_t>(UNPACK_N_VECTORS) > n_vecs) {
 		return;
 	}
 	if (static_cast<uint32_t>(lane) >=

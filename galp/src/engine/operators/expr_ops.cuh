@@ -184,12 +184,16 @@ void add_expression_to_batch(const size_t                 expr_index,
 	}
 	if (emit_typed_work_items) {
 		const size_t decode_vector_width = output_vector_width;
-		batch.work_items.reserve(batch.work_items.size() + (n_vecs + decode_vector_width - 1U) / decode_vector_width);
-		for (size_t vec = 0; vec < n_vecs; vec += decode_vector_width) {
-			if (vec + decode_vector_width > n_vecs) {
-				throw std::out_of_range("FastLanes decode chunk extends past column vectors");
-			}
+		const size_t full_n_vecs =
+		    decode_vector_width <= 1U ? n_vecs : (n_vecs / decode_vector_width) * decode_vector_width;
+		batch.work_items.reserve(batch.work_items.size() + (full_n_vecs + decode_vector_width - 1U) / decode_vector_width);
+		for (size_t vec = 0; vec < full_n_vecs; vec += decode_vector_width) {
 			batch.work_items.push_back(
+			    WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>(), static_cast<uint32_t>(vec)});
+		}
+		batch.scalar_tail_work_items.reserve(batch.scalar_tail_work_items.size() + (n_vecs - full_n_vecs));
+		for (size_t vec = full_n_vecs; vec < n_vecs; ++vec) {
+			batch.scalar_tail_work_items.push_back(
 			    WorkItemAny {device_idx, static_cast<uint32_t>(vec), type_tag_for<T>(), static_cast<uint32_t>(vec)});
 		}
 	}

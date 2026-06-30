@@ -78,27 +78,32 @@ void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 	// `unpack_n_vectors` vectors into overlapping (and tail out-of-bounds) outputs.
 	const uint32_t decode_vector_width = std::max(1U, cfg.unpack_n_vectors);
 
-	galp::execution::WorkItemAny pending_half {};
-	bool                         has_pending_half = false;
-
-	const auto append_work = [&](const galp::execution::WorkItemAny& work, const uint32_t semantic_lanes) {
+	const auto append_to_slots = [](std::vector<galp::execution::MixedWorkSlot>& slots,
+	                                galp::execution::WorkItemAny&               pending_half,
+	                                bool&                                       has_pending_half,
+	                                const galp::execution::WorkItemAny&         work,
+	                                const uint32_t                              semantic_lanes) {
 		if (semantic_lanes == galp::execution::lane_count_for_type(galp::execution::TypeTag::I8)) {
 			if (has_pending_half) {
-				workset.slots.mixed.push_back(
-				    galp::execution::MixedWorkSlot {pending_half, galp::execution::invalid_work_item()});
+				slots.push_back(galp::execution::MixedWorkSlot {pending_half, galp::execution::invalid_work_item()});
 				has_pending_half = false;
 			}
-			workset.slots.mixed.push_back(galp::execution::MixedWorkSlot {work, galp::execution::invalid_work_item()});
+			slots.push_back(galp::execution::MixedWorkSlot {work, galp::execution::invalid_work_item()});
 			return;
 		}
 		if (has_pending_half) {
-			workset.slots.mixed.push_back(galp::execution::MixedWorkSlot {pending_half, work});
+			slots.push_back(galp::execution::MixedWorkSlot {pending_half, work});
 			has_pending_half = false;
 		} else {
 			pending_half     = work;
 			has_pending_half = true;
 		}
 	};
+
+	galp::execution::WorkItemAny pending_half {};
+	bool                         has_pending_half = false;
+	galp::execution::WorkItemAny pending_scalar_tail_half {};
+	bool                         has_pending_scalar_tail_half = false;
 
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T              = typename decltype(tag)::type;
@@ -108,7 +113,16 @@ void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 			for (const auto& work : batch.work_items) {
 				const auto semantic_lanes =
 				    galp::execution::semantic_lane_count(type, batch.device_exprs[work.expr_index].plan);
-				append_work(work, semantic_lanes);
+				append_to_slots(workset.slots.mixed, pending_half, has_pending_half, work, semantic_lanes);
+			}
+			for (const auto& work : batch.scalar_tail_work_items) {
+				const auto semantic_lanes =
+				    galp::execution::semantic_lane_count(type, batch.device_exprs[work.expr_index].plan);
+				append_to_slots(workset.slots.scalar_tail_mixed,
+				                pending_scalar_tail_half,
+				                has_pending_scalar_tail_half,
+				                work,
+				                semantic_lanes);
 			}
 			return;
 		}
@@ -116,11 +130,22 @@ void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 			const auto& expr           = batch.device_exprs[expr_idx];
 			const auto  semantic_lanes = galp::execution::semantic_lane_count(type, expr.plan);
 			const auto  n_vecs         = galp::codec::utils::get_n_vecs_from_size(expr.n_values);
-			for (uint32_t vec = 0; vec < n_vecs; vec += decode_vector_width) {
-				if (vec + decode_vector_width > n_vecs) {
-					throw std::out_of_range("FastLanes decode chunk extends past column vectors");
-				}
-				append_work(galp::execution::WorkItemAny {expr_idx, vec, type, vec}, semantic_lanes);
+			const uint32_t full_n_vecs =
+			    decode_vector_width <= 1U ? static_cast<uint32_t>(n_vecs)
+			                              : static_cast<uint32_t>((n_vecs / decode_vector_width) * decode_vector_width);
+			for (uint32_t vec = 0; vec < full_n_vecs; vec += decode_vector_width) {
+				append_to_slots(workset.slots.mixed,
+				                pending_half,
+				                has_pending_half,
+				                galp::execution::WorkItemAny {expr_idx, vec, type, vec},
+				                semantic_lanes);
+			}
+			for (uint32_t vec = full_n_vecs; vec < n_vecs; ++vec) {
+				append_to_slots(workset.slots.scalar_tail_mixed,
+				                pending_scalar_tail_half,
+				                has_pending_scalar_tail_half,
+				                galp::execution::WorkItemAny {expr_idx, vec, type, vec},
+				                semantic_lanes);
 			}
 		}
 	});
@@ -129,14 +154,21 @@ void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 		workset.slots.mixed.push_back(
 		    galp::execution::MixedWorkSlot {pending_half, galp::execution::invalid_work_item()});
 	}
+	if (has_pending_scalar_tail_half) {
+		workset.slots.scalar_tail_mixed.push_back(
+		    galp::execution::MixedWorkSlot {pending_scalar_tail_half, galp::execution::invalid_work_item()});
+	}
 }
 
 } // namespace
 
 void clear_mixed_slots(WorksetSlots& slots) {
 	slots.mixed.clear();
+	slots.scalar_tail_mixed.clear();
 	slots.owned.reset();
+	slots.owned_scalar_tail.reset();
 	slots.d = nullptr;
+	slots.d_scalar_tail = nullptr;
 }
 
 UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
@@ -149,7 +181,9 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 	const auto t0         = clock::now();
 	const auto h2d_stream = ensure_workset_h2d_stream(workset);
 	workset.slots.owned.reset();
-	workset.slots.d           = nullptr;
+	workset.slots.owned_scalar_tail.reset();
+	workset.slots.d             = nullptr;
+	workset.slots.d_scalar_tail = nullptr;
 	const bool mixed_dispatch = cfg.launch_strategy == galp::execution::LaunchStrategy::MixedDispatch;
 	if (!mixed_dispatch) {
 		clear_mixed_slots(workset.slots);
@@ -161,9 +195,12 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 		auto& dev_batch = workset.buffers.device_batches.template get<T>();
 		dev_batch.owned_exprs.reset();
 		dev_batch.owned_items.reset();
+		dev_batch.owned_scalar_tail_items.reset();
 		dev_batch.d_exprs = nullptr;
 		dev_batch.d_items = nullptr;
+		dev_batch.d_scalar_tail_items = nullptr;
 		dev_batch.n_items = 0;
+		dev_batch.n_scalar_tail_items = 0;
 	});
 	const auto t0a          = clock::now();
 	breakdown.prep_reset_ms = ms(t0, t0a);
@@ -204,12 +241,24 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 				dev_batch.n_items   = host_batch.work_items.size();
 				arena.resolve_to(reinterpret_cast<void**>(&dev_batch.d_items), item_idx);
 			}
+			if (!mixed_dispatch && !host_batch.scalar_tail_work_items.empty()) {
+				const auto item_idx = arena.template add<galp::execution::WorkItemAny>(
+				    host_batch.scalar_tail_work_items.size(), host_batch.scalar_tail_work_items.data());
+				dev_batch.n_scalar_tail_items = host_batch.scalar_tail_work_items.size();
+				arena.resolve_to(reinterpret_cast<void**>(&dev_batch.d_scalar_tail_items), item_idx);
+			}
 		});
 		if (!workset.slots.mixed.empty()) {
 			auto&      arena    = *workset.buffers.chunk_arena;
 			const auto slot_idx = arena.template add<galp::execution::MixedWorkSlot>(workset.slots.mixed.size(),
 			                                                                         workset.slots.mixed.data());
 			arena.resolve_to(reinterpret_cast<void**>(&workset.slots.d), slot_idx);
+		}
+		if (!workset.slots.scalar_tail_mixed.empty()) {
+			auto&      arena    = *workset.buffers.chunk_arena;
+			const auto slot_idx = arena.template add<galp::execution::MixedWorkSlot>(
+			    workset.slots.scalar_tail_mixed.size(), workset.slots.scalar_tail_mixed.data());
+			arena.resolve_to(reinterpret_cast<void**>(&workset.slots.d_scalar_tail), slot_idx);
 		}
 		const auto t2             = clock::now();
 		breakdown.arena_pack_ms   = ms(t1, t2);

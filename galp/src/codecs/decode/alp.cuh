@@ -439,9 +439,11 @@ struct ALPDecompressor : DecompressorBase<T> {
 	PatcherT  patcher;
 
 	__device__ __forceinline__ ALPDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.ffor.bp.packed_array + column.ffor.bp.vector_offsets[vector_index],
+	    : unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
 	               lane,
-	               column.ffor.bp.bit_widths[vector_index],
 	               ALPFunctor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index,
 	                                               column.factors,
 	                                               column.factor_indices + vector_index,

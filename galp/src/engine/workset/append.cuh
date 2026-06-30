@@ -69,7 +69,8 @@ inline size_t count_work_items(const ExecutionWorkset& workset) {
 	size_t total = 0;
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T = typename decltype(tag)::type;
-		total += workset.buffers.host_batches.template get<T>().work_items.size();
+		const auto& batch = workset.buffers.host_batches.template get<T>();
+		total += batch.work_items.size() + batch.scalar_tail_work_items.size();
 	});
 	return total;
 }
@@ -80,7 +81,7 @@ inline size_t count_expr_work_items(const ExecutionWorkset& workset) {
 		using T           = typename decltype(tag)::type;
 		const auto& batch = workset.buffers.host_batches.template get<T>();
 		if (batch.work_items_explicit) {
-			total += batch.work_items.size();
+			total += batch.work_items.size() + batch.scalar_tail_work_items.size();
 			return;
 		}
 		for (const auto& expr : batch.device_exprs) {
@@ -194,7 +195,9 @@ inline void append_expressions(ExecutionWorkset&                          workse
 				                               cfg.freq_patcher,
 				                               cfg.freq_branchless_threshold,
 				                               cfg.launch_strategy != galp::execution::LaunchStrategy::MixedDispatch,
-				                               *active_chunk_arena);
+				                               *active_chunk_arena,
+				                               /*selected_vectors=*/nullptr,
+				                               /*selected_vector_width=*/std::max(1U, cfg.unpack_n_vectors));
 			    }
 		    },
 		    expr.column->host);

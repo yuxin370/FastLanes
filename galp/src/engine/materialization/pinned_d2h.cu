@@ -32,19 +32,26 @@ void clear_materialize_workset_state(ExecutionWorkset& workset) {
 		batch.device_exprs.clear();
 		batch.output_offsets.clear();
 		batch.work_items.clear();
+		batch.scalar_tail_work_items.clear();
 		batch.work_items_explicit = false;
 		batch.expr_indices.clear();
 
 		auto& dev = workset.buffers.device_batches.template get<T>();
 		dev.owned_exprs.reset();
 		dev.owned_items.reset();
+		dev.owned_scalar_tail_items.reset();
 		dev.d_exprs = nullptr;
 		dev.d_items = nullptr;
+		dev.d_scalar_tail_items = nullptr;
 		dev.n_items = 0;
+		dev.n_scalar_tail_items = 0;
 	});
 	workset.slots.owned.reset();
+	workset.slots.owned_scalar_tail.reset();
 	workset.slots.d = nullptr;
+	workset.slots.d_scalar_tail = nullptr;
 	workset.slots.mixed.clear();
+	workset.slots.scalar_tail_mixed.clear();
 }
 
 void snapshot_materialize_entries(ExecutionWorkset& workset, PendingMaterialize& pending) {

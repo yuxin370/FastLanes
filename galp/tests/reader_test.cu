@@ -1150,3 +1150,128 @@ TEST(Reader, WholeTablePrefetchBuildsPredicateScheduleBeforeRead) {
 	EXPECT_EQ(callbacks, expected_rowgroups);
 	EXPECT_EQ(result.rowgroups, 1U);
 }
+
+TEST(Reader, MultiVectorUnpackHandlesPartialTailRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+
+	const auto fls_path = make_partial_rowgroup_fls_fixture();
+
+	galp::format::FlsReader rdr(fls_path);
+	ASSERT_EQ(rdr.rowgroup_count(), 2U);
+
+	const auto td_handle = galp::format::detail::load_table_descriptor(fls_path);
+	const auto* td       = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	const auto* rowgroups = td->m_rowgroup_descriptors();
+	ASSERT_NE(rowgroups, nullptr);
+	const auto* rg_desc = rowgroups->Get(1);
+	ASSERT_NE(rg_desc, nullptr);
+	ASSERT_NE(static_cast<size_t>(rg_desc->m_n_vec()) % 4U, 0U);
+
+	auto rowgroup    = rdr.read_rowgroup(1);
+	auto expressions = galp::expression::assemble(rowgroup);
+
+	galp::execution::ExecutionConfig cfg_u1 {};
+	cfg_u1.unpack_n_vectors = 1;
+	cfg_u1.write_out        = true;
+	const auto result_u1    = galp::execution::decompress_rowgroup(expressions, cfg_u1);
+
+	for (const auto strategy :
+	     {galp::execution::LaunchStrategy::MixedDispatch, galp::execution::LaunchStrategy::TypedBatches}) {
+		SCOPED_TRACE(strategy == galp::execution::LaunchStrategy::MixedDispatch ? "mixed_u4_tail" : "typed_u4_tail");
+
+		galp::execution::ExecutionConfig cfg_u4 {};
+		cfg_u4.unpack_n_vectors = 4;
+		cfg_u4.launch_strategy  = strategy;
+		cfg_u4.write_out        = true;
+		const auto result_u4    = galp::execution::decompress_rowgroup(expressions, cfg_u4);
+
+		ASSERT_EQ(result_u1.columns.size(), result_u4.columns.size());
+		ASSERT_FALSE(result_u1.columns.empty());
+		ASSERT_TRUE(result_u1.columns[0].has_value());
+		ASSERT_TRUE(result_u4.columns[0].has_value());
+
+		const size_t n_vals = result_u1.columns[0]->meta.value_count;
+		ASSERT_EQ(n_vals, result_u4.columns[0]->meta.value_count);
+		const auto& ptr_u1 = std::get<std::shared_ptr<int8_t[]>>(result_u1.columns[0]->values);
+		const auto& ptr_u4 = std::get<std::shared_ptr<int8_t[]>>(result_u4.columns[0]->values);
+		for (size_t row = 0; row < n_vals; ++row) {
+			EXPECT_EQ(ptr_u1[row], ptr_u4[row]) << "row=" << row;
+		}
+	}
+}
+
+TEST(Reader, MultiVectorUnpackMatchesSingleVector) {
+	const auto fls_path = pick_fls_file();
+	if (fls_path.empty()) {
+		GTEST_SKIP() << "No .fls file found (set FLS_READER_TEST_FILE).";
+	}
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+
+	galp::format::FlsReader rdr(fls_path);
+	const size_t            n_rowgroups = rdr.rowgroup_count();
+	ASSERT_GT(n_rowgroups, 0U);
+
+	const auto supported = supported_tokens();
+	const auto td_handle = galp::format::detail::load_table_descriptor(fls_path);
+	const auto* td       = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+
+	size_t compared_total = 0;
+
+	for (size_t rg_idx = 0; rg_idx < n_rowgroups; ++rg_idx) {
+		const auto* rg_desc = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
+		if (!rg_desc) continue;
+		std::vector<fastlanes::OperatorToken> unsup;
+		if (!rowgroup_supported(rg_desc, supported, unsup)) continue;
+
+		auto rowgroup    = rdr.read_rowgroup(static_cast<uint32_t>(rg_idx));
+		auto expressions = galp::expression::assemble(rowgroup);
+
+		galp::execution::ExecutionConfig cfg_u1 {};
+		cfg_u1.unpack_n_vectors = 1;
+		cfg_u1.write_out        = true;
+		const auto result_u1    = galp::execution::decompress_rowgroup(expressions, cfg_u1);
+
+		for (const auto strategy :
+		     {galp::execution::LaunchStrategy::MixedDispatch, galp::execution::LaunchStrategy::TypedBatches}) {
+			SCOPED_TRACE(strategy == galp::execution::LaunchStrategy::MixedDispatch ? "mixed_u4" : "typed_u4");
+
+			galp::execution::ExecutionConfig cfg_u4 {};
+			cfg_u4.unpack_n_vectors = 4;
+			cfg_u4.launch_strategy  = strategy;
+			cfg_u4.write_out        = true;
+			const auto result_u4    = galp::execution::decompress_rowgroup(expressions, cfg_u4);
+
+			ASSERT_EQ(result_u1.columns.size(), result_u4.columns.size());
+			for (size_t col = 0; col < result_u1.columns.size(); ++col) {
+				if (!result_u1.columns[col].has_value()) continue;
+				ASSERT_TRUE(result_u4.columns[col].has_value())
+				    << "rg=" << rg_idx << " col=" << col << " missing in unpack=4";
+
+				const size_t n_vals = result_u1.columns[col]->meta.value_count;
+				std::visit(
+				    [&](auto& ptr_u1) {
+					    using T      = std::remove_pointer_t<decltype(ptr_u1.get())>;
+					    auto& ptr_u4 = std::get<std::shared_ptr<T[]>>(result_u4.columns[col]->values);
+					    for (size_t row = 0; row < n_vals; ++row) {
+						    if (ptr_u1[row] != ptr_u4[row]) {
+							    ADD_FAILURE() << "rg=" << rg_idx << " col=" << col << " row=" << row
+							                  << " u1=" << static_cast<int64_t>(ptr_u1[row])
+							                  << " u4=" << static_cast<int64_t>(ptr_u4[row]);
+							    return;
+						    }
+					    }
+					    ++compared_total;
+				    },
+				    result_u1.columns[col]->values);
+			}
+		}
+	}
+
+	EXPECT_GT(compared_total, 0U) << "No columns were compared.";
+}

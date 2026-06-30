@@ -25,6 +25,7 @@ struct Batch {
 	std::vector<DeviceExpression<T>> device_exprs;
 	std::vector<size_t>              output_offsets;
 	std::vector<WorkItemAny>         work_items;
+	std::vector<WorkItemAny>         scalar_tail_work_items;
 	bool                             work_items_explicit = false;
 };
 
@@ -55,9 +56,12 @@ template <typename T>
 struct DeviceBatch {
 	std::optional<GPUArray<DeviceExpression<T>>> owned_exprs;
 	std::optional<GPUArray<WorkItemAny>>         owned_items;
+	std::optional<GPUArray<WorkItemAny>>         owned_scalar_tail_items;
 	DeviceExpression<T>*                         d_exprs = nullptr;
 	WorkItemAny*                                 d_items = nullptr;
+	WorkItemAny*                                 d_scalar_tail_items = nullptr;
 	size_t                                       n_items = 0;
+	size_t                                       n_scalar_tail_items = 0;
 };
 
 template <typename... Ts>
