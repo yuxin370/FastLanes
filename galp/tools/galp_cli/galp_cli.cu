@@ -70,9 +70,14 @@ struct Options {
 	galp::execution::PipelineBenchmarkMode pipeline_mode           = galp::execution::PipelineBenchmarkMode::Compare;
 	size_t                                 pipeline_window_images  = 256;
 	size_t                                 pipeline_cache_capacity_bytes = 0;
-	size_t                                 pipeline_decode_batch_rowgroups = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
-	bool                                   pipeline_verify_outputs       = true;
-	std::vector<uint32_t>                  pipeline_image_ids;
+	size_t pipeline_decode_batch_rowgroups    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
+	bool   pipeline_enable_rowgroup_prefetch  = true;
+	size_t pipeline_rowgroup_prefetch_depth   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth;
+	size_t pipeline_rowgroup_prefetch_workers = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
+	size_t pipeline_rowgroup_prefetch_min_decode_batches =
+	    galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches;
+	bool                  pipeline_verify_outputs = true;
+	std::vector<uint32_t> pipeline_image_ids;
 #endif
 };
 
@@ -204,8 +209,37 @@ void print_pipeline_stage(const char* label, const galp::execution::PipelineBenc
 	std::cout << label << "_runtime_policy_full_rowgroups: " << stage.runtime_policy_full_rowgroups << "\n";
 	std::cout << label << "_runtime_policy_tail_full_rowgroups: " << stage.runtime_policy_tail_full_rowgroups << "\n";
 	std::cout << label << "_runtime_policy_ratio_full_rowgroups: " << stage.runtime_policy_ratio_full_rowgroups << "\n";
-	std::cout << label << "_runtime_policy_low_saving_full_rowgroups: "
-	          << stage.runtime_policy_low_saving_full_rowgroups << "\n";
+	std::cout << label
+	          << "_runtime_policy_low_saving_full_rowgroups: " << stage.runtime_policy_low_saving_full_rowgroups
+	          << "\n";
+	std::cout << label
+	          << "_prefetch_initial_cache_hit_rowgroup_count: " << stage.prefetch_initial_cache_hit_rowgroup_count
+	          << "\n";
+	std::cout << label << "_prefetch_candidate_rowgroup_count: " << stage.prefetch_candidate_rowgroup_count << "\n";
+	std::cout << label << "_prefetch_active_shard_count: " << stage.prefetch_active_shard_count << "\n";
+	std::cout << label << "_prefetch_config_disabled_shard_count: " << stage.prefetch_config_disabled_shard_count
+	          << "\n";
+	std::cout << label << "_prefetch_all_hit_shard_count: " << stage.prefetch_all_hit_shard_count << "\n";
+	std::cout << label
+	          << "_prefetch_small_batch_disabled_shard_count: " << stage.prefetch_small_batch_disabled_shard_count
+	          << "\n";
+	std::cout << label << "_prefetch_selected_vector_disabled_shard_count: "
+	          << stage.prefetch_selected_vector_disabled_shard_count << "\n";
+	std::cout << label
+	          << "_prefetch_selected_vector_miss_rowgroup_count: " << stage.prefetch_selected_vector_miss_rowgroup_count
+	          << "\n";
+	std::cout << label << "_prefetch_initial_hit_runtime_miss_count: " << stage.prefetch_initial_hit_runtime_miss_count
+	          << "\n";
+	std::cout << label
+	          << "_prefetch_skipped_repeated_runtime_miss_count: " << stage.prefetch_skipped_repeated_runtime_miss_count
+	          << "\n";
+	std::cout << label << "_prefetched_rowgroup_count: " << stage.prefetched_rowgroup_count << "\n";
+	std::cout << label << "_prefetch_consumed_as_hit_count: " << stage.prefetch_consumed_as_hit_count << "\n";
+	std::cout << label
+	          << "_prefetch_skipped_repeated_rowgroup_count: " << stage.prefetch_skipped_repeated_rowgroup_count
+	          << "\n";
+	std::cout << label << "_prefetch_consumed_as_hit_read_ms: " << stage.prefetch_consumed_as_hit_read_ms << "\n";
+	std::cout << label << "_prefetch_consumed_as_hit_wait_ms: " << stage.prefetch_consumed_as_hit_wait_ms << "\n";
 	std::cout << label << "_runtime_policy_decision: "
 	          << (stage.runtime_policy_decision.empty() ? "none" : stage.runtime_policy_decision) << "\n";
 	std::cout << label << "_runtime_policy_reason: "
@@ -215,6 +249,14 @@ void print_pipeline_stage(const char* label, const galp::execution::PipelineBenc
 	std::cout << label << "_workset_upload_ms: " << stage.workset_upload_ms << "\n";
 	std::cout << label << "_decode_ms: " << stage.decode_ms << "\n";
 	std::cout << label << "_gather_ms: " << stage.gather_ms << "\n";
+	std::cout << label << "_decoded_gather_ms: " << stage.decoded_gather_ms << "\n";
+	std::cout << label << "_cached_gather_ms: " << stage.cached_gather_ms << "\n";
+	std::cout << label << "_prefetch_wait_ms: " << stage.prefetch_wait_ms << "\n";
+	std::cout << label << "_prefetch_depth_block_ms: " << stage.prefetch_depth_block_ms << "\n";
+	std::cout << label << "_prefetch_queue_start_ms: " << stage.prefetch_queue_start_ms << "\n";
+	std::cout << label << "_prefetch_rowgroup_read_ms: " << stage.prefetch_rowgroup_read_ms << "\n";
+	std::cout << label << "_prefetch_ready_ahead_ms: " << stage.prefetch_ready_ahead_ms << "\n";
+	std::cout << label << "_sync_rowgroup_read_ms: " << stage.sync_rowgroup_read_ms << "\n";
 	std::cout << label << "_peak_window_images: " << stage.peak_window_images << "\n";
 	std::cout << label << "_peak_window_input_blocks: " << stage.peak_window_input_blocks << "\n";
 	std::cout << label << "_peak_window_output_blocks: " << stage.peak_window_output_blocks << "\n";
@@ -325,6 +367,7 @@ void print_usage(const char* prog) {
 	    << "  " << prog
 	    << " pipeline_benchmark <manifest.bin> [--crop x y width height] [--window-images N] "
 	       "[--cache-capacity-mib N] [--decode-batch-rowgroups N] "
+	       "[--no-jpeg-device-rowgroup-prefetch] "
 	       "[--mode compare|pushdown|baseline|auto] [--no-verify] [image_id ...]\n"
 #endif
 	    << "  " << prog << " measure_launch [--iters N] [--grid N] [--block N]\n"
@@ -361,6 +404,13 @@ void print_usage(const char* prog) {
 	    << "  --cache-capacity-mib N  Decoded rowgroup cache capacity for JPEG DCT pipeline\n"
 	    << "  --decode-batch-rowgroups N  Rowgroups per JPEG DCT decode workset (default: "
 	    << galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups << ")\n"
+	    << "  --no-jpeg-device-rowgroup-prefetch  Disable JPEG DCT device rowgroup prefetch\n"
+	    << "  --jpeg-device-prefetch-depth N  JPEG DCT device rowgroup prefetch queue depth (default: "
+	    << galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth << ")\n"
+	    << "  --jpeg-device-prefetch-workers N  JPEG DCT device prefetch worker threads (default: "
+	    << galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers << ")\n"
+	    << "  --jpeg-device-prefetch-min-batches N  Minimum miss decode batches before prefetch (default: "
+	    << galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches << ")\n"
 	    << "  --mode MODE  pipeline_benchmark mode: compare, pushdown, baseline/full-then-crop, or auto. "
 	       "compare runs both and verifies matching cropped output\n"
 	    << "  --no-verify  Skip coefficient equality validation in compare mode\n"
@@ -492,6 +542,32 @@ bool parse_args(int argc, char** argv, Options& opt) {
 		if (arg == "--decode-batch-rowgroups" && i + 1 < argc) {
 			opt.pipeline_decode_batch_rowgroups = parse_size_arg(argv[++i], "decode-batch-rowgroups");
 			if (opt.pipeline_decode_batch_rowgroups == 0) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "--no-jpeg-device-rowgroup-prefetch") {
+			opt.pipeline_enable_rowgroup_prefetch = false;
+			continue;
+		}
+		if (arg == "--jpeg-device-prefetch-depth" && i + 1 < argc) {
+			opt.pipeline_rowgroup_prefetch_depth = parse_size_arg(argv[++i], "jpeg-device-prefetch-depth");
+			if (opt.pipeline_rowgroup_prefetch_depth == 0) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "--jpeg-device-prefetch-workers" && i + 1 < argc) {
+			opt.pipeline_rowgroup_prefetch_workers = parse_size_arg(argv[++i], "jpeg-device-prefetch-workers");
+			if (opt.pipeline_rowgroup_prefetch_workers == 0) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "--jpeg-device-prefetch-min-batches" && i + 1 < argc) {
+			opt.pipeline_rowgroup_prefetch_min_decode_batches =
+			    parse_size_arg(argv[++i], "jpeg-device-prefetch-min-batches");
+			if (opt.pipeline_rowgroup_prefetch_min_decode_batches == 0) {
 				return false;
 			}
 			continue;
@@ -677,14 +753,18 @@ int main(int argc, char** argv) {
 		if (opt.mode == Mode::PipelineBenchmark) {
 #if GALP_WITH_JPEG_DCT
 			galp::execution::PipelineBenchmarkConfig pipeline_cfg;
-			pipeline_cfg.image_ids            = opt.pipeline_image_ids;
-			pipeline_cfg.crop                 = opt.pipeline_crop;
-			pipeline_cfg.mode                 = opt.pipeline_mode;
-			pipeline_cfg.window_images        = opt.pipeline_window_images;
-			pipeline_cfg.cache_capacity_bytes = opt.pipeline_cache_capacity_bytes;
-			pipeline_cfg.decode_batch_rowgroups = opt.pipeline_decode_batch_rowgroups;
-			pipeline_cfg.verify_outputs       = opt.pipeline_verify_outputs;
-			const auto result                 = galp::execution::benchmark_jpeg_dct_pipeline(opt.input, pipeline_cfg);
+			pipeline_cfg.image_ids                            = opt.pipeline_image_ids;
+			pipeline_cfg.crop                                 = opt.pipeline_crop;
+			pipeline_cfg.mode                                 = opt.pipeline_mode;
+			pipeline_cfg.window_images                        = opt.pipeline_window_images;
+			pipeline_cfg.cache_capacity_bytes                 = opt.pipeline_cache_capacity_bytes;
+			pipeline_cfg.decode_batch_rowgroups               = opt.pipeline_decode_batch_rowgroups;
+			pipeline_cfg.enable_rowgroup_prefetch             = opt.pipeline_enable_rowgroup_prefetch;
+			pipeline_cfg.rowgroup_prefetch_depth              = opt.pipeline_rowgroup_prefetch_depth;
+			pipeline_cfg.rowgroup_prefetch_workers            = opt.pipeline_rowgroup_prefetch_workers;
+			pipeline_cfg.rowgroup_prefetch_min_decode_batches = opt.pipeline_rowgroup_prefetch_min_decode_batches;
+			pipeline_cfg.verify_outputs                       = opt.pipeline_verify_outputs;
+			const auto result = galp::execution::benchmark_jpeg_dct_pipeline(opt.input, pipeline_cfg);
 			galp::memory::sync_h2d();
 			CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
@@ -715,6 +795,11 @@ int main(int argc, char** argv) {
 			}
 			std::cout << "  window_images: " << opt.pipeline_window_images << "\n";
 			std::cout << "  decode_batch_rowgroups: " << opt.pipeline_decode_batch_rowgroups << "\n";
+			std::cout << "  jpeg_device_rowgroup_prefetch: " << (opt.pipeline_enable_rowgroup_prefetch ? 1 : 0) << "\n";
+			std::cout << "  jpeg_device_prefetch_depth: " << opt.pipeline_rowgroup_prefetch_depth << "\n";
+			std::cout << "  jpeg_device_prefetch_workers: " << opt.pipeline_rowgroup_prefetch_workers << "\n";
+			std::cout << "  jpeg_device_prefetch_min_batches: " << opt.pipeline_rowgroup_prefetch_min_decode_batches
+			          << "\n";
 			std::cout << "  cache_capacity_bytes: " << opt.pipeline_cache_capacity_bytes << "\n";
 			std::cout << "  verify_outputs: " << (opt.pipeline_verify_outputs ? 1 : 0) << "\n";
 			if (show_comparison) {
@@ -1009,9 +1094,7 @@ int main(int argc, char** argv) {
 		try {
 			galp::memory::sync_h2d();
 			CUDA_SAFE_CALL(cudaDeviceSynchronize());
-		} catch (const std::exception& cleanup_ex) {
-			std::cerr << "Cleanup warning: " << cleanup_ex.what() << "\n";
-		}
+		} catch (const std::exception& cleanup_ex) { std::cerr << "Cleanup warning: " << cleanup_ex.what() << "\n"; }
 #endif
 		std::cerr << "Error: " << ex.what() << "\n";
 		return 1;

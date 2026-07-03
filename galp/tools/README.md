@@ -95,10 +95,33 @@ python3 scripts/my_tool/summarize_pipeline_benchmark.py \
   pipeline_benchmark.log
 ```
 
+For JPEG DCT device rowgroup prefetch work, collect an on/off matrix with:
+
+```bash
+python3 scripts/my_tool/run_jpeg_device_prefetch_benchmark.py \
+  --input data/flower_photos \
+  --work-dir /tmp/galp_jpeg_prefetch \
+  --mode compare \
+  --repeats 3
+```
+
+The script generates or reuses a sharded JPEG DCT manifest, runs small and large
+window benchmarks with prefetch enabled and disabled, and writes a CSV summary
+that includes the prefetch overhead and readiness metrics. `--repeats` controls
+independent samples per on/off case; keep the raw samples when judging whether a
+small workload regressed or a large miss workload improved. The runner also
+writes `jpeg_device_prefetch_pairs.csv`, a paired on/off delta table with wall
+time delta, off/on speedup, and the key prefetch wait/readiness/waste metrics.
+If raw benchmark logs were already summarized, regenerate only the paired table
+with `--pair-summary-only <summary.csv> --pairs-out <pairs.csv>`.
+Use `--dry-run` first on machines without a CUDA driver or dataset access to
+inspect the exact manifest, benchmark, and summary commands without executing
+them.
+
 Record at least the following fields for every reported dataset/crop:
 
-| dataset | image size | crop size | mode | outputs_match | pushdown_selected_vector_ratio | full_then_crop_selected_vector_ratio | pushdown_total_ms | full_then_crop_total_ms | pushdown_speedup_vs_full_then_crop | pushdown_saved_ms_vs_full_then_crop | pushdown_plan_ms | pushdown_read_decode_ms | pushdown_decode_ms | pushdown_gather_ms | pushdown_workset_count | pushdown_decode_kernel_launch_count | pushdown_gather_kernel_launch_count | pushdown_scratch_allocation_count | pushdown_internal_sync_count | pushdown_runtime_policy_decision |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| dataset | image size | crop size | mode | outputs_match | pushdown_selected_vector_ratio | full_then_crop_selected_vector_ratio | pushdown_total_ms | full_then_crop_total_ms | pushdown_speedup_vs_full_then_crop | pushdown_saved_ms_vs_full_then_crop | pushdown_plan_ms | pushdown_read_decode_ms | pushdown_decode_ms | pushdown_gather_ms | pushdown_decoded_gather_ms | pushdown_cached_gather_ms | pushdown_sync_rowgroup_read_ms | pushdown_prefetch_queue_start_ms | pushdown_prefetch_wait_ms | pushdown_prefetch_depth_block_ms | pushdown_prefetch_rowgroup_read_ms | pushdown_prefetch_ready_ahead_ms | pushdown_prefetch_initial_cache_hit_rowgroup_count | pushdown_prefetch_candidate_rowgroup_count | pushdown_prefetch_active_shard_count | pushdown_prefetch_config_disabled_shard_count | pushdown_prefetch_all_hit_shard_count | pushdown_prefetch_small_batch_disabled_shard_count | pushdown_prefetch_selected_vector_disabled_shard_count | pushdown_prefetch_selected_vector_miss_rowgroup_count | pushdown_prefetch_initial_hit_runtime_miss_count | pushdown_prefetch_skipped_repeated_runtime_miss_count | pushdown_prefetched_rowgroup_count | pushdown_prefetch_consumed_as_hit_count | pushdown_prefetch_skipped_repeated_rowgroup_count | pushdown_prefetch_consumed_as_hit_read_ms | pushdown_prefetch_consumed_as_hit_wait_ms | pushdown_workset_count | pushdown_decode_kernel_launch_count | pushdown_gather_kernel_launch_count | pushdown_scratch_allocation_count | pushdown_internal_sync_count | pushdown_runtime_policy_decision |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
 For `auto` runs also report `auto_pushdown_windows`,
 `auto_full_then_crop_windows`, `auto_policy_selected_vector_ratio`,
@@ -196,6 +219,53 @@ Benchmark output metrics
   *_device_planning_ms            Crop-to-rowgroup/vector planning time inside the JPEG DCT reader.
   *_workset_build_ms / *_workset_upload_ms / *_decode_ms / *_gather_ms
                                   Internal JPEG DCT device-stage timings.
+  *_decoded_gather_ms / *_cached_gather_ms
+                                  Gather time split by decoded-rowgroup path and dense-cache-hit path.
+  *_sync_rowgroup_read_ms         Synchronous JPEG DCT rowgroup read + materialization time.
+  *_prefetch_queue_start_ms       Time to create JPEG DCT rowgroup prefetch queues.
+  *_prefetch_wait_ms              Time the device batch consumer waited for prefetched rowgroups.
+  *_prefetch_depth_block_ms       Time JPEG DCT prefetch workers spent blocked by depth back-pressure.
+  *_prefetch_rowgroup_read_ms     Background rowgroup read + materialization time for consumed
+                                  prefetched rowgroups.
+  *_prefetch_ready_ahead_ms       Time prefetched rowgroups were ready before the consumer asked
+                                  for them; high values indicate the queue ran ahead.
+  *_prefetch_initial_cache_hit_rowgroup_count
+                                  Rowgroups that were already present in the decoded cache during
+                                  prefetch planning.
+  *_prefetch_candidate_rowgroup_count
+                                  Initial cache misses considered by the JPEG DCT prefetch policy.
+  *_prefetch_active_shard_count   Shards where JPEG DCT rowgroup prefetch was started.
+  *_prefetch_config_disabled_shard_count
+                                  Shards where prefetch was disabled by configuration.
+  *_prefetch_all_hit_shard_count  Shards where every rowgroup was already cached.
+  *_prefetch_small_batch_disabled_shard_count
+                                  Shards where miss candidates did not span enough decode batches
+                                  to offer structural overlap.
+  *_prefetch_selected_vector_disabled_shard_count
+                                  Shards where prefetch had no full-rowgroup miss candidates because
+                                  all misses used selected-vector decode.
+  *_prefetch_selected_vector_miss_rowgroup_count
+                                  Initial cache misses excluded from JPEG DCT rowgroup prefetch because
+                                  the runtime policy chose selected-vector decode.
+  *_prefetch_initial_hit_runtime_miss_count
+                                  Rowgroups that were cache hits during prefetch planning but became
+                                  runtime misses before consumption.
+  *_prefetch_skipped_repeated_runtime_miss_count
+                                  Repeated rowgroups skipped by prefetch planning but still read
+                                  synchronously because the expected dense cache reuse was unavailable.
+  *_prefetched_rowgroup_count     Rowgroups scheduled into JPEG DCT device prefetch queues.
+  *_prefetch_consumed_as_hit_count
+                                  Prefetched rowgroups discarded because cache service became
+                                  available before consumption.
+  *_prefetch_skipped_repeated_rowgroup_count
+                                  Repeated rowgroups left out of the prefetch schedule because
+                                  a prior full-rowgroup decode can populate the dense cache.
+  *_prefetch_consumed_as_hit_read_ms
+                                  Background read + materialization time spent on rowgroups
+                                  later discarded because the cache became a hit.
+  *_prefetch_consumed_as_hit_wait_ms
+                                  Consumer wait time spent before discarding prefetched
+                                  rowgroups that had become cache hits.
   *_plan_ms / *_read_decode_ms    Pipeline benchmark plan time and prepared-plan execution time.
                                   Device planning is counted once through *_device_planning_ms;
                                   read_decode excludes prepared-plan construction.
@@ -294,6 +364,13 @@ Options
   --decode-batch-rowgroups N        Rowgroups per JPEG DCT decode workset (default: 64).
                                     Larger values can reduce small workset launches and batch-end
                                     syncs when the window has many tiny touched rowgroups.
+  --no-jpeg-device-rowgroup-prefetch
+                                    Disable JPEG DCT device rowgroup prefetch.
+  --jpeg-device-prefetch-depth N    JPEG DCT device rowgroup prefetch queue depth (default: 4).
+  --jpeg-device-prefetch-workers N  JPEG DCT device prefetch worker threads (default: 1).
+  --jpeg-device-prefetch-min-batches N
+                                    Minimum miss decode batches before device prefetch starts
+                                    (default: 2).
   --mode MODE                       pipeline_benchmark mode:
                                     compare runs pushdown and full-then-crop and verifies matching
                                     cropped DCT coefficients;

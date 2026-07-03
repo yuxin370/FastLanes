@@ -11,6 +11,7 @@ Testing/
 build-support/boost_*
 scripts/my_tool/*
 !scripts/my_tool/summarize_pipeline_benchmark.py
+!scripts/my_tool/run_jpeg_device_prefetch_benchmark.py
 galp/docs/*
 !galp/docs/jpeg_dct_crop_pushdown.md
 # Build directories created by Clion

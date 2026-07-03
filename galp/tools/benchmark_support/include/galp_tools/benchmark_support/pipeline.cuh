@@ -24,14 +24,16 @@ namespace galp::execution {
 
 namespace detail {
 
-constexpr double kAutoVerySmallCropBlockRatio      = 0.125;
-constexpr double kAutoMaxLargeWindowBlockRatio     = 0.85;
-constexpr double kAutoMaxSelectedBlockRatio        = 0.75;
-constexpr double kAutoMaxSelectedVectorRatio       = 0.75;
-constexpr double kAutoMaxTouchedRowgroupRatio      = 0.90;
-constexpr size_t kAutoMinFullWindowBlocksForGeneralPushdown = 8U * 1024U;
-constexpr size_t kAutoLargeFullWindowBlocks        = 64U * 1024U;
-constexpr double kAutoMinAvgFullBlocksPerRowgroup  = 1024.0;
+constexpr double kAutoVerySmallCropBlockRatio                       = 0.125;
+constexpr double kAutoMaxLargeWindowBlockRatio                      = 0.85;
+constexpr double kAutoMaxSelectedBlockRatio                         = 0.75;
+constexpr double kAutoMaxSelectedVectorRatio                        = 0.75;
+constexpr double kAutoMaxTouchedRowgroupRatio                       = 0.90;
+constexpr size_t kAutoMinFullWindowBlocksForGeneralPushdown         = 8U * 1024U;
+constexpr size_t kAutoLargeFullWindowBlocks                         = 64U * 1024U;
+constexpr double kAutoMinAvgFullBlocksPerRowgroup                   = 1024.0;
+constexpr double kAutoMaxTinyRowgroupPushdownBlockRatio             = 0.30;
+constexpr double kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio   = 0.40;
 constexpr double kAutoMinSelectedVectorRatioWhenWorksetsDoNotShrink = 0.50;
 
 enum class AutoPipelinePolicyReason {
@@ -76,9 +78,9 @@ inline const char* auto_pipeline_policy_reason_name(const AutoPipelinePolicyReas
 	return "unknown";
 }
 
-inline size_t count_auto_reuse_candidate_rowgroups(
-    const std::vector<galp::jpeg::JpegDctDeviceRowgroupMetadata>& rowgroups,
-    std::set<std::pair<uint32_t, uint32_t>>&                      seen) {
+inline size_t
+count_auto_reuse_candidate_rowgroups(const std::vector<galp::jpeg::JpegDctDeviceRowgroupMetadata>& rowgroups,
+                                     std::set<std::pair<uint32_t, uint32_t>>&                      seen) {
 	size_t repeated = 0;
 	for (const auto& rowgroup : rowgroups) {
 		if (!seen.insert({rowgroup.shard_id, rowgroup.rowgroup_index}).second) {
@@ -90,8 +92,7 @@ inline size_t count_auto_reuse_candidate_rowgroups(
 
 inline size_t estimate_auto_worksets_for_rowgroups(
     const std::vector<galp::jpeg::JpegDctDeviceRowgroupMetadata>& rowgroups,
-    const size_t                                                  decode_batch_rowgroups =
-        galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups) {
+    const size_t decode_batch_rowgroups = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups) {
 	const size_t effective_decode_batch_rowgroups =
 	    decode_batch_rowgroups == 0 ? galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups : decode_batch_rowgroups;
 	std::unordered_map<uint32_t, size_t> rowgroups_by_shard;
@@ -112,14 +113,14 @@ inline double external_plan_overhead_ms(const double measured_plan_ms, const dou
 }
 
 struct AutoPipelinePolicyDecision {
-	bool                     use_pushdown                 = false;
-	AutoPipelinePolicyReason reason_code                  = AutoPipelinePolicyReason::EmptyWindow;
-	double                   selected_block_ratio         = 0.0;
-	double                   selected_vector_ratio        = 0.0;
-	double                   touched_rowgroup_ratio       = 0.0;
-	double                   avg_full_blocks_per_rowgroup = 0.0;
-	size_t                   estimated_pushdown_worksets  = 0;
-	size_t                   estimated_full_worksets      = 0;
+	bool                     use_pushdown                    = false;
+	AutoPipelinePolicyReason reason_code                     = AutoPipelinePolicyReason::EmptyWindow;
+	double                   selected_block_ratio            = 0.0;
+	double                   selected_vector_ratio           = 0.0;
+	double                   touched_rowgroup_ratio          = 0.0;
+	double                   avg_full_blocks_per_rowgroup    = 0.0;
+	size_t                   estimated_pushdown_worksets     = 0;
+	size_t                   estimated_full_worksets         = 0;
 	size_t                   estimated_pushdown_gather_items = 0;
 	size_t                   estimated_full_gather_items     = 0;
 	std::string              reason;
@@ -137,27 +138,26 @@ inline std::string format_auto_pipeline_policy_reason(const AutoPipelinePolicyDe
 	       ",estimated_full_gather_items=" + std::to_string(decision.estimated_full_gather_items);
 }
 
-inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(
-    const size_t selected_blocks,
-    const size_t full_blocks,
-    const size_t touched_rowgroups,
-    const size_t full_rowgroups,
-    const size_t selected_vectors,
-    const size_t full_vectors,
-    const size_t estimated_pushdown_worksets,
-    const size_t estimated_full_worksets) {
+inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(const size_t selected_blocks,
+                                                                             const size_t full_blocks,
+                                                                             const size_t touched_rowgroups,
+                                                                             const size_t full_rowgroups,
+                                                                             const size_t selected_vectors,
+                                                                             const size_t full_vectors,
+                                                                             const size_t estimated_pushdown_worksets,
+                                                                             const size_t estimated_full_worksets) {
 	AutoPipelinePolicyDecision decision;
 	decision.selected_block_ratio =
 	    full_blocks == 0 ? 0.0 : static_cast<double>(selected_blocks) / static_cast<double>(full_blocks);
-	decision.selected_vector_ratio =
-	    full_vectors == 0 ? decision.selected_block_ratio
-	                      : static_cast<double>(selected_vectors) / static_cast<double>(full_vectors);
+	decision.selected_vector_ratio = full_vectors == 0
+	                                     ? decision.selected_block_ratio
+	                                     : static_cast<double>(selected_vectors) / static_cast<double>(full_vectors);
 	decision.touched_rowgroup_ratio =
 	    full_rowgroups == 0 ? 0.0 : static_cast<double>(touched_rowgroups) / static_cast<double>(full_rowgroups);
 	decision.avg_full_blocks_per_rowgroup =
 	    full_rowgroups == 0 ? 0.0 : static_cast<double>(full_blocks) / static_cast<double>(full_rowgroups);
-	decision.estimated_pushdown_worksets = estimated_pushdown_worksets;
-	decision.estimated_full_worksets     = estimated_full_worksets;
+	decision.estimated_pushdown_worksets     = estimated_pushdown_worksets;
+	decision.estimated_full_worksets         = estimated_full_worksets;
 	decision.estimated_pushdown_gather_items = selected_blocks;
 	decision.estimated_full_gather_items     = full_blocks;
 
@@ -179,6 +179,16 @@ inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(
 	           decision.selected_vector_ratio < kAutoMaxLargeWindowBlockRatio) {
 		decision.use_pushdown = true;
 		decision.reason_code  = AutoPipelinePolicyReason::LargeWindowAmortizesPushdown;
+		// 2026-07 50%+ crop sweep: tiny-imagenet still benefits from pushdown when
+		// it keeps about 25% of blocks and touches about 25% of rowgroups, while
+		// svhn/cifar10 remain slower at similar block ratios but about 50% rowgroup
+		// touch ratios. Let strong rowgroup pruning bypass the tiny-rowgroup guard.
+	} else if (decision.avg_full_blocks_per_rowgroup < kAutoMinAvgFullBlocksPerRowgroup &&
+	           decision.selected_block_ratio <= kAutoMaxTinyRowgroupPushdownBlockRatio &&
+	           decision.selected_vector_ratio < kAutoMaxSelectedVectorRatio &&
+	           decision.touched_rowgroup_ratio <= kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio) {
+		decision.use_pushdown = true;
+		decision.reason_code  = AutoPipelinePolicyReason::CropSavesEnoughBlocks;
 	} else if (decision.avg_full_blocks_per_rowgroup < kAutoMinAvgFullBlocksPerRowgroup) {
 		decision.use_pushdown = false;
 		decision.reason_code  = AutoPipelinePolicyReason::TinyRowgroupsFixedOverhead;
@@ -205,14 +215,14 @@ inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(
 	return decision;
 }
 
-inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_counts(const size_t selected_blocks,
-                                                                         const size_t full_blocks,
-                                                                         const size_t touched_rowgroups,
-                                                                         const size_t full_rowgroups,
-                                                                         const size_t selected_vectors = 0,
-                                                                         const size_t full_vectors     = 0,
-                                                                         const size_t decode_batch_rowgroups =
-                                                                             galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups) {
+inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_counts(
+    const size_t selected_blocks,
+    const size_t full_blocks,
+    const size_t touched_rowgroups,
+    const size_t full_rowgroups,
+    const size_t selected_vectors       = 0,
+    const size_t full_vectors           = 0,
+    const size_t decode_batch_rowgroups = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups) {
 	const size_t effective_decode_batch_rowgroups =
 	    decode_batch_rowgroups == 0 ? galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups : decode_batch_rowgroups;
 	return choose_auto_pipeline_policy_from_estimates(
@@ -238,77 +248,104 @@ enum class PipelineBenchmarkMode {
 struct PipelineBenchmarkConfig {
 	std::vector<uint32_t>      image_ids;
 	galp::jpeg::JpegDctCropBox crop {};
-	PipelineBenchmarkMode      mode                 = PipelineBenchmarkMode::Compare;
-	size_t                     window_images        = 256;
-	size_t                     cache_capacity_bytes = 0;
-	size_t                     decode_batch_rowgroups = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
-	bool                       verify_outputs       = true;
+	PipelineBenchmarkMode      mode                      = PipelineBenchmarkMode::Compare;
+	size_t                     window_images             = 256;
+	size_t                     cache_capacity_bytes      = 0;
+	size_t                     decode_batch_rowgroups    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
+	bool                       enable_rowgroup_prefetch  = true;
+	size_t                     rowgroup_prefetch_depth   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth;
+	size_t                     rowgroup_prefetch_workers = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
+	size_t rowgroup_prefetch_min_decode_batches = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches;
+	bool   verify_outputs                       = true;
 };
 
 struct PipelineBenchmarkStageResult {
-	size_t windows                   = 0;
-	size_t requests                  = 0;
-	size_t input_blocks              = 0;
-	size_t output_blocks             = 0;
-	size_t output_coefficients       = 0;
-	size_t output_bytes              = 0;
-	size_t rowgroup_visits           = 0;
-	size_t unique_rowgroups          = 0;
-	size_t repeated_rowgroups        = 0;
-	size_t cache_hits                = 0;
-	size_t cache_misses              = 0;
-	size_t dense_cache_hits          = 0;
-	size_t dense_cache_misses        = 0;
-	size_t cache_inserts             = 0;
-	size_t cache_evictions           = 0;
-	size_t cache_resident_bytes      = 0;
-	size_t cache_resident_rowgroups  = 0;
-	size_t planned_selected_vector_count = 0;
-	size_t selected_vector_count     = 0;
-	size_t full_vector_count         = 0;
-	size_t planned_saved_vector_count = 0;
-	size_t actual_saved_vector_count  = 0;
-	size_t rowgroup_count             = 0;
-	double planned_selected_vector_ratio = 0.0;
-	double selected_vector_ratio     = 0.0;
-	size_t workset_count             = 0;
-	size_t decode_kernel_launch_count = 0;
-	size_t gather_kernel_launch_count = 0;
-	size_t cached_gather_kernel_launch_count = 0;
-	size_t materialize_kernel_launch_count = 0;
-	size_t gather_item_count          = 0;
-	size_t decoded_gather_item_count  = 0;
-	size_t cached_gather_item_count   = 0;
-	size_t workset_upload_count       = 0;
-	size_t scratch_upload_count       = 0;
-	size_t scratch_allocation_count   = 0;
-	size_t internal_sync_count        = 0;
-	size_t cached_gather_sync_count   = 0;
-	size_t decoded_batch_sync_count   = 0;
-	size_t cached_gather_event_handoff_count = 0;
-	size_t sparse_vector_cache_hits   = 0;
-	size_t sparse_vector_cache_misses = 0;
-	size_t runtime_policy_selected_rowgroups = 0;
-	size_t runtime_policy_full_rowgroups     = 0;
-	size_t runtime_policy_tail_full_rowgroups = 0;
-	size_t runtime_policy_ratio_full_rowgroups = 0;
-	size_t runtime_policy_low_saving_full_rowgroups = 0;
-	double device_planning_ms         = 0.0;
-	double workset_build_ms           = 0.0;
-	double workset_upload_ms          = 0.0;
-	double decode_ms                  = 0.0;
-	double gather_ms                  = 0.0;
+	size_t      windows                                       = 0;
+	size_t      requests                                      = 0;
+	size_t      input_blocks                                  = 0;
+	size_t      output_blocks                                 = 0;
+	size_t      output_coefficients                           = 0;
+	size_t      output_bytes                                  = 0;
+	size_t      rowgroup_visits                               = 0;
+	size_t      unique_rowgroups                              = 0;
+	size_t      repeated_rowgroups                            = 0;
+	size_t      cache_hits                                    = 0;
+	size_t      cache_misses                                  = 0;
+	size_t      dense_cache_hits                              = 0;
+	size_t      dense_cache_misses                            = 0;
+	size_t      cache_inserts                                 = 0;
+	size_t      cache_evictions                               = 0;
+	size_t      cache_resident_bytes                          = 0;
+	size_t      cache_resident_rowgroups                      = 0;
+	size_t      planned_selected_vector_count                 = 0;
+	size_t      selected_vector_count                         = 0;
+	size_t      full_vector_count                             = 0;
+	size_t      planned_saved_vector_count                    = 0;
+	size_t      actual_saved_vector_count                     = 0;
+	size_t      rowgroup_count                                = 0;
+	double      planned_selected_vector_ratio                 = 0.0;
+	double      selected_vector_ratio                         = 0.0;
+	size_t      workset_count                                 = 0;
+	size_t      decode_kernel_launch_count                    = 0;
+	size_t      gather_kernel_launch_count                    = 0;
+	size_t      cached_gather_kernel_launch_count             = 0;
+	size_t      materialize_kernel_launch_count               = 0;
+	size_t      gather_item_count                             = 0;
+	size_t      decoded_gather_item_count                     = 0;
+	size_t      cached_gather_item_count                      = 0;
+	size_t      workset_upload_count                          = 0;
+	size_t      scratch_upload_count                          = 0;
+	size_t      scratch_allocation_count                      = 0;
+	size_t      internal_sync_count                           = 0;
+	size_t      cached_gather_sync_count                      = 0;
+	size_t      decoded_batch_sync_count                      = 0;
+	size_t      cached_gather_event_handoff_count             = 0;
+	size_t      sparse_vector_cache_hits                      = 0;
+	size_t      sparse_vector_cache_misses                    = 0;
+	size_t      runtime_policy_selected_rowgroups             = 0;
+	size_t      runtime_policy_full_rowgroups                 = 0;
+	size_t      runtime_policy_tail_full_rowgroups            = 0;
+	size_t      runtime_policy_ratio_full_rowgroups           = 0;
+	size_t      runtime_policy_low_saving_full_rowgroups      = 0;
+	size_t      prefetch_initial_cache_hit_rowgroup_count     = 0;
+	size_t      prefetch_candidate_rowgroup_count             = 0;
+	size_t      prefetch_active_shard_count                   = 0;
+	size_t      prefetch_config_disabled_shard_count          = 0;
+	size_t      prefetch_all_hit_shard_count                  = 0;
+	size_t      prefetch_small_batch_disabled_shard_count     = 0;
+	size_t      prefetch_selected_vector_disabled_shard_count = 0;
+	size_t      prefetch_selected_vector_miss_rowgroup_count  = 0;
+	size_t      prefetch_initial_hit_runtime_miss_count       = 0;
+	size_t      prefetch_skipped_repeated_runtime_miss_count  = 0;
+	size_t      prefetched_rowgroup_count                     = 0;
+	size_t      prefetch_consumed_as_hit_count                = 0;
+	size_t      prefetch_skipped_repeated_rowgroup_count      = 0;
+	double      prefetch_consumed_as_hit_read_ms              = 0.0;
+	double      prefetch_consumed_as_hit_wait_ms              = 0.0;
+	double      device_planning_ms                            = 0.0;
+	double      workset_build_ms                              = 0.0;
+	double      workset_upload_ms                             = 0.0;
+	double      decode_ms                                     = 0.0;
+	double      gather_ms                                     = 0.0;
+	double      decoded_gather_ms                             = 0.0;
+	double      cached_gather_ms                              = 0.0;
+	double      prefetch_wait_ms                              = 0.0;
+	double      prefetch_depth_block_ms                       = 0.0;
+	double      prefetch_queue_start_ms                       = 0.0;
+	double      prefetch_rowgroup_read_ms                     = 0.0;
+	double      prefetch_ready_ahead_ms                       = 0.0;
+	double      sync_rowgroup_read_ms                         = 0.0;
 	std::string runtime_policy_decision;
 	std::string runtime_policy_reason;
-	size_t peak_window_images        = 0;
-	size_t peak_window_input_blocks  = 0;
-	size_t peak_window_output_blocks = 0;
-	size_t peak_window_output_bytes  = 0;
-	double plan_ms                   = 0.0;
-	double read_decode_ms            = 0.0;
-	double transform_ms              = 0.0;
-	double sink_ms                   = 0.0;
-	double total_ms                  = 0.0;
+	size_t      peak_window_images        = 0;
+	size_t      peak_window_input_blocks  = 0;
+	size_t      peak_window_output_blocks = 0;
+	size_t      peak_window_output_bytes  = 0;
+	double      plan_ms                   = 0.0;
+	double      read_decode_ms            = 0.0;
+	double      transform_ms              = 0.0;
+	double      sink_ms                   = 0.0;
+	double      total_ms                  = 0.0;
 };
 
 struct PipelineBenchmarkResult {
@@ -321,37 +358,37 @@ struct PipelineBenchmarkResult {
 	double                       auto_policy_ms              = 0.0;
 	double                       auto_total_ms               = 0.0;
 	std::string                  auto_policy_reason;
-	size_t                       auto_policy_selected_blocks = 0;
-	size_t                       auto_policy_full_blocks = 0;
-	size_t                       auto_policy_selected_vectors = 0;
-	size_t                       auto_policy_full_vectors = 0;
-	size_t                       auto_policy_touched_rowgroups = 0;
-	size_t                       auto_policy_full_rowgroups = 0;
-	size_t                       auto_policy_estimated_pushdown_worksets = 0;
-	size_t                       auto_policy_estimated_full_worksets = 0;
-	size_t                       auto_policy_estimated_pushdown_gather_items = 0;
-	size_t                       auto_policy_estimated_full_gather_items = 0;
+	size_t                       auto_policy_selected_blocks                    = 0;
+	size_t                       auto_policy_full_blocks                        = 0;
+	size_t                       auto_policy_selected_vectors                   = 0;
+	size_t                       auto_policy_full_vectors                       = 0;
+	size_t                       auto_policy_touched_rowgroups                  = 0;
+	size_t                       auto_policy_full_rowgroups                     = 0;
+	size_t                       auto_policy_estimated_pushdown_worksets        = 0;
+	size_t                       auto_policy_estimated_full_worksets            = 0;
+	size_t                       auto_policy_estimated_pushdown_gather_items    = 0;
+	size_t                       auto_policy_estimated_full_gather_items        = 0;
 	size_t                       auto_policy_pushdown_reuse_candidate_rowgroups = 0;
-	size_t                       auto_policy_full_reuse_candidate_rowgroups = 0;
-	double                       auto_policy_selected_block_ratio = 0.0;
-	double                       auto_policy_selected_vector_ratio = 0.0;
-	double                       auto_policy_touched_rowgroup_ratio = 0.0;
-	double                       auto_policy_pushdown_reuse_candidate_ratio = 0.0;
-	double                       auto_policy_full_reuse_candidate_ratio = 0.0;
-	double                       auto_policy_avg_full_blocks_per_rowgroup = 0.0;
-	size_t                       auto_policy_empty_windows = 0;
-	size_t                       auto_policy_crop_covers_full_windows = 0;
-	size_t                       auto_policy_very_small_crop_windows = 0;
-	size_t                       auto_policy_small_window_full_windows = 0;
-	size_t                       auto_policy_large_window_pushdown_windows = 0;
-	size_t                       auto_policy_workset_overhead_full_windows = 0;
-	size_t                       auto_policy_tiny_rowgroups_full_windows = 0;
-	size_t                       auto_policy_touches_most_rowgroups_windows = 0;
-	size_t                       auto_policy_gather_output_full_windows = 0;
-	size_t                       auto_policy_saves_enough_blocks_windows = 0;
-	size_t                       auto_policy_savings_too_small_windows = 0;
-	bool                         outputs_match = true;
-	double                       verify_ms     = 0.0;
+	size_t                       auto_policy_full_reuse_candidate_rowgroups     = 0;
+	double                       auto_policy_selected_block_ratio               = 0.0;
+	double                       auto_policy_selected_vector_ratio              = 0.0;
+	double                       auto_policy_touched_rowgroup_ratio             = 0.0;
+	double                       auto_policy_pushdown_reuse_candidate_ratio     = 0.0;
+	double                       auto_policy_full_reuse_candidate_ratio         = 0.0;
+	double                       auto_policy_avg_full_blocks_per_rowgroup       = 0.0;
+	size_t                       auto_policy_empty_windows                      = 0;
+	size_t                       auto_policy_crop_covers_full_windows           = 0;
+	size_t                       auto_policy_very_small_crop_windows            = 0;
+	size_t                       auto_policy_small_window_full_windows          = 0;
+	size_t                       auto_policy_large_window_pushdown_windows      = 0;
+	size_t                       auto_policy_workset_overhead_full_windows      = 0;
+	size_t                       auto_policy_tiny_rowgroups_full_windows        = 0;
+	size_t                       auto_policy_touches_most_rowgroups_windows     = 0;
+	size_t                       auto_policy_gather_output_full_windows         = 0;
+	size_t                       auto_policy_saves_enough_blocks_windows        = 0;
+	size_t                       auto_policy_savings_too_small_windows          = 0;
+	bool                         outputs_match                                  = true;
+	double                       verify_ms                                      = 0.0;
 	std::string                  mismatch;
 };
 
