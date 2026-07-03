@@ -16,7 +16,10 @@
 
 namespace galp::jpeg {
 
-inline constexpr size_t kDefaultJpegDctDecodeBatchRowgroups = 64;
+inline constexpr size_t kDefaultJpegDctDecodeBatchRowgroups                   = 64;
+inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchDepth            = 4;
+inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchWorkers          = 1;
+inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches = 2;
 
 enum class JpegComponentMode {
 	kAllComponents,
@@ -244,9 +247,14 @@ struct JpegDctImageCropRequest {
 };
 
 struct JpegDctDeviceBatchOptions {
-	JpegDctDeviceLayout layout               = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
-	size_t              cache_capacity_bytes = 0;
+	JpegDctDeviceLayout layout                 = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+	size_t              cache_capacity_bytes   = 0;
 	size_t              decode_batch_rowgroups = kDefaultJpegDctDecodeBatchRowgroups;
+	// Advanced rowgroup IO/materialization prefetch controls. Zero-valued sizes are normalized to defaults.
+	bool   enable_rowgroup_prefetch             = true;
+	size_t rowgroup_prefetch_depth              = kDefaultJpegDctDeviceRowgroupPrefetchDepth;
+	size_t rowgroup_prefetch_workers            = kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
+	size_t rowgroup_prefetch_min_decode_batches = kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches;
 };
 
 struct JpegDctDeviceImageLayout {
@@ -279,39 +287,62 @@ struct JpegDctDeviceCacheStats {
 };
 
 struct JpegDctDeviceExecutionStats {
-	size_t planned_selected_vector_count = 0;
-	size_t selected_vector_count      = 0;
-	size_t full_vector_count          = 0;
-	size_t planned_saved_vector_count = 0;
-	size_t actual_saved_vector_count  = 0;
-	size_t rowgroup_count             = 0;
-	size_t workset_count              = 0;
-	size_t decode_kernel_launch_count = 0;
-	size_t gather_kernel_launch_count = 0;
-	size_t cached_gather_kernel_launch_count = 0;
-	size_t materialize_kernel_launch_count = 0;
-	size_t gather_item_count          = 0;
-	size_t decoded_gather_item_count  = 0;
-	size_t cached_gather_item_count   = 0;
-	size_t workset_upload_count       = 0;
-	size_t scratch_upload_count       = 0;
-	size_t scratch_allocation_count   = 0;
-	size_t internal_sync_count        = 0;
-	size_t cached_gather_sync_count   = 0;
-	size_t decoded_batch_sync_count   = 0;
-	size_t cached_gather_event_handoff_count = 0;
-	size_t sparse_vector_cache_hits   = 0;
-	size_t sparse_vector_cache_misses = 0;
-	size_t runtime_policy_selected_rowgroups = 0;
-	size_t runtime_policy_full_rowgroups     = 0;
-	size_t runtime_policy_tail_full_rowgroups = 0;
-	size_t runtime_policy_ratio_full_rowgroups = 0;
-	size_t runtime_policy_low_saving_full_rowgroups = 0;
-	double planning_ms                = 0.0;
-	double workset_build_ms           = 0.0;
-	double workset_upload_ms          = 0.0;
-	double decode_ms                  = 0.0;
-	double gather_ms                  = 0.0;
+	size_t      planned_selected_vector_count                 = 0;
+	size_t      selected_vector_count                         = 0;
+	size_t      full_vector_count                             = 0;
+	size_t      planned_saved_vector_count                    = 0;
+	size_t      actual_saved_vector_count                     = 0;
+	size_t      rowgroup_count                                = 0;
+	size_t      workset_count                                 = 0;
+	size_t      decode_kernel_launch_count                    = 0;
+	size_t      gather_kernel_launch_count                    = 0;
+	size_t      cached_gather_kernel_launch_count             = 0;
+	size_t      materialize_kernel_launch_count               = 0;
+	size_t      gather_item_count                             = 0;
+	size_t      decoded_gather_item_count                     = 0;
+	size_t      cached_gather_item_count                      = 0;
+	size_t      workset_upload_count                          = 0;
+	size_t      scratch_upload_count                          = 0;
+	size_t      scratch_allocation_count                      = 0;
+	size_t      internal_sync_count                           = 0;
+	size_t      cached_gather_sync_count                      = 0;
+	size_t      decoded_batch_sync_count                      = 0;
+	size_t      cached_gather_event_handoff_count             = 0;
+	size_t      sparse_vector_cache_hits                      = 0;
+	size_t      sparse_vector_cache_misses                    = 0;
+	size_t      runtime_policy_selected_rowgroups             = 0;
+	size_t      runtime_policy_full_rowgroups                 = 0;
+	size_t      runtime_policy_tail_full_rowgroups            = 0;
+	size_t      runtime_policy_ratio_full_rowgroups           = 0;
+	size_t      runtime_policy_low_saving_full_rowgroups      = 0;
+	size_t      prefetch_initial_cache_hit_rowgroup_count     = 0;
+	size_t      prefetch_candidate_rowgroup_count             = 0;
+	size_t      prefetch_active_shard_count                   = 0;
+	size_t      prefetch_config_disabled_shard_count          = 0;
+	size_t      prefetch_all_hit_shard_count                  = 0;
+	size_t      prefetch_small_batch_disabled_shard_count     = 0;
+	size_t      prefetch_selected_vector_disabled_shard_count = 0;
+	size_t      prefetch_selected_vector_miss_rowgroup_count  = 0;
+	size_t      prefetch_initial_hit_runtime_miss_count       = 0;
+	size_t      prefetch_skipped_repeated_runtime_miss_count  = 0;
+	size_t      prefetched_rowgroup_count                     = 0;
+	size_t      prefetch_consumed_as_hit_count                = 0;
+	size_t      prefetch_skipped_repeated_rowgroup_count      = 0;
+	double      prefetch_consumed_as_hit_read_ms              = 0.0;
+	double      prefetch_consumed_as_hit_wait_ms              = 0.0;
+	double      planning_ms                                   = 0.0;
+	double      workset_build_ms                              = 0.0;
+	double      workset_upload_ms                             = 0.0;
+	double      decode_ms                                     = 0.0;
+	double      gather_ms                                     = 0.0;
+	double      decoded_gather_ms                             = 0.0;
+	double      cached_gather_ms                              = 0.0;
+	double      prefetch_wait_ms                              = 0.0;
+	double      prefetch_depth_block_ms                       = 0.0;
+	double      prefetch_queue_start_ms                       = 0.0;
+	double      prefetch_rowgroup_read_ms                     = 0.0;
+	double      prefetch_ready_ahead_ms                       = 0.0;
+	double      sync_rowgroup_read_ms                         = 0.0;
 	std::string runtime_policy_decision;
 	std::string runtime_policy_reason;
 };
@@ -331,6 +362,14 @@ struct JpegDctDeviceBatchPlanPreview {
 	double                                     planning_ms                     = 0.0;
 };
 
+struct JpegDctDeviceBatchPlanEstimate {
+	JpegDctDeviceLayout                        layout      = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+	size_t                                     block_count = 0;
+	std::vector<JpegDctDeviceRowgroupMetadata> rowgroups;
+	size_t                                     full_vector_count = 0;
+	double                                     planning_ms       = 0.0;
+};
+
 class JpegDctDeviceBatchPreparedPlan {
 public:
 	struct Impl;
@@ -344,19 +383,19 @@ public:
 	JpegDctDeviceBatchPreparedPlan(JpegDctDeviceBatchPreparedPlan&&) noexcept;
 	JpegDctDeviceBatchPreparedPlan& operator=(JpegDctDeviceBatchPreparedPlan&&) noexcept;
 
-	[[nodiscard]] bool                                             empty() const noexcept;
-	[[nodiscard]] JpegDctDeviceLayout                              layout() const noexcept;
-	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&     image_layouts() const noexcept;
-	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&   block_metadata() const noexcept;
+	[[nodiscard]] bool                                              empty() const noexcept;
+	[[nodiscard]] JpegDctDeviceLayout                               layout() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;
+	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&    block_metadata() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;
-	[[nodiscard]] size_t                                           planned_selected_vector_count() const noexcept;
-	[[nodiscard]] size_t                                           estimated_selected_vector_count() const noexcept;
-	[[nodiscard]] size_t                                           full_vector_count() const noexcept;
-	[[nodiscard]] size_t                                           planned_saved_vector_count() const noexcept;
-	[[nodiscard]] size_t                                           estimated_saved_vector_count() const noexcept;
-	[[nodiscard]] double                                           planned_selected_vector_ratio() const noexcept;
-	[[nodiscard]] double                                           estimated_selected_vector_ratio() const noexcept;
-	[[nodiscard]] double                                           planning_ms() const noexcept;
+	[[nodiscard]] size_t                                            planned_selected_vector_count() const noexcept;
+	[[nodiscard]] size_t                                            estimated_selected_vector_count() const noexcept;
+	[[nodiscard]] size_t                                            full_vector_count() const noexcept;
+	[[nodiscard]] size_t                                            planned_saved_vector_count() const noexcept;
+	[[nodiscard]] size_t                                            estimated_saved_vector_count() const noexcept;
+	[[nodiscard]] double                                            planned_selected_vector_ratio() const noexcept;
+	[[nodiscard]] double                                            estimated_selected_vector_ratio() const noexcept;
+	[[nodiscard]] double                                            planning_ms() const noexcept;
 
 private:
 	friend class JpegDctShardDatasetReader;
@@ -403,13 +442,16 @@ public:
 	JpegDctShardDatasetReader(JpegDctShardDatasetReader&&) noexcept;
 	JpegDctShardDatasetReader& operator=(JpegDctShardDatasetReader&&) noexcept;
 
-	[[nodiscard]] uint64_t image_count() const noexcept;
+	[[nodiscard]] uint64_t          image_count() const noexcept;
 	[[nodiscard]] JpegImageMetadata ImageMetadata(uint32_t global_image_index) const;
 
 	MaterializedJpegDctImage MaterializeImageDct(uint32_t global_image_index);
 
 	JpegDctDeviceBatchPlanPreview PlanDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
 	                                                 const JpegDctDeviceBatchOptions&            options = {}) const;
+
+	JpegDctDeviceBatchPlanEstimate EstimateDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
+	                                                      const JpegDctDeviceBatchOptions& options = {}) const;
 
 	JpegDctDeviceBatchPreparedPlan PrepareDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
 	                                                     const JpegDctDeviceBatchOptions&            options = {});

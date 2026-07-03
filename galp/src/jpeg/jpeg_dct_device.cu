@@ -5,6 +5,7 @@
 #include "cuda/memory/gpu_array.cuh"
 #include "engine/materialization/metadata.cuh"
 #include "engine/operators/rowgroup.cuh"
+#include "engine/pipeline/rowgroup_prefetch_queue.cuh"
 #include "engine/workset/append.cuh"
 #include "engine/workset/upload.cuh"
 #include "format/reader.cuh"
@@ -101,7 +102,7 @@ const std::vector<JpegDctDeviceRowgroupMetadata>& JpegDctDeviceBatch::rowgroups(
 
 namespace galp::jpeg::detail {
 
-using Clock = std::chrono::steady_clock;
+using Clock                                       = std::chrono::steady_clock;
 constexpr size_t kMinJpegDctScratchBufferCapacity = 1024;
 
 double elapsed_ms(const Clock::time_point start, const Clock::time_point end) {
@@ -199,7 +200,7 @@ struct JpegDctDeviceScratchBuffer {
 	T*     data     = nullptr;
 	size_t capacity = 0;
 
-	JpegDctDeviceScratchBuffer() = default;
+	JpegDctDeviceScratchBuffer()                                             = default;
 	JpegDctDeviceScratchBuffer(const JpegDctDeviceScratchBuffer&)            = delete;
 	JpegDctDeviceScratchBuffer& operator=(const JpegDctDeviceScratchBuffer&) = delete;
 
@@ -347,10 +348,9 @@ __global__ void gather_dct_blocks_batch_kernel(const DeviceCoeffBinding* __restr
 	out[item.output_block_index * 64U + coeff_idx] = value;
 }
 
-__global__ void materialize_dense_dct_rowgroup_batch_kernel(
-    const DeviceCoeffBinding* __restrict column_bindings,
-    const JpegDctDeviceMaterializeBatchItem* __restrict items,
-    const size_t item_count) {
+__global__ void materialize_dense_dct_rowgroup_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                                            const JpegDctDeviceMaterializeBatchItem* __restrict items,
+                                                            const size_t item_count) {
 	const size_t item_idx = static_cast<size_t>(blockIdx.y);
 	if (item_idx >= item_count) {
 		return;
@@ -382,9 +382,9 @@ __global__ void gather_cached_dct_blocks_batch_kernel(const JpegDctDeviceCachedG
 	if (linear >= total) {
 		return;
 	}
-	const size_t item_idx                          = linear / 64U;
-	const size_t coeff_idx                         = linear % 64U;
-	const auto   item                              = items[item_idx];
+	const size_t item_idx  = linear / 64U;
+	const size_t coeff_idx = linear % 64U;
+	const auto   item      = items[item_idx];
 	out[item.output_block_index * 64U + coeff_idx] =
 	    item.dense[static_cast<size_t>(item.row_in_rowgroup) * 64U + coeff_idx];
 }
@@ -404,7 +404,7 @@ BoundCoeffColumns bind_coeff_columns(const galp::execution::Rowgroup&       rowg
 			if (materialize_idx < expr_index_base || materialize_idx >= expr_index_base + bound.columns_i16.size()) {
 				continue;
 			}
-			const auto logical_idx             = materialize_idx - expr_index_base;
+			const auto logical_idx            = materialize_idx - expr_index_base;
 			bound.columns_i8[logical_idx]     = batch.device_exprs[expr_idx].out;
 			bound.column_sources[logical_idx] = DeviceCoeffSource::kI8;
 		}
@@ -416,7 +416,7 @@ BoundCoeffColumns bind_coeff_columns(const galp::execution::Rowgroup&       rowg
 			if (materialize_idx < expr_index_base || materialize_idx >= expr_index_base + bound.columns_i16.size()) {
 				continue;
 			}
-			const auto logical_idx              = materialize_idx - expr_index_base;
+			const auto logical_idx            = materialize_idx - expr_index_base;
 			bound.columns_i16[logical_idx]    = batch.device_exprs[expr_idx].out;
 			bound.column_sources[logical_idx] = DeviceCoeffSource::kI16;
 		}
@@ -451,7 +451,7 @@ BoundCoeffColumns bind_coeff_columns(const galp::execution::Rowgroup&       rowg
 void gather_cached_rowgroups_batch(const std::vector<JpegDctDeviceCachedGatherBatchItem>& items,
                                    int16_t*                                               output,
                                    JpegDctDeviceScratch&                                  scratch,
-                                   JpegDctDeviceExecutionStats&                            stats,
+                                   JpegDctDeviceExecutionStats&                           stats,
                                    cudaStream_t                                           stream) {
 	if (items.empty()) {
 		return;
@@ -469,12 +469,12 @@ void gather_cached_rowgroups_batch(const std::vector<JpegDctDeviceCachedGatherBa
 	++stats.cached_gather_kernel_launch_count;
 }
 
-void gather_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>&             sources,
+void gather_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>&            sources,
                                    const std::vector<JpegDctDeviceGatherBatchItem>& items,
-                                   int16_t*                                          output,
-                                   JpegDctDeviceScratch&                             scratch,
-                                   JpegDctDeviceExecutionStats&                       stats,
-                                   cudaStream_t                                      stream) {
+                                   int16_t*                                         output,
+                                   JpegDctDeviceScratch&                            scratch,
+                                   JpegDctDeviceExecutionStats&                     stats,
+                                   cudaStream_t                                     stream) {
 	if (sources.empty() || items.empty()) {
 		return;
 	}
@@ -484,8 +484,8 @@ void gather_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>&        
 	column_bindings.reserve(sources.size() * 64U);
 	for (const auto& source : sources) {
 		for (size_t coeff_idx = 0; coeff_idx < source.column_sources.size(); ++coeff_idx) {
-			column_bindings.push_back(
-			    DeviceCoeffBinding {source.columns_i8[coeff_idx], source.columns_i16[coeff_idx], source.column_sources[coeff_idx]});
+			column_bindings.push_back(DeviceCoeffBinding {
+			    source.columns_i8[coeff_idx], source.columns_i16[coeff_idx], source.column_sources[coeff_idx]});
 		}
 	}
 
@@ -495,18 +495,16 @@ void gather_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>&        
 	const size_t total = items.size() * 64U;
 	const dim3   block(kThreads);
 	const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads));
-	gather_dct_blocks_batch_kernel<<<grid, block, 0, stream>>>(scratch.column_bindings.data,
-	                                                           scratch.batch_gather_items.data,
-	                                                           items.size(),
-	                                                           output);
+	gather_dct_blocks_batch_kernel<<<grid, block, 0, stream>>>(
+	    scratch.column_bindings.data, scratch.batch_gather_items.data, items.size(), output);
 	CUDA_SAFE_CALL(cudaGetLastError());
 	++stats.gather_kernel_launch_count;
 }
 
 void materialize_dense_rowgroup_batch(const std::vector<JpegDctDeviceMaterializeBatchItem>& items,
-                                      JpegDctDeviceScratch&                                scratch,
+                                      JpegDctDeviceScratch&                                 scratch,
                                       JpegDctDeviceExecutionStats&                          stats,
-                                      cudaStream_t                                         stream) {
+                                      cudaStream_t                                          stream) {
 	if (items.empty()) {
 		return;
 	}
@@ -522,11 +520,9 @@ void materialize_dense_rowgroup_batch(const std::vector<JpegDctDeviceMaterialize
 	}
 	const size_t total = static_cast<size_t>(max_rows) * 64U;
 	const dim3   block(kThreads);
-	const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads),
-	                  static_cast<unsigned>(items.size()));
-	materialize_dense_dct_rowgroup_batch_kernel<<<grid, block, 0, stream>>>(scratch.column_bindings.data,
-	                                                                        scratch.batch_materialize_items.data,
-	                                                                        items.size());
+	const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads), static_cast<unsigned>(items.size()));
+	materialize_dense_dct_rowgroup_batch_kernel<<<grid, block, 0, stream>>>(
+	    scratch.column_bindings.data, scratch.batch_materialize_items.data, items.size());
 	CUDA_SAFE_CALL(cudaGetLastError());
 	++stats.materialize_kernel_launch_count;
 }
@@ -545,14 +541,13 @@ void refresh_runtime_policy_summary(JpegDctDeviceExecutionStats& stats) {
 	} else {
 		stats.runtime_policy_decision = "full-rowgroup";
 	}
-	stats.runtime_policy_reason =
-	    "selected=" + std::to_string(stats.runtime_policy_selected_rowgroups) +
-	    ",full=" + std::to_string(stats.runtime_policy_full_rowgroups) +
-	    ",tail_full=" + std::to_string(stats.runtime_policy_tail_full_rowgroups) +
-	    ",ratio_full=" + std::to_string(stats.runtime_policy_ratio_full_rowgroups) +
-	    ",low_saving_full=" + std::to_string(stats.runtime_policy_low_saving_full_rowgroups) +
-	    ",max_selected_ratio=" + std::to_string(kMaxSelectedVectorRatioForPushdown) +
-	    ",min_saved_vectors=" + std::to_string(kMinSavedVectorsForPushdown);
+	stats.runtime_policy_reason = "selected=" + std::to_string(stats.runtime_policy_selected_rowgroups) +
+	                              ",full=" + std::to_string(stats.runtime_policy_full_rowgroups) +
+	                              ",tail_full=" + std::to_string(stats.runtime_policy_tail_full_rowgroups) +
+	                              ",ratio_full=" + std::to_string(stats.runtime_policy_ratio_full_rowgroups) +
+	                              ",low_saving_full=" + std::to_string(stats.runtime_policy_low_saving_full_rowgroups) +
+	                              ",max_selected_ratio=" + std::to_string(kMaxSelectedVectorRatioForPushdown) +
+	                              ",min_saved_vectors=" + std::to_string(kMinSavedVectorsForPushdown);
 }
 
 void record_runtime_policy(const JpegDctRuntimePolicyResult policy, JpegDctDeviceExecutionStats& stats) {
@@ -576,11 +571,11 @@ void record_runtime_policy(const JpegDctRuntimePolicyResult policy, JpegDctDevic
 	}
 }
 
-void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&       workset,
-                                  const galp::execution::Rowgroup&       rowgroup,
+void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&        workset,
+                                  const galp::execution::Rowgroup&        rowgroup,
                                   const galp::execution::ExecutionConfig& cfg,
-                                  const size_t                           expr_index_base,
-                                  const std::vector<uint32_t>*           selected_vectors) {
+                                  const size_t                            expr_index_base,
+                                  const std::vector<uint32_t>*            selected_vectors) {
 	workset.outputs.required = workset.outputs.required || cfg.write_out;
 	galp::runtime::begin_workset_chunk_arena(workset, rowgroup.columns.size());
 	auto* active_chunk_arena = workset.buffers.chunk_arena.get();
@@ -612,18 +607,37 @@ void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&       workset
 	}
 }
 
+DecodedRowgroupWork prepare_decoded_rowgroup_work_from_materialized(galp::execution::Rowgroup          rowgroup,
+                                                                    uint32_t                           shard_id,
+                                                                    const JpegDctDeviceRowgroupPlan&   rowgroup_plan,
+                                                                    JpegDctDeviceDecodedRowgroupCache* cache,
+                                                                    JpegDctDeviceExecutionStats&       execution_stats);
+
 DecodedRowgroupWork prepare_decoded_rowgroup_work(galp::format::FlsReader&           rdr,
                                                   const uint32_t                     shard_id,
                                                   const JpegDctDeviceRowgroupPlan&   rowgroup_plan,
                                                   JpegDctDeviceDecodedRowgroupCache* cache,
                                                   JpegDctDeviceExecutionStats&       execution_stats) {
-	auto zero_copy = rdr.read_rowgroup_zero_copy(rowgroup_plan.rowgroup_index);
+	const auto sync_read_start = Clock::now();
+	auto       zero_copy       = rdr.read_rowgroup_zero_copy(rowgroup_plan.rowgroup_index);
+	auto       rowgroup        = rdr.materialize_zero_copy_rowgroup(std::move(zero_copy));
+	const auto sync_read_end   = Clock::now();
+	execution_stats.sync_rowgroup_read_ms += elapsed_ms(sync_read_start, sync_read_end);
 
+	return prepare_decoded_rowgroup_work_from_materialized(
+	    std::move(rowgroup), shard_id, rowgroup_plan, cache, execution_stats);
+}
+
+DecodedRowgroupWork prepare_decoded_rowgroup_work_from_materialized(galp::execution::Rowgroup          rowgroup,
+                                                                    const uint32_t                     shard_id,
+                                                                    const JpegDctDeviceRowgroupPlan&   rowgroup_plan,
+                                                                    JpegDctDeviceDecodedRowgroupCache* cache,
+                                                                    JpegDctDeviceExecutionStats& execution_stats) {
 	DecodedRowgroupWork work;
 	work.shard_id       = shard_id;
 	work.rowgroup_index = rowgroup_plan.rowgroup_index;
 	work.cache_key      = JpegDctDeviceDecodedRowgroupCacheKey {shard_id, rowgroup_plan.rowgroup_index};
-	work.rowgroup       = rdr.materialize_zero_copy_rowgroup(std::move(zero_copy));
+	work.rowgroup       = std::move(rowgroup);
 	work.owns_rowgroup  = true;
 	if (work.rowgroup.columns.size() < 64) {
 		throw std::runtime_error("JPEG DCT FLS rowgroup has fewer than 64 coefficient columns");
@@ -679,43 +693,13 @@ DecodedRowgroupWork prepare_decoded_rowgroup_work(galp::format::FlsReader&      
 	return work;
 }
 
-void insert_ready_cache_entry(JpegDctDeviceDecodedRowgroupCache&                    cache,
-                              const JpegDctDeviceDecodedRowgroupCacheKey&          key,
-                              std::unique_ptr<JpegDctDeviceDecodedRowgroupCacheEntry> entry,
-                              JpegDctDeviceCacheStats&                             batch_cache_stats) {
-	if (!entry) {
-		return;
-	}
-	cache.resident += entry->bytes;
-	cache.entries[key] = std::move(entry);
-	++batch_cache_stats.inserts;
-	while (cache.resident > cache.capacity && !cache.entries.empty()) {
-		auto evict_it          = cache.entries.end();
-		auto evict_last_access = std::numeric_limits<uint64_t>::max();
-		for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
-			if (it->first == key) {
-				continue;
-			}
-			if (it->second->last_access < evict_last_access) {
-				evict_it          = it;
-				evict_last_access = it->second->last_access;
-			}
-		}
-		if (evict_it == cache.entries.end()) {
-			break;
-		}
-		cache.resident -= evict_it->second->bytes;
-		cache.entries.erase(evict_it);
-		++batch_cache_stats.evictions;
-	}
-}
-
 void finish_cached_gather_after_wait(JpegDctDeviceScratch& scratch, JpegDctDeviceExecutionStats& execution_stats) {
 	if (!scratch.cached_gather_in_flight) {
 		return;
 	}
-	execution_stats.gather_ms +=
-	    static_cast<double>(scratch.cached_gather_done.elapsed_since(scratch.cached_gather_start));
+	const auto elapsed_ms = static_cast<double>(scratch.cached_gather_done.elapsed_since(scratch.cached_gather_start));
+	execution_stats.cached_gather_ms += elapsed_ms;
+	execution_stats.gather_ms += elapsed_ms;
 	if (scratch.cache_hit_stream) {
 		galp::memory::complete_h2d(scratch.cache_hit_stream.get());
 	}
@@ -870,14 +854,16 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&  works,
 	}
 	finish_cached_gather_after_wait(scratch, execution_stats);
 	if (run.stop != nullptr) {
-		execution_stats.gather_ms += static_cast<double>(scratch.decoded_batch_gather_done.elapsed_since(*run.stop));
+		const auto elapsed_ms = static_cast<double>(scratch.decoded_batch_gather_done.elapsed_since(*run.stop));
+		execution_stats.decoded_gather_ms += elapsed_ms;
+		execution_stats.gather_ms += elapsed_ms;
 	}
 	finish_workset_run_after_stream_tail_wait(run);
 	execution_stats.decode_ms += run.elapsed_ms;
 
 	if (cache != nullptr && cache->capacity > 0) {
 		for (auto& work : works) {
-			insert_ready_cache_entry(*cache, work.cache_key, std::move(work.cache_entry), batch_cache_stats);
+			cache->insert_ready_entry(work.cache_key, std::move(work.cache_entry), batch_cache_stats);
 		}
 	}
 	works.clear();
@@ -910,21 +896,47 @@ void execute_cached_rowgroup_hits(const std::vector<JpegDctDeviceCachedGatherBat
 	scratch.cached_gather_in_flight = true;
 }
 
-void execute_shard_plan(galp::format::FlsReader&                  rdr,
-                        const JpegDctDeviceShardPlan&             shard,
-                        int16_t*                                  output,
-                        JpegDctDeviceDecodedRowgroupCache*        cache,
-                        JpegDctDeviceCacheStats&                  batch_cache_stats,
-                        JpegDctDeviceExecutionStats&              execution_stats,
-                        JpegDctDeviceScratch&                     scratch,
-                        const size_t                              decode_batch_rowgroups,
+void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
+                        const JpegDctDeviceShardPlan&                    shard,
+                        int16_t*                                         output,
+                        JpegDctDeviceDecodedRowgroupCache*               cache,
+                        JpegDctDeviceCacheStats&                         batch_cache_stats,
+                        JpegDctDeviceExecutionStats&                     execution_stats,
+                        JpegDctDeviceScratch&                            scratch,
+                        const size_t                                     decode_batch_rowgroups,
+                        const JpegDctDeviceRowgroupPrefetchConfig&       rowgroup_prefetch,
                         std::vector<JpegDctDeviceCachedGatherBatchItem>& cached_pending) {
+	if (!rdr) {
+		throw std::runtime_error("execute_shard_plan: reader is null");
+	}
 	auto& pending = scratch.host_pending_works;
 	pending.clear();
 	const size_t effective_decode_batch_rowgroups =
 	    decode_batch_rowgroups == 0 ? kDefaultJpegDctDecodeBatchRowgroups : decode_batch_rowgroups;
 	pending.reserve(std::min(effective_decode_batch_rowgroups, shard.rowgroups.size()));
 	bool pending_may_insert_cache = false;
+	auto prefetch_plan =
+	    plan_jpeg_dct_rowgroup_prefetch(shard, cache, rowgroup_prefetch, effective_decode_batch_rowgroups);
+	std::unique_ptr<galp::runtime::RowgroupPrefetchQueue> prefetch_queue;
+	if (prefetch_plan.enabled) {
+		const size_t scheduled_rowgroups  = prefetch_plan.rowgroup_indices.size();
+		const auto   prefetch_queue_start = Clock::now();
+		prefetch_queue                    = std::make_unique<galp::runtime::RowgroupPrefetchQueue>(
+            rdr, std::move(prefetch_plan.rowgroup_indices), rowgroup_prefetch.depth, rowgroup_prefetch.workers);
+		const auto prefetch_queue_end = Clock::now();
+		execution_stats.prefetch_queue_start_ms += elapsed_ms(prefetch_queue_start, prefetch_queue_end);
+		execution_stats.prefetched_rowgroup_count += scheduled_rowgroups;
+	}
+	execution_stats.prefetch_initial_cache_hit_rowgroup_count += prefetch_plan.initial_cache_hit_rowgroup_count;
+	execution_stats.prefetch_candidate_rowgroup_count += prefetch_plan.candidate_rowgroup_count;
+	execution_stats.prefetch_active_shard_count += prefetch_plan.enabled ? 1U : 0U;
+	execution_stats.prefetch_config_disabled_shard_count += prefetch_plan.disabled_by_config ? 1U : 0U;
+	execution_stats.prefetch_all_hit_shard_count += prefetch_plan.disabled_by_all_hits ? 1U : 0U;
+	execution_stats.prefetch_small_batch_disabled_shard_count += prefetch_plan.disabled_by_small_batch_count ? 1U : 0U;
+	execution_stats.prefetch_selected_vector_disabled_shard_count +=
+	    prefetch_plan.disabled_by_selected_vector_miss ? 1U : 0U;
+	execution_stats.prefetch_selected_vector_miss_rowgroup_count += prefetch_plan.selected_vector_miss_rowgroup_count;
+	execution_stats.prefetch_skipped_repeated_rowgroup_count += prefetch_plan.skipped_repeated_rowgroup_count;
 
 	const auto flush_cached = [&]() {
 		execute_cached_rowgroup_hits(cached_pending, output, execution_stats, scratch);
@@ -939,9 +951,35 @@ void execute_shard_plan(galp::format::FlsReader&                  rdr,
 		execute_decoded_rowgroup_batch(pending, output, cache, batch_cache_stats, execution_stats, scratch);
 		pending_may_insert_cache = false;
 	};
+	const auto pop_prefetched_rowgroup = [&](const JpegDctDeviceRowgroupPlan& rowgroup_plan,
+	                                         const bool                       consumed_as_hit = false) {
+		auto result = prefetch_queue->pop();
+		if (result.rowgroup_index != rowgroup_plan.rowgroup_index) {
+			galp::execution::free_rowgroup(result.rowgroup);
+			throw std::runtime_error("JPEG DCT rowgroup prefetch queue returned an unexpected rowgroup");
+		}
+		execution_stats.prefetch_rowgroup_read_ms += result.timing.read_ms;
+		execution_stats.prefetch_depth_block_ms += result.prefetch.depth_block_ms;
+		const auto ready_push = result.timing.timeline.ready_push;
+		const auto wait_start = result.timing.timeline.consumer_wait_start;
+		const auto wait_end   = result.timing.timeline.consumer_wait_end;
+		double     wait_ms    = 0.0;
+		if (wait_start != Clock::time_point {} && wait_end != Clock::time_point {} && wait_start <= wait_end) {
+			wait_ms = elapsed_ms(wait_start, wait_end);
+		}
+		if (consumed_as_hit) {
+			execution_stats.prefetch_consumed_as_hit_read_ms += result.timing.read_ms;
+			execution_stats.prefetch_consumed_as_hit_wait_ms += wait_ms;
+		}
+		if (ready_push != Clock::time_point {} && wait_start != Clock::time_point {} && ready_push < wait_start) {
+			execution_stats.prefetch_ready_ahead_ms += elapsed_ms(ready_push, wait_start);
+		}
+		return std::move(result.rowgroup);
+	};
 
-	for (const auto& rowgroup_plan : shard.rowgroups) {
-		const auto key = JpegDctDeviceDecodedRowgroupCacheKey {shard.shard_id, rowgroup_plan.rowgroup_index};
+	for (size_t rowgroup_pos = 0; rowgroup_pos < shard.rowgroups.size(); ++rowgroup_pos) {
+		const auto& rowgroup_plan = shard.rowgroups[rowgroup_pos];
+		const auto  key           = JpegDctDeviceDecodedRowgroupCacheKey {shard.shard_id, rowgroup_plan.rowgroup_index};
 		if (cache != nullptr && cache->capacity > 0) {
 			auto it = cache->entries.find(key);
 			if (it != cache->entries.end() && it->second->blocks.has_value()) {
@@ -960,13 +998,26 @@ void execute_shard_plan(galp::format::FlsReader&                  rdr,
 						cached_pending.push_back(
 						    JpegDctDeviceCachedGatherBatchItem {dense, item.row_in_rowgroup, item.output_block_index});
 					}
+					if (prefetch_plan.use_prefetch_for_position[rowgroup_pos]) {
+						auto rowgroup = pop_prefetched_rowgroup(rowgroup_plan, /*consumed_as_hit=*/true);
+						galp::execution::free_rowgroup(rowgroup);
+						++execution_stats.prefetch_consumed_as_hit_count;
+					}
 					continue;
 				}
 			}
 			++batch_cache_stats.misses;
+			execution_stats.prefetch_initial_hit_runtime_miss_count +=
+			    prefetch_plan.initial_cache_hit_for_position[rowgroup_pos] ? 1U : 0U;
+			execution_stats.prefetch_skipped_repeated_runtime_miss_count +=
+			    prefetch_plan.skipped_repeated_for_position[rowgroup_pos] ? 1U : 0U;
 		}
 
-		auto work = prepare_decoded_rowgroup_work(rdr, shard.shard_id, rowgroup_plan, cache, execution_stats);
+		auto work =
+		    prefetch_plan.use_prefetch_for_position[rowgroup_pos]
+		        ? prepare_decoded_rowgroup_work_from_materialized(
+		              pop_prefetched_rowgroup(rowgroup_plan), shard.shard_id, rowgroup_plan, cache, execution_stats)
+		        : prepare_decoded_rowgroup_work(*rdr, shard.shard_id, rowgroup_plan, cache, execution_stats);
 		if (!pending.empty() && pending.front().decode_unpack_n_vectors != work.decode_unpack_n_vectors) {
 			flush_pending();
 		}
@@ -977,9 +1028,47 @@ void execute_shard_plan(galp::format::FlsReader&                  rdr,
 		}
 	}
 	flush_pending();
+	if (prefetch_queue) {
+		execution_stats.prefetch_wait_ms += prefetch_queue->wait_ms();
+	}
 }
 
 } // namespace
+
+void JpegDctDeviceDecodedRowgroupCache::insert_ready_entry(
+    const JpegDctDeviceDecodedRowgroupCacheKey&             key,
+    std::unique_ptr<JpegDctDeviceDecodedRowgroupCacheEntry> entry,
+    JpegDctDeviceCacheStats&                                batch_cache_stats) {
+	if (!entry || capacity == 0) {
+		return;
+	}
+	const auto existing = entries.find(key);
+	if (existing != entries.end()) {
+		resident = existing->second->bytes <= resident ? resident - existing->second->bytes : 0;
+	}
+	resident += entry->bytes;
+	entries[key] = std::move(entry);
+	++batch_cache_stats.inserts;
+	while (resident > capacity && !entries.empty()) {
+		auto evict_it          = entries.end();
+		auto evict_last_access = std::numeric_limits<uint64_t>::max();
+		for (auto it = entries.begin(); it != entries.end(); ++it) {
+			if (it->first == key) {
+				continue;
+			}
+			if (it->second->last_access < evict_last_access) {
+				evict_it          = it;
+				evict_last_access = it->second->last_access;
+			}
+		}
+		if (evict_it == entries.end()) {
+			break;
+		}
+		resident = evict_it->second->bytes <= resident ? resident - evict_it->second->bytes : 0;
+		entries.erase(evict_it);
+		++batch_cache_stats.evictions;
+	}
+}
 
 void JpegDctDeviceDecodedRowgroupCache::set_capacity(const size_t bytes) {
 	capacity = bytes;
@@ -1022,28 +1111,28 @@ size_t JpegDctDeviceDecodedRowgroupCache::resident_rowgroups() const noexcept {
 }
 
 JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan plan) {
-	auto impl               = std::make_unique<JpegDctDeviceBatch::Impl>();
-	impl->layout            = plan.layout;
-	impl->image_layouts     = std::move(plan.image_layouts);
-	impl->block_metadata    = std::move(plan.block_metadata);
-	impl->rowgroups         = std::move(plan.rowgroups);
-	impl->execution_stats.planning_ms = plan.planning_ms;
-	impl->execution_stats.rowgroup_count = impl->rowgroups.size();
+	auto impl                                           = std::make_unique<JpegDctDeviceBatch::Impl>();
+	impl->layout                                        = plan.layout;
+	impl->image_layouts                                 = std::move(plan.image_layouts);
+	impl->block_metadata                                = std::move(plan.block_metadata);
+	impl->rowgroups                                     = std::move(plan.rowgroups);
+	impl->execution_stats.planning_ms                   = plan.planning_ms;
+	impl->execution_stats.rowgroup_count                = impl->rowgroups.size();
 	impl->execution_stats.planned_selected_vector_count = plan.planned_selected_vector_count;
 	impl->execution_stats.full_vector_count             = plan.full_vector_count;
 	impl->execution_stats.planned_saved_vector_count    = plan.planned_saved_vector_count;
-	impl->coefficient_count = impl->block_metadata.size() * 64U;
+	impl->coefficient_count                             = impl->block_metadata.size() * 64U;
 	if (impl->coefficient_count != 0) {
 		impl->coefficients.emplace(impl->coefficient_count);
 	}
 
-	int16_t* output = impl->coefficients.has_value() ? impl->coefficients->get() : nullptr;
+	int16_t*             output = impl->coefficients.has_value() ? impl->coefficients->get() : nullptr;
 	JpegDctDeviceScratch local_scratch;
-	auto&                scratch = plan.scratch != nullptr ? *plan.scratch : local_scratch;
+	auto&                scratch        = plan.scratch != nullptr ? *plan.scratch : local_scratch;
 	auto&                cached_pending = scratch.host_cached_gather_items;
 	cached_pending.clear();
 	for (const auto& shard : plan.shards) {
-		galp::format::FlsReader rdr(shard.fls_path, /*load_column_names=*/false);
+		auto rdr = std::make_shared<galp::format::FlsReader>(shard.fls_path, /*load_column_names=*/false);
 		execute_shard_plan(rdr,
 		                   shard,
 		                   output,
@@ -1052,6 +1141,7 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 		                   impl->execution_stats,
 		                   scratch,
 		                   plan.decode_batch_rowgroups,
+		                   plan.rowgroup_prefetch,
 		                   cached_pending);
 	}
 	execute_cached_rowgroup_hits(cached_pending, output, impl->execution_stats, scratch);

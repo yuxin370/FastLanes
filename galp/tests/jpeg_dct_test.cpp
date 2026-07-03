@@ -179,11 +179,18 @@ TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {
 	EXPECT_EQ(default_batch_options.layout, galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff);
 	EXPECT_EQ(default_batch_options.cache_capacity_bytes, 0U);
 	EXPECT_EQ(default_batch_options.decode_batch_rowgroups, galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups);
+	EXPECT_TRUE(default_batch_options.enable_rowgroup_prefetch);
+	EXPECT_EQ(default_batch_options.rowgroup_prefetch_depth, galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth);
+	EXPECT_EQ(default_batch_options.rowgroup_prefetch_workers,
+	          galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers);
+	EXPECT_EQ(default_batch_options.rowgroup_prefetch_min_decode_batches,
+	          galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches);
 
 	galp::jpeg::JpegDctDeviceBatchOptions legacy_batch_options {
 	    galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff, 4096U};
 	EXPECT_EQ(legacy_batch_options.cache_capacity_bytes, 4096U);
 	EXPECT_EQ(legacy_batch_options.decode_batch_rowgroups, galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups);
+	EXPECT_TRUE(legacy_batch_options.enable_rowgroup_prefetch);
 }
 
 TEST(JpegDct, DatasetReadPreservesImageMetadata) {
@@ -383,7 +390,7 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 
 TEST(JpegDct, DeviceBatchPlanPreviewMapsPixelCropsToDctBlocks) {
 	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
-	const auto dir = std::filesystem::temp_directory_path() / ("galp_jpeg_dct_plan_preview_" + std::to_string(suffix));
+	const auto dir  = std::filesystem::temp_directory_path() / ("galp_jpeg_dct_plan_preview_" + std::to_string(suffix));
 	const auto path = dir / "input.jpg";
 	std::filesystem::create_directories(dir);
 	write_test_jpeg(path, 16, 16);
@@ -400,8 +407,8 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsPixelCropsToDctBlocks) {
 	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path}, output_dir, reader_options, shard_options);
 
 	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
-	const auto aligned = reader.PlanDeviceDctBatch(
-	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}});
+	const auto                            aligned =
+	    reader.PlanDeviceDctBatch({galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}});
 	ASSERT_EQ(aligned.image_layouts.size(), 1U);
 	EXPECT_EQ(aligned.image_layouts[0].block_offset, 0U);
 	EXPECT_EQ(aligned.image_layouts[0].block_count, 1U);
@@ -418,8 +425,8 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsPixelCropsToDctBlocks) {
 	EXPECT_DOUBLE_EQ(aligned.planned_selected_vector_ratio, 1.0);
 	EXPECT_DOUBLE_EQ(aligned.estimated_selected_vector_ratio, 1.0);
 
-	const auto unaligned = reader.PlanDeviceDctBatch(
-	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {4, 4, 8, 8}}});
+	const auto unaligned =
+	    reader.PlanDeviceDctBatch({galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {4, 4, 8, 8}}});
 	ASSERT_EQ(unaligned.image_layouts.size(), 1U);
 	EXPECT_EQ(unaligned.image_layouts[0].block_count, 4U);
 	ASSERT_EQ(unaligned.block_metadata.size(), 4U);
@@ -441,8 +448,8 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsPixelCropsToDctBlocks) {
 	EXPECT_DOUBLE_EQ(unaligned.planned_selected_vector_ratio, 1.0);
 	EXPECT_DOUBLE_EQ(unaligned.estimated_selected_vector_ratio, 1.0);
 
-	const auto clipped = reader.PlanDeviceDctBatch(
-	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {8, 8, 64, 64}}});
+	const auto clipped =
+	    reader.PlanDeviceDctBatch({galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {8, 8, 64, 64}}});
 	ASSERT_EQ(clipped.image_layouts.size(), 1U);
 	EXPECT_EQ(clipped.image_layouts[0].block_count, 1U);
 	ASSERT_EQ(clipped.block_metadata.size(), 1U);
@@ -457,8 +464,8 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsPixelCropsToDctBlocks) {
 	EXPECT_DOUBLE_EQ(clipped.planned_selected_vector_ratio, 1.0);
 	EXPECT_DOUBLE_EQ(clipped.estimated_selected_vector_ratio, 1.0);
 
-	const auto full_from_empty_sentinel = reader.PlanDeviceDctBatch(
-	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 0, 0}}});
+	const auto full_from_empty_sentinel =
+	    reader.PlanDeviceDctBatch({galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 0, 0}}});
 	ASSERT_EQ(full_from_empty_sentinel.image_layouts.size(), 1U);
 	EXPECT_EQ(full_from_empty_sentinel.image_layouts[0].block_count, 4U);
 	ASSERT_EQ(full_from_empty_sentinel.block_metadata.size(), 4U);
@@ -495,8 +502,8 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsCropsAcrossComponents) {
 	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path}, output_dir, reader_options, shard_options);
 
 	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
-	const auto preview = reader.PlanDeviceDctBatch(
-	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {4, 4, 8, 8}}});
+	const auto                            preview =
+	    reader.PlanDeviceDctBatch({galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {4, 4, 8, 8}}});
 	ASSERT_EQ(preview.image_layouts.size(), 1U);
 	ASSERT_EQ(preview.image_layouts[0].block_offset, 0U);
 	EXPECT_EQ(preview.image_layouts[0].block_count, preview.block_metadata.size());
@@ -515,8 +522,7 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsCropsAcrossComponents) {
 }
 
 TEST(JpegDct, DeviceBatchPlanPreviewCanSpanRowgroups) {
-	const auto suffix =
-	    std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto dir =
 	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_plan_preview_rowgroups_" + std::to_string(suffix));
 	const auto path = dir / "wide.jpg";
@@ -535,8 +541,8 @@ TEST(JpegDct, DeviceBatchPlanPreviewCanSpanRowgroups) {
 	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path}, output_dir, reader_options, shard_options);
 
 	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
-	const auto preview = reader.PlanDeviceDctBatch(
-	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {8184, 0, 16, 8}}});
+	const auto                            preview = reader.PlanDeviceDctBatch(
+        {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {8184, 0, 16, 8}}});
 	ASSERT_EQ(preview.image_layouts.size(), 1U);
 	EXPECT_EQ(preview.image_layouts[0].block_count, 2U);
 	ASSERT_EQ(preview.block_metadata.size(), 2U);
@@ -577,7 +583,7 @@ TEST(JpegDct, DeviceBatchPlanPreviewPreservesRequestMajorLayout) {
 	const auto output_dir             = dir / "out";
 	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
 
-	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
+	galp::jpeg::JpegDctShardDatasetReader                  reader(output_dir / "manifest.bin");
 	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
 	    galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}},
 	    galp::jpeg::JpegDctImageCropRequest {1, galp::jpeg::JpegDctCropBox {8, 8, 8, 8}},
@@ -622,6 +628,46 @@ TEST(JpegDct, DeviceBatchPlanPreviewPreservesRequestMajorLayout) {
 	std::filesystem::remove_all(dir);
 }
 
+TEST(JpegDct, DeviceBatchPlanEstimateMatchesFullPlanSummary) {
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir = std::filesystem::temp_directory_path() / ("galp_jpeg_dct_plan_estimate_" + std::to_string(suffix));
+	const auto path0 = dir / "input0.jpg";
+	const auto path1 = dir / "input1.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path0, 16, 16);
+	write_test_jpeg(path1, 32, 16);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.component_mode           = galp::jpeg::JpegComponentMode::kSingleComponent;
+	reader_options.selected_component_index = 0;
+	reader_options.validation_mode          = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 2;
+	shard_options.rowgroup_vectors    = 1;
+	shard_options.rowgroups_per_shard = 256;
+	const auto output_dir             = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
+
+	galp::jpeg::JpegDctShardDatasetReader                  reader(output_dir / "manifest.bin");
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
+	    galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {}},
+	    galp::jpeg::JpegDctImageCropRequest {1, galp::jpeg::JpegDctCropBox {}},
+	};
+	const auto preview  = reader.PlanDeviceDctBatch(requests);
+	const auto estimate = reader.EstimateDeviceDctBatch(requests);
+
+	EXPECT_EQ(estimate.layout, preview.layout);
+	EXPECT_EQ(estimate.block_count, preview.block_metadata.size());
+	EXPECT_EQ(estimate.full_vector_count, preview.full_vector_count);
+	ASSERT_EQ(estimate.rowgroups.size(), preview.rowgroups.size());
+	for (size_t i = 0; i < estimate.rowgroups.size(); ++i) {
+		EXPECT_EQ(estimate.rowgroups[i].shard_id, preview.rowgroups[i].shard_id);
+		EXPECT_EQ(estimate.rowgroups[i].rowgroup_index, preview.rowgroups[i].rowgroup_index);
+	}
+
+	std::filesystem::remove_all(dir);
+}
+
 TEST(JpegDct, DeviceBatchPlanPreviewEstimatesVectorSavings) {
 	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto dir =
@@ -644,8 +690,8 @@ TEST(JpegDct, DeviceBatchPlanPreviewEstimatesVectorSavings) {
 	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
 
 	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
-	const auto preview = reader.PlanDeviceDctBatch(
-	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}});
+	const auto                            preview =
+	    reader.PlanDeviceDctBatch({galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}});
 	ASSERT_EQ(preview.block_metadata.size(), 1U);
 	ASSERT_EQ(preview.rowgroups.size(), 1U);
 	EXPECT_EQ(preview.planned_selected_vector_count, 1U);
@@ -660,9 +706,9 @@ TEST(JpegDct, DeviceBatchPlanPreviewEstimatesVectorSavings) {
 }
 
 TEST(JpegDct, RuntimePolicyUsesVectorPushdownOnlyForMeaningfulSavings) {
+	using galp::jpeg::detail::choose_jpeg_dct_runtime_policy;
 	using galp::jpeg::detail::JpegDctRuntimePolicyDecision;
 	using galp::jpeg::detail::JpegDctRuntimePolicyReason;
-	using galp::jpeg::detail::choose_jpeg_dct_runtime_policy;
 
 	{
 		const auto policy = choose_jpeg_dct_runtime_policy(8, 32, true);
@@ -688,8 +734,8 @@ TEST(JpegDct, RuntimePolicyUsesVectorPushdownOnlyForMeaningfulSavings) {
 
 TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 	using galp::execution::detail::AutoPipelinePolicyReason;
-	using galp::execution::detail::choose_auto_pipeline_policy_from_estimates;
 	using galp::execution::detail::choose_auto_pipeline_policy_from_counts;
+	using galp::execution::detail::choose_auto_pipeline_policy_from_estimates;
 
 	{
 		const auto policy = choose_auto_pipeline_policy_from_counts(
@@ -729,6 +775,32 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		    /*selected_blocks=*/768, /*full_blocks=*/12288, /*touched_rowgroups=*/1, /*full_rowgroups=*/2);
 		EXPECT_TRUE(policy.use_pushdown);
 		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::VerySmallCrop);
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_counts(/*selected_blocks=*/3072,
+		                                                            /*full_blocks=*/12288,
+		                                                            /*touched_rowgroups=*/6,
+		                                                            /*full_rowgroups=*/24,
+		                                                            /*selected_vectors=*/24,
+		                                                            /*full_vectors=*/96);
+		EXPECT_TRUE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+		EXPECT_LT(policy.avg_full_blocks_per_rowgroup, galp::execution::detail::kAutoMinAvgFullBlocksPerRowgroup);
+		EXPECT_LE(policy.touched_rowgroup_ratio,
+		          galp::execution::detail::kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio);
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_counts(/*selected_blocks=*/3072,
+		                                                            /*full_blocks=*/12288,
+		                                                            /*touched_rowgroups=*/12,
+		                                                            /*full_rowgroups=*/24,
+		                                                            /*selected_vectors=*/24,
+		                                                            /*full_vectors=*/96);
+		EXPECT_FALSE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::TinyRowgroupsFixedOverhead);
+		EXPECT_LT(policy.avg_full_blocks_per_rowgroup, galp::execution::detail::kAutoMinAvgFullBlocksPerRowgroup);
+		EXPECT_GT(policy.touched_rowgroup_ratio,
+		          galp::execution::detail::kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_counts(/*selected_blocks=*/102400,
@@ -820,7 +892,7 @@ TEST(JpegDct, AutoPipelineReuseCandidateCountsRepeatedPreviewRowgroups) {
 	using galp::execution::detail::count_auto_reuse_candidate_rowgroups;
 	using galp::execution::detail::estimate_auto_worksets_for_rowgroups;
 
-	std::set<std::pair<uint32_t, uint32_t>> seen;
+	std::set<std::pair<uint32_t, uint32_t>>                seen;
 	std::vector<galp::jpeg::JpegDctDeviceRowgroupMetadata> first_window {
 	    galp::jpeg::JpegDctDeviceRowgroupMetadata {0, 7},
 	    galp::jpeg::JpegDctDeviceRowgroupMetadata {0, 8},
@@ -865,13 +937,250 @@ TEST(JpegDct, AutoPipelineExtraPlanMsDoesNotDoubleCountPreparedPlan) {
 	EXPECT_DOUBLE_EQ(external_plan_overhead_ms(/*measured_plan_ms=*/6.5, /*executed_plan_planning_ms=*/7.0), 0.0);
 }
 
+TEST(JpegDct, DevicePrefetchPolicyRequiresStructuralOverlap) {
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPlan;
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPrefetchConfig;
+	using galp::jpeg::detail::JpegDctDeviceShardPlan;
+	using galp::jpeg::detail::JpegDctRuntimePolicyDecision;
+	using galp::jpeg::detail::plan_jpeg_dct_rowgroup_prefetch_from_hits;
+
+	JpegDctDeviceShardPlan shard;
+	shard.shard_id = 7;
+	for (uint32_t rowgroup_index = 0; rowgroup_index < 5; ++rowgroup_index) {
+		JpegDctDeviceRowgroupPlan rowgroup;
+		rowgroup.rowgroup_index          = rowgroup_index;
+		rowgroup.runtime_policy.decision = JpegDctRuntimePolicyDecision::kFullRowgroup;
+		shard.rowgroups.push_back(std::move(rowgroup));
+	}
+
+	JpegDctDeviceRowgroupPrefetchConfig config;
+	config.min_decode_batches = 2;
+
+	auto plan = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard, {false, false, false, false, false}, config, 5);
+	EXPECT_FALSE(plan.enabled);
+	EXPECT_TRUE(plan.rowgroup_indices.empty());
+	EXPECT_EQ(plan.use_prefetch_for_position.size(), shard.rowgroups.size());
+	EXPECT_EQ(plan.candidate_rowgroup_count, 5U);
+	EXPECT_TRUE(plan.disabled_by_small_batch_count);
+
+	plan = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard, {false, false, false, false, false}, config, 4);
+	ASSERT_TRUE(plan.enabled);
+	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {0, 1, 2, 3, 4}));
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {true, true, true, true, true}));
+	EXPECT_EQ(plan.candidate_rowgroup_count, 5U);
+	EXPECT_FALSE(plan.disabled_by_small_batch_count);
+
+	config.enabled = false;
+	plan           = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard, {false, false, false, false, false}, config, 4);
+	EXPECT_FALSE(plan.enabled);
+	EXPECT_TRUE(plan.rowgroup_indices.empty());
+	EXPECT_EQ(plan.candidate_rowgroup_count, 5U);
+	EXPECT_TRUE(plan.disabled_by_config);
+}
+
+TEST(JpegDct, DevicePrefetchPolicySkipsCacheHits) {
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPlan;
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPrefetchConfig;
+	using galp::jpeg::detail::JpegDctDeviceShardPlan;
+	using galp::jpeg::detail::JpegDctRuntimePolicyDecision;
+	using galp::jpeg::detail::plan_jpeg_dct_rowgroup_prefetch_from_hits;
+
+	JpegDctDeviceShardPlan shard;
+	for (uint32_t rowgroup_index = 10; rowgroup_index < 15; ++rowgroup_index) {
+		JpegDctDeviceRowgroupPlan rowgroup;
+		rowgroup.rowgroup_index          = rowgroup_index;
+		rowgroup.runtime_policy.decision = JpegDctRuntimePolicyDecision::kFullRowgroup;
+		shard.rowgroups.push_back(std::move(rowgroup));
+	}
+
+	JpegDctDeviceRowgroupPrefetchConfig config;
+	config.min_decode_batches = 2;
+	const auto plan = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard, {true, false, true, false, false}, config, 2);
+	ASSERT_TRUE(plan.enabled);
+	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {11, 13, 14}));
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {false, true, false, true, true}));
+	EXPECT_EQ(plan.initial_cache_hit_for_position, (std::vector<bool> {true, false, true, false, false}));
+	EXPECT_EQ(plan.initial_cache_hit_rowgroup_count, 2U);
+	EXPECT_EQ(plan.candidate_rowgroup_count, 3U);
+}
+
+TEST(JpegDct, DevicePrefetchPolicyReportsAllHitShard) {
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPlan;
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPrefetchConfig;
+	using galp::jpeg::detail::JpegDctDeviceShardPlan;
+	using galp::jpeg::detail::JpegDctRuntimePolicyDecision;
+	using galp::jpeg::detail::plan_jpeg_dct_rowgroup_prefetch_from_hits;
+
+	JpegDctDeviceShardPlan shard;
+	for (uint32_t rowgroup_index = 0; rowgroup_index < 3; ++rowgroup_index) {
+		JpegDctDeviceRowgroupPlan rowgroup;
+		rowgroup.rowgroup_index          = rowgroup_index;
+		rowgroup.runtime_policy.decision = JpegDctRuntimePolicyDecision::kFullRowgroup;
+		shard.rowgroups.push_back(std::move(rowgroup));
+	}
+
+	const auto plan =
+	    plan_jpeg_dct_rowgroup_prefetch_from_hits(shard, {true, true, true}, {}, /*decode_batch_rowgroups=*/2);
+	EXPECT_FALSE(plan.enabled);
+	EXPECT_TRUE(plan.disabled_by_all_hits);
+	EXPECT_EQ(plan.initial_cache_hit_rowgroup_count, 3U);
+	EXPECT_EQ(plan.candidate_rowgroup_count, 0U);
+	EXPECT_TRUE(plan.rowgroup_indices.empty());
+}
+
+TEST(JpegDct, DevicePrefetchPolicyTreatsDisabledCacheAsMisses) {
+	using galp::jpeg::detail::JpegDctDeviceDecodedRowgroupCache;
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPlan;
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPrefetchConfig;
+	using galp::jpeg::detail::JpegDctDeviceShardPlan;
+	using galp::jpeg::detail::JpegDctRuntimePolicyDecision;
+	using galp::jpeg::detail::plan_jpeg_dct_rowgroup_prefetch;
+
+	JpegDctDeviceShardPlan shard;
+	shard.shard_id = 3;
+	for (uint32_t rowgroup_index = 0; rowgroup_index < 5; ++rowgroup_index) {
+		JpegDctDeviceRowgroupPlan rowgroup;
+		rowgroup.rowgroup_index          = rowgroup_index;
+		rowgroup.runtime_policy.decision = JpegDctRuntimePolicyDecision::kFullRowgroup;
+		shard.rowgroups.push_back(std::move(rowgroup));
+	}
+
+	JpegDctDeviceDecodedRowgroupCache cache;
+	cache.set_capacity(0);
+
+	JpegDctDeviceRowgroupPrefetchConfig config;
+	config.min_decode_batches = 2;
+	const auto plan = plan_jpeg_dct_rowgroup_prefetch(shard, &cache, config, /*effective_decode_batch_rowgroups=*/2);
+	ASSERT_TRUE(plan.enabled);
+	EXPECT_EQ(plan.initial_cache_hit_rowgroup_count, 0U);
+	EXPECT_EQ(plan.candidate_rowgroup_count, 5U);
+	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {0, 1, 2, 3, 4}));
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {true, true, true, true, true}));
+}
+
+TEST(JpegDct, DeviceDecodedCacheReplacementKeepsResidentBytesStable) {
+	using galp::jpeg::JpegDctDeviceCacheStats;
+	using galp::jpeg::detail::JpegDctDeviceDecodedRowgroupCache;
+	using galp::jpeg::detail::JpegDctDeviceDecodedRowgroupCacheEntry;
+	using galp::jpeg::detail::JpegDctDeviceDecodedRowgroupCacheKey;
+
+	const auto make_entry = [](const size_t bytes, const uint64_t last_access) {
+		auto entry         = std::make_unique<JpegDctDeviceDecodedRowgroupCacheEntry>();
+		entry->bytes       = bytes;
+		entry->last_access = last_access;
+		return entry;
+	};
+
+	JpegDctDeviceDecodedRowgroupCache cache;
+	cache.set_capacity(250);
+	JpegDctDeviceCacheStats stats;
+	const JpegDctDeviceDecodedRowgroupCacheKey key_a {1, 10};
+	const JpegDctDeviceDecodedRowgroupCacheKey key_b {1, 11};
+	const JpegDctDeviceDecodedRowgroupCacheKey key_c {1, 12};
+
+	cache.insert_ready_entry(key_a, make_entry(100, 1), stats);
+	cache.insert_ready_entry(key_b, make_entry(100, 2), stats);
+	ASSERT_EQ(cache.resident_bytes(), 200U);
+	ASSERT_EQ(cache.resident_rowgroups(), 2U);
+
+	cache.insert_ready_entry(key_a, make_entry(100, 3), stats);
+	EXPECT_EQ(cache.resident_bytes(), 200U);
+	EXPECT_EQ(cache.resident_rowgroups(), 2U);
+	EXPECT_EQ(stats.inserts, 3U);
+	EXPECT_EQ(stats.evictions, 0U);
+
+	cache.insert_ready_entry(key_c, make_entry(100, 4), stats);
+	EXPECT_EQ(cache.resident_bytes(), 200U);
+	EXPECT_EQ(cache.resident_rowgroups(), 2U);
+	EXPECT_NE(cache.entries.find(key_a), cache.entries.end());
+	EXPECT_EQ(cache.entries.find(key_b), cache.entries.end());
+	EXPECT_NE(cache.entries.find(key_c), cache.entries.end());
+	EXPECT_EQ(stats.evictions, 1U);
+}
+
+TEST(JpegDct, DevicePrefetchPolicySkipsSelectedVectorMisses) {
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPlan;
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPrefetchConfig;
+	using galp::jpeg::detail::JpegDctDeviceShardPlan;
+	using galp::jpeg::detail::plan_jpeg_dct_rowgroup_prefetch_from_hits;
+
+	JpegDctDeviceShardPlan shard;
+	for (uint32_t rowgroup_index = 0; rowgroup_index < 5; ++rowgroup_index) {
+		JpegDctDeviceRowgroupPlan rowgroup;
+		rowgroup.rowgroup_index = rowgroup_index;
+		shard.rowgroups.push_back(std::move(rowgroup));
+	}
+
+	JpegDctDeviceRowgroupPrefetchConfig config;
+	config.min_decode_batches = 2;
+	const auto plan = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard, {false, false, false, false, false}, config, 2);
+	EXPECT_FALSE(plan.enabled);
+	EXPECT_TRUE(plan.rowgroup_indices.empty());
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {false, false, false, false, false}));
+	EXPECT_EQ(plan.candidate_rowgroup_count, 0U);
+	EXPECT_EQ(plan.selected_vector_miss_rowgroup_count, 5U);
+	EXPECT_FALSE(plan.disabled_by_all_hits);
+	EXPECT_TRUE(plan.disabled_by_selected_vector_miss);
+}
+
+TEST(JpegDct, DevicePrefetchPolicySkipsRepeatedFullMissAfterDecodeBatch) {
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPlan;
+	using galp::jpeg::detail::JpegDctDeviceRowgroupPrefetchConfig;
+	using galp::jpeg::detail::JpegDctDeviceShardPlan;
+	using galp::jpeg::detail::JpegDctRuntimePolicyDecision;
+	using galp::jpeg::detail::plan_jpeg_dct_rowgroup_prefetch_from_hits;
+
+	JpegDctDeviceShardPlan shard;
+	for (const uint32_t rowgroup_index : {10U, 11U, 10U, 12U, 10U}) {
+		JpegDctDeviceRowgroupPlan rowgroup;
+		rowgroup.rowgroup_index          = rowgroup_index;
+		rowgroup.full_vector_count       = 1;
+		rowgroup.runtime_policy.decision = JpegDctRuntimePolicyDecision::kFullRowgroup;
+		shard.rowgroups.push_back(std::move(rowgroup));
+	}
+
+	JpegDctDeviceRowgroupPrefetchConfig config;
+	config.min_decode_batches = 2;
+	auto plan                 = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard,
+	                                                                      {false, false, false, false, false},
+	                                                                      config,
+	                                                                      /*effective_decode_batch_rowgroups=*/2,
+	                                                                      /*decoded_cache_capacity_bytes=*/1U << 20U);
+	ASSERT_TRUE(plan.enabled);
+	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {10, 11, 12}));
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {true, true, false, true, false}));
+	EXPECT_EQ(plan.skipped_repeated_for_position, (std::vector<bool> {false, false, true, false, true}));
+	EXPECT_EQ(plan.candidate_rowgroup_count, 5U);
+	EXPECT_EQ(plan.skipped_repeated_rowgroup_count, 2U);
+
+	plan = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard,
+	                                                 {false, false, false, false, false},
+	                                                 config,
+	                                                 /*effective_decode_batch_rowgroups=*/2,
+	                                                 /*decoded_cache_capacity_bytes=*/1);
+	ASSERT_TRUE(plan.enabled);
+	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {10, 11, 10, 12, 10}));
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {true, true, true, true, true}));
+	EXPECT_EQ(plan.skipped_repeated_rowgroup_count, 0U);
+
+	plan = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard,
+	                                                 {false, false, false, false, false},
+	                                                 config,
+	                                                 /*effective_decode_batch_rowgroups=*/2,
+	                                                 /*decoded_cache_capacity_bytes=*/0);
+	ASSERT_TRUE(plan.enabled);
+	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {10, 11, 10, 12, 10}));
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {true, true, true, true, true}));
+	EXPECT_EQ(plan.skipped_repeated_rowgroup_count, 0U);
+}
+
 TEST(JpegDct, SelectedVectorPlanningCompactsAndRemapsMultiVectorChunks) {
 	using galp::jpeg::detail::JpegDctDeviceGatherItem;
 	using galp::jpeg::detail::remap_items_to_selected_vectors;
 	using galp::jpeg::detail::selected_decode_chunks_fit;
 	using galp::jpeg::detail::selected_decode_vectors;
 
-	const auto vec_values = static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
+	const auto     vec_values       = static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
 	const unsigned unpack_n_vectors = 4;
 	const std::vector<JpegDctDeviceGatherItem> items {
 	    JpegDctDeviceGatherItem {0, 5U * vec_values + 7U, 0},
@@ -909,7 +1218,7 @@ TEST(JpegDct, SelectedVectorPlanningRejectsTailChunkOverrun) {
 	using galp::jpeg::detail::selected_decode_chunks_fit;
 	using galp::jpeg::detail::selected_decode_vectors;
 
-	const auto vec_values = static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
+	const auto     vec_values       = static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
 	const unsigned unpack_n_vectors = 4;
 	const std::vector<JpegDctDeviceGatherItem> tail_items {
 	    JpegDctDeviceGatherItem {0, 9U * vec_values + 5U, 0},

@@ -17,9 +17,9 @@
 
 namespace galp::jpeg::detail {
 
-constexpr double kMaxSelectedVectorRatioForPushdown = 0.75;
-constexpr size_t kMinSavedVectorsForPushdown        = 4;
-constexpr unsigned kJpegDctDeviceUnpackNVectors     = 1;
+constexpr double   kMaxSelectedVectorRatioForPushdown = 0.75;
+constexpr size_t   kMinSavedVectorsForPushdown        = 4;
+constexpr unsigned kJpegDctDeviceUnpackNVectors       = 1;
 
 struct JpegDctDeviceScratch;
 
@@ -52,19 +52,15 @@ inline JpegDctRuntimePolicyResult choose_jpeg_dct_runtime_policy(const size_t se
                                                                  const size_t full_vector_count,
                                                                  const bool   selected_chunks_fit) {
 	if (!selected_chunks_fit) {
-		return {JpegDctRuntimePolicyDecision::kFullRowgroup,
-		        JpegDctRuntimePolicyReason::kTailChunkWouldOverrun};
+		return {JpegDctRuntimePolicyDecision::kFullRowgroup, JpegDctRuntimePolicyReason::kTailChunkWouldOverrun};
 	}
 	if (full_vector_count == 0 || selected_vector_count >= full_vector_count) {
-		return {JpegDctRuntimePolicyDecision::kFullRowgroup,
-		        JpegDctRuntimePolicyReason::kSelectedCoversMostVectors};
+		return {JpegDctRuntimePolicyDecision::kFullRowgroup, JpegDctRuntimePolicyReason::kSelectedCoversMostVectors};
 	}
-	const double selected_ratio =
-	    static_cast<double>(selected_vector_count) / static_cast<double>(full_vector_count);
-	const size_t saved_vectors = full_vector_count - selected_vector_count;
+	const double selected_ratio = static_cast<double>(selected_vector_count) / static_cast<double>(full_vector_count);
+	const size_t saved_vectors  = full_vector_count - selected_vector_count;
 	if (selected_ratio >= kMaxSelectedVectorRatioForPushdown) {
-		return {JpegDctRuntimePolicyDecision::kFullRowgroup,
-		        JpegDctRuntimePolicyReason::kSelectedCoversMostVectors};
+		return {JpegDctRuntimePolicyDecision::kFullRowgroup, JpegDctRuntimePolicyReason::kSelectedCoversMostVectors};
 	}
 	if (saved_vectors < kMinSavedVectorsForPushdown) {
 		return {JpegDctRuntimePolicyDecision::kFullRowgroup, JpegDctRuntimePolicyReason::kSavingsTooSmall};
@@ -118,8 +114,7 @@ remap_items_to_selected_vectors(const std::vector<JpegDctDeviceGatherItem>& item
 		auto       mapped               = item;
 		const auto selected_chunk_index = static_cast<uint32_t>(std::distance(selected_vectors.begin(), it));
 		const auto chunk_vector_offset  = source_vector - source_chunk;
-		const auto row_offset =
-		    item.row_in_rowgroup % static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
+		const auto row_offset  = item.row_in_rowgroup % static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
 		mapped.row_in_rowgroup = (selected_chunk_index * unpack_n_vectors + chunk_vector_offset) *
 		                             static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR) +
 		                         row_offset;
@@ -128,9 +123,9 @@ remap_items_to_selected_vectors(const std::vector<JpegDctDeviceGatherItem>& item
 	return remapped;
 }
 
-inline bool selected_decode_chunks_fit(const std::vector<uint32_t>&            selected_vectors,
-                                       const size_t                            rowgroup_n_vecs,
-                                       const unsigned                          unpack_n_vectors_cfg) {
+inline bool selected_decode_chunks_fit(const std::vector<uint32_t>& selected_vectors,
+                                       const size_t                 rowgroup_n_vecs,
+                                       const unsigned               unpack_n_vectors_cfg) {
 	const auto unpack_n_vectors = static_cast<size_t>(std::max(1U, unpack_n_vectors_cfg));
 	return std::all_of(selected_vectors.begin(), selected_vectors.end(), [&](const uint32_t vec) {
 		return static_cast<size_t>(vec) + unpack_n_vectors <= rowgroup_n_vecs;
@@ -162,14 +157,21 @@ struct JpegDctDeviceShardPlan {
 	std::vector<JpegDctDeviceRowgroupPlan> rowgroups;
 };
 
+struct JpegDctDeviceRowgroupPrefetchConfig {
+	bool   enabled            = true;
+	size_t depth              = kDefaultJpegDctDeviceRowgroupPrefetchDepth;
+	size_t workers            = kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
+	size_t min_decode_batches = kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches;
+};
+
 struct JpegDctDeviceBatchPlan {
 	JpegDctDeviceLayout                        layout = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
 	std::vector<JpegDctDeviceShardPlan>        shards;
 	std::vector<JpegDctDeviceImageLayout>      image_layouts;
 	std::vector<JpegDctDeviceBlockMetadata>    block_metadata;
 	std::vector<JpegDctDeviceRowgroupMetadata> rowgroups;
-	struct JpegDctDeviceDecodedRowgroupCache*  cache                         = nullptr;
-	JpegDctDeviceScratch*                      scratch                       = nullptr;
+	struct JpegDctDeviceDecodedRowgroupCache*  cache                           = nullptr;
+	JpegDctDeviceScratch*                      scratch                         = nullptr;
 	size_t                                     planned_selected_vector_count   = 0;
 	size_t                                     estimated_selected_vector_count = 0;
 	size_t                                     full_vector_count               = 0;
@@ -179,6 +181,7 @@ struct JpegDctDeviceBatchPlan {
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;
 	size_t                                     decode_batch_rowgroups          = kDefaultJpegDctDecodeBatchRowgroups;
+	JpegDctDeviceRowgroupPrefetchConfig        rowgroup_prefetch {};
 };
 
 struct JpegDctDeviceDecodedRowgroupCacheKey {
@@ -208,6 +211,9 @@ struct JpegDctDeviceDecodedRowgroupCacheEntry {
 struct JpegDctDeviceDecodedRowgroupCache {
 	void                 set_capacity(size_t bytes);
 	void                 clear();
+	void                 insert_ready_entry(const JpegDctDeviceDecodedRowgroupCacheKey&             key,
+	                                        std::unique_ptr<JpegDctDeviceDecodedRowgroupCacheEntry> entry,
+	                                        JpegDctDeviceCacheStats&                                batch_cache_stats);
 	[[nodiscard]] size_t capacity_bytes() const noexcept;
 	[[nodiscard]] size_t resident_bytes() const noexcept;
 	[[nodiscard]] size_t resident_rowgroups() const noexcept;
@@ -220,6 +226,139 @@ struct JpegDctDeviceDecodedRowgroupCache {
 	                   JpegDctDeviceDecodedRowgroupCacheKeyHash>
 	    entries;
 };
+
+struct JpegDctDeviceRowgroupPrefetchPlan {
+	bool                enabled                             = false;
+	bool                disabled_by_config                  = false;
+	bool                disabled_by_all_hits                = false;
+	bool                disabled_by_small_batch_count       = false;
+	bool                disabled_by_selected_vector_miss    = false;
+	size_t              initial_cache_hit_rowgroup_count    = 0;
+	size_t              candidate_rowgroup_count            = 0;
+	size_t              selected_vector_miss_rowgroup_count = 0;
+	size_t              skipped_repeated_rowgroup_count     = 0;
+	std::vector<size_t> rowgroup_indices;
+	std::vector<bool>   use_prefetch_for_position;
+	std::vector<bool>   initial_cache_hit_for_position;
+	std::vector<bool>   skipped_repeated_for_position;
+};
+
+inline bool has_decoded_cache_entry(const JpegDctDeviceDecodedRowgroupCache*    cache,
+                                    const JpegDctDeviceDecodedRowgroupCacheKey& key) {
+	if (cache == nullptr || cache->capacity == 0) {
+		return false;
+	}
+	const auto it = cache->entries.find(key);
+	return it != cache->entries.end() && it->second->blocks.has_value();
+}
+
+inline JpegDctDeviceRowgroupPrefetchPlan
+plan_jpeg_dct_rowgroup_prefetch_from_hits(const JpegDctDeviceShardPlan&              shard,
+                                          const std::vector<bool>&                   cache_hit_by_position,
+                                          const JpegDctDeviceRowgroupPrefetchConfig& config,
+                                          const size_t                               effective_decode_batch_rowgroups,
+                                          const size_t                               decoded_cache_capacity_bytes = 0) {
+	JpegDctDeviceRowgroupPrefetchPlan plan;
+	plan.use_prefetch_for_position.assign(shard.rowgroups.size(), false);
+	plan.initial_cache_hit_for_position.assign(shard.rowgroups.size(), false);
+	plan.skipped_repeated_for_position.assign(shard.rowgroups.size(), false);
+	if (cache_hit_by_position.size() != shard.rowgroups.size()) {
+		throw std::invalid_argument("JPEG DCT prefetch hit map size does not match shard rowgroups");
+	}
+
+	std::vector<size_t> candidate_positions;
+	candidate_positions.reserve(shard.rowgroups.size());
+	plan.rowgroup_indices.reserve(shard.rowgroups.size());
+	std::unordered_map<uint32_t, size_t> earlier_full_decode_miss_ordinal;
+	size_t                               miss_ordinal = 0;
+	for (size_t rowgroup_pos = 0; rowgroup_pos < shard.rowgroups.size(); ++rowgroup_pos) {
+		const auto& rowgroup_plan = shard.rowgroups[rowgroup_pos];
+		if (cache_hit_by_position[rowgroup_pos]) {
+			plan.initial_cache_hit_for_position[rowgroup_pos] = true;
+			++plan.initial_cache_hit_rowgroup_count;
+			continue;
+		}
+		// Current prefetch materializes whole rowgroups and only has dense-cache reuse
+		// semantics. Keep selected-vector misses synchronous until the sparse path has an
+		// explicit prefetch/cache contract instead of mixing policies in this planner.
+		if (rowgroup_plan.runtime_policy.decision != JpegDctRuntimePolicyDecision::kFullRowgroup) {
+			++plan.selected_vector_miss_rowgroup_count;
+			continue;
+		}
+		++plan.candidate_rowgroup_count;
+		const auto earlier_full_it = earlier_full_decode_miss_ordinal.find(rowgroup_plan.rowgroup_index);
+		const bool can_reuse_earlier_full_decode =
+		    decoded_cache_capacity_bytes != 0 && earlier_full_it != earlier_full_decode_miss_ordinal.end() &&
+		    miss_ordinal >= earlier_full_it->second + effective_decode_batch_rowgroups;
+		if (!can_reuse_earlier_full_decode) {
+			candidate_positions.push_back(rowgroup_pos);
+			plan.rowgroup_indices.push_back(rowgroup_plan.rowgroup_index);
+		} else {
+			plan.skipped_repeated_for_position[rowgroup_pos] = true;
+			++plan.skipped_repeated_rowgroup_count;
+		}
+		const auto dense_rowgroup_bytes =
+		    rowgroup_plan.full_vector_count * galp::codec::consts::VALUES_PER_VECTOR * 64U * sizeof(int16_t);
+		if (decoded_cache_capacity_bytes != 0 &&
+		    rowgroup_plan.runtime_policy.decision == JpegDctRuntimePolicyDecision::kFullRowgroup &&
+		    dense_rowgroup_bytes <= decoded_cache_capacity_bytes) {
+			earlier_full_decode_miss_ordinal.emplace(rowgroup_plan.rowgroup_index, miss_ordinal);
+		}
+		++miss_ordinal;
+	}
+	if (!config.enabled) {
+		plan.disabled_by_config = !shard.rowgroups.empty();
+		plan.rowgroup_indices.clear();
+		return plan;
+	}
+	if (effective_decode_batch_rowgroups == 0) {
+		plan.disabled_by_small_batch_count = plan.candidate_rowgroup_count != 0;
+		plan.rowgroup_indices.clear();
+		return plan;
+	}
+	if (plan.candidate_rowgroup_count == 0) {
+		plan.disabled_by_all_hits =
+		    !shard.rowgroups.empty() && plan.initial_cache_hit_rowgroup_count == shard.rowgroups.size();
+		plan.disabled_by_selected_vector_miss =
+		    !plan.disabled_by_all_hits && plan.selected_vector_miss_rowgroup_count != 0;
+		return plan;
+	}
+
+	const size_t min_batches = std::max<size_t>(1, config.min_decode_batches);
+	const size_t candidate_batches =
+	    (plan.rowgroup_indices.size() + effective_decode_batch_rowgroups - 1U) / effective_decode_batch_rowgroups;
+	// Prefetch only when miss candidates span enough decode batches for CPU IO/materialization
+	// to run behind already-launched GPU work. This is a structural overlap guard, not a dataset threshold.
+	if (candidate_batches < min_batches) {
+		plan.disabled_by_small_batch_count = true;
+		plan.rowgroup_indices.clear();
+		return plan;
+	}
+
+	plan.enabled = true;
+	for (const size_t rowgroup_pos : candidate_positions) {
+		plan.use_prefetch_for_position[rowgroup_pos] = true;
+	}
+	return plan;
+}
+
+inline JpegDctDeviceRowgroupPrefetchPlan
+plan_jpeg_dct_rowgroup_prefetch(const JpegDctDeviceShardPlan&              shard,
+                                const JpegDctDeviceDecodedRowgroupCache*   cache,
+                                const JpegDctDeviceRowgroupPrefetchConfig& config,
+                                const size_t                               effective_decode_batch_rowgroups) {
+	std::vector<bool> cache_hit_by_position(shard.rowgroups.size(), false);
+	for (size_t rowgroup_pos = 0; rowgroup_pos < shard.rowgroups.size(); ++rowgroup_pos) {
+		const auto& rowgroup_plan = shard.rowgroups[rowgroup_pos];
+		const auto  key           = JpegDctDeviceDecodedRowgroupCacheKey {shard.shard_id, rowgroup_plan.rowgroup_index};
+		cache_hit_by_position[rowgroup_pos] = has_decoded_cache_entry(cache, key);
+	}
+	return plan_jpeg_dct_rowgroup_prefetch_from_hits(shard,
+	                                                 cache_hit_by_position,
+	                                                 config,
+	                                                 effective_decode_batch_rowgroups,
+	                                                 cache == nullptr ? 0U : cache->capacity);
+}
 
 JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan plan);
 

@@ -1678,10 +1678,10 @@ struct JpegDctShardDatasetReader::Impl {
 		shards.reserve(manifest.shards.size());
 		for (const auto& entry : manifest.shards) {
 			ShardState state;
-			state.entry         = entry;
-			state.fls_path      = root_dir / entry.fls_file_name;
-			state.metadata_path = root_dir / entry.metadata_file_name;
-			state.metadata      = read_metadata(state.metadata_path);
+			state.entry             = entry;
+			state.fls_path          = root_dir / entry.fls_file_name;
+			state.metadata_path     = root_dir / entry.metadata_file_name;
+			state.metadata          = read_metadata(state.metadata_path);
 			state.rowgroup_n_tuples = derive_rowgroup_n_tuples(state.metadata, entry.rowgroup_count);
 			state.block_group_lookup.reserve(state.metadata.block_group_index.size());
 			for (size_t group_idx = 0; group_idx < state.metadata.block_group_index.size(); ++group_idx) {
@@ -2034,17 +2034,26 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.layout = options.layout;
 		plan.decode_batch_rowgroups =
 		    options.decode_batch_rowgroups == 0 ? kDefaultJpegDctDecodeBatchRowgroups : options.decode_batch_rowgroups;
+		plan.rowgroup_prefetch.enabled = options.enable_rowgroup_prefetch;
+		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0 ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
+		                                                                    : options.rowgroup_prefetch_depth;
+		plan.rowgroup_prefetch.workers            = options.rowgroup_prefetch_workers == 0
+		                                                ? kDefaultJpegDctDeviceRowgroupPrefetchWorkers
+		                                                : options.rowgroup_prefetch_workers;
+		plan.rowgroup_prefetch.min_decode_batches = options.rowgroup_prefetch_min_decode_batches == 0
+		                                                ? kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches
+		                                                : options.rowgroup_prefetch_min_decode_batches;
 		plan.image_layouts.reserve(requests.size());
 		std::unordered_map<RankCursorKey, RankCursor, RankCursorKeyHash> rank_cursors;
-		std::unordered_map<uint32_t, size_t>                              shard_plan_indices;
-		std::vector<std::unordered_map<uint32_t, size_t>>                 rowgroup_plan_indices;
+		std::unordered_map<uint32_t, size_t>                             shard_plan_indices;
+		std::vector<std::unordered_map<uint32_t, size_t>>                rowgroup_plan_indices;
 
 		const auto shard_plan_index_for = [&](const ShardState& shard) -> size_t {
 			const auto found = shard_plan_indices.find(shard.entry.shard_id);
 			if (found != shard_plan_indices.end()) {
 				return found->second;
 			}
-			const size_t shard_plan_index = plan.shards.size();
+			const size_t                   shard_plan_index = plan.shards.size();
 			detail::JpegDctDeviceShardPlan shard_plan;
 			shard_plan.shard_id = shard.entry.shard_id;
 			shard_plan.fls_path = shard.fls_path;
@@ -2054,14 +2063,15 @@ struct JpegDctShardDatasetReader::Impl {
 			return shard_plan_index;
 		};
 
-		const auto rowgroup_plan_index_for = [&](const size_t shard_plan_index, const uint32_t rowgroup_index) -> size_t {
-			auto& rowgroup_indices = rowgroup_plan_indices[shard_plan_index];
-			const auto found       = rowgroup_indices.find(rowgroup_index);
+		const auto rowgroup_plan_index_for = [&](const size_t   shard_plan_index,
+		                                         const uint32_t rowgroup_index) -> size_t {
+			auto&      rowgroup_indices = rowgroup_plan_indices[shard_plan_index];
+			const auto found            = rowgroup_indices.find(rowgroup_index);
 			if (found != rowgroup_indices.end()) {
 				return found->second;
 			}
-			auto& shard_plan = plan.shards[shard_plan_index];
-			const size_t rowgroup_plan_index = shard_plan.rowgroups.size();
+			auto&                             shard_plan          = plan.shards[shard_plan_index];
+			const size_t                      rowgroup_plan_index = shard_plan.rowgroups.size();
 			detail::JpegDctDeviceRowgroupPlan rowgroup_plan;
 			rowgroup_plan.rowgroup_index = rowgroup_index;
 			shard_plan.rowgroups.push_back(std::move(rowgroup_plan));
@@ -2114,9 +2124,10 @@ struct JpegDctShardDatasetReader::Impl {
 						                                                          component.semantic_slot_id,
 						                                                          block_x,
 						                                                          block_y});
-						const auto shard_plan_index    = shard_plan_index_for(shard);
-						const auto rowgroup_plan_index = rowgroup_plan_index_for(shard_plan_index, ref.fls_rowgroup_index);
-						auto&      rowgroup_plan       = plan.shards[shard_plan_index].rowgroups[rowgroup_plan_index];
+						const auto shard_plan_index = shard_plan_index_for(shard);
+						const auto rowgroup_plan_index =
+						    rowgroup_plan_index_for(shard_plan_index, ref.fls_rowgroup_index);
+						auto& rowgroup_plan = plan.shards[shard_plan_index].rowgroups[rowgroup_plan_index];
 						rowgroup_plan.items.push_back(
 						    detail::JpegDctDeviceGatherItem {ref.fls_rowgroup_index,
 						                                     ref.row_start_in_rowgroup + ref.row_offset_in_block_group,
@@ -2141,16 +2152,14 @@ struct JpegDctShardDatasetReader::Impl {
 				if (rowgroup_plan.rowgroup_index >= shard.rowgroup_n_tuples.size()) {
 					throw std::runtime_error("JPEG DCT planned rowgroup exceeds shard rowgroup metadata");
 				}
-				const auto full_vector_count = row_count_to_vector_count(shard.rowgroup_n_tuples[rowgroup_plan.rowgroup_index]);
-				auto selected_vectors =
-				    detail::selected_decode_vectors(
-				        rowgroup_plan.items, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
-				const auto planned_selected_vector_count =
-				    detail::selected_decode_vector_count(
-				        selected_vectors, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
-				const auto selected_chunks_fit =
-				    detail::selected_decode_chunks_fit(
-				        selected_vectors, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
+				const auto full_vector_count =
+				    row_count_to_vector_count(shard.rowgroup_n_tuples[rowgroup_plan.rowgroup_index]);
+				auto selected_vectors = detail::selected_decode_vectors(
+				    rowgroup_plan.items, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
+				const auto planned_selected_vector_count = detail::selected_decode_vector_count(
+				    selected_vectors, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
+				const auto selected_chunks_fit = detail::selected_decode_chunks_fit(
+				    selected_vectors, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
 				const auto runtime_policy = detail::choose_jpeg_dct_runtime_policy(
 				    planned_selected_vector_count, full_vector_count, selected_chunks_fit);
 				rowgroup_plan.selected_vector_count = planned_selected_vector_count;
@@ -2162,7 +2171,7 @@ struct JpegDctShardDatasetReader::Impl {
 					rowgroup_plan.selected_gather_items = detail::remap_items_to_selected_vectors(
 					    rowgroup_plan.items, selected_vectors, detail::kJpegDctDeviceUnpackNVectors);
 				}
-				rowgroup_plan.selected_vectors      = std::move(selected_vectors);
+				rowgroup_plan.selected_vectors = std::move(selected_vectors);
 				plan.planned_selected_vector_count += planned_selected_vector_count;
 				plan.estimated_selected_vector_count +=
 				    runtime_policy.decision == detail::JpegDctRuntimePolicyDecision::kFullRowgroup
@@ -2171,20 +2180,92 @@ struct JpegDctShardDatasetReader::Impl {
 				plan.full_vector_count += full_vector_count;
 			}
 		}
-		plan.planned_saved_vector_count = plan.full_vector_count - plan.planned_selected_vector_count;
+		plan.planned_saved_vector_count   = plan.full_vector_count - plan.planned_selected_vector_count;
 		plan.estimated_saved_vector_count = plan.full_vector_count - plan.estimated_selected_vector_count;
 		plan.planned_selected_vector_ratio =
 		    plan.full_vector_count == 0
 		        ? 0.0
 		        : static_cast<double>(plan.planned_selected_vector_count) / static_cast<double>(plan.full_vector_count);
-		plan.estimated_selected_vector_ratio =
-		    plan.full_vector_count == 0
-		        ? 0.0
-		        : static_cast<double>(plan.estimated_selected_vector_count) / static_cast<double>(plan.full_vector_count);
+		plan.estimated_selected_vector_ratio = plan.full_vector_count == 0
+		                                           ? 0.0
+		                                           : static_cast<double>(plan.estimated_selected_vector_count) /
+		                                                 static_cast<double>(plan.full_vector_count);
 		return plan;
 	}
 
-	void attach_device_runtime_resources(detail::JpegDctDeviceBatchPlan& plan,
+	JpegDctDeviceBatchPlanEstimate estimate_device_batch(const std::vector<JpegDctImageCropRequest>& requests,
+	                                                     const JpegDctDeviceBatchOptions&            options) const {
+		if (options.layout != JpegDctDeviceLayout::kImageMajorComponentBlockCoeff) {
+			throw std::runtime_error("unsupported JPEG DCT device output layout");
+		}
+
+		JpegDctDeviceBatchPlanEstimate estimate;
+		estimate.layout = options.layout;
+		std::unordered_map<uint64_t, size_t> seen_rowgroups;
+
+		const auto add_rowgroup = [&](const ShardState& shard, const uint32_t rowgroup_index) {
+			const auto key = (static_cast<uint64_t>(shard.entry.shard_id) << 32U) | rowgroup_index;
+			if (!seen_rowgroups.emplace(key, estimate.rowgroups.size()).second) {
+				return;
+			}
+			if (rowgroup_index >= shard.rowgroup_n_tuples.size()) {
+				throw std::runtime_error("JPEG DCT estimated rowgroup exceeds shard rowgroup metadata");
+			}
+			estimate.rowgroups.push_back(JpegDctDeviceRowgroupMetadata {shard.entry.shard_id, rowgroup_index});
+			estimate.full_vector_count += row_count_to_vector_count(shard.rowgroup_n_tuples[rowgroup_index]);
+		};
+
+		for (const auto& request : requests) {
+			const auto& shard = shard_for_global_image(request.global_image_index);
+			const auto  local_image_index =
+			    static_cast<uint32_t>(request.global_image_index - shard.entry.first_global_image_index);
+			if (local_image_index >= shard.metadata.images.size()) {
+				throw std::runtime_error("JPEG DCT shard metadata does not contain the requested local image");
+			}
+
+			const auto& image = shard.metadata.images[local_image_index];
+			const auto  crop  = effective_crop_box(image, request.source_crop);
+
+			for (const auto& component : image.components) {
+				if (!component.present || component.width_in_blocks == 0 || component.height_in_blocks == 0) {
+					continue;
+				}
+
+				const uint32_t x0 = std::min(component.width_in_blocks,
+				                             floor_mul_div_u32(crop.x, component.width_in_blocks, image.image_width));
+				const uint32_t y0 = std::min(component.height_in_blocks,
+				                             floor_mul_div_u32(crop.y, component.height_in_blocks, image.image_height));
+				const uint32_t x1 =
+				    std::min(component.width_in_blocks,
+				             ceil_mul_div_u32(crop.x + crop.width, component.width_in_blocks, image.image_width));
+				const uint32_t y1 =
+				    std::min(component.height_in_blocks,
+				             ceil_mul_div_u32(crop.y + crop.height, component.height_in_blocks, image.image_height));
+				for (uint32_t block_y = y0; block_y < y1; ++block_y) {
+					for (uint32_t block_x = x0; block_x < x1; ++block_x) {
+						const auto* group =
+						    find_group_or_null(shard, component.semantic_slot_id, block_x, block_y);
+						if (group == nullptr) {
+							throw std::runtime_error("JPEG DCT block group was not found in shard metadata");
+						}
+
+						++estimate.block_count;
+						add_rowgroup(shard, group->fls_rowgroup_index);
+					}
+				}
+			}
+		}
+
+		std::sort(estimate.rowgroups.begin(), estimate.rowgroups.end(), [](const auto& lhs, const auto& rhs) {
+			if (lhs.shard_id != rhs.shard_id) {
+				return lhs.shard_id < rhs.shard_id;
+			}
+			return lhs.rowgroup_index < rhs.rowgroup_index;
+		});
+		return estimate;
+	}
+
+	void attach_device_runtime_resources(detail::JpegDctDeviceBatchPlan&  plan,
 	                                     const JpegDctDeviceBatchOptions& options) const {
 		if (!device_scratch) {
 			device_scratch = detail::make_jpeg_dct_device_scratch();
@@ -2205,7 +2286,7 @@ struct JpegDctShardDatasetReader::Impl {
 	std::filesystem::path                                              root_dir;
 	JpegDctShardManifest                                               manifest;
 	std::vector<ShardState>                                            shards;
-	std::shared_ptr<const uint8_t>                                      plan_owner_token = std::make_shared<uint8_t>(0);
+	std::shared_ptr<const uint8_t>                                     plan_owner_token = std::make_shared<uint8_t>(0);
 	mutable std::unique_ptr<detail::JpegDctDeviceDecodedRowgroupCache> device_cache;
 	mutable detail::JpegDctDeviceScratchPtr                            device_scratch;
 };
@@ -2229,9 +2310,9 @@ struct JpegDctDeviceBatchPreparedPlan::Impl {
 	    , owner_token(std::move(owner_token_in)) {
 	}
 
-	detail::JpegDctDeviceBatchPlan  plan;
-	JpegDctDeviceBatchOptions       options;
-	std::shared_ptr<const uint8_t>   owner_token;
+	detail::JpegDctDeviceBatchPlan plan;
+	JpegDctDeviceBatchOptions      options;
+	std::shared_ptr<const uint8_t> owner_token;
 };
 
 JpegDctDeviceBatchPreparedPlan::JpegDctDeviceBatchPreparedPlan() noexcept = default;
@@ -2329,10 +2410,10 @@ JpegDctShardDatasetReader::PlanDeviceDctBatch(const std::vector<JpegDctImageCrop
 	const auto plan_end   = std::chrono::steady_clock::now();
 
 	JpegDctDeviceBatchPlanPreview preview;
-	preview.layout         = plan.layout;
-	preview.image_layouts  = std::move(plan.image_layouts);
-	preview.block_metadata = std::move(plan.block_metadata);
-	preview.rowgroups      = std::move(plan.rowgroups);
+	preview.layout                          = plan.layout;
+	preview.image_layouts                   = std::move(plan.image_layouts);
+	preview.block_metadata                  = std::move(plan.block_metadata);
+	preview.rowgroups                       = std::move(plan.rowgroups);
 	preview.planned_selected_vector_count   = plan.planned_selected_vector_count;
 	preview.estimated_selected_vector_count = plan.estimated_selected_vector_count;
 	preview.full_vector_count               = plan.full_vector_count;
@@ -2344,6 +2425,19 @@ JpegDctShardDatasetReader::PlanDeviceDctBatch(const std::vector<JpegDctImageCrop
 	return preview;
 }
 
+JpegDctDeviceBatchPlanEstimate
+JpegDctShardDatasetReader::EstimateDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
+                                                  const JpegDctDeviceBatchOptions&            options) const {
+	if (impl_ == nullptr) {
+		throw std::runtime_error("JPEG DCT shard dataset reader is not initialized");
+	}
+	const auto estimate_start = std::chrono::steady_clock::now();
+	auto       estimate       = impl_->estimate_device_batch(requests, options);
+	const auto estimate_end   = std::chrono::steady_clock::now();
+	estimate.planning_ms = std::chrono::duration<double, std::milli>(estimate_end - estimate_start).count();
+	return estimate;
+}
+
 JpegDctDeviceBatchPreparedPlan
 JpegDctShardDatasetReader::PrepareDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
                                                  const JpegDctDeviceBatchOptions&            options) {
@@ -2353,7 +2447,7 @@ JpegDctShardDatasetReader::PrepareDeviceDctBatch(const std::vector<JpegDctImageC
 	const auto plan_start = std::chrono::steady_clock::now();
 	auto       plan       = impl_->plan_device_batch(requests, options);
 	const auto plan_end   = std::chrono::steady_clock::now();
-	plan.planning_ms = std::chrono::duration<double, std::milli>(plan_end - plan_start).count();
+	plan.planning_ms      = std::chrono::duration<double, std::milli>(plan_end - plan_start).count();
 	return JpegDctDeviceBatchPreparedPlan(
 	    std::make_unique<JpegDctDeviceBatchPreparedPlan::Impl>(std::move(plan), options, impl_->plan_owner_token));
 }
