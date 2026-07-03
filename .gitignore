@@ -36,6 +36,7 @@ data/dct_blocks/
 /galp/scripts/*
 !/galp/scripts/codegen/
 !/galp/scripts/codegen/**
+scripts/my_tool
 #########################################
 # Editor temporary/working/backup files #
 .#*
