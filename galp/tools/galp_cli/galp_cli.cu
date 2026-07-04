@@ -822,6 +822,8 @@ int main(int argc, char** argv) {
 				if (!result.auto_policy_reason.empty()) {
 					std::cout << "  auto_policy_reason: " << result.auto_policy_reason << "\n";
 				}
+				std::cout << "  auto_policy_fast_gate_windows: " << result.auto_policy_fast_gate_windows << "\n";
+				std::cout << "  auto_policy_estimate_windows: " << result.auto_policy_estimate_windows << "\n";
 				std::cout << "  auto_policy_selected_blocks: " << result.auto_policy_selected_blocks << "\n";
 				std::cout << "  auto_policy_full_blocks: " << result.auto_policy_full_blocks << "\n";
 				std::cout << "  auto_policy_selected_block_ratio: " << result.auto_policy_selected_block_ratio << "\n";

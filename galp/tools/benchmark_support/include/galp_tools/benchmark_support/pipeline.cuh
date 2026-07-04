@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -35,6 +36,7 @@ constexpr double kAutoMinAvgFullBlocksPerRowgroup                   = 1024.0;
 constexpr double kAutoMaxTinyRowgroupPushdownBlockRatio             = 0.30;
 constexpr double kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio   = 0.40;
 constexpr double kAutoMinSelectedVectorRatioWhenWorksetsDoNotShrink = 0.50;
+constexpr double kAutoMinMetadataFastPushdownAvgBlocksPerImage       = 64.0;
 
 enum class AutoPipelinePolicyReason {
 	EmptyWindow,
@@ -215,6 +217,77 @@ inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(con
 	return decision;
 }
 
+inline AutoPipelinePolicyDecision make_auto_pipeline_fast_policy_decision(const size_t                   selected_blocks,
+                                                                          const size_t                   full_blocks,
+                                                                          const size_t                   image_count,
+                                                                          const bool                     use_pushdown,
+                                                                          const AutoPipelinePolicyReason reason) {
+	AutoPipelinePolicyDecision decision;
+	decision.use_pushdown         = use_pushdown;
+	decision.reason_code          = reason;
+	decision.selected_block_ratio = full_blocks == 0 ? 0.0
+	                                                 : static_cast<double>(selected_blocks) /
+	                                                       static_cast<double>(full_blocks);
+	// The fast path intentionally avoids vector/rowgroup planning. Use block ratio
+	// as the fast decision proxy and mark the reason so summaries do not treat it
+	// as a precise vector estimate.
+	decision.selected_vector_ratio           = decision.selected_block_ratio;
+	decision.touched_rowgroup_ratio          = 0.0;
+	decision.avg_full_blocks_per_rowgroup    = 0.0;
+	decision.estimated_pushdown_worksets     = image_count == 0 ? 0U : 1U;
+	decision.estimated_full_worksets         = image_count == 0 ? 0U : 1U;
+	decision.estimated_pushdown_gather_items = selected_blocks;
+	decision.estimated_full_gather_items     = full_blocks;
+	decision.reason                          = format_auto_pipeline_policy_reason(decision) + ",metadata_fast=1";
+	return decision;
+}
+
+inline std::optional<AutoPipelinePolicyDecision>
+choose_auto_pipeline_policy_from_block_estimate(const size_t selected_blocks,
+                                                const size_t full_blocks,
+                                                const size_t image_count) {
+	const double selected_block_ratio =
+	    full_blocks == 0 ? 0.0 : static_cast<double>(selected_blocks) / static_cast<double>(full_blocks);
+	const double avg_full_blocks_per_image =
+	    image_count == 0 ? 0.0 : static_cast<double>(full_blocks) / static_cast<double>(image_count);
+
+	if (full_blocks == 0 || selected_blocks == 0) {
+		return make_auto_pipeline_fast_policy_decision(
+		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::EmptyWindow);
+	}
+	if (selected_blocks >= full_blocks || selected_block_ratio >= 0.95) {
+		return make_auto_pipeline_fast_policy_decision(
+		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::CropCoversFullWindow);
+	}
+	if (full_blocks < kAutoMinFullWindowBlocksForGeneralPushdown) {
+		return make_auto_pipeline_fast_policy_decision(
+		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
+	}
+	// Pushdown decisions depend on selected-vector and workset estimates, so
+	// block-only metadata gates only make fast reject decisions.
+	if (selected_block_ratio <= kAutoVerySmallCropBlockRatio) {
+		return std::nullopt;
+	}
+	if (full_blocks >= kAutoLargeFullWindowBlocks &&
+	    selected_block_ratio < kAutoMaxLargeWindowBlockRatio) {
+		return std::nullopt;
+	}
+	if (selected_block_ratio < kAutoMaxSelectedBlockRatio) {
+		return std::nullopt;
+	}
+	if (avg_full_blocks_per_image < kAutoMinMetadataFastPushdownAvgBlocksPerImage) {
+		return make_auto_pipeline_fast_policy_decision(
+		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
+	}
+	if (selected_block_ratio >= kAutoMaxSelectedBlockRatio) {
+		return make_auto_pipeline_fast_policy_decision(
+		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::GatherOutputTooHigh);
+	}
+	// CropSavesEnoughBlocks depends on touched_rowgroup_ratio for tiny rowgroups;
+	// metadata-only block estimates must fall back to the exact plan there.
+	return std::nullopt;
+}
+
 inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_counts(
     const size_t selected_blocks,
     const size_t full_blocks,
@@ -358,6 +431,8 @@ struct PipelineBenchmarkResult {
 	double                       auto_policy_ms              = 0.0;
 	double                       auto_total_ms               = 0.0;
 	std::string                  auto_policy_reason;
+	size_t                       auto_policy_fast_gate_windows                 = 0;
+	size_t                       auto_policy_estimate_windows                  = 0;
 	size_t                       auto_policy_selected_blocks                    = 0;
 	size_t                       auto_policy_full_blocks                        = 0;
 	size_t                       auto_policy_selected_vectors                   = 0;

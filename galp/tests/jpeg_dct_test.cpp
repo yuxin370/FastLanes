@@ -734,6 +734,7 @@ TEST(JpegDct, RuntimePolicyUsesVectorPushdownOnlyForMeaningfulSavings) {
 
 TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 	using galp::execution::detail::AutoPipelinePolicyReason;
+	using galp::execution::detail::choose_auto_pipeline_policy_from_block_estimate;
 	using galp::execution::detail::choose_auto_pipeline_policy_from_counts;
 	using galp::execution::detail::choose_auto_pipeline_policy_from_estimates;
 
@@ -844,6 +845,54 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		EXPECT_EQ(policy.estimated_full_worksets, 1U);
 		EXPECT_EQ(policy.estimated_pushdown_gather_items, 1000U);
 		EXPECT_EQ(policy.estimated_full_gather_items, 20000U);
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/768, /*full_blocks=*/3072, /*image_count=*/128);
+		ASSERT_TRUE(policy.has_value());
+		EXPECT_FALSE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
+		EXPECT_NE(policy->reason.find("metadata_fast=1"), std::string::npos);
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/32000, /*full_blocks=*/100000, /*image_count=*/128);
+		EXPECT_FALSE(policy.has_value());
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/1000, /*full_blocks=*/200000, /*image_count=*/128);
+		EXPECT_FALSE(policy.has_value());
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/512, /*full_blocks=*/8192, /*image_count=*/256);
+		EXPECT_FALSE(policy.has_value());
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/80000, /*full_blocks=*/100000, /*image_count=*/2000);
+		EXPECT_FALSE(policy.has_value());
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/10000, /*full_blocks=*/20000, /*image_count=*/400);
+		EXPECT_FALSE(policy.has_value());
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/102400, /*full_blocks=*/128000, /*image_count=*/128);
+		EXPECT_FALSE(policy.has_value());
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/3072, /*full_blocks=*/12288, /*image_count=*/128);
+		EXPECT_FALSE(policy.has_value());
+	}
+	{
+		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/10000, /*full_blocks=*/20000, /*image_count=*/128);
+		EXPECT_FALSE(policy.has_value());
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_counts(/*selected_blocks=*/1000,
