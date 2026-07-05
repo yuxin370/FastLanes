@@ -25,6 +25,7 @@ namespace galp::execution {
 
 namespace detail {
 
+constexpr size_t kAutoJpegDctCoefficientCount                       = 64;
 constexpr double kAutoVerySmallCropBlockRatio                       = 0.125;
 constexpr double kAutoMaxLargeWindowBlockRatio                      = 0.85;
 constexpr double kAutoMaxSelectedBlockRatio                         = 0.75;
@@ -36,11 +37,15 @@ constexpr double kAutoMinAvgFullBlocksPerRowgroup                   = 1024.0;
 constexpr double kAutoMaxTinyRowgroupPushdownBlockRatio             = 0.30;
 constexpr double kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio   = 0.40;
 constexpr double kAutoMinSelectedVectorRatioWhenWorksetsDoNotShrink = 0.50;
-constexpr double kAutoMinMetadataFastPushdownAvgBlocksPerImage       = 64.0;
+constexpr double kAutoMinMetadataFastPushdownAvgBlocksPerImage      = 64.0;
+constexpr double kAutoMaxCoefficientPushdownRatio                   = 0.25;
+constexpr size_t kAutoMinCoefficientPushdownBlocks                  = 8U * 1024U * 1024U;
+constexpr size_t kAutoMinCoefficientPushdownSavedCoefficients       = 512U * 1024U * 1024U;
 
 enum class AutoPipelinePolicyReason {
 	EmptyWindow,
 	CropCoversFullWindow,
+	CoefficientSelectionPushdown,
 	VerySmallCrop,
 	SmallWindowFixedOverhead,
 	LargeWindowAmortizesPushdown,
@@ -58,6 +63,8 @@ inline const char* auto_pipeline_policy_reason_name(const AutoPipelinePolicyReas
 		return "empty_window";
 	case AutoPipelinePolicyReason::CropCoversFullWindow:
 		return "crop_covers_full_window";
+	case AutoPipelinePolicyReason::CoefficientSelectionPushdown:
+		return "coefficient_selection_pushdown";
 	case AutoPipelinePolicyReason::VerySmallCrop:
 		return "very_small_crop";
 	case AutoPipelinePolicyReason::SmallWindowFixedOverhead:
@@ -217,17 +224,57 @@ inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(con
 	return decision;
 }
 
-inline AutoPipelinePolicyDecision make_auto_pipeline_fast_policy_decision(const size_t                   selected_blocks,
-                                                                          const size_t                   full_blocks,
-                                                                          const size_t                   image_count,
-                                                                          const bool                     use_pushdown,
+inline AutoPipelinePolicyDecision
+choose_auto_coefficient_selection_policy_from_estimates(const size_t selected_blocks,
+                                                        const size_t full_blocks,
+                                                        const size_t touched_rowgroups,
+                                                        const size_t full_rowgroups,
+                                                        const size_t selected_vectors,
+                                                        const size_t full_vectors,
+                                                        const size_t estimated_pushdown_worksets,
+                                                        const size_t estimated_full_worksets,
+                                                        const size_t selected_coefficients) {
+	auto         decision          = choose_auto_pipeline_policy_from_estimates(selected_blocks,
+                                                               full_blocks,
+                                                               touched_rowgroups,
+                                                               full_rowgroups,
+                                                               selected_vectors,
+                                                               full_vectors,
+                                                               estimated_pushdown_worksets,
+                                                               estimated_full_worksets);
+	const size_t full_coefficients = kAutoJpegDctCoefficientCount;
+	const double selected_ratio =
+	    full_coefficients == 0 ? 1.0
+	                           : static_cast<double>(selected_coefficients) / static_cast<double>(full_coefficients);
+	const size_t saved_coefficients_per_block =
+	    full_coefficients > selected_coefficients ? full_coefficients - selected_coefficients : 0U;
+	const bool saves_enough_coefficients =
+	    saved_coefficients_per_block != 0U &&
+	    selected_blocks >= (kAutoMinCoefficientPushdownSavedCoefficients + saved_coefficients_per_block - 1U) /
+	                           saved_coefficients_per_block;
+	if (selected_coefficients != 0U && selected_coefficients < full_coefficients &&
+	    selected_ratio <= kAutoMaxCoefficientPushdownRatio && selected_blocks >= kAutoMinCoefficientPushdownBlocks &&
+	    saves_enough_coefficients) {
+		decision.use_pushdown = true;
+		decision.reason_code  = AutoPipelinePolicyReason::CoefficientSelectionPushdown;
+	} else if (!decision.use_pushdown) {
+		decision.use_pushdown = false;
+		decision.reason_code  = AutoPipelinePolicyReason::SavingsTooSmall;
+	}
+	decision.reason = format_auto_pipeline_policy_reason(decision);
+	return decision;
+}
+
+inline AutoPipelinePolicyDecision make_auto_pipeline_fast_policy_decision(const size_t selected_blocks,
+                                                                          const size_t full_blocks,
+                                                                          const size_t image_count,
+                                                                          const bool   use_pushdown,
                                                                           const AutoPipelinePolicyReason reason) {
 	AutoPipelinePolicyDecision decision;
-	decision.use_pushdown         = use_pushdown;
-	decision.reason_code          = reason;
-	decision.selected_block_ratio = full_blocks == 0 ? 0.0
-	                                                 : static_cast<double>(selected_blocks) /
-	                                                       static_cast<double>(full_blocks);
+	decision.use_pushdown = use_pushdown;
+	decision.reason_code  = reason;
+	decision.selected_block_ratio =
+	    full_blocks == 0 ? 0.0 : static_cast<double>(selected_blocks) / static_cast<double>(full_blocks);
 	// The fast path intentionally avoids vector/rowgroup planning. Use block ratio
 	// as the fast decision proxy and mark the reason so summaries do not treat it
 	// as a precise vector estimate.
@@ -242,10 +289,8 @@ inline AutoPipelinePolicyDecision make_auto_pipeline_fast_policy_decision(const 
 	return decision;
 }
 
-inline std::optional<AutoPipelinePolicyDecision>
-choose_auto_pipeline_policy_from_block_estimate(const size_t selected_blocks,
-                                                const size_t full_blocks,
-                                                const size_t image_count) {
+inline std::optional<AutoPipelinePolicyDecision> choose_auto_pipeline_policy_from_block_estimate(
+    const size_t selected_blocks, const size_t full_blocks, const size_t image_count) {
 	const double selected_block_ratio =
 	    full_blocks == 0 ? 0.0 : static_cast<double>(selected_blocks) / static_cast<double>(full_blocks);
 	const double avg_full_blocks_per_image =
@@ -268,8 +313,7 @@ choose_auto_pipeline_policy_from_block_estimate(const size_t selected_blocks,
 	if (selected_block_ratio <= kAutoVerySmallCropBlockRatio) {
 		return std::nullopt;
 	}
-	if (full_blocks >= kAutoLargeFullWindowBlocks &&
-	    selected_block_ratio < kAutoMaxLargeWindowBlockRatio) {
+	if (full_blocks >= kAutoLargeFullWindowBlocks && selected_block_ratio < kAutoMaxLargeWindowBlockRatio) {
 		return std::nullopt;
 	}
 	if (selected_block_ratio < kAutoMaxSelectedBlockRatio) {
@@ -316,18 +360,20 @@ enum class PipelineBenchmarkMode {
 	FullThenCrop,
 	Compare,
 	Auto,
+	DctCompare,
 };
 
 struct PipelineBenchmarkConfig {
-	std::vector<uint32_t>      image_ids;
-	galp::jpeg::JpegDctCropBox crop {};
-	PipelineBenchmarkMode      mode                      = PipelineBenchmarkMode::Compare;
-	size_t                     window_images             = 256;
-	size_t                     cache_capacity_bytes      = 0;
-	size_t                     decode_batch_rowgroups    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
-	bool                       enable_rowgroup_prefetch  = true;
-	size_t                     rowgroup_prefetch_depth   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth;
-	size_t                     rowgroup_prefetch_workers = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
+	std::vector<uint32_t>                   image_ids;
+	galp::jpeg::JpegDctCropBox              crop {};
+	galp::jpeg::JpegDctCoefficientSelection coefficient_selection {};
+	PipelineBenchmarkMode                   mode                     = PipelineBenchmarkMode::Compare;
+	size_t                                  window_images            = 256;
+	size_t                                  cache_capacity_bytes     = 0;
+	size_t                                  decode_batch_rowgroups   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
+	bool                                    enable_rowgroup_prefetch = true;
+	size_t rowgroup_prefetch_depth              = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth;
+	size_t rowgroup_prefetch_workers            = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
 	size_t rowgroup_prefetch_min_decode_batches = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches;
 	bool   verify_outputs                       = true;
 };
@@ -337,8 +383,15 @@ struct PipelineBenchmarkStageResult {
 	size_t      requests                                      = 0;
 	size_t      input_blocks                                  = 0;
 	size_t      output_blocks                                 = 0;
+	size_t      selected_coefficient_count                    = 64;
+	size_t      full_coefficient_count                        = 64;
+	double      selected_coefficient_ratio                    = 1.0;
+	size_t      coefficients_per_block                        = 64;
 	size_t      output_coefficients                           = 0;
 	size_t      output_bytes                                  = 0;
+	size_t      decoded_coefficients_per_block                = 64;
+	size_t      decoded_coefficients                          = 0;
+	size_t      decoded_bytes                                 = 0;
 	size_t      rowgroup_visits                               = 0;
 	size_t      unique_rowgroups                              = 0;
 	size_t      repeated_rowgroups                            = 0;
@@ -361,6 +414,7 @@ struct PipelineBenchmarkStageResult {
 	size_t      workset_count                                 = 0;
 	size_t      decode_kernel_launch_count                    = 0;
 	size_t      gather_kernel_launch_count                    = 0;
+	size_t      prefix_gather_kernel_launch_count             = 0;
 	size_t      cached_gather_kernel_launch_count             = 0;
 	size_t      materialize_kernel_launch_count               = 0;
 	size_t      gather_item_count                             = 0;
@@ -426,13 +480,14 @@ struct PipelineBenchmarkResult {
 	PipelineBenchmarkMode        mode           = PipelineBenchmarkMode::Compare;
 	PipelineBenchmarkStageResult pushdown;
 	PipelineBenchmarkStageResult full_then_crop;
+	PipelineBenchmarkStageResult dct_post_decode;
 	size_t                       auto_pushdown_windows       = 0;
 	size_t                       auto_full_then_crop_windows = 0;
 	double                       auto_policy_ms              = 0.0;
 	double                       auto_total_ms               = 0.0;
 	std::string                  auto_policy_reason;
-	size_t                       auto_policy_fast_gate_windows                 = 0;
-	size_t                       auto_policy_estimate_windows                  = 0;
+	size_t                       auto_policy_fast_gate_windows                  = 0;
+	size_t                       auto_policy_estimate_windows                   = 0;
 	size_t                       auto_policy_selected_blocks                    = 0;
 	size_t                       auto_policy_full_blocks                        = 0;
 	size_t                       auto_policy_selected_vectors                   = 0;
@@ -453,6 +508,7 @@ struct PipelineBenchmarkResult {
 	double                       auto_policy_avg_full_blocks_per_rowgroup       = 0.0;
 	size_t                       auto_policy_empty_windows                      = 0;
 	size_t                       auto_policy_crop_covers_full_windows           = 0;
+	size_t                       auto_policy_coefficient_pushdown_windows       = 0;
 	size_t                       auto_policy_very_small_crop_windows            = 0;
 	size_t                       auto_policy_small_window_full_windows          = 0;
 	size_t                       auto_policy_large_window_pushdown_windows      = 0;

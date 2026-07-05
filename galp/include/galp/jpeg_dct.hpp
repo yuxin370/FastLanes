@@ -12,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace galp::jpeg {
@@ -168,6 +169,19 @@ enum class JpegDctDeviceLayout {
 	kImageMajorComponentBlockCoeff,
 };
 
+struct JpegDctCoefficientSelection {
+	std::vector<uint8_t> coefficients;
+
+	[[nodiscard]] bool empty() const noexcept {
+		return coefficients.empty();
+	}
+	[[nodiscard]] size_t size() const noexcept {
+		return coefficients.empty() ? 64U : coefficients.size();
+	}
+};
+
+[[nodiscard]] bool parse_jpeg_dct_coefficient_selection(std::string_view spec, JpegDctCoefficientSelection& selection);
+
 struct JpegDctShardOptions {
 	size_t             shard_images                  = 8192;
 	uint32_t           rowgroup_vectors              = 128;
@@ -255,6 +269,7 @@ struct JpegDctDeviceBatchOptions {
 	size_t rowgroup_prefetch_depth              = kDefaultJpegDctDeviceRowgroupPrefetchDepth;
 	size_t rowgroup_prefetch_workers            = kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
 	size_t rowgroup_prefetch_min_decode_batches = kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches;
+	JpegDctCoefficientSelection coefficient_selection {};
 };
 
 struct JpegDctDeviceImageLayout {
@@ -296,6 +311,7 @@ struct JpegDctDeviceExecutionStats {
 	size_t      workset_count                                 = 0;
 	size_t      decode_kernel_launch_count                    = 0;
 	size_t      gather_kernel_launch_count                    = 0;
+	size_t      prefix_gather_kernel_launch_count             = 0;
 	size_t      cached_gather_kernel_launch_count             = 0;
 	size_t      materialize_kernel_launch_count               = 0;
 	size_t      gather_item_count                             = 0;
@@ -357,6 +373,8 @@ struct JpegDctDeviceBatchPlanPreview {
 	size_t                                     full_vector_count               = 0;
 	size_t                                     planned_saved_vector_count      = 0;
 	size_t                                     estimated_saved_vector_count    = 0;
+	std::vector<uint8_t>                       selected_coefficients;
+	size_t                                     coefficients_per_block          = 64;
 	double                                     planned_selected_vector_ratio   = 0.0;
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;
@@ -393,6 +411,8 @@ public:
 	[[nodiscard]] size_t                                            full_vector_count() const noexcept;
 	[[nodiscard]] size_t                                            planned_saved_vector_count() const noexcept;
 	[[nodiscard]] size_t                                            estimated_saved_vector_count() const noexcept;
+	[[nodiscard]] const std::vector<uint8_t>&                       selected_coefficients() const noexcept;
+	[[nodiscard]] size_t                                            coefficients_per_block() const noexcept;
 	[[nodiscard]] double                                            planned_selected_vector_ratio() const noexcept;
 	[[nodiscard]] double                                            estimated_selected_vector_ratio() const noexcept;
 	[[nodiscard]] double                                            planning_ms() const noexcept;
@@ -418,6 +438,7 @@ public:
 	[[nodiscard]] const int16_t*                                    device_coefficients() const noexcept;
 	[[nodiscard]] size_t                                            coefficient_count() const noexcept;
 	[[nodiscard]] size_t                                            coefficient_bytes() const noexcept;
+	[[nodiscard]] size_t                                            coefficients_per_block() const noexcept;
 	[[nodiscard]] size_t                                            block_count() const noexcept;
 	[[nodiscard]] size_t                                            image_count() const noexcept;
 	[[nodiscard]] size_t                                            rowgroup_count() const noexcept;
@@ -427,6 +448,7 @@ public:
 	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&    block_metadata() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;
+	[[nodiscard]] const std::vector<uint8_t>&                       selected_coefficients() const noexcept;
 
 private:
 	std::unique_ptr<Impl> impl_;

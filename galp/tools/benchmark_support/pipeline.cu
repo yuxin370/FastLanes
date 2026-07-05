@@ -151,9 +151,8 @@ size_t component_block_count_for_crop(const galp::jpeg::JpegImageMetadata&     i
 	    std::min(component.width_in_blocks, floor_mul_div_u32(crop.x, component.width_in_blocks, image.image_width));
 	const uint32_t y0 =
 	    std::min(component.height_in_blocks, floor_mul_div_u32(crop.y, component.height_in_blocks, image.image_height));
-	const uint32_t x1 =
-	    std::min(component.width_in_blocks,
-	             ceil_mul_div_u32(crop.x + crop.width, component.width_in_blocks, image.image_width));
+	const uint32_t x1 = std::min(component.width_in_blocks,
+	                             ceil_mul_div_u32(crop.x + crop.width, component.width_in_blocks, image.image_width));
 	const uint32_t y1 =
 	    std::min(component.height_in_blocks,
 	             ceil_mul_div_u32(crop.y + crop.height, component.height_in_blocks, image.image_height));
@@ -161,10 +160,10 @@ size_t component_block_count_for_crop(const galp::jpeg::JpegImageMetadata&     i
 }
 
 AutoBlockEstimate estimate_auto_blocks_from_metadata(galp::jpeg::JpegDctShardDatasetReader& reader,
-                                                     const std::vector<uint32_t>&            image_ids,
-                                                     const size_t                            begin,
-                                                     const size_t                            end,
-                                                     const galp::jpeg::JpegDctCropBox&       crop) {
+                                                     const std::vector<uint32_t>&           image_ids,
+                                                     const size_t                           begin,
+                                                     const size_t                           end,
+                                                     const galp::jpeg::JpegDctCropBox&      crop) {
 	AutoBlockEstimate estimate;
 	estimate.image_count = end - begin;
 	for (size_t i = begin; i < end; ++i) {
@@ -198,6 +197,17 @@ std::vector<int16_t> copy_coefficients_to_host(const galp::jpeg::JpegDctDeviceBa
 		    host.data(), batch.device_coefficients(), host.size() * sizeof(int16_t), cudaMemcpyDeviceToHost));
 	}
 	return host;
+}
+
+void update_stage_coefficient_stats(PipelineBenchmarkStageResult& stage,
+                                    const size_t                  output_coefficients_per_block,
+                                    const size_t                  decoded_coefficients_per_block) {
+	stage.coefficients_per_block     = output_coefficients_per_block;
+	stage.selected_coefficient_count = output_coefficients_per_block;
+	stage.full_coefficient_count     = galp::jpeg::detail::kJpegDctCoefficientCount;
+	stage.selected_coefficient_ratio = static_cast<double>(output_coefficients_per_block) /
+	                                   static_cast<double>(galp::jpeg::detail::kJpegDctCoefficientCount);
+	stage.decoded_coefficients_per_block = decoded_coefficients_per_block;
 }
 
 void accumulate_cache_stats(PipelineBenchmarkStageResult& stage, const galp::jpeg::JpegDctDeviceBatch& batch) {
@@ -250,6 +260,7 @@ void accumulate_execution_stats(PipelineBenchmarkStageResult& stage, const galp:
 	stage.workset_count += stats.workset_count;
 	stage.decode_kernel_launch_count += stats.decode_kernel_launch_count;
 	stage.gather_kernel_launch_count += stats.gather_kernel_launch_count;
+	stage.prefix_gather_kernel_launch_count += stats.prefix_gather_kernel_launch_count;
 	stage.cached_gather_kernel_launch_count += stats.cached_gather_kernel_launch_count;
 	stage.materialize_kernel_launch_count += stats.materialize_kernel_launch_count;
 	stage.gather_item_count += stats.gather_item_count;
@@ -343,20 +354,35 @@ choose_auto_pipeline_policy(const galp::jpeg::JpegDctDeviceBatchPreparedPlan& cr
 	    detail::estimate_auto_worksets_for_rowgroups(full_estimate.rowgroups, decode_batch_rowgroups));
 }
 
+detail::AutoPipelinePolicyDecision
+make_auto_coefficient_selection_policy_decision(const galp::jpeg::JpegDctDeviceBatchPreparedPlan& coefficient_plan,
+                                                const galp::jpeg::JpegDctDeviceBatchPlanEstimate& full_estimate,
+                                                const size_t decode_batch_rowgroups) {
+	return detail::choose_auto_coefficient_selection_policy_from_estimates(
+	    coefficient_plan.block_metadata().size(),
+	    full_estimate.block_count,
+	    coefficient_plan.rowgroups().size(),
+	    full_estimate.rowgroups.size(),
+	    coefficient_plan.estimated_selected_vector_count(),
+	    full_estimate.full_vector_count,
+	    detail::estimate_auto_worksets_for_rowgroups(coefficient_plan.rowgroups(), decode_batch_rowgroups),
+	    detail::estimate_auto_worksets_for_rowgroups(full_estimate.rowgroups, decode_batch_rowgroups),
+	    coefficient_plan.coefficients_per_block());
+}
+
 void refresh_auto_pipeline_policy_ratios(PipelineBenchmarkResult& result) {
-	result.auto_policy_selected_block_ratio = result.auto_policy_full_blocks == 0
-	                                              ? 0.0
-	                                              : static_cast<double>(result.auto_policy_selected_blocks) /
-	                                                    static_cast<double>(result.auto_policy_full_blocks);
-	result.auto_policy_selected_vector_ratio = result.auto_policy_full_vectors == 0
-	                                               ? 0.0
-	                                               : static_cast<double>(result.auto_policy_selected_vectors) /
-	                                                     static_cast<double>(result.auto_policy_full_vectors);
-	result.auto_policy_touched_rowgroup_ratio =
-	    result.auto_policy_full_rowgroups == 0
-	        ? 0.0
-	        : static_cast<double>(result.auto_policy_touched_rowgroups) /
-	              static_cast<double>(result.auto_policy_full_rowgroups);
+	result.auto_policy_selected_block_ratio   = result.auto_policy_full_blocks == 0
+	                                                ? 0.0
+	                                                : static_cast<double>(result.auto_policy_selected_blocks) /
+                                                        static_cast<double>(result.auto_policy_full_blocks);
+	result.auto_policy_selected_vector_ratio  = result.auto_policy_full_vectors == 0
+	                                                ? 0.0
+	                                                : static_cast<double>(result.auto_policy_selected_vectors) /
+                                                         static_cast<double>(result.auto_policy_full_vectors);
+	result.auto_policy_touched_rowgroup_ratio = result.auto_policy_full_rowgroups == 0
+	                                                ? 0.0
+	                                                : static_cast<double>(result.auto_policy_touched_rowgroups) /
+	                                                      static_cast<double>(result.auto_policy_full_rowgroups);
 	result.auto_policy_pushdown_reuse_candidate_ratio =
 	    result.auto_policy_touched_rowgroups == 0
 	        ? 0.0
@@ -444,6 +470,9 @@ void record_auto_pipeline_policy_reason(PipelineBenchmarkResult&               r
 	case detail::AutoPipelinePolicyReason::CropCoversFullWindow:
 		++result.auto_policy_crop_covers_full_windows;
 		break;
+	case detail::AutoPipelinePolicyReason::CoefficientSelectionPushdown:
+		++result.auto_policy_coefficient_pushdown_windows;
+		break;
 	case detail::AutoPipelinePolicyReason::VerySmallCrop:
 		++result.auto_policy_very_small_crop_windows;
 		break;
@@ -479,11 +508,14 @@ void accumulate_pushdown_window(PipelineBenchmarkStageResult&            stage,
                                 const double                             read_decode_ms,
                                 std::set<std::pair<uint32_t, uint32_t>>& seen_rowgroups) {
 	++stage.windows;
+	update_stage_coefficient_stats(stage, batch.coefficients_per_block(), batch.coefficients_per_block());
 	stage.requests += batch.image_count();
 	stage.input_blocks += batch.block_count();
 	stage.output_blocks += batch.block_count();
 	stage.output_coefficients += batch.coefficient_count();
 	stage.output_bytes += batch.coefficient_bytes();
+	stage.decoded_coefficients += batch.coefficient_count();
+	stage.decoded_bytes += batch.coefficient_bytes();
 	stage.peak_window_images        = std::max(stage.peak_window_images, batch.image_count());
 	stage.peak_window_input_blocks  = std::max(stage.peak_window_input_blocks, batch.block_count());
 	stage.peak_window_output_blocks = std::max(stage.peak_window_output_blocks, batch.block_count());
@@ -494,23 +526,28 @@ void accumulate_pushdown_window(PipelineBenchmarkStageResult&            stage,
 	accumulate_rowgroups(stage, batch, seen_rowgroups);
 }
 
-void accumulate_full_then_crop_window(PipelineBenchmarkStageResult&            stage,
-                                      const galp::jpeg::JpegDctDeviceBatch&    batch,
-                                      const size_t                             output_blocks,
-                                      const double                             plan_ms,
-                                      const double                             read_decode_ms,
-                                      const double                             transform_ms,
-                                      std::set<std::pair<uint32_t, uint32_t>>& seen_rowgroups) {
+void accumulate_projected_window(PipelineBenchmarkStageResult&            stage,
+                                 const galp::jpeg::JpegDctDeviceBatch&    batch,
+                                 const size_t                             output_blocks,
+                                 const size_t                             output_coefficients_per_block,
+                                 const double                             plan_ms,
+                                 const double                             read_decode_ms,
+                                 const double                             transform_ms,
+                                 std::set<std::pair<uint32_t, uint32_t>>& seen_rowgroups) {
 	++stage.windows;
+	update_stage_coefficient_stats(stage, output_coefficients_per_block, batch.coefficients_per_block());
 	stage.requests += batch.image_count();
 	stage.input_blocks += batch.block_count();
 	stage.output_blocks += output_blocks;
-	stage.output_coefficients += output_blocks * 64U;
-	stage.output_bytes += output_blocks * 64U * sizeof(int16_t);
+	stage.output_coefficients += output_blocks * output_coefficients_per_block;
+	stage.output_bytes += output_blocks * output_coefficients_per_block * sizeof(int16_t);
+	stage.decoded_coefficients += batch.coefficient_count();
+	stage.decoded_bytes += batch.coefficient_bytes();
 	stage.peak_window_images        = std::max(stage.peak_window_images, batch.image_count());
 	stage.peak_window_input_blocks  = std::max(stage.peak_window_input_blocks, batch.block_count());
 	stage.peak_window_output_blocks = std::max(stage.peak_window_output_blocks, output_blocks);
-	stage.peak_window_output_bytes  = std::max(stage.peak_window_output_bytes, output_blocks * 64U * sizeof(int16_t));
+	stage.peak_window_output_bytes =
+	    std::max(stage.peak_window_output_bytes, output_blocks * output_coefficients_per_block * sizeof(int16_t));
 	stage.plan_ms += plan_ms;
 	stage.read_decode_ms += read_decode_ms;
 	stage.transform_ms += transform_ms;
@@ -589,23 +626,34 @@ std::vector<size_t> crop_full_batch_to_requested_blocks(galp::jpeg::JpegDctShard
 	return selected;
 }
 
-void verify_equal_blocks(const galp::jpeg::JpegDctDeviceBatch& pushdown,
-                         const galp::jpeg::JpegDctDeviceBatch& full,
+void verify_equal_blocks(const galp::jpeg::JpegDctDeviceBatch& selected,
+                         const galp::jpeg::JpegDctDeviceBatch& reference,
                          const std::vector<size_t>&            selected_full_blocks) {
-	if (pushdown.block_count() != selected_full_blocks.size()) {
-		throw std::runtime_error("pushdown and full-then-crop block counts differ");
+	if (selected.block_count() != selected_full_blocks.size()) {
+		throw std::runtime_error("selected and reference DCT block counts differ");
 	}
-	const auto push_host = copy_coefficients_to_host(pushdown);
-	const auto full_host = copy_coefficients_to_host(full);
+	const auto& selected_coefficients = selected.selected_coefficients();
+	if (selected_coefficients.empty() || selected.coefficients_per_block() != selected_coefficients.size()) {
+		throw std::runtime_error("selected DCT coefficient metadata does not match output layout");
+	}
+	if (reference.coefficients_per_block() != galp::jpeg::detail::kJpegDctCoefficientCount) {
+		throw std::runtime_error("reference batch must expose all 64 DCT coefficients for subset validation");
+	}
+	const auto selected_host  = copy_coefficients_to_host(selected);
+	const auto reference_host = copy_coefficients_to_host(reference);
 	for (size_t block_idx = 0; block_idx < selected_full_blocks.size(); ++block_idx) {
 		const auto full_block_idx = selected_full_blocks[block_idx];
-		const auto push_offset    = block_idx * 64U;
-		const auto full_offset    = full_block_idx * 64U;
-		if (push_offset + 64U > push_host.size() || full_offset + 64U > full_host.size()) {
+		const auto push_offset    = block_idx * selected.coefficients_per_block();
+		const auto full_offset    = full_block_idx * reference.coefficients_per_block();
+		if (push_offset + selected.coefficients_per_block() > selected_host.size() ||
+		    full_offset + reference.coefficients_per_block() > reference_host.size()) {
 			throw std::runtime_error("DCT coefficient validation encountered an out-of-range block");
 		}
-		if (std::memcmp(push_host.data() + push_offset, full_host.data() + full_offset, 64U * sizeof(int16_t)) != 0) {
-			throw std::runtime_error("pushdown and full-then-crop DCT coefficients differ");
+		for (size_t coeff_slot = 0; coeff_slot < selected_coefficients.size(); ++coeff_slot) {
+			const auto coeff_idx = selected_coefficients[coeff_slot];
+			if (selected_host[push_offset + coeff_slot] != reference_host[full_offset + coeff_idx]) {
+				throw std::runtime_error("selected and reference DCT coefficient subset differ");
+			}
 		}
 	}
 }
@@ -625,16 +673,30 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 	auto                                  image_ids = resolve_image_ids(metadata_reader, cfg.image_ids);
 
 	PipelineBenchmarkResult result;
-	result.dataset_images = metadata_reader.image_count();
-	result.mode           = cfg.mode;
+	result.dataset_images            = metadata_reader.image_count();
+	result.mode                      = cfg.mode;
+	const auto selected_coefficients = galp::jpeg::detail::normalize_coefficient_selection(cfg.coefficient_selection);
+	const bool has_coefficient_selection = !galp::jpeg::detail::selects_all_coefficients(selected_coefficients);
+	if (cfg.mode == PipelineBenchmarkMode::DctCompare && !has_coefficient_selection) {
+		throw std::invalid_argument("pipeline benchmark dct-compare mode requires a DCT coefficient subset");
+	}
 
-	galp::jpeg::JpegDctDeviceBatchOptions batch_options;
-	batch_options.cache_capacity_bytes                 = cfg.cache_capacity_bytes;
-	batch_options.decode_batch_rowgroups               = cfg.decode_batch_rowgroups;
-	batch_options.enable_rowgroup_prefetch             = cfg.enable_rowgroup_prefetch;
-	batch_options.rowgroup_prefetch_depth              = cfg.rowgroup_prefetch_depth;
-	batch_options.rowgroup_prefetch_workers            = cfg.rowgroup_prefetch_workers;
-	batch_options.rowgroup_prefetch_min_decode_batches = cfg.rowgroup_prefetch_min_decode_batches;
+	galp::jpeg::JpegDctDeviceBatchOptions pushdown_batch_options;
+	pushdown_batch_options.cache_capacity_bytes                 = cfg.cache_capacity_bytes;
+	pushdown_batch_options.decode_batch_rowgroups               = cfg.decode_batch_rowgroups;
+	pushdown_batch_options.coefficient_selection                = cfg.coefficient_selection;
+	pushdown_batch_options.enable_rowgroup_prefetch             = cfg.enable_rowgroup_prefetch;
+	pushdown_batch_options.rowgroup_prefetch_depth              = cfg.rowgroup_prefetch_depth;
+	pushdown_batch_options.rowgroup_prefetch_workers            = cfg.rowgroup_prefetch_workers;
+	pushdown_batch_options.rowgroup_prefetch_min_decode_batches = cfg.rowgroup_prefetch_min_decode_batches;
+
+	galp::jpeg::JpegDctDeviceBatchOptions baseline_batch_options;
+	baseline_batch_options.cache_capacity_bytes                 = cfg.cache_capacity_bytes;
+	baseline_batch_options.decode_batch_rowgroups               = cfg.decode_batch_rowgroups;
+	baseline_batch_options.enable_rowgroup_prefetch             = cfg.enable_rowgroup_prefetch;
+	baseline_batch_options.rowgroup_prefetch_depth              = cfg.rowgroup_prefetch_depth;
+	baseline_batch_options.rowgroup_prefetch_workers            = cfg.rowgroup_prefetch_workers;
+	baseline_batch_options.rowgroup_prefetch_min_decode_batches = cfg.rowgroup_prefetch_min_decode_batches;
 
 	std::set<std::pair<uint32_t, uint32_t>> pushdown_rowgroups;
 	std::set<std::pair<uint32_t, uint32_t>> baseline_rowgroups;
@@ -643,27 +705,125 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 	const bool run_pushdown = cfg.mode == PipelineBenchmarkMode::Pushdown || cfg.mode == PipelineBenchmarkMode::Compare;
 	const bool run_baseline =
 	    cfg.mode == PipelineBenchmarkMode::FullThenCrop || cfg.mode == PipelineBenchmarkMode::Compare;
-	const bool run_auto = cfg.mode == PipelineBenchmarkMode::Auto;
+	const bool run_auto        = cfg.mode == PipelineBenchmarkMode::Auto;
+	const bool run_dct_compare = cfg.mode == PipelineBenchmarkMode::DctCompare;
 
 	std::unique_ptr<galp::jpeg::JpegDctShardDatasetReader> pushdown_reader;
 	std::unique_ptr<galp::jpeg::JpegDctShardDatasetReader> baseline_reader;
-	if (run_pushdown || (run_auto && has_crop(cfg.crop))) {
+	if (run_pushdown || run_dct_compare || (run_auto && (has_crop(cfg.crop) || has_coefficient_selection))) {
 		pushdown_reader = std::make_unique<galp::jpeg::JpegDctShardDatasetReader>(manifest_path);
 	}
-	if (run_baseline || run_auto) {
+	if (run_baseline || run_dct_compare || run_auto) {
 		baseline_reader = std::make_unique<galp::jpeg::JpegDctShardDatasetReader>(manifest_path);
 	}
 
 	for (size_t begin = 0; begin < image_ids.size(); begin += cfg.window_images) {
 		const size_t end = std::min(image_ids.size(), begin + cfg.window_images);
 
+		if (run_dct_compare) {
+			auto requests = make_requests(image_ids, begin, end, cfg.crop);
+
+			const auto push_plan_start = Clock::now();
+			auto       push_plan       = pushdown_reader->PrepareDeviceDctBatch(requests, pushdown_batch_options);
+			const auto push_plan_end   = Clock::now();
+			const auto push_read_start = Clock::now();
+			auto       push_batch      = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(push_plan));
+			const auto push_read_end   = Clock::now();
+			result.pushdown.plan_ms +=
+			    external_plan_overhead_ms(elapsed_ms(push_plan_start, push_plan_end), push_batch);
+			accumulate_pushdown_window(
+			    result.pushdown, push_batch, elapsed_ms(push_read_start, push_read_end), pushdown_rowgroups);
+
+			const auto post_plan_start = Clock::now();
+			auto       post_plan       = baseline_reader->PrepareDeviceDctBatch(requests, baseline_batch_options);
+			const auto post_plan_end   = Clock::now();
+			const auto post_read_start = Clock::now();
+			auto       post_batch      = baseline_reader->ReadPreparedDeviceDctBatch(std::move(post_plan));
+			const auto post_read_end   = Clock::now();
+
+			const auto          transform_start      = Clock::now();
+			std::vector<size_t> selected_post_blocks = crop_full_batch_to_pushdown_blocks(push_batch, post_batch);
+			const auto          transform_end        = Clock::now();
+
+			accumulate_projected_window(
+			    result.dct_post_decode,
+			    post_batch,
+			    selected_post_blocks.size(),
+			    selected_coefficients.size(),
+			    external_plan_overhead_ms(elapsed_ms(post_plan_start, post_plan_end), post_batch),
+			    elapsed_ms(post_read_start, post_read_end),
+			    elapsed_ms(transform_start, transform_end),
+			    baseline_rowgroups);
+
+			if (cfg.verify_outputs) {
+				const auto verify_start = Clock::now();
+				try {
+					verify_equal_blocks(push_batch, post_batch, selected_post_blocks);
+				} catch (const std::exception& e) {
+					result.outputs_match = false;
+					result.mismatch      = e.what();
+				}
+				const auto verify_end = Clock::now();
+				result.verify_ms += elapsed_ms(verify_start, verify_end);
+			}
+			continue;
+		}
+
 		if (run_auto) {
 			if (!has_crop(cfg.crop)) {
 				const auto auto_policy_start = Clock::now();
 				auto       full_requests     = make_requests(image_ids, begin, end, galp::jpeg::JpegDctCropBox {});
-				auto       full_plan         = baseline_reader->PrepareDeviceDctBatch(full_requests, batch_options);
+				if (has_coefficient_selection) {
+					auto coefficient_plan =
+					    pushdown_reader->PrepareDeviceDctBatch(full_requests, pushdown_batch_options);
+					auto full_estimate = baseline_reader->EstimateDeviceDctBatch(full_requests, baseline_batch_options);
+					const auto decision = make_auto_coefficient_selection_policy_decision(
+					    coefficient_plan, full_estimate, pushdown_batch_options.decode_batch_rowgroups);
+					const auto auto_policy_end = Clock::now();
+					const auto auto_policy_ms  = elapsed_ms(auto_policy_start, auto_policy_end);
+					result.auto_policy_ms += auto_policy_ms;
+					result.auto_policy_reason = decision.reason;
+					++result.auto_policy_estimate_windows;
+					accumulate_auto_pipeline_policy_plan(result,
+					                                     coefficient_plan,
+					                                     full_estimate,
+					                                     decision,
+					                                     auto_pushdown_policy_rowgroups,
+					                                     auto_full_policy_rowgroups);
+					record_auto_pipeline_policy_reason(result, decision.reason_code);
+
+					if (decision.use_pushdown) {
+						++result.auto_pushdown_windows;
+						const auto read_start  = Clock::now();
+						auto coefficient_batch = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(coefficient_plan));
+						const auto read_end    = Clock::now();
+						result.pushdown.plan_ms += external_plan_overhead_ms(auto_policy_ms, coefficient_batch);
+						accumulate_pushdown_window(
+						    result.pushdown, coefficient_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
+					} else {
+						++result.auto_full_then_crop_windows;
+						const auto plan_start = Clock::now();
+						auto       full_plan  = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
+						const auto plan_end   = Clock::now();
+						const auto read_start = Clock::now();
+						auto       full_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
+						const auto read_end   = Clock::now();
+
+						accumulate_projected_window(result.full_then_crop,
+						                            full_batch,
+						                            full_batch.block_count(),
+						                            selected_coefficients.size(),
+						                            external_plan_overhead_ms(auto_policy_ms + elapsed_ms(plan_start, plan_end),
+						                                                      full_batch),
+						                            elapsed_ms(read_start, read_end),
+						                            0.0,
+						                            baseline_rowgroups);
+					}
+					continue;
+				}
+				auto       full_plan = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
 				const auto decision =
-				    choose_auto_pipeline_policy(full_plan, full_plan, batch_options.decode_batch_rowgroups);
+				    choose_auto_pipeline_policy(full_plan, full_plan, baseline_batch_options.decode_batch_rowgroups);
 				const auto auto_policy_end = Clock::now();
 				const auto auto_policy_ms  = elapsed_ms(auto_policy_start, auto_policy_end);
 				result.auto_policy_ms += auto_policy_ms;
@@ -679,13 +839,14 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 
 				const size_t output_blocks = full_batch.block_count();
 
-				accumulate_full_then_crop_window(result.full_then_crop,
-				                                 full_batch,
-				                                 output_blocks,
-				                                 external_plan_overhead_ms(auto_policy_ms, full_batch),
-				                                 elapsed_ms(read_start, read_end),
-				                                 0.0,
-				                                 baseline_rowgroups);
+				accumulate_projected_window(result.full_then_crop,
+				                            full_batch,
+				                            output_blocks,
+				                            selected_coefficients.size(),
+				                            external_plan_overhead_ms(auto_policy_ms, full_batch),
+				                            elapsed_ms(read_start, read_end),
+				                            0.0,
+				                            baseline_rowgroups);
 				continue;
 			}
 
@@ -696,7 +857,7 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 			    block_estimate.selected_blocks, block_estimate.full_blocks, block_estimate.image_count);
 			const auto fast_policy_end = Clock::now();
 			const auto fast_policy_ms  = elapsed_ms(fast_policy_start, fast_policy_end);
-			if (fast_decision.has_value()) {
+			if (fast_decision.has_value() && !has_coefficient_selection) {
 				result.auto_policy_ms += fast_policy_ms;
 				result.auto_policy_reason = fast_decision->reason;
 				++result.auto_policy_fast_gate_windows;
@@ -707,11 +868,11 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 					++result.auto_pushdown_windows;
 					const auto plan_start    = Clock::now();
 					auto       push_requests = make_requests(image_ids, begin, end, cfg.crop);
-					auto       crop_plan     = pushdown_reader->PrepareDeviceDctBatch(push_requests, batch_options);
+					auto       crop_plan     = pushdown_reader->PrepareDeviceDctBatch(push_requests, pushdown_batch_options);
 					const auto plan_end      = Clock::now();
-					const auto read_start    = Clock::now();
-					auto       push_batch    = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(crop_plan));
-					const auto read_end      = Clock::now();
+					const auto read_start = Clock::now();
+					auto       push_batch = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(crop_plan));
+					const auto read_end   = Clock::now();
 					result.pushdown.plan_ms +=
 					    external_plan_overhead_ms(fast_policy_ms + elapsed_ms(plan_start, plan_end), push_batch);
 					accumulate_pushdown_window(
@@ -720,25 +881,26 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 					++result.auto_full_then_crop_windows;
 					const auto plan_start    = Clock::now();
 					auto       full_requests = make_requests(image_ids, begin, end, galp::jpeg::JpegDctCropBox {});
-					auto       full_plan     = baseline_reader->PrepareDeviceDctBatch(full_requests, batch_options);
+					auto       full_plan     = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
 					const auto plan_end      = Clock::now();
-					const auto read_start    = Clock::now();
-					auto       full_batch    = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
-					const auto read_end      = Clock::now();
+					const auto read_start = Clock::now();
+					auto       full_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
+					const auto read_end   = Clock::now();
 
 					const auto          transform_start = Clock::now();
 					std::vector<size_t> selected_full_blocks =
 					    crop_full_batch_to_requested_blocks(*baseline_reader, full_batch, cfg.crop);
 					const auto transform_end = Clock::now();
 
-					accumulate_full_then_crop_window(result.full_then_crop,
-					                                 full_batch,
-					                                 selected_full_blocks.size(),
-					                                 external_plan_overhead_ms(
-					                                     fast_policy_ms + elapsed_ms(plan_start, plan_end), full_batch),
-					                                 elapsed_ms(read_start, read_end),
-					                                 elapsed_ms(transform_start, transform_end),
-					                                 baseline_rowgroups);
+					accumulate_projected_window(
+					    result.full_then_crop,
+					    full_batch,
+					    selected_full_blocks.size(),
+					    selected_coefficients.size(),
+					    external_plan_overhead_ms(fast_policy_ms + elapsed_ms(plan_start, plan_end), full_batch),
+					    elapsed_ms(read_start, read_end),
+					    elapsed_ms(transform_start, transform_end),
+					    baseline_rowgroups);
 				}
 				continue;
 			}
@@ -746,10 +908,13 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 			const auto auto_policy_start = Clock::now();
 			auto       push_requests     = make_requests(image_ids, begin, end, cfg.crop);
 			auto       full_requests     = make_requests(image_ids, begin, end, galp::jpeg::JpegDctCropBox {});
-			auto       crop_plan         = pushdown_reader->PrepareDeviceDctBatch(push_requests, batch_options);
-			auto       full_estimate     = baseline_reader->EstimateDeviceDctBatch(full_requests, batch_options);
+			auto       crop_plan         = pushdown_reader->PrepareDeviceDctBatch(push_requests, pushdown_batch_options);
+			auto       full_estimate     = baseline_reader->EstimateDeviceDctBatch(full_requests, baseline_batch_options);
 			const auto decision =
-			    choose_auto_pipeline_policy(crop_plan, full_estimate, batch_options.decode_batch_rowgroups);
+			    has_coefficient_selection
+			        ? make_auto_coefficient_selection_policy_decision(
+			              crop_plan, full_estimate, pushdown_batch_options.decode_batch_rowgroups)
+			        : choose_auto_pipeline_policy(crop_plan, full_estimate, pushdown_batch_options.decode_batch_rowgroups);
 			const auto auto_policy_end = Clock::now();
 			const auto auto_policy_ms  = fast_policy_ms + elapsed_ms(auto_policy_start, auto_policy_end);
 			result.auto_policy_ms += auto_policy_ms;
@@ -770,7 +935,7 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 			} else {
 				++result.auto_full_then_crop_windows;
 				const auto plan_start = Clock::now();
-				auto       full_plan  = baseline_reader->PrepareDeviceDctBatch(full_requests, batch_options);
+				auto       full_plan  = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
 				const auto plan_end   = Clock::now();
 				const auto read_start = Clock::now();
 				auto       full_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
@@ -781,14 +946,15 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 				    crop_full_batch_to_requested_blocks(*baseline_reader, full_batch, cfg.crop);
 				const auto transform_end = Clock::now();
 
-				accumulate_full_then_crop_window(result.full_then_crop,
-				                                 full_batch,
-				                                 selected_full_blocks.size(),
-				                                 external_plan_overhead_ms(
-				                                     auto_policy_ms + elapsed_ms(plan_start, plan_end), full_batch),
-				                                 elapsed_ms(read_start, read_end),
-				                                 elapsed_ms(transform_start, transform_end),
-				                                 baseline_rowgroups);
+				accumulate_projected_window(
+				    result.full_then_crop,
+				    full_batch,
+				    selected_full_blocks.size(),
+				    selected_coefficients.size(),
+				    external_plan_overhead_ms(auto_policy_ms + elapsed_ms(plan_start, plan_end), full_batch),
+				    elapsed_ms(read_start, read_end),
+				    elapsed_ms(transform_start, transform_end),
+				    baseline_rowgroups);
 			}
 			continue;
 		}
@@ -797,7 +963,7 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 		if (run_pushdown) {
 			const auto plan_start    = Clock::now();
 			auto       push_requests = make_requests(image_ids, begin, end, cfg.crop);
-			auto       push_plan     = pushdown_reader->PrepareDeviceDctBatch(push_requests, batch_options);
+			auto       push_plan     = pushdown_reader->PrepareDeviceDctBatch(push_requests, pushdown_batch_options);
 			const auto plan_end      = Clock::now();
 			const auto read_start    = Clock::now();
 			pushdown_batch           = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(push_plan));
@@ -810,7 +976,7 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 		if (run_baseline) {
 			const auto plan_start    = Clock::now();
 			auto       full_requests = make_requests(image_ids, begin, end, galp::jpeg::JpegDctCropBox {});
-			auto       full_plan     = baseline_reader->PrepareDeviceDctBatch(full_requests, batch_options);
+			auto       full_plan     = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
 			const auto plan_end      = Clock::now();
 			const auto read_start    = Clock::now();
 			auto       full_batch    = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
@@ -825,13 +991,14 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 			}
 			const auto transform_end = Clock::now();
 
-			accumulate_full_then_crop_window(result.full_then_crop,
-			                                 full_batch,
-			                                 selected_full_blocks.size(),
-			                                 external_plan_overhead_ms(elapsed_ms(plan_start, plan_end), full_batch),
-			                                 elapsed_ms(read_start, read_end),
-			                                 elapsed_ms(transform_start, transform_end),
-			                                 baseline_rowgroups);
+			accumulate_projected_window(result.full_then_crop,
+			                            full_batch,
+			                            selected_full_blocks.size(),
+			                            selected_coefficients.size(),
+			                            external_plan_overhead_ms(elapsed_ms(plan_start, plan_end), full_batch),
+			                            elapsed_ms(read_start, read_end),
+			                            elapsed_ms(transform_start, transform_end),
+			                            baseline_rowgroups);
 
 			if (cfg.verify_outputs && run_pushdown) {
 				const auto verify_start = Clock::now();
@@ -851,6 +1018,8 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 	                           result.pushdown.sink_ms;
 	result.full_then_crop.total_ms = result.full_then_crop.plan_ms + result.full_then_crop.read_decode_ms +
 	                                 result.full_then_crop.transform_ms + result.full_then_crop.sink_ms;
+	result.dct_post_decode.total_ms = result.dct_post_decode.plan_ms + result.dct_post_decode.read_decode_ms +
+	                                  result.dct_post_decode.transform_ms + result.dct_post_decode.sink_ms;
 	if (run_auto) {
 		// Each selected auto window folds its policy/prepared-plan time into the chosen stage's plan_ms.
 		result.auto_total_ms = result.pushdown.total_ms + result.full_then_crop.total_ms;

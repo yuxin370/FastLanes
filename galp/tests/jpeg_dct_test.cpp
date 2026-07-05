@@ -146,6 +146,15 @@ ShardManifestHeader read_shard_manifest_header(const std::filesystem::path& path
 	return header;
 }
 
+std::vector<uint8_t> all_dct_coefficients() {
+	std::vector<uint8_t> coefficients;
+	coefficients.reserve(galp::jpeg::detail::kJpegDctCoefficientCount);
+	for (uint8_t coeff = 0; coeff < galp::jpeg::detail::kJpegDctCoefficientCount; ++coeff) {
+		coefficients.push_back(coeff);
+	}
+	return coefficients;
+}
+
 TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {
 	galp::jpeg::JpegDctReaderOptions options {galp::jpeg::JpegComponentMode::kSingleComponent,
 	                                          0,
@@ -179,6 +188,8 @@ TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {
 	EXPECT_EQ(default_batch_options.layout, galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff);
 	EXPECT_EQ(default_batch_options.cache_capacity_bytes, 0U);
 	EXPECT_EQ(default_batch_options.decode_batch_rowgroups, galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups);
+	EXPECT_TRUE(default_batch_options.coefficient_selection.empty());
+	EXPECT_EQ(default_batch_options.coefficient_selection.size(), galp::jpeg::detail::kJpegDctCoefficientCount);
 	EXPECT_TRUE(default_batch_options.enable_rowgroup_prefetch);
 	EXPECT_EQ(default_batch_options.rowgroup_prefetch_depth, galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth);
 	EXPECT_EQ(default_batch_options.rowgroup_prefetch_workers,
@@ -191,6 +202,102 @@ TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {
 	EXPECT_EQ(legacy_batch_options.cache_capacity_bytes, 4096U);
 	EXPECT_EQ(legacy_batch_options.decode_batch_rowgroups, galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups);
 	EXPECT_TRUE(legacy_batch_options.enable_rowgroup_prefetch);
+
+	galp::jpeg::JpegDctDeviceBatchOptions legacy_prefetch_options {
+	    galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff, 4096U, 8U, false, 2U, 3U, 4U};
+	EXPECT_EQ(legacy_prefetch_options.cache_capacity_bytes, 4096U);
+	EXPECT_EQ(legacy_prefetch_options.decode_batch_rowgroups, 8U);
+	EXPECT_FALSE(legacy_prefetch_options.enable_rowgroup_prefetch);
+	EXPECT_EQ(legacy_prefetch_options.rowgroup_prefetch_depth, 2U);
+	EXPECT_EQ(legacy_prefetch_options.rowgroup_prefetch_workers, 3U);
+	EXPECT_EQ(legacy_prefetch_options.rowgroup_prefetch_min_decode_batches, 4U);
+	EXPECT_TRUE(legacy_prefetch_options.coefficient_selection.empty());
+}
+
+TEST(JpegDct, DctCoefficientSelectionParserAndNormalization) {
+	galp::jpeg::JpegDctCoefficientSelection selection;
+
+	ASSERT_TRUE(galp::jpeg::parse_jpeg_dct_coefficient_selection("all", selection));
+	EXPECT_TRUE(selection.coefficients.empty());
+	EXPECT_EQ(galp::jpeg::detail::normalize_coefficient_selection(selection), all_dct_coefficients());
+
+	ASSERT_TRUE(galp::jpeg::parse_jpeg_dct_coefficient_selection("first:3", selection));
+	EXPECT_EQ(selection.coefficients, (std::vector<uint8_t> {0U, 1U, 2U}));
+	EXPECT_EQ(galp::jpeg::detail::normalize_coefficient_selection(selection), (std::vector<uint8_t> {0U, 1U, 2U}));
+
+	ASSERT_TRUE(galp::jpeg::parse_jpeg_dct_coefficient_selection("list:5,0,2", selection));
+	const std::vector<uint8_t> listed {5U, 0U, 2U};
+	EXPECT_EQ(selection.coefficients, listed);
+	EXPECT_EQ(galp::jpeg::detail::normalize_coefficient_selection(selection), listed);
+
+	EXPECT_FALSE(galp::jpeg::parse_jpeg_dct_coefficient_selection("first:0", selection));
+	EXPECT_FALSE(galp::jpeg::parse_jpeg_dct_coefficient_selection("first:65", selection));
+	EXPECT_FALSE(galp::jpeg::parse_jpeg_dct_coefficient_selection("list:", selection));
+	EXPECT_FALSE(galp::jpeg::parse_jpeg_dct_coefficient_selection("list:1,1", selection));
+	EXPECT_FALSE(galp::jpeg::parse_jpeg_dct_coefficient_selection("list:64", selection));
+	EXPECT_FALSE(galp::jpeg::parse_jpeg_dct_coefficient_selection("list:1,,2", selection));
+	EXPECT_FALSE(galp::jpeg::parse_jpeg_dct_coefficient_selection("0,1,2", selection));
+	EXPECT_EQ(selection.coefficients, listed);
+
+	galp::jpeg::JpegDctCoefficientSelection duplicate_selection;
+	duplicate_selection.coefficients = {1U, 1U};
+	EXPECT_THROW((void)galp::jpeg::detail::normalize_coefficient_selection(duplicate_selection), std::invalid_argument);
+	galp::jpeg::JpegDctCoefficientSelection out_of_range_selection;
+	out_of_range_selection.coefficients = {64U};
+	EXPECT_THROW((void)galp::jpeg::detail::normalize_coefficient_selection(out_of_range_selection), std::out_of_range);
+}
+
+TEST(JpegDct, ClassifiesNormalizedDctCoefficientSelectionShapes) {
+	const auto all = galp::jpeg::detail::normalize_coefficient_selection(galp::jpeg::JpegDctCoefficientSelection {});
+	const auto all_shape = galp::jpeg::detail::classify_coefficient_selection(all);
+	EXPECT_EQ(all_shape.kind, galp::jpeg::detail::JpegDctCoefficientSelectionKind::kAll);
+	EXPECT_EQ(all_shape.count, galp::jpeg::detail::kJpegDctCoefficientCount);
+	EXPECT_TRUE(all_shape.is_contiguous_prefix());
+
+	galp::jpeg::JpegDctCoefficientSelection prefix_selection;
+	prefix_selection.coefficients = {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U};
+	const auto prefix             = galp::jpeg::detail::normalize_coefficient_selection(prefix_selection);
+	const auto prefix_shape       = galp::jpeg::detail::classify_coefficient_selection(prefix);
+	EXPECT_EQ(prefix_shape.kind, galp::jpeg::detail::JpegDctCoefficientSelectionKind::kPrefix);
+	EXPECT_EQ(prefix_shape.count, 8U);
+	EXPECT_TRUE(prefix_shape.is_contiguous_prefix());
+
+	galp::jpeg::JpegDctCoefficientSelection list_selection;
+	list_selection.coefficients = {0U, 2U, 5U};
+	const auto list             = galp::jpeg::detail::normalize_coefficient_selection(list_selection);
+	const auto list_shape       = galp::jpeg::detail::classify_coefficient_selection(list);
+	EXPECT_EQ(list_shape.kind, galp::jpeg::detail::JpegDctCoefficientSelectionKind::kList);
+	EXPECT_EQ(list_shape.count, 3U);
+	EXPECT_FALSE(list_shape.is_contiguous_prefix());
+}
+
+TEST(JpegDct, DctGatherLayoutCompressesCoefficientAxisBySelectedSlotOrder) {
+	const std::vector<uint8_t> selected_coefficients {5U, 0U, 2U};
+	const size_t               coefficients_per_block = selected_coefficients.size();
+	const size_t               block_count            = 2;
+
+	std::vector<int16_t> full(block_count * galp::jpeg::detail::kJpegDctCoefficientCount);
+	for (size_t block_idx = 0; block_idx < block_count; ++block_idx) {
+		for (size_t coeff_idx = 0; coeff_idx < galp::jpeg::detail::kJpegDctCoefficientCount; ++coeff_idx) {
+			full[block_idx * galp::jpeg::detail::kJpegDctCoefficientCount + coeff_idx] =
+			    static_cast<int16_t>(block_idx * 100U + coeff_idx);
+		}
+	}
+
+	std::vector<int16_t> gathered(block_count * coefficients_per_block);
+	for (size_t block_idx = 0; block_idx < block_count; ++block_idx) {
+		for (size_t coeff_slot = 0; coeff_slot < coefficients_per_block; ++coeff_slot) {
+			const auto coeff_idx = selected_coefficients[coeff_slot];
+			gathered[galp::jpeg::detail::selected_dct_output_offset(block_idx, coeff_slot, coefficients_per_block)] =
+			    full[block_idx * galp::jpeg::detail::kJpegDctCoefficientCount + coeff_idx];
+		}
+	}
+
+	EXPECT_EQ(galp::jpeg::detail::selected_dct_binding_offset(0, 0, coefficients_per_block), 0U);
+	EXPECT_EQ(galp::jpeg::detail::selected_dct_binding_offset(1, 2, coefficients_per_block), 5U);
+	EXPECT_EQ(galp::jpeg::detail::selected_dct_output_offset(0, 2, coefficients_per_block), 2U);
+	EXPECT_EQ(galp::jpeg::detail::selected_dct_output_offset(1, 0, coefficients_per_block), 3U);
+	EXPECT_EQ(gathered, (std::vector<int16_t> {5, 0, 2, 105, 100, 102}));
 }
 
 TEST(JpegDct, DatasetReadPreservesImageMetadata) {
@@ -354,7 +461,9 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 	ASSERT_EQ(batch.layout(), galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff);
 	ASSERT_EQ(batch.image_count(), requests.size());
 	ASSERT_NE(batch.device_coefficients(), nullptr);
-	ASSERT_EQ(batch.coefficient_count(), batch.block_count() * 64U);
+	ASSERT_EQ(batch.coefficients_per_block(), galp::jpeg::detail::kJpegDctCoefficientCount);
+	ASSERT_EQ(batch.selected_coefficients(), all_dct_coefficients());
+	ASSERT_EQ(batch.coefficient_count(), batch.block_count() * batch.coefficients_per_block());
 	ASSERT_EQ(batch.image_layouts().size(), requests.size());
 	ASSERT_EQ(batch.block_metadata().size(), batch.block_count());
 	ASSERT_EQ(batch.rowgroups().size(), batch.rowgroup_count());
@@ -364,26 +473,169 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 	EXPECT_EQ(batch.image_layouts()[1].block_offset, batch.image_layouts()[0].block_count);
 	EXPECT_GT(batch.image_layouts()[1].block_count, 0U);
 
-	std::vector<int16_t> host(batch.coefficient_count());
-	ASSERT_EQ(cudaMemcpy(host.data(), batch.device_coefficients(), batch.coefficient_bytes(), cudaMemcpyDeviceToHost),
-	          cudaSuccess);
+	const auto expect_batch_matches_materialized = [&](const galp::jpeg::JpegDctDeviceBatch& batch_to_check) {
+		ASSERT_EQ(batch_to_check.coefficient_count(),
+		          batch_to_check.block_count() * batch_to_check.coefficients_per_block());
+		ASSERT_EQ(batch_to_check.selected_coefficients().size(), batch_to_check.coefficients_per_block());
+		ASSERT_NE(batch_to_check.device_coefficients(), nullptr);
 
-	for (size_t output_block_idx = 0; output_block_idx < batch.block_metadata().size(); ++output_block_idx) {
-		const auto& meta         = batch.block_metadata()[output_block_idx];
-		const auto  materialized = reader.MaterializeImageDct(meta.global_image_index);
-		const auto* expected     = static_cast<const galp::jpeg::MaterializedJpegDctBlock*>(nullptr);
-		for (const auto& block : materialized.blocks) {
-			if (block.semantic_slot_id == meta.semantic_slot_id && block.block_x == meta.block_x &&
-			    block.block_y == meta.block_y) {
-				expected = &block;
-				break;
+		std::vector<int16_t> host(batch_to_check.coefficient_count());
+		ASSERT_EQ(cudaMemcpy(host.data(),
+		                     batch_to_check.device_coefficients(),
+		                     batch_to_check.coefficient_bytes(),
+		                     cudaMemcpyDeviceToHost),
+		          cudaSuccess);
+
+		for (size_t output_block_idx = 0; output_block_idx < batch_to_check.block_metadata().size();
+		     ++output_block_idx) {
+			const auto& meta         = batch_to_check.block_metadata()[output_block_idx];
+			const auto  materialized = reader.MaterializeImageDct(meta.global_image_index);
+			const auto* expected     = static_cast<const galp::jpeg::MaterializedJpegDctBlock*>(nullptr);
+			for (const auto& block : materialized.blocks) {
+				if (block.semantic_slot_id == meta.semantic_slot_id && block.block_x == meta.block_x &&
+				    block.block_y == meta.block_y) {
+					expected = &block;
+					break;
+				}
+			}
+			ASSERT_NE(expected, nullptr);
+			for (size_t coeff_slot = 0; coeff_slot < batch_to_check.coefficients_per_block(); ++coeff_slot) {
+				const auto coeff_idx = batch_to_check.selected_coefficients()[coeff_slot];
+				EXPECT_EQ(host[output_block_idx * batch_to_check.coefficients_per_block() + coeff_slot],
+				          expected->coefficients[coeff_idx]);
 			}
 		}
-		ASSERT_NE(expected, nullptr);
-		for (size_t coeff_idx = 0; coeff_idx < expected->coefficients.size(); ++coeff_idx) {
-			EXPECT_EQ(host[output_block_idx * 64U + coeff_idx], expected->coefficients[coeff_idx]);
-		}
+	};
+
+	expect_batch_matches_materialized(batch);
+
+	galp::jpeg::JpegDctDeviceBatchOptions selected_options;
+	const std::vector<uint8_t>            selected_coefficients {0U, 2U, 5U};
+	selected_options.coefficient_selection.coefficients = selected_coefficients;
+
+	auto selected_crop_batch = reader.ReadDeviceDctBatch(requests, selected_options);
+	ASSERT_EQ(selected_crop_batch.coefficients_per_block(), selected_coefficients.size());
+	ASSERT_EQ(selected_crop_batch.selected_coefficients(), selected_coefficients);
+	ASSERT_EQ(selected_crop_batch.coefficient_count(),
+	          selected_crop_batch.block_count() * selected_coefficients.size());
+	expect_batch_matches_materialized(selected_crop_batch);
+
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> full_image_requests {
+	    galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {}},
+	};
+	auto selected_full_batch = reader.ReadDeviceDctBatch(full_image_requests, selected_options);
+	ASSERT_EQ(selected_full_batch.image_count(), 1U);
+	ASSERT_EQ(selected_full_batch.coefficients_per_block(), selected_coefficients.size());
+	ASSERT_EQ(selected_full_batch.selected_coefficients(), selected_coefficients);
+	ASSERT_EQ(selected_full_batch.coefficient_count(),
+	          selected_full_batch.block_count() * selected_coefficients.size());
+	expect_batch_matches_materialized(selected_full_batch);
+
+	std::filesystem::remove_all(dir);
+}
+
+TEST(JpegDct, PipelineCompareValidatesDctCoefficientSelectionForCropAndFullImage) {
+	int        device_count  = 0;
+	const auto device_status = cudaGetDeviceCount(&device_count);
+	if (device_status != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
 	}
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir =
+	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_pipeline_dct_coeffs_" + std::to_string(suffix));
+	const auto path0 = dir / "input0.jpg";
+	const auto path1 = dir / "input1.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path0, 16, 16);
+	write_test_jpeg(path1, 16, 16);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 2;
+	shard_options.rowgroup_vectors    = 1;
+	shard_options.rowgroups_per_shard = 256;
+	const auto output_dir             = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
+
+	galp::execution::PipelineBenchmarkConfig cfg;
+	cfg.mode                                    = galp::execution::PipelineBenchmarkMode::Compare;
+	cfg.window_images                           = 1;
+	cfg.decode_batch_rowgroups                  = 1;
+	cfg.enable_rowgroup_prefetch                = false;
+	cfg.coefficient_selection.coefficients      = {0U, 2U, 5U};
+	constexpr size_t selected_coefficient_count = 3;
+	constexpr double selected_coefficient_ratio = static_cast<double>(selected_coefficient_count) /
+	                                              static_cast<double>(galp::jpeg::detail::kJpegDctCoefficientCount);
+	const auto assert_selected_compare_stage = [&](const galp::execution::PipelineBenchmarkStageResult& stage) {
+		EXPECT_EQ(stage.coefficients_per_block, selected_coefficient_count);
+		EXPECT_EQ(stage.selected_coefficient_count, selected_coefficient_count);
+		EXPECT_EQ(stage.full_coefficient_count, galp::jpeg::detail::kJpegDctCoefficientCount);
+		EXPECT_DOUBLE_EQ(stage.selected_coefficient_ratio, selected_coefficient_ratio);
+		EXPECT_GT(stage.output_blocks, 0U);
+		EXPECT_EQ(stage.output_coefficients, stage.output_blocks * selected_coefficient_count);
+		EXPECT_EQ(stage.output_bytes, stage.output_coefficients * sizeof(int16_t));
+	};
+	const auto assert_dct_pushdown_stage = [&](const galp::execution::PipelineBenchmarkStageResult& stage) {
+		assert_selected_compare_stage(stage);
+		EXPECT_EQ(stage.decoded_coefficients_per_block, selected_coefficient_count);
+		EXPECT_EQ(stage.decoded_coefficients, stage.output_blocks * selected_coefficient_count);
+		EXPECT_EQ(stage.decoded_bytes, stage.decoded_coefficients * sizeof(int16_t));
+	};
+	const auto assert_post_decode_stage = [&](const galp::execution::PipelineBenchmarkStageResult& stage) {
+		assert_selected_compare_stage(stage);
+		EXPECT_EQ(stage.decoded_coefficients_per_block, galp::jpeg::detail::kJpegDctCoefficientCount);
+		EXPECT_EQ(stage.decoded_coefficients, stage.input_blocks * galp::jpeg::detail::kJpegDctCoefficientCount);
+		EXPECT_EQ(stage.decoded_bytes, stage.decoded_coefficients * sizeof(int16_t));
+	};
+
+	cfg.crop           = galp::jpeg::JpegDctCropBox {0, 0, 8, 8};
+	const auto cropped = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
+	EXPECT_TRUE(cropped.outputs_match) << cropped.mismatch;
+	assert_dct_pushdown_stage(cropped.pushdown);
+	assert_post_decode_stage(cropped.full_then_crop);
+
+	cfg.crop        = galp::jpeg::JpegDctCropBox {};
+	const auto full = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
+	EXPECT_TRUE(full.outputs_match) << full.mismatch;
+	assert_dct_pushdown_stage(full.pushdown);
+	assert_post_decode_stage(full.full_then_crop);
+
+	cfg.mode               = galp::execution::PipelineBenchmarkMode::DctCompare;
+	cfg.crop               = galp::jpeg::JpegDctCropBox {0, 0, 8, 8};
+	const auto dct_compare = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
+	EXPECT_TRUE(dct_compare.outputs_match) << dct_compare.mismatch;
+	EXPECT_EQ(dct_compare.full_then_crop.windows, 0U);
+	EXPECT_GT(dct_compare.pushdown.windows, 0U);
+	EXPECT_GT(dct_compare.dct_post_decode.windows, 0U);
+	assert_dct_pushdown_stage(dct_compare.pushdown);
+	assert_post_decode_stage(dct_compare.dct_post_decode);
+
+	cfg.mode                  = galp::execution::PipelineBenchmarkMode::Auto;
+	cfg.crop                  = galp::jpeg::JpegDctCropBox {};
+	const auto automatic_full = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
+	EXPECT_TRUE(automatic_full.outputs_match) << automatic_full.mismatch;
+	EXPECT_EQ(automatic_full.auto_pushdown_windows, 0U);
+	EXPECT_EQ(automatic_full.auto_full_then_crop_windows, 2U);
+	EXPECT_EQ(automatic_full.auto_policy_coefficient_pushdown_windows, 0U);
+	EXPECT_EQ(automatic_full.auto_policy_savings_too_small_windows, 2U);
+	EXPECT_NE(automatic_full.auto_policy_reason.find("savings_too_small"), std::string::npos);
+	EXPECT_EQ(automatic_full.pushdown.windows, 0U);
+	assert_post_decode_stage(automatic_full.full_then_crop);
+
+	cfg.crop                         = galp::jpeg::JpegDctCropBox {0, 0, 16, 16};
+	const auto automatic_full_crop   = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
+	EXPECT_TRUE(automatic_full_crop.outputs_match) << automatic_full_crop.mismatch;
+	EXPECT_EQ(automatic_full_crop.auto_policy_fast_gate_windows, 0U);
+	EXPECT_EQ(automatic_full_crop.auto_policy_estimate_windows, 2U);
+	EXPECT_EQ(automatic_full_crop.auto_pushdown_windows, 0U);
+	EXPECT_EQ(automatic_full_crop.auto_full_then_crop_windows, 2U);
+	EXPECT_EQ(automatic_full_crop.auto_policy_coefficient_pushdown_windows, 0U);
+	EXPECT_EQ(automatic_full_crop.auto_policy_savings_too_small_windows, 2U);
+	EXPECT_NE(automatic_full_crop.auto_policy_reason.find("savings_too_small"), std::string::npos);
+	EXPECT_EQ(automatic_full_crop.pushdown.windows, 0U);
+	assert_post_decode_stage(automatic_full_crop.full_then_crop);
 
 	std::filesystem::remove_all(dir);
 }
@@ -424,6 +676,37 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsPixelCropsToDctBlocks) {
 	EXPECT_EQ(aligned.estimated_saved_vector_count, 0U);
 	EXPECT_DOUBLE_EQ(aligned.planned_selected_vector_ratio, 1.0);
 	EXPECT_DOUBLE_EQ(aligned.estimated_selected_vector_ratio, 1.0);
+	EXPECT_EQ(aligned.coefficients_per_block, galp::jpeg::detail::kJpegDctCoefficientCount);
+	EXPECT_EQ(aligned.selected_coefficients, all_dct_coefficients());
+
+	galp::jpeg::JpegDctDeviceBatchOptions selected_options;
+	const std::vector<uint8_t>            selected_coefficients {0U, 2U, 5U};
+	selected_options.coefficient_selection.coefficients = selected_coefficients;
+	const auto selected                                 = reader.PlanDeviceDctBatch(
+        {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}}, selected_options);
+	ASSERT_EQ(selected.image_layouts.size(), 1U);
+	EXPECT_EQ(selected.image_layouts[0].block_count, 1U);
+	ASSERT_EQ(selected.block_metadata.size(), 1U);
+	EXPECT_EQ(selected.coefficients_per_block, selected_coefficients.size());
+	EXPECT_EQ(selected.selected_coefficients, selected_coefficients);
+	auto prepared_selected = reader.PrepareDeviceDctBatch(
+	    {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}}, selected_options);
+	EXPECT_FALSE(prepared_selected.empty());
+	EXPECT_EQ(prepared_selected.coefficients_per_block(), selected_coefficients.size());
+	EXPECT_EQ(prepared_selected.selected_coefficients(), selected_coefficients);
+
+	galp::jpeg::JpegDctDeviceBatchOptions duplicate_options;
+	duplicate_options.coefficient_selection.coefficients = {2U, 2U};
+	EXPECT_THROW(
+	    (void)reader.PlanDeviceDctBatch(
+	        {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}}, duplicate_options),
+	    std::invalid_argument);
+	galp::jpeg::JpegDctDeviceBatchOptions out_of_range_options;
+	out_of_range_options.coefficient_selection.coefficients = {64U};
+	EXPECT_THROW(
+	    (void)reader.PlanDeviceDctBatch(
+	        {galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}}, out_of_range_options),
+	    std::out_of_range);
 
 	const auto unaligned =
 	    reader.PlanDeviceDctBatch({galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {4, 4, 8, 8}}});
@@ -734,6 +1017,7 @@ TEST(JpegDct, RuntimePolicyUsesVectorPushdownOnlyForMeaningfulSavings) {
 
 TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 	using galp::execution::detail::AutoPipelinePolicyReason;
+	using galp::execution::detail::choose_auto_coefficient_selection_policy_from_estimates;
 	using galp::execution::detail::choose_auto_pipeline_policy_from_block_estimate;
 	using galp::execution::detail::choose_auto_pipeline_policy_from_counts;
 	using galp::execution::detail::choose_auto_pipeline_policy_from_estimates;
@@ -935,6 +1219,65 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		EXPECT_EQ(policy.estimated_pushdown_worksets, 2U);
 		EXPECT_EQ(policy.estimated_full_worksets, 2U);
 	}
+	{
+		const auto policy = choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/360000,
+		                                                                            /*full_blocks=*/360000,
+		                                                                            /*touched_rowgroups=*/89,
+		                                                                            /*full_rowgroups=*/89,
+		                                                                            /*selected_vectors=*/2809,
+		                                                                            /*full_vectors=*/11211,
+		                                                                            /*estimated_pushdown_worksets=*/469,
+		                                                                            /*estimated_full_worksets=*/469,
+		                                                                            /*selected_coefficients=*/8);
+		EXPECT_FALSE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::SavingsTooSmall);
+	}
+	{
+		const auto crop_only_policy = choose_auto_pipeline_policy_from_counts(
+		    /*selected_blocks=*/768,
+		    /*full_blocks=*/12288,
+		    /*touched_rowgroups=*/1,
+		    /*full_rowgroups=*/2,
+		    /*selected_vectors=*/6,
+		    /*full_vectors=*/96);
+		EXPECT_TRUE(crop_only_policy.use_pushdown);
+		EXPECT_EQ(crop_only_policy.reason_code, AutoPipelinePolicyReason::VerySmallCrop);
+
+		const auto policy = choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/768,
+		                                                                            /*full_blocks=*/12288,
+		                                                                            /*touched_rowgroups=*/1,
+		                                                                            /*full_rowgroups=*/2,
+		                                                                            /*selected_vectors=*/6,
+		                                                                            /*full_vectors=*/96,
+		                                                                            /*estimated_pushdown_worksets=*/1,
+		                                                                            /*estimated_full_worksets=*/1,
+		                                                                            /*selected_coefficients=*/8);
+		EXPECT_TRUE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::VerySmallCrop);
+	}
+	{
+		const auto crop_only_policy = choose_auto_pipeline_policy_from_counts(/*selected_blocks=*/14237789,
+		                                                                      /*full_blocks=*/14237789,
+		                                                                      /*touched_rowgroups=*/5425,
+		                                                                      /*full_rowgroups=*/5425,
+		                                                                      /*selected_vectors=*/52333,
+		                                                                      /*full_vectors=*/71999,
+		                                                                      /*decode_batch_rowgroups=*/28);
+		EXPECT_FALSE(crop_only_policy.use_pushdown);
+		EXPECT_EQ(crop_only_policy.reason_code, AutoPipelinePolicyReason::CropCoversFullWindow);
+
+		const auto policy = choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/14237789,
+		                                                                            /*full_blocks=*/14237789,
+		                                                                            /*touched_rowgroups=*/5425,
+		                                                                            /*full_rowgroups=*/5425,
+		                                                                            /*selected_vectors=*/52333,
+		                                                                            /*full_vectors=*/71999,
+		                                                                            /*estimated_pushdown_worksets=*/193,
+		                                                                            /*estimated_full_worksets=*/193,
+		                                                                            /*selected_coefficients=*/8);
+		EXPECT_TRUE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CoefficientSelectionPushdown);
+	}
 }
 
 TEST(JpegDct, AutoPipelineReuseCandidateCountsRepeatedPreviewRowgroups) {
@@ -1122,7 +1465,7 @@ TEST(JpegDct, DeviceDecodedCacheReplacementKeepsResidentBytesStable) {
 
 	JpegDctDeviceDecodedRowgroupCache cache;
 	cache.set_capacity(250);
-	JpegDctDeviceCacheStats stats;
+	JpegDctDeviceCacheStats                    stats;
 	const JpegDctDeviceDecodedRowgroupCacheKey key_a {1, 10};
 	const JpegDctDeviceDecodedRowgroupCacheKey key_b {1, 11};
 	const JpegDctDeviceDecodedRowgroupCacheKey key_c {1, 12};
@@ -1192,9 +1535,9 @@ TEST(JpegDct, DevicePrefetchPolicySkipsRepeatedFullMissAfterDecodeBatch) {
 	config.min_decode_batches = 2;
 	auto plan                 = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard,
 	                                                                      {false, false, false, false, false},
-	                                                                      config,
-	                                                                      /*effective_decode_batch_rowgroups=*/2,
-	                                                                      /*decoded_cache_capacity_bytes=*/1U << 20U);
+                                                          config,
+                                                          /*effective_decode_batch_rowgroups=*/2,
+                                                          /*decoded_cache_capacity_bytes=*/1U << 20U);
 	ASSERT_TRUE(plan.enabled);
 	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {10, 11, 12}));
 	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {true, true, false, true, false}));

@@ -1,5 +1,3 @@
-add_subdirectory(benchmark_support)
-
 if (GALP_WITH_JPEG_DCT)
         add_subdirectory(jpeg_dct)
 endif ()
@@ -32,6 +30,8 @@ if (BUILD_TESTING)
         endif ()
         if (GALP_WITH_JPEG_DCT)
                 add_test(NAME GalpCliPipelineBenchmarkHelp COMMAND galp_cli pipeline_benchmark --help)
-                set_tests_properties(GalpCliPipelineBenchmarkHelp PROPERTIES LABELS "galp;cli;smoke")
+                set_tests_properties(GalpCliPipelineBenchmarkHelp PROPERTIES
+                        LABELS "galp;cli;smoke"
+                        PASS_REGULAR_EXPRESSION "--dct-coeffs")
         endif ()
 endif ()

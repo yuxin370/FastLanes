@@ -5,6 +5,7 @@
 #include "cuda/memory/gpu_array.cuh"
 #include "galp/jpeg_dct.hpp"
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -15,13 +16,35 @@
 #include <unordered_map>
 #include <vector>
 
+namespace galp::execution {
+struct ExecutionConfig;
+struct Rowgroup;
+} // namespace galp::execution
+
+namespace galp::runtime {
+struct ExecutionWorkset;
+} // namespace galp::runtime
+
 namespace galp::jpeg::detail {
 
 constexpr double   kMaxSelectedVectorRatioForPushdown = 0.75;
 constexpr size_t   kMinSavedVectorsForPushdown        = 4;
 constexpr unsigned kJpegDctDeviceUnpackNVectors       = 1;
+constexpr size_t   kJpegDctCoefficientCount           = 64;
+
+__host__ __device__ inline size_t
+selected_dct_binding_offset(const size_t source_index, const size_t coeff_slot, const size_t coefficients_per_block) {
+	return source_index * coefficients_per_block + coeff_slot;
+}
+
+__host__ __device__ inline size_t selected_dct_output_offset(const size_t output_block_index,
+                                                             const size_t coeff_slot,
+                                                             const size_t coefficients_per_block) {
+	return output_block_index * coefficients_per_block + coeff_slot;
+}
 
 struct JpegDctDeviceScratch;
+struct JpegDctCoefficientSelectionShape;
 
 struct JpegDctDeviceScratchDeleter {
 	void operator()(JpegDctDeviceScratch* scratch) const noexcept;
@@ -30,6 +53,21 @@ struct JpegDctDeviceScratchDeleter {
 using JpegDctDeviceScratchPtr = std::unique_ptr<JpegDctDeviceScratch, JpegDctDeviceScratchDeleter>;
 
 JpegDctDeviceScratchPtr make_jpeg_dct_device_scratch();
+
+void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&        workset,
+                                  const galp::execution::Rowgroup&        rowgroup,
+                                  const galp::execution::ExecutionConfig& cfg,
+                                  size_t                                  expr_index_base,
+                                  const std::vector<uint8_t>&             selected_coefficients,
+                                  const std::vector<uint32_t>*            selected_vectors = nullptr);
+
+void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&        workset,
+                                  const galp::execution::Rowgroup&        rowgroup,
+                                  const galp::execution::ExecutionConfig& cfg,
+                                  size_t                                  expr_index_base,
+                                  const std::vector<uint8_t>&             selected_coefficients,
+                                  const JpegDctCoefficientSelectionShape& selection_shape,
+                                  const std::vector<uint32_t>*            selected_vectors = nullptr);
 
 enum class JpegDctRuntimePolicyDecision {
 	kSelectedVectors,
@@ -66,6 +104,70 @@ inline JpegDctRuntimePolicyResult choose_jpeg_dct_runtime_policy(const size_t se
 		return {JpegDctRuntimePolicyDecision::kFullRowgroup, JpegDctRuntimePolicyReason::kSavingsTooSmall};
 	}
 	return {JpegDctRuntimePolicyDecision::kSelectedVectors, JpegDctRuntimePolicyReason::kCropSavesEnoughVectors};
+}
+
+inline std::vector<uint8_t> normalize_coefficient_selection(const JpegDctCoefficientSelection& selection) {
+	std::vector<uint8_t> coefficients;
+	if (selection.coefficients.empty()) {
+		coefficients.reserve(kJpegDctCoefficientCount);
+		for (uint8_t coeff = 0; coeff < kJpegDctCoefficientCount; ++coeff) {
+			coefficients.push_back(coeff);
+		}
+		return coefficients;
+	}
+
+	coefficients = selection.coefficients;
+	std::array<bool, kJpegDctCoefficientCount> seen {};
+	for (const auto coeff : coefficients) {
+		if (coeff >= kJpegDctCoefficientCount) {
+			throw std::out_of_range("JPEG DCT coefficient selection index is outside [0, 64)");
+		}
+		if (seen[coeff]) {
+			throw std::invalid_argument("JPEG DCT coefficient selection contains duplicates");
+		}
+		seen[coeff] = true;
+	}
+	return coefficients;
+}
+
+inline bool selects_all_coefficients(const std::vector<uint8_t>& selected_coefficients) {
+	if (selected_coefficients.size() != kJpegDctCoefficientCount) {
+		return false;
+	}
+	for (size_t idx = 0; idx < selected_coefficients.size(); ++idx) {
+		if (selected_coefficients[idx] != idx) {
+			return false;
+		}
+	}
+	return true;
+}
+
+enum class JpegDctCoefficientSelectionKind {
+	kAll,
+	kPrefix,
+	kList,
+};
+
+struct JpegDctCoefficientSelectionShape {
+	JpegDctCoefficientSelectionKind kind  = JpegDctCoefficientSelectionKind::kAll;
+	size_t                          count = kJpegDctCoefficientCount;
+
+	[[nodiscard]] bool is_contiguous_prefix() const noexcept {
+		return kind == JpegDctCoefficientSelectionKind::kAll || kind == JpegDctCoefficientSelectionKind::kPrefix;
+	}
+};
+
+inline JpegDctCoefficientSelectionShape
+classify_coefficient_selection(const std::vector<uint8_t>& selected_coefficients) {
+	if (selects_all_coefficients(selected_coefficients)) {
+		return {JpegDctCoefficientSelectionKind::kAll, kJpegDctCoefficientCount};
+	}
+	for (size_t idx = 0; idx < selected_coefficients.size(); ++idx) {
+		if (selected_coefficients[idx] != idx) {
+			return {JpegDctCoefficientSelectionKind::kList, selected_coefficients.size()};
+		}
+	}
+	return {JpegDctCoefficientSelectionKind::kPrefix, selected_coefficients.size()};
 }
 
 struct JpegDctDeviceGatherItem {
@@ -177,6 +279,9 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     full_vector_count               = 0;
 	size_t                                     planned_saved_vector_count      = 0;
 	size_t                                     estimated_saved_vector_count    = 0;
+	std::vector<uint8_t>                       selected_coefficients;
+	JpegDctCoefficientSelectionShape           coefficient_selection_shape {};
+	size_t                                     coefficients_per_block          = kJpegDctCoefficientCount;
 	double                                     planned_selected_vector_ratio   = 0.0;
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;

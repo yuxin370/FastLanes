@@ -170,28 +170,35 @@ add_subdirectory(src)
 add_subdirectory(extensions/alp)
 
 # ────────────────────────────────────────────────
-# 7. Tests
+# 7. Shared benchmark support
+# ────────────────────────────────────────────────
+if (GALP_BUILD_TOOLS OR (GALP_BUILD_TESTS AND GALP_WITH_JPEG_DCT))
+    add_subdirectory(tools/benchmark_support)
+endif ()
+
+# ────────────────────────────────────────────────
+# 8. Tests
 # ────────────────────────────────────────────────
 if (GALP_BUILD_TESTS)
     add_subdirectory(tests)
 endif ()
 
 ## ────────────────────────────────────────────────
-## 8. Benchmarks
+## 9. Benchmarks
 ## ────────────────────────────────────────────────
 if (GALP_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif ()
 
 ## ────────────────────────────────────────────────
-## 9. Tools
+## 10. Tools
 ## ────────────────────────────────────────────────
 if (GALP_BUILD_TOOLS)
     add_subdirectory(tools)
 endif ()
 
 ## ────────────────────────────────────────────────
-## 10. Examples
+## 11. Examples
 ## ────────────────────────────────────────────────
 if (GALP_BUILD_EXAMPLES)
     add_subdirectory(examples)

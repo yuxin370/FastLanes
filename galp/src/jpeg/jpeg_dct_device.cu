@@ -26,10 +26,12 @@ namespace galp::jpeg {
 struct JpegDctDeviceBatch::Impl {
 	JpegDctDeviceLayout                        layout = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
 	std::optional<GPUArray<int16_t>>           coefficients;
-	size_t                                     coefficient_count = 0;
+	size_t                                     coefficient_count      = 0;
+	size_t                                     coefficients_per_block = 64;
 	std::vector<JpegDctDeviceImageLayout>      image_layouts;
 	std::vector<JpegDctDeviceBlockMetadata>    block_metadata;
 	std::vector<JpegDctDeviceRowgroupMetadata> rowgroups;
+	std::vector<uint8_t>                       selected_coefficients;
 	JpegDctDeviceCacheStats                    cache_stats;
 	JpegDctDeviceExecutionStats                execution_stats;
 };
@@ -57,6 +59,10 @@ size_t JpegDctDeviceBatch::coefficient_count() const noexcept {
 
 size_t JpegDctDeviceBatch::coefficient_bytes() const noexcept {
 	return coefficient_count() * sizeof(int16_t);
+}
+
+size_t JpegDctDeviceBatch::coefficients_per_block() const noexcept {
+	return impl_ ? impl_->coefficients_per_block : 64;
 }
 
 size_t JpegDctDeviceBatch::block_count() const noexcept {
@@ -96,6 +102,11 @@ const std::vector<JpegDctDeviceBlockMetadata>& JpegDctDeviceBatch::block_metadat
 const std::vector<JpegDctDeviceRowgroupMetadata>& JpegDctDeviceBatch::rowgroups() const noexcept {
 	static const std::vector<JpegDctDeviceRowgroupMetadata> empty;
 	return impl_ ? impl_->rowgroups : empty;
+}
+
+const std::vector<uint8_t>& JpegDctDeviceBatch::selected_coefficients() const noexcept {
+	static const std::vector<uint8_t> empty;
+	return impl_ ? impl_->selected_coefficients : empty;
 }
 
 } // namespace galp::jpeg
@@ -328,16 +339,17 @@ namespace {
 __global__ void gather_dct_blocks_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
                                                const JpegDctDeviceGatherBatchItem* __restrict items,
                                                const size_t item_count,
+                                               const size_t coefficients_per_block,
                                                int16_t* __restrict out) {
 	const size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-	const size_t total  = item_count * 64U;
+	const size_t total  = item_count * coefficients_per_block;
 	if (linear >= total) {
 		return;
 	}
-	const size_t item_idx     = linear / 64U;
-	const size_t coeff_idx    = linear % 64U;
+	const size_t item_idx     = linear / coefficients_per_block;
+	const size_t coeff_idx    = linear % coefficients_per_block;
 	const auto   item         = items[item_idx];
-	const size_t source_coeff = static_cast<size_t>(item.source_index) * 64U + coeff_idx;
+	const size_t source_coeff = selected_dct_binding_offset(item.source_index, coeff_idx, coefficients_per_block);
 	const auto   binding      = column_bindings[source_coeff];
 	int16_t      value        = 0;
 	if (binding.source == DeviceCoeffSource::kI16) {
@@ -345,7 +357,56 @@ __global__ void gather_dct_blocks_batch_kernel(const DeviceCoeffBinding* __restr
 	} else if (binding.source == DeviceCoeffSource::kI8) {
 		value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
 	}
-	out[item.output_block_index * 64U + coeff_idx] = value;
+	out[selected_dct_output_offset(item.output_block_index, coeff_idx, coefficients_per_block)] = value;
+}
+
+template <size_t PrefixCount>
+__global__ void gather_prefix_dct_blocks_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                                      const JpegDctDeviceGatherBatchItem* __restrict items,
+                                                      const size_t item_count,
+                                                      int16_t* __restrict out) {
+	const size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	const size_t total  = item_count * PrefixCount;
+	if (linear >= total) {
+		return;
+	}
+	const size_t item_idx     = linear / PrefixCount;
+	const size_t coeff_idx    = linear % PrefixCount;
+	const auto   item         = items[item_idx];
+	const size_t source_coeff = selected_dct_binding_offset(item.source_index, coeff_idx, PrefixCount);
+	const auto   binding      = column_bindings[source_coeff];
+	int16_t      value        = 0;
+	if (binding.source == DeviceCoeffSource::kI16) {
+		value = binding.column_i16[item.row_in_rowgroup];
+	} else if (binding.source == DeviceCoeffSource::kI8) {
+		value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
+	}
+	out[selected_dct_output_offset(item.output_block_index, coeff_idx, PrefixCount)] = value;
+}
+
+template <size_t PrefixCount>
+__global__ void gather_prefix_dct_blocks_by_item_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                                        const JpegDctDeviceGatherBatchItem* __restrict items,
+                                                        const size_t item_count,
+                                                        int16_t* __restrict out) {
+	const size_t item_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (item_idx >= item_count) {
+		return;
+	}
+	const auto item      = items[item_idx];
+	int16_t*   out_block = out + selected_dct_output_offset(item.output_block_index, 0, PrefixCount);
+#pragma unroll
+	for (size_t coeff_idx = 0; coeff_idx < PrefixCount; ++coeff_idx) {
+		const size_t source_coeff = selected_dct_binding_offset(item.source_index, coeff_idx, PrefixCount);
+		const auto   binding      = column_bindings[source_coeff];
+		int16_t      value        = 0;
+		if (binding.source == DeviceCoeffSource::kI16) {
+			value = binding.column_i16[item.row_in_rowgroup];
+		} else if (binding.source == DeviceCoeffSource::kI8) {
+			value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
+		}
+		out_block[coeff_idx] = value;
+	}
 }
 
 __global__ void materialize_dense_dct_rowgroup_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
@@ -389,9 +450,26 @@ __global__ void gather_cached_dct_blocks_batch_kernel(const JpegDctDeviceCachedG
 	    item.dense[static_cast<size_t>(item.row_in_rowgroup) * 64U + coeff_idx];
 }
 
-BoundCoeffColumns bind_coeff_columns(const galp::execution::Rowgroup&       rowgroup,
-                                     const galp::runtime::ExecutionWorkset& workset,
-                                     const size_t                           expr_index_base = 0) {
+template <typename Fn>
+void for_each_selected_coefficient(const std::vector<uint8_t>&             selected_coefficients,
+                                   const JpegDctCoefficientSelectionShape& selection_shape,
+                                   Fn&&                                    fn) {
+	if (selection_shape.is_contiguous_prefix()) {
+		for (size_t coeff_idx = 0; coeff_idx < selection_shape.count; ++coeff_idx) {
+			fn(coeff_idx);
+		}
+		return;
+	}
+	for (const auto coeff_idx : selected_coefficients) {
+		fn(static_cast<size_t>(coeff_idx));
+	}
+}
+
+BoundCoeffColumns bind_coeff_columns(const galp::execution::Rowgroup&        rowgroup,
+                                     const galp::runtime::ExecutionWorkset&  workset,
+                                     const std::vector<uint8_t>&             selected_coefficients,
+                                     const JpegDctCoefficientSelectionShape& selection_shape,
+                                     const size_t                            expr_index_base = 0) {
 	if (rowgroup.columns.size() < 64) {
 		throw std::runtime_error("JPEG DCT device batch requires at least 64 logical coefficient columns");
 	}
@@ -442,9 +520,9 @@ BoundCoeffColumns bind_coeff_columns(const galp::execution::Rowgroup&       rowg
 		}
 		throw std::runtime_error("JPEG DCT device batch could not bind a coefficient column to device output");
 	};
-	for (size_t coeff_idx = 0; coeff_idx < bound.column_sources.size(); ++coeff_idx) {
+	for_each_selected_coefficient(selected_coefficients, selection_shape, [&](const size_t coeff_idx) {
 		(void)resolve_column(resolve_column, coeff_idx);
-	}
+	});
 	return bound;
 }
 
@@ -469,34 +547,122 @@ void gather_cached_rowgroups_batch(const std::vector<JpegDctDeviceCachedGatherBa
 	++stats.cached_gather_kernel_launch_count;
 }
 
+template <size_t PrefixCount>
+void launch_prefix_gather_by_coefficient(const DeviceCoeffBinding*           column_bindings,
+                                         const JpegDctDeviceGatherBatchItem* items,
+                                         const size_t                        item_count,
+                                         int16_t*                            output,
+                                         cudaStream_t                        stream) {
+	constexpr unsigned kThreads = 256;
+	const size_t       total    = item_count * PrefixCount;
+	const dim3         block(kThreads);
+	const dim3         grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads));
+	gather_prefix_dct_blocks_batch_kernel<PrefixCount>
+	    <<<grid, block, 0, stream>>>(column_bindings, items, item_count, output);
+}
+
+template <size_t PrefixCount>
+void launch_prefix_gather_by_item(const DeviceCoeffBinding*           column_bindings,
+                                  const JpegDctDeviceGatherBatchItem* items,
+                                  const size_t                        item_count,
+                                  int16_t*                            output,
+                                  cudaStream_t                        stream) {
+	constexpr unsigned kThreads = 256;
+	const dim3         block(kThreads);
+	const dim3         grid(static_cast<unsigned>((item_count + kThreads - 1U) / kThreads));
+	gather_prefix_dct_blocks_by_item_kernel<PrefixCount>
+	    <<<grid, block, 0, stream>>>(column_bindings, items, item_count, output);
+}
+
+bool launch_prefix_gather_if_supported(const size_t                        prefix_count,
+                                       const DeviceCoeffBinding*           column_bindings,
+                                       const JpegDctDeviceGatherBatchItem* items,
+                                       const size_t                        item_count,
+                                       int16_t*                            output,
+                                       cudaStream_t                        stream) {
+	switch (prefix_count) {
+	case 1:
+		launch_prefix_gather_by_item<1>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 2:
+		launch_prefix_gather_by_item<2>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 3:
+		launch_prefix_gather_by_item<3>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 4:
+		launch_prefix_gather_by_item<4>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 5:
+		launch_prefix_gather_by_item<5>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 6:
+		launch_prefix_gather_by_item<6>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 7:
+		launch_prefix_gather_by_item<7>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 8:
+		launch_prefix_gather_by_item<8>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 16:
+		launch_prefix_gather_by_item<16>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 32:
+		launch_prefix_gather_by_coefficient<32>(column_bindings, items, item_count, output, stream);
+		return true;
+	case 64:
+		launch_prefix_gather_by_coefficient<64>(column_bindings, items, item_count, output, stream);
+		return true;
+	default:
+		return false;
+	}
+}
+
 void gather_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>&            sources,
                                    const std::vector<JpegDctDeviceGatherBatchItem>& items,
+                                   const std::vector<uint8_t>&                      selected_coefficients,
+                                   const JpegDctCoefficientSelectionShape&          selection_shape,
                                    int16_t*                                         output,
                                    JpegDctDeviceScratch&                            scratch,
                                    JpegDctDeviceExecutionStats&                     stats,
                                    cudaStream_t                                     stream) {
-	if (sources.empty() || items.empty()) {
+	if (sources.empty() || items.empty() || selected_coefficients.empty()) {
 		return;
 	}
 
 	auto& column_bindings = scratch.host_column_bindings;
 	column_bindings.clear();
-	column_bindings.reserve(sources.size() * 64U);
+	column_bindings.reserve(sources.size() * selected_coefficients.size());
 	for (const auto& source : sources) {
-		for (size_t coeff_idx = 0; coeff_idx < source.column_sources.size(); ++coeff_idx) {
+		for_each_selected_coefficient(selected_coefficients, selection_shape, [&](const size_t coeff_idx) {
 			column_bindings.push_back(DeviceCoeffBinding {
 			    source.columns_i8[coeff_idx], source.columns_i16[coeff_idx], source.column_sources[coeff_idx]});
-		}
+		});
 	}
 
 	constexpr unsigned kThreads = 256;
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
 	scratch.batch_gather_items.upload(items.data(), items.size(), stream, stats);
-	const size_t total = items.size() * 64U;
-	const dim3   block(kThreads);
-	const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads));
-	gather_dct_blocks_batch_kernel<<<grid, block, 0, stream>>>(
-	    scratch.column_bindings.data, scratch.batch_gather_items.data, items.size(), output);
+	const bool launched_prefix_gather =
+	    selection_shape.is_contiguous_prefix() && launch_prefix_gather_if_supported(selection_shape.count,
+	                                                                                scratch.column_bindings.data,
+	                                                                                scratch.batch_gather_items.data,
+	                                                                                items.size(),
+	                                                                                output,
+	                                                                                stream);
+	if (!launched_prefix_gather) {
+		const size_t total = items.size() * selected_coefficients.size();
+		const dim3   block(kThreads);
+		const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads));
+		gather_dct_blocks_batch_kernel<<<grid, block, 0, stream>>>(scratch.column_bindings.data,
+		                                                           scratch.batch_gather_items.data,
+		                                                           items.size(),
+		                                                           selected_coefficients.size(),
+		                                                           output);
+	} else {
+		++stats.prefix_gather_kernel_launch_count;
+	}
 	CUDA_SAFE_CALL(cudaGetLastError());
 	++stats.gather_kernel_launch_count;
 }
@@ -568,42 +734,6 @@ void record_runtime_policy(const JpegDctRuntimePolicyResult policy, JpegDctDevic
 	case JpegDctRuntimePolicyReason::kSavingsTooSmall:
 		++stats.runtime_policy_low_saving_full_rowgroups;
 		break;
-	}
-}
-
-void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&        workset,
-                                  const galp::execution::Rowgroup&        rowgroup,
-                                  const galp::execution::ExecutionConfig& cfg,
-                                  const size_t                            expr_index_base,
-                                  const std::vector<uint32_t>*            selected_vectors) {
-	workset.outputs.required = workset.outputs.required || cfg.write_out;
-	galp::runtime::begin_workset_chunk_arena(workset, rowgroup.columns.size());
-	auto* active_chunk_arena = workset.buffers.chunk_arena.get();
-
-	const void* last_backing_base  = nullptr;
-	size_t      last_backing_bytes = 0;
-	for (size_t coeff_idx = 0; coeff_idx < rowgroup.columns.size(); ++coeff_idx) {
-		const auto& column = rowgroup.columns[coeff_idx];
-		if (column.skip_decompress) {
-			continue;
-		}
-		if (galp::runtime::has_pinned_backing(column) &&
-		    (column.backing_base != last_backing_base || column.backing_bytes != last_backing_bytes)) {
-			active_chunk_arena->register_backing(column.backing_base, column.backing_bytes);
-			last_backing_base  = column.backing_base;
-			last_backing_bytes = column.backing_bytes;
-		}
-		const uint32_t selected_vector_width = std::max(1U, cfg.unpack_n_vectors);
-		galp::runtime::append_column_to_workset(workset,
-		                                        column,
-		                                        cfg,
-		                                        expr_index_base + coeff_idx,
-		                                        *active_chunk_arena,
-		                                        nullptr,
-		                                        /*emit_typed_work_items=*/true,
-		                                        /*register_backing=*/false,
-		                                        selected_vectors,
-		                                        selected_vector_width);
 	}
 }
 
@@ -755,12 +885,14 @@ void release_completed_workset(galp::runtime::ExecutionWorkset&      workset,
 	guard.dismiss();
 }
 
-void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&  works,
-                                    int16_t*                           output,
-                                    JpegDctDeviceDecodedRowgroupCache* cache,
-                                    JpegDctDeviceCacheStats&           batch_cache_stats,
-                                    JpegDctDeviceExecutionStats&       execution_stats,
-                                    JpegDctDeviceScratch&              scratch) {
+void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       works,
+                                    int16_t*                                output,
+                                    const std::vector<uint8_t>&             selected_coefficients,
+                                    const JpegDctCoefficientSelectionShape& selection_shape,
+                                    JpegDctDeviceDecodedRowgroupCache*      cache,
+                                    JpegDctDeviceCacheStats&                batch_cache_stats,
+                                    JpegDctDeviceExecutionStats&            execution_stats,
+                                    JpegDctDeviceScratch&                   scratch) {
 	if (works.empty()) {
 		return;
 	}
@@ -776,7 +908,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&  works,
 	auto&                                workset = scratch.decode_workset;
 	galp::runtime::ExecutionWorksetGuard guard(workset);
 	const auto                           build_start = Clock::now();
-	galp::runtime::reserve_batch_expr_storage(workset, works.size() * 64U);
+	galp::runtime::reserve_batch_expr_storage(workset, works.size() * kJpegDctCoefficientCount);
 	for (size_t idx = 0; idx < works.size(); ++idx) {
 		auto& work           = works[idx];
 		work.expr_index_base = idx * 64U;
@@ -784,6 +916,8 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&  works,
 		                             work.rowgroup,
 		                             cfg,
 		                             work.expr_index_base,
+		                             selected_coefficients,
+		                             selection_shape,
 		                             work.decodes_full_rowgroup ? nullptr : work.selected_vectors);
 	}
 	const auto build_end = Clock::now();
@@ -812,7 +946,8 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&  works,
 	batch_items.reserve(total_gather_items);
 	for (size_t source_idx = 0; source_idx < works.size(); ++source_idx) {
 		const auto& work = works[source_idx];
-		sources.push_back(bind_coeff_columns(work.rowgroup, workset, work.expr_index_base));
+		sources.push_back(
+		    bind_coeff_columns(work.rowgroup, workset, selected_coefficients, selection_shape, work.expr_index_base));
 		if (work.gather_items == nullptr) {
 			continue;
 		}
@@ -823,8 +958,9 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&  works,
 	}
 	execution_stats.gather_item_count += batch_items.size();
 	execution_stats.decoded_gather_item_count += batch_items.size();
-	gather_decoded_rowgroup_batch(sources, batch_items, output, scratch, execution_stats, stream);
-	if (cache != nullptr && cache->capacity > 0) {
+	gather_decoded_rowgroup_batch(
+	    sources, batch_items, selected_coefficients, selection_shape, output, scratch, execution_stats, stream);
+	if (cache != nullptr && cache->capacity > 0 && selects_all_coefficients(selected_coefficients)) {
 		auto& materialize_items = scratch.host_materialize_items;
 		materialize_items.clear();
 		materialize_items.reserve(works.size());
@@ -899,6 +1035,8 @@ void execute_cached_rowgroup_hits(const std::vector<JpegDctDeviceCachedGatherBat
 void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
                         const JpegDctDeviceShardPlan&                    shard,
                         int16_t*                                         output,
+                        const std::vector<uint8_t>&                      selected_coefficients,
+                        const JpegDctCoefficientSelectionShape&          selection_shape,
                         JpegDctDeviceDecodedRowgroupCache*               cache,
                         JpegDctDeviceCacheStats&                         batch_cache_stats,
                         JpegDctDeviceExecutionStats&                     execution_stats,
@@ -948,7 +1086,14 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
 		if (pending_may_insert_cache) {
 			flush_cached();
 		}
-		execute_decoded_rowgroup_batch(pending, output, cache, batch_cache_stats, execution_stats, scratch);
+		execute_decoded_rowgroup_batch(pending,
+		                               output,
+		                               selected_coefficients,
+		                               selection_shape,
+		                               cache,
+		                               batch_cache_stats,
+		                               execution_stats,
+		                               scratch);
 		pending_may_insert_cache = false;
 	};
 	const auto pop_prefetched_rowgroup = [&](const JpegDctDeviceRowgroupPlan& rowgroup_plan,
@@ -1035,6 +1180,88 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
 
 } // namespace
 
+void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&        workset,
+                                  const galp::execution::Rowgroup&        rowgroup,
+                                  const galp::execution::ExecutionConfig& cfg,
+                                  const size_t                            expr_index_base,
+                                  const std::vector<uint8_t>&             selected_coefficients,
+                                  const std::vector<uint32_t>*            selected_vectors) {
+	append_jpeg_rowgroup_columns(workset,
+	                             rowgroup,
+	                             cfg,
+	                             expr_index_base,
+	                             selected_coefficients,
+	                             classify_coefficient_selection(selected_coefficients),
+	                             selected_vectors);
+}
+
+void append_jpeg_rowgroup_columns(galp::runtime::ExecutionWorkset&        workset,
+                                  const galp::execution::Rowgroup&        rowgroup,
+                                  const galp::execution::ExecutionConfig& cfg,
+                                  const size_t                            expr_index_base,
+                                  const std::vector<uint8_t>&             selected_coefficients,
+                                  const JpegDctCoefficientSelectionShape& selection_shape,
+                                  const std::vector<uint32_t>*            selected_vectors) {
+	workset.outputs.required = workset.outputs.required || cfg.write_out;
+	galp::runtime::begin_workset_chunk_arena(workset, rowgroup.columns.size());
+	auto* active_chunk_arena = workset.buffers.chunk_arena.get();
+
+	std::array<bool, kJpegDctCoefficientCount> decode_coefficients {};
+	const auto mark_decode_coefficient = [&](const auto& self, const size_t coeff_idx) -> void {
+		if (coeff_idx >= kJpegDctCoefficientCount || coeff_idx >= rowgroup.columns.size()) {
+			throw std::out_of_range("JPEG DCT selected coefficient is outside the rowgroup column range");
+		}
+		if (decode_coefficients[coeff_idx]) {
+			return;
+		}
+		decode_coefficients[coeff_idx] = true;
+		const auto& column             = rowgroup.columns[coeff_idx];
+		if (column.alias_of.has_value()) {
+			self(self, *column.alias_of);
+		}
+	};
+	if (selection_shape.kind == JpegDctCoefficientSelectionKind::kAll) {
+		for (size_t coeff_idx = 0; coeff_idx < kJpegDctCoefficientCount && coeff_idx < rowgroup.columns.size();
+		     ++coeff_idx) {
+			decode_coefficients[coeff_idx] = true;
+		}
+	} else {
+		for_each_selected_coefficient(selected_coefficients, selection_shape, [&](const size_t coeff_idx) {
+			mark_decode_coefficient(mark_decode_coefficient, coeff_idx);
+		});
+	}
+
+	const void* last_backing_base  = nullptr;
+	size_t      last_backing_bytes = 0;
+	for (size_t coeff_idx = 0; coeff_idx < kJpegDctCoefficientCount && coeff_idx < rowgroup.columns.size();
+	     ++coeff_idx) {
+		if (!decode_coefficients[coeff_idx]) {
+			continue;
+		}
+		const auto& column = rowgroup.columns[coeff_idx];
+		if (column.skip_decompress) {
+			continue;
+		}
+		if (galp::runtime::has_pinned_backing(column) &&
+		    (column.backing_base != last_backing_base || column.backing_bytes != last_backing_bytes)) {
+			active_chunk_arena->register_backing(column.backing_base, column.backing_bytes);
+			last_backing_base  = column.backing_base;
+			last_backing_bytes = column.backing_bytes;
+		}
+		const uint32_t selected_vector_width = std::max(1U, cfg.unpack_n_vectors);
+		galp::runtime::append_column_to_workset(workset,
+		                                        column,
+		                                        cfg,
+		                                        expr_index_base + coeff_idx,
+		                                        *active_chunk_arena,
+		                                        nullptr,
+		                                        /*emit_typed_work_items=*/true,
+		                                        /*register_backing=*/false,
+		                                        selected_vectors,
+		                                        selected_vector_width);
+	}
+}
+
 void JpegDctDeviceDecodedRowgroupCache::insert_ready_entry(
     const JpegDctDeviceDecodedRowgroupCacheKey&             key,
     std::unique_ptr<JpegDctDeviceDecodedRowgroupCacheEntry> entry,
@@ -1116,12 +1343,14 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 	impl->image_layouts                                 = std::move(plan.image_layouts);
 	impl->block_metadata                                = std::move(plan.block_metadata);
 	impl->rowgroups                                     = std::move(plan.rowgroups);
+	impl->selected_coefficients                         = std::move(plan.selected_coefficients);
+	impl->coefficients_per_block                        = plan.coefficients_per_block;
 	impl->execution_stats.planning_ms                   = plan.planning_ms;
 	impl->execution_stats.rowgroup_count                = impl->rowgroups.size();
 	impl->execution_stats.planned_selected_vector_count = plan.planned_selected_vector_count;
 	impl->execution_stats.full_vector_count             = plan.full_vector_count;
 	impl->execution_stats.planned_saved_vector_count    = plan.planned_saved_vector_count;
-	impl->coefficient_count                             = impl->block_metadata.size() * 64U;
+	impl->coefficient_count                             = impl->block_metadata.size() * impl->coefficients_per_block;
 	if (impl->coefficient_count != 0) {
 		impl->coefficients.emplace(impl->coefficient_count);
 	}
@@ -1136,6 +1365,8 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 		execute_shard_plan(rdr,
 		                   shard,
 		                   output,
+		                   impl->selected_coefficients,
+		                   plan.coefficient_selection_shape,
 		                   plan.cache,
 		                   impl->cache_stats,
 		                   impl->execution_stats,

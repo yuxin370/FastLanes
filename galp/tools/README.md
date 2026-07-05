@@ -47,13 +47,22 @@ Replace the placeholders below:
 14) JPEG DCT auto policy: choose pushdown or full-then-crop per window
 <GALP_CLI> pipeline_benchmark <manifest.bin> --crop 64 64 512 512 --mode auto
 
+15) JPEG DCT coefficient pushdown: compare selected DCT coefficients only
+<GALP_CLI> pipeline_benchmark <manifest.bin> --crop 64 64 512 512 --dct-coeffs list:0,2,5 --mode compare
+
+16) JPEG DCT coefficient pushdown benchmark: keep crop pushdown fixed, compare against post-decode coefficient selection
+<GALP_CLI> pipeline_benchmark <manifest.bin> --crop 64 64 512 512 --dct-coeffs first:8 --mode dct-compare
+
 JPEG DCT pushdown validation matrix
 
 Use `compare` for correctness: it runs vector-level crop pushdown and
 full-decode-then-crop over the same windows and returns a non-zero exit code
-only on coefficient mismatch. Keep verification enabled for correctness runs;
-use `--no-verify` only for timing-only sweeps after correctness has already
-been checked for the same dataset, crop, window size, and cache setting.
+only on coefficient mismatch. With `--dct-coeffs`, compare mode validates the
+selected output against the corresponding coefficient subset from the full
+64-coefficient baseline. Keep verification enabled for correctness runs; use
+`--no-verify` only for timing-only sweeps after correctness has already been
+checked for the same dataset, crop, window size, coefficient selection, and
+cache setting.
 
 Recommended GPU validation commands:
 
@@ -78,6 +87,26 @@ Recommended GPU validation commands:
   --window-images 128 \
   --cache-capacity-mib 1024 \
   --mode auto
+
+# DCT coefficient pushdown: crop plus selected coefficient columns.
+<GALP_CLI> pipeline_benchmark <manifest.bin> \
+  --crop 30 40 224 224 \
+  --window-images 128 \
+  --dct-coeffs list:0,2,5 \
+  --mode compare
+
+# DCT coefficient pushdown without crop: full-image selected coefficient columns.
+<GALP_CLI> pipeline_benchmark <manifest.bin> \
+  --window-images 128 \
+  --dct-coeffs list:0,2,5 \
+  --mode compare
+
+# Isolated DCT coefficient pushdown benchmark: both sides use crop pushdown.
+<GALP_CLI> pipeline_benchmark <manifest.bin> \
+  --crop 30 40 224 224 \
+  --window-images 128 \
+  --dct-coeffs first:8 \
+  --mode dct-compare
 ```
 
 Save raw output and generate the reporting table with:
@@ -89,7 +118,7 @@ Save raw output and generate the reporting table with:
   --cache-capacity-mib 1024 \
   --mode compare | tee pipeline_benchmark.log
 
-python3 scripts/my_tool/summarize_pipeline_benchmark.py \
+python3 scripts/my_tool/bench_pipeline_summary.py \
   --dataset <dataset> --image-size <width>x<height-or-varies> \
   --require-match --require-default-fields \
   pipeline_benchmark.log
@@ -98,7 +127,7 @@ python3 scripts/my_tool/summarize_pipeline_benchmark.py \
 For JPEG DCT device rowgroup prefetch work, collect an on/off matrix with:
 
 ```bash
-python3 scripts/my_tool/run_jpeg_device_prefetch_benchmark.py \
+python3 scripts/my_tool/bench_jpeg_prefetch.py \
   --input data/flower_photos \
   --work-dir /tmp/galp_jpeg_prefetch \
   --mode compare \
@@ -120,16 +149,17 @@ them.
 
 Record at least the following fields for every reported dataset/crop:
 
-| dataset | image size | crop size | mode | outputs_match | pushdown_selected_vector_ratio | full_then_crop_selected_vector_ratio | pushdown_total_ms | full_then_crop_total_ms | pushdown_speedup_vs_full_then_crop | pushdown_saved_ms_vs_full_then_crop | pushdown_plan_ms | pushdown_read_decode_ms | pushdown_decode_ms | pushdown_gather_ms | pushdown_decoded_gather_ms | pushdown_cached_gather_ms | pushdown_sync_rowgroup_read_ms | pushdown_prefetch_queue_start_ms | pushdown_prefetch_wait_ms | pushdown_prefetch_depth_block_ms | pushdown_prefetch_rowgroup_read_ms | pushdown_prefetch_ready_ahead_ms | pushdown_prefetch_initial_cache_hit_rowgroup_count | pushdown_prefetch_candidate_rowgroup_count | pushdown_prefetch_active_shard_count | pushdown_prefetch_config_disabled_shard_count | pushdown_prefetch_all_hit_shard_count | pushdown_prefetch_small_batch_disabled_shard_count | pushdown_prefetch_selected_vector_disabled_shard_count | pushdown_prefetch_selected_vector_miss_rowgroup_count | pushdown_prefetch_initial_hit_runtime_miss_count | pushdown_prefetch_skipped_repeated_runtime_miss_count | pushdown_prefetched_rowgroup_count | pushdown_prefetch_consumed_as_hit_count | pushdown_prefetch_skipped_repeated_rowgroup_count | pushdown_prefetch_consumed_as_hit_read_ms | pushdown_prefetch_consumed_as_hit_wait_ms | pushdown_workset_count | pushdown_decode_kernel_launch_count | pushdown_gather_kernel_launch_count | pushdown_scratch_allocation_count | pushdown_internal_sync_count | pushdown_runtime_policy_decision |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| dataset | image size | crop size | mode | outputs_match | dct coeffs | pushdown_selected_vector_ratio | full_then_crop_selected_vector_ratio | pushdown_total_ms | full_then_crop_total_ms | pushdown_speedup_vs_full_then_crop | pushdown_saved_ms_vs_full_then_crop | pushdown_plan_ms | pushdown_read_decode_ms | pushdown_decode_ms | pushdown_gather_ms | pushdown_decoded_gather_ms | pushdown_cached_gather_ms | pushdown_sync_rowgroup_read_ms | pushdown_prefetch_queue_start_ms | pushdown_prefetch_wait_ms | pushdown_prefetch_depth_block_ms | pushdown_prefetch_rowgroup_read_ms | pushdown_prefetch_ready_ahead_ms | pushdown_prefetch_initial_cache_hit_rowgroup_count | pushdown_prefetch_candidate_rowgroup_count | pushdown_prefetch_active_shard_count | pushdown_prefetch_config_disabled_shard_count | pushdown_prefetch_all_hit_shard_count | pushdown_prefetch_small_batch_disabled_shard_count | pushdown_prefetch_selected_vector_disabled_shard_count | pushdown_prefetch_selected_vector_miss_rowgroup_count | pushdown_prefetch_initial_hit_runtime_miss_count | pushdown_prefetch_skipped_repeated_runtime_miss_count | pushdown_prefetched_rowgroup_count | pushdown_prefetch_consumed_as_hit_count | pushdown_prefetch_skipped_repeated_rowgroup_count | pushdown_prefetch_consumed_as_hit_read_ms | pushdown_prefetch_consumed_as_hit_wait_ms | pushdown_workset_count | pushdown_decode_kernel_launch_count | pushdown_gather_kernel_launch_count | pushdown_scratch_allocation_count | pushdown_internal_sync_count | pushdown_runtime_policy_decision |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
 For `auto` runs also report `auto_pushdown_windows`,
 `auto_full_then_crop_windows`, `auto_policy_selected_vector_ratio`,
 `auto_policy_estimated_pushdown_worksets`,
-`auto_policy_estimated_full_worksets`, and `auto_policy_reason`. The policy is
-expected to make decisions from selected/full vectors, block ratio, rowgroup
-ratio, estimated worksets, and estimated gather items; it should not depend on
-dataset names.
+`auto_policy_estimated_full_worksets`, `auto_policy_coefficient_pushdown_windows`,
+and `auto_policy_reason`. The default summary includes the full auto policy
+field set. The policy is expected to make decisions from selected/full vectors,
+block ratio, rowgroup ratio, estimated worksets, and estimated gather items; it
+should not depend on dataset names.
 
 Benchmark output metrics
   benchmark_wall_ms                End-to-end wall clock of the whole benchmark run.
@@ -371,6 +401,8 @@ Options
   --jpeg-device-prefetch-min-batches N
                                     Minimum miss decode batches before device prefetch starts
                                     (default: 2).
+  --dct-coeffs SPEC                 DCT coefficient pushdown for pipeline_benchmark:
+                                    all, first:N, or list:0,1,...
   --mode MODE                       pipeline_benchmark mode:
                                     compare runs pushdown and full-then-crop and verifies matching
                                     cropped DCT coefficients;

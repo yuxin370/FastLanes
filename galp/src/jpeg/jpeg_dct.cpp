@@ -25,6 +25,79 @@
 
 namespace galp::jpeg {
 
+bool parse_jpeg_dct_coefficient_selection(const std::string_view spec, JpegDctCoefficientSelection& selection) {
+	JpegDctCoefficientSelection parsed;
+	if (spec == "all") {
+		selection = std::move(parsed);
+		return true;
+	}
+
+	const auto parse_coeff = [](const std::string_view token, uint8_t& out) -> bool {
+		if (token.empty()) {
+			return false;
+		}
+		try {
+			size_t     parsed_chars = 0;
+			const auto value        = std::stoull(std::string(token), &parsed_chars);
+			if (parsed_chars != token.size() || value >= detail::kJpegDctCoefficientCount) {
+				return false;
+			}
+			out = static_cast<uint8_t>(value);
+			return true;
+		} catch (...) { return false; }
+	};
+
+	constexpr std::string_view first_prefix = "first:";
+	constexpr std::string_view list_prefix  = "list:";
+	if (spec.substr(0, first_prefix.size()) == first_prefix) {
+		size_t     count    = 0;
+		const auto count_sv = spec.substr(first_prefix.size());
+		try {
+			size_t parsed_chars = 0;
+			count               = std::stoull(std::string(count_sv), &parsed_chars);
+			if (parsed_chars != count_sv.size()) {
+				return false;
+			}
+		} catch (...) { return false; }
+		if (count == 0 || count > detail::kJpegDctCoefficientCount) {
+			return false;
+		}
+		parsed.coefficients.reserve(count);
+		for (size_t coeff = 0; coeff < count; ++coeff) {
+			parsed.coefficients.push_back(static_cast<uint8_t>(coeff));
+		}
+		selection = std::move(parsed);
+		return true;
+	}
+
+	if (spec.substr(0, list_prefix.size()) == list_prefix) {
+		auto list = spec.substr(list_prefix.size());
+		if (list.empty()) {
+			return false;
+		}
+		while (!list.empty()) {
+			const auto comma = list.find(',');
+			const auto token = comma == std::string_view::npos ? list : list.substr(0, comma);
+			uint8_t    coeff = 0;
+			if (!parse_coeff(token, coeff)) {
+				return false;
+			}
+			if (std::find(parsed.coefficients.begin(), parsed.coefficients.end(), coeff) != parsed.coefficients.end()) {
+				return false;
+			}
+			parsed.coefficients.push_back(coeff);
+			if (comma == std::string_view::npos) {
+				break;
+			}
+			list = list.substr(comma + 1);
+		}
+		selection = std::move(parsed);
+		return true;
+	}
+
+	return false;
+}
+
 namespace {
 
 using DctRow = std::array<int16_t, 64>;
@@ -2031,7 +2104,10 @@ struct JpegDctShardDatasetReader::Impl {
 		}
 
 		detail::JpegDctDeviceBatchPlan plan;
-		plan.layout = options.layout;
+		plan.layout                      = options.layout;
+		plan.selected_coefficients       = detail::normalize_coefficient_selection(options.coefficient_selection);
+		plan.coefficient_selection_shape = detail::classify_coefficient_selection(plan.selected_coefficients);
+		plan.coefficients_per_block      = plan.selected_coefficients.size();
 		plan.decode_batch_rowgroups =
 		    options.decode_batch_rowgroups == 0 ? kDefaultJpegDctDecodeBatchRowgroups : options.decode_batch_rowgroups;
 		plan.rowgroup_prefetch.enabled = options.enable_rowgroup_prefetch;
@@ -2243,8 +2319,7 @@ struct JpegDctShardDatasetReader::Impl {
 				             ceil_mul_div_u32(crop.y + crop.height, component.height_in_blocks, image.image_height));
 				for (uint32_t block_y = y0; block_y < y1; ++block_y) {
 					for (uint32_t block_x = x0; block_x < x1; ++block_x) {
-						const auto* group =
-						    find_group_or_null(shard, component.semantic_slot_id, block_x, block_y);
+						const auto* group = find_group_or_null(shard, component.semantic_slot_id, block_x, block_y);
 						if (group == nullptr) {
 							throw std::runtime_error("JPEG DCT block group was not found in shard metadata");
 						}
@@ -2271,7 +2346,7 @@ struct JpegDctShardDatasetReader::Impl {
 			device_scratch = detail::make_jpeg_dct_device_scratch();
 		}
 		plan.scratch = device_scratch.get();
-		if (options.cache_capacity_bytes > 0) {
+		if (options.cache_capacity_bytes > 0 && detail::selects_all_coefficients(plan.selected_coefficients)) {
 			if (device_cache == nullptr) {
 				device_cache = std::make_unique<detail::JpegDctDeviceDecodedRowgroupCache>();
 			}
@@ -2371,6 +2446,15 @@ size_t JpegDctDeviceBatchPreparedPlan::estimated_saved_vector_count() const noex
 	return impl_ ? impl_->plan.estimated_saved_vector_count : 0;
 }
 
+const std::vector<uint8_t>& JpegDctDeviceBatchPreparedPlan::selected_coefficients() const noexcept {
+	static const std::vector<uint8_t> empty;
+	return impl_ ? impl_->plan.selected_coefficients : empty;
+}
+
+size_t JpegDctDeviceBatchPreparedPlan::coefficients_per_block() const noexcept {
+	return impl_ ? impl_->plan.coefficients_per_block : detail::kJpegDctCoefficientCount;
+}
+
 double JpegDctDeviceBatchPreparedPlan::planned_selected_vector_ratio() const noexcept {
 	return impl_ ? impl_->plan.planned_selected_vector_ratio : 0.0;
 }
@@ -2419,6 +2503,8 @@ JpegDctShardDatasetReader::PlanDeviceDctBatch(const std::vector<JpegDctImageCrop
 	preview.full_vector_count               = plan.full_vector_count;
 	preview.planned_saved_vector_count      = plan.planned_saved_vector_count;
 	preview.estimated_saved_vector_count    = plan.estimated_saved_vector_count;
+	preview.selected_coefficients           = std::move(plan.selected_coefficients);
+	preview.coefficients_per_block          = plan.coefficients_per_block;
 	preview.planned_selected_vector_ratio   = plan.planned_selected_vector_ratio;
 	preview.estimated_selected_vector_ratio = plan.estimated_selected_vector_ratio;
 	preview.planning_ms                     = std::chrono::duration<double, std::milli>(plan_end - plan_start).count();
@@ -2434,7 +2520,7 @@ JpegDctShardDatasetReader::EstimateDeviceDctBatch(const std::vector<JpegDctImage
 	const auto estimate_start = std::chrono::steady_clock::now();
 	auto       estimate       = impl_->estimate_device_batch(requests, options);
 	const auto estimate_end   = std::chrono::steady_clock::now();
-	estimate.planning_ms = std::chrono::duration<double, std::milli>(estimate_end - estimate_start).count();
+	estimate.planning_ms      = std::chrono::duration<double, std::milli>(estimate_end - estimate_start).count();
 	return estimate;
 }
 
@@ -2462,7 +2548,11 @@ JpegDctDeviceBatch JpegDctShardDatasetReader::ReadPreparedDeviceDctBatch(JpegDct
 	if (plan.impl_->owner_token != impl_->plan_owner_token) {
 		throw std::runtime_error("JPEG DCT prepared device batch plan belongs to a different reader");
 	}
-	auto detail_plan = std::move(plan.impl_->plan);
+	auto       detail_plan         = std::move(plan.impl_->plan);
+	const auto requested_selection = detail::normalize_coefficient_selection(plan.impl_->options.coefficient_selection);
+	if (requested_selection != detail_plan.selected_coefficients) {
+		throw std::runtime_error("JPEG DCT prepared device batch coefficient selection was modified");
+	}
 	impl_->attach_device_runtime_resources(detail_plan, plan.impl_->options);
 	plan.impl_.reset();
 	return detail::execute_jpeg_dct_device_batch_plan(std::move(detail_plan));

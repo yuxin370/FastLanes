@@ -37,7 +37,9 @@ target_compile_definitions(galp_tests PRIVATE
         GALP_TEST_DATA_DIR="${GALP_TEST_DATA_DIR}"
 )
 if (GALP_WITH_JPEG_DCT)
-        target_link_libraries(galp_tests PRIVATE JPEG::JPEG)
+        target_link_libraries(galp_tests PRIVATE
+                galp_benchmark_support
+                JPEG::JPEG)
 endif ()
 
 apply_warnings(galp_tests)

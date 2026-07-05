@@ -216,6 +216,15 @@ crop reads from a sharded DCT/FLS manifest:
 ```bash
 ./build-galp-ninja/galp/tools/galp_cli pipeline_benchmark /path/to/manifest.bin \
   --crop 64 64 512 512 --window-images 256 --mode compare
+
+./build-galp-ninja/galp/tools/galp_cli pipeline_benchmark /path/to/manifest.bin \
+  --crop 64 64 512 512 --window-images 256 --dct-coeffs list:0,2,5 --mode compare
+
+./build-galp-ninja/galp/tools/galp_cli pipeline_benchmark /path/to/manifest.bin \
+  --window-images 256 --dct-coeffs list:0,2,5 --mode compare
+
+./build-galp-ninja/galp/tools/galp_cli pipeline_benchmark /path/to/manifest.bin \
+  --crop 64 64 512 512 --window-images 256 --dct-coeffs first:8 --mode dct-compare
 ```
 
 The implementation and validation status is summarized in
@@ -227,7 +236,7 @@ it with:
 ./build-galp-ninja/galp/tools/galp_cli pipeline_benchmark /path/to/manifest.bin \
   --crop 64 64 512 512 --window-images 256 --mode compare | tee pipeline_benchmark.log
 
-python3 scripts/my_tool/summarize_pipeline_benchmark.py \
+python3 scripts/my_tool/bench_pipeline_summary.py \
   --dataset <dataset> --image-size <width>x<height-or-varies> \
   --require-match --require-default-fields \
   pipeline_benchmark.log
@@ -236,7 +245,9 @@ python3 scripts/my_tool/summarize_pipeline_benchmark.py \
 The summarizer derives crop size and speedup fields and fails when correctness
 or required counters are missing. Pass `--image-size` for one result block, or
 `--image-sizes` with `--datasets` for logs containing multiple result blocks,
-because `pipeline_benchmark` output does not include image dimensions.
+because `pipeline_benchmark` output does not include image dimensions. The
+default report keeps `dct_coeffs` visible and selects mode-specific fields for
+`auto` and `dct-compare` result rows.
 
 The pipeline modes are:
 
@@ -246,6 +257,11 @@ The pipeline modes are:
 - `baseline` or `full-then-crop`: decode full images first, then select the DCT
   blocks that intersect the same pixel crop from the decoded full output.
 - `compare`: run both paths and verify that the cropped DCT coefficients match.
+- `dct-compare`: keep crop pushdown fixed for both paths and compare DCT
+  coefficient selection pushdown against a post-decode baseline. The pushdown
+  path decodes/gathers only the selected coefficient columns; the
+  `dct_post_decode` path uses the same crop requests but decodes all 64
+  coefficients and logically projects the selected subset afterwards.
 - `auto`: use CPU prepared plans for each window to choose pushdown or
   full-then-crop from selected/full FastLanes vector ratio, crop/full block
   ratio, touched-rowgroup ratio, average full blocks per rowgroup, and estimated
@@ -450,7 +466,7 @@ The main path is fused rowgroup prefetch:
 
 ```bash
 PREFETCH_DEPTH=4 PREFETCH_WORKERS=0 STREAM_MAX_ROWGROUPS=1 \
-  bash scripts/my_tool/run_bench.sh
+  bash scripts/my_tool/bench_fls_end2end.sh
 ```
 
 `PREFETCH_WORKERS=0` lets `galp_cli` choose the worker count from the rowgroup
@@ -461,14 +477,14 @@ controls kernel replay inside each sample and defaults to 1.
 
 Local helper scripts:
 
-- `scripts/my_tool/run_bench.sh`: default end-to-end benchmark, writes CSV files
+- `scripts/my_tool/bench_fls_end2end.sh`: default end-to-end benchmark, writes CSV files
   under `scripts/my_tool/end2end_res/`.
-- `scripts/my_tool/run_bench_code_cache.sh`: cold/warm cache comparisons using
+- `scripts/my_tool/bench_fls_cache.sh`: cold/warm cache comparisons using
   `CACHE_DROP_MODE`.
-- `scripts/my_tool/run_galp_io_sweep.sh`: IO and prefetch parameter matrix.
-- `scripts/my_tool/run_ncu.sh`: NCU profiler entry point.
-- `scripts/my_tool/run_nsys.sh`: NSYS profiler entry point.
-- `scripts/my_tool/diff.sh`: compares `galp_cli` output with FastLanes
+- `scripts/my_tool/bench_fls_io_sweep.sh`: IO and prefetch parameter matrix.
+- `scripts/my_tool/profile_ncu.sh`: NCU profiler entry point.
+- `scripts/my_tool/profile_nsys.sh`: NSYS profiler entry point.
+- `scripts/my_tool/check_decompressed_diff.sh`: compares `galp_cli` output with FastLanes
   decompression output.
 
 Important metrics:

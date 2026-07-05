@@ -65,11 +65,12 @@ struct Options {
 	size_t                               compute_inflight_chunks    = 0;
 	bool                                 help_requested             = false;
 #if GALP_WITH_JPEG_DCT
-	galp::jpeg::JpegDctCropBox             pipeline_crop {};
-	bool                                   pipeline_crop_specified = false;
-	galp::execution::PipelineBenchmarkMode pipeline_mode           = galp::execution::PipelineBenchmarkMode::Compare;
-	size_t                                 pipeline_window_images  = 256;
-	size_t                                 pipeline_cache_capacity_bytes = 0;
+	galp::jpeg::JpegDctCropBox              pipeline_crop {};
+	galp::jpeg::JpegDctCoefficientSelection pipeline_coefficient_selection {};
+	bool                                    pipeline_crop_specified = false;
+	galp::execution::PipelineBenchmarkMode  pipeline_mode           = galp::execution::PipelineBenchmarkMode::Compare;
+	size_t                                  pipeline_window_images  = 256;
+	size_t                                  pipeline_cache_capacity_bytes = 0;
 	size_t pipeline_decode_batch_rowgroups    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups;
 	bool   pipeline_enable_rowgroup_prefetch  = true;
 	size_t pipeline_rowgroup_prefetch_depth   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth;
@@ -113,6 +114,35 @@ size_t parse_size_arg(const char* value, const char* label) {
 		return static_cast<size_t>(parsed);
 	} catch (const std::exception&) { throw std::runtime_error(std::string("invalid ") + label + ": " + value); }
 }
+
+bool parse_dct_coefficients(std::string_view value, galp::jpeg::JpegDctCoefficientSelection& selection) {
+	return galp::jpeg::parse_jpeg_dct_coefficient_selection(value, selection);
+}
+
+std::string format_dct_coefficients(const galp::jpeg::JpegDctCoefficientSelection& selection) {
+	if (selection.coefficients.empty()) {
+		return "all";
+	}
+	bool is_prefix = true;
+	for (size_t idx = 0; idx < selection.coefficients.size(); ++idx) {
+		if (selection.coefficients[idx] != idx) {
+			is_prefix = false;
+			break;
+		}
+	}
+	if (is_prefix) {
+		return "first:" + std::to_string(selection.coefficients.size());
+	}
+	std::ostringstream out;
+	out << "list:";
+	for (size_t idx = 0; idx < selection.coefficients.size(); ++idx) {
+		if (idx != 0) {
+			out << ',';
+		}
+		out << static_cast<unsigned>(selection.coefficients[idx]);
+	}
+	return out.str();
+}
 #endif
 
 const char* freq_patcher_name(const galp::execution::FreqPatcher patcher) {
@@ -138,11 +168,17 @@ const char* pipeline_mode_name(const galp::execution::PipelineBenchmarkMode mode
 		return "compare";
 	case galp::execution::PipelineBenchmarkMode::Auto:
 		return "auto";
+	case galp::execution::PipelineBenchmarkMode::DctCompare:
+		return "dct-compare";
 	}
 	return "unknown";
 }
 
 bool parse_pipeline_mode(const std::string_view value, galp::execution::PipelineBenchmarkMode& mode) {
+	if (value == "dct-compare" || value == "dct") {
+		mode = galp::execution::PipelineBenchmarkMode::DctCompare;
+		return true;
+	}
 	if (value == "auto") {
 		mode = galp::execution::PipelineBenchmarkMode::Auto;
 		return true;
@@ -167,8 +203,15 @@ void print_pipeline_stage(const char* label, const galp::execution::PipelineBenc
 	std::cout << label << "_requests: " << stage.requests << "\n";
 	std::cout << label << "_input_blocks: " << stage.input_blocks << "\n";
 	std::cout << label << "_output_blocks: " << stage.output_blocks << "\n";
+	std::cout << label << "_selected_coefficient_count: " << stage.selected_coefficient_count << "\n";
+	std::cout << label << "_full_coefficient_count: " << stage.full_coefficient_count << "\n";
+	std::cout << label << "_selected_coefficient_ratio: " << stage.selected_coefficient_ratio << "\n";
+	std::cout << label << "_coefficients_per_block: " << stage.coefficients_per_block << "\n";
 	std::cout << label << "_output_coefficients: " << stage.output_coefficients << "\n";
 	std::cout << label << "_output_bytes: " << stage.output_bytes << "\n";
+	std::cout << label << "_decoded_coefficients_per_block: " << stage.decoded_coefficients_per_block << "\n";
+	std::cout << label << "_decoded_coefficients: " << stage.decoded_coefficients << "\n";
+	std::cout << label << "_decoded_bytes: " << stage.decoded_bytes << "\n";
 	std::cout << label << "_rowgroup_visits: " << stage.rowgroup_visits << "\n";
 	std::cout << label << "_unique_rowgroups: " << stage.unique_rowgroups << "\n";
 	std::cout << label << "_repeated_rowgroups: " << stage.repeated_rowgroups << "\n";
@@ -191,6 +234,7 @@ void print_pipeline_stage(const char* label, const galp::execution::PipelineBenc
 	std::cout << label << "_workset_count: " << stage.workset_count << "\n";
 	std::cout << label << "_decode_kernel_launch_count: " << stage.decode_kernel_launch_count << "\n";
 	std::cout << label << "_gather_kernel_launch_count: " << stage.gather_kernel_launch_count << "\n";
+	std::cout << label << "_prefix_gather_kernel_launch_count: " << stage.prefix_gather_kernel_launch_count << "\n";
 	std::cout << label << "_cached_gather_kernel_launch_count: " << stage.cached_gather_kernel_launch_count << "\n";
 	std::cout << label << "_materialize_kernel_launch_count: " << stage.materialize_kernel_launch_count << "\n";
 	std::cout << label << "_gather_item_count: " << stage.gather_item_count << "\n";
@@ -368,7 +412,8 @@ void print_usage(const char* prog) {
 	    << " pipeline_benchmark <manifest.bin> [--crop x y width height] [--window-images N] "
 	       "[--cache-capacity-mib N] [--decode-batch-rowgroups N] "
 	       "[--no-jpeg-device-rowgroup-prefetch] "
-	       "[--mode compare|pushdown|baseline|auto] [--no-verify] [image_id ...]\n"
+	       "[--dct-coeffs all|first:N|list:0,1,...] "
+	       "[--mode compare|pushdown|baseline|auto|dct-compare] [--no-verify] [image_id ...]\n"
 #endif
 	    << "  " << prog << " measure_launch [--iters N] [--grid N] [--block N]\n"
 	    << "\n"
@@ -411,8 +456,10 @@ void print_usage(const char* prog) {
 	    << galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers << ")\n"
 	    << "  --jpeg-device-prefetch-min-batches N  Minimum miss decode batches before prefetch (default: "
 	    << galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches << ")\n"
-	    << "  --mode MODE  pipeline_benchmark mode: compare, pushdown, baseline/full-then-crop, or auto. "
-	       "compare runs both and verifies matching cropped output\n"
+	    << "  --dct-coeffs SPEC  DCT coefficient pushdown for pipeline_benchmark: all, first:N, or list:0,1,...\n"
+	    << "  --mode MODE  pipeline_benchmark mode: compare, pushdown, baseline/full-then-crop, auto, "
+	       "or dct-compare. compare runs crop pushdown vs full-then-crop; dct-compare keeps crop pushdown fixed "
+	       "and compares DCT coefficient pushdown against post-decode coefficient selection\n"
 	    << "  --no-verify  Skip coefficient equality validation in compare mode\n"
 #endif
 	    << "  --freq-patcher MODE  FREQ patcher: stateful, branchless, or hybrid[:threshold] (default: stateful)\n";
@@ -568,6 +615,12 @@ bool parse_args(int argc, char** argv, Options& opt) {
 			opt.pipeline_rowgroup_prefetch_min_decode_batches =
 			    parse_size_arg(argv[++i], "jpeg-device-prefetch-min-batches");
 			if (opt.pipeline_rowgroup_prefetch_min_decode_batches == 0) {
+				return false;
+			}
+			continue;
+		}
+		if (arg == "--dct-coeffs" && i + 1 < argc) {
+			if (!parse_dct_coefficients(argv[++i], opt.pipeline_coefficient_selection)) {
 				return false;
 			}
 			continue;
@@ -755,6 +808,7 @@ int main(int argc, char** argv) {
 			galp::execution::PipelineBenchmarkConfig pipeline_cfg;
 			pipeline_cfg.image_ids                            = opt.pipeline_image_ids;
 			pipeline_cfg.crop                                 = opt.pipeline_crop;
+			pipeline_cfg.coefficient_selection                = opt.pipeline_coefficient_selection;
 			pipeline_cfg.mode                                 = opt.pipeline_mode;
 			pipeline_cfg.window_images                        = opt.pipeline_window_images;
 			pipeline_cfg.cache_capacity_bytes                 = opt.pipeline_cache_capacity_bytes;
@@ -778,15 +832,17 @@ int main(int argc, char** argv) {
 			// single-mode run is readable. compare/auto print the full schema (both stages, the
 			// auto policy block, and the comparison fields) for cross-stage analysis and tooling.
 			using galp::execution::PipelineBenchmarkMode;
-			const bool show_pushdown = result.mode == PipelineBenchmarkMode::Pushdown ||
-			                           result.mode == PipelineBenchmarkMode::Compare ||
-			                           result.mode == PipelineBenchmarkMode::Auto;
+			const bool show_pushdown =
+			    result.mode == PipelineBenchmarkMode::Pushdown || result.mode == PipelineBenchmarkMode::Compare ||
+			    result.mode == PipelineBenchmarkMode::Auto || result.mode == PipelineBenchmarkMode::DctCompare;
 			const bool show_full = result.mode == PipelineBenchmarkMode::FullThenCrop ||
 			                       result.mode == PipelineBenchmarkMode::Compare ||
 			                       result.mode == PipelineBenchmarkMode::Auto;
-			const bool show_auto = result.mode == PipelineBenchmarkMode::Auto;
-			const bool show_comparison =
-			    result.mode == PipelineBenchmarkMode::Compare || result.mode == PipelineBenchmarkMode::Auto;
+			const bool show_dct_post_decode = result.mode == PipelineBenchmarkMode::DctCompare;
+			const bool show_auto            = result.mode == PipelineBenchmarkMode::Auto;
+			const bool show_comparison      = result.mode == PipelineBenchmarkMode::Compare ||
+			                             result.mode == PipelineBenchmarkMode::Auto ||
+			                             result.mode == PipelineBenchmarkMode::DctCompare;
 			if (opt.pipeline_crop_specified) {
 				std::cout << "  crop: " << opt.pipeline_crop.x << "," << opt.pipeline_crop.y << ","
 				          << opt.pipeline_crop.width << "," << opt.pipeline_crop.height << "\n";
@@ -794,6 +850,7 @@ int main(int argc, char** argv) {
 				std::cout << "  crop: full-image\n";
 			}
 			std::cout << "  window_images: " << opt.pipeline_window_images << "\n";
+			std::cout << "  dct_coeffs: " << format_dct_coefficients(opt.pipeline_coefficient_selection) << "\n";
 			std::cout << "  decode_batch_rowgroups: " << opt.pipeline_decode_batch_rowgroups << "\n";
 			std::cout << "  jpeg_device_rowgroup_prefetch: " << (opt.pipeline_enable_rowgroup_prefetch ? 1 : 0) << "\n";
 			std::cout << "  jpeg_device_prefetch_depth: " << opt.pipeline_rowgroup_prefetch_depth << "\n";
@@ -805,6 +862,8 @@ int main(int argc, char** argv) {
 			if (show_comparison) {
 				std::cout << "  outputs_match: " << (result.outputs_match ? 1 : 0) << "\n";
 				std::cout << "  verify_ms: " << result.verify_ms << "\n";
+			}
+			if (result.mode == PipelineBenchmarkMode::Compare || result.mode == PipelineBenchmarkMode::Auto) {
 				const bool has_pushdown_comparison =
 				    result.pushdown.total_ms > 0.0 && result.full_then_crop.total_ms > 0.0;
 				std::cout << "  pushdown_speedup_vs_full_then_crop: "
@@ -812,6 +871,15 @@ int main(int argc, char** argv) {
 				          << "\n";
 				std::cout << "  pushdown_saved_ms_vs_full_then_crop: "
 				          << (has_pushdown_comparison ? result.full_then_crop.total_ms - result.pushdown.total_ms : 0.0)
+				          << "\n";
+			}
+			if (show_dct_post_decode) {
+				const bool has_dct_comparison = result.pushdown.total_ms > 0.0 && result.dct_post_decode.total_ms > 0.0;
+				std::cout << "  dct_pushdown_speedup_vs_post_decode: "
+				          << (has_dct_comparison ? result.dct_post_decode.total_ms / result.pushdown.total_ms : 0.0)
+				          << "\n";
+				std::cout << "  dct_pushdown_saved_ms_vs_post_decode: "
+				          << (has_dct_comparison ? result.dct_post_decode.total_ms - result.pushdown.total_ms : 0.0)
 				          << "\n";
 			}
 			if (show_auto) {
@@ -856,6 +924,8 @@ int main(int argc, char** argv) {
 				std::cout << "  auto_policy_empty_windows: " << result.auto_policy_empty_windows << "\n";
 				std::cout << "  auto_policy_crop_covers_full_windows: " << result.auto_policy_crop_covers_full_windows
 				          << "\n";
+				std::cout << "  auto_policy_coefficient_pushdown_windows: "
+				          << result.auto_policy_coefficient_pushdown_windows << "\n";
 				std::cout << "  auto_policy_very_small_crop_windows: " << result.auto_policy_very_small_crop_windows
 				          << "\n";
 				std::cout << "  auto_policy_small_window_full_windows: " << result.auto_policy_small_window_full_windows
@@ -883,6 +953,9 @@ int main(int argc, char** argv) {
 			}
 			if (show_full) {
 				print_pipeline_stage("full_then_crop", result.full_then_crop);
+			}
+			if (show_dct_post_decode) {
+				print_pipeline_stage("dct_post_decode", result.dct_post_decode);
 			}
 			return result.outputs_match ? 0 : 2;
 #else
