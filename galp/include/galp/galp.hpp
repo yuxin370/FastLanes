@@ -2,6 +2,7 @@
 #define GALP_GALP_HPP
 
 #include "galp/config.hpp"
+#include "galp/direct_dct.hpp"
 #include "galp/errors.hpp"
 #include "galp/options.hpp"
 #include "galp/reader.hpp"

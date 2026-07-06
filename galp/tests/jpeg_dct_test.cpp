@@ -1,3 +1,4 @@
+#include "galp/direct_dct.hpp"
 #include "galp/jpeg_dct.hpp"
 #include "galp_tools/benchmark_support/pipeline.cuh"
 #include "jpeg/jpeg_dct_device.cuh"
@@ -540,6 +541,96 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 	ASSERT_EQ(selected_full_batch.coefficient_count(),
 	          selected_full_batch.block_count() * selected_coefficients.size());
 	expect_batch_matches_materialized(selected_full_batch);
+
+	std::filesystem::remove_all(dir);
+}
+
+TEST(JpegDct, DirectDctRuntimeExposesStayOnGpuTensorDescriptor) {
+	int        device_count  = 0;
+	const auto device_status = cudaGetDeviceCount(&device_count);
+	if (device_status != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
+	}
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir    = std::filesystem::temp_directory_path() / ("galp_direct_dct_runtime_" + std::to_string(suffix));
+	const auto path0  = dir / "input0.jpg";
+	const auto path1  = dir / "input1.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path0, 16, 16);
+	write_test_jpeg(path1, 16, 16);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 2;
+	shard_options.rowgroup_vectors    = 1;
+	shard_options.rowgroups_per_shard = 256;
+	const auto output_dir             = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
+
+	const std::vector<uint32_t> image_ids {0U, 1U};
+	const std::vector<uint8_t>  selected_coefficients {5U, 0U, 2U};
+	galp::jpeg::JpegDctDeviceBatchOptions options;
+	options.coefficient_selection.coefficients = selected_coefficients;
+
+	galp::jpeg::DirectDctRuntime runtime(output_dir / "manifest.bin");
+	auto                         batch =
+	    runtime.ReadBatch(image_ids, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}, options);
+
+	EXPECT_EQ(runtime.image_count(), 2U);
+	EXPECT_EQ(batch.global_image_ids(), image_ids);
+	EXPECT_EQ(batch.image_count(), image_ids.size());
+	EXPECT_EQ(batch.selected_coefficients(), selected_coefficients);
+	EXPECT_EQ(batch.coefficients_per_block(), selected_coefficients.size());
+	EXPECT_EQ(batch.coefficient_count(), batch.block_count() * selected_coefficients.size());
+	ASSERT_EQ(batch.image_layouts().size(), image_ids.size());
+	ASSERT_EQ(batch.block_metadata().size(), batch.block_count());
+	EXPECT_GT(batch.rowgroups().size(), 0U);
+
+	const auto descriptor = batch.tensor();
+	EXPECT_EQ(descriptor.data, batch.device_data());
+	EXPECT_EQ(descriptor.shape[0], batch.block_count());
+	EXPECT_EQ(descriptor.shape[1], selected_coefficients.size());
+	EXPECT_EQ(descriptor.strides[0], selected_coefficients.size());
+	EXPECT_EQ(descriptor.strides[1], 1U);
+	EXPECT_EQ(descriptor.dtype, galp::jpeg::DirectDctTensorDataType::kInt16);
+	EXPECT_EQ(descriptor.device, galp::jpeg::DirectDctTensorDevice::kCuda);
+	EXPECT_GE(descriptor.cuda_device, 0);
+	ASSERT_NE(descriptor.data, nullptr);
+
+	auto moved_batch       = std::move(batch);
+	const auto moved_tensor = moved_batch.tensor();
+	ASSERT_NE(moved_tensor.data, nullptr);
+	EXPECT_EQ(moved_tensor.shape[0], moved_batch.block_count());
+	EXPECT_EQ(moved_tensor.shape[1], moved_batch.coefficients_per_block());
+
+	std::vector<int16_t> host(moved_batch.coefficient_count());
+	ASSERT_EQ(cudaMemcpy(host.data(),
+	                     moved_batch.device_data(),
+	                     moved_batch.coefficient_bytes(),
+	                     cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+
+	galp::jpeg::JpegDctShardDatasetReader reference_reader(output_dir / "manifest.bin");
+	for (size_t output_block_idx = 0; output_block_idx < moved_batch.block_metadata().size(); ++output_block_idx) {
+		const auto& meta         = moved_batch.block_metadata()[output_block_idx];
+		const auto  materialized = reference_reader.MaterializeImageDct(meta.global_image_index);
+		const auto* expected     = static_cast<const galp::jpeg::MaterializedJpegDctBlock*>(nullptr);
+		for (const auto& block : materialized.blocks) {
+			if (block.semantic_slot_id == meta.semantic_slot_id && block.block_x == meta.block_x &&
+			    block.block_y == meta.block_y) {
+				expected = &block;
+				break;
+			}
+		}
+		ASSERT_NE(expected, nullptr);
+		for (size_t coeff_slot = 0; coeff_slot < moved_batch.coefficients_per_block(); ++coeff_slot) {
+			const auto coeff_idx = moved_batch.selected_coefficients()[coeff_slot];
+			EXPECT_EQ(host[output_block_idx * moved_batch.coefficients_per_block() + coeff_slot],
+			          expected->coefficients[coeff_idx]);
+		}
+	}
 
 	std::filesystem::remove_all(dir);
 }

@@ -14,6 +14,7 @@ option(GALP_BUILD_TESTS "Build GALP tests" ${BUILD_TESTING})
 option(GALP_BUILD_BENCHMARKS "Build GALP benchmarks" OFF)
 option(GALP_BUILD_TOOLS "Build GALP command-line tools" ON)
 option(GALP_BUILD_EXAMPLES "Build GALP examples" OFF)
+option(GALP_BUILD_TORCH "Build optional PyTorch direct-DCT runtime bindings" OFF)
 option(GALP_WITH_NVCOMP "Build nvCOMP compressor comparison targets" OFF)
 option(GALP_WITH_JPEG_DCT "Build JPEG DCT dataset reader/compressor" ON)
 option(GALP_ENABLE_MULTI_COLUMN "Reserved; experimental multi-column generated bindings are currently disabled" OFF)
@@ -202,4 +203,14 @@ endif ()
 ## ────────────────────────────────────────────────
 if (GALP_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif ()
+
+## ────────────────────────────────────────────────
+## 12. Optional PyTorch bindings
+## ────────────────────────────────────────────────
+if (GALP_BUILD_TORCH)
+    if (NOT GALP_WITH_JPEG_DCT)
+        message(FATAL_ERROR "GALP_BUILD_TORCH requires GALP_WITH_JPEG_DCT=ON")
+    endif ()
+    add_subdirectory(torch)
 endif ()

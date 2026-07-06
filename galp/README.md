@@ -132,6 +132,77 @@ FFOR+SLPATCH i8/i16, dictionary i8/i16, cross-RLE i8, RLE i8/i16, and
 `galp::UnsupportedFormatError` with token, rowgroup, column, and column name
 context.
 
+## Direct-DCT Runtime
+
+When `GALP_WITH_JPEG_DCT=ON`, `galp/direct_dct.hpp` exposes a small
+stay-on-GPU runtime facade for direct-DCT ML workloads:
+
+```cpp
+#include <galp/direct_dct.hpp>
+
+galp::jpeg::DirectDctRuntime runtime("/path/to/manifest.bin");
+
+galp::jpeg::JpegDctDeviceBatchOptions options;
+galp::jpeg::parse_jpeg_dct_coefficient_selection("first:8", options.coefficient_selection);
+
+auto batch = runtime.ReadBatch(
+    std::vector<uint32_t> {0, 1, 2, 3},
+    galp::jpeg::JpegDctCropBox {30, 40, 224, 224},
+    options);
+
+auto tensor = batch.tensor();
+// tensor.data is a CUDA int16 pointer with logical shape [block_count, coefficients_per_block].
+```
+
+`DirectDctBatch` owns the underlying `JpegDctDeviceBatch`, so the CUDA pointer
+returned by `DirectDctBatch::tensor()` remains valid as long as the batch or a
+wrapper that owns it remains alive. The initial tensor contract is a compact
+flat layout:
+
+```text
+coefficients: int16 CUDA buffer, logical shape [total_blocks, K]
+K: selected DCT coefficient count, 64 for all coefficients
+image_layouts: per-request global image id, block offset, block count
+block_metadata: request/image/component/block coordinates for each tensor row
+selected_coefficients: logical DCT coefficient id for each tensor column
+```
+
+The runtime keeps the existing JPEG DCT crop pushdown, DCT coefficient
+selection pushdown, rowgroup cache, prefetch, and decode-batch behavior. It
+does not perform IDCT, RGB reconstruction, torchvision-equivalent transforms,
+or detection/segmentation collation.
+
+The first runtime API does not accept a caller-owned CUDA stream. It delegates
+planning, compressed rowgroup upload, GPU FastLanes decode, gather/projection,
+cache reuse, and event handoff to the existing `JpegDctShardDatasetReader`
+device-batch path. The direct-DCT facade and PyTorch export path do not issue
+device-to-host copies, `cudaDeviceSynchronize()`, or `cudaStreamSynchronize()`.
+The optional PyTorch wrapper records a CUDA event on the current PyTorch stream
+when external tensor storage is released and delays `DirectDctBatch` destruction
+until that event completes, preventing GALP's device pool from reusing a buffer
+while already queued PyTorch kernels on that stream are still consuming it.
+Custom-stream callers should use normal CUDA/PyTorch stream synchronization
+around the returned tensor before launching dependent work on another stream.
+
+An optional PyTorch extension is available behind `GALP_BUILD_TORCH=ON`. This
+is deliberately not part of `Galp::core`'s default dependency set:
+
+```bash
+cmake -S . -B build-galp-torch -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
+  -DGALP_BUILD_TORCH=ON \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+cmake --build build-galp-torch --target _galp_direct_dct -j
+PYTHONPATH=build-galp-torch/galp/torch \
+  python3 galp/examples/direct_dct_torch_demo.py /path/to/manifest.bin
+```
+
+The Python demo returns a CUDA `torch.int16` tensor backed by the GALP DCT
+output buffer, exposes batch/cache/execution metadata, and consumes it with GPU
+tensor operations without copying the coefficient data back to host. The CMake
+module also tries to discover this Torch prefix automatically from the selected
+Python interpreter when `Torch_DIR` is not already set.
+
 Public headers must not include private implementation prefixes such as
 `core/`, `format/`, `engine/`, `cuda/`, `codecs/`, benchmark,
 extension, or tool-support implementation paths. Check the boundary with:

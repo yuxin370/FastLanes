@@ -27,6 +27,7 @@ set(GALP_CORE_SOURCES
 )
 if (GALP_WITH_JPEG_DCT)
         list(APPEND GALP_CORE_SOURCES
+                api/direct_dct.cpp
                 jpeg/jpeg_dct.cpp
                 jpeg/jpeg_dct_device.cu
         )
