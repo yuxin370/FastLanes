@@ -1,6 +1,7 @@
 #include "galp/jpeg_dct.hpp"
 #include "galp_tools/benchmark_support/pipeline.cuh"
 #include "jpeg/jpeg_dct_device.cuh"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -505,12 +506,15 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 				          expected->coefficients[coeff_idx]);
 			}
 		}
-	};
+		};
 
-	expect_batch_matches_materialized(batch);
+		expect_batch_matches_materialized(batch);
+		const auto dense_stats = batch.execution_stats();
+		EXPECT_GT(dense_stats.decoded_gather_item_count, 0U);
+		EXPECT_EQ(dense_stats.decoded_projection_item_count, 0U);
 
-	galp::jpeg::JpegDctDeviceBatchOptions selected_options;
-	const std::vector<uint8_t>            selected_coefficients {0U, 2U, 5U};
+		galp::jpeg::JpegDctDeviceBatchOptions selected_options;
+		const std::vector<uint8_t>            selected_coefficients {0U, 2U, 5U};
 	selected_options.coefficient_selection.coefficients = selected_coefficients;
 
 	auto selected_crop_batch = reader.ReadDeviceDctBatch(requests, selected_options);
@@ -519,6 +523,12 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 	ASSERT_EQ(selected_crop_batch.coefficient_count(),
 	          selected_crop_batch.block_count() * selected_coefficients.size());
 	expect_batch_matches_materialized(selected_crop_batch);
+	const auto selected_crop_stats = selected_crop_batch.execution_stats();
+	EXPECT_EQ(selected_crop_stats.decoded_gather_item_count, 0U);
+	EXPECT_EQ(selected_crop_stats.gather_kernel_launch_count, 0U);
+	EXPECT_EQ(selected_crop_stats.decoded_projection_item_count,
+	          selected_crop_batch.block_count() * selected_coefficients.size());
+	EXPECT_GT(selected_crop_stats.materialize_kernel_launch_count, 0U);
 
 	const std::vector<galp::jpeg::JpegDctImageCropRequest> full_image_requests {
 	    galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {}},
@@ -614,28 +624,32 @@ TEST(JpegDct, PipelineCompareValidatesDctCoefficientSelectionForCropAndFullImage
 
 	cfg.mode                  = galp::execution::PipelineBenchmarkMode::Auto;
 	cfg.crop                  = galp::jpeg::JpegDctCropBox {};
-	const auto automatic_full = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
-	EXPECT_TRUE(automatic_full.outputs_match) << automatic_full.mismatch;
-	EXPECT_EQ(automatic_full.auto_pushdown_windows, 0U);
-	EXPECT_EQ(automatic_full.auto_full_then_crop_windows, 2U);
-	EXPECT_EQ(automatic_full.auto_policy_coefficient_pushdown_windows, 0U);
-	EXPECT_EQ(automatic_full.auto_policy_savings_too_small_windows, 2U);
-	EXPECT_NE(automatic_full.auto_policy_reason.find("savings_too_small"), std::string::npos);
-	EXPECT_EQ(automatic_full.pushdown.windows, 0U);
-	assert_post_decode_stage(automatic_full.full_then_crop);
+		const auto automatic_full = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
+		EXPECT_TRUE(automatic_full.outputs_match) << automatic_full.mismatch;
+		EXPECT_EQ(automatic_full.auto_pushdown_windows, 0U);
+		EXPECT_EQ(automatic_full.auto_full_then_crop_windows, 0U);
+		EXPECT_EQ(automatic_full.auto_no_dct_pushdown_windows, 2U);
+		EXPECT_EQ(automatic_full.auto_policy_coefficient_pushdown_windows, 0U);
+		EXPECT_EQ(automatic_full.auto_policy_savings_too_small_windows, 2U);
+		EXPECT_NE(automatic_full.auto_policy_reason.find("savings_too_small"), std::string::npos);
+		EXPECT_EQ(automatic_full.pushdown.windows, 0U);
+		EXPECT_EQ(automatic_full.full_then_crop.windows, 0U);
+		assert_post_decode_stage(automatic_full.auto_no_dct_pushdown);
 
-	cfg.crop                         = galp::jpeg::JpegDctCropBox {0, 0, 16, 16};
-	const auto automatic_full_crop   = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
-	EXPECT_TRUE(automatic_full_crop.outputs_match) << automatic_full_crop.mismatch;
-	EXPECT_EQ(automatic_full_crop.auto_policy_fast_gate_windows, 0U);
-	EXPECT_EQ(automatic_full_crop.auto_policy_estimate_windows, 2U);
-	EXPECT_EQ(automatic_full_crop.auto_pushdown_windows, 0U);
-	EXPECT_EQ(automatic_full_crop.auto_full_then_crop_windows, 2U);
-	EXPECT_EQ(automatic_full_crop.auto_policy_coefficient_pushdown_windows, 0U);
-	EXPECT_EQ(automatic_full_crop.auto_policy_savings_too_small_windows, 2U);
-	EXPECT_NE(automatic_full_crop.auto_policy_reason.find("savings_too_small"), std::string::npos);
-	EXPECT_EQ(automatic_full_crop.pushdown.windows, 0U);
-	assert_post_decode_stage(automatic_full_crop.full_then_crop);
+		cfg.crop                         = galp::jpeg::JpegDctCropBox {0, 0, 16, 16};
+		const auto automatic_full_crop   = galp::execution::benchmark_jpeg_dct_pipeline(output_dir / "manifest.bin", cfg);
+		EXPECT_TRUE(automatic_full_crop.outputs_match) << automatic_full_crop.mismatch;
+		EXPECT_EQ(automatic_full_crop.auto_policy_fast_gate_windows, 0U);
+		EXPECT_EQ(automatic_full_crop.auto_policy_estimate_windows, 2U);
+		EXPECT_EQ(automatic_full_crop.auto_pushdown_windows, 0U);
+		EXPECT_EQ(automatic_full_crop.auto_full_then_crop_windows, 0U);
+		EXPECT_EQ(automatic_full_crop.auto_no_dct_pushdown_windows, 2U);
+		EXPECT_EQ(automatic_full_crop.auto_policy_coefficient_pushdown_windows, 0U);
+		EXPECT_EQ(automatic_full_crop.auto_policy_savings_too_small_windows, 2U);
+		EXPECT_NE(automatic_full_crop.auto_policy_reason.find("savings_too_small"), std::string::npos);
+		EXPECT_EQ(automatic_full_crop.pushdown.windows, 0U);
+		EXPECT_EQ(automatic_full_crop.full_then_crop.windows, 0U);
+		assert_post_decode_stage(automatic_full_crop.auto_no_dct_pushdown);
 
 	std::filesystem::remove_all(dir);
 }
@@ -1199,11 +1213,21 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		                                                               /*selected_vectors=*/6,
 		                                                               /*full_vectors=*/10,
 		                                                               /*estimated_pushdown_worksets=*/1,
-		                                                               /*estimated_full_worksets=*/2);
+		                                                               /*estimated_full_worksets=*/2,
+		                                                               /*selected_coefficients=*/64,
+		                                                               /*active_physical_coefficients=*/64,
+		                                                               /*estimated_pushdown_reuse_candidate_rowgroups=*/1,
+		                                                               /*estimated_full_reuse_candidate_rowgroups=*/3);
 		EXPECT_TRUE(policy.use_pushdown);
 		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
 		EXPECT_EQ(policy.estimated_pushdown_worksets, 1U);
 		EXPECT_EQ(policy.estimated_full_worksets, 2U);
+		EXPECT_EQ(policy.estimated_pushdown_reuse_candidate_rowgroups, 1U);
+		EXPECT_EQ(policy.estimated_full_reuse_candidate_rowgroups, 3U);
+		EXPECT_DOUBLE_EQ(policy.selected_blocks_per_pushdown_workset, 10000.0);
+		EXPECT_NE(policy.reason.find("selected_blocks_per_pushdown_workset=10000.000000"), std::string::npos);
+		EXPECT_NE(policy.reason.find("estimated_pushdown_reuse_candidate_rowgroups=1"), std::string::npos);
+		EXPECT_NE(policy.reason.find("estimated_full_reuse_candidate_rowgroups=3"), std::string::npos);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_estimates(/*selected_blocks=*/10000,
@@ -1231,6 +1255,74 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		                                                                            /*selected_coefficients=*/8);
 		EXPECT_FALSE(policy.use_pushdown);
 		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::SavingsTooSmall);
+		EXPECT_EQ(policy.selected_coefficient_count, 8U);
+		EXPECT_EQ(policy.active_physical_coefficient_count, 8U);
+		EXPECT_EQ(policy.estimated_pushdown_decoded_bytes,
+		          2809U * galp::codec::consts::VALUES_PER_VECTOR * 8U * sizeof(int16_t));
+		EXPECT_EQ(policy.estimated_output_bytes, 360000U * 8U * sizeof(int16_t));
+		EXPECT_NE(policy.reason.find("active_physical_coefficients=8"), std::string::npos);
+		EXPECT_NE(policy.reason.find("estimated_pushdown_decoded_bytes="), std::string::npos);
+		EXPECT_NE(policy.reason.find("estimated_output_bytes="), std::string::npos);
+	}
+	{
+		const auto policy = choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/321702,
+		                                                                            /*full_blocks=*/321702,
+		                                                                            /*touched_rowgroups=*/256,
+		                                                                            /*full_rowgroups=*/256,
+		                                                                            /*selected_vectors=*/1144,
+		                                                                            /*full_vectors=*/1144,
+		                                                                            /*estimated_pushdown_worksets=*/4,
+		                                                                            /*estimated_full_worksets=*/4,
+		                                                                            /*selected_coefficients=*/8);
+		EXPECT_TRUE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CoefficientSelectionPushdown);
+		EXPECT_GT(policy.selected_blocks_per_pushdown_workset,
+		          galp::execution::detail::kAutoMinCoefficientPushdownBlocksPerWorkset);
+		EXPECT_NE(policy.reason.find("coefficient_selection_pushdown"), std::string::npos);
+	}
+	{
+		const auto policy = choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/1528,
+		                                                                            /*full_blocks=*/1528,
+		                                                                            /*touched_rowgroups=*/6,
+		                                                                            /*full_rowgroups=*/6,
+		                                                                            /*selected_vectors=*/32,
+		                                                                            /*full_vectors=*/32,
+		                                                                            /*estimated_pushdown_worksets=*/1,
+		                                                                            /*estimated_full_worksets=*/1,
+		                                                                            /*selected_coefficients=*/8);
+		EXPECT_TRUE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CoefficientSelectionPushdown);
+	}
+	{
+		const auto svhn_policy =
+		    choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/396,
+		                                                            /*full_blocks=*/396,
+		                                                            /*touched_rowgroups=*/1,
+		                                                            /*full_rowgroups=*/1,
+		                                                            /*selected_vectors=*/2,
+		                                                            /*full_vectors=*/2,
+		                                                            /*estimated_pushdown_worksets=*/1,
+		                                                            /*estimated_full_worksets=*/1,
+		                                                            /*selected_coefficients=*/8);
+		EXPECT_FALSE(svhn_policy.use_pushdown);
+		EXPECT_EQ(svhn_policy.reason_code, AutoPipelinePolicyReason::SavingsTooSmall);
+		EXPECT_LT(svhn_policy.selected_blocks_per_pushdown_workset,
+		          galp::execution::detail::kAutoMinCoefficientPushdownBlocksPerWorkset);
+
+		const auto cifar_policy =
+		    choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/576,
+		                                                            /*full_blocks=*/576,
+		                                                            /*touched_rowgroups=*/3,
+		                                                            /*full_rowgroups=*/3,
+		                                                            /*selected_vectors=*/5,
+		                                                            /*full_vectors=*/5,
+		                                                            /*estimated_pushdown_worksets=*/1,
+		                                                            /*estimated_full_worksets=*/1,
+		                                                            /*selected_coefficients=*/8);
+		EXPECT_FALSE(cifar_policy.use_pushdown);
+		EXPECT_EQ(cifar_policy.reason_code, AutoPipelinePolicyReason::SavingsTooSmall);
+		EXPECT_LT(cifar_policy.selected_blocks_per_pushdown_workset,
+		          galp::execution::detail::kAutoMinCoefficientPushdownBlocksPerWorkset);
 	}
 	{
 		const auto crop_only_policy = choose_auto_pipeline_policy_from_counts(
@@ -1254,6 +1346,23 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		                                                                            /*selected_coefficients=*/8);
 		EXPECT_TRUE(policy.use_pushdown);
 		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::VerySmallCrop);
+		EXPECT_NE(policy.reason.find("very_small_crop"), std::string::npos);
+		EXPECT_EQ(policy.selected_coefficient_count, 8U);
+		EXPECT_EQ(policy.active_physical_coefficient_count, 8U);
+	}
+	{
+		const auto policy = choose_auto_coefficient_selection_policy_from_estimates(/*selected_blocks=*/10000,
+		                                                                            /*full_blocks=*/20000,
+		                                                                            /*touched_rowgroups=*/2,
+		                                                                            /*full_rowgroups=*/10,
+		                                                                            /*selected_vectors=*/6,
+		                                                                            /*full_vectors=*/10,
+		                                                                            /*estimated_pushdown_worksets=*/1,
+		                                                                            /*estimated_full_worksets=*/2,
+		                                                                            /*selected_coefficients=*/8);
+		EXPECT_TRUE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+		EXPECT_NE(policy.reason.find("crop_saves_enough_blocks"), std::string::npos);
 	}
 	{
 		const auto crop_only_policy = choose_auto_pipeline_policy_from_counts(/*selected_blocks=*/14237789,
@@ -1274,14 +1383,26 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		                                                                            /*full_vectors=*/71999,
 		                                                                            /*estimated_pushdown_worksets=*/193,
 		                                                                            /*estimated_full_worksets=*/193,
-		                                                                            /*selected_coefficients=*/8);
+		                                                                            /*selected_coefficients=*/8,
+		                                                                            /*active_physical_coefficients=*/6);
 		EXPECT_TRUE(policy.use_pushdown);
 		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CoefficientSelectionPushdown);
+		EXPECT_EQ(policy.selected_coefficient_count, 8U);
+		EXPECT_EQ(policy.active_physical_coefficient_count, 6U);
+		EXPECT_EQ(policy.estimated_pushdown_decoded_bytes,
+		          52333U * galp::codec::consts::VALUES_PER_VECTOR * 6U * sizeof(int16_t));
+		EXPECT_EQ(policy.estimated_full_decoded_bytes,
+		          71999U * galp::codec::consts::VALUES_PER_VECTOR *
+		              galp::execution::detail::kAutoJpegDctCoefficientCount * sizeof(int16_t));
+		EXPECT_EQ(policy.estimated_output_bytes, 14237789U * 8U * sizeof(int16_t));
+		EXPECT_NE(policy.reason.find("coefficient_selection_pushdown"), std::string::npos);
+		EXPECT_NE(policy.reason.find("active_physical_coefficients=6"), std::string::npos);
 	}
 }
 
 TEST(JpegDct, AutoPipelineReuseCandidateCountsRepeatedPreviewRowgroups) {
 	using galp::execution::detail::count_auto_reuse_candidate_rowgroups;
+	using galp::execution::detail::estimate_auto_reuse_candidate_rowgroups;
 	using galp::execution::detail::estimate_auto_worksets_for_rowgroups;
 
 	std::set<std::pair<uint32_t, uint32_t>>                seen;
@@ -1296,7 +1417,11 @@ TEST(JpegDct, AutoPipelineReuseCandidateCountsRepeatedPreviewRowgroups) {
 	    galp::jpeg::JpegDctDeviceRowgroupMetadata {1, 9},
 	};
 
+	EXPECT_EQ(estimate_auto_reuse_candidate_rowgroups(first_window, seen), 0U);
+	EXPECT_TRUE(seen.empty());
 	EXPECT_EQ(count_auto_reuse_candidate_rowgroups(first_window, seen), 0U);
+	EXPECT_EQ(seen.size(), 3U);
+	EXPECT_EQ(estimate_auto_reuse_candidate_rowgroups(second_window, seen), 2U);
 	EXPECT_EQ(seen.size(), 3U);
 	EXPECT_EQ(count_auto_reuse_candidate_rowgroups(second_window, seen), 2U);
 	EXPECT_EQ(seen.size(), 4U);

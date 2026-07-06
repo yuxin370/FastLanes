@@ -3,6 +3,8 @@
 #if GALP_WITH_JPEG_DCT
 #include "jpeg/jpeg_dct_device.cuh"
 #endif
+#include <algorithm>
+#include <array>
 #include <gtest/gtest.h>
 #include <memory>
 #include <stdexcept>
@@ -193,5 +195,82 @@ TEST(WorksetSelectedVectors, JpegDctColumnProjectionAppendsOnlySelectedColumnsAn
 	EXPECT_EQ(batch.expr_indices[1], 103U);
 	EXPECT_EQ(batch.expr_indices[2], 105U);
 	EXPECT_EQ(workset.outputs.used_bytes, 3U * rowgroup.n_values * sizeof(int8_t));
+}
+
+TEST(WorksetSelectedVectors, JpegDctFusedProjectionPlanCoversPrefixListAndAliasSelections) {
+	galp::execution::Rowgroup rowgroup;
+	rowgroup.columns.resize(galp::jpeg::detail::kJpegDctCoefficientCount);
+	rowgroup.columns[9].alias_of        = 3U;
+	rowgroup.columns[9].skip_decompress = true;
+
+	const std::vector<galp::jpeg::detail::JpegDctDeviceGatherItem> blocks {
+	    galp::jpeg::detail::JpegDctDeviceGatherItem {7U, 11U, 2U},
+	    galp::jpeg::detail::JpegDctDeviceGatherItem {7U, 19U, 3U}};
+
+	const auto make_projection_items_for_blocks =
+	    [](const std::vector<galp::jpeg::detail::JpegDctDeviceGatherItem>& block_items,
+	       const std::vector<uint8_t>& selected_coefficients) {
+		    std::vector<galp::jpeg::detail::JpegDctDeviceProjectionItem> projection_items;
+		    projection_items.reserve(block_items.size() * selected_coefficients.size());
+		    for (const auto& block_item : block_items) {
+			    for (size_t coeff_slot = 0; coeff_slot < selected_coefficients.size(); ++coeff_slot) {
+				    const auto logical_coeff = selected_coefficients[coeff_slot];
+				    projection_items.push_back(galp::jpeg::detail::JpegDctDeviceProjectionItem {
+				        block_item.rowgroup_index,
+				        block_item.row_in_rowgroup,
+				        block_item.output_block_index,
+				        static_cast<uint16_t>(coeff_slot),
+				        logical_coeff,
+				        logical_coeff});
+			    }
+		    }
+		    return projection_items;
+	    };
+
+	const std::vector<uint8_t> prefix_coefficients {0U, 1U, 2U};
+	const auto                 prefix_projection = make_projection_items_for_blocks(blocks, prefix_coefficients);
+	ASSERT_EQ(prefix_projection.size(), blocks.size() * prefix_coefficients.size());
+	EXPECT_EQ(prefix_projection[0].output_block_index, 2U);
+	EXPECT_EQ(prefix_projection[0].rowgroup_index, 7U);
+	EXPECT_EQ(prefix_projection[0].row_in_rowgroup, 11U);
+	EXPECT_EQ(prefix_projection[0].selected_coefficient_slot, 0U);
+	EXPECT_EQ(prefix_projection[0].logical_coefficient_id, 0U);
+	const auto resolved_prefix =
+	    galp::jpeg::detail::resolve_projection_physical_columns(rowgroup, prefix_projection);
+	EXPECT_EQ(resolved_prefix.active_physical_coefficients, prefix_coefficients);
+
+	const std::vector<uint8_t> list_coefficients {5U, 9U, 2U};
+	const auto                 list_projection = make_projection_items_for_blocks(blocks, list_coefficients);
+	const auto resolved_list   = galp::jpeg::detail::resolve_projection_physical_columns(rowgroup, list_projection);
+	ASSERT_EQ(resolved_list.items.size(), blocks.size() * list_coefficients.size());
+	EXPECT_EQ(resolved_list.items[1].selected_coefficient_slot, 1U);
+	EXPECT_EQ(resolved_list.items[1].logical_coefficient_id, 9U);
+	EXPECT_EQ(resolved_list.items[1].physical_coefficient_column_id, 3U);
+	EXPECT_EQ(resolved_list.active_physical_coefficients, (std::vector<uint8_t> {2U, 3U, 5U}));
+
+	std::vector<int16_t> compact(list_coefficients.size());
+	std::array<int16_t, galp::jpeg::detail::kJpegDctCoefficientCount> physical_values {};
+	for (size_t coeff = 0; coeff < physical_values.size(); ++coeff) {
+		physical_values[coeff] = static_cast<int16_t>(coeff);
+	}
+	for (const auto& item : resolved_list.items) {
+		if (item.output_block_index != 2U) {
+			continue;
+		}
+		compact[galp::jpeg::detail::selected_dct_output_offset(
+		    0U, item.selected_coefficient_slot, list_coefficients.size())] =
+		    physical_values[item.physical_coefficient_column_id];
+	}
+	EXPECT_EQ(compact, (std::vector<int16_t> {5, 3, 2}));
+
+	const std::vector<uint8_t> alias_only_coefficients {9U};
+	const auto                 alias_only_projection = make_projection_items_for_blocks(blocks, alias_only_coefficients);
+	const auto resolved_alias_only =
+	    galp::jpeg::detail::resolve_projection_physical_columns(rowgroup, alias_only_projection);
+	ASSERT_EQ(resolved_alias_only.items.size(), blocks.size());
+	EXPECT_EQ(resolved_alias_only.items[0].selected_coefficient_slot, 0U);
+	EXPECT_EQ(resolved_alias_only.items[0].logical_coefficient_id, 9U);
+	EXPECT_EQ(resolved_alias_only.items[0].physical_coefficient_column_id, 3U);
+	EXPECT_EQ(resolved_alias_only.active_physical_coefficients, (std::vector<uint8_t> {3U}));
 }
 #endif

@@ -10,6 +10,7 @@
 
 #if GALP_WITH_JPEG_DCT
 
+#include "codecs/consts.cuh"
 #include "galp/jpeg_dct.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -39,8 +40,10 @@ constexpr double kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio   = 0.40;
 constexpr double kAutoMinSelectedVectorRatioWhenWorksetsDoNotShrink = 0.50;
 constexpr double kAutoMinMetadataFastPushdownAvgBlocksPerImage      = 64.0;
 constexpr double kAutoMaxCoefficientPushdownRatio                   = 0.25;
-constexpr size_t kAutoMinCoefficientPushdownBlocks                  = 8U * 1024U * 1024U;
-constexpr size_t kAutoMinCoefficientPushdownSavedCoefficients       = 512U * 1024U * 1024U;
+constexpr size_t kAutoMinCoefficientPushdownBlocks                  = 1024U;
+constexpr double kAutoMinCoefficientPushdownBlocksPerWorkset        = 1024.0;
+constexpr size_t kAutoMinCoefficientPushdownSavedCoefficients       = 64U * 1024U;
+constexpr size_t kAutoMinCoefficientPushdownSavedDecodedBytes       = 2U * 1024U * 1024U;
 
 enum class AutoPipelinePolicyReason {
 	EmptyWindow,
@@ -99,6 +102,18 @@ count_auto_reuse_candidate_rowgroups(const std::vector<galp::jpeg::JpegDctDevice
 	return repeated;
 }
 
+inline size_t
+estimate_auto_reuse_candidate_rowgroups(const std::vector<galp::jpeg::JpegDctDeviceRowgroupMetadata>& rowgroups,
+                                        const std::set<std::pair<uint32_t, uint32_t>>&                seen) {
+	size_t repeated = 0;
+	for (const auto& rowgroup : rowgroups) {
+		if (seen.find({rowgroup.shard_id, rowgroup.rowgroup_index}) != seen.end()) {
+			++repeated;
+		}
+	}
+	return repeated;
+}
+
 inline size_t estimate_auto_worksets_for_rowgroups(
     const std::vector<galp::jpeg::JpegDctDeviceRowgroupMetadata>& rowgroups,
     const size_t decode_batch_rowgroups = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups) {
@@ -132,6 +147,19 @@ struct AutoPipelinePolicyDecision {
 	size_t                   estimated_full_worksets         = 0;
 	size_t                   estimated_pushdown_gather_items = 0;
 	size_t                   estimated_full_gather_items     = 0;
+	size_t                   selected_coefficient_count      = kAutoJpegDctCoefficientCount;
+	size_t                   active_physical_coefficient_count = kAutoJpegDctCoefficientCount;
+	double                   selected_coefficient_ratio      = 1.0;
+	size_t                   estimated_pushdown_materialization_items = 0;
+	size_t                   estimated_full_materialization_items     = 0;
+	size_t                   estimated_pushdown_syncs                = 0;
+	size_t                   estimated_full_syncs                    = 0;
+	double                   selected_blocks_per_pushdown_workset    = 0.0;
+	size_t                   estimated_pushdown_reuse_candidate_rowgroups = 0;
+	size_t                   estimated_full_reuse_candidate_rowgroups     = 0;
+	size_t                   estimated_pushdown_decoded_bytes        = 0;
+	size_t                   estimated_full_decoded_bytes            = 0;
+	size_t                   estimated_output_bytes                  = 0;
 	std::string              reason;
 };
 
@@ -144,7 +172,25 @@ inline std::string format_auto_pipeline_policy_reason(const AutoPipelinePolicyDe
 	       ",estimated_pushdown_worksets=" + std::to_string(decision.estimated_pushdown_worksets) +
 	       ",estimated_full_worksets=" + std::to_string(decision.estimated_full_worksets) +
 	       ",estimated_pushdown_gather_items=" + std::to_string(decision.estimated_pushdown_gather_items) +
-	       ",estimated_full_gather_items=" + std::to_string(decision.estimated_full_gather_items);
+	       ",estimated_full_gather_items=" + std::to_string(decision.estimated_full_gather_items) +
+	       ",selected_coefficients=" + std::to_string(decision.selected_coefficient_count) +
+	       ",active_physical_coefficients=" + std::to_string(decision.active_physical_coefficient_count) +
+	       ",selected_coefficient_ratio=" + std::to_string(decision.selected_coefficient_ratio) +
+	       ",estimated_pushdown_materialization_items=" +
+	           std::to_string(decision.estimated_pushdown_materialization_items) +
+	       ",estimated_full_materialization_items=" +
+	           std::to_string(decision.estimated_full_materialization_items) +
+	       ",estimated_pushdown_syncs=" + std::to_string(decision.estimated_pushdown_syncs) +
+	       ",estimated_full_syncs=" + std::to_string(decision.estimated_full_syncs) +
+	       ",selected_blocks_per_pushdown_workset=" +
+	           std::to_string(decision.selected_blocks_per_pushdown_workset) +
+	       ",estimated_pushdown_reuse_candidate_rowgroups=" +
+	           std::to_string(decision.estimated_pushdown_reuse_candidate_rowgroups) +
+	       ",estimated_full_reuse_candidate_rowgroups=" +
+	           std::to_string(decision.estimated_full_reuse_candidate_rowgroups) +
+	       ",estimated_pushdown_decoded_bytes=" + std::to_string(decision.estimated_pushdown_decoded_bytes) +
+	       ",estimated_full_decoded_bytes=" + std::to_string(decision.estimated_full_decoded_bytes) +
+	       ",estimated_output_bytes=" + std::to_string(decision.estimated_output_bytes);
 }
 
 inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(const size_t selected_blocks,
@@ -154,8 +200,16 @@ inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(con
                                                                              const size_t selected_vectors,
                                                                              const size_t full_vectors,
                                                                              const size_t estimated_pushdown_worksets,
-                                                                             const size_t estimated_full_worksets) {
+                                                                             const size_t estimated_full_worksets,
+                                                                             const size_t selected_coefficients = kAutoJpegDctCoefficientCount,
+                                                                             const size_t active_physical_coefficients = kAutoJpegDctCoefficientCount,
+                                                                             const size_t estimated_pushdown_reuse_candidate_rowgroups = 0,
+                                                                             const size_t estimated_full_reuse_candidate_rowgroups = 0) {
 	AutoPipelinePolicyDecision decision;
+	const size_t normalized_selected_coefficients =
+	    selected_coefficients == 0 ? kAutoJpegDctCoefficientCount : selected_coefficients;
+	const size_t normalized_active_physical_coefficients =
+	    active_physical_coefficients == 0 ? normalized_selected_coefficients : active_physical_coefficients;
 	decision.selected_block_ratio =
 	    full_blocks == 0 ? 0.0 : static_cast<double>(selected_blocks) / static_cast<double>(full_blocks);
 	decision.selected_vector_ratio = full_vectors == 0
@@ -169,6 +223,26 @@ inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(con
 	decision.estimated_full_worksets         = estimated_full_worksets;
 	decision.estimated_pushdown_gather_items = selected_blocks;
 	decision.estimated_full_gather_items     = full_blocks;
+	decision.selected_coefficient_count      = normalized_selected_coefficients;
+	decision.active_physical_coefficient_count = normalized_active_physical_coefficients;
+	decision.selected_coefficient_ratio =
+	    static_cast<double>(normalized_selected_coefficients) / static_cast<double>(kAutoJpegDctCoefficientCount);
+	decision.estimated_pushdown_materialization_items = selected_blocks * normalized_selected_coefficients;
+	decision.estimated_full_materialization_items     = full_blocks * normalized_selected_coefficients;
+	decision.estimated_pushdown_syncs                 = estimated_pushdown_worksets;
+	decision.estimated_full_syncs                     = estimated_full_worksets;
+	decision.selected_blocks_per_pushdown_workset =
+	    estimated_pushdown_worksets == 0
+	        ? static_cast<double>(selected_blocks)
+	        : static_cast<double>(selected_blocks) / static_cast<double>(estimated_pushdown_worksets);
+	decision.estimated_pushdown_reuse_candidate_rowgroups = estimated_pushdown_reuse_candidate_rowgroups;
+	decision.estimated_full_reuse_candidate_rowgroups     = estimated_full_reuse_candidate_rowgroups;
+	decision.estimated_pushdown_decoded_bytes =
+	    selected_vectors * galp::codec::consts::VALUES_PER_VECTOR * normalized_active_physical_coefficients *
+	    sizeof(int16_t);
+	decision.estimated_full_decoded_bytes =
+	    full_vectors * galp::codec::consts::VALUES_PER_VECTOR * kAutoJpegDctCoefficientCount * sizeof(int16_t);
+	decision.estimated_output_bytes = selected_blocks * normalized_selected_coefficients * sizeof(int16_t);
 
 	if (full_blocks == 0 || selected_blocks == 0) {
 		decision.use_pushdown = false;
@@ -233,7 +307,10 @@ choose_auto_coefficient_selection_policy_from_estimates(const size_t selected_bl
                                                         const size_t full_vectors,
                                                         const size_t estimated_pushdown_worksets,
                                                         const size_t estimated_full_worksets,
-                                                        const size_t selected_coefficients) {
+                                                        const size_t selected_coefficients,
+                                                        const size_t active_physical_coefficients = 0,
+                                                        const size_t estimated_pushdown_reuse_candidate_rowgroups = 0,
+                                                        const size_t estimated_full_reuse_candidate_rowgroups = 0) {
 	auto         decision          = choose_auto_pipeline_policy_from_estimates(selected_blocks,
                                                                full_blocks,
                                                                touched_rowgroups,
@@ -241,7 +318,13 @@ choose_auto_coefficient_selection_policy_from_estimates(const size_t selected_bl
                                                                selected_vectors,
                                                                full_vectors,
                                                                estimated_pushdown_worksets,
-                                                               estimated_full_worksets);
+                                                               estimated_full_worksets,
+                                                               selected_coefficients,
+                                                               active_physical_coefficients == 0
+                                                                   ? selected_coefficients
+                                                                   : active_physical_coefficients,
+                                                               estimated_pushdown_reuse_candidate_rowgroups,
+                                                               estimated_full_reuse_candidate_rowgroups);
 	const size_t full_coefficients = kAutoJpegDctCoefficientCount;
 	const double selected_ratio =
 	    full_coefficients == 0 ? 1.0
@@ -252,9 +335,20 @@ choose_auto_coefficient_selection_policy_from_estimates(const size_t selected_bl
 	    saved_coefficients_per_block != 0U &&
 	    selected_blocks >= (kAutoMinCoefficientPushdownSavedCoefficients + saved_coefficients_per_block - 1U) /
 	                           saved_coefficients_per_block;
+	const size_t decoded_bytes_saved =
+	    decision.estimated_full_decoded_bytes > decision.estimated_pushdown_decoded_bytes
+	        ? decision.estimated_full_decoded_bytes - decision.estimated_pushdown_decoded_bytes
+	        : 0U;
+	const bool saves_enough_decoded_bytes = decoded_bytes_saved >= kAutoMinCoefficientPushdownSavedDecodedBytes;
+	const bool has_enough_blocks_per_workset =
+	    decision.selected_blocks_per_pushdown_workset >= kAutoMinCoefficientPushdownBlocksPerWorkset;
+	const bool workset_syncs_do_not_increase =
+	    decision.estimated_pushdown_worksets <= decision.estimated_full_worksets &&
+	    decision.estimated_pushdown_syncs <= decision.estimated_full_syncs;
 	if (selected_coefficients != 0U && selected_coefficients < full_coefficients &&
 	    selected_ratio <= kAutoMaxCoefficientPushdownRatio && selected_blocks >= kAutoMinCoefficientPushdownBlocks &&
-	    saves_enough_coefficients) {
+	    saves_enough_coefficients && saves_enough_decoded_bytes && has_enough_blocks_per_workset &&
+	    workset_syncs_do_not_increase) {
 		decision.use_pushdown = true;
 		decision.reason_code  = AutoPipelinePolicyReason::CoefficientSelectionPushdown;
 	} else if (!decision.use_pushdown) {
@@ -420,6 +514,8 @@ struct PipelineBenchmarkStageResult {
 	size_t      gather_item_count                             = 0;
 	size_t      decoded_gather_item_count                     = 0;
 	size_t      cached_gather_item_count                      = 0;
+	size_t      projection_item_count                         = 0;
+	size_t      decoded_projection_item_count                 = 0;
 	size_t      workset_upload_count                          = 0;
 	size_t      scratch_upload_count                          = 0;
 	size_t      scratch_allocation_count                      = 0;
@@ -456,6 +552,8 @@ struct PipelineBenchmarkStageResult {
 	double      gather_ms                                     = 0.0;
 	double      decoded_gather_ms                             = 0.0;
 	double      cached_gather_ms                              = 0.0;
+	double      projection_ms                                 = 0.0;
+	double      decoded_projection_ms                         = 0.0;
 	double      prefetch_wait_ms                              = 0.0;
 	double      prefetch_depth_block_ms                       = 0.0;
 	double      prefetch_queue_start_ms                       = 0.0;
@@ -477,13 +575,15 @@ struct PipelineBenchmarkStageResult {
 
 struct PipelineBenchmarkResult {
 	uint64_t                     dataset_images = 0;
-	PipelineBenchmarkMode        mode           = PipelineBenchmarkMode::Compare;
-	PipelineBenchmarkStageResult pushdown;
-	PipelineBenchmarkStageResult full_then_crop;
-	PipelineBenchmarkStageResult dct_post_decode;
-	size_t                       auto_pushdown_windows       = 0;
-	size_t                       auto_full_then_crop_windows = 0;
-	double                       auto_policy_ms              = 0.0;
+		PipelineBenchmarkMode        mode           = PipelineBenchmarkMode::Compare;
+		PipelineBenchmarkStageResult pushdown;
+		PipelineBenchmarkStageResult full_then_crop;
+		PipelineBenchmarkStageResult auto_no_dct_pushdown;
+		PipelineBenchmarkStageResult dct_post_decode;
+		size_t                       auto_pushdown_windows       = 0;
+		size_t                       auto_full_then_crop_windows = 0;
+		size_t                       auto_no_dct_pushdown_windows = 0;
+		double                       auto_policy_ms              = 0.0;
 	double                       auto_total_ms               = 0.0;
 	std::string                  auto_policy_reason;
 	size_t                       auto_policy_fast_gate_windows                  = 0;

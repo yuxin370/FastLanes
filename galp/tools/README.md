@@ -153,7 +153,8 @@ Record at least the following fields for every reported dataset/crop:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
 For `auto` runs also report `auto_pushdown_windows`,
-`auto_full_then_crop_windows`, `auto_policy_selected_vector_ratio`,
+`auto_full_then_crop_windows`, `auto_no_dct_pushdown_windows`,
+`auto_policy_selected_vector_ratio`,
 `auto_policy_estimated_pushdown_worksets`,
 `auto_policy_estimated_full_worksets`, `auto_policy_coefficient_pushdown_windows`,
 and `auto_policy_reason`. The default summary includes the full auto policy
@@ -208,17 +209,26 @@ Benchmark output metrics
                                   JPEG scratch preserves the decode workset's stream, events,
                                   output arena, and chunk arena capacity across these submissions.
   *_decode_kernel_launch_count    FastLanes decode kernel launches.
-  *_gather_kernel_launch_count    DCT block-major gather launches.
+  *_gather_kernel_launch_count    DCT block-major gather launches. Newly decoded rowgroups use
+                                  fused projection materialization; gather remains for dense
+                                  decoded-rowgroup cache hits.
   *_cached_gather_kernel_launch_count
                                   Gather launches sourced only from dense decoded-rowgroup cache hits.
   *_materialize_kernel_launch_count
-                                  Dense decoded-rowgroup cache materialization launches.
-  *_gather_item_count             DCT blocks handled by gather kernels.
-  *_decoded_gather_item_count     Gather items sourced from newly decoded FastLanes worksets.
+                                  Fused projection and dense decoded-rowgroup cache
+                                  materialization launches.
+  *_gather_item_count             DCT blocks handled by cached gather kernels.
+  *_decoded_gather_item_count     Legacy decoded gather items; expected to stay zero for the
+                                  fused projection path.
   *_cached_gather_item_count      Gather items sourced from dense decoded-rowgroup cache hits.
+  *_projection_item_count         Compact DCT projection entries materialized directly from
+                                  newly decoded FastLanes worksets.
+  *_decoded_projection_item_count Projection entries sourced from newly decoded FastLanes
+                                  worksets.
   *_workset_upload_count          Workset metadata uploads.
-  *_scratch_upload_count          Device scratch metadata uploads. Decoded-gather coefficient
-                                  pointers and source tags are packed into one binding array.
+  *_scratch_upload_count          Device scratch metadata uploads. Projection coefficient
+                                  pointers, source tags, and projection entries are packed into
+                                  reusable scratch arrays.
   *_scratch_allocation_count      Reader-owned reusable device scratch capacity growth events.
                                   Host staging vectors, including pending rowgroup work, are
                                   reused but not counted as device allocations. The reusable
@@ -250,7 +260,10 @@ Benchmark output metrics
   *_workset_build_ms / *_workset_upload_ms / *_decode_ms / *_gather_ms
                                   Internal JPEG DCT device-stage timings.
   *_decoded_gather_ms / *_cached_gather_ms
-                                  Gather time split by decoded-rowgroup path and dense-cache-hit path.
+                                  Gather time split by legacy decoded-rowgroup path and dense-cache-hit path.
+                                  The fused decoded path should report projection time instead.
+  *_projection_ms / *_decoded_projection_ms
+                                  Fused compact DCT projection materialization time.
   *_sync_rowgroup_read_ms         Synchronous JPEG DCT rowgroup read + materialization time.
   *_prefetch_queue_start_ms       Time to create JPEG DCT rowgroup prefetch queues.
   *_prefetch_wait_ms              Time the device batch consumer waited for prefetched rowgroups.
@@ -305,13 +318,17 @@ Benchmark output metrics
   pushdown_saved_ms_vs_full_then_crop
                                   full_then_crop_total_ms - pushdown_total_ms when both stages run;
                                   0 for one-sided modes.
-  auto_pushdown_windows / auto_full_then_crop_windows
+  auto_pushdown_windows / auto_full_then_crop_windows / auto_no_dct_pushdown_windows
                                   Window-level decisions made by pipeline_benchmark --mode auto.
+                                  auto_no_dct_pushdown means crop remains pushed down and only
+                                  DCT coefficient pushdown is rejected.
   auto_policy_ms / auto_total_ms   CPU prepared-plan policy time and aggregate selected-path time
                                   in auto mode. The selected path reuses the prepared plan instead
                                   of planning again; no-crop auto windows prepare only the full
                                   candidate. auto_total_ms includes auto policy/planning time once.
-  auto_policy_reason               Last auto decision reason and its prepared-plan ratios.
+  auto_policy_reason               Last auto decision reason, including prepared-plan ratios,
+                                  coefficient counts, reuse candidates, materialization/sync
+                                  estimates, and decoded/output byte estimates.
   auto_policy_selected_blocks / auto_policy_full_blocks
                                   Aggregate crop/full prepared-plan block counts used by auto mode.
   auto_policy_selected_block_ratio Aggregate selected/full prepared-plan block ratio.

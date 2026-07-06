@@ -176,6 +176,26 @@ struct JpegDctDeviceGatherItem {
 	uint64_t output_block_index = 0;
 };
 
+struct JpegDctDeviceProjectionItem {
+	uint32_t rowgroup_index                  = 0;
+	uint32_t row_in_rowgroup                 = 0;
+	uint64_t output_block_index              = 0;
+	uint16_t selected_coefficient_slot       = 0;
+	uint8_t  logical_coefficient_id          = 0;
+	uint8_t  physical_coefficient_column_id  = 0;
+};
+
+struct JpegDctDeviceResolvedProjection {
+	std::vector<JpegDctDeviceProjectionItem> items;
+	std::vector<uint8_t>                     active_physical_coefficients;
+};
+
+size_t resolve_physical_coefficient_column(const galp::execution::Rowgroup& rowgroup, size_t logical_coeff_idx);
+
+JpegDctDeviceResolvedProjection
+resolve_projection_physical_columns(const galp::execution::Rowgroup&               rowgroup,
+                                    const std::vector<JpegDctDeviceProjectionItem>& projection_items);
+
 inline std::vector<uint32_t> selected_decode_vectors(const std::vector<JpegDctDeviceGatherItem>& items,
                                                      const size_t                                rowgroup_n_vecs,
                                                      const unsigned                              unpack_n_vectors_cfg) {
@@ -225,6 +245,33 @@ remap_items_to_selected_vectors(const std::vector<JpegDctDeviceGatherItem>& item
 	return remapped;
 }
 
+inline std::vector<JpegDctDeviceProjectionItem>
+remap_projection_items_to_selected_vectors(const std::vector<JpegDctDeviceProjectionItem>& items,
+                                           const std::vector<uint32_t>&                     selected_vectors,
+                                           const unsigned                                   unpack_n_vectors_cfg) {
+	const auto                             unpack_n_vectors = std::max(1U, unpack_n_vectors_cfg);
+	std::vector<JpegDctDeviceProjectionItem> remapped;
+	remapped.reserve(items.size());
+	for (const auto& item : items) {
+		const uint32_t source_vector =
+		    item.row_in_rowgroup / static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
+		const uint32_t source_chunk = (source_vector / unpack_n_vectors) * unpack_n_vectors;
+		const auto     it           = std::lower_bound(selected_vectors.begin(), selected_vectors.end(), source_chunk);
+		if (it == selected_vectors.end() || *it != source_chunk) {
+			throw std::runtime_error("JPEG DCT selected-vector projection remap missing source vector");
+		}
+		auto       mapped               = item;
+		const auto selected_chunk_index = static_cast<uint32_t>(std::distance(selected_vectors.begin(), it));
+		const auto chunk_vector_offset  = source_vector - source_chunk;
+		const auto row_offset  = item.row_in_rowgroup % static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
+		mapped.row_in_rowgroup = (selected_chunk_index * unpack_n_vectors + chunk_vector_offset) *
+		                             static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR) +
+		                         row_offset;
+		remapped.push_back(mapped);
+	}
+	return remapped;
+}
+
 inline bool selected_decode_chunks_fit(const std::vector<uint32_t>& selected_vectors,
                                        const size_t                 rowgroup_n_vecs,
                                        const unsigned               unpack_n_vectors_cfg) {
@@ -244,8 +291,10 @@ inline size_t selected_decode_vector_count(const std::vector<uint32_t>& selected
 struct JpegDctDeviceRowgroupPlan {
 	uint32_t                             rowgroup_index = 0;
 	std::vector<JpegDctDeviceGatherItem> items;
+	std::vector<JpegDctDeviceProjectionItem> projection_items;
 	std::vector<uint32_t>                selected_vectors;
 	std::vector<JpegDctDeviceGatherItem> selected_gather_items;
+	std::vector<JpegDctDeviceProjectionItem> selected_projection_items;
 	size_t                               selected_vector_count = 0;
 	size_t                               full_vector_count     = 0;
 	bool                                 selected_chunks_fit   = true;

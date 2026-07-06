@@ -2108,6 +2108,8 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.selected_coefficients       = detail::normalize_coefficient_selection(options.coefficient_selection);
 		plan.coefficient_selection_shape = detail::classify_coefficient_selection(plan.selected_coefficients);
 		plan.coefficients_per_block      = plan.selected_coefficients.size();
+		const bool materialize_projection_items =
+		    plan.coefficient_selection_shape.kind != detail::JpegDctCoefficientSelectionKind::kAll;
 		plan.decode_batch_rowgroups =
 		    options.decode_batch_rowgroups == 0 ? kDefaultJpegDctDecodeBatchRowgroups : options.decode_batch_rowgroups;
 		plan.rowgroup_prefetch.enabled = options.enable_rowgroup_prefetch;
@@ -2208,6 +2210,19 @@ struct JpegDctShardDatasetReader::Impl {
 						    detail::JpegDctDeviceGatherItem {ref.fls_rowgroup_index,
 						                                     ref.row_start_in_rowgroup + ref.row_offset_in_block_group,
 						                                     output_block_index});
+						if (materialize_projection_items) {
+							const auto row_in_rowgroup = ref.row_start_in_rowgroup + ref.row_offset_in_block_group;
+							for (size_t coeff_slot = 0; coeff_slot < plan.selected_coefficients.size(); ++coeff_slot) {
+								const auto logical_coeff = plan.selected_coefficients[coeff_slot];
+								rowgroup_plan.projection_items.push_back(detail::JpegDctDeviceProjectionItem {
+								    ref.fls_rowgroup_index,
+								    row_in_rowgroup,
+								    output_block_index,
+								    static_cast<uint16_t>(coeff_slot),
+								    logical_coeff,
+								    logical_coeff});
+							}
+						}
 					}
 				}
 			}
@@ -2246,6 +2261,10 @@ struct JpegDctShardDatasetReader::Impl {
 				if (runtime_policy.decision == detail::JpegDctRuntimePolicyDecision::kSelectedVectors) {
 					rowgroup_plan.selected_gather_items = detail::remap_items_to_selected_vectors(
 					    rowgroup_plan.items, selected_vectors, detail::kJpegDctDeviceUnpackNVectors);
+					if (materialize_projection_items) {
+						rowgroup_plan.selected_projection_items = detail::remap_projection_items_to_selected_vectors(
+						    rowgroup_plan.projection_items, selected_vectors, detail::kJpegDctDeviceUnpackNVectors);
+					}
 				}
 				rowgroup_plan.selected_vectors = std::move(selected_vectors);
 				plan.planned_selected_vector_count += planned_selected_vector_count;

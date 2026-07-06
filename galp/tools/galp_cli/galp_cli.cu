@@ -240,6 +240,8 @@ void print_pipeline_stage(const char* label, const galp::execution::PipelineBenc
 	std::cout << label << "_gather_item_count: " << stage.gather_item_count << "\n";
 	std::cout << label << "_decoded_gather_item_count: " << stage.decoded_gather_item_count << "\n";
 	std::cout << label << "_cached_gather_item_count: " << stage.cached_gather_item_count << "\n";
+	std::cout << label << "_projection_item_count: " << stage.projection_item_count << "\n";
+	std::cout << label << "_decoded_projection_item_count: " << stage.decoded_projection_item_count << "\n";
 	std::cout << label << "_workset_upload_count: " << stage.workset_upload_count << "\n";
 	std::cout << label << "_scratch_upload_count: " << stage.scratch_upload_count << "\n";
 	std::cout << label << "_scratch_allocation_count: " << stage.scratch_allocation_count << "\n";
@@ -295,6 +297,8 @@ void print_pipeline_stage(const char* label, const galp::execution::PipelineBenc
 	std::cout << label << "_gather_ms: " << stage.gather_ms << "\n";
 	std::cout << label << "_decoded_gather_ms: " << stage.decoded_gather_ms << "\n";
 	std::cout << label << "_cached_gather_ms: " << stage.cached_gather_ms << "\n";
+	std::cout << label << "_projection_ms: " << stage.projection_ms << "\n";
+	std::cout << label << "_decoded_projection_ms: " << stage.decoded_projection_ms << "\n";
 	std::cout << label << "_prefetch_wait_ms: " << stage.prefetch_wait_ms << "\n";
 	std::cout << label << "_prefetch_depth_block_ms: " << stage.prefetch_depth_block_ms << "\n";
 	std::cout << label << "_prefetch_queue_start_ms: " << stage.prefetch_queue_start_ms << "\n";
@@ -837,7 +841,9 @@ int main(int argc, char** argv) {
 			    result.mode == PipelineBenchmarkMode::Auto || result.mode == PipelineBenchmarkMode::DctCompare;
 			const bool show_full = result.mode == PipelineBenchmarkMode::FullThenCrop ||
 			                       result.mode == PipelineBenchmarkMode::Compare ||
-			                       result.mode == PipelineBenchmarkMode::Auto;
+			                       (result.mode == PipelineBenchmarkMode::Auto && result.full_then_crop.windows > 0);
+			const bool show_auto_no_dct =
+			    result.mode == PipelineBenchmarkMode::Auto && result.auto_no_dct_pushdown.windows > 0;
 			const bool show_dct_post_decode = result.mode == PipelineBenchmarkMode::DctCompare;
 			const bool show_auto            = result.mode == PipelineBenchmarkMode::Auto;
 			const bool show_comparison      = result.mode == PipelineBenchmarkMode::Compare ||
@@ -863,7 +869,8 @@ int main(int argc, char** argv) {
 				std::cout << "  outputs_match: " << (result.outputs_match ? 1 : 0) << "\n";
 				std::cout << "  verify_ms: " << result.verify_ms << "\n";
 			}
-			if (result.mode == PipelineBenchmarkMode::Compare || result.mode == PipelineBenchmarkMode::Auto) {
+			if (result.mode == PipelineBenchmarkMode::Compare ||
+			    (result.mode == PipelineBenchmarkMode::Auto && result.full_then_crop.total_ms > 0.0)) {
 				const bool has_pushdown_comparison =
 				    result.pushdown.total_ms > 0.0 && result.full_then_crop.total_ms > 0.0;
 				std::cout << "  pushdown_speedup_vs_full_then_crop: "
@@ -871,6 +878,18 @@ int main(int argc, char** argv) {
 				          << "\n";
 				std::cout << "  pushdown_saved_ms_vs_full_then_crop: "
 				          << (has_pushdown_comparison ? result.full_then_crop.total_ms - result.pushdown.total_ms : 0.0)
+				          << "\n";
+			}
+			if (show_auto_no_dct) {
+				const bool has_no_dct_comparison =
+				    result.pushdown.total_ms > 0.0 && result.auto_no_dct_pushdown.total_ms > 0.0;
+				std::cout << "  pushdown_speedup_vs_auto_no_dct_pushdown: "
+				          << (has_no_dct_comparison ? result.auto_no_dct_pushdown.total_ms / result.pushdown.total_ms
+				                                    : 0.0)
+				          << "\n";
+				std::cout << "  pushdown_saved_ms_vs_auto_no_dct_pushdown: "
+				          << (has_no_dct_comparison ? result.auto_no_dct_pushdown.total_ms - result.pushdown.total_ms
+				                                    : 0.0)
 				          << "\n";
 			}
 			if (show_dct_post_decode) {
@@ -885,6 +904,7 @@ int main(int argc, char** argv) {
 			if (show_auto) {
 				std::cout << "  auto_pushdown_windows: " << result.auto_pushdown_windows << "\n";
 				std::cout << "  auto_full_then_crop_windows: " << result.auto_full_then_crop_windows << "\n";
+				std::cout << "  auto_no_dct_pushdown_windows: " << result.auto_no_dct_pushdown_windows << "\n";
 				std::cout << "  auto_policy_ms: " << result.auto_policy_ms << "\n";
 				std::cout << "  auto_total_ms: " << result.auto_total_ms << "\n";
 				if (!result.auto_policy_reason.empty()) {
@@ -953,6 +973,9 @@ int main(int argc, char** argv) {
 			}
 			if (show_full) {
 				print_pipeline_stage("full_then_crop", result.full_then_crop);
+			}
+			if (show_auto_no_dct) {
+				print_pipeline_stage("auto_no_dct_pushdown", result.auto_no_dct_pushdown);
 			}
 			if (show_dct_post_decode) {
 				print_pipeline_stage("dct_post_decode", result.dct_post_decode);

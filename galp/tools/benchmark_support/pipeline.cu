@@ -266,6 +266,8 @@ void accumulate_execution_stats(PipelineBenchmarkStageResult& stage, const galp:
 	stage.gather_item_count += stats.gather_item_count;
 	stage.decoded_gather_item_count += stats.decoded_gather_item_count;
 	stage.cached_gather_item_count += stats.cached_gather_item_count;
+	stage.projection_item_count += stats.projection_item_count;
+	stage.decoded_projection_item_count += stats.decoded_projection_item_count;
 	stage.workset_upload_count += stats.workset_upload_count;
 	stage.scratch_upload_count += stats.scratch_upload_count;
 	stage.scratch_allocation_count += stats.scratch_allocation_count;
@@ -304,6 +306,8 @@ void accumulate_execution_stats(PipelineBenchmarkStageResult& stage, const galp:
 	stage.gather_ms += stats.gather_ms;
 	stage.decoded_gather_ms += stats.decoded_gather_ms;
 	stage.cached_gather_ms += stats.cached_gather_ms;
+	stage.projection_ms += stats.projection_ms;
+	stage.decoded_projection_ms += stats.decoded_projection_ms;
 	stage.prefetch_wait_ms += stats.prefetch_wait_ms;
 	stage.prefetch_depth_block_ms += stats.prefetch_depth_block_ms;
 	stage.prefetch_queue_start_ms += stats.prefetch_queue_start_ms;
@@ -327,7 +331,9 @@ void accumulate_rowgroups(PipelineBenchmarkStageResult&            stage,
 detail::AutoPipelinePolicyDecision
 choose_auto_pipeline_policy(const galp::jpeg::JpegDctDeviceBatchPreparedPlan& crop_plan,
                             const galp::jpeg::JpegDctDeviceBatchPreparedPlan& full_plan,
-                            const size_t                                      decode_batch_rowgroups) {
+                            const size_t                                      decode_batch_rowgroups,
+                            const size_t                                      pushdown_reuse_candidate_rowgroups = 0,
+                            const size_t                                      full_reuse_candidate_rowgroups = 0) {
 	return detail::choose_auto_pipeline_policy_from_estimates(
 	    crop_plan.block_metadata().size(),
 	    full_plan.block_metadata().size(),
@@ -336,13 +342,19 @@ choose_auto_pipeline_policy(const galp::jpeg::JpegDctDeviceBatchPreparedPlan& cr
 	    crop_plan.estimated_selected_vector_count(),
 	    full_plan.full_vector_count(),
 	    detail::estimate_auto_worksets_for_rowgroups(crop_plan.rowgroups(), decode_batch_rowgroups),
-	    detail::estimate_auto_worksets_for_rowgroups(full_plan.rowgroups(), decode_batch_rowgroups));
+	    detail::estimate_auto_worksets_for_rowgroups(full_plan.rowgroups(), decode_batch_rowgroups),
+	    detail::kAutoJpegDctCoefficientCount,
+	    detail::kAutoJpegDctCoefficientCount,
+	    pushdown_reuse_candidate_rowgroups,
+	    full_reuse_candidate_rowgroups);
 }
 
 detail::AutoPipelinePolicyDecision
 choose_auto_pipeline_policy(const galp::jpeg::JpegDctDeviceBatchPreparedPlan& crop_plan,
                             const galp::jpeg::JpegDctDeviceBatchPlanEstimate& full_estimate,
-                            const size_t                                      decode_batch_rowgroups) {
+                            const size_t                                      decode_batch_rowgroups,
+                            const size_t                                      pushdown_reuse_candidate_rowgroups = 0,
+                            const size_t                                      full_reuse_candidate_rowgroups = 0) {
 	return detail::choose_auto_pipeline_policy_from_estimates(
 	    crop_plan.block_metadata().size(),
 	    full_estimate.block_count,
@@ -351,23 +363,32 @@ choose_auto_pipeline_policy(const galp::jpeg::JpegDctDeviceBatchPreparedPlan& cr
 	    crop_plan.estimated_selected_vector_count(),
 	    full_estimate.full_vector_count,
 	    detail::estimate_auto_worksets_for_rowgroups(crop_plan.rowgroups(), decode_batch_rowgroups),
-	    detail::estimate_auto_worksets_for_rowgroups(full_estimate.rowgroups, decode_batch_rowgroups));
+	    detail::estimate_auto_worksets_for_rowgroups(full_estimate.rowgroups, decode_batch_rowgroups),
+	    detail::kAutoJpegDctCoefficientCount,
+	    detail::kAutoJpegDctCoefficientCount,
+	    pushdown_reuse_candidate_rowgroups,
+	    full_reuse_candidate_rowgroups);
 }
 
 detail::AutoPipelinePolicyDecision
 make_auto_coefficient_selection_policy_decision(const galp::jpeg::JpegDctDeviceBatchPreparedPlan& coefficient_plan,
-                                                const galp::jpeg::JpegDctDeviceBatchPlanEstimate& full_estimate,
-                                                const size_t decode_batch_rowgroups) {
+                                                const galp::jpeg::JpegDctDeviceBatchPreparedPlan& no_dct_plan,
+                                                const size_t                                      decode_batch_rowgroups,
+                                                const size_t pushdown_reuse_candidate_rowgroups = 0,
+                                                const size_t full_reuse_candidate_rowgroups = 0) {
 	return detail::choose_auto_coefficient_selection_policy_from_estimates(
 	    coefficient_plan.block_metadata().size(),
-	    full_estimate.block_count,
+	    no_dct_plan.block_metadata().size(),
 	    coefficient_plan.rowgroups().size(),
-	    full_estimate.rowgroups.size(),
+	    no_dct_plan.rowgroups().size(),
 	    coefficient_plan.estimated_selected_vector_count(),
-	    full_estimate.full_vector_count,
+	    no_dct_plan.estimated_selected_vector_count(),
 	    detail::estimate_auto_worksets_for_rowgroups(coefficient_plan.rowgroups(), decode_batch_rowgroups),
-	    detail::estimate_auto_worksets_for_rowgroups(full_estimate.rowgroups, decode_batch_rowgroups),
-	    coefficient_plan.coefficients_per_block());
+	    detail::estimate_auto_worksets_for_rowgroups(no_dct_plan.rowgroups(), decode_batch_rowgroups),
+	    coefficient_plan.coefficients_per_block(),
+	    coefficient_plan.coefficients_per_block(),
+	    pushdown_reuse_candidate_rowgroups,
+	    full_reuse_candidate_rowgroups);
 }
 
 void refresh_auto_pipeline_policy_ratios(PipelineBenchmarkResult& result) {
@@ -408,7 +429,7 @@ void accumulate_auto_pipeline_policy_plan(PipelineBenchmarkResult&              
 	result.auto_policy_selected_blocks += crop_plan.block_metadata().size();
 	result.auto_policy_full_blocks += full_plan.block_metadata().size();
 	result.auto_policy_selected_vectors += crop_plan.estimated_selected_vector_count();
-	result.auto_policy_full_vectors += full_plan.full_vector_count();
+	result.auto_policy_full_vectors += full_plan.estimated_selected_vector_count();
 	result.auto_policy_touched_rowgroups += crop_plan.rowgroups().size();
 	result.auto_policy_full_rowgroups += full_plan.rowgroups().size();
 	result.auto_policy_pushdown_reuse_candidate_rowgroups +=
@@ -776,9 +797,17 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 				if (has_coefficient_selection) {
 					auto coefficient_plan =
 					    pushdown_reader->PrepareDeviceDctBatch(full_requests, pushdown_batch_options);
-					auto full_estimate = baseline_reader->EstimateDeviceDctBatch(full_requests, baseline_batch_options);
+					auto no_dct_plan = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
+					const auto pushdown_reuse_candidates = detail::estimate_auto_reuse_candidate_rowgroups(
+					    coefficient_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+					const auto no_dct_reuse_candidates =
+					    detail::estimate_auto_reuse_candidate_rowgroups(no_dct_plan.rowgroups(), auto_full_policy_rowgroups);
 					const auto decision = make_auto_coefficient_selection_policy_decision(
-					    coefficient_plan, full_estimate, pushdown_batch_options.decode_batch_rowgroups);
+					    coefficient_plan,
+					    no_dct_plan,
+					    pushdown_batch_options.decode_batch_rowgroups,
+					    pushdown_reuse_candidates,
+					    no_dct_reuse_candidates);
 					const auto auto_policy_end = Clock::now();
 					const auto auto_policy_ms  = elapsed_ms(auto_policy_start, auto_policy_end);
 					result.auto_policy_ms += auto_policy_ms;
@@ -786,7 +815,7 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 					++result.auto_policy_estimate_windows;
 					accumulate_auto_pipeline_policy_plan(result,
 					                                     coefficient_plan,
-					                                     full_estimate,
+					                                     no_dct_plan,
 					                                     decision,
 					                                     auto_pushdown_policy_rowgroups,
 					                                     auto_full_policy_rowgroups);
@@ -801,20 +830,16 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 						accumulate_pushdown_window(
 						    result.pushdown, coefficient_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
 					} else {
-						++result.auto_full_then_crop_windows;
-						const auto plan_start = Clock::now();
-						auto       full_plan  = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
-						const auto plan_end   = Clock::now();
+						++result.auto_no_dct_pushdown_windows;
 						const auto read_start = Clock::now();
-						auto       full_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
-						const auto read_end   = Clock::now();
+						auto       no_dct_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(no_dct_plan));
+						const auto read_end     = Clock::now();
 
-						accumulate_projected_window(result.full_then_crop,
-						                            full_batch,
-						                            full_batch.block_count(),
+						accumulate_projected_window(result.auto_no_dct_pushdown,
+						                            no_dct_batch,
+						                            no_dct_batch.block_count(),
 						                            selected_coefficients.size(),
-						                            external_plan_overhead_ms(auto_policy_ms + elapsed_ms(plan_start, plan_end),
-						                                                      full_batch),
+						                            external_plan_overhead_ms(auto_policy_ms, no_dct_batch),
 						                            elapsed_ms(read_start, read_end),
 						                            0.0,
 						                            baseline_rowgroups);
@@ -822,8 +847,15 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 					continue;
 				}
 				auto       full_plan = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
-				const auto decision =
-				    choose_auto_pipeline_policy(full_plan, full_plan, baseline_batch_options.decode_batch_rowgroups);
+				const auto pushdown_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(full_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+				const auto full_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(full_plan.rowgroups(), auto_full_policy_rowgroups);
+				const auto decision = choose_auto_pipeline_policy(full_plan,
+				                                                  full_plan,
+				                                                  baseline_batch_options.decode_batch_rowgroups,
+				                                                  pushdown_reuse_candidates,
+				                                                  full_reuse_candidates);
 				const auto auto_policy_end = Clock::now();
 				const auto auto_policy_ms  = elapsed_ms(auto_policy_start, auto_policy_end);
 				result.auto_policy_ms += auto_policy_ms;
@@ -909,12 +941,65 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 			auto       push_requests     = make_requests(image_ids, begin, end, cfg.crop);
 			auto       full_requests     = make_requests(image_ids, begin, end, galp::jpeg::JpegDctCropBox {});
 			auto       crop_plan         = pushdown_reader->PrepareDeviceDctBatch(push_requests, pushdown_batch_options);
+			if (has_coefficient_selection) {
+				auto no_dct_plan = baseline_reader->PrepareDeviceDctBatch(push_requests, baseline_batch_options);
+				const auto pushdown_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(crop_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+				const auto no_dct_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(no_dct_plan.rowgroups(), auto_full_policy_rowgroups);
+				const auto decision = make_auto_coefficient_selection_policy_decision(
+				    crop_plan,
+				    no_dct_plan,
+				    pushdown_batch_options.decode_batch_rowgroups,
+				    pushdown_reuse_candidates,
+				    no_dct_reuse_candidates);
+				const auto auto_policy_end = Clock::now();
+				const auto auto_policy_ms  = fast_policy_ms + elapsed_ms(auto_policy_start, auto_policy_end);
+				result.auto_policy_ms += auto_policy_ms;
+				result.auto_policy_reason = decision.reason;
+				++result.auto_policy_estimate_windows;
+				accumulate_auto_pipeline_policy_plan(result,
+				                                     crop_plan,
+				                                     no_dct_plan,
+				                                     decision,
+				                                     auto_pushdown_policy_rowgroups,
+				                                     auto_full_policy_rowgroups);
+				record_auto_pipeline_policy_reason(result, decision.reason_code);
+
+				if (decision.use_pushdown) {
+					++result.auto_pushdown_windows;
+					const auto read_start = Clock::now();
+					auto       push_batch = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(crop_plan));
+					const auto read_end   = Clock::now();
+					result.pushdown.plan_ms += external_plan_overhead_ms(auto_policy_ms, push_batch);
+					accumulate_pushdown_window(
+					    result.pushdown, push_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
+				} else {
+					++result.auto_no_dct_pushdown_windows;
+					const auto read_start = Clock::now();
+					auto       no_dct_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(no_dct_plan));
+					const auto read_end     = Clock::now();
+					accumulate_projected_window(result.auto_no_dct_pushdown,
+					                            no_dct_batch,
+					                            no_dct_batch.block_count(),
+					                            selected_coefficients.size(),
+					                            external_plan_overhead_ms(auto_policy_ms, no_dct_batch),
+					                            elapsed_ms(read_start, read_end),
+					                            0.0,
+					                            baseline_rowgroups);
+				}
+				continue;
+			}
 			auto       full_estimate     = baseline_reader->EstimateDeviceDctBatch(full_requests, baseline_batch_options);
-			const auto decision =
-			    has_coefficient_selection
-			        ? make_auto_coefficient_selection_policy_decision(
-			              crop_plan, full_estimate, pushdown_batch_options.decode_batch_rowgroups)
-			        : choose_auto_pipeline_policy(crop_plan, full_estimate, pushdown_batch_options.decode_batch_rowgroups);
+			const auto pushdown_reuse_candidates =
+			    detail::estimate_auto_reuse_candidate_rowgroups(crop_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+			const auto full_reuse_candidates =
+			    detail::estimate_auto_reuse_candidate_rowgroups(full_estimate.rowgroups, auto_full_policy_rowgroups);
+			const auto decision = choose_auto_pipeline_policy(crop_plan,
+			                                                  full_estimate,
+			                                                  pushdown_batch_options.decode_batch_rowgroups,
+			                                                  pushdown_reuse_candidates,
+			                                                  full_reuse_candidates);
 			const auto auto_policy_end = Clock::now();
 			const auto auto_policy_ms  = fast_policy_ms + elapsed_ms(auto_policy_start, auto_policy_end);
 			result.auto_policy_ms += auto_policy_ms;
@@ -1018,11 +1103,15 @@ PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&
 	                           result.pushdown.sink_ms;
 	result.full_then_crop.total_ms = result.full_then_crop.plan_ms + result.full_then_crop.read_decode_ms +
 	                                 result.full_then_crop.transform_ms + result.full_then_crop.sink_ms;
+	result.auto_no_dct_pushdown.total_ms =
+	    result.auto_no_dct_pushdown.plan_ms + result.auto_no_dct_pushdown.read_decode_ms +
+	    result.auto_no_dct_pushdown.transform_ms + result.auto_no_dct_pushdown.sink_ms;
 	result.dct_post_decode.total_ms = result.dct_post_decode.plan_ms + result.dct_post_decode.read_decode_ms +
 	                                  result.dct_post_decode.transform_ms + result.dct_post_decode.sink_ms;
 	if (run_auto) {
 		// Each selected auto window folds its policy/prepared-plan time into the chosen stage's plan_ms.
-		result.auto_total_ms = result.pushdown.total_ms + result.full_then_crop.total_ms;
+		result.auto_total_ms =
+		    result.pushdown.total_ms + result.full_then_crop.total_ms + result.auto_no_dct_pushdown.total_ms;
 	}
 	return result;
 }

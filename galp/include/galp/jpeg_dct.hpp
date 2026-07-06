@@ -317,6 +317,8 @@ struct JpegDctDeviceExecutionStats {
 	size_t      gather_item_count                             = 0;
 	size_t      decoded_gather_item_count                     = 0;
 	size_t      cached_gather_item_count                      = 0;
+	size_t      projection_item_count                         = 0;
+	size_t      decoded_projection_item_count                 = 0;
 	size_t      workset_upload_count                          = 0;
 	size_t      scratch_upload_count                          = 0;
 	size_t      scratch_allocation_count                      = 0;
@@ -353,6 +355,8 @@ struct JpegDctDeviceExecutionStats {
 	double      gather_ms                                     = 0.0;
 	double      decoded_gather_ms                             = 0.0;
 	double      cached_gather_ms                              = 0.0;
+	double      projection_ms                                 = 0.0;
+	double      decoded_projection_ms                         = 0.0;
 	double      prefetch_wait_ms                              = 0.0;
 	double      prefetch_depth_block_ms                       = 0.0;
 	double      prefetch_queue_start_ms                       = 0.0;
