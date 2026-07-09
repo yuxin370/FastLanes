@@ -16,16 +16,12 @@ CODEGEN_DIR = GALP_ROOT / "scripts" / "codegen"
 EXPECTED_BINDING_FILES = [
     "alp-double-decompress_column-bindings.cu",
     "alp-double-query_column-bindings.cu",
-    "alp-double-query_multi_column-bindings.cu",
     "alp-float-decompress_column-bindings.cu",
     "alp-float-query_column-bindings.cu",
-    "alp-float-query_multi_column-bindings.cu",
     "alpextended-double-decompress_column-bindings.cu",
     "alpextended-double-query_column-bindings.cu",
-    "alpextended-double-query_multi_column-bindings.cu",
     "alpextended-float-decompress_column-bindings.cu",
     "alpextended-float-query_column-bindings.cu",
-    "alpextended-float-query_multi_column-bindings.cu",
     "bp-uint32_t-decompress_column-bindings.cu",
     "bp-uint32_t-query_column-bindings.cu",
     "bp-uint64_t-decompress_column-bindings.cu",
@@ -45,11 +41,9 @@ EXPECTED_BINDING_FILES = [
     "ffor-uint32_t-compute_column-bindings.cu",
     "ffor-uint32_t-decompress_column-bindings.cu",
     "ffor-uint32_t-query_column-bindings.cu",
-    "ffor-uint32_t-query_multi_column-bindings.cu",
     "ffor-uint64_t-compute_column-bindings.cu",
     "ffor-uint64_t-decompress_column-bindings.cu",
     "ffor-uint64_t-query_column-bindings.cu",
-    "ffor-uint64_t-query_multi_column-bindings.cu",
     "freq-int16_t-decompress_column-bindings.cu",
     "freq-int8_t-decompress_column-bindings.cu",
     "freq-uint32_t-decompress_column-bindings.cu",
@@ -67,8 +61,6 @@ EXPECTED_BINDING_FILES = [
 
 EXPECTED_HEADER_FILES = [
     "kernel_bindings.cuh",
-    "multi_column_device_kernels.cuh",
-    "multi_column_host_kernels.cuh",
 ]
 
 
@@ -104,18 +96,6 @@ def run_codegen(tmp_dir: Path) -> tuple[Path, Path]:
             "--out-dir",
             str(bindings_dir),
             "--header-out-dir",
-            str(headers_dir),
-            "--logging-level",
-            "40",
-        ],
-        check=True,
-        cwd=REPO_ROOT,
-    )
-    subprocess.run(
-        [
-            sys.executable,
-            str(CODEGEN_DIR / "generate_multicolumn_kernels.py"),
-            "--out-dir",
             str(headers_dir),
             "--logging-level",
             "40",

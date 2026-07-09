@@ -17,13 +17,6 @@ option(GALP_BUILD_EXAMPLES "Build GALP examples" OFF)
 option(GALP_BUILD_TORCH "Build optional PyTorch direct-DCT runtime bindings" OFF)
 option(GALP_WITH_NVCOMP "Build nvCOMP compressor comparison targets" OFF)
 option(GALP_WITH_JPEG_DCT "Build JPEG DCT dataset reader/compressor" ON)
-option(GALP_ENABLE_MULTI_COLUMN "Reserved; experimental multi-column generated bindings are currently disabled" OFF)
-if (GALP_ENABLE_MULTI_COLUMN)
-    message(FATAL_ERROR
-            "GALP_ENABLE_MULTI_COLUMN is currently disabled because query_multi_column generated CUDA sources "
-            "have prohibitive compile time. Leave GALP_ENABLE_MULTI_COLUMN=OFF; multi-column benchmarks are "
-            "not part of the supported GALP build.")
-endif ()
 if (DEFINED FLS_ENABLE_INSTALL)
     set(GALP_ENABLE_INSTALL_DEFAULT ${FLS_ENABLE_INSTALL})
 else ()

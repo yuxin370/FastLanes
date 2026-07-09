@@ -17,7 +17,6 @@ GENERATED_HEADERS_DIR: str | None = None
 
 FILE_HEADER = """
 #include "cuda/launch/dispatch.cuh"
-#include "galp_bench/generated/multi_column_host_kernels.cuh"
 #include "galp_bench/generated/kernel_bindings.cuh"
 #include <stdexcept>
 
@@ -75,15 +74,6 @@ bool compute_column(const ColumnT column,
                     const unsigned n_repetitions,
                     const uint32_t n_samples);
 
-template <typename T, typename ColumnT>
-bool query_multi_column(const ColumnT& column,
-                        const unsigned unpack_n_vectors,
-                        const unsigned unpack_n_values,
-                        const galp::format::Unpacker unpacker,
-                        const galp::format::Patcher patcher,
-                        const T magic_value,
-                        const uint32_t n_samples);
-
 } // namespace galp::bench::bindings
 
 #endif // GALP_BENCH_GENERATED_KERNEL_BINDINGS_CUH
@@ -103,7 +93,6 @@ FUNCTIONS = [
     "decompress_column",
     "query_column",
     "compute_column",
-    "query_multi_column",
 ]
 
 ENCODINGS = [
@@ -160,11 +149,6 @@ EXPANDERS = [
     "PrefetchBranchless"
 ]
 
-MULTI_COLUMN_UNPACKERS = [
-    UNPACKERS[2],
-    UNPACKERS[3],
-]
-
 PATCHERS = [
     "None",
     "Dummy",
@@ -175,19 +159,7 @@ PATCHERS = [
     "PrefetchAll",
     "PrefetchAllBranchless",
 ]
-MULTI_COLUMN_PATCHERS = [
-    PATCHERS[0],
-    PATCHERS[3],
-    PATCHERS[4],
-    PATCHERS[5],
-    PATCHERS[6],
-    PATCHERS[7],
-]
-
-
-def get_column_t(
-    encoding: str, data_type: str, function: str, for_decompressor: bool = False
-) -> str:
+def get_column_t(encoding: str, data_type: str, function: str) -> str:
     column_t = f"BPColumn<{data_type}>"
     if "CROSSRLEExtended" in encoding:
         column_t = f"CROSSRLEExtendedColumn<{data_type}>"
@@ -215,11 +187,7 @@ def get_column_t(
         column_t = f"RLEColumn<{data_type}, {data_type}>"
     elif "CONSTANT" in encoding:
         column_t = f"CONSTANTColumn<{data_type}>"
-    return (
-        "galp::codec::device::"
-        if function != "query_multi_column" or for_decompressor
-        else "galp::codec::host::"
-    ) + column_t
+    return "galp::codec::device::" + column_t
 
 
 def get_decompressor_type(
@@ -232,7 +200,7 @@ def get_decompressor_type(
     n_vec: int,
     n_val: int,
 ) -> str:
-    column_t = get_column_t(encoding, data_type, function, True)
+    column_t = get_column_t(encoding, data_type, function)
     functor = f"BPFunctor<{data_type}>"
     patcher_t = f""
     decompressor_t = f"{encoding}Decompressor"
@@ -327,7 +295,6 @@ def get_if_statement(
     patcher: str,
     expander: str = "None",
     is_query_column: bool = False,
-    n_columns: int | None = None,
     n_repetitions: int | None = None,
 ) -> str:
 
@@ -343,35 +310,31 @@ def get_if_statement(
     decompressor_t = get_decompressor_type(
         encoding, data_type, function, unpacker, patcher, expander, n_vec, n_val
     )
-    extra_param = (
-        "," + str(n_columns)
-        if n_columns
-        else ", magic_value" if is_query_column else ""
-    )
+    extra_param = ", magic_value" if is_query_column else ""
 
     if encoding == "CROSSRLE" or encoding == "CROSSRLEExtended" or encoding == "CROSSRLELaneMask":
         return (
-            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == galp::format::Expander::{expander} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && expander == galp::format::Expander::{expander}) "
             + "{"  # }
             f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
         )
     if encoding == "CONSTANT":
         return (
-            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val}) "
             + "{"  # }
             f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
         )
     if encoding == "FREQ" or encoding == "FREQExtended":
         return (
-            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && patcher == galp::format::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+            f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && patcher == galp::format::Patcher::{patcher}) "
             + "{"  # }
             f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
             "}"
         )
     return (
-        f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && unpacker == galp::format::Unpacker::{unpacker} && patcher == galp::format::Patcher::{patcher} {'&& n_columns == ' + str(n_columns) if n_columns else ''}) "
+        f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && unpacker == galp::format::Unpacker::{unpacker} && patcher == galp::format::Patcher::{patcher}) "
         + "{"  # }
         f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
         "}"
@@ -385,15 +348,14 @@ def get_function(
     return_type: str,
     content: list[str],
     is_query_column: bool = False,
-    is_multi_column: bool = False,
     is_compute_column: bool = False,
 ) -> str:
-    assert not (is_multi_column and is_compute_column)
     column_t = get_column_t(encoding, data_type, function)
-    column_param_t = f"const {column_t}&" if is_multi_column else f"const {column_t}"
+    expander_param = ", const galp::format::Expander expander" if function == "decompress_column" else ""
+    magic_param = f", const {data_type} magic_value" if is_query_column else ""
+    repetitions_param = ", const unsigned n_repetitions" if is_compute_column else ""
     return (
-        # f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values{', const galp::format::Expander expander' if encoding == "CROSSRLE" else ', const galp::format::Unpacker unpacker, const galp::format::Patcher patcher '}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
-        f"template<> {return_type} {function}<{data_type},{column_t}>({column_param_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values, const galp::format::Unpacker unpacker, const galp::format::Patcher patcher{', const galp::format::Expander expander' if function == "decompress_column" else ''}{', const ' + data_type + ' magic_value' if is_query_column or is_multi_column else ''}{', const unsigned n_repetitions' if is_compute_column else ''}, const uint32_t n_samples)"
+        f"template<> {return_type} {function}<{data_type},{column_t}>(const {column_t} column, const unsigned unpack_n_vectors, const unsigned unpack_n_values, const galp::format::Unpacker unpacker, const galp::format::Patcher patcher{expander_param}{magic_param}{repetitions_param}, const uint32_t n_samples)"
         + "{"
         + "\n".join(content)
         + f'throw std::invalid_argument("Could not find correct binding in {function} {encoding}<{data_type}>");'
@@ -431,7 +393,6 @@ def get_if_statement_check_wrapper(
     patcher: str,
     expander: str = "None",
     is_query_column: bool = False,
-    n_columns: int | None = None,
     n_repetitions: int | None = None,
 ) -> str:
     # du handling
@@ -453,18 +414,12 @@ def get_if_statement_check_wrapper(
         or "uint" not in data_type
         or function == "compute_column"
     )
-    multi_column_filter = function == "query_multi_column" and (
-        unpacker not in MULTI_COLUMN_UNPACKERS
-        or patcher not in MULTI_COLUMN_PATCHERS
-        or args.disable_multi_column
-    )
     legacy_fastlanes_filter = unpacker == "OldFls" and (
         n_vec != 1 or data_type not in ["uint32_t", "float"]
     )
     is_filtered = (
         unnessary_filter
         or switch_case_filter
-        or multi_column_filter
         or legacy_fastlanes_filter
     )
     if is_filtered:
@@ -480,7 +435,6 @@ def get_if_statement_check_wrapper(
         patcher,
         expander,
         is_query_column,
-        n_columns,
         n_repetitions,
     )
 
@@ -492,7 +446,6 @@ def main(args):
         for data_type in ["int8_t", "int16_t", "uint32_t", "uint64_t"]:
             for binding in ["decompress_column"]:
                 is_query_column = binding == "query_column"
-                is_multi_column = binding == "query_multi_column"
                 write_file(
                     f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
                     [
@@ -500,11 +453,7 @@ def main(args):
                             encoding,
                             data_type,
                             binding,
-                            (
-                                "bool"
-                                if is_query_column or is_multi_column
-                                else data_type + "*"
-                            ),
+                            "bool" if is_query_column else data_type + "*",
                             [
                                 get_if_statement_check_wrapper(
                                     args.disable_unnecessary,
@@ -515,7 +464,7 @@ def main(args):
                                     n_val,
                                     "None",
                                     patcher,
-                                    is_query_column=is_query_column or is_multi_column,
+                                    is_query_column=is_query_column,
                                     n_repetitions=None,
                                 )
                                 for n_vec in [1, 4]
@@ -523,7 +472,6 @@ def main(args):
                                 for patcher in patchers_per_encoding
                             ],
                             is_query_column=is_query_column,
-                            is_multi_column=is_multi_column,
                         )
                     ],
                 )
@@ -705,9 +653,8 @@ def main(args):
 
     for encoding in ["FFOR"]:
         for data_type in ["uint32_t", "uint64_t"]:
-            for binding in ["query_multi_column", "compute_column"]:
+            for binding in ["compute_column"]:
                 is_compute_column = binding == "compute_column"
-                is_multi_column = binding == "query_multi_column"
                 write_file(
                     f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
                     [
@@ -727,13 +674,11 @@ def main(args):
                                     unpacker,
                                     "None",
                                     n_repetitions=10 if is_compute_column else None,
-                                    is_query_column=is_multi_column,
                                 )
                                 for n_vec in [1, 4]
                                 for n_val in [1]
                                 for unpacker in UNPACKERS[1:]
                             ],
-                            is_multi_column=is_multi_column,
                             is_compute_column=is_compute_column,
                         )
                     ],
@@ -839,9 +784,8 @@ def main(args):
         ["ALP", "ALPExtended"], [PATCHERS[1:4], PATCHERS[4:]]
     ):
         for data_type in ["float", "double"]:
-            for binding in ["decompress_column", "query_column", "query_multi_column"]:
+            for binding in ["decompress_column", "query_column"]:
                 is_query_column = binding == "query_column"
-                is_multi_column = binding == "query_multi_column"
                 write_file(
                     f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
                     [
@@ -849,11 +793,7 @@ def main(args):
                             encoding,
                             data_type,
                             binding,
-                            (
-                                "bool"
-                                if is_query_column or is_multi_column
-                                else data_type + "*"
-                            ),
+                            "bool" if is_query_column else data_type + "*",
                             [
                                 get_if_statement_check_wrapper(
                                     args.disable_unnecessary,
@@ -864,7 +804,7 @@ def main(args):
                                     n_val,
                                     unpacker,
                                     patcher,
-                                    is_query_column=is_query_column or is_multi_column,
+                                    is_query_column=is_query_column,
                                     n_repetitions=None,
                                 )
                                 for n_vec in [1, 4]
@@ -873,7 +813,6 @@ def main(args):
                                 for patcher in patchers_per_encoding
                             ],
                             is_query_column=is_query_column,
-                            is_multi_column=is_multi_column,
                         )
                     ],
                 )
@@ -887,13 +826,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "-du",
         "--disable-unnecessary",
-        type=bool,
-        default=False,
-        action=argparse.BooleanOptionalAction,
-    )
-    parser.add_argument(
-        "-dmc",
-        "--disable-multi-column",
         type=bool,
         default=False,
         action=argparse.BooleanOptionalAction,

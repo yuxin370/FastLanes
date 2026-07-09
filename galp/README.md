@@ -167,6 +167,25 @@ block_metadata: request/image/component/block coordinates for each tensor row
 selected_coefficients: logical DCT coefficient id for each tensor column
 ```
 
+The PyTorch extension also exposes GPU-resident metadata tensors for hot
+training paths:
+
+```text
+image_offsets_tensor: int64 CUDA tensor [image_count]
+image_counts_tensor: int64 CUDA tensor [image_count]
+block_to_image_tensor: int64 CUDA tensor [total_blocks]
+```
+
+Use these tensors for per-image pooling or token packing on CUDA. The legacy
+`image_layouts`, `block_metadata`, `rowgroups`, and `execution_stats`
+properties still materialize Python list/dict objects and are intended for
+debugging, logging, and compatibility.
+
+The Python binding defaults `cache_capacity_mib` to `1024`; pass `0` to
+disable the decoded rowgroup cache explicitly. For double buffering, use
+`reader.prefetch_batch(...)` (or `read_batch_async(...)`) and consume the handle
+with `reader.read_prefetched(handle)`.
+
 The runtime keeps the existing JPEG DCT crop pushdown, DCT coefficient
 selection pushdown, rowgroup cache, prefetch, and decode-batch behavior. It
 does not perform IDCT, RGB reconstruction, torchvision-equivalent transforms,
@@ -194,14 +213,38 @@ cmake -S . -B build-galp-torch -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"
 cmake --build build-galp-torch --target _galp_direct_dct -j
 PYTHONPATH=build-galp-torch/galp/torch \
-  python3 galp/examples/direct_dct_torch_demo.py /path/to/manifest.bin
+  python3 galp/examples/direct_dct_torch_end_to_end_demo.py /path/to/manifest.bin \
+    --batch-size 32 \
+    --crop 0 0 64 64 \
+    --dct-coeffs first:8 \
+    --cache-capacity-mib 1024 \
+    --model tiny-dct-vit \
+    --steps 3 \
+    --train-smoke
 ```
 
-The Python demo returns a CUDA `torch.int16` tensor backed by the GALP DCT
-output buffer, exposes batch/cache/execution metadata, and consumes it with GPU
-tensor operations without copying the coefficient data back to host. The CMake
-module also tries to discover this Torch prefix automatically from the selected
-Python interpreter when `Torch_DIR` is not already set.
+The end-to-end script keeps the GALP coefficient tensor on CUDA, constructs
+per-image DCT-token features from tensorized metadata, runs either a small MLP
+or a tiny ViT-like classifier, and reports logits/loss/timing plus GALP
+execution counters and `cache_capacity_mib`. It enables Python-side async
+prefetch by default; pass `--no-async-prefetch` to force synchronous reads. It
+can also request the YCbCr DCT grid layout:
+
+```bash
+PYTHONPATH=build-galp-torch/galp/torch \
+  python3 galp/examples/direct_dct_torch_end_to_end_demo.py /path/to/manifest.bin \
+    --batch-size 32 \
+    --crop 0 0 64 64 \
+    --dct-coeffs first:8 \
+    --output-layout ycbcr_dct_grid \
+    --phase loader
+```
+
+Both paths keep tensor operations on CUDA and avoid copying coefficient data
+back to host. The CMake module also tries to discover this Torch prefix
+automatically from the selected Python interpreter when `Torch_DIR` is not
+already set. The demo uses crop pushdown only; DCT-domain flip and rotation
+augmentation are not implemented.
 
 Public headers must not include private implementation prefixes such as
 `core/`, `format/`, `engine/`, `cuda/`, `codecs/`, benchmark,
@@ -248,7 +291,6 @@ GALP_BUILD_TOOLS        Build galp_cli
 GALP_BUILD_EXAMPLES     Build GALP examples
 GALP_BUILD_BENCHMARKS   Build generated bindings and microbenchmarks
 GALP_WITH_NVCOMP        Build nvCOMP compressor comparison targets
-GALP_ENABLE_MULTI_COLUMN Reserved; keep OFF, ON fails configure by design
 GALP_ENABLE_INSTALL     Generate install/export/package targets
 ```
 
@@ -625,12 +667,6 @@ expected generated file manifest with:
 python3 galp/scripts/codegen/check_generated_reproducible.py \
   --tmp-dir /tmp/galp_codegen_checker
 ```
-
-`GALP_ENABLE_MULTI_COLUMN=ON` intentionally fails during configure.
-Multi-column generated `query_multi_column` translation units compile too slowly
-for the supported GALP benchmark build. Those files are still generated in the
-build tree for reproducibility checks, but they are not compiled into the
-supported benchmark binding target.
 
 ## Development Rules
 

@@ -32,7 +32,7 @@ foreach (path IN LISTS cxx_paths)
 endforeach ()
 
 set(python_paths
-        "${GALP_ROOT}/examples/direct_dct_torch_demo.py"
+        "${GALP_ROOT}/examples/direct_dct_torch_end_to_end_demo.py"
         "${GALP_ROOT}/torch/direct_dct_torch_runtime_smoke.py"
 )
 

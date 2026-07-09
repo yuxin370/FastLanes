@@ -9,9 +9,6 @@ build/
 *-build/
 Testing/
 build-support/boost_*
-scripts/my_tool/*
-galp/docs/*
-!galp/docs/jpeg_dct_crop_pushdown.md
 # Build directories created by Clion
 cmake-build-*/
 data/decompress*
@@ -20,7 +17,6 @@ skills
 #test 
 python/tests/
 build*/
-scripts/my_tool/*_result
 *.all
 *.ncu-rep
 *.nsys-rep
@@ -30,7 +26,10 @@ scripts/my_tool/*_result
 data/fls/
 data/dct_blocks/
 
-#galp/scripts
+#galp/
+galp/docs/*
+!galp/docs/direct_dct_rgbnomore_blockers.md
+galp/data
 /galp/scripts/*
 !/galp/scripts/codegen/
 !/galp/scripts/codegen/**
@@ -47,6 +46,10 @@ scripts/my_tool
 *.kdev4
 *.log
 *.swp
+
+# Python bytecode
+__pycache__/
+*.py[cod]
 
 #########################################
 # ignore tmp directory
