@@ -28,9 +28,6 @@ def main() -> int:
     if not manifest:
         print("skipping: GALP_DIRECT_DCT_TEST_MANIFEST is not set")
         return SKIP_RETURN_CODE
-    if not torch.cuda.is_available():
-        print("skipping: torch.cuda.is_available() is false")
-        return SKIP_RETURN_CODE
 
     batch_size = int(os.environ.get("GALP_DIRECT_DCT_TEST_BATCH_SIZE", "32"))
     crop = _parse_crop(os.environ.get("GALP_DIRECT_DCT_TEST_CROP"))
@@ -38,6 +35,45 @@ def main() -> int:
 
     reader = galp_dct.DirectDctReader(manifest)
     image_ids = list(range(min(batch_size, reader.image_count)))
+    fixed_plan = reader.plan_batch(
+        image_ids,
+        crop=None,
+        dct_coeffs="all",
+        layout="ycbcr_dct_grid_fixed",
+        preprocess="rgbnomore_val",
+    )
+    if fixed_plan["layout"] != "ycbcr_dct_grid_fixed":
+        raise RuntimeError(f"unexpected fixed-grid plan layout: {fixed_plan['layout']}")
+    if fixed_plan["image_count"] != len(image_ids):
+        raise RuntimeError("fixed-grid plan image count does not match request count")
+    if tuple(fixed_plan["y_shape"]) != (len(image_ids), 1, 28, 28, 8, 8):
+        raise RuntimeError(f"unexpected fixed-grid Y shape: {tuple(fixed_plan['y_shape'])}")
+    if tuple(fixed_plan["cbcr_shape"]) != (len(image_ids), 2, 14, 14, 8, 8):
+        raise RuntimeError(f"unexpected fixed-grid CbCr shape: {tuple(fixed_plan['cbcr_shape'])}")
+    if len(fixed_plan["selected_coefficients"]) != 64:
+        raise RuntimeError("fixed-grid RGB-no-more pushdown must request all 64 coefficients")
+    try:
+        reader.plan_batch(
+            image_ids,
+            crop=None,
+            dct_coeffs="first:8",
+            layout="ycbcr_dct_grid_fixed",
+            preprocess="rgbnomore_val",
+        )
+    except RuntimeError as exc:
+        if "requires dct_coeffs=all" not in str(exc):
+            raise
+    else:
+        raise RuntimeError("fixed-grid RGB-no-more pushdown unexpectedly accepted sparse coefficients")
+
+    if not torch.cuda.is_available():
+        print(
+            "fixed_plan=ok "
+            f"images={fixed_plan['image_count']} blocks={fixed_plan['block_count']} "
+            f"rowgroups={fixed_plan['rowgroup_count']}; skipping CUDA read: torch.cuda.is_available() is false"
+        )
+        return SKIP_RETURN_CODE
+
     batch = reader.read_batch(image_ids, crop=crop, dct_coeffs=dct_coeffs)
 
     coefficients = batch.coefficients
@@ -59,10 +95,27 @@ def main() -> int:
         )
     if batch.coefficient_count != coefficients.numel():
         raise RuntimeError("coefficient count does not match tensor numel")
-    if len(batch.global_image_ids) != len(image_ids) or len(batch.image_layouts) != len(image_ids):
+    image_offsets = batch.image_offsets_tensor
+    image_counts = batch.image_counts_tensor
+    block_to_image = batch.block_to_image_tensor
+    for name, metadata_tensor in (
+        ("image_offsets_tensor", image_offsets),
+        ("image_counts_tensor", image_counts),
+        ("block_to_image_tensor", block_to_image),
+    ):
+        if not metadata_tensor.is_cuda:
+            raise RuntimeError(f"{name} is not a CUDA tensor")
+        if metadata_tensor.dtype != torch.int64:
+            raise RuntimeError(f"{name} must be torch.int64, got {metadata_tensor.dtype}")
+
+    if len(batch.global_image_ids) != len(image_ids) or image_offsets.numel() != len(image_ids):
         raise RuntimeError("image metadata count does not match request count")
-    if len(batch.block_metadata) != batch.block_count:
+    if image_counts.numel() != len(image_ids):
+        raise RuntimeError("image count tensor length does not match request count")
+    if block_to_image.numel() != batch.block_count:
         raise RuntimeError("block metadata count does not match tensor rows")
+    if int(image_counts.sum().item()) != batch.block_count:
+        raise RuntimeError("image block counts do not sum to tensor rows")
     if len(batch.selected_coefficients) != batch.coefficients_per_block:
         raise RuntimeError("selected coefficient count does not match tensor columns")
 

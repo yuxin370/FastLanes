@@ -43,6 +43,27 @@ struct DirectDctTensorDescriptor {
 	}
 };
 
+struct DirectDctGridTensorDescriptor {
+	const int16_t*          data        = nullptr;
+	std::array<size_t, 6>   shape       = {0, 0, 0, 0, 0, 0};
+	std::array<size_t, 6>   strides     = {0, 0, 0, 0, 0, 1};
+	DirectDctTensorDataType dtype       = DirectDctTensorDataType::kInt16;
+	DirectDctTensorDevice   device      = DirectDctTensorDevice::kCuda;
+	int                     cuda_device = -1;
+
+	[[nodiscard]] size_t element_count() const noexcept {
+		size_t count = 1;
+		for (const auto dim : shape) {
+			count *= dim;
+		}
+		return count;
+	}
+
+	[[nodiscard]] bool empty() const noexcept {
+		return element_count() == 0;
+	}
+};
+
 class DirectDctBatch {
 public:
 	DirectDctBatch() noexcept;
@@ -54,11 +75,17 @@ public:
 	DirectDctBatch& operator=(DirectDctBatch&&) noexcept;
 
 	[[nodiscard]] const int16_t*            device_data() const noexcept;
-	[[nodiscard]] DirectDctTensorDescriptor tensor() const noexcept;
+	[[nodiscard]] const int16_t*            y_device_data() const noexcept;
+	[[nodiscard]] const int16_t*            cbcr_device_data() const noexcept;
+	[[nodiscard]] DirectDctTensorDescriptor tensor() const;
+	[[nodiscard]] DirectDctGridTensorDescriptor y_tensor() const;
+	[[nodiscard]] DirectDctGridTensorDescriptor cbcr_tensor() const;
 	[[nodiscard]] size_t                    block_count() const noexcept;
 	[[nodiscard]] size_t                    coefficients_per_block() const noexcept;
 	[[nodiscard]] size_t                    coefficient_count() const noexcept;
 	[[nodiscard]] size_t                    coefficient_bytes() const noexcept;
+	[[nodiscard]] size_t                    y_coefficient_count() const noexcept;
+	[[nodiscard]] size_t                    cbcr_coefficient_count() const noexcept;
 	[[nodiscard]] size_t                    image_count() const noexcept;
 	[[nodiscard]] int                       cuda_device() const noexcept;
 
@@ -69,6 +96,8 @@ public:
 	[[nodiscard]] const std::vector<uint8_t>&                       selected_coefficients() const noexcept;
 	[[nodiscard]] JpegDctDeviceCacheStats                           cache_stats() const noexcept;
 	[[nodiscard]] JpegDctDeviceExecutionStats                       execution_stats() const noexcept;
+	[[nodiscard]] const JpegDctDeviceCacheStats&                    cache_stats_ref() const noexcept;
+	[[nodiscard]] const JpegDctDeviceExecutionStats&                execution_stats_ref() const noexcept;
 	[[nodiscard]] const JpegDctDeviceBatch&                         device_batch() const noexcept;
 
 private:

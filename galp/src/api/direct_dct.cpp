@@ -2,33 +2,11 @@
 
 #if GALP_WITH_JPEG_DCT
 
-#include <cuda_runtime.h>
+#include <stdexcept>
 #include <utility>
 
 namespace galp::jpeg {
 namespace {
-
-int detect_cuda_device(const int16_t* ptr) noexcept {
-	int device = -1;
-	if (ptr != nullptr) {
-		cudaPointerAttributes attrs {};
-		const auto            status = cudaPointerGetAttributes(&attrs, ptr);
-		if (status == cudaSuccess) {
-			device = attrs.device;
-		} else {
-			(void)cudaGetLastError();
-		}
-	}
-	if (device < 0) {
-		int current_device = -1;
-		if (cudaGetDevice(&current_device) == cudaSuccess) {
-			device = current_device;
-		} else {
-			(void)cudaGetLastError();
-		}
-	}
-	return device;
-}
 
 std::vector<uint32_t> request_global_image_ids(const std::vector<JpegDctImageCropRequest>& requests) {
 	std::vector<uint32_t> image_ids;
@@ -71,12 +49,69 @@ const int16_t* DirectDctBatch::device_data() const noexcept {
 	return batch_.device_coefficients();
 }
 
-DirectDctTensorDescriptor DirectDctBatch::tensor() const noexcept {
+const int16_t* DirectDctBatch::y_device_data() const noexcept {
+	return batch_.y_coefficients();
+}
+
+const int16_t* DirectDctBatch::cbcr_device_data() const noexcept {
+	return batch_.cbcr_coefficients();
+}
+
+DirectDctTensorDescriptor DirectDctBatch::tensor() const {
+	if (batch_.layout() == JpegDctDeviceLayout::kYcbcrDctGrid ||
+	    batch_.layout() == JpegDctDeviceLayout::kYcbcrDctGridFixed) {
+		throw std::logic_error(
+		    "compact Direct-DCT tensor is not available for Y/CbCr grid layouts; use y_tensor() or cbcr_tensor()");
+	}
 	const auto columns = coefficients_per_block();
 	return DirectDctTensorDescriptor {
 	    device_data(),
 	    {block_count(), columns},
 	    {columns, 1U},
+	    DirectDctTensorDataType::kInt16,
+	    DirectDctTensorDevice::kCuda,
+	    cuda_device_,
+	};
+}
+
+DirectDctGridTensorDescriptor DirectDctBatch::y_tensor() const {
+	if (batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGrid &&
+	    batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGridFixed) {
+		throw std::logic_error(
+		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor() for compact layout");
+	}
+	const auto shape = batch_.ycbcr_dct_grid_shape().y;
+	return DirectDctGridTensorDescriptor {
+	    y_device_data(),
+	    shape,
+	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[3] * shape[4] * shape[5],
+	     shape[4] * shape[5],
+	     shape[5],
+	     1U},
+	    DirectDctTensorDataType::kInt16,
+	    DirectDctTensorDevice::kCuda,
+	    cuda_device_,
+	};
+}
+
+DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor() const {
+	if (batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGrid &&
+	    batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGridFixed) {
+		throw std::logic_error(
+		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor() for compact layout");
+	}
+	const auto shape = batch_.ycbcr_dct_grid_shape().cbcr;
+	return DirectDctGridTensorDescriptor {
+	    cbcr_device_data(),
+	    shape,
+	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[3] * shape[4] * shape[5],
+	     shape[4] * shape[5],
+	     shape[5],
+	     1U},
 	    DirectDctTensorDataType::kInt16,
 	    DirectDctTensorDevice::kCuda,
 	    cuda_device_,
@@ -97,6 +132,14 @@ size_t DirectDctBatch::coefficient_count() const noexcept {
 
 size_t DirectDctBatch::coefficient_bytes() const noexcept {
 	return batch_.coefficient_bytes();
+}
+
+size_t DirectDctBatch::y_coefficient_count() const noexcept {
+	return batch_.y_coefficient_count();
+}
+
+size_t DirectDctBatch::cbcr_coefficient_count() const noexcept {
+	return batch_.cbcr_coefficient_count();
 }
 
 size_t DirectDctBatch::image_count() const noexcept {
@@ -135,6 +178,14 @@ JpegDctDeviceExecutionStats DirectDctBatch::execution_stats() const noexcept {
 	return batch_.execution_stats();
 }
 
+const JpegDctDeviceCacheStats& DirectDctBatch::cache_stats_ref() const noexcept {
+	return batch_.cache_stats_ref();
+}
+
+const JpegDctDeviceExecutionStats& DirectDctBatch::execution_stats_ref() const noexcept {
+	return batch_.execution_stats_ref();
+}
+
 const JpegDctDeviceBatch& DirectDctBatch::device_batch() const noexcept {
 	return batch_;
 }
@@ -161,14 +212,18 @@ DirectDctBatch DirectDctRuntime::ReadBatch(const std::vector<JpegDctImageCropReq
                                            const JpegDctDeviceBatchOptions&            options) {
 	auto       batch  = reader_.ReadDeviceDctBatch(requests, options);
 	auto       ids    = request_global_image_ids(requests);
-	const auto device = detect_cuda_device(batch.device_coefficients());
+	const auto device = batch.cuda_device();
 	return DirectDctBatch(std::move(batch), std::move(ids), device);
 }
 
 DirectDctBatch DirectDctRuntime::ReadBatch(const std::vector<uint32_t>&     global_image_ids,
                                            const JpegDctCropBox&            crop,
                                            const JpegDctDeviceBatchOptions& options) {
-	return ReadBatch(make_crop_requests(global_image_ids, crop), options);
+	auto       requests = make_crop_requests(global_image_ids, crop);
+	auto       batch    = reader_.ReadDeviceDctBatch(requests, options);
+	auto       ids      = std::vector<uint32_t>(global_image_ids.begin(), global_image_ids.end());
+	const auto device   = batch.cuda_device();
+	return DirectDctBatch(std::move(batch), std::move(ids), device);
 }
 
 JpegDctDeviceBatchPlanPreview DirectDctRuntime::PlanBatch(const std::vector<JpegDctImageCropRequest>& requests,
