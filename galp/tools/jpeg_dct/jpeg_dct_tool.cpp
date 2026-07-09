@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -16,13 +17,15 @@ struct Options {
 	std::filesystem::path                 output_metadata;
 	std::filesystem::path                 output_dir;
 	std::vector<std::filesystem::path>    inputs;
-	galp::jpeg::JpegDatasetValidationMode policy           = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
 	galp::jpeg::JpegMetadataProfile       metadata_profile = galp::jpeg::JpegMetadataProfile::kDctDatasetOnly;
 	galp::jpeg::JpegDctShardPreset        shard_preset     = galp::jpeg::JpegDctShardPreset::kBalanced;
 	size_t                                shard_images     = 8192;
 	uint32_t                              rowgroup_vectors = 128;
 	uint32_t                              rowgroups_per_shard           = 256;
+	size_t                                threads                       = 1;
+	size_t                                shard_workers                 = 1;
 	bool                                  shard_mode                    = false;
+	bool                                  threads_specified             = false;
 	bool                                  metadata_profile_specified    = false;
 	bool                                  shard_images_specified        = false;
 	bool                                  rowgroup_vectors_specified    = false;
@@ -33,19 +36,20 @@ void print_usage(const char* prog) {
 	std::cerr
 	    << "Usage:\n"
 	    << "  " << prog
-	    << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] "
+	    << " --out output.fls --metadata output.metadata.bin "
 	       "[--metadata-profile dct|reconstruct|preserve] input.jpg\n"
 	    << "  " << prog
-	    << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] "
+	    << " --out output.fls --metadata output.metadata.bin "
 	       "[--metadata-profile dct|reconstruct|preserve] input_dir\n"
 	    << "  " << prog
-	    << " --out output.fls --metadata output.metadata.bin [--policy ragged|strict|pad] "
+	    << " --out output.fls --metadata output.metadata.bin "
 	       "[--metadata-profile dct|reconstruct|preserve] input0.jpg [input1.jpg ...]\n"
 	    << "  " << prog
-	    << " --shard --out-dir output_dct [--policy ragged|strict|pad] [--preset crop-latency|balanced|throughput] "
-	       "[--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N] input_dir\n"
-	    << "Default: --policy ragged and the legacy metadata format.\n"
-	    << "  --policy pad is a dense-layout mode for callers that require fixed num_images rows per block group.\n"
+	    << " --shard --out-dir output_dct [--preset crop-latency|balanced|throughput] "
+	       "[--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N] [--threads N] "
+	       "[--shard-workers N] input_dir\n"
+	    << "Default: ragged DCT block layout and the legacy metadata format.\n"
+	    << "  --threads defaults to all available cores when not set.\n"
 	    << "  --metadata-profile writes the sectioned metadata format; use reconstruct to persist image dimensions "
 	       "and quantization tables.\n"
 	    << "  --shard writes manifest.bin plus shard_*.fls and shard_*.meta.bin; default preset is balanced.\n";
@@ -143,14 +147,8 @@ bool parse_args(const int argc, char** argv, Options& options) {
 		}
 		if (arg == "--policy" && i + 1 < argc) {
 			const std::string_view policy = argv[++i];
-			if (policy == "strict") {
-				options.policy = galp::jpeg::JpegDatasetValidationMode::kRequireSameComponentGrids;
-			} else if (policy == "pad") {
-				options.policy = galp::jpeg::JpegDatasetValidationMode::kPadToMaxComponentGrids;
-			} else if (policy == "ragged") {
-				options.policy = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
-			} else {
-				throw std::runtime_error("unknown --policy value; expected strict, pad, or ragged");
+			if (policy != "ragged") {
+				throw std::runtime_error("unknown --policy value; only ragged is supported");
 			}
 			continue;
 		}
@@ -196,6 +194,21 @@ bool parse_args(const int argc, char** argv, Options& options) {
 			options.rowgroups_per_shard_specified = true;
 			continue;
 		}
+		if (arg == "--threads" && i + 1 < argc) {
+			options.threads           = parse_size_arg(arg, argv[++i]);
+			options.threads_specified = true;
+			if (options.threads == 0) {
+				throw std::runtime_error("--threads must be greater than zero");
+			}
+			continue;
+		}
+		if (arg == "--shard-workers" && i + 1 < argc) {
+			options.shard_workers = parse_size_arg(arg, argv[++i]);
+			if (options.shard_workers == 0) {
+				throw std::runtime_error("--shard-workers must be greater than zero");
+			}
+			continue;
+		}
 		if (arg == "--help" || arg == "-h") {
 			return false;
 		}
@@ -203,6 +216,11 @@ bool parse_args(const int argc, char** argv, Options& options) {
 	}
 
 	apply_shard_preset(options);
+	if (!options.threads_specified) {
+		// Default to saturating all available cores when --threads is not set.
+		const unsigned hw = std::thread::hardware_concurrency();
+		options.threads    = hw == 0 ? 1 : static_cast<size_t>(hw);
+	}
 	if (options.shard_mode) {
 		return !options.output_dir.empty() && !options.inputs.empty();
 	}
@@ -222,7 +240,6 @@ int main(const int argc, char** argv) {
 		options.inputs = expand_inputs(options.inputs);
 
 		galp::jpeg::JpegDctReaderOptions reader_options;
-		reader_options.validation_mode = options.policy;
 		reader_options.capture_metadata_markers =
 		    options.metadata_profile == galp::jpeg::JpegMetadataProfile::kPreserveOriginalMarkers;
 		galp::jpeg::JpegDctMetadataWriterOptions writer_options;
@@ -232,6 +249,8 @@ int main(const int argc, char** argv) {
 			shard_options.shard_images        = options.shard_images;
 			shard_options.rowgroup_vectors    = options.rowgroup_vectors;
 			shard_options.rowgroups_per_shard = options.rowgroups_per_shard;
+			shard_options.threads             = options.threads;
+			shard_options.shard_workers       = options.shard_workers;
 			shard_options.preset              = options.shard_preset;
 			shard_options.shard_images_specified        = options.shard_images_specified;
 			shard_options.rowgroup_vectors_specified    = options.rowgroup_vectors_specified;

@@ -63,7 +63,7 @@ static void print_usage(const char* program_name, const char* error = nullptr) {
 	             "  data_type: i8, i16, u32, u64, f32, f64\n"
 	             "  encoding: alp, bit-packing, ffor, frequency, cross-rle, dictionary, slpatch, "
 	             "constant, rle, dict-slpatch\n"
-	             "  kernel: decompress, query, query-multi-column\n"
+	             "  kernel: decompress, query\n"
 	             "  unpacker: none, dummy, old-fls, switch-case, stateless, stateless-branchless, "
 	             "stateful-cache, stateful-local-1, stateful-local-2, stateful-local-4, "
 	             "stateful-shared-1, stateful-shared-2, stateful-shared-4, stateful-register-1, "
@@ -231,32 +231,6 @@ query_column(const ColumnT& column, const ProgramParameters params, const bool q
 	return galp::bench::verification::compare_data(&a, &b, 1);
 }
 
-#ifndef GALP_ENABLE_MULTI_COLUMN
-#define GALP_ENABLE_MULTI_COLUMN 0
-#endif
-
-#if GALP_ENABLE_MULTI_COLUMN
-template <typename T, typename ColumnT>
-galp::bench::verification::ExecutionResult<T>
-query_multi_column(const ColumnT& column, const ProgramParameters params, const bool query_result, const T magic_value) {
-	const bool answer = galp::bench::bindings::query_multi_column<T, ColumnT>(column,
-	                                                             params.unpack_n_vecs,
-	                                                             params.unpack_n_vals,
-	                                                             params.unpacker,
-	                                                             params.patcher,
-	                                                             magic_value,
-	                                                             params.n_samples);
-	T          a      = query_result ? 1.0 : 0.0;
-	T          b      = answer ? 1.0 : 0.0;
-	return galp::bench::verification::compare_data(&a, &b, 1);
-}
-#else
-template <typename T, typename ColumnT>
-galp::bench::verification::ExecutionResult<T> query_multi_column(const ColumnT&, const ProgramParameters, const bool, const T) {
-	throw std::invalid_argument("QueryMultiColumn is disabled at build time (GALP_ENABLE_MULTI_COLUMN=OFF).");
-}
-#endif
-
 template <typename T, typename ColumnT>
 galp::bench::verification::ExecutionResult<T>
 execute_kernel(const ColumnT& column, const ProgramParameters params, const bool query_result, const T magic_value) {
@@ -264,8 +238,6 @@ execute_kernel(const ColumnT& column, const ProgramParameters params, const bool
 		return decompress_column<T, ColumnT>(column, params);
 	} else if (params.kernel == galp::format::Kernel::Query) {
 		return query_column<T, ColumnT>(column, params, query_result, magic_value);
-		// } else if (params.kernel == galp::format::Kernel::QueryMultiColumn) {
-		// 	return query_multi_column<T, ColumnT>(column, params, query_result, magic_value);
 	} else {
 		throw std::invalid_argument("Kernel not implemented yet.\n");
 	}
@@ -279,8 +251,8 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_bp(const Prog
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
 		printf("processing bitwidth = %d\n", vbw);
 		auto vbw_range = galp::bench::ValueRange<vbw_t>(vbw);
-		if (params.kernel == galp::format::Kernel::QueryMultiColumn || params.kernel == galp::format::Kernel::Query) {
-			throw std::invalid_argument("QueryMultiColumn not supported for Bit-Packing columns.\n");
+		if (params.kernel == galp::format::Kernel::Query) {
+			throw std::invalid_argument("Query not supported for Bit-Packing columns.\n");
 		}
 		bool                      query_result = false;
 		T                         magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
@@ -304,9 +276,6 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_ffor(const Pr
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
 		printf("processing bitwidth = %d\n", vbw);
 		auto vbw_range = galp::bench::ValueRange<vbw_t>(vbw);
-		if (params.kernel == galp::format::Kernel::QueryMultiColumn) {
-			vbw_range = params.bit_width_range;
-		}
 		bool                        query_result = false;
 		T                           magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
 		galp::codec::host::FFORColumn<T> column;
@@ -321,19 +290,10 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_ffor(const Pr
 			    params.n_values, vbw_range, galp::bench::ValueRange<T>(0, 100), params.unpack_n_vecs);
 		}
 
-		if (params.kernel == galp::format::Kernel::QueryMultiColumn) {
-			// We do not want query multicolumn to ever find a full lane of the
-			// value to query to limit write bandwidth
-			magic_value = std::numeric_limits<T>::max();
-		}
-
 		results.push_back(execute_kernel<T, galp::codec::host::FFORColumn<T>>(column, params, query_result, magic_value));
 
 		galp::codec::host::free_column(column);
 
-		if (params.kernel == galp::format::Kernel::QueryMultiColumn) {
-			break;
-		}
 	}
 
 	return results;
@@ -387,9 +347,6 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_freq(const Pr
 	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	auto results = std::vector<galp::bench::verification::ExecutionResult<T>>();
 
-	if (params.kernel == galp::format::Kernel::QueryMultiColumn) {
-		throw std::invalid_argument("QueryMultiColumn not supported for FREQ columns.\n");
-	}
 	// for (vbw_t vbw{params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw)
 	{
 		bool query_result = false;
@@ -428,8 +385,8 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_dict(const Pr
 	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	auto results = std::vector<galp::bench::verification::ExecutionResult<T>>();
 
-	if (params.kernel == galp::format::Kernel::QueryMultiColumn || params.kernel == galp::format::Kernel::Query) {
-		throw std::invalid_argument("QueryMultiColumn/Query not supported for DICT columns.\n");
+	if (params.kernel == galp::format::Kernel::Query) {
+		throw std::invalid_argument("Query not supported for DICT columns.\n");
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
@@ -454,8 +411,8 @@ template <typename T>
 std::vector<galp::bench::verification::ExecutionResult<T>> execute_slpatch(const ProgramParameters params) {
 	auto results = std::vector<galp::bench::verification::ExecutionResult<T>>();
 
-	if (params.kernel == galp::format::Kernel::QueryMultiColumn || params.kernel == galp::format::Kernel::Query) {
-		throw std::invalid_argument("QueryMultiColumn/Query not supported for SLPATCH columns.\n");
+	if (params.kernel == galp::format::Kernel::Query) {
+		throw std::invalid_argument("Query not supported for SLPATCH columns.\n");
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
@@ -477,8 +434,8 @@ template <typename T>
 std::vector<galp::bench::verification::ExecutionResult<T>> execute_dict_slpatch(const ProgramParameters params) {
 	auto results = std::vector<galp::bench::verification::ExecutionResult<T>>();
 
-	if (params.kernel == galp::format::Kernel::QueryMultiColumn || params.kernel == galp::format::Kernel::Query) {
-		throw std::invalid_argument("QueryMultiColumn/Query not supported for DICT+SLPATCH columns.\n");
+	if (params.kernel == galp::format::Kernel::Query) {
+		throw std::invalid_argument("Query not supported for DICT+SLPATCH columns.\n");
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
@@ -501,8 +458,8 @@ template <typename T>
 std::vector<galp::bench::verification::ExecutionResult<T>> execute_rle(const ProgramParameters params) {
 	auto results = std::vector<galp::bench::verification::ExecutionResult<T>>();
 
-	if (params.kernel == galp::format::Kernel::QueryMultiColumn || params.kernel == galp::format::Kernel::Query) {
-		throw std::invalid_argument("QueryMultiColumn/Query not supported for RLE columns.\n");
+	if (params.kernel == galp::format::Kernel::Query) {
+		throw std::invalid_argument("Query not supported for RLE columns.\n");
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
@@ -524,8 +481,8 @@ template <typename T>
 std::vector<galp::bench::verification::ExecutionResult<T>> execute_constant(const ProgramParameters params) {
 	auto results = std::vector<galp::bench::verification::ExecutionResult<T>>();
 
-	if (params.kernel == galp::format::Kernel::QueryMultiColumn || params.kernel == galp::format::Kernel::Query) {
-		throw std::invalid_argument("QueryMultiColumn/Query not supported for CONSTANT columns.\n");
+	if (params.kernel == galp::format::Kernel::Query) {
+		throw std::invalid_argument("Query not supported for CONSTANT columns.\n");
 	}
 
 	bool query_result = false;
@@ -544,8 +501,8 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_cross_rle(con
 	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
 	auto results = std::vector<galp::bench::verification::ExecutionResult<T>>();
 
-	if (params.kernel == galp::format::Kernel::QueryMultiColumn || params.kernel == galp::format::Kernel::Query) {
-		throw std::invalid_argument("QueryMultiColumn/Query not supported for CROSS RLE columns.\n");
+	if (params.kernel == galp::format::Kernel::Query) {
+		throw std::invalid_argument("Query not supported for CROSS RLE columns.\n");
 	}
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {

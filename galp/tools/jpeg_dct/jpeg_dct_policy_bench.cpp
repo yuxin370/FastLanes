@@ -277,10 +277,8 @@ double measure_crop_lookup_latency_ns(galp::jpeg::JpegDctShardDatasetReader& rea
 PolicyResult run_policy(const std::vector<std::filesystem::path>&   paths,
                         const std::filesystem::path&                output_dir,
                         const Options&                              cli_options,
-                        const std::string&                          policy_name,
-                        const galp::jpeg::JpegDatasetValidationMode policy) {
+                        const std::string&                          policy_name) {
 	galp::jpeg::JpegDctReaderOptions reader_options;
-	reader_options.validation_mode = policy;
 
 	const auto policy_dir = output_dir / policy_name;
 	std::filesystem::remove_all(policy_dir);
@@ -355,56 +353,38 @@ void print_csv_row(const PolicyResult& r) {
 	          << r.decode_error << '"' << '\n';
 }
 
-void print_human_metric(const char* name, const std::string& pad, const std::string& ragged) {
-	std::cout << std::left << std::setw(30) << name << std::right << std::setw(18) << pad << std::setw(18) << ragged
-	          << '\n';
+void print_human_metric(const char* name, const std::string& ragged) {
+	std::cout << std::left << std::setw(30) << name << std::right << std::setw(18) << ragged << '\n';
 }
 
 void print_human_report(const std::vector<std::filesystem::path>& paths,
                         const std::filesystem::path&              output_dir,
-                        const PolicyResult&                       pad,
                         const PolicyResult&                       ragged) {
-	std::cout << "JPEG DCT sharded policy benchmark\n";
+	std::cout << "JPEG DCT sharded ragged benchmark\n";
 	std::cout << "images: " << format_count(paths.size()) << '\n';
 	std::cout << "output_dir: " << output_dir << "\n\n";
-	std::cout << std::left << std::setw(30) << "metric" << std::right << std::setw(18) << "pad" << std::setw(18)
-	          << "ragged" << '\n';
-	std::cout << std::string(66, '-') << '\n';
-	print_human_metric("total output", format_bytes(pad.total_output_size), format_bytes(ragged.total_output_size));
-	print_human_metric(
-	    "compressed data", format_bytes(pad.compressed_data_size), format_bytes(ragged.compressed_data_size));
-	print_human_metric("metadata", format_bytes(pad.metadata_size), format_bytes(ragged.metadata_size));
-	print_human_metric("source JPEG", format_bytes(pad.source_jpeg_size), format_bytes(ragged.source_jpeg_size));
-	print_human_metric(
-	    "expansion vs JPEG", format_ratio(pad.expansion_vs_jpeg), format_ratio(ragged.expansion_vs_jpeg));
-	print_human_metric("semantic ratio",
-	                   format_ratio(pad.semantic_compression_ratio),
-	                   format_ratio(ragged.semantic_compression_ratio));
-	print_human_metric("encode", format_ms(pad.encode_ms), format_ms(ragged.encode_ms));
-	print_human_metric("decode",
-	                   pad.decode_supported ? format_ms(pad.decode_ms) : "unsupported",
-	                   ragged.decode_supported ? format_ms(ragged.decode_ms) : "unsupported");
-	print_human_metric("crop lookup",
-	                   pad.decode_supported ? format_ns(pad.crop_lookup_latency_ns) : "unsupported",
-	                   ragged.decode_supported ? format_ns(ragged.crop_lookup_latency_ns) : "unsupported");
-	print_human_metric("peak RSS", format_bytes(pad.peak_rss_bytes), format_bytes(ragged.peak_rss_bytes));
-	print_human_metric("real rows", format_count(pad.real_row_count), format_count(ragged.real_row_count));
-	print_human_metric("padding rows", format_count(pad.padding_row_count), format_count(ragged.padding_row_count));
-	print_human_metric("physical rows", format_count(pad.physical_row_count), format_count(ragged.physical_row_count));
-	print_human_metric("shards", format_count(pad.shard_count), format_count(ragged.shard_count));
-	print_human_metric("rowgroups", format_count(pad.rowgroup_count), format_count(ragged.rowgroup_count));
-	print_human_metric("block groups", format_count(pad.block_group_count), format_count(ragged.block_group_count));
-	print_human_metric("physical ratio",
-	                   format_ratio(pad.physical_compression_ratio),
-	                   format_ratio(ragged.physical_compression_ratio));
-	if (!pad.decode_supported || !ragged.decode_supported) {
+	std::cout << std::left << std::setw(30) << "metric" << std::right << std::setw(18) << "ragged" << '\n';
+	std::cout << std::string(48, '-') << '\n';
+	print_human_metric("total output", format_bytes(ragged.total_output_size));
+	print_human_metric("compressed data", format_bytes(ragged.compressed_data_size));
+	print_human_metric("metadata", format_bytes(ragged.metadata_size));
+	print_human_metric("source JPEG", format_bytes(ragged.source_jpeg_size));
+	print_human_metric("expansion vs JPEG", format_ratio(ragged.expansion_vs_jpeg));
+	print_human_metric("semantic ratio", format_ratio(ragged.semantic_compression_ratio));
+	print_human_metric("encode", format_ms(ragged.encode_ms));
+	print_human_metric("decode", ragged.decode_supported ? format_ms(ragged.decode_ms) : "unsupported");
+	print_human_metric("crop lookup", ragged.decode_supported ? format_ns(ragged.crop_lookup_latency_ns) : "unsupported");
+	print_human_metric("peak RSS", format_bytes(ragged.peak_rss_bytes));
+	print_human_metric("real rows", format_count(ragged.real_row_count));
+	print_human_metric("padding rows", format_count(ragged.padding_row_count));
+	print_human_metric("physical rows", format_count(ragged.physical_row_count));
+	print_human_metric("shards", format_count(ragged.shard_count));
+	print_human_metric("rowgroups", format_count(ragged.rowgroup_count));
+	print_human_metric("block groups", format_count(ragged.block_group_count));
+	print_human_metric("physical ratio", format_ratio(ragged.physical_compression_ratio));
+	if (!ragged.decode_supported) {
 		std::cout << "\ndecode note:\n";
-		if (!pad.decode_supported) {
-			std::cout << "  pad: " << pad.decode_error << '\n';
-		}
-		if (!ragged.decode_supported) {
-			std::cout << "  ragged: " << ragged.decode_error << '\n';
-		}
+		std::cout << "  ragged: " << ragged.decode_error << '\n';
 	}
 }
 
@@ -421,16 +401,12 @@ int main(const int argc, char** argv) {
 		std::filesystem::create_directories(options.output_dir);
 		const auto paths = collect_jpegs(options.input);
 
-		const auto pad = run_policy(
-		    paths, options.output_dir, options, "pad", galp::jpeg::JpegDatasetValidationMode::kPadToMaxComponentGrids);
-		const auto ragged = run_policy(
-		    paths, options.output_dir, options, "ragged", galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor);
+		const auto ragged = run_policy(paths, options.output_dir, options, "ragged");
 		if (options.csv) {
 			print_csv_header();
-			print_csv_row(pad);
 			print_csv_row(ragged);
 		} else {
-			print_human_report(paths, options.output_dir, pad, ragged);
+			print_human_report(paths, options.output_dir, ragged);
 		}
 		return 0;
 	} catch (const std::exception& e) {

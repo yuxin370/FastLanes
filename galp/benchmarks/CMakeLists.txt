@@ -14,16 +14,12 @@ set(GALP_GENERATED_STAMP "${GALP_GENERATED_BENCHMARK_DIR}/generated-bindings.sta
 set(GALP_GENERATED_BINDING_FILENAMES
         alp-double-decompress_column-bindings.cu
         alp-double-query_column-bindings.cu
-        alp-double-query_multi_column-bindings.cu
         alp-float-decompress_column-bindings.cu
         alp-float-query_column-bindings.cu
-        alp-float-query_multi_column-bindings.cu
         alpextended-double-decompress_column-bindings.cu
         alpextended-double-query_column-bindings.cu
-        alpextended-double-query_multi_column-bindings.cu
         alpextended-float-decompress_column-bindings.cu
         alpextended-float-query_column-bindings.cu
-        alpextended-float-query_multi_column-bindings.cu
         bp-uint32_t-decompress_column-bindings.cu
         bp-uint32_t-query_column-bindings.cu
         bp-uint64_t-decompress_column-bindings.cu
@@ -43,11 +39,9 @@ set(GALP_GENERATED_BINDING_FILENAMES
         ffor-uint32_t-compute_column-bindings.cu
         ffor-uint32_t-decompress_column-bindings.cu
         ffor-uint32_t-query_column-bindings.cu
-        ffor-uint32_t-query_multi_column-bindings.cu
         ffor-uint64_t-compute_column-bindings.cu
         ffor-uint64_t-decompress_column-bindings.cu
         ffor-uint64_t-query_column-bindings.cu
-        ffor-uint64_t-query_multi_column-bindings.cu
         freq-int16_t-decompress_column-bindings.cu
         freq-int8_t-decompress_column-bindings.cu
         freq-uint32_t-decompress_column-bindings.cu
@@ -63,12 +57,7 @@ set(GALP_GENERATED_BINDING_FILENAMES
         slpatch-uint64_t-decompress_column-bindings.cu
 )
 
-# Keep the experimental multi-column binding sources in-tree, but do not compile
-# them as part of the generated benchmark bindings target. They instantiate very
-# large CUDA kernels and can make nvcc stall on query_multi_column translation units.
-# GALP_ENABLE_MULTI_COLUMN=ON is rejected during configure in galp/CMakeLists.txt.
 set(GALP_GENERATED_BINDING_COMPILED_FILENAMES ${GALP_GENERATED_BINDING_FILENAMES})
-list(FILTER GALP_GENERATED_BINDING_COMPILED_FILENAMES EXCLUDE REGEX "query_multi_column-bindings\\.cu$")
 
 set(GALP_GENERATED_BINDINGS_OUTPUTS)
 foreach (generated_file IN LISTS GALP_GENERATED_BINDING_FILENAMES)
@@ -81,12 +70,9 @@ foreach (generated_file IN LISTS GALP_GENERATED_BINDING_COMPILED_FILENAMES)
 endforeach ()
 
 set(GALP_GENERATED_HEADERS
-        "${GALP_GENERATED_HEADER_DIR}/kernel_bindings.cuh"
-        "${GALP_GENERATED_HEADER_DIR}/multi_column_device_kernels.cuh"
-        "${GALP_GENERATED_HEADER_DIR}/multi_column_host_kernels.cuh")
+        "${GALP_GENERATED_HEADER_DIR}/kernel_bindings.cuh")
 
 set(GALP_GENERATE_KERNEL_BINDINGS_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/codegen/generate_kernel_bindings.py")
-set(GALP_GENERATE_MULTICOLUMN_KERNELS_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/codegen/generate_multicolumn_kernels.py")
 
 add_custom_command(
         OUTPUT "${GALP_GENERATED_STAMP}"
@@ -98,14 +84,9 @@ add_custom_command(
                 --out-dir "${GALP_GENERATED_BINDINGS_DIR}"
                 --header-out-dir "${GALP_GENERATED_HEADER_DIR}"
                 --logging-level 40
-        COMMAND ${Python3_EXECUTABLE}
-                "${GALP_GENERATE_MULTICOLUMN_KERNELS_SCRIPT}"
-                --out-dir "${GALP_GENERATED_HEADER_DIR}"
-                --logging-level 40
         COMMAND ${CMAKE_COMMAND} -E touch "${GALP_GENERATED_STAMP}"
         DEPENDS
                 "${GALP_GENERATE_KERNEL_BINDINGS_SCRIPT}"
-                "${GALP_GENERATE_MULTICOLUMN_KERNELS_SCRIPT}"
         COMMENT "Generating GALP benchmark bindings"
         VERBATIM)
 
@@ -160,7 +141,6 @@ endif ()
 
 add_executable(micro_bench micro_bench.cu)
 apply_warnings(micro_bench)
-target_compile_definitions(micro_bench PRIVATE GALP_ENABLE_MULTI_COLUMN=0)
 target_include_directories(micro_bench PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${GALP_GENERATED_INCLUDE_DIR}
