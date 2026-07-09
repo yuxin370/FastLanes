@@ -114,9 +114,9 @@ void encoder<PT, IS_NULL>::encode_simdized(const PT*      data_p,
 		for (uint64_t i {0}; i < config::VECTOR_SIZE; i = i + 8) {
 			__m512d l            = _mm512_loadu_pd(ENCODED_VALUE_ARR + i);
 			__m512d r            = _mm512_loadu_pd(VALUE_ARR_WITHOUT_SPECIALS + i);
-			__m512i index        = _mm512_loadu_pd(DOUBLE_INDEX_ARR + i);
+			__m512i index        = _mm512_loadu_si512(DOUBLE_INDEX_ARR + i);
 			auto    is_exception = _mm512_cmpneq_pd_mask(l, r);
-			_mm512_mask_compressstoreu_pd(TMP_INDEX_ARR + exceptions_idx, is_exception, index);
+			_mm512_mask_compressstoreu_epi64(TMP_INDEX_ARR + exceptions_idx, is_exception, index);
 			exceptions_idx += LOOKUP_TABLE[is_exception];
 		}
 	} else {
@@ -125,7 +125,7 @@ void encoder<PT, IS_NULL>::encode_simdized(const PT*      data_p,
 			__m512   r            = _mm512_loadu_ps(VALUE_ARR_WITHOUT_SPECIALS + i);
 			__m512i  index        = _mm512_loadu_si512(FLOAT_INDEX_ARR + i);
 			uint16_t is_exception = _mm512_cmpneq_ps_mask(l, r);
-			_mm512_mask_compressstoreu_ps(TMP_INDEX_ARR + exceptions_idx, is_exception, index);
+			_mm512_mask_compressstoreu_epi32(TMP_INDEX_ARR + exceptions_idx, is_exception, index);
 			uint16_t n_exceptions = LOOKUP_TABLE[is_exception & 0b0000000011111111] + LOOKUP_TABLE[is_exception >> 8];
 			exceptions_idx += n_exceptions; // Update index
 		}
