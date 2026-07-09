@@ -14,7 +14,6 @@ namespace galp::format {
 enum class Kernel {
 	Decompress,
 	Query,
-	QueryMultiColumn,
 };
 
 enum class Unpacker {

@@ -12,7 +12,6 @@ Kernel string_to_kernel(const std::string& str) {
 	static const std::unordered_map<std::string, Kernel> mapping = {
 	    {"decompress", Kernel::Decompress},
 	    {"query", Kernel::Query},
-	    {"query-multi-column", Kernel::QueryMultiColumn},
 	};
 
 	auto it = mapping.find(str);

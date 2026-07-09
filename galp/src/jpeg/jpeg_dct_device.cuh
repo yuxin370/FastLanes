@@ -183,6 +183,19 @@ struct JpegDctDeviceProjectionItem {
 	uint16_t selected_coefficient_slot       = 0;
 	uint8_t  logical_coefficient_id          = 0;
 	uint8_t  physical_coefficient_column_id  = 0;
+	uint8_t  output_coefficient_id           = 0;
+	uint8_t  output_grid_tensor              = 0;
+	float    weight                          = 1.0F;
+};
+
+struct JpegDctDeviceFixedTransformItem {
+	uint32_t rowgroup_index       = 0;
+	uint32_t row_in_rowgroup      = 0;
+	uint32_t image_index          = 0;
+	uint16_t local_block_x        = 0;
+	uint16_t local_block_y        = 0;
+	uint8_t  component            = 0;
+	bool     zigzag_columns       = false;
 };
 
 struct JpegDctDeviceResolvedProjection {
@@ -272,6 +285,33 @@ remap_projection_items_to_selected_vectors(const std::vector<JpegDctDeviceProjec
 	return remapped;
 }
 
+inline std::vector<JpegDctDeviceFixedTransformItem>
+remap_fixed_transform_items_to_selected_vectors(const std::vector<JpegDctDeviceFixedTransformItem>& items,
+                                                const std::vector<uint32_t>&                        selected_vectors,
+                                                const unsigned                                      unpack_n_vectors_cfg) {
+	const auto                                  unpack_n_vectors = std::max(1U, unpack_n_vectors_cfg);
+	std::vector<JpegDctDeviceFixedTransformItem> remapped;
+	remapped.reserve(items.size());
+	for (const auto& item : items) {
+		const uint32_t source_vector =
+		    item.row_in_rowgroup / static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
+		const uint32_t source_chunk = (source_vector / unpack_n_vectors) * unpack_n_vectors;
+		const auto     it           = std::lower_bound(selected_vectors.begin(), selected_vectors.end(), source_chunk);
+		if (it == selected_vectors.end() || *it != source_chunk) {
+			throw std::runtime_error("JPEG DCT selected-vector fixed transform remap missing source vector");
+		}
+		auto       mapped               = item;
+		const auto selected_chunk_index = static_cast<uint32_t>(std::distance(selected_vectors.begin(), it));
+		const auto chunk_vector_offset  = source_vector - source_chunk;
+		const auto row_offset  = item.row_in_rowgroup % static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR);
+		mapped.row_in_rowgroup = (selected_chunk_index * unpack_n_vectors + chunk_vector_offset) *
+		                             static_cast<uint32_t>(galp::codec::consts::VALUES_PER_VECTOR) +
+		                         row_offset;
+		remapped.push_back(mapped);
+	}
+	return remapped;
+}
+
 inline bool selected_decode_chunks_fit(const std::vector<uint32_t>& selected_vectors,
                                        const size_t                 rowgroup_n_vecs,
                                        const unsigned               unpack_n_vectors_cfg) {
@@ -292,9 +332,11 @@ struct JpegDctDeviceRowgroupPlan {
 	uint32_t                             rowgroup_index = 0;
 	std::vector<JpegDctDeviceGatherItem> items;
 	std::vector<JpegDctDeviceProjectionItem> projection_items;
+	std::vector<JpegDctDeviceFixedTransformItem> fixed_transform_items;
 	std::vector<uint32_t>                selected_vectors;
 	std::vector<JpegDctDeviceGatherItem> selected_gather_items;
 	std::vector<JpegDctDeviceProjectionItem> selected_projection_items;
+	std::vector<JpegDctDeviceFixedTransformItem> selected_fixed_transform_items;
 	size_t                               selected_vector_count = 0;
 	size_t                               full_vector_count     = 0;
 	bool                                 selected_chunks_fit   = true;
@@ -322,6 +364,7 @@ struct JpegDctDeviceBatchPlan {
 	std::vector<JpegDctDeviceBlockMetadata>    block_metadata;
 	std::vector<JpegDctDeviceRowgroupMetadata> rowgroups;
 	struct JpegDctDeviceDecodedRowgroupCache*  cache                           = nullptr;
+	bool                                       cache_enabled                   = false;
 	JpegDctDeviceScratch*                      scratch                         = nullptr;
 	size_t                                     planned_selected_vector_count   = 0;
 	size_t                                     estimated_selected_vector_count = 0;
@@ -331,6 +374,7 @@ struct JpegDctDeviceBatchPlan {
 	std::vector<uint8_t>                       selected_coefficients;
 	JpegDctCoefficientSelectionShape           coefficient_selection_shape {};
 	size_t                                     coefficients_per_block          = kJpegDctCoefficientCount;
+	JpegDctYcbcrDctGridShape            ycbcr_dct_grid_shape {};
 	double                                     planned_selected_vector_ratio   = 0.0;
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;

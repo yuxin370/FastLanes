@@ -138,7 +138,7 @@ struct JpegDctBlockGroupIndex {
 struct JpegDctDatasetMetadata {
 	std::vector<JpegImageMetadata>     images;
 	JpegDctRowOrdering                 row_ordering    = JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor;
-	JpegDatasetValidationMode          validation_mode = JpegDatasetValidationMode::kRequireSameComponentGrids;
+	JpegDatasetValidationMode          validation_mode = JpegDatasetValidationMode::kRaggedBlockMajor;
 	bool                               zigzag_columns  = true;
 	bool                               z_curve_block_order = true;
 	size_t                             image_count         = 0;
@@ -167,6 +167,37 @@ enum class JpegDctShardPreset {
 
 enum class JpegDctDeviceLayout {
 	kImageMajorComponentBlockCoeff,
+	kYcbcrDctGrid,
+	kYcbcrDctGridFixed,
+};
+
+enum class JpegDctDevicePreprocess {
+	kNone,
+	kRgbNoMoreVal,
+};
+
+inline constexpr uint8_t kJpegDctYcbcrDctGridTensorY    = 1;
+inline constexpr uint8_t kJpegDctYcbcrDctGridTensorCbCr = 2;
+
+struct JpegDctYcbcrDctGridShape {
+	std::array<size_t, 6> y    = {0, 1, 0, 0, 8, 8};
+	std::array<size_t, 6> cbcr = {0, 2, 0, 0, 8, 8};
+
+	[[nodiscard]] size_t y_count() const noexcept {
+		size_t count = 1;
+		for (const auto dim : y) {
+			count *= dim;
+		}
+		return count;
+	}
+
+	[[nodiscard]] size_t cbcr_count() const noexcept {
+		size_t count = 1;
+		for (const auto dim : cbcr) {
+			count *= dim;
+		}
+		return count;
+	}
 };
 
 struct JpegDctCoefficientSelection {
@@ -186,6 +217,8 @@ struct JpegDctShardOptions {
 	size_t             shard_images                  = 8192;
 	uint32_t           rowgroup_vectors              = 128;
 	uint32_t           rowgroups_per_shard           = 256;
+	size_t             threads                       = 1;
+	size_t             shard_workers                 = 1;
 	JpegDctShardPreset preset                        = JpegDctShardPreset::kBalanced;
 	bool               shard_images_specified        = false;
 	bool               rowgroup_vectors_specified    = false;
@@ -209,7 +242,6 @@ struct JpegDctShardManifestEntry {
 
 struct JpegDctShardManifest {
 	uint32_t                               version             = 1;
-	JpegDatasetValidationMode              policy              = JpegDatasetValidationMode::kRaggedBlockMajor;
 	uint32_t                               rowgroup_vectors    = 128;
 	uint32_t                               rowgroups_per_shard = 256;
 	uint64_t                               image_count         = 0;
@@ -262,6 +294,7 @@ struct JpegDctImageCropRequest {
 
 struct JpegDctDeviceBatchOptions {
 	JpegDctDeviceLayout layout                 = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+	JpegDctDevicePreprocess preprocess         = JpegDctDevicePreprocess::kNone;
 	size_t              cache_capacity_bytes   = 0;
 	size_t              decode_batch_rowgroups = kDefaultJpegDctDecodeBatchRowgroups;
 	// Advanced rowgroup IO/materialization prefetch controls. Zero-valued sizes are normalized to defaults.
@@ -317,8 +350,6 @@ struct JpegDctDeviceExecutionStats {
 	size_t      gather_item_count                             = 0;
 	size_t      decoded_gather_item_count                     = 0;
 	size_t      cached_gather_item_count                      = 0;
-	size_t      projection_item_count                         = 0;
-	size_t      decoded_projection_item_count                 = 0;
 	size_t      workset_upload_count                          = 0;
 	size_t      scratch_upload_count                          = 0;
 	size_t      scratch_allocation_count                      = 0;
@@ -365,6 +396,11 @@ struct JpegDctDeviceExecutionStats {
 	double      sync_rowgroup_read_ms                         = 0.0;
 	std::string runtime_policy_decision;
 	std::string runtime_policy_reason;
+	size_t      projection_item_count         = 0;
+	size_t      decoded_projection_item_count = 0;
+	size_t      fixed_transform_item_count    = 0;
+	size_t      fixed_transform_image_count   = 0;
+	bool        cache_enabled                 = false;
 };
 
 struct JpegDctDeviceBatchPlanPreview {
@@ -382,6 +418,7 @@ struct JpegDctDeviceBatchPlanPreview {
 	double                                     planned_selected_vector_ratio   = 0.0;
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;
+	JpegDctYcbcrDctGridShape                   ycbcr_dct_grid_shape;
 };
 
 struct JpegDctDeviceBatchPlanEstimate {
@@ -440,19 +477,27 @@ public:
 	JpegDctDeviceBatch& operator=(JpegDctDeviceBatch&&) noexcept;
 
 	[[nodiscard]] const int16_t*                                    device_coefficients() const noexcept;
+	[[nodiscard]] const int16_t*                                    y_coefficients() const noexcept;
+	[[nodiscard]] const int16_t*                                    cbcr_coefficients() const noexcept;
 	[[nodiscard]] size_t                                            coefficient_count() const noexcept;
 	[[nodiscard]] size_t                                            coefficient_bytes() const noexcept;
+	[[nodiscard]] size_t                                            y_coefficient_count() const noexcept;
+	[[nodiscard]] size_t                                            cbcr_coefficient_count() const noexcept;
 	[[nodiscard]] size_t                                            coefficients_per_block() const noexcept;
 	[[nodiscard]] size_t                                            block_count() const noexcept;
 	[[nodiscard]] size_t                                            image_count() const noexcept;
 	[[nodiscard]] size_t                                            rowgroup_count() const noexcept;
+	[[nodiscard]] int                                               cuda_device() const noexcept;
 	[[nodiscard]] JpegDctDeviceCacheStats                           cache_stats() const noexcept;
 	[[nodiscard]] JpegDctDeviceExecutionStats                       execution_stats() const noexcept;
+	[[nodiscard]] const JpegDctDeviceCacheStats&                    cache_stats_ref() const noexcept;
+	[[nodiscard]] const JpegDctDeviceExecutionStats&                execution_stats_ref() const noexcept;
 	[[nodiscard]] JpegDctDeviceLayout                               layout() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&    block_metadata() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;
 	[[nodiscard]] const std::vector<uint8_t>&                       selected_coefficients() const noexcept;
+	[[nodiscard]] JpegDctYcbcrDctGridShape                    ycbcr_dct_grid_shape() const noexcept;
 
 private:
 	std::unique_ptr<Impl> impl_;
