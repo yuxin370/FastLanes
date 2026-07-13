@@ -4,14 +4,10 @@
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 import torch
 
 import _galp_direct_dct as galp_dct
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 

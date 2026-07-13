@@ -27,6 +27,11 @@ from torch import nn
 import torch.nn.functional as F
 
 import _galp_direct_dct as galp_dct
+
+TORCH_SOURCE_DIR = Path(__file__).resolve().parents[1] / "torch"
+if str(TORCH_SOURCE_DIR) not in sys.path:
+    sys.path.insert(0, str(TORCH_SOURCE_DIR))
+
 from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 

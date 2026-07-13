@@ -28,12 +28,11 @@ data/dct_blocks/
 
 #galp/
 galp/docs/*
-!galp/docs/direct_dct_rgbnomore_blockers.md
 galp/data
 /galp/scripts/*
 !/galp/scripts/codegen/
 !/galp/scripts/codegen/**
-scripts/my_tool
+scripts/my_tool/*
 #########################################
 # Editor temporary/working/backup files #
 .#*
@@ -156,3 +155,6 @@ skbuild-*/
 build_win.bat
 cmake_output.txt
 build_win/
+
+# Content fingerprints cached beside large GALP shard manifests.
+*.payload_fingerprints.json
