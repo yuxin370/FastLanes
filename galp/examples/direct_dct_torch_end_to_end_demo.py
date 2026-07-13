@@ -27,6 +27,7 @@ from torch import nn
 import torch.nn.functional as F
 
 import _galp_direct_dct as galp_dct
+from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class DirectDctBatchView:
     galp_ptr: int
     tensor_is_galp_backed: bool
     stats: dict[str, Any]
+    cache_stats: dict[str, Any]
     output_layout: str
     selected_coefficients: list[int]
     y: torch.Tensor | None = None
@@ -73,7 +75,7 @@ def _read_batch(
     dct_coeffs: str,
     cache_capacity_mib: int,
     output_layout: str,
-    preprocess: str = "none",
+    grid_transform_spec: dict[str, Any] | None = None,
     prefetch: Any | None = None,
 ) -> DirectDctBatchView:
     if prefetch is None:
@@ -83,14 +85,14 @@ def _read_batch(
             dct_coeffs=dct_coeffs,
             cache_capacity_mib=cache_capacity_mib,
             layout=output_layout,
-            preprocess=preprocess,
+            grid_transform=grid_transform_spec,
         )
     else:
         batch = reader.read_prefetched(prefetch)
     if batch.layout != output_layout:
         raise RuntimeError(f"unexpected GALP output layout: got {batch.layout}, expected {output_layout}")
 
-    if output_layout in ("ycbcr_dct_grid", "ycbcr_dct_grid_fixed"):
+    if output_layout in ("ycbcr_dct_grid", "transformed_dct_grid"):
         y = batch.y
         cbcr = batch.cbcr
         if not y.is_cuda or not cbcr.is_cuda:
@@ -135,6 +137,7 @@ def _read_batch(
             galp_ptr=batch.y_device_data_ptr,
             tensor_is_galp_backed=False,
             stats=batch.execution_stats,
+            cache_stats=batch.cache_stats,
             output_layout=output_layout,
             selected_coefficients=list(batch.selected_coefficients),
             y=y,
@@ -210,6 +213,7 @@ def _read_batch(
         galp_ptr=batch.device_data_ptr,
         tensor_is_galp_backed=True,
         stats=batch.execution_stats,
+        cache_stats=batch.cache_stats,
         output_layout=output_layout,
         selected_coefficients=list(batch.selected_coefficients),
     )
@@ -224,7 +228,7 @@ def _prefetch_batch(
     dct_coeffs: str,
     cache_capacity_mib: int,
     output_layout: str,
-    preprocess: str = "none",
+    grid_transform_spec: dict[str, Any] | None = None,
 ) -> Any:
     return reader.prefetch_batch(
         image_ids,
@@ -232,7 +236,7 @@ def _prefetch_batch(
         dct_coeffs=dct_coeffs,
         cache_capacity_mib=cache_capacity_mib,
         layout=output_layout,
-        preprocess=preprocess,
+        grid_transform=grid_transform_spec,
     )
 
 
@@ -275,13 +279,13 @@ def _read_rgbnomore_val_crop_batch(
     source_batches = []
     for image_id in image_ids:
         source = _read_batch(
-            reader,
-            [int(image_id)],
-            None,
-            "all",
-            cache_capacity_mib,
-            "ycbcr_dct_grid",
-            "none",
+            reader=reader,
+            image_ids=[int(image_id)],
+            crop=None,
+            dct_coeffs="all",
+            cache_capacity_mib=cache_capacity_mib,
+            output_layout="ycbcr_dct_grid",
+            grid_transform_spec=None,
         )
         if source.y is None or source.cbcr is None:
             raise RuntimeError("RGB-no-more DCT val crop requires Y/CbCr grid tensors")
@@ -313,6 +317,7 @@ def _read_rgbnomore_val_crop_batch(
         galp_ptr=source_batches[0].y_ptr if source_batches else 0,
         tensor_is_galp_backed=False,
         stats=_sum_execution_stats(source_batches),
+        cache_stats={},
         output_layout="ycbcr_dct_grid",
         selected_coefficients=list(range(64)),
         y=y,
@@ -333,8 +338,10 @@ def _read_demo_batch(
         if grid_transform is None:
             raise RuntimeError("RGB-no-more val crop transform was not initialized")
         return _read_rgbnomore_val_crop_batch(reader, image_ids, args.cache_capacity_mib, grid_transform)
-    preprocess = "rgbnomore_val" if args.grid_preprocess == "rgbnomore-val-pushdown" else "none"
-    return _read_batch(reader, image_ids, crop, args.dct_coeffs, args.cache_capacity_mib, args.output_layout, preprocess)
+    transform_spec = RGBNOMORE_VAL_DCT_GRID_TRANSFORM if args.grid_preprocess == "rgbnomore-val-pushdown" else None
+    return _read_batch(
+        reader, image_ids, crop, args.dct_coeffs, args.cache_capacity_mib, args.output_layout, transform_spec
+    )
 
 
 def _mean_pool_by_layout(block_embeddings: torch.Tensor, layout: ImageBlockLayout) -> torch.Tensor:
@@ -470,8 +477,9 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _accumulate_stats(totals: dict[str, int], batch: DirectDctBatchView) -> None:
+def _accumulate_stats(totals: dict[str, int | float], batch: DirectDctBatchView) -> None:
     stats = batch.stats
+    cache_stats = batch.cache_stats
     totals["selected_vectors"] += int(stats["selected_vector_count"])
     totals["full_vectors"] += int(stats["full_vector_count"])
     totals["decode_kernels"] += int(stats["decode_kernel_launch_count"])
@@ -479,6 +487,57 @@ def _accumulate_stats(totals: dict[str, int], batch: DirectDctBatchView) -> None
     totals["worksets"] += int(stats["workset_count"])
     totals["projection_items"] += int(stats["projection_item_count"])
     totals["internal_syncs"] += int(stats["internal_sync_count"])
+    totals["cache_hits"] += int(cache_stats.get("hits", 0))
+    totals["cache_misses"] += int(cache_stats.get("misses", 0))
+    totals["cache_inserts"] += int(cache_stats.get("inserts", 0))
+    totals["cache_evictions"] += int(cache_stats.get("evictions", 0))
+    totals["cache_resident_rowgroups"] = max(
+        totals["cache_resident_rowgroups"], int(cache_stats.get("resident_rowgroups", 0))
+    )
+    projection_item_build_seconds = float(stats.get("projection_item_build_ms", 0.0)) / 1000.0
+    totals["planning_seconds"] += float(stats.get("planning_ms", 0.0)) / 1000.0
+    totals["projection_build_seconds"] += projection_item_build_seconds
+    totals["projection_item_build_seconds"] += projection_item_build_seconds
+    totals["resize_weight_build_seconds"] += float(stats.get("resize_weight_build_ms", 0.0)) / 1000.0
+    totals["gpu_projection_seconds"] += float(stats.get("projection_ms", 0.0)) / 1000.0
+    totals["decoded_projection_seconds"] += float(stats.get("decoded_projection_ms", 0.0)) / 1000.0
+    totals["fixed_transform_kernel_seconds"] += float(stats.get("fixed_transform_ms", 0.0)) / 1000.0
+    totals["round_kernel_seconds"] += float(stats.get("fixed_grid_round_ms", 0.0)) / 1000.0
+
+
+def _empty_totals() -> dict[str, int | float]:
+    return {
+        "selected_vectors": 0,
+        "full_vectors": 0,
+        "decode_kernels": 0,
+        "rowgroups": 0,
+        "worksets": 0,
+        "projection_items": 0,
+        "internal_syncs": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_inserts": 0,
+        "cache_evictions": 0,
+        "cache_resident_rowgroups": 0,
+        "planning_seconds": 0.0,
+        "projection_build_seconds": 0.0,
+        "projection_item_build_seconds": 0.0,
+        "resize_weight_build_seconds": 0.0,
+        "gpu_projection_seconds": 0.0,
+        "decoded_projection_seconds": 0.0,
+        "fixed_transform_kernel_seconds": 0.0,
+        "round_kernel_seconds": 0.0,
+    }
+
+
+def _cache_visibility(args: argparse.Namespace) -> dict[str, Any]:
+    if args.cache_capacity_mib <= 0:
+        return {"cache_active": False, "cache_disabled_reason": "cache_capacity_mib=0"}
+    if args.output_layout == "ycbcr_dct_grid":
+        return {"cache_active": False, "cache_disabled_reason": "dense cache disabled for Y/CbCr grid layouts"}
+    if args.dct_coeffs != "all":
+        return {"cache_active": False, "cache_disabled_reason": "dct_coeffs subset disables dense rowgroup cache"}
+    return {"cache_active": True, "cache_disabled_reason": ""}
 
 
 def _print_batch_line(phase: str, step: int, batch: DirectDctBatchView, logits: torch.Tensor | None = None,
@@ -528,15 +587,7 @@ def _run_loader_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, in
 
     _sync(device)
     total_images = 0
-    totals = {
-        "selected_vectors": 0,
-        "full_vectors": 0,
-        "decode_kernels": 0,
-        "rowgroups": 0,
-        "worksets": 0,
-        "projection_items": 0,
-        "internal_syncs": 0,
-    }
+    totals = _empty_totals()
     started = time.perf_counter()
     pending_ids: list[int] | None = None
     pending: Any | None = None
@@ -549,7 +600,7 @@ def _run_loader_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, in
             args.dct_coeffs,
             args.cache_capacity_mib,
             args.output_layout,
-            "rgbnomore_val" if args.grid_preprocess == "rgbnomore-val-pushdown" else "none",
+            RGBNOMORE_VAL_DCT_GRID_TRANSFORM if args.grid_preprocess == "rgbnomore-val-pushdown" else None,
         )
     for step in range(args.steps):
         if args.async_prefetch:
@@ -574,7 +625,7 @@ def _run_loader_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, in
                     args.dct_coeffs,
                     args.cache_capacity_mib,
                     args.output_layout,
-                    "rgbnomore_val" if args.grid_preprocess == "rgbnomore-val-pushdown" else "none",
+                    RGBNOMORE_VAL_DCT_GRID_TRANSFORM if args.grid_preprocess == "rgbnomore-val-pushdown" else None,
                 )
             else:
                 pending_ids = None
@@ -607,6 +658,7 @@ def _run_loader_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, in
         "device": str(device),
         "async_prefetch": bool(args.async_prefetch),
         "grid_preprocess": args.grid_preprocess,
+        **_cache_visibility(args),
         **totals,
     }
     print("RESULT_JSON " + json.dumps(result, sort_keys=True))
@@ -631,15 +683,7 @@ def _run_train_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, int
     _sync(device)
     total_images = 0
     final_loss = 0.0
-    totals = {
-        "selected_vectors": 0,
-        "full_vectors": 0,
-        "decode_kernels": 0,
-        "rowgroups": 0,
-        "worksets": 0,
-        "projection_items": 0,
-        "internal_syncs": 0,
-    }
+    totals = _empty_totals()
     started = time.perf_counter()
     pending_ids: list[int] | None = None
     pending: Any | None = None
@@ -652,7 +696,7 @@ def _run_train_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, int
             args.dct_coeffs,
             args.cache_capacity_mib,
             args.output_layout,
-            "rgbnomore_val" if args.grid_preprocess == "rgbnomore-val-pushdown" else "none",
+            RGBNOMORE_VAL_DCT_GRID_TRANSFORM if args.grid_preprocess == "rgbnomore-val-pushdown" else None,
         )
     for step in range(args.steps):
         if args.async_prefetch:
@@ -677,7 +721,7 @@ def _run_train_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, int
                     args.dct_coeffs,
                     args.cache_capacity_mib,
                     args.output_layout,
-                    "rgbnomore_val" if args.grid_preprocess == "rgbnomore-val-pushdown" else "none",
+                    RGBNOMORE_VAL_DCT_GRID_TRANSFORM if args.grid_preprocess == "rgbnomore-val-pushdown" else None,
                 )
             else:
                 pending_ids = None
@@ -718,6 +762,7 @@ def _run_train_phase(reader: Any, args: argparse.Namespace, crop: tuple[int, int
         "train_smoke": bool(args.train_smoke),
         "async_prefetch": bool(args.async_prefetch),
         "grid_preprocess": args.grid_preprocess,
+        **_cache_visibility(args),
         **totals,
     }
     print("RESULT_JSON " + json.dumps(result, sort_keys=True))
@@ -736,7 +781,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(getattr(galp_dct, "DEFAULT_CACHE_CAPACITY_MIB", 1024)),
     )
-    parser.add_argument("--output-layout", choices=("compact", "ycbcr_dct_grid", "ycbcr_dct_grid_fixed"), default="compact")
+    parser.add_argument("--output-layout", choices=("compact", "ycbcr_dct_grid", "transformed_dct_grid"), default="compact")
     parser.add_argument(
         "--grid-preprocess",
         choices=("none", "rgbnomore-val-crop", "rgbnomore-val-pushdown"),
@@ -770,13 +815,13 @@ def main() -> None:
     if args.num_classes <= 1:
         raise ValueError("--num-classes must be greater than 1")
     if args.grid_preprocess != "none":
-        if args.output_layout not in ("ycbcr_dct_grid", "ycbcr_dct_grid_fixed"):
+        if args.output_layout not in ("ycbcr_dct_grid", "transformed_dct_grid"):
             raise ValueError("--grid-preprocess requires a Y/CbCr grid output layout")
         if not args.rgbnomore_root.exists():
             raise FileNotFoundError(args.rgbnomore_root)
         args.dct_coeffs = "all"
         if args.grid_preprocess == "rgbnomore-val-pushdown":
-            args.output_layout = "ycbcr_dct_grid_fixed"
+            args.output_layout = "transformed_dct_grid"
         if args.async_prefetch and args.grid_preprocess != "rgbnomore-val-pushdown":
             print("grid_preprocess disables async_prefetch because it reads full-image grids per image before stacking")
             args.async_prefetch = False

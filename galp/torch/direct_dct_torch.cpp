@@ -1,5 +1,6 @@
 #include "galp/direct_dct.hpp"
 #include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <chrono>
@@ -24,7 +25,7 @@ namespace py = pybind11;
 namespace {
 
 constexpr size_t kBytesPerMiB                         = size_t {1024} * size_t {1024};
-constexpr size_t kDefaultDirectDctCacheCapacityMiB    = 1024;
+constexpr size_t kDefaultDirectDctCacheCapacityMiB    = 0;
 constexpr auto   kImmediateFuturePollDuration         = std::chrono::seconds(0);
 
 galp::jpeg::JpegDctCropBox parse_crop(const py::object& crop) {
@@ -45,7 +46,63 @@ galp::jpeg::JpegDctCropBox parse_crop(const py::object& crop) {
 
 galp::jpeg::JpegDctCoefficientSelection parse_coefficients(const std::string& spec);
 galp::jpeg::JpegDctDeviceLayout parse_layout(const std::string& layout);
-galp::jpeg::JpegDctDevicePreprocess parse_preprocess(const std::string& preprocess);
+
+std::optional<galp::jpeg::JpegDctGridTransformSpec> parse_grid_transform(const py::object& value) {
+	if (value.is_none()) {
+		return std::nullopt;
+	}
+	if (!py::isinstance<py::dict>(value)) {
+		throw std::invalid_argument("grid_transform must be None or a dict");
+	}
+	const auto dict = py::reinterpret_borrow<py::dict>(value);
+	const auto required_u32 = [&](const char* key) {
+		if (!dict.contains(key)) {
+			throw std::invalid_argument(std::string("grid_transform is missing ") + key);
+		}
+		return dict[key].cast<uint32_t>();
+	};
+	const auto optional_bool = [&](const char* key, const bool fallback) {
+		return dict.contains(key) ? dict[key].cast<bool>() : fallback;
+	};
+
+	galp::jpeg::JpegDctGridTransformSpec spec;
+	spec.y_output_width_blocks        = required_u32("y_output_width_blocks");
+	spec.y_output_height_blocks       = required_u32("y_output_height_blocks");
+	spec.cbcr_output_width_blocks     = required_u32("cbcr_output_width_blocks");
+	spec.cbcr_output_height_blocks    = required_u32("cbcr_output_height_blocks");
+	spec.crop_reference_width_blocks  = required_u32("crop_reference_width_blocks");
+	spec.crop_reference_height_blocks = required_u32("crop_reference_height_blocks");
+	spec.crop_origin_alignment_blocks = required_u32("crop_origin_alignment_blocks");
+	spec.chroma_crop_scale_x          = required_u32("chroma_crop_scale_x");
+	spec.chroma_crop_scale_y          = required_u32("chroma_crop_scale_y");
+	if (!dict.contains("clamp_min") || !dict.contains("clamp_max")) {
+		throw std::invalid_argument("grid_transform requires clamp_min and clamp_max");
+	}
+	spec.clamp_min                = dict["clamp_min"].cast<int32_t>();
+	spec.clamp_max                = dict["clamp_max"].cast<int32_t>();
+	spec.dequantize               = optional_bool("dequantize", true);
+	spec.require_all_coefficients = optional_bool("require_all_coefficients", true);
+	spec.allow_grayscale          = optional_bool("allow_grayscale", false);
+	if (dict.contains("preferred_small_crop_width_blocks")) {
+		spec.preferred_small_crop_width_blocks =
+		    dict["preferred_small_crop_width_blocks"].cast<std::vector<uint32_t>>();
+	}
+	if (dict.contains("preferred_small_crop_height_blocks")) {
+		spec.preferred_small_crop_height_blocks =
+		    dict["preferred_small_crop_height_blocks"].cast<std::vector<uint32_t>>();
+	}
+	if (dict.contains("allowed_chroma_sampling_ratios")) {
+		for (const auto item : dict["allowed_chroma_sampling_ratios"].cast<py::sequence>()) {
+			const auto ratio = py::reinterpret_borrow<py::sequence>(item);
+			if (ratio.size() != 4) {
+				throw std::invalid_argument("each allowed_chroma_sampling_ratios item must contain four integers");
+			}
+			spec.allowed_chroma_sampling_ratios.push_back(galp::jpeg::JpegDctSamplingRatio {
+			    ratio[0].cast<uint16_t>(), ratio[1].cast<uint16_t>(), ratio[2].cast<uint16_t>(), ratio[3].cast<uint16_t>()});
+		}
+	}
+	return spec;
+}
 
 size_t cache_capacity_bytes_from_mib(const size_t cache_capacity_mib) {
 	if (cache_capacity_mib > std::numeric_limits<size_t>::max() / kBytesPerMiB) {
@@ -58,15 +115,21 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
                                                          const size_t       cache_capacity_mib,
                                                          const size_t       decode_batch_rowgroups,
                                                          const bool         enable_rowgroup_prefetch,
+                                                         const size_t       rowgroup_prefetch_depth,
+                                                         const size_t       rowgroup_prefetch_workers,
+                                                         const size_t       rowgroup_prefetch_min_decode_batches,
                                                          const std::string& layout,
-                                                         const std::string& preprocess) {
+                                                         const py::object&  grid_transform) {
 	galp::jpeg::JpegDctDeviceBatchOptions options;
 	options.coefficient_selection    = parse_coefficients(dct_coeffs);
 	options.layout                   = parse_layout(layout);
-	options.preprocess               = parse_preprocess(preprocess);
+	options.grid_transform           = parse_grid_transform(grid_transform);
 	options.cache_capacity_bytes     = cache_capacity_bytes_from_mib(cache_capacity_mib);
 	options.decode_batch_rowgroups   = decode_batch_rowgroups;
 	options.enable_rowgroup_prefetch = enable_rowgroup_prefetch;
+	options.rowgroup_prefetch_depth  = rowgroup_prefetch_depth;
+	options.rowgroup_prefetch_workers = rowgroup_prefetch_workers;
+	options.rowgroup_prefetch_min_decode_batches = rowgroup_prefetch_min_decode_batches;
 	return options;
 }
 
@@ -86,21 +149,11 @@ galp::jpeg::JpegDctDeviceLayout parse_layout(const std::string& layout) {
 	if (layout == "ycbcr_dct_grid" || layout == "ycbcr-dct-grid") {
 		return galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGrid;
 	}
-	if (layout == "ycbcr_dct_grid_fixed" || layout == "ycbcr-dct-grid-fixed") {
-		return galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed;
+	if (layout == "transformed_dct_grid" || layout == "transformed-dct-grid") {
+		return galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
 	}
 	throw std::invalid_argument(
-	    "invalid DCT output layout; expected compact, ycbcr_dct_grid, or ycbcr_dct_grid_fixed");
-}
-
-galp::jpeg::JpegDctDevicePreprocess parse_preprocess(const std::string& preprocess) {
-	if (preprocess == "none" || preprocess.empty()) {
-		return galp::jpeg::JpegDctDevicePreprocess::kNone;
-	}
-	if (preprocess == "rgbnomore_val" || preprocess == "rgbnomore-val") {
-		return galp::jpeg::JpegDctDevicePreprocess::kRgbNoMoreVal;
-	}
-	throw std::invalid_argument("invalid DCT preprocess; expected none or rgbnomore_val");
+	    "invalid DCT output layout; expected compact, ycbcr_dct_grid, or transformed_dct_grid");
 }
 
 std::string layout_to_string(const galp::jpeg::JpegDctDeviceLayout layout) {
@@ -109,8 +162,8 @@ std::string layout_to_string(const galp::jpeg::JpegDctDeviceLayout layout) {
 		return "compact";
 	case galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGrid:
 		return "ycbcr_dct_grid";
-	case galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed:
-		return "ycbcr_dct_grid_fixed";
+	case galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid:
+		return "transformed_dct_grid";
 	}
 	return "unknown";
 }
@@ -165,6 +218,11 @@ py::dict block_metadata_to_dict(const galp::jpeg::JpegDctDeviceBlockMetadata& bl
 		out["planned_selected_vector_ratio"]   = preview.planned_selected_vector_ratio;
 		out["estimated_selected_vector_ratio"] = preview.estimated_selected_vector_ratio;
 		out["planning_ms"]                     = preview.planning_ms;
+		out["resize_weight_build_ms"]          = preview.resize_weight_build_ms;
+		out["dct_resize_weight_cache_hits"]    = preview.dct_resize_weight_cache_hits;
+		out["dct_resize_weight_cache_misses"]  = preview.dct_resize_weight_cache_misses;
+		out["dct_conversion_matrix_cache_hits"] = preview.dct_conversion_matrix_cache_hits;
+		out["dct_conversion_matrix_cache_misses"] = preview.dct_conversion_matrix_cache_misses;
 
 		py::list selected_coefficients;
 		for (const auto coeff : preview.selected_coefficients) {
@@ -189,7 +247,7 @@ py::dict block_metadata_to_dict(const galp::jpeg::JpegDctDeviceBlockMetadata& bl
 			rowgroups.append(rowgroup_metadata_to_dict(rowgroup));
 		}
 		out["rowgroups"] = std::move(rowgroups);
-		if (preview.layout == galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed) {
+		if (preview.layout == galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid) {
 			out["y_shape"] = py::make_tuple(preview.ycbcr_dct_grid_shape.y[0],
 			                                preview.ycbcr_dct_grid_shape.y[1],
 			                                preview.ycbcr_dct_grid_shape.y[2],
@@ -285,6 +343,12 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["decoded_projection_item_count"]                 = stats.decoded_projection_item_count;
 	out["fixed_transform_item_count"]                    = stats.fixed_transform_item_count;
 	out["fixed_transform_image_count"]                   = stats.fixed_transform_image_count;
+	out["fixed_transform_component_count"]               = stats.fixed_transform_component_count;
+	out["fixed_transform_source_block_count"]            = stats.fixed_transform_source_block_count;
+	out["fixed_transform_output_block_count"]            = stats.fixed_transform_output_block_count;
+	out["project_decoded_ycbcr_grid_launch_count"]       = stats.project_decoded_ycbcr_grid_launch_count;
+	out["jpeg_dct_projection_items_materialized"]        = stats.jpeg_dct_projection_items_materialized;
+	out["fixed_grid_round_event_handoff_count"]          = stats.fixed_grid_round_event_handoff_count;
 	out["workset_upload_count"]                          = stats.workset_upload_count;
 	out["scratch_upload_count"]                          = stats.scratch_upload_count;
 	out["scratch_allocation_count"]                      = stats.scratch_allocation_count;
@@ -317,12 +381,30 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["planning_ms"]                                   = stats.planning_ms;
 	out["workset_build_ms"]                              = stats.workset_build_ms;
 	out["workset_upload_ms"]                             = stats.workset_upload_ms;
+	out["workset_upload_prep_ms"]                        = stats.workset_upload_prep_ms;
+	out["workset_upload_arena_ms"]                       = stats.workset_upload_arena_ms;
+	out["workset_upload_arena_pack_ms"]                  = stats.workset_upload_arena_pack_ms;
+	out["workset_upload_arena_layout_ms"]                = stats.workset_upload_arena_layout_ms;
+	out["workset_upload_arena_alloc_ms"]                 = stats.workset_upload_arena_alloc_ms;
+	out["workset_upload_arena_resolve_ms"]               = stats.workset_upload_arena_resolve_ms;
+	out["workset_upload_dma_issue_ms"]                   = stats.workset_upload_dma_issue_ms;
+	out["workset_upload_event_record_ms"]                = stats.workset_upload_event_record_ms;
+	out["workset_upload_dma_bytes"]                      = stats.workset_upload_dma_bytes;
+	out["workset_upload_dma_count"]                      = stats.workset_upload_dma_count;
 	out["decode_ms"]                                     = stats.decode_ms;
 	out["gather_ms"]                                     = stats.gather_ms;
 	out["decoded_gather_ms"]                             = stats.decoded_gather_ms;
 	out["cached_gather_ms"]                              = stats.cached_gather_ms;
 	out["projection_ms"]                                 = stats.projection_ms;
 	out["decoded_projection_ms"]                         = stats.decoded_projection_ms;
+	out["projection_item_build_ms"]                      = stats.projection_item_build_ms;
+	out["fixed_transform_ms"]                            = stats.fixed_transform_ms;
+	out["fixed_grid_round_ms"]                           = stats.fixed_grid_round_ms;
+	out["resize_weight_build_ms"]                        = stats.resize_weight_build_ms;
+	out["dct_resize_weight_cache_hits"]                  = stats.dct_resize_weight_cache_hits;
+	out["dct_resize_weight_cache_misses"]                = stats.dct_resize_weight_cache_misses;
+	out["dct_conversion_matrix_cache_hits"]              = stats.dct_conversion_matrix_cache_hits;
+	out["dct_conversion_matrix_cache_misses"]            = stats.dct_conversion_matrix_cache_misses;
 	out["prefetch_wait_ms"]                              = stats.prefetch_wait_ms;
 	out["prefetch_depth_block_ms"]                       = stats.prefetch_depth_block_ms;
 	out["prefetch_queue_start_ms"]                       = stats.prefetch_queue_start_ms;
@@ -489,10 +571,12 @@ struct TorchDirectDctBatch {
 	}
 
 	torch::Tensor coefficients() {
+		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
 		if (tensor.defined()) {
 			return tensor;
 		}
-		const auto desc         = batch->tensor();
+		wait_for_batch_completion();
+		const auto desc         = batch->tensor_async();
 		const auto device_index = static_cast<c10::DeviceIndex>(desc.cuda_device < 0 ? 0 : desc.cuda_device);
 		auto options = torch::TensorOptions().dtype(torch::kInt16).device(torch::Device(torch::kCUDA, device_index));
 		if (desc.data == nullptr || desc.empty()) {
@@ -512,11 +596,13 @@ struct TorchDirectDctBatch {
 	}
 
 	torch::Tensor y() {
-		return grid_tensor(batch->y_tensor(), y_tensor);
+		wait_for_batch_completion();
+		return grid_tensor(batch->y_tensor_async(), y_tensor);
 	}
 
 	torch::Tensor cbcr() {
-		return grid_tensor(batch->cbcr_tensor(), cbcr_tensor);
+		wait_for_batch_completion();
+		return grid_tensor(batch->cbcr_tensor_async(), cbcr_tensor);
 	}
 
 	torch::Tensor image_offsets_tensor() {
@@ -703,6 +789,7 @@ private:
 	}
 
 	torch::Tensor grid_tensor(const galp::jpeg::DirectDctGridTensorDescriptor& desc, torch::Tensor& cached) {
+		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
 		if (cached.defined()) {
 			return cached;
 		}
@@ -731,6 +818,17 @@ private:
                                   },
                                   options);
 		return cached;
+	}
+
+	void wait_for_batch_completion() const {
+		auto* event = batch->cuda_completion_event();
+		if (event == nullptr) {
+			return;
+		}
+		const auto device_index = tensor_device_index();
+		c10::cuda::CUDAGuard guard(device_index);
+		auto stream = c10::cuda::getCurrentCUDAStream(device_index);
+		C10_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), static_cast<cudaEvent_t>(event), 0));
 	}
 };
 
@@ -928,11 +1026,21 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	            const size_t                 cache_capacity_mib,
 	            const size_t                 decode_batch_rowgroups,
 	            const bool                   enable_rowgroup_prefetch,
+	            const size_t                 rowgroup_prefetch_depth,
+	            const size_t                 rowgroup_prefetch_workers,
+	            const size_t                 rowgroup_prefetch_min_decode_batches,
 	            const std::string&           layout,
-	            const std::string&           preprocess) {
+	            const py::object&            grid_transform) {
 		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(
-		             dct_coeffs, cache_capacity_mib, decode_batch_rowgroups, enable_rowgroup_prefetch, layout, preprocess);
+		         const auto options = make_batch_options(dct_coeffs,
+		                                                 cache_capacity_mib,
+		                                                 decode_batch_rowgroups,
+		                                                 enable_rowgroup_prefetch,
+		                                                 rowgroup_prefetch_depth,
+		                                                 rowgroup_prefetch_workers,
+		                                                 rowgroup_prefetch_min_decode_batches,
+		                                                 layout,
+		                                                 grid_transform);
 		         return reader.plan_batch(image_ids, crop_box, options);
 	         },
 	         py::arg("image_ids"),
@@ -941,8 +1049,12 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
 	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
 	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("layout")                   = "compact",
-	         py::arg("preprocess")               = "none")
+	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	         py::arg("rowgroup_prefetch_min_decode_batches") =
+	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	         py::arg("layout")         = "compact",
+	         py::arg("grid_transform") = py::none())
 	    .def("read_batch",
 	         [](TorchDirectDctReader& reader,
 	            const std::vector<uint32_t>& image_ids,
@@ -951,11 +1063,21 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	            const size_t                 cache_capacity_mib,
 	            const size_t                 decode_batch_rowgroups,
 	            const bool                   enable_rowgroup_prefetch,
+	            const size_t                 rowgroup_prefetch_depth,
+	            const size_t                 rowgroup_prefetch_workers,
+	            const size_t                 rowgroup_prefetch_min_decode_batches,
 	            const std::string&           layout,
-	            const std::string&           preprocess) {
+	            const py::object&            grid_transform) {
 		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(
-		             dct_coeffs, cache_capacity_mib, decode_batch_rowgroups, enable_rowgroup_prefetch, layout, preprocess);
+		         const auto options = make_batch_options(dct_coeffs,
+		                                                 cache_capacity_mib,
+		                                                 decode_batch_rowgroups,
+		                                                 enable_rowgroup_prefetch,
+		                                                 rowgroup_prefetch_depth,
+		                                                 rowgroup_prefetch_workers,
+		                                                 rowgroup_prefetch_min_decode_batches,
+		                                                 layout,
+		                                                 grid_transform);
 		         py::gil_scoped_release release;
 		         return reader.read_batch(image_ids, crop_box, options);
 	         },
@@ -965,8 +1087,12 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
 	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
 	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("layout")                   = "compact",
-	         py::arg("preprocess")               = "none")
+	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	         py::arg("rowgroup_prefetch_min_decode_batches") =
+	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	         py::arg("layout")         = "compact",
+	         py::arg("grid_transform") = py::none())
 	    .def("prefetch_batch",
 	         [](TorchDirectDctReader&      reader,
 	            std::vector<uint32_t>      image_ids,
@@ -975,11 +1101,21 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	            const size_t               cache_capacity_mib,
 	            const size_t               decode_batch_rowgroups,
 	            const bool                 enable_rowgroup_prefetch,
+	            const size_t               rowgroup_prefetch_depth,
+	            const size_t               rowgroup_prefetch_workers,
+	            const size_t                 rowgroup_prefetch_min_decode_batches,
 	            const std::string&         layout,
-	            const std::string&         preprocess) {
+	            const py::object&          grid_transform) {
 		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(
-		             dct_coeffs, cache_capacity_mib, decode_batch_rowgroups, enable_rowgroup_prefetch, layout, preprocess);
+		         const auto options = make_batch_options(dct_coeffs,
+		                                                 cache_capacity_mib,
+		                                                 decode_batch_rowgroups,
+		                                                 enable_rowgroup_prefetch,
+		                                                 rowgroup_prefetch_depth,
+		                                                 rowgroup_prefetch_workers,
+		                                                 rowgroup_prefetch_min_decode_batches,
+		                                                 layout,
+		                                                 grid_transform);
 		         return reader.prefetch_batch(std::move(image_ids), crop_box, options);
 	         },
 	         py::arg("image_ids"),
@@ -988,8 +1124,12 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
 	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
 	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("layout")                   = "compact",
-	         py::arg("preprocess")               = "none")
+	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	         py::arg("rowgroup_prefetch_min_decode_batches") =
+	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	         py::arg("layout")         = "compact",
+	         py::arg("grid_transform") = py::none())
 	    .def("read_batch_async",
 	         [](TorchDirectDctReader&      reader,
 	            std::vector<uint32_t>      image_ids,
@@ -997,12 +1137,22 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	            const std::string&         dct_coeffs,
 	            const size_t               cache_capacity_mib,
 	            const size_t               decode_batch_rowgroups,
-	            const bool                 enable_rowgroup_prefetch,
+	            const bool                   enable_rowgroup_prefetch,
+	            const size_t                 rowgroup_prefetch_depth,
+	            const size_t                 rowgroup_prefetch_workers,
+	            const size_t                 rowgroup_prefetch_min_decode_batches,
 	            const std::string&         layout,
-	            const std::string&         preprocess) {
+	            const py::object&          grid_transform) {
 		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(
-		             dct_coeffs, cache_capacity_mib, decode_batch_rowgroups, enable_rowgroup_prefetch, layout, preprocess);
+		         const auto options = make_batch_options(dct_coeffs,
+		                                                 cache_capacity_mib,
+		                                                 decode_batch_rowgroups,
+		                                                 enable_rowgroup_prefetch,
+		                                                 rowgroup_prefetch_depth,
+		                                                 rowgroup_prefetch_workers,
+		                                                 rowgroup_prefetch_min_decode_batches,
+		                                                 layout,
+		                                                 grid_transform);
 		         return reader.prefetch_batch(std::move(image_ids), crop_box, options);
 	         },
 	         py::arg("image_ids"),
@@ -1011,8 +1161,12 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
 	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
 	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("layout")                   = "compact",
-	         py::arg("preprocess")               = "none")
+	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	         py::arg("rowgroup_prefetch_min_decode_batches") =
+	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	         py::arg("layout")         = "compact",
+	         py::arg("grid_transform") = py::none())
 	    .def("read_prefetched",
 	         &TorchDirectDctReader::read_prefetched,
 	         py::arg("prefetch"),

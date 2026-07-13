@@ -57,9 +57,25 @@ const int16_t* DirectDctBatch::cbcr_device_data() const noexcept {
 	return batch_.cbcr_coefficients();
 }
 
+const int16_t* DirectDctBatch::device_data_async() const noexcept {
+	return batch_.device_coefficients_async();
+}
+
+const int16_t* DirectDctBatch::y_device_data_async() const noexcept {
+	return batch_.y_coefficients_async();
+}
+
+const int16_t* DirectDctBatch::cbcr_device_data_async() const noexcept {
+	return batch_.cbcr_coefficients_async();
+}
+
+void DirectDctBatch::synchronize() const {
+	batch_.synchronize();
+}
+
 DirectDctTensorDescriptor DirectDctBatch::tensor() const {
 	if (batch_.layout() == JpegDctDeviceLayout::kYcbcrDctGrid ||
-	    batch_.layout() == JpegDctDeviceLayout::kYcbcrDctGridFixed) {
+	    batch_.layout() == JpegDctDeviceLayout::kTransformedDctGrid) {
 		throw std::logic_error(
 		    "compact Direct-DCT tensor is not available for Y/CbCr grid layouts; use y_tensor() or cbcr_tensor()");
 	}
@@ -76,7 +92,7 @@ DirectDctTensorDescriptor DirectDctBatch::tensor() const {
 
 DirectDctGridTensorDescriptor DirectDctBatch::y_tensor() const {
 	if (batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGrid &&
-	    batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGridFixed) {
+	    batch_.layout() != JpegDctDeviceLayout::kTransformedDctGrid) {
 		throw std::logic_error(
 		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor() for compact layout");
 	}
@@ -98,13 +114,74 @@ DirectDctGridTensorDescriptor DirectDctBatch::y_tensor() const {
 
 DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor() const {
 	if (batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGrid &&
-	    batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGridFixed) {
+	    batch_.layout() != JpegDctDeviceLayout::kTransformedDctGrid) {
 		throw std::logic_error(
 		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor() for compact layout");
 	}
 	const auto shape = batch_.ycbcr_dct_grid_shape().cbcr;
 	return DirectDctGridTensorDescriptor {
 	    cbcr_device_data(),
+	    shape,
+	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[3] * shape[4] * shape[5],
+	     shape[4] * shape[5],
+	     shape[5],
+	     1U},
+	    DirectDctTensorDataType::kInt16,
+	    DirectDctTensorDevice::kCuda,
+	    cuda_device_,
+	};
+}
+
+DirectDctTensorDescriptor DirectDctBatch::tensor_async() const {
+	if (batch_.layout() == JpegDctDeviceLayout::kYcbcrDctGrid ||
+	    batch_.layout() == JpegDctDeviceLayout::kTransformedDctGrid) {
+		throw std::logic_error(
+		    "compact Direct-DCT tensor is not available for Y/CbCr grid layouts; use y_tensor_async() or cbcr_tensor_async()");
+	}
+	const auto columns = coefficients_per_block();
+	return DirectDctTensorDescriptor {
+	    device_data_async(),
+	    {block_count(), columns},
+	    {columns, 1U},
+	    DirectDctTensorDataType::kInt16,
+	    DirectDctTensorDevice::kCuda,
+	    cuda_device_,
+	};
+}
+
+DirectDctGridTensorDescriptor DirectDctBatch::y_tensor_async() const {
+	if (batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGrid &&
+	    batch_.layout() != JpegDctDeviceLayout::kTransformedDctGrid) {
+		throw std::logic_error(
+		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor_async() for compact layout");
+	}
+	const auto shape = batch_.ycbcr_dct_grid_shape().y;
+	return DirectDctGridTensorDescriptor {
+	    y_device_data_async(),
+	    shape,
+	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[2] * shape[3] * shape[4] * shape[5],
+	     shape[3] * shape[4] * shape[5],
+	     shape[4] * shape[5],
+	     shape[5],
+	     1U},
+	    DirectDctTensorDataType::kInt16,
+	    DirectDctTensorDevice::kCuda,
+	    cuda_device_,
+	};
+}
+
+DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor_async() const {
+	if (batch_.layout() != JpegDctDeviceLayout::kYcbcrDctGrid &&
+	    batch_.layout() != JpegDctDeviceLayout::kTransformedDctGrid) {
+		throw std::logic_error(
+		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor_async() for compact layout");
+	}
+	const auto shape = batch_.ycbcr_dct_grid_shape().cbcr;
+	return DirectDctGridTensorDescriptor {
+	    cbcr_device_data_async(),
 	    shape,
 	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
 	     shape[2] * shape[3] * shape[4] * shape[5],
@@ -148,6 +225,10 @@ size_t DirectDctBatch::image_count() const noexcept {
 
 int DirectDctBatch::cuda_device() const noexcept {
 	return cuda_device_;
+}
+
+void* DirectDctBatch::cuda_completion_event() const noexcept {
+	return batch_.cuda_completion_event();
 }
 
 const std::vector<uint32_t>& DirectDctBatch::global_image_ids() const noexcept {

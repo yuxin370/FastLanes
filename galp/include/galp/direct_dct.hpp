@@ -77,9 +77,16 @@ public:
 	[[nodiscard]] const int16_t*            device_data() const noexcept;
 	[[nodiscard]] const int16_t*            y_device_data() const noexcept;
 	[[nodiscard]] const int16_t*            cbcr_device_data() const noexcept;
+	[[nodiscard]] const int16_t*            device_data_async() const noexcept;
+	[[nodiscard]] const int16_t*            y_device_data_async() const noexcept;
+	[[nodiscard]] const int16_t*            cbcr_device_data_async() const noexcept;
+	void                                    synchronize() const;
 	[[nodiscard]] DirectDctTensorDescriptor tensor() const;
 	[[nodiscard]] DirectDctGridTensorDescriptor y_tensor() const;
 	[[nodiscard]] DirectDctGridTensorDescriptor cbcr_tensor() const;
+	[[nodiscard]] DirectDctTensorDescriptor tensor_async() const;
+	[[nodiscard]] DirectDctGridTensorDescriptor y_tensor_async() const;
+	[[nodiscard]] DirectDctGridTensorDescriptor cbcr_tensor_async() const;
 	[[nodiscard]] size_t                    block_count() const noexcept;
 	[[nodiscard]] size_t                    coefficients_per_block() const noexcept;
 	[[nodiscard]] size_t                    coefficient_count() const noexcept;
@@ -88,6 +95,7 @@ public:
 	[[nodiscard]] size_t                    cbcr_coefficient_count() const noexcept;
 	[[nodiscard]] size_t                    image_count() const noexcept;
 	[[nodiscard]] int                       cuda_device() const noexcept;
+	[[nodiscard]] void*                     cuda_completion_event() const noexcept;
 
 	[[nodiscard]] const std::vector<uint32_t>&                      global_image_ids() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;

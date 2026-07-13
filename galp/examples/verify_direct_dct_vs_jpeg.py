@@ -79,7 +79,6 @@ def _galp_grids(reader: Any, image_id: int, cache_capacity_mib: int) -> tuple[to
         dct_coeffs="all",
         cache_capacity_mib=cache_capacity_mib,
         layout="ycbcr_dct_grid",
-        preprocess="none",
     )
     y = batch.y.detach().to("cpu", torch.int32) if batch.y is not None else None
     cbcr = batch.cbcr.detach().to("cpu", torch.int32) if batch.cbcr is not None else None

@@ -5,10 +5,14 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import torch
 
 import _galp_direct_dct as galp_dct
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
+from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 
 SKIP_RETURN_CODE = 77
@@ -39,32 +43,32 @@ def main() -> int:
         image_ids,
         crop=None,
         dct_coeffs="all",
-        layout="ycbcr_dct_grid_fixed",
-        preprocess="rgbnomore_val",
+        layout="transformed_dct_grid",
+        grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
     )
-    if fixed_plan["layout"] != "ycbcr_dct_grid_fixed":
-        raise RuntimeError(f"unexpected fixed-grid plan layout: {fixed_plan['layout']}")
+    if fixed_plan["layout"] != "transformed_dct_grid":
+        raise RuntimeError(f"unexpected transformed-grid plan layout: {fixed_plan['layout']}")
     if fixed_plan["image_count"] != len(image_ids):
-        raise RuntimeError("fixed-grid plan image count does not match request count")
+        raise RuntimeError("transformed-grid plan image count does not match request count")
     if tuple(fixed_plan["y_shape"]) != (len(image_ids), 1, 28, 28, 8, 8):
-        raise RuntimeError(f"unexpected fixed-grid Y shape: {tuple(fixed_plan['y_shape'])}")
+        raise RuntimeError(f"unexpected transformed-grid Y shape: {tuple(fixed_plan['y_shape'])}")
     if tuple(fixed_plan["cbcr_shape"]) != (len(image_ids), 2, 14, 14, 8, 8):
-        raise RuntimeError(f"unexpected fixed-grid CbCr shape: {tuple(fixed_plan['cbcr_shape'])}")
+        raise RuntimeError(f"unexpected transformed-grid CbCr shape: {tuple(fixed_plan['cbcr_shape'])}")
     if len(fixed_plan["selected_coefficients"]) != 64:
-        raise RuntimeError("fixed-grid RGB-no-more pushdown must request all 64 coefficients")
+        raise RuntimeError("transformed-grid RGB-no-more profile must request all 64 coefficients")
     try:
         reader.plan_batch(
             image_ids,
             crop=None,
             dct_coeffs="first:8",
-            layout="ycbcr_dct_grid_fixed",
-            preprocess="rgbnomore_val",
+            layout="transformed_dct_grid",
+            grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
         )
     except RuntimeError as exc:
         if "requires dct_coeffs=all" not in str(exc):
             raise
     else:
-        raise RuntimeError("fixed-grid RGB-no-more pushdown unexpectedly accepted sparse coefficients")
+        raise RuntimeError("transformed-grid RGB-no-more profile unexpectedly accepted sparse coefficients")
 
     if not torch.cuda.is_available():
         print(
