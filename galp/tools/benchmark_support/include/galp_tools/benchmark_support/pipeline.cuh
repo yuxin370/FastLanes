@@ -39,6 +39,12 @@ constexpr double kAutoMaxTinyRowgroupPushdownBlockRatio             = 0.30;
 constexpr double kAutoMaxTinyRowgroupPushdownTouchedRowgroupRatio   = 0.40;
 constexpr double kAutoMinSelectedVectorRatioWhenWorksetsDoNotShrink = 0.50;
 constexpr double kAutoMinMetadataFastPushdownAvgBlocksPerImage      = 64.0;
+constexpr double kAutoMaxMetadataFastPushdownBlockRatio             = 0.35;
+constexpr size_t kAutoMinMetadataFastPushdownSelectedBlocks         = 1024U;
+constexpr double kAutoMaxSmallWindowPushdownBlockRatio              = 0.25;
+constexpr size_t kAutoMinSmallWindowPushdownSelectedBlocks          = 384U;
+constexpr double kAutoMaxSmallWindowMediumPushdownBlockRatio        = 0.72;
+constexpr size_t kAutoMinSmallWindowMediumPushdownSelectedBlocks    = 1024U;
 constexpr double kAutoMaxCoefficientPushdownRatio                   = 0.25;
 constexpr size_t kAutoMinCoefficientPushdownBlocks                  = 1024U;
 constexpr double kAutoMinCoefficientPushdownBlocksPerWorkset        = 1024.0;
@@ -250,6 +256,18 @@ inline AutoPipelinePolicyDecision choose_auto_pipeline_policy_from_estimates(con
 	} else if (selected_blocks >= full_blocks || decision.selected_vector_ratio >= 0.95) {
 		decision.use_pushdown = false;
 		decision.reason_code  = AutoPipelinePolicyReason::CropCoversFullWindow;
+	} else if (full_blocks < kAutoMinFullWindowBlocksForGeneralPushdown &&
+	           selected_blocks >= kAutoMinSmallWindowPushdownSelectedBlocks &&
+	           decision.selected_block_ratio <= kAutoMaxSmallWindowPushdownBlockRatio &&
+	           decision.selected_vector_ratio <= kAutoMaxSmallWindowPushdownBlockRatio) {
+		decision.use_pushdown = true;
+		decision.reason_code  = AutoPipelinePolicyReason::CropSavesEnoughBlocks;
+	} else if (full_blocks < kAutoMinFullWindowBlocksForGeneralPushdown &&
+	           selected_blocks >= kAutoMinSmallWindowMediumPushdownSelectedBlocks &&
+	           decision.selected_block_ratio <= kAutoMaxSmallWindowMediumPushdownBlockRatio &&
+	           decision.selected_vector_ratio <= kAutoMaxSmallWindowMediumPushdownBlockRatio) {
+		decision.use_pushdown = true;
+		decision.reason_code  = AutoPipelinePolicyReason::CropSavesEnoughBlocks;
 	} else if (full_blocks < kAutoMinFullWindowBlocksForGeneralPushdown) {
 		decision.use_pushdown = false;
 		decision.reason_code  = AutoPipelinePolicyReason::SmallWindowFixedOverhead;
@@ -398,31 +416,38 @@ inline std::optional<AutoPipelinePolicyDecision> choose_auto_pipeline_policy_fro
 		return make_auto_pipeline_fast_policy_decision(
 		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::CropCoversFullWindow);
 	}
+	if (full_blocks < kAutoMinFullWindowBlocksForGeneralPushdown &&
+	    selected_blocks >= kAutoMinSmallWindowPushdownSelectedBlocks &&
+	    selected_block_ratio <= kAutoMaxSmallWindowPushdownBlockRatio) {
+		return make_auto_pipeline_fast_policy_decision(
+		    selected_blocks, full_blocks, image_count, true, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+	}
+	if (full_blocks < kAutoMinFullWindowBlocksForGeneralPushdown &&
+	    selected_blocks >= kAutoMinSmallWindowMediumPushdownSelectedBlocks &&
+	    selected_block_ratio <= kAutoMaxSmallWindowMediumPushdownBlockRatio) {
+		return make_auto_pipeline_fast_policy_decision(
+		    selected_blocks, full_blocks, image_count, true, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+	}
 	if (full_blocks < kAutoMinFullWindowBlocksForGeneralPushdown) {
 		return make_auto_pipeline_fast_policy_decision(
 		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
-	}
-	// Pushdown decisions depend on selected-vector and workset estimates, so
-	// block-only metadata gates only make fast reject decisions.
-	if (selected_block_ratio <= kAutoVerySmallCropBlockRatio) {
-		return std::nullopt;
-	}
-	if (full_blocks >= kAutoLargeFullWindowBlocks && selected_block_ratio < kAutoMaxLargeWindowBlockRatio) {
-		return std::nullopt;
-	}
-	if (selected_block_ratio < kAutoMaxSelectedBlockRatio) {
-		return std::nullopt;
 	}
 	if (avg_full_blocks_per_image < kAutoMinMetadataFastPushdownAvgBlocksPerImage) {
 		return make_auto_pipeline_fast_policy_decision(
 		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
 	}
+	if (selected_blocks >= kAutoMinMetadataFastPushdownSelectedBlocks &&
+	    selected_block_ratio <= kAutoMaxMetadataFastPushdownBlockRatio) {
+		const auto reason = full_blocks >= kAutoLargeFullWindowBlocks
+		                        ? AutoPipelinePolicyReason::LargeWindowAmortizesPushdown
+		                        : AutoPipelinePolicyReason::CropSavesEnoughBlocks;
+		return make_auto_pipeline_fast_policy_decision(selected_blocks, full_blocks, image_count, true, reason);
+	}
 	if (selected_block_ratio >= kAutoMaxSelectedBlockRatio) {
 		return make_auto_pipeline_fast_policy_decision(
 		    selected_blocks, full_blocks, image_count, false, AutoPipelinePolicyReason::GatherOutputTooHigh);
 	}
-	// CropSavesEnoughBlocks depends on touched_rowgroup_ratio for tiny rowgroups;
-	// metadata-only block estimates must fall back to the exact plan there.
+	// Ambiguous windows still need selected-vector and rowgroup estimates.
 	return std::nullopt;
 }
 

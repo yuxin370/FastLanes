@@ -1,5 +1,6 @@
 #include "galp/direct_dct.hpp"
 #include "galp/jpeg_dct.hpp"
+#include "galp/profiles/rgbnomore.hpp"
 #include "galp_tools/benchmark_support/pipeline.cuh"
 #include "jpeg/jpeg_dct_device.cuh"
 #include <algorithm>
@@ -188,21 +189,23 @@ TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {
 
 	galp::jpeg::JpegDctDeviceBatchOptions default_batch_options;
 	EXPECT_EQ(default_batch_options.layout, galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff);
-	EXPECT_EQ(default_batch_options.preprocess, galp::jpeg::JpegDctDevicePreprocess::kNone);
+	EXPECT_FALSE(default_batch_options.grid_transform.has_value());
 	EXPECT_EQ(default_batch_options.cache_capacity_bytes, 0U);
 	EXPECT_EQ(default_batch_options.decode_batch_rowgroups, galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups);
 	EXPECT_TRUE(default_batch_options.coefficient_selection.empty());
 	EXPECT_EQ(default_batch_options.coefficient_selection.size(), galp::jpeg::detail::kJpegDctCoefficientCount);
 	EXPECT_TRUE(default_batch_options.enable_rowgroup_prefetch);
 	EXPECT_EQ(default_batch_options.rowgroup_prefetch_depth, galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth);
+	EXPECT_EQ(default_batch_options.rowgroup_prefetch_depth, 4U);
 	EXPECT_EQ(default_batch_options.rowgroup_prefetch_workers,
 	          galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers);
+	EXPECT_EQ(default_batch_options.rowgroup_prefetch_workers, 1U);
 	EXPECT_EQ(default_batch_options.rowgroup_prefetch_min_decode_batches,
 	          galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches);
 
 	galp::jpeg::JpegDctDeviceBatchOptions legacy_batch_options {
 	    galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff,
-	    galp::jpeg::JpegDctDevicePreprocess::kNone,
+	    std::nullopt,
 	    4096U};
 	EXPECT_EQ(legacy_batch_options.cache_capacity_bytes, 4096U);
 	EXPECT_EQ(legacy_batch_options.decode_batch_rowgroups, galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups);
@@ -210,7 +213,7 @@ TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {
 
 	galp::jpeg::JpegDctDeviceBatchOptions legacy_prefetch_options {
 	    galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff,
-	    galp::jpeg::JpegDctDevicePreprocess::kNone,
+	    std::nullopt,
 	    4096U,
 	    8U,
 	    false,
@@ -613,7 +616,7 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 	std::filesystem::remove_all(dir);
 }
 
-TEST(JpegDct, DeviceBatchReadsRgbNoMoreFixedGridIntoYcbcrTensors) {
+TEST(JpegDct, DeviceBatchReadsTransformedGridWithRgbNoMoreProfile) {
 	int        device_count  = 0;
 	const auto device_status = cudaGetDeviceCount(&device_count);
 	if (device_status != cudaSuccess || device_count == 0) {
@@ -622,7 +625,7 @@ TEST(JpegDct, DeviceBatchReadsRgbNoMoreFixedGridIntoYcbcrTensors) {
 
 	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto dir =
-	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_fixed_grid_device_" + std::to_string(suffix));
+	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_transformed_grid_device_" + std::to_string(suffix));
 	const auto path0 = dir / "input0.jpg";
 	const auto path1 = dir / "input1.jpg";
 	std::filesystem::create_directories(dir);
@@ -639,8 +642,9 @@ TEST(JpegDct, DeviceBatchReadsRgbNoMoreFixedGridIntoYcbcrTensors) {
 	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
 
 	galp::jpeg::JpegDctDeviceBatchOptions options;
-	options.layout     = galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed;
-	options.preprocess = galp::jpeg::JpegDctDevicePreprocess::kRgbNoMoreVal;
+	options.layout               = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	options.grid_transform       = galp::profiles::rgbnomore_val_dct_grid_transform();
+	options.cache_capacity_bytes = 1U << 20U;
 
 	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
 	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
@@ -649,7 +653,7 @@ TEST(JpegDct, DeviceBatchReadsRgbNoMoreFixedGridIntoYcbcrTensors) {
 	};
 	auto batch = reader.ReadDeviceDctBatch(requests, options);
 
-	EXPECT_EQ(batch.layout(), galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed);
+	EXPECT_EQ(batch.layout(), galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid);
 	EXPECT_EQ(batch.image_count(), requests.size());
 	EXPECT_EQ(batch.selected_coefficients(), all_dct_coefficients());
 	EXPECT_EQ(batch.coefficients_per_block(), galp::jpeg::detail::kJpegDctCoefficientCount);
@@ -673,8 +677,42 @@ TEST(JpegDct, DeviceBatchReadsRgbNoMoreFixedGridIntoYcbcrTensors) {
 	                     cudaMemcpyDeviceToHost),
 	          cudaSuccess);
 	const auto stats = batch.execution_stats();
-	EXPECT_GT(stats.projection_item_count, 0U);
+	EXPECT_EQ(stats.projection_item_count, 0U);
+	EXPECT_EQ(stats.decoded_projection_item_count, 0U);
+	EXPECT_GT(stats.fixed_transform_item_count, 0U);
+	EXPECT_EQ(stats.fixed_transform_image_count, requests.size());
+	EXPECT_EQ(stats.fixed_transform_component_count, requests.size() * 3U);
+	EXPECT_EQ(stats.fixed_transform_source_block_count, batch.block_count());
+	EXPECT_EQ(stats.fixed_transform_output_block_count,
+	          (batch.y_coefficient_count() + batch.cbcr_coefficient_count()) / 64U);
 	EXPECT_GT(stats.materialize_kernel_launch_count, 0U);
+	EXPECT_GT(stats.fixed_grid_round_ms, 0.0);
+
+	auto cached_plan_batch = reader.ReadDeviceDctBatch(requests, options);
+	const auto cached_plan_stats = cached_plan_batch.execution_stats();
+	EXPECT_GT(cached_plan_batch.cache_stats().hits, 0U);
+	EXPECT_EQ(cached_plan_stats.fixed_transform_component_count, stats.fixed_transform_component_count);
+	EXPECT_EQ(cached_plan_stats.fixed_transform_source_block_count, stats.fixed_transform_source_block_count);
+	EXPECT_EQ(cached_plan_stats.fixed_transform_output_block_count, stats.fixed_transform_output_block_count);
+	EXPECT_GT(cached_plan_stats.fixed_transform_ms, 0.0);
+	EXPECT_EQ(cached_plan_stats.cached_gather_ms, 0.0);
+	EXPECT_EQ(cached_plan_stats.resize_weight_build_ms, 0.0);
+	EXPECT_EQ(cached_plan_stats.dct_resize_weight_cache_hits, 0U);
+	EXPECT_EQ(cached_plan_stats.dct_resize_weight_cache_misses, 0U);
+	EXPECT_EQ(cached_plan_stats.dct_conversion_matrix_cache_hits, 0U);
+	EXPECT_EQ(cached_plan_stats.dct_conversion_matrix_cache_misses, 0U);
+
+	auto empty_batch = reader.ReadDeviceDctBatch({}, options);
+	EXPECT_EQ(empty_batch.layout(), galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid);
+	EXPECT_EQ(empty_batch.image_count(), 0U);
+	EXPECT_EQ(empty_batch.y_coefficient_count(), 0U);
+	EXPECT_EQ(empty_batch.cbcr_coefficient_count(), 0U);
+	EXPECT_EQ(empty_batch.y_coefficients(), nullptr);
+	EXPECT_EQ(empty_batch.cbcr_coefficients(), nullptr);
+	EXPECT_EQ(empty_batch.ycbcr_dct_grid_shape().y,
+	          (std::array<size_t, 6> {0U, 1U, 28U, 28U, 8U, 8U}));
+	EXPECT_EQ(empty_batch.ycbcr_dct_grid_shape().cbcr,
+	          (std::array<size_t, 6> {0U, 2U, 14U, 14U, 8U, 8U}));
 
 	std::filesystem::remove_all(dir);
 }
@@ -769,7 +807,7 @@ TEST(JpegDct, DirectDctRuntimeExposesStayOnGpuTensorDescriptor) {
 	std::filesystem::remove_all(dir);
 }
 
-TEST(JpegDct, DirectDctRuntimeExposesRgbNoMoreFixedGridTensorDescriptors) {
+TEST(JpegDct, DirectDctRuntimeExposesTransformedGridTensorDescriptors) {
 	int        device_count  = 0;
 	const auto device_status = cudaGetDeviceCount(&device_count);
 	if (device_status != cudaSuccess || device_count == 0) {
@@ -778,7 +816,7 @@ TEST(JpegDct, DirectDctRuntimeExposesRgbNoMoreFixedGridTensorDescriptors) {
 
 	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto dir =
-	    std::filesystem::temp_directory_path() / ("galp_direct_dct_fixed_grid_runtime_" + std::to_string(suffix));
+	    std::filesystem::temp_directory_path() / ("galp_direct_dct_transformed_grid_runtime_" + std::to_string(suffix));
 	const auto path0 = dir / "input0.jpg";
 	const auto path1 = dir / "input1.jpg";
 	std::filesystem::create_directories(dir);
@@ -795,8 +833,8 @@ TEST(JpegDct, DirectDctRuntimeExposesRgbNoMoreFixedGridTensorDescriptors) {
 	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path0, path1}, output_dir, reader_options, shard_options);
 
 	galp::jpeg::JpegDctDeviceBatchOptions options;
-	options.layout     = galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed;
-	options.preprocess = galp::jpeg::JpegDctDevicePreprocess::kRgbNoMoreVal;
+	options.layout         = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	options.grid_transform = galp::profiles::rgbnomore_val_dct_grid_transform();
 
 	const std::vector<uint32_t> image_ids {0U, 1U};
 	galp::jpeg::DirectDctRuntime runtime(output_dir / "manifest.bin");
@@ -804,7 +842,7 @@ TEST(JpegDct, DirectDctRuntimeExposesRgbNoMoreFixedGridTensorDescriptors) {
 
 	EXPECT_EQ(batch.global_image_ids(), image_ids);
 	EXPECT_EQ(batch.image_count(), image_ids.size());
-	EXPECT_EQ(batch.device_batch().layout(), galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed);
+	EXPECT_EQ(batch.device_batch().layout(), galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid);
 	EXPECT_THROW((void)batch.tensor(), std::logic_error);
 
 	const auto y = batch.y_tensor();
@@ -1103,7 +1141,7 @@ TEST(JpegDct, DeviceBatchPlanPreviewMapsCropsAcrossComponents) {
 	std::filesystem::remove_all(dir);
 }
 
-TEST(JpegDct, DeviceBatchPlanPreviewSupportsRgbNoMoreFixedGridPushdown) {
+TEST(JpegDct, DeviceBatchPlanPreviewSupportsConfiguredTransformedGrid) {
 	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto dir =
 	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_plan_preview_rgbnomore_fixed_" + std::to_string(suffix));
@@ -1128,11 +1166,11 @@ TEST(JpegDct, DeviceBatchPlanPreviewSupportsRgbNoMoreFixedGridPushdown) {
 	    galp::jpeg::JpegDctImageCropRequest {1, galp::jpeg::JpegDctCropBox {}},
 	};
 	galp::jpeg::JpegDctDeviceBatchOptions options;
-	options.layout     = galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed;
-	options.preprocess = galp::jpeg::JpegDctDevicePreprocess::kRgbNoMoreVal;
+	options.layout         = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	options.grid_transform = galp::profiles::rgbnomore_val_dct_grid_transform();
 
 	const auto preview = reader.PlanDeviceDctBatch(requests, options);
-	EXPECT_EQ(preview.layout, galp::jpeg::JpegDctDeviceLayout::kYcbcrDctGridFixed);
+	EXPECT_EQ(preview.layout, galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid);
 	ASSERT_EQ(preview.image_layouts.size(), requests.size());
 	EXPECT_GT(preview.block_metadata.size(), 0U);
 	EXPECT_GT(preview.rowgroups.size(), 0U);
@@ -1141,9 +1179,24 @@ TEST(JpegDct, DeviceBatchPlanPreviewSupportsRgbNoMoreFixedGridPushdown) {
 	EXPECT_EQ(preview.ycbcr_dct_grid_shape.y, (std::array<size_t, 6> {2U, 1U, 28U, 28U, 8U, 8U}));
 	EXPECT_EQ(preview.ycbcr_dct_grid_shape.cbcr, (std::array<size_t, 6> {2U, 2U, 14U, 14U, 8U, 8U}));
 
-	galp::jpeg::JpegDctDeviceBatchOptions missing_preprocess = options;
-	missing_preprocess.preprocess = galp::jpeg::JpegDctDevicePreprocess::kNone;
-	EXPECT_THROW((void)reader.PlanDeviceDctBatch(requests, missing_preprocess), std::runtime_error);
+	auto custom_transform                     = *options.grid_transform;
+	custom_transform.y_output_width_blocks    = 16;
+	custom_transform.y_output_height_blocks   = 12;
+	custom_transform.cbcr_output_width_blocks = 8;
+	custom_transform.cbcr_output_height_blocks = 6;
+	custom_transform.clamp_min                 = -500;
+	custom_transform.clamp_max                 = 500;
+	galp::jpeg::JpegDctDeviceBatchOptions custom_options = options;
+	custom_options.grid_transform = custom_transform;
+	const auto custom_preview = reader.PlanDeviceDctBatch(requests, custom_options);
+	EXPECT_EQ(custom_preview.ycbcr_dct_grid_shape.y,
+	          (std::array<size_t, 6> {2U, 1U, 12U, 16U, 8U, 8U}));
+	EXPECT_EQ(custom_preview.ycbcr_dct_grid_shape.cbcr,
+	          (std::array<size_t, 6> {2U, 2U, 6U, 8U, 8U, 8U}));
+
+	galp::jpeg::JpegDctDeviceBatchOptions missing_transform = options;
+	missing_transform.grid_transform.reset();
+	EXPECT_THROW((void)reader.PlanDeviceDctBatch(requests, missing_transform), std::runtime_error);
 
 	galp::jpeg::JpegDctDeviceBatchOptions sparse_options = options;
 	sparse_options.coefficient_selection.coefficients    = {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U};
@@ -1384,12 +1437,23 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 	{
 		const auto policy = choose_auto_pipeline_policy_from_counts(
 		    /*selected_blocks=*/768, /*full_blocks=*/3072, /*touched_rowgroups=*/1, /*full_rowgroups=*/2);
-		EXPECT_FALSE(policy.use_pushdown);
-		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
+		EXPECT_TRUE(policy.use_pushdown);
+		EXPECT_EQ(policy.reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
 		EXPECT_EQ(policy.estimated_pushdown_worksets, 1U);
 		EXPECT_EQ(policy.estimated_full_worksets, 1U);
 		EXPECT_EQ(policy.estimated_pushdown_gather_items, 768U);
 		EXPECT_EQ(policy.estimated_full_gather_items, 3072U);
+	}
+	{
+		const auto svhn_policy = choose_auto_pipeline_policy_from_counts(
+		    /*selected_blocks=*/1122, /*full_blocks=*/1584, /*touched_rowgroups=*/1, /*full_rowgroups=*/1);
+		EXPECT_TRUE(svhn_policy.use_pushdown);
+		EXPECT_EQ(svhn_policy.reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+
+		const auto cifar_policy = choose_auto_pipeline_policy_from_counts(
+		    /*selected_blocks=*/1632, /*full_blocks=*/2304, /*touched_rowgroups=*/1, /*full_rowgroups=*/2);
+		EXPECT_TRUE(cifar_policy.use_pushdown);
+		EXPECT_EQ(cifar_policy.reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_counts(
@@ -1482,14 +1546,45 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
 		    /*selected_blocks=*/768, /*full_blocks=*/3072, /*image_count=*/128);
 		ASSERT_TRUE(policy.has_value());
-		EXPECT_FALSE(policy->use_pushdown);
-		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
+		EXPECT_TRUE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
 		EXPECT_NE(policy->reason.find("metadata_fast=1"), std::string::npos);
+	}
+	{
+		const auto svhn_policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/1122, /*full_blocks=*/1584, /*image_count=*/128);
+		ASSERT_TRUE(svhn_policy.has_value());
+		EXPECT_TRUE(svhn_policy->use_pushdown);
+		EXPECT_EQ(svhn_policy->reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+		EXPECT_NE(svhn_policy->reason.find("metadata_fast=1"), std::string::npos);
+
+		const auto cifar_policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/1632, /*full_blocks=*/2304, /*image_count=*/128);
+		ASSERT_TRUE(cifar_policy.has_value());
+		EXPECT_TRUE(cifar_policy->use_pushdown);
+		EXPECT_EQ(cifar_policy->reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+		EXPECT_NE(cifar_policy->reason.find("metadata_fast=1"), std::string::npos);
+	}
+	{
+		const auto svhn_policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/396, /*full_blocks=*/1584, /*image_count=*/128);
+		ASSERT_TRUE(svhn_policy.has_value());
+		EXPECT_TRUE(svhn_policy->use_pushdown);
+		EXPECT_EQ(svhn_policy->reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+
+		const auto cifar_policy = choose_auto_pipeline_policy_from_block_estimate(
+		    /*selected_blocks=*/576, /*full_blocks=*/2304, /*image_count=*/128);
+		ASSERT_TRUE(cifar_policy.has_value());
+		EXPECT_TRUE(cifar_policy->use_pushdown);
+		EXPECT_EQ(cifar_policy->reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
 		    /*selected_blocks=*/32000, /*full_blocks=*/100000, /*image_count=*/128);
-		EXPECT_FALSE(policy.has_value());
+		ASSERT_TRUE(policy.has_value());
+		EXPECT_TRUE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::LargeWindowAmortizesPushdown);
+		EXPECT_NE(policy->reason.find("metadata_fast=1"), std::string::npos);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
@@ -1499,27 +1594,38 @@ TEST(JpegDct, AutoPipelinePolicyAvoidsTinyRowgroupOverhead) {
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
 		    /*selected_blocks=*/512, /*full_blocks=*/8192, /*image_count=*/256);
-		EXPECT_FALSE(policy.has_value());
+		ASSERT_TRUE(policy.has_value());
+		EXPECT_FALSE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
 		    /*selected_blocks=*/80000, /*full_blocks=*/100000, /*image_count=*/2000);
-		EXPECT_FALSE(policy.has_value());
+		ASSERT_TRUE(policy.has_value());
+		EXPECT_FALSE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
 		    /*selected_blocks=*/10000, /*full_blocks=*/20000, /*image_count=*/400);
-		EXPECT_FALSE(policy.has_value());
+		ASSERT_TRUE(policy.has_value());
+		EXPECT_FALSE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::SmallWindowFixedOverhead);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
 		    /*selected_blocks=*/102400, /*full_blocks=*/128000, /*image_count=*/128);
-		EXPECT_FALSE(policy.has_value());
+		ASSERT_TRUE(policy.has_value());
+		EXPECT_FALSE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::GatherOutputTooHigh);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
 		    /*selected_blocks=*/3072, /*full_blocks=*/12288, /*image_count=*/128);
-		EXPECT_FALSE(policy.has_value());
+		ASSERT_TRUE(policy.has_value());
+		EXPECT_TRUE(policy->use_pushdown);
+		EXPECT_EQ(policy->reason_code, AutoPipelinePolicyReason::CropSavesEnoughBlocks);
+		EXPECT_NE(policy->reason.find("metadata_fast=1"), std::string::npos);
 	}
 	{
 		const auto policy = choose_auto_pipeline_policy_from_block_estimate(
@@ -1949,7 +2055,7 @@ TEST(JpegDct, DeviceDecodedCacheReplacementKeepsResidentBytesStable) {
 	EXPECT_EQ(stats.evictions, 1U);
 }
 
-TEST(JpegDct, DevicePrefetchPolicySkipsSelectedVectorMisses) {
+TEST(JpegDct, DevicePrefetchPolicyIncludesSelectedVectorMisses) {
 	using galp::jpeg::detail::JpegDctDeviceRowgroupPlan;
 	using galp::jpeg::detail::JpegDctDeviceRowgroupPrefetchConfig;
 	using galp::jpeg::detail::JpegDctDeviceShardPlan;
@@ -1965,13 +2071,13 @@ TEST(JpegDct, DevicePrefetchPolicySkipsSelectedVectorMisses) {
 	JpegDctDeviceRowgroupPrefetchConfig config;
 	config.min_decode_batches = 2;
 	const auto plan = plan_jpeg_dct_rowgroup_prefetch_from_hits(shard, {false, false, false, false, false}, config, 2);
-	EXPECT_FALSE(plan.enabled);
-	EXPECT_TRUE(plan.rowgroup_indices.empty());
-	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {false, false, false, false, false}));
-	EXPECT_EQ(plan.candidate_rowgroup_count, 0U);
+	EXPECT_TRUE(plan.enabled);
+	EXPECT_EQ(plan.rowgroup_indices, (std::vector<size_t> {0U, 1U, 2U, 3U, 4U}));
+	EXPECT_EQ(plan.use_prefetch_for_position, (std::vector<bool> {true, true, true, true, true}));
+	EXPECT_EQ(plan.candidate_rowgroup_count, 5U);
 	EXPECT_EQ(plan.selected_vector_miss_rowgroup_count, 5U);
 	EXPECT_FALSE(plan.disabled_by_all_hits);
-	EXPECT_TRUE(plan.disabled_by_selected_vector_miss);
+	EXPECT_FALSE(plan.disabled_by_selected_vector_miss);
 }
 
 TEST(JpegDct, DevicePrefetchPolicySkipsRepeatedFullMissAfterDecodeBatch) {

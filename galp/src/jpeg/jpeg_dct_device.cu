@@ -16,11 +16,14 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <list>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace galp::jpeg {
@@ -33,6 +36,8 @@ struct JpegDctDeviceBatch::Impl {
 	std::optional<GPUArray<int16_t>>           cbcr_coefficients;
 	std::optional<GPUArray<float>>             y_accum;
 	std::optional<GPUArray<float>>             cbcr_accum;
+	std::optional<GPUArray<uint16_t>>          fixed_quant_tables;
+	std::optional<GPUArray<float>>             fixed_resize_weight_matrices;
 	size_t                                     coefficient_count      = 0;
 	size_t                                     y_coefficient_count    = 0;
 	size_t                                     cbcr_coefficient_count = 0;
@@ -44,6 +49,35 @@ struct JpegDctDeviceBatch::Impl {
 	std::vector<uint8_t>                       selected_coefficients;
 	JpegDctDeviceCacheStats                    cache_stats;
 	JpegDctDeviceExecutionStats                execution_stats;
+	galp::memory::CudaEvent                    fixed_grid_round_start_event;
+	galp::memory::CudaEvent                    completion_event;
+	bool                                       completion_synchronized           = false;
+	bool                                       fixed_grid_round_timing_finalized = false;
+
+	void finalize_fixed_grid_round_timing() {
+		if (fixed_grid_round_timing_finalized || !fixed_grid_round_start_event || !completion_event) {
+			return;
+		}
+		execution_stats.fixed_grid_round_ms +=
+		    static_cast<double>(completion_event.elapsed_since(fixed_grid_round_start_event));
+		fixed_grid_round_timing_finalized = true;
+	}
+
+	void synchronize_completion() {
+		if (completion_event && !completion_synchronized) {
+			completion_event.synchronize();
+			completion_synchronized = true;
+		}
+		finalize_fixed_grid_round_timing();
+	}
+
+	void synchronize_completion_noexcept() noexcept {
+		try {
+			synchronize_completion();
+		} catch (const std::exception& e) {
+			std::fprintf(stderr, "JpegDctDeviceBatch completion wait failed: %s\n", e.what());
+		}
+	}
 };
 
 JpegDctDeviceBatch::JpegDctDeviceBatch() noexcept = default;
@@ -52,25 +86,67 @@ JpegDctDeviceBatch::JpegDctDeviceBatch(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {
 }
 
-JpegDctDeviceBatch::~JpegDctDeviceBatch() = default;
+JpegDctDeviceBatch::~JpegDctDeviceBatch() {
+	if (impl_) {
+		impl_->synchronize_completion_noexcept();
+	}
+}
 
 JpegDctDeviceBatch::JpegDctDeviceBatch(JpegDctDeviceBatch&&) noexcept = default;
 
-JpegDctDeviceBatch& JpegDctDeviceBatch::operator=(JpegDctDeviceBatch&&) noexcept = default;
+JpegDctDeviceBatch& JpegDctDeviceBatch::operator=(JpegDctDeviceBatch&& other) noexcept {
+	if (this != &other) {
+		if (impl_) {
+			impl_->synchronize_completion_noexcept();
+		}
+		impl_ = std::move(other.impl_);
+	}
+	return *this;
+}
 
 const int16_t* JpegDctDeviceBatch::device_coefficients() const noexcept {
+	if (impl_) {
+		impl_->synchronize_completion_noexcept();
+	}
 	return impl_ && impl_->coefficients.has_value() ? const_cast<GPUArray<int16_t>&>(*impl_->coefficients).get()
 	                                                : nullptr;
 }
 
 const int16_t* JpegDctDeviceBatch::y_coefficients() const noexcept {
+	if (impl_) {
+		impl_->synchronize_completion_noexcept();
+	}
 	return impl_ && impl_->y_coefficients.has_value() ? const_cast<GPUArray<int16_t>&>(*impl_->y_coefficients).get()
 	                                                  : nullptr;
 }
 
 const int16_t* JpegDctDeviceBatch::cbcr_coefficients() const noexcept {
+	if (impl_) {
+		impl_->synchronize_completion_noexcept();
+	}
 	return impl_ && impl_->cbcr_coefficients.has_value() ? const_cast<GPUArray<int16_t>&>(*impl_->cbcr_coefficients).get()
 	                                                     : nullptr;
+}
+
+const int16_t* JpegDctDeviceBatch::device_coefficients_async() const noexcept {
+	return impl_ && impl_->coefficients.has_value() ? const_cast<GPUArray<int16_t>&>(*impl_->coefficients).get()
+	                                                : nullptr;
+}
+
+const int16_t* JpegDctDeviceBatch::y_coefficients_async() const noexcept {
+	return impl_ && impl_->y_coefficients.has_value() ? const_cast<GPUArray<int16_t>&>(*impl_->y_coefficients).get()
+	                                                  : nullptr;
+}
+
+const int16_t* JpegDctDeviceBatch::cbcr_coefficients_async() const noexcept {
+	return impl_ && impl_->cbcr_coefficients.has_value() ? const_cast<GPUArray<int16_t>&>(*impl_->cbcr_coefficients).get()
+	                                                     : nullptr;
+}
+
+void JpegDctDeviceBatch::synchronize() const {
+	if (impl_) {
+		impl_->synchronize_completion();
+	}
 }
 
 size_t JpegDctDeviceBatch::coefficient_count() const noexcept {
@@ -114,6 +190,12 @@ JpegDctDeviceCacheStats JpegDctDeviceBatch::cache_stats() const noexcept {
 }
 
 JpegDctDeviceExecutionStats JpegDctDeviceBatch::execution_stats() const noexcept {
+	if (impl_) {
+		// GPU stage durations are only available once their timing events complete.
+		// Keep submission asynchronous and pay this wait only when callers request
+		// the complete statistics snapshot.
+		impl_->synchronize_completion_noexcept();
+	}
 	return execution_stats_ref();
 }
 
@@ -129,6 +211,10 @@ const JpegDctDeviceExecutionStats& JpegDctDeviceBatch::execution_stats_ref() con
 
 JpegDctDeviceLayout JpegDctDeviceBatch::layout() const noexcept {
 	return impl_ ? impl_->layout : JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+}
+
+void* JpegDctDeviceBatch::cuda_completion_event() const noexcept {
+	return impl_ && impl_->completion_event ? impl_->completion_event.get() : nullptr;
 }
 
 const std::vector<JpegDctDeviceImageLayout>& JpegDctDeviceBatch::image_layouts() const noexcept {
@@ -247,11 +333,27 @@ struct JpegDctDeviceProjectionBatchItem {
 struct JpegDctDeviceFixedTransformBatchItem {
 	uint32_t binding_base     = 0;
 	uint32_t row_in_rowgroup  = 0;
-	uint32_t image_index      = 0;
-	uint16_t local_block_x    = 0;
-	uint16_t local_block_y    = 0;
+	uint64_t output_block_index = 0;
 	uint8_t  component        = 0;
 	uint8_t  zigzag_columns   = 0;
+	uint16_t x_factor         = 2;
+	uint16_t y_factor         = 2;
+	uint8_t  x_subblock       = 0;
+	uint8_t  y_subblock       = 0;
+	uint8_t  x_upsample       = 0;
+	uint8_t  y_upsample       = 0;
+	uint16_t x_up_factor      = 1;
+	uint16_t y_up_factor      = 1;
+	uint16_t x_down_factor    = 1;
+	uint16_t y_down_factor    = 1;
+	uint32_t quant_table_index = 0;
+	uint32_t x_weight_matrix_index = 0;
+	uint32_t y_weight_matrix_index = 0;
+};
+
+struct JpegDctDeviceCachedFixedTransformBatchItem {
+	const int16_t*                        dense = nullptr;
+	JpegDctDeviceFixedTransformBatchItem transform {};
 };
 
 struct JpegDctDeviceMaterializeBatchItem {
@@ -403,7 +505,6 @@ struct JpegDctDeviceScratch {
 	galp::memory::CudaEvent                                        cached_gather_start;
 	galp::memory::CudaEvent                                        cached_gather_done;
 	galp::memory::CudaEvent                                        decoded_batch_gather_done;
-	galp::memory::CudaEvent                                        fixed_grid_round_done;
 	galp::memory::CudaStream                                       fixed_grid_round_stream;
 	galp::runtime::ExecutionWorkset                                decode_workset;
 	JpegDctDeviceScratchBuffer<DeviceCoeffBinding>                  column_bindings;
@@ -411,6 +512,7 @@ struct JpegDctDeviceScratch {
 	JpegDctDeviceScratchBuffer<JpegDctDeviceFixedTransformBatchItem> batch_fixed_transform_items;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceMaterializeBatchItem>   batch_materialize_items;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceCachedGatherBatchItem>  cached_gather_items;
+	JpegDctDeviceScratchBuffer<JpegDctDeviceCachedFixedTransformBatchItem> cached_fixed_transform_items;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceDecodedGatherBatchItem> decoded_gather_items;
 	std::vector<DeviceCoeffBinding>                                 host_column_bindings;
 	std::vector<BoundCoeffColumns>                                  host_bound_sources;
@@ -419,9 +521,39 @@ struct JpegDctDeviceScratch {
 	std::vector<JpegDctDeviceMaterializeBatchItem>                  host_materialize_items;
 	std::vector<JpegDctDeviceDecodedGatherBatchItem>                host_decoded_gather_items;
 	std::vector<JpegDctDeviceCachedGatherBatchItem>                 host_cached_gather_items;
+	std::vector<JpegDctDeviceCachedFixedTransformBatchItem>         host_cached_fixed_transform_items;
 	std::deque<std::vector<JpegDctDeviceCachedGatherBatchItem>>     host_cached_gather_uploads;
+	std::deque<std::vector<JpegDctDeviceCachedFixedTransformBatchItem>> host_cached_fixed_transform_uploads;
 	std::vector<DecodedRowgroupWork>                               host_pending_works;
+	std::shared_ptr<galp::runtime::PinnedRowgroupBufferPool>        rowgroup_prefetch_pinned_pool;
+	size_t                                                         rowgroup_prefetch_pinned_pool_slots = 0;
 	bool                                                           cached_gather_in_flight = false;
+	bool                                                           cached_fixed_transform_in_flight = false;
+	std::list<std::string>                                         fls_reader_lru;
+	struct CachedFlsReaderEntry {
+		std::shared_ptr<galp::format::FlsReader> reader;
+		std::list<std::string>::iterator         lru_position;
+	};
+	std::unordered_map<std::string, CachedFlsReaderEntry> fls_readers;
+
+	std::shared_ptr<galp::format::FlsReader> fls_reader(const std::filesystem::path& path) {
+		const auto key   = path.lexically_normal().string();
+		const auto found = fls_readers.find(key);
+		if (found != fls_readers.end()) {
+			fls_reader_lru.splice(fls_reader_lru.begin(), fls_reader_lru, found->second.lru_position);
+			return found->second.reader;
+		}
+
+		constexpr size_t kFlsReaderCacheCapacity = 64;
+		if (fls_readers.size() >= kFlsReaderCacheCapacity) {
+			fls_readers.erase(fls_reader_lru.back());
+			fls_reader_lru.pop_back();
+		}
+		auto reader = std::make_shared<galp::format::FlsReader>(path, /*load_column_names=*/false);
+		fls_reader_lru.push_front(key);
+		fls_readers.emplace(key, CachedFlsReaderEntry {reader, fls_reader_lru.begin()});
+		return reader;
+	}
 
 	~JpegDctDeviceScratch() {
 		try {
@@ -440,6 +572,7 @@ struct JpegDctDeviceScratch {
 			batch_fixed_transform_items.release();
 			batch_materialize_items.release();
 			cached_gather_items.release();
+			cached_fixed_transform_items.release();
 			decoded_gather_items.release();
 			galp::runtime::release_workset(
 			    decode_workset, /*preserve_resources=*/false, /*h2d_already_complete=*/false);
@@ -469,9 +602,6 @@ struct JpegDctDeviceScratch {
 		decoded_batch_gather_done.create();
 	}
 
-	void ensure_fixed_grid_round_event() {
-		fixed_grid_round_done.create();
-	}
 };
 
 void JpegDctDeviceScratchDeleter::operator()(JpegDctDeviceScratch* scratch) const noexcept {
@@ -483,8 +613,6 @@ JpegDctDeviceScratchPtr make_jpeg_dct_device_scratch() {
 }
 
 namespace {
-
-__constant__ float kRgbNoMoreDctDownsample2[16 * 16];
 
 __device__ __forceinline__ uint8_t natural_to_physical_coeff_device(const uint8_t natural,
                                                                     const uint8_t zigzag_columns) {
@@ -574,53 +702,111 @@ __global__ void round_dct_grid_accum_kernel(const float* __restrict in,
 	out[idx]    = static_cast<int16_t>(value);
 }
 
-__global__ void fixed_rgbnomore_transform_sources_kernel(
+__global__ void transformed_dct_grid_sources_kernel(
     const DeviceCoeffBinding* __restrict column_bindings,
     const JpegDctDeviceFixedTransformBatchItem* __restrict items,
     const size_t item_count,
+    const uint16_t* __restrict quant_tables,
+    const float* __restrict resize_weight_matrices,
+    const int32_t clamp_min,
+    const int32_t clamp_max,
     float* __restrict y_accum,
     float* __restrict cbcr_accum) {
-	const size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-	const size_t total  = item_count * 64U * 64U;
-	if (linear >= total) {
+	const size_t item_idx = static_cast<size_t>(blockIdx.x);
+	const auto lane = static_cast<uint8_t>(threadIdx.x);
+	if (item_idx >= item_count || lane >= 64U || quant_tables == nullptr || resize_weight_matrices == nullptr) {
 		return;
 	}
-	const size_t contribution = linear % 4096U;
-	const size_t item_idx     = linear / 4096U;
-	const size_t out_coeff    = contribution / 64U;
-	const size_t in_coeff     = contribution % 64U;
-	const auto   item         = items[item_idx];
-
-	const uint8_t in_y_coeff  = static_cast<uint8_t>(in_coeff / 8U);
-	const uint8_t in_x_coeff  = static_cast<uint8_t>(in_coeff % 8U);
-	const uint8_t out_y_coeff = static_cast<uint8_t>(out_coeff / 8U);
-	const uint8_t out_x_coeff = static_cast<uint8_t>(out_coeff % 8U);
-	const auto    physical    = natural_to_physical_coeff_device(static_cast<uint8_t>(in_coeff), item.zigzag_columns);
-	const auto    binding     = column_bindings[item.binding_base + physical];
-	int16_t       value       = 0;
+	const auto item = items[item_idx];
+	__shared__ float source[64];
+	__shared__ float horizontal[64];
+	const auto physical = natural_to_physical_coeff_device(lane, item.zigzag_columns);
+	const auto binding = column_bindings[item.binding_base + physical];
+	int16_t value = 0;
 	if (binding.source == DeviceCoeffSource::kI16) {
 		value = binding.column_i16[item.row_in_rowgroup];
 	} else if (binding.source == DeviceCoeffSource::kI8) {
 		value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
 	}
-	if (value == 0) {
+	const auto quant = static_cast<int32_t>(
+	    quant_tables[static_cast<size_t>(item.quant_table_index) * 64U + lane]);
+	source[lane] = static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+	__syncthreads();
+	const auto source_y = static_cast<uint8_t>(lane / 8U);
+	const auto out_x_coeff = static_cast<uint8_t>(lane % 8U);
+	float x_sum = 0.0F;
+	for (uint8_t in_x_coeff = 0; in_x_coeff < 8U; ++in_x_coeff) {
+		const float wx = resize_weight_matrices[
+		    static_cast<size_t>(item.x_weight_matrix_index) * 64U + out_x_coeff * 8U + in_x_coeff];
+		x_sum += source[source_y * 8U + in_x_coeff] * wx;
+	}
+	horizontal[lane] = x_sum;
+	__syncthreads();
+	const auto out_y_coeff = static_cast<uint8_t>(lane / 8U);
+	float weighted = 0.0F;
+	for (uint8_t in_y_coeff = 0; in_y_coeff < 8U; ++in_y_coeff) {
+		const float wy = resize_weight_matrices[
+		    static_cast<size_t>(item.y_weight_matrix_index) * 64U + out_y_coeff * 8U + in_y_coeff];
+		weighted += horizontal[in_y_coeff * 8U + out_x_coeff] * wy;
+	}
+	if (weighted == 0.0F) {
 		return;
 	}
-
-	const uint8_t in_sub_x = static_cast<uint8_t>(item.local_block_x & 1U);
-	const uint8_t in_sub_y = static_cast<uint8_t>(item.local_block_y & 1U);
-	const float   wx       = kRgbNoMoreDctDownsample2[out_x_coeff * 16U + in_sub_x * 8U + in_x_coeff];
-	const float   wy       = kRgbNoMoreDctDownsample2[out_y_coeff * 16U + in_sub_y * 8U + in_y_coeff];
-	const float   weighted = static_cast<float>(value) * wx * wy;
-	const auto    out_x    = static_cast<uint32_t>(item.local_block_x / 2U);
-	const auto    out_y    = static_cast<uint32_t>(item.local_block_y / 2U);
 	if (item.component == 0 && y_accum != nullptr) {
-		const auto output_block = (static_cast<uint64_t>(item.image_index) * 28U + out_y) * 28U + out_x;
-		atomicAdd(y_accum + output_block * 64U + out_coeff, weighted);
+		atomicAdd(y_accum + item.output_block_index * 64U + lane, weighted);
 	} else if (item.component != 0 && cbcr_accum != nullptr) {
-		const auto channel      = static_cast<uint64_t>(item.component - 1U);
-		const auto output_block = ((static_cast<uint64_t>(item.image_index) * 2U + channel) * 14U + out_y) * 14U + out_x;
-		atomicAdd(cbcr_accum + output_block * 64U + out_coeff, weighted);
+		atomicAdd(cbcr_accum + item.output_block_index * 64U + lane, weighted);
+	}
+}
+
+__global__ void transformed_dct_grid_cached_kernel(
+    const JpegDctDeviceCachedFixedTransformBatchItem* __restrict items,
+    const size_t item_count,
+    const uint16_t* __restrict quant_tables,
+    const float* __restrict resize_weight_matrices,
+    const int32_t clamp_min,
+    const int32_t clamp_max,
+    float* __restrict y_accum,
+    float* __restrict cbcr_accum) {
+	const size_t item_idx = static_cast<size_t>(blockIdx.x);
+	const auto lane = static_cast<uint8_t>(threadIdx.x);
+	if (item_idx >= item_count || lane >= 64U || quant_tables == nullptr || resize_weight_matrices == nullptr) {
+		return;
+	}
+	const auto cached = items[item_idx];
+	const auto item = cached.transform;
+	__shared__ float source[64];
+	__shared__ float horizontal[64];
+	const auto physical = natural_to_physical_coeff_device(lane, item.zigzag_columns);
+	const auto value = cached.dense[item.row_in_rowgroup * 64U + physical];
+	const auto quant = static_cast<int32_t>(
+	    quant_tables[static_cast<size_t>(item.quant_table_index) * 64U + lane]);
+	source[lane] = static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+	__syncthreads();
+	const auto source_y = static_cast<uint8_t>(lane / 8U);
+	const auto out_x_coeff = static_cast<uint8_t>(lane % 8U);
+	float x_sum = 0.0F;
+	for (uint8_t in_x_coeff = 0; in_x_coeff < 8U; ++in_x_coeff) {
+		const float wx = resize_weight_matrices[
+		    static_cast<size_t>(item.x_weight_matrix_index) * 64U + out_x_coeff * 8U + in_x_coeff];
+		x_sum += source[source_y * 8U + in_x_coeff] * wx;
+	}
+	horizontal[lane] = x_sum;
+	__syncthreads();
+	const auto out_y_coeff = static_cast<uint8_t>(lane / 8U);
+	float weighted = 0.0F;
+	for (uint8_t in_y_coeff = 0; in_y_coeff < 8U; ++in_y_coeff) {
+		const float wy = resize_weight_matrices[
+		    static_cast<size_t>(item.y_weight_matrix_index) * 64U + out_y_coeff * 8U + in_y_coeff];
+		weighted += horizontal[in_y_coeff * 8U + out_x_coeff] * wy;
+	}
+	if (weighted == 0.0F) {
+		return;
+	}
+	if (item.component == 0 && y_accum != nullptr) {
+		atomicAdd(y_accum + item.output_block_index * 64U + lane, weighted);
+	} else if (item.component != 0 && cbcr_accum != nullptr) {
+		atomicAdd(cbcr_accum + item.output_block_index * 64U + lane, weighted);
 	}
 }
 
@@ -795,56 +981,11 @@ void append_dense_column_bindings(const BoundCoeffColumns&       source,
 	}
 }
 
-void ensure_rgbnomore_dct_downsample2(cudaStream_t stream) {
-	int current_device = -1;
-	CUDA_SAFE_CALL(cudaGetDevice(&current_device));
-	static std::mutex       init_mutex;
-	static std::vector<int> initialized_devices;
-	std::lock_guard<std::mutex> guard(init_mutex);
-	if (std::find(initialized_devices.begin(), initialized_devices.end(), current_device) != initialized_devices.end()) {
-		return;
-	}
-	constexpr double pi = 3.141592653589793238462643383279502884;
-	auto basis = [](const uint32_t rows, const uint32_t u, const uint32_t x) {
-		const double scale = u == 0 ? std::sqrt(1.0 / static_cast<double>(rows))
-		                            : std::sqrt(2.0 / static_cast<double>(rows));
-		return static_cast<float>(
-		    scale * std::cos((static_cast<double>(u) * (static_cast<double>(x) + 0.5) * pi) /
-		                     static_cast<double>(rows)));
-	};
-	std::array<float, 16 * 16> large {};
-	std::array<float, 8 * 8>   small {};
-	std::array<float, 16 * 16> conversion {};
-	for (uint32_t u = 0; u < 16U; ++u) {
-		for (uint32_t x = 0; x < 16U; ++x) {
-			large[u * 16U + x] = basis(16U, u, x);
-		}
-	}
-	for (uint32_t u = 0; u < 8U; ++u) {
-		for (uint32_t x = 0; x < 8U; ++x) {
-			small[u * 8U + x] = basis(8U, u, x);
-		}
-	}
-	constexpr float norm = 0.70710678118654752440F;
-	for (uint32_t out = 0; out < 8U; ++out) {
-		for (uint32_t in_subblock = 0; in_subblock < 2U; ++in_subblock) {
-			for (uint32_t in = 0; in < 8U; ++in) {
-				float sum = 0.0F;
-				for (uint32_t x = 0; x < 8U; ++x) {
-					sum += large[out * 16U + in_subblock * 8U + x] * small[in * 8U + x];
-				}
-				conversion[out * 16U + in_subblock * 8U + in] = sum * norm;
-			}
-		}
-	}
-	CUDA_SAFE_CALL(cudaMemcpyToSymbolAsync(
-	    kRgbNoMoreDctDownsample2, conversion.data(), conversion.size() * sizeof(float), 0, cudaMemcpyHostToDevice, stream));
-	CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
-	initialized_devices.push_back(current_device);
-}
-
-void project_fixed_rgbnomore_grid_batch(const std::vector<BoundCoeffColumns>&   sources,
+void project_transformed_dct_grid_batch(const std::vector<BoundCoeffColumns>&   sources,
                                         const std::vector<DecodedRowgroupWork>& works,
+                                        const uint16_t*                         quant_tables,
+                                        const float*                            resize_weight_matrices,
+                                        const JpegDctGridTransformSpec&          transform,
                                         float*                                  y_accum,
                                         float*                                  cbcr_accum,
                                         JpegDctDeviceScratch&                   scratch,
@@ -852,6 +993,9 @@ void project_fixed_rgbnomore_grid_batch(const std::vector<BoundCoeffColumns>&   
                                         cudaStream_t                            stream) {
 	if (sources.empty() || works.empty()) {
 		return;
+	}
+	if (quant_tables == nullptr || resize_weight_matrices == nullptr) {
+		throw std::runtime_error("JPEG DCT fixed transform requires uploaded quantization tables and resize weights");
 	}
 	if (sources.size() != works.size()) {
 		throw std::runtime_error("JPEG DCT fixed transform source/work count mismatch");
@@ -881,26 +1025,42 @@ void project_fixed_rgbnomore_grid_batch(const std::vector<BoundCoeffColumns>&   
 		for (const auto& item : *work.fixed_transform_items) {
 			transform_items.push_back(JpegDctDeviceFixedTransformBatchItem {binding_base,
 			                                                               item.row_in_rowgroup,
-			                                                               item.image_index,
-			                                                               item.local_block_x,
-			                                                               item.local_block_y,
+			                                                               item.output_block_index,
 			                                                               item.component,
-			                                                               static_cast<uint8_t>(item.zigzag_columns ? 1U : 0U)});
+			                                                               static_cast<uint8_t>(item.zigzag_columns ? 1U : 0U),
+			                                                               item.x_factor,
+			                                                               item.y_factor,
+			                                                               item.x_subblock,
+			                                                               item.y_subblock,
+			                                                               static_cast<uint8_t>(item.x_upsample ? 1U : 0U),
+			                                                               static_cast<uint8_t>(item.y_upsample ? 1U : 0U),
+			                                                               item.x_up_factor,
+			                                                               item.y_up_factor,
+			                                                               item.x_down_factor,
+			                                                               item.y_down_factor,
+			                                                               item.quant_table_index,
+			                                                               item.x_weight_matrix_index,
+			                                                               item.y_weight_matrix_index});
 		}
 	}
 	if (transform_items.empty()) {
 		return;
 	}
-
-	ensure_rgbnomore_dct_downsample2(stream);
-	constexpr unsigned kThreads = 256;
+	constexpr unsigned kThreads = 64;
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
 	scratch.batch_fixed_transform_items.upload(transform_items.data(), transform_items.size(), stream, stats);
-	const size_t total = transform_items.size() * 64U * 64U;
 	const dim3   block(kThreads);
-	const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads));
-	fixed_rgbnomore_transform_sources_kernel<<<grid, block, 0, stream>>>(
-	    scratch.column_bindings.data, scratch.batch_fixed_transform_items.data, transform_items.size(), y_accum, cbcr_accum);
+	const dim3   grid(static_cast<unsigned>(transform_items.size()));
+	transformed_dct_grid_sources_kernel<<<grid, block, 0, stream>>>(
+	    scratch.column_bindings.data,
+	    scratch.batch_fixed_transform_items.data,
+	    transform_items.size(),
+	    quant_tables,
+	    resize_weight_matrices,
+	    transform.clamp_min,
+	    transform.clamp_max,
+	    y_accum,
+	    cbcr_accum);
 	CUDA_SAFE_CALL(cudaGetLastError());
 	++stats.materialize_kernel_launch_count;
 	stats.fixed_transform_item_count += transform_items.size();
@@ -1007,6 +1167,7 @@ void project_fixed_rgbnomore_grid_batch(const std::vector<BoundCoeffColumns>&   
 	auto& projection_items = scratch.host_projection_items;
 	column_bindings.clear();
 	projection_items.clear();
+	const auto build_start = Clock::now();
 
 	size_t total_projection_items = 0;
 	size_t total_active_columns   = 0;
@@ -1050,8 +1211,10 @@ void project_fixed_rgbnomore_grid_batch(const std::vector<BoundCoeffColumns>&   
 		}
 	}
 	if (projection_items.empty()) {
+		stats.projection_item_build_ms += elapsed_ms(build_start, Clock::now());
 		return;
 	}
+	stats.projection_item_build_ms += elapsed_ms(build_start, Clock::now());
 
 	constexpr unsigned kThreads = 256;
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
@@ -1068,6 +1231,7 @@ void project_fixed_rgbnomore_grid_batch(const std::vector<BoundCoeffColumns>&   
 	++stats.materialize_kernel_launch_count;
 	stats.projection_item_count += projection_items.size();
 	stats.decoded_projection_item_count += projection_items.size();
+	stats.jpeg_dct_projection_items_materialized += projection_items.size();
 }
 
 void project_decoded_ycbcr_grid_batch(const std::vector<BoundCoeffColumns>&   sources,
@@ -1091,6 +1255,7 @@ void project_decoded_ycbcr_grid_batch(const std::vector<BoundCoeffColumns>&   so
 	auto& projection_items = scratch.host_projection_items;
 	column_bindings.clear();
 	projection_items.clear();
+	const auto build_start = Clock::now();
 
 	size_t total_projection_items = 0;
 	size_t total_active_columns   = 0;
@@ -1135,8 +1300,10 @@ void project_decoded_ycbcr_grid_batch(const std::vector<BoundCoeffColumns>&   so
 		}
 	}
 	if (projection_items.empty()) {
+		stats.projection_item_build_ms += elapsed_ms(build_start, Clock::now());
 		return;
 	}
+	stats.projection_item_build_ms += elapsed_ms(build_start, Clock::now());
 
 	constexpr unsigned kThreads = 256;
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
@@ -1153,8 +1320,10 @@ void project_decoded_ycbcr_grid_batch(const std::vector<BoundCoeffColumns>&   so
 	    cbcr_accum);
 	CUDA_SAFE_CALL(cudaGetLastError());
 	++stats.materialize_kernel_launch_count;
+	++stats.project_decoded_ycbcr_grid_launch_count;
 	stats.projection_item_count += projection_items.size();
 	stats.decoded_projection_item_count += projection_items.size();
+	stats.jpeg_dct_projection_items_materialized += projection_items.size();
 }
 
 void materialize_dense_rowgroup_batch(const std::vector<JpegDctDeviceMaterializeBatchItem>& items,
@@ -1190,33 +1359,35 @@ void round_fixed_ycbcr_grid_outputs(float*                       y_accum,
                                     const size_t                 y_count,
                                     const size_t                 cbcr_count,
                                     JpegDctDeviceScratch&        scratch,
-                                    JpegDctDeviceExecutionStats& stats) {
+                                    JpegDctDeviceExecutionStats& stats,
+                                    galp::memory::CudaEvent&     timing_start_event,
+                                    galp::memory::CudaEvent&     completion_event) {
 	constexpr unsigned kThreads = 256;
-	bool               launched = false;
+	const bool launch_y    = y_accum != nullptr && y_output != nullptr && y_count != 0;
+	const bool launch_cbcr = cbcr_accum != nullptr && cbcr_output != nullptr && cbcr_count != 0;
+	if (!launch_y && !launch_cbcr) {
+		return;
+	}
 	const cudaStream_t stream   = scratch.stream_for_fixed_grid_rounding();
-	if (y_accum != nullptr && y_output != nullptr && y_count != 0) {
+	timing_start_event.create();
+	completion_event.create();
+	timing_start_event.record(stream);
+	if (launch_y) {
 		const dim3 block(kThreads);
 		const dim3 grid(static_cast<unsigned>((y_count + kThreads - 1U) / kThreads));
 		round_dct_grid_accum_kernel<<<grid, block, 0, stream>>>(y_accum, y_count, y_output);
 		CUDA_SAFE_CALL(cudaGetLastError());
 		++stats.materialize_kernel_launch_count;
-		launched = true;
 	}
-	if (cbcr_accum != nullptr && cbcr_output != nullptr && cbcr_count != 0) {
+	if (launch_cbcr) {
 		const dim3 block(kThreads);
 		const dim3 grid(static_cast<unsigned>((cbcr_count + kThreads - 1U) / kThreads));
 		round_dct_grid_accum_kernel<<<grid, block, 0, stream>>>(cbcr_accum, cbcr_count, cbcr_output);
 		CUDA_SAFE_CALL(cudaGetLastError());
 		++stats.materialize_kernel_launch_count;
-		launched = true;
 	}
-	if (!launched) {
-		return;
-	}
-	scratch.ensure_fixed_grid_round_event();
-	scratch.fixed_grid_round_done.record(stream);
-	scratch.fixed_grid_round_done.synchronize();
-	++stats.internal_sync_count;
+	completion_event.record(stream);
+	++stats.fixed_grid_round_event_handoff_count;
 }
 
 size_t decoded_rowgroup_bytes(const size_t rows) {
@@ -1397,13 +1568,19 @@ void finish_cached_gather_after_wait(JpegDctDeviceScratch& scratch, JpegDctDevic
 		return;
 	}
 	const auto elapsed_ms = static_cast<double>(scratch.cached_gather_done.elapsed_since(scratch.cached_gather_start));
-	execution_stats.cached_gather_ms += elapsed_ms;
-	execution_stats.gather_ms += elapsed_ms;
+	if (scratch.cached_fixed_transform_in_flight) {
+		execution_stats.fixed_transform_ms += elapsed_ms;
+	} else {
+		execution_stats.cached_gather_ms += elapsed_ms;
+		execution_stats.gather_ms += elapsed_ms;
+	}
 	if (scratch.cache_hit_stream) {
 		galp::memory::complete_h2d(scratch.cache_hit_stream.get());
 	}
 	scratch.host_cached_gather_uploads.clear();
+	scratch.host_cached_fixed_transform_uploads.clear();
 	scratch.cached_gather_in_flight = false;
+	scratch.cached_fixed_transform_in_flight = false;
 }
 
 void drain_cached_gather(JpegDctDeviceScratch& scratch, JpegDctDeviceExecutionStats& execution_stats) {
@@ -1460,10 +1637,13 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
                                     int16_t*                                cbcr_output,
                                     float*                                  y_accum,
                                     float*                                  cbcr_accum,
+                                    const uint16_t*                         fixed_quant_tables,
+                                    const float*                            fixed_resize_weight_matrices,
+                                    const JpegDctGridTransformSpec&          grid_transform,
                                     const std::vector<uint8_t>&             selected_coefficients,
                                     const JpegDctCoefficientSelectionShape& selection_shape,
                                     const bool                              output_ycbcr_dct_grid,
-                                    const bool                              output_fixed_rgbnomore_grid,
+                                    const bool                              output_transformed_dct_grid,
                                     JpegDctDeviceDecodedRowgroupCache*      cache,
                                     JpegDctDeviceCacheStats&                batch_cache_stats,
                                     JpegDctDeviceExecutionStats&            execution_stats,
@@ -1499,9 +1679,19 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 	const auto build_end = Clock::now();
 	execution_stats.workset_build_ms += elapsed_ms(build_start, build_end);
 	const auto upload_start = Clock::now();
-	(void)galp::runtime::upload_workset(workset, cfg);
+	const auto upload_breakdown = galp::runtime::upload_workset(workset, cfg);
 	const auto upload_end = Clock::now();
 	execution_stats.workset_upload_ms += elapsed_ms(upload_start, upload_end);
+	execution_stats.workset_upload_prep_ms += upload_breakdown.prep_ms;
+	execution_stats.workset_upload_arena_ms += upload_breakdown.arena_upload_ms;
+	execution_stats.workset_upload_arena_pack_ms += upload_breakdown.arena_pack_ms;
+	execution_stats.workset_upload_arena_layout_ms += upload_breakdown.arena.layout_ms;
+	execution_stats.workset_upload_arena_alloc_ms += upload_breakdown.arena.alloc_ms;
+	execution_stats.workset_upload_arena_resolve_ms += upload_breakdown.arena.resolve_ms;
+	execution_stats.workset_upload_dma_issue_ms += upload_breakdown.arena.dma_issue_ms;
+	execution_stats.workset_upload_event_record_ms += upload_breakdown.event_record_ms;
+	execution_stats.workset_upload_dma_bytes += upload_breakdown.arena.dma_bytes;
+	execution_stats.workset_upload_dma_count += upload_breakdown.arena.dma_count;
 	++execution_stats.workset_count;
 	++execution_stats.workset_upload_count;
 	size_t launches = 0;
@@ -1517,7 +1707,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 	    cache != nullptr && cache->capacity > 0 && selects_all_coefficients(selected_coefficients);
 	const bool uses_decoded_gather =
 	    selection_shape.kind == JpegDctCoefficientSelectionKind::kAll && !output_ycbcr_dct_grid;
-	const bool batch_has_fixed_transform = output_fixed_rgbnomore_grid && std::any_of(
+	const bool batch_has_fixed_transform = output_transformed_dct_grid && std::any_of(
 	    works.begin(), works.end(), [](const auto& work) {
 		    return work.fixed_transform_items != nullptr && !work.fixed_transform_items->empty();
 	    });
@@ -1537,8 +1727,17 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		}
 	}
 	if (batch_has_fixed_transform) {
-		project_fixed_rgbnomore_grid_batch(
-		    sources, works, y_accum, cbcr_accum, scratch, execution_stats, stream);
+		project_transformed_dct_grid_batch(
+		    sources,
+		    works,
+		    fixed_quant_tables,
+		    fixed_resize_weight_matrices,
+		    grid_transform,
+		    y_accum,
+		    cbcr_accum,
+		    scratch,
+		    execution_stats,
+		    stream);
 	} else if (uses_decoded_gather) {
 		gather_decoded_rowgroup_batch(sources, works, output, scratch, execution_stats, stream);
 	} else if (output_ycbcr_dct_grid) {
@@ -1596,6 +1795,8 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		if (uses_decoded_gather) {
 			execution_stats.decoded_gather_ms += elapsed_ms;
 			execution_stats.gather_ms += elapsed_ms;
+		} else if (batch_has_fixed_transform) {
+			execution_stats.fixed_transform_ms += elapsed_ms;
 		} else {
 			execution_stats.decoded_projection_ms += elapsed_ms;
 			execution_stats.projection_ms += elapsed_ms;
@@ -1620,6 +1821,9 @@ void execute_cached_rowgroup_hits(const std::vector<JpegDctDeviceCachedGatherBat
 	if (items.empty()) {
 		return;
 	}
+	if (scratch.cached_gather_in_flight && scratch.cached_fixed_transform_in_flight) {
+		drain_cached_gather(scratch, execution_stats);
+	}
 	// Cached gathers use one stream. If the item scratch already has capacity, the next upload is
 	// stream-ordered after the previous gather and does not need a host wait. Growing the buffer may
 	// free the old device pointer, so that path still drains first.
@@ -1633,8 +1837,57 @@ void execute_cached_rowgroup_hits(const std::vector<JpegDctDeviceCachedGatherBat
 	scratch.ensure_cached_gather_events();
 	if (!scratch.cached_gather_in_flight) {
 		scratch.cached_gather_start.record(stream);
+		scratch.cached_fixed_transform_in_flight = false;
 	}
 	gather_cached_rowgroups_batch(upload_items, output, scratch, execution_stats, stream);
+	scratch.cached_gather_done.record(stream);
+	scratch.cached_gather_in_flight = true;
+}
+
+void execute_cached_fixed_transform_hits(
+    const std::vector<JpegDctDeviceCachedFixedTransformBatchItem>& items,
+    const uint16_t*                                                quant_tables,
+    const float*                                                   resize_weight_matrices,
+    const JpegDctGridTransformSpec&                                transform,
+    float*                                                         y_accum,
+    float*                                                         cbcr_accum,
+    JpegDctDeviceExecutionStats&                                   execution_stats,
+    JpegDctDeviceScratch&                                          scratch) {
+	if (items.empty()) {
+		return;
+	}
+	if (scratch.cached_gather_in_flight && !scratch.cached_fixed_transform_in_flight) {
+		drain_cached_gather(scratch, execution_stats);
+	}
+	if (scratch.cached_gather_in_flight &&
+	    scratch.cached_fixed_transform_items.needs_reallocation(items.size())) {
+		drain_cached_gather(scratch, execution_stats);
+	}
+	auto& upload_items = scratch.host_cached_fixed_transform_uploads.emplace_back(items.begin(), items.end());
+	const auto stream = scratch.stream_for_cache_hit();
+	scratch.ensure_cached_gather_events();
+	if (!scratch.cached_gather_in_flight) {
+		scratch.cached_gather_start.record(stream);
+		scratch.cached_fixed_transform_in_flight = true;
+	}
+	scratch.cached_fixed_transform_items.upload(
+	    upload_items.data(), upload_items.size(), stream, execution_stats);
+	constexpr unsigned kThreads = 64;
+	const dim3 block(kThreads);
+	const dim3 grid(static_cast<unsigned>(upload_items.size()));
+	transformed_dct_grid_cached_kernel<<<grid, block, 0, stream>>>(
+	    scratch.cached_fixed_transform_items.data,
+	    upload_items.size(),
+	    quant_tables,
+	    resize_weight_matrices,
+	    transform.clamp_min,
+	    transform.clamp_max,
+	    y_accum,
+	    cbcr_accum);
+	CUDA_SAFE_CALL(cudaGetLastError());
+	++execution_stats.materialize_kernel_launch_count;
+	execution_stats.fixed_transform_item_count += upload_items.size();
+	execution_stats.cached_gather_item_count += upload_items.size();
 	scratch.cached_gather_done.record(stream);
 	scratch.cached_gather_in_flight = true;
 }
@@ -1646,8 +1899,11 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
                         int16_t*                                         cbcr_output,
                         float*                                           y_accum,
                         float*                                           cbcr_accum,
+                        const uint16_t*                                  fixed_quant_tables,
+                        const float*                                     fixed_resize_weight_matrices,
+                        const JpegDctGridTransformSpec&                   grid_transform,
                         const bool                                       output_ycbcr_dct_grid,
-                        const bool                                       output_fixed_rgbnomore_grid,
+                        const bool                                       output_transformed_dct_grid,
                         const std::vector<uint8_t>&                      selected_coefficients,
                         const JpegDctCoefficientSelectionShape&          selection_shape,
                         JpegDctDeviceDecodedRowgroupCache*               cache,
@@ -1656,7 +1912,8 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
                         JpegDctDeviceScratch&                            scratch,
                         const size_t                                     decode_batch_rowgroups,
                         const JpegDctDeviceRowgroupPrefetchConfig&       rowgroup_prefetch,
-                        std::vector<JpegDctDeviceCachedGatherBatchItem>& cached_pending) {
+                        std::vector<JpegDctDeviceCachedGatherBatchItem>& cached_pending,
+                        std::vector<JpegDctDeviceCachedFixedTransformBatchItem>& cached_fixed_pending) {
 	if (!rdr) {
 		throw std::runtime_error("execute_shard_plan: reader is null");
 	}
@@ -1672,8 +1929,23 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
 	if (prefetch_plan.enabled) {
 		const size_t scheduled_rowgroups  = prefetch_plan.rowgroup_indices.size();
 		const auto   prefetch_queue_start = Clock::now();
+		// Popped rowgroups remain live until the current decode workset completes, while
+		// the producer may keep `depth` more rowgroups queued. Size the shared pool for
+		// both sets so workers cannot deadlock waiting for leases held by `pending`.
+		const size_t pinned_pool_slots = effective_decode_batch_rowgroups + rowgroup_prefetch.depth +
+		                                 std::max<size_t>(1U, rowgroup_prefetch.workers);
+		if (!scratch.rowgroup_prefetch_pinned_pool ||
+		    scratch.rowgroup_prefetch_pinned_pool_slots < pinned_pool_slots) {
+			scratch.rowgroup_prefetch_pinned_pool =
+			    galp::runtime::PinnedRowgroupBufferPool::create(pinned_pool_slots);
+			scratch.rowgroup_prefetch_pinned_pool_slots = pinned_pool_slots;
+		}
 		prefetch_queue = std::make_unique<galp::runtime::RowgroupPrefetchQueue>(
-		    rdr, std::move(prefetch_plan.rowgroup_indices), rowgroup_prefetch.depth, rowgroup_prefetch.workers);
+		    rdr,
+		    std::move(prefetch_plan.rowgroup_indices),
+		    rowgroup_prefetch.depth,
+		    rowgroup_prefetch.workers,
+		    scratch.rowgroup_prefetch_pinned_pool);
 		const auto prefetch_queue_end = Clock::now();
 		execution_stats.prefetch_queue_start_ms += elapsed_ms(prefetch_queue_start, prefetch_queue_end);
 		execution_stats.prefetched_rowgroup_count += scheduled_rowgroups;
@@ -1691,7 +1963,16 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
 
 	const auto flush_cached = [&]() {
 		execute_cached_rowgroup_hits(cached_pending, output, execution_stats, scratch);
+		execute_cached_fixed_transform_hits(cached_fixed_pending,
+		                                    fixed_quant_tables,
+		                                    fixed_resize_weight_matrices,
+		                                    grid_transform,
+		                                    y_accum,
+		                                    cbcr_accum,
+		                                    execution_stats,
+		                                    scratch);
 		cached_pending.clear();
+		cached_fixed_pending.clear();
 	};
 	const auto flush_pending = [&]() {
 		// Pending dense materialization can evict cached dense buffers referenced by cached_pending.
@@ -1705,10 +1986,13 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
 		                               cbcr_output,
 		                               y_accum,
 		                               cbcr_accum,
+		                               fixed_quant_tables,
+		                               fixed_resize_weight_matrices,
+		                               grid_transform,
 		                               selected_coefficients,
 		                               selection_shape,
 		                               output_ycbcr_dct_grid,
-		                               output_fixed_rgbnomore_grid,
+		                               output_transformed_dct_grid,
 		                               cache,
 		                               batch_cache_stats,
 		                               execution_stats,
@@ -1757,10 +2041,37 @@ void execute_shard_plan(const std::shared_ptr<galp::format::FlsReader>&  rdr,
 					it->second->last_access = ++cache->clock;
 					++batch_cache_stats.hits;
 					const auto* dense = it->second->blocks->get();
-					cached_pending.reserve(cached_pending.size() + rowgroup_plan.items.size());
-					for (const auto& item : rowgroup_plan.items) {
-						cached_pending.push_back(
-						    JpegDctDeviceCachedGatherBatchItem {dense, item.row_in_rowgroup, item.output_block_index});
+					if (output_transformed_dct_grid) {
+						cached_fixed_pending.reserve(
+						    cached_fixed_pending.size() + rowgroup_plan.fixed_transform_items.size());
+						for (const auto& item : rowgroup_plan.fixed_transform_items) {
+							cached_fixed_pending.push_back(JpegDctDeviceCachedFixedTransformBatchItem {
+							    dense,
+							    JpegDctDeviceFixedTransformBatchItem {0U,
+							                                          item.row_in_rowgroup,
+							                                          item.output_block_index,
+							                                          item.component,
+							                                          static_cast<uint8_t>(item.zigzag_columns ? 1U : 0U),
+							                                          item.x_factor,
+							                                          item.y_factor,
+							                                          item.x_subblock,
+							                                          item.y_subblock,
+							                                          static_cast<uint8_t>(item.x_upsample ? 1U : 0U),
+							                                          static_cast<uint8_t>(item.y_upsample ? 1U : 0U),
+							                                          item.x_up_factor,
+							                                          item.y_up_factor,
+							                                          item.x_down_factor,
+							                                          item.y_down_factor,
+							                                          item.quant_table_index,
+							                                          item.x_weight_matrix_index,
+							                                          item.y_weight_matrix_index}});
+						}
+					} else {
+						cached_pending.reserve(cached_pending.size() + rowgroup_plan.items.size());
+						for (const auto& item : rowgroup_plan.items) {
+							cached_pending.push_back(JpegDctDeviceCachedGatherBatchItem {
+							    dense, item.row_in_rowgroup, item.output_block_index});
+						}
 					}
 					if (prefetch_plan.use_prefetch_for_position[rowgroup_pos]) {
 						auto rowgroup = pop_prefetched_rowgroup(rowgroup_plan, /*consumed_as_hit=*/true);
@@ -1979,19 +2290,27 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 	impl->selected_coefficients                         = std::move(plan.selected_coefficients);
 	impl->coefficients_per_block                        = plan.coefficients_per_block;
 	impl->execution_stats.planning_ms                   = plan.planning_ms;
+	impl->execution_stats.resize_weight_build_ms        = plan.resize_weight_build_ms;
+	impl->execution_stats.dct_resize_weight_cache_hits       = plan.dct_resize_weight_cache_hits;
+	impl->execution_stats.dct_resize_weight_cache_misses     = plan.dct_resize_weight_cache_misses;
+	impl->execution_stats.dct_conversion_matrix_cache_hits   = plan.dct_conversion_matrix_cache_hits;
+	impl->execution_stats.dct_conversion_matrix_cache_misses = plan.dct_conversion_matrix_cache_misses;
 	impl->execution_stats.rowgroup_count                = impl->rowgroups.size();
 	impl->execution_stats.planned_selected_vector_count = plan.planned_selected_vector_count;
 	impl->execution_stats.full_vector_count             = plan.full_vector_count;
 	impl->execution_stats.planned_saved_vector_count    = plan.planned_saved_vector_count;
 	impl->execution_stats.cache_enabled                 = plan.cache_enabled;
 	impl->execution_stats.fixed_transform_image_count   =
-	    plan.layout == JpegDctDeviceLayout::kYcbcrDctGridFixed ? impl->image_layouts.size() : 0;
+	    plan.layout == JpegDctDeviceLayout::kTransformedDctGrid ? impl->image_layouts.size() : 0;
+	impl->execution_stats.fixed_transform_component_count    = plan.fixed_transform_component_count;
+	impl->execution_stats.fixed_transform_source_block_count = plan.fixed_transform_source_block_count;
+	impl->execution_stats.fixed_transform_output_block_count = plan.fixed_transform_output_block_count;
 	impl->ycbcr_dct_grid_shape                    = plan.ycbcr_dct_grid_shape;
 
 	const bool output_ycbcr_dct_grid =
 	    plan.layout == JpegDctDeviceLayout::kYcbcrDctGrid ||
-	    plan.layout == JpegDctDeviceLayout::kYcbcrDctGridFixed;
-	const bool output_weighted_grid = plan.layout == JpegDctDeviceLayout::kYcbcrDctGridFixed;
+	    plan.layout == JpegDctDeviceLayout::kTransformedDctGrid;
+	const bool output_weighted_grid = plan.layout == JpegDctDeviceLayout::kTransformedDctGrid;
 	if (output_ycbcr_dct_grid) {
 		impl->coefficient_count      = 0;
 		impl->y_coefficient_count    = impl->ycbcr_dct_grid_shape.y_count();
@@ -2026,12 +2345,32 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 	int16_t*             cbcr_output = impl->cbcr_coefficients.has_value() ? impl->cbcr_coefficients->get() : nullptr;
 	float*               y_accum = impl->y_accum.has_value() ? impl->y_accum->get() : nullptr;
 	float*               cbcr_accum = impl->cbcr_accum.has_value() ? impl->cbcr_accum->get() : nullptr;
+	const bool has_weighted_grid_output =
+	    output_weighted_grid && (impl->y_coefficient_count != 0 || impl->cbcr_coefficient_count != 0);
+	if (has_weighted_grid_output) {
+		if (plan.fixed_quant_tables.empty() || plan.fixed_quant_tables.size() % 64U != 0U) {
+			throw std::runtime_error("JPEG DCT fixed transform plan has invalid quantization tables");
+		}
+		if (plan.fixed_resize_weight_matrices.empty() || plan.fixed_resize_weight_matrices.size() % 64U != 0U) {
+			throw std::runtime_error("JPEG DCT fixed transform plan has invalid resize weight matrices");
+		}
+		impl->fixed_quant_tables.emplace(plan.fixed_quant_tables.size(), plan.fixed_quant_tables.data());
+		impl->fixed_resize_weight_matrices.emplace(
+		    plan.fixed_resize_weight_matrices.size(), plan.fixed_resize_weight_matrices.data());
+	}
+	const uint16_t* fixed_quant_tables =
+	    impl->fixed_quant_tables.has_value() ? impl->fixed_quant_tables->get() : nullptr;
+	const float* fixed_resize_weight_matrices = impl->fixed_resize_weight_matrices.has_value()
+	                                                ? impl->fixed_resize_weight_matrices->get()
+	                                                : nullptr;
 	JpegDctDeviceScratch local_scratch;
 	auto&                scratch        = plan.scratch != nullptr ? *plan.scratch : local_scratch;
 	auto&                cached_pending = scratch.host_cached_gather_items;
+	auto&                cached_fixed_pending = scratch.host_cached_fixed_transform_items;
 	cached_pending.clear();
+	cached_fixed_pending.clear();
 	for (const auto& shard : plan.shards) {
-		auto rdr = std::make_shared<galp::format::FlsReader>(shard.fls_path, /*load_column_names=*/false);
+		auto rdr = scratch.fls_reader(shard.fls_path);
 		execute_shard_plan(rdr,
 		                   shard,
 		                   output,
@@ -2039,23 +2378,37 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 		                   cbcr_output,
 		                   y_accum,
 		                   cbcr_accum,
+		                   fixed_quant_tables,
+		                   fixed_resize_weight_matrices,
+		                   plan.grid_transform,
 		                   output_ycbcr_dct_grid,
 		                   output_weighted_grid,
 		                   impl->selected_coefficients,
 		                   plan.coefficient_selection_shape,
-		                   output_ycbcr_dct_grid ? nullptr : plan.cache,
+		                   output_ycbcr_dct_grid && !output_weighted_grid ? nullptr : plan.cache,
 		                   impl->cache_stats,
 		                   impl->execution_stats,
 		                   scratch,
 		                   plan.decode_batch_rowgroups,
 		                   plan.rowgroup_prefetch,
-		                   cached_pending);
+		                   cached_pending,
+		                   cached_fixed_pending);
 	}
 	if (!output_ycbcr_dct_grid) {
 		execute_cached_rowgroup_hits(cached_pending, output, impl->execution_stats, scratch);
+	} else if (output_weighted_grid) {
+		execute_cached_fixed_transform_hits(cached_fixed_pending,
+		                                    fixed_quant_tables,
+		                                    fixed_resize_weight_matrices,
+		                                    plan.grid_transform,
+		                                    y_accum,
+		                                    cbcr_accum,
+		                                    impl->execution_stats,
+		                                    scratch);
 	}
 	drain_cached_gather(scratch, impl->execution_stats);
 	cached_pending.clear();
+	cached_fixed_pending.clear();
 	if (output_weighted_grid) {
 		round_fixed_ycbcr_grid_outputs(y_accum,
 		                               cbcr_accum,
@@ -2064,7 +2417,9 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 		                               impl->y_coefficient_count,
 		                               impl->cbcr_coefficient_count,
 		                               scratch,
-		                               impl->execution_stats);
+		                               impl->execution_stats,
+		                               impl->fixed_grid_round_start_event,
+		                               impl->completion_event);
 	}
 	if (plan.cache != nullptr) {
 		impl->cache_stats.capacity_bytes     = plan.cache->capacity_bytes();

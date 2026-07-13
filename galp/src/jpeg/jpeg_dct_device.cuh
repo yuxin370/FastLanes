@@ -25,6 +25,7 @@ namespace galp::runtime {
 struct ExecutionWorkset;
 } // namespace galp::runtime
 
+
 namespace galp::jpeg::detail {
 
 constexpr double   kMaxSelectedVectorRatioForPushdown = 0.75;
@@ -191,11 +192,27 @@ struct JpegDctDeviceProjectionItem {
 struct JpegDctDeviceFixedTransformItem {
 	uint32_t rowgroup_index       = 0;
 	uint32_t row_in_rowgroup      = 0;
+	uint64_t output_block_index   = 0;
 	uint32_t image_index          = 0;
 	uint16_t local_block_x        = 0;
 	uint16_t local_block_y        = 0;
+	uint16_t output_block_x       = 0;
+	uint16_t output_block_y       = 0;
 	uint8_t  component            = 0;
 	bool     zigzag_columns       = false;
+	uint16_t x_factor             = 2;
+	uint16_t y_factor             = 2;
+	uint8_t  x_subblock           = 0;
+	uint8_t  y_subblock           = 0;
+	bool     x_upsample           = false;
+	bool     y_upsample           = false;
+	uint16_t x_up_factor          = 1;
+	uint16_t y_up_factor          = 1;
+	uint16_t x_down_factor        = 1;
+	uint16_t y_down_factor        = 1;
+	uint32_t quant_table_index    = 0;
+	uint32_t x_weight_matrix_index = 0;
+	uint32_t y_weight_matrix_index = 0;
 };
 
 struct JpegDctDeviceResolvedProjection {
@@ -371,13 +388,30 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     full_vector_count               = 0;
 	size_t                                     planned_saved_vector_count      = 0;
 	size_t                                     estimated_saved_vector_count    = 0;
+	size_t                                     fixed_transform_component_count    = 0;
+	size_t                                     fixed_transform_source_block_count = 0;
+	size_t                                     fixed_transform_output_block_count = 0;
 	std::vector<uint8_t>                       selected_coefficients;
+	// Flat, natural-order 8x8 JPEG quantization tables used by the transformed
+	// DCT grid. Source coefficients are dequantized and clamped
+	// before resize because resize mixes coefficient positions.
+	std::vector<uint16_t>                      fixed_quant_tables;
+	// Flat row-major 8x8 axis matrices. Each fixed transform item references
+	// one matrix for X and one for Y, avoiding trigonometric conversion-matrix
+	// construction inside every GPU contribution thread.
+	std::vector<float>                         fixed_resize_weight_matrices;
+	JpegDctGridTransformSpec                   grid_transform;
 	JpegDctCoefficientSelectionShape           coefficient_selection_shape {};
 	size_t                                     coefficients_per_block          = kJpegDctCoefficientCount;
-	JpegDctYcbcrDctGridShape            ycbcr_dct_grid_shape {};
+	JpegDctYcbcrDctGridShape                   ycbcr_dct_grid_shape {};
 	double                                     planned_selected_vector_ratio   = 0.0;
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;
+	double                                     resize_weight_build_ms          = 0.0;
+	size_t                                     dct_resize_weight_cache_hits    = 0;
+	size_t                                     dct_resize_weight_cache_misses  = 0;
+	size_t                                     dct_conversion_matrix_cache_hits   = 0;
+	size_t                                     dct_conversion_matrix_cache_misses = 0;
 	size_t                                     decode_batch_rowgroups          = kDefaultJpegDctDecodeBatchRowgroups;
 	JpegDctDeviceRowgroupPrefetchConfig        rowgroup_prefetch {};
 };
@@ -476,17 +510,18 @@ plan_jpeg_dct_rowgroup_prefetch_from_hits(const JpegDctDeviceShardPlan&         
 			++plan.initial_cache_hit_rowgroup_count;
 			continue;
 		}
-		// Current prefetch materializes whole rowgroups and only has dense-cache reuse
-		// semantics. Keep selected-vector misses synchronous until the sparse path has an
-		// explicit prefetch/cache contract instead of mixing policies in this planner.
-		if (rowgroup_plan.runtime_policy.decision != JpegDctRuntimePolicyDecision::kFullRowgroup) {
+		const bool full_rowgroup =
+		    rowgroup_plan.runtime_policy.decision == JpegDctRuntimePolicyDecision::kFullRowgroup;
+		if (!full_rowgroup) {
 			++plan.selected_vector_miss_rowgroup_count;
-			continue;
 		}
 		++plan.candidate_rowgroup_count;
-		const auto earlier_full_it = earlier_full_decode_miss_ordinal.find(rowgroup_plan.rowgroup_index);
+		const auto earlier_full_it = full_rowgroup
+		                                 ? earlier_full_decode_miss_ordinal.find(rowgroup_plan.rowgroup_index)
+		                                 : earlier_full_decode_miss_ordinal.end();
 		const bool can_reuse_earlier_full_decode =
-		    decoded_cache_capacity_bytes != 0 && earlier_full_it != earlier_full_decode_miss_ordinal.end() &&
+		    full_rowgroup && decoded_cache_capacity_bytes != 0 &&
+		    earlier_full_it != earlier_full_decode_miss_ordinal.end() &&
 		    miss_ordinal >= earlier_full_it->second + effective_decode_batch_rowgroups;
 		if (!can_reuse_earlier_full_decode) {
 			candidate_positions.push_back(rowgroup_pos);
@@ -497,8 +532,7 @@ plan_jpeg_dct_rowgroup_prefetch_from_hits(const JpegDctDeviceShardPlan&         
 		}
 		const auto dense_rowgroup_bytes =
 		    rowgroup_plan.full_vector_count * galp::codec::consts::VALUES_PER_VECTOR * 64U * sizeof(int16_t);
-		if (decoded_cache_capacity_bytes != 0 &&
-		    rowgroup_plan.runtime_policy.decision == JpegDctRuntimePolicyDecision::kFullRowgroup &&
+		if (decoded_cache_capacity_bytes != 0 && full_rowgroup &&
 		    dense_rowgroup_bytes <= decoded_cache_capacity_bytes) {
 			earlier_full_decode_miss_ordinal.emplace(rowgroup_plan.rowgroup_index, miss_ordinal);
 		}

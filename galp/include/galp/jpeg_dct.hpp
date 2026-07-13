@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -168,12 +169,38 @@ enum class JpegDctShardPreset {
 enum class JpegDctDeviceLayout {
 	kImageMajorComponentBlockCoeff,
 	kYcbcrDctGrid,
-	kYcbcrDctGridFixed,
+	kTransformedDctGrid,
 };
 
-enum class JpegDctDevicePreprocess {
-	kNone,
-	kRgbNoMoreVal,
+struct JpegDctSamplingRatio {
+	uint16_t horizontal_numerator   = 1;
+	uint16_t horizontal_denominator = 1;
+	uint16_t vertical_numerator     = 1;
+	uint16_t vertical_denominator   = 1;
+};
+
+// Generic parameters for a fused JPEG-DCT grid transform. Application profiles
+// provide concrete geometry, numeric policy, and accepted sampling ratios;
+// the JPEG planner/executor only lowers this specification to the existing
+// batched dequantize/clamp/rational-resize kernel.
+struct JpegDctGridTransformSpec {
+	uint32_t y_output_width_blocks     = 0;
+	uint32_t y_output_height_blocks    = 0;
+	uint32_t cbcr_output_width_blocks  = 0;
+	uint32_t cbcr_output_height_blocks = 0;
+	uint32_t crop_reference_width_blocks  = 0;
+	uint32_t crop_reference_height_blocks = 0;
+	uint32_t crop_origin_alignment_blocks = 1;
+	uint32_t chroma_crop_scale_x           = 1;
+	uint32_t chroma_crop_scale_y           = 1;
+	int32_t  clamp_min                      = std::numeric_limits<int16_t>::min();
+	int32_t  clamp_max                      = std::numeric_limits<int16_t>::max();
+	bool     dequantize                     = true;
+	bool     require_all_coefficients       = true;
+	bool     allow_grayscale                = false;
+	std::vector<uint32_t>             preferred_small_crop_width_blocks;
+	std::vector<uint32_t>             preferred_small_crop_height_blocks;
+	std::vector<JpegDctSamplingRatio> allowed_chroma_sampling_ratios;
 };
 
 inline constexpr uint8_t kJpegDctYcbcrDctGridTensorY    = 1;
@@ -294,7 +321,7 @@ struct JpegDctImageCropRequest {
 
 struct JpegDctDeviceBatchOptions {
 	JpegDctDeviceLayout layout                 = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
-	JpegDctDevicePreprocess preprocess         = JpegDctDevicePreprocess::kNone;
+	std::optional<JpegDctGridTransformSpec> grid_transform;
 	size_t              cache_capacity_bytes   = 0;
 	size_t              decode_batch_rowgroups = kDefaultJpegDctDecodeBatchRowgroups;
 	// Advanced rowgroup IO/materialization prefetch controls. Zero-valued sizes are normalized to defaults.
@@ -382,12 +409,26 @@ struct JpegDctDeviceExecutionStats {
 	double      planning_ms                                   = 0.0;
 	double      workset_build_ms                              = 0.0;
 	double      workset_upload_ms                             = 0.0;
+	double      workset_upload_prep_ms                        = 0.0;
+	double      workset_upload_arena_ms                       = 0.0;
+	double      workset_upload_arena_pack_ms                  = 0.0;
+	double      workset_upload_arena_layout_ms                = 0.0;
+	double      workset_upload_arena_alloc_ms                 = 0.0;
+	double      workset_upload_arena_resolve_ms               = 0.0;
+	double      workset_upload_dma_issue_ms                   = 0.0;
+	double      workset_upload_event_record_ms                = 0.0;
+	size_t      workset_upload_dma_bytes                      = 0;
+	size_t      workset_upload_dma_count                      = 0;
 	double      decode_ms                                     = 0.0;
 	double      gather_ms                                     = 0.0;
 	double      decoded_gather_ms                             = 0.0;
 	double      cached_gather_ms                              = 0.0;
 	double      projection_ms                                 = 0.0;
 	double      decoded_projection_ms                         = 0.0;
+	double      projection_item_build_ms                      = 0.0;
+	double      fixed_transform_ms                            = 0.0;
+	double      fixed_grid_round_ms                           = 0.0;
+	double      resize_weight_build_ms                        = 0.0;
 	double      prefetch_wait_ms                              = 0.0;
 	double      prefetch_depth_block_ms                       = 0.0;
 	double      prefetch_queue_start_ms                       = 0.0;
@@ -400,6 +441,16 @@ struct JpegDctDeviceExecutionStats {
 	size_t      decoded_projection_item_count = 0;
 	size_t      fixed_transform_item_count    = 0;
 	size_t      fixed_transform_image_count   = 0;
+	size_t      fixed_transform_component_count    = 0;
+	size_t      fixed_transform_source_block_count = 0;
+	size_t      fixed_transform_output_block_count = 0;
+	size_t      dct_resize_weight_cache_hits       = 0;
+	size_t      dct_resize_weight_cache_misses     = 0;
+	size_t      dct_conversion_matrix_cache_hits   = 0;
+	size_t      dct_conversion_matrix_cache_misses = 0;
+	size_t      project_decoded_ycbcr_grid_launch_count = 0;
+	size_t      jpeg_dct_projection_items_materialized   = 0;
+	size_t      fixed_grid_round_event_handoff_count     = 0;
 	bool        cache_enabled                 = false;
 };
 
@@ -418,6 +469,11 @@ struct JpegDctDeviceBatchPlanPreview {
 	double                                     planned_selected_vector_ratio   = 0.0;
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;
+	double                                     resize_weight_build_ms          = 0.0;
+	size_t                                     dct_resize_weight_cache_hits       = 0;
+	size_t                                     dct_resize_weight_cache_misses     = 0;
+	size_t                                     dct_conversion_matrix_cache_hits   = 0;
+	size_t                                     dct_conversion_matrix_cache_misses = 0;
 	JpegDctYcbcrDctGridShape                   ycbcr_dct_grid_shape;
 };
 
@@ -479,6 +535,10 @@ public:
 	[[nodiscard]] const int16_t*                                    device_coefficients() const noexcept;
 	[[nodiscard]] const int16_t*                                    y_coefficients() const noexcept;
 	[[nodiscard]] const int16_t*                                    cbcr_coefficients() const noexcept;
+	[[nodiscard]] const int16_t*                                    device_coefficients_async() const noexcept;
+	[[nodiscard]] const int16_t*                                    y_coefficients_async() const noexcept;
+	[[nodiscard]] const int16_t*                                    cbcr_coefficients_async() const noexcept;
+	void                                                            synchronize() const;
 	[[nodiscard]] size_t                                            coefficient_count() const noexcept;
 	[[nodiscard]] size_t                                            coefficient_bytes() const noexcept;
 	[[nodiscard]] size_t                                            y_coefficient_count() const noexcept;
@@ -493,6 +553,7 @@ public:
 	[[nodiscard]] const JpegDctDeviceCacheStats&                    cache_stats_ref() const noexcept;
 	[[nodiscard]] const JpegDctDeviceExecutionStats&                execution_stats_ref() const noexcept;
 	[[nodiscard]] JpegDctDeviceLayout                               layout() const noexcept;
+	[[nodiscard]] void*                                             cuda_completion_event() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&    block_metadata() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;
