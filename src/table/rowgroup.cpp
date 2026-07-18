@@ -707,14 +707,16 @@ n_t Rowgroup::ColCount() const {
 template <typename PT>
 TypedColumnView<PT>::TypedColumnView(const col_pt& column)
     : m_vec_idx(INVALID_N) {
-	static const uint8_t zero_null_map[65536] = {};
 	visit(overloaded {//
 	                  [&](const up<TypedCol<PT>>& typed_col) {
 		                  //
 		                  m_data    = typed_col->data.data();
 		                  m_stats_p = &typed_col->m_stats;
 		                  n_vals    = typed_col->data.size();
-		                  m_bools   = typed_col->null_map_arr.empty() ? zero_null_map : typed_col->null_map_arr.data();
+		                  // A missing null map means every value is valid. Keep that state explicit instead of pointing at a
+		                  // rowgroup-sized static array: rowgroups may legitimately contain more than the historical 64
+		                  // vectors, and offsetting a fixed 64-vector buffer would read out of bounds.
+		                  m_bools   = typed_col->null_map_arr.empty() ? nullptr : typed_col->null_map_arr.data();
 		                  n_tuples  = typed_col->data.size();
 	                  },
 	                  [&](const std::monostate&) { FLS_UNREACHABLE() },
@@ -747,6 +749,10 @@ template <typename PT>
 const uint8_t* TypedColumnView<PT>::NullMap() const {
 	FLS_ASSERT_CORRECT_IDX(m_vec_idx)
 
+	static const uint8_t zero_null_vector[CFG::VEC_SZ] = {};
+	if (m_bools == nullptr) {
+		return zero_null_vector;
+	}
 	return m_bools + (m_vec_idx * CFG::VEC_SZ);
 }
 
@@ -771,13 +777,12 @@ template class TypedColumnView<flt_pt>;
 \*--------------------------------------------------------------------------------------------------------------------*/
 
 NullMapView::NullMapView(const col_pt& column) {
-	static const uint8_t zero_null_map[65536] = {};
 	visit(overloaded {[&]<typename PT>(const up<TypedCol<PT>>& typed_col) {
-		                  m_null_map = typed_col->null_map_arr.empty() ? zero_null_map : typed_col->null_map_arr.data();
+		                  m_null_map = typed_col->null_map_arr.empty() ? nullptr : typed_col->null_map_arr.data();
 	                  },
 	                  [&](const up<FLSStrColumn>& fls_str_column) {
-		                  m_null_map = fls_str_column->null_map_arr.empty() ? zero_null_map
-		                                                                    : fls_str_column->null_map_arr.data();
+		                  m_null_map =
+		                      fls_str_column->null_map_arr.empty() ? nullptr : fls_str_column->null_map_arr.data();
 	                  },
 	                  [&](const std::monostate&) { FLS_UNREACHABLE() },
 	                  [&](const auto& arg) {
@@ -788,6 +793,10 @@ NullMapView::NullMapView(const col_pt& column) {
 const uint8_t* NullMapView::NullMap() const {
 	FLS_ASSERT_CORRECT_IDX(m_vec_idx)
 
+	static const uint8_t zero_null_vector[CFG::VEC_SZ] = {};
+	if (m_null_map == nullptr) {
+		return zero_null_vector;
+	}
 	return m_null_map + (m_vec_idx * CFG::VEC_SZ);
 }
 /*--------------------------------------------------------------------------------------------------------------------*\

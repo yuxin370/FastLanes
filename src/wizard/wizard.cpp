@@ -1047,14 +1047,22 @@ struct col_map_1t1_visitor {
 	template <typename FIRST_PT, typename SECOND_PT>
 	bool operator()(const up<TypedCol<FIRST_PT>>& left_col, const up<TypedCol<SECOND_PT>>& right_col) {
 
-		/* ── added: safety guard (5 lines) ─────────────────────────────── */
-		if (!left_col || !right_col)
+		if (!left_col || !right_col) {
 			return false;
+		}
 		const n_t rows = left_col->data.size();
-		if (rows != right_col->data.size() || rows != left_col->null_map_arr.size() ||
-		    rows != right_col->null_map_arr.size())
+		if (rows != right_col->data.size()) {
 			return false;
-		/* ──────────────────────────────────────────────────────────────── */
+		}
+		// MemoryTable columns omit the null map to represent an all-valid
+		// column. CSV columns carry one byte per row. Reject only malformed
+		// partial maps, and handle the omitted form without indexing it.
+		const bool left_has_null_map  = !left_col->null_map_arr.empty();
+		const bool right_has_null_map = !right_col->null_map_arr.empty();
+		if ((left_has_null_map && rows != left_col->null_map_arr.size()) ||
+		    (right_has_null_map && rows != right_col->null_map_arr.size())) {
+			return false;
+		}
 
 		unordered_map<FIRST_PT, SECOND_PT> forward_map; // col_1 → col_2
 		unordered_map<SECOND_PT, FIRST_PT> reverse_map; // col_2 → col_1
@@ -1063,8 +1071,8 @@ struct col_map_1t1_visitor {
 			const auto& left_val  = left_col->data[row_idx];
 			const auto& right_val = right_col->data[row_idx];
 
-			const bool is_left_val_null  = left_col->null_map_arr[row_idx];
-			const bool is_right_val_null = right_col->null_map_arr[row_idx];
+			const bool is_left_val_null  = left_has_null_map && left_col->null_map_arr[row_idx];
+			const bool is_right_val_null = right_has_null_map && right_col->null_map_arr[row_idx];
 
 			if (is_left_val_null != is_right_val_null)
 				return false;

@@ -13,9 +13,11 @@
 #include "fls/std/filesystem.hpp"
 #include "fls/std/vector.hpp"
 #include "fls/table/table.hpp"
+#include <algorithm>
 #include <cstddef> // std::size_t
 #include <cstdint> // uint8_t
 #include <cstring> // std::memcpy
+#include <limits>
 #include <memory> // std::shared_ptr, std::make_shared
 #include <stdexcept>
 #include <utility> // std::move
@@ -23,13 +25,29 @@
 
 namespace fastlanes {
 
+namespace {
+
+flatbuffers::Verifier::Options table_descriptor_verifier_options(const std::size_t byte_size) {
+	flatbuffers::Verifier::Options options;
+	// Large shards contain many small expression tables per (rowgroup, column). The fixed one-million-table default
+	// rejects a valid descriptor before finding any malformed byte. No valid table can consume fewer than one byte, so
+	// using the buffer size as the ceiling keeps verification finite and input-size-proportional while allowing the
+	// rowgroup index to scale.
+	const auto table_budget = std::max<std::size_t>(options.max_tables, byte_size);
+	options.max_tables = static_cast<flatbuffers::uoffset_t>(
+	    std::min<std::size_t>(table_budget, std::numeric_limits<flatbuffers::uoffset_t>::max()));
+	return options;
+}
+
+} // namespace
+
 const TableDescriptor& get_table_descriptor(const uint8_t* data, std::size_t size) {
 	if (!data || size == 0) {
 		throw std::invalid_argument("get_table_descriptor: null data or zero size");
 	}
 #if defined(DEBUG)
 	{
-		flatbuffers::Verifier v(data, size);
+		flatbuffers::Verifier v(data, size, table_descriptor_verifier_options(size));
 		if (!VerifyTableDescriptorBuffer(v)) {
 			throw std::runtime_error("get_table_descriptor: invalid TableDescriptor FlatBuffer");
 		}
@@ -89,13 +107,13 @@ const TableDescriptor* TableDescriptorHandle::MakePtr(const std::shared_ptr<vect
 
 #if defined(DEBUG)
 	(void)verify; // always verify in DEBUG
-	flatbuffers::Verifier v(data, sz);
+	flatbuffers::Verifier v(data, sz, table_descriptor_verifier_options(sz));
 	if (!VerifyTableDescriptorBuffer(v)) {
 		throw std::runtime_error("TableDescriptorHandle: verification failed (DEBUG)");
 	}
 #else
 	if (verify) {
-		flatbuffers::Verifier v(data, sz);
+		flatbuffers::Verifier v(data, sz, table_descriptor_verifier_options(sz));
 		if (!VerifyTableDescriptorBuffer(v)) {
 			throw std::runtime_error("TableDescriptorHandle: verification failed");
 		}

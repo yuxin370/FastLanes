@@ -1,10 +1,16 @@
 #include "fls/connection.hpp"
+#include "fls/reader/rowgroup_reader.hpp"
+#include "fls/reader/table_reader.hpp"
 #include "fls/table/memory_table.hpp"
+#include "fls/table/rowgroup.hpp"
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <gtest/gtest.h>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -122,6 +128,56 @@ TEST(MemoryTable, ClearsForcedSchemaBetweenLoads) {
 	EXPECT_TRUE(connection.get_forced_schema().empty());
 	EXPECT_FALSE(connection.is_forced_schema_pool());
 	EXPECT_TRUE(connection.get_forced_schema_pool().empty());
+}
+
+TEST(MemoryTable, MissingNullMapRemainsValidBeyondLegacy64VectorBoundary) {
+	constexpr size_t row_count = 65U * fastlanes::CFG::VEC_SZ + 17U;
+	std::vector<int16_t> values(row_count);
+	for (size_t row = 0; row < values.size(); ++row) {
+		values[row] = static_cast<int16_t>(static_cast<int>((row * 17U) % 257U) - 128);
+	}
+	const std::array<fastlanes::MemoryColumn, 1> columns {
+	    fastlanes::MemoryColumn {
+	        "i16",
+	        std::span<const int16_t> {values},
+	    },
+	};
+	const std::array<fastlanes::n_t, 1> rowgroups {row_count};
+	fastlanes::MemoryTableOptions       options;
+	options.n_vectors_per_rowgroup = 66;
+	options.rowgroup_n_tuples      = std::span<const fastlanes::n_t> {rowgroups};
+	options.force_schema           = true;
+	options.forced_schema.push_back(fastlanes::OperatorToken::EXP_FFOR_I16);
+
+	fastlanes::Connection writer;
+	writer.read_memory(fastlanes::MemoryTable {std::span<const fastlanes::MemoryColumn> {columns}}, options);
+	ASSERT_EQ(writer.get_table().m_rowgroups.size(), 1U);
+	const auto& encoded_rowgroup = *writer.get_table().m_rowgroups.front();
+	fastlanes::NullMapView null_map(encoded_rowgroup.internal_rowgroup.front());
+	null_map.PointTo(0);
+	const auto* first_zero_vector = null_map.NullMap();
+	null_map.PointTo(64);
+	const auto* boundary_zero_vector = null_map.NullMap();
+	EXPECT_EQ(boundary_zero_vector, first_zero_vector);
+	for (size_t row = 0; row < fastlanes::CFG::VEC_SZ; ++row) {
+		ASSERT_EQ(boundary_zero_vector[row], 0U);
+	}
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto path =
+	    std::filesystem::temp_directory_path() / ("fastlanes_memory_table_large_rowgroup_" + std::to_string(suffix) + ".fls");
+	writer.to_fls(path);
+
+	fastlanes::Connection reader_connection;
+	auto                  table_reader    = reader_connection.read_fls(path);
+	auto                  rowgroup_reader = table_reader->get_rowgroup_reader(0);
+	auto                  decoded         = rowgroup_reader->materialize();
+	const auto& decoded_column = std::get<fastlanes::up<fastlanes::col_i16>>(decoded->internal_rowgroup.front());
+	ASSERT_NE(decoded_column, nullptr);
+	ASSERT_GE(decoded_column->data.size(), values.size());
+	EXPECT_TRUE(std::equal(values.begin(), values.end(), decoded_column->data.begin()));
+
+	std::filesystem::remove(path);
 }
 
 } // namespace
