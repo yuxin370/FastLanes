@@ -44,6 +44,7 @@ PRESETS = {
     "smoke": {"batch_size": 2, "warmup_batches": 1, "measurement_batches": 2, "repeats": 1, "workers": 1, "semantic_samples": 2},
     "e2e": {"batch_size": 64, "warmup_batches": 5, "measurement_batches": 20, "repeats": 5, "workers": 8, "semantic_samples": 8},
 }
+GALP_E2E_MIN_THROUGHPUT_IMAGES_PER_S = 3000.0
 
 
 def _value(args: argparse.Namespace, key: str) -> int:
@@ -102,9 +103,12 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         raise ValueError("invalid execution dimensions")
     if (
         args.galp_cache_capacity_mib < 0
+        or args.galp_plan_cache_capacity < 0
         or args.galp_decode_batch_rowgroups <= 0
+        or args.galp_batch_prefetch_depth <= 0
         or args.galp_rowgroup_prefetch_depth <= 0
         or args.galp_rowgroup_prefetch_workers <= 0
+        or args.galp_rowgroup_prefetch_min_decode_batches <= 0
     ):
         raise ValueError("invalid GALP cache/decode dimensions")
     if "dali" in args.pipelines and workers <= 0:
@@ -130,6 +134,10 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
     device = normalize_device(args.device)
     device_id = int(device.split(":", 1)[1]) if device.startswith("cuda:") else 0
     galp_manifest_fingerprint = fingerprint_file(galp_manifest)
+    manifest_header = galp_manifest.read_bytes()[:12]
+    if len(manifest_header) != 12 or manifest_header[:8] != b"GJDCTSH1":
+        raise ValueError(f"unexpected GALP shard manifest format: {galp_manifest}")
+    galp_manifest_version = int.from_bytes(manifest_header[8:12], "little")
     galp_payload_fingerprints: list[dict[str, Any]] = []
     galp_payload_cache: Path | None = None
     if "galp" in args.pipelines:
@@ -216,6 +224,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "enabled": list(args.pipelines),
             "galp": {
                 "manifest": str(galp_manifest),
+                "manifest_version": galp_manifest_version,
                 "manifest_sha256": galp_manifest_fingerprint["sha256"],
                 "manifest_fingerprint": galp_manifest_fingerprint,
                 "payload_fingerprints": galp_payload_fingerprints,
@@ -225,9 +234,12 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "torch_binding_dir": str(args.torch_binding_dir.resolve()),
                 "preprocess": args.galp_preprocess,
                 "cache_capacity_mib": args.galp_cache_capacity_mib,
+                "plan_cache_capacity": args.galp_plan_cache_capacity,
                 "decode_batch_rowgroups": args.galp_decode_batch_rowgroups,
+                "batch_prefetch_depth": args.galp_batch_prefetch_depth,
                 "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
+                "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
             },
             "rgbnomore": {"root": str(rgbnomore_root), "adapter_policy": "reuse_external_model_dataset_and_transform_code"},
             "dali": {
@@ -242,10 +254,25 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "includes": ["read", "decode", "preprocess", "host_to_device", "model_forward", "top1_top5_accounting"],
             "excludes": ["manifest_creation", "model_load", "pipeline_build", "warmup"],
             "cuda_sync_per_batch": True,
+            "cuda_sync_scope": "model_stream_only",
+            "cuda_device_sync_per_batch": False,
             "next_batch_prefetch_overlap": True,
+            "galp_batch_prefetch_depth": args.galp_batch_prefetch_depth,
             "latency_unit": "milliseconds_per_batch",
             "throughput_unit": "images_per_second",
             "os_page_cache_policy": "uncontrolled; e2e aggregate excludes repeat 0 and reports every repeat",
+        },
+        "performance_gates": {
+            "galp": {
+                "minimum_median_throughput_images_per_s": (
+                    GALP_E2E_MIN_THROUGHPUT_IMAGES_PER_S if args.preset == "e2e" else None
+                ),
+                "image_major_manifest_minimum_version": 2,
+                "rowgroups_per_image": 1,
+                "worksets_per_batch": 1,
+                "internal_syncs_per_batch": 1,
+                "decode_kernels_per_batch": 1,
+            }
         },
         "semantic_validation": {
             "sample_count": semantic_samples,
@@ -387,10 +414,38 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--galp-manifest", type=Path, default=DEFAULT_GALP_MANIFEST)
     parser.add_argument("--galp-label-map-json", type=Path, default=DEFAULT_GALP_LABEL_MAP)
     parser.add_argument("--torch-binding-dir", type=Path, default=DEFAULT_BINDING_DIR)
-    parser.add_argument("--galp-cache-capacity-mib", type=int, default=1024)
-    parser.add_argument("--galp-decode-batch-rowgroups", type=int, default=2)
+    parser.add_argument(
+        "--galp-cache-capacity-mib",
+        type=int,
+        default=0,
+        help="Decoded-rowgroup cache size; random-access image-major training defaults to zero-copy streaming.",
+    )
+    parser.add_argument(
+        "--galp-plan-cache-capacity",
+        type=int,
+        default=128,
+        help="Number of transformed batch plans retained; zero disables the batch-plan cache.",
+    )
+    parser.add_argument(
+        "--galp-decode-batch-rowgroups",
+        type=int,
+        default=64,
+        help="Legacy-layout compatibility limit; the image-major production path submits one logical batch.",
+    )
+    parser.add_argument(
+        "--galp-batch-prefetch-depth",
+        type=int,
+        default=2,
+        help="Ordered GALP batch lookahead; depth 2 overlaps two native reads with the current model forward.",
+    )
     parser.add_argument("--galp-rowgroup-prefetch-depth", type=int, default=16)
     parser.add_argument("--galp-rowgroup-prefetch-workers", type=int, default=4)
+    parser.add_argument(
+        "--galp-rowgroup-prefetch-min-decode-batches",
+        type=int,
+        default=1,
+        help="Enable parallel rowgroup reads for a single image-major decode workset.",
+    )
     parser.add_argument(
         "--refresh-galp-payload-fingerprints",
         action="store_true",

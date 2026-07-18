@@ -255,6 +255,10 @@ def load_contract(path: Path) -> dict[str, Any]:
         "unsupported timing boundary",
     )
     require(payload["timing"].get("cuda_sync_per_batch") is True, "v2 requires per-batch CUDA synchronization")
+    require(
+        payload["timing"].get("cuda_sync_scope") == "model_stream_only",
+        "v2 requires model-stream completion without draining next-batch preprocessing",
+    )
     return payload
 
 

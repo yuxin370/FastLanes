@@ -110,6 +110,22 @@ def _validate_pipeline_result(
                     failures,
                     f"{record_label}: generic projection fallback was used",
                 )
+                gate = contract.get("performance_gates", {}).get("galp", {})
+                manifest_version = int(contract["pipelines"]["galp"].get("manifest_version", 1))
+                if manifest_version >= int(gate.get("image_major_manifest_minimum_version", 2)):
+                    expected_batches = int(contract["execution"]["measurement_batches"])
+                    structural_expectations = {
+                        "rowgroups": expected_images * int(gate.get("rowgroups_per_image", 1)),
+                        "worksets": expected_batches * int(gate.get("worksets_per_batch", 1)),
+                        "internal_syncs": expected_batches * int(gate.get("internal_syncs_per_batch", 1)),
+                        "decode_kernels": expected_batches * int(gate.get("decode_kernels_per_batch", 1)),
+                    }
+                    for counter, expected in structural_expectations.items():
+                        _require(
+                            int(native_counters.get(counter, -1)) == expected,
+                            failures,
+                            f"{record_label}: {counter}={native_counters.get(counter)}; expected {expected}",
+                        )
 
 
 def _array_diff(expected: np.ndarray, actual: np.ndarray) -> dict[str, Any]:
@@ -219,6 +235,32 @@ def _aggregate_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _evaluate_performance_gates(
+    contract: dict[str, Any], aggregates: Sequence[dict[str, Any]], failures: list[str]
+) -> list[dict[str, Any]]:
+    configured = contract.get("performance_gates", {}).get("galp", {})
+    minimum = configured.get("minimum_median_throughput_images_per_s")
+    if minimum is None or "galp" not in contract["pipelines"]["enabled"]:
+        return []
+    galp = next((item for item in aggregates if item["pipeline"] == "galp"), None)
+    if galp is None:
+        return []
+    actual = float(galp["throughput_images_per_s"]["p50"])
+    target = float(minimum)
+    passed = actual >= target
+    if not passed:
+        failures.append(f"pipeline galp: median throughput {actual:.3f} img/s is below required {target:.3f} img/s")
+    return [
+        {
+            "pipeline": "galp",
+            "metric": "median_throughput_images_per_s",
+            "target": target,
+            "actual": actual,
+            "ok": passed,
+        }
+    ]
+
+
 CSV_COLUMNS = [
     "pipeline",
     "domain",
@@ -299,6 +341,15 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
             f"{item['mean_end_to_end_latency_ms']['p50']:.3f} | {item['accuracy_top1']['p50']:.4f} | "
             f"{item['accuracy_top5']['p50']:.4f} |"
         )
+    lines.extend(["", "## Performance gates", ""])
+    if summary["performance_gates"]:
+        for gate in summary["performance_gates"]:
+            lines.append(
+                f"- {gate['pipeline']} {gate['metric']}: "
+                f"{'PASS' if gate['ok'] else 'FAIL'}; {gate['actual']:.3f} >= {gate['target']:.3f}."
+            )
+    else:
+        lines.append("- No throughput gate applies to this preset.")
     lines.extend(["", "## Comparability", ""])
     for comparison in summary["comparability"]:
         lines.append(f"- **{comparison['pair']}**: `{comparison['classification']}` — {comparison['reason']}")
@@ -365,6 +416,9 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
         )
 
     semantic_by_pair = {tuple(item["pipelines"]): item for item in semantic_comparisons}
+    ordered_results = [results[name] for name in contract["pipelines"]["enabled"] if name in results]
+    aggregates = [_aggregate_pipeline(payload) for payload in ordered_results]
+    performance_gates = _evaluate_performance_gates(contract, aggregates, failures)
 
     def classification(left: str, right: str) -> str:
         if left not in results or right not in results:
@@ -395,7 +449,6 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
             "reason": "DCT and RGB models require different input-domain checkpoints; both checkpoints declare the same RGB-no-more ImageNet ViT-Ti recipe family, but tensors and weights are not interchangeable.",
         },
     ]
-    ordered_results = [results[name] for name in contract["pipelines"]["enabled"] if name in results]
     summary = {
         "schema_version": "galp_system_benchmark_summary_v2",
         "ok": not failures,
@@ -424,7 +477,8 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
         "contract_sha256": sha256_json(contract),
         "sample_manifest_sha256": contract["dataset"]["manifest_sha256"],
         "expected_measured_sample_trace": expected_trace,
-        "aggregates": [_aggregate_pipeline(payload) for payload in ordered_results],
+        "aggregates": aggregates,
+        "performance_gates": performance_gates,
         "semantic_validation": {
             "sample_count": contract["semantic_validation"]["sample_count"],
             "comparisons": semantic_comparisons,
@@ -435,7 +489,7 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
             "GALP, DALI, and PyTorch expose different worker abstractions; the configured count is identical where the API permits, and each result records worker_semantics.",
             "Torch peak-memory counters exclude GALP/DALI native allocator memory; peak_gpu_memory_scope makes this limitation explicit.",
             "Top-1/top-5 are computed on the contract's measured subset, not silently presented as full ImageNet validation accuracy.",
-            "Each adapter may submit next-batch prefetch before the current forward; the common per-batch CUDA synchronization keeps the reported latency boundary reproducible.",
+			"Adapters may submit bounded prefetch before the current forward; GALP records its ordered batch lookahead depth, and synchronization waits only for the current model stream without draining independent preprocessing streams.",
         ],
         "pipeline_results": ordered_results,
     }

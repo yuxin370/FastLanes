@@ -138,6 +138,86 @@ def _write_label_map(
     }
 
 
+def _write_selected_index(paths: list[Path], index_file: Path, output_csv: Path) -> dict[str, Any]:
+    """Persist the exact storage-order dataset view used by a limited manifest."""
+    label_index = _load_label_index(index_file)
+    rows = []
+    for path in paths:
+        key = _imagenet_index_key_from_path(path)
+        if key not in label_index:
+            raise RuntimeError(f"input path is missing from {index_file}: {key}")
+        rows.append({"Filepath": key, "Label": int(label_index[key])})
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=("Filepath", "Label"))
+        writer.writeheader()
+        writer.writerows(rows)
+    return {"selected_index_csv": str(output_csv), "selected_index_count": len(rows)}
+
+
+def _materialize_selected_data_root(paths: list[Path], output_root: Path) -> dict[str, Any]:
+    """Create a no-copy ImageFolder view whose contents exactly match the selected index."""
+    if output_root.is_symlink():
+        raise RuntimeError(f"selected dataset root must not be a symlink: {output_root}")
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_root_resolved = output_root.resolve()
+    desired: dict[Path, Path] = {}
+    for path in paths:
+        source = path.resolve(strict=True)
+        if source == output_root_resolved or output_root_resolved in source.parents:
+            raise RuntimeError(f"selected dataset source must be outside the output root: {source}")
+        relative = Path(_imagenet_index_key_from_path(source))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError(f"selected dataset path escapes the output root: {relative}")
+        if relative in desired:
+            raise RuntimeError(f"selected dataset contains a duplicate destination: {relative}")
+        desired[relative] = source
+
+    # Synchronize the managed view before adding missing links. This removes
+    # images left by an earlier, larger selection and refreshes destinations
+    # whose source inode changed between preparation runs.
+    for existing in list(output_root.rglob("*")):
+        if not existing.is_symlink() and not existing.is_file():
+            continue
+        relative = existing.relative_to(output_root)
+        source = desired.get(relative)
+        if source is not None and not existing.is_symlink() and existing.samefile(source):
+            continue
+        existing.unlink()
+
+    directories = sorted(
+        (path for path in output_root.rglob("*") if path.is_dir() and not path.is_symlink()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+    linked_bytes = 0
+    for relative, path in desired.items():
+        destination = output_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            os.link(path, destination)
+        linked_bytes += path.stat().st_size
+
+    materialized = {path.relative_to(output_root) for path in _collect_jpegs(output_root)}
+    if materialized != set(desired):
+        raise RuntimeError(
+            "selected dataset materialization mismatch: "
+            f"expected {len(desired)} images, found {len(materialized)}"
+        )
+    return {
+        "selected_data_root": str(output_root),
+        "selected_data_count": len(desired),
+        "selected_data_logical_bytes": linked_bytes,
+        "selected_data_storage": "hardlink",
+    }
+
+
 def _validation_summary(
     manifest: Path,
     torch_binding_dir: Path,
@@ -217,16 +297,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, help="Output directory for reconstructable GALP shards.")
     parser.add_argument("--tool", type=Path, default=DEFAULT_TOOL)
     parser.add_argument("--torch-binding-dir", type=Path, default=DEFAULT_TORCH_BINDING_DIR)
-    parser.add_argument("--preset", choices=("crop-latency", "balanced", "throughput"), default="balanced")
+    parser.add_argument(
+        "--preset",
+        choices=("crop-latency", "balanced", "throughput", "random-access"),
+        default="random-access",
+        help="Storage architecture preset; random-access is the production path for globally shuffled batches.",
+    )
     parser.add_argument("--policy", choices=("ragged",), default="ragged")
-    parser.add_argument("--shard-images", type=int, default=8192)
-    parser.add_argument("--rowgroup-vectors", type=int, default=128)
-    parser.add_argument("--rowgroups-per-shard", type=int, default=256)
+    parser.add_argument("--shard-images", type=int)
+    parser.add_argument("--rowgroup-vectors", type=int)
+    parser.add_argument("--rowgroups-per-shard", type=int)
     parser.add_argument("--limit", type=int, help="Use the first N JPEGs after deterministic path sorting.")
     parser.add_argument("--validate-sample-images", type=int, default=8)
     parser.add_argument("--manifest", type=Path, help="Existing manifest.bin to validate with --verify-only.")
     parser.add_argument("--expected-image-count", type=int, help="Assert the manifest image_count matches this value.")
     parser.add_argument("--index-file", type=Path, help="RGB-no-more index CSV used to generate a GALP image_id -> label sidecar.")
+    parser.add_argument("--selected-index-csv", type=Path, help="Write the exact selected dataset view for reproducible subset benchmarks. Defaults to OUT_DIR/index.csv when --index-file is set.")
+    parser.add_argument("--selected-data-root", type=Path, help="Create a hard-linked ImageFolder view containing exactly the selected images.")
     parser.add_argument("--label-map-json", type=Path, help="Output path for the GALP image_id -> label sidecar. Defaults to OUT_DIR/labels.json when --index-file is set.")
     parser.add_argument("--write-label-map-only", action="store_true", help="Only write the label sidecar from the selected input paths and index file; do not generate or verify shards.")
     parser.add_argument("--output-json", type=Path)
@@ -266,6 +353,8 @@ def main() -> None:
         args.out_dir = _default_out_dir(args.split)
     if args.label_map_json is None and args.index_file is not None:
         args.label_map_json = args.out_dir / "labels.json"
+    if args.selected_index_csv is None and args.index_file is not None:
+        args.selected_index_csv = args.out_dir / "index.csv"
     if args.expected_image_count is None and not (args.verify_only and explicit_manifest and args.limit is None):
         args.expected_image_count = _default_expected_count(args.split, args.limit)
     if args.write_label_map_only:
@@ -296,7 +385,10 @@ def main() -> None:
                 input_dir=args.input_dir,
                 manifest=args.manifest or (args.out_dir / "manifest.bin"),
             ),
+            **_write_selected_index(paths, args.index_file, args.selected_index_csv),
         }
+        if args.selected_data_root is not None:
+            summary.update(_materialize_selected_data_root(paths, args.selected_data_root))
         _emit_summary(summary, args.output_json)
         return
     if args.verify_only:
@@ -343,7 +435,7 @@ def main() -> None:
     if args.validate_sample_images < 0:
         raise ValueError("--validate-sample-images must be non-negative")
     for name in ("shard_images", "rowgroup_vectors", "rowgroups_per_shard"):
-        if getattr(args, name) <= 0:
+        if getattr(args, name) is not None and getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
 
     if args.out_dir.exists():
@@ -380,14 +472,15 @@ def main() -> None:
         args.preset,
         "--metadata-profile",
         "reconstruct",
-        "--shard-images",
-        str(args.shard_images),
-        "--rowgroup-vectors",
-        str(args.rowgroup_vectors),
-        "--rowgroups-per-shard",
-        str(args.rowgroups_per_shard),
-        *input_args,
     ]
+    for flag, value in (
+        ("--shard-images", args.shard_images),
+        ("--rowgroup-vectors", args.rowgroup_vectors),
+        ("--rowgroups-per-shard", args.rowgroups_per_shard),
+    ):
+        if value is not None:
+            command.extend((flag, str(value)))
+    command.extend(input_args)
     summary: dict[str, Any] = {
         "command": command,
         "input_dir": str(args.input_dir),
@@ -398,6 +491,7 @@ def main() -> None:
         "limit": args.limit,
         "input_count": input_count,
         "metadata_profile": "reconstruct",
+        "storage_preset": args.preset,
         "dry_run": args.dry_run,
     }
     if args.index_file is not None:
@@ -441,6 +535,13 @@ def main() -> None:
                 input_dir=args.input_dir,
                 manifest=manifest,
             )
+            summary["selected_index"] = _write_selected_index(
+                selected_paths_for_label_map, args.index_file, args.selected_index_csv
+            )
+            if args.selected_data_root is not None:
+                summary["selected_data"] = _materialize_selected_data_root(
+                    selected_paths_for_label_map, args.selected_data_root
+                )
         summary["payload_fingerprints"] = _fingerprint_payloads(manifest)
 
     _emit_summary(summary, args.output_json)

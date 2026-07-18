@@ -19,7 +19,7 @@ baseline、comparison runner、summarizer 和 validator 已移除，其能力全
 
 | Pipeline | 输入域 | 数据路径 | 模型 |
 | --- | --- | --- | --- |
-| `galp` | JPEG DCT | GALP sharded Direct-DCT、融合 transformed-grid pushdown、异步 next-batch prefetch | RGB-no-more JPEG-Ti |
+| `galp` | JPEG DCT | GALP sharded Direct-DCT、融合 transformed-grid pushdown、有界有序 batch prefetch | RGB-no-more JPEG-Ti |
 | `rgbnomore` | JPEG DCT | RGB-no-more 原生 DCT reader 与验证变换 | 同一 DCT checkpoint |
 | `dali` | RGB | DALI file reader、mixed JPEG decode、GPU resize/crop/normalize | RGB-no-more RGB ViT-Ti |
 | `pytorch` | RGB | canonical manifest、PyTorch DataLoader、RGB-no-more 验证变换 | 同一 RGB checkpoint |
@@ -45,8 +45,9 @@ DCT 与 RGB 使用输入域专用 checkpoint，只做系统级参考，不做逐
 7. CUDA 同步。
 
 模型创建、checkpoint 加载、pipeline build、manifest 生成和 warmup 不计时。
-各 pipeline 使用其生产级预取机制；GALP 在当前 batch forward 前提交下一 batch 的
-Direct-DCT prefetch。每 batch 的同步边界保持一致，因此吞吐和延迟可复核。
+各 pipeline 使用其生产级预取机制；GALP 默认维护深度为 2 的有序 Direct-DCT prefetch 队列，使后续两个 batch 的 CPU 读取/规划可以与当前 batch forward 重叠；
+单个 image-major workset 内也启用并行 rowgroup 读取。
+每 batch 的同步边界保持一致，因此吞吐和延迟可复核。
 
 ## 4. Preset
 

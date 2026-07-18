@@ -257,6 +257,7 @@ def _read_grid_batch(
     rowgroup_prefetch_depth: int = 16,
     rowgroup_prefetch_workers: int = 4,
     rowgroup_prefetch_min_decode_batches: int = 2,
+    plan_cache_capacity: int = 128,
 ) -> Any:
     return reader.read_batch(
         image_ids,
@@ -267,6 +268,7 @@ def _read_grid_batch(
         rowgroup_prefetch_depth=rowgroup_prefetch_depth,
         rowgroup_prefetch_workers=rowgroup_prefetch_workers,
         rowgroup_prefetch_min_decode_batches=rowgroup_prefetch_min_decode_batches,
+        plan_cache_capacity=plan_cache_capacity,
         layout=layout,
         grid_transform=grid_transform,
     )
@@ -603,12 +605,23 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     totals["dct_resize_weight_cache_misses"] += int(stats.get("dct_resize_weight_cache_misses", 0))
     totals["dct_conversion_matrix_cache_hits"] += int(stats.get("dct_conversion_matrix_cache_hits", 0))
     totals["dct_conversion_matrix_cache_misses"] += int(stats.get("dct_conversion_matrix_cache_misses", 0))
+    totals["plan_cache_hits"] += int(stats.get("plan_cache_hits", 0))
+    totals["plan_cache_misses"] += int(stats.get("plan_cache_misses", 0))
+    totals["plan_cache_evictions"] += int(stats.get("plan_cache_evictions", 0))
     totals["project_decoded_ycbcr_grid_launches"] += int(stats.get("project_decoded_ycbcr_grid_launch_count", 0))
     totals["jpeg_dct_projection_items_materialized"] += int(
         stats.get("jpeg_dct_projection_items_materialized", stats["projection_item_count"])
     )
     totals["internal_syncs"] += int(stats["internal_sync_count"])
     totals["planning_seconds"] += float(stats.get("planning_ms", 0.0)) / 1000.0
+    totals["workset_build_seconds"] += float(stats.get("workset_build_ms", 0.0)) / 1000.0
+    totals["workset_upload_seconds"] += float(stats.get("workset_upload_ms", 0.0)) / 1000.0
+    totals["decode_seconds"] += float(stats.get("decode_ms", 0.0)) / 1000.0
+    totals["gather_seconds"] += float(stats.get("gather_ms", 0.0)) / 1000.0
+    totals["decoded_gather_seconds"] += float(stats.get("decoded_gather_ms", 0.0)) / 1000.0
+    totals["prefetch_wait_seconds"] += float(stats.get("prefetch_wait_ms", 0.0)) / 1000.0
+    totals["prefetch_rowgroup_read_seconds"] += float(stats.get("prefetch_rowgroup_read_ms", 0.0)) / 1000.0
+    totals["sync_rowgroup_read_seconds"] += float(stats.get("sync_rowgroup_read_ms", 0.0)) / 1000.0
     projection_item_build_seconds = float(stats.get("projection_item_build_ms", 0.0)) / 1000.0
     totals["projection_build_seconds"] += projection_item_build_seconds
     totals["projection_item_build_seconds"] += projection_item_build_seconds
@@ -636,10 +649,21 @@ def _empty_totals() -> dict[str, int | float]:
         "dct_resize_weight_cache_misses": 0,
         "dct_conversion_matrix_cache_hits": 0,
         "dct_conversion_matrix_cache_misses": 0,
+        "plan_cache_hits": 0,
+        "plan_cache_misses": 0,
+        "plan_cache_evictions": 0,
         "project_decoded_ycbcr_grid_launches": 0,
         "jpeg_dct_projection_items_materialized": 0,
         "internal_syncs": 0,
         "planning_seconds": 0.0,
+        "workset_build_seconds": 0.0,
+        "workset_upload_seconds": 0.0,
+        "decode_seconds": 0.0,
+        "gather_seconds": 0.0,
+        "decoded_gather_seconds": 0.0,
+        "prefetch_wait_seconds": 0.0,
+        "prefetch_rowgroup_read_seconds": 0.0,
+        "sync_rowgroup_read_seconds": 0.0,
         "projection_build_seconds": 0.0,
         "projection_item_build_seconds": 0.0,
         "resize_weight_build_seconds": 0.0,
@@ -780,6 +804,10 @@ def read_and_adapt_batch(
             decode_batch_rowgroups=int(getattr(args, "decode_batch_rowgroups", 2)),
             rowgroup_prefetch_depth=int(getattr(args, "rowgroup_prefetch_depth", 16)),
             rowgroup_prefetch_workers=int(getattr(args, "rowgroup_prefetch_workers", 4)),
+            rowgroup_prefetch_min_decode_batches=int(
+                getattr(args, "rowgroup_prefetch_min_decode_batches", 2)
+            ),
+            plan_cache_capacity=int(getattr(args, "plan_cache_capacity", 128)),
         )
         input_y, input_cbcr = adapt_galp_batch_to_rgbnomore(
             reader,
@@ -820,6 +848,10 @@ def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: l
         decode_batch_rowgroups=int(getattr(args, "decode_batch_rowgroups", 2)),
         rowgroup_prefetch_depth=int(getattr(args, "rowgroup_prefetch_depth", 16)),
         rowgroup_prefetch_workers=int(getattr(args, "rowgroup_prefetch_workers", 4)),
+        rowgroup_prefetch_min_decode_batches=int(
+            getattr(args, "rowgroup_prefetch_min_decode_batches", 2)
+        ),
+        plan_cache_capacity=int(getattr(args, "plan_cache_capacity", 128)),
         layout="transformed_dct_grid",
         grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
     )
@@ -964,6 +996,7 @@ def run_loader_phase(
         "decode_batch_rowgroups": args.decode_batch_rowgroups,
         "rowgroup_prefetch_depth": args.rowgroup_prefetch_depth,
         "rowgroup_prefetch_workers": args.rowgroup_prefetch_workers,
+        "rowgroup_prefetch_min_decode_batches": args.rowgroup_prefetch_min_decode_batches,
         "sampling_policy": args.sampling_policy,
         "image_ids_wrapped": not args.no_wrap_image_ids,
         "unsupported_sampling_skipped_count": len(unsupported_sampling_skips),
@@ -1193,6 +1226,7 @@ def run_end_to_end_phase(
         "decode_batch_rowgroups": args.decode_batch_rowgroups,
         "rowgroup_prefetch_depth": args.rowgroup_prefetch_depth,
         "rowgroup_prefetch_workers": args.rowgroup_prefetch_workers,
+        "rowgroup_prefetch_min_decode_batches": args.rowgroup_prefetch_min_decode_batches,
         "sampling_policy": args.sampling_policy,
         "image_ids_wrapped": not args.no_wrap_image_ids,
         "unsupported_sampling_skipped_count": len(unsupported_sampling_skips),
@@ -1366,6 +1400,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rowgroup-prefetch-depth", type=int, default=16)
     parser.add_argument("--rowgroup-prefetch-workers", type=int, default=4)
+    parser.add_argument("--rowgroup-prefetch-min-decode-batches", type=int, default=2)
     parser.add_argument(
         "--no-async-prefetch",
         action="store_false",
@@ -1403,8 +1438,12 @@ def main() -> None:
         raise ValueError("--cache-capacity-mib must be non-negative")
     if args.decode_batch_rowgroups <= 0:
         raise ValueError("--decode-batch-rowgroups must be positive")
-    if args.rowgroup_prefetch_depth <= 0 or args.rowgroup_prefetch_workers <= 0:
-        raise ValueError("--rowgroup-prefetch-depth/workers must be positive")
+    if (
+        args.rowgroup_prefetch_depth <= 0
+        or args.rowgroup_prefetch_workers <= 0
+        or args.rowgroup_prefetch_min_decode_batches <= 0
+    ):
+        raise ValueError("--rowgroup-prefetch-depth/workers/min-decode-batches must be positive")
     if args.train_lr < 0.0:
         raise ValueError("--train-lr must be non-negative")
     if args.preprocess in ("rgbnomore-val", "rgbnomore-val-pushdown") and args.no_scale:

@@ -10,6 +10,7 @@ import json
 import platform
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -338,9 +339,13 @@ class GalpAdapter(PipelineAdapter):
         self.args = SimpleNamespace(
             preprocess=config["preprocess"],
             cache_capacity_mib=int(config["cache_capacity_mib"]),
-            decode_batch_rowgroups=int(config.get("decode_batch_rowgroups", 2)),
+            plan_cache_capacity=int(config.get("plan_cache_capacity", 128)),
+            decode_batch_rowgroups=int(config.get("decode_batch_rowgroups", 64)),
             rowgroup_prefetch_depth=int(config.get("rowgroup_prefetch_depth", 16)),
             rowgroup_prefetch_workers=int(config.get("rowgroup_prefetch_workers", 4)),
+            rowgroup_prefetch_min_decode_batches=int(
+                config.get("rowgroup_prefetch_min_decode_batches", 1)
+            ),
             no_dequantize=False,
             no_scale=False,
         )
@@ -349,12 +354,30 @@ class GalpAdapter(PipelineAdapter):
             if config["preprocess"] == "rgbnomore-val"
             else None
         )
-        self.pending: Any | None = None
-        self.pending_image_ids: list[int] | None = None
+        self.batch_size = int(contract["execution"]["batch_size"])
+        self.batch_prefetch_depth = int(config.get("batch_prefetch_depth", 2))
+        self.total_batches = len(self.samples) // self.batch_size
+        self.pending_batches: deque[tuple[list[int], Any]] = deque()
+        self.next_prefetch_batch_index = 0
+
+    def _enqueue_next_pushdown_batch(self) -> None:
+        if self.next_prefetch_batch_index >= self.total_batches:
+            return
+        begin = self.next_prefetch_batch_index * self.batch_size
+        expected = self.samples[begin : begin + self.batch_size]
+        if len(expected) != self.batch_size:
+            raise RuntimeError("GALP prefetch encountered an incomplete batch")
+        image_ids = [int(sample["galp_image_id"]) for sample in expected]
+        pending = self.module._prefetch_pushdown_batch(self.reader, self.args, image_ids)
+        self.pending_batches.append((image_ids, pending))
+        self.next_prefetch_batch_index += 1
 
     def begin_repeat(self) -> None:
-        self.pending = None
-        self.pending_image_ids = None
+        self.pending_batches.clear()
+        self.next_prefetch_batch_index = 0
+        if self.args.preprocess == "rgbnomore-val-pushdown":
+            for _ in range(min(self.batch_prefetch_depth, self.total_batches)):
+                self._enqueue_next_pushdown_batch()
 
     def load(
         self,
@@ -363,25 +386,20 @@ class GalpAdapter(PipelineAdapter):
     ) -> LoadedBatch:
         image_ids = [int(sample["galp_image_id"]) for sample in expected]
         if self.args.preprocess == "rgbnomore-val-pushdown":
-            if self.pending is None:
-                self.pending = self.module._prefetch_pushdown_batch(self.reader, self.args, image_ids)
-                self.pending_image_ids = image_ids
-            if self.pending_image_ids != image_ids:
+            if not self.pending_batches:
+                raise RuntimeError("GALP pushdown prefetch queue is empty")
+            queued_image_ids, pending = self.pending_batches.popleft()
+            if queued_image_ids != image_ids:
                 raise RuntimeError(
-                    f"GALP pending batch mismatch: expected {image_ids}, queued {self.pending_image_ids}"
+                    f"GALP pending batch mismatch: expected {image_ids}, queued {queued_image_ids}"
                 )
             input_y, input_cbcr, source_batches = self.module._adapt_prefetched_pushdown_batch(
                 self.reader,
                 self.args,
                 image_ids,
-                self.pending,
+                pending,
             )
-            self.pending = None
-            self.pending_image_ids = None
-            if next_expected is not None:
-                next_image_ids = [int(sample["galp_image_id"]) for sample in next_expected]
-                self.pending = self.module._prefetch_pushdown_batch(self.reader, self.args, next_image_ids)
-                self.pending_image_ids = next_image_ids
+            self._enqueue_next_pushdown_batch()
         else:
             input_y, input_cbcr, source_batches = self.module.read_and_adapt_batch(
                 self.reader,
@@ -425,8 +443,8 @@ class GalpAdapter(PipelineAdapter):
         )
 
     def end_repeat(self) -> None:
-        self.pending = None
-        self.pending_image_ids = None
+        self.pending_batches.clear()
+        self.next_prefetch_batch_index = 0
 
 
 def _make_adapter(name: str, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device) -> PipelineAdapter:
@@ -477,6 +495,12 @@ def _new_event(device: torch.device) -> torch.cuda.Event | None:
 
 def _event_ms(start: torch.cuda.Event | None, end: torch.cuda.Event | None) -> float:
     return float(start.elapsed_time(end)) if start is not None and end is not None else 0.0
+
+
+def _synchronize_model_stream(device: torch.device) -> None:
+    """Finish the consumed batch without draining independent next-batch preprocessing streams."""
+    if device.type == "cuda":
+        torch.cuda.current_stream(device).synchronize()
 
 
 def _capture_semantic(
@@ -576,11 +600,10 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
             batch = _to_device(adapter.load(expected, following_batch(warmup_index)), device)
             _validate_batch_identity(batch, expected)
             _forward(model, batch.inputs, contract, device)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            _synchronize_model_stream(device)
 
         if device.type == "cuda":
-            torch.cuda.synchronize(device)
+            _synchronize_model_stream(device)
             torch.cuda.reset_peak_memory_stats(device)
         cpu_process_seconds = 0.0
         latency_ms: list[float] = []
@@ -620,8 +643,7 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
             if forward_end is not None:
                 forward_end.record()
             batch_correct1, batch_correct5 = _accuracy_counts(logits, batch.labels)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            _synchronize_model_stream(device)
             wall_ended_ns = time.perf_counter_ns()
             cpu_process_seconds += time.process_time() - process_started
 
