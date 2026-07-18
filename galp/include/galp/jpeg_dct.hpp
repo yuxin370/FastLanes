@@ -19,6 +19,7 @@
 namespace galp::jpeg {
 
 inline constexpr size_t kDefaultJpegDctDecodeBatchRowgroups                   = 64;
+inline constexpr size_t kDefaultJpegDctDevicePlanCacheCapacity                = 128;
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchDepth            = 4;
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchWorkers          = 1;
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches = 2;
@@ -53,6 +54,16 @@ enum class JpegDctCoefficientEncoding {
 	kJpegLikeRunLength,
 };
 
+// Physical order of spatial DCT blocks inside each component of an image-major
+// record. Tiles are measured in DCT blocks, not pixels. The image-major rowgroup
+// remains the storage/decode atom for every mode.
+enum class JpegDctSpatialOrder {
+	kRaster,
+	kTiledRaster32,
+	kZOrder,
+	kTiledZ32,
+};
+
 struct JpegDctReaderOptions {
 	JpegComponentMode              component_mode               = JpegComponentMode::kAllComponents;
 	int                            selected_component_index     = -1;
@@ -62,6 +73,9 @@ struct JpegDctReaderOptions {
 	JpegCompressionPartitionPolicy compression_partition_policy = JpegCompressionPartitionPolicy::kBySemanticSlot;
 	JpegDctCoefficientEncoding     coefficient_encoding         = JpegDctCoefficientEncoding::kDense64FastLanes;
 	bool                           capture_metadata_markers     = false;
+	// Applies only to the image-major physical layout. Kept at the end to
+	// preserve legacy positional aggregate initialization.
+	JpegDctSpatialOrder            image_major_spatial_order     = JpegDctSpatialOrder::kTiledZ32;
 };
 
 struct JpegDctMetadataWriterOptions {
@@ -123,6 +137,16 @@ struct JpegImageMetadata {
 enum class JpegDctRowOrdering {
 	kSingleImageComponentMajorBlockMajor,
 	kDatasetComponentMajorBlockMajorImageMinor,
+	// Random-access layout: every image is an independently addressable FLS
+	// rowgroup and rows inside it are component-major/spatial-order-block-major.
+	kDatasetImageMajorComponentBlockMajor,
+};
+
+enum class JpegDctPhysicalLayout {
+	// Legacy layout optimized for the same spatial block across adjacent images.
+	kSpatialMajorImageMinor,
+	// Random-batch layout with exactly one independently decodable rowgroup per image.
+	kImageMajor,
 };
 
 struct JpegDctBlockGroupIndex {
@@ -130,6 +154,14 @@ struct JpegDctBlockGroupIndex {
 	uint32_t z_order_index         = 0;
 	uint32_t block_x               = 0;
 	uint32_t block_y               = 0;
+	uint64_t row_start             = 0;
+	uint32_t row_count             = 0;
+	uint32_t fls_rowgroup_index    = 0;
+	uint32_t row_start_in_rowgroup = 0;
+};
+
+struct JpegDctImageGroupIndex {
+	uint32_t local_image_index     = 0;
 	uint64_t row_start             = 0;
 	uint32_t row_count             = 0;
 	uint32_t fls_rowgroup_index    = 0;
@@ -148,6 +180,10 @@ struct JpegDctDatasetMetadata {
 	std::vector<JpegDctBlockGroupIndex>      block_group_index;
 	JpegCompressionPartitionPolicy compression_partition_policy = JpegCompressionPartitionPolicy::kBySemanticSlot;
 	JpegDctCoefficientEncoding     coefficient_encoding         = JpegDctCoefficientEncoding::kDense64FastLanes;
+	std::vector<JpegDctImageGroupIndex>      image_group_index;
+	// Explicit for newly written image-major v2 metadata. Old v2 metadata did
+	// not carry this field and is decoded as the historical raster invariant.
+	JpegDctSpatialOrder                    image_major_spatial_order = JpegDctSpatialOrder::kRaster;
 };
 
 struct JpegDctTable {
@@ -164,6 +200,9 @@ enum class JpegDctShardPreset {
 	kCropLatency,
 	kBalanced,
 	kThroughput,
+	// Architecture preset for globally shuffled batches. It selects the
+	// image-major physical format rather than tuning the legacy layout.
+	kRandomAccess,
 };
 
 enum class JpegDctDeviceLayout {
@@ -250,6 +289,8 @@ struct JpegDctShardOptions {
 	bool               shard_images_specified        = false;
 	bool               rowgroup_vectors_specified    = false;
 	bool               rowgroups_per_shard_specified = false;
+	JpegDctPhysicalLayout physical_layout            = JpegDctPhysicalLayout::kSpatialMajorImageMinor;
+	bool                  physical_layout_specified  = false;
 };
 
 struct JpegDctShardManifestEntry {
@@ -324,6 +365,8 @@ struct JpegDctDeviceBatchOptions {
 	std::optional<JpegDctGridTransformSpec> grid_transform;
 	size_t              cache_capacity_bytes   = 0;
 	size_t              decode_batch_rowgroups = kDefaultJpegDctDecodeBatchRowgroups;
+	// Number of transformed batch plans retained by the reader. Zero disables this cache.
+	size_t              plan_cache_capacity    = kDefaultJpegDctDevicePlanCacheCapacity;
 	// Advanced rowgroup IO/materialization prefetch controls. Zero-valued sizes are normalized to defaults.
 	bool   enable_rowgroup_prefetch             = true;
 	size_t rowgroup_prefetch_depth              = kDefaultJpegDctDeviceRowgroupPrefetchDepth;
@@ -386,6 +429,9 @@ struct JpegDctDeviceExecutionStats {
 	size_t      cached_gather_event_handoff_count             = 0;
 	size_t      sparse_vector_cache_hits                      = 0;
 	size_t      sparse_vector_cache_misses                    = 0;
+	size_t      plan_cache_hits                               = 0;
+	size_t      plan_cache_misses                             = 0;
+	size_t      plan_cache_evictions                          = 0;
 	size_t      runtime_policy_selected_rowgroups             = 0;
 	size_t      runtime_policy_full_rowgroups                 = 0;
 	size_t      runtime_policy_tail_full_rowgroups            = 0;

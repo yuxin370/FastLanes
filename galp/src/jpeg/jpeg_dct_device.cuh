@@ -361,6 +361,26 @@ struct JpegDctDeviceRowgroupPlan {
 	JpegDctRuntimePolicyResult           runtime_policy {};
 };
 
+inline unsigned constrain_jpeg_dct_batch_unpack_n_vectors(
+    const unsigned                        preferred_unpack_n_vectors,
+    const JpegDctDeviceRowgroupPlan& rowgroup_plan) {
+	const auto unpack_n_vectors = std::max(1U, preferred_unpack_n_vectors);
+	if (unpack_n_vectors == 1U) {
+		return 1U;
+	}
+	// A workset has one FLS unpack width. If any rowgroup can require a full
+	// decode whose vector count is not divisible by the preferred width, use
+	// the universally compatible scalar width for the entire workset. Plans
+	// without vector-policy metadata are treated conservatively for the same
+	// reason.
+	if (!rowgroup_plan.has_vector_plan ||
+	    (rowgroup_plan.runtime_policy.decision == JpegDctRuntimePolicyDecision::kFullRowgroup &&
+	     rowgroup_plan.full_vector_count % unpack_n_vectors != 0U)) {
+		return 1U;
+	}
+	return unpack_n_vectors;
+}
+
 struct JpegDctDeviceShardPlan {
 	uint32_t                               shard_id = 0;
 	std::filesystem::path                  fls_path;
@@ -376,13 +396,23 @@ struct JpegDctDeviceRowgroupPrefetchConfig {
 
 struct JpegDctDeviceBatchPlan {
 	JpegDctDeviceLayout                        layout = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
-	std::vector<JpegDctDeviceShardPlan>        shards;
+	// The shard/rowgroup transform graph dominates a prepared plan (hundreds of thousands of items per batch).
+	// Cache hits share this immutable graph instead of copying it back out of the plan cache every iteration.
+	std::shared_ptr<std::vector<JpegDctDeviceShardPlan>> shards =
+	    std::make_shared<std::vector<JpegDctDeviceShardPlan>>();
+	// Source-item permutation and group boundaries for deterministic fixed-grid reduction. Both follow the flattened
+	// shard/rowgroup/item order above and are shared across cached plan instances.
+	std::shared_ptr<std::vector<uint32_t>> fixed_transform_item_order =
+	    std::make_shared<std::vector<uint32_t>>();
+	std::shared_ptr<std::vector<uint32_t>> fixed_transform_group_offsets =
+	    std::make_shared<std::vector<uint32_t>>();
 	std::vector<JpegDctDeviceImageLayout>      image_layouts;
 	std::vector<JpegDctDeviceBlockMetadata>    block_metadata;
 	std::vector<JpegDctDeviceRowgroupMetadata> rowgroups;
 	struct JpegDctDeviceDecodedRowgroupCache*  cache                           = nullptr;
 	bool                                       cache_enabled                   = false;
 	JpegDctDeviceScratch*                      scratch                         = nullptr;
+	bool                                       unify_rowgroups_across_shards   = false;
 	size_t                                     planned_selected_vector_count   = 0;
 	size_t                                     estimated_selected_vector_count = 0;
 	size_t                                     full_vector_count               = 0;
@@ -407,6 +437,9 @@ struct JpegDctDeviceBatchPlan {
 	double                                     planned_selected_vector_ratio   = 0.0;
 	double                                     estimated_selected_vector_ratio = 0.0;
 	double                                     planning_ms                     = 0.0;
+	size_t                                     plan_cache_hits                 = 0;
+	size_t                                     plan_cache_misses               = 0;
+	size_t                                     plan_cache_evictions            = 0;
 	double                                     resize_weight_build_ms          = 0.0;
 	size_t                                     dct_resize_weight_cache_hits    = 0;
 	size_t                                     dct_resize_weight_cache_misses  = 0;

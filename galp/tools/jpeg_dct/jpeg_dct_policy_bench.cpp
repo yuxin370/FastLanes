@@ -1,12 +1,22 @@
 #include "galp/jpeg_dct.hpp"
+#include "core/operator_capabilities.hpp"
+#include "fls/expression/rpn.hpp"
+#include "fls/file/file_footer.hpp"
+#include "fls/file/file_header.hpp"
+#include "fls/footer/table_descriptor.hpp"
+#include "fls/io/file.hpp"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <locale>
+#include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -29,10 +39,20 @@ struct Options {
 	bool                           shard_images_specified        = false;
 	bool                           rowgroup_vectors_specified    = false;
 	bool                           rowgroups_per_shard_specified = false;
+	galp::jpeg::JpegDctSpatialOrder spatial_order                 = galp::jpeg::JpegDctSpatialOrder::kTiledZ32;
+	bool                             spatial_order_specified       = false;
 };
 
-struct PolicyResult {
-	std::string policy;
+struct TokenStat {
+	uint64_t rowgroup_count   = 0;
+	uint64_t column_count     = 0;
+	uint64_t compressed_bytes = 0;
+};
+
+using TokenStats = std::map<fastlanes::OperatorToken, TokenStat>;
+
+struct BenchmarkResult {
+	std::string label;
 	uintmax_t   total_output_size          = 0;
 	uintmax_t   compressed_data_size       = 0;
 	uintmax_t   metadata_size              = 0;
@@ -52,13 +72,16 @@ struct PolicyResult {
 	uint64_t    peak_rss_bytes             = 0;
 	bool        decode_supported           = true;
 	std::string decode_error;
+	TokenStats                 token_stats;
+	std::array<TokenStats, 64> coefficient_token_stats;
 };
 
 void print_usage(const char* prog) {
 	std::cerr << "Usage:\n"
 	          << "  " << prog << " --input jpeg_dir [--out-dir output_dir] [--csv]\n"
-	          << "      [--preset crop-latency|balanced|throughput]\n"
-	          << "      [--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N]\n";
+	          << "      [--preset crop-latency|balanced|throughput|random-access]\n"
+	          << "      [--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N]\n"
+	          << "      [--spatial-order raster|tiled-raster-32|z-order|tiled-z-32]\n";
 }
 
 uint32_t parse_u32_arg(const std::string_view name, const char* value) {
@@ -91,6 +114,11 @@ void apply_shard_preset(Options& options) {
 	case galp::jpeg::JpegDctShardPreset::kThroughput:
 		preset_rowgroup_vectors = 256;
 		break;
+	case galp::jpeg::JpegDctShardPreset::kRandomAccess:
+		preset_shard_images        = 8192;
+		preset_rowgroup_vectors    = 128;
+		preset_rowgroups_per_shard = 8192;
+		break;
 	}
 	if (!options.shard_images_specified) {
 		options.shard_images = preset_shard_images;
@@ -118,6 +146,23 @@ bool parse_args(const int argc, char** argv, Options& options) {
 			options.csv = true;
 			continue;
 		}
+		if (arg == "--spatial-order" && i + 1 < argc) {
+			const std::string_view order = argv[++i];
+			if (order == "raster") {
+				options.spatial_order = galp::jpeg::JpegDctSpatialOrder::kRaster;
+			} else if (order == "tiled-raster-32") {
+				options.spatial_order = galp::jpeg::JpegDctSpatialOrder::kTiledRaster32;
+			} else if (order == "z-order") {
+				options.spatial_order = galp::jpeg::JpegDctSpatialOrder::kZOrder;
+			} else if (order == "tiled-z-32") {
+				options.spatial_order = galp::jpeg::JpegDctSpatialOrder::kTiledZ32;
+			} else {
+				throw std::runtime_error(
+				    "unknown --spatial-order value; expected raster, tiled-raster-32, z-order, or tiled-z-32");
+			}
+			options.spatial_order_specified = true;
+			continue;
+		}
 		if (arg == "--preset" && i + 1 < argc) {
 			const std::string_view preset = argv[++i];
 			if (preset == "crop-latency") {
@@ -126,8 +171,11 @@ bool parse_args(const int argc, char** argv, Options& options) {
 				options.preset = galp::jpeg::JpegDctShardPreset::kBalanced;
 			} else if (preset == "throughput") {
 				options.preset = galp::jpeg::JpegDctShardPreset::kThroughput;
+			} else if (preset == "random-access") {
+				options.preset = galp::jpeg::JpegDctShardPreset::kRandomAccess;
 			} else {
-				throw std::runtime_error("unknown --preset value; expected crop-latency, balanced, or throughput");
+				throw std::runtime_error(
+				    "unknown --preset value; expected crop-latency, balanced, throughput, or random-access");
 			}
 			continue;
 		}
@@ -258,38 +306,120 @@ galp::jpeg::JpegDctShardOptions make_shard_options(const Options& options) {
 	shard_options.shard_images_specified        = options.shard_images_specified;
 	shard_options.rowgroup_vectors_specified    = options.rowgroup_vectors_specified;
 	shard_options.rowgroups_per_shard_specified = options.rowgroups_per_shard_specified;
+	if (options.spatial_order_specified) {
+		shard_options.physical_layout           = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
+		shard_options.physical_layout_specified = true;
+	}
 	return shard_options;
 }
 
-double measure_crop_lookup_latency_ns(galp::jpeg::JpegDctShardDatasetReader& reader) {
-	const auto start = Clock::now();
-	const auto ref   = reader.LocateRow(0, 0, 0, 0);
-	if (ref.present) {
-		auto group = reader.ReadBlockGroup(ref.shard_id, ref.semantic_slot_id, ref.block_x, ref.block_y);
-		if (group.rows.empty()) {
-			std::cerr << "";
-		}
+std::string spatial_order_name(const galp::jpeg::JpegDctSpatialOrder order) {
+	switch (order) {
+	case galp::jpeg::JpegDctSpatialOrder::kRaster:
+		return "raster";
+	case galp::jpeg::JpegDctSpatialOrder::kTiledRaster32:
+		return "tiled_raster_32";
+	case galp::jpeg::JpegDctSpatialOrder::kZOrder:
+		return "z_order";
+	case galp::jpeg::JpegDctSpatialOrder::kTiledZ32:
+		return "tiled_z_32";
+	default:
+		throw std::runtime_error("unknown JPEG DCT spatial order");
 	}
-	const auto end = Clock::now();
-	return std::chrono::duration<double, std::nano>(end - start).count();
 }
 
-PolicyResult run_policy(const std::vector<std::filesystem::path>&   paths,
-                        const std::filesystem::path&                output_dir,
-                        const Options&                              cli_options,
-                        const std::string&                          policy_name) {
-	galp::jpeg::JpegDctReaderOptions reader_options;
+void scan_expression_stats(const std::filesystem::path& fls_path, BenchmarkResult& result) {
+	fastlanes::File       file(fls_path);
+	fastlanes::FileHeader header {};
+	fastlanes::FileFooter footer {};
+	fastlanes::FileHeader::Load(header, file);
+	fastlanes::FileFooter::Load(footer, file);
+	const auto handle = header.settings.inline_footer
+	                        ? fastlanes::TableDescriptorHandle::FromFileSlice(
+	                              file, footer.table_descriptor_offset, footer.table_descriptor_size, true)
+	                        : fastlanes::TableDescriptorHandle::FromFile(
+	                              fls_path.parent_path() / "table_descriptor.fbb", true);
+	const auto* table  = handle.Get();
+	if (table == nullptr || table->m_rowgroup_descriptors() == nullptr) {
+		throw std::runtime_error("missing table/rowgroup descriptor while scanning " + fls_path.string());
+	}
+	for (const auto* rowgroup : *table->m_rowgroup_descriptors()) {
+		if (rowgroup == nullptr || rowgroup->m_column_descriptors() == nullptr) {
+			throw std::runtime_error("missing rowgroup/column descriptor while scanning " + fls_path.string());
+		}
+		std::set<fastlanes::OperatorToken> rowgroup_tokens;
+		for (size_t coeff_id = 0; coeff_id < rowgroup->m_column_descriptors()->size(); ++coeff_id) {
+			const auto* column = rowgroup->m_column_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(coeff_id));
+			if (column == nullptr || column->encoding_rpn() == nullptr ||
+			    column->encoding_rpn()->operator_tokens() == nullptr ||
+			    column->encoding_rpn()->operator_tokens()->empty()) {
+				throw std::runtime_error("missing operator token while scanning " + fls_path.string());
+			}
+			if (coeff_id >= result.coefficient_token_stats.size()) {
+				throw std::runtime_error("JPEG DCT audit found more than 64 coefficient columns");
+			}
+			const auto token = column->encoding_rpn()->operator_tokens()->Get(0);
+			const auto bytes = static_cast<uint64_t>(column->total_size());
+			auto&      total = result.token_stats[token];
+			++total.column_count;
+			total.compressed_bytes += bytes;
+			auto& by_coefficient = result.coefficient_token_stats[coeff_id][token];
+			++by_coefficient.column_count;
+			by_coefficient.compressed_bytes += bytes;
+			rowgroup_tokens.insert(token);
+		}
+		for (const auto token : rowgroup_tokens) {
+			++result.token_stats[token].rowgroup_count;
+		}
+		for (size_t coeff_id = 0; coeff_id < rowgroup->m_column_descriptors()->size(); ++coeff_id) {
+			const auto* column = rowgroup->m_column_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(coeff_id));
+			const auto token = column->encoding_rpn()->operator_tokens()->Get(0);
+			++result.coefficient_token_stats[coeff_id][token].rowgroup_count;
+		}
+	}
+}
 
-	const auto policy_dir = output_dir / policy_name;
-	std::filesystem::remove_all(policy_dir);
+double measure_crop_lookup_latency_ns(galp::jpeg::JpegDctShardDatasetReader& reader) {
+	const auto image = reader.ImageMetadata(0);
+	auto component = std::find_if(image.components.begin(), image.components.end(), [](const auto& value) {
+		return value.present && value.width_in_blocks != 0 && value.height_in_blocks != 0;
+	});
+	if (component == image.components.end()) {
+		return 0.0;
+	}
+	constexpr size_t iterations = 10000;
+	uint64_t         checksum   = 0;
+	const auto start = Clock::now();
+	for (size_t iteration = 0; iteration < iterations; ++iteration) {
+		const auto x = static_cast<uint32_t>(iteration % component->width_in_blocks);
+		const auto y = static_cast<uint32_t>((iteration / component->width_in_blocks) % component->height_in_blocks);
+		const auto ref = reader.LocateRow(0, component->semantic_slot_id, x, y);
+		checksum += ref.physical_row_index;
+	}
+	const auto end = Clock::now();
+	if (checksum == std::numeric_limits<uint64_t>::max()) {
+		std::cerr << "";
+	}
+	return std::chrono::duration<double, std::nano>(end - start).count() / iterations;
+}
+
+BenchmarkResult run_benchmark(const std::vector<std::filesystem::path>& paths,
+                              const std::filesystem::path&              output_dir,
+                              const Options&                            cli_options,
+                              const std::string&                        label) {
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.image_major_spatial_order = cli_options.spatial_order;
+
+	const auto dataset_dir = output_dir / label;
+	std::filesystem::remove_all(dataset_dir);
 
 	const auto encode_start = Clock::now();
 	const auto manifest     = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
-        paths, policy_dir, reader_options, make_shard_options(cli_options));
+	    paths, dataset_dir, reader_options, make_shard_options(cli_options));
 	const auto encode_end = Clock::now();
 
-	PolicyResult result;
-	result.policy           = policy_name;
+	BenchmarkResult result;
+	result.label            = label;
 	result.source_jpeg_size = total_source_jpeg_size(paths);
 	result.encode_ms        = elapsed_ms(encode_start, encode_end);
 	result.shard_count      = static_cast<uint32_t>(manifest.shards.size());
@@ -302,8 +432,9 @@ PolicyResult run_policy(const std::vector<std::filesystem::path>&   paths,
 		result.physical_row_count += shard.physical_row_count;
 		result.rowgroup_count += shard.rowgroup_count;
 		result.block_group_count += shard.block_group_count;
+		scan_expression_stats(dataset_dir / shard.fls_file_name, result);
 	}
-	result.metadata_size += std::filesystem::file_size(policy_dir / "manifest.bin");
+	result.metadata_size += std::filesystem::file_size(dataset_dir / "manifest.bin");
 	result.total_output_size = result.compressed_data_size + result.metadata_size;
 
 	const double physical_uncompressed = static_cast<double>(result.physical_row_count) * 64.0 * sizeof(int16_t);
@@ -318,7 +449,7 @@ PolicyResult run_policy(const std::vector<std::filesystem::path>&   paths,
 	}
 
 	try {
-		galp::jpeg::JpegDctShardDatasetReader reader(policy_dir / "manifest.bin");
+		galp::jpeg::JpegDctShardDatasetReader reader(dataset_dir / "manifest.bin");
 		const auto                            decode_start = Clock::now();
 		auto                                  image        = reader.MaterializeImageDct(0);
 		if (image.blocks.empty()) {
@@ -335,16 +466,57 @@ PolicyResult run_policy(const std::vector<std::filesystem::path>&   paths,
 	return result;
 }
 
+void write_result_csv_files(const std::filesystem::path& output_dir, const BenchmarkResult& result) {
+	{
+		std::ofstream out(output_dir / (result.label + "_summary.csv"));
+		out << "layout,compressed_data_size,total_output_size,semantic_compression_ratio,"
+		       "encode_ms,decode_ms,row_lookup_ns,rowgroup_count,shard_count\n";
+		out << result.label << ',' << result.compressed_data_size << ',' << result.total_output_size << ','
+		    << result.semantic_compression_ratio << ',' << result.encode_ms << ',' << result.decode_ms << ','
+		    << result.crop_lookup_latency_ns << ',' << result.rowgroup_count << ',' << result.shard_count << '\n';
+	}
+	{
+		std::ofstream out(output_dir / (result.label + "_tokens.csv"));
+		out << "layout,token,gpu_supported,rowgroup_count,column_count,compressed_bytes\n";
+		for (const auto& [token, stat] : result.token_stats) {
+			out << result.label << ',' << fastlanes::token_to_string(token) << ','
+			    << (galp::expression::is_supported_token(token) ? "true" : "false") << ',' << stat.rowgroup_count
+			    << ',' << stat.column_count << ',' << stat.compressed_bytes << '\n';
+		}
+	}
+	{
+		std::ofstream out(output_dir / (result.label + "_coefficients.csv"));
+		out << "layout,coefficient_id,token,gpu_supported,rowgroup_count,column_count,compressed_bytes\n";
+		for (size_t coefficient = 0; coefficient < result.coefficient_token_stats.size(); ++coefficient) {
+			for (const auto& [token, stat] : result.coefficient_token_stats[coefficient]) {
+				out << result.label << ',' << coefficient << ',' << fastlanes::token_to_string(token) << ','
+				    << (galp::expression::is_supported_token(token) ? "true" : "false") << ','
+				    << stat.rowgroup_count << ',' << stat.column_count << ',' << stat.compressed_bytes << '\n';
+			}
+		}
+	}
+}
+
+void print_wizard_expression_stats(const BenchmarkResult& result) {
+	std::cout << "\nWizard-selected root expressions\n";
+	std::cout << "token,rowgroups,columns,compressed_bytes,gpu_supported\n";
+	for (const auto& [token, stat] : result.token_stats) {
+		std::cout << fastlanes::token_to_string(token) << ',' << stat.rowgroup_count << ',' << stat.column_count << ','
+		          << stat.compressed_bytes << ',' << (galp::expression::is_supported_token(token) ? "true" : "false")
+		          << '\n';
+	}
+}
+
 void print_csv_header() {
-	std::cout << "policy,total_output_size,semantic_compression_ratio,encode_ms,decode_ms,"
+	std::cout << "layout,total_output_size,semantic_compression_ratio,encode_ms,decode_ms,"
 	             "crop_lookup_latency_ns,expansion_vs_jpeg,peak_rss_bytes,"
 	             "compressed_data_size,metadata_size,source_jpeg_size,real_row_count,padding_row_count,"
 	             "physical_row_count,shard_count,rowgroup_count,block_group_count,physical_compression_ratio,"
 	             "decode_supported,decode_error\n";
 }
 
-void print_csv_row(const PolicyResult& r) {
-	std::cout << r.policy << ',' << r.total_output_size << ',' << r.semantic_compression_ratio << ',' << r.encode_ms
+void print_csv_row(const BenchmarkResult& r) {
+	std::cout << r.label << ',' << r.total_output_size << ',' << r.semantic_compression_ratio << ',' << r.encode_ms
 	          << ',' << r.decode_ms << ',' << r.crop_lookup_latency_ns << ',' << r.expansion_vs_jpeg << ','
 	          << r.peak_rss_bytes << ',' << r.compressed_data_size << ',' << r.metadata_size << ','
 	          << r.source_jpeg_size << ',' << r.real_row_count << ',' << r.padding_row_count << ','
@@ -353,39 +525,40 @@ void print_csv_row(const PolicyResult& r) {
 	          << r.decode_error << '"' << '\n';
 }
 
-void print_human_metric(const char* name, const std::string& ragged) {
-	std::cout << std::left << std::setw(30) << name << std::right << std::setw(18) << ragged << '\n';
+void print_human_metric(const char* name, const std::string& value) {
+	std::cout << std::left << std::setw(30) << name << std::right << std::setw(18) << value << '\n';
 }
 
 void print_human_report(const std::vector<std::filesystem::path>& paths,
                         const std::filesystem::path&              output_dir,
-                        const PolicyResult&                       ragged) {
-	std::cout << "JPEG DCT sharded ragged benchmark\n";
+                        const BenchmarkResult&                    result) {
+	std::cout << "JPEG DCT sharded benchmark\n";
 	std::cout << "images: " << format_count(paths.size()) << '\n';
 	std::cout << "output_dir: " << output_dir << "\n\n";
-	std::cout << std::left << std::setw(30) << "metric" << std::right << std::setw(18) << "ragged" << '\n';
+	std::cout << std::left << std::setw(30) << "metric" << std::right << std::setw(18) << result.label << '\n';
 	std::cout << std::string(48, '-') << '\n';
-	print_human_metric("total output", format_bytes(ragged.total_output_size));
-	print_human_metric("compressed data", format_bytes(ragged.compressed_data_size));
-	print_human_metric("metadata", format_bytes(ragged.metadata_size));
-	print_human_metric("source JPEG", format_bytes(ragged.source_jpeg_size));
-	print_human_metric("expansion vs JPEG", format_ratio(ragged.expansion_vs_jpeg));
-	print_human_metric("semantic ratio", format_ratio(ragged.semantic_compression_ratio));
-	print_human_metric("encode", format_ms(ragged.encode_ms));
-	print_human_metric("decode", ragged.decode_supported ? format_ms(ragged.decode_ms) : "unsupported");
-	print_human_metric("crop lookup", ragged.decode_supported ? format_ns(ragged.crop_lookup_latency_ns) : "unsupported");
-	print_human_metric("peak RSS", format_bytes(ragged.peak_rss_bytes));
-	print_human_metric("real rows", format_count(ragged.real_row_count));
-	print_human_metric("padding rows", format_count(ragged.padding_row_count));
-	print_human_metric("physical rows", format_count(ragged.physical_row_count));
-	print_human_metric("shards", format_count(ragged.shard_count));
-	print_human_metric("rowgroups", format_count(ragged.rowgroup_count));
-	print_human_metric("block groups", format_count(ragged.block_group_count));
-	print_human_metric("physical ratio", format_ratio(ragged.physical_compression_ratio));
-	if (!ragged.decode_supported) {
+	print_human_metric("total output", format_bytes(result.total_output_size));
+	print_human_metric("compressed data", format_bytes(result.compressed_data_size));
+	print_human_metric("metadata", format_bytes(result.metadata_size));
+	print_human_metric("source JPEG", format_bytes(result.source_jpeg_size));
+	print_human_metric("expansion vs JPEG", format_ratio(result.expansion_vs_jpeg));
+	print_human_metric("semantic ratio", format_ratio(result.semantic_compression_ratio));
+	print_human_metric("encode", format_ms(result.encode_ms));
+	print_human_metric("decode", result.decode_supported ? format_ms(result.decode_ms) : "unsupported");
+	print_human_metric("crop lookup", result.decode_supported ? format_ns(result.crop_lookup_latency_ns) : "unsupported");
+	print_human_metric("peak RSS", format_bytes(result.peak_rss_bytes));
+	print_human_metric("real rows", format_count(result.real_row_count));
+	print_human_metric("padding rows", format_count(result.padding_row_count));
+	print_human_metric("physical rows", format_count(result.physical_row_count));
+	print_human_metric("shards", format_count(result.shard_count));
+	print_human_metric("rowgroups", format_count(result.rowgroup_count));
+	print_human_metric("block groups", format_count(result.block_group_count));
+	print_human_metric("physical ratio", format_ratio(result.physical_compression_ratio));
+	if (!result.decode_supported) {
 		std::cout << "\ndecode note:\n";
-		std::cout << "  ragged: " << ragged.decode_error << '\n';
+		std::cout << "  " << result.label << ": " << result.decode_error << '\n';
 	}
+	print_wizard_expression_stats(result);
 }
 
 } // namespace
@@ -401,12 +574,16 @@ int main(const int argc, char** argv) {
 		std::filesystem::create_directories(options.output_dir);
 		const auto paths = collect_jpegs(options.input);
 
-		const auto ragged = run_policy(paths, options.output_dir, options, "ragged");
+		const bool image_major = options.spatial_order_specified ||
+		                         options.preset == galp::jpeg::JpegDctShardPreset::kRandomAccess;
+		const auto label  = image_major ? spatial_order_name(options.spatial_order) : "spatial_major";
+		const auto result = run_benchmark(paths, options.output_dir, options, label);
+		write_result_csv_files(options.output_dir, result);
 		if (options.csv) {
 			print_csv_header();
-			print_csv_row(ragged);
+			print_csv_row(result);
 		} else {
-			print_human_report(paths, options.output_dir, ragged);
+			print_human_report(paths, options.output_dir, result);
 		}
 		return 0;
 	} catch (const std::exception& e) {

@@ -1,6 +1,7 @@
 #ifndef GALP_JPEG_DCT_ORDER_HPP
 #define GALP_JPEG_DCT_ORDER_HPP
 
+#include "galp/jpeg_dct.hpp"
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -29,6 +30,19 @@ uint64_t morton_key(uint32_t x, uint32_t y);
 std::vector<MortonBlockCoord> make_block_order(uint32_t width_in_blocks,
                                                uint32_t height_in_blocks,
                                                bool     use_z_curve_order);
+
+std::vector<MortonBlockCoord> make_block_order(uint32_t            width_in_blocks,
+                                               uint32_t            height_in_blocks,
+                                               JpegDctSpatialOrder spatial_order);
+
+// Dense rank of (x, y) in make_block_order(). This is O(log(max(width,
+// height))) for Z modes and O(1) for raster modes, including ragged edge
+// tiles, so the hot image-major planner does not need a per-image rank table.
+uint64_t block_order_rank(uint32_t            width_in_blocks,
+                          uint32_t            height_in_blocks,
+                          uint32_t            x,
+                          uint32_t            y,
+                          JpegDctSpatialOrder spatial_order);
 
 } // namespace galp::jpeg::detail
 
