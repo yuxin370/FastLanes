@@ -14,6 +14,7 @@
 #include "codecs/encodings/cross_rle.cuh"
 #include "codecs/encodings/cross_rle_extended.cuh"
 #include "codecs/encodings/cross_rle_lane_mask.cuh"
+#include "codecs/encodings/delta.cuh"
 #include "codecs/encodings/dict_ffor.cuh"
 #include "codecs/encodings/dict_ref.cuh"
 #include "codecs/encodings/dict_slpatch.cuh"

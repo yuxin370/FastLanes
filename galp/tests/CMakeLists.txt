@@ -2,6 +2,7 @@ add_executable(galp_tests
         thrust_memcpy_test.cu
         thrust_core_test.cu
         galp_test.cu
+		delta_test.cu
         reader_test.cu
         workset_selected_vectors_test.cu
         jpeg_dct_order_test.cpp
@@ -93,12 +94,12 @@ gtest_discover_tests(galp_tests
         PROPERTIES LABELS "galp-workset-cpu"
 )
 gtest_discover_tests(galp_tests
-        TEST_FILTER "ThrustMemcpy.*:ThrustCore.*:DeviceUtils.*:JpegDct.*:JpegDctOrder.*"
+		TEST_FILTER "ThrustMemcpy.*:ThrustCore.*:DeviceUtils.*:DeltaUnsumer.*:DeltaDecode.*:JpegDct.*:JpegDctMixedExpressions.*:JpegDctOrder.*"
         DISCOVERY_TIMEOUT 60
         PROPERTIES LABELS "galp-gpu-cuda"
 )
 gtest_discover_tests(galp_tests
-        TEST_FILTER "Materialize.*:Reader.*"
+	        TEST_FILTER "Materialize.*:Reader.*:ExternalDictionaryI16.*"
         DISCOVERY_TIMEOUT 60
         PROPERTIES LABELS "galp-gpu-reader"
 )

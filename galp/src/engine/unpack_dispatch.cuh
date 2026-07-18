@@ -22,10 +22,11 @@ inline void validate_unpack_config(const ExecutionConfig& cfg) {
 
 	switch (cfg.unpack_n_vectors) {
 	case 1:
+	case 2:
 	case galp::codec::consts::MAX_UNPACK_N_VECS:
 		return;
 	default:
-		throw std::invalid_argument("unsupported unpack config: supported tuples are (1,1) and (4,1)");
+		throw std::invalid_argument("unsupported unpack config: supported tuples are (1,1), (2,1), and (4,1)");
 	}
 }
 
@@ -36,11 +37,13 @@ decltype(auto) with_unpack_config(const ExecutionConfig& cfg, Fn&& fn) {
 	switch (cfg.unpack_n_vectors) {
 	case 1:
 		return fn(std::integral_constant<unsigned, 1> {}, std::integral_constant<unsigned, 1> {});
+	case 2:
+		return fn(std::integral_constant<unsigned, 2> {}, std::integral_constant<unsigned, 1> {});
 	case galp::codec::consts::MAX_UNPACK_N_VECS:
 		return fn(std::integral_constant<unsigned, galp::codec::consts::MAX_UNPACK_N_VECS> {},
 		          std::integral_constant<unsigned, 1> {});
 	default:
-		throw std::invalid_argument("unsupported unpack config: supported tuples are (1,1) and (4,1)");
+		throw std::invalid_argument("unsupported unpack config: supported tuples are (1,1), (2,1), and (4,1)");
 	}
 }
 

@@ -8,7 +8,7 @@
 
 #include "codecs/encodings/all.cuh"
 #include "core/data/model.cuh"
-#include "fls/footer/operator_token_generated.h"
+#include "core/operator_capabilities.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -20,63 +20,11 @@ struct Expression {
 	galp::execution::Column* column; // non-owning
 };
 
-inline bool is_supported_token(const fastlanes::OperatorToken token) {
-	using enum fastlanes::OperatorToken;
-	switch (token) {
-	case EXP_UNCOMPRESSED_I08:
-	case EXP_CONSTANT_I08:
-	case EXP_FFOR_I08:
-	case EXP_FFOR_I16:
-	case EXP_FFOR_SLPATCH_I08:
-	case EXP_FFOR_SLPATCH_I16:
-	case EXP_FREQUENCY_I08:
-	case EXP_FREQUENCY_I16:
-	case EXP_CROSS_RLE_I08:
-	case EXP_CROSS_RLE_I16:
-	case EXP_RLE_I08_U16:
-	case EXP_RLE_I16_U16:
-	case EXP_RLE_I08_SLPATCH_U16:
-	case EXP_RLE_I16_SLPATCH_U16:
-	case EXP_EQUAL:
-	case EXP_DICT_I08_FFOR_SLPATCH_U08:
-	case EXP_DICT_I16_FFOR_SLPATCH_U08:
-	case EXP_DICT_I16_FFOR_SLPATCH_U16:
-	case EXP_DICT_I08_FFOR_U08:
-	case EXP_DICT_I16_FFOR_U16:
-	case EXP_DICT_I16_FFOR_U08:
-	case EXP_DICT_I08_U08:
-		return true;
-	default:
-		return false;
-	}
-}
-
 std::vector<Expression> assemble(galp::execution::Rowgroup& rowgroup);
 
 } // namespace galp::expression
 
 namespace galp::execution {
-
-enum class PlanKind : uint8_t {
-	UNCOMPRESSED,
-	CONSTANT,
-	UNFFOR,
-	UNFFOR_SLPATCH,
-	RLE_U8,
-	RLE_U16,
-	RLE_SLPATCH_U16,
-	FREQUENCY,
-	CROSS_RLE,
-	DICT_FFOR_U8,
-	DICT_FFOR_U16,
-	DICT_FFOR_SLPATCH_U8,
-	DICT_FFOR_SLPATCH_U16,
-};
-
-enum class TypeTag : uint8_t {
-	I8,
-	I16,
-};
 
 struct WorkItemAny {
 	uint32_t expr_index;
@@ -123,6 +71,7 @@ struct DeviceExpression {
 	union {
 		galp::codec::device::BPColumn<T>                    bp;
 		galp::codec::device::CONSTANTColumn<T>              constant;
+		galp::codec::device::DELTAColumn<T>                 delta;
 		galp::codec::device::FFORColumn<T>                  ffor;
 		galp::codec::device::SLPATCHColumn<T>               slpatch;
 		galp::codec::device::DICTFFORColumn<T, uint16_t>    dictffor_u16;

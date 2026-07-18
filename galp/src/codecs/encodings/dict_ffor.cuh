@@ -7,7 +7,7 @@
 #define GALP_COMPRESSION_COLUMNS_DICT_FFOR_CUH
 
 #include "codecs/encodings/ffor.cuh"
-#include <cstring>
+#include <type_traits>
 #include <utility>
 
 namespace galp::codec {
@@ -85,27 +85,36 @@ void free_column(device::DICTFFORColumn<T, IndexT> column) {
 	free_device_pointer(column.keys);
 }
 
-inline galp::codec::host::FFORColumn<uint8_t> make_ffor_u8_from_ffor_i8(const galp::codec::host::FFORColumn<int8_t>& col) {
-	auto*                           packed = galp::codec::utils::copy_array(col.bp.packed_array.get(), col.bp.n_packed_values);
-	auto*                           bws    = galp::codec::utils::copy_array(col.bp.bit_widths.get(), col.bp.get_n_vecs());
-	auto*                           offs   = galp::codec::utils::copy_array(col.bp.vector_offsets.get(), col.bp.get_n_vecs());
-	galp::codec::host::BPColumn<uint8_t> bp {col.bp.n_values, col.bp.n_packed_values, packed, bws, offs};
+template <typename IndexT, typename SourceT>
+galp::codec::host::FFORColumn<IndexT>
+make_index_ffor_from_ffor(const galp::codec::host::FFORColumn<SourceT>& col) {
+	static_assert(std::is_unsigned_v<IndexT>, "dictionary indexes must be unsigned");
+	static_assert(sizeof(IndexT) == sizeof(SourceT), "dictionary index conversion must preserve width");
+	using SourceUInt = typename galp::codec::utils::same_width_uint<SourceT>::type;
+	static_assert(std::is_same_v<IndexT, SourceUInt>, "dictionary index storage types must match");
 
-	auto* bases = new uint8_t[col.get_n_vecs()];
-	for (size_t i = 0; i < col.get_n_vecs(); ++i) {
-		bases[i] = static_cast<uint8_t>(col.bases[i]);
-	}
-		return galp::codec::host::FFORColumn<uint8_t> {std::move(bp), bases};
+	auto* packed = galp::codec::utils::copy_array(col.bp.packed_array.get(), col.bp.n_packed_values);
+	auto* bws    = galp::codec::utils::copy_array(col.bp.bit_widths.get(), col.bp.get_n_vecs());
+	auto* offs   = galp::codec::utils::copy_array(col.bp.vector_offsets.get(), col.bp.get_n_vecs());
+	galp::codec::host::BPColumn<IndexT> bp {col.bp.n_values, col.bp.n_packed_values, packed, bws, offs};
+	auto* bases = galp::codec::utils::copy_array(col.bases.get(), col.get_n_vecs());
+	return galp::codec::host::FFORColumn<IndexT> {std::move(bp), bases};
 }
 
-inline galp::codec::host::FFORColumn<uint8_t> make_ffor_u8_from_bp_i8(const galp::codec::host::BPColumn<int8_t>& col) {
-	auto*                           packed = galp::codec::utils::copy_array(col.packed_array.get(), col.n_packed_values);
-	auto*                           bws    = galp::codec::utils::copy_array(col.bit_widths.get(), col.get_n_vecs());
-	auto*                           offs   = galp::codec::utils::copy_array(col.vector_offsets.get(), col.get_n_vecs());
-	galp::codec::host::BPColumn<uint8_t> bp {col.n_values, col.n_packed_values, packed, bws, offs};
-	auto*                           bases = new uint8_t[bp.get_n_vecs()];
-	std::memset(bases, 0, bp.get_n_vecs() * sizeof(uint8_t));
-		return galp::codec::host::FFORColumn<uint8_t> {std::move(bp), bases};
+template <typename IndexT, typename SourceT>
+galp::codec::host::FFORColumn<IndexT>
+make_index_ffor_from_bp(const galp::codec::host::BPColumn<SourceT>& col) {
+	static_assert(std::is_unsigned_v<IndexT>, "dictionary indexes must be unsigned");
+	static_assert(sizeof(IndexT) == sizeof(SourceT), "dictionary index conversion must preserve width");
+	using SourceUInt = typename galp::codec::utils::same_width_uint<SourceT>::type;
+	static_assert(std::is_same_v<IndexT, SourceUInt>, "dictionary index storage types must match");
+
+	auto* packed = galp::codec::utils::copy_array(col.packed_array.get(), col.n_packed_values);
+	auto* bws    = galp::codec::utils::copy_array(col.bit_widths.get(), col.get_n_vecs());
+	auto* offs   = galp::codec::utils::copy_array(col.vector_offsets.get(), col.get_n_vecs());
+	galp::codec::host::BPColumn<IndexT> bp {col.n_values, col.n_packed_values, packed, bws, offs};
+	auto* bases = new IndexT[bp.get_n_vecs()] {};
+	return galp::codec::host::FFORColumn<IndexT> {std::move(bp), bases};
 }
 
 } // namespace host

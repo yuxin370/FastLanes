@@ -4,9 +4,11 @@
 // galp/src/engine/materialization/zero_copy_materializer.cu
 // ────────────────────────────────────────────────────────
 #include "format/compression_column_builder.cuh"
+#include "core/expression.cuh"
 #include "engine/materialization/zero_copy_materializer.cuh"
 #include "fls/expression/rpn.hpp"
 #include <flatbuffers/base.h>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -73,6 +75,13 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				    << ")";
 				throw std::runtime_error(msg.str());
 			}
+			if (!galp::expression::is_supported_token(zcol.token)) {
+				std::ostringstream msg;
+				msg << "GPU-unsupported operator token in zero-copy materializer (col_index=" << zcol.column_index
+				    << ", name=" << zero_copy_column_name(zcol)
+				    << ", token=" << fastlanes::token_to_string(zcol.token) << ")";
+				throw std::runtime_error(msg.str());
+			}
 			switch (zcol.token) {
 				using enum fastlanes::OperatorToken;
 			case EXP_UNCOMPRESSED_I08: {
@@ -82,6 +91,16 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				const auto seg = zero_copy_segment(
 				    zcol, static_cast<uint32_t>(zero_copy_operand(zcol, zero_copy_operand_count(zcol) - 1)));
 				result.host                  = make_uncompressed_zero_copy<int8_t>(seg, zero_copy.n_values, *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
+			case EXP_UNCOMPRESSED_I16: {
+				if (zero_copy_operand_count(zcol) < 1) {
+					throw std::runtime_error("EXP_UNCOMPRESSED_I16: missing operand tokens");
+				}
+				const auto seg = zero_copy_segment(
+				    zcol, static_cast<uint32_t>(zero_copy_operand(zcol, zero_copy_operand_count(zcol) - 1)));
+				result.host                  = make_uncompressed_zero_copy<int16_t>(seg, zero_copy.n_values, *storage);
 				result.host_owned_by_backing = true;
 				break;
 			}
@@ -95,6 +114,23 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				}
 				const auto value             = *reinterpret_cast<const int8_t*>(bin->data());
 				result.host                  = galp::codec::host::CONSTANTColumn<int8_t> {zero_copy.n_values, value};
+				result.host_owned_by_backing = false;
+				break;
+			}
+			case EXP_CONSTANT_I16: {
+				if (zcol.column_descriptor == nullptr || !zcol.column_descriptor->max()) {
+					throw std::runtime_error("EXP_CONSTANT_I16: missing max value");
+				}
+				const auto* bin = zcol.column_descriptor->max()->binary_data();
+				if (bin == nullptr || bin->size() != sizeof(int16_t)) {
+					std::ostringstream msg;
+					msg << "EXP_CONSTANT_I16: invalid constant size (expected=" << sizeof(int16_t)
+					    << ", actual=" << (bin == nullptr ? 0 : bin->size()) << ")";
+					throw std::runtime_error(msg.str());
+				}
+				int16_t value {};
+				std::memcpy(&value, bin->data(), sizeof(value));
+				result.host                  = galp::codec::host::CONSTANTColumn<int16_t> {zero_copy.n_values, value};
 				result.host_owned_by_backing = false;
 				break;
 			}
@@ -163,6 +199,42 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 0)));
 				result.host = make_ffor_zero_copy<int16_t>(
 				    seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
+			case EXP_DELTA_I08: {
+				if (zero_copy_operand_count(zcol) < 4) {
+					throw std::runtime_error("EXP_DELTA_I08: missing operand tokens");
+				}
+				const size_t base_idx = zero_copy_operand_count(zcol) - 1;
+				const auto seg_rsum =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 3)));
+				const auto seg_bitpacked =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 2)));
+				const auto seg_bw =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 1)));
+				const auto seg_base =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 0)));
+				result.host = make_delta_zero_copy<int8_t>(
+				    seg_rsum, seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
+			case EXP_DELTA_I16: {
+				if (zero_copy_operand_count(zcol) < 4) {
+					throw std::runtime_error("EXP_DELTA_I16: missing operand tokens");
+				}
+				const size_t base_idx = zero_copy_operand_count(zcol) - 1;
+				const auto seg_rsum =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 3)));
+				const auto seg_bitpacked =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 2)));
+				const auto seg_bw =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 1)));
+				const auto seg_base =
+				    zero_copy_segment(zcol, static_cast<uint32_t>(zero_copy_operand(zcol, base_idx - 0)));
+				result.host = make_delta_zero_copy<int16_t>(
+				    seg_rsum, seg_bitpacked, seg_bw, seg_base, zero_copy.n_values, zero_copy.n_vecs, *storage);
 				result.host_owned_by_backing = true;
 				break;
 			}
@@ -300,6 +372,30 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
                     zcol, static_cast<uint32_t>(zero_copy_operand(zcol, zero_copy_operand_count(zcol) - 1)));
 				result.host =
 				    make_dict_ref_zero_copy<int8_t, uint8_t>(seg_keys, index_col_idx, zero_copy.n_values, *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
+			case EXP_DICT_I16_U08: {
+				if (zero_copy_operand_count(zcol) < 2) {
+					throw std::runtime_error("EXP_DICT_I16_U08: missing operand tokens");
+				}
+				const auto index_col_idx = static_cast<uint32_t>(zero_copy_operand(zcol, 0));
+				const auto seg_keys      = zero_copy_segment(
+				    zcol, static_cast<uint32_t>(zero_copy_operand(zcol, zero_copy_operand_count(zcol) - 1)));
+				result.host =
+				    make_dict_ref_zero_copy<int16_t, uint8_t>(seg_keys, index_col_idx, zero_copy.n_values, *storage);
+				result.host_owned_by_backing = true;
+				break;
+			}
+			case EXP_DICT_I16_U16: {
+				if (zero_copy_operand_count(zcol) < 2) {
+					throw std::runtime_error("EXP_DICT_I16_U16: missing operand tokens");
+				}
+				const auto index_col_idx = static_cast<uint32_t>(zero_copy_operand(zcol, 0));
+				const auto seg_keys      = zero_copy_segment(
+				    zcol, static_cast<uint32_t>(zero_copy_operand(zcol, zero_copy_operand_count(zcol) - 1)));
+				result.host =
+				    make_dict_ref_zero_copy<int16_t, uint16_t>(seg_keys, index_col_idx, zero_copy.n_values, *storage);
 				result.host_owned_by_backing = true;
 				break;
 			}

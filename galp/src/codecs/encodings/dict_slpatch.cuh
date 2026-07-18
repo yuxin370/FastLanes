@@ -97,19 +97,24 @@ void free_column(device::DICTSLPATCHColumn<T, IndexT> column) {
 	free_device_pointer(column.keys);
 }
 
-inline galp::codec::host::SLPATCHColumn<uint8_t>
-make_slpatch_u8_from_slpatch_i8(const galp::codec::host::SLPATCHColumn<int8_t>& col) {
-	auto index_ffor = make_ffor_u8_from_ffor_i8(col.ffor);
+template <typename IndexT, typename SourceT>
+galp::codec::host::SLPATCHColumn<IndexT>
+make_index_slpatch_from_slpatch(const galp::codec::host::SLPATCHColumn<SourceT>& col) {
+	static_assert(std::is_unsigned_v<IndexT>, "dictionary indexes must be unsigned");
+	static_assert(sizeof(IndexT) == sizeof(SourceT), "dictionary index conversion must preserve width");
+	using SourceUInt = typename galp::codec::utils::same_width_uint<SourceT>::type;
+	static_assert(std::is_same_v<IndexT, SourceUInt>, "dictionary index storage types must match");
 
-		auto* offsets     = galp::codec::utils::copy_array(col.exceptions_offsets.get(), col.n_vecs);
-		auto* pos         = galp::codec::utils::copy_array(col.positions.get(), col.n_exceptions);
-		auto* cnt         = galp::codec::utils::copy_array(col.counts.get(), col.n_vecs);
-	auto* exc         = new uint8_t[col.n_exceptions];
+	auto  index_ffor = make_index_ffor_from_ffor<IndexT>(col.ffor);
+	auto* offsets    = galp::codec::utils::copy_array(col.exceptions_offsets.get(), col.n_vecs);
+	auto* pos        = galp::codec::utils::copy_array(col.positions.get(), col.n_exceptions);
+	auto* cnt        = galp::codec::utils::copy_array(col.counts.get(), col.n_vecs);
+	auto* exc        = new IndexT[col.n_exceptions];
 	for (size_t i = 0; i < col.n_exceptions; ++i) {
-		exc[i] = static_cast<uint8_t>(col.exceptions[i]);
+		exc[i] = static_cast<IndexT>(col.exceptions[i]);
 	}
 
-	return galp::codec::host::SLPATCHColumn<uint8_t> {
+	return galp::codec::host::SLPATCHColumn<IndexT> {
 	    col.n_values, col.n_vecs, std::move(index_ffor), col.n_exceptions, offsets, exc, pos, cnt};
 }
 

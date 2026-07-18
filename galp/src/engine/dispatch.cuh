@@ -65,6 +65,25 @@ __device__ __forceinline__ void execute_plan(const galp::execution::DeviceExpres
 		run_decompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(iterator, lane, out);
 		break;
 	}
+	case galp::execution::PlanKind::DELTA: {
+		using UIntT = typename galp::codec::utils::same_width_uint<T>::type;
+		using UnpackerT = galp::codec::device::BitUnpackerStatefulBranchless<
+		    UIntT,
+		    UNPACK_N_VECTORS,
+		    UNPACK_N_VALUES,
+		    galp::codec::device::FFORFunctor<UIntT, UNPACK_N_VECTORS>>;
+		using ColumnT = galp::codec::device::DELTAColumn<T>;
+		using DecompressorT =
+		    galp::codec::device::DELTADecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT>;
+		auto iterator = DecompressorT(expr.col.delta, vector_index, lane);
+		run_decompressor<T,
+		                 UNPACK_N_VECTORS,
+		                 UNPACK_N_VALUES,
+		                 WRITE_OUT,
+		                 T,
+		                 galp::codec::device::FastLanes1024InputUntransposer>(iterator, lane, out);
+		break;
+	}
 	case galp::execution::PlanKind::UNFFOR: {
 		using UnpackerT =
 		    galp::codec::device::BitUnpackerStatefulBranchless<T,

@@ -4,18 +4,25 @@
 // galp/tests/reader_test.cu
 // ────────────────────────────────────────────────────────
 #include "engine/materialization/pinned_d2h.cuh"
+#include "engine/materialization/metadata.cuh"
+#include "engine/operators/column.cuh"
 #include "engine/operators/rowgroup.cuh"
 #include "engine/pipeline/pipeline.cuh"
 #include "engine/table/table.cuh"
+#include "engine/workset/append.cuh"
+#include "engine/workset/upload.cuh"
+#include "cuda/launch/launch.cuh"
 #include "format/reader.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/reader/table_reader.hpp"
+#include "fls/table/memory_table.hpp"
 #include "fls/table/rowgroup.hpp"
 #include "codecs/encodings/all.cuh"
 #include "galp/galp.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -116,27 +123,13 @@ format_window(const OutT* out, const std::vector<ExpT>& expected, size_t start, 
 }
 
 std::unordered_set<fastlanes::OperatorToken> supported_tokens() {
-	return {
-	    fastlanes::OperatorToken::EXP_FFOR_SLPATCH_I08,
-	    fastlanes::OperatorToken::EXP_FREQUENCY_I08,
-	    fastlanes::OperatorToken::EXP_FREQUENCY_I16,
-	    fastlanes::OperatorToken::EXP_CROSS_RLE_I08,
-	    fastlanes::OperatorToken::EXP_CROSS_RLE_I16,
-	    fastlanes::OperatorToken::EXP_FFOR_SLPATCH_I16,
-	    fastlanes::OperatorToken::EXP_CONSTANT_I08,
-	    fastlanes::OperatorToken::EXP_DICT_I08_FFOR_SLPATCH_U08,
-	    fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08,
-	    fastlanes::OperatorToken::EXP_FFOR_I08,
-	    fastlanes::OperatorToken::EXP_FFOR_I16,
-	    fastlanes::OperatorToken::EXP_DICT_I08_FFOR_U08,
-	    fastlanes::OperatorToken::EXP_DICT_I08_U08,
-	    fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U16,
-	    fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U08,
-	    fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U16,
-	    fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U08,
-	    fastlanes::OperatorToken::EXP_RLE_I08_U16,
-	    fastlanes::OperatorToken::EXP_RLE_I16_U16,
-	};
+	std::unordered_set<fastlanes::OperatorToken> out;
+	for (const auto& capability : galp::expression::kOperatorCapabilities) {
+		if (capability.gpu_supported) {
+			out.insert(capability.token);
+		}
+	}
+	return out;
 }
 
 bool cuda_available_for_reader_tests() {
@@ -275,6 +268,757 @@ std::filesystem::path make_cross_rle_i16_fls_fixture() {
 	    .read_csv(root)
 	    .to_fls(fls_path);
 	return fls_path;
+}
+
+std::filesystem::path make_forced_i16_fls_fixture(const fastlanes::OperatorToken token,
+                                                  const std::string&              label,
+                                                  const std::vector<int16_t>&     values) {
+	const std::filesystem::path root = std::filesystem::path {GALP_TEST_DATA_DIR} / label;
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+
+	const auto fls_path = root / "data.fls";
+	const std::array<fastlanes::MemoryColumn, 1> columns {
+	    fastlanes::MemoryColumn {"value", std::span<const int16_t>(values.data(), values.size())}};
+	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 70;
+	// Forced schemas intentionally bypass wizard statistics. Constants need
+	// the wizard's max-value metadata, whereas uncompressed is safely forced.
+	if (token != fastlanes::OperatorToken::EXP_CONSTANT_I16) {
+		options.force_schema  = true;
+		options.forced_schema = {token};
+	}
+	fastlanes::write_memory_table_to_fls(table, fls_path, options);
+	return fls_path;
+}
+
+void expect_forced_i16_gpu_roundtrip(const fastlanes::OperatorToken token,
+                                     const std::string&              label,
+                                     const std::vector<int16_t>&     expected) {
+	const auto fls_path = make_forced_i16_fls_fixture(token, label, expected);
+
+	const auto  td_handle = galp::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	ASSERT_NE(td->m_rowgroup_descriptors(), nullptr);
+	ASSERT_EQ(td->m_rowgroup_descriptors()->size(), 1U);
+	const auto* rg = td->m_rowgroup_descriptors()->Get(0);
+	ASSERT_NE(rg, nullptr);
+	ASSERT_GT(rg->m_n_vec(), 64U);
+	ASSERT_NE(rg->m_column_descriptors(), nullptr);
+	ASSERT_EQ(rg->m_column_descriptors()->size(), 1U);
+	const auto* col = rg->m_column_descriptors()->Get(0);
+	ASSERT_NE(col, nullptr);
+	ASSERT_NE(col->encoding_rpn(), nullptr);
+	ASSERT_NE(col->encoding_rpn()->operator_tokens(), nullptr);
+	ASSERT_EQ(col->encoding_rpn()->operator_tokens()->size(), 1U);
+	ASSERT_EQ(col->encoding_rpn()->operator_tokens()->Get(0), token);
+
+	galp::format::FlsReader reader(fls_path);
+	auto                    rowgroup = reader.read_rowgroup(0);
+	ASSERT_EQ(rowgroup.n_tuples, expected.size());
+	ASSERT_EQ(rowgroup.columns.size(), 1U);
+	EXPECT_EQ(rowgroup.columns[0].token, token);
+	if (token == fastlanes::OperatorToken::EXP_CONSTANT_I16) {
+		EXPECT_TRUE((std::holds_alternative<galp::codec::host::CONSTANTColumn<int16_t>>(rowgroup.columns[0].host)));
+	} else {
+		EXPECT_TRUE((std::holds_alternative<galp::codec::host::BPColumn<int16_t>>(rowgroup.columns[0].host)));
+	}
+
+	auto expressions = galp::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 1U);
+	galp::execution::ExecutionConfig config {};
+	config.unpack_n_vectors = 1;
+	config.write_out        = true;
+	const auto result       = galp::execution::decompress_rowgroup(expressions, config);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+	ASSERT_EQ(result.columns[0]->meta.value_count, rowgroup.n_values);
+	const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[0]->values);
+	ASSERT_NE(output, nullptr);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		ASSERT_EQ(output[row], expected[row]) << "token=" << fastlanes::token_to_string(token) << " row=" << row;
+	}
+	for (size_t row = expected.size(); row < rowgroup.n_values; ++row) {
+		ASSERT_EQ(output[row], expected.back())
+		    << "padded token=" << fastlanes::token_to_string(token) << " row=" << row;
+	}
+}
+
+struct ExternalDictI16Fixture {
+	std::filesystem::path   root;
+	std::filesystem::path   fls_path;
+	std::vector<int16_t>    source;
+	std::vector<int16_t>    mapped;
+	fastlanes::OperatorToken expected_ref_token;
+};
+
+ExternalDictI16Fixture make_external_dict_i16_fixture(const size_t cardinality, const std::string& label) {
+	if (cardinality == 0 || cardinality > 1024) {
+		throw std::invalid_argument("external dictionary fixture cardinality is outside the test range");
+	}
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	ExternalDictI16Fixture fixture;
+	fixture.root = std::filesystem::temp_directory_path() /
+	               ("galp_external_dict_i16_" + label + "_" + std::to_string(suffix));
+	fixture.fls_path = fixture.root / "data.fls";
+	fixture.expected_ref_token = cardinality <= 256U ? fastlanes::OperatorToken::EXP_DICT_I16_U08
+	                                                : fastlanes::OperatorToken::EXP_DICT_I16_U16;
+	std::filesystem::create_directories(fixture.root);
+
+	const size_t n_values = 12U * galp::codec::consts::VALUES_PER_VECTOR;
+	fixture.source.resize(n_values);
+	fixture.mapped.resize(n_values);
+	for (size_t row = 0; row < n_values; ++row) {
+		const size_t rank    = row % cardinality;
+		const size_t mapping = (rank * 37U) % cardinality;
+		fixture.source[row]  = static_cast<int16_t>(static_cast<int>(rank) - static_cast<int>(cardinality / 2U));
+		fixture.mapped[row]  = static_cast<int16_t>(static_cast<int>(mapping) * 41 - 15000);
+	}
+	{
+		std::ofstream schema(fixture.root / "schema.json");
+		schema << R"({"columns":[{"name":"source","type":"FLS_I16"},{"name":"mapped","type":"FLS_I16"}]})";
+	}
+	{
+		std::ofstream csv(fixture.root / "generated.csv");
+		for (size_t row = 0; row < n_values; ++row) {
+			csv << fixture.source[row] << '|' << fixture.mapped[row] << '\n';
+		}
+	}
+	fastlanes::Connection writer;
+	writer.set_n_vectors_per_rowgroup(12).read_csv(fixture.root).to_fls(fixture.fls_path);
+	return fixture;
+}
+
+void set_external_dict_source(galp::execution::Column& column, const uint32_t source_index) {
+	bool updated = false;
+	std::visit(
+	    [&](auto& payload) {
+		    using PayloadT = std::decay_t<decltype(payload)>;
+		    if constexpr (std::is_same_v<PayloadT, galp::codec::host::DICTREFColumn<int16_t, uint8_t>> ||
+		                  std::is_same_v<PayloadT, galp::codec::host::DICTREFColumn<int16_t, uint16_t>>) {
+			    payload.index_column_index = source_index;
+			    updated                     = true;
+		    }
+	    },
+	    column.host);
+	if (!updated) {
+		throw std::runtime_error("test expected an unresolved I16 external dictionary");
+	}
+}
+
+galp::execution::Column make_test_alias_column(const size_t n_values, const size_t target, const std::string& name) {
+	galp::execution::Column alias {};
+	alias.name            = name;
+	alias.token           = fastlanes::OperatorToken::EXP_EQUAL;
+	alias.host            = galp::codec::host::CONSTANTColumn<int16_t> {n_values, 0};
+	alias.skip_decompress = true;
+	alias.alias_of        = target;
+	return alias;
+}
+
+TEST(ExternalDictionaryI16, Full) {
+	for (const auto& [cardinality, label] :
+	     std::array<std::pair<size_t, const char*>, 2> {{{61U, "u8"}, {300U, "u16"}}}) {
+		auto fixture = make_external_dict_i16_fixture(cardinality, label);
+		SCOPED_TRACE(label);
+
+		const auto  descriptor_handle = galp::format::detail::load_table_descriptor(fixture.fls_path);
+		const auto* descriptor        = descriptor_handle.Get();
+		ASSERT_NE(descriptor, nullptr);
+		ASSERT_NE(descriptor->m_rowgroup_descriptors(), nullptr);
+		ASSERT_EQ(descriptor->m_rowgroup_descriptors()->size(), 1U);
+		const auto* rowgroup_descriptor = descriptor->m_rowgroup_descriptors()->Get(0);
+		ASSERT_NE(rowgroup_descriptor, nullptr);
+		ASSERT_NE(rowgroup_descriptor->m_column_descriptors(), nullptr);
+		ASSERT_EQ(rowgroup_descriptor->m_column_descriptors()->size(), 2U);
+		const auto* ref_descriptor = rowgroup_descriptor->m_column_descriptors()->Get(1);
+		ASSERT_NE(ref_descriptor, nullptr);
+		ASSERT_NE(ref_descriptor->encoding_rpn(), nullptr);
+		ASSERT_EQ(ref_descriptor->encoding_rpn()->operator_tokens()->Get(0), fixture.expected_ref_token);
+
+		galp::format::FlsReader reader(fixture.fls_path);
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		ASSERT_EQ(rowgroup.columns.size(), 2U);
+		ASSERT_TRUE(rowgroup.backing_storage);
+		EXPECT_EQ(rowgroup.columns[1].token, fixture.expected_ref_token);
+
+		const uint16_t* borrowed_keys = nullptr;
+		if (fixture.expected_ref_token == fastlanes::OperatorToken::EXP_DICT_I16_U08) {
+			const auto& dict_ref =
+			    std::get<galp::codec::host::DICTREFColumn<int16_t, uint8_t>>(rowgroup.columns[1].host);
+			EXPECT_FALSE(dict_ref.keys.owns());
+			borrowed_keys = dict_ref.keys.get();
+		} else {
+			const auto& dict_ref =
+			    std::get<galp::codec::host::DICTREFColumn<int16_t, uint16_t>>(rowgroup.columns[1].host);
+			EXPECT_FALSE(dict_ref.keys.owns());
+			borrowed_keys = dict_ref.keys.get();
+		}
+		ASSERT_NE(borrowed_keys, nullptr);
+
+		auto expressions = galp::expression::assemble(rowgroup);
+		galp::execution::resolve_dict_refs(expressions);
+		EXPECT_FALSE(galp::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+		EXPECT_TRUE(rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U08 ||
+		            rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U08 ||
+		            rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U16 ||
+		            rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U16);
+		std::visit(
+		    [&](const auto& column) {
+			    using ColumnT = std::decay_t<decltype(column)>;
+			    if constexpr (std::is_same_v<ColumnT, galp::codec::host::DICTFFORColumn<int16_t, uint8_t>> ||
+			                  std::is_same_v<ColumnT, galp::codec::host::DICTFFORColumn<int16_t, uint16_t>> ||
+			                  std::is_same_v<ColumnT, galp::codec::host::DICTSLPATCHColumn<int16_t, uint8_t>> ||
+			                  std::is_same_v<ColumnT, galp::codec::host::DICTSLPATCHColumn<int16_t, uint16_t>>) {
+				    EXPECT_EQ(column.keys.get(), borrowed_keys);
+				    EXPECT_FALSE(column.keys.owns());
+			    }
+		    },
+		    rowgroup.columns[1].host);
+
+		if (cuda_available_for_reader_tests()) {
+			galp::execution::ExecutionConfig config {};
+			config.unpack_n_vectors = 4;
+			config.write_out        = true;
+			const auto result       = galp::execution::decompress_rowgroup(expressions, config);
+			ASSERT_EQ(result.columns.size(), 2U);
+			ASSERT_TRUE(result.columns[1].has_value());
+			const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+			for (size_t row = 0; row < fixture.mapped.size(); ++row) {
+				ASSERT_EQ(output[row], fixture.mapped[row]) << "row=" << row;
+			}
+		}
+		galp::execution::free_rowgroup(rowgroup);
+		std::filesystem::remove_all(fixture.root);
+	}
+}
+
+TEST(ExternalDictionaryI16, AliasChain) {
+	auto fixture = make_external_dict_i16_fixture(61U, "alias_chain");
+	galp::format::FlsReader reader(fixture.fls_path);
+	auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+	ASSERT_EQ(rowgroup.columns.size(), 2U);
+	set_external_dict_source(rowgroup.columns[1], 2U);
+	rowgroup.columns.push_back(make_test_alias_column(rowgroup.n_values, 3U, "alias_1"));
+	rowgroup.columns.push_back(make_test_alias_column(rowgroup.n_values, 0U, "alias_2"));
+
+	auto expressions = galp::expression::assemble(rowgroup);
+	EXPECT_NO_THROW(galp::execution::resolve_dict_refs(expressions));
+	EXPECT_FALSE(galp::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+	EXPECT_EQ(rowgroup.columns[1].token, fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U08);
+
+	galp::execution::free_rowgroup(rowgroup);
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(ExternalDictionaryI16, DependencyErrors) {
+	auto fixture = make_external_dict_i16_fixture(300U, "dependency_errors");
+	galp::format::FlsReader reader(fixture.fls_path);
+	const auto expect_error = [](auto&& action, const std::string& expected_fragment) {
+		try {
+			action();
+			FAIL() << "expected DICTREF resolution to fail";
+		} catch (const std::exception& error) {
+			EXPECT_NE(std::string(error.what()).find(expected_fragment), std::string::npos) << error.what();
+		}
+	};
+
+	{
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		set_external_dict_source(rowgroup.columns[1], 99U);
+		auto expressions = galp::expression::assemble(rowgroup);
+		expect_error([&] { galp::execution::resolve_dict_refs(expressions); }, "rowgroup has 2 columns");
+		galp::execution::free_rowgroup(rowgroup);
+	}
+	{
+		auto rowgroup  = reader.read_rowgroup_zero_copy_materialized(0);
+		auto expressions = galp::expression::assemble(rowgroup);
+		expressions[0].column = nullptr;
+		expect_error([&] { galp::execution::resolve_dict_refs(expressions); }, "source column 0 is missing");
+		galp::execution::free_rowgroup(rowgroup);
+	}
+	{
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		rowgroup.columns[0].host = galp::codec::host::CONSTANTColumn<int16_t> {rowgroup.n_values, 0};
+		rowgroup.columns[0].token = fastlanes::OperatorToken::EXP_CONSTANT_I16;
+		auto expressions = galp::expression::assemble(rowgroup);
+		expect_error([&] { galp::execution::resolve_dict_refs(expressions); }, "expects a 16-bit BP/FFOR/SLPATCH");
+		galp::execution::free_rowgroup(rowgroup);
+	}
+
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(ExternalDictionaryI16, CycleDetection) {
+	auto fixture = make_external_dict_i16_fixture(61U, "cycle");
+	galp::format::FlsReader reader(fixture.fls_path);
+	auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+	set_external_dict_source(rowgroup.columns[1], 2U);
+	rowgroup.columns.push_back(make_test_alias_column(rowgroup.n_values, 1U, "cycle_alias"));
+	auto expressions = galp::expression::assemble(rowgroup);
+	try {
+		galp::execution::resolve_dict_refs(expressions);
+		FAIL() << "expected a DICTREF dependency cycle";
+	} catch (const std::exception& error) {
+		EXPECT_NE(std::string(error.what()).find("DICTREF dependency cycle detected: 1 -> 2 -> 1"), std::string::npos)
+		    << error.what();
+	}
+	galp::execution::free_rowgroup(rowgroup);
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(ExternalDictionaryI16, SelectedVectors) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	auto fixture = make_external_dict_i16_fixture(300U, "selected_vectors");
+	galp::format::FlsReader reader(fixture.fls_path);
+	auto rowgroup   = reader.read_rowgroup_zero_copy_materialized(0);
+	auto expressions = galp::expression::assemble(rowgroup);
+	ASSERT_TRUE(galp::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+
+	galp::runtime::ExecutionWorkset      workset {};
+	galp::runtime::ExecutionWorksetGuard guard(workset);
+	galp::execution::ExecutionConfig     config {};
+	config.unpack_n_vectors = 2;
+	config.launch_strategy  = galp::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	const std::vector<uint32_t> selected_vectors {1U, 6U, 10U};
+	galp::runtime::append_rowgroup_columns_selected_vectors(workset, rowgroup, config, selected_vectors);
+	EXPECT_FALSE(galp::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+	galp::runtime::upload_workset(workset, config);
+	galp::runtime::run_workset(workset, 1U, config);
+	const auto result = galp::runtime::materialize_workset(workset, expressions, config);
+	ASSERT_EQ(result.columns.size(), 2U);
+	ASSERT_TRUE(result.columns[1].has_value());
+	const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+	for (size_t chunk = 0; chunk < selected_vectors.size(); ++chunk) {
+		for (size_t row = 0; row < 2U * galp::codec::consts::VALUES_PER_VECTOR; ++row) {
+			const size_t source = static_cast<size_t>(selected_vectors[chunk]) *
+			                          galp::codec::consts::VALUES_PER_VECTOR +
+			                      row;
+			const size_t destination = chunk * 2U * galp::codec::consts::VALUES_PER_VECTOR + row;
+			ASSERT_EQ(output[destination], fixture.mapped[source]) << "chunk=" << chunk << " row=" << row;
+		}
+	}
+
+	galp::execution::free_rowgroup(rowgroup);
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(Reader, CapabilityTableIsUniqueAndCoversNewI16Tokens) {
+	std::unordered_set<fastlanes::OperatorToken> seen;
+	for (const auto& capability : galp::expression::kOperatorCapabilities) {
+		EXPECT_TRUE(seen.insert(capability.token).second) << fastlanes::token_to_string(capability.token);
+		EXPECT_EQ(galp::expression::capability_for_token(capability.token), &capability);
+		EXPECT_EQ(galp::expression::is_supported_token(capability.token), capability.gpu_supported);
+	}
+	EXPECT_TRUE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_CONSTANT_I16));
+	EXPECT_TRUE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_UNCOMPRESSED_I16));
+	EXPECT_TRUE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_DELTA_I08));
+	EXPECT_TRUE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_DELTA_I16));
+	EXPECT_FALSE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_NULL_I16));
+	EXPECT_TRUE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_DICT_I16_U08));
+	EXPECT_TRUE(galp::expression::is_supported_token(fastlanes::OperatorToken::EXP_DICT_I16_U16));
+}
+
+TEST(Reader, ConstantI16GpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const std::vector<int16_t> expected(65U * galp::codec::consts::VALUES_PER_VECTOR + 7U, -12345);
+	expect_forced_i16_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_CONSTANT_I16, "constant_i16_large_partial", expected);
+}
+
+TEST(Reader, UncompressedI16GpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	std::vector<int16_t> expected(65U * galp::codec::consts::VALUES_PER_VECTOR + 7U);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		expected[row] = static_cast<int16_t>((row * 251U + row / 17U) & 0xFFFFU);
+	}
+	expect_forced_i16_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_UNCOMPRESSED_I16, "uncompressed_i16_large_partial", expected);
+}
+
+template <typename T>
+std::filesystem::path make_forced_delta_fls_fixture(const fastlanes::OperatorToken token,
+	                                                const std::string&              label,
+	                                                const std::vector<T>&           values) {
+	const std::filesystem::path root = std::filesystem::path {GALP_TEST_DATA_DIR} / label;
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto fls_path = root / "data.fls";
+	const std::array<fastlanes::MemoryColumn, 1> columns {
+	    fastlanes::MemoryColumn {"value", std::span<const T>(values.data(), values.size())}};
+	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 70;
+	options.force_schema           = true;
+	options.forced_schema          = {token};
+	fastlanes::write_memory_table_to_fls(table, fls_path, options);
+	return fls_path;
+}
+
+TEST(ExternalDictionaryI16, RawIndexPayloadsAndOwnedKeys) {
+	const auto run_case = [&]<typename SourceT, typename IndexT>(
+	                          const fastlanes::OperatorToken source_token,
+	                          const fastlanes::OperatorToken resolved_token,
+	                          const std::string&              label,
+	                          const size_t                    key_count,
+	                          const std::vector<SourceT>&     indexes) {
+		const auto fls_path = make_forced_delta_fls_fixture(source_token, label, indexes);
+		galp::format::FlsReader reader(fls_path);
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		ASSERT_EQ(rowgroup.columns.size(), 1U);
+
+		auto* keys = new uint16_t[key_count];
+		std::vector<int16_t> expected_keys(key_count);
+		for (size_t index = 0; index < key_count; ++index) {
+			expected_keys[index] = static_cast<int16_t>(-15000 + static_cast<int>(index) * 41);
+			keys[index]          = to_column_bits(expected_keys[index]);
+		}
+		const auto* original_keys = keys;
+		galp::execution::Column target {};
+		target.name  = "external";
+		target.token = std::is_same_v<IndexT, uint8_t> ? fastlanes::OperatorToken::EXP_DICT_I16_U08
+		                                              : fastlanes::OperatorToken::EXP_DICT_I16_U16;
+		target.host = galp::codec::host::DICTREFColumn<int16_t, IndexT> {
+		    rowgroup.n_values, 0U, keys, key_count};
+		rowgroup.columns.push_back(std::move(target));
+
+		auto expressions = galp::expression::assemble(rowgroup);
+		galp::execution::resolve_dict_refs(expressions);
+		EXPECT_EQ(rowgroup.columns[1].token, resolved_token);
+		std::visit(
+		    [&](const auto& column) {
+			    using ColumnT = std::decay_t<decltype(column)>;
+			    if constexpr (std::is_same_v<ColumnT, galp::codec::host::DICTFFORColumn<int16_t, IndexT>> ||
+			                  std::is_same_v<ColumnT, galp::codec::host::DICTSLPATCHColumn<int16_t, IndexT>>) {
+				    EXPECT_EQ(column.keys.get(), original_keys);
+				    EXPECT_TRUE(column.keys.owns());
+			    }
+		    },
+		    rowgroup.columns[1].host);
+
+		if (cuda_available_for_reader_tests()) {
+			galp::execution::ExecutionConfig config {};
+			config.unpack_n_vectors = 1;
+			config.write_out        = true;
+			const auto result       = galp::execution::decompress_rowgroup(expressions, config);
+			ASSERT_EQ(result.columns.size(), 2U);
+			ASSERT_TRUE(result.columns[1].has_value());
+			const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+			for (size_t row = 0; row < indexes.size(); ++row) {
+				const auto index = static_cast<size_t>(static_cast<IndexT>(indexes[row]));
+				ASSERT_LT(index, expected_keys.size());
+				ASSERT_EQ(output[row], expected_keys[index]) << "row=" << row;
+			}
+		}
+		galp::execution::free_rowgroup(rowgroup);
+	};
+
+	const size_t n_values = 4U * galp::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int8_t> bp_i8(n_values);
+	std::vector<int16_t> ffor_i16(n_values);
+	std::vector<int16_t> slpatch_i16(n_values);
+	for (size_t row = 0; row < n_values; ++row) {
+		bp_i8[row]      = static_cast<int8_t>(row % 61U);
+		ffor_i16[row]   = static_cast<int16_t>(row % 300U);
+		slpatch_i16[row] = static_cast<int16_t>((row % 257U == 0U) ? 299U : (row % 7U));
+	}
+	run_case.template operator()<int8_t, uint8_t>(fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08,
+	                                               fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U08,
+	                                               "external_raw_bp_i8",
+	                                               61U,
+	                                               bp_i8);
+	run_case.template operator()<int16_t, uint16_t>(fastlanes::OperatorToken::EXP_FFOR_I16,
+	                                                 fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U16,
+	                                                 "external_raw_ffor_i16",
+	                                                 300U,
+	                                                 ffor_i16);
+	run_case.template operator()<int16_t, uint16_t>(fastlanes::OperatorToken::EXP_FFOR_SLPATCH_I16,
+	                                                 fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U16,
+	                                                 "external_raw_slpatch_i16",
+	                                                 300U,
+	                                                 slpatch_i16);
+}
+
+template <typename T>
+void expect_forced_delta_cpu_gpu_roundtrip(const fastlanes::OperatorToken token,
+	                                       const std::string&              label,
+	                                       const std::vector<T>&           expected) {
+	const auto fls_path = make_forced_delta_fls_fixture<T>(token, label, expected);
+	const auto handle   = galp::format::detail::load_table_descriptor(fls_path);
+	const auto* table   = handle.Get();
+	ASSERT_NE(table, nullptr);
+	ASSERT_NE(table->m_rowgroup_descriptors(), nullptr);
+	ASSERT_EQ(table->m_rowgroup_descriptors()->size(), 1U);
+	const auto* rg = table->m_rowgroup_descriptors()->Get(0);
+	ASSERT_NE(rg, nullptr);
+	ASSERT_GT(rg->m_n_vec(), 64U);
+	ASSERT_NE(rg->m_column_descriptors(), nullptr);
+	const auto* column = rg->m_column_descriptors()->Get(0);
+	ASSERT_NE(column, nullptr);
+	ASSERT_EQ(column->encoding_rpn()->operator_tokens()->Get(0), token);
+	ASSERT_EQ(column->encoding_rpn()->operand_tokens()->size(), 4U);
+
+	// FastLanes CPU is the format oracle; compare it bit-for-bit before
+	// checking every GPU launch configuration.
+	auto connection = fastlanes::connect();
+	auto table_reader = connection->read_fls(fls_path);
+	auto rowgroup_reader = table_reader->get_rowgroup_reader(0);
+	auto cpu_rowgroup = rowgroup_reader->materialize();
+	const auto* cpu_column = std::get_if<fastlanes::up<fastlanes::TypedCol<T>>>(&cpu_rowgroup->internal_rowgroup[0]);
+	ASSERT_NE(cpu_column, nullptr);
+	ASSERT_NE(cpu_column->get(), nullptr);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		ASSERT_EQ((*cpu_column)->data[row], expected[row]) << "CPU row=" << row;
+	}
+
+	galp::format::FlsReader reader(fls_path);
+	auto                    rowgroup = reader.read_rowgroup(0);
+	ASSERT_EQ(rowgroup.n_tuples, expected.size());
+	ASSERT_EQ(rowgroup.columns.size(), 1U);
+	EXPECT_TRUE((std::holds_alternative<galp::codec::host::DELTAColumn<T>>(rowgroup.columns[0].host)));
+	auto expressions = galp::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 1U);
+	galp::execution::ExecutionConfig standalone_config {};
+	standalone_config.unpack_n_vectors = 4;
+	standalone_config.write_out        = true;
+	const auto standalone = galp::execution::decompress(expressions[0], standalone_config);
+	const auto& standalone_output = std::get<std::shared_ptr<T[]>>(standalone);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		ASSERT_EQ(standalone_output[row], expected[row]) << "standalone GPU row=" << row;
+	}
+	const auto standalone_hot = galp::execution::decompress(expressions[0], standalone_config);
+	const auto& standalone_hot_output = std::get<std::shared_ptr<T[]>>(standalone_hot);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		ASSERT_EQ(standalone_hot_output[row], expected[row]) << "hot standalone GPU row=" << row;
+	}
+
+	for (const unsigned unpack_n_vectors : {1U, 4U}) {
+		for (const auto strategy :
+		     {galp::execution::LaunchStrategy::MixedDispatch, galp::execution::LaunchStrategy::TypedBatches}) {
+			SCOPED_TRACE(std::string("unpack=") + std::to_string(unpack_n_vectors) +
+			             (strategy == galp::execution::LaunchStrategy::MixedDispatch ? " mixed" : " typed"));
+			galp::execution::ExecutionConfig config {};
+			config.unpack_n_vectors = unpack_n_vectors;
+			config.launch_strategy  = strategy;
+			config.write_out        = true;
+			const auto result       = galp::execution::decompress_rowgroup(expressions, config);
+			ASSERT_EQ(result.columns.size(), 1U);
+			ASSERT_TRUE(result.columns[0].has_value());
+			const auto& output = std::get<std::shared_ptr<T[]>>(result.columns[0]->values);
+			ASSERT_NE(output, nullptr);
+			for (size_t row = 0; row < expected.size(); ++row) {
+				ASSERT_EQ(output[row], expected[row]) << "GPU row=" << row;
+			}
+		}
+	}
+
+	galp::runtime::ExecutionWorkset selected_workset {};
+	galp::runtime::ExecutionWorksetGuard selected_guard(selected_workset);
+	galp::execution::ExecutionConfig selected_config {};
+	selected_config.unpack_n_vectors = 4;
+	selected_config.launch_strategy  = galp::execution::LaunchStrategy::MixedDispatch;
+	selected_config.write_out        = true;
+	const std::vector<uint32_t> selected_vectors {1U, 17U, 61U};
+	galp::runtime::append_rowgroup_columns_selected_vectors(
+	    selected_workset, rowgroup, selected_config, selected_vectors);
+	galp::runtime::upload_workset(selected_workset, selected_config);
+	galp::runtime::run_workset(selected_workset, 1, selected_config);
+	const auto selected_result =
+	    galp::runtime::materialize_workset(selected_workset, expressions, selected_config);
+	ASSERT_EQ(selected_result.columns.size(), 1U);
+	ASSERT_TRUE(selected_result.columns[0].has_value());
+	const auto& selected_output = std::get<std::shared_ptr<T[]>>(selected_result.columns[0]->values);
+	for (size_t chunk = 0; chunk < selected_vectors.size(); ++chunk) {
+		for (size_t row = 0; row < 4U * galp::codec::consts::VALUES_PER_VECTOR; ++row) {
+			const size_t expected_row =
+			    static_cast<size_t>(selected_vectors[chunk]) * galp::codec::consts::VALUES_PER_VECTOR + row;
+			const size_t output_row = chunk * 4U * galp::codec::consts::VALUES_PER_VECTOR + row;
+			ASSERT_EQ(selected_output[output_row], expected[expected_row])
+			    << "selected chunk=" << chunk << " row=" << row;
+		}
+	}
+}
+
+TEST(Reader, DeltaI08CpuGpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	std::vector<int8_t> expected(65U * galp::codec::consts::VALUES_PER_VECTOR + 7U);
+	int8_t             value = -101;
+	for (size_t row = 0; row < expected.size(); ++row) {
+		value         = static_cast<int8_t>(value + static_cast<int8_t>((row % 9U) - 4));
+		expected[row] = value;
+	}
+	expect_forced_delta_cpu_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_DELTA_I08, "delta_i08_large_partial", expected);
+}
+
+TEST(Reader, DeltaI16CpuGpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	std::vector<int16_t> expected(65U * galp::codec::consts::VALUES_PER_VECTOR + 7U);
+	int16_t              value = -30000;
+	for (size_t row = 0; row < expected.size(); ++row) {
+		value         = static_cast<int16_t>(value + static_cast<int16_t>((row % 31U) - 15));
+		expected[row] = value;
+	}
+	expect_forced_delta_cpu_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_DELTA_I16, "delta_i16_large_partial", expected);
+}
+
+TEST(DeltaDecode, SelectedVectors) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	constexpr size_t vector_count = 10U;
+	const size_t     n_values     = vector_count * galp::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int8_t> expected(n_values);
+	uint8_t             bits = 241U;
+	for (size_t row = 0; row < n_values; ++row) {
+		bits = static_cast<uint8_t>(bits + static_cast<uint8_t>((row * 5U + 3U) & 0x1FU));
+		std::memcpy(&expected[row], &bits, sizeof(bits));
+	}
+
+	const auto fls_path = make_forced_delta_fls_fixture(
+	    fastlanes::OperatorToken::EXP_DELTA_I08, "delta_decode_selected_vectors", expected);
+	galp::format::FlsReader reader(fls_path);
+	auto                    rowgroup   = reader.read_rowgroup(0);
+	auto                    expressions = galp::expression::assemble(rowgroup);
+
+	galp::runtime::ExecutionWorkset      workset {};
+	galp::runtime::ExecutionWorksetGuard guard(workset);
+	galp::execution::ExecutionConfig     config {};
+	config.unpack_n_vectors = 2;
+	config.launch_strategy  = galp::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	const std::vector<uint32_t> selected_vectors {1U, 7U};
+	galp::runtime::append_rowgroup_columns_selected_vectors(workset, rowgroup, config, selected_vectors);
+	galp::runtime::upload_workset(workset, config);
+	galp::runtime::run_workset(workset, 1U, config);
+	const auto result = galp::runtime::materialize_workset(workset, expressions, config);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+	const auto& output = std::get<std::shared_ptr<int8_t[]>>(result.columns[0]->values);
+	for (size_t chunk = 0; chunk < selected_vectors.size(); ++chunk) {
+		for (size_t row = 0; row < 2U * galp::codec::consts::VALUES_PER_VECTOR; ++row) {
+			const size_t source = static_cast<size_t>(selected_vectors[chunk]) *
+			                          galp::codec::consts::VALUES_PER_VECTOR +
+			                      row;
+			const size_t destination = chunk * 2U * galp::codec::consts::VALUES_PER_VECTOR + row;
+			ASSERT_EQ(output[destination], expected[source]) << "chunk=" << chunk << " row=" << row;
+		}
+	}
+}
+
+TEST(DeltaDecode, VectorTail) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	constexpr size_t vector_count = 7U;
+	const size_t     n_values     = vector_count * galp::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int16_t> expected(n_values);
+	uint16_t              bits = 65500U;
+	for (size_t row = 0; row < n_values; ++row) {
+		bits = static_cast<uint16_t>(bits + static_cast<uint16_t>((row * 29U + 7U) & 0x1FFU));
+		std::memcpy(&expected[row], &bits, sizeof(bits));
+	}
+
+	const auto fls_path = make_forced_delta_fls_fixture(
+	    fastlanes::OperatorToken::EXP_DELTA_I16, "delta_decode_vector_tail", expected);
+	galp::format::FlsReader reader(fls_path);
+	auto                    rowgroup   = reader.read_rowgroup(0);
+	auto                    expressions = galp::expression::assemble(rowgroup);
+	ASSERT_EQ(rowgroup.n_vecs, vector_count);
+	galp::execution::ExecutionConfig config {};
+	config.unpack_n_vectors = 4;
+	config.launch_strategy  = galp::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	const auto result       = galp::execution::decompress_rowgroup(expressions, config);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+	const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[0]->values);
+	for (size_t row = 0; row < n_values; ++row) {
+		ASSERT_EQ(output[row], expected[row]) << "row=" << row;
+	}
+}
+
+TEST(Reader, DeltaI08I16ShareOneMixedWorksetAndPreserveColumnOrder) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const size_t n_values = 8U * galp::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int8_t>  expected_i8(n_values);
+	std::vector<int16_t> expected_i16(n_values);
+	for (size_t row = 0; row < n_values; ++row) {
+		expected_i8[row]  = static_cast<int8_t>((row * 7U + row / 13U) & 0xFFU);
+		expected_i16[row] = static_cast<int16_t>((row * 251U + row / 17U) & 0xFFFFU);
+	}
+
+	const auto root = std::filesystem::path {GALP_TEST_DATA_DIR} / "delta_i08_i16_mixed";
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto fls_path = root / "data.fls";
+	const std::array<fastlanes::MemoryColumn, 2> columns {
+	    fastlanes::MemoryColumn {"i8", std::span<const int8_t>(expected_i8)},
+	    fastlanes::MemoryColumn {"i16", std::span<const int16_t>(expected_i16)}};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 12;
+	options.force_schema           = true;
+	options.forced_schema          = {fastlanes::OperatorToken::EXP_DELTA_I08,
+	                                  fastlanes::OperatorToken::EXP_DELTA_I16};
+	fastlanes::write_memory_table_to_fls(
+	    fastlanes::MemoryTable {std::span<const fastlanes::MemoryColumn>(columns)}, fls_path, options);
+
+	galp::format::FlsReader reader(fls_path);
+	auto                    rowgroup = reader.read_rowgroup(0);
+	auto                    expressions = galp::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 2U);
+
+	galp::runtime::ExecutionWorkset workset {};
+	galp::runtime::ExecutionWorksetGuard guard(workset);
+	galp::execution::ExecutionConfig config {};
+	config.unpack_n_vectors = 4;
+	config.launch_strategy  = galp::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	galp::runtime::append_expressions(workset, expressions, config);
+	galp::runtime::upload_workset(workset, config);
+	ASSERT_FALSE(workset.slots.mixed.empty());
+	bool saw_i8  = false;
+	bool saw_i16 = false;
+	for (const auto& slot : workset.slots.mixed) {
+		for (const auto& work : {slot.first, slot.second}) {
+			if (!galp::execution::is_valid_work_item(work)) {
+				continue;
+			}
+			saw_i8  = saw_i8 || work.type == galp::execution::TypeTag::I8;
+			saw_i16 = saw_i16 || work.type == galp::execution::TypeTag::I16;
+		}
+	}
+	EXPECT_TRUE(saw_i8);
+	EXPECT_TRUE(saw_i16);
+	size_t launches = 0;
+	galp::runtime::run_workset(workset, 1, config, nullptr, &launches);
+	EXPECT_EQ(launches, 1U);
+	const auto result = galp::runtime::materialize_workset(workset, expressions, config);
+	ASSERT_EQ(result.columns.size(), 2U);
+	ASSERT_TRUE(result.columns[0].has_value());
+	ASSERT_TRUE(result.columns[1].has_value());
+	const auto& out_i8  = std::get<std::shared_ptr<int8_t[]>>(result.columns[0]->values);
+	const auto& out_i16 = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+	for (size_t row = 0; row < n_values; ++row) {
+		ASSERT_EQ(out_i8[row], expected_i8[row]) << "i8 row=" << row;
+		ASSERT_EQ(out_i16[row], expected_i16[row]) << "i16 row=" << row;
+	}
 }
 
 TEST(Materialize, KickPinnedD2HPreservesZeroLengthEntries) {
@@ -1201,6 +1945,7 @@ TEST(Reader, MultiVectorUnpackHandlesPartialTailRowgroup) {
 			EXPECT_EQ(ptr_u1[row], ptr_u4[row]) << "row=" << row;
 		}
 	}
+
 }
 
 TEST(Reader, MultiVectorUnpackMatchesSingleVector) {

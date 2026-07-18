@@ -63,6 +63,106 @@ public:
 	}
 };
 
+template <typename T, unsigned UNPACK_N_VECTORS>
+struct DeltaUnsumer;
+
+// FastLanes I8 DELTA codes arrive in prefix order, so only one running
+// prefix per unpacked vector is needed.
+template <unsigned UNPACK_N_VECTORS>
+struct DeltaUnsumer<int8_t, UNPACK_N_VECTORS> {
+private:
+	using UIntT = uint8_t;
+	static constexpr int32_t N_LANES = galp::codec::utils::get_n_lanes<int8_t>();
+	UIntT                   prefixes[UNPACK_N_VECTORS];
+
+public:
+	template <typename ColumnT>
+	__device__ __forceinline__ DeltaUnsumer(const ColumnT column, const vi_t vector_index, const lane_t lane) {
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			prefixes[vector] = column.rsum_bases[(vector_index + vector) * N_LANES + lane];
+		}
+	}
+
+	template <typename UnpackerT>
+	__device__ __forceinline__ void unsum_next_into(UnpackerT& unpacker, int8_t* __restrict out) {
+		UIntT deltas[UNPACK_N_VECTORS];
+		unpacker.unpack_next_into(deltas);
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			prefixes[vector] = static_cast<UIntT>(prefixes[vector] + deltas[vector]);
+			out[vector]      = static_cast<int8_t>(prefixes[vector]);
+		}
+	}
+};
+
+// FastLanes I16 DELTA stores each lane in 0,2,...,14,1,3,...,15 prefix
+// order while the unpacker emits physical positions 0..15. Buffering the
+// complete lane is therefore required before the first physical output.
+template <unsigned UNPACK_N_VECTORS>
+struct DeltaUnsumer<int16_t, UNPACK_N_VECTORS> {
+private:
+	using UIntT = uint16_t;
+	static constexpr unsigned N_VALUES_PER_LANE = galp::codec::utils::get_values_per_lane<int16_t>();
+	static constexpr int32_t  N_LANES           = galp::codec::utils::get_n_lanes<int16_t>();
+	static_assert(N_VALUES_PER_LANE == 16);
+
+	UIntT   values[UNPACK_N_VECTORS * N_VALUES_PER_LANE];
+	UIntT   prefixes[UNPACK_N_VECTORS];
+	unsigned cursor      = 0;
+	bool     initialized = false;
+
+	__device__ __forceinline__ static constexpr unsigned code_index(const unsigned logical_position) {
+		return logical_position < 8U ? logical_position * 2U : (logical_position - 8U) * 2U + 1U;
+	}
+
+	template <typename UnpackerT>
+	__device__ __forceinline__ void initialize(UnpackerT& unpacker) {
+		if (initialized) {
+			return;
+		}
+#pragma unroll
+		for (unsigned position = 0; position < N_VALUES_PER_LANE; ++position) {
+			UIntT deltas[UNPACK_N_VECTORS];
+			unpacker.unpack_next_into(deltas);
+#pragma unroll
+			for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+				values[vector * N_VALUES_PER_LANE + position] = deltas[vector];
+			}
+		}
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			UIntT prefix = prefixes[vector];
+#pragma unroll
+			for (unsigned logical_position = 0; logical_position < N_VALUES_PER_LANE; ++logical_position) {
+				const unsigned index = vector * N_VALUES_PER_LANE + code_index(logical_position);
+				prefix               = static_cast<UIntT>(prefix + values[index]);
+				values[index]         = prefix;
+			}
+		}
+		initialized = true;
+	}
+
+public:
+	template <typename ColumnT>
+	__device__ __forceinline__ DeltaUnsumer(const ColumnT column, const vi_t vector_index, const lane_t lane) {
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			prefixes[vector] = column.rsum_bases[(vector_index + vector) * N_LANES + lane];
+		}
+	}
+
+	template <typename UnpackerT>
+	__device__ __forceinline__ void unsum_next_into(UnpackerT& unpacker, int16_t* __restrict out) {
+		initialize(unpacker);
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			out[vector] = static_cast<int16_t>(values[vector * N_VALUES_PER_LANE + cursor]);
+		}
+		++cursor;
+	}
+};
+
 } // namespace galp::codec::device
 
 #endif // GALP_DECOMPRESSION_PRIMITIVES_UNSUMER_CUH

@@ -179,6 +179,20 @@ struct RebindUnpackVectors<galp::codec::device::FFORDecompressor<T, OLD_UNPACK_N
 };
 
 template <typename T,
+	      unsigned OLD_UNPACK_N_VECTORS,
+	      typename UnpackerT,
+	      typename ColumnT,
+	      unsigned NEW_UNPACK_N_VECTORS>
+struct RebindUnpackVectors<galp::codec::device::DELTADecompressor<T, OLD_UNPACK_N_VECTORS, UnpackerT, ColumnT>,
+	                       NEW_UNPACK_N_VECTORS> {
+	using type =
+	    galp::codec::device::DELTADecompressor<T,
+	                                          NEW_UNPACK_N_VECTORS,
+	                                          typename RebindUnpackVectors<UnpackerT, NEW_UNPACK_N_VECTORS>::type,
+	                                          ColumnT>;
+};
+
+template <typename T,
           unsigned OLD_UNPACK_N_VECTORS,
           unsigned UNPACK_N_VALUES,
           typename ColumnT,

@@ -16,25 +16,30 @@
 
 namespace galp::kernels::detail {
 
-template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
+template <typename T,
+	      unsigned UNPACK_N_VECTORS,
+	      unsigned UNPACK_N_VALUES,
+	      typename DecompressorT,
+	      typename ColumnT,
+	      typename UntransposerT>
 __host__ void
 launch_decompress_column_sample(const ColumnT column, T* out, const size_t n_vecs, const size_t shmem_bytes) {
 	if constexpr (UNPACK_N_VECTORS == 1) {
 		const ThreadblockMapping<T> mapping(UNPACK_N_VECTORS, n_vecs);
-		device::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>
+		device::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT, UntransposerT>
 		    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK, shmem_bytes>>>(column, out, n_vecs, 0);
 	} else {
 		const size_t full_n_vecs = full_vector_count(n_vecs, UNPACK_N_VECTORS);
 		if (full_n_vecs != 0) {
 			const ThreadblockMapping<T> mapping(UNPACK_N_VECTORS, full_n_vecs);
-			device::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>
+			device::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT, UntransposerT>
 			    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK, shmem_bytes>>>(column, out, full_n_vecs, 0);
 		}
 		if (full_n_vecs != n_vecs) {
 			using TailDecompressorT                 = ScalarTailDecompressorT<DecompressorT>;
 			const size_t                tail_n_vecs = n_vecs - full_n_vecs;
 			const ThreadblockMapping<T> mapping(1, tail_n_vecs);
-			device::decompress_column<T, 1, UNPACK_N_VALUES, TailDecompressorT, ColumnT>
+			device::decompress_column<T, 1, UNPACK_N_VALUES, TailDecompressorT, ColumnT, UntransposerT>
 			    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK, shmem_bytes>>>(column, out, tail_n_vecs, full_n_vecs);
 		}
 	}
@@ -96,7 +101,12 @@ __host__ void launch_compute_column_sample(const ColumnT column, bool* out, cons
 
 namespace galp::kernels::host {
 
-template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
+template <typename T,
+	      unsigned UNPACK_N_VECTORS,
+	      unsigned UNPACK_N_VALUES,
+	      typename DecompressorT,
+	      typename ColumnT,
+	      typename UntransposerT = galp::codec::device::IdentityUntransposer>
 __host__ T* decompress_column(const ColumnT column, const uint32_t n_samples) {
 	size_t      n_vecs = galp::codec::utils::get_n_vecs_from_size(column.n_values);
 	GPUArray<T> device_out(column.n_values);
@@ -108,7 +118,8 @@ __host__ T* decompress_column(const ColumnT column, const uint32_t n_samples) {
 
 	size_t shmem_bytes = 0;
 	for (uint32_t i {0}; i < n_samples; ++i) {
-		detail::launch_decompress_column_sample<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		detail::launch_decompress_column_sample<
+		    T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT, UntransposerT>(
 		    column, device_out.get(), n_vecs, shmem_bytes);
 		CUDA_SAFE_CALL(cudaGetLastError());
 	}

@@ -50,6 +50,18 @@ struct ColumnKindTraits<galp::codec::host::CONSTANTColumn<T>> {
 };
 
 template <typename T>
+struct ColumnKindTraits<galp::codec::host::DELTAColumn<T>> {
+	using value_type                    = T;
+	static constexpr PlanKind plan_kind = PlanKind::DELTA;
+	static void fill(DeviceExpression<T>&                     expr,
+	                 const galp::codec::host::DELTAColumn<T>& host_col,
+	                 galp::memory::DeviceArena&               arena,
+	                 [[maybe_unused]] bool                    freq_use_extended) {
+		host_col.copy_to_device(arena, expr.col.delta);
+	}
+};
+
+template <typename T>
 struct ColumnKindTraits<galp::codec::host::FFORColumn<T>> {
 	using value_type                    = T;
 	static constexpr PlanKind plan_kind = PlanKind::UNFFOR;
@@ -197,6 +209,10 @@ struct column_value_type<galp::codec::device::BPColumn<T>> {
 };
 template <typename T>
 struct column_value_type<galp::codec::device::CONSTANTColumn<T>> {
+	using type = T;
+};
+template <typename T>
+struct column_value_type<galp::codec::device::DELTAColumn<T>> {
 	using type = T;
 };
 template <typename T>

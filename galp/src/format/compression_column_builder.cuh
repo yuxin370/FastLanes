@@ -257,6 +257,27 @@ inline galp::codec::host::FFORColumn<T> make_ffor_zero_copy(const fastlanes::Seg
 	return galp::codec::host::FFORColumn<T> {std::move(bp), galp::codec::host::borrow_array(bases)};
 }
 
+template <typename T>
+inline galp::codec::host::DELTAColumn<T> make_delta_zero_copy(const fastlanes::SegmentView& seg_rsum,
+	                                                          const fastlanes::SegmentView& seg_bitpacked,
+	                                                          const fastlanes::SegmentView& seg_bw,
+	                                                          const fastlanes::SegmentView& seg_base,
+	                                                          const size_t                  n_values,
+	                                                          const size_t                  n_vecs,
+	                                                          ZeroCopyHostStorage&          storage) {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	const size_t expected_bases = n_vecs * galp::codec::utils::get_n_lanes<T>();
+	if (seg_rsum.data_span.size() != expected_bases * sizeof(UINT_T)) {
+		std::ostringstream msg;
+		msg << "EXP_DELTA: rsum bases size mismatch (expected=" << (expected_bases * sizeof(UINT_T))
+		    << ", actual=" << seg_rsum.data_span.size() << ")";
+		throw std::runtime_error(msg.str());
+	}
+	auto ffor  = make_ffor_zero_copy<UINT_T>(seg_bitpacked, seg_bw, seg_base, n_values, n_vecs, storage);
+	auto* rsum = segment_ptr_or_copy<UINT_T>(seg_rsum, storage);
+	return galp::codec::host::DELTAColumn<T> {std::move(ffor), galp::codec::host::borrow_array(rsum)};
+}
+
 inline SegmentOffsets build_entrypoint_offsets(const fastlanes::SegmentView& seg,
                                                const size_t                  n_vecs,
                                                const size_t                  elem_bytes,
@@ -569,6 +590,13 @@ inline galp::codec::host::FFORColumn<T> clone_column(const galp::codec::host::FF
 template <typename T>
 inline galp::codec::host::CONSTANTColumn<T> clone_column(const galp::codec::host::CONSTANTColumn<T>& col) {
 	return col;
+}
+
+template <typename T>
+inline galp::codec::host::DELTAColumn<T> clone_column(const galp::codec::host::DELTAColumn<T>& col) {
+	return galp::codec::host::DELTAColumn<T> {
+	    clone_column(col.ffor),
+	    clone_array(col.rsum_bases.get(), col.get_n_vecs() * galp::codec::utils::get_n_lanes<T>())};
 }
 
 template <typename T>

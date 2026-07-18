@@ -74,6 +74,7 @@ enum class Encoding {
 	ALP,
 	BIT_PACKING,
 	FFOR,
+	DELTA,
 	FREQUENCY,
 	CROSS_RLE,
 	DICTIONARY,

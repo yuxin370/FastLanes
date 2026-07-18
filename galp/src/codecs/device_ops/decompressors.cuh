@@ -71,6 +71,30 @@ struct CONSTANTDecompressor : DecompressorBase<T> {
 	}
 };
 
+template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
+struct DELTADecompressor : DecompressorBase<T> {
+	using UIntT = typename galp::codec::utils::same_width_uint<T>::type;
+
+	UnpackerT                              unpacker;
+	DeltaUnsumer<T, UNPACK_N_VECTORS> unsumer;
+
+	__device__ __forceinline__ DELTADecompressor(const ColumnT column,
+	                                            const vi_t    vector_index,
+	                                            const lane_t  lane)
+	    : unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
+	               lane,
+	               FFORFunctor<UIntT, UNPACK_N_VECTORS>(column.ffor.bases + vector_index))
+	    , unsumer(column, vector_index, lane) {
+	}
+
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
+		unsumer.unsum_next_into(unpacker, out);
+	}
+};
+
 template <typename T, unsigned UNPACK_N_VECTORS, typename PatcherT, typename ColumnT>
 struct FREQDecompressor : DecompressorBase<T> {
 	PatcherT                   patcher;

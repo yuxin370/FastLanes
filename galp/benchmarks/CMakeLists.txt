@@ -36,6 +36,10 @@ set(GALP_GENERATED_BINDING_FILENAMES
         dict-uint64_t-decompress_column-bindings.cu
         dictslpatch-uint32_t-decompress_column-bindings.cu
         dictslpatch-uint64_t-decompress_column-bindings.cu
+		delta-int16_t-decompress_column-bindings.cu
+		delta-int8_t-decompress_column-bindings.cu
+		ffor-int16_t-decompress_column-bindings.cu
+		ffor-int8_t-decompress_column-bindings.cu
         ffor-uint32_t-compute_column-bindings.cu
         ffor-uint32_t-decompress_column-bindings.cu
         ffor-uint32_t-query_column-bindings.cu

@@ -105,7 +105,7 @@ inline bool can_direct_append_column(const galp::execution::Column& column) {
 	if (column.skip_decompress) {
 		return true;
 	}
-	return !std::holds_alternative<galp::codec::host::DICTREFColumn<int8_t, uint8_t>>(column.host);
+	return !galp::execution::has_unresolved_dict_ref(column.host);
 }
 
 inline bool can_direct_append_rowgroup(const galp::execution::Rowgroup& rowgroup) {
@@ -217,6 +217,9 @@ inline void append_column_to_workset(ExecutionWorkset&              workset,
 	if (column.skip_decompress) {
 		return;
 	}
+	if (galp::execution::has_unresolved_dict_ref(column.host)) {
+		throw std::runtime_error("unresolved DICTREF reached GPU workset construction");
+	}
 	if (register_backing && has_pinned_backing(column)) {
 		active_chunk_arena.register_backing(column.backing_base, column.backing_bytes);
 	}
@@ -293,11 +296,13 @@ inline void append_rowgroup_columns(ExecutionWorkset&                workset,
 }
 
 inline void append_rowgroup_columns_selected_vectors(ExecutionWorkset&                workset,
-                                                     const galp::execution::Rowgroup& rowgroup,
+	                                                     galp::execution::Rowgroup&       rowgroup,
                                                      const ExecutionConfig&           cfg,
                                                      const std::vector<uint32_t>&     selected_vectors,
                                                      const size_t                     expr_index_base       = 0,
                                                      const bool                       use_global_expr_index = false) {
+	auto expressions = galp::expression::assemble(rowgroup);
+	galp::execution::resolve_dict_refs(expressions);
 	workset.outputs.required = workset.outputs.required || cfg.write_out;
 	begin_workset_chunk_arena(workset, rowgroup.columns.size());
 	galp::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();

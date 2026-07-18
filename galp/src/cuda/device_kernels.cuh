@@ -14,7 +14,12 @@
 
 namespace galp::kernels::device {
 
-template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
+template <typename T,
+	      int UNPACK_N_VECTORS,
+	      int UNPACK_N_VALUES,
+	      typename DecompressorT,
+	      typename ColumnT,
+	      typename UntransposerT = galp::codec::device::IdentityUntransposer>
 __global__ void
 decompress_column(const ColumnT column, T* out, const size_t scheduled_n_vecs = 0, const size_t vector_offset = 0) {
 	constexpr uint32_t N_VALUES           = UNPACK_N_VALUES * UNPACK_N_VECTORS;
@@ -50,7 +55,8 @@ decompress_column(const ColumnT column, T* out, const size_t scheduled_n_vecs = 
 #pragma unroll
 			for (int w {0}; w < UNPACK_N_VALUES; ++w) {
 				const uint32_t in_idx  = static_cast<uint32_t>(lane) + static_cast<uint32_t>(i + w) * mapping.N_LANES;
-				const size_t   out_idx = static_cast<size_t>(v) * galp::codec::consts::VALUES_PER_VECTOR + in_idx;
+				const size_t out_idx = static_cast<size_t>(v) * galp::codec::consts::VALUES_PER_VECTOR +
+				                       UntransposerT::map_index(in_idx);
 				if (vector_base + out_idx < column.n_values) {
 					out[out_idx] = registers[w + v * UNPACK_N_VALUES];
 				}

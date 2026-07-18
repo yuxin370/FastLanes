@@ -26,6 +26,7 @@
 #include <random>
 #include <stdexcept>
 #include <tuple>
+#include <vector>
 
 namespace galp::bench {
 
@@ -792,6 +793,116 @@ galp::codec::host::FFORColumn<T> make_ffor_from_values(const T* values, const si
 	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(n_values);
 	auto*        bases  = primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0});
 	return galp::codec::host::FFORColumn<T> {std::move(bp), bases};
+}
+
+inline uint32_t benchmark_fastlanes_untranspose_index(const uint32_t in_idx) {
+	const auto reverse3 = [](const uint32_t value) {
+		return ((value & 0x04U) >> 2U) | (value & 0x02U) | ((value & 0x01U) << 2U);
+	};
+	const uint32_t low4       = in_idx & 0x0FU;
+	const uint32_t block6     = (in_idx >> 4U) & 0x3FU;
+	const uint32_t block_low3 = block6 & 0x07U;
+	const uint32_t block_hi3  = (block6 >> 3U) & 0x07U;
+	return (low4 << 6U) | (reverse3(block_low3) << 3U) | block_hi3;
+}
+
+template <typename T>
+struct DeltaBenchmarkData {
+	galp::codec::host::DELTAColumn<T> column;
+	std::vector<T>                    expected;
+};
+
+template <typename T>
+DeltaBenchmarkData<T> generate_delta_column(const size_t n_values, const vbw_t delta_bit_width) {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	constexpr size_t kValuesPerVector = galp::codec::consts::VALUES_PER_VECTOR;
+	constexpr size_t kTypeBits        = sizeof(UINT_T) * 8U;
+	if (n_values == 0 || n_values % kValuesPerVector != 0) {
+		throw std::invalid_argument("DELTA benchmark requires a positive whole number of FastLanes vectors");
+	}
+	if (delta_bit_width == 0 || delta_bit_width > kTypeBits) {
+		throw std::invalid_argument("DELTA benchmark bit width is outside the value type");
+	}
+
+	const size_t n_vecs          = n_values / kValuesPerVector;
+	const size_t n_lanes         = galp::codec::utils::get_n_lanes<T>();
+	const size_t values_per_lane = galp::codec::utils::get_values_per_lane<T>();
+	const UINT_T delta_mask = delta_bit_width == kTypeBits
+	                              ? std::numeric_limits<UINT_T>::max()
+	                              : static_cast<UINT_T>((UINT_T {1} << delta_bit_width) - UINT_T {1});
+	const UINT_T high_bit = static_cast<UINT_T>(UINT_T {1} << (delta_bit_width - 1U));
+
+	std::vector<UINT_T> deltas(n_values);
+	auto*               rsum_bases = new UINT_T[n_vecs * n_lanes];
+	std::vector<T>      expected(n_values);
+	for (size_t vec = 0; vec < n_vecs; ++vec) {
+		const size_t vector_base = vec * kValuesPerVector;
+		for (size_t lane = 0; lane < n_lanes; ++lane) {
+			UINT_T prefix = static_cast<UINT_T>(std::numeric_limits<UINT_T>::max() -
+			                                    static_cast<UINT_T>((vec * 13U + lane * 7U) & 0x1FU));
+			rsum_bases[vec * n_lanes + lane] = prefix;
+			for (size_t logical_pos = 0; logical_pos < values_per_lane; ++logical_pos) {
+				const size_t code_pos = sizeof(T) == sizeof(int16_t)
+				                            ? (logical_pos < 8U ? logical_pos * 2U : (logical_pos - 8U) * 2U + 1U)
+				                            : logical_pos;
+				UINT_T delta = static_cast<UINT_T>((vec * 29U + lane * 11U + logical_pos * 5U + 1U) & delta_mask);
+				if (vec == 0 && lane == 0 && logical_pos == 0) {
+					delta = high_bit;
+				}
+				const size_t encoded_index = vector_base + lane + code_pos * n_lanes;
+				deltas[encoded_index]       = delta;
+				prefix = static_cast<UINT_T>(prefix + delta);
+
+				T value {};
+				std::memcpy(&value, &prefix, sizeof(T));
+				const auto output_index = benchmark_fastlanes_untranspose_index(
+				    static_cast<uint32_t>(lane + code_pos * n_lanes));
+				expected[vector_base + output_index] = value;
+			}
+		}
+	}
+
+	auto ffor = make_ffor_from_values<UINT_T>(deltas.data(), n_values, delta_bit_width);
+	return DeltaBenchmarkData<T> {
+	    galp::codec::host::DELTAColumn<T> {std::move(ffor), rsum_bases}, std::move(expected)};
+}
+
+template <typename T>
+struct FforBenchmarkData {
+	galp::codec::host::FFORColumn<T> column;
+	std::vector<T>                   expected;
+};
+
+template <typename T>
+FforBenchmarkData<T> generate_ffor_column(const size_t n_values, const vbw_t bit_width) {
+	using UINT_T = typename galp::codec::utils::same_width_uint<T>::type;
+	constexpr size_t kTypeBits = sizeof(UINT_T) * 8U;
+	if (n_values == 0 || n_values % galp::codec::consts::VALUES_PER_VECTOR != 0) {
+		throw std::invalid_argument("FFOR benchmark requires a positive whole number of FastLanes vectors");
+	}
+	if (bit_width == 0 || bit_width > kTypeBits) {
+		throw std::invalid_argument("FFOR benchmark bit width is outside the value type");
+	}
+	const UINT_T mask = bit_width == kTypeBits
+	                        ? std::numeric_limits<UINT_T>::max()
+	                        : static_cast<UINT_T>((UINT_T {1} << bit_width) - UINT_T {1});
+	std::vector<UINT_T> values(n_values);
+	std::vector<T>      expected(n_values);
+	for (size_t i = 0; i < n_values; ++i) {
+		values[i] = static_cast<UINT_T>((i * 37U + i / 17U + 3U) & mask);
+		std::memcpy(&expected[i], &values[i], sizeof(T));
+	}
+	auto unsigned_bp = galp::bench::bindings::compress(values.data(), n_values, bit_width);
+	galp::codec::host::BPColumn<T> bp {
+	    unsigned_bp.n_values,
+	    unsigned_bp.n_packed_values,
+	    unsigned_bp.packed_array.release(),
+	    unsigned_bp.bit_widths.release(),
+	    unsigned_bp.vector_offsets.release()};
+	const size_t n_vecs = n_values / galp::codec::consts::VALUES_PER_VECTOR;
+	auto* bases = primitives::fill_array_with_constant<UINT_T>(new UINT_T[n_vecs], n_vecs, UINT_T {0});
+	return FforBenchmarkData<T> {
+	    galp::codec::host::FFORColumn<T> {std::move(bp), bases}, std::move(expected)};
 }
 
 template <typename T>

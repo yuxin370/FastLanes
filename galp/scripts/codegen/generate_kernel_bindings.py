@@ -98,6 +98,7 @@ FUNCTIONS = [
 ENCODINGS = [
     "BP",
     "FFOR",
+    "DELTA",
     "ALP",
     "ALPExtended",
     "FREQ",
@@ -169,6 +170,8 @@ def get_column_t(encoding: str, data_type: str, function: str) -> str:
         column_t = f"CROSSRLEColumn<{data_type}>"
     elif "DICTSLPATCH" in encoding:
         column_t = f"DICTSLPATCHColumn<{data_type}>"
+    elif encoding == "DELTA":
+        column_t = f"DELTAColumn<{data_type}>"
     elif "FFOR" in encoding:
         column_t = f"FFORColumn<{data_type}>"
     elif "SLPATCH" in encoding:
@@ -205,7 +208,11 @@ def get_decompressor_type(
     patcher_t = f""
     decompressor_t = f"{encoding}Decompressor"
     expander_t = f""
-    if "FFOR" in encoding:
+    if encoding == "DELTA":
+        uint_t = f"typename galp::codec::utils::same_width_uint<{data_type}>::type"
+        functor = f"FFORFunctor<{uint_t}, {n_vec}>"
+        decompressor_t = "DELTADecompressor"
+    elif "FFOR" in encoding:
         functor = f"FFORFunctor<{data_type}, {n_vec}>"
     elif "SLPATCH" in encoding and "DICTSLPATCH" not in encoding:
         functor = f"FFORFunctor<{data_type}, {n_vec}>"
@@ -268,7 +275,12 @@ def get_decompressor_type(
             loader_t += f"RegisterLoader<{data_type}, {n_vec}, {unpacker[-1]}>"
         unpacker = "Stateful"
 
-    unpacker_t = f"galp::codec::device::BitUnpacker{unpacker}<{data_type}, {n_vec}, {n_val},  galp::codec::device::{functor} {loader_t}>,"
+    unpacker_data_type = (
+        f"typename galp::codec::utils::same_width_uint<{data_type}>::type"
+        if encoding == "DELTA"
+        else data_type
+    )
+    unpacker_t = f"galp::codec::device::BitUnpacker{unpacker}<{unpacker_data_type}, {n_vec}, {n_val},  galp::codec::device::{functor} {loader_t}>,"
 
     if "FREQ" in encoding or "FREQExtended" in encoding or "CROSSRLE" in encoding or "CROSSRLEExtended" in encoding or "CROSSRLELaneMask" in encoding:
         unpacker_t = f""
@@ -311,6 +323,11 @@ def get_if_statement(
         encoding, data_type, function, unpacker, patcher, expander, n_vec, n_val
     )
     extra_param = ", magic_value" if is_query_column else ""
+    untransposer_t = (
+        ", galp::codec::device::FastLanes1024InputUntransposer"
+        if encoding == "DELTA" and function == "decompress_column"
+        else ""
+    )
 
     if encoding == "CROSSRLE" or encoding == "CROSSRLEExtended" or encoding == "CROSSRLELaneMask":
         return (
@@ -336,7 +353,7 @@ def get_if_statement(
     return (
         f"if (unpack_n_vectors == {n_vec} && unpack_n_values == {n_val} && unpacker == galp::format::Unpacker::{unpacker} && patcher == galp::format::Patcher::{patcher}) "
         + "{"  # }
-        f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
+        f"return galp::kernels::host::{function}<{data_type}, {n_vec}, {n_val}, {decompressor_t}, {column_t}{untransposer_t} {',' + str(n_repetitions) if n_repetitions else ''}>(column {extra_param}, n_samples);"
         "}"
     )
 
@@ -683,6 +700,34 @@ def main(args):
                         )
                     ],
                 )
+
+    for encoding in ["FFOR", "DELTA"]:
+        for data_type in ["int8_t", "int16_t"]:
+            binding = "decompress_column"
+            write_file(
+                f"{encoding.lower()}-{data_type}-{binding}-bindings.cu",
+                [
+                    get_function(
+                        encoding,
+                        data_type,
+                        binding,
+                        data_type + "*",
+                        [
+                            get_if_statement_check_wrapper(
+                                args.disable_unnecessary,
+                                encoding,
+                                data_type,
+                                binding,
+                                n_vec,
+                                1,
+                                "StatefulBranchless",
+                                "None",
+                            )
+                            for n_vec in [1, 2, 4]
+                        ],
+                    )
+                ],
+            )
 
     for encoding in ["SLPATCH"]:
         for data_type in ["int16_t", "uint32_t", "uint64_t"]:
