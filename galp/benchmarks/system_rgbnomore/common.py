@@ -336,9 +336,11 @@ def percentile(values: Sequence[float], quantile: float) -> float:
 def distribution(values: Sequence[float]) -> dict[str, float]:
     require(values, "cannot summarize an empty sequence")
     numeric = [float(value) for value in values]
+    mean = statistics.fmean(numeric)
     return {
         "count": len(numeric),
-        "mean": statistics.fmean(numeric),
+        "mean": mean,
+        "cv_population": statistics.pstdev(numeric) / abs(mean) if mean else 0.0,
         "min": min(numeric),
         "p50": percentile(numeric, 0.50),
         "p90": percentile(numeric, 0.90),
@@ -365,6 +367,7 @@ def finite_number(value: Any) -> bool:
 
 def source_tree_metadata(root: Path, relative_files: Sequence[str]) -> dict[str, Any]:
     root = root.resolve()
+    unique_relative_files = list(dict.fromkeys(relative_files))
 
     def git(*arguments: str) -> str:
         result = subprocess.run(
@@ -377,15 +380,22 @@ def source_tree_metadata(root: Path, relative_files: Sequence[str]) -> dict[str,
         return result.stdout.strip()
 
     files: dict[str, str | None] = {}
-    for relative in relative_files:
+    for relative in unique_relative_files:
         path = root / relative
         files[relative] = sha256_file(path) if path.is_file() else None
     status = git("status", "--porcelain")
+    tracked_status = git("status", "--porcelain", "--untracked-files=no")
+    runtime_status = git("status", "--porcelain", "--", *unique_relative_files)
     return {
         "root": str(root),
         "git_commit": git("rev-parse", "HEAD"),
         "git_dirty": bool(status),
         "git_status": status.splitlines(),
+        "git_tracked_dirty": bool(tracked_status),
+        "git_tracked_status": tracked_status.splitlines(),
+        "benchmark_source_clean": not bool(runtime_status),
+        "runtime_git_status": runtime_status.splitlines(),
         "tracked_diff_sha256": sha256_json(git("diff", "--binary")),
+        "runtime_diff_sha256": sha256_json(git("diff", "HEAD", "--binary", "--", *unique_relative_files)),
         "runtime_file_sha256": files,
     }

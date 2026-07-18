@@ -120,18 +120,20 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
                                                          const size_t       rowgroup_prefetch_min_decode_batches,
                                                          const std::string& layout,
                                                          const py::object&  grid_transform,
-                                                         const size_t       plan_cache_capacity) {
+                                                         const size_t       plan_cache_capacity,
+                                                         const bool         enable_planless_execution) {
 	galp::jpeg::JpegDctDeviceBatchOptions options;
-	options.coefficient_selection    = parse_coefficients(dct_coeffs);
-	options.layout                   = parse_layout(layout);
-	options.grid_transform           = parse_grid_transform(grid_transform);
-	options.cache_capacity_bytes     = cache_capacity_bytes_from_mib(cache_capacity_mib);
-	options.decode_batch_rowgroups   = decode_batch_rowgroups;
-	options.plan_cache_capacity      = plan_cache_capacity;
-	options.enable_rowgroup_prefetch = enable_rowgroup_prefetch;
-	options.rowgroup_prefetch_depth  = rowgroup_prefetch_depth;
-	options.rowgroup_prefetch_workers = rowgroup_prefetch_workers;
+	options.coefficient_selection                = parse_coefficients(dct_coeffs);
+	options.layout                               = parse_layout(layout);
+	options.grid_transform                       = parse_grid_transform(grid_transform);
+	options.cache_capacity_bytes                 = cache_capacity_bytes_from_mib(cache_capacity_mib);
+	options.decode_batch_rowgroups               = decode_batch_rowgroups;
+	options.plan_cache_capacity                  = plan_cache_capacity;
+	options.enable_rowgroup_prefetch             = enable_rowgroup_prefetch;
+	options.rowgroup_prefetch_depth              = rowgroup_prefetch_depth;
+	options.rowgroup_prefetch_workers            = rowgroup_prefetch_workers;
 	options.rowgroup_prefetch_min_decode_batches = rowgroup_prefetch_min_decode_batches;
+	options.enable_planless_execution            = enable_planless_execution;
 	return options;
 }
 
@@ -215,22 +217,41 @@ py::dict block_metadata_to_dict(const galp::jpeg::JpegDctDeviceBlockMetadata& bl
 		out["estimated_selected_vector_count"] = preview.estimated_selected_vector_count;
 		out["full_vector_count"]               = preview.full_vector_count;
 		out["planned_saved_vector_count"]      = preview.planned_saved_vector_count;
-		out["estimated_saved_vector_count"]    = preview.estimated_saved_vector_count;
-		out["coefficients_per_block"]          = preview.coefficients_per_block;
-		out["planned_selected_vector_ratio"]   = preview.planned_selected_vector_ratio;
-		out["estimated_selected_vector_ratio"] = preview.estimated_selected_vector_ratio;
-		out["planning_ms"]                     = preview.planning_ms;
-		out["resize_weight_build_ms"]          = preview.resize_weight_build_ms;
-		out["dct_resize_weight_cache_hits"]    = preview.dct_resize_weight_cache_hits;
-		out["dct_resize_weight_cache_misses"]  = preview.dct_resize_weight_cache_misses;
-		out["dct_conversion_matrix_cache_hits"] = preview.dct_conversion_matrix_cache_hits;
-		out["dct_conversion_matrix_cache_misses"] = preview.dct_conversion_matrix_cache_misses;
+	    out["estimated_saved_vector_count"]                = preview.estimated_saved_vector_count;
+	    out["coefficients_per_block"]                      = preview.coefficients_per_block;
+	    out["planned_selected_vector_ratio"]               = preview.planned_selected_vector_ratio;
+	    out["estimated_selected_vector_ratio"]             = preview.estimated_selected_vector_ratio;
+	    out["planning_ms"]                                 = preview.planning_ms;
+	    out["resize_weight_build_ms"]                      = preview.resize_weight_build_ms;
+	    out["dct_resize_weight_cache_hits"]                = preview.dct_resize_weight_cache_hits;
+	    out["dct_resize_weight_cache_misses"]              = preview.dct_resize_weight_cache_misses;
+	    out["dct_conversion_matrix_cache_hits"]            = preview.dct_conversion_matrix_cache_hits;
+	    out["dct_conversion_matrix_cache_misses"]          = preview.dct_conversion_matrix_cache_misses;
+	    out["uses_planless_fixed_transform"]               = preview.uses_planless_fixed_transform;
+	    out["compact_image_descriptor_count"]              = preview.compact_image_descriptor_count;
+	    out["fixed_transform_component_count"]             = preview.fixed_transform_component_count;
+	    out["fixed_transform_source_block_count"]          = preview.fixed_transform_source_block_count;
+	    out["fixed_transform_output_block_count"]          = preview.fixed_transform_output_block_count;
+	    out["host_expanded_transform_items_created"]       = preview.host_expanded_transform_items_created;
+	    out["host_output_block_source_lists_created"]      = preview.host_output_block_source_lists_created;
+	    out["host_global_transform_sort_items"]            = preview.host_global_transform_sort_items;
+	    out["planless_axis_program_count"]                 = preview.planless_axis_program_count;
+	    out["planless_axis_phase_matrix_count"]            = preview.planless_axis_phase_matrix_count;
+	    out["planless_axis_program_bytes"]                 = preview.planless_axis_program_bytes;
+	    out["exact_batch_plan_cache_enabled"]              = preview.exact_batch_plan_cache_enabled;
+	    out["compact_reader_image_locator_bytes"]          = preview.compact_reader_image_locator_bytes;
+	    out["compact_reader_shard_index_bytes"]            = preview.compact_reader_shard_index_bytes;
+	    out["compact_reader_layout_dictionary_bytes"]      = preview.compact_reader_layout_dictionary_bytes;
+	    out["compact_reader_quant_table_dictionary_bytes"] = preview.compact_reader_quant_table_dictionary_bytes;
+	    out["compact_reader_total_bytes"]                  = preview.compact_reader_total_bytes;
+	    out["compact_reader_shard_descriptor_bytes"]       = preview.compact_reader_shard_descriptor_bytes;
+	    out["compact_reader_shard_index_derived"]          = preview.compact_reader_shard_index_derived;
 
-		py::list selected_coefficients;
-		for (const auto coeff : preview.selected_coefficients) {
-			selected_coefficients.append(coeff);
-		}
-		out["selected_coefficients"] = std::move(selected_coefficients);
+	    py::list selected_coefficients;
+	    for (const auto coeff : preview.selected_coefficients) {
+		    selected_coefficients.append(coeff);
+	    }
+	    out["selected_coefficients"] = std::move(selected_coefficients);
 
 		py::list image_layouts;
 		for (const auto& layout : preview.image_layouts) {
@@ -348,6 +369,23 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["fixed_transform_component_count"]               = stats.fixed_transform_component_count;
 	out["fixed_transform_source_block_count"]            = stats.fixed_transform_source_block_count;
 	out["fixed_transform_output_block_count"]            = stats.fixed_transform_output_block_count;
+	out["host_expanded_transform_items_created"]         = stats.host_expanded_transform_items_created;
+	out["host_output_block_source_lists_created"]        = stats.host_output_block_source_lists_created;
+	out["host_global_transform_sort_items"]              = stats.host_global_transform_sort_items;
+	out["planless_image_descriptor_count"]               = stats.planless_image_descriptor_count;
+	out["planless_transform_output_block_count"]         = stats.planless_transform_output_block_count;
+	out["rowgroup_storage_bytes_read"]                   = stats.rowgroup_storage_bytes_read;
+	out["galp_native_device_in_use_bytes"]               = stats.galp_native_device_in_use_bytes;
+	out["galp_native_device_peak_in_use_bytes"]          = stats.galp_native_device_peak_in_use_bytes;
+	out["galp_native_device_cached_bytes"]               = stats.galp_native_device_cached_bytes;
+	out["galp_native_device_allocation_requests"]        = stats.galp_native_device_allocation_requests;
+	out["galp_native_device_cuda_allocation_count"]      = stats.galp_native_device_cuda_allocation_count;
+	out["galp_native_device_cuda_allocation_bytes"]      = stats.galp_native_device_cuda_allocation_bytes;
+	out["device_mapping_ms"]                             = stats.device_mapping_ms;
+	out["device_mapping_fused"]                          = stats.device_mapping_fused;
+	out["planless_axis_program_count"]                   = stats.planless_axis_program_count;
+	out["planless_axis_phase_matrix_count"]              = stats.planless_axis_phase_matrix_count;
+	out["planless_axis_program_bytes"]                   = stats.planless_axis_program_bytes;
 	out["project_decoded_ycbcr_grid_launch_count"]       = stats.project_decoded_ycbcr_grid_launch_count;
 	out["jpeg_dct_projection_items_materialized"]        = stats.jpeg_dct_projection_items_materialized;
 	out["fixed_grid_round_event_handoff_count"]          = stats.fixed_grid_round_event_handoff_count;
@@ -363,6 +401,7 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["plan_cache_hits"]                               = stats.plan_cache_hits;
 	out["plan_cache_misses"]                             = stats.plan_cache_misses;
 	out["plan_cache_evictions"]                          = stats.plan_cache_evictions;
+	out["exact_batch_plan_cache_enabled"]                = stats.exact_batch_plan_cache_enabled;
 	out["runtime_policy_selected_rowgroups"]             = stats.runtime_policy_selected_rowgroups;
 	out["runtime_policy_full_rowgroups"]                 = stats.runtime_policy_full_rowgroups;
 	out["runtime_policy_tail_full_rowgroups"]            = stats.runtime_policy_tail_full_rowgroups;
@@ -967,6 +1006,12 @@ public:
 		return image_metadata_to_dict(state->runtime.ImageMetadata(global_image_index));
 	}
 
+	[[nodiscard]] uint64_t rowgroup_storage_bytes(const uint32_t               shard_id,
+	                                              const std::vector<uint32_t>& rowgroup_indices) const {
+		std::lock_guard<std::mutex> lock(state->runtime_mutex);
+		return state->runtime.RowgroupStorageBytes(shard_id, rowgroup_indices);
+	}
+
 private:
 	std::shared_ptr<TorchDirectDctReaderState> state;
 };
@@ -1051,174 +1096,195 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	         &TorchDirectDctReader::image_metadata,
 	         py::arg("global_image_index"),
 	         "Return JPEG metadata needed by adapters, including component slots and quantization tables.")
-	    .def("plan_batch",
-	         [](TorchDirectDctReader& reader,
-	            const std::vector<uint32_t>& image_ids,
-	            const py::object&            crop,
-	            const std::string&           dct_coeffs,
-	            const size_t                 cache_capacity_mib,
-	            const size_t                 decode_batch_rowgroups,
-	            const bool                   enable_rowgroup_prefetch,
-	            const size_t                 rowgroup_prefetch_depth,
-	            const size_t                 rowgroup_prefetch_workers,
-	            const size_t                 rowgroup_prefetch_min_decode_batches,
-	            const std::string&           layout,
-	            const py::object&            grid_transform,
-	            const size_t                 plan_cache_capacity) {
-		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(dct_coeffs,
-		                                                 cache_capacity_mib,
-		                                                 decode_batch_rowgroups,
-		                                                 enable_rowgroup_prefetch,
-		                                                 rowgroup_prefetch_depth,
-		                                                 rowgroup_prefetch_workers,
-		                                                 rowgroup_prefetch_min_decode_batches,
-		                                                 layout,
-		                                                 grid_transform,
-		                                                 plan_cache_capacity);
-		         return reader.plan_batch(image_ids, crop_box, options);
-	         },
-	         py::arg("image_ids"),
-	         py::arg("crop")                     = py::none(),
-	         py::arg("dct_coeffs")               = "all",
-	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
-	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
-	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
-	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
-	         py::arg("rowgroup_prefetch_min_decode_batches") =
-	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
-	         py::arg("layout")              = "compact",
-	         py::arg("grid_transform")      = py::none(),
-	         py::arg("plan_cache_capacity") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity)
-	    .def("read_batch",
-	         [](TorchDirectDctReader& reader,
-	            const std::vector<uint32_t>& image_ids,
-	            const py::object&            crop,
-	            const std::string&           dct_coeffs,
-	            const size_t                 cache_capacity_mib,
-	            const size_t                 decode_batch_rowgroups,
-	            const bool                   enable_rowgroup_prefetch,
-	            const size_t                 rowgroup_prefetch_depth,
-	            const size_t                 rowgroup_prefetch_workers,
-	            const size_t                 rowgroup_prefetch_min_decode_batches,
-	            const std::string&           layout,
-	            const py::object&            grid_transform,
-	            const size_t                 plan_cache_capacity) {
-		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(dct_coeffs,
-		                                                 cache_capacity_mib,
-		                                                 decode_batch_rowgroups,
-		                                                 enable_rowgroup_prefetch,
-		                                                 rowgroup_prefetch_depth,
-		                                                 rowgroup_prefetch_workers,
-		                                                 rowgroup_prefetch_min_decode_batches,
-		                                                 layout,
-		                                                 grid_transform,
-		                                                 plan_cache_capacity);
-		         py::gil_scoped_release release;
-		         return reader.read_batch(image_ids, crop_box, options);
-	         },
-	         py::arg("image_ids"),
-	         py::arg("crop")                     = py::none(),
-	         py::arg("dct_coeffs")               = "all",
-	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
-	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
-	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
-	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
-	         py::arg("rowgroup_prefetch_min_decode_batches") =
-	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
-	         py::arg("layout")              = "compact",
-	         py::arg("grid_transform")      = py::none(),
-	         py::arg("plan_cache_capacity") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity)
-	    .def("prefetch_batch",
-	         [](TorchDirectDctReader&      reader,
-	            std::vector<uint32_t>      image_ids,
-	            const py::object&          crop,
-	            const std::string&         dct_coeffs,
-	            const size_t               cache_capacity_mib,
-	            const size_t               decode_batch_rowgroups,
-	            const bool                 enable_rowgroup_prefetch,
-	            const size_t               rowgroup_prefetch_depth,
-	            const size_t               rowgroup_prefetch_workers,
-	            const size_t                 rowgroup_prefetch_min_decode_batches,
-	            const std::string&         layout,
-	            const py::object&          grid_transform,
-	            const size_t               plan_cache_capacity) {
-		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(dct_coeffs,
-		                                                 cache_capacity_mib,
-		                                                 decode_batch_rowgroups,
-		                                                 enable_rowgroup_prefetch,
-		                                                 rowgroup_prefetch_depth,
-		                                                 rowgroup_prefetch_workers,
-		                                                 rowgroup_prefetch_min_decode_batches,
-		                                                 layout,
-		                                                 grid_transform,
-		                                                 plan_cache_capacity);
-		         return reader.prefetch_batch(std::move(image_ids), crop_box, options);
-	         },
-	         py::arg("image_ids"),
-	         py::arg("crop")                     = py::none(),
-	         py::arg("dct_coeffs")               = "all",
-	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
-	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
-	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
-	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
-	         py::arg("rowgroup_prefetch_min_decode_batches") =
-	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
-	         py::arg("layout")              = "compact",
-	         py::arg("grid_transform")      = py::none(),
-	         py::arg("plan_cache_capacity") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity)
-	    .def("read_batch_async",
-	         [](TorchDirectDctReader&      reader,
-	            std::vector<uint32_t>      image_ids,
-	            const py::object&          crop,
-	            const std::string&         dct_coeffs,
-	            const size_t               cache_capacity_mib,
-	            const size_t               decode_batch_rowgroups,
-	            const bool                   enable_rowgroup_prefetch,
-	            const size_t                 rowgroup_prefetch_depth,
-	            const size_t                 rowgroup_prefetch_workers,
-	            const size_t                 rowgroup_prefetch_min_decode_batches,
-	            const std::string&         layout,
-	            const py::object&          grid_transform,
-	            const size_t               plan_cache_capacity) {
-		         const auto crop_box = parse_crop(crop);
-		         const auto options = make_batch_options(dct_coeffs,
-		                                                 cache_capacity_mib,
-		                                                 decode_batch_rowgroups,
-		                                                 enable_rowgroup_prefetch,
-		                                                 rowgroup_prefetch_depth,
-		                                                 rowgroup_prefetch_workers,
-		                                                 rowgroup_prefetch_min_decode_batches,
-		                                                 layout,
-		                                                 grid_transform,
-		                                                 plan_cache_capacity);
-		         return reader.prefetch_batch(std::move(image_ids), crop_box, options);
-	         },
-	         py::arg("image_ids"),
-	         py::arg("crop")                     = py::none(),
-	         py::arg("dct_coeffs")               = "all",
-	         py::arg("cache_capacity_mib")       = kDefaultDirectDctCacheCapacityMiB,
-	         py::arg("decode_batch_rowgroups")   = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
-	         py::arg("enable_rowgroup_prefetch") = true,
-	         py::arg("rowgroup_prefetch_depth")  = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
-	         py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
-	         py::arg("rowgroup_prefetch_min_decode_batches") =
-	             galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
-	         py::arg("layout")              = "compact",
-	         py::arg("grid_transform")      = py::none(),
-	         py::arg("plan_cache_capacity") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity)
+	    .def("rowgroup_storage_bytes",
+	         &TorchDirectDctReader::rowgroup_storage_bytes,
+	         py::arg("shard_id"),
+	         py::arg("rowgroup_indices"),
+	         "Return exact compressed FLS bytes for the requested rowgroup records.")
+	    .def(
+	        "plan_batch",
+	        [](TorchDirectDctReader&        reader,
+	           const std::vector<uint32_t>& image_ids,
+	           const py::object&            crop,
+	           const std::string&           dct_coeffs,
+	           const size_t                 cache_capacity_mib,
+	           const size_t                 decode_batch_rowgroups,
+	           const bool                   enable_rowgroup_prefetch,
+	           const size_t                 rowgroup_prefetch_depth,
+	           const size_t                 rowgroup_prefetch_workers,
+	           const size_t                 rowgroup_prefetch_min_decode_batches,
+	           const std::string&           layout,
+	           const py::object&            grid_transform,
+	           const size_t                 plan_cache_capacity,
+	           const bool                   enable_planless_execution) {
+		        const auto crop_box = parse_crop(crop);
+		        const auto options  = make_batch_options(dct_coeffs,
+                                                        cache_capacity_mib,
+                                                        decode_batch_rowgroups,
+                                                        enable_rowgroup_prefetch,
+                                                        rowgroup_prefetch_depth,
+                                                        rowgroup_prefetch_workers,
+                                                        rowgroup_prefetch_min_decode_batches,
+                                                        layout,
+                                                        grid_transform,
+                                                        plan_cache_capacity,
+                                                        enable_planless_execution);
+		        return reader.plan_batch(image_ids, crop_box, options);
+	        },
+	        py::arg("image_ids"),
+	        py::arg("crop")                      = py::none(),
+	        py::arg("dct_coeffs")                = "all",
+	        py::arg("cache_capacity_mib")        = kDefaultDirectDctCacheCapacityMiB,
+	        py::arg("decode_batch_rowgroups")    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
+	        py::arg("enable_rowgroup_prefetch")  = true,
+	        py::arg("rowgroup_prefetch_depth")   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	        py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	        py::arg("rowgroup_prefetch_min_decode_batches") =
+	            galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	        py::arg("layout")                    = "compact",
+	        py::arg("grid_transform")            = py::none(),
+	        py::arg("plan_cache_capacity")       = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity,
+	        py::arg("enable_planless_execution") = true)
+	    .def(
+	        "read_batch",
+	        [](TorchDirectDctReader&        reader,
+	           const std::vector<uint32_t>& image_ids,
+	           const py::object&            crop,
+	           const std::string&           dct_coeffs,
+	           const size_t                 cache_capacity_mib,
+	           const size_t                 decode_batch_rowgroups,
+	           const bool                   enable_rowgroup_prefetch,
+	           const size_t                 rowgroup_prefetch_depth,
+	           const size_t                 rowgroup_prefetch_workers,
+	           const size_t                 rowgroup_prefetch_min_decode_batches,
+	           const std::string&           layout,
+	           const py::object&            grid_transform,
+	           const size_t                 plan_cache_capacity,
+	           const bool                   enable_planless_execution) {
+		        const auto             crop_box = parse_crop(crop);
+		        const auto             options  = make_batch_options(dct_coeffs,
+                                                        cache_capacity_mib,
+                                                        decode_batch_rowgroups,
+                                                        enable_rowgroup_prefetch,
+                                                        rowgroup_prefetch_depth,
+                                                        rowgroup_prefetch_workers,
+                                                        rowgroup_prefetch_min_decode_batches,
+                                                        layout,
+                                                        grid_transform,
+                                                        plan_cache_capacity,
+                                                        enable_planless_execution);
+		        py::gil_scoped_release release;
+		        return reader.read_batch(image_ids, crop_box, options);
+	        },
+	        py::arg("image_ids"),
+	        py::arg("crop")                      = py::none(),
+	        py::arg("dct_coeffs")                = "all",
+	        py::arg("cache_capacity_mib")        = kDefaultDirectDctCacheCapacityMiB,
+	        py::arg("decode_batch_rowgroups")    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
+	        py::arg("enable_rowgroup_prefetch")  = true,
+	        py::arg("rowgroup_prefetch_depth")   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	        py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	        py::arg("rowgroup_prefetch_min_decode_batches") =
+	            galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	        py::arg("layout")                    = "compact",
+	        py::arg("grid_transform")            = py::none(),
+	        py::arg("plan_cache_capacity")       = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity,
+	        py::arg("enable_planless_execution") = true)
+	    .def(
+	        "prefetch_batch",
+	        [](TorchDirectDctReader& reader,
+	           std::vector<uint32_t> image_ids,
+	           const py::object&     crop,
+	           const std::string&    dct_coeffs,
+	           const size_t          cache_capacity_mib,
+	           const size_t          decode_batch_rowgroups,
+	           const bool            enable_rowgroup_prefetch,
+	           const size_t          rowgroup_prefetch_depth,
+	           const size_t          rowgroup_prefetch_workers,
+	           const size_t          rowgroup_prefetch_min_decode_batches,
+	           const std::string&    layout,
+	           const py::object&     grid_transform,
+	           const size_t          plan_cache_capacity,
+	           const bool            enable_planless_execution) {
+		        const auto crop_box = parse_crop(crop);
+		        const auto options  = make_batch_options(dct_coeffs,
+                                                        cache_capacity_mib,
+                                                        decode_batch_rowgroups,
+                                                        enable_rowgroup_prefetch,
+                                                        rowgroup_prefetch_depth,
+                                                        rowgroup_prefetch_workers,
+                                                        rowgroup_prefetch_min_decode_batches,
+                                                        layout,
+                                                        grid_transform,
+                                                        plan_cache_capacity,
+                                                        enable_planless_execution);
+		        return reader.prefetch_batch(std::move(image_ids), crop_box, options);
+	        },
+	        py::arg("image_ids"),
+	        py::arg("crop")                      = py::none(),
+	        py::arg("dct_coeffs")                = "all",
+	        py::arg("cache_capacity_mib")        = kDefaultDirectDctCacheCapacityMiB,
+	        py::arg("decode_batch_rowgroups")    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
+	        py::arg("enable_rowgroup_prefetch")  = true,
+	        py::arg("rowgroup_prefetch_depth")   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	        py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	        py::arg("rowgroup_prefetch_min_decode_batches") =
+	            galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	        py::arg("layout")                    = "compact",
+	        py::arg("grid_transform")            = py::none(),
+	        py::arg("plan_cache_capacity")       = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity,
+	        py::arg("enable_planless_execution") = true)
+	    .def(
+	        "read_batch_async",
+	        [](TorchDirectDctReader& reader,
+	           std::vector<uint32_t> image_ids,
+	           const py::object&     crop,
+	           const std::string&    dct_coeffs,
+	           const size_t          cache_capacity_mib,
+	           const size_t          decode_batch_rowgroups,
+	           const bool            enable_rowgroup_prefetch,
+	           const size_t          rowgroup_prefetch_depth,
+	           const size_t          rowgroup_prefetch_workers,
+	           const size_t          rowgroup_prefetch_min_decode_batches,
+	           const std::string&    layout,
+	           const py::object&     grid_transform,
+	           const size_t          plan_cache_capacity,
+	           const bool            enable_planless_execution) {
+		        const auto crop_box = parse_crop(crop);
+		        const auto options  = make_batch_options(dct_coeffs,
+                                                        cache_capacity_mib,
+                                                        decode_batch_rowgroups,
+                                                        enable_rowgroup_prefetch,
+                                                        rowgroup_prefetch_depth,
+                                                        rowgroup_prefetch_workers,
+                                                        rowgroup_prefetch_min_decode_batches,
+                                                        layout,
+                                                        grid_transform,
+                                                        plan_cache_capacity,
+                                                        enable_planless_execution);
+		        return reader.prefetch_batch(std::move(image_ids), crop_box, options);
+	        },
+	        py::arg("image_ids"),
+	        py::arg("crop")                      = py::none(),
+	        py::arg("dct_coeffs")                = "all",
+	        py::arg("cache_capacity_mib")        = kDefaultDirectDctCacheCapacityMiB,
+	        py::arg("decode_batch_rowgroups")    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
+	        py::arg("enable_rowgroup_prefetch")  = true,
+	        py::arg("rowgroup_prefetch_depth")   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	        py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	        py::arg("rowgroup_prefetch_min_decode_batches") =
+	            galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	        py::arg("layout")                    = "compact",
+	        py::arg("grid_transform")            = py::none(),
+	        py::arg("plan_cache_capacity")       = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity,
+	        py::arg("enable_planless_execution") = true)
 	    .def("read_prefetched",
 	         &TorchDirectDctReader::read_prefetched,
 	         py::arg("prefetch"),
 	         py::call_guard<py::gil_scoped_release>())
 	    .def("manual_reclaim", &TorchDirectDctReader::manual_reclaim);
 
-	m.attr("DEFAULT_CACHE_CAPACITY_MIB") = kDefaultDirectDctCacheCapacityMiB;
+	m.attr("DEFAULT_CACHE_CAPACITY_MIB")  = kDefaultDirectDctCacheCapacityMiB;
 	m.attr("DEFAULT_PLAN_CACHE_CAPACITY") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity;
 	m.def("manual_reclaim", []() { return DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished(); });
 }

@@ -40,6 +40,30 @@ HERE = Path(__file__).resolve().parent
 DIAGNOSTICS_DIR = HERE / "diagnostics"
 
 
+def _process_memory_snapshot(status_path: Path = Path("/proc/self/status")) -> dict[str, int]:
+    """Return Linux main-process resident and lifetime-peak resident bytes."""
+    values: dict[str, int] = {}
+    try:
+        lines = status_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RuntimeError(f"cannot read process memory status from {status_path}: {error}") from error
+    for line in lines:
+        name, separator, raw_value = line.partition(":")
+        if separator and name in ("VmRSS", "VmHWM"):
+            fields = raw_value.split()
+            if len(fields) != 2 or fields[1] != "kB":
+                raise RuntimeError(f"unexpected {name} format in {status_path}: {line}")
+            values[name] = int(fields[0]) * 1024
+    if values.get("VmRSS", 0) <= 0 or values.get("VmHWM", 0) <= 0:
+        raise RuntimeError(f"process memory status lacks positive VmRSS/VmHWM values: {status_path}")
+    if values["VmHWM"] < values["VmRSS"]:
+        raise RuntimeError(f"process VmHWM is smaller than VmRSS in {status_path}")
+    return {
+        "rss_bytes": values["VmRSS"],
+        "peak_rss_bytes": values["VmHWM"],
+    }
+
+
 @dataclass
 class LoadedBatch:
     inputs: tuple[torch.Tensor, ...]
@@ -326,6 +350,8 @@ class DaliAdapter(PipelineAdapter):
 class GalpAdapter(PipelineAdapter):
     domain = "dct"
     worker_semantics = "galp_internal_runtime_not_configured_by_worker_count"
+    config_name = "galp"
+    require_planless = True
 
     def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device) -> None:
         super().__init__(contract, samples, device)
@@ -334,12 +360,12 @@ class GalpAdapter(PipelineAdapter):
         _add_diagnostics_to_path()
         self.module = importlib.import_module("direct_dct")
         galp_dct = importlib.import_module("_galp_direct_dct")
-        config = contract["pipelines"]["galp"]
+        config = contract["pipelines"][self.config_name]
         self.reader = galp_dct.DirectDctReader(str(config["manifest"]))
         self.args = SimpleNamespace(
             preprocess=config["preprocess"],
             cache_capacity_mib=int(config["cache_capacity_mib"]),
-            plan_cache_capacity=int(config.get("plan_cache_capacity", 128)),
+            plan_cache_capacity=int(config.get("plan_cache_capacity", 0)),
             decode_batch_rowgroups=int(config.get("decode_batch_rowgroups", 64)),
             rowgroup_prefetch_depth=int(config.get("rowgroup_prefetch_depth", 16)),
             rowgroup_prefetch_workers=int(config.get("rowgroup_prefetch_workers", 4)),
@@ -348,6 +374,7 @@ class GalpAdapter(PipelineAdapter):
             ),
             no_dequantize=False,
             no_scale=False,
+            enable_planless_execution=bool(config.get("enable_planless_execution", True)),
         )
         self.transform = (
             self.module.build_rgbnomore_dct_val_transform(Path(contract["pipelines"]["rgbnomore"]["root"]))
@@ -410,17 +437,45 @@ class GalpAdapter(PipelineAdapter):
             )
         totals = self.module._empty_totals()
         self.module._accumulate_many_stats(totals, source_batches)
-        if self.args.preprocess == "rgbnomore-val-pushdown":
+        if self.args.preprocess == "rgbnomore-val-pushdown" and self.require_planless:
             for source_batch in source_batches:
                 stats = dict(source_batch.execution_stats)
-                if int(stats.get("fixed_transform_item_count", 0)) <= 0:
-                    raise RuntimeError("GALP benchmark did not exercise the fused transformed-grid path")
+                planless = (
+                    int(stats.get("planless_image_descriptor_count", 0)) == len(image_ids)
+                    and int(stats.get("fixed_transform_item_count", 0)) == 0
+                    and int(stats.get("host_expanded_transform_items_created", 0)) == 0
+                    and int(stats.get("host_output_block_source_lists_created", 0)) == 0
+                    and int(stats.get("host_global_transform_sort_items", 0)) == 0
+                    and not bool(stats.get("exact_batch_plan_cache_enabled", False))
+                    and not bool(stats.get("cache_enabled", False))
+                    and bool(stats.get("device_mapping_fused", False))
+                )
+                if not planless:
+                    raise RuntimeError(
+                        "GALP benchmark did not exercise the planless transformed-grid path: "
+                        f"descriptors={stats.get('planless_image_descriptor_count', 0)} "
+                        f"items={stats.get('fixed_transform_item_count', 0)}"
+                    )
                 if (
                     int(stats.get("projection_item_count", 0)) != 0
                     or int(stats.get("decoded_projection_item_count", 0)) != 0
                     or int(stats.get("project_decoded_ycbcr_grid_launch_count", 0)) != 0
                 ):
                     raise RuntimeError("GALP benchmark unexpectedly used generic projection")
+        elif self.args.preprocess == "rgbnomore-val-pushdown" and not self.require_planless:
+            for source_batch in source_batches:
+                stats = dict(source_batch.execution_stats)
+                if (
+                    int(stats.get("planless_image_descriptor_count", 0)) != 0
+                    or int(stats.get("fixed_transform_item_count", 0)) <= 0
+                    or int(stats.get("host_expanded_transform_items_created", 0)) <= 0
+                    or int(stats.get("host_global_transform_sort_items", 0)) <= 0
+                    or bool(stats.get("exact_batch_plan_cache_enabled", False))
+                    or bool(stats.get("cache_enabled", False))
+                ):
+                    raise RuntimeError(
+                        "GALP legacy A/B pipeline did not exercise the expanded transformed-grid graph"
+                    )
         labels = torch.tensor([sample["label"] for sample in expected], dtype=torch.long, device=self.device)
         native_stage_seconds = {
             key: float(value)
@@ -447,9 +502,15 @@ class GalpAdapter(PipelineAdapter):
         self.next_prefetch_batch_index = 0
 
 
+class GalpLegacyAdapter(GalpAdapter):
+    config_name = "galp_legacy"
+    require_planless = False
+
+
 def _make_adapter(name: str, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device) -> PipelineAdapter:
     adapters = {
         "galp": GalpAdapter,
+        "galp_legacy": GalpLegacyAdapter,
         "rgbnomore": RgbNoMoreAdapter,
         "dali": DaliAdapter,
         "pytorch": PyTorchAdapter,
@@ -556,8 +617,8 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         sha256_file(canonical_index) == contract["dataset"]["canonical_index_sha256"],
         "canonical RGB-no-more index changed after contract creation",
     )
-    if name == "galp":
-        galp_config = contract["pipelines"]["galp"]
+    if name in ("galp", "galp_legacy"):
+        galp_config = contract["pipelines"][name]
         verify_file_fingerprint(
             Path(galp_config["manifest"]), galp_config["manifest_fingerprint"], "GALP manifest"
         )
@@ -580,6 +641,7 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
     model = _build_rgb_model(contract, device) if adapter.domain == "rgb" else _build_dct_model(contract, device)
     semantic_count = int(contract["semantic_validation"]["sample_count"])
     semantic_store: dict[str, list[np.ndarray]] = {}
+    prediction_store: dict[str, list[np.ndarray]] = {}
     repeat_records: list[dict[str, Any]] = []
 
     measured_expected = measured_samples(samples, batch_size, warmup_batches, measurement_batches)
@@ -605,6 +667,7 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         if device.type == "cuda":
             _synchronize_model_stream(device)
             torch.cuda.reset_peak_memory_stats(device)
+        host_memory_before = _process_memory_snapshot()
         cpu_process_seconds = 0.0
         latency_ms: list[float] = []
         loader_submit_ms: list[float] = []
@@ -612,6 +675,7 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         forward_gpu_ms: list[float] = []
         actual_samples: list[dict[str, Any]] = []
         native_stage_seconds: dict[str, float] = {}
+        native_stage_ms_by_batch: dict[str, list[float]] = {}
         native_counters: dict[str, int] = {}
         correct1 = 0
         correct5 = 0
@@ -655,6 +719,16 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
                     expected,
                     semantic_count - semantic_captured,
                 )
+            if repeat == 0:
+                prediction_store.setdefault("prediction_ordinals", []).append(
+                    np.asarray(batch.ordinals, dtype=np.int64)
+                )
+                prediction_store.setdefault("prediction_labels", []).append(
+                    np.asarray([item["label"] for item in expected], dtype=np.int64)
+                )
+                top5 = torch.topk(logits.detach(), k=min(5, logits.shape[1]), dim=1).indices.cpu().numpy()
+                prediction_store.setdefault("top1_predictions", []).append(top5[:, 0].astype(np.int64))
+                prediction_store.setdefault("top5_predictions", []).append(top5.astype(np.int64))
             latency_ms.append((wall_ended_ns - wall_started_ns) / 1e6)
             loader_submit_ms.append((load_ended_ns - load_started_ns) / 1e6)
             h2d_gpu_ms.append(_event_ms(h2d_start, h2d_end))
@@ -663,15 +737,32 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
             correct5 += batch_correct5
             actual_samples.extend(expected)
             for key, value in batch.native_stage_seconds.items():
-                native_stage_seconds[key] = native_stage_seconds.get(key, 0.0) + float(value)
+                seconds = float(value)
+                native_stage_seconds[key] = native_stage_seconds.get(key, 0.0) + seconds
+                native_stage_ms_by_batch.setdefault(key, []).append(seconds * 1000.0)
+            if (
+                "device_mapping_seconds" in batch.native_stage_seconds
+                or "fixed_transform_kernel_seconds" in batch.native_stage_seconds
+            ):
+                combined_ms = 1000.0 * (
+                    float(batch.native_stage_seconds.get("device_mapping_seconds", 0.0))
+                    + float(batch.native_stage_seconds.get("fixed_transform_kernel_seconds", 0.0))
+                )
+                native_stage_ms_by_batch.setdefault(
+                    "device_mapping_plus_fixed_transform_seconds", []
+                ).append(combined_ms)
             for key, value in batch.native_counters.items():
-                native_counters[key] = native_counters.get(key, 0) + int(value)
+                if key.startswith("galp_native_device_"):
+                    native_counters[key] = max(native_counters.get(key, 0), int(value))
+                else:
+                    native_counters[key] = native_counters.get(key, 0) + int(value)
 
         measured_seconds = sum(latency_ms) / 1000.0
         images = measurement_batches * batch_size
         actual_trace = sample_trace(actual_samples)
         if actual_trace["sha256"] != expected_trace["sha256"]:
             raise RuntimeError("measured sample trace does not match the contract")
+        host_memory_after = _process_memory_snapshot()
         record = {
             "repeat": repeat,
             "images": images,
@@ -684,11 +775,21 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
             "correct_top5": correct5,
             "cpu_process_seconds": cpu_process_seconds,
             "cpu_time_scope": "main_process_only_excludes_loader_workers",
+            "host_process_rss_before_measurement_bytes": host_memory_before["rss_bytes"],
+            "host_process_rss_after_measurement_bytes": host_memory_after["rss_bytes"],
+            "host_process_peak_rss_bytes": host_memory_after["peak_rss_bytes"],
+            "host_process_memory_scope": (
+                "linux_main_pipeline_process_VmRSS_and_lifetime_VmHWM_includes_python_torch_"
+                "and_native_pipeline_allocations_excludes_loader_worker_processes"
+            ),
             "stage_breakdown_ms": {
                 "loader_and_preprocess_submit": distribution(loader_submit_ms),
                 "host_to_device_gpu": distribution(h2d_gpu_ms),
                 "model_forward_gpu": distribution(forward_gpu_ms),
                 "native_totals_seconds": native_stage_seconds,
+                "native_per_batch_ms": {
+                    key: distribution(values) for key, values in native_stage_ms_by_batch.items()
+                },
             },
             "native_counters": native_counters,
             "peak_gpu_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
@@ -706,6 +807,7 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         adapter.end_repeat()
 
     semantic_path = output.parent / f"semantic_{name}.npz"
+    semantic_store.update(prediction_store)
     _write_semantic(
         semantic_path,
         semantic_store,
@@ -713,6 +815,9 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
             "pipeline": name,
             "domain": adapter.domain,
             "sample_count": semantic_count,
+            "prediction_agreement_sample_count": int(
+                contract["semantic_validation"]["prediction_agreement_sample_count"]
+            ),
             "contract_sha256": sha256_json(contract),
         },
     )
@@ -763,7 +868,11 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pipeline", choices=("galp", "rgbnomore", "dali", "pytorch"), required=True)
+    parser.add_argument(
+        "--pipeline",
+        choices=("galp", "galp_legacy", "rgbnomore", "dali", "pytorch"),
+        required=True,
+    )
     parser.add_argument("--contract", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()

@@ -15,6 +15,7 @@ import argparse
 import csv
 import importlib
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -105,6 +106,31 @@ def _make_benchmark_image_ids(
     supported_only = args.sampling_policy == "supported-only" or (
         args.sampling_policy == "preprocess-default" and args.preprocess == "rgbnomore-val-pushdown"
     )
+    if getattr(args, "image_order", "sequential") == "shuffled":
+        population = getattr(args, "_ordered_image_population", None)
+        if population is None:
+            population = [
+                image_id
+                for image_id in range(image_count)
+                if not supported_only or _sampling_mode(reader, image_id) in SUPPORTED_SAMPLING_MODES
+            ]
+            random.Random(int(getattr(args, "shuffle_seed", 20260718))).shuffle(population)
+            setattr(args, "_ordered_image_population", population)
+        if not population:
+            raise RuntimeError("shuffled benchmark population is empty")
+        count = min(args.batch_size, len(population))
+        if warmup:
+            start = (step * count) % len(population)
+            return [int(population[(start + offset) % len(population)]) for offset in range(count)], []
+        start = step * args.batch_size
+        if getattr(args, "no_wrap_image_ids", False):
+            image_ids = [int(image_id) for image_id in population[start : start + args.batch_size]]
+            if not image_ids:
+                raise RuntimeError(
+                    f"benchmark step {step} exceeds the shuffled image population of {len(population)}"
+                )
+            return image_ids, []
+        return [int(population[(start + offset) % len(population)]) for offset in range(count)], []
     if getattr(args, "no_wrap_image_ids", False):
         if image_count <= 0:
             raise RuntimeError("manifest has no images")
@@ -258,6 +284,7 @@ def _read_grid_batch(
     rowgroup_prefetch_workers: int = 4,
     rowgroup_prefetch_min_decode_batches: int = 2,
     plan_cache_capacity: int = 128,
+    enable_planless_execution: bool = True,
 ) -> Any:
     return reader.read_batch(
         image_ids,
@@ -269,6 +296,7 @@ def _read_grid_batch(
         rowgroup_prefetch_workers=rowgroup_prefetch_workers,
         rowgroup_prefetch_min_decode_batches=rowgroup_prefetch_min_decode_batches,
         plan_cache_capacity=plan_cache_capacity,
+        enable_planless_execution=enable_planless_execution,
         layout=layout,
         grid_transform=grid_transform,
     )
@@ -588,6 +616,21 @@ def inspect_metadata_only(reader: Any, args: argparse.Namespace) -> dict[str, An
     return result
 
 
+def _uses_planless_fixed_transform(stats: dict[str, Any]) -> bool:
+    return (
+        int(stats.get("planless_image_descriptor_count", 0)) > 0
+        and int(stats.get("fixed_transform_item_count", 0)) == 0
+        and int(stats.get("host_expanded_transform_items_created", 0)) == 0
+        and int(stats.get("host_output_block_source_lists_created", 0)) == 0
+        and int(stats.get("host_global_transform_sort_items", 0)) == 0
+        and bool(stats.get("device_mapping_fused", False))
+    )
+
+
+def _uses_fixed_transform(stats: dict[str, Any]) -> bool:
+    return _uses_planless_fixed_transform(stats) or int(stats.get("fixed_transform_item_count", 0)) > 0
+
+
 def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     stats = batch.execution_stats
     totals["selected_vectors"] += int(stats["selected_vector_count"])
@@ -598,6 +641,34 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     totals["projection_items"] += int(stats["projection_item_count"])
     totals["decoded_projection_items"] += int(stats.get("decoded_projection_item_count", 0))
     totals["fixed_transform_items"] += int(stats.get("fixed_transform_item_count", 0))
+    # Planless execution submits one compact image descriptor and creates no
+    # host-side transform items, source lists, or sort entries.
+    totals["planless_image_descriptors"] += int(stats.get("planless_image_descriptor_count", 0))
+    totals["planless_transform_output_blocks"] += int(stats.get("planless_transform_output_block_count", 0))
+    for key in (
+        "planless_axis_program_count",
+        "planless_axis_phase_matrix_count",
+        "planless_axis_program_bytes",
+    ):
+        totals[key] = max(int(totals[key]), int(stats.get(key, 0)))
+    totals["rowgroup_storage_bytes_read"] += int(stats.get("rowgroup_storage_bytes_read", 0))
+    for key in (
+        "galp_native_device_in_use_bytes",
+        "galp_native_device_peak_in_use_bytes",
+        "galp_native_device_cached_bytes",
+        "galp_native_device_allocation_requests",
+        "galp_native_device_cuda_allocation_count",
+        "galp_native_device_cuda_allocation_bytes",
+    ):
+        totals[key] = max(int(totals[key]), int(stats.get(key, 0)))
+    totals["host_expanded_transform_items_created"] += int(
+        stats.get("host_expanded_transform_items_created", 0)
+    )
+    totals["host_output_block_source_lists_created"] += int(
+        stats.get("host_output_block_source_lists_created", 0)
+    )
+    totals["host_global_transform_sort_items"] += int(stats.get("host_global_transform_sort_items", 0))
+    totals["device_mapping_fused_batches"] += int(bool(stats.get("device_mapping_fused", False)))
     totals["fixed_transform_components"] += int(stats.get("fixed_transform_component_count", 0))
     totals["fixed_transform_source_blocks"] += int(stats.get("fixed_transform_source_block_count", 0))
     totals["fixed_transform_output_blocks"] += int(stats.get("fixed_transform_output_block_count", 0))
@@ -608,6 +679,10 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     totals["plan_cache_hits"] += int(stats.get("plan_cache_hits", 0))
     totals["plan_cache_misses"] += int(stats.get("plan_cache_misses", 0))
     totals["plan_cache_evictions"] += int(stats.get("plan_cache_evictions", 0))
+    totals["exact_batch_plan_cache_enabled_batches"] += int(
+        bool(stats.get("exact_batch_plan_cache_enabled", False))
+    )
+    totals["decoded_rowgroup_cache_enabled_batches"] += int(bool(stats.get("cache_enabled", False)))
     totals["project_decoded_ycbcr_grid_launches"] += int(stats.get("project_decoded_ycbcr_grid_launch_count", 0))
     totals["jpeg_dct_projection_items_materialized"] += int(
         stats.get("jpeg_dct_projection_items_materialized", stats["projection_item_count"])
@@ -629,6 +704,7 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     totals["gpu_projection_seconds"] += float(stats.get("projection_ms", 0.0)) / 1000.0
     totals["decoded_projection_seconds"] += float(stats.get("decoded_projection_ms", 0.0)) / 1000.0
     totals["fixed_transform_kernel_seconds"] += float(stats.get("fixed_transform_ms", 0.0)) / 1000.0
+    totals["device_mapping_seconds"] += float(stats.get("device_mapping_ms", 0.0)) / 1000.0
     totals["round_kernel_seconds"] += float(stats.get("fixed_grid_round_ms", 0.0)) / 1000.0
 
 
@@ -642,6 +718,22 @@ def _empty_totals() -> dict[str, int | float]:
         "projection_items": 0,
         "decoded_projection_items": 0,
         "fixed_transform_items": 0,
+        "planless_image_descriptors": 0,
+        "planless_transform_output_blocks": 0,
+        "planless_axis_program_count": 0,
+        "planless_axis_phase_matrix_count": 0,
+        "planless_axis_program_bytes": 0,
+        "rowgroup_storage_bytes_read": 0,
+        "galp_native_device_in_use_bytes": 0,
+        "galp_native_device_peak_in_use_bytes": 0,
+        "galp_native_device_cached_bytes": 0,
+        "galp_native_device_allocation_requests": 0,
+        "galp_native_device_cuda_allocation_count": 0,
+        "galp_native_device_cuda_allocation_bytes": 0,
+        "host_expanded_transform_items_created": 0,
+        "host_output_block_source_lists_created": 0,
+        "host_global_transform_sort_items": 0,
+        "device_mapping_fused_batches": 0,
         "fixed_transform_components": 0,
         "fixed_transform_source_blocks": 0,
         "fixed_transform_output_blocks": 0,
@@ -652,6 +744,8 @@ def _empty_totals() -> dict[str, int | float]:
         "plan_cache_hits": 0,
         "plan_cache_misses": 0,
         "plan_cache_evictions": 0,
+        "exact_batch_plan_cache_enabled_batches": 0,
+        "decoded_rowgroup_cache_enabled_batches": 0,
         "project_decoded_ycbcr_grid_launches": 0,
         "jpeg_dct_projection_items_materialized": 0,
         "internal_syncs": 0,
@@ -670,6 +764,7 @@ def _empty_totals() -> dict[str, int | float]:
         "gpu_projection_seconds": 0.0,
         "decoded_projection_seconds": 0.0,
         "fixed_transform_kernel_seconds": 0.0,
+        "device_mapping_seconds": 0.0,
         "round_kernel_seconds": 0.0,
     }
 
@@ -681,7 +776,17 @@ def _annotate_fixed_path_result(result: dict[str, Any], preprocess: str) -> None
         or int(result.get("project_decoded_ycbcr_grid_launches", 0)) != 0
         or int(result.get("jpeg_dct_projection_items_materialized", 0)) != 0
     )
-    result["fixed_specialized_path_used"] = (
+    result["planless_path_used"] = (
+        preprocess == "rgbnomore-val-pushdown"
+        and int(result.get("planless_image_descriptors", 0)) > 0
+        and int(result.get("fixed_transform_items", 0)) == 0
+        and int(result.get("host_expanded_transform_items_created", 0)) == 0
+        and int(result.get("host_output_block_source_lists_created", 0)) == 0
+        and int(result.get("host_global_transform_sort_items", 0)) == 0
+        and int(result.get("exact_batch_plan_cache_enabled_batches", 0)) == 0
+        and int(result.get("decoded_rowgroup_cache_enabled_batches", 0)) == 0
+    )
+    result["fixed_specialized_path_used"] = result["planless_path_used"] or (
         preprocess == "rgbnomore-val-pushdown" and int(result.get("fixed_transform_items", 0)) > 0
     )
     result["fallback_reason"] = "fixed-grid path used generic projection" if result["generic_projection_used"] else ""
@@ -808,6 +913,7 @@ def read_and_adapt_batch(
                 getattr(args, "rowgroup_prefetch_min_decode_batches", 2)
             ),
             plan_cache_capacity=int(getattr(args, "plan_cache_capacity", 128)),
+            enable_planless_execution=bool(getattr(args, "enable_planless_execution", True)),
         )
         input_y, input_cbcr = adapt_galp_batch_to_rgbnomore(
             reader,
@@ -852,6 +958,7 @@ def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: l
             getattr(args, "rowgroup_prefetch_min_decode_batches", 2)
         ),
         plan_cache_capacity=int(getattr(args, "plan_cache_capacity", 128)),
+        enable_planless_execution=bool(getattr(args, "enable_planless_execution", True)),
         layout="transformed_dct_grid",
         grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
     )
@@ -953,9 +1060,8 @@ def run_loader_phase(
                 "image_ids": image_ids,
                 "image_count": len(image_ids),
                 "read_batch_call_count": len(batches),
-                "fixed_specialized_path_used": all(
-                    int(stats.get("fixed_transform_item_count", 0)) > 0 for stats in batch_stats
-                ),
+                "fixed_specialized_path_used": all(_uses_fixed_transform(stats) for stats in batch_stats),
+                "planless_path_used": all(_uses_planless_fixed_transform(stats) for stats in batch_stats),
                 "generic_projection_used": any(
                     int(stats.get("projection_item_count", 0)) != 0
                     or int(stats.get("decoded_projection_item_count", 0)) != 0
@@ -998,6 +1104,8 @@ def run_loader_phase(
         "rowgroup_prefetch_workers": args.rowgroup_prefetch_workers,
         "rowgroup_prefetch_min_decode_batches": args.rowgroup_prefetch_min_decode_batches,
         "sampling_policy": args.sampling_policy,
+        "image_order": getattr(args, "image_order", "sequential"),
+        "shuffle_seed": int(getattr(args, "shuffle_seed", 20260718)),
         "image_ids_wrapped": not args.no_wrap_image_ids,
         "unsupported_sampling_skipped_count": len(unsupported_sampling_skips),
         "unsupported_sampling_skipped_samples": unsupported_sampling_skips[:16],
@@ -1083,6 +1191,8 @@ def run_forward_phase(
         "logits_shape": logits_shape,
         "cache_capacity_mib": args.cache_capacity_mib,
         "sampling_policy": args.sampling_policy,
+        "image_order": getattr(args, "image_order", "sequential"),
+        "shuffle_seed": int(getattr(args, "shuffle_seed", 20260718)),
         "image_ids_wrapped": not args.no_wrap_image_ids,
         "unsupported_sampling_skipped_count": len(unsupported_sampling_skips),
         "unsupported_sampling_skipped_samples": unsupported_sampling_skips[:16],
@@ -1167,7 +1277,7 @@ def run_end_to_end_phase(
                     f"pushdown end-to-end batch must use exactly one batched read, got {len(batches)}"
                 )
             stats = dict(batches[0].execution_stats)
-            fixed_path = int(stats.get("fixed_transform_item_count", 0)) > 0
+            fixed_path = _uses_fixed_transform(stats)
             generic_projection = (
                 int(stats.get("projection_item_count", 0)) != 0
                 or int(stats.get("decoded_projection_item_count", 0)) != 0
@@ -1185,6 +1295,7 @@ def run_end_to_end_phase(
                     "image_count": len(image_ids),
                     "read_batch_call_count": 1,
                     "fixed_specialized_path_used": True,
+                    "planless_path_used": _uses_planless_fixed_transform(stats),
                     "generic_projection_used": False,
                     "fallback_reason": "",
                     "stats": [stats],
@@ -1228,6 +1339,8 @@ def run_end_to_end_phase(
         "rowgroup_prefetch_workers": args.rowgroup_prefetch_workers,
         "rowgroup_prefetch_min_decode_batches": args.rowgroup_prefetch_min_decode_batches,
         "sampling_policy": args.sampling_policy,
+        "image_order": getattr(args, "image_order", "sequential"),
+        "shuffle_seed": int(getattr(args, "shuffle_seed", 20260718)),
         "image_ids_wrapped": not args.no_wrap_image_ids,
         "unsupported_sampling_skipped_count": len(unsupported_sampling_skips),
         "unsupported_sampling_skipped_samples": unsupported_sampling_skips[:16],
@@ -1351,6 +1464,8 @@ def run_train_phase(
         "index_file": str(args.index_file) if args.index_file is not None else None,
         "cache_capacity_mib": args.cache_capacity_mib,
         "sampling_policy": args.sampling_policy,
+        "image_order": getattr(args, "image_order", "sequential"),
+        "shuffle_seed": int(getattr(args, "shuffle_seed", 20260718)),
         "image_ids_wrapped": not args.no_wrap_image_ids,
         "unsupported_sampling_skipped_count": len(unsupported_sampling_skips),
         "unsupported_sampling_skipped_samples": unsupported_sampling_skips[:16],
@@ -1398,6 +1513,19 @@ def _parse_args() -> argparse.Namespace:
         default=2,
         help="Number of materialized rowgroups combined into one decode workset.",
     )
+    parser.add_argument(
+        "--plan-cache-capacity",
+        type=int,
+        default=0,
+        help="Legacy exact-batch plan entries; canonical planless execution bypasses this cache.",
+    )
+    parser.add_argument(
+        "--disable-planless-execution",
+        action="store_false",
+        dest="enable_planless_execution",
+        help="Diagnostic A/B mode that forces the legacy expanded transformed-grid graph.",
+    )
+    parser.set_defaults(enable_planless_execution=True)
     parser.add_argument("--rowgroup-prefetch-depth", type=int, default=16)
     parser.add_argument("--rowgroup-prefetch-workers", type=int, default=4)
     parser.add_argument("--rowgroup-prefetch-min-decode-batches", type=int, default=2)
@@ -1416,9 +1544,16 @@ def _parse_args() -> argparse.Namespace:
             "Image selection policy. preprocess-default preserves legacy behavior "
             "(fixed-grid pushdown skips unsupported JPEG sampling); supported-only "
             "uses the same supported 4:2:0/4:4:4 image stream for all "
-            "preprocess modes; all uses sequential image ids without filtering."
+            "preprocess modes; all uses the complete image-id population without filtering."
         ),
     )
+    parser.add_argument(
+        "--image-order",
+        choices=("sequential", "shuffled"),
+        default="sequential",
+        help="Deterministic image-id trace used by loader/forward/end-to-end/train phases.",
+    )
+    parser.add_argument("--shuffle-seed", type=int, default=20260718)
     parser.add_argument("--no-dequantize", action="store_true", help="Feed raw quantized coefficients instead of RGB-no-more dequantized inputs.")
     parser.add_argument("--no-scale", action="store_true", help="Do not scale dequantized DCT coefficients from [-1024,1016] to RGB-no-more's [-1,1] range.")
     parser.add_argument("--train-lr", type=float, default=0.0, help="SGD learning rate used only for --phase train.")
@@ -1436,6 +1571,8 @@ def main() -> None:
         raise ValueError("--warmup must be non-negative")
     if args.cache_capacity_mib < 0:
         raise ValueError("--cache-capacity-mib must be non-negative")
+    if args.plan_cache_capacity < 0:
+        raise ValueError("--plan-cache-capacity must be non-negative")
     if args.decode_batch_rowgroups <= 0:
         raise ValueError("--decode-batch-rowgroups must be positive")
     if (

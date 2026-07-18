@@ -11,6 +11,7 @@ import platform
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +43,11 @@ DEFAULT_BENCHMARK_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/
 
 PRESETS = {
     "smoke": {"batch_size": 2, "warmup_batches": 1, "measurement_batches": 2, "repeats": 1, "workers": 1, "semantic_samples": 2},
-    "e2e": {"batch_size": 64, "warmup_batches": 5, "measurement_batches": 20, "repeats": 5, "workers": 8, "semantic_samples": 8},
+    "e2e": {"batch_size": 50, "warmup_batches": 0, "measurement_batches": 1000, "repeats": 5, "workers": 8, "semantic_samples": 8},
 }
-GALP_E2E_MIN_THROUGHPUT_IMAGES_PER_S = 3000.0
+GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO = 1.10
+E2E_MAX_HOT_THROUGHPUT_CV = 0.05
+E2E_PIPELINES = ("galp", "galp_legacy", "rgbnomore", "dali")
 
 
 def _value(args: argparse.Namespace, key: str) -> int:
@@ -81,6 +84,89 @@ def _git_metadata() -> dict[str, Any]:
     }
 
 
+def _system_state_snapshot(*, dry_run: bool) -> dict[str, Any]:
+    if dry_run:
+        return {"scope": "dry_run_not_sampled"}
+
+    def read_text(path: str) -> str:
+        try:
+            return Path(path).read_text(encoding="utf-8").strip()
+        except OSError as error:
+            return f"unavailable: {error}"
+
+    cpu_fields = read_text("/proc/stat").splitlines()[0].split()
+    cpu_ticks = [int(value) for value in cpu_fields[1:]] if cpu_fields and cpu_fields[0] == "cpu" else []
+    diskstats: dict[str, dict[str, int]] = {}
+    for line in read_text("/proc/diskstats").splitlines():
+        fields = line.split()
+        if len(fields) < 14:
+            continue
+        name = fields[2]
+        if not name.startswith(("nvme", "sd", "vd")):
+            continue
+        diskstats[name] = {
+            "reads_completed": int(fields[3]),
+            "sectors_read": int(fields[5]),
+            "writes_completed": int(fields[7]),
+            "sectors_written": int(fields[9]),
+            "io_ms": int(fields[12]),
+        }
+    meminfo = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        key, _, value = line.partition(":")
+        if key in {"MemTotal", "MemAvailable", "Cached", "Dirty"}:
+            meminfo[key] = value.strip()
+    gpu_query = [
+        "nvidia-smi",
+        "--query-gpu=timestamp,index,name,driver_version,temperature.gpu,clocks.current.graphics,clocks.current.memory,power.draw,utilization.gpu,memory.used",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        gpu = subprocess.run(gpu_query, check=False, capture_output=True, text=True, timeout=10)
+        gpu_state: dict[str, Any] = {
+            "command": gpu_query,
+            "exit_code": gpu.returncode,
+            "rows": [row.strip() for row in gpu.stdout.splitlines() if row.strip()],
+            "stderr": gpu.stderr.strip(),
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        gpu_state = {"command": gpu_query, "error": str(error)}
+    return {
+        "captured_at_unix_ns": time.time_ns(),
+        "cpu_ticks": cpu_ticks,
+        "loadavg": read_text("/proc/loadavg"),
+        "meminfo": meminfo,
+        "diskstats": diskstats,
+        "gpu": gpu_state,
+    }
+
+
+def _system_state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_ticks = before.get("cpu_ticks", [])
+    after_ticks = after.get("cpu_ticks", [])
+    cpu_utilization: float | None = None
+    if len(before_ticks) == len(after_ticks) and len(before_ticks) >= 5:
+        deltas = [max(0, int(end) - int(start)) for start, end in zip(before_ticks, after_ticks)]
+        total = sum(deltas)
+        idle = deltas[3] + deltas[4]
+        cpu_utilization = (total - idle) / total if total else None
+    disk_delta: dict[str, dict[str, int]] = {}
+    for name in sorted(set(before.get("diskstats", {})) & set(after.get("diskstats", {}))):
+        disk_delta[name] = {
+            key: max(0, int(after["diskstats"][name][key]) - int(before["diskstats"][name][key]))
+            for key in before["diskstats"][name]
+        }
+    return {
+        "elapsed_seconds": (
+            (int(after["captured_at_unix_ns"]) - int(before["captured_at_unix_ns"])) / 1e9
+            if "captured_at_unix_ns" in before and "captured_at_unix_ns" in after
+            else None
+        ),
+        "cpu_utilization_ratio": cpu_utilization,
+        "diskstats_delta": disk_delta,
+    }
+
+
 def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str, Any], Path]:
     rgbnomore_root = args.rgbnomore_root.resolve()
     data_root = args.data_root.resolve()
@@ -113,6 +199,12 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         raise ValueError("invalid GALP cache/decode dimensions")
     if "dali" in args.pipelines and workers <= 0:
         raise ValueError("DALI requires workers/num_threads > 0")
+    if args.preset == "e2e" and not set(E2E_PIPELINES).issubset(args.pipelines):
+        raise ValueError("e2e requires same-round galp, galp_legacy, rgbnomore, and dali pipelines")
+    if args.preset == "e2e" and (
+        args.galp_cache_capacity_mib != 0 or args.galp_plan_cache_capacity != 0
+    ):
+        raise ValueError("e2e requires decoded-rowgroup cache=0 and exact-batch plan cache=0")
     if semantic_samples <= 0 or semantic_samples > batch_size * measurement_batches:
         raise ValueError("semantic_samples must be within the measured subset")
 
@@ -140,7 +232,8 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
     galp_manifest_version = int.from_bytes(manifest_header[8:12], "little")
     galp_payload_fingerprints: list[dict[str, Any]] = []
     galp_payload_cache: Path | None = None
-    if "galp" in args.pipelines:
+    galp_native_binary: dict[str, Any] | None = None
+    if {"galp", "galp_legacy"}.intersection(args.pipelines):
         galp_payload_cache = galp_manifest.with_name(galp_manifest.name + ".payload_fingerprints.json")
         galp_payload_fingerprints = cached_file_fingerprints(
             galp_manifest_payloads(galp_manifest),
@@ -148,6 +241,12 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             cache_format="galp_shard_payload_fingerprints_v1",
             allow_hash_misses=args.refresh_galp_payload_fingerprints,
         )
+        binding_candidates = sorted(args.torch_binding_dir.glob("_galp_direct_dct*.so"))
+        if len(binding_candidates) != 1:
+            raise FileNotFoundError(
+                f"expected one _galp_direct_dct shared library in {args.torch_binding_dir}, got {binding_candidates}"
+            )
+        galp_native_binary = fingerprint_file(binding_candidates[0])
 
     contract: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA,
@@ -229,6 +328,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "manifest_fingerprint": galp_manifest_fingerprint,
                 "payload_fingerprints": galp_payload_fingerprints,
                 "payload_fingerprint_cache": str(galp_payload_cache) if galp_payload_cache is not None else None,
+                "native_binary_fingerprint": galp_native_binary,
                 "label_map_json": str(galp_label_map),
                 "label_map_sha256": sha256_file(galp_label_map),
                 "torch_binding_dir": str(args.torch_binding_dir.resolve()),
@@ -240,6 +340,28 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
+                "enable_planless_execution": True,
+            },
+            "galp_legacy": {
+                "manifest": str(galp_manifest),
+                "manifest_version": galp_manifest_version,
+                "manifest_sha256": galp_manifest_fingerprint["sha256"],
+                "manifest_fingerprint": galp_manifest_fingerprint,
+                "payload_fingerprints": galp_payload_fingerprints,
+                "payload_fingerprint_cache": str(galp_payload_cache) if galp_payload_cache is not None else None,
+                "native_binary_fingerprint": galp_native_binary,
+                "label_map_json": str(galp_label_map),
+                "label_map_sha256": sha256_file(galp_label_map),
+                "torch_binding_dir": str(args.torch_binding_dir.resolve()),
+                "preprocess": args.galp_preprocess,
+                "cache_capacity_mib": args.galp_cache_capacity_mib,
+                "plan_cache_capacity": 0,
+                "decode_batch_rowgroups": args.galp_decode_batch_rowgroups,
+                "batch_prefetch_depth": args.galp_batch_prefetch_depth,
+                "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
+                "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
+                "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
+                "enable_planless_execution": False,
             },
             "rgbnomore": {"root": str(rgbnomore_root), "adapter_policy": "reuse_external_model_dataset_and_transform_code"},
             "dali": {
@@ -264,9 +386,16 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         },
         "performance_gates": {
             "galp": {
-                "minimum_median_throughput_images_per_s": (
-                    GALP_E2E_MIN_THROUGHPUT_IMAGES_PER_S if args.preset == "e2e" else None
+                "minimum_median_throughput_images_per_s": None,
+                "minimum_hot_median_to_dali_hot_median_ratio": (
+                    GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO if args.preset == "e2e" else None
                 ),
+                "require_hot_min_above_dali_hot_median": args.preset == "e2e",
+                "maximum_hot_throughput_cv": E2E_MAX_HOT_THROUGHPUT_CV if args.preset == "e2e" else None,
+                "planning_median_ms_max": 2.0 if args.preset == "e2e" else None,
+                "planning_p95_ms_max": 3.0 if args.preset == "e2e" else None,
+                "device_mapping_median_ms_max": 1.0 if args.preset == "e2e" else None,
+                "device_mapping_plus_fixed_transform_median_ms_max": 6.5 if args.preset == "e2e" else None,
                 "image_major_manifest_minimum_version": 2,
                 "rowgroups_per_image": 1,
                 "worksets_per_batch": 1,
@@ -276,6 +405,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         },
         "semantic_validation": {
             "sample_count": semantic_samples,
+            "prediction_agreement_sample_count": batch_size * measurement_batches,
             "identity_checks": ["sample_id", "ordinal", "label", "measured_trace_sha256"],
             "comparison_groups": [
                 {
@@ -287,6 +417,22 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                         "input_mean_abs": 0.0001,
                         "logit_cosine_min": 0.999,
                         "logit_top1_agreement_min": 1.0,
+                        "full_prediction_top1_agreement_min": 1.0,
+                        "full_prediction_sample_count": batch_size * measurement_batches,
+                    },
+                },
+                {
+                    "pipelines": ["galp", "galp_legacy"],
+                    "domain": "dct",
+                    "enforcement": "strict",
+                    "thresholds": {
+                        "input_max_abs": 0.0,
+                        "input_mean_abs": 0.0,
+                        "logit_max_abs": 0.0,
+                        "logit_cosine_min": 0.999999999,
+                        "logit_top1_agreement_min": 1.0,
+                        "full_prediction_top1_agreement_min": 1.0,
+                        "full_prediction_sample_count": batch_size * measurement_batches,
                     },
                 },
                 {
@@ -308,7 +454,21 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/benchmarks/system_rgbnomore/pipeline.py",
                     "galp/benchmarks/system_rgbnomore/validate.py",
                     "galp/benchmarks/system_rgbnomore/run.py",
+                    "galp/benchmarks/system_rgbnomore/PLANLESS_DIRECT_DCT_RFC.md",
+                    "galp/benchmarks/system_rgbnomore/diagnostics/audit_planless_storage_io.py",
+                    "galp/benchmarks/system_rgbnomore/diagnostics/benchmark_planless_planning.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/direct_dct.py",
+                    "galp/benchmarks/system_rgbnomore/diagnostics/validate_pushdown.py",
+                    "galp/include/galp/direct_dct.hpp",
+                    "galp/include/galp/jpeg_dct.hpp",
+                    "galp/src/api/direct_dct.cpp",
+                    "galp/src/cuda/memory/device_pool.cuh",
+                    "galp/src/jpeg/jpeg_dct.cpp",
+                    "galp/src/jpeg/jpeg_dct_device.cu",
+                    "galp/src/jpeg/jpeg_dct_device.cuh",
+                    "galp/tests/jpeg_dct_test.cpp",
+                    "galp/tests/test_system_benchmark.py",
+                    "galp/torch/direct_dct_torch.cpp",
                     "galp/torch/rgbnomore_dct_profile.py",
                 ],
             ),
@@ -318,6 +478,21 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             ),
         },
     }
+    if args.preset == "e2e" and not args.dry_run:
+        dirty_sources = [
+            name
+            for name, revision in contract["source_revisions"].items()
+            if not bool(revision.get("benchmark_source_clean", False))
+        ]
+        if dirty_sources:
+            details = {
+                name: contract["source_revisions"][name].get("runtime_git_status", [])
+                for name in dirty_sources
+            }
+            raise RuntimeError(
+                "e2e requires every benchmark runtime source to match its recorded clean commit; "
+                f"dirty sources: {details}"
+            )
     contract_path = output_dir / "contract.json"
     write_json(contract_path, contract)
     return contract, contract_path
@@ -368,11 +543,21 @@ def run(args: argparse.Namespace) -> int:
             str(output_dir / f"pipeline_{pipeline}.json"),
         ]
         pipeline_env = dict(env)
-        if pipeline == "galp":
-            binding = contract["pipelines"]["galp"]["torch_binding_dir"]
+        if pipeline in ("galp", "galp_legacy"):
+            binding = contract["pipelines"][pipeline]["torch_binding_dir"]
             pipeline_env["PYTHONPATH"] = binding + (os.pathsep + pipeline_env["PYTHONPATH"] if pipeline_env.get("PYTHONPATH") else "")
-        commands.append({"name": pipeline, "command": command, "env_overrides": {"PYTHONPATH": pipeline_env.get("PYTHONPATH")} if pipeline == "galp" else {}})
+        command_record = {
+            "name": pipeline,
+            "command": command,
+            "env_overrides": {"PYTHONPATH": pipeline_env.get("PYTHONPATH")} if pipeline in ("galp", "galp_legacy") else {},
+            "system_state_before": _system_state_snapshot(dry_run=args.dry_run),
+        }
+        commands.append(command_record)
         code = _run_streamed(command, pipeline_env, output_dir / f"pipeline_{pipeline}.log", args.dry_run)
+        command_record["system_state_after"] = _system_state_snapshot(dry_run=args.dry_run)
+        command_record["system_state_delta"] = _system_state_delta(
+            command_record["system_state_before"], command_record["system_state_after"]
+        )
         if code != 0:
             write_json(output_dir / "failed.json", {"pipeline": pipeline, "exit_code": code, "command": command})
             write_json(output_dir / "commands.json", commands)
@@ -404,7 +589,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--benchmark-id")
     parser.add_argument("--python", type=Path, default=DEFAULT_BENCHMARK_PYTHON if DEFAULT_BENCHMARK_PYTHON.exists() else Path(sys.executable))
-    parser.add_argument("--pipelines", nargs="+", choices=PIPELINES, default=list(PIPELINES))
+    parser.add_argument(
+        "--pipelines",
+        nargs="+",
+        choices=PIPELINES + ("galp_legacy",),
+        default=None,
+    )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--split", default="val")
     parser.add_argument("--index-csv", type=Path)
@@ -423,8 +613,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--galp-plan-cache-capacity",
         type=int,
-        default=128,
-        help="Number of transformed batch plans retained; zero disables the batch-plan cache.",
+        default=0,
+        help="Number of transformed batch plans retained; canonical runs disable the batch-plan cache.",
     )
     parser.add_argument(
         "--galp-decode-batch-rowgroups",
@@ -468,7 +658,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=("fp32", "amp_fp16", "amp_bf16"), default="fp32")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.pipelines is None:
+        args.pipelines = list(E2E_PIPELINES if args.preset == "e2e" else PIPELINES)
+    return args
 
 
 def main() -> None:

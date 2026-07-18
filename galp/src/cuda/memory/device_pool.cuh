@@ -9,6 +9,7 @@
 #include "cuda/cuda_macros.cuh"
 #include "cuda/memory/pinned_host_pool.cuh"
 #include "cuda/memory/transfer_tracker.cuh"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +30,15 @@ struct DeviceAllocInfo {
 	bool         async_alloc  = false;
 	cudaStream_t alloc_stream = nullptr;
 	bool         sub_alloc    = false; // true for arena sub-pointers (no-op on free)
+};
+
+struct DevicePoolStats {
+	size_t in_use_bytes          = 0;
+	size_t peak_in_use_bytes     = 0;
+	size_t cached_bytes          = 0;
+	size_t allocation_requests   = 0;
+	size_t cuda_allocation_count = 0;
+	size_t cuda_allocation_bytes = 0;
 };
 
 class DevicePool {
@@ -55,6 +65,7 @@ public:
 				void*  cached_ptr  = take_cached_block_locked(bytes, actual_size);
 				if (cached_ptr != nullptr) {
 					in_use_[cached_ptr] = DeviceAllocInfo {actual_size, false, nullptr};
+					record_in_use_allocation_locked(actual_size, /*cuda_allocation=*/false);
 					return cached_ptr;
 				}
 			}
@@ -88,8 +99,19 @@ public:
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? stream : nullptr};
+			record_in_use_allocation_locked(bytes, /*cuda_allocation=*/true);
 		}
 		return ptr;
+	}
+
+	DevicePoolStats stats() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return DevicePoolStats {in_use_bytes_,
+		                        peak_in_use_bytes_,
+		                        free_cached_bytes_,
+		                        allocation_requests_,
+		                        cuda_allocation_count_,
+		                        cuda_allocation_bytes_};
 	}
 
 	void register_sub_allocation(void* ptr) {
@@ -266,6 +288,16 @@ private:
 		void* ptr = nullptr;
 	};
 
+	void record_in_use_allocation_locked(const size_t bytes, const bool cuda_allocation) {
+		in_use_bytes_ += bytes;
+		peak_in_use_bytes_ = std::max(peak_in_use_bytes_, in_use_bytes_);
+		++allocation_requests_;
+		if (cuda_allocation) {
+			++cuda_allocation_count_;
+			cuda_allocation_bytes_ += bytes;
+		}
+	}
+
 	static void free_cached_block(const CachedBlock& block) {
 		CUDA_SAFE_CALL(cudaFree(block.ptr));
 	}
@@ -295,6 +327,7 @@ private:
 		}
 		const auto info = it->second;
 		in_use_.erase(it);
+		in_use_bytes_ = info.size <= in_use_bytes_ ? in_use_bytes_ - info.size : 0;
 		if (enabled_ && !info.async_alloc) {
 			std::vector<CachedBlock> evicted_cached;
 			if (info.size <= free_cache_limit_bytes_) {
@@ -419,6 +452,11 @@ private:
 	size_t     free_cache_limit_bytes_ = 0;
 	size_t     max_reuse_slack_bytes_  = 0;
 	size_t     free_cached_bytes_      = 0;
+	size_t     in_use_bytes_           = 0;
+	size_t     peak_in_use_bytes_      = 0;
+	size_t     allocation_requests_    = 0;
+	size_t     cuda_allocation_count_  = 0;
+	size_t     cuda_allocation_bytes_  = 0;
 
 	std::map<size_t, std::vector<void*>>       free_sync_by_size_;
 	std::unordered_map<void*, DeviceAllocInfo> in_use_;
@@ -441,6 +479,10 @@ inline void device_free(void* ptr) {
 
 inline void device_release_cached() {
 	DevicePool::instance().release_cached();
+}
+
+inline DevicePoolStats device_pool_stats() {
+	return DevicePool::instance().stats();
 }
 
 inline void device_memcpy_h2d(void* dst, const void* src, size_t bytes) {

@@ -289,6 +289,11 @@ JpegImageMetadata DirectDctRuntime::ImageMetadata(const uint32_t global_image_in
 	return reader_.ImageMetadata(global_image_index);
 }
 
+uint64_t DirectDctRuntime::RowgroupStorageBytes(
+    const uint32_t shard_id, const std::vector<uint32_t>& rowgroup_indices) const {
+	return reader_.RowgroupStorageBytes(shard_id, rowgroup_indices);
+}
+
 DirectDctBatch DirectDctRuntime::ReadBatch(const std::vector<JpegDctImageCropRequest>& requests,
                                            const JpegDctDeviceBatchOptions&            options) {
 	auto       batch  = reader_.ReadDeviceDctBatch(requests, options);

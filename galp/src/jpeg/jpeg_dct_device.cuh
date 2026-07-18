@@ -4,6 +4,7 @@
 #include "codecs/consts.cuh"
 #include "cuda/memory/gpu_array.cuh"
 #include "galp/jpeg_dct.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -215,6 +216,42 @@ struct JpegDctDeviceFixedTransformItem {
 	uint32_t y_weight_matrix_index = 0;
 };
 
+// Compact, output-driven fixed-grid execution description.  One descriptor is
+// submitted per image; source rows and the bounded source stencil are derived
+// by the device from output coordinates.  Unlike JpegDctDeviceFixedTransformItem,
+// these objects do not scale with source or output block count.
+struct JpegDctDevicePlanlessComponentDescriptor {
+	uint32_t component_row_offset = 0;
+	uint32_t width_in_blocks      = 0;
+	uint32_t height_in_blocks     = 0;
+	int32_t  crop_x               = 0;
+	int32_t  crop_y               = 0;
+	uint32_t crop_width           = 0;
+	uint32_t crop_height          = 0;
+	uint16_t x_up_factor          = 1;
+	uint16_t y_up_factor          = 1;
+	uint16_t x_down_factor        = 1;
+	uint16_t y_down_factor        = 1;
+	// Matrix indices for the first phase of the reduced (up, down)
+	// relation.  A source/output pair selects
+	//   base + source * up - output * down + up - 1.
+	// Identity/down2 axes use the exact composed fast path and leave the base
+	// at the invalid sentinel.
+	uint32_t x_phase_matrix_base  = std::numeric_limits<uint32_t>::max();
+	uint32_t y_phase_matrix_base  = std::numeric_limits<uint32_t>::max();
+	uint32_t quant_table_index    = 0;
+	uint8_t  present              = 0;
+};
+
+struct JpegDctDevicePlanlessImageDescriptor {
+	uint32_t request_index         = 0;
+	uint32_t binding_base          = 0;
+	uint32_t row_start_in_rowgroup = 0;
+	uint8_t  zigzag_columns        = 0;
+	uint8_t  spatial_order         = 0;
+	std::array<JpegDctDevicePlanlessComponentDescriptor, 3> components {};
+};
+
 struct JpegDctDeviceResolvedProjection {
 	std::vector<JpegDctDeviceProjectionItem> items;
 	std::vector<uint8_t>                     active_physical_coefficients;
@@ -347,6 +384,8 @@ inline size_t selected_decode_vector_count(const std::vector<uint32_t>& selected
 
 struct JpegDctDeviceRowgroupPlan {
 	uint32_t                             rowgroup_index = 0;
+	uint32_t                             source_shard_id = std::numeric_limits<uint32_t>::max();
+	const std::filesystem::path*         source_fls_path = nullptr;
 	std::vector<JpegDctDeviceGatherItem> items;
 	std::vector<JpegDctDeviceProjectionItem> projection_items;
 	std::vector<JpegDctDeviceFixedTransformItem> fixed_transform_items;
@@ -354,6 +393,7 @@ struct JpegDctDeviceRowgroupPlan {
 	std::vector<JpegDctDeviceGatherItem> selected_gather_items;
 	std::vector<JpegDctDeviceProjectionItem> selected_projection_items;
 	std::vector<JpegDctDeviceFixedTransformItem> selected_fixed_transform_items;
+	std::vector<JpegDctDevicePlanlessImageDescriptor> planless_images;
 	size_t                               selected_vector_count = 0;
 	size_t                               full_vector_count     = 0;
 	bool                                 selected_chunks_fit   = true;
@@ -383,7 +423,11 @@ inline unsigned constrain_jpeg_dct_batch_unpack_n_vectors(
 
 struct JpegDctDeviceShardPlan {
 	uint32_t                               shard_id = 0;
-	std::filesystem::path                  fls_path;
+	// Batch plans are owned by a reader and executed only through that reader,
+	// so retaining the reader-resident path avoids one heap-backed path copy per
+	// selected shard without weakening the prepared-plan lifetime check.
+	const std::filesystem::path*           fls_path = nullptr;
+	bool                                   mixed_physical_shards = false;
 	std::vector<JpegDctDeviceRowgroupPlan> rowgroups;
 };
 
@@ -421,6 +465,12 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     fixed_transform_component_count    = 0;
 	size_t                                     fixed_transform_source_block_count = 0;
 	size_t                                     fixed_transform_output_block_count = 0;
+	bool                                       uses_planless_fixed_transform      = false;
+	size_t                                     host_expanded_transform_items_created = 0;
+	size_t                                     host_output_block_source_lists_created = 0;
+	size_t                                     host_global_transform_sort_items      = 0;
+	size_t                                     planless_axis_program_count           = 0;
+	size_t                                     planless_axis_phase_matrix_count      = 0;
 	std::vector<uint8_t>                       selected_coefficients;
 	// Flat, natural-order 8x8 JPEG quantization tables used by the transformed
 	// DCT grid. Source coefficients are dequantized and clamped
@@ -440,6 +490,7 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     plan_cache_hits                 = 0;
 	size_t                                     plan_cache_misses               = 0;
 	size_t                                     plan_cache_evictions            = 0;
+	bool                                       exact_batch_plan_cache_enabled  = false;
 	double                                     resize_weight_build_ms          = 0.0;
 	size_t                                     dct_resize_weight_cache_hits    = 0;
 	size_t                                     dct_resize_weight_cache_misses  = 0;

@@ -373,6 +373,10 @@ struct JpegDctDeviceBatchOptions {
 	size_t rowgroup_prefetch_workers            = kDefaultJpegDctDeviceRowgroupPrefetchWorkers;
 	size_t rowgroup_prefetch_min_decode_batches = kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches;
 	JpegDctCoefficientSelection coefficient_selection {};
+	// Diagnostic A/B switch. Production transformed execution keeps this true;
+	// false forces the legacy expanded graph so device tests and benchmark
+	// reports can compare both algorithms under an otherwise identical contract.
+	bool enable_planless_execution = true;
 };
 
 struct JpegDctDeviceImageLayout {
@@ -498,6 +502,26 @@ struct JpegDctDeviceExecutionStats {
 	size_t      jpeg_dct_projection_items_materialized   = 0;
 	size_t      fixed_grid_round_event_handoff_count     = 0;
 	bool        cache_enabled                 = false;
+	// Phase-2 architecture counters are appended to preserve the positional
+	// initialization order of the legacy public aggregate.
+	bool        exact_batch_plan_cache_enabled               = false;
+	size_t      host_expanded_transform_items_created        = 0;
+	size_t      host_output_block_source_lists_created       = 0;
+	size_t      host_global_transform_sort_items              = 0;
+	size_t      planless_image_descriptor_count              = 0;
+	size_t      planless_transform_output_block_count        = 0;
+	size_t      planless_axis_program_count                   = 0;
+	size_t      planless_axis_phase_matrix_count              = 0;
+	size_t      planless_axis_program_bytes                   = 0;
+	size_t      rowgroup_storage_bytes_read                   = 0;
+	size_t      galp_native_device_in_use_bytes               = 0;
+	size_t      galp_native_device_peak_in_use_bytes          = 0;
+	size_t      galp_native_device_cached_bytes               = 0;
+	size_t      galp_native_device_allocation_requests        = 0;
+	size_t      galp_native_device_cuda_allocation_count      = 0;
+	size_t      galp_native_device_cuda_allocation_bytes      = 0;
+	double      device_mapping_ms                             = 0.0;
+	bool        device_mapping_fused                          = false;
 };
 
 struct JpegDctDeviceBatchPlanPreview {
@@ -521,6 +545,25 @@ struct JpegDctDeviceBatchPlanPreview {
 	size_t                                     dct_conversion_matrix_cache_hits   = 0;
 	size_t                                     dct_conversion_matrix_cache_misses = 0;
 	JpegDctYcbcrDctGridShape                   ycbcr_dct_grid_shape;
+	bool                                       uses_planless_fixed_transform = false;
+	size_t                                     compact_image_descriptor_count = 0;
+	size_t                                     fixed_transform_component_count = 0;
+	size_t                                     fixed_transform_source_block_count = 0;
+	size_t                                     fixed_transform_output_block_count = 0;
+	size_t                                     host_expanded_transform_items_created = 0;
+	size_t                                     host_output_block_source_lists_created = 0;
+	size_t                                     host_global_transform_sort_items = 0;
+	size_t                                     planless_axis_program_count = 0;
+	size_t                                     planless_axis_phase_matrix_count = 0;
+	size_t                                     planless_axis_program_bytes = 0;
+	bool                                       exact_batch_plan_cache_enabled = false;
+	size_t                                     compact_reader_image_locator_bytes = 0;
+	size_t                                     compact_reader_shard_index_bytes = 0;
+	size_t                                     compact_reader_layout_dictionary_bytes = 0;
+	size_t                                     compact_reader_quant_table_dictionary_bytes = 0;
+	size_t                                     compact_reader_total_bytes = 0;
+	size_t                                     compact_reader_shard_descriptor_bytes = 0;
+	bool                                       compact_reader_shard_index_derived = false;
 };
 
 struct JpegDctDeviceBatchPlanEstimate {
@@ -559,6 +602,9 @@ public:
 	[[nodiscard]] double                                            planned_selected_vector_ratio() const noexcept;
 	[[nodiscard]] double                                            estimated_selected_vector_ratio() const noexcept;
 	[[nodiscard]] double                                            planning_ms() const noexcept;
+	[[nodiscard]] bool                                              uses_planless_fixed_transform() const noexcept;
+	[[nodiscard]] bool                                              exact_batch_plan_cache_enabled() const noexcept;
+	[[nodiscard]] bool                                              decoded_rowgroup_cache_enabled() const noexcept;
 
 private:
 	friend class JpegDctShardDatasetReader;
@@ -622,6 +668,8 @@ public:
 
 	[[nodiscard]] uint64_t          image_count() const noexcept;
 	[[nodiscard]] JpegImageMetadata ImageMetadata(uint32_t global_image_index) const;
+	[[nodiscard]] uint64_t RowgroupStorageBytes(uint32_t                     shard_id,
+	                                            const std::vector<uint32_t>& rowgroup_indices) const;
 
 	MaterializedJpegDctImage MaterializeImageDct(uint32_t global_image_index);
 

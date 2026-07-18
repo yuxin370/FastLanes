@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import subprocess
 import struct
 import sys
 import tempfile
@@ -29,16 +30,129 @@ from common import (  # noqa: E402
     galp_manifest_payloads,
     load_sample_manifest,
     sample_trace,
+    source_tree_metadata,
     verify_file_fingerprint,
 )
+from diagnostics.audit_planless_storage_io import _counter_values  # noqa: E402
+from diagnostics.direct_dct import _make_benchmark_image_ids  # noqa: E402
 from manifest import build_manifest, collect_dataset, validate_galp_label_map  # noqa: E402
-from pipeline import GalpAdapter  # noqa: E402
+from pipeline import GalpAdapter, GalpLegacyAdapter, _process_memory_snapshot  # noqa: E402
 from prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
-from run import GALP_E2E_MIN_THROUGHPUT_IMAGES_PER_S, PRESETS  # noqa: E402
-from validate import _evaluate_performance_gates, _semantic_compare  # noqa: E402
+from run import E2E_MAX_HOT_THROUGHPUT_CV, E2E_PIPELINES, GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, PRESETS  # noqa: E402
+from validate import _aggregate_pipeline, _evaluate_performance_gates, _semantic_compare  # noqa: E402
 
 
 class SystemBenchmarkTest(unittest.TestCase):
+    def test_source_tree_cleanliness_is_scoped_to_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Benchmark Test"], check=True)
+            runtime = root / "runtime.py"
+            runtime.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "runtime.py"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+
+            clean = source_tree_metadata(root, ["runtime.py"])
+            self.assertTrue(clean["benchmark_source_clean"])
+            self.assertFalse(clean["git_dirty"])
+
+            (root / "unrelated.txt").write_text("user data\n", encoding="utf-8")
+            unrelated = source_tree_metadata(root, ["runtime.py"])
+            self.assertTrue(unrelated["benchmark_source_clean"])
+            self.assertTrue(unrelated["git_dirty"])
+
+            runtime.write_text("VALUE = 2\n", encoding="utf-8")
+            dirty = source_tree_metadata(root, ["runtime.py"])
+            self.assertFalse(dirty["benchmark_source_clean"])
+            self.assertTrue(dirty["runtime_git_status"])
+
+    def test_process_memory_snapshot_reports_linux_rss_and_peak(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            status = Path(temporary) / "status"
+            status.write_text("Name:\ttest\nVmHWM:\t2048 kB\nVmRSS:\t1024 kB\n", encoding="utf-8")
+            self.assertEqual(
+                _process_memory_snapshot(status),
+                {"rss_bytes": 1024 * 1024, "peak_rss_bytes": 2048 * 1024},
+            )
+
+    def test_pipeline_aggregate_reports_host_peak_rss(self) -> None:
+        payload = {
+            "pipeline": "galp",
+            "domain": "dct",
+            "execution": {"aggregate_exclude_first_repeat": True},
+            "repeats": [
+                {
+                    "repeat": 0,
+                    "throughput_images_per_s": 1.0,
+                    "end_to_end_latency_ms": {"mean": 1.0, "p95": 1.0},
+                    "accuracy_top1": 1.0,
+                    "accuracy_top5": 1.0,
+                    "peak_gpu_memory_allocated_bytes": 1,
+                    "peak_gpu_memory_reserved_bytes": 2,
+                    "peak_gpu_memory_scope": "torch_allocator",
+                    "host_process_rss_after_measurement_bytes": 10,
+                    "host_process_peak_rss_bytes": 20,
+                    "host_process_memory_scope": "main_process",
+                },
+                {
+                    "repeat": 1,
+                    "throughput_images_per_s": 2.0,
+                    "end_to_end_latency_ms": {"mean": 2.0, "p95": 2.0},
+                    "accuracy_top1": 1.0,
+                    "accuracy_top5": 1.0,
+                    "peak_gpu_memory_allocated_bytes": 3,
+                    "peak_gpu_memory_reserved_bytes": 4,
+                    "peak_gpu_memory_scope": "torch_allocator",
+                    "host_process_rss_after_measurement_bytes": 30,
+                    "host_process_peak_rss_bytes": 40,
+                    "host_process_memory_scope": "main_process",
+                },
+            ],
+        }
+        aggregate = _aggregate_pipeline(payload)
+        self.assertEqual(aggregate["host_process_rss_after_measurement_bytes"]["p50"], 30.0)
+        self.assertEqual(aggregate["host_process_peak_rss_bytes"]["p50"], 40.0)
+        self.assertEqual(aggregate["host_process_memory_scope"], "main_process")
+
+    def test_deterministic_shuffled_direct_dct_trace_covers_population_once(self) -> None:
+        reader = SimpleNamespace(image_count=10)
+        args = SimpleNamespace(
+            sampling_policy="all",
+            preprocess="rgbnomore-val-pushdown",
+            image_order="shuffled",
+            shuffle_seed=17,
+            no_wrap_image_ids=True,
+            batch_size=3,
+        )
+        actual = []
+        for step in range(4):
+            image_ids, skipped = _make_benchmark_image_ids(reader, args, step)
+            self.assertEqual(skipped, [])
+            actual.extend(image_ids)
+        expected = list(range(10))
+        import random
+
+        random.Random(17).shuffle(expected)
+        self.assertEqual(actual, expected)
+
+    def test_storage_counter_reader_accepts_pipeline_repeat_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = Path(temporary) / "pipeline.json"
+            result.write_text(
+                json.dumps(
+                    {
+                        "repeats": [
+                            {"native_counters": {"rowgroup_storage_bytes_read": 11}},
+                            {"native_counters": {"rowgroup_storage_bytes_read": 13}},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_counter_values(result), [11, 13])
+
     def test_selected_dataset_materialization_removes_stale_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -73,10 +187,14 @@ class SystemBenchmarkTest(unittest.TestCase):
 
     def test_only_smoke_and_canonical_e2e_presets_exist(self) -> None:
         self.assertEqual(set(PRESETS), {"smoke", "e2e"})
-        self.assertEqual(PRESETS["e2e"]["batch_size"], 64)
+        self.assertEqual(PRESETS["e2e"]["batch_size"], 50)
+        self.assertEqual(PRESETS["e2e"]["warmup_batches"], 0)
+        self.assertEqual(PRESETS["e2e"]["measurement_batches"], 1000)
         self.assertEqual(PRESETS["e2e"]["repeats"], 5)
+        self.assertEqual(E2E_PIPELINES, ("galp", "galp_legacy", "rgbnomore", "dali"))
         self.assertGreater(PRESETS["e2e"]["measurement_batches"], PRESETS["smoke"]["measurement_batches"])
-        self.assertEqual(GALP_E2E_MIN_THROUGHPUT_IMAGES_PER_S, 3000.0)
+        self.assertEqual(GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, 1.10)
+        self.assertEqual(E2E_MAX_HOT_THROUGHPUT_CV, 0.05)
 
     def test_galp_e2e_throughput_gate_is_hard(self) -> None:
         contract = {
@@ -88,6 +206,44 @@ class SystemBenchmarkTest(unittest.TestCase):
         gates = _evaluate_performance_gates(contract, aggregates, failures)
         self.assertFalse(gates[0]["ok"])
         self.assertTrue(any("below required" in failure for failure in failures))
+
+    def test_galp_e2e_relative_dali_and_stability_gates_are_hard(self) -> None:
+        contract = {
+            "pipelines": {"enabled": ["galp", "dali"]},
+            "performance_gates": {
+                "galp": {
+                    "minimum_hot_median_to_dali_hot_median_ratio": 1.10,
+                    "require_hot_min_above_dali_hot_median": True,
+                    "maximum_hot_throughput_cv": 0.05,
+                }
+            },
+        }
+        aggregates = [
+            {
+                "pipeline": "galp",
+                "throughput_images_per_s": {
+                    "p50": 1890.0,
+                    "min": 1750.0,
+                    "cv_population": 0.04,
+                },
+            },
+            {
+                "pipeline": "dali",
+                "throughput_images_per_s": {
+                    "p50": 1720.0,
+                    "min": 1700.0,
+                    "cv_population": 0.03,
+                },
+            },
+        ]
+        failures: list[str] = []
+        gates = _evaluate_performance_gates(contract, aggregates, failures)
+        by_metric = {gate["metric"]: gate for gate in gates}
+        self.assertFalse(by_metric["hot_median_to_dali_hot_median_ratio"]["ok"])
+        self.assertTrue(by_metric["hot_min_throughput_above_dali_hot_median"]["ok"])
+        self.assertTrue(by_metric["galp_hot_throughput_cv"]["ok"])
+        self.assertTrue(by_metric["dali_hot_throughput_cv"]["ok"])
+        self.assertTrue(failures)
 
     def test_legacy_duplicate_benchmark_entrypoints_are_removed(self) -> None:
         galp_root = Path(__file__).resolve().parents[1]
@@ -119,6 +275,7 @@ class SystemBenchmarkTest(unittest.TestCase):
 
     def test_distribution_and_trace_are_deterministic(self) -> None:
         self.assertEqual(distribution([1.0, 2.0, 3.0])["p50"], 2.0)
+        self.assertAlmostEqual(distribution([1.0, 2.0, 3.0])["cv_population"], (2.0 / 3.0) ** 0.5 / 2.0)
         rows = [
             {"ordinal": 0, "sample_id": "val/a.JPEG", "label": 3},
             {"ordinal": 1, "sample_id": "val/b.JPEG", "label": 4},
@@ -291,6 +448,11 @@ class SystemBenchmarkTest(unittest.TestCase):
                 "ordinals": np.asarray([0], dtype=np.int64),
                 "labels": np.asarray([7], dtype=np.int64),
                 "input_0": np.zeros((1, 1), dtype=np.float32),
+                "prediction_ordinals": np.asarray([0], dtype=np.int64),
+                "prediction_labels": np.asarray([7], dtype=np.int64),
+                "top1_predictions": np.asarray([7], dtype=np.int64),
+                "top5_predictions": np.asarray([[7, 1, 2, 3, 4]], dtype=np.int64),
+                "metadata_json": np.asarray(json.dumps({"prediction_agreement_sample_count": 1})),
             }
             np.savez(left, **identity, logits=np.asarray([[1.0, 0.999]], dtype=np.float32))
             np.savez(right, **identity, logits=np.asarray([[0.999, 1.0]], dtype=np.float32))
@@ -306,6 +468,8 @@ class SystemBenchmarkTest(unittest.TestCase):
                     "logit_max_abs": 0.25,
                     "logit_cosine_min": 0.999,
                     "logit_top1_agreement_min": 1.0,
+                    "full_prediction_top1_agreement_min": 1.0,
+                    "full_prediction_sample_count": 1,
                 },
                 "strict",
                 failures,
@@ -313,6 +477,7 @@ class SystemBenchmarkTest(unittest.TestCase):
             self.assertGreater(result["logits"]["cosine_mean"], 0.999)
             self.assertEqual(result["logits"]["top1_agreement"], 0.0)
             self.assertFalse(result["logits"]["within_tolerance"])
+            self.assertTrue(result["full_prediction"]["within_tolerance"])
             self.assertTrue(any("logits exceed tolerance" in failure for failure in failures))
 
     def test_galp_adapter_prefetches_two_batches_ahead_in_order(self) -> None:
@@ -324,7 +489,12 @@ class SystemBenchmarkTest(unittest.TestCase):
 
         class SourceBatch:
             execution_stats = {
-                "fixed_transform_item_count": 1,
+                "fixed_transform_item_count": 0,
+                "planless_image_descriptor_count": 2,
+                "host_expanded_transform_items_created": 0,
+                "host_output_block_source_lists_created": 0,
+                "host_global_transform_sort_items": 0,
+                "device_mapping_fused": True,
                 "projection_item_count": 0,
                 "decoded_projection_item_count": 0,
                 "project_decoded_ycbcr_grid_launch_count": 0,
@@ -386,6 +556,72 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(first_batch.ordinals, [0, 1])
         self.assertEqual(second_batch.ordinals, [2, 3])
         self.assertEqual(third_batch.ordinals, [4, 5])
+        self.assertEqual(list(adapter.pending_batches), [])
+
+    def test_galp_legacy_adapter_uses_same_prefetch_path_and_expanded_graph(self) -> None:
+        prefetch_calls: list[list[int]] = []
+
+        class Pending:
+            def __init__(self, image_ids: list[int]) -> None:
+                self.image_ids = image_ids
+
+        class SourceBatch:
+            execution_stats = {
+                "fixed_transform_item_count": 8,
+                "planless_image_descriptor_count": 0,
+                "host_expanded_transform_items_created": 8,
+                "host_global_transform_sort_items": 8,
+                "exact_batch_plan_cache_enabled": False,
+                "cache_enabled": False,
+            }
+
+        class Module:
+            @staticmethod
+            def _prefetch_pushdown_batch(reader, args, image_ids):
+                del reader, args
+                prefetch_calls.append(list(image_ids))
+                return Pending(list(image_ids))
+
+            @staticmethod
+            def _adapt_prefetched_pushdown_batch(reader, args, image_ids, pending):
+                del reader, args
+                self.assertEqual(pending.image_ids, image_ids)
+                count = len(image_ids)
+                return torch.zeros((count, 1)), torch.zeros((count, 2)), [SourceBatch()]
+
+            @staticmethod
+            def read_and_adapt_batch(*args, **kwargs):
+                raise AssertionError("legacy A/B must use the same prefetch path")
+
+            @staticmethod
+            def _empty_totals():
+                return {"fixed_transform_items": 0, "projection_items": 0}
+
+            @staticmethod
+            def _accumulate_many_stats(totals, batches):
+                totals["fixed_transform_items"] += len(batches)
+
+        adapter = object.__new__(GalpLegacyAdapter)
+        adapter.module = Module()
+        adapter.reader = object()
+        adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
+        adapter.device = torch.device("cpu")
+        adapter.transform = None
+        adapter.batch_size = 2
+        adapter.batch_prefetch_depth = 1
+        adapter.pending_batches = deque()
+        adapter.next_prefetch_batch_index = 0
+        adapter.samples = [
+            {"galp_image_id": 20, "label": 1, "ordinal": 0},
+            {"galp_image_id": 21, "label": 2, "ordinal": 1},
+        ]
+        adapter.total_batches = 1
+
+        adapter.begin_repeat()
+        loaded = adapter.load(adapter.samples, None)
+
+        self.assertEqual(prefetch_calls, [[20, 21]])
+        self.assertEqual(loaded.ordinals, [0, 1])
         self.assertEqual(list(adapter.pending_batches), [])
 
 

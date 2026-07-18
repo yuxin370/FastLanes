@@ -277,6 +277,11 @@ def _validate_pushdown_batch(name: str, batch: Any, expected_batch_size: int, sa
     decoded_projection_items = int(stats.get("decoded_projection_item_count", 0))
     fixed_transform_items = int(stats.get("fixed_transform_item_count", 0))
     fixed_transform_images = int(stats.get("fixed_transform_image_count", 0))
+    planless_descriptors = int(stats.get("planless_image_descriptor_count", 0))
+    host_expanded_items = int(stats.get("host_expanded_transform_items_created", 0))
+    host_source_lists = int(stats.get("host_output_block_source_lists_created", 0))
+    host_sort_items = int(stats.get("host_global_transform_sort_items", 0))
+    exact_batch_plan_cache_enabled = bool(stats.get("exact_batch_plan_cache_enabled", False))
     project_decoded_launches = int(stats.get("project_decoded_ycbcr_grid_launch_count", 0))
     projection_items_materialized = int(stats.get("jpeg_dct_projection_items_materialized", projection_items))
     generic_projection_used = (
@@ -285,7 +290,18 @@ def _validate_pushdown_batch(name: str, batch: Any, expected_batch_size: int, sa
         or project_decoded_launches != 0
         or projection_items_materialized != 0
     )
-    fixed_specialized_path_used = fixed_transform_items > 0 and fixed_transform_images == expected_batch_size
+    planless_path_used = (
+        planless_descriptors == expected_batch_size
+        and fixed_transform_items == 0
+        and host_expanded_items == 0
+        and host_source_lists == 0
+        and host_sort_items == 0
+        and not exact_batch_plan_cache_enabled
+        and bool(stats.get("device_mapping_fused", False))
+    )
+    fixed_specialized_path_used = planless_path_used or (
+        fixed_transform_items > 0 and fixed_transform_images == expected_batch_size
+    )
     fallback_reason = ""
     if generic_projection_used:
         fallback_reason = "fixed-grid path used generic projection"
@@ -299,11 +315,15 @@ def _validate_pushdown_batch(name: str, batch: Any, expected_batch_size: int, sa
             f"project_decoded_ycbcr_grid_launch_count={project_decoded_launches} "
             f"jpeg_dct_projection_items_materialized={projection_items_materialized}"
         )
-    if fixed_transform_items <= 0 or fixed_transform_images != expected_batch_size:
+    if not fixed_specialized_path_used or fixed_transform_images != expected_batch_size:
         raise RuntimeError(
             f"{name} expected fixed-grid transform descriptors, "
-            f"got fixed_transform_item_count={fixed_transform_items} fixed_transform_image_count={fixed_transform_images}"
+            f"got fixed_transform_item_count={fixed_transform_items} "
+            f"planless_image_descriptor_count={planless_descriptors} "
+            f"fixed_transform_image_count={fixed_transform_images}"
         )
+    if exact_batch_plan_cache_enabled:
+        raise RuntimeError(f"{name} unexpectedly enabled the exact-batch plan cache")
     return {
         "name": name,
         "sampling": sampling,
@@ -321,9 +341,16 @@ def _validate_pushdown_batch(name: str, batch: Any, expected_batch_size: int, sa
         "decoded_projection_item_count": decoded_projection_items,
         "generic_projection_used": generic_projection_used,
         "fixed_specialized_path_used": fixed_specialized_path_used,
+        "planless_path_used": planless_path_used,
         "fallback_reason": fallback_reason,
         "fixed_transform_item_count": fixed_transform_items,
         "fixed_transform_image_count": fixed_transform_images,
+        "planless_image_descriptor_count": planless_descriptors,
+        "host_expanded_transform_items_created": host_expanded_items,
+        "host_output_block_source_lists_created": host_source_lists,
+        "host_global_transform_sort_items": host_sort_items,
+        "exact_batch_plan_cache_enabled": exact_batch_plan_cache_enabled,
+        "device_mapping_fused": bool(stats.get("device_mapping_fused", False)),
         "fixed_transform_component_count": int(stats.get("fixed_transform_component_count", 0)),
         "fixed_transform_source_block_count": int(stats.get("fixed_transform_source_block_count", 0)),
         "fixed_transform_output_block_count": int(stats.get("fixed_transform_output_block_count", 0)),
@@ -707,6 +734,9 @@ def main() -> None:
     fixed_specialized_path_used = bool(all_checks) and all(
         bool(check["fixed_specialized_path_used"]) for check in all_checks
     )
+    exact_batch_plan_cache_enabled = any(
+        bool(check["exact_batch_plan_cache_enabled"]) for check in all_checks
+    )
     fallback_reasons = sorted({check["fallback_reason"] for check in all_checks if check["fallback_reason"]})
     payload = {
         "manifest": args.manifest,
@@ -724,6 +754,7 @@ def main() -> None:
         "projection_items_per_image_distribution": _projection_distribution(all_checks),
         "generic_projection_used": generic_projection_used,
         "fixed_specialized_path_used": fixed_specialized_path_used,
+        "exact_batch_plan_cache_enabled": exact_batch_plan_cache_enabled,
         "fallback_reason": "; ".join(fallback_reasons),
         "project_decoded_ycbcr_grid_launches": total_project_decoded_launches,
         "passed": (
@@ -732,6 +763,7 @@ def main() -> None:
             and total_projection_items == 0
             and not generic_projection_used
             and fixed_specialized_path_used
+            and not exact_batch_plan_cache_enabled
         ),
         "steps_detail": results,
     }
