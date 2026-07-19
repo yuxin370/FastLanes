@@ -382,7 +382,11 @@ def _component_quant_tables(
 
 
 def _scale_to_rgbnomore_dct_range(tensor: torch.Tensor) -> torch.Tensor:
-    return (tensor + 1024.0) / 2040.0 * 2.0 - 1.0
+    # ToRange(-1024, 1016 -> -1, 1) simplifies to (x + 4) / 1020.
+    # `tensor` is a fresh FP32 conversion in the Direct-DCT adapter, so doing
+    # the two affine operations in place avoids four full-sized temporaries
+    # per Y/CbCr pair while preserving the reference FP32 mapping.
+    return tensor.add_(4.0).mul_(1.0 / 1020.0)
 
 
 def build_rgbnomore_dct_val_transform(rgbnomore_root: Path) -> torch.nn.Module:

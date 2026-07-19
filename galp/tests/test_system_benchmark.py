@@ -34,7 +34,7 @@ from common import (  # noqa: E402
     verify_file_fingerprint,
 )
 from diagnostics.audit_planless_storage_io import _counter_values  # noqa: E402
-from diagnostics.direct_dct import _make_benchmark_image_ids  # noqa: E402
+from diagnostics.direct_dct import _make_benchmark_image_ids, _scale_to_rgbnomore_dct_range  # noqa: E402
 from manifest import build_manifest, collect_dataset, validate_galp_label_map  # noqa: E402
 from pipeline import GalpAdapter, GalpLegacyAdapter, _process_memory_snapshot  # noqa: E402
 from prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
@@ -43,6 +43,14 @@ from validate import _aggregate_pipeline, _evaluate_performance_gates, _semantic
 
 
 class SystemBenchmarkTest(unittest.TestCase):
+    def test_in_place_rgbnomore_range_scale_matches_reference(self) -> None:
+        values = torch.arange(-1024, 1017, dtype=torch.float32)
+        reference = (values + 1024.0) / 2040.0 * 2.0 - 1.0
+        actual = _scale_to_rgbnomore_dct_range(values.clone())
+        torch.testing.assert_close(actual, reference, rtol=0.0, atol=torch.finfo(torch.float32).eps)
+        self.assertEqual(float(actual[0]), -1.0)
+        self.assertEqual(float(actual[-1]), 1.0)
+
     def test_source_tree_cleanliness_is_scoped_to_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

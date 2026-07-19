@@ -974,9 +974,14 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 		const auto source_width  = x_down * 8U;
 		const auto source_height = y_down * 8U;
 		const auto source_count  = source_width * source_height;
-		if (lane < source_count) {
-			const auto source_block_slot = lane / 64U;
-			const auto coeff             = static_cast<uint8_t>(lane % 64U);
+		// Keep the block at two warps: the transform produces 64 coefficients, and
+		// the largest canonical down2 source contains only four coefficients per
+		// lane.  A 256-thread block left six warps idle after the source load and
+		// needlessly limited residency across the tens of thousands of output
+		// blocks in an ImageNet batch.
+		for (uint32_t source_linear = lane; source_linear < source_count; source_linear += blockDim.x) {
+			const auto source_block_slot = source_linear / 64U;
+			const auto coeff             = static_cast<uint8_t>(source_linear % 64U);
 			const auto subblock_x        = source_block_slot % x_down;
 			const auto subblock_y        = source_block_slot / x_down;
 			const auto source_x          = static_cast<uint32_t>(descriptor.crop_x) + output_x * x_down + subblock_x;
@@ -1001,9 +1006,10 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 			    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
 		}
 		__syncthreads();
-		if (lane < 8U * source_width) {
-			const auto out_y    = lane / source_width;
-			const auto source_x = lane % source_width;
+		for (uint32_t vertical_linear = lane; vertical_linear < 8U * source_width;
+		     vertical_linear += blockDim.x) {
+			const auto out_y    = vertical_linear / source_width;
+			const auto source_x = vertical_linear % source_width;
 			float      sum      = 0.0F;
 			if (y_down == 1U) {
 				sum = composed[out_y * source_width + source_x];
@@ -1653,7 +1659,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	}
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
 	scratch.planless_image_descriptors.upload(images.data(), images.size(), stream, stats);
-	transformed_dct_grid_planless_kernel<<<dim3(static_cast<unsigned>(output_blocks)), dim3(256U), 0, stream>>>(
+	transformed_dct_grid_planless_kernel<<<dim3(static_cast<unsigned>(output_blocks)), dim3(64U), 0, stream>>>(
 	    scratch.column_bindings.data,
 	    scratch.planless_image_descriptors.data,
 	    images.size(),
