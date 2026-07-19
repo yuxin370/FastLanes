@@ -681,13 +681,13 @@ T_model_with_transform - T_model_only
 |---|---|
 | `galp/src/cuda/memory/cuda_raii.cuh` | `CudaStream` 增加 `cudaStreamCreateWithPriority` RAII 接口 |
 | `galp/src/engine/workset/model.cuh`、`streams.cu` | persistent H2D/compute/D2H workset stream 支持设备定义的 priority |
-| `galp/include/galp/jpeg_dct.hpp` | 新增三种 scheduling policy、transform chunk 配置与 stream/event/launch 统计 |
+| `galp/include/galp/jpeg_dct.hpp` | 新增三种 scheduling policy、独立 output-chunk/CTA-cap 配置与 stream/event/launch 统计 |
 | `galp/src/jpeg/jpeg_dct.cpp`、`jpeg_dct_device.cuh` | scheduling options 进入 plan 和 plan-cache key，并传到 device executor |
-| `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event、offset-aware chunk、最多 64 CTA 的 grid-stride planless kernel、低优先级 round/cache stream |
-| `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、chunk blocks、低优先级开关和新增 counters |
+| `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event、offset-aware output chunk、可配置 CTA cap 的 grid-stride planless kernel、低优先级 round/cache stream |
+| `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、output chunk、CTA cap、低优先级开关和新增 counters |
 | `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用 PyTorch 运行时可用的 greatest-priority stream；serial 延迟下一批 prefetch |
 | `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略、输出 chunk 和 CTA cap；在找到满足吞吐 gate 的 limited 点前默认 fully-overlapped |
-| `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、limited-overlap、serial 并计算核心 delta |
+| `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、成对 output/CTA limited sweep、serial，校验实际 priority/counters 并计算核心 delta 与 Pareto frontier |
 | `jpeg_dct_test.cpp` | 512-output/64-CTA grid-stride 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
 | `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
 
