@@ -44,6 +44,12 @@ public:
 		}
 	}
 
+	void create_with_priority(const unsigned flags, const int priority) {
+		if (stream_ == nullptr) {
+			CUDA_SAFE_CALL(cudaStreamCreateWithPriority(&stream_, flags, priority));
+		}
+	}
+
 	void reset(cudaStream_t stream = nullptr) noexcept {
 		if (stream_ != nullptr) {
 			CUDA_LOG_CALL(cudaStreamDestroy(stream_));

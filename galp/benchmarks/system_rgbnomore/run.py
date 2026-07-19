@@ -196,8 +196,11 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         or args.galp_rowgroup_prefetch_depth <= 0
         or args.galp_rowgroup_prefetch_workers <= 0
         or args.galp_rowgroup_prefetch_min_decode_batches <= 0
+        or args.galp_transform_blocks_per_launch < 0
     ):
         raise ValueError("invalid GALP cache/decode dimensions")
+    if args.galp_scheduling_policy == "limited-overlap" and args.galp_transform_blocks_per_launch <= 0:
+        raise ValueError("limited-overlap requires --galp-transform-blocks-per-launch > 0")
     if "dali" in args.pipelines and workers <= 0:
         raise ValueError("DALI requires workers/num_threads > 0")
     if args.preset == "e2e" and not set(E2E_PIPELINES).issubset(args.pipelines):
@@ -277,6 +280,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "seed": args.seed,
             "device": device,
             "precision": args.precision,
+            "model_stream_priority": -1,
             "drop_last": True,
             "aggregate_exclude_first_repeat": args.preset == "e2e" and repeats > 1,
         },
@@ -342,6 +346,13 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
                 "enable_planless_execution": True,
+                "scheduling_policy": args.galp_scheduling_policy,
+                "transform_blocks_per_launch": (
+                    args.galp_transform_blocks_per_launch
+                    if args.galp_scheduling_policy == "limited-overlap"
+                    else 0
+                ),
+                "use_low_priority_streams": True,
             },
             "galp_legacy": {
                 "manifest": str(galp_manifest),
@@ -363,6 +374,9 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
                 "enable_planless_execution": False,
+                "scheduling_policy": args.galp_scheduling_policy,
+                "transform_blocks_per_launch": 0,
+                "use_low_priority_streams": True,
             },
             "rgbnomore": {"root": str(rgbnomore_root), "adapter_policy": "reuse_external_model_dataset_and_transform_code"},
             "dali": {
@@ -379,7 +393,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "cuda_sync_per_batch": True,
             "cuda_sync_scope": "model_stream_only",
             "cuda_device_sync_per_batch": False,
-            "next_batch_prefetch_overlap": True,
+            "next_batch_prefetch_overlap": args.galp_scheduling_policy != "serial",
             "galp_batch_prefetch_depth": args.galp_batch_prefetch_depth,
             "latency_unit": "milliseconds_per_batch",
             "throughput_unit": "images_per_second",
@@ -628,6 +642,18 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Ordered GALP batch lookahead; depth 2 overlaps two native reads with the current model forward.",
+    )
+    parser.add_argument(
+        "--galp-scheduling-policy",
+        choices=("fully-overlapped", "limited-overlap", "serial"),
+        default="limited-overlap",
+        help="Direct-DCT/model overlap policy; limited-overlap protects the high-priority model stream with bounded transform grids.",
+    )
+    parser.add_argument(
+        "--galp-transform-blocks-per-launch",
+        type=int,
+        default=64,
+        help="Maximum planless transform blocks per CUDA launch for limited-overlap (64 caps occupancy near half of a 128-SM GPU).",
     )
     parser.add_argument("--galp-rowgroup-prefetch-depth", type=int, default=16)
     parser.add_argument("--galp-rowgroup-prefetch-workers", type=int, default=4)

@@ -46,6 +46,7 @@ galp::jpeg::JpegDctCropBox parse_crop(const py::object& crop) {
 
 galp::jpeg::JpegDctCoefficientSelection parse_coefficients(const std::string& spec);
 galp::jpeg::JpegDctDeviceLayout parse_layout(const std::string& layout);
+galp::jpeg::JpegDctSchedulingPolicy parse_scheduling_policy(const std::string& policy);
 
 std::optional<galp::jpeg::JpegDctGridTransformSpec> parse_grid_transform(const py::object& value) {
 	if (value.is_none()) {
@@ -121,7 +122,10 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
                                                          const std::string& layout,
                                                          const py::object&  grid_transform,
                                                          const size_t       plan_cache_capacity,
-                                                         const bool         enable_planless_execution) {
+                                                         const bool         enable_planless_execution,
+                                                         const std::string& scheduling_policy = "fully-overlapped",
+                                                         const size_t       transform_blocks_per_launch = 0,
+                                                         const bool         use_low_priority_streams = false) {
 	galp::jpeg::JpegDctDeviceBatchOptions options;
 	options.coefficient_selection                = parse_coefficients(dct_coeffs);
 	options.layout                               = parse_layout(layout);
@@ -134,6 +138,9 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
 	options.rowgroup_prefetch_workers            = rowgroup_prefetch_workers;
 	options.rowgroup_prefetch_min_decode_batches = rowgroup_prefetch_min_decode_batches;
 	options.enable_planless_execution            = enable_planless_execution;
+	options.scheduling_policy                    = parse_scheduling_policy(scheduling_policy);
+	options.transform_blocks_per_launch          = transform_blocks_per_launch;
+	options.use_low_priority_streams              = use_low_priority_streams;
 	return options;
 }
 
@@ -158,6 +165,20 @@ galp::jpeg::JpegDctDeviceLayout parse_layout(const std::string& layout) {
 	}
 	throw std::invalid_argument(
 	    "invalid DCT output layout; expected compact, ycbcr_dct_grid, or transformed_dct_grid");
+}
+
+galp::jpeg::JpegDctSchedulingPolicy parse_scheduling_policy(const std::string& policy) {
+	if (policy == "fully-overlapped" || policy == "fully_overlapped") {
+		return galp::jpeg::JpegDctSchedulingPolicy::kFullyOverlapped;
+	}
+	if (policy == "limited-overlap" || policy == "limited_overlap") {
+		return galp::jpeg::JpegDctSchedulingPolicy::kLimitedOverlap;
+	}
+	if (policy == "serial") {
+		return galp::jpeg::JpegDctSchedulingPolicy::kSerial;
+	}
+	throw std::invalid_argument(
+	    "invalid scheduling_policy; expected fully-overlapped, limited-overlap, or serial");
 }
 
 std::string layout_to_string(const galp::jpeg::JpegDctDeviceLayout layout) {
@@ -388,6 +409,13 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["planless_axis_program_bytes"]                   = stats.planless_axis_program_bytes;
 	out["project_decoded_ycbcr_grid_launch_count"]       = stats.project_decoded_ycbcr_grid_launch_count;
 	out["jpeg_dct_projection_items_materialized"]        = stats.jpeg_dct_projection_items_materialized;
+	out["planless_transform_kernel_launch_count"]        = stats.planless_transform_kernel_launch_count;
+	out["planless_transform_max_blocks_per_launch"]      = stats.planless_transform_max_blocks_per_launch;
+	out["decode_to_transform_event_handoff_count"]       = stats.decode_to_transform_event_handoff_count;
+	out["copy_to_decode_event_handoff_count"]            = stats.copy_to_decode_event_handoff_count;
+	out["direct_dct_stream_priority"]                     = stats.direct_dct_stream_priority;
+	out["direct_dct_low_priority_streams"]                = stats.direct_dct_low_priority_streams;
+	out["scheduling_policy"]                              = stats.scheduling_policy;
 	out["fixed_grid_round_event_handoff_count"]          = stats.fixed_grid_round_event_handoff_count;
 	out["workset_upload_count"]                          = stats.workset_upload_count;
 	out["scratch_upload_count"]                          = stats.scratch_upload_count;
@@ -1160,7 +1188,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	           const std::string&           layout,
 	           const py::object&            grid_transform,
 	           const size_t                 plan_cache_capacity,
-	           const bool                   enable_planless_execution) {
+	           const bool                   enable_planless_execution,
+	           const std::string&           scheduling_policy,
+	           const size_t                 transform_blocks_per_launch,
+	           const bool                   use_low_priority_streams) {
 		        const auto             crop_box = parse_crop(crop);
 		        const auto             options  = make_batch_options(dct_coeffs,
                                                         cache_capacity_mib,
@@ -1172,7 +1203,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
                                                         layout,
                                                         grid_transform,
                                                         plan_cache_capacity,
-                                                        enable_planless_execution);
+                                                        enable_planless_execution,
+                                                        scheduling_policy,
+                                                        transform_blocks_per_launch,
+                                                        use_low_priority_streams);
 		        py::gil_scoped_release release;
 		        return reader.read_batch(image_ids, crop_box, options);
 	        },
@@ -1189,7 +1223,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("layout")                    = "compact",
 	        py::arg("grid_transform")            = py::none(),
 	        py::arg("plan_cache_capacity")       = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity,
-	        py::arg("enable_planless_execution") = true)
+	        py::arg("enable_planless_execution") = true,
+	        py::arg("scheduling_policy")          = "fully-overlapped",
+	        py::arg("transform_blocks_per_launch") = 0,
+	        py::arg("use_low_priority_streams")   = false)
 	    .def(
 	        "prefetch_batch",
 	        [](TorchDirectDctReader& reader,
@@ -1205,7 +1242,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	           const std::string&    layout,
 	           const py::object&     grid_transform,
 	           const size_t          plan_cache_capacity,
-	           const bool            enable_planless_execution) {
+	           const bool            enable_planless_execution,
+	           const std::string&    scheduling_policy,
+	           const size_t          transform_blocks_per_launch,
+	           const bool            use_low_priority_streams) {
 		        const auto crop_box = parse_crop(crop);
 		        const auto options  = make_batch_options(dct_coeffs,
                                                         cache_capacity_mib,
@@ -1217,7 +1257,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
                                                         layout,
                                                         grid_transform,
                                                         plan_cache_capacity,
-                                                        enable_planless_execution);
+                                                        enable_planless_execution,
+                                                        scheduling_policy,
+                                                        transform_blocks_per_launch,
+                                                        use_low_priority_streams);
 		        return reader.prefetch_batch(std::move(image_ids), crop_box, options);
 	        },
 	        py::arg("image_ids"),
@@ -1233,7 +1276,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("layout")                    = "compact",
 	        py::arg("grid_transform")            = py::none(),
 	        py::arg("plan_cache_capacity")       = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity,
-	        py::arg("enable_planless_execution") = true)
+	        py::arg("enable_planless_execution") = true,
+	        py::arg("scheduling_policy")          = "fully-overlapped",
+	        py::arg("transform_blocks_per_launch") = 0,
+	        py::arg("use_low_priority_streams")   = false)
 	    .def(
 	        "read_batch_async",
 	        [](TorchDirectDctReader& reader,

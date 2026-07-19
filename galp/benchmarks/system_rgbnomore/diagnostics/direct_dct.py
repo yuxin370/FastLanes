@@ -285,6 +285,9 @@ def _read_grid_batch(
     rowgroup_prefetch_min_decode_batches: int = 2,
     plan_cache_capacity: int = 128,
     enable_planless_execution: bool = True,
+    scheduling_policy: str = "fully-overlapped",
+    transform_blocks_per_launch: int = 0,
+    use_low_priority_streams: bool = False,
 ) -> Any:
     return reader.read_batch(
         image_ids,
@@ -297,6 +300,9 @@ def _read_grid_batch(
         rowgroup_prefetch_min_decode_batches=rowgroup_prefetch_min_decode_batches,
         plan_cache_capacity=plan_cache_capacity,
         enable_planless_execution=enable_planless_execution,
+        scheduling_policy=scheduling_policy,
+        transform_blocks_per_launch=transform_blocks_per_launch,
+        use_low_priority_streams=use_low_priority_streams,
         layout=layout,
         grid_transform=grid_transform,
     )
@@ -649,6 +655,22 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     # host-side transform items, source lists, or sort entries.
     totals["planless_image_descriptors"] += int(stats.get("planless_image_descriptor_count", 0))
     totals["planless_transform_output_blocks"] += int(stats.get("planless_transform_output_block_count", 0))
+    totals["planless_transform_kernel_launches"] += int(
+        stats.get("planless_transform_kernel_launch_count", 0)
+    )
+    totals["planless_transform_max_blocks_per_launch"] = max(
+        int(totals["planless_transform_max_blocks_per_launch"]),
+        int(stats.get("planless_transform_max_blocks_per_launch", 0)),
+    )
+    totals["decode_to_transform_event_handoffs"] += int(
+        stats.get("decode_to_transform_event_handoff_count", 0)
+    )
+    totals["copy_to_decode_event_handoffs"] += int(
+        stats.get("copy_to_decode_event_handoff_count", 0)
+    )
+    totals["direct_dct_low_priority_batches"] += int(
+        bool(stats.get("direct_dct_low_priority_streams", False))
+    )
     for key in (
         "planless_axis_program_count",
         "planless_axis_phase_matrix_count",
@@ -724,6 +746,11 @@ def _empty_totals() -> dict[str, int | float]:
         "fixed_transform_items": 0,
         "planless_image_descriptors": 0,
         "planless_transform_output_blocks": 0,
+        "planless_transform_kernel_launches": 0,
+        "planless_transform_max_blocks_per_launch": 0,
+        "decode_to_transform_event_handoffs": 0,
+        "copy_to_decode_event_handoffs": 0,
+        "direct_dct_low_priority_batches": 0,
         "planless_axis_program_count": 0,
         "planless_axis_phase_matrix_count": 0,
         "planless_axis_program_bytes": 0,
@@ -963,6 +990,9 @@ def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: l
         ),
         plan_cache_capacity=int(getattr(args, "plan_cache_capacity", 128)),
         enable_planless_execution=bool(getattr(args, "enable_planless_execution", True)),
+        scheduling_policy=str(getattr(args, "scheduling_policy", "fully-overlapped")),
+        transform_blocks_per_launch=int(getattr(args, "transform_blocks_per_launch", 0)),
+        use_low_priority_streams=bool(getattr(args, "use_low_priority_streams", False)),
         layout="transformed_dct_grid",
         grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
     )

@@ -653,3 +653,144 @@ t_model < 50 / (1.10 × 4839.499) = 9.392407 ms/batch
 `11.164525 ms/batch`，距离目标 `9.392407 ms/batch` 需要再减少 `1.772118 ms/batch`（`15.87%`）。如果新的
 模型/编译方案同时改变 DALI 吞吐，右侧目标也必须使用新的同轮 DALI median 重新计算，不能继续使用
 `4839.499 img/s` 这个分母。
+
+## 14. 高优先级模型与受限 Direct-DCT 重叠实现
+
+### 14.1 为什么继续处理 0.766317 ms
+
+第 1 节的 `5188.818 img/s` 证明原 `1.10× DALI` gate 在固定模型下不可达，但当前
+end-to-end 仍未到这个模型上界。最新完整轮的 GALP model-forward p50 中位值为
+`10.402424 ms`，forward-only 为 `9.636107 ms`：
+
+```text
+T_model_with_transform - T_model_only
+= 10.402424 - 9.636107
+= 0.766317 ms/batch
+```
+
+同期 planless transform p50 中位值为 `0.878592 ms`，模型额外延迟相当于 transform
+时间的 87.22%。这表明 next-batch transform 与当前模型发生了明显 GPU 资源争用；即使
+不改变固定模型上界，也仍应消除这部分实现损失，使 end-to-end 接近 DALI 并尽量接近
+`5188.818 img/s`。
+
+### 14.2 具体代码修改
+
+本轮未改变模型、checkpoint、FP32 精度、输入形状或 Direct-DCT 数值语义，修改内容如下：
+
+| 文件 | 具体修改 |
+|---|---|
+| `galp/src/cuda/memory/cuda_raii.cuh` | `CudaStream` 增加 `cudaStreamCreateWithPriority` RAII 接口 |
+| `galp/src/engine/workset/model.cuh`、`streams.cu` | persistent H2D/compute/D2H workset stream 支持设备定义的 priority |
+| `galp/include/galp/jpeg_dct.hpp` | 新增三种 scheduling policy、transform chunk 配置与 stream/event/launch 统计 |
+| `galp/src/jpeg/jpeg_dct.cpp`、`jpeg_dct_device.cuh` | scheduling options 进入 plan 和 plan-cache key，并传到 device executor |
+| `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event handoff、offset-aware chunked planless kernel、低优先级 round/cache stream |
+| `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、chunk blocks、低优先级开关和新增 counters |
+| `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用显式 priority `-1` stream；serial 延迟下一批 prefetch |
+| `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略和 chunk size，默认 limited-overlap/64 blocks |
+| `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、limited-overlap、serial 并计算核心 delta |
+| `jpeg_dct_test.cpp` | 7-block chunk 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
+| `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
+
+Native event graph 由原来的：
+
+```text
+H2D event -> decode compute stream -> transform（同一 stream）
+host synchronize -> round stream -> batch completion
+```
+
+变为：
+
+```text
+低优先级 H2D stream
+  -> H2D-ready event
+低优先级 decode stream
+  -> decode-done event
+低优先级 transform stream（可分块）
+  -> 低优先级 round stream
+  -> batch completion event
+高优先级 model stream 只等待当前 batch completion
+```
+
+同一 rowgroup 的 transform 依赖 decode 输出，因此该依赖不能删除；“解耦”的含义是
+把 copy、decode、transform 从一个隐式 compute-stream 尾链拆成独立 stream 和可审计 event
+handoff，使不同 batch 的 Direct-DCT 工作可以被高优先级模型调度打断，而不是取消真实数据依赖。
+
+### 14.3 三种策略的严格定义
+
+| 策略 | next-batch overlap | transform grid | 用途 |
+|---|---|---|---|
+| `fully-overlapped` | 是 | 每 workset 一个完整 grid | 低优先级 stream 本身的隔离效果 |
+| `limited-overlap` | 是 | 默认最多 64 blocks/launch | 限制 active SM 并增加模型插入边界 |
+| `serial` | 否 | 完整 grid | 同 contract 的 `T_model_only` 参考和吞吐下界 |
+
+serial 不是另一个模型-only microbenchmark：它仍执行同样的 Direct-DCT、adapter 和模型，只是
+下一批预取必须等上一批 model stream 完成。这使三种策略的样本、输入、模型、checkpoint、精度
+和统计边界保持相同，可直接用 serial 的 model-forward 时间计算
+`T_model_with_transform - T_model_only`。
+
+### 14.4 数据量、计算量和 chunk 上限
+
+batch 50 的输出和执行规模为：
+
+```text
+每图 output blocks = 28×28 + 2×14×14 = 1,176
+每 batch output blocks = 50×1,176 = 58,800
+每 block CUDA threads = 64
+每 batch transform threads = 3,763,200
+source blocks = 235,200 = 4×output blocks
+```
+
+canonical factor-2 路径每个 output block 的主要矩阵工作约为 3,072 FMA，因此一个
+batch 约为 180.63M FMA（约 361.27M FLOPs），另有 235,200 source blocks 的系数
+读取、反量化和 clamp。transform 实测只需约 0.879 ms，而模型为 9.636 ms，因此从
+工作量看 transform 可以被模型窗口隐藏；限制来自共享 SM 和 memory subsystem，不是必须串行
+相加的理论依赖。
+
+RTX 4090 有 128 SM。64-block grid 在任一 launch 内最多把 blocks 分配给 64 个 SM，
+active-SM 几何上界约为 50%，但每 batch 需要：
+
+```text
+ceil(58,800 / 64) = 919 launches
+```
+
+若每次 launch/调度固定成本约 3–5 µs，919 次的固定开销约为 2.76–4.60 ms，连同
+原 kernel 工作约为 3.64–5.48 ms。最新 planning、read、workset build/upload、decode、
+transform、round 热态合计约 6.49 ms，原本低于 9.636 ms 模型窗口；64-block 策略在
+低 launch-overhead 端仍可能完全隐藏，在高端则可能损失 next-batch readiness。因此 64 是
+“优先保护模型”的实测起点，不是预先宣称的最优值；若吞吐下降，应继续比较 128/256，取得
+模型额外延迟与 launch 开销的 Pareto 点。
+
+### 14.5 验证状态和复现命令
+
+已通过：
+
+- 全量 `cmake --build build -j2`；
+- `_galp_direct_dct` 和 `galp_tests` 增量构建；
+- Direct-DCT Torch import CTest；
+- `galp.tests.test_system_benchmark` 20/20；
+- Python `py_compile`；
+- `git diff --check`。
+
+当前受控执行环境可通过 `nvidia-smi` 枚举 RTX 4090，但测试进程中的
+`cudaGetDeviceCount` 返回无可用设备，所以 GPU correctness test 被明确 skip，未伪造三策略
+结果。请在有 CUDA runtime 权限的目标终端运行：
+
+```bash
+cd /home/tangyuxin/gfastlanes/FastLanes
+
+GALP_RUN_GPU_TESTS=1 CUDA_VISIBLE_DEVICES=0 \
+  ./build/galp/tests/galp_tests \
+  --gtest_filter=JpegDct.PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix
+
+CUDA_VISIBLE_DEVICES=0 \
+  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  galp/benchmarks/system_rgbnomore/scheduler_matrix.py \
+  --contract /tmp/galp-planless-phase2-upper-final-3932b5d/contract.json \
+  --output-dir /tmp/galp-planless-scheduler-matrix \
+  --binding-dir build/galp/torch \
+  --transform-blocks 64
+```
+
+矩阵汇总写入 `/tmp/galp-planless-scheduler-matrix/scheduler_matrix.json`。最终验收必须同时
+检查 bit-exact correctness、三策略 Top-1/Top-5、sample trace、event/launch counters、
+`model_extra_p50_ms_vs_serial` 和总吞吐，不能只挑一个最好 latency 数字。

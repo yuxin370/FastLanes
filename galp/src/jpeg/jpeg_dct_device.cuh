@@ -498,6 +498,9 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     dct_conversion_matrix_cache_misses = 0;
 	size_t                                     decode_batch_rowgroups          = kDefaultJpegDctDecodeBatchRowgroups;
 	JpegDctDeviceRowgroupPrefetchConfig        rowgroup_prefetch {};
+	JpegDctSchedulingPolicy                    scheduling_policy           = JpegDctSchedulingPolicy::kFullyOverlapped;
+	size_t                                     transform_blocks_per_launch = 0;
+	bool                                       use_low_priority_streams    = false;
 };
 
 struct JpegDctDeviceDecodedRowgroupCacheKey {

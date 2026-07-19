@@ -1793,18 +1793,26 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			planless_options.enable_planless_execution = true;
 			auto legacy_options                        = planless_options;
 			legacy_options.enable_planless_execution   = false;
+			auto chunked_options                       = planless_options;
+			chunked_options.scheduling_policy           = galp::jpeg::JpegDctSchedulingPolicy::kLimitedOverlap;
+			chunked_options.transform_blocks_per_launch = 7U;
+			chunked_options.use_low_priority_streams     = true;
 
 			auto       planless        = reader.ReadDeviceDctBatch(requests, planless_options);
 			auto       legacy          = reader.ReadDeviceDctBatch(requests, legacy_options);
 			auto       planless_repeat = reader.ReadDeviceDctBatch(requests, planless_options);
+			auto       chunked         = reader.ReadDeviceDctBatch(requests, chunked_options);
 			const auto planless_host   = copy_grid(planless);
 			const auto legacy_host     = copy_grid(legacy);
 			const auto repeat_host     = copy_grid(planless_repeat);
+			const auto chunked_host    = copy_grid(chunked);
 			EXPECT_EQ(planless_host, legacy_host) << test_case.name << " transform=" << transform_index;
 			EXPECT_EQ(planless_host, repeat_host) << test_case.name << " transform=" << transform_index;
+			EXPECT_EQ(planless_host, chunked_host) << test_case.name << " transform=" << transform_index;
 
 			const auto planless_stats = planless.execution_stats();
 			const auto legacy_stats   = legacy.execution_stats();
+			const auto chunked_stats  = chunked.execution_stats();
 			EXPECT_EQ(planless_stats.planless_image_descriptor_count, requests.size()) << test_case.name;
 			EXPECT_EQ(planless_stats.fixed_transform_item_count, 0U) << test_case.name;
 			EXPECT_EQ(planless_stats.host_expanded_transform_items_created, 0U) << test_case.name;
@@ -1819,6 +1827,13 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			EXPECT_EQ(planless_stats.internal_sync_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.decoded_batch_sync_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.cached_gather_sync_count, 0U) << test_case.name;
+			EXPECT_EQ(chunked_stats.planless_transform_max_blocks_per_launch, 7U) << test_case.name;
+			EXPECT_EQ(chunked_stats.planless_transform_kernel_launch_count,
+			          (chunked_stats.planless_transform_output_block_count + 6U) / 7U)
+			    << test_case.name;
+			EXPECT_EQ(chunked_stats.decode_to_transform_event_handoff_count, 1U) << test_case.name;
+			EXPECT_TRUE(chunked_stats.direct_dct_low_priority_streams) << test_case.name;
+			EXPECT_EQ(chunked_stats.scheduling_policy, "limited-overlap") << test_case.name;
 			EXPECT_GT(legacy_stats.fixed_transform_item_count, 0U) << test_case.name;
 			if (transform_index == 0U) {
 				EXPECT_EQ(planless_stats.planless_axis_program_count, 0U) << test_case.name;

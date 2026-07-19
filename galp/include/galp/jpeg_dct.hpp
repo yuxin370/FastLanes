@@ -360,6 +360,18 @@ struct JpegDctImageCropRequest {
 	JpegDctCropBox source_crop {};
 };
 
+enum class JpegDctSchedulingPolicy {
+	// Queue the complete transform grid and overlap next-batch Direct-DCT work
+	// with the current model invocation.
+	kFullyOverlapped,
+	// Split the transform into bounded grids on a low-priority stream so a
+	// high-priority model stream can claim most SMs between launches.
+	kLimitedOverlap,
+	// Use the same native event graph as fully-overlapped execution; callers
+	// suppress next-batch prefetch until the current model invocation finishes.
+	kSerial,
+};
+
 struct JpegDctDeviceBatchOptions {
 	JpegDctDeviceLayout layout                 = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
 	std::optional<JpegDctGridTransformSpec> grid_transform;
@@ -377,6 +389,12 @@ struct JpegDctDeviceBatchOptions {
 	// false forces the legacy expanded graph so device tests and benchmark
 	// reports can compare both algorithms under an otherwise identical contract.
 	bool enable_planless_execution = true;
+	JpegDctSchedulingPolicy scheduling_policy = JpegDctSchedulingPolicy::kFullyOverlapped;
+	// Zero launches the complete planless transform grid once. A positive value
+	// caps each kernel grid and therefore the maximum number of transform blocks
+	// that can concurrently occupy SMs.
+	size_t transform_blocks_per_launch = 0;
+	bool   use_low_priority_streams     = false;
 };
 
 struct JpegDctDeviceImageLayout {
@@ -522,6 +540,14 @@ struct JpegDctDeviceExecutionStats {
 	size_t      galp_native_device_cuda_allocation_bytes      = 0;
 	double      device_mapping_ms                             = 0.0;
 	bool        device_mapping_fused                          = false;
+	// Scheduling/stream diagnostics (appended for aggregate compatibility).
+	size_t      planless_transform_kernel_launch_count        = 0;
+	size_t      planless_transform_max_blocks_per_launch      = 0;
+	size_t      decode_to_transform_event_handoff_count       = 0;
+	size_t      copy_to_decode_event_handoff_count            = 0;
+	int         direct_dct_stream_priority                     = 0;
+	bool        direct_dct_low_priority_streams                = false;
+	std::string scheduling_policy;
 };
 
 struct JpegDctDeviceBatchPlanPreview {

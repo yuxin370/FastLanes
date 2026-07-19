@@ -533,6 +533,8 @@ struct JpegDctDeviceScratch {
 	galp::memory::CudaEvent                                                cached_gather_done;
 	galp::memory::CudaEvent                                                decoded_batch_gather_done;
 	galp::memory::CudaStream                                               fixed_grid_round_stream;
+	galp::memory::CudaStream                                               transform_stream;
+	galp::memory::CudaEvent                                                decode_to_transform_event;
 	galp::runtime::ExecutionWorkset                                        decode_workset;
 	JpegDctDeviceScratchBuffer<DeviceCoeffBinding>                         column_bindings;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceProjectionBatchItem>           batch_projection_items;
@@ -565,6 +567,9 @@ struct JpegDctDeviceScratch {
 	size_t                                                                 rowgroup_prefetch_pinned_pool_slots = 0;
 	bool                                                                   cached_gather_in_flight             = false;
 	bool                                                                   cached_fixed_transform_in_flight    = false;
+	int                                                                    direct_dct_stream_priority          = 0;
+	bool                                                                   direct_dct_low_priority_streams     = false;
+	size_t                                                                 transform_blocks_per_launch         = 0;
 	std::list<std::string>                                                 fls_reader_lru;
 	struct CachedFlsReaderEntry {
 		std::shared_ptr<galp::format::FlsReader> reader;
@@ -619,16 +624,33 @@ struct JpegDctDeviceScratch {
 
 	cudaStream_t stream_for_cache_hit() {
 		if (!cache_hit_stream) {
-			cache_hit_stream.create(cudaStreamNonBlocking);
+			cache_hit_stream.create_with_priority(cudaStreamNonBlocking, direct_dct_stream_priority);
 		}
 		return cache_hit_stream.get();
 	}
 
 	cudaStream_t stream_for_fixed_grid_rounding() {
 		if (!fixed_grid_round_stream) {
-			fixed_grid_round_stream.create(cudaStreamNonBlocking);
+			fixed_grid_round_stream.create_with_priority(cudaStreamNonBlocking, direct_dct_stream_priority);
 		}
 		return fixed_grid_round_stream.get();
+	}
+
+	cudaStream_t stream_for_transform() {
+		if (!transform_stream) {
+			transform_stream.create_with_priority(cudaStreamNonBlocking, direct_dct_stream_priority);
+		}
+		return transform_stream.get();
+	}
+
+	void configure_scheduling(const bool use_low_priority, const size_t blocks_per_launch) {
+		int least_priority    = 0;
+		int greatest_priority = 0;
+		CUDA_SAFE_CALL(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+		direct_dct_low_priority_streams     = use_low_priority;
+		direct_dct_stream_priority          = use_low_priority ? least_priority : 0;
+		transform_blocks_per_launch         = blocks_per_launch;
+		decode_workset.transfer.stream_priority   = direct_dct_stream_priority;
 	}
 
 	void ensure_cached_gather_events() {
@@ -923,6 +945,7 @@ __device__ float planless_axis_phase_weight(const float* __restrict phase_matric
 __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column_bindings,
                                                      const JpegDctDevicePlanlessImageDescriptor* __restrict images,
                                                      const size_t image_count,
+                                                     const uint64_t output_block_offset,
                                                      const uint16_t* __restrict quant_tables,
                                                      const float* __restrict phase_matrices,
                                                      const uint32_t y_output_width,
@@ -937,7 +960,7 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 	const uint64_t y_blocks            = static_cast<uint64_t>(y_output_width) * y_output_height;
 	const uint64_t cbcr_channel_blocks = static_cast<uint64_t>(cbcr_output_width) * cbcr_output_height;
 	const uint64_t blocks_per_image    = y_blocks + 2U * cbcr_channel_blocks;
-	const uint64_t linear_block        = static_cast<uint64_t>(blockIdx.x);
+	const uint64_t linear_block        = output_block_offset + static_cast<uint64_t>(blockIdx.x);
 	if (blocks_per_image == 0U || linear_block >= image_count * blocks_per_image || quant_tables == nullptr) {
 		return;
 	}
@@ -1615,6 +1638,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
                                                  float*                                  cbcr_accum,
                                                  JpegDctDeviceScratch&                   scratch,
                                                  JpegDctDeviceExecutionStats&            stats,
+                                                 const size_t                           transform_blocks_per_launch,
                                                  cudaStream_t                            stream) {
 	if (sources.empty() || works.empty()) {
 		return;
@@ -1659,22 +1683,32 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	}
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
 	scratch.planless_image_descriptors.upload(images.data(), images.size(), stream, stats);
-	transformed_dct_grid_planless_kernel<<<dim3(static_cast<unsigned>(output_blocks)), dim3(64U), 0, stream>>>(
-	    scratch.column_bindings.data,
-	    scratch.planless_image_descriptors.data,
-	    images.size(),
-	    quant_tables,
-	    phase_matrices,
-	    transform.y_output_width_blocks,
-	    transform.y_output_height_blocks,
-	    transform.cbcr_output_width_blocks,
-	    transform.cbcr_output_height_blocks,
-	    transform.clamp_min,
-	    transform.clamp_max,
-	    y_accum,
-	    cbcr_accum);
-	CUDA_SAFE_CALL(cudaGetLastError());
-	++stats.materialize_kernel_launch_count;
+	const uint64_t launch_block_limit = transform_blocks_per_launch == 0
+	                                      ? output_blocks
+	                                      : std::min<uint64_t>(output_blocks, transform_blocks_per_launch);
+	for (uint64_t offset = 0; offset < output_blocks; offset += launch_block_limit) {
+		const auto launch_blocks = static_cast<unsigned>(std::min<uint64_t>(launch_block_limit, output_blocks - offset));
+		transformed_dct_grid_planless_kernel<<<dim3(launch_blocks), dim3(64U), 0, stream>>>(
+		    scratch.column_bindings.data,
+		    scratch.planless_image_descriptors.data,
+		    images.size(),
+		    offset,
+		    quant_tables,
+		    phase_matrices,
+		    transform.y_output_width_blocks,
+		    transform.y_output_height_blocks,
+		    transform.cbcr_output_width_blocks,
+		    transform.cbcr_output_height_blocks,
+		    transform.clamp_min,
+		    transform.clamp_max,
+		    y_accum,
+		    cbcr_accum);
+		CUDA_SAFE_CALL(cudaGetLastError());
+		++stats.materialize_kernel_launch_count;
+		++stats.planless_transform_kernel_launch_count;
+		stats.planless_transform_max_blocks_per_launch =
+		    std::max(stats.planless_transform_max_blocks_per_launch, static_cast<size_t>(launch_blocks));
+	}
 	stats.planless_image_descriptor_count += images.size();
 	stats.planless_transform_output_block_count += output_blocks;
 	stats.device_mapping_fused = true;
@@ -2477,8 +2511,10 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 	size_t launches = 0;
 	auto   run      = galp::runtime::run_workset_async(workset, 1, cfg, nullptr, &launches);
 	execution_stats.decode_kernel_launch_count += launches;
-	const cudaStream_t stream = run.stream;
-	make_stream_wait_for_cached_gather(stream, scratch, execution_stats);
+	if (galp::runtime::use_async_h2d() && workset.transfer.h2d_stream && workset.transfer.h2d_ready_event) {
+		++execution_stats.copy_to_decode_event_handoff_count;
+	}
+	const cudaStream_t decode_stream = run.stream;
 
 	auto& sources = scratch.host_bound_sources;
 	sources.clear();
@@ -2499,6 +2535,15 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		throw std::runtime_error("JPEG DCT workset mixed expanded and planless fixed transforms");
 	}
 	const bool batch_has_fixed_transform = batch_has_expanded_fixed_transform || batch_has_planless_fixed_transform;
+	cudaStream_t materialize_stream = decode_stream;
+	if (batch_has_fixed_transform) {
+		scratch.decode_to_transform_event.create_with_flags(cudaEventDisableTiming);
+		scratch.decode_to_transform_event.record(decode_stream);
+		materialize_stream = scratch.stream_for_transform();
+		CUDA_SAFE_CALL(cudaStreamWaitEvent(materialize_stream, scratch.decode_to_transform_event.get(), 0));
+		++execution_stats.decode_to_transform_event_handoff_count;
+	}
+	make_stream_wait_for_cached_gather(materialize_stream, scratch, execution_stats);
 	const bool use_dense_bindings        = materializes_dense_cache || uses_decoded_gather || batch_has_fixed_transform;
 	for (size_t source_idx = 0; source_idx < works.size(); ++source_idx) {
 		const auto& work = works[source_idx];
@@ -2524,7 +2569,8 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		                                            cbcr_accum,
 		                                            scratch,
 		                                            execution_stats,
-		                                            stream);
+		                                            scratch.transform_blocks_per_launch,
+		                                            materialize_stream);
 	} else if (batch_has_expanded_fixed_transform) {
 		project_transformed_dct_grid_batch(sources,
 		                                   works,
@@ -2537,9 +2583,9 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		                                   cbcr_accum,
 		                                   scratch,
 		                                   execution_stats,
-		                                   stream);
+		                                   materialize_stream);
 	} else if (uses_decoded_gather) {
-		gather_decoded_rowgroup_batch(sources, works, output, scratch, execution_stats, stream);
+		gather_decoded_rowgroup_batch(sources, works, output, scratch, execution_stats, materialize_stream);
 	} else if (output_ycbcr_dct_grid) {
 		project_decoded_ycbcr_grid_batch(sources,
 		                                 works,
@@ -2550,7 +2596,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		                                 cbcr_accum,
 		                                 scratch,
 		                                 execution_stats,
-		                                 stream);
+		                                 materialize_stream);
 	} else {
 		project_decoded_rowgroup_batch(sources,
 		                               works,
@@ -2559,7 +2605,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		                               output,
 		                               scratch,
 		                               execution_stats,
-		                               stream);
+		                               materialize_stream);
 	}
 	if (materializes_dense_cache) {
 		auto& materialize_items = scratch.host_materialize_items;
@@ -2576,18 +2622,21 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 				    static_cast<uint32_t>(source_idx), row_count, work.cache_entry->blocks->get()});
 			}
 		}
-		materialize_dense_rowgroup_batch(materialize_items, scratch, execution_stats, stream);
+		materialize_dense_rowgroup_batch(materialize_items, scratch, execution_stats, materialize_stream);
 	}
 	scratch.ensure_decoded_batch_events();
-	scratch.decoded_batch_gather_done.record(stream);
+	scratch.decoded_batch_gather_done.record(materialize_stream);
 
 	// Rowgroup metadata, workset output arena, and scratch are reused after this batch.
 	// Wait only for the projection completion event; batch-level workset ownership can remove this later.
 	scratch.decoded_batch_gather_done.synchronize();
 	++execution_stats.internal_sync_count;
 	++execution_stats.decoded_batch_sync_count;
-	if (stream != nullptr) {
-		galp::memory::complete_h2d(stream);
+	if (decode_stream != nullptr) {
+		galp::memory::complete_h2d(decode_stream);
+	}
+	if (materialize_stream != nullptr && materialize_stream != decode_stream) {
+		galp::memory::complete_h2d(materialize_stream);
 	}
 	finish_cached_gather_after_wait(scratch, execution_stats);
 	if (run.stop != nullptr) {
@@ -3381,6 +3430,20 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 	    impl->fixed_resize_weight_matrices.has_value() ? impl->fixed_resize_weight_matrices->get() : nullptr;
 	JpegDctDeviceScratch local_scratch;
 	auto&                scratch              = plan.scratch != nullptr ? *plan.scratch : local_scratch;
+	scratch.configure_scheduling(plan.use_low_priority_streams, plan.transform_blocks_per_launch);
+	impl->execution_stats.direct_dct_stream_priority      = scratch.direct_dct_stream_priority;
+	impl->execution_stats.direct_dct_low_priority_streams = scratch.direct_dct_low_priority_streams;
+	switch (plan.scheduling_policy) {
+	case JpegDctSchedulingPolicy::kFullyOverlapped:
+		impl->execution_stats.scheduling_policy = "fully-overlapped";
+		break;
+	case JpegDctSchedulingPolicy::kLimitedOverlap:
+		impl->execution_stats.scheduling_policy = "limited-overlap";
+		break;
+	case JpegDctSchedulingPolicy::kSerial:
+		impl->execution_stats.scheduling_policy = "serial";
+		break;
+	}
 	auto&                cached_pending       = scratch.host_cached_gather_items;
 	auto&                cached_fixed_pending = scratch.host_cached_fixed_transform_items;
 	cached_pending.clear();

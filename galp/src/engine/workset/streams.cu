@@ -23,21 +23,21 @@ cudaStream_t ensure_workset_h2d_stream(ExecutionWorkset& workset) {
 		return nullptr;
 	}
 	if (!workset.transfer.h2d_stream) {
-		workset.transfer.h2d_stream.create(cudaStreamNonBlocking);
+		workset.transfer.h2d_stream.create_with_priority(cudaStreamNonBlocking, workset.transfer.stream_priority);
 	}
 	return workset.transfer.h2d_stream.get();
 }
 
 cudaStream_t ensure_workset_compute_stream(ExecutionWorkset& workset) {
 	if (!workset.transfer.compute_stream) {
-		workset.transfer.compute_stream.create(cudaStreamNonBlocking);
+		workset.transfer.compute_stream.create_with_priority(cudaStreamNonBlocking, workset.transfer.stream_priority);
 	}
 	return workset.transfer.compute_stream.get();
 }
 
 cudaStream_t ensure_workset_d2h_stream(ExecutionWorkset& workset) {
 	if (!workset.transfer.d2h_stream) {
-		workset.transfer.d2h_stream.create(cudaStreamNonBlocking);
+		workset.transfer.d2h_stream.create_with_priority(cudaStreamNonBlocking, workset.transfer.stream_priority);
 	}
 	return workset.transfer.d2h_stream.get();
 }

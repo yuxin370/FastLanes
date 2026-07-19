@@ -566,6 +566,78 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(third_batch.ordinals, [4, 5])
         self.assertEqual(list(adapter.pending_batches), [])
 
+    def test_galp_serial_policy_defers_next_prefetch_until_next_load(self) -> None:
+        prefetch_calls: list[list[int]] = []
+
+        class Pending:
+            def __init__(self, image_ids: list[int]) -> None:
+                self.image_ids = image_ids
+
+        class SourceBatch:
+            execution_stats = {
+                "fixed_transform_item_count": 0,
+                "planless_image_descriptor_count": 2,
+                "host_expanded_transform_items_created": 0,
+                "host_output_block_source_lists_created": 0,
+                "host_global_transform_sort_items": 0,
+                "device_mapping_fused": True,
+                "projection_item_count": 0,
+                "decoded_projection_item_count": 0,
+                "project_decoded_ycbcr_grid_launch_count": 0,
+            }
+
+        class Module:
+            @staticmethod
+            def _prefetch_pushdown_batch(reader, args, image_ids):
+                del reader, args
+                prefetch_calls.append(list(image_ids))
+                return Pending(list(image_ids))
+
+            @staticmethod
+            def _adapt_prefetched_pushdown_batch(reader, args, image_ids, pending):
+                del reader, args
+                self.assertEqual(pending.image_ids, image_ids)
+                count = len(image_ids)
+                return torch.zeros((count, 1)), torch.zeros((count, 2)), [SourceBatch()]
+
+            @staticmethod
+            def _empty_totals():
+                return {"fixed_transform_items": 0, "projection_items": 0}
+
+            @staticmethod
+            def _accumulate_many_stats(totals, batches):
+                totals["fixed_transform_items"] += len(batches)
+
+        adapter = object.__new__(GalpAdapter)
+        adapter.module = Module()
+        adapter.reader = object()
+        adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
+        adapter.device = torch.device("cpu")
+        adapter.transform = None
+        adapter.batch_size = 2
+        adapter.batch_prefetch_depth = 2
+        adapter.scheduling_policy = "serial"
+        adapter.pending_batches = deque()
+        adapter.next_prefetch_batch_index = 0
+        first = [
+            {"galp_image_id": 30, "label": 1, "ordinal": 0},
+            {"galp_image_id": 31, "label": 2, "ordinal": 1},
+        ]
+        second = [
+            {"galp_image_id": 32, "label": 3, "ordinal": 2},
+            {"galp_image_id": 33, "label": 4, "ordinal": 3},
+        ]
+        adapter.samples = first + second
+        adapter.total_batches = 2
+
+        adapter.begin_repeat()
+        self.assertEqual(prefetch_calls, [[30, 31]])
+        adapter.load(first, second)
+        self.assertEqual(prefetch_calls, [[30, 31]])
+        adapter.load(second, None)
+        self.assertEqual(prefetch_calls, [[30, 31], [32, 33]])
+        self.assertEqual(list(adapter.pending_batches), [])
+
     def test_galp_legacy_adapter_uses_same_prefetch_path_and_expanded_graph(self) -> None:
         prefetch_calls: list[list[int]] = []
 

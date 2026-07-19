@@ -65,6 +65,10 @@ struct WorksetTransfer {
 	galp::memory::CudaEvent  timing_queued_event;
 	galp::memory::CudaEvent  timing_start_event;
 	galp::memory::CudaEvent  timing_stop_event;
+	// CUDA stream priorities are device-defined: numerically smaller values are
+	// higher priority. JPEG Direct-DCT sets this to the device's least-priority
+	// value before any persistent workset stream is created.
+	int stream_priority = 0;
 };
 
 struct ExecutionWorkset {

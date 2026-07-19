@@ -362,6 +362,9 @@ class GalpAdapter(PipelineAdapter):
         self.module = importlib.import_module("direct_dct")
         galp_dct = importlib.import_module("_galp_direct_dct")
         config = contract["pipelines"][self.config_name]
+        self.scheduling_policy = str(config.get("scheduling_policy", "fully-overlapped"))
+        if self.scheduling_policy not in ("fully-overlapped", "limited-overlap", "serial"):
+            raise ValueError(f"invalid GALP scheduling policy: {self.scheduling_policy}")
         self.reader = galp_dct.DirectDctReader(str(config["manifest"]))
         self.args = SimpleNamespace(
             preprocess=config["preprocess"],
@@ -376,6 +379,9 @@ class GalpAdapter(PipelineAdapter):
             no_dequantize=False,
             no_scale=False,
             enable_planless_execution=bool(config.get("enable_planless_execution", True)),
+            scheduling_policy=self.scheduling_policy,
+            transform_blocks_per_launch=int(config.get("transform_blocks_per_launch", 0)),
+            use_low_priority_streams=bool(config.get("use_low_priority_streams", False)),
         )
         self.transform = (
             self.module.build_rgbnomore_dct_val_transform(Path(contract["pipelines"]["rgbnomore"]["root"]))
@@ -404,7 +410,9 @@ class GalpAdapter(PipelineAdapter):
         self.pending_batches.clear()
         self.next_prefetch_batch_index = 0
         if self.args.preprocess == "rgbnomore-val-pushdown":
-            for _ in range(min(self.batch_prefetch_depth, self.total_batches)):
+            policy = getattr(self, "scheduling_policy", "fully-overlapped")
+            initial_depth = 1 if policy == "serial" else self.batch_prefetch_depth
+            for _ in range(min(initial_depth, self.total_batches)):
                 self._enqueue_next_pushdown_batch()
 
     def load(
@@ -414,6 +422,12 @@ class GalpAdapter(PipelineAdapter):
     ) -> LoadedBatch:
         image_ids = [int(sample["galp_image_id"]) for sample in expected]
         if self.args.preprocess == "rgbnomore-val-pushdown":
+            policy = getattr(self, "scheduling_policy", "fully-overlapped")
+            if not self.pending_batches and policy == "serial":
+                # The previous iteration synchronizes the model stream before
+                # load() is called again, so creating this batch here prohibits
+                # Direct-DCT/model overlap while retaining the native event graph.
+                self._enqueue_next_pushdown_batch()
             if not self.pending_batches:
                 raise RuntimeError("GALP pushdown prefetch queue is empty")
             queued_image_ids, pending = self.pending_batches.popleft()
@@ -427,7 +441,8 @@ class GalpAdapter(PipelineAdapter):
                 image_ids,
                 pending,
             )
-            self._enqueue_next_pushdown_batch()
+            if policy != "serial":
+                self._enqueue_next_pushdown_batch()
         else:
             input_y, input_cbcr, source_batches = self.module.read_and_adapt_batch(
                 self.reader,
@@ -640,6 +655,14 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         torch.cuda.set_device(device)
     adapter = _make_adapter(name, contract, samples, device)
     model = _build_rgb_model(contract, device) if adapter.domain == "rgb" else _build_dct_model(contract, device)
+    model_stream: torch.cuda.Stream | None = None
+    previous_stream: torch.cuda.Stream | None = None
+    model_stream_priority = int(execution.get("model_stream_priority", -1))
+    if device.type == "cuda":
+        previous_stream = torch.cuda.current_stream(device)
+        previous_stream.synchronize()
+        model_stream = torch.cuda.Stream(device=device, priority=model_stream_priority)
+        torch.cuda.set_stream(model_stream)
     semantic_count = int(contract["semantic_validation"]["sample_count"])
     semantic_store: dict[str, list[np.ndarray]] = {}
     prediction_store: dict[str, list[np.ndarray]] = {}
@@ -843,6 +866,10 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         "sample_manifest_sha256": contract["dataset"]["manifest_sha256"],
         "model": _model_metadata(contract, adapter.domain),
         "execution": dict(execution),
+        "cuda_scheduling": {
+            "model_stream_priority_requested": model_stream_priority,
+            "model_stream_is_explicit": model_stream is not None,
+        },
         "worker_semantics": adapter.worker_semantics,
         "timing": dict(contract["timing"]),
         "preprocess": dict(contract["preprocess"][adapter.domain]),
@@ -856,12 +883,15 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
                 "name": torch.cuda.get_device_name(device),
                 "capability": list(torch.cuda.get_device_capability(device)),
                 "total_memory_bytes": torch.cuda.get_device_properties(device).total_memory,
+                "multi_processor_count": torch.cuda.get_device_properties(device).multi_processor_count,
             }
             if device.type == "cuda"
             else {"name": "cpu"}
         ),
         "repeats": repeat_records,
     }
+    if previous_stream is not None:
+        torch.cuda.set_stream(previous_stream)
     write_json(output, result)
     adapter.close()
     return result
