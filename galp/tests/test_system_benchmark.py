@@ -46,6 +46,7 @@ from prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # n
 from run import E2E_MAX_HOT_THROUGHPUT_CV, E2E_PIPELINES, GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, PRESETS  # noqa: E402
 from scheduler_matrix import (  # noqa: E402
     _invariant_counter,
+    _normalize_limited_candidates,
     _normalize_transform_blocks,
     _pareto_frontier,
     _policy_specs,
@@ -62,23 +63,28 @@ class SystemBenchmarkTest(unittest.TestCase):
             _resolve_model_stream_priority("high", (0, -3))
 
     def test_scheduler_matrix_expands_limited_overlap_sweep(self) -> None:
-        blocks = _normalize_transform_blocks([1024, 256, 1024])
-        self.assertEqual(blocks, [256, 1024])
+        self.assertEqual(_normalize_transform_blocks([1024, 256, 1024]), [256, 1024])
+        candidates = _normalize_limited_candidates(
+            [1024, 256, 1024], [128, 64, 128]
+        )
+        self.assertEqual(candidates, [(256, 64), (1024, 128)])
         self.assertEqual(
-            _policy_specs(blocks),
+            _policy_specs(candidates),
             [
-                ("fully-overlapped", "fully-overlapped", 0),
-                ("limited-overlap-256", "limited-overlap", 256),
-                ("limited-overlap-1024", "limited-overlap", 1024),
-                ("serial", "serial", 0),
+                ("fully-overlapped", "fully-overlapped", 0, 0),
+                ("limited-overlap-o256-c64", "limited-overlap", 256, 64),
+                ("limited-overlap-o1024-c128", "limited-overlap", 1024, 128),
+                ("serial", "serial", 0, 0),
             ],
         )
         self.assertEqual(
-            _policy_specs(_normalize_transform_blocks(64))[1],
-            ("limited-overlap", "limited-overlap", 64),
+            _policy_specs(_normalize_limited_candidates(64, None))[1],
+            ("limited-overlap", "limited-overlap", 64, 64),
         )
         with self.assertRaisesRegex(ValueError, "positive integers"):
             _normalize_transform_blocks([0])
+        with self.assertRaisesRegex(ValueError, "equal counts"):
+            _normalize_limited_candidates([256, 512], [64, 128, 256])
 
     def test_scheduler_matrix_computes_limited_pareto_frontier(self) -> None:
         summaries = {

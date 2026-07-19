@@ -500,6 +500,7 @@ struct JpegDctDeviceBatchPlan {
 	JpegDctDeviceRowgroupPrefetchConfig        rowgroup_prefetch {};
 	JpegDctSchedulingPolicy                    scheduling_policy           = JpegDctSchedulingPolicy::kFullyOverlapped;
 	size_t                                     transform_blocks_per_launch = 0;
+	size_t                                     transform_ctas_per_launch   = 0;
 	bool                                       use_low_priority_streams    = false;
 };
 

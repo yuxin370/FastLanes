@@ -1796,6 +1796,7 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			auto chunked_options                       = planless_options;
 			chunked_options.scheduling_policy           = galp::jpeg::JpegDctSchedulingPolicy::kLimitedOverlap;
 			chunked_options.transform_blocks_per_launch = 512U;
+			chunked_options.transform_ctas_per_launch   = 64U;
 			chunked_options.use_low_priority_streams     = true;
 
 			auto       planless        = reader.ReadDeviceDctBatch(requests, planless_options);

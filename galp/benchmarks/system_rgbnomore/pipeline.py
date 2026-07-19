@@ -394,6 +394,7 @@ class GalpAdapter(PipelineAdapter):
             enable_planless_execution=bool(config.get("enable_planless_execution", True)),
             scheduling_policy=self.scheduling_policy,
             transform_blocks_per_launch=int(config.get("transform_blocks_per_launch", 0)),
+            transform_ctas_per_launch=int(config.get("transform_ctas_per_launch", 0)),
             use_low_priority_streams=bool(config.get("use_low_priority_streams", False)),
         )
         self.transform = (

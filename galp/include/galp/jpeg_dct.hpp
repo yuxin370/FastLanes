@@ -391,10 +391,13 @@ struct JpegDctDeviceBatchOptions {
 	bool enable_planless_execution = true;
 	JpegDctSchedulingPolicy scheduling_policy = JpegDctSchedulingPolicy::kFullyOverlapped;
 	// Zero launches the complete planless transform grid once. A positive value
-	// caps output work per launch. Limited-overlap launches at most 64 CTAs and
-	// lets each CTA process multiple output blocks to bound active SMs without
-	// paying one CUDA launch per 64 outputs.
+	// caps output work per launch. Limited-overlap uses a separately configured
+	// CTA cap and lets each CTA process multiple output blocks to bound active
+	// SMs without forcing one CUDA launch per small output group.
 	size_t transform_blocks_per_launch = 0;
+	// Maximum CUDA CTAs per limited-overlap launch. Zero selects the native
+	// default (64). Ignored when transform_blocks_per_launch is zero.
+	size_t transform_ctas_per_launch = 0;
 	bool   use_low_priority_streams     = false;
 };
 

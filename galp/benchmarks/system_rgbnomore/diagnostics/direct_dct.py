@@ -287,6 +287,7 @@ def _read_grid_batch(
     enable_planless_execution: bool = True,
     scheduling_policy: str = "fully-overlapped",
     transform_blocks_per_launch: int = 0,
+    transform_ctas_per_launch: int = 0,
     use_low_priority_streams: bool = False,
 ) -> Any:
     return reader.read_batch(
@@ -302,6 +303,7 @@ def _read_grid_batch(
         enable_planless_execution=enable_planless_execution,
         scheduling_policy=scheduling_policy,
         transform_blocks_per_launch=transform_blocks_per_launch,
+        transform_ctas_per_launch=transform_ctas_per_launch,
         use_low_priority_streams=use_low_priority_streams,
         layout=layout,
         grid_transform=grid_transform,
@@ -1014,6 +1016,7 @@ def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: l
         enable_planless_execution=bool(getattr(args, "enable_planless_execution", True)),
         scheduling_policy=str(getattr(args, "scheduling_policy", "fully-overlapped")),
         transform_blocks_per_launch=int(getattr(args, "transform_blocks_per_launch", 0)),
+        transform_ctas_per_launch=int(getattr(args, "transform_ctas_per_launch", 0)),
         use_low_priority_streams=bool(getattr(args, "use_low_priority_streams", False)),
         layout="transformed_dct_grid",
         grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,

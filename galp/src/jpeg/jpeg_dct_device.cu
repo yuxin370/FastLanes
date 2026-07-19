@@ -572,6 +572,7 @@ struct JpegDctDeviceScratch {
 	int                                                                    cuda_greatest_stream_priority       = 0;
 	bool                                                                   direct_dct_low_priority_streams     = false;
 	size_t                                                                 transform_blocks_per_launch         = 0;
+	size_t                                                                 transform_ctas_per_launch           = 0;
 	std::list<std::string>                                                 fls_reader_lru;
 	struct CachedFlsReaderEntry {
 		std::shared_ptr<galp::format::FlsReader> reader;
@@ -645,12 +646,15 @@ struct JpegDctDeviceScratch {
 		return transform_stream.get();
 	}
 
-	void configure_scheduling(const bool use_low_priority, const size_t blocks_per_launch) {
+	void configure_scheduling(const bool   use_low_priority,
+	                          const size_t blocks_per_launch,
+	                          const size_t ctas_per_launch) {
 		CUDA_SAFE_CALL(cudaDeviceGetStreamPriorityRange(
 		    &cuda_least_stream_priority, &cuda_greatest_stream_priority));
 		direct_dct_low_priority_streams       = use_low_priority;
 		direct_dct_stream_priority            = use_low_priority ? cuda_least_stream_priority : 0;
 		transform_blocks_per_launch           = blocks_per_launch;
+		transform_ctas_per_launch             = ctas_per_launch;
 		decode_workset.transfer.stream_priority = direct_dct_stream_priority;
 	}
 
@@ -1661,6 +1665,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
                                                  JpegDctDeviceScratch&                   scratch,
                                                  JpegDctDeviceExecutionStats&            stats,
                                                  const size_t                            transform_blocks_per_launch,
+                                                 const size_t                            transform_ctas_per_launch,
                                                  cudaStream_t                            stream) {
 	if (sources.empty() || works.empty()) {
 		return;
@@ -1710,10 +1715,13 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	                                         : std::min<uint64_t>(output_blocks, transform_blocks_per_launch);
 	for (uint64_t offset = 0; offset < output_blocks; offset += launch_output_limit) {
 		const auto launch_output_blocks = std::min<uint64_t>(launch_output_limit, output_blocks - offset);
+		const auto limited_cta_limit = transform_ctas_per_launch == 0
+		                                   ? static_cast<uint64_t>(kLimitedPlanlessTransformCtasPerLaunch)
+		                                   : static_cast<uint64_t>(transform_ctas_per_launch);
 		const auto launch_ctas          = static_cast<unsigned>(
             transform_blocks_per_launch == 0
                 ? launch_output_blocks
-                : std::min<uint64_t>(launch_output_blocks, kLimitedPlanlessTransformCtasPerLaunch));
+                : std::min<uint64_t>(launch_output_blocks, limited_cta_limit));
 		transformed_dct_grid_planless_kernel<<<dim3(launch_ctas), dim3(64U), 0, stream>>>(
 		    scratch.column_bindings.data,
 		    scratch.planless_image_descriptors.data,
@@ -2599,6 +2607,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		                                            scratch,
 		                                            execution_stats,
 		                                            scratch.transform_blocks_per_launch,
+		                                            scratch.transform_ctas_per_launch,
 		                                            materialize_stream);
 	} else if (batch_has_expanded_fixed_transform) {
 		project_transformed_dct_grid_batch(sources,
@@ -3459,7 +3468,8 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 	    impl->fixed_resize_weight_matrices.has_value() ? impl->fixed_resize_weight_matrices->get() : nullptr;
 	JpegDctDeviceScratch local_scratch;
 	auto&                scratch              = plan.scratch != nullptr ? *plan.scratch : local_scratch;
-	scratch.configure_scheduling(plan.use_low_priority_streams, plan.transform_blocks_per_launch);
+	scratch.configure_scheduling(
+	    plan.use_low_priority_streams, plan.transform_blocks_per_launch, plan.transform_ctas_per_launch);
 	impl->execution_stats.direct_dct_stream_priority      = scratch.direct_dct_stream_priority;
 	impl->execution_stats.cuda_least_stream_priority      = scratch.cuda_least_stream_priority;
 	impl->execution_stats.cuda_greatest_stream_priority   = scratch.cuda_greatest_stream_priority;

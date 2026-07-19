@@ -125,6 +125,7 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
                                                          const bool         enable_planless_execution,
                                                          const std::string& scheduling_policy = "fully-overlapped",
                                                          const size_t       transform_blocks_per_launch = 0,
+                                                         const size_t       transform_ctas_per_launch = 0,
                                                          const bool         use_low_priority_streams = false) {
 	galp::jpeg::JpegDctDeviceBatchOptions options;
 	options.coefficient_selection                = parse_coefficients(dct_coeffs);
@@ -140,6 +141,7 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
 	options.enable_planless_execution            = enable_planless_execution;
 	options.scheduling_policy                    = parse_scheduling_policy(scheduling_policy);
 	options.transform_blocks_per_launch          = transform_blocks_per_launch;
+	options.transform_ctas_per_launch            = transform_ctas_per_launch;
 	options.use_low_priority_streams              = use_low_priority_streams;
 	return options;
 }
@@ -1199,6 +1201,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	           const bool                   enable_planless_execution,
 	           const std::string&           scheduling_policy,
 	           const size_t                 transform_blocks_per_launch,
+	           const size_t                 transform_ctas_per_launch,
 	           const bool                   use_low_priority_streams) {
 		        const auto             crop_box = parse_crop(crop);
 		        const auto             options  = make_batch_options(dct_coeffs,
@@ -1214,6 +1217,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
                                                         enable_planless_execution,
                                                         scheduling_policy,
                                                         transform_blocks_per_launch,
+                                                        transform_ctas_per_launch,
                                                         use_low_priority_streams);
 		        py::gil_scoped_release release;
 		        return reader.read_batch(image_ids, crop_box, options);
@@ -1234,6 +1238,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("enable_planless_execution") = true,
 	        py::arg("scheduling_policy")          = "fully-overlapped",
 	        py::arg("transform_blocks_per_launch") = 0,
+	        py::arg("transform_ctas_per_launch")  = 0,
 	        py::arg("use_low_priority_streams")   = false)
 	    .def(
 	        "prefetch_batch",
@@ -1253,6 +1258,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	           const bool            enable_planless_execution,
 	           const std::string&    scheduling_policy,
 	           const size_t          transform_blocks_per_launch,
+	           const size_t          transform_ctas_per_launch,
 	           const bool            use_low_priority_streams) {
 		        const auto crop_box = parse_crop(crop);
 		        const auto options  = make_batch_options(dct_coeffs,
@@ -1268,6 +1274,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
                                                         enable_planless_execution,
                                                         scheduling_policy,
                                                         transform_blocks_per_launch,
+                                                        transform_ctas_per_launch,
                                                         use_low_priority_streams);
 		        return reader.prefetch_batch(std::move(image_ids), crop_box, options);
 	        },
@@ -1287,6 +1294,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("enable_planless_execution") = true,
 	        py::arg("scheduling_policy")          = "fully-overlapped",
 	        py::arg("transform_blocks_per_launch") = 0,
+	        py::arg("transform_ctas_per_launch")  = 0,
 	        py::arg("use_low_priority_streams")   = false)
 	    .def(
 	        "read_batch_async",

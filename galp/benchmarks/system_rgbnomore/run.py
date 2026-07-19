@@ -197,10 +197,13 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         or args.galp_rowgroup_prefetch_workers <= 0
         or args.galp_rowgroup_prefetch_min_decode_batches <= 0
         or args.galp_transform_blocks_per_launch < 0
+        or args.galp_transform_ctas_per_launch < 0
     ):
         raise ValueError("invalid GALP cache/decode dimensions")
     if args.galp_scheduling_policy == "limited-overlap" and args.galp_transform_blocks_per_launch <= 0:
         raise ValueError("limited-overlap requires --galp-transform-blocks-per-launch > 0")
+    if args.galp_scheduling_policy == "limited-overlap" and args.galp_transform_ctas_per_launch <= 0:
+        raise ValueError("limited-overlap requires --galp-transform-ctas-per-launch > 0")
     if "dali" in args.pipelines and workers <= 0:
         raise ValueError("DALI requires workers/num_threads > 0")
     if args.preset == "e2e" and not set(E2E_PIPELINES).issubset(args.pipelines):
@@ -352,6 +355,11 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     if args.galp_scheduling_policy == "limited-overlap"
                     else 0
                 ),
+                "transform_ctas_per_launch": (
+                    args.galp_transform_ctas_per_launch
+                    if args.galp_scheduling_policy == "limited-overlap"
+                    else 0
+                ),
                 "use_low_priority_streams": True,
             },
             "galp_legacy": {
@@ -376,6 +384,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "enable_planless_execution": False,
                 "scheduling_policy": args.galp_scheduling_policy,
                 "transform_blocks_per_launch": 0,
+                "transform_ctas_per_launch": 0,
                 "use_low_priority_streams": True,
             },
             "rgbnomore": {"root": str(rgbnomore_root), "adapter_policy": "reuse_external_model_dataset_and_transform_code"},
@@ -646,14 +655,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--galp-scheduling-policy",
         choices=("fully-overlapped", "limited-overlap", "serial"),
-        default="limited-overlap",
+        default="fully-overlapped",
         help="Direct-DCT/model overlap policy; limited-overlap protects the high-priority model stream with bounded transform grids.",
     )
     parser.add_argument(
         "--galp-transform-blocks-per-launch",
         type=int,
+        default=512,
+        help="Maximum planless output blocks per limited-overlap launch; CTA concurrency is configured separately.",
+    )
+    parser.add_argument(
+        "--galp-transform-ctas-per-launch",
+        type=int,
         default=64,
-        help="Maximum planless output blocks per limited-overlap launch; native execution caps actual CTAs at 64.",
+        help="Maximum planless CUDA CTAs per limited-overlap launch.",
     )
     parser.add_argument("--galp-rowgroup-prefetch-depth", type=int, default=16)
     parser.add_argument("--galp-rowgroup-prefetch-workers", type=int, default=4)

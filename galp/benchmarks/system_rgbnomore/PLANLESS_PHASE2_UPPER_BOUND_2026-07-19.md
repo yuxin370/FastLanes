@@ -686,7 +686,7 @@ T_model_with_transform - T_model_only
 | `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event、offset-aware chunk、最多 64 CTA 的 grid-stride planless kernel、低优先级 round/cache stream |
 | `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、chunk blocks、低优先级开关和新增 counters |
 | `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用 PyTorch 运行时可用的 greatest-priority stream；serial 延迟下一批 prefetch |
-| `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略和 chunk size，默认 limited-overlap/64 blocks |
+| `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略、输出 chunk 和 CTA cap；在找到满足吞吐 gate 的 limited 点前默认 fully-overlapped |
 | `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、limited-overlap、serial 并计算核心 delta |
 | `jpeg_dct_test.cpp` | 512-output/64-CTA grid-stride 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
 | `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
@@ -811,16 +811,21 @@ CUDA_VISIBLE_DEVICES=0 \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   galp/benchmarks/system_rgbnomore/scheduler_matrix.py \
   --contract /tmp/galp-planless-phase2-upper-final-3932b5d/contract.json \
-  --output-dir /tmp/galp-planless-scheduler-sweep-greatest \
+  --output-dir /tmp/galp-planless-scheduler-cta-sweep \
   --binding-dir build/galp/torch \
-  --transform-blocks 256 \
   --transform-blocks 512 \
   --transform-blocks 1024 \
   --transform-blocks 2048 \
-  --transform-blocks 4096
+  --transform-blocks 4096 \
+  --transform-blocks 8192 \
+  --transform-ctas 128 \
+  --transform-ctas 256 \
+  --transform-ctas 512 \
+  --transform-ctas 1024 \
+  --transform-ctas 2048
 ```
 
-矩阵汇总写入 `/tmp/galp-planless-scheduler-sweep-greatest/scheduler_matrix.json`。最终验收必须同时
+矩阵汇总写入 `/tmp/galp-planless-scheduler-cta-sweep/scheduler_matrix.json`。最终验收必须同时
 检查 bit-exact correctness、三策略 Top-1/Top-5、sample trace、event/launch counters、
 `model_extra_p50_ms_vs_serial` 和总吞吐，不能只挑一个最好 latency 数字。
 
@@ -867,3 +872,43 @@ JpegDct.PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix: 1155 ms
 新 grid-stride Torch binding SHA-256 为
 `0004f8810a2a714f2b19f1aabc9e6c7184bdf6d9750c9e2f87e04dce3b81e742`；其 CUDA/C++ 构建、Torch import
 CTest、24 个 Python 单测、`py_compile` 和 diff 检查均已通过，GPU bit-exact 与性能需要下一轮验证。
+
+### 14.7 greatest-priority / 64-CTA sweep 实测
+
+完整结果目录为 `/tmp/galp-planless-scheduler-sweep-greatest`，汇总 SHA-256 为
+`2a2e64b3dd4c2d1c09bc5c4b9136a328acb3bd7d0ed932bb9b7ab054e1847123`。矩阵自身硬检查均通过：
+
+- model stream 请求 `"greatest"`，PyTorch range 为 `[0,-3]`，实际 model priority 为 `-3`；
+- 原生 CUDA range 为 `[0,-5]`，四条 Direct-DCT stream 实际 priority 都为 `0`；
+- 七个策略的 sample trace、DCT inputs、logits 和 predictions bit-exact；
+- Top-1/Top-5 全部为 `0.75140/0.92446`；
+- 每个 repeat 的 copy→decode、decode→transform、launch/output/CTA counters 都通过结构公式检查。
+
+排除 repeat 0 后的核心结果：
+
+| 策略 | 输出/launch | CTA/launch | launch/batch | 吞吐 img/s | fully 吞吐保留 | model 额外 p50 ms | transform p50 ms | E2E p50 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fully-overlapped | 58,800 | 58,800 | 1 | 4561.411 | 100% | 0.659208 | 2.020360 | 10.911057 |
+| limited | 256 | 64 | 230 | 3513.041 | 77.02% | **0.184600** | 7.316264 | 14.201228 |
+| limited | 512 | 64 | 115 | 3637.614 | 79.75% | 0.228832 | 6.882816 | 13.710826 |
+| limited | 1,024 | 64 | 58 | 3520.103 | 77.17% | 0.436592 | 6.454272 | 14.010811 |
+| limited | 2,048 | 64 | 29 | 3650.455 | 80.03% | 0.452008 | **6.380776** | 13.659396 |
+| limited | 4,096 | 64 | 15 | **3679.535** | **80.67%** | 0.373592 | 6.710784 | **13.545096** |
+| serial | 58,800 | 58,800 | 1 | 2806.215 | 61.52% | 0 | 0.809472 | 17.457175 |
+
+fully 吞吐为同轮 DALI `4839.499 img/s` 的 `94.25%`。256-output 候选将模型额外 p50 从
+`0.659208` 降到 `0.184600 ms`（减少 `72.0%`，相对原始 `0.766317 ms` 只剩 `24.1%`），但所有
+limited 候选都只保留 fully 的 `77%–81%` 吞吐，因此 `recommended_limited_policy=null`，98% 吞吐
+gate 正确失败，不能选任何一个作为最终配置。
+
+这轮把 919 launches 降到最低 15 后，transform 仍为 `6.38–7.32 ms`，说明 launch overhead 已不再是
+主瓶颈。根因是固定 64 CTA 只允许一半 SM 上存在 transform CTA，而且低优先级 transform 在模型高优先级
+工作持续排队时被明显延后；模型结束后 loader 仍需等待约 `3.4–4.2 ms` 才能取得下一批。下一步必须把
+`output_blocks_per_launch` 与 `ctas_per_launch` 都变为独立参数，比较 128/256/512/1024/2048 CTA；目标是在提高
+transform 前进速度的同时，仍把 resident CTA 数限制在远小于 full-grid 的范围。
+
+CTA cap 现已贯通 public options、plan-cache key、native executor、Torch binding、Python contract 和矩阵。
+下一轮保持每 CTA 最多 4 个输出，配对测试 `(outputs,CTAs) = (512,128)、(1024,256)、(2048,512)、
+(4096,1024)、(8192,2048)`。新 binding 的 pybind 签名已确认包含 `transform_ctas_per_launch`，SHA-256 为
+`61b68bb43a0d7cfb570816c0850c02ecbf7dba768b4f56d420f911e1f5e699ff`；目标构建、Torch import、24 个
+Python 单测、`py_compile` 和 diff 检查均通过。

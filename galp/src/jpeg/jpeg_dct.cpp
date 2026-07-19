@@ -3404,6 +3404,7 @@ struct JpegDctShardDatasetReader::Impl {
 		    options.decode_batch_rowgroups == 0 ? kDefaultJpegDctDecodeBatchRowgroups : options.decode_batch_rowgroups;
 		plan.scheduling_policy           = options.scheduling_policy;
 		plan.transform_blocks_per_launch = options.transform_blocks_per_launch;
+		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
 		plan.rowgroup_prefetch.enabled = options.enable_rowgroup_prefetch;
 		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0 ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
@@ -3754,6 +3755,7 @@ struct JpegDctShardDatasetReader::Impl {
 		    options.decode_batch_rowgroups == 0 ? kDefaultJpegDctDecodeBatchRowgroups : options.decode_batch_rowgroups;
 		plan.scheduling_policy           = options.scheduling_policy;
 		plan.transform_blocks_per_launch = options.transform_blocks_per_launch;
+		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
 		plan.rowgroup_prefetch.enabled = options.enable_rowgroup_prefetch;
 		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0 ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
@@ -4519,7 +4521,8 @@ struct JpegDctShardDatasetReader::Impl {
 		    << options.enable_rowgroup_prefetch << ':' << options.rowgroup_prefetch_depth << ':'
 		    << options.rowgroup_prefetch_workers << ':' << options.rowgroup_prefetch_min_decode_batches << ':'
 		    << options.enable_planless_execution << ':' << static_cast<int>(options.scheduling_policy) << ':'
-		    << options.transform_blocks_per_launch << ':' << options.use_low_priority_streams << ':';
+		    << options.transform_blocks_per_launch << ':' << options.transform_ctas_per_launch << ':'
+		    << options.use_low_priority_streams << ':';
 		if (options.grid_transform.has_value()) {
 			const auto& spec = *options.grid_transform;
 			key << spec.y_output_width_blocks << ',' << spec.y_output_height_blocks << ','

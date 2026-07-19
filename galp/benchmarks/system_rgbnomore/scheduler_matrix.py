@@ -81,18 +81,46 @@ def _normalize_transform_blocks(values: int | list[int] | None) -> list[int]:
     return normalized
 
 
-def _policy_specs(transform_blocks: list[int]) -> list[tuple[str, str, int]]:
-    single_limited = len(transform_blocks) == 1
-    specs = [("fully-overlapped", "fully-overlapped", 0)]
+def _normalize_limited_candidates(
+    transform_blocks: int | list[int] | None,
+    transform_ctas: int | list[int] | None,
+) -> list[tuple[int, int]]:
+    if transform_blocks is None:
+        blocks = [64]
+    elif isinstance(transform_blocks, int):
+        blocks = [transform_blocks]
+    else:
+        blocks = [int(value) for value in transform_blocks]
+    if not blocks or any(value <= 0 for value in blocks):
+        raise ValueError("--transform-blocks must contain positive integers")
+    if transform_ctas is None:
+        ctas = [64]
+    elif isinstance(transform_ctas, int):
+        ctas = [transform_ctas]
+    else:
+        ctas = [int(value) for value in transform_ctas]
+    if not ctas or any(value <= 0 for value in ctas):
+        raise ValueError("--transform-ctas must contain positive integers")
+    if len(ctas) == 1:
+        ctas *= len(blocks)
+    if len(ctas) != len(blocks):
+        raise ValueError("--transform-blocks and --transform-ctas must have equal counts")
+    return sorted(set(zip(blocks, ctas)))
+
+
+def _policy_specs(limited_candidates: list[tuple[int, int]]) -> list[tuple[str, str, int, int]]:
+    single_limited = len(limited_candidates) == 1
+    specs = [("fully-overlapped", "fully-overlapped", 0, 0)]
     specs.extend(
         (
-            "limited-overlap" if single_limited else f"limited-overlap-{blocks}",
+            "limited-overlap" if single_limited else f"limited-overlap-o{blocks}-c{ctas}",
             "limited-overlap",
             blocks,
+            ctas,
         )
-        for blocks in transform_blocks
+        for blocks, ctas in limited_candidates
     )
-    specs.append(("serial", "serial", 0))
+    specs.append(("serial", "serial", 0, 0))
     return specs
 
 
@@ -203,6 +231,7 @@ def _policy_contract(
     policy_label: str,
     policy: str,
     transform_blocks: int,
+    transform_ctas: int,
     binding_dir: Path,
     binding: Path,
 ) -> dict[str, Any]:
@@ -211,6 +240,7 @@ def _policy_contract(
     galp = contract["pipelines"]["galp"]
     galp["scheduling_policy"] = policy
     galp["transform_blocks_per_launch"] = transform_blocks if policy == "limited-overlap" else 0
+    galp["transform_ctas_per_launch"] = transform_ctas if policy == "limited-overlap" else 0
     galp["use_low_priority_streams"] = True
     galp["torch_binding_dir"] = str(binding_dir.resolve())
     galp["native_binary_fingerprint"] = _binding_fingerprint(binding)
@@ -223,9 +253,9 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     base_contract = json.loads(args.contract.read_text(encoding="utf-8"))
     if "galp" not in base_contract.get("pipelines", {}).get("enabled", []):
         raise ValueError("base contract must enable the galp pipeline")
-    transform_blocks_values = _normalize_transform_blocks(args.transform_blocks)
-    policy_specs = _policy_specs(transform_blocks_values)
-    limited_labels = [label for label, policy, _ in policy_specs if policy == "limited-overlap"]
+    limited_candidates = _normalize_limited_candidates(args.transform_blocks, args.transform_ctas)
+    policy_specs = _policy_specs(limited_candidates)
+    limited_labels = [label for label, policy, _, _ in policy_specs if policy == "limited-overlap"]
     binding_candidates = sorted(args.binding_dir.glob("_galp_direct_dct*.so"))
     if len(binding_candidates) != 1:
         raise RuntimeError(f"expected one Direct-DCT binding in {args.binding_dir}, got {binding_candidates}")
@@ -234,13 +264,14 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     result_paths: dict[str, str] = {}
     semantic_paths: dict[str, Path] = {}
     result_payloads: dict[str, dict[str, Any]] = {}
-    for policy_label, policy, transform_blocks in policy_specs:
+    for policy_label, policy, transform_blocks, transform_ctas in policy_specs:
         policy_dir = args.output_dir / policy_label
         contract = _policy_contract(
             base_contract,
             policy_label,
             policy,
             transform_blocks,
+            transform_ctas,
             args.binding_dir,
             binding_candidates[0],
         )
@@ -270,6 +301,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         policy_summaries[policy_label] = _summarize_policy(contract, result)
         policy_summaries[policy_label]["scheduling_policy"] = policy
         policy_summaries[policy_label]["transform_blocks_per_launch"] = transform_blocks
+        policy_summaries[policy_label]["transform_ctas_per_launch"] = transform_ctas
         result_paths[policy_label] = str(output_path.resolve())
         semantic_paths[policy_label] = policy_dir / "semantic_galp.npz"
 
@@ -364,7 +396,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     blocks_per_image = y_width * y_height + 2 * c_width * c_height
     output_blocks = batch_size * blocks_per_image
     limited_launches = {
-        blocks: math.ceil(output_blocks / blocks) for blocks in transform_blocks_values
+        blocks: math.ceil(output_blocks / blocks) for blocks, _ in limited_candidates
     }
     device = result_payloads[limited_labels[0]]["device_metadata"]
     sm_count = int(device.get("multi_processor_count", 0))
@@ -372,8 +404,9 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     for policy_label, summary in policy_summaries.items():
         policy = str(summary["scheduling_policy"])
         blocks = int(summary["transform_blocks_per_launch"])
+        ctas = int(summary["transform_ctas_per_launch"])
         expected_launches_per_batch = limited_launches[blocks] if policy == "limited-overlap" else 1
-        expected_max_blocks = min(64, blocks) if policy == "limited-overlap" else output_blocks
+        expected_max_blocks = min(ctas, blocks) if policy == "limited-overlap" else output_blocks
         expected_max_output_blocks = blocks if policy == "limited-overlap" else output_blocks
         expected_total_launches = measurement_batches * expected_launches_per_batch
         if int(summary["planless_transform_kernel_launches"]) != expected_total_launches:
@@ -428,6 +461,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         )
         limited_comparisons[policy_label] = {
             "transform_blocks_per_launch": limited["transform_blocks_per_launch"],
+            "transform_ctas_per_launch": limited["transform_ctas_per_launch"],
             "throughput_ratio_to_fully_overlapped": throughput_ratio,
             "model_extra_reduction_ms_vs_fully_overlapped": (
                 fully["model_extra_p50_ms_vs_serial"]
@@ -494,21 +528,22 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
             "transform_output_blocks_per_batch": output_blocks,
             "device_sm_count": sm_count,
             "limited_candidates": {
-                str(blocks): {
+                f"o{blocks}-c{ctas}": {
                     "configured_output_blocks_per_launch": blocks,
-                    "ctas_per_launch": min(64, blocks),
-                    "output_blocks_per_cta_upper_bound": math.ceil(blocks / min(64, blocks)),
+                    "ctas_per_launch": min(ctas, blocks),
+                    "output_blocks_per_cta_upper_bound": math.ceil(blocks / min(ctas, blocks)),
                     "launches_per_batch_theoretical": limited_launches[blocks],
                     "max_resident_block_fraction_upper_bound": (
-                        min(1.0, min(64, blocks) / sm_count) if sm_count > 0 else None
+                        min(1.0, min(ctas, blocks) / sm_count) if sm_count > 0 else None
                     ),
                 }
-                for blocks in transform_blocks_values
+                for blocks, ctas in limited_candidates
             },
             "interpretation": (
-                "Each transform CUDA block produces one 8x8 DCT output block with 64 threads. "
-                "The chunk limit bounds simultaneously eligible low-priority transform blocks; "
-                "launch count grows as ceil(output_blocks/chunk), trading launch overhead for model isolation."
+                "Each 64-thread transform CTA processes one or more 8x8 DCT output blocks by grid stride. "
+                "The output limit determines launch count as ceil(output_blocks/output_limit), while the "
+                "independent CTA cap bounds simultaneously eligible low-priority work; together they trade "
+                "transform progress and launch overhead against model isolation."
             ),
         },
     }
@@ -527,6 +562,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         action="append",
         help="Transform blocks per limited-overlap launch; repeat to sweep multiple limits (default: 64).",
+    )
+    parser.add_argument(
+        "--transform-ctas",
+        type=int,
+        action="append",
+        help="CTA cap paired with each --transform-blocks value; one value broadcasts (default: 64).",
     )
     return parser.parse_args()
 
