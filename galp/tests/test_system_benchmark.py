@@ -36,14 +36,67 @@ from common import (  # noqa: E402
 from diagnostics.audit_planless_storage_io import _counter_values  # noqa: E402
 from diagnostics.direct_dct import _make_benchmark_image_ids, _scale_to_rgbnomore_dct_range  # noqa: E402
 from manifest import build_manifest, collect_dataset, validate_galp_label_map  # noqa: E402
-from pipeline import GalpAdapter, GalpLegacyAdapter, _process_memory_snapshot  # noqa: E402
+from pipeline import (  # noqa: E402
+    GalpAdapter,
+    GalpLegacyAdapter,
+    _process_memory_snapshot,
+    _resolve_model_stream_priority,
+)
 from prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
 from run import E2E_MAX_HOT_THROUGHPUT_CV, E2E_PIPELINES, GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, PRESETS  # noqa: E402
-from scheduler_matrix import _invariant_counter  # noqa: E402
+from scheduler_matrix import (  # noqa: E402
+    _invariant_counter,
+    _normalize_transform_blocks,
+    _pareto_frontier,
+    _policy_specs,
+)
 from validate import _aggregate_pipeline, _evaluate_performance_gates, _semantic_compare  # noqa: E402
 
 
 class SystemBenchmarkTest(unittest.TestCase):
+    def test_model_stream_priority_resolves_framework_range(self) -> None:
+        self.assertEqual(_resolve_model_stream_priority("greatest", (0, -3)), -3)
+        self.assertEqual(_resolve_model_stream_priority("least", (0, -3)), 0)
+        self.assertEqual(_resolve_model_stream_priority(-1, (0, -3)), -1)
+        with self.assertRaisesRegex(ValueError, "invalid model stream priority"):
+            _resolve_model_stream_priority("high", (0, -3))
+
+    def test_scheduler_matrix_expands_limited_overlap_sweep(self) -> None:
+        blocks = _normalize_transform_blocks([1024, 256, 1024])
+        self.assertEqual(blocks, [256, 1024])
+        self.assertEqual(
+            _policy_specs(blocks),
+            [
+                ("fully-overlapped", "fully-overlapped", 0),
+                ("limited-overlap-256", "limited-overlap", 256),
+                ("limited-overlap-1024", "limited-overlap", 1024),
+                ("serial", "serial", 0),
+            ],
+        )
+        self.assertEqual(
+            _policy_specs(_normalize_transform_blocks(64))[1],
+            ("limited-overlap", "limited-overlap", 64),
+        )
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            _normalize_transform_blocks([0])
+
+    def test_scheduler_matrix_computes_limited_pareto_frontier(self) -> None:
+        summaries = {
+            "a": {
+                "throughput_images_per_s_median": 4500.0,
+                "model_extra_p50_ms_vs_serial": 0.30,
+            },
+            "b": {
+                "throughput_images_per_s_median": 4400.0,
+                "model_extra_p50_ms_vs_serial": 0.20,
+            },
+            "dominated": {
+                "throughput_images_per_s_median": 4300.0,
+                "model_extra_p50_ms_vs_serial": 0.35,
+            },
+        }
+        self.assertEqual(_pareto_frontier(summaries, ["a", "b", "dominated"]), ["a", "b"])
+
     def test_scheduler_matrix_requires_invariant_native_priority_counters(self) -> None:
         repeats = [
             {"native_counters": {"direct_dct_stream_priority": 0}},

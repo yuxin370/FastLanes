@@ -683,20 +683,20 @@ T_model_with_transform - T_model_only
 | `galp/src/engine/workset/model.cuh`、`streams.cu` | persistent H2D/compute/D2H workset stream 支持设备定义的 priority |
 | `galp/include/galp/jpeg_dct.hpp` | 新增三种 scheduling policy、transform chunk 配置与 stream/event/launch 统计 |
 | `galp/src/jpeg/jpeg_dct.cpp`、`jpeg_dct_device.cuh` | scheduling options 进入 plan 和 plan-cache key，并传到 device executor |
-| `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event handoff、offset-aware chunked planless kernel、低优先级 round/cache stream |
+| `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event、offset-aware chunk、最多 64 CTA 的 grid-stride planless kernel、低优先级 round/cache stream |
 | `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、chunk blocks、低优先级开关和新增 counters |
-| `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用显式 priority `-1` stream；serial 延迟下一批 prefetch |
+| `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用 PyTorch 运行时可用的 greatest-priority stream；serial 延迟下一批 prefetch |
 | `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略和 chunk size，默认 limited-overlap/64 blocks |
 | `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、limited-overlap、serial 并计算核心 delta |
-| `jpeg_dct_test.cpp` | 7-block chunk 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
+| `jpeg_dct_test.cpp` | 512-output/64-CTA grid-stride 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
 | `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
 
 为了避免把“请求了 priority”误当成“priority 已生效”，native 结果同时记录
 `cuda_least_stream_priority`、`cuda_greatest_stream_priority` 和通过
 `cudaStreamGetPriority` 分别读取的 H2D、decode、transform、round 实际 stream priority；
-pipeline 记录 Torch model stream 的实际 `priority`。矩阵要求模型实际值等于设备 greatest
-priority、四条 Direct-DCT stream 的实际值都等于 least priority，且 greatest 数值严格小于
-least，否则直接失败。
+pipeline 分别记录 PyTorch 支持的 priority range、model stream 的解析值和实际值。矩阵要求模型
+实际值等于 **PyTorch greatest priority**、四条 Direct-DCT stream 的实际值都等于原生 CUDA
+least priority，并验证模型数值严格小于 Direct-DCT；不能把 PyTorch 支持范围与设备原生范围混为一谈。
 
 Native event graph 由原来的：
 
@@ -760,12 +760,13 @@ active-SM 几何上界约为 50%，但每 batch 需要：
 ceil(58,800 / 64) = 919 launches
 ```
 
-若每次 launch/调度固定成本约 3–5 µs，919 次的固定开销约为 2.76–4.60 ms，连同
-原 kernel 工作约为 3.64–5.48 ms。最新 planning、read、workset build/upload、decode、
-transform、round 热态合计约 6.49 ms，原本低于 9.636 ms 模型窗口；64-block 策略在
-低 launch-overhead 端仍可能完全隐藏，在高端则可能损失 next-batch readiness。因此 64 是
-“优先保护模型”的实测起点，不是预先宣称的最优值；若吞吐下降，应继续比较 128/256，取得
-模型额外延迟与 launch 开销的 Pareto 点。
+若每次 launch/调度固定成本约 3–5 µs，919 次的固定开销约为 2.76–4.60 ms，连同原 kernel 工作
+约为 3.64–5.48 ms。第一轮实测进一步证明 64-output/64-CTA 的 launch 数才是主要吞吐损失来源。
+修正版把两个上限解耦：limited-overlap 每 launch 最多 64 CTA，但每 CTA 用 grid-stride 顺序处理多个
+输出块。例如 512-output 候选只需 `ceil(58,800/512)=115` 次 launch，每次仍只有 64 CTA、每 CTA
+最多 8 个输出块；它保持 50% active-SM 几何上限，同时把 launch 数降低 8 倍。代价是单 CTA
+连续驻留更久，所以 `256/512/1024/2048/4096` 分别对应每 CTA 最多 `4/8/16/32/64` 个输出，
+需要实测 launch overhead 与高优先级模型插入粒度的 Pareto frontier。
 
 ### 14.5 验证状态和复现命令
 
@@ -774,7 +775,7 @@ transform、round 热态合计约 6.49 ms，原本低于 9.636 ms 模型窗口�
 - 全量 `cmake --build build -j2`；
 - `_galp_direct_dct` 和 `galp_tests` 增量构建；
 - Direct-DCT Torch import CTest；
-- `galp.tests.test_system_benchmark` 21/21（含 priority counter 跨 repeat 不变量测试）；
+- `galp.tests.test_system_benchmark` 24/24（含 priority 解析、counter 不变量、multi-chunk sweep 和 Pareto 测试）；
 - Python `py_compile`；
 - `git diff --check`。
 
@@ -786,7 +787,8 @@ transform、round 热态合计约 6.49 ms，原本低于 9.636 ms 模型窗口�
 并逐数组 bit-exact 比较 semantic artifact 中的 DCT 输入、logits 和预测。结构检查同时要求：
 
 - `fully-overlapped`/`serial` 每 batch 恰好 1 次、58,800 blocks 的 transform launch；
-- `limited-overlap/64` 每 batch 恰好 919 次 launch，任一次不超过 64 blocks；
+- limited 候选 `B` 每 batch 恰好 `ceil(58,800/B)` 次 launch，每次最多 `B` 个输出工作、但实际 CUDA CTA
+  始终不超过 64；
 - 每个测量 batch 都出现一次 copy→decode 和 decode→transform event handoff；
 - 每个测量 batch 的 Direct-DCT 四条实际 stream 都处于设备 least priority。
 
@@ -809,11 +811,59 @@ CUDA_VISIBLE_DEVICES=0 \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   galp/benchmarks/system_rgbnomore/scheduler_matrix.py \
   --contract /tmp/galp-planless-phase2-upper-final-3932b5d/contract.json \
-  --output-dir /tmp/galp-planless-scheduler-matrix \
+  --output-dir /tmp/galp-planless-scheduler-sweep-greatest \
   --binding-dir build/galp/torch \
-  --transform-blocks 64
+  --transform-blocks 256 \
+  --transform-blocks 512 \
+  --transform-blocks 1024 \
+  --transform-blocks 2048 \
+  --transform-blocks 4096
 ```
 
-矩阵汇总写入 `/tmp/galp-planless-scheduler-matrix/scheduler_matrix.json`。最终验收必须同时
+矩阵汇总写入 `/tmp/galp-planless-scheduler-sweep-greatest/scheduler_matrix.json`。最终验收必须同时
 检查 bit-exact correctness、三策略 Top-1/Top-5、sample trace、event/launch counters、
 `model_extra_p50_ms_vs_serial` 和总吞吐，不能只挑一个最好 latency 数字。
+
+### 14.6 第一轮 GPU 调度诊断与修正
+
+用户目标终端运行的 GPU correctness test 已通过：
+
+```text
+[  PASSED  ] 1 test
+JpegDct.PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix: 1155 ms
+```
+
+矩阵三个 pipeline 也都完成了 5 repeats；汇总程序随后正确地拒绝了错误的 priority 假设：RTX 4090
+原生 CUDA range 为 `least=0, greatest=-5`，而第一版 contract 将模型硬编码为 `-1`。因此 `-1`
+虽然高于 Direct-DCT 的 `0`，却不是框架可用的最高级。PyTorch 2.11 的 CUDA stream pool 仅暴露
+其编译期支持的 priority 子集，所以修正方案是 contract 写语义值 `"greatest"`，运行时用
+`torch.cuda.Stream.priority_range()` 解析并记录 PyTorch greatest，而不是假设设备 greatest 必为 `-1`
+或要求 Torch 等于原生 `-5`。
+
+第一轮结果在排除 repeat 0 后为：
+
+| 策略 | 吞吐 img/s | model p50 ms | 相对 serial 额外 model ms | transform p50 ms | loader submit p50 ms | E2E p50 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| fully-overlapped | 4585.725 | 10.210624 | 0.725536 | 1.846016 | 0.442969 | 10.876634 |
+| limited-overlap/64 | 3205.981 | 9.658296 | 0.173208 | 8.889344 | 5.694779 | 15.573527 |
+| serial | 2893.116 | 9.485088 | 0 | 0.802816 | 7.344193 | 17.054913 |
+
+三策略 Top-1/Top-5 都为 `0.75140/0.92446`；sample trace 和 semantic artifact 的逐数组 bit-exact
+比较已在 priority 检查之前通过。Direct-DCT H2D/decode/transform/round 的实际 priority 均为 `0`，
+每个测量 batch 都观测到 copy→decode 和 decode→transform handoff。GPU correctness 与数值语义已成立。
+
+64-block 策略把模型额外 p50 从 fully 的 `0.725536 ms` 降到 `0.173208 ms`，减少 `76.13%`，
+相对原始 `0.766317 ms` 只剩 `22.60%`；但吞吐仅保留 fully 的 `69.91%`，transform 因每 batch
+`919` 次 launch 从串行 `0.803 ms` 膨胀到 `8.889 ms`，所以 **64 blocks 不满足整体吞吐约束，不能作为
+最终配置**。fully 已达到 DALI 的 `94.76%`，而 64-block limited 仅为 `66.25%`。
+
+第一版 pipeline 还把 `planless_transform_max_blocks_per_launch` 跨 1000 batches 求和，错误显示为
+`58,800,000/64,000`；实际每 launch 上限是 `58,800/64`。代码现已改成跨 batch 取最大值，并把矩阵
+扩展为一次运行多个 chunk 候选、输出非支配 Pareto frontier，并自动选择“吞吐至少保留 fully 的 98% 且降低模型额外 p50”的候选。
+下一轮应 sweep `256/512/1024/2048/4096` blocks，寻找 launch overhead 与模型隔离的 Pareto 点。
+
+为避免再次把“输出工作量”和“实际 CTA 数”混用，native 现在分别记录
+`planless_transform_max_output_blocks_per_launch` 和 `planless_transform_max_blocks_per_launch`（实际 CTA）。
+新 grid-stride Torch binding SHA-256 为
+`0004f8810a2a714f2b19f1aabc9e6c7184bdf6d9750c9e2f87e04dce3b81e742`；其 CUDA/C++ 构建、Torch import
+CTest、24 个 Python 单测、`py_compile` 和 diff 检查均已通过，GPU bit-exact 与性能需要下一轮验证。

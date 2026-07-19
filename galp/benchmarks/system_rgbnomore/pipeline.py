@@ -76,6 +76,19 @@ class LoadedBatch:
     keepalive: list[Any] = field(default_factory=list)
 
 
+def _resolve_model_stream_priority(
+    requested: str | int, priority_range: tuple[int, int]
+) -> int:
+    least_priority, greatest_priority = (int(value) for value in priority_range)
+    if requested == "greatest":
+        return greatest_priority
+    if requested == "least":
+        return least_priority
+    if isinstance(requested, str):
+        raise ValueError(f"invalid model stream priority: {requested}")
+    return int(requested)
+
+
 def _add_diagnostics_to_path() -> None:
     text = str(DIAGNOSTICS_DIR)
     if text not in sys.path:
@@ -657,11 +670,19 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
     model = _build_rgb_model(contract, device) if adapter.domain == "rgb" else _build_dct_model(contract, device)
     model_stream: torch.cuda.Stream | None = None
     previous_stream: torch.cuda.Stream | None = None
-    model_stream_priority = int(execution.get("model_stream_priority", -1))
+    model_stream_priority_requested = execution.get("model_stream_priority", "greatest")
+    model_stream_priority_resolved: int | None = None
+    torch_stream_priority_range: tuple[int, int] | None = None
     if device.type == "cuda":
         previous_stream = torch.cuda.current_stream(device)
         previous_stream.synchronize()
-        model_stream = torch.cuda.Stream(device=device, priority=model_stream_priority)
+        torch_stream_priority_range = tuple(
+            int(value) for value in torch.cuda.Stream.priority_range()
+        )
+        model_stream_priority_resolved = _resolve_model_stream_priority(
+            model_stream_priority_requested, torch_stream_priority_range
+        )
+        model_stream = torch.cuda.Stream(device=device, priority=model_stream_priority_resolved)
         torch.cuda.set_stream(model_stream)
     semantic_count = int(contract["semantic_validation"]["sample_count"])
     semantic_store: dict[str, list[np.ndarray]] = {}
@@ -776,7 +797,10 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
                     "device_mapping_plus_fixed_transform_seconds", []
                 ).append(combined_ms)
             for key, value in batch.native_counters.items():
-                if key.startswith("galp_native_device_"):
+                if key.startswith("galp_native_device_") or key in {
+                    "planless_transform_max_blocks_per_launch",
+                    "planless_transform_max_output_blocks_per_launch",
+                }:
                     native_counters[key] = max(native_counters.get(key, 0), int(value))
                 elif key in {
                     "direct_dct_stream_priority",
@@ -880,9 +904,16 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         "model": _model_metadata(contract, adapter.domain),
         "execution": dict(execution),
         "cuda_scheduling": {
-            "model_stream_priority_requested": model_stream_priority,
+            "model_stream_priority_requested": model_stream_priority_requested,
+            "model_stream_priority_resolved": model_stream_priority_resolved,
             "model_stream_priority_actual": (
                 int(model_stream.priority) if model_stream is not None else None
+            ),
+            "torch_least_stream_priority": (
+                torch_stream_priority_range[0] if torch_stream_priority_range is not None else None
+            ),
+            "torch_greatest_stream_priority": (
+                torch_stream_priority_range[1] if torch_stream_priority_range is not None else None
             ),
             "model_stream_is_explicit": model_stream is not None,
         },

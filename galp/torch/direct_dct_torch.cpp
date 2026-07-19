@@ -411,6 +411,8 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["jpeg_dct_projection_items_materialized"]        = stats.jpeg_dct_projection_items_materialized;
 	out["planless_transform_kernel_launch_count"]        = stats.planless_transform_kernel_launch_count;
 	out["planless_transform_max_blocks_per_launch"]      = stats.planless_transform_max_blocks_per_launch;
+	out["planless_transform_max_output_blocks_per_launch"] =
+	    stats.planless_transform_max_output_blocks_per_launch;
 	out["decode_to_transform_event_handoff_count"]       = stats.decode_to_transform_event_handoff_count;
 	out["copy_to_decode_event_handoff_count"]            = stats.copy_to_decode_event_handoff_count;
 	out["direct_dct_stream_priority"]                     = stats.direct_dct_stream_priority;

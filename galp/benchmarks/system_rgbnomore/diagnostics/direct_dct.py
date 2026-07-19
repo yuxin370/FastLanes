@@ -662,6 +662,10 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
         int(totals["planless_transform_max_blocks_per_launch"]),
         int(stats.get("planless_transform_max_blocks_per_launch", 0)),
     )
+    totals["planless_transform_max_output_blocks_per_launch"] = max(
+        int(totals["planless_transform_max_output_blocks_per_launch"]),
+        int(stats.get("planless_transform_max_output_blocks_per_launch", 0)),
+    )
     totals["decode_to_transform_event_handoffs"] += int(
         stats.get("decode_to_transform_event_handoff_count", 0)
     )
@@ -758,6 +762,7 @@ def _empty_totals() -> dict[str, int | float]:
         "planless_transform_output_blocks": 0,
         "planless_transform_kernel_launches": 0,
         "planless_transform_max_blocks_per_launch": 0,
+        "planless_transform_max_output_blocks_per_launch": 0,
         "decode_to_transform_event_handoffs": 0,
         "copy_to_decode_event_handoffs": 0,
         "direct_dct_low_priority_batches": 0,

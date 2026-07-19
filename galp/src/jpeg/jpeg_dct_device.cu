@@ -683,6 +683,8 @@ JpegDctDeviceScratchPtr make_jpeg_dct_device_scratch() {
 
 namespace {
 
+constexpr unsigned kLimitedPlanlessTransformCtasPerLaunch = 64U;
+
 struct FixedTransformPlanView {
 	const std::vector<uint32_t>* item_order    = nullptr;
 	const std::vector<uint32_t>* group_offsets = nullptr;
@@ -954,8 +956,9 @@ __device__ float planless_axis_phase_weight(const float* __restrict phase_matric
 
 __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column_bindings,
                                                      const JpegDctDevicePlanlessImageDescriptor* __restrict images,
-                                                     const size_t image_count,
+                                                     const size_t   image_count,
                                                      const uint64_t output_block_offset,
+                                                     const uint64_t output_block_count,
                                                      const uint16_t* __restrict quant_tables,
                                                      const float* __restrict phase_matrices,
                                                      const uint32_t y_output_width,
@@ -966,152 +969,60 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
                                                      const int32_t  clamp_max,
                                                      float* __restrict y_accum,
                                                      float* __restrict cbcr_accum) {
-	const auto     lane                = static_cast<uint32_t>(threadIdx.x);
-	const uint64_t y_blocks            = static_cast<uint64_t>(y_output_width) * y_output_height;
-	const uint64_t cbcr_channel_blocks = static_cast<uint64_t>(cbcr_output_width) * cbcr_output_height;
-	const uint64_t blocks_per_image    = y_blocks + 2U * cbcr_channel_blocks;
-	const uint64_t linear_block        = output_block_offset + static_cast<uint64_t>(blockIdx.x);
-	if (blocks_per_image == 0U || linear_block >= image_count * blocks_per_image || quant_tables == nullptr) {
-		return;
-	}
-	const auto image_index = static_cast<size_t>(linear_block / blocks_per_image);
-	const auto local_block = linear_block % blocks_per_image;
-	uint32_t   component   = 0U;
-	uint32_t   output_x    = 0U;
-	uint32_t   output_y    = 0U;
-	if (local_block < y_blocks) {
-		output_y = static_cast<uint32_t>(local_block / y_output_width);
-		output_x = static_cast<uint32_t>(local_block % y_output_width);
-	} else {
-		const auto chroma_local  = local_block - y_blocks;
-		component                = 1U + static_cast<uint32_t>(chroma_local / cbcr_channel_blocks);
-		const auto channel_local = chroma_local % cbcr_channel_blocks;
-		output_y                 = static_cast<uint32_t>(channel_local / cbcr_output_width);
-		output_x                 = static_cast<uint32_t>(channel_local % cbcr_output_width);
-	}
-	const auto image      = images[image_index];
-	const auto descriptor = image.components[component];
-	if (descriptor.present == 0U || descriptor.x_up_factor == 0U || descriptor.y_up_factor == 0U ||
-	    descriptor.x_down_factor == 0U || descriptor.y_down_factor == 0U) {
-		return;
-	}
-	const auto       x_down = static_cast<uint32_t>(descriptor.x_down_factor);
-	const auto       y_down = static_cast<uint32_t>(descriptor.y_down_factor);
+	const auto       lane                = static_cast<uint32_t>(threadIdx.x);
+	const uint64_t   y_blocks            = static_cast<uint64_t>(y_output_width) * y_output_height;
+	const uint64_t   cbcr_channel_blocks = static_cast<uint64_t>(cbcr_output_width) * cbcr_output_height;
+	const uint64_t   blocks_per_image    = y_blocks + 2U * cbcr_channel_blocks;
 	__shared__ float composed[16U * 16U];
 	__shared__ float vertical[8U * 16U];
 	__shared__ float source[64U];
 	__shared__ float horizontal[64U];
-	const bool       use_reference_down2_axes = descriptor.x_up_factor == 1U && descriptor.y_up_factor == 1U &&
-	                                      x_down >= 1U && x_down <= 2U && y_down >= 1U && y_down <= 2U;
-	if (use_reference_down2_axes) {
-		const auto source_width  = x_down * 8U;
-		const auto source_height = y_down * 8U;
-		const auto source_count  = source_width * source_height;
-		// Keep the block at two warps: the transform produces 64 coefficients, and
-		// the largest canonical down2 source contains only four coefficients per
-		// lane.  A 256-thread block left six warps idle after the source load and
-		// needlessly limited residency across the tens of thousands of output
-		// blocks in an ImageNet batch.
-		for (uint32_t source_linear = lane; source_linear < source_count; source_linear += blockDim.x) {
-			const auto source_block_slot = source_linear / 64U;
-			const auto coeff             = static_cast<uint8_t>(source_linear % 64U);
-			const auto subblock_x        = source_block_slot % x_down;
-			const auto subblock_y        = source_block_slot / x_down;
-			const auto source_x          = static_cast<uint32_t>(descriptor.crop_x) + output_x * x_down + subblock_x;
-			const auto source_y          = static_cast<uint32_t>(descriptor.crop_y) + output_y * y_down + subblock_y;
-			const auto rank              = planless_block_order_rank(
-                descriptor.width_in_blocks, descriptor.height_in_blocks, source_x, source_y, image.spatial_order);
-			const auto row =
-			    static_cast<uint64_t>(image.row_start_in_rowgroup) + descriptor.component_row_offset + rank;
-			const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
-			const auto binding  = column_bindings[image.binding_base + physical];
-			int16_t    value    = 0;
-			if (binding.source == DeviceCoeffSource::kI16) {
-				value = binding.column_i16[row];
-			} else if (binding.source == DeviceCoeffSource::kI8) {
-				value = static_cast<int16_t>(binding.column_i8[row]);
-			}
-			const auto quant =
-			    static_cast<int32_t>(quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
-			const auto composed_y = subblock_y * 8U + coeff / 8U;
-			const auto composed_x = subblock_x * 8U + coeff % 8U;
-			composed[composed_y * source_width + composed_x] =
-			    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+	for (uint64_t launch_block = blockIdx.x; launch_block < output_block_count; launch_block += gridDim.x) {
+		const uint64_t linear_block = output_block_offset + launch_block;
+		if (blocks_per_image == 0U || linear_block >= image_count * blocks_per_image || quant_tables == nullptr) {
+			continue;
 		}
-		__syncthreads();
-		for (uint32_t vertical_linear = lane; vertical_linear < 8U * source_width;
-		     vertical_linear += blockDim.x) {
-			const auto out_y    = vertical_linear / source_width;
-			const auto source_x = vertical_linear % source_width;
-			float      sum      = 0.0F;
-			if (y_down == 1U) {
-				sum = composed[out_y * source_width + source_x];
-			} else {
-#pragma unroll
-				for (uint32_t source_y = 0; source_y < 16U; ++source_y) {
-					sum = fmaf(kRgbNoMoreDown2Conversion[out_y * 16U + source_y],
-					           composed[source_y * source_width + source_x],
-					           sum);
-				}
-			}
-			vertical[out_y * source_width + source_x] = sum;
+		const auto image_index = static_cast<size_t>(linear_block / blocks_per_image);
+		const auto local_block = linear_block % blocks_per_image;
+		uint32_t   component   = 0U;
+		uint32_t   output_x    = 0U;
+		uint32_t   output_y    = 0U;
+		if (local_block < y_blocks) {
+			output_y = static_cast<uint32_t>(local_block / y_output_width);
+			output_x = static_cast<uint32_t>(local_block % y_output_width);
+		} else {
+			const auto chroma_local  = local_block - y_blocks;
+			component                = 1U + static_cast<uint32_t>(chroma_local / cbcr_channel_blocks);
+			const auto channel_local = chroma_local % cbcr_channel_blocks;
+			output_y                 = static_cast<uint32_t>(channel_local / cbcr_output_width);
+			output_x                 = static_cast<uint32_t>(channel_local % cbcr_output_width);
 		}
-		__syncthreads();
-		if (lane < 64U) {
-			const auto out_y = lane / 8U;
-			const auto out_x = lane % 8U;
-			float      sum   = 0.0F;
-			if (x_down == 1U) {
-				sum = vertical[out_y * source_width + out_x];
-			} else {
-#pragma unroll
-				for (uint32_t source_x = 0; source_x < 16U; ++source_x) {
-					sum = fmaf(vertical[out_y * source_width + source_x],
-					           kRgbNoMoreDown2Conversion[out_x * 16U + source_x],
-					           sum);
-				}
-			}
-			const auto factor_product = x_down * y_down;
-			const auto value          = factor_product == 4U   ? sum * 0.5F
-			                            : factor_product == 2U ? sum / 0x1.6a09e60000000p+0F
-			                                                   : sum;
-			if (component == 0U && y_accum != nullptr) {
-				const auto output_block_index =
-				    (static_cast<uint64_t>(image.request_index) * y_output_height + output_y) * y_output_width +
-				    output_x;
-				y_accum[output_block_index * 64U + lane] = value;
-			} else if (component != 0U && cbcr_accum != nullptr) {
-				const auto output_block_index =
-				    ((static_cast<uint64_t>(image.request_index) * 2U + component - 1U) * cbcr_output_height +
-				     output_y) *
-				        cbcr_output_width +
-				    output_x;
-				cbcr_accum[output_block_index * 64U + lane] = value;
-			}
+		const auto image      = images[image_index];
+		const auto descriptor = image.components[component];
+		if (descriptor.present == 0U || descriptor.x_up_factor == 0U || descriptor.y_up_factor == 0U ||
+		    descriptor.x_down_factor == 0U || descriptor.y_down_factor == 0U) {
+			continue;
 		}
-		return;
-	}
-
-	const bool needs_x_program = descriptor.x_phase_matrix_base != std::numeric_limits<uint32_t>::max();
-	const bool needs_y_program = descriptor.y_phase_matrix_base != std::numeric_limits<uint32_t>::max();
-	if ((needs_x_program || needs_y_program) && phase_matrices == nullptr) {
-		return;
-	}
-	const auto source_x_begin =
-	    static_cast<uint32_t>((static_cast<uint64_t>(output_x) * descriptor.x_down_factor) / descriptor.x_up_factor);
-	const auto source_x_end = static_cast<uint32_t>(
-	    ((static_cast<uint64_t>(output_x + 1U) * descriptor.x_down_factor) - 1U) / descriptor.x_up_factor);
-	const auto source_y_begin =
-	    static_cast<uint32_t>((static_cast<uint64_t>(output_y) * descriptor.y_down_factor) / descriptor.y_up_factor);
-	const auto source_y_end = static_cast<uint32_t>(
-	    ((static_cast<uint64_t>(output_y + 1U) * descriptor.y_down_factor) - 1U) / descriptor.y_up_factor);
-	float output_sum = 0.0F;
-	for (uint32_t source_y_block = source_y_begin; source_y_block <= source_y_end; ++source_y_block) {
-		for (uint32_t source_x_block = source_x_begin; source_x_block <= source_x_end; ++source_x_block) {
-			if (lane < 64U) {
-				const auto coeff    = static_cast<uint8_t>(lane);
-				const auto source_x = static_cast<uint32_t>(descriptor.crop_x) + source_x_block;
-				const auto source_y = static_cast<uint32_t>(descriptor.crop_y) + source_y_block;
+		const auto x_down                   = static_cast<uint32_t>(descriptor.x_down_factor);
+		const auto y_down                   = static_cast<uint32_t>(descriptor.y_down_factor);
+		const bool use_reference_down2_axes = descriptor.x_up_factor == 1U && descriptor.y_up_factor == 1U &&
+		                                      x_down >= 1U && x_down <= 2U && y_down >= 1U && y_down <= 2U;
+		if (use_reference_down2_axes) {
+			const auto source_width  = x_down * 8U;
+			const auto source_height = y_down * 8U;
+			const auto source_count  = source_width * source_height;
+			// Keep the block at two warps: the transform produces 64 coefficients, and
+			// the largest canonical down2 source contains only four coefficients per
+			// lane.  A 256-thread block left six warps idle after the source load and
+			// needlessly limited residency across the tens of thousands of output
+			// blocks in an ImageNet batch.
+			for (uint32_t source_linear = lane; source_linear < source_count; source_linear += blockDim.x) {
+				const auto source_block_slot = source_linear / 64U;
+				const auto coeff             = static_cast<uint8_t>(source_linear % 64U);
+				const auto subblock_x        = source_block_slot % x_down;
+				const auto subblock_y        = source_block_slot / x_down;
+				const auto source_x = static_cast<uint32_t>(descriptor.crop_x) + output_x * x_down + subblock_x;
+				const auto source_y = static_cast<uint32_t>(descriptor.crop_y) + output_y * y_down + subblock_y;
 				const auto rank     = planless_block_order_rank(
                     descriptor.width_in_blocks, descriptor.height_in_blocks, source_x, source_y, image.spatial_order);
 				const auto row =
@@ -1126,59 +1037,160 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 				}
 				const auto quant =
 				    static_cast<int32_t>(quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
-				source[lane] = static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+				const auto composed_y = subblock_y * 8U + coeff / 8U;
+				const auto composed_x = subblock_x * 8U + coeff % 8U;
+				composed[composed_y * source_width + composed_x] =
+				    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+			}
+			__syncthreads();
+			for (uint32_t vertical_linear = lane; vertical_linear < 8U * source_width; vertical_linear += blockDim.x) {
+				const auto out_y    = vertical_linear / source_width;
+				const auto source_x = vertical_linear % source_width;
+				float      sum      = 0.0F;
+				if (y_down == 1U) {
+					sum = composed[out_y * source_width + source_x];
+				} else {
+#pragma unroll
+					for (uint32_t source_y = 0; source_y < 16U; ++source_y) {
+						sum = fmaf(kRgbNoMoreDown2Conversion[out_y * 16U + source_y],
+						           composed[source_y * source_width + source_x],
+						           sum);
+					}
+				}
+				vertical[out_y * source_width + source_x] = sum;
 			}
 			__syncthreads();
 			if (lane < 64U) {
-				const auto source_y_coeff = lane / 8U;
-				const auto out_x_coeff    = lane % 8U;
-				float      x_sum          = 0.0F;
-				for (uint32_t in_x_coeff = 0U; in_x_coeff < 8U; ++in_x_coeff) {
-					const auto wx = planless_axis_phase_weight(phase_matrices,
-					                                           descriptor.x_phase_matrix_base,
-					                                           descriptor.x_up_factor,
-					                                           descriptor.x_down_factor,
-					                                           source_x_block,
-					                                           output_x,
-					                                           out_x_coeff,
-					                                           in_x_coeff);
-					x_sum += source[source_y_coeff * 8U + in_x_coeff] * wx;
+				const auto out_y = lane / 8U;
+				const auto out_x = lane % 8U;
+				float      sum   = 0.0F;
+				if (x_down == 1U) {
+					sum = vertical[out_y * source_width + out_x];
+				} else {
+#pragma unroll
+					for (uint32_t source_x = 0; source_x < 16U; ++source_x) {
+						sum = fmaf(vertical[out_y * source_width + source_x],
+						           kRgbNoMoreDown2Conversion[out_x * 16U + source_x],
+						           sum);
+					}
 				}
-				horizontal[lane] = x_sum;
+				const auto factor_product = x_down * y_down;
+				const auto value          = factor_product == 4U   ? sum * 0.5F
+				                            : factor_product == 2U ? sum / 0x1.6a09e60000000p+0F
+				                                                   : sum;
+				if (component == 0U && y_accum != nullptr) {
+					const auto output_block_index =
+					    (static_cast<uint64_t>(image.request_index) * y_output_height + output_y) * y_output_width +
+					    output_x;
+					y_accum[output_block_index * 64U + lane] = value;
+				} else if (component != 0U && cbcr_accum != nullptr) {
+					const auto output_block_index =
+					    ((static_cast<uint64_t>(image.request_index) * 2U + component - 1U) * cbcr_output_height +
+					     output_y) *
+					        cbcr_output_width +
+					    output_x;
+					cbcr_accum[output_block_index * 64U + lane] = value;
+				}
 			}
 			__syncthreads();
-			if (lane < 64U) {
-				const auto out_x_coeff = lane % 8U;
-				const auto out_y_coeff = lane / 8U;
-				float      weighted    = 0.0F;
-				for (uint32_t in_y_coeff = 0U; in_y_coeff < 8U; ++in_y_coeff) {
-					const auto wy = planless_axis_phase_weight(phase_matrices,
-					                                           descriptor.y_phase_matrix_base,
-					                                           descriptor.y_up_factor,
-					                                           descriptor.y_down_factor,
-					                                           source_y_block,
-					                                           output_y,
-					                                           out_y_coeff,
-					                                           in_y_coeff);
-					weighted += horizontal[in_y_coeff * 8U + out_x_coeff] * wy;
+			continue;
+		}
+
+		const bool needs_x_program = descriptor.x_phase_matrix_base != std::numeric_limits<uint32_t>::max();
+		const bool needs_y_program = descriptor.y_phase_matrix_base != std::numeric_limits<uint32_t>::max();
+		if ((needs_x_program || needs_y_program) && phase_matrices == nullptr) {
+			continue;
+		}
+		const auto source_x_begin = static_cast<uint32_t>((static_cast<uint64_t>(output_x) * descriptor.x_down_factor) /
+		                                                  descriptor.x_up_factor);
+		const auto source_x_end   = static_cast<uint32_t>(
+            ((static_cast<uint64_t>(output_x + 1U) * descriptor.x_down_factor) - 1U) / descriptor.x_up_factor);
+		const auto source_y_begin = static_cast<uint32_t>((static_cast<uint64_t>(output_y) * descriptor.y_down_factor) /
+		                                                  descriptor.y_up_factor);
+		const auto source_y_end   = static_cast<uint32_t>(
+            ((static_cast<uint64_t>(output_y + 1U) * descriptor.y_down_factor) - 1U) / descriptor.y_up_factor);
+		float output_sum = 0.0F;
+		for (uint32_t source_y_block = source_y_begin; source_y_block <= source_y_end; ++source_y_block) {
+			for (uint32_t source_x_block = source_x_begin; source_x_block <= source_x_end; ++source_x_block) {
+				if (lane < 64U) {
+					const auto coeff    = static_cast<uint8_t>(lane);
+					const auto source_x = static_cast<uint32_t>(descriptor.crop_x) + source_x_block;
+					const auto source_y = static_cast<uint32_t>(descriptor.crop_y) + source_y_block;
+					const auto rank     = planless_block_order_rank(descriptor.width_in_blocks,
+                                                                descriptor.height_in_blocks,
+                                                                source_x,
+                                                                source_y,
+                                                                image.spatial_order);
+					const auto row =
+					    static_cast<uint64_t>(image.row_start_in_rowgroup) + descriptor.component_row_offset + rank;
+					const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
+					const auto binding  = column_bindings[image.binding_base + physical];
+					int16_t    value    = 0;
+					if (binding.source == DeviceCoeffSource::kI16) {
+						value = binding.column_i16[row];
+					} else if (binding.source == DeviceCoeffSource::kI8) {
+						value = static_cast<int16_t>(binding.column_i8[row]);
+					}
+					const auto quant = static_cast<int32_t>(
+					    quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
+					source[lane] =
+					    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
 				}
-				output_sum += weighted;
+				__syncthreads();
+				if (lane < 64U) {
+					const auto source_y_coeff = lane / 8U;
+					const auto out_x_coeff    = lane % 8U;
+					float      x_sum          = 0.0F;
+					for (uint32_t in_x_coeff = 0U; in_x_coeff < 8U; ++in_x_coeff) {
+						const auto wx = planless_axis_phase_weight(phase_matrices,
+						                                           descriptor.x_phase_matrix_base,
+						                                           descriptor.x_up_factor,
+						                                           descriptor.x_down_factor,
+						                                           source_x_block,
+						                                           output_x,
+						                                           out_x_coeff,
+						                                           in_x_coeff);
+						x_sum += source[source_y_coeff * 8U + in_x_coeff] * wx;
+					}
+					horizontal[lane] = x_sum;
+				}
+				__syncthreads();
+				if (lane < 64U) {
+					const auto out_x_coeff = lane % 8U;
+					const auto out_y_coeff = lane / 8U;
+					float      weighted    = 0.0F;
+					for (uint32_t in_y_coeff = 0U; in_y_coeff < 8U; ++in_y_coeff) {
+						const auto wy = planless_axis_phase_weight(phase_matrices,
+						                                           descriptor.y_phase_matrix_base,
+						                                           descriptor.y_up_factor,
+						                                           descriptor.y_down_factor,
+						                                           source_y_block,
+						                                           output_y,
+						                                           out_y_coeff,
+						                                           in_y_coeff);
+						weighted += horizontal[in_y_coeff * 8U + out_x_coeff] * wy;
+					}
+					output_sum += weighted;
+				}
+				__syncthreads();
 			}
-			__syncthreads();
 		}
-	}
-	if (lane < 64U) {
-		if (component == 0U && y_accum != nullptr) {
-			const auto output_block_index =
-			    (static_cast<uint64_t>(image.request_index) * y_output_height + output_y) * y_output_width + output_x;
-			y_accum[output_block_index * 64U + lane] = output_sum;
-		} else if (component != 0U && cbcr_accum != nullptr) {
-			const auto output_block_index =
-			    ((static_cast<uint64_t>(image.request_index) * 2U + component - 1U) * cbcr_output_height + output_y) *
-			        cbcr_output_width +
-			    output_x;
-			cbcr_accum[output_block_index * 64U + lane] = output_sum;
+		if (lane < 64U) {
+			if (component == 0U && y_accum != nullptr) {
+				const auto output_block_index =
+				    (static_cast<uint64_t>(image.request_index) * y_output_height + output_y) * y_output_width +
+				    output_x;
+				y_accum[output_block_index * 64U + lane] = output_sum;
+			} else if (component != 0U && cbcr_accum != nullptr) {
+				const auto output_block_index =
+				    ((static_cast<uint64_t>(image.request_index) * 2U + component - 1U) * cbcr_output_height +
+				     output_y) *
+				        cbcr_output_width +
+				    output_x;
+				cbcr_accum[output_block_index * 64U + lane] = output_sum;
+			}
 		}
+		__syncthreads();
 	}
 }
 
@@ -1648,7 +1660,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
                                                  float*                                  cbcr_accum,
                                                  JpegDctDeviceScratch&                   scratch,
                                                  JpegDctDeviceExecutionStats&            stats,
-                                                 const size_t                           transform_blocks_per_launch,
+                                                 const size_t                            transform_blocks_per_launch,
                                                  cudaStream_t                            stream) {
 	if (sources.empty() || works.empty()) {
 		return;
@@ -1693,16 +1705,21 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	}
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
 	scratch.planless_image_descriptors.upload(images.data(), images.size(), stream, stats);
-	const uint64_t launch_block_limit = transform_blocks_per_launch == 0
-	                                      ? output_blocks
-	                                      : std::min<uint64_t>(output_blocks, transform_blocks_per_launch);
-	for (uint64_t offset = 0; offset < output_blocks; offset += launch_block_limit) {
-		const auto launch_blocks = static_cast<unsigned>(std::min<uint64_t>(launch_block_limit, output_blocks - offset));
-		transformed_dct_grid_planless_kernel<<<dim3(launch_blocks), dim3(64U), 0, stream>>>(
+	const uint64_t launch_output_limit = transform_blocks_per_launch == 0
+	                                         ? output_blocks
+	                                         : std::min<uint64_t>(output_blocks, transform_blocks_per_launch);
+	for (uint64_t offset = 0; offset < output_blocks; offset += launch_output_limit) {
+		const auto launch_output_blocks = std::min<uint64_t>(launch_output_limit, output_blocks - offset);
+		const auto launch_ctas          = static_cast<unsigned>(
+            transform_blocks_per_launch == 0
+                ? launch_output_blocks
+                : std::min<uint64_t>(launch_output_blocks, kLimitedPlanlessTransformCtasPerLaunch));
+		transformed_dct_grid_planless_kernel<<<dim3(launch_ctas), dim3(64U), 0, stream>>>(
 		    scratch.column_bindings.data,
 		    scratch.planless_image_descriptors.data,
 		    images.size(),
 		    offset,
+		    launch_output_blocks,
 		    quant_tables,
 		    phase_matrices,
 		    transform.y_output_width_blocks,
@@ -1717,7 +1734,9 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 		++stats.materialize_kernel_launch_count;
 		++stats.planless_transform_kernel_launch_count;
 		stats.planless_transform_max_blocks_per_launch =
-		    std::max(stats.planless_transform_max_blocks_per_launch, static_cast<size_t>(launch_blocks));
+		    std::max(stats.planless_transform_max_blocks_per_launch, static_cast<size_t>(launch_ctas));
+		stats.planless_transform_max_output_blocks_per_launch =
+		    std::max(stats.planless_transform_max_output_blocks_per_launch, static_cast<size_t>(launch_output_blocks));
 	}
 	stats.planless_image_descriptor_count += images.size();
 	stats.planless_transform_output_block_count += output_blocks;

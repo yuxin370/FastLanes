@@ -1795,7 +1795,7 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			legacy_options.enable_planless_execution   = false;
 			auto chunked_options                       = planless_options;
 			chunked_options.scheduling_policy           = galp::jpeg::JpegDctSchedulingPolicy::kLimitedOverlap;
-			chunked_options.transform_blocks_per_launch = 7U;
+			chunked_options.transform_blocks_per_launch = 512U;
 			chunked_options.use_low_priority_streams     = true;
 
 			auto       planless        = reader.ReadDeviceDctBatch(requests, planless_options);
@@ -1827,9 +1827,12 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			EXPECT_EQ(planless_stats.internal_sync_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.decoded_batch_sync_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.cached_gather_sync_count, 0U) << test_case.name;
-			EXPECT_EQ(chunked_stats.planless_transform_max_blocks_per_launch, 7U) << test_case.name;
+			EXPECT_EQ(chunked_stats.planless_transform_max_blocks_per_launch, 64U) << test_case.name;
+			EXPECT_EQ(chunked_stats.planless_transform_max_output_blocks_per_launch,
+			          std::min<size_t>(512U, chunked_stats.planless_transform_output_block_count))
+			    << test_case.name;
 			EXPECT_EQ(chunked_stats.planless_transform_kernel_launch_count,
-			          (chunked_stats.planless_transform_output_block_count + 6U) / 7U)
+			          (chunked_stats.planless_transform_output_block_count + 511U) / 512U)
 			    << test_case.name;
 			EXPECT_EQ(chunked_stats.decode_to_transform_event_handoff_count, 1U) << test_case.name;
 			EXPECT_TRUE(chunked_stats.direct_dct_low_priority_streams) << test_case.name;
