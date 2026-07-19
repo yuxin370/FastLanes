@@ -761,12 +761,22 @@ ceil(58,800 / 64) = 919 launches
 ```
 
 若每次 launch/调度固定成本约 3–5 µs，919 次的固定开销约为 2.76–4.60 ms，连同原 kernel 工作
-约为 3.64–5.48 ms。第一轮实测进一步证明 64-output/64-CTA 的 launch 数才是主要吞吐损失来源。
-修正版把两个上限解耦：limited-overlap 每 launch 最多 64 CTA，但每 CTA 用 grid-stride 顺序处理多个
-输出块。例如 512-output 候选只需 `ceil(58,800/512)=115` 次 launch，每次仍只有 64 CTA、每 CTA
-最多 8 个输出块；它保持 50% active-SM 几何上限，同时把 launch 数降低 8 倍。代价是单 CTA
-连续驻留更久，所以 `256/512/1024/2048/4096` 分别对应每 CTA 最多 `4/8/16/32/64` 个输出，
-需要实测 launch overhead 与高优先级模型插入粒度的 Pareto frontier。
+约为 3.64–5.48 ms。因此第一版 64-output/64-CTA 配置首先受到 launch 数限制。grid-stride 修正版把
+输出上限提高到 256–4096 后，launch 数从 230 降到 15，但第 14.7 节实测 transform 仍为
+`6.38–7.32 ms`、吞吐仍只有 fully 的 `77%–81%`；这证明消除 launch overhead 后，固定 64 CTA
+导致的 transform 前进不足成为新的主限制，不能把全部损失继续归因于 launch。
+
+当前实现进一步把两个上限完全解耦：`output_blocks_per_launch=B` 决定
+`ceil(58,800/B)` 次 launch，`ctas_per_launch=C` 决定每个 launch 最多提交多少 CTA，每个 CTA 再用
+grid-stride 处理至多 `ceil(B/C)` 个输出块。下一轮配对 `(B,C)=(512,128)...(8192,2048)`，固定
+`ceil(B/C)=4`，使 launch 数从 115 降到 8、CTA cap 从 128 增到 2048。128 CTA 等于 RTX 4090 的
+SM 数，只表示每个 SM 至少可分到一个 CTA 的几何尺度，并不等于 100% occupancy；实际驻留还受
+register、shared memory 和每 SM block 上限约束。
+
+CUDA stream priority 只影响尚未开始的 work selection，不会抢占已经驻留的低优先级 CTA。因此增大
+`C` 一方面能让 361.27 MFLOPs、约 50.24–64.60 MiB/batch 的 transform 更快前进，减少模型结束后的
+loader 尾部等待；另一方面会增加模型到来时仍在运行的低优先级 CTA 数，抬高模型额外延迟。这里不存在
+只由 FLOPs 推出的解析最优点，必须用 `model extra` 与总吞吐的 Pareto 实测确定上限。
 
 ### 14.5 验证状态和复现命令
 
@@ -779,7 +789,7 @@ ceil(58,800 / 64) = 919 launches
 - Python `py_compile`；
 - `git diff --check`。
 
-加入实际 stream priority 回读与矩阵结构 gate 后，重新构建的 Torch binding SHA-256 为
+加入实际 stream priority 回读与矩阵结构 gate 后，中间版 Torch binding SHA-256 为
 `b83fe01e8804205069dc6b94adf0d077c66a57337e91fd9322b92b3036b9c32b`；矩阵生成的派生 contract
 会自动记录这个新二进制指纹，避免误用第 12 节历史结果所对应的旧 binding。
 
@@ -787,8 +797,8 @@ ceil(58,800 / 64) = 919 launches
 并逐数组 bit-exact 比较 semantic artifact 中的 DCT 输入、logits 和预测。结构检查同时要求：
 
 - `fully-overlapped`/`serial` 每 batch 恰好 1 次、58,800 blocks 的 transform launch；
-- limited 候选 `B` 每 batch 恰好 `ceil(58,800/B)` 次 launch，每次最多 `B` 个输出工作、但实际 CUDA CTA
-  始终不超过 64；
+- limited 候选 `(B,C)` 每 batch 恰好 `ceil(58,800/B)` 次 launch，每次最多 `B` 个输出工作、实际 CUDA CTA
+  不超过 `min(B,C)`；
 - 每个测量 batch 都出现一次 copy→decode 和 decode→transform event handoff；
 - 每个测量 batch 的 Direct-DCT 四条实际 stream 都处于设备 least priority。
 
