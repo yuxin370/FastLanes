@@ -21,6 +21,7 @@ import torch
 
 from common import (
     RESULT_SCHEMA,
+    CONTRACT_PIPELINES,
     distribution,
     load_contract,
     load_sample_manifest,
@@ -870,7 +871,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pipeline",
-        choices=("galp", "galp_legacy", "rgbnomore", "dali", "pytorch"),
+        choices=CONTRACT_PIPELINES,
         required=True,
     )
     parser.add_argument("--contract", type=Path, required=True)

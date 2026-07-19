@@ -17,6 +17,7 @@ from typing import Any
 
 from common import (
     CONTRACT_SCHEMA,
+    CONTRACT_PIPELINES,
     PIPELINES,
     cached_file_fingerprints,
     checkpoint_metadata,
@@ -592,7 +593,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pipelines",
         nargs="+",
-        choices=PIPELINES + ("galp_legacy",),
+        choices=CONTRACT_PIPELINES,
         default=None,
     )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)

@@ -18,6 +18,7 @@ CONTRACT_SCHEMA = "galp_system_benchmark_contract_v2"
 MANIFEST_SCHEMA = "galp_system_benchmark_manifest_v2"
 RESULT_SCHEMA = "galp_system_benchmark_result_v2"
 PIPELINES = ("galp", "rgbnomore", "dali", "pytorch")
+CONTRACT_PIPELINES = PIPELINES + ("galp_legacy",)
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -230,7 +231,7 @@ def load_contract(path: Path) -> dict[str, Any]:
     configured = payload["pipelines"].get("enabled")
     require(isinstance(configured, list) and configured, "pipelines.enabled must be a non-empty list")
     require(len(set(configured)) == len(configured), "pipelines.enabled contains duplicates")
-    require(all(item in PIPELINES for item in configured), f"pipelines.enabled must be a subset of {PIPELINES}")
+    require(all(item in CONTRACT_PIPELINES for item in configured), f"pipelines.enabled must be a subset of {CONTRACT_PIPELINES}")
     if "galp" in configured:
         galp = payload["pipelines"].get("galp")
         require(isinstance(galp, dict), "pipelines.galp must be an object")
