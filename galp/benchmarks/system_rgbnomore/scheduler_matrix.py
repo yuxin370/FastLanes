@@ -64,6 +64,13 @@ def _median(values: list[float]) -> float:
     return float(statistics.median(values))
 
 
+def _invariant_counter(repeats: list[dict[str, Any]], key: str) -> int:
+    values = {int(repeat["native_counters"][key]) for repeat in repeats}
+    if len(values) != 1:
+        raise RuntimeError(f"native counter is not invariant across repeats: {key}={sorted(values)}")
+    return values.pop()
+
+
 def _summarize_policy(contract: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     repeats = _selected_repeats(contract, result)
     return {
@@ -98,6 +105,21 @@ def _summarize_policy(contract: dict[str, Any], result: dict[str, Any]) -> dict[
         "copy_to_decode_event_handoffs": _median(
             [float(repeat["native_counters"].get("copy_to_decode_event_handoffs", 0)) for repeat in repeats]
         ),
+        "direct_dct_low_priority_batches": _median(
+            [
+                float(repeat["native_counters"].get("direct_dct_low_priority_batches", 0))
+                for repeat in repeats
+            ]
+        ),
+        "direct_dct_stream_priority": _invariant_counter(repeats, "direct_dct_stream_priority"),
+        "direct_dct_h2d_stream_priority": _invariant_counter(repeats, "direct_dct_h2d_stream_priority"),
+        "direct_dct_decode_stream_priority": _invariant_counter(repeats, "direct_dct_decode_stream_priority"),
+        "direct_dct_transform_stream_priority": _invariant_counter(
+            repeats, "direct_dct_transform_stream_priority"
+        ),
+        "direct_dct_round_stream_priority": _invariant_counter(repeats, "direct_dct_round_stream_priority"),
+        "cuda_least_stream_priority": _invariant_counter(repeats, "cuda_least_stream_priority"),
+        "cuda_greatest_stream_priority": _invariant_counter(repeats, "cuda_greatest_stream_priority"),
     }
 
 
@@ -187,6 +209,34 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
                     if not np.array_equal(reference[key], candidate[key]):
                         raise RuntimeError(f"semantic artifact mismatch for {policy}: {key}")
 
+    for policy, payload in result_payloads.items():
+        summary = policy_summaries[policy]
+        model_priority = int(payload["cuda_scheduling"]["model_stream_priority_actual"])
+        least_priority = int(summary["cuda_least_stream_priority"])
+        greatest_priority = int(summary["cuda_greatest_stream_priority"])
+        direct_dct_priorities = {
+            stage: int(summary[f"direct_dct_{stage}_stream_priority"])
+            for stage in ("h2d", "decode", "transform", "round")
+        }
+        if greatest_priority >= least_priority:
+            raise RuntimeError(
+                f"device does not expose distinct CUDA stream priorities: "
+                f"greatest={greatest_priority} least={least_priority}"
+            )
+        if model_priority != greatest_priority:
+            raise RuntimeError(
+                f"model stream is not at greatest priority for {policy}: "
+                f"actual={model_priority} greatest={greatest_priority}"
+            )
+        for stage, actual_priority in direct_dct_priorities.items():
+            if actual_priority != least_priority:
+                raise RuntimeError(
+                    f"Direct-DCT {stage} stream is not at least priority for {policy}: "
+                    f"actual={actual_priority} least={least_priority}"
+                )
+        summary["model_stream_priority_actual"] = model_priority
+        summary["priority_isolation_verified"] = True
+
     model_only_p50 = policy_summaries["serial"]["model_forward_gpu_p50_ms_median"]
     model_only_mean = policy_summaries["serial"]["model_forward_gpu_mean_ms_median"]
     for summary in policy_summaries.values():
@@ -210,6 +260,51 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     limited_launches = math.ceil(output_blocks / args.transform_blocks)
     device = json.loads(Path(result_paths["limited-overlap"]).read_text(encoding="utf-8"))["device_metadata"]
     sm_count = int(device.get("multi_processor_count", 0))
+    measurement_batches = int(base_contract["execution"]["measurement_batches"])
+    for policy, summary in policy_summaries.items():
+        expected_launches_per_batch = limited_launches if policy == "limited-overlap" else 1
+        expected_max_blocks = (
+            args.transform_blocks if policy == "limited-overlap" else output_blocks
+        )
+        expected_total_launches = measurement_batches * expected_launches_per_batch
+        if int(summary["planless_transform_kernel_launches"]) != expected_total_launches:
+            raise RuntimeError(
+                f"unexpected transform launch count for {policy}: "
+                f"actual={summary['planless_transform_kernel_launches']} "
+                f"expected={expected_total_launches}"
+            )
+        if int(summary["planless_transform_max_blocks_per_launch"]) != expected_max_blocks:
+            raise RuntimeError(
+                f"unexpected max transform grid for {policy}: "
+                f"actual={summary['planless_transform_max_blocks_per_launch']} "
+                f"expected={expected_max_blocks}"
+            )
+        for handoff in ("copy_to_decode_event_handoffs", "decode_to_transform_event_handoffs"):
+            if int(summary[handoff]) != measurement_batches:
+                raise RuntimeError(
+                    f"unexpected {handoff} for {policy}: "
+                    f"actual={summary[handoff]} expected={measurement_batches}"
+                )
+        if int(summary["direct_dct_low_priority_batches"]) != measurement_batches:
+            raise RuntimeError(
+                f"low-priority Direct-DCT was not active for every batch in {policy}"
+            )
+
+    fully = policy_summaries["fully-overlapped"]
+    limited = policy_summaries["limited-overlap"]
+    serial = policy_summaries["serial"]
+    limited_throughput_ratio = (
+        limited["throughput_images_per_s_median"] / fully["throughput_images_per_s_median"]
+    )
+    dali_throughput: float | None = None
+    dali_result_path = args.contract.parent / "pipeline_dali.json"
+    if dali_result_path.exists():
+        dali_payload = json.loads(dali_result_path.read_text(encoding="utf-8"))
+        dali_repeats = _selected_repeats(base_contract, dali_payload)
+        dali_throughput = _median(
+            [float(repeat["throughput_images_per_s"]) for repeat in dali_repeats]
+        )
+    model_only_ceiling = batch_size * 1000.0 / serial["model_forward_gpu_p50_ms_median"]
 
     result = {
         "schema_version": "galp_scheduler_matrix_v1",
@@ -219,6 +314,31 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         "core_metric": "T_model_with_transform - T_model_only",
         "model_only_reference": "serial policy under the same contract",
         "semantic_bit_exact_across_policies": True,
+        "priority_isolation_verified_across_policies": True,
+        "structural_scheduler_counters_verified_across_policies": True,
+        "comparison": {
+            "limited_throughput_ratio_to_fully_overlapped": limited_throughput_ratio,
+            "limited_model_extra_reduction_ms_vs_fully_overlapped": (
+                fully["model_extra_p50_ms_vs_serial"]
+                - limited["model_extra_p50_ms_vs_serial"]
+            ),
+            "model_only_ceiling_images_per_s_from_serial_p50": model_only_ceiling,
+            "dali_reference_throughput_images_per_s": dali_throughput,
+            "limited_throughput_ratio_to_dali": (
+                limited["throughput_images_per_s_median"] / dali_throughput
+                if dali_throughput is not None
+                else None
+            ),
+        },
+        "gates": {
+            "limited_preserves_at_least_98pct_fully_overlapped_throughput": (
+                limited_throughput_ratio >= 0.98
+            ),
+            "limited_reduces_model_extra_p50_vs_fully_overlapped": (
+                limited["model_extra_p50_ms_vs_serial"]
+                <= fully["model_extra_p50_ms_vs_serial"]
+            ),
+        },
         "policies": policy_summaries,
         "policy_results": result_paths,
         "theoretical_work": {

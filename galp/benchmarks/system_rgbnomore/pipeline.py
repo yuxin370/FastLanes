@@ -778,6 +778,19 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
             for key, value in batch.native_counters.items():
                 if key.startswith("galp_native_device_"):
                     native_counters[key] = max(native_counters.get(key, 0), int(value))
+                elif key in {
+                    "direct_dct_stream_priority",
+                    "direct_dct_h2d_stream_priority",
+                    "direct_dct_decode_stream_priority",
+                    "direct_dct_transform_stream_priority",
+                    "direct_dct_round_stream_priority",
+                    "cuda_least_stream_priority",
+                    "cuda_greatest_stream_priority",
+                }:
+                    current = native_counters.get(key)
+                    if current is not None and current != int(value):
+                        raise RuntimeError(f"invariant native counter changed within repeat: {key}")
+                    native_counters[key] = int(value)
                 else:
                     native_counters[key] = native_counters.get(key, 0) + int(value)
 
@@ -868,6 +881,9 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
         "execution": dict(execution),
         "cuda_scheduling": {
             "model_stream_priority_requested": model_stream_priority,
+            "model_stream_priority_actual": (
+                int(model_stream.priority) if model_stream is not None else None
+            ),
             "model_stream_is_explicit": model_stream is not None,
         },
         "worker_semantics": adapter.worker_semantics,

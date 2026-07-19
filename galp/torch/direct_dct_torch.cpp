@@ -414,6 +414,12 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["decode_to_transform_event_handoff_count"]       = stats.decode_to_transform_event_handoff_count;
 	out["copy_to_decode_event_handoff_count"]            = stats.copy_to_decode_event_handoff_count;
 	out["direct_dct_stream_priority"]                     = stats.direct_dct_stream_priority;
+	out["direct_dct_h2d_stream_priority"]                 = stats.direct_dct_h2d_stream_priority;
+	out["direct_dct_decode_stream_priority"]              = stats.direct_dct_decode_stream_priority;
+	out["direct_dct_transform_stream_priority"]           = stats.direct_dct_transform_stream_priority;
+	out["direct_dct_round_stream_priority"]               = stats.direct_dct_round_stream_priority;
+	out["cuda_least_stream_priority"]                     = stats.cuda_least_stream_priority;
+	out["cuda_greatest_stream_priority"]                  = stats.cuda_greatest_stream_priority;
 	out["direct_dct_low_priority_streams"]                = stats.direct_dct_low_priority_streams;
 	out["scheduling_policy"]                              = stats.scheduling_policy;
 	out["fixed_grid_round_event_handoff_count"]          = stats.fixed_grid_round_event_handoff_count;

@@ -672,6 +672,16 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
         bool(stats.get("direct_dct_low_priority_streams", False))
     )
     for key in (
+        "direct_dct_stream_priority",
+        "direct_dct_h2d_stream_priority",
+        "direct_dct_decode_stream_priority",
+        "direct_dct_transform_stream_priority",
+        "direct_dct_round_stream_priority",
+        "cuda_least_stream_priority",
+        "cuda_greatest_stream_priority",
+    ):
+        totals[key] = int(stats.get(key, 0))
+    for key in (
         "planless_axis_program_count",
         "planless_axis_phase_matrix_count",
         "planless_axis_program_bytes",
@@ -751,6 +761,13 @@ def _empty_totals() -> dict[str, int | float]:
         "decode_to_transform_event_handoffs": 0,
         "copy_to_decode_event_handoffs": 0,
         "direct_dct_low_priority_batches": 0,
+        "direct_dct_stream_priority": 0,
+        "direct_dct_h2d_stream_priority": 0,
+        "direct_dct_decode_stream_priority": 0,
+        "direct_dct_transform_stream_priority": 0,
+        "direct_dct_round_stream_priority": 0,
+        "cuda_least_stream_priority": 0,
+        "cuda_greatest_stream_priority": 0,
         "planless_axis_program_count": 0,
         "planless_axis_phase_matrix_count": 0,
         "planless_axis_program_bytes": 0,

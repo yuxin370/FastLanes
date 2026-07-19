@@ -1833,6 +1833,18 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			    << test_case.name;
 			EXPECT_EQ(chunked_stats.decode_to_transform_event_handoff_count, 1U) << test_case.name;
 			EXPECT_TRUE(chunked_stats.direct_dct_low_priority_streams) << test_case.name;
+			EXPECT_EQ(chunked_stats.direct_dct_stream_priority, chunked_stats.cuda_least_stream_priority)
+			    << test_case.name;
+			EXPECT_EQ(chunked_stats.direct_dct_h2d_stream_priority, chunked_stats.cuda_least_stream_priority)
+			    << test_case.name;
+			EXPECT_EQ(chunked_stats.direct_dct_decode_stream_priority, chunked_stats.cuda_least_stream_priority)
+			    << test_case.name;
+			EXPECT_EQ(chunked_stats.direct_dct_transform_stream_priority, chunked_stats.cuda_least_stream_priority)
+			    << test_case.name;
+			EXPECT_EQ(chunked_stats.direct_dct_round_stream_priority, chunked_stats.cuda_least_stream_priority)
+			    << test_case.name;
+			EXPECT_LT(chunked_stats.cuda_greatest_stream_priority, chunked_stats.cuda_least_stream_priority)
+			    << test_case.name;
 			EXPECT_EQ(chunked_stats.scheduling_policy, "limited-overlap") << test_case.name;
 			EXPECT_GT(legacy_stats.fixed_transform_item_count, 0U) << test_case.name;
 			if (transform_index == 0U) {

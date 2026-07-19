@@ -691,6 +691,13 @@ T_model_with_transform - T_model_only
 | `jpeg_dct_test.cpp` | 7-block chunk 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
 | `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
 
+为了避免把“请求了 priority”误当成“priority 已生效”，native 结果同时记录
+`cuda_least_stream_priority`、`cuda_greatest_stream_priority` 和通过
+`cudaStreamGetPriority` 分别读取的 H2D、decode、transform、round 实际 stream priority；
+pipeline 记录 Torch model stream 的实际 `priority`。矩阵要求模型实际值等于设备 greatest
+priority、四条 Direct-DCT stream 的实际值都等于 least priority，且 greatest 数值严格小于
+least，否则直接失败。
+
 Native event graph 由原来的：
 
 ```text
@@ -767,9 +774,25 @@ transform、round 热态合计约 6.49 ms，原本低于 9.636 ms 模型窗口�
 - 全量 `cmake --build build -j2`；
 - `_galp_direct_dct` 和 `galp_tests` 增量构建；
 - Direct-DCT Torch import CTest；
-- `galp.tests.test_system_benchmark` 20/20；
+- `galp.tests.test_system_benchmark` 21/21（含 priority counter 跨 repeat 不变量测试）；
 - Python `py_compile`；
 - `git diff --check`。
+
+加入实际 stream priority 回读与矩阵结构 gate 后，重新构建的 Torch binding SHA-256 为
+`b83fe01e8804205069dc6b94adf0d077c66a57337e91fd9322b92b3036b9c32b`；矩阵生成的派生 contract
+会自动记录这个新二进制指纹，避免误用第 12 节历史结果所对应的旧 binding。
+
+三策略矩阵还会硬检查 priority range/实际值跨 repeat 不变、三策略 sample trace 完全一致，
+并逐数组 bit-exact 比较 semantic artifact 中的 DCT 输入、logits 和预测。结构检查同时要求：
+
+- `fully-overlapped`/`serial` 每 batch 恰好 1 次、58,800 blocks 的 transform launch；
+- `limited-overlap/64` 每 batch 恰好 919 次 launch，任一次不超过 64 blocks；
+- 每个测量 batch 都出现一次 copy→decode 和 decode→transform event handoff；
+- 每个测量 batch 的 Direct-DCT 四条实际 stream 都处于设备 least priority。
+
+汇总还报告 limited 相对 fully-overlapped 的吞吐比、模型额外 p50 延迟减少量、由 serial
+model p50 推导的 model-only ceiling，以及同目录 `pipeline_dali.json` 存在时的 DALI 吞吐比；
+其中“保留至少 98% fully-overlapped 吞吐”和“降低模型额外 p50”作为显式布尔 gate 输出。
 
 当前受控执行环境可通过 `nvidia-smi` 枚举 RTX 4090，但测试进程中的
 `cudaGetDeviceCount` 返回无可用设备，所以 GPU correctness test 被明确 skip，未伪造三策略

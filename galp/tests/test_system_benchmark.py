@@ -39,10 +39,21 @@ from manifest import build_manifest, collect_dataset, validate_galp_label_map  #
 from pipeline import GalpAdapter, GalpLegacyAdapter, _process_memory_snapshot  # noqa: E402
 from prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
 from run import E2E_MAX_HOT_THROUGHPUT_CV, E2E_PIPELINES, GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, PRESETS  # noqa: E402
+from scheduler_matrix import _invariant_counter  # noqa: E402
 from validate import _aggregate_pipeline, _evaluate_performance_gates, _semantic_compare  # noqa: E402
 
 
 class SystemBenchmarkTest(unittest.TestCase):
+    def test_scheduler_matrix_requires_invariant_native_priority_counters(self) -> None:
+        repeats = [
+            {"native_counters": {"direct_dct_stream_priority": 0}},
+            {"native_counters": {"direct_dct_stream_priority": 0}},
+        ]
+        self.assertEqual(_invariant_counter(repeats, "direct_dct_stream_priority"), 0)
+        repeats[1]["native_counters"]["direct_dct_stream_priority"] = -1
+        with self.assertRaisesRegex(RuntimeError, "not invariant"):
+            _invariant_counter(repeats, "direct_dct_stream_priority")
+
     def test_in_place_rgbnomore_range_scale_matches_reference(self) -> None:
         values = torch.arange(-1024, 1017, dtype=torch.float32)
         reference = (values + 1024.0) / 2040.0 * 2.0 - 1.0

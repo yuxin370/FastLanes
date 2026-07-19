@@ -546,6 +546,12 @@ struct JpegDctDeviceExecutionStats {
 	size_t      decode_to_transform_event_handoff_count       = 0;
 	size_t      copy_to_decode_event_handoff_count            = 0;
 	int         direct_dct_stream_priority                     = 0;
+	int         direct_dct_h2d_stream_priority                 = 0;
+	int         direct_dct_decode_stream_priority              = 0;
+	int         direct_dct_transform_stream_priority           = 0;
+	int         direct_dct_round_stream_priority               = 0;
+	int         cuda_least_stream_priority                     = 0;
+	int         cuda_greatest_stream_priority                  = 0;
 	bool        direct_dct_low_priority_streams                = false;
 	std::string scheduling_policy;
 };

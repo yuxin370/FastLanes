@@ -568,6 +568,8 @@ struct JpegDctDeviceScratch {
 	bool                                                                   cached_gather_in_flight             = false;
 	bool                                                                   cached_fixed_transform_in_flight    = false;
 	int                                                                    direct_dct_stream_priority          = 0;
+	int                                                                    cuda_least_stream_priority          = 0;
+	int                                                                    cuda_greatest_stream_priority       = 0;
 	bool                                                                   direct_dct_low_priority_streams     = false;
 	size_t                                                                 transform_blocks_per_launch         = 0;
 	std::list<std::string>                                                 fls_reader_lru;
@@ -644,13 +646,21 @@ struct JpegDctDeviceScratch {
 	}
 
 	void configure_scheduling(const bool use_low_priority, const size_t blocks_per_launch) {
-		int least_priority    = 0;
-		int greatest_priority = 0;
-		CUDA_SAFE_CALL(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
-		direct_dct_low_priority_streams     = use_low_priority;
-		direct_dct_stream_priority          = use_low_priority ? least_priority : 0;
-		transform_blocks_per_launch         = blocks_per_launch;
-		decode_workset.transfer.stream_priority   = direct_dct_stream_priority;
+		CUDA_SAFE_CALL(cudaDeviceGetStreamPriorityRange(
+		    &cuda_least_stream_priority, &cuda_greatest_stream_priority));
+		direct_dct_low_priority_streams       = use_low_priority;
+		direct_dct_stream_priority            = use_low_priority ? cuda_least_stream_priority : 0;
+		transform_blocks_per_launch           = blocks_per_launch;
+		decode_workset.transfer.stream_priority = direct_dct_stream_priority;
+	}
+
+	int actual_stream_priority(const cudaStream_t stream) const {
+		if (stream == nullptr) {
+			return std::numeric_limits<int>::max();
+		}
+		int actual_priority = 0;
+		CUDA_SAFE_CALL(cudaStreamGetPriority(stream, &actual_priority));
+		return actual_priority;
 	}
 
 	void ensure_cached_gather_events() {
@@ -3432,6 +3442,8 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 	auto&                scratch              = plan.scratch != nullptr ? *plan.scratch : local_scratch;
 	scratch.configure_scheduling(plan.use_low_priority_streams, plan.transform_blocks_per_launch);
 	impl->execution_stats.direct_dct_stream_priority      = scratch.direct_dct_stream_priority;
+	impl->execution_stats.cuda_least_stream_priority      = scratch.cuda_least_stream_priority;
+	impl->execution_stats.cuda_greatest_stream_priority   = scratch.cuda_greatest_stream_priority;
 	impl->execution_stats.direct_dct_low_priority_streams = scratch.direct_dct_low_priority_streams;
 	switch (plan.scheduling_policy) {
 	case JpegDctSchedulingPolicy::kFullyOverlapped:
@@ -3552,6 +3564,15 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan pla
 	        ? impl->execution_stats.full_vector_count - impl->execution_stats.selected_vector_count
 	        : 0;
 	const auto native_device                                       = galp::memory::device_pool_stats();
+	impl->execution_stats.direct_dct_h2d_stream_priority = scratch.actual_stream_priority(
+	    scratch.decode_workset.transfer.h2d_stream ? scratch.decode_workset.transfer.h2d_stream.get() : nullptr);
+	impl->execution_stats.direct_dct_decode_stream_priority = scratch.actual_stream_priority(
+	    scratch.decode_workset.transfer.compute_stream ? scratch.decode_workset.transfer.compute_stream.get() : nullptr);
+	impl->execution_stats.direct_dct_transform_stream_priority =
+	    scratch.actual_stream_priority(scratch.transform_stream ? scratch.transform_stream.get() : nullptr);
+	impl->execution_stats.direct_dct_round_stream_priority = scratch.actual_stream_priority(
+	    scratch.fixed_grid_round_stream ? scratch.fixed_grid_round_stream.get() : nullptr);
+	impl->execution_stats.direct_dct_stream_priority = impl->execution_stats.direct_dct_transform_stream_priority;
 	impl->execution_stats.galp_native_device_in_use_bytes          = native_device.in_use_bytes;
 	impl->execution_stats.galp_native_device_peak_in_use_bytes     = native_device.peak_in_use_bytes;
 	impl->execution_stats.galp_native_device_cached_bytes          = native_device.cached_bytes;
