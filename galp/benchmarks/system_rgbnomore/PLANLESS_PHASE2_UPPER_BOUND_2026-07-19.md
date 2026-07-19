@@ -4,14 +4,14 @@
 
 ## 1. 结论
 
-在本轮固定合同（ImageNet-val 50K、batch 50、FP32、warmup 0、eager、同一 checkpoint、cache 0）下，
+在本轮固定合同（ImageNet-val 50K、batch 50、FP32、warmup 0、eager、预先固定的 domain checkpoints、cache 0）下，
 `1.10 × DALI hot median` 门槛不可由当前固定模型执行达到。
 
-同轮 DALI hot median 为 `4789.330 img/s`，所以硬门槛为：
+最新完整轮 DALI hot median 为 `4839.499 img/s`，所以硬门槛为：
 
 ```text
-4789.330 × 1.10 = 5268.263 img/s
-50 / 5268.263 = 9.490794 ms/batch
+4839.499 × 1.10 = 5323.449 img/s
+50 / 5323.449 = 9.392407 ms/batch
 ```
 
 隔离 GALP 的读取、解码、变换和异步预取后，只对一批已经生成的 FP32 DCT 输入重复执行固定 DCT 模型，
@@ -33,10 +33,10 @@ T_end_to_end <= 5188.818 img/s
 仍有：
 
 ```text
-5188.818 / 4789.330 = 1.083412 < 1.10
+5188.818 / 4839.499 = 1.072181 < 1.10
 ```
 
-距离原门槛还差 `79.446 img/s`，即目标值的 `1.508%`；对应每批只差 `0.145313 ms`，
+距离最新同轮门槛还差 `134.631 img/s`，即目标值的 `2.529%`；对应每批只差 `0.243699 ms`，
 但这个差值已经出现在任何 GALP 工作发生之前的固定模型上。
 
 这是“当前合同、当前 eager 模型实现、当前硬件状态”的操作上界，不是 RTX 4090 芯片的绝对物理上界。
@@ -47,28 +47,29 @@ accuracy/semantic 基线；只有 checkpoint 同时引入剪枝、结构化稀�
 
 ## 2. 证据范围
 
-主证据目录：
-
-```text
-/tmp/galp-planless-phase2-gpu-d7b3e11
-```
-
-该目录是无共享主机争用的固定合同完整轮，FastLanes benchmark source 为 tracked-clean，运行 commit 为
-`f0102221ea860cf87a38c622b8055245afe65600`，native binary SHA-256 为
-`4ed7e83999c031081d6fd421e4996e1d2d19eed96d04b8b538ce3102e0414917`。
-
-优化后实现的完整复跑目录为：
+最新优化实现的完整结果目录：
 
 ```text
 /tmp/galp-planless-phase2-upper-final-3932b5d
 ```
 
-其 FastLanes benchmark source 同样为 tracked-clean，运行 commit 为
-`3932b5da9f22a8a899cc3bf9449cc25b3a3a5025`，native binary SHA-256 为
-`0d4dd21af3f25020cfcf58af1b68f1f390562b24c7720d96c6d973f2f9f432fd`。该复跑的语义、结构和阶段 gate
-通过，但 GALP 阶段受到可观测的共享主机/GPU1 工作负载干扰，因此不用于估计端到端架构上限；第 10 节给出判据。
+该轮 contract 在 tracked-clean commit `a5b932ae18791abf84fbc063fa441630bad23499` 创建，使用的 native
+binary SHA-256 为 `0d4dd21af3f25020cfcf58af1b68f1f390562b24c7720d96c6d973f2f9f432fd`。运行期间 HEAD
+变为 `22816846ed415294c70964d8c11536b179262559`，两 commit 之间只有本报告 Markdown 变化，benchmark
+runtime files 和 native binary hashes 均未改变。因此最新性能、结构和语义结果反映同一实现，但严格 validator
+仍正确保留 `git commit changed during the benchmark` provenance failure；第 10 节详述。
 
-关键文件：
+历史无争用基线和 model-only/storage/I/O 补充证据目录为：
+
+```text
+/tmp/galp-planless-phase2-gpu-d7b3e11
+```
+
+该基线 FastLanes benchmark source 为 tracked-clean，运行 commit 为
+`f0102221ea860cf87a38c622b8055245afe65600`，native binary SHA-256 为
+`4ed7e83999c031081d6fd421e4996e1d2d19eed96d04b8b538ce3102e0414917`。
+
+最新目录关键文件：
 
 ```text
 pipeline_galp.json
@@ -77,6 +78,12 @@ pipeline_rgbnomore.json
 pipeline_dali.json
 results.json
 validation.json
+commands.json
+```
+
+历史补充证据：
+
+```text
 storage_io_actual.json
 forward_only.json
 ```
@@ -91,7 +98,8 @@ forward_only.json
 | `f010222` | 修正 `galp_legacy` 在 contract、runner、pipeline 间的名称/配置一致性 | 3 files，+6/-3 |
 | `a3080b2` | 让实际 I/O 审计读取 pipeline 五轮 repeat schema 中的 native counter | 1 file，+22 |
 | `3932b5d` | 64-thread planless kernel、FP32 原地范围映射和上限分析 | 4 files，+353/-9 |
-| `a5b932a` | 加入最终污染审计、验收结论和证据哈希 | 1 file，+108 |
+| `a5b932a` | 加入首版运行审计、上限验收结论和证据哈希 | 1 file，+108 |
+| `2281684` | 补充文件/函数级修改报告并澄清条件上界的合同边界 | 1 file，+199/-4 |
 
 #### 2.1.2 执行架构的前后变化
 
@@ -168,7 +176,7 @@ derived shard index `0 B`、7 个 shard descriptors `224 B`、layout `64 B`、qu
 - grayscale、4:4:4、4:2:0、variable shape、cross-shard 和 shuffled request order 使用同一 compact path；
 - canonical batch 保持一个 logical workset、一个 decode launch 和一个 internal synchronization；
 - 后续把 block size 从 256 改为 64 threads，每个 lane 循环装载最多四个 canonical down2 source
-  coefficients；实测 fixed-transform p50 从 `1.601024 ms` 降到 `1.183744 ms`。
+  coefficients；最新完整轮 fixed-transform p50 中位值从基线 `1.601024 ms` 降到 `0.878592 ms`。
 
 Mapping 已融合进 fixed-transform kernel，因此单独的 `device_mapping_ms=0`，并由
 `device_mapping_fused=true` 证明；mapping instructions 的时间包含在 fixed-transform 事件中，而不是被漏记。
@@ -243,28 +251,30 @@ galp_native_device_* allocation counters
 
 | 指标 | GALP planless | DALI |
 |---|---:|---:|
-| hot median throughput | 4203.211 img/s | 4789.330 img/s |
-| hot min throughput | 4194.590 img/s | 4518.097 img/s |
-| hot CV | 0.112% | 2.646% |
-| 等价平均 batch 时间 | 11.895668 ms | 10.439873 ms |
-| hot model-forward 典型值 | 约 11.09 ms | 约 9.69--9.76 ms |
-| loader submit 典型值 | 约 0.52--0.55 ms | 约 0.41--0.44 ms |
+| hot median throughput | 4478.479 img/s | 4839.499 img/s |
+| hot min throughput | 4465.184 img/s | 4795.794 img/s |
+| hot CV | 0.234% | 0.653% |
+| 等价平均 batch 时间 | 11.164525 ms | 10.331704 ms |
+| hot model-forward p50 中位值 | 10.402 ms | 约 9.527--9.600 ms |
+| loader submit p50 中位值 | 0.492 ms | 约 0.391--0.441 ms |
 
 GALP 当前达到 model-only ceiling 的：
 
 ```text
-4203.211 / 5188.818 = 81.005%
+4478.479 / 5188.818 = 86.310%
 ```
 
 对应剩余系统差距为：
 
 ```text
-11.895668 - 9.636107 = 2.259561 ms/batch
+11.164525 - 9.636107 = 1.528418 ms/batch
 ```
 
 这个差距不是阶段时间的简单求和，因为读取、CPU workset 构建和下一批 GPU 变换与当前模型前向重叠。
-实测当前模型前向在重叠时从隔离值约 `9.64 ms` 上升到约 `11.09 ms`，说明下一批变换与当前模型
+实测当前模型前向在重叠时从隔离值约 `9.64 ms` 上升到约 `10.40 ms`，说明下一批变换与当前模型
 争用 GPU 是主要剩余损耗之一。
+
+相对历史无争用基线，最新实现的 GALP hot median 提高 `6.549%`，平均 batch 时间降低 `6.146%`。
 
 ## 4. 存储与输入数据量
 
@@ -366,7 +376,7 @@ model-only 的实测有效算力为：
 原门槛对应：
 
 ```text
-123.375565 GFLOPs / 9.490794 ms = 12.999 TFLOP/s
+123.375565 GFLOPs / 9.392407 ms = 13.136 TFLOP/s
 ```
 
 这两个数都显著低于 nominal shader FP32 peak，因为 ViT-Ti 包含大量小矩阵、attention、einsum、
@@ -402,7 +412,7 @@ total:                                  3,072 FMAs/output block
                   361,267,200 FLOPs
 ```
 
-这只有模型 `123.376 GFLOPs/batch` 的 `0.293%`。但该 kernel 实测约 `1.59 ms/batch`，不是算术峰值受限，
+这只有模型 `123.376 GFLOPs/batch` 的 `0.293%`。基线 kernel 实测约 `1.60 ms/batch`，不是算术峰值受限，
 而是 58,800 个小 thread block 的调度、共享内存同步、地址推导和不规则列读取受限。
 
 只计 decoded source、float accumulation 和 round-trip output，忽略量化表、binding 和 descriptor 读取，
@@ -413,9 +423,9 @@ total:                                  3,072 FMAs/output block
 coefficient；后续最多使用 64 threads。新实现使用 64-thread block，每线程循环装载最多四个 source
 coefficient，使通用 rational 路径与 canonical 路径都保持两 warp 的执行宽度。
 
-优化后完整复跑虽然受到外部争用，native CUDA event 仍把 fixed-transform kernel 与 host 阶段分开记录。
-hot repeats 的 fixed-transform p50 中位值从 `1.601024 ms` 降到 `1.183744 ms`，降低 `26.06%`；这与
-64-thread block 减少空闲 warp 的预期一致。该局部事件时间不用于替换无争用轮的端到端吞吐。
+最新完整轮由 native CUDA event 将 fixed-transform kernel 与 host 阶段分开记录。hot repeats 的
+fixed-transform p50 中位值从历史基线 `1.601024 ms` 降到 `0.878592 ms`，降低 `45.12%`；这与 64-thread
+block 减少空闲 warp 的预期一致。
 
 ## 7. 阶段时间与剩余余量
 
@@ -423,26 +433,26 @@ hot repeats 的 fixed-transform p50 中位值从 `1.601024 ms` 降到 `1.183744 
 
 | 阶段 | 典型时间/batch |
 |---|---:|
-| planning | 0.036 ms |
-| sync rowgroup read | 3.23 ms p50 |
-| workset build | 0.86 ms p50 |
-| workset upload | 0.94--1.08 ms p50 |
-| decode | 0.11 ms p50 |
-| fixed transform | 1.60 ms p50 |
-| round | 0.07 ms p50 |
+| planning | 0.03794 ms p50；0.08047 ms p95 |
+| sync rowgroup read | 3.371 ms p50 |
+| workset build | 0.876 ms p50 |
+| workset upload | 1.144 ms p50 |
+| decode | 0.107 ms p50 |
+| mapping + fixed transform | 0.879 ms p50 |
+| round | 0.073 ms p50 |
 
 读取、CPU build/upload 和下一批 GPU 工作与当前模型重叠，因此不能把这些数直接相加得到端到端时间。
 当前主要瓶颈已从 Phase 1 的 host planning 转移到 GPU 资源竞争和固定模型本身：
 
 ```text
-legacy hot median             = 656.251 img/s
-planless hot median           = 4203.211 img/s
-planless / legacy             = 6.405×
+legacy hot median             = 635.288 img/s
+planless hot median           = 4478.479 img/s
+planless / legacy             = 7.050×
 planless model-only ceiling   = 5188.818 img/s
-current / model-only ceiling  = 81.005%
+current / model-only ceiling  = 86.310%
 ```
 
-planless 已经消除随 output blocks 增长的 host items、global sort 和 plan cache 依赖；剩余约 19% 的系统余量
+planless 已经消除随 output blocks 增长的 host items、global sort 和 plan cache 依赖；剩余约 13.7% 的系统余量
 来自不可完全隐藏的读取/变换、FP32 输入生成以及变换与模型在同一 GPU 上的竞争，而不是 planning 规模退化。
 
 ## 8. Gate 判定
@@ -460,14 +470,16 @@ planning median/p95、规模与顺序稳定性
 GALP hot CV 和 DALI hot CV
 ```
 
-唯一失败为原始相对吞吐门槛：
+最新 validator 的算法性能失败仍为原始两项相对吞吐门槛：
 
 ```text
-GALP hot median / DALI hot median = 0.877620 < 1.10
-GALP hot min                      = 4194.590 < DALI median 4789.330
+GALP hot median / DALI hot median = 0.925401 < 1.10
+GALP hot min                      = 4465.184 < DALI median 4839.499
 ```
 
-由于固定模型的隔离上界本身只有 `1.083412 × DALI`，`1.10×` 门槛在本轮合同下是过约束。
+此外存在一项非算法 provenance failure：运行期间仅报告 commit 发生变化；benchmark runtime files 和 native
+binary 未变化，详见第 10 节。固定模型的隔离上界只有最新 DALI 的 `1.072181×`，因此 `1.10×` 门槛在本轮
+合同下仍是过约束。
 合理的上限验收应改为同时报告：
 
 ```text
@@ -499,47 +511,56 @@ galp/benchmarks/system_rgbnomore/diagnostics/direct_dct.py \
   --output-json /tmp/galp-planless-phase2-gpu-d7b3e11/forward_only.json
 ```
 
-## 10. 优化后完整复跑的污染审计
+## 10. 最新优化完整轮与 provenance 审计
 
-优化后完整复跑产生了全部合同文件，validator 仍只有原始两项吞吐 gate 失败，两个严格语义比较均通过：
+目录 `/tmp/galp-planless-phase2-upper-final-3932b5d` 已在 16:45--16:57 被最新完整轮覆盖。该轮产生所有四条
+pipeline、5 repeats、50K prediction trace 和 validator 文件。两个严格语义比较均通过：
 
 ```text
 GALP vs RGBNoMore: 50,000/50,000 prediction trace，Top-1 agreement = 1.0
 GALP vs legacy:    inputs/logits max_abs = 0，Top-1 agreement = 1.0
 ```
 
-但该轮不能作为吞吐上限样本。和无争用完整轮对比：
+最新性能结果：
 
-| 指标 | 无争用完整轮 | 优化后复跑 |
-|---|---:|---:|
-| GALP hot median | 4203.211 img/s | 2289.910 img/s |
-| GALP hot process CPU time 中位值 | 19.734 s/repeat | 41.007 s/repeat |
-| host loadavg，GALP 开始 | 4.05 | 29.17 |
-| host loadavg，GALP 结束 | 5.58 | 30.19 |
-| 全机 CPU utilization ratio | 7.06% | 32.90% |
-| fixed-transform p50 中位值 | 1.601 ms | 1.184 ms |
-| model-stream event p50 中位值 | 11.092 ms | 19.453 ms |
+| 指标 | 历史无争用基线 | 最新优化完整轮 | 变化 |
+|---|---:|---:|---:|
+| GALP hot median | 4203.211 img/s | 4478.479 img/s | +6.549% |
+| GALP mean batch time | 11.895668 ms | 11.164525 ms | -6.146% |
+| fixed-transform p50 中位值 | 1.601024 ms | 0.878592 ms | -45.123% |
+| planless/legacy hot median | 6.405× | 7.050× | +10.06% |
+| GALP hot CV | 0.112% | 0.234% | 两者均通过 5% gate |
 
-更直接的外部干扰证据来自 `commands.json`：优化后 GALP 开始时 GPU1（H100）为空闲状态，结束时 GPU1
-已占用 `19,989 MiB`、功耗 `201.23 W`；随后执行 DALI 时 GPU1 又恢复为空闲状态。也就是说 GALP 和 DALI
-没有受到相同的共享 CPU/内存/驱动负载。
+最新轮的 GALP 与 DALI host load 都较高，但比被覆盖的旧污染轮更对称：GALP 前后 loadavg 为
+`27.76 -> 34.81`、全机 CPU utilization `30.11%`；DALI 为 `35.08 -> 33.53`、CPU utilization `35.55%`。
+GALP 运行期间 GPU1 保持空闲；DALI 结束时 GPU2 出现外部负载，因此系统状态仍不是理想独占环境。尽管如此，
+GALP/DALI hot CV 分别只有 `0.234%/0.653%`，四个 hot repeats 内部稳定。
 
-同一轮中，GALP 的 sync rowgroup read、workset build 和 workset upload 典型值分别从无争用轮约
-`3.23/0.86/0.94--1.08 ms` 上升到约 `8.28/2.91/4.84 ms`。这些 host 路径没有被 64-thread CUDA kernel
-修改；与此同时独立 CUDA event 测得 kernel 本身反而快了 26%。模型 stream 会等待预处理完成，所以等待时间
-被包含在 model-stream event 中，解释了其从约 11.09 ms 增至 19.45 ms。
+validator 的第三项失败不是代码或 binary 变化，而是基准运行期间发生了一次报告提交：
 
-因此 `2289.910 img/s` 是共享资源争用下的受污染下界，不是新实现回归后的架构上限，也不能用来修改第 1 节
-的结论。上限判定继续使用无争用固定合同完整轮和隔离 model-only 测量。
+```text
+contract/start commit = a5b932ae18791abf84fbc063fa441630bad23499
+end commit            = 22816846ed415294c70964d8c11536b179262559
+changed tracked file  = PLANLESS_PHASE2_UPPER_BOUND_2026-07-19.md only
+native binary SHA-256 = 0d4dd21af3f25020cfcf58af1b68f1f390562b24c7720d96c6d973f2f9f432fd
+```
+
+contract 中列出的所有 benchmark runtime file hashes 与执行时一致，native `.so` 也与当前文件一致；否则
+validator 会同时报告 runtime source 或 binary mismatch。严格复现规则仍把 commit 变化判为失败，因此本报告不把
+`validation.ok` 改写为 true。该轮可作为同一实现的最新性能/语义观察值，但若需要一份 validator 完全 clean 的
+正式归档，仍需在报告提交停止后原样重跑。
 
 ## 11. 最终上限验收判定
 
 原始 validator 和门槛均未修改。严格按原始 Definition of Done，性能项仍是：
 
 ```text
-FAIL: 4203.211 / 4789.330 = 0.877620 < 1.10
-FAIL: GALP hot min 4194.590 < DALI hot median 4789.330
+FAIL: 4478.479 / 4839.499 = 0.925401 < 1.10
+FAIL: GALP hot min 4465.184 < DALI hot median 4839.499
 ```
+
+最新 artifact 另有一项报告 commit 在运行中变化的 provenance failure；它不改变上述算法性能结论，但意味着
+该 artifact 的 `validation.ok=false` 不能只归因于两项吞吐 gate。
 
 按用户授权的“达到固定合同上限即可，但必须给出数据量和计算量理论分析”收口，本阶段接受结论为：
 
@@ -550,10 +571,10 @@ ACCEPT AT OPERATIONAL UPPER BOUND
 理由不是端到端实现已经等于 model-only ceiling，而是原 `1.10×` 要求本身高于固定模型的实测操作上界：
 
 ```text
-required                         = 5268.263 img/s = 9.490794 ms/batch
+required                         = 5323.449 img/s = 9.392407 ms/batch
 fixed model-only                 = 5188.818 img/s = 9.636107 ms/batch
-fixed model-only / DALI          = 1.083412
-required - fixed model-only      = 79.446 img/s = 1.508% of target
+fixed model-only / DALI          = 1.072181
+required - fixed model-only      = 134.631 img/s = 2.529% of target
 ```
 
 任何合法 Direct-DCT 端到端路径还必须执行正成本的读取、workset、解码、变换和输入生成，因此不能超过该
@@ -566,7 +587,7 @@ planning、mapping/fixed-transform 和 CV gate 均已有文件化证据通过。
 
 ## 12. 证据哈希归档
 
-无争用主证据：
+历史无争用补充证据：
 
 | 文件 | SHA-256 |
 |---|---|
@@ -577,18 +598,23 @@ planning、mapping/fixed-transform 和 CV gate 均已有文件化证据通过。
 | `forward_only.json` | `95614686382da81fa165bd60780010d47dd6b0a3c356ef3b1f530d5b5fdd199b` |
 | CPU `planning.json` | `21bf797377787ff69fb9a4aea5d39bb6dea3b901c75f866c0ced362c30c3a58e` |
 
-优化后污染审计证据：
+最新优化完整轮证据：
 
 | 文件 | SHA-256 |
 |---|---|
-| `contract.json` | `47d65e43d86b74509b522fdd76eab5734e54a6ec207344018a030b88df8ac719` |
-| `results.json` | `ad92868b312122d47d6a25b74c9b9bb13034c26803e30f392b480ce05eb736ca` |
-| `validation.json` | `5ba5eb04aaf452540ba9c273196b1ad161e3f515c60321bd6b43d02d627ce8b8` |
-| `commands.json` | `d2e7bf75cb42481e27363e2dab9f240a63d05b8153e9c52ac6baee329b626349` |
+| `contract.json` | `44928ecb039ff7bf666558725db0812d6184e9707e44fe62471a1531267eb78c` |
+| `results.json` | `9f15f61d0f252f4cdb1463ad1f532d670c3ef0ba495768f8455ccfaed2f48a4e` |
+| `validation.json` | `b1a65d59ea0a2ee95c6a23cb47f6193b912e129da91d06d0407355687f7a36ce` |
+| `commands.json` | `e54c2206c975bb0b3a90f277794c0826710aa26da070bd1f3e8211dc3aee3a64` |
+| `pipeline_galp.json` | `71c606adb904b79d4107753a9534b527525e68d5a4c82a8dee1ce044733ae00e` |
+| `pipeline_galp_legacy.json` | `419f22e5c82db6d7af783acb45e5ced67e19879286fcd47e1342bfbbac135fdc` |
+| `pipeline_rgbnomore.json` | `f1a90199a76f03887874a7bfb71dca130d7136bee113a855c9874189acc9a893` |
+| `pipeline_dali.json` | `3d3052b7337cd1a6b99acfc5a6b89695f3cfb3bcb40777e656a5af99c9e1355e` |
 
-两个 FastLanes contract 都记录 `benchmark_source_clean=true`、`git_tracked_dirty=false`。仓库中仅有用户原有的
-`.cache/` 和 `galp/examples/image_order_benchmark/res` 两个未跟踪目录，它们未进入 benchmark runtime source，
-也没有被本阶段修改或删除。
+两个 FastLanes contract 在创建时都记录 `benchmark_source_clean=true`、`git_tracked_dirty=false`。最新轮结束前
+发生的 tracked change 仅为本报告提交；仓库中用户原有的 `.cache/` 和
+`galp/examples/image_order_benchmark/res` 两个未跟踪目录未进入 benchmark runtime source，也没有被本阶段修改
+或删除。
 
 ## 13. “改变模型实现、编译模式、精度或 checkpoint”的确切含义
 
@@ -620,10 +646,10 @@ checkpoint，两者不是同一组权重。所谓公平重测不是强行使用�
 要让原 `1.10×` gate 从数学上“可能”，新模型前向首先必须满足：
 
 ```text
-t_model < 50 / (1.10 × 4789.330) = 9.490794 ms/batch
+t_model < 50 / (1.10 × 4839.499) = 9.392407 ms/batch
 ```
 
-这只是必要条件，不是充分条件，因为端到端还存在正成本的非重叠读取、变换和提交。当前无争用端到端为
-`11.895668 ms/batch`，距离目标 `9.490794 ms/batch` 需要再减少 `2.404874 ms/batch`（`20.22%`）。如果新的
+这只是必要条件，不是充分条件，因为端到端还存在正成本的非重叠读取、变换和提交。当前最新端到端为
+`11.164525 ms/batch`，距离目标 `9.392407 ms/batch` 需要再减少 `1.772118 ms/batch`（`15.87%`）。如果新的
 模型/编译方案同时改变 DALI 吞吐，右侧目标也必须使用新的同轮 DALI median 重新计算，不能继续使用
-`4789.330 img/s` 这个旧分母。
+`4839.499 img/s` 这个分母。
