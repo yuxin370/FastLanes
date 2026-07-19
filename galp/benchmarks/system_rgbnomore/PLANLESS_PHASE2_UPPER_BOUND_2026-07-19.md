@@ -965,3 +965,52 @@ CUDA occupancy API 的实际回读值为准，而不是只相信手工推导。
 并发度三者无控制地同时改变。包含 resource counters 的最新 Torch binding SHA-256 为
 `e8f5ae333e84a45bc22ee52c9803f7b56343f3f374b3cd5f7ae74acab63170f3`；CUDA/C++ 构建、Torch import CTest、
 25 个 Python 单测、`py_compile` 和 diff 检查均已通过。
+
+### 14.9 occupancy sweep 实测与最后一轮 CTA-lifetime 诊断
+
+完整结果目录为 `/tmp/galp-planless-scheduler-cta-sweep`，v3 汇总 SHA-256 为
+`d1e192ae23d3c3dcb681f490b64577b7f166512dd59c8f6a4009affbbb17bccf`，binding SHA-256 与第 14.8 节一致。
+矩阵的 semantic bit-exact、priority isolation、structural counters、kernel resource invariance 四类硬 gate
+全部通过；七种策略 Top-1/Top-5 都是 `0.75140/0.92446`。所有派生 contract 的 canonical JSON SHA-256、
+semantic artifact SHA-256 和 binding SHA-256 均独立复核通过。排除 repeat 0 后的吞吐 CV 为 `0.16%–1.81%`。
+
+| 策略 | output/launch | CTA/launch | CTA/SM 上界 | thread occupancy 上界 | 吞吐 img/s | fully 吞吐保留 | model extra p50 ms | transform p50 ms | E2E p50 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fully-overlapped | 58,800 | 58,800 | 10 | 41.67% | 4528.837 | 100% | 0.635304 | 2.018816 | 10.992204 |
+| limited | 512 | 128 | 1 | 4.17% | 4166.597 | 92.00% | **0.294888** | 5.324032 | 11.977408 |
+| limited | 1,024 | 256 | 2 | 8.33% | 4503.938 | 99.45% | 0.525472 | 4.213520 | 11.066592 |
+| limited | 2,048 | 512 | 4 | 16.67% | 4575.250 | 101.02% | 0.521928 | 2.756608 | 10.904124 |
+| limited | 4,096 | 1,024 | 8 | 33.33% | 4564.201 | 100.78% | 0.516112 | 1.817088 | 10.897824 |
+| limited | 8,192 | 2,048 | 10 | 41.67% | **4590.158** | **101.35%** | 0.509688 | **1.458176** | **10.838159** |
+| serial | 58,800 | 58,800 | 10 | 41.67% | 2751.736 | 60.76% | 0 | 0.808960 | 17.943254 |
+
+首个满足 98% gate 的点是 256 CTA。2048 CTA 点同时取得所有 eligible limited 点中最低 model extra、最高
+吞吐和最低 E2E，因此矩阵推荐 `limited-overlap-o8192-c2048`；limited Pareto frontier 只剩低干扰但吞吐不合格的
+128 CTA，以及吞吐合格的 2048 CTA。推荐点相对 fully 将 model extra 从 `0.635304` 降至 `0.509688 ms`
+（减少 `19.77%`），相对最初 `0.766317 ms` 减少 `33.49%`；吞吐反而提高 `1.35%`。它达到同轮 DALI
+`4839.499 img/s` 的 `94.85%`，差距为 `249.341 img/s`（`5.15%`），也比 fully 的 `93.58%` 更接近 DALI。
+
+这轮已经证明 resident concurrency 的可接受上限，但每个 limited CTA 都用 grid-stride 连续处理最多 4 个输出。
+CUDA stream priority 不能抢占已经驻留的 CTA，所以剩余 `0.509688 ms` 可能包含这四个输出形成的不可抢占窗口。
+最后一轮固定 `B=C`，让每个 CTA 只处理一个输出，并在 2/4/8/10 CTA/SM 四档比较：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  galp/benchmarks/system_rgbnomore/scheduler_matrix.py \
+  --contract /tmp/galp-planless-phase2-upper-final-3932b5d/contract.json \
+  --output-dir /tmp/galp-planless-scheduler-single-output-cta \
+  --binding-dir build/galp/torch \
+  --transform-blocks 256 \
+  --transform-blocks 512 \
+  --transform-blocks 1024 \
+  --transform-blocks 2048 \
+  --transform-ctas 256 \
+  --transform-ctas 512 \
+  --transform-ctas 1024 \
+  --transform-ctas 2048
+```
+
+其理论 launch 数为 `230/115/58/29`，CTA 的最短工作单位都是一个 8×8 output block。若它不能在保留 98%
+吞吐的同时把 model extra 降到 `0.509688 ms` 以下，则当前 4-output/CTA、2048-CTA 点就是固定模型/FP32/eager
+合同下的已测调度上限；若能，则按同一 gate 选择新的最低 model-extra 点。
