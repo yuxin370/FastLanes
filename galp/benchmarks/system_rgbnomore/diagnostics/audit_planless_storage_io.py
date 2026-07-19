@@ -287,8 +287,30 @@ def _scheduled_trace_audit(
     }
 
 
+def _record_counter(record: dict[str, Any]) -> int | None:
+    if "rowgroup_storage_bytes_read" in record:
+        return int(record["rowgroup_storage_bytes_read"])
+    native = record.get("native_counters")
+    if isinstance(native, dict) and "rowgroup_storage_bytes_read" in native:
+        return int(native["rowgroup_storage_bytes_read"])
+    return None
+
+
 def _counter_values(result_path: Path) -> list[int]:
     payload = json.loads(result_path.read_text(encoding="utf-8"))
+    # The `--repeats N` benchmark writes a top-level JSON list, one run record per
+    # repeat, each carrying its own `rowgroup_storage_bytes_read` (or a nested
+    # `native_counters.rowgroup_storage_bytes_read`).
+    if isinstance(payload, list):
+        values = [
+            counter
+            for record in payload
+            if isinstance(record, dict)
+            for counter in (_record_counter(record),)
+            if counter is not None
+        ]
+        if values:
+            return values
     if isinstance(payload, dict):
         for records_key in ("repeat_records", "repeats"):
             repeat_records = payload.get(records_key)
