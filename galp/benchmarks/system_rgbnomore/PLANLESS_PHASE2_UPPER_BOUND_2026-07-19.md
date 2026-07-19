@@ -992,25 +992,30 @@ semantic artifact SHA-256 和 binding SHA-256 均独立复核通过。排除 rep
 
 这轮已经证明 resident concurrency 的可接受上限，但每个 limited CTA 都用 grid-stride 连续处理最多 4 个输出。
 CUDA stream priority 不能抢占已经驻留的 CTA，所以剩余 `0.509688 ms` 可能包含这四个输出形成的不可抢占窗口。
-最后一轮固定 `B=C`，让每个 CTA 只处理一个输出，并在 2/4/8/10 CTA/SM 四档比较：
+最后一轮的四个新候选固定 `B=C`，让每个 CTA 只处理一个输出，并在 2/4/8/10 CTA/SM 四档比较；同时
+在同一轮重跑当前 4-output/CTA 赢家 `(B,C)=(8192,2048)`，避免跨时段的 model-only、温度和频率漂移
+污染最终选择：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   galp/benchmarks/system_rgbnomore/scheduler_matrix.py \
   --contract /tmp/galp-planless-phase2-upper-final-3932b5d/contract.json \
-  --output-dir /tmp/galp-planless-scheduler-single-output-cta \
+  --output-dir /tmp/galp-planless-scheduler-cta-lifetime \
   --binding-dir build/galp/torch \
   --transform-blocks 256 \
   --transform-blocks 512 \
   --transform-blocks 1024 \
   --transform-blocks 2048 \
+  --transform-blocks 8192 \
   --transform-ctas 256 \
   --transform-ctas 512 \
   --transform-ctas 1024 \
+  --transform-ctas 2048 \
   --transform-ctas 2048
 ```
 
-其理论 launch 数为 `230/115/58/29`，CTA 的最短工作单位都是一个 8×8 output block。若它不能在保留 98%
-吞吐的同时把 model extra 降到 `0.509688 ms` 以下，则当前 4-output/CTA、2048-CTA 点就是固定模型/FP32/eager
-合同下的已测调度上限；若能，则按同一 gate 选择新的最低 model-extra 点。
+四个 single-output 候选的理论 launch 数为 `230/115/58/29`，CTA 的最短工作单位都是一个 8×8 output
+block；第五个 reference 仍是 8 launches、每 CTA 最多 4 outputs。最终只比较本轮内部的 model extra 和
+throughput gate：若 single-output 候选不能在保留 98% 吞吐的同时优于同轮 `8192/2048` reference，则后者就是
+固定模型/FP32/eager 合同下的已测调度上限；若能，则选择本轮 eligible 点中最低 model-extra 的配置。
