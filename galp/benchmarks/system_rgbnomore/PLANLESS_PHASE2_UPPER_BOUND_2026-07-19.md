@@ -40,8 +40,10 @@ T_end_to_end <= 5188.818 img/s
 但这个差值已经出现在任何 GALP 工作发生之前的固定模型上。
 
 这是“当前合同、当前 eager 模型实现、当前硬件状态”的操作上界，不是 RTX 4090 芯片的绝对物理上界。
-若允许改变模型实现、编译模式、精度或 checkpoint，界限会变化；这些不属于本阶段允许用于证明 Direct-DCT
-执行架构收益的手段。
+改变模型算子实现、编译/执行后端或数值精度会改变这个实测界限，因此必须建立新合同并同时重测 GALP 与
+DALI。单独替换形状和稠密算子完全相同的 FP32 checkpoint 通常不会实质改变计算量或吞吐上限，只会改变
+accuracy/semantic 基线；只有 checkpoint 同时引入剪枝、结构化稀疏、量化或网络结构变化时，才会通过改变
+执行工作量影响上限。第 13 节给出严格边界。
 
 ## 2. 证据范围
 
@@ -78,6 +80,160 @@ validation.json
 storage_io_actual.json
 forward_only.json
 ```
+
+### 2.1 具体修改内容报告
+
+#### 2.1.1 提交和代码范围
+
+| Commit | 修改内容 | 规模 |
+|---|---|---:|
+| `d7b3e11` | Planless Direct-DCT 主实现、审计工具、validator 和测试矩阵 | 19 files，+4964/-1143 |
+| `f010222` | 修正 `galp_legacy` 在 contract、runner、pipeline 间的名称/配置一致性 | 3 files，+6/-3 |
+| `a3080b2` | 让实际 I/O 审计读取 pipeline 五轮 repeat schema 中的 native counter | 1 file，+22 |
+| `3932b5d` | 64-thread planless kernel、FP32 原地范围映射和上限分析 | 4 files，+353/-9 |
+| `a5b932a` | 加入最终污染审计、验收结论和证据哈希 | 1 file，+108 |
+
+#### 2.1.2 执行架构的前后变化
+
+修改前：
+
+```text
+每个 batch 的 image/crop requests
+  -> CPU 为每个 source block 创建 FixedTransformItem
+  -> 生成约 235,200 个 64-byte item
+  -> remap selected vectors
+  -> stable_sort + permutation + group offsets
+  -> 再生成并上传 device batch items
+  -> grouped transform kernel
+```
+
+修改后：
+
+```text
+每个 batch 的 image/crop requests
+  -> CPU 生成每图一个 compact descriptor
+  -> request-order flat rowgroup workset
+  -> 一次 descriptor/binding upload
+  -> GPU 每个 thread block 独占一个 output DCT block
+  -> GPU 公式推导 source coordinates/physical row/output address
+  -> dequantize + DCT transform + output
+```
+
+旧路径仅 `FixedTransformItem` vector 就是：
+
+```text
+235,200 × 64 B = 15,052,800 B/batch
+```
+
+新路径的核心 batch schedule 是：
+
+```text
+50 images × 172 B = 8,600 B/batch
+```
+
+即核心变换 schedule 从约 `15.05 MB` 降为 `8.6 KB`，约缩小 `1750×`；同时删除 source-list、全局排序、
+permutation、group offsets 和第二份 device-batch-item 数组。Host planning 从
+`O(transform_items log transform_items)` 变为 `O(batch_images + selected_rowgroups)`。
+
+#### 2.1.3 Reader 和 compact representation
+
+在 `galp/src/jpeg/jpeg_dct.cpp`、`galp/include/galp/jpeg_dct.hpp` 中完成：
+
+- reader open 时把既有 image-major v2 metadata 编译为 `16 B/image` locator；
+- 对验证过的 uniform shard ranges 使用公式计算 shard，不保存全量 shard index；不规则 ranges 才使用
+  compact `uint16_t/image` fallback；
+- 每 shard 使用 32-byte descriptor，相同 image layout 只保存一份 64-byte interned layout；
+- quantization table 按值去重并常驻 reader；
+- `plan_device_batch` 的 canonical path 每图只创建一个 `JpegDctDevicePlanlessImageDescriptor`；
+- transformed production path 直接绕过 exact-batch plan cache，并停用 decoded-rowgroup cache；legacy 路径仅作为
+  显式 A/B diagnostic 保留；
+- selected image rowgroup 作为当前 FLS 的最小物理读取/解码原子，避免为了 crop 再创建无法减少物理读取量的
+  per-vector source list。
+
+canonical 50K reader-resident compact structures 的实测总量为 `800,544 B`：locator `800,000 B`、
+derived shard index `0 B`、7 个 shard descriptors `224 B`、layout `64 B`、quant dictionary `256 B`。
+磁盘格式、coefficient payload 和持久化文件均未改变。
+
+#### 2.1.4 GPU mapping 与变换
+
+在 `galp/src/jpeg/jpeg_dct_device.cu/.cuh` 中新增
+`transformed_dct_grid_planless_kernel` 和 `project_planless_transformed_dct_grid_batch`：
+
+- 一个 CUDA block 独占一个 output DCT block，不需要 atomic、全局 sort 或 group schedule；
+- 从 output `(component, x, y)` 和 descriptor 中直接推导 bounded source stencil；
+- 支持 raster、tiled-raster-32、Morton/Z-order 和 tiled-Z-32 的 physical-row 公式；
+- 在同一 kernel 内完成 source mapping、coefficient load、dequantize、identity/down2 或 rational transform；
+- identity/down2 保留 RGBNoMore 原有 FP32 operation graph；一般约分关系支持 `up/down <= 64`，每个轴只存
+  `up + down - 1` 个共享 8x8 phase matrices，不按绝对 output position 展开矩阵；
+- grayscale、4:4:4、4:2:0、variable shape、cross-shard 和 shuffled request order 使用同一 compact path；
+- canonical batch 保持一个 logical workset、一个 decode launch 和一个 internal synchronization；
+- 后续把 block size 从 256 改为 64 threads，每个 lane 循环装载最多四个 canonical down2 source
+  coefficients；实测 fixed-transform p50 从 `1.601024 ms` 降到 `1.183744 ms`。
+
+Mapping 已融合进 fixed-transform kernel，因此单独的 `device_mapping_ms=0`，并由
+`device_mapping_fused=true` 证明；mapping instructions 的时间包含在 fixed-transform 事件中，而不是被漏记。
+
+#### 2.1.5 C++/Torch API、生命周期和内存计数
+
+在 `galp/include/galp/direct_dct.hpp`、`galp/src/api/direct_dct.cpp`、
+`galp/torch/direct_dct_torch.cpp` 和 `galp/src/cuda/memory/device_pool.cuh` 中完成：
+
+- 复用已有 `y_tensor_async()`、`cbcr_tensor_async()` 和 `record_stream()` 生命周期接口，让 planless kernel 直接
+  写入并返回 native output-owned Y/CbCr CUDA grid，不增加 host 中间 transform tensor；
+- 为 `plan_batch/read_batch/prefetch_batch/read_batch_async` 增加 `enable_planless_execution` diagnostic A/B 开关，
+  production 默认 `true`，`false` 只用于 legacy 对照；
+- 新增 `RowgroupStorageBytes()` C++/Python diagnostic API，以真实 FLS record bytes 验证实际读取量；
+- 扩展 Python plan preview 和 execution stats，暴露 compact representation、结构计数和各阶段 timing；
+- native device pool 增加 in-use、peak、cached、allocation requests、实际 `cudaMalloc` 次数/字节计数，避免只看
+  Torch allocator 而漏掉 GALP 自有 CUDA 内存。
+
+新增的关键证明计数包括：
+
+```text
+host_expanded_transform_items_created
+host_output_block_source_lists_created
+host_global_transform_sort_items
+planless_image_descriptor_count
+planless_transform_output_block_count
+planless_axis_program_count / phase_matrix_count / bytes
+rowgroup_storage_bytes_read
+device_mapping_fused / device_mapping_ms
+exact_batch_plan_cache_enabled_batches
+decoded_rowgroup_cache_enabled_batches
+galp_native_device_* allocation counters
+```
+
+#### 2.1.6 Benchmark、审计和 validator
+
+在 `galp/benchmarks/system_rgbnomore/` 中完成：
+
+- 新增 `diagnostics/benchmark_planless_planning.py`：分别测 1K/50K、sequential/shuffled、5 repeats，并硬门控
+  median、p95、顺序差异和规模差异；
+- 新增 `diagnostics/audit_planless_storage_io.py`：统计 raw/compressed/index/persistent bytes、execution metadata、
+  sequential/shuffled 实际 read amplification，并读取每个 repeat 的 native I/O counter；
+- `run.py` 增加固定 50K 合同、tracked-clean runtime source hash、native binary fingerprint、四 pipeline 同轮运行
+  和每 pipeline 前后 CPU/GPU/memory/block-I/O snapshot；
+- `pipeline.py` 增加 `galp_legacy` controlled A/B、native per-batch stage distributions、主进程 VmRSS/VmHWM、完整
+  50K compact prediction trace；
+- `validate.py` 强制 planless/legacy 结构计数、cache-off、one-workset/decode/sync、planning/mapping gates、完整
+  prediction agreement、sampled input/logit 数值一致性、CV/hot-min/hot-median gates；
+- `direct_dct.py` 将 `(x + 1024) / 2040 * 2 - 1` 化简为 fresh FP32 tensor 上的
+  `add_(4).mul_(1/1020)`，每批最低 tensor traffic 从 `136.377 MiB` 降到 `78.955 MiB`；
+- `validate_pushdown.py` 同步检查 compact structural counters 和 native allocation/read counters。
+
+#### 2.1.7 测试修改
+
+`galp/tests/jpeg_dct_test.cpp` 新增三类核心测试：
+
+- `CanonicalImageMajorFixedGridUsesCompactPlanlessDescriptors`：跨 shard canonical batch、零 expanded objects、
+  cache bypass；
+- `PlanlessRationalProgramsCoverSamplingShapesShardsAndSpatialOrders`：variable shapes、四种 spatial orders、
+  grayscale/4:4:4/4:2:0、7/5 与 3/2 rational relations、shuffled requests；
+- `PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix`：目标 GPU 上逐元素比较 planless 与 legacy int16 Y/CbCr
+  输出，并检查 one-workset/decode/sync。
+
+`galp/tests/test_system_benchmark.py` 增加 contract/validator、repeat-schema I/O counter parser 和 FP32 原地范围映射
+等回归测试。最终本地验证包括 23 个 Python tests、相关 CTest、CPU structural gtests 和目标 GPU 通用性矩阵。
 
 硬件由 canonical pipeline 记录为 NVIDIA GeForce RTX 4090，compute capability 8.9，显存
 `25,252,724,736` bytes。NVIDIA 公布的 RTX 4090 nominal shader FP32 峰值约为 `83 TFLOP/s`；
@@ -401,8 +557,9 @@ required - fixed model-only      = 79.446 img/s = 1.508% of target
 ```
 
 任何合法 Direct-DCT 端到端路径还必须执行正成本的读取、workset、解码、变换和输入生成，因此不能超过该
-model-only bound。改变编译模式、模型、checkpoint、precision、batch 或 cache 才可能改变界限，但这些会破坏
-固定合同，不能用作本阶段的性能证明。
+model-only bound。优化模型 operator graph/执行后端、降低 precision，或改变 batch/model architecture 可以建立
+一个不同的新上限，但这些会改变固定合同；同形状稠密 checkpoint 的单独替换一般不会改变吞吐上限。无论采用
+哪种新合同，都必须让 GALP 与 DALI 使用等价设置并重新测量，不能只优化分子。
 
 除被数学上界否定的两项相对吞吐 gate 外，correctness、通用性、结构、存储、metadata、实际 I/O amplification、
 planning、mapping/fixed-transform 和 CV gate 均已有文件化证据通过。原失败保持可见，没有被静默放宽。
@@ -432,3 +589,41 @@ planning、mapping/fixed-transform 和 CV gate 均已有文件化证据通过。
 两个 FastLanes contract 都记录 `benchmark_source_clean=true`、`git_tracked_dirty=false`。仓库中仅有用户原有的
 `.cache/` 和 `galp/examples/image_order_benchmark/res` 两个未跟踪目录，它们未进入 benchmark runtime source，
 也没有被本阶段修改或删除。
+
+## 13. “改变模型实现、编译模式、精度或 checkpoint”的确切含义
+
+`5188.818 img/s` 是条件上界：它测量的是当前 DCT ViT-Ti checkpoint、FP32、PyTorch eager operator graph、
+batch 50 和当前 CUDA/PyTorch 栈。下面这些改变会有不同影响：
+
+| 改变 | 例子 | 为什么可能改变上限 | 是否仍是当前合同 |
+|---|---|---|---|
+| 模型算子实现 | 融合 QKV/MLP、fused LayerNorm、FlashAttention、手写 Triton/CUDA kernel | 减少 kernel launch、global-memory round trip 或提高 GEMM 利用率 | 否，需建立新实现合同 |
+| 编译/执行模式 | `torch.compile`/Inductor、TensorRT、CUDA Graph | 融合 eager operators、消除 Python/dispatcher 开销、固定 graph launch | 否，必须两侧同等启用并重测 |
+| 数值精度 | FP32 改为 TF32、FP16、BF16、INT8 | 减少数据字节并使用 Tensor Core，但数值误差和可用 kernel 改变 | 否，需重新定义 correctness tolerance |
+| 模型结构 | depth/width/token 数、attention/MLP 结构、patch embedding | 直接改变参数量、FLOPs 和 activation traffic | 否，已经是另一个模型 |
+| checkpoint，仅权重值变化 | 同一稠密 ViT-Ti 的另一组 FP32 weights | shape、operator graph、FLOPs 和内存量不变，通常吞吐几乎不变 | 性能近似不变，但 accuracy/语义合同失效 |
+| checkpoint 携带执行结构变化 | pruning、2:4 sparsity、量化权重、蒸馏后小模型 | 只有执行后端真正利用稀疏/量化/小结构时，计算和流量才减少 | 否，本质上同时改了结构或精度 |
+
+因此原句不是说“随便换一个 checkpoint 就能通过”。更准确的判定是：
+
+```text
+只换同结构 dense FP32 weights：t_model 基本不变，5188.818 img/s 上界基本不变；
+换执行图/后端/precision/architecture：t_model 必须重新测量，旧上界作废；
+只给 GALP 启用优化而 DALI 不启用：不是公平的 Direct-DCT vs DALI 证据。
+```
+
+当前比较本来就使用 input-domain-specific checkpoints：GALP/RGBNoMore 使用 DCT checkpoint，DALI 使用 RGB
+checkpoint，两者不是同一组权重。所谓公平重测不是强行使用同一 checkpoint bytes，而是在实验前固定同一模型
+规模/recipe family、precision 和执行后端，以及各自预先声明的 domain checkpoint，不能看完结果后只替换其中
+一侧。对于相同 shape 的 dense checkpoint，性能边界基本不变，变化的主要是 accuracy 和语义基线。
+
+要让原 `1.10×` gate 从数学上“可能”，新模型前向首先必须满足：
+
+```text
+t_model < 50 / (1.10 × 4789.330) = 9.490794 ms/batch
+```
+
+这只是必要条件，不是充分条件，因为端到端还存在正成本的非重叠读取、变换和提交。当前无争用端到端为
+`11.895668 ms/batch`，距离目标 `9.490794 ms/batch` 需要再减少 `2.404874 ms/batch`（`20.22%`）。如果新的
+模型/编译方案同时改变 DALI 吞吐，右侧目标也必须使用新的同轮 DALI median 重新计算，不能继续使用
+`4789.330 img/s` 这个旧分母。
