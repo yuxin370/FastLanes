@@ -801,6 +801,13 @@ def run_pipeline(name: str, contract_path: Path, output: Path) -> dict[str, Any]
                 if key.startswith("galp_native_device_") or key in {
                     "planless_transform_max_blocks_per_launch",
                     "planless_transform_max_output_blocks_per_launch",
+                    "planless_transform_registers_per_thread",
+                    "planless_transform_static_shared_bytes_per_cta",
+                    "planless_transform_local_bytes_per_thread",
+                    "planless_transform_threads_per_cta",
+                    "planless_transform_max_active_ctas_per_sm",
+                    "cuda_max_threads_per_sm",
+                    "cuda_warp_size",
                 }:
                     native_counters[key] = max(native_counters.get(key, 0), int(value))
                 elif key in {

@@ -573,6 +573,13 @@ struct JpegDctDeviceScratch {
 	bool                                                                   direct_dct_low_priority_streams     = false;
 	size_t                                                                 transform_blocks_per_launch         = 0;
 	size_t                                                                 transform_ctas_per_launch           = 0;
+	bool                                                                   planless_transform_resources_ready  = false;
+	size_t                                                                 planless_transform_registers_per_thread = 0;
+	size_t                                                                 planless_transform_static_shared_bytes_per_cta = 0;
+	size_t                                                                 planless_transform_local_bytes_per_thread = 0;
+	size_t                                                                 planless_transform_max_active_ctas_per_sm = 0;
+	size_t                                                                 cuda_max_threads_per_sm             = 0;
+	size_t                                                                 cuda_warp_size                      = 0;
 	std::list<std::string>                                                 fls_reader_lru;
 	struct CachedFlsReaderEntry {
 		std::shared_ptr<galp::format::FlsReader> reader;
@@ -687,6 +694,7 @@ JpegDctDeviceScratchPtr make_jpeg_dct_device_scratch() {
 
 namespace {
 
+constexpr unsigned kPlanlessTransformThreadsPerCta        = 64U;
 constexpr unsigned kLimitedPlanlessTransformCtasPerLaunch = 64U;
 
 struct FixedTransformPlanView {
@@ -1198,6 +1206,40 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 	}
 }
 
+void record_planless_transform_resources(JpegDctDeviceScratch& scratch, JpegDctDeviceExecutionStats& stats) {
+	if (!scratch.planless_transform_resources_ready) {
+		cudaFuncAttributes attributes {};
+		CUDA_SAFE_CALL(cudaFuncGetAttributes(&attributes, transformed_dct_grid_planless_kernel));
+		int max_active_ctas_per_sm = 0;
+		CUDA_SAFE_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+		    &max_active_ctas_per_sm, transformed_dct_grid_planless_kernel, kPlanlessTransformThreadsPerCta, 0));
+		int device = 0;
+		int max_threads_per_sm = 0;
+		int warp_size = 0;
+		CUDA_SAFE_CALL(cudaGetDevice(&device));
+		CUDA_SAFE_CALL(cudaDeviceGetAttribute(&max_threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device));
+		CUDA_SAFE_CALL(cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, device));
+		if (attributes.numRegs <= 0 || max_active_ctas_per_sm <= 0 || max_threads_per_sm <= 0 || warp_size <= 0) {
+			throw std::runtime_error("invalid CUDA planless transform kernel resource attributes");
+		}
+		scratch.planless_transform_registers_per_thread = static_cast<size_t>(attributes.numRegs);
+		scratch.planless_transform_static_shared_bytes_per_cta = attributes.sharedSizeBytes;
+		scratch.planless_transform_local_bytes_per_thread = attributes.localSizeBytes;
+		scratch.planless_transform_max_active_ctas_per_sm = static_cast<size_t>(max_active_ctas_per_sm);
+		scratch.cuda_max_threads_per_sm = static_cast<size_t>(max_threads_per_sm);
+		scratch.cuda_warp_size = static_cast<size_t>(warp_size);
+		scratch.planless_transform_resources_ready = true;
+	}
+	stats.planless_transform_registers_per_thread = scratch.planless_transform_registers_per_thread;
+	stats.planless_transform_static_shared_bytes_per_cta =
+	    scratch.planless_transform_static_shared_bytes_per_cta;
+	stats.planless_transform_local_bytes_per_thread = scratch.planless_transform_local_bytes_per_thread;
+	stats.planless_transform_threads_per_cta = kPlanlessTransformThreadsPerCta;
+	stats.planless_transform_max_active_ctas_per_sm = scratch.planless_transform_max_active_ctas_per_sm;
+	stats.cuda_max_threads_per_sm = scratch.cuda_max_threads_per_sm;
+	stats.cuda_warp_size = scratch.cuda_warp_size;
+}
+
 __global__ void transformed_dct_grid_sources_kernel(const DeviceCoeffBinding* __restrict column_bindings,
                                                     const JpegDctDeviceFixedTransformBatchItem* __restrict items,
                                                     const size_t item_count,
@@ -1701,6 +1743,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	if (images.empty()) {
 		return;
 	}
+	record_planless_transform_resources(scratch, stats);
 	const uint64_t blocks_per_image =
 	    static_cast<uint64_t>(transform.y_output_width_blocks) * transform.y_output_height_blocks +
 	    2U * static_cast<uint64_t>(transform.cbcr_output_width_blocks) * transform.cbcr_output_height_blocks;
@@ -1722,7 +1765,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
             transform_blocks_per_launch == 0
                 ? launch_output_blocks
                 : std::min<uint64_t>(launch_output_blocks, limited_cta_limit));
-		transformed_dct_grid_planless_kernel<<<dim3(launch_ctas), dim3(64U), 0, stream>>>(
+		transformed_dct_grid_planless_kernel<<<dim3(launch_ctas), dim3(kPlanlessTransformThreadsPerCta), 0, stream>>>(
 		    scratch.column_bindings.data,
 		    scratch.planless_image_descriptors.data,
 		    images.size(),

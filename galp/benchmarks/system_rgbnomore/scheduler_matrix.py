@@ -19,6 +19,15 @@ import numpy as np
 
 
 HERE = Path(__file__).resolve().parent
+PLANLESS_RESOURCE_COUNTERS = (
+    "planless_transform_registers_per_thread",
+    "planless_transform_static_shared_bytes_per_cta",
+    "planless_transform_local_bytes_per_thread",
+    "planless_transform_threads_per_cta",
+    "planless_transform_max_active_ctas_per_sm",
+    "cuda_max_threads_per_sm",
+    "cuda_warp_size",
+)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -124,6 +133,38 @@ def _policy_specs(limited_candidates: list[tuple[int, int]]) -> list[tuple[str, 
     return specs
 
 
+def _residency_bounds(
+    *,
+    submitted_ctas: int,
+    sm_count: int,
+    max_active_ctas_per_sm: int,
+    threads_per_cta: int,
+    max_threads_per_sm: int,
+) -> dict[str, float | int]:
+    values = (
+        submitted_ctas,
+        sm_count,
+        max_active_ctas_per_sm,
+        threads_per_cta,
+        max_threads_per_sm,
+    )
+    if any(value <= 0 for value in values):
+        raise ValueError("kernel residency inputs must be positive")
+    device_cta_capacity = sm_count * max_active_ctas_per_sm
+    resident_ctas = min(submitted_ctas, device_cta_capacity)
+    resident_threads = resident_ctas * threads_per_cta
+    return {
+        "submitted_ctas_per_launch": submitted_ctas,
+        "device_resident_cta_capacity": device_cta_capacity,
+        "max_resident_ctas_per_launch": resident_ctas,
+        "average_resident_ctas_per_sm_upper_bound": resident_ctas / sm_count,
+        "sm_coverage_fraction_upper_bound": min(1.0, resident_ctas / sm_count),
+        "resident_cta_capacity_fraction_upper_bound": resident_ctas / device_cta_capacity,
+        "thread_occupancy_fraction_upper_bound": resident_threads
+        / (sm_count * max_threads_per_sm),
+    }
+
+
 def _pareto_frontier(
     policy_summaries: dict[str, dict[str, Any]], policy_labels: list[str]
 ) -> list[str]:
@@ -223,6 +264,10 @@ def _summarize_policy(contract: dict[str, Any], result: dict[str, Any]) -> dict[
         "direct_dct_round_stream_priority": _invariant_counter(repeats, "direct_dct_round_stream_priority"),
         "cuda_least_stream_priority": _invariant_counter(repeats, "cuda_least_stream_priority"),
         "cuda_greatest_stream_priority": _invariant_counter(repeats, "cuda_greatest_stream_priority"),
+        **{
+            key: _invariant_counter(repeats, key)
+            for key in PLANLESS_RESOURCE_COUNTERS
+        },
     }
 
 
@@ -400,6 +445,30 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     }
     device = result_payloads[limited_labels[0]]["device_metadata"]
     sm_count = int(device.get("multi_processor_count", 0))
+    if sm_count <= 0:
+        raise RuntimeError(f"invalid CUDA multiprocessor count: {sm_count}")
+    resource_reference = {
+        key: int(policy_summaries["fully-overlapped"][key])
+        for key in PLANLESS_RESOURCE_COUNTERS
+    }
+    required_positive_resources = (
+        "planless_transform_registers_per_thread",
+        "planless_transform_threads_per_cta",
+        "planless_transform_max_active_ctas_per_sm",
+        "cuda_max_threads_per_sm",
+        "cuda_warp_size",
+    )
+    if any(resource_reference[key] <= 0 for key in required_positive_resources):
+        raise RuntimeError(f"invalid planless transform resource counters: {resource_reference}")
+    for policy_label, summary in policy_summaries.items():
+        actual_resources = {
+            key: int(summary[key]) for key in PLANLESS_RESOURCE_COUNTERS
+        }
+        if actual_resources != resource_reference:
+            raise RuntimeError(
+                f"planless transform resources changed for {policy_label}: "
+                f"actual={actual_resources} expected={resource_reference}"
+            )
     measurement_batches = int(base_contract["execution"]["measurement_batches"])
     for policy_label, summary in policy_summaries.items():
         policy = str(summary["scheduling_policy"])
@@ -499,7 +568,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     pareto_frontier_limited_policies = _pareto_frontier(policy_summaries, limited_labels)
 
     result = {
-        "schema_version": "galp_scheduler_matrix_v2",
+        "schema_version": "galp_scheduler_matrix_v3",
         "base_contract": str(args.contract.resolve()),
         "binding": str(binding_candidates[0].resolve()),
         "binding_sha256": _sha256(binding_candidates[0]),
@@ -508,6 +577,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         "semantic_bit_exact_across_policies": True,
         "priority_isolation_verified_across_policies": True,
         "structural_scheduler_counters_verified_across_policies": True,
+        "kernel_resource_limits_verified_across_policies": True,
         "comparison": {
             "model_only_ceiling_images_per_s_from_serial_p50": model_only_ceiling,
             "dali_reference_throughput_images_per_s": dali_throughput,
@@ -527,14 +597,23 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
             "transform_output_blocks_per_image": blocks_per_image,
             "transform_output_blocks_per_batch": output_blocks,
             "device_sm_count": sm_count,
+            "kernel_resources": resource_reference,
             "limited_candidates": {
                 f"o{blocks}-c{ctas}": {
                     "configured_output_blocks_per_launch": blocks,
                     "ctas_per_launch": min(ctas, blocks),
                     "output_blocks_per_cta_upper_bound": math.ceil(blocks / min(ctas, blocks)),
                     "launches_per_batch_theoretical": limited_launches[blocks],
-                    "max_resident_block_fraction_upper_bound": (
-                        min(1.0, min(ctas, blocks) / sm_count) if sm_count > 0 else None
+                    **_residency_bounds(
+                        submitted_ctas=min(ctas, blocks),
+                        sm_count=sm_count,
+                        max_active_ctas_per_sm=resource_reference[
+                            "planless_transform_max_active_ctas_per_sm"
+                        ],
+                        threads_per_cta=resource_reference[
+                            "planless_transform_threads_per_cta"
+                        ],
+                        max_threads_per_sm=resource_reference["cuda_max_threads_per_sm"],
                     ),
                 }
                 for blocks, ctas in limited_candidates
@@ -542,7 +621,8 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
             "interpretation": (
                 "Each 64-thread transform CTA processes one or more 8x8 DCT output blocks by grid stride. "
                 "The output limit determines launch count as ceil(output_blocks/output_limit), while the "
-                "independent CTA cap bounds simultaneously eligible low-priority work; together they trade "
+                "independent CTA cap bounds submitted low-priority work. CUDA Runtime kernel attributes and "
+                "occupancy APIs bound actual resident CTAs and thread occupancy; together these values trade "
                 "transform progress and launch overhead against model isolation."
             ),
         },

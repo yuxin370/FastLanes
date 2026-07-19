@@ -50,6 +50,7 @@ from scheduler_matrix import (  # noqa: E402
     _normalize_transform_blocks,
     _pareto_frontier,
     _policy_specs,
+    _residency_bounds,
 )
 from validate import _aggregate_pipeline, _evaluate_performance_gates, _semantic_compare  # noqa: E402
 
@@ -102,6 +103,33 @@ class SystemBenchmarkTest(unittest.TestCase):
             },
         }
         self.assertEqual(_pareto_frontier(summaries, ["a", "b", "dominated"]), ["a", "b"])
+
+    def test_scheduler_matrix_computes_resource_limited_residency(self) -> None:
+        one_cta_per_sm = _residency_bounds(
+            submitted_ctas=128,
+            sm_count=128,
+            max_active_ctas_per_sm=10,
+            threads_per_cta=64,
+            max_threads_per_sm=1536,
+        )
+        self.assertEqual(one_cta_per_sm["max_resident_ctas_per_launch"], 128)
+        self.assertEqual(one_cta_per_sm["average_resident_ctas_per_sm_upper_bound"], 1.0)
+        self.assertEqual(one_cta_per_sm["sm_coverage_fraction_upper_bound"], 1.0)
+        self.assertAlmostEqual(
+            one_cta_per_sm["thread_occupancy_fraction_upper_bound"], 1.0 / 24.0
+        )
+        saturated = _residency_bounds(
+            submitted_ctas=2048,
+            sm_count=128,
+            max_active_ctas_per_sm=10,
+            threads_per_cta=64,
+            max_threads_per_sm=1536,
+        )
+        self.assertEqual(saturated["max_resident_ctas_per_launch"], 1280)
+        self.assertEqual(saturated["resident_cta_capacity_fraction_upper_bound"], 1.0)
+        self.assertAlmostEqual(
+            saturated["thread_occupancy_fraction_upper_bound"], 10.0 / 24.0
+        )
 
     def test_scheduler_matrix_requires_invariant_native_priority_counters(self) -> None:
         repeats = [

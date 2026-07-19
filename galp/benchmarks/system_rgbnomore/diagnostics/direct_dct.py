@@ -668,6 +668,16 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
         int(totals["planless_transform_max_output_blocks_per_launch"]),
         int(stats.get("planless_transform_max_output_blocks_per_launch", 0)),
     )
+    for key in (
+        "planless_transform_registers_per_thread",
+        "planless_transform_static_shared_bytes_per_cta",
+        "planless_transform_local_bytes_per_thread",
+        "planless_transform_threads_per_cta",
+        "planless_transform_max_active_ctas_per_sm",
+        "cuda_max_threads_per_sm",
+        "cuda_warp_size",
+    ):
+        totals[key] = max(int(totals[key]), int(stats.get(key, 0)))
     totals["decode_to_transform_event_handoffs"] += int(
         stats.get("decode_to_transform_event_handoff_count", 0)
     )
@@ -765,6 +775,13 @@ def _empty_totals() -> dict[str, int | float]:
         "planless_transform_kernel_launches": 0,
         "planless_transform_max_blocks_per_launch": 0,
         "planless_transform_max_output_blocks_per_launch": 0,
+        "planless_transform_registers_per_thread": 0,
+        "planless_transform_static_shared_bytes_per_cta": 0,
+        "planless_transform_local_bytes_per_thread": 0,
+        "planless_transform_threads_per_cta": 0,
+        "planless_transform_max_active_ctas_per_sm": 0,
+        "cuda_max_threads_per_sm": 0,
+        "cuda_warp_size": 0,
         "decode_to_transform_event_handoffs": 0,
         "copy_to_decode_event_handoffs": 0,
         "direct_dct_low_priority_batches": 0,

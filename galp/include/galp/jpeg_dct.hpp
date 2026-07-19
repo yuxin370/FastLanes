@@ -548,6 +548,13 @@ struct JpegDctDeviceExecutionStats {
 	size_t      planless_transform_kernel_launch_count        = 0;
 	size_t      planless_transform_max_blocks_per_launch      = 0;
 	size_t      planless_transform_max_output_blocks_per_launch = 0;
+	size_t      planless_transform_registers_per_thread       = 0;
+	size_t      planless_transform_static_shared_bytes_per_cta = 0;
+	size_t      planless_transform_local_bytes_per_thread     = 0;
+	size_t      planless_transform_threads_per_cta            = 0;
+	size_t      planless_transform_max_active_ctas_per_sm     = 0;
+	size_t      cuda_max_threads_per_sm                       = 0;
+	size_t      cuda_warp_size                                = 0;
 	size_t      decode_to_transform_event_handoff_count       = 0;
 	size_t      copy_to_decode_event_handoff_count            = 0;
 	int         direct_dct_stream_priority                     = 0;

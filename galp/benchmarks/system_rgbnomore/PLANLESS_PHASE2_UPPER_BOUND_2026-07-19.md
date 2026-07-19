@@ -683,11 +683,11 @@ T_model_with_transform - T_model_only
 | `galp/src/engine/workset/model.cuh`、`streams.cu` | persistent H2D/compute/D2H workset stream 支持设备定义的 priority |
 | `galp/include/galp/jpeg_dct.hpp` | 新增三种 scheduling policy、独立 output-chunk/CTA-cap 配置与 stream/event/launch 统计 |
 | `galp/src/jpeg/jpeg_dct.cpp`、`jpeg_dct_device.cuh` | scheduling options 进入 plan 和 plan-cache key，并传到 device executor |
-| `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event、offset-aware output chunk、可配置 CTA cap 的 grid-stride planless kernel、低优先级 round/cache stream |
-| `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、output chunk、CTA cap、低优先级开关和新增 counters |
+| `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event、offset-aware output chunk、可配置 CTA cap 的 grid-stride planless kernel、低优先级 round/cache stream，并通过 CUDA Runtime 回读 kernel attributes/occupancy |
+| `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、output chunk、CTA cap、低优先级开关、stream/event counters 和 kernel resource counters |
 | `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用 PyTorch 运行时可用的 greatest-priority stream；serial 延迟下一批 prefetch |
 | `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略、输出 chunk 和 CTA cap；在找到满足吞吐 gate 的 limited 点前默认 fully-overlapped |
-| `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、成对 output/CTA limited sweep、serial，校验实际 priority/counters 并计算核心 delta 与 Pareto frontier |
+| `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、成对 output/CTA limited sweep、serial，校验实际 priority/counters/kernel resources，并计算核心 delta、真实 residency/occupancy 上限与 Pareto frontier |
 | `jpeg_dct_test.cpp` | 512-output/64-CTA grid-stride 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
 | `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
 
@@ -922,3 +922,46 @@ CTA cap 现已贯通 public options、plan-cache key、native executor、Torch b
 (4096,1024)、(8192,2048)`。新 binding 的 pybind 签名已确认包含 `transform_ctas_per_launch`，SHA-256 为
 `61b68bb43a0d7cfb570816c0850c02ecbf7dba768b4f56d420f911e1f5e699ff`；目标构建、Torch import、24 个
 Python 单测、`py_compile` 和 diff 检查均通过。
+
+### 14.8 kernel resource 与真实 occupancy 上限
+
+仅用 `CTA/SM` 只能回答一个 launch 是否有足够 blocks 覆盖全部 SM，不能回答同时可驻留多少 CTA 或 warp。
+为避免把“SM coverage”误写成“occupancy”，native executor 现通过 `cudaFuncGetAttributes` 记录寄存器、静态
+shared/local memory，通过 `cudaOccupancyMaxActiveBlocksPerMultiprocessor` 记录目标设备上每 SM 的最大 active CTA，
+并记录 `maxThreadsPerMultiProcessor` 和 warp size。矩阵要求这些值跨 repeat、跨三种策略完全不变，否则拒绝生成
+最终汇总。
+
+重新构建后，`cuobjdump --dump-resource-usage` 对 SM89 cubin 的实际结果为：
+
+```text
+REG:93  STACK:240  SHARED:2048  LOCAL:0  threads/CTA:64
+```
+
+RTX 4090 每 SM 有 65,536 个 32-bit registers；SM89 以每 warp 256-register 粒度分配。因而：
+
+```text
+registers/warp = ceil(93×32/256)×256 = 3,072
+registers/CTA  = 2 warps×3,072       = 6,144
+CTA/SM register bound = floor(65,536/6,144) = 10
+thread occupancy bound = 10×64/1,536 = 41.67%
+```
+
+`2,048 B/CTA` static shared memory、24 blocks/SM 和 48 warps/SM 都比 10-CTA register bound 更宽松；
+`STACK:240` 不进入 resident register 数，但可能形成额外 local-memory stack traffic。最终 JSON 仍以目标 GPU 上
+CUDA occupancy API 的实际回读值为准，而不是只相信手工推导。
+
+若 runtime 回读同样为 10 CTA/SM，则下一轮候选的最大驻留上界为：
+
+| output/launch | submitted CTA | max resident CTA/device | 平均 resident CTA/SM | thread occupancy 上界 | launch/batch |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 128 | 128 | 1 | 4.17% | 115 |
+| 1,024 | 256 | 256 | 2 | 8.33% | 58 |
+| 2,048 | 512 | 512 | 4 | 16.67% | 29 |
+| 4,096 | 1,024 | 1,024 | 8 | 33.33% | 15 |
+| 8,192 | 2,048 | 1,280 | 10 | 41.67% | 8 |
+
+这五档不是任意取点：它们从每 SM 一个 CTA 扫到寄存器允许的饱和驻留，同时始终保持每 CTA 最多 4 个输出，
+所以 CTA 生命周期粒度近似固定。这样实测差异主要反映 resident concurrency，而不是把 CTA 时长、launch 数和
+并发度三者无控制地同时改变。包含 resource counters 的最新 Torch binding SHA-256 为
+`e8f5ae333e84a45bc22ee52c9803f7b56343f3f374b3cd5f7ae74acab63170f3`；CUDA/C++ 构建、Torch import CTest、
+25 个 Python 单测、`py_compile` 和 diff 检查均已通过。
