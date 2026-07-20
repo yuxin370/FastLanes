@@ -43,7 +43,13 @@ from pipeline import (  # noqa: E402
     _resolve_model_stream_priority,
 )
 from prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
-from run import E2E_MAX_HOT_THROUGHPUT_CV, E2E_PIPELINES, GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, PRESETS  # noqa: E402
+from run import (  # noqa: E402
+    E2E_MAX_HOT_THROUGHPUT_CV,
+    E2E_PIPELINES,
+    GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO,
+    PRESETS,
+    _parse_args as _parse_run_args,
+)
 from scheduler_matrix import (  # noqa: E402
     _invariant_counter,
     _normalize_limited_candidates,
@@ -56,6 +62,15 @@ from validate import _aggregate_pipeline, _evaluate_performance_gates, _semantic
 
 
 class SystemBenchmarkTest(unittest.TestCase):
+    def test_measured_limited_overlap_is_the_production_default(self) -> None:
+        with mock.patch.object(
+            sys, "argv", ["run.py", "--output-dir", "/tmp/galp-default-contract-test"]
+        ):
+            args = _parse_run_args()
+        self.assertEqual(args.galp_scheduling_policy, "limited-overlap")
+        self.assertEqual(args.galp_transform_blocks_per_launch, 512)
+        self.assertEqual(args.galp_transform_ctas_per_launch, 512)
+
     def test_model_stream_priority_resolves_framework_range(self) -> None:
         self.assertEqual(_resolve_model_stream_priority("greatest", (0, -3)), -3)
         self.assertEqual(_resolve_model_stream_priority("least", (0, -3)), 0)

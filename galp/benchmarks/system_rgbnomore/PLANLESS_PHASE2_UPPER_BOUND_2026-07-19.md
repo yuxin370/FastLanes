@@ -686,7 +686,7 @@ T_model_with_transform - T_model_only
 | `galp/src/jpeg/jpeg_dct_device.cu` | 独立低优先级 transform stream、decode→transform event、offset-aware output chunk、可配置 CTA cap 的 grid-stride planless kernel、低优先级 round/cache stream，并通过 CUDA Runtime 回读 kernel attributes/occupancy |
 | `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、output chunk、CTA cap、低优先级开关、stream/event counters 和 kernel resource counters |
 | `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用 PyTorch 运行时可用的 greatest-priority stream；serial 延迟下一批 prefetch |
-| `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略、输出 chunk 和 CTA cap；在找到满足吞吐 gate 的 limited 点前默认 fully-overlapped |
+| `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略、输出 chunk 和 CTA cap；最终生产默认值为实测通过 gate 的 limited-overlap 512 outputs/512 CTA |
 | `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、成对 output/CTA limited sweep、serial，校验实际 priority/counters/kernel resources，并计算核心 delta、真实 residency/occupancy 上限与 Pareto frontier |
 | `jpeg_dct_test.cpp` | 512-output/64-CTA grid-stride 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
 | `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
@@ -1019,3 +1019,42 @@ CUDA_VISIBLE_DEVICES=0 \
 block；第五个 reference 仍是 8 launches、每 CTA 最多 4 outputs。最终只比较本轮内部的 model extra 和
 throughput gate：若 single-output 候选不能在保留 98% 吞吐的同时优于同轮 `8192/2048` reference，则后者就是
 固定模型/FP32/eager 合同下的已测调度上限；若能，则选择本轮 eligible 点中最低 model-extra 的配置。
+
+### 14.10 CTA-lifetime 最终矩阵与生产配置
+
+完整结果目录为 `/tmp/galp-planless-scheduler-cta-lifetime`，v3 汇总 SHA-256 为
+`dcc703855852287aadb259664d3cedf27a2a9b1de8f30c607ca8a8110a27ad02`，binding 仍为
+`e8f5ae333e84a45bc22ee52c9803f7b56343f3f374b3cd5f7ae74acab63170f3`。六种调度配置加 serial 的
+semantic bit-exact、priority isolation、structural counters、kernel resources 四类硬 gate 全部通过，Top-1/Top-5
+均为 `0.75140/0.92446`；派生 contract canonical hash、semantic artifact hash 和 binding hash 独立复核通过。
+排除 repeat 0 后，所有策略吞吐 CV 为 `0.17%–4.00%`，低于合同 `5%` 上限；最终候选自身为 `1.30%`。
+
+| 策略 | output/launch | CTA/launch | outputs/CTA | CTA/SM 上界 | 吞吐 img/s | fully 吞吐保留 | model extra p50 ms | transform p50 ms | E2E p50 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fully-overlapped | 58,800 | 58,800 | 1 | 10 | 4503.939 | 100% | 0.552240 | 2.025216 | 11.078252 |
+| limited | 256 | 256 | 1 | 2 | 4247.505 | 94.31% | **0.262032** | 4.825856 | 11.741728 |
+| limited | **512** | **512** | **1** | **4** | **4477.204** | **99.41%** | **0.452616** | 4.458496 | 11.127098 |
+| limited | 1,024 | 1,024 | 1 | 8 | 4505.022 | 100.02% | 0.554536 | 2.879488 | 11.086084 |
+| limited | 2,048 | 2,048 | 1 | 10 | 4444.313 | 98.68% | 0.645952 | 2.528256 | 11.237283 |
+| limited reference | 8,192 | 2,048 | 4 | 10 | 4509.202 | 100.12% | 0.507272 | **1.455104** | **11.073438** |
+| serial | 58,800 | 58,800 | 1 | 10 | 2733.796 | 60.70% | 0 | 0.809472 | 18.070795 |
+
+256/256 虽把 model extra 降到 `0.262032 ms`，但只保留 `94.31%` fully 吞吐，违反显式 98% gate。
+512/512 是所有 eligible 点中 model extra 最低者：相对同轮 fully 的 `0.552240 ms` 减少 `0.099624 ms`
+（`18.04%`），相对同轮 8192/2048 reference 的 `0.507272 ms` 减少 `0.054656 ms`（`10.77%`），相对最初
+`0.766317 ms` 减少 `0.313701 ms`（`40.94%`）。其吞吐为 fully 的 `99.41%`、reference 的 `99.29%`，因此
+在“先满足整体吞吐、再最小化 model extra”的规则下，矩阵正确推荐 `limited-overlap-o512-c512`。
+
+最终点达到同轮 DALI `4839.499 img/s` 的 `92.51%`，仍差 `362.295 img/s`（`7.49%`）；E2E 比 fully
+增加 `0.048847 ms/batch`。8192/2048 的 E2E 和 DALI 比例略好，但核心 model-extra 更高，不能在已声明的
+主指标下取代 512/512。single-output 结果同时解释了边界：2 CTA/SM 对模型隔离最好但 transform 前进不足；
+4 CTA/SM 是第一个满足吞吐 gate 的点；8–10 CTA/SM 持续资源竞争使 model extra 回升，而增加 CTA 数不再改善
+主指标。故 512 outputs/512 CTA、每 CTA 一个 output 是固定模型/FP32/eager/RTX 4090 合同下的实测调度上限。
+
+生产 CLI 默认值现设为：
+
+```text
+--galp-scheduling-policy limited-overlap
+--galp-transform-blocks-per-launch 512
+--galp-transform-ctas-per-launch 512
+```
