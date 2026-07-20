@@ -35,7 +35,7 @@ TORCH_SOURCE_DIR = REPO_ROOT / "galp/torch"
 if str(TORCH_SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(TORCH_SOURCE_DIR))
 
-from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
 
 
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
@@ -436,8 +436,20 @@ def adapt_galp_batch_to_rgbnomore(
 
     input_y = batch.y
     input_cbcr = batch.cbcr
-    if input_y.dtype != torch.int16 or input_cbcr.dtype != torch.int16:
-        raise RuntimeError(f"expected int16 GALP DCT grids, got y={input_y.dtype} cbcr={input_cbcr.dtype}")
+    if input_y.dtype != input_cbcr.dtype or input_y.dtype not in (torch.int16, torch.float32):
+        raise RuntimeError(
+            "expected matching int16 or float32 GALP DCT grids, "
+            f"got y={input_y.dtype} cbcr={input_cbcr.dtype}"
+        )
+
+    if input_y.dtype == torch.float32:
+        if preprocess != "rgbnomore-val-pushdown" or not dequantize or not scale:
+            raise RuntimeError(
+                "native float32 GALP grids are already dequantized, rounded, clamped, and range-mapped; "
+                "they are only valid for scaled rgbnomore-val-pushdown"
+            )
+        _validate_rgbnomore_shapes(input_y, input_cbcr, image_ids)
+        return input_y, input_cbcr
 
     y_float = input_y.to(torch.float32)
     cbcr_float = input_cbcr.to(torch.float32)
@@ -653,6 +665,15 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     totals["projection_items"] += int(stats["projection_item_count"])
     totals["decoded_projection_items"] += int(stats.get("decoded_projection_item_count", 0))
     totals["fixed_transform_items"] += int(stats.get("fixed_transform_item_count", 0))
+    totals["fixed_grid_finalize_kernel_launches"] += int(
+        stats.get("fixed_grid_finalize_kernel_launch_count", 0)
+    )
+    totals["fixed_grid_float32_output_batches"] += int(
+        bool(stats.get("fixed_grid_output_float32", False))
+    )
+    totals["fixed_grid_affine_applied_batches"] += int(
+        bool(stats.get("fixed_grid_output_affine_applied", False))
+    )
     # Planless execution submits one compact image descriptor and creates no
     # host-side transform items, source lists, or sort entries.
     totals["planless_image_descriptors"] += int(stats.get("planless_image_descriptor_count", 0))
@@ -770,6 +791,9 @@ def _empty_totals() -> dict[str, int | float]:
         "projection_items": 0,
         "decoded_projection_items": 0,
         "fixed_transform_items": 0,
+        "fixed_grid_finalize_kernel_launches": 0,
+        "fixed_grid_float32_output_batches": 0,
+        "fixed_grid_affine_applied_batches": 0,
         "planless_image_descriptors": 0,
         "planless_transform_output_blocks": 0,
         "planless_transform_kernel_launches": 0,
@@ -977,7 +1001,7 @@ def read_and_adapt_batch(
             None,
             args.cache_capacity_mib,
             layout="transformed_dct_grid",
-            grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
+            grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32,
             decode_batch_rowgroups=int(getattr(args, "decode_batch_rowgroups", 2)),
             rowgroup_prefetch_depth=int(getattr(args, "rowgroup_prefetch_depth", 16)),
             rowgroup_prefetch_workers=int(getattr(args, "rowgroup_prefetch_workers", 4)),
@@ -1036,7 +1060,7 @@ def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: l
         transform_ctas_per_launch=int(getattr(args, "transform_ctas_per_launch", 0)),
         use_low_priority_streams=bool(getattr(args, "use_low_priority_streams", False)),
         layout="transformed_dct_grid",
-        grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
+        grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32,
     )
 
 

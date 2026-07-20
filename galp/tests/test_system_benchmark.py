@@ -34,7 +34,11 @@ from common import (  # noqa: E402
     verify_file_fingerprint,
 )
 from diagnostics.audit_planless_storage_io import _counter_values  # noqa: E402
-from diagnostics.direct_dct import _make_benchmark_image_ids, _scale_to_rgbnomore_dct_range  # noqa: E402
+from diagnostics.direct_dct import (  # noqa: E402
+    _make_benchmark_image_ids,
+    _scale_to_rgbnomore_dct_range,
+    adapt_galp_batch_to_rgbnomore,
+)
 from manifest import build_manifest, collect_dataset, validate_galp_label_map  # noqa: E402
 from pipeline import (  # noqa: E402
     GalpAdapter,
@@ -163,6 +167,37 @@ class SystemBenchmarkTest(unittest.TestCase):
         torch.testing.assert_close(actual, reference, rtol=0.0, atol=torch.finfo(torch.float32).eps)
         self.assertEqual(float(actual[0]), -1.0)
         self.assertEqual(float(actual[-1]), 1.0)
+
+    def test_native_float32_direct_dct_adapter_is_zero_copy(self) -> None:
+        y = torch.randn((2, 1, 28, 28, 8, 8), dtype=torch.float32)
+        cbcr = torch.randn((2, 2, 14, 14, 8, 8), dtype=torch.float32)
+        batch = SimpleNamespace(
+            layout="transformed_dct_grid",
+            selected_coefficients=list(range(64)),
+            y=y,
+            cbcr=cbcr,
+        )
+        actual_y, actual_cbcr = adapt_galp_batch_to_rgbnomore(
+            object(),
+            batch,
+            [0, 1],
+            dequantize=True,
+            scale=True,
+            preprocess="rgbnomore-val-pushdown",
+            rgbnomore_dct_val_transform=None,
+        )
+        self.assertIs(actual_y, y)
+        self.assertIs(actual_cbcr, cbcr)
+        with self.assertRaisesRegex(RuntimeError, "already dequantized"):
+            adapt_galp_batch_to_rgbnomore(
+                object(),
+                batch,
+                [0, 1],
+                dequantize=True,
+                scale=False,
+                preprocess="rgbnomore-val-pushdown",
+                rgbnomore_dct_val_transform=None,
+            )
 
     def test_source_tree_cleanliness_is_scoped_to_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -619,6 +654,9 @@ class SystemBenchmarkTest(unittest.TestCase):
                 "projection_item_count": 0,
                 "decoded_projection_item_count": 0,
                 "project_decoded_ycbcr_grid_launch_count": 0,
+                "fixed_grid_output_float32": True,
+                "fixed_grid_output_affine_applied": True,
+                "fixed_grid_finalize_kernel_launch_count": 1,
             }
 
         class Module:
@@ -697,6 +735,9 @@ class SystemBenchmarkTest(unittest.TestCase):
                 "projection_item_count": 0,
                 "decoded_projection_item_count": 0,
                 "project_decoded_ycbcr_grid_launch_count": 0,
+                "fixed_grid_output_float32": True,
+                "fixed_grid_output_affine_applied": True,
+                "fixed_grid_finalize_kernel_launch_count": 1,
             }
 
         class Module:
@@ -766,6 +807,9 @@ class SystemBenchmarkTest(unittest.TestCase):
                 "host_global_transform_sort_items": 8,
                 "exact_batch_plan_cache_enabled": False,
                 "cache_enabled": False,
+                "fixed_grid_output_float32": True,
+                "fixed_grid_output_affine_applied": True,
+                "fixed_grid_finalize_kernel_launch_count": 1,
             }
 
         class Module:

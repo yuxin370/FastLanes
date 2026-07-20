@@ -8,7 +8,7 @@ import os
 import torch
 
 import _galp_direct_dct as galp_dct
-from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM, RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
 
 
 SKIP_RETURN_CODE = 77
@@ -52,6 +52,17 @@ def main() -> int:
         raise RuntimeError(f"unexpected transformed-grid CbCr shape: {tuple(fixed_plan['cbcr_shape'])}")
     if len(fixed_plan["selected_coefficients"]) != 64:
         raise RuntimeError("transformed-grid RGB-no-more profile must request all 64 coefficients")
+    fixed_float_plan = reader.plan_batch(
+        image_ids,
+        crop=None,
+        dct_coeffs="all",
+        layout="transformed_dct_grid",
+        grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32,
+    )
+    if tuple(fixed_float_plan["y_shape"]) != tuple(fixed_plan["y_shape"]):
+        raise RuntimeError("float32 transformed-grid plan changed the Y shape")
+    if tuple(fixed_float_plan["cbcr_shape"]) != tuple(fixed_plan["cbcr_shape"]):
+        raise RuntimeError("float32 transformed-grid plan changed the CbCr shape")
     try:
         reader.plan_batch(
             image_ids,

@@ -1180,6 +1180,71 @@ TEST(JpegDct, DirectDctRuntimeExposesTransformedGridTensorDescriptors) {
 	EXPECT_EQ(cbcr.element_count(), batch.cbcr_coefficient_count());
 	ASSERT_NE(y.data, nullptr);
 	ASSERT_NE(cbcr.data, nullptr);
+	EXPECT_EQ(y.float_data, nullptr);
+	EXPECT_EQ(cbcr.float_data, nullptr);
+
+	auto float_options                    = options;
+	auto float_transform                  = *float_options.grid_transform;
+	float_transform.output_data_type      = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+	float_transform.output_add            = 4.0F;
+	float_transform.output_scale          = 1.0F / 1020.0F;
+	float_options.grid_transform           = float_transform;
+	auto float_batch = runtime.ReadBatch(image_ids, galp::jpeg::JpegDctCropBox {}, float_options);
+
+	const auto float_y    = float_batch.y_tensor();
+	const auto float_cbcr = float_batch.cbcr_tensor();
+	EXPECT_EQ(float_y.data, nullptr);
+	EXPECT_EQ(float_cbcr.data, nullptr);
+	EXPECT_EQ(float_y.float_data, float_batch.y_float_device_data());
+	EXPECT_EQ(float_cbcr.float_data, float_batch.cbcr_float_device_data());
+	EXPECT_EQ(float_y.raw_data(), float_y.float_data);
+	EXPECT_EQ(float_cbcr.raw_data(), float_cbcr.float_data);
+	EXPECT_EQ(float_y.shape, y.shape);
+	EXPECT_EQ(float_cbcr.shape, cbcr.shape);
+	EXPECT_EQ(float_y.strides, y.strides);
+	EXPECT_EQ(float_cbcr.strides, cbcr.strides);
+	EXPECT_EQ(float_y.dtype, galp::jpeg::DirectDctTensorDataType::kFloat32);
+	EXPECT_EQ(float_cbcr.dtype, galp::jpeg::DirectDctTensorDataType::kFloat32);
+	ASSERT_NE(float_y.float_data, nullptr);
+	ASSERT_NE(float_cbcr.float_data, nullptr);
+
+	std::vector<int16_t> y_int16(y.element_count());
+	std::vector<int16_t> cbcr_int16(cbcr.element_count());
+	std::vector<float>   y_float(float_y.element_count());
+	std::vector<float>   cbcr_float(float_cbcr.element_count());
+	ASSERT_EQ(cudaMemcpy(y_int16.data(), y.data, y_int16.size() * sizeof(int16_t), cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(cudaMemcpy(
+	              cbcr_int16.data(), cbcr.data, cbcr_int16.size() * sizeof(int16_t), cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(cudaMemcpy(y_float.data(),
+	                     float_y.float_data,
+	                     y_float.size() * sizeof(float),
+	                     cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(cudaMemcpy(cbcr_float.data(),
+	                     float_cbcr.float_data,
+	                     cbcr_float.size() * sizeof(float),
+	                     cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	const auto expect_scaled = [](const std::vector<int16_t>& integer, const std::vector<float>& actual) {
+		ASSERT_EQ(integer.size(), actual.size());
+		for (size_t index = 0; index < integer.size(); ++index) {
+			const float shifted = static_cast<float>(integer[index]) + 4.0F;
+			const float expected = shifted * (1.0F / 1020.0F);
+			EXPECT_EQ(actual[index], expected) << "coefficient index " << index;
+		}
+	};
+	expect_scaled(y_int16, y_float);
+	expect_scaled(cbcr_int16, cbcr_float);
+	const auto float_stats = float_batch.execution_stats();
+	EXPECT_EQ(float_stats.plan_cache_hits, 0U);
+	EXPECT_EQ(float_stats.plan_cache_misses, 1U);
+	EXPECT_TRUE(float_stats.fixed_grid_output_float32);
+	EXPECT_TRUE(float_stats.fixed_grid_output_affine_applied);
+	EXPECT_EQ(float_stats.fixed_grid_finalize_kernel_launch_count, 1U);
+	EXPECT_FLOAT_EQ(float_stats.fixed_grid_output_add, 4.0F);
+	EXPECT_FLOAT_EQ(float_stats.fixed_grid_output_scale, 1.0F / 1020.0F);
 
 	std::filesystem::remove_all(dir);
 }
@@ -1517,6 +1582,22 @@ TEST(JpegDct, DeviceBatchPlanPreviewSupportsConfiguredTransformedGrid) {
 	sparse_options.coefficient_selection.coefficients    = {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U};
 	EXPECT_THROW((void)reader.PlanDeviceDctBatch(requests, sparse_options), std::runtime_error);
 
+	auto int16_affine_transform         = *options.grid_transform;
+	int16_affine_transform.output_add   = 4.0F;
+	auto int16_affine_options           = options;
+	int16_affine_options.grid_transform = int16_affine_transform;
+	EXPECT_THROW((void)reader.PlanDeviceDctBatch(requests, int16_affine_options), std::runtime_error);
+
+	auto float_transform                    = *options.grid_transform;
+	float_transform.output_data_type        = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+	float_transform.output_add              = 4.0F;
+	float_transform.output_scale            = 1.0F / 1020.0F;
+	auto float_options                  = options;
+	float_options.grid_transform        = float_transform;
+	const auto float_preview            = reader.PlanDeviceDctBatch(requests, float_options);
+	EXPECT_EQ(float_preview.ycbcr_dct_grid_shape.y, preview.ycbcr_dct_grid_shape.y);
+	EXPECT_EQ(float_preview.ycbcr_dct_grid_shape.cbcr, preview.ycbcr_dct_grid_shape.cbcr);
+
 	std::filesystem::remove_all(dir);
 }
 
@@ -1766,6 +1847,40 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
         }
         return host;
 	};
+	const auto copy_float_grid = [](const galp::jpeg::JpegDctDeviceBatch& batch) {
+		std::pair<std::vector<float>, std::vector<float>> host {std::vector<float>(batch.y_coefficient_count()),
+		                                                        std::vector<float>(batch.cbcr_coefficient_count())};
+		if (!host.first.empty()) {
+			EXPECT_EQ(cudaMemcpy(host.first.data(),
+			                     batch.y_float_coefficients(),
+			                     host.first.size() * sizeof(float),
+			                     cudaMemcpyDeviceToHost),
+			          cudaSuccess);
+		}
+		if (!host.second.empty()) {
+			EXPECT_EQ(cudaMemcpy(host.second.data(),
+			                     batch.cbcr_float_coefficients(),
+			                     host.second.size() * sizeof(float),
+			                     cudaMemcpyDeviceToHost),
+			          cudaSuccess);
+		}
+		return host;
+	};
+	const auto expect_float_grid_matches_adapter =
+	    [](const std::pair<std::vector<int16_t>, std::vector<int16_t>>& integer,
+	       const std::pair<std::vector<float>, std::vector<float>>&     actual) {
+		    const auto expect_component = [](const std::vector<int16_t>& integer_component,
+		                                     const std::vector<float>&   actual_component) {
+			    ASSERT_EQ(integer_component.size(), actual_component.size());
+			    for (size_t index = 0; index < integer_component.size(); ++index) {
+				    const float shifted  = static_cast<float>(integer_component[index]) + 4.0F;
+				    const float expected = shifted * (1.0F / 1020.0F);
+				    EXPECT_EQ(actual_component[index], expected) << "coefficient index " << index;
+			    }
+		    };
+		    expect_component(integer.first, actual.first);
+		    expect_component(integer.second, actual.second);
+	    };
 
 	for (const auto& test_case : cases) {
 		galp::jpeg::JpegDctReaderOptions reader_options;
@@ -1786,18 +1901,18 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 
 		for (size_t transform_index = 0U; transform_index < transforms.size(); ++transform_index) {
 			galp::jpeg::JpegDctDeviceBatchOptions planless_options;
-			planless_options.layout                    = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
-			planless_options.grid_transform            = transforms[transform_index];
-			planless_options.cache_capacity_bytes      = 0U;
-			planless_options.plan_cache_capacity       = 0U;
-			planless_options.enable_planless_execution = true;
-			auto legacy_options                        = planless_options;
-			legacy_options.enable_planless_execution   = false;
-			auto chunked_options                       = planless_options;
+			planless_options.layout                     = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+			planless_options.grid_transform             = transforms[transform_index];
+			planless_options.cache_capacity_bytes       = 0U;
+			planless_options.plan_cache_capacity        = 0U;
+			planless_options.enable_planless_execution  = true;
+			auto legacy_options                         = planless_options;
+			legacy_options.enable_planless_execution    = false;
+			auto chunked_options                        = planless_options;
 			chunked_options.scheduling_policy           = galp::jpeg::JpegDctSchedulingPolicy::kLimitedOverlap;
 			chunked_options.transform_blocks_per_launch = 512U;
 			chunked_options.transform_ctas_per_launch   = 64U;
-			chunked_options.use_low_priority_streams     = true;
+			chunked_options.use_low_priority_streams    = true;
 
 			auto       planless        = reader.ReadDeviceDctBatch(requests, planless_options);
 			auto       legacy          = reader.ReadDeviceDctBatch(requests, legacy_options);
@@ -1810,6 +1925,26 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			EXPECT_EQ(planless_host, legacy_host) << test_case.name << " transform=" << transform_index;
 			EXPECT_EQ(planless_host, repeat_host) << test_case.name << " transform=" << transform_index;
 			EXPECT_EQ(planless_host, chunked_host) << test_case.name << " transform=" << transform_index;
+
+			auto float_transform                  = transforms[transform_index];
+			float_transform.output_data_type      = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+			float_transform.output_add            = 4.0F;
+			float_transform.output_scale          = 1.0F / 1020.0F;
+			auto float_planless_options           = planless_options;
+			float_planless_options.grid_transform = float_transform;
+			auto float_legacy_options             = legacy_options;
+			float_legacy_options.grid_transform   = float_transform;
+			auto       float_planless             = reader.ReadDeviceDctBatch(requests, float_planless_options);
+			auto       float_legacy               = reader.ReadDeviceDctBatch(requests, float_legacy_options);
+			const auto float_planless_host        = copy_float_grid(float_planless);
+			const auto float_legacy_host          = copy_float_grid(float_legacy);
+			EXPECT_EQ(float_planless_host, float_legacy_host) << test_case.name << " transform=" << transform_index;
+			expect_float_grid_matches_adapter(planless_host, float_planless_host);
+			EXPECT_TRUE(float_planless.execution_stats().fixed_grid_output_float32) << test_case.name;
+			EXPECT_TRUE(float_planless.execution_stats().fixed_grid_output_affine_applied) << test_case.name;
+			EXPECT_EQ(float_planless.execution_stats().fixed_grid_finalize_kernel_launch_count, 1U) << test_case.name;
+			EXPECT_TRUE(float_legacy.execution_stats().fixed_grid_output_affine_applied) << test_case.name;
+			EXPECT_EQ(float_legacy.execution_stats().fixed_grid_finalize_kernel_launch_count, 1U) << test_case.name;
 
 			const auto planless_stats = planless.execution_stats();
 			const auto legacy_stats   = legacy.execution_stats();
@@ -1825,6 +1960,7 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			EXPECT_EQ(planless_stats.device_mapping_ms, 0.0) << test_case.name;
 			EXPECT_EQ(planless_stats.workset_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.decode_kernel_launch_count, 1U) << test_case.name;
+			EXPECT_EQ(planless_stats.fixed_grid_finalize_kernel_launch_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.internal_sync_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.decoded_batch_sync_count, 1U) << test_case.name;
 			EXPECT_EQ(planless_stats.cached_gather_sync_count, 0U) << test_case.name;

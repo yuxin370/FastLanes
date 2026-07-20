@@ -69,6 +69,22 @@ const int16_t* DirectDctBatch::cbcr_device_data_async() const noexcept {
 	return batch_.cbcr_coefficients_async();
 }
 
+const float* DirectDctBatch::y_float_device_data() const noexcept {
+	return batch_.y_float_coefficients();
+}
+
+const float* DirectDctBatch::cbcr_float_device_data() const noexcept {
+	return batch_.cbcr_float_coefficients();
+}
+
+const float* DirectDctBatch::y_float_device_data_async() const noexcept {
+	return batch_.y_float_coefficients_async();
+}
+
+const float* DirectDctBatch::cbcr_float_device_data_async() const noexcept {
+	return batch_.cbcr_float_coefficients_async();
+}
+
 void DirectDctBatch::synchronize() const {
 	batch_.synchronize();
 }
@@ -97,8 +113,10 @@ DirectDctGridTensorDescriptor DirectDctBatch::y_tensor() const {
 		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor() for compact layout");
 	}
 	const auto shape = batch_.ycbcr_dct_grid_shape().y;
+	const bool float_output = batch_.grid_output_data_type() == JpegDctGridOutputDataType::kFloat32;
 	return DirectDctGridTensorDescriptor {
-	    y_device_data(),
+	    float_output ? nullptr : y_device_data(),
+	    float_output ? y_float_device_data() : nullptr,
 	    shape,
 	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
 	     shape[2] * shape[3] * shape[4] * shape[5],
@@ -106,7 +124,7 @@ DirectDctGridTensorDescriptor DirectDctBatch::y_tensor() const {
 	     shape[4] * shape[5],
 	     shape[5],
 	     1U},
-	    DirectDctTensorDataType::kInt16,
+	    float_output ? DirectDctTensorDataType::kFloat32 : DirectDctTensorDataType::kInt16,
 	    DirectDctTensorDevice::kCuda,
 	    cuda_device_,
 	};
@@ -119,8 +137,10 @@ DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor() const {
 		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor() for compact layout");
 	}
 	const auto shape = batch_.ycbcr_dct_grid_shape().cbcr;
+	const bool float_output = batch_.grid_output_data_type() == JpegDctGridOutputDataType::kFloat32;
 	return DirectDctGridTensorDescriptor {
-	    cbcr_device_data(),
+	    float_output ? nullptr : cbcr_device_data(),
+	    float_output ? cbcr_float_device_data() : nullptr,
 	    shape,
 	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
 	     shape[2] * shape[3] * shape[4] * shape[5],
@@ -128,7 +148,7 @@ DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor() const {
 	     shape[4] * shape[5],
 	     shape[5],
 	     1U},
-	    DirectDctTensorDataType::kInt16,
+	    float_output ? DirectDctTensorDataType::kFloat32 : DirectDctTensorDataType::kInt16,
 	    DirectDctTensorDevice::kCuda,
 	    cuda_device_,
 	};
@@ -158,8 +178,10 @@ DirectDctGridTensorDescriptor DirectDctBatch::y_tensor_async() const {
 		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor_async() for compact layout");
 	}
 	const auto shape = batch_.ycbcr_dct_grid_shape().y;
+	const bool float_output = batch_.grid_output_data_type() == JpegDctGridOutputDataType::kFloat32;
 	return DirectDctGridTensorDescriptor {
-	    y_device_data_async(),
+	    float_output ? nullptr : y_device_data_async(),
+	    float_output ? y_float_device_data_async() : nullptr,
 	    shape,
 	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
 	     shape[2] * shape[3] * shape[4] * shape[5],
@@ -167,7 +189,7 @@ DirectDctGridTensorDescriptor DirectDctBatch::y_tensor_async() const {
 	     shape[4] * shape[5],
 	     shape[5],
 	     1U},
-	    DirectDctTensorDataType::kInt16,
+	    float_output ? DirectDctTensorDataType::kFloat32 : DirectDctTensorDataType::kInt16,
 	    DirectDctTensorDevice::kCuda,
 	    cuda_device_,
 	};
@@ -180,8 +202,10 @@ DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor_async() const {
 		    "Y/CbCr DCT grid tensor is only available for Y/CbCr grid layouts; use tensor_async() for compact layout");
 	}
 	const auto shape = batch_.ycbcr_dct_grid_shape().cbcr;
+	const bool float_output = batch_.grid_output_data_type() == JpegDctGridOutputDataType::kFloat32;
 	return DirectDctGridTensorDescriptor {
-	    cbcr_device_data_async(),
+	    float_output ? nullptr : cbcr_device_data_async(),
+	    float_output ? cbcr_float_device_data_async() : nullptr,
 	    shape,
 	    {shape[1] * shape[2] * shape[3] * shape[4] * shape[5],
 	     shape[2] * shape[3] * shape[4] * shape[5],
@@ -189,7 +213,7 @@ DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor_async() const {
 	     shape[4] * shape[5],
 	     shape[5],
 	     1U},
-	    DirectDctTensorDataType::kInt16,
+	    float_output ? DirectDctTensorDataType::kFloat32 : DirectDctTensorDataType::kInt16,
 	    DirectDctTensorDevice::kCuda,
 	    cuda_device_,
 	};

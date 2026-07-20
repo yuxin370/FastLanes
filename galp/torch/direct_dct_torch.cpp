@@ -81,6 +81,18 @@ std::optional<galp::jpeg::JpegDctGridTransformSpec> parse_grid_transform(const p
 	}
 	spec.clamp_min                = dict["clamp_min"].cast<int32_t>();
 	spec.clamp_max                = dict["clamp_max"].cast<int32_t>();
+	if (dict.contains("output_dtype")) {
+		const auto output_dtype = dict["output_dtype"].cast<std::string>();
+		if (output_dtype == "int16") {
+			spec.output_data_type = galp::jpeg::JpegDctGridOutputDataType::kInt16;
+		} else if (output_dtype == "float32") {
+			spec.output_data_type = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+		} else {
+			throw std::invalid_argument("grid_transform output_dtype must be 'int16' or 'float32'");
+		}
+	}
+	spec.output_add   = dict.contains("output_add") ? dict["output_add"].cast<float>() : 0.0F;
+	spec.output_scale = dict.contains("output_scale") ? dict["output_scale"].cast<float>() : 1.0F;
 	spec.dequantize               = optional_bool("dequantize", true);
 	spec.require_all_coefficients = optional_bool("require_all_coefficients", true);
 	spec.allow_grayscale          = optional_bool("allow_grayscale", false);
@@ -435,6 +447,11 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["direct_dct_low_priority_streams"]                = stats.direct_dct_low_priority_streams;
 	out["scheduling_policy"]                              = stats.scheduling_policy;
 	out["fixed_grid_round_event_handoff_count"]          = stats.fixed_grid_round_event_handoff_count;
+	out["fixed_grid_finalize_kernel_launch_count"]       = stats.fixed_grid_finalize_kernel_launch_count;
+	out["fixed_grid_output_float32"]                     = stats.fixed_grid_output_float32;
+	out["fixed_grid_output_affine_applied"]              = stats.fixed_grid_output_affine_applied;
+	out["fixed_grid_output_add"]                         = stats.fixed_grid_output_add;
+	out["fixed_grid_output_scale"]                       = stats.fixed_grid_output_scale;
 	out["workset_upload_count"]                          = stats.workset_upload_count;
 	out["scratch_upload_count"]                          = stats.scratch_upload_count;
 	out["scratch_allocation_count"]                      = stats.scratch_allocation_count;
@@ -853,11 +870,15 @@ struct TorchDirectDctBatch {
 	}
 
 	[[nodiscard]] uintptr_t y_device_data_ptr() const noexcept {
-		return reinterpret_cast<uintptr_t>(batch->y_device_data());
+		return batch->device_batch().grid_output_data_type() == galp::jpeg::JpegDctGridOutputDataType::kFloat32
+		           ? reinterpret_cast<uintptr_t>(batch->y_float_device_data_async())
+		           : reinterpret_cast<uintptr_t>(batch->y_device_data_async());
 	}
 
 	[[nodiscard]] uintptr_t cbcr_device_data_ptr() const noexcept {
-		return reinterpret_cast<uintptr_t>(batch->cbcr_device_data());
+		return batch->device_batch().grid_output_data_type() == galp::jpeg::JpegDctGridOutputDataType::kFloat32
+		           ? reinterpret_cast<uintptr_t>(batch->cbcr_float_device_data_async())
+		           : reinterpret_cast<uintptr_t>(batch->cbcr_device_data_async());
 	}
 
 	[[nodiscard]] std::string layout() const {
@@ -884,7 +905,9 @@ private:
 			return cached;
 		}
 		const auto device_index = static_cast<c10::DeviceIndex>(desc.cuda_device < 0 ? 0 : desc.cuda_device);
-		auto options = torch::TensorOptions().dtype(torch::kInt16).device(torch::Device(torch::kCUDA, device_index));
+		const auto scalar_type = desc.dtype == galp::jpeg::DirectDctTensorDataType::kFloat32 ? torch::kFloat32
+		                                                                                     : torch::kInt16;
+		auto options = torch::TensorOptions().dtype(scalar_type).device(torch::Device(torch::kCUDA, device_index));
 		std::vector<int64_t> shape;
 		std::vector<int64_t> strides;
 		shape.reserve(desc.shape.size());
@@ -895,12 +918,12 @@ private:
 		for (const auto stride : desc.strides) {
 			strides.push_back(static_cast<int64_t>(stride));
 		}
-		if (desc.data == nullptr || desc.empty()) {
+		if (desc.raw_data() == nullptr || desc.empty()) {
 			cached = torch::empty(shape, options);
 			return cached;
 		}
 		auto owner = batch;
-		cached     = torch::from_blob(const_cast<int16_t*>(desc.data),
+		cached     = torch::from_blob(const_cast<void*>(desc.raw_data()),
                                   shape,
                                   strides,
                                   [owner = std::move(owner), device_index](void*) mutable {

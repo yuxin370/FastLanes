@@ -25,3 +25,13 @@ RGBNOMORE_VAL_DCT_GRID_TRANSFORM: dict[str, Any] = {
     "allowed_chroma_sampling_ratios": [(1, 1, 1, 1), (1, 2, 1, 2)],
 }
 
+# Production pushdown output: the generic executor preserves the legacy
+# nearbyint/clamp policy, then applies the same two FP32 operations previously
+# issued by the PyTorch adapter. Keep the int16 profile above for compatibility
+# and transform-reference diagnostics.
+RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32: dict[str, Any] = {
+    **RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
+    "output_dtype": "float32",
+    "output_add": 4.0,
+    "output_scale": 1.0 / 1020.0,
+}

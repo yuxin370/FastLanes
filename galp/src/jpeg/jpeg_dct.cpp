@@ -2877,6 +2877,13 @@ struct JpegDctShardDatasetReader::Impl {
 		    spec.clamp_max > std::numeric_limits<int16_t>::max() || spec.clamp_min > spec.clamp_max) {
 			throw std::runtime_error("transformed DCT grid clamp range must be ordered and fit int16");
 		}
+		if (!std::isfinite(spec.output_add) || !std::isfinite(spec.output_scale)) {
+			throw std::runtime_error("transformed DCT grid FP32 output affine must be finite");
+		}
+		if (spec.output_data_type == JpegDctGridOutputDataType::kInt16 &&
+		    (spec.output_add != 0.0F || spec.output_scale != 1.0F)) {
+			throw std::runtime_error("transformed DCT grid int16 output cannot apply an FP32 affine");
+		}
 		if (!spec.dequantize) {
 			throw std::runtime_error("transformed DCT grid executor currently requires dequantize=true");
 		}
@@ -4529,7 +4536,9 @@ struct JpegDctShardDatasetReader::Impl {
 			    << spec.cbcr_output_width_blocks << ',' << spec.cbcr_output_height_blocks << ','
 			    << spec.crop_reference_width_blocks << ',' << spec.crop_reference_height_blocks << ','
 			    << spec.crop_origin_alignment_blocks << ',' << spec.chroma_crop_scale_x << ','
-			    << spec.chroma_crop_scale_y << ',' << spec.clamp_min << ',' << spec.clamp_max << ',' << spec.dequantize
+			    << spec.chroma_crop_scale_y << ',' << spec.clamp_min << ',' << spec.clamp_max << ','
+			    << static_cast<int>(spec.output_data_type) << ',' << std::hexfloat << spec.output_add << ','
+			    << spec.output_scale << std::defaultfloat << ',' << spec.dequantize
 			    << ',' << spec.require_all_coefficients << ',' << spec.allow_grayscale << ':';
 			for (const auto value : spec.preferred_small_crop_width_blocks) {
 				key << value << ',';

@@ -506,6 +506,20 @@ class GalpAdapter(PipelineAdapter):
                     raise RuntimeError(
                         "GALP legacy A/B pipeline did not exercise the expanded transformed-grid graph"
                     )
+        if self.args.preprocess == "rgbnomore-val-pushdown":
+            for source_batch in source_batches:
+                stats = dict(source_batch.execution_stats)
+                if (
+                    not bool(stats.get("fixed_grid_output_float32", False))
+                    or not bool(stats.get("fixed_grid_output_affine_applied", False))
+                    or int(stats.get("fixed_grid_finalize_kernel_launch_count", 0)) != 1
+                ):
+                    raise RuntimeError(
+                        "GALP transformed-grid output did not use the required generic FP32 finalize: "
+                        f"float32={stats.get('fixed_grid_output_float32', False)} "
+                        f"affine_applied={stats.get('fixed_grid_output_affine_applied', False)} "
+                        f"finalize_launches={stats.get('fixed_grid_finalize_kernel_launch_count', 0)}"
+                    )
         labels = torch.tensor([sample["label"] for sample in expected], dtype=torch.long, device=self.device)
         native_stage_seconds = {
             key: float(value)

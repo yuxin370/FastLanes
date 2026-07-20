@@ -16,6 +16,7 @@ namespace galp::jpeg {
 
 enum class DirectDctTensorDataType {
 	kInt16,
+	kFloat32,
 };
 
 enum class DirectDctTensorDevice {
@@ -45,6 +46,7 @@ struct DirectDctTensorDescriptor {
 
 struct DirectDctGridTensorDescriptor {
 	const int16_t*          data        = nullptr;
+	const float*            float_data  = nullptr;
 	std::array<size_t, 6>   shape       = {0, 0, 0, 0, 0, 0};
 	std::array<size_t, 6>   strides     = {0, 0, 0, 0, 0, 1};
 	DirectDctTensorDataType dtype       = DirectDctTensorDataType::kInt16;
@@ -61,6 +63,11 @@ struct DirectDctGridTensorDescriptor {
 
 	[[nodiscard]] bool empty() const noexcept {
 		return element_count() == 0;
+	}
+
+	[[nodiscard]] const void* raw_data() const noexcept {
+		return dtype == DirectDctTensorDataType::kFloat32 ? static_cast<const void*>(float_data)
+		                                                    : static_cast<const void*>(data);
 	}
 };
 
@@ -80,6 +87,10 @@ public:
 	[[nodiscard]] const int16_t*            device_data_async() const noexcept;
 	[[nodiscard]] const int16_t*            y_device_data_async() const noexcept;
 	[[nodiscard]] const int16_t*            cbcr_device_data_async() const noexcept;
+	[[nodiscard]] const float*              y_float_device_data() const noexcept;
+	[[nodiscard]] const float*              cbcr_float_device_data() const noexcept;
+	[[nodiscard]] const float*              y_float_device_data_async() const noexcept;
+	[[nodiscard]] const float*              cbcr_float_device_data_async() const noexcept;
 	void                                    synchronize() const;
 	[[nodiscard]] DirectDctTensorDescriptor tensor() const;
 	[[nodiscard]] DirectDctGridTensorDescriptor y_tensor() const;

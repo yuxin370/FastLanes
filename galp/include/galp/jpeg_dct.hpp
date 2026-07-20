@@ -211,6 +211,11 @@ enum class JpegDctDeviceLayout {
 	kTransformedDctGrid,
 };
 
+enum class JpegDctGridOutputDataType {
+	kInt16,
+	kFloat32,
+};
+
 struct JpegDctSamplingRatio {
 	uint16_t horizontal_numerator   = 1;
 	uint16_t horizontal_denominator = 1;
@@ -234,6 +239,14 @@ struct JpegDctGridTransformSpec {
 	uint32_t chroma_crop_scale_y           = 1;
 	int32_t  clamp_min                      = std::numeric_limits<int16_t>::min();
 	int32_t  clamp_max                      = std::numeric_limits<int16_t>::max();
+	// The transform always applies the legacy nearbyint/clamp policy first.
+	// Float output then evaluates (rounded + output_add) * output_scale with
+	// separate IEEE-754 round-to-nearest operations. This keeps the generic
+	// executor independent of application-specific ranges while allowing a
+	// consumer to remove an int16 intermediate and follow-up affine kernels.
+	JpegDctGridOutputDataType output_data_type = JpegDctGridOutputDataType::kInt16;
+	float                     output_add       = 0.0F;
+	float                     output_scale     = 1.0F;
 	bool     dequantize                     = true;
 	bool     require_all_coefficients       = true;
 	bool     allow_grayscale                = false;
@@ -566,6 +579,13 @@ struct JpegDctDeviceExecutionStats {
 	int         cuda_greatest_stream_priority                  = 0;
 	bool        direct_dct_low_priority_streams                = false;
 	std::string scheduling_policy;
+	// Generic transformed-grid output diagnostics. Appended to keep older
+	// aggregate field positions stable.
+	size_t      fixed_grid_finalize_kernel_launch_count = 0;
+	bool        fixed_grid_output_float32               = false;
+	bool        fixed_grid_output_affine_applied        = false;
+	float       fixed_grid_output_add                   = 0.0F;
+	float       fixed_grid_output_scale                 = 1.0F;
 };
 
 struct JpegDctDeviceBatchPlanPreview {
@@ -674,6 +694,11 @@ public:
 	[[nodiscard]] const int16_t*                                    device_coefficients_async() const noexcept;
 	[[nodiscard]] const int16_t*                                    y_coefficients_async() const noexcept;
 	[[nodiscard]] const int16_t*                                    cbcr_coefficients_async() const noexcept;
+	[[nodiscard]] const float*                                      y_float_coefficients() const noexcept;
+	[[nodiscard]] const float*                                      cbcr_float_coefficients() const noexcept;
+	[[nodiscard]] const float*                                      y_float_coefficients_async() const noexcept;
+	[[nodiscard]] const float*                                      cbcr_float_coefficients_async() const noexcept;
+	[[nodiscard]] JpegDctGridOutputDataType                         grid_output_data_type() const noexcept;
 	void                                                            synchronize() const;
 	[[nodiscard]] size_t                                            coefficient_count() const noexcept;
 	[[nodiscard]] size_t                                            coefficient_bytes() const noexcept;
