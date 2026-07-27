@@ -9,6 +9,7 @@
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/std/string.hpp"
+#include <algorithm>
 #if !defined(_WIN32)
 #include <cerrno>
 #endif
@@ -25,9 +26,11 @@
 #include <string>
 #if !defined(_WIN32)
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 #include <stdexcept> // for std::runtime_error
+#include <vector>
 
 namespace fastlanes {
 
@@ -135,6 +138,83 @@ void File::ReadRangeUnchecked(void* dst, const n_t offset, const n_t size) {
 #else
 	open_read_handle();
 	pread_exact(m_fd, m_path, dst, offset, size);
+#endif
+}
+
+n_t File::ReadScatterUnchecked(const std::span<const FileScatterReadTarget> targets, const n_t offset) {
+#if defined(_WIN32)
+	n_t current_offset = offset;
+	n_t read_count     = 0;
+	for (const auto& target : targets) {
+		if (target.size == 0) {
+			continue;
+		}
+		if (target.data == nullptr) {
+			throw std::invalid_argument("scatter read destination is null");
+		}
+		ReadRangeUnchecked(target.data, current_offset, target.size);
+		current_offset += target.size;
+		++read_count;
+	}
+	return read_count;
+#else
+	open_read_handle();
+	const long   configured_iov_max = ::sysconf(_SC_IOV_MAX);
+	const size_t iov_max = configured_iov_max > 0 ? static_cast<size_t>(configured_iov_max) : 1024U;
+	n_t          current_offset = offset;
+	n_t          read_count     = 0;
+	std::vector<iovec> iovecs;
+	iovecs.reserve(std::min(iov_max, targets.size()));
+
+	const auto flush = [&]() {
+		if (iovecs.empty()) {
+			return;
+		}
+		size_t first = 0;
+		while (first < iovecs.size()) {
+			const auto nread = ::preadv(m_fd,
+			                           iovecs.data() + first,
+			                           static_cast<int>(iovecs.size() - first),
+			                           static_cast<off_t>(current_offset));
+			if (nread == 0) {
+				throw std::runtime_error("unexpected EOF while scatter-reading: " + m_path.string());
+			}
+			if (nread < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				throw make_io_error(m_path, "preadv failed");
+			}
+			++read_count;
+			current_offset += static_cast<n_t>(nread);
+			size_t consumed = static_cast<size_t>(nread);
+			while (first < iovecs.size() && consumed >= iovecs[first].iov_len) {
+				consumed -= iovecs[first].iov_len;
+				++first;
+			}
+			if (consumed != 0U) {
+				auto* const bytes = static_cast<std::byte*>(iovecs[first].iov_base);
+				iovecs[first].iov_base = bytes + consumed;
+				iovecs[first].iov_len -= consumed;
+			}
+		}
+		iovecs.clear();
+	};
+
+	for (const auto& target : targets) {
+		if (target.size == 0) {
+			continue;
+		}
+		if (target.data == nullptr) {
+			throw std::invalid_argument("scatter read destination is null");
+		}
+		if (iovecs.size() == iov_max) {
+			flush();
+		}
+		iovecs.push_back(iovec {target.data, static_cast<size_t>(target.size)});
+	}
+	flush();
+	return read_count;
 #endif
 }
 

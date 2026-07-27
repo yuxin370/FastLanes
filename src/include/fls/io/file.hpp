@@ -11,11 +11,17 @@
 #include "fls/std/string.hpp"
 #include <cstdint>
 #include <mutex>
+#include <span>
 
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
 class Buf;
 /*--------------------------------------------------------------------------------------------------------------------*/
+
+struct FileScatterReadTarget {
+	void* data = nullptr;
+	n_t   size = 0;
+};
 
 class File {
 public:
@@ -37,6 +43,9 @@ public:
 	void ReadRange(void* dst, n_t offset, n_t size);
 	//
 	void ReadRangeUnchecked(void* dst, n_t offset, n_t size);
+	// Read one contiguous file range directly into multiple destination spans.
+	// Returns the number of physical read syscalls issued.
+	n_t ReadScatterUnchecked(std::span<const FileScatterReadTarget> targets, n_t offset);
 	// get file size
 	[[nodiscard]] n_t Size() const;
 
