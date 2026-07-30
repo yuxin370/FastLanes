@@ -19,6 +19,7 @@ import numpy as np
 
 
 HERE = Path(__file__).resolve().parent
+INFERENCE_DIR = HERE.parent / "inference"
 PLANLESS_RESOURCE_COUNTERS = (
     "planless_transform_registers_per_thread",
     "planless_transform_static_shared_bytes_per_cta",
@@ -330,7 +331,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         subprocess.run(
             [
                 str(args.python),
-                str(HERE / "pipeline.py"),
+                str(INFERENCE_DIR / "pipeline.py"),
                 "--pipeline",
                 "galp",
                 "--contract",

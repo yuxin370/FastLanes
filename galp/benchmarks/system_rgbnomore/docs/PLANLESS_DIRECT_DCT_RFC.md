@@ -216,7 +216,8 @@ The compact path preserves:
 - request-major output addressing across shards and shuffled input order;
 - raster, tiled-raster-32, Z-order, and tiled-Z-32 row formulas;
 - grayscale presence semantics (missing chroma outputs remain zero);
-- 4:4:4 and 4:2:0 component geometry for all supported reduced rational axes;
+- 4:4:4, 4:2:0, 4:2:2, 4:4:0, and 4:1:1 component geometry for all
+  supported reduced rational axes, including zero-padded fixed chroma crops;
 - variable image shapes and cross-shard shuffled request order;
 - all 64 coefficient selection and existing dequantize/clamp/round behavior.
 
@@ -226,8 +227,8 @@ cross-shard canonical batch creates two descriptors and zero expanded objects.
 It also prepares the same compact batch twice with nonzero exact-plan and
 decoded-cache capacities and proves that both caches are disabled.
 `PlanlessRationalProgramsCoverSamplingShapesShardsAndSpatialOrders` exercises
-all four spatial orders, three variable shapes in three shards, shuffled input,
-grayscale/4:4:4/4:2:0 sampling, and 7/5 plus 3/2 relations.  It proves the batch
+all four spatial orders, variable shapes, shuffled input, grayscale and the
+five accepted color sampling families, and 7/5 plus 3/2 relations.  It proves the batch
 uses two relation programs, exactly 15 phase matrices (3,840 bytes), and zero
 expanded objects across deterministic repeats.  The compiled target-device
 test `PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix` compares exact int16

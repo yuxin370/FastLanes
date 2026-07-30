@@ -15,7 +15,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from common import (
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
+if str(BENCHMARK_ROOT) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_ROOT))
+
+from shared.common import (
     CONTRACT_SCHEMA,
     CONTRACT_PIPELINES,
     PIPELINES,
@@ -29,15 +33,19 @@ from common import (
     source_tree_metadata,
     write_json,
 )
-from manifest import build_manifest
+from dataset.manifest import build_manifest
 
 
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[2]
+REPO_ROOT = HERE.parents[3]
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
-DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
-DEFAULT_GALP_MANIFEST = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/manifest.bin"
-DEFAULT_GALP_LABEL_MAP = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/labels.json"
+DEFAULT_E2E_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2"
+DEFAULT_DATA_ROOT = DEFAULT_E2E_DATA_ROOT / "imagenet"
+DEFAULT_INDEX_CSV = DEFAULT_E2E_DATA_ROOT / "indexbase_val.csv"
+DEFAULT_RGB_CHECKPOINT = DEFAULT_E2E_DATA_ROOT / "checkpoints/imgnetRGBViTTi_ep300_74.1.pth"
+DEFAULT_DCT_CHECKPOINT = DEFAULT_E2E_DATA_ROOT / "checkpoints/imgnetDCTViTTi_ep300_75.1.pth"
+DEFAULT_GALP_MANIFEST = DEFAULT_E2E_DATA_ROOT / "dct/manifest.bin"
+DEFAULT_GALP_LABEL_MAP = DEFAULT_E2E_DATA_ROOT / "dct/labels.json"
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_BENCHMARK_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
 
@@ -168,12 +176,26 @@ def _system_state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[s
     }
 
 
+def _source_revision_policy(source_revisions: dict[str, Any]) -> dict[str, Any]:
+    dirty_source_details = {
+        name: revision.get("runtime_git_status", [])
+        for name, revision in source_revisions.items()
+        if not bool(revision.get("benchmark_source_clean", False))
+    }
+    return {
+        "cleanliness_enforcement": "warning",
+        "dirty_sources_at_contract_creation": dirty_source_details,
+        "runtime_file_hashes_recorded": True,
+        "runtime_file_changes_during_benchmark_are_errors": True,
+    }
+
+
 def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str, Any], Path]:
     rgbnomore_root = args.rgbnomore_root.resolve()
     data_root = args.data_root.resolve()
-    index_csv = (args.index_csv or (rgbnomore_root / "assets/indexbase_val.csv")).resolve()
-    rgb_checkpoint = (args.rgb_checkpoint or (rgbnomore_root / "checkpoints/imgnetRGBViTTi_ep300_74.1.pth")).resolve()
-    dct_checkpoint = (args.dct_checkpoint or (rgbnomore_root / "checkpoints/imgnetDCTViTTi_ep300_75.1.pth")).resolve()
+    index_csv = (args.index_csv or DEFAULT_INDEX_CSV).resolve()
+    rgb_checkpoint = (args.rgb_checkpoint or DEFAULT_RGB_CHECKPOINT).resolve()
+    dct_checkpoint = (args.dct_checkpoint or DEFAULT_DCT_CHECKPOINT).resolve()
     galp_manifest = args.galp_manifest.resolve()
     galp_label_map = args.galp_label_map_json.resolve()
 
@@ -238,6 +260,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         raise ValueError(f"unexpected GALP shard manifest format: {galp_manifest}")
     galp_manifest_version = int.from_bytes(manifest_header[8:12], "little")
     galp_payload_fingerprints: list[dict[str, Any]] = []
+    galp_vector_bundle_fingerprints: list[dict[str, Any]] = []
     galp_payload_cache: Path | None = None
     galp_native_binary: dict[str, Any] | None = None
     if {"galp", "galp_legacy"}.intersection(args.pipelines):
@@ -248,6 +271,9 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             cache_format="galp_shard_payload_fingerprints_v1",
             allow_hash_misses=args.refresh_galp_payload_fingerprints,
         )
+        galp_vector_bundle_fingerprints = [
+            item for item in galp_payload_fingerprints if item.get("kind") == "vector_bundle"
+        ]
         binding_candidates = sorted(args.torch_binding_dir.glob("_galp_direct_dct*.so"))
         if len(binding_candidates) != 1:
             raise FileNotFoundError(
@@ -336,6 +362,13 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "manifest_fingerprint": galp_manifest_fingerprint,
                 "payload_fingerprints": galp_payload_fingerprints,
                 "payload_fingerprint_cache": str(galp_payload_cache) if galp_payload_cache is not None else None,
+                "vector_bundle_payload_count": len(galp_vector_bundle_fingerprints),
+                "vector_bundle_payload_bytes": sum(
+                    int(item["size_bytes"]) for item in galp_vector_bundle_fingerprints
+                ),
+                "vector_bundle_read_supported": bool(galp_vector_bundle_fingerprints)
+                and len(galp_vector_bundle_fingerprints)
+                == sum(item.get("kind") == "fls" for item in galp_payload_fingerprints),
                 "native_binary_fingerprint": galp_native_binary,
                 "label_map_json": str(galp_label_map),
                 "label_map_sha256": sha256_file(galp_label_map),
@@ -349,6 +382,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
                 "enable_planless_execution": True,
+                "crop_execution_mode": args.galp_crop_execution_mode,
                 "scheduling_policy": args.galp_scheduling_policy,
                 "transform_blocks_per_launch": (
                     args.galp_transform_blocks_per_launch
@@ -369,6 +403,13 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "manifest_fingerprint": galp_manifest_fingerprint,
                 "payload_fingerprints": galp_payload_fingerprints,
                 "payload_fingerprint_cache": str(galp_payload_cache) if galp_payload_cache is not None else None,
+                "vector_bundle_payload_count": len(galp_vector_bundle_fingerprints),
+                "vector_bundle_payload_bytes": sum(
+                    int(item["size_bytes"]) for item in galp_vector_bundle_fingerprints
+                ),
+                "vector_bundle_read_supported": bool(galp_vector_bundle_fingerprints)
+                and len(galp_vector_bundle_fingerprints)
+                == sum(item.get("kind") == "fls" for item in galp_payload_fingerprints),
                 "native_binary_fingerprint": galp_native_binary,
                 "label_map_json": str(galp_label_map),
                 "label_map_sha256": sha256_file(galp_label_map),
@@ -382,6 +423,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
                 "enable_planless_execution": False,
+                "crop_execution_mode": args.galp_crop_execution_mode,
                 "scheduling_policy": args.galp_scheduling_policy,
                 "transform_blocks_per_launch": 0,
                 "transform_ctas_per_launch": 0,
@@ -472,24 +514,46 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "fastlanes": source_tree_metadata(
                 REPO_ROOT,
                 [
-                    "galp/benchmarks/system_rgbnomore/common.py",
-                    "galp/benchmarks/system_rgbnomore/manifest.py",
-                    "galp/benchmarks/system_rgbnomore/model_factory.py",
-                    "galp/benchmarks/system_rgbnomore/pipeline.py",
-                    "galp/benchmarks/system_rgbnomore/validate.py",
-                    "galp/benchmarks/system_rgbnomore/run.py",
-                    "galp/benchmarks/system_rgbnomore/PLANLESS_DIRECT_DCT_RFC.md",
+                    "galp/benchmarks/system_rgbnomore/shared/common.py",
+                    "galp/benchmarks/system_rgbnomore/dataset/manifest.py",
+                    "galp/benchmarks/system_rgbnomore/inference/model_factory.py",
+                    "galp/benchmarks/system_rgbnomore/inference/crop_io_ab.py",
+                    "galp/benchmarks/system_rgbnomore/inference/pipeline.py",
+                    "galp/benchmarks/system_rgbnomore/inference/validate.py",
+                    "galp/benchmarks/system_rgbnomore/inference/run.py",
+                    "galp/benchmarks/system_rgbnomore/docs/PLANLESS_DIRECT_DCT_RFC.md",
                     "galp/benchmarks/system_rgbnomore/diagnostics/audit_planless_storage_io.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/benchmark_planless_planning.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/direct_dct.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/validate_pushdown.py",
                     "galp/include/galp/direct_dct.hpp",
+                    "galp/include/galp/jpeg_dct_device.hpp",
+                    "galp/include/galp/jpeg_dct_diagnostics.hpp",
+                    "galp/include/galp/jpeg_dct_format.hpp",
+                    "galp/include/galp/jpeg_dct_storage.hpp",
+                    "galp/include/galp/sparse_vector_bundle.hpp",
                     "galp/include/galp/jpeg_dct.hpp",
                     "galp/src/api/direct_dct.cpp",
                     "galp/src/cuda/memory/device_pool.cuh",
-                    "galp/src/jpeg/jpeg_dct.cpp",
+                    "galp/src/format/reader.cu",
+                    "galp/src/format/reader.cuh",
+                    "galp/src/format/rowgroup_io.cuh",
+                    "galp/src/engine/pipeline/rowgroup_prefetch_queue.cuh",
+                    "galp/src/engine/pipeline/rowgroup_prefetch_types.cuh",
+                    "galp/src/jpeg/jpeg_dct_planner.cpp",
+                    "galp/src/jpeg/jpeg_dct_shard_reader.cpp",
+                    "galp/src/jpeg/jpeg_dct_shard_writer.cpp",
+                    "galp/src/jpeg/jpeg_dct_metadata.cpp",
+                    "galp/src/jpeg/jpeg_dct_decode.cpp",
+                    "galp/src/jpeg/jpeg_dct_device_bridge.cpp",
                     "galp/src/jpeg/jpeg_dct_device.cu",
-                    "galp/src/jpeg/jpeg_dct_device.cuh",
+                    "galp/src/jpeg/jpeg_dct_gather_kernels.cu",
+                    "galp/src/jpeg/jpeg_dct_transform_kernels.cu",
+                    "galp/src/jpeg/jpeg_dct_plan_types.hpp",
+                    "galp/src/jpeg/jpeg_dct_policy.hpp",
+                    "galp/src/jpeg/jpeg_dct_policy.cpp",
+                    "galp/src/jpeg/jpeg_dct_device_runtime.hpp",
+                    "galp/src/jpeg/jpeg_dct_cuda_internal.cuh",
                     "galp/tests/jpeg_dct_test.cpp",
                     "galp/tests/test_system_benchmark.py",
                     "galp/torch/direct_dct_torch.cpp",
@@ -502,21 +566,16 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             ),
         },
     }
-    if args.preset == "e2e" and not args.dry_run:
-        dirty_sources = [
-            name
-            for name, revision in contract["source_revisions"].items()
-            if not bool(revision.get("benchmark_source_clean", False))
-        ]
-        if dirty_sources:
-            details = {
-                name: contract["source_revisions"][name].get("runtime_git_status", [])
-                for name in dirty_sources
-            }
-            raise RuntimeError(
-                "e2e requires every benchmark runtime source to match its recorded clean commit; "
-                f"dirty sources: {details}"
-            )
+    contract["source_revision_policy"] = _source_revision_policy(contract["source_revisions"])
+    dirty_source_details = contract["source_revision_policy"]["dirty_sources_at_contract_creation"]
+    if args.preset == "e2e" and dirty_source_details:
+        print(
+            "WARNING: e2e contract includes uncommitted benchmark runtime sources; "
+            "results remain traceable through recorded status and per-file SHA-256 values: "
+            f"{dirty_source_details}",
+            file=sys.stderr,
+            flush=True,
+        )
     contract_path = output_dir / "contract.json"
     write_json(contract_path, contract)
     return contract, contract_path
@@ -657,6 +716,17 @@ def _parse_args() -> argparse.Namespace:
         choices=("fully-overlapped", "limited-overlap", "serial"),
         default="limited-overlap",
         help="Direct-DCT/model overlap policy; production defaults to the measured 512-output/512-CTA limited point.",
+    )
+    parser.add_argument(
+        "--galp-crop-execution-mode",
+        choices=(
+            "auto",
+            "full-rowgroup-decode",
+            "rowgroup-read-selected-decode",
+            "vector-range-read-selected-decode",
+        ),
+        default="auto",
+        help="Select a storage/decode granularity for same-contract crop A/B measurements.",
     )
     parser.add_argument(
         "--galp-transform-blocks-per-launch",

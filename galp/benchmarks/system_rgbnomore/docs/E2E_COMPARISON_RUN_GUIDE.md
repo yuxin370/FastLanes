@@ -59,7 +59,7 @@ OUT="$PWD/galp/benchmarks/system_rgbnomore/res/e2e_compare_latest"
 numactl --cpunodebind=0 --membind=0 env \
   PYTHONPATH=build/galp/torch \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/run.py \
+  galp/benchmarks/system_rgbnomore/inference/run.py \
   --preset e2e \
   --output-dir "$OUT" \
   --benchmark-id galp-e2e-compare-latest \

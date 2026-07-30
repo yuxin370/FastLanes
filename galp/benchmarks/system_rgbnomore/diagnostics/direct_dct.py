@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Diagnostic GALP Direct-DCT phase benchmark for RGB-no-more JPEG-Ti.
 
-Published end-to-end comparisons must use ``../run.py``. This script is
+Published end-to-end comparisons must use ``../inference/run.py``. This script is
 retained for loader/kernel/overlap diagnosis and is also imported by the
 canonical benchmark's GALP adapter. It requests the
 GALP Y/CbCr DCT grid layout, adapts it to RGB-no-more's JPEG-Ti input contract,
@@ -40,7 +40,7 @@ from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
 
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
 DEFAULT_DCT_CHECKPOINT = DEFAULT_RGBNOMORE_ROOT / "checkpoints" / "imgnetDCTViTTi_ep300_75.1.pth"
-SUPPORTED_SAMPLING_MODES = ("4:2:0", "4:4:4")
+SUPPORTED_SAMPLING_MODES = ("4:4:4", "4:2:0", "4:2:2", "4:4:0", "4:1:1", "grayscale", "components:4")
 
 
 def _make_image_ids(step: int, batch_size: int, image_count: int) -> list[int]:
@@ -92,6 +92,16 @@ def _sampling_mode(reader: Any, image_id: int) -> str:
         and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
     ):
         return "4:2:2"
+    if (
+        int(cb.get("h_samp_factor", 0)) == int(y.get("h_samp_factor", 0))
+        and int(cb.get("v_samp_factor", 0)) * 2 == int(y.get("v_samp_factor", 0))
+    ):
+        return "4:4:0"
+    if (
+        int(cb.get("h_samp_factor", 0)) * 4 == int(y.get("h_samp_factor", 0))
+        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
+    ):
+        return "4:1:1"
     return "unsupported"
 
 
@@ -289,6 +299,7 @@ def _read_grid_batch(
     transform_blocks_per_launch: int = 0,
     transform_ctas_per_launch: int = 0,
     use_low_priority_streams: bool = False,
+    crop_execution_mode: str = "auto",
 ) -> Any:
     return reader.read_batch(
         image_ids,
@@ -305,6 +316,7 @@ def _read_grid_batch(
         transform_blocks_per_launch=transform_blocks_per_launch,
         transform_ctas_per_launch=transform_ctas_per_launch,
         use_low_priority_streams=use_low_priority_streams,
+        crop_execution_mode=crop_execution_mode,
         layout=layout,
         grid_transform=grid_transform,
     )
@@ -655,10 +667,17 @@ def _uses_fixed_transform(stats: dict[str, Any]) -> bool:
     return _uses_planless_fixed_transform(stats) or int(stats.get("fixed_transform_item_count", 0)) > 0
 
 
-def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
+def _accumulate_stats(totals: dict[str, int | float | str], batch: Any) -> None:
     stats = batch.execution_stats
     totals["selected_vectors"] += int(stats["selected_vector_count"])
     totals["full_vectors"] += int(stats["full_vector_count"])
+    totals["planned_vector_count"] += int(
+        stats.get("planned_vector_count", stats.get("planned_selected_vector_count", 0))
+    )
+    totals["actual_vector_count"] += int(
+        stats.get("actual_vector_count", stats.get("selected_vector_count", 0))
+    )
+    totals["full_vector_count"] += int(stats.get("full_vector_count", 0))
     totals["decode_kernels"] += int(stats["decode_kernel_launch_count"])
     totals["rowgroups"] += int(stats["rowgroup_count"])
     totals["worksets"] += int(stats["workset_count"])
@@ -725,6 +744,57 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     ):
         totals[key] = max(int(totals[key]), int(stats.get(key, 0)))
     totals["rowgroup_storage_bytes_read"] += int(stats.get("rowgroup_storage_bytes_read", 0))
+    totals["compressed_payload_bytes_read"] += int(
+        stats.get("compressed_payload_bytes_read", stats.get("rowgroup_storage_bytes_read", 0))
+    )
+    totals["full_compressed_payload_bytes"] += int(
+        stats.get("full_compressed_payload_bytes", stats.get("rowgroup_storage_bytes_read", 0))
+    )
+    totals["pread_count"] += int(stats.get("pread_count", 0))
+    totals["vector_bundle_rowgroup_count"] += int(stats.get("vector_bundle_rowgroup_count", 0))
+    totals["vector_bundle_envelope_rowgroup_count"] += int(
+        stats.get("vector_bundle_envelope_rowgroup_count", 0)
+    )
+    totals["vector_bundle_pread_count"] += int(stats.get("vector_bundle_pread_count", 0))
+    totals["pinned_rowgroup_read_count"] += int(stats.get("pinned_rowgroup_read_count", 0))
+    totals["pinned_rowgroup_read_bytes"] += int(stats.get("pinned_rowgroup_read_bytes", 0))
+    totals["requested_source_block_count"] += int(
+        stats.get("requested_source_block_count", stats.get("fixed_transform_source_block_count", 0))
+    )
+    totals["source_blocks_transformed"] += int(
+        stats.get("source_blocks_transformed", stats.get("fixed_transform_source_block_count", 0))
+    )
+    totals["sparse_read_supported_batches"] += int(bool(stats.get("sparse_read_supported", False)))
+    totals["sparse_read_fallback_rowgroup_count"] += int(
+        stats.get("sparse_read_fallback_rowgroup_count", 0)
+    )
+    for key in (
+        "automatic_sparse_storage_candidate_rowgroup_count",
+        "automatic_sparse_storage_selected_rowgroup_count",
+        "automatic_sparse_storage_rejected_rowgroup_count",
+        "automatic_sparse_storage_full_bytes",
+        "automatic_sparse_storage_candidate_bytes",
+        "automatic_sparse_storage_candidate_pread_count",
+    ):
+        totals[key] += int(stats.get(key, 0))
+    for key in (
+        "automatic_sparse_storage_full_estimated_ns",
+        "automatic_sparse_storage_candidate_estimated_ns",
+    ):
+        totals[key] += float(stats.get(key, 0.0))
+    for key, default in (
+        ("storage_read_granularity", "rowgroup"),
+        ("decode_granularity", "rowgroup"),
+        ("sparse_read_fallback_reason", ""),
+    ):
+        value = str(stats.get(key, default))
+        previous = str(totals.get(key, ""))
+        if not previous:
+            totals[key] = value
+        elif value and value != previous:
+            totals[key] = "mixed" if key != "sparse_read_fallback_reason" else "; ".join(
+                sorted(set(filter(None, previous.split("; ") + [value])))
+            )
     for key in (
         "galp_native_device_in_use_bytes",
         "galp_native_device_peak_in_use_bytes",
@@ -732,6 +802,12 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
         "galp_native_device_allocation_requests",
         "galp_native_device_cuda_allocation_count",
         "galp_native_device_cuda_allocation_bytes",
+        "galp_native_pinned_in_use_bytes",
+        "galp_native_pinned_peak_in_use_bytes",
+        "galp_native_pinned_cached_bytes",
+        "galp_native_pinned_allocation_requests",
+        "galp_native_pinned_cuda_allocation_count",
+        "galp_native_pinned_cuda_allocation_bytes",
     ):
         totals[key] = max(int(totals[key]), int(stats.get(key, 0)))
     totals["host_expanded_transform_items_created"] += int(
@@ -764,6 +840,11 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     totals["planning_seconds"] += float(stats.get("planning_ms", 0.0)) / 1000.0
     totals["workset_build_seconds"] += float(stats.get("workset_build_ms", 0.0)) / 1000.0
     totals["workset_upload_seconds"] += float(stats.get("workset_upload_ms", 0.0)) / 1000.0
+    totals["workset_upload_arena_pack_seconds"] += (
+        float(stats.get("workset_upload_arena_pack_ms", 0.0)) / 1000.0
+    )
+    totals["workset_upload_dma_bytes"] += int(stats.get("workset_upload_dma_bytes", 0))
+    totals["workset_upload_dma_count"] += int(stats.get("workset_upload_dma_count", 0))
     totals["decode_seconds"] += float(stats.get("decode_ms", 0.0)) / 1000.0
     totals["gather_seconds"] += float(stats.get("gather_ms", 0.0)) / 1000.0
     totals["decoded_gather_seconds"] += float(stats.get("decoded_gather_ms", 0.0)) / 1000.0
@@ -781,10 +862,13 @@ def _accumulate_stats(totals: dict[str, int | float], batch: Any) -> None:
     totals["round_kernel_seconds"] += float(stats.get("fixed_grid_round_ms", 0.0)) / 1000.0
 
 
-def _empty_totals() -> dict[str, int | float]:
+def _empty_totals() -> dict[str, int | float | str]:
     return {
         "selected_vectors": 0,
         "full_vectors": 0,
+        "planned_vector_count": 0,
+        "actual_vector_count": 0,
+        "full_vector_count": 0,
         "decode_kernels": 0,
         "rowgroups": 0,
         "worksets": 0,
@@ -820,12 +904,41 @@ def _empty_totals() -> dict[str, int | float]:
         "planless_axis_phase_matrix_count": 0,
         "planless_axis_program_bytes": 0,
         "rowgroup_storage_bytes_read": 0,
+        "compressed_payload_bytes_read": 0,
+        "full_compressed_payload_bytes": 0,
+        "pread_count": 0,
+        "vector_bundle_rowgroup_count": 0,
+        "vector_bundle_envelope_rowgroup_count": 0,
+        "vector_bundle_pread_count": 0,
+        "pinned_rowgroup_read_count": 0,
+        "pinned_rowgroup_read_bytes": 0,
+        "requested_source_block_count": 0,
+        "source_blocks_transformed": 0,
+        "sparse_read_supported_batches": 0,
+        "sparse_read_fallback_rowgroup_count": 0,
+        "automatic_sparse_storage_candidate_rowgroup_count": 0,
+        "automatic_sparse_storage_selected_rowgroup_count": 0,
+        "automatic_sparse_storage_rejected_rowgroup_count": 0,
+        "automatic_sparse_storage_full_bytes": 0,
+        "automatic_sparse_storage_candidate_bytes": 0,
+        "automatic_sparse_storage_candidate_pread_count": 0,
+        "automatic_sparse_storage_full_estimated_ns": 0.0,
+        "automatic_sparse_storage_candidate_estimated_ns": 0.0,
+        "storage_read_granularity": "",
+        "decode_granularity": "",
+        "sparse_read_fallback_reason": "",
         "galp_native_device_in_use_bytes": 0,
         "galp_native_device_peak_in_use_bytes": 0,
         "galp_native_device_cached_bytes": 0,
         "galp_native_device_allocation_requests": 0,
         "galp_native_device_cuda_allocation_count": 0,
         "galp_native_device_cuda_allocation_bytes": 0,
+        "galp_native_pinned_in_use_bytes": 0,
+        "galp_native_pinned_peak_in_use_bytes": 0,
+        "galp_native_pinned_cached_bytes": 0,
+        "galp_native_pinned_allocation_requests": 0,
+        "galp_native_pinned_cuda_allocation_count": 0,
+        "galp_native_pinned_cuda_allocation_bytes": 0,
         "host_expanded_transform_items_created": 0,
         "host_output_block_source_lists_created": 0,
         "host_global_transform_sort_items": 0,
@@ -848,6 +961,9 @@ def _empty_totals() -> dict[str, int | float]:
         "planning_seconds": 0.0,
         "workset_build_seconds": 0.0,
         "workset_upload_seconds": 0.0,
+        "workset_upload_arena_pack_seconds": 0.0,
+        "workset_upload_dma_bytes": 0,
+        "workset_upload_dma_count": 0,
         "decode_seconds": 0.0,
         "gather_seconds": 0.0,
         "decoded_gather_seconds": 0.0,
@@ -865,7 +981,84 @@ def _empty_totals() -> dict[str, int | float]:
     }
 
 
+def validate_crop_pushdown_accounting(stats: dict[str, Any]) -> list[str]:
+    """Reject crop-pushdown claims that are not supported by physical counters."""
+    failures: list[str] = []
+    planned = int(stats.get("planned_vector_count", stats.get("planned_selected_vector_count", 0)))
+    actual = int(stats.get("actual_vector_count", stats.get("selected_vector_count", 0)))
+    full = int(stats.get("full_vector_count", stats.get("full_vectors", 0)))
+    physical_bytes = int(
+        stats.get("compressed_payload_bytes_read", stats.get("rowgroup_storage_bytes_read", 0))
+    )
+    full_bytes = int(stats.get("full_compressed_payload_bytes", physical_bytes))
+    decode_granularity = str(stats.get("decode_granularity", "rowgroup"))
+    storage_granularity = str(stats.get("storage_read_granularity", "rowgroup"))
+    claims_vector_pushdown = decode_granularity in {"selected-vector", "vector"}
+    claims_lower_io = storage_granularity not in {"", "rowgroup", "none"}
+
+    if claims_vector_pushdown and full > 0 and (planned >= full or actual >= full):
+        failures.append(
+            "vector pushdown claimed but selected/decoded vectors cover the full rowgroup"
+        )
+    if claims_lower_io and full_bytes > 0 and physical_bytes >= full_bytes:
+        failures.append(
+            "lower physical I/O claimed but compressed payload bytes equal the full-rowgroup baseline"
+        )
+    if (
+        claims_lower_io
+        and int(stats.get("source_blocks_transformed", 0)) > 0
+        and full_bytes > 0
+        and physical_bytes >= full_bytes
+    ):
+        failures.append(
+            "transform block reduction was reported as storage read reduction without fewer physical bytes"
+        )
+    return failures
+
+
 def _annotate_fixed_path_result(result: dict[str, Any], preprocess: str) -> None:
+    result["planned_vector_count"] = int(
+        result.get("planned_vector_count", result.get("planned_selected_vector_count", 0))
+    )
+    result["actual_vector_count"] = int(
+        result.get("actual_vector_count", result.get("selected_vectors", 0))
+    )
+    result["full_vector_count"] = int(result.get("full_vector_count", result.get("full_vectors", 0)))
+    result["compressed_payload_bytes_read"] = int(
+        result.get("compressed_payload_bytes_read", result.get("rowgroup_storage_bytes_read", 0))
+    )
+    result["full_compressed_payload_bytes"] = int(
+        result.get("full_compressed_payload_bytes", result["compressed_payload_bytes_read"])
+    )
+    result["pread_count"] = int(result.get("pread_count", 0))
+    result["vector_bundle_rowgroup_count"] = int(result.get("vector_bundle_rowgroup_count", 0))
+    result["vector_bundle_envelope_rowgroup_count"] = int(
+        result.get("vector_bundle_envelope_rowgroup_count", 0)
+    )
+    result["vector_bundle_pread_count"] = int(result.get("vector_bundle_pread_count", 0))
+    result["storage_read_granularity"] = str(result.get("storage_read_granularity") or "rowgroup")
+    result["decode_granularity"] = str(result.get("decode_granularity") or "rowgroup")
+    result["source_blocks_transformed"] = int(
+        result.get("source_blocks_transformed", result.get("fixed_transform_source_blocks", 0))
+    )
+    full_bytes = result["full_compressed_payload_bytes"]
+    result["read_amplification"] = (
+        result["compressed_payload_bytes_read"] / full_bytes if full_bytes > 0 else 0.0
+    )
+    result["sparse_read_supported"] = bool(result.get("sparse_read_supported_batches", 0))
+    accounting_failures = validate_crop_pushdown_accounting(result)
+    result["crop_pushdown_accounting"] = {
+        "ok": not accounting_failures,
+        "failures": accounting_failures,
+        "stage_chain": [
+            "requested_source_blocks",
+            "planned_selected_vectors",
+            "actual_decoded_vectors",
+            "physical_compressed_bytes_read",
+        ],
+    }
+    if accounting_failures:
+        raise RuntimeError("invalid crop-pushdown accounting: " + "; ".join(accounting_failures))
     result["generic_projection_used"] = (
         int(result.get("projection_items", 0)) != 0
         or int(result.get("decoded_projection_items", 0)) != 0
@@ -901,7 +1094,7 @@ def _annotate_fixed_path_result(result: dict[str, Any], preprocess: str) -> None
         )
 
 
-def _accumulate_many_stats(totals: dict[str, int | float], batches: list[Any]) -> None:
+def _accumulate_many_stats(totals: dict[str, int | float | str], batches: list[Any]) -> None:
     for batch in batches:
         _accumulate_stats(totals, batch)
 
@@ -1010,6 +1203,7 @@ def read_and_adapt_batch(
             ),
             plan_cache_capacity=int(getattr(args, "plan_cache_capacity", 128)),
             enable_planless_execution=bool(getattr(args, "enable_planless_execution", True)),
+            crop_execution_mode=str(getattr(args, "crop_execution_mode", "auto")),
         )
         input_y, input_cbcr = adapt_galp_batch_to_rgbnomore(
             reader,
@@ -1028,6 +1222,7 @@ def read_and_adapt_batch(
         crop,
         args.cache_capacity_mib,
         decode_batch_rowgroups=int(getattr(args, "decode_batch_rowgroups", 2)),
+        crop_execution_mode=str(getattr(args, "crop_execution_mode", "auto")),
     )
     input_y, input_cbcr = adapt_galp_batch_to_rgbnomore(
         reader,
@@ -1059,6 +1254,7 @@ def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: l
         transform_blocks_per_launch=int(getattr(args, "transform_blocks_per_launch", 0)),
         transform_ctas_per_launch=int(getattr(args, "transform_ctas_per_launch", 0)),
         use_low_priority_streams=bool(getattr(args, "use_low_priority_streams", False)),
+        crop_execution_mode=str(getattr(args, "crop_execution_mode", "auto")),
         layout="transformed_dct_grid",
         grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32,
     )
@@ -1641,10 +1837,10 @@ def _parse_args() -> argparse.Namespace:
         choices=("preprocess-default", "supported-only", "all"),
         default="preprocess-default",
         help=(
-            "Image selection policy. preprocess-default preserves legacy behavior "
-            "(fixed-grid pushdown skips unsupported JPEG sampling); supported-only "
-            "uses the same supported 4:2:0/4:4:4 image stream for all "
-            "preprocess modes; all uses the complete image-id population without filtering."
+            "Image selection policy. preprocess-default and supported-only use the complete "
+            "ImageNet validation JPEG domain accepted by RGB-no-more/GALP "
+            "(4:4:4, 4:2:0, 4:2:2, 4:4:0, 4:1:1, grayscale, and four-component); "
+            "all disables sampling filtering for diagnostic manifests."
         ),
     )
     parser.add_argument(

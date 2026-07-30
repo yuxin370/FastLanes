@@ -147,6 +147,17 @@ def galp_manifest_payloads(manifest_path: Path) -> list[dict[str, Any]]:
                     "expected_size": expected_size,
                 }
             )
+        bundle_path = (root / fls_name).resolve().with_suffix(".svb")
+        if bundle_path.is_file():
+            require(bundle_path.is_relative_to(root), f"GALP vector-bundle payload escapes manifest directory: {bundle_path}")
+            payloads.append(
+                {
+                    "kind": "vector_bundle",
+                    "relative_path": bundle_path.relative_to(root).as_posix(),
+                    "path": bundle_path,
+                    "expected_size": bundle_path.stat().st_size,
+                }
+            )
     require(offset == len(data), f"GALP shard manifest has trailing bytes: {manifest_path}")
     return payloads
 
@@ -280,7 +291,11 @@ def load_sample_manifest(path: Path, expected_sha256: str | None = None) -> tupl
         require(isinstance(sample.get("label"), int) and 0 <= sample["label"] < 1000, f"sample {ordinal} has bad label")
         require(isinstance(sample.get("galp_image_id"), int) and sample["galp_image_id"] >= 0, f"sample {ordinal} has bad GALP image id")
         require(isinstance(sample.get("size_bytes"), int) and sample["size_bytes"] > 0, f"sample {ordinal} has bad size")
-        require(sample.get("jpeg_sampling") in ("4:2:0", "4:4:4"), f"sample {ordinal} is outside the shared JPEG sampling domain")
+        require(
+            sample.get("jpeg_sampling")
+            in {"4:4:4", "4:2:0", "4:2:2", "4:4:0", "4:1:1", "grayscale", "components:4"},
+            f"sample {ordinal} is outside the shared JPEG sampling domain",
+        )
         require(isinstance(sample.get("sha256"), str) and len(sample["sha256"]) == 64, f"sample {ordinal} has bad SHA-256")
         identity = sample.get("file_identity")
         require(isinstance(identity, dict), f"sample {ordinal} has no file identity snapshot")

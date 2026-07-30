@@ -7,14 +7,28 @@ import argparse
 import csv
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
-from common import MANIFEST_SCHEMA, fingerprint_file, sha256_file, sha256_json, write_json
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
+if str(BENCHMARK_ROOT) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_ROOT))
+
+from shared.common import MANIFEST_SCHEMA, fingerprint_file, sha256_file, sha256_json, write_json
 
 
 JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe"}
 SOF_MARKERS = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+SUPPORTED_JPEG_SAMPLING = {
+    "4:4:4",
+    "4:2:0",
+    "4:2:2",
+    "4:4:0",
+    "4:1:1",
+    "grayscale",
+    "components:4",
+}
 
 
 def _normalize_relative(value: str) -> str:
@@ -89,6 +103,10 @@ def jpeg_sampling(path: Path) -> str:
                 return "4:2:0"
             if y[0] == cb[0] * 2 and y[1] == cb[1]:
                 return "4:2:2"
+            if y[0] == cb[0] and y[1] == cb[1] * 2:
+                return "4:4:0"
+            if y[0] == cb[0] * 4 and y[1] == cb[1]:
+                return "4:1:1"
             return "unsupported"
     raise ValueError(f"JPEG SOF marker not found: {path}")
 
@@ -171,7 +189,7 @@ def build_manifest(
     output: Path,
 ) -> tuple[dict[str, Any], str]:
     full_entries = collect_dataset(data_root, split, index_csv)
-    eligible_entries = [entry for entry in full_entries if entry["jpeg_sampling"] in ("4:2:0", "4:4:4")]
+    eligible_entries = [entry for entry in full_entries if entry["jpeg_sampling"] in SUPPORTED_JPEG_SAMPLING]
     if sample_count <= 0 or sample_count > len(eligible_entries):
         raise ValueError(f"sample_count must be in [1,{len(eligible_entries)}], got {sample_count}")
     label_map = validate_galp_label_map(galp_label_map_json, full_entries)
@@ -213,7 +231,10 @@ def build_manifest(
             "seed": seed,
             "sample_count": sample_count,
             "order": "manifest_ordinal",
-            "eligibility": "three-component JPEG with 4:2:0 or 4:4:4 sampling (intersection supported by all four pipelines)",
+            "eligibility": (
+                "ImageNet validation JPEG layouts accepted by RGB-no-more and GALP: "
+                "4:4:4, 4:2:0, 4:2:2, 4:4:0, 4:1:1, grayscale, or four-component"
+            ),
         },
         "samples": selected,
     }

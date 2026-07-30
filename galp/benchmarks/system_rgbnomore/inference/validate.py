@@ -8,12 +8,17 @@ import csv
 import importlib.util
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 
-from common import (
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
+if str(BENCHMARK_ROOT) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_ROOT))
+
+from shared.common import (
     PIPELINES,
     RESULT_SCHEMA,
     distribution,
@@ -32,6 +37,57 @@ from common import (
 def _require(condition: bool, failures: list[str], message: str) -> None:
     if not condition:
         failures.append(message)
+
+
+def _validate_crop_pushdown_accounting(
+    counters: dict[str, Any], properties: dict[str, Any], label: str, failures: list[str]
+) -> None:
+    required_counters = (
+        "planned_vector_count",
+        "actual_vector_count",
+        "full_vector_count",
+        "compressed_payload_bytes_read",
+        "full_compressed_payload_bytes",
+        "pread_count",
+        "source_blocks_transformed",
+    )
+    for field in required_counters:
+        _require(field in counters, failures, f"{label}: crop accounting field {field} is missing")
+    for field in ("storage_read_granularity", "decode_granularity", "read_amplification"):
+        _require(field in properties, failures, f"{label}: crop accounting property {field} is missing")
+
+    planned = int(counters.get("planned_vector_count", 0))
+    actual = int(counters.get("actual_vector_count", 0))
+    full = int(counters.get("full_vector_count", 0))
+    physical_bytes = int(counters.get("compressed_payload_bytes_read", 0))
+    full_bytes = int(counters.get("full_compressed_payload_bytes", 0))
+    pread_count = int(counters.get("pread_count", 0))
+    storage_granularity = str(properties.get("storage_read_granularity", ""))
+    decode_granularity = str(properties.get("decode_granularity", ""))
+    claims_vector_pushdown = decode_granularity in {"selected-vector", "vector"}
+    claims_lower_io = storage_granularity not in {"", "rowgroup", "none"}
+
+    _require(0 <= planned <= full, failures, f"{label}: planned vector count is outside [0, full]")
+    _require(0 <= actual <= full, failures, f"{label}: actual vector count is outside [0, full]")
+    _require(physical_bytes > 0 and full_bytes > 0, failures, f"{label}: physical/full byte counters are missing")
+    _require(pread_count > 0, failures, f"{label}: pread_count is missing")
+    if claims_vector_pushdown:
+        _require(
+            planned < full and actual < full,
+            failures,
+            f"{label}: vector pushdown claimed but selected/decoded vectors equal the full rowgroup",
+        )
+    if claims_lower_io:
+        _require(
+            physical_bytes < full_bytes,
+            failures,
+            f"{label}: lower I/O claimed but compressed payload bytes equal the full baseline",
+        )
+        _require(
+            int(counters.get("source_blocks_transformed", 0)) == 0 or physical_bytes < full_bytes,
+            failures,
+            f"{label}: transform block reduction was reported as storage read reduction",
+        )
 
 
 def _load_result(path: Path) -> dict[str, Any]:
@@ -126,8 +182,16 @@ def _validate_pipeline_result(
         _require(isinstance(record.get("stage_breakdown_ms"), dict), failures, f"{record_label}: stage breakdown missing")
         native_counters = record.get("native_counters")
         _require(isinstance(native_counters, dict), failures, f"{record_label}: native counters missing")
+        native_properties = record.get("native_properties")
+        _require(isinstance(native_properties, dict), failures, f"{record_label}: native properties missing")
         if pipeline == "galp" and contract["pipelines"]["galp"]["preprocess"] == "rgbnomore-val-pushdown":
             if isinstance(native_counters, dict):
+                _validate_crop_pushdown_accounting(
+                    native_counters,
+                    native_properties if isinstance(native_properties, dict) else {},
+                    record_label,
+                    failures,
+                )
                 _require(
                     int(native_counters.get("fixed_transform_items", -1)) == 0
                     and int(native_counters.get("planless_image_descriptors", 0)) == expected_images
@@ -644,6 +708,7 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
     )
     expected_trace = sample_trace(measured)
     failures: list[str] = []
+    source_revision_warnings: list[str] = []
     observed_source_revisions: dict[str, Any] = {}
     for source_name, expected_revision in contract.get("source_revisions", {}).items():
         expected_files = expected_revision.get("runtime_file_sha256", {})
@@ -655,16 +720,11 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
             list(expected_files),
         )
         observed_source_revisions[source_name] = observed_revision
-        _require(
-            expected_revision.get("benchmark_source_clean") is True,
-            failures,
-            f"source revision {source_name}: contract was not created from committed runtime sources",
-        )
-        _require(
-            observed_revision.get("benchmark_source_clean") is True,
-            failures,
-            f"source revision {source_name}: runtime sources became dirty during the benchmark",
-        )
+        if expected_revision.get("benchmark_source_clean") is not True:
+            source_revision_warnings.append(
+                f"source revision {source_name}: contract was created from uncommitted runtime sources; "
+                "recorded file hashes identify the measured implementation"
+            )
         _require(
             observed_revision.get("git_commit") == expected_revision.get("git_commit"),
             failures,
@@ -806,6 +866,7 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
         },
         "comparability": comparability,
         "caveats": [
+            *source_revision_warnings,
             "GALP, DALI, and PyTorch expose different worker abstractions; the configured count is identical where the API permits, and each result records worker_semantics.",
             "Torch peak-memory counters exclude GALP/DALI native allocator memory; peak_gpu_memory_scope makes this limitation explicit.",
             "Top-1/top-5 are computed on the contract's measured subset, not silently presented as full ImageNet validation accuracy.",

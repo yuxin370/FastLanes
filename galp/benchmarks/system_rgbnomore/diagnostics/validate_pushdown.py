@@ -38,6 +38,7 @@ from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 DEFAULT_JPEG_TOOL = REPO_ROOT / "build/galp/tools/jpeg_dct/galp_jpeg_dct_tool"
 DEFAULT_SYNTHETIC_FIXTURE_DIR = Path("/tmp/galp_rgbnomore_pushdown_fixtures")
+SUPPORTED_COLOR_SAMPLING_MODES = {"4:4:4", "4:2:0", "4:2:2", "4:4:0", "4:1:1"}
 
 
 def _read_dequantized_rgbnomore_reference(
@@ -174,6 +175,16 @@ def _sampling_mode(reader: Any, image_id: int) -> str:
         and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
     ):
         return "4:2:2"
+    if (
+        int(cb.get("h_samp_factor", 0)) == int(y.get("h_samp_factor", 0))
+        and int(cb.get("v_samp_factor", 0)) * 2 == int(y.get("v_samp_factor", 0))
+    ):
+        return "4:4:0"
+    if (
+        int(cb.get("h_samp_factor", 0)) * 4 == int(y.get("h_samp_factor", 0))
+        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
+    ):
+        return "4:1:1"
     return "unsupported"
 
 
@@ -450,6 +461,7 @@ def _validate_fixture_manifest_sampling(manifest: Path, expected_sampling: str) 
 def _run_synthetic_fixture_checks(args: argparse.Namespace, transform: Any) -> list[dict[str, Any]]:
     fixture_specs = [
         ("synthetic_420", "rgb_420", "4:2:0"),
+        ("synthetic_422", "rgb_422", "4:2:2"),
         ("synthetic_444", "rgb_444", "4:4:4"),
         ("synthetic_grayscale", "grayscale", "grayscale"),
     ]
@@ -504,42 +516,6 @@ def _run_synthetic_fixture_checks(args: argparse.Namespace, transform: Any) -> l
             for result in tensor_results
         )
         print(f"fixture={fixture_name} sampling={expected_sampling} {summary}")
-    unsupported_manifest = _build_synthetic_manifest(args, "synthetic_422", "rgb_422")
-    _validate_fixture_manifest_sampling(unsupported_manifest, "4:2:2")
-    reader = galp_dct.DirectDctReader(str(unsupported_manifest))
-    try:
-        reader.plan_batch(
-            [0],
-            crop=None,
-            dct_coeffs="all",
-            cache_capacity_mib=args.cache_capacity_mib,
-            layout="transformed_dct_grid",
-            grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM,
-        )
-    except RuntimeError as exc:
-        message = str(exc)
-        if "does not allow this chroma sampling ratio" not in message:
-            raise RuntimeError(f"synthetic_422 failed with an unexpected error: {message}") from exc
-        fixture_results.append(
-            {
-                "step": "synthetic_422",
-                "manifest": str(unsupported_manifest),
-                "image_ids": [0],
-                "color_image_ids": [0],
-                "fallback_color_image_ids": [],
-                "grayscale_image_ids": [],
-                "sampling": "4:2:2",
-                "reference_layout": "unsupported_sampling",
-                "pushdown_layout": "transformed_dct_grid",
-                "pushdown_checks": [],
-                "pushdown_stats": None,
-                "tensors": [],
-                "expected_error": message,
-            }
-        )
-        print(f"fixture=synthetic_422 sampling=4:2:2 expected_error={message}")
-    else:
-        raise RuntimeError("synthetic_422 expected transformed_dct_grid to reject 4:2:2 sampling")
     return fixture_results
 
 
@@ -582,12 +558,14 @@ def main() -> None:
         supported_color_ids = [
             image_id
             for image_id in image_ids
-            if modes[image_id] == "semantic_color" and sampling_modes[image_id] in ("4:2:0", "4:4:4")
+            if modes[image_id] == "semantic_color"
+            and sampling_modes[image_id] in SUPPORTED_COLOR_SAMPLING_MODES
         ]
         unsupported_color_ids = [
             image_id
             for image_id in image_ids
-            if modes[image_id] == "semantic_color" and sampling_modes[image_id] not in ("4:2:0", "4:4:4")
+            if modes[image_id] == "semantic_color"
+            and sampling_modes[image_id] not in SUPPORTED_COLOR_SAMPLING_MODES
         ]
         fallback_color_ids = [image_id for image_id in image_ids if modes[image_id] == "fallback_color"]
         grayscale_ids = [image_id for image_id in image_ids if modes[image_id] == "grayscale"]

@@ -501,13 +501,13 @@ benchmark 分离并记录：
 - `galp/torch/direct_dct_torch.cpp`
 - `galp/torch/rgbnomore_dct_profile.py`（新增）
 - `galp/benchmarks/system_rgbnomore/README.md`
-- `galp/benchmarks/system_rgbnomore/common.py`
+- `galp/benchmarks/system_rgbnomore/shared/common.py`
 - `galp/benchmarks/system_rgbnomore/diagnostics/direct_dct.py`
-- `galp/benchmarks/system_rgbnomore/pipeline.py`
-- `galp/benchmarks/system_rgbnomore/prepare_dataset.py`
-- `galp/benchmarks/system_rgbnomore/run.py`
-- `galp/benchmarks/system_rgbnomore/validate.py`
-- `galp/benchmarks/system_rgbnomore/E2E_COMPARISON_RUN_GUIDE.md`（新增）
+- `galp/benchmarks/system_rgbnomore/inference/pipeline.py`
+- `galp/benchmarks/system_rgbnomore/dataset/prepare_dataset.py`
+- `galp/benchmarks/system_rgbnomore/inference/run.py`
+- `galp/benchmarks/system_rgbnomore/inference/validate.py`
+- `galp/benchmarks/system_rgbnomore/docs/E2E_COMPARISON_RUN_GUIDE.md`（新增）
 - `galp/tests/test_system_benchmark.py`（新增）
 
 不得纳入 milestone commit：

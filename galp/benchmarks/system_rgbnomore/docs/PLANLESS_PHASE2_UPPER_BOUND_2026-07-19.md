@@ -687,7 +687,7 @@ T_model_with_transform - T_model_only
 | `galp/torch/direct_dct_torch.cpp` | Python API 暴露 scheduling policy、output chunk、CTA cap、低优先级开关、stream/event counters 和 kernel resource counters |
 | `pipeline.py` | 模型、adapter tensor ops 和计时 event 使用 PyTorch 运行时可用的 greatest-priority stream；serial 延迟下一批 prefetch |
 | `run.py` | 正式 contract 记录 model/Direct-DCT priority、策略、输出 chunk 和 CTA cap；最终生产默认值为实测通过 gate 的 limited-overlap 512 outputs/512 CTA |
-| `scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、成对 output/CTA limited sweep、serial，校验实际 priority/counters/kernel resources，并计算核心 delta、真实 residency/occupancy 上限与 Pareto frontier |
+| `diagnostics/scheduler_matrix.py` | 同 contract 自动运行 fully-overlapped、成对 output/CTA limited sweep、serial，校验实际 priority/counters/kernel resources，并计算核心 delta、真实 residency/occupancy 上限与 Pareto frontier |
 | `jpeg_dct_test.cpp` | 512-output/64-CTA grid-stride 的尾块/多 launch 输出必须与 single-grid 和 legacy bit-exact |
 | `test_system_benchmark.py` | 证明 serial 在下一次 `load()` 前不会提交 next-batch prefetch |
 
@@ -819,7 +819,7 @@ GALP_RUN_GPU_TESTS=1 CUDA_VISIBLE_DEVICES=0 \
 
 CUDA_VISIBLE_DEVICES=0 \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/scheduler_matrix.py \
+  galp/benchmarks/system_rgbnomore/diagnostics/scheduler_matrix.py \
   --contract /tmp/galp-planless-phase2-upper-final-3932b5d/contract.json \
   --output-dir /tmp/galp-planless-scheduler-cta-sweep \
   --binding-dir build/galp/torch \
@@ -999,7 +999,7 @@ CUDA stream priority 不能抢占已经驻留的 CTA，所以剩余 `0.509688 ms
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/scheduler_matrix.py \
+  galp/benchmarks/system_rgbnomore/diagnostics/scheduler_matrix.py \
   --contract /tmp/galp-planless-phase2-upper-final-3932b5d/contract.json \
   --output-dir /tmp/galp-planless-scheduler-cta-lifetime \
   --binding-dir build/galp/torch \

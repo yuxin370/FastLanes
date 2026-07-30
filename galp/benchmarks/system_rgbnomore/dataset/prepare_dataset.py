@@ -20,10 +20,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from common import cached_file_fingerprints, galp_manifest_payloads
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
+if str(BENCHMARK_ROOT) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_ROOT))
+
+from shared.common import cached_file_fingerprints, galp_manifest_payloads
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_INPUT_DIR = Path("/tmp/rgbnomore_imagenet/val")
 DEFAULT_OUT_DIR = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val-rg8"
 DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
@@ -304,6 +308,14 @@ def _parse_args() -> argparse.Namespace:
         help="Storage architecture preset; random-access is the production path for globally shuffled batches.",
     )
     parser.add_argument("--policy", choices=("ragged",), default="ragged")
+    parser.add_argument(
+        "--physical-layout",
+        choices=("image-major", "image-major-vector-rowgroups"),
+        help=(
+            "Override the preset layout. image-major-vector-rowgroups writes the manifest-v3 "
+            "one-FastLanes-vector-per-rowgroup upper-bound prototype."
+        ),
+    )
     parser.add_argument("--shard-images", type=int)
     parser.add_argument("--rowgroup-vectors", type=int)
     parser.add_argument("--rowgroups-per-shard", type=int)
@@ -474,6 +486,7 @@ def main() -> None:
         "reconstruct",
     ]
     for flag, value in (
+        ("--physical-layout", args.physical_layout),
         ("--shard-images", args.shard_images),
         ("--rowgroup-vectors", args.rowgroup_vectors),
         ("--rowgroups-per-shard", args.rowgroups_per_shard),
@@ -492,6 +505,7 @@ def main() -> None:
         "input_count": input_count,
         "metadata_profile": "reconstruct",
         "storage_preset": args.preset,
+        "physical_layout": args.physical_layout or "preset-default",
         "dry_run": args.dry_run,
     }
     if args.index_file is not None:
