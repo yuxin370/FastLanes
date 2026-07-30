@@ -105,6 +105,7 @@ plot/*.tex
 /paper/dataset_lib/__pycache__
 /_deps
 /.cmake
+/.cache/
 *.ninja
 /test/local_result
 DartConfiguration.tcl

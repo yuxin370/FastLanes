@@ -7,7 +7,6 @@ include(CMakePackageConfigHelpers)
 # ────────────────────────────────────────────────
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 option(GALP_BUILD_TESTS "Build GALP tests" ${BUILD_TESTING})
@@ -17,6 +16,7 @@ option(GALP_BUILD_EXAMPLES "Build GALP examples" OFF)
 option(GALP_BUILD_TORCH "Build optional PyTorch direct-DCT runtime bindings" OFF)
 option(GALP_WITH_NVCOMP "Build nvCOMP compressor comparison targets" OFF)
 option(GALP_WITH_JPEG_DCT "Build JPEG DCT dataset reader/compressor" ON)
+option(GALP_CUDA_EMBED_SOURCE_IN_PTX "Embed CUDA source in PTX for diagnostic builds" OFF)
 if (DEFINED FLS_ENABLE_INSTALL)
     set(GALP_ENABLE_INSTALL_DEFAULT ${FLS_ENABLE_INSTALL})
 else ()
@@ -91,6 +91,20 @@ if (GALP_VERBOSE_BUILD)
     set(CMAKE_VERBOSE_MAKEFILE ON)
 endif ()
 
+# Respect explicitly configured launchers. Otherwise use the same optional
+# ccache executable for both host C++ and CUDA compilation.
+find_program(GALP_CCACHE_EXECUTABLE NAMES ccache)
+if (GALP_CCACHE_EXECUTABLE)
+    if (NOT DEFINED CACHE{CMAKE_CXX_COMPILER_LAUNCHER})
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${GALP_CCACHE_EXECUTABLE}" CACHE STRING
+            "Launcher for C++ compilation")
+    endif ()
+    if (NOT DEFINED CACHE{CMAKE_CUDA_COMPILER_LAUNCHER})
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${GALP_CCACHE_EXECUTABLE}" CACHE STRING
+            "Launcher for CUDA compilation")
+    endif ()
+endif ()
+
 set(COMMON_WARNINGS "")
 set(CLANG_ONLY_WARNINGS
         -Wno-c++98-compat-local-type-template-args
@@ -117,10 +131,13 @@ set(CLANG_ONLY_WARNINGS
 
 macro(apply_warnings tgt)
 	    target_compile_options(${tgt} PRIVATE
-	            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo -src-in-ptx --diag-suppress=550>
+	            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo --diag-suppress=550>
 	            $<$<COMPILE_LANGUAGE:CXX>:${COMMON_WARNINGS}>
 	            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:${CLANG_ONLY_WARNINGS}>
 	            $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_WARNINGS}>)
+	    if (GALP_CUDA_EMBED_SOURCE_IN_PTX)
+	        target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-src-in-ptx>)
+	    endif ()
 endmacro()
 
 # Sample data root for tests and benchmarks. Attach the definition to those

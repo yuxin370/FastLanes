@@ -340,8 +340,9 @@ crop reads from a sharded DCT/FLS manifest:
   --crop 64 64 512 512 --window-images 256 --dct-coeffs first:8 --mode dct-compare
 ```
 
-The implementation and validation status is summarized in
-`galp/docs/jpeg_dct_crop_pushdown.md`.
+The current implementation, benchmark, and historical-document status is indexed in
+[`galp/docs/README.md`](docs/README.md). The executable inference contract is documented in
+[`galp/benchmarks/system_rgbnomore/docs/E2E_COMPARISON_RUN_GUIDE.md`](benchmarks/system_rgbnomore/docs/E2E_COMPARISON_RUN_GUIDE.md).
 For GPU evidence collection, save raw `pipeline_benchmark` output and summarize
 it with:
 

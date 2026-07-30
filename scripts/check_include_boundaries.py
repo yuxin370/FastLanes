@@ -3,7 +3,7 @@
 
 This script intentionally checks only lightweight include and CMake target
 boundaries. It does not move files, inspect transitive dependencies, or classify
-algorithms. Production source membership is taken from the galp_core source list
+algorithms. Production engine source membership is taken from the galp_engine source list
 rather than inferred only from paths.
 """
 
@@ -224,7 +224,7 @@ def parse_cmake_source_set(cmake_file: Path, variable: str) -> list[str]:
 
 
 def galp_core_sources(galp_root: Path) -> set[str]:
-    source_entries = parse_cmake_source_set(galp_root / "src" / "CMakeLists.txt", "GALP_CORE_SOURCES")
+    source_entries = parse_cmake_source_set(galp_root / "src" / "CMakeLists.txt", "GALP_ENGINE_SOURCES")
     return {(galp_root / "src" / entry).resolve().as_posix() for entry in source_entries}
 
 
@@ -367,7 +367,7 @@ def check_galp_core_sources(galp_root: Path, repo_root: Path) -> list[tuple[str,
     violations: list[tuple[str, int, str, str, str]] = []
     forbidden_roots = [(name, galp_root / name) for name in FORBIDDEN_CORE_SOURCE_ROOTS]
 
-    for line_number, entry in parse_cmake_source_set_entries(cmake_file, "GALP_CORE_SOURCES"):
+    for line_number, entry in parse_cmake_source_set_entries(cmake_file, "GALP_ENGINE_SOURCES"):
         entry_path = Path(entry)
         source_path = entry_path if entry_path.is_absolute() else (galp_root / "src" / entry)
         resolved = source_path.resolve()

@@ -8,7 +8,7 @@
 #if GALP_WITH_JPEG_DCT
 
 #include "cuda/cuda_macros.cuh"
-#include "jpeg/jpeg_dct_device.cuh"
+#include "jpeg/jpeg_dct_policy.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstring>

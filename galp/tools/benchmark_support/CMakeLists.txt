@@ -13,5 +13,8 @@ target_include_directories(galp_benchmark_support PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src
         ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(galp_benchmark_support PUBLIC
-        galp_core)
+        galp_engine)
+if (GALP_WITH_JPEG_DCT)
+        target_link_libraries(galp_benchmark_support PUBLIC galp_jpeg_dct_device)
+endif ()
 apply_warnings(galp_benchmark_support)

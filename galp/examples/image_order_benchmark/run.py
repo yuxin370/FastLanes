@@ -105,8 +105,8 @@ def _load_runtime_modules(binding_dir: Path):
         if text not in sys.path:
             sys.path.insert(0, text)
     import _galp_direct_dct as galp_dct
-    import manifest as system_manifest
-    import pipeline as system_pipeline
+    from dataset import manifest as system_manifest
+    from inference import pipeline as system_pipeline
 
     return galp_dct, system_manifest, system_pipeline
 

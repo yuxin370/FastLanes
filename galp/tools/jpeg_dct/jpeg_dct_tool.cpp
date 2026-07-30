@@ -1,10 +1,30 @@
 #include "galp/jpeg_dct.hpp"
+#include "galp/profiles/rgbnomore.hpp"
+#include "galp/sparse_vector_bundle.hpp"
+#include "jpeg/jpeg_dct_expression_validation.hpp"
+#include "jpeg/jpeg_dct_metadata.hpp"
+#include "jpeg/jpeg_dct_shard_reader.hpp"
+#include "fls/connection.hpp"
+#include "fls/expression/rpn.hpp"
+#include "fls/file/file_footer.hpp"
+#include "fls/file/file_header.hpp"
+#include "fls/footer/table_descriptor.hpp"
+#include "fls/footer/table_descriptor_generated.h"
+#include "fls/io/file.hpp"
+#include "fls/table/memory_table.hpp"
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -19,6 +39,10 @@ struct Options {
 	std::filesystem::path                 output_metadata;
 	std::filesystem::path                 output_dir;
 	std::filesystem::path                 verify_manifest;
+	std::filesystem::path                 sparse_bundle_source;
+	std::filesystem::path                 sparse_bundle_output;
+	std::filesystem::path                 inspect_crop_manifest;
+	std::filesystem::path                 benchmark_rowgroup_read_source;
 	std::vector<std::filesystem::path>    inputs;
 	galp::jpeg::JpegMetadataProfile       metadata_profile = galp::jpeg::JpegMetadataProfile::kDctDatasetOnly;
 	galp::jpeg::JpegDctShardPreset        shard_preset     = galp::jpeg::JpegDctShardPreset::kBalanced;
@@ -38,6 +62,11 @@ struct Options {
 	bool                                  physical_layout_specified      = false;
 	bool                                  spatial_order_specified        = false;
 	bool                                  verify_mode                    = false;
+	bool                                  sparse_bundle_mode             = false;
+	bool                                  inspect_encodings_mode          = false;
+	bool                                  inspect_crop_plan_mode           = false;
+	bool                                  benchmark_rowgroup_read_mode       = false;
+	size_t                                benchmark_repeats                  = 5U;
 	uint32_t                              verify_image_index             = 0;
 	bool                                  verify_image_index_specified   = false;
 };
@@ -56,13 +85,17 @@ void print_usage(const char* prog) {
 	       "[--metadata-profile dct|reconstruct|preserve] input0.jpg [input1.jpg ...]\n"
 	    << "  " << prog
 	    << " --shard --out-dir output_dct [--preset crop-latency|balanced|throughput|random-access] "
-		       "[--physical-layout spatial-major|image-major] "
+	       "[--physical-layout spatial-major|image-major|image-major-vector-rowgroups] "
 		       "[--spatial-order raster|tiled-raster-32|z-order|tiled-z-32] "
 	       "[--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N] [--threads N] "
 	       "[--shard-workers N] input_dir\n"
 	    << "  " << prog
 		    << " --verify-manifest manifest.bin [--image-index N] source.jpg\n"
-		    << "  " << prog << " --verify-manifest manifest.bin source_dir\n"
+	    << "  " << prog << " --verify-manifest manifest.bin source_dir\n"
+	    << "  " << prog << " --build-sparse-bundle input.fls --bundle-output output.svb\n"
+	    << "  " << prog << " --inspect-encodings input.fls [input1.fls ...]\n"
+	    << "  " << prog << " --inspect-crop-plan manifest.bin [--image-index N]\n"
+	    << "  " << prog << " --benchmark-rowgroup-read input.fls [--repeats N]\n"
 	    << "Default: ragged DCT block layout and the legacy metadata format.\n"
 	    << "  --threads defaults to all available cores when not set.\n"
 	    << "  --metadata-profile writes the sectioned metadata format; use reconstruct to persist image dimensions "
@@ -327,6 +360,128 @@ size_t parse_size_arg(const std::string_view name, const char* value) {
 	return static_cast<size_t>(parsed);
 }
 
+int inspect_encodings(const std::vector<std::filesystem::path>& paths) {
+	std::map<std::string, size_t> token_counts;
+	size_t                        rowgroup_count = 0;
+	size_t                        column_count   = 0;
+
+	for (const auto& path : paths) {
+		fastlanes::FileHeader header {};
+		fastlanes::FileFooter footer {};
+		fastlanes::FileHeader::Load(header, path);
+		fastlanes::FileFooter::Load(footer, path);
+		auto descriptor =
+		    header.settings.inline_footer
+		        ? fastlanes::TableDescriptorHandle::FromFileSlice(
+		              path, footer.table_descriptor_offset, footer.table_descriptor_size, true)
+		        : fastlanes::TableDescriptorHandle::FromFile(path.parent_path() / "table_descriptor.fbb", true);
+		const auto* table     = descriptor.Get();
+		const auto* rowgroups = table->m_rowgroup_descriptors();
+		if (rowgroups == nullptr) {
+			throw std::runtime_error("missing rowgroup descriptors in " + path.string());
+		}
+		for (flatbuffers::uoffset_t rowgroup_index = 0; rowgroup_index < rowgroups->size(); ++rowgroup_index) {
+			const auto* rowgroup = rowgroups->Get(rowgroup_index);
+			const auto* columns  = rowgroup == nullptr ? nullptr : rowgroup->m_column_descriptors();
+			if (columns == nullptr) {
+				throw std::runtime_error("missing column descriptors in " + path.string());
+			}
+			for (flatbuffers::uoffset_t column_index = 0; column_index < columns->size(); ++column_index) {
+				const auto* column = columns->Get(column_index);
+				const auto* rpn    = column == nullptr ? nullptr : column->encoding_rpn();
+				const auto* tokens = rpn == nullptr ? nullptr : rpn->operator_tokens();
+				if (tokens == nullptr || tokens->empty()) {
+					throw std::runtime_error("missing encoding tokens in " + path.string());
+				}
+				for (flatbuffers::uoffset_t token_index = 0; token_index < tokens->size(); ++token_index) {
+					const auto name = fastlanes::token_to_string(tokens->Get(token_index));
+					++token_counts[name];
+				}
+			}
+			++rowgroup_count;
+			column_count += columns->size();
+		}
+	}
+
+	std::cout << "files: " << paths.size() << '\n'
+	          << "rowgroups: " << rowgroup_count << '\n'
+	          << "columns: " << column_count << '\n'
+	          << "token,count\n";
+	for (const auto& [token, count] : token_counts) {
+		std::cout << token << ',' << count << '\n';
+	}
+	return 0;
+}
+
+int inspect_crop_plan(const std::filesystem::path& manifest_path, const uint32_t image_index) {
+	galp::jpeg::JpegDctShardDatasetReader reader(manifest_path);
+	if (image_index >= reader.image_count()) {
+		throw std::runtime_error("--image-index is outside the manifest image range");
+	}
+	galp::jpeg::JpegDctDeviceBatchOptions options;
+	options.layout                    = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	options.grid_transform            = galp::profiles::rgbnomore_val_dct_grid_transform();
+	options.crop_execution_mode       = galp::jpeg::JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode;
+	options.enable_planless_execution = true;
+	const auto preview                = reader.PlanDeviceDctBatch(
+        std::vector<galp::jpeg::JpegDctImageCropRequest> {{image_index, {}, false, {}, {}}}, options);
+	std::cout << "manifest: " << manifest_path << '\n'
+	          << "image_index: " << image_index << '\n'
+	          << "full_vectors: " << preview.full_vector_count << '\n'
+	          << "selected_vectors: " << preview.planned_selected_vector_count << '\n';
+	for (const auto& rowgroup_plan : preview.rowgroup_vector_plans) {
+		std::cout << "rowgroup: shard=" << rowgroup_plan.rowgroup.shard_id
+		          << " index=" << rowgroup_plan.rowgroup.rowgroup_index << " vectors=";
+		for (size_t index = 0; index < rowgroup_plan.selected_vectors.size(); ++index) {
+			if (index != 0U) {
+				std::cout << ',';
+			}
+			std::cout << rowgroup_plan.selected_vectors[index];
+		}
+		std::cout << '\n';
+	}
+	return 0;
+}
+
+int benchmark_rowgroup_read(const std::filesystem::path& path, const size_t repeats) {
+	if (repeats == 0U) {
+		throw std::invalid_argument("--repeats must be greater than zero");
+	}
+	fastlanes::File       file(path);
+	fastlanes::FileHeader header {};
+	fastlanes::FileFooter footer {};
+	fastlanes::FileHeader::Load(header, file);
+	fastlanes::FileFooter::Load(footer, file);
+	auto descriptor =
+	    header.settings.inline_footer
+	        ? fastlanes::TableDescriptorHandle::FromFileSlice(
+	              file, footer.table_descriptor_offset, footer.table_descriptor_size, true)
+	        : fastlanes::TableDescriptorHandle::FromFile(path.parent_path() / "table_descriptor.fbb", true);
+	const auto* rowgroups = descriptor.Get()->m_rowgroup_descriptors();
+	if (rowgroups == nullptr || rowgroups->empty()) {
+		throw std::runtime_error("rowgroup read benchmark input has no rowgroups");
+	}
+	size_t max_rowgroup_bytes = 0U;
+	for (flatbuffers::uoffset_t rowgroup = 0; rowgroup < rowgroups->size(); ++rowgroup) {
+		max_rowgroup_bytes = std::max(max_rowgroup_bytes, static_cast<size_t>(rowgroups->Get(rowgroup)->m_size()));
+	}
+	std::vector<std::byte> backing(max_rowgroup_bytes);
+	for (size_t repeat = 0; repeat < repeats; ++repeat) {
+		size_t     bytes = 0U;
+		const auto start = std::chrono::steady_clock::now();
+		for (flatbuffers::uoffset_t rowgroup = 0; rowgroup < rowgroups->size(); ++rowgroup) {
+			const auto* entry = rowgroups->Get(rowgroup);
+			file.ReadRangeUnchecked(backing.data(), entry->m_offset(), entry->m_size());
+			bytes += static_cast<size_t>(entry->m_size());
+		}
+		const auto end = std::chrono::steady_clock::now();
+		std::cout << "repeat=" << repeat
+		          << " wall_ms=" << std::chrono::duration<double, std::milli>(end - start).count() << " bytes=" << bytes
+		          << " preads=" << rowgroups->size() << '\n';
+	}
+	return 0;
+}
+
 void apply_shard_preset(Options& options) {
 	size_t   preset_shard_images        = 8192;
 	uint32_t preset_rowgroup_vectors    = 128;
@@ -362,7 +517,7 @@ void apply_shard_preset(Options& options) {
 	}
 	if (options.spatial_order_specified) {
 		if (options.physical_layout_specified &&
-		    options.physical_layout != galp::jpeg::JpegDctPhysicalLayout::kImageMajor) {
+		    !galp::jpeg::is_image_major_physical_layout(options.physical_layout)) {
 			throw std::runtime_error("--spatial-order requires the image-major physical layout");
 		}
 		options.physical_layout           = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
@@ -380,6 +535,33 @@ bool parse_args(const int argc, char** argv, Options& options) {
 		if (arg == "--verify-manifest" && i + 1 < argc) {
 			options.verify_manifest = argv[++i];
 			options.verify_mode     = true;
+			continue;
+		}
+		if (arg == "--build-sparse-bundle" && i + 1 < argc) {
+			options.sparse_bundle_source = argv[++i];
+			options.sparse_bundle_mode   = true;
+			continue;
+		}
+		if (arg == "--inspect-encodings") {
+			options.inspect_encodings_mode = true;
+			continue;
+		}
+		if (arg == "--inspect-crop-plan" && i + 1 < argc) {
+			options.inspect_crop_manifest = argv[++i];
+			options.inspect_crop_plan_mode = true;
+			continue;
+		}
+		if (arg == "--benchmark-rowgroup-read" && i + 1 < argc) {
+			options.benchmark_rowgroup_read_source = argv[++i];
+			options.benchmark_rowgroup_read_mode = true;
+			continue;
+		}
+		if (arg == "--repeats" && i + 1 < argc) {
+			options.benchmark_repeats = parse_size_arg(arg, argv[++i]);
+			continue;
+		}
+		if (arg == "--bundle-output" && i + 1 < argc) {
+			options.sparse_bundle_output = argv[++i];
 			continue;
 		}
 		if (arg == "--image-index" && i + 1 < argc) {
@@ -443,9 +625,12 @@ bool parse_args(const int argc, char** argv, Options& options) {
 				options.physical_layout = galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor;
 			} else if (layout == "image-major") {
 				options.physical_layout = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
+			} else if (layout == "image-major-vector-rowgroups") {
+				options.physical_layout = galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
 			} else {
 				throw std::runtime_error(
-				    "unknown --physical-layout value; expected spatial-major or image-major");
+				    "unknown --physical-layout value; expected spatial-major, image-major, or "
+				    "image-major-vector-rowgroups");
 			}
 			continue;
 		}
@@ -514,6 +699,18 @@ bool parse_args(const int argc, char** argv, Options& options) {
 	if (options.verify_mode) {
 		return !options.verify_manifest.empty() && !options.inputs.empty();
 	}
+	if (options.sparse_bundle_mode) {
+		return !options.sparse_bundle_source.empty() && !options.sparse_bundle_output.empty();
+	}
+	if (options.inspect_encodings_mode) {
+		return !options.inputs.empty();
+	}
+	if (options.inspect_crop_plan_mode) {
+		return !options.inspect_crop_manifest.empty();
+	}
+	if (options.benchmark_rowgroup_read_mode) {
+		return !options.benchmark_rowgroup_read_source.empty();
+	}
 	return !options.output_fls.empty() && !options.output_metadata.empty() && !options.inputs.empty();
 }
 
@@ -525,6 +722,20 @@ int main(const int argc, char** argv) {
 		if (!parse_args(argc, argv, options)) {
 			print_usage(argv[0]);
 			return 1;
+		}
+
+		if (options.sparse_bundle_mode) {
+			galp::format::write_sparse_vector_bundle(options.sparse_bundle_source, options.sparse_bundle_output);
+			return 0;
+		}
+		if (options.inspect_encodings_mode) {
+			return inspect_encodings(options.inputs);
+		}
+		if (options.inspect_crop_plan_mode) {
+			return inspect_crop_plan(options.inspect_crop_manifest, options.verify_image_index);
+		}
+		if (options.benchmark_rowgroup_read_mode) {
+			return benchmark_rowgroup_read(options.benchmark_rowgroup_read_source, options.benchmark_repeats);
 		}
 
 		options.inputs = expand_inputs(options.inputs);

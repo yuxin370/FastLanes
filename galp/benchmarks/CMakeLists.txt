@@ -111,7 +111,7 @@ target_include_directories(galp_generated_bindings PRIVATE
 target_link_libraries(galp_generated_bindings PRIVATE
         CUDA::cudart
         Thrust::Thrust
-        galp_core
+        galp_engine
         galp_alp_support)
 apply_warnings(galp_generated_bindings)
 set_target_properties(galp_generated_bindings PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -134,7 +134,7 @@ if (GALP_WITH_NVCOMP)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../src
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/data/include)
         target_link_libraries(compressor_bench PRIVATE
-                galp_core
+                galp_engine
                 galp_alp_support
                 nvcomp::nvcomp)
         target_compile_definitions(compressor_bench PRIVATE FLS_GALP_SOURCE_DIR="${GALP_DATA_ROOT}")
@@ -150,7 +150,7 @@ target_include_directories(micro_bench PRIVATE
         ${GALP_GENERATED_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(micro_bench PRIVATE
-        galp_core
+        galp_engine
         galp_generated_bindings
         galp_alp_support)
 

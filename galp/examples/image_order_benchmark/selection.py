@@ -157,7 +157,7 @@ def build_condition_orders(
             f"need {total_batches} fully supported aligned batches, found {len(candidates)}"
         )
 
-    # The operational condition exactly mirrors benchmarks/system_rgbnomore/manifest.py:
+    # The operational condition exactly mirrors benchmarks/system_rgbnomore/dataset/manifest.py:
     # random.Random(seed).shuffle(full eligible permutation), then take its prefix.
     current_random = list(eligible)
     random.Random(seed).shuffle(current_random)

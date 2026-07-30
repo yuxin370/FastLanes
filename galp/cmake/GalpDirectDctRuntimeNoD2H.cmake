@@ -5,9 +5,13 @@ endif ()
 set(cxx_paths
         "${GALP_ROOT}/include/galp/jpeg_dct.hpp"
         "${GALP_ROOT}/include/galp/direct_dct.hpp"
-        "${GALP_ROOT}/src/jpeg/jpeg_dct.cpp"
+        "${GALP_ROOT}/src/jpeg/jpeg_dct_planner.cpp"
+        "${GALP_ROOT}/src/jpeg/jpeg_dct_device_bridge.cpp"
         "${GALP_ROOT}/src/jpeg/jpeg_dct_device.cu"
-        "${GALP_ROOT}/src/jpeg/jpeg_dct_device.cuh"
+        "${GALP_ROOT}/src/jpeg/jpeg_dct_gather_kernels.cu"
+        "${GALP_ROOT}/src/jpeg/jpeg_dct_transform_kernels.cu"
+        "${GALP_ROOT}/src/jpeg/jpeg_dct_device_runtime.hpp"
+        "${GALP_ROOT}/src/jpeg/jpeg_dct_cuda_internal.cuh"
         "${GALP_ROOT}/src/api/direct_dct.cpp"
         "${GALP_ROOT}/torch/direct_dct_torch.cpp"
 )

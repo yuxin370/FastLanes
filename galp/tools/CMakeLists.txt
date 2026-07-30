@@ -1,3 +1,5 @@
+add_subdirectory(metadata)
+
 if (GALP_WITH_JPEG_DCT)
         add_subdirectory(jpeg_dct)
 endif ()
