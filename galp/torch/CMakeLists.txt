@@ -52,7 +52,7 @@ target_include_directories(_galp_direct_dct PRIVATE
 )
 
 target_link_libraries(_galp_direct_dct PRIVATE
-        Galp::core
+        Galp::jpeg_dct_device
         ${TORCH_LIBRARIES}
 )
 if (GALP_TORCH_PYTHON_LIBRARY)

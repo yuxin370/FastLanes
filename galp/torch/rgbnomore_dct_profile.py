@@ -22,7 +22,16 @@ RGBNOMORE_VAL_DCT_GRID_TRANSFORM: dict[str, Any] = {
     "allow_grayscale": True,
     "preferred_small_crop_width_blocks": [2, 4, 14, 28],
     "preferred_small_crop_height_blocks": [2, 4, 14, 28],
-    "allowed_chroma_sampling_ratios": [(1, 1, 1, 1), (1, 2, 1, 2)],
+    # Full ImageNet-val contains 4:4:4, 4:2:0, 4:2:2, vertical 4:4:0,
+    # 4:1:1, grayscale, and one four-component JPEG. RGB-no-more's own DCT
+    # loader applies the same fixed chroma crop rule to all color layouts.
+    "allowed_chroma_sampling_ratios": [
+        (1, 1, 1, 1),
+        (1, 2, 1, 2),
+        (1, 2, 1, 1),
+        (1, 1, 1, 2),
+        (1, 4, 1, 1),
+    ],
 }
 
 # Production pushdown output: the generic executor preserves the legacy
