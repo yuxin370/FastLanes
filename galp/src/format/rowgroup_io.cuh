@@ -55,10 +55,19 @@ struct ZeroCopyRowgroup {
 	bool                                                    backing_is_pinned = false;
 	std::shared_ptr<fastlanes::RowgroupView>                rowgroup_view;
 	std::vector<ZeroCopyColumn>                             columns;
+	std::shared_ptr<const galp::execution::PackedRowgroupDevicePayload> packed_device_payload;
 };
 
 struct ZeroCopyReadTiming {
 	size_t                                storage_bytes           = 0;
+	size_t                                full_storage_bytes      = 0;
+	size_t                                pread_count             = 0;
+	bool                                  sparse_read_supported   = false;
+	bool                                  used_sparse_read        = false;
+	bool                                  used_pinned_backing     = false;
+	bool                                  used_vector_bundle_read = false;
+	bool                                  used_vector_bundle_envelope_read = false;
+	std::string                           sparse_fallback_reason;
 	double                                pread_ms                = 0.0;
 	double                                zero_copy_view_setup_ms = 0.0;
 	std::chrono::steady_clock::time_point pread_start {};

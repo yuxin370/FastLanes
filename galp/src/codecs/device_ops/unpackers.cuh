@@ -609,6 +609,74 @@ struct BitUnpackerStatefulBranchless : BitUnpackerBase<OutT> {
 	}
 };
 
+// Whole-lane bit unpacker for codecs whose transform needs every value in a
+// semantic lane at once (currently DELTA register decode). A small reservoir
+// consumes each packed word once. In contrast, BitUnpackerStatefulBranchless
+// issues two candidate loads for every value and advances them with predicates.
+//
+// A FastLanes lane contains BIT_COUNT values for the supported I8/I16 types,
+// hence exactly `bit_width` input words are consumed for a complete lane.
+template <typename OutT,
+          unsigned UNPACK_N_VECTORS,
+          unsigned UNPACK_N_VALUES,
+          typename OutputProcessor,
+          typename InT = OutT>
+struct BitUnpackerLaneTile : BitUnpackerBase<OutT> {
+	using UINT_T = typename galp::codec::utils::same_width_uint<InT>::type;
+	static constexpr unsigned BIT_COUNT = galp::codec::utils::sizeof_in_bits<UINT_T>();
+	static constexpr unsigned N_LANES   = galp::codec::utils::get_n_lanes<UINT_T>();
+
+	static_assert(BIT_COUNT <= 16U, "32-bit reservoir currently supports I8/I16 inputs");
+	static_assert(UNPACK_N_VALUES == galp::codec::utils::get_values_per_lane<InT>(),
+	              "lane-tile unpacker must consume a complete FastLanes lane");
+
+	OutputProcessor processor;
+	const UINT_T*   in[UNPACK_N_VECTORS];
+	vbw_t           value_bit_width[UNPACK_N_VECTORS];
+	UINT_T          value_mask[UNPACK_N_VECTORS];
+
+	__device__ __forceinline__ BitUnpackerLaneTile(const UINT_T* __restrict    packed_array,
+	                                               const uint32_t* __restrict vector_offsets,
+	                                               const vbw_t* __restrict    bit_widths,
+	                                               const vi_t                 vector_index,
+	                                               const lane_t               lane,
+	                                               OutputProcessor            processor)
+	    : processor(processor) {
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			const vbw_t bit_width    = bit_widths[vector_index + vector];
+			in[vector]                = packed_array + vector_offsets[vector_index + vector] + lane;
+			value_bit_width[vector]   = bit_width;
+			value_mask[vector]        = galp::codec::utils::set_first_n_bits<UINT_T>(bit_width);
+		}
+	}
+
+	__device__ __forceinline__ void unpack_next_into(OutT* __restrict out) {
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			const unsigned bit_width = value_bit_width[vector];
+			uint32_t       reservoir = 0;
+			unsigned       buffered_bits = 0;
+			unsigned       input_line    = 0;
+
+#pragma unroll
+			for (unsigned position = 0; position < UNPACK_N_VALUES; ++position) {
+				// Refill only when the residual reservoir cannot provide one value.
+				// A single input word is sufficient because bit_width <= BIT_COUNT.
+				if (buffered_bits < bit_width) {
+					reservoir |= static_cast<uint32_t>(in[vector][input_line * N_LANES]) << buffered_bits;
+					++input_line;
+					buffered_bits += BIT_COUNT;
+				}
+				const UINT_T raw = static_cast<UINT_T>(reservoir) & value_mask[vector];
+				out[vector * UNPACK_N_VALUES + position] = processor(static_cast<InT>(raw), vector);
+				reservoir >>= bit_width;
+				buffered_bits -= bit_width;
+			}
+		}
+	}
+};
+
 } // namespace galp::codec::device
 
 #endif // GALP_DECOMPRESSION_PRIMITIVES_UNPACKERS_CUH

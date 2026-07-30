@@ -147,6 +147,9 @@ void release_workset(ExecutionWorkset& workset,
 	workset.slots.scalar_tail_mixed.clear();
 	workset.outputs.used_bytes = 0;
 	workset.outputs.required   = false;
+	workset.buffers.device_scatter_copies.clear();
+	workset.buffers.pending_device_scatters.clear();
+	workset.buffers.d_device_scatter_copies = nullptr;
 	if (workset.transfer.h2d_stream) {
 		if (h2d_already_complete) {
 			galp::memory::complete_h2d(workset.transfer.h2d_stream.get());

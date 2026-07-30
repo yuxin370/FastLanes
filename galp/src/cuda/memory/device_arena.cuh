@@ -34,6 +34,7 @@ class DeviceArena {
 		size_t           bytes         = 0;
 		size_t           slab_bytes    = 0;
 		size_t           device_offset = 0;
+		bool             upload        = true;
 	};
 
 	struct ResolverTarget {
@@ -53,7 +54,7 @@ public:
 	DeviceArena(const DeviceArena&)            = delete;
 	DeviceArena& operator=(const DeviceArena&) = delete;
 
-	void register_backing(const void* base, size_t bytes);
+	void register_backing(const void* base, size_t bytes, bool upload = true);
 	void coalesce_backing_regions();
 
 	template <typename T>

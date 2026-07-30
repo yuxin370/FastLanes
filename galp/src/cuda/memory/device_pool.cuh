@@ -114,6 +114,10 @@ public:
 		                        cuda_allocation_bytes_};
 	}
 
+	PinnedHostPoolStats pinned_stats() {
+		return pinned_pool_.stats();
+	}
+
 	void register_sub_allocation(void* ptr) {
 		if (ptr == nullptr) {
 			return;
@@ -210,6 +214,7 @@ public:
 				CUDA_SAFE_CALL(cudaFree(ptr));
 			}
 		}
+		pinned_pool_.release_cached();
 	}
 
 	void set_enabled(bool enabled) {
@@ -245,6 +250,7 @@ public:
 		// every device allocation when the context is destroyed.
 		int device = 0;
 		if (cudaGetDevice(&device) != cudaSuccess) {
+			pinned_pool_.abandon_without_free();
 			return;
 		}
 
@@ -441,7 +447,9 @@ private:
 
 	DevicePool()
 	    : free_cache_limit_bytes_(read_size_env("GALP_DEVICE_POOL_CACHE_LIMIT_BYTES", 1024ULL * 1024ULL * 1024ULL))
-	    , max_reuse_slack_bytes_(read_size_env("GALP_DEVICE_POOL_MAX_REUSE_SLACK_BYTES", 256ULL * 1024ULL * 1024ULL)) {
+	    , max_reuse_slack_bytes_(read_size_env("GALP_DEVICE_POOL_MAX_REUSE_SLACK_BYTES", 256ULL * 1024ULL * 1024ULL))
+	    , pinned_pool_(read_size_env("GALP_PINNED_HOST_POOL_CACHE_LIMIT_BYTES", 256ULL * 1024ULL * 1024ULL),
+	                   read_size_env("GALP_PINNED_HOST_POOL_MAX_REUSE_SLACK_BYTES", 64ULL * 1024ULL * 1024ULL)) {
 	}
 
 	std::mutex mutex_;
@@ -483,6 +491,10 @@ inline void device_release_cached() {
 
 inline DevicePoolStats device_pool_stats() {
 	return DevicePool::instance().stats();
+}
+
+inline PinnedHostPoolStats pinned_host_pool_stats() {
+	return DevicePool::instance().pinned_stats();
 }
 
 inline void device_memcpy_h2d(void* dst, const void* src, size_t bytes) {

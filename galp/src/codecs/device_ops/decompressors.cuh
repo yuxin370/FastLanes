@@ -6,12 +6,12 @@
 #ifndef GALP_DECOMPRESSION_PRIMITIVES_DECOMPRESSORS_CUH
 #define GALP_DECOMPRESSION_PRIMITIVES_DECOMPRESSORS_CUH
 
-#include "codecs/device_types.cuh"
 #include "codecs/device_ops/expanders.cuh"
 #include "codecs/device_ops/functors.cuh"
 #include "codecs/device_ops/patchers.cuh"
 #include "codecs/device_ops/unpackers.cuh"
 #include "codecs/device_ops/unsumer.cuh"
+#include "codecs/device_types.cuh"
 #include "codecs/encodings/all.cuh"
 #include "codecs/utils.cuh"
 #include <assert.h>
@@ -23,12 +23,7 @@ template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename Co
 struct BPDecompressor : DecompressorBase<T> {
 	UnpackerT                  unpacker;
 	__device__ __forceinline__ BPDecompressor(const BPColumn<T> column, const vi_t vector_index, const lane_t lane)
-	    : unpacker(column.packed_array,
-	               column.vector_offsets,
-	               column.bit_widths,
-	               vector_index,
-	               lane,
-	               BPFunctor<T>()) {
+	    : unpacker(column.packed_array, column.vector_offsets, column.bit_widths, vector_index, lane, BPFunctor<T>()) {
 	}
 
 	void __device__ unpack_next_into(T* __restrict out) {
@@ -75,12 +70,10 @@ template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename Co
 struct DELTADecompressor : DecompressorBase<T> {
 	using UIntT = typename galp::codec::utils::same_width_uint<T>::type;
 
-	UnpackerT                              unpacker;
+	UnpackerT                         unpacker;
 	DeltaUnsumer<T, UNPACK_N_VECTORS> unsumer;
 
-	__device__ __forceinline__ DELTADecompressor(const ColumnT column,
-	                                            const vi_t    vector_index,
-	                                            const lane_t  lane)
+	__device__ __forceinline__ DELTADecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
 	    : unpacker(column.ffor.bp.packed_array,
 	               column.ffor.bp.vector_offsets,
 	               column.ffor.bp.bit_widths,
@@ -92,6 +85,53 @@ struct DELTADecompressor : DecompressorBase<T> {
 
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		unsumer.unsum_next_into(unpacker, out);
+	}
+};
+
+// Register-tiled DELTA variant. Unlike DELTADecompressor, which exposes one
+// physical value per call and therefore has to retain the complete I16 lane
+// behind a runtime cursor, this variant decodes the complete semantic lane in
+// one call. Every array index is compile-time constant after unrolling, which
+// lets CUDA scalarize the lane tile instead of placing the addressable I16
+// buffer in local memory.
+template <typename T, unsigned UNPACK_N_VECTORS, typename UnpackerT, typename ColumnT>
+struct DELTARegisterDecompressor : DecompressorBase<T> {
+	using UIntT                                 = typename galp::codec::utils::same_width_uint<T>::type;
+	static constexpr unsigned N_VALUES_PER_LANE = galp::codec::utils::get_values_per_lane<T>();
+
+	UnpackerT                                 unpacker;
+	DeltaRegisterUnsumer<T, UNPACK_N_VECTORS> unsumer;
+
+	__device__ __forceinline__
+	DELTARegisterDecompressor(const ColumnT column, const vi_t vector_index, const lane_t lane)
+	    : unpacker(column.ffor.bp.packed_array,
+	               column.ffor.bp.vector_offsets,
+	               column.ffor.bp.bit_widths,
+	               vector_index,
+	               lane,
+	               FFORFunctor<UIntT, UNPACK_N_VECTORS>(column.ffor.bases + vector_index))
+	    , unsumer(column, vector_index, lane) {
+	}
+
+	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
+		UIntT deltas[UNPACK_N_VECTORS * N_VALUES_PER_LANE];
+		decode_lane_into(deltas);
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+#pragma unroll
+			for (unsigned position = 0; position < N_VALUES_PER_LANE; ++position) {
+				const unsigned index = vector * N_VALUES_PER_LANE + position;
+				out[index]           = static_cast<T>(deltas[index]);
+			}
+		}
+	}
+
+	// Typed entry point used by the fused DELTA runner. It lets unpack, FFOR
+	// restoration, prefix scan, untranspose and store share one register tile,
+	// avoiding the generic iterator's second signed-value tile and copy.
+	__device__ __forceinline__ void decode_lane_into(UIntT* __restrict values) {
+		unpacker.unpack_next_into(values);
+		unsumer.unsum_inplace(values);
 	}
 };
 
@@ -203,8 +243,9 @@ struct DICTShfl32Decompressor : DecompressorBase<T> {
 	               column.ffor.bp.bit_widths,
 	               vector_index,
 	               lane,
-		               DICTShfl32Functor<T, UNPACK_N_VECTORS>(
-		                   column.ffor.bases + vector_index, reinterpret_cast<const UINT_T*>(column.keys), column.key_count)) {
+	               DICTShfl32Functor<T, UNPACK_N_VECTORS>(column.ffor.bases + vector_index,
+	                                                      reinterpret_cast<const UINT_T*>(column.keys),
+	                                                      column.key_count)) {
 	}
 	__device__ __forceinline__ void unpack_next_into(T* __restrict out) {
 		unpacker.unpack_next_into(out);

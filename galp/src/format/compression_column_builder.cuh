@@ -12,8 +12,10 @@
 #include "codecs/utils.cuh"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -136,6 +138,17 @@ inline T* segment_ptr_or_copy(const fastlanes::SegmentView& seg, ZeroCopyHostSto
 	auto* raw = seg.data_span.data();
 	if ((reinterpret_cast<uintptr_t>(raw) % alignof(T)) == 0) {
 		return const_cast<T*>(reinterpret_cast<const T*>(raw));
+	}
+	if (std::getenv("GALP_TRACE_UNALIGNED_ZERO_COPY_SEGMENTS") != nullptr) {
+		static std::atomic<size_t> trace_count {0U};
+		const size_t               trace_index = trace_count.fetch_add(1U, std::memory_order_relaxed);
+		if (trace_index < 256U) {
+			std::fprintf(stderr,
+			             "GALP_UNALIGNED_ZERO_COPY element_bytes=%zu segment_bytes=%zu address_mod=%zu\n",
+			             sizeof(T),
+			             n_bytes,
+			             reinterpret_cast<uintptr_t>(raw) % alignof(T));
+		}
 	}
 
 	const size_t n_elems = n_bytes / sizeof(T);

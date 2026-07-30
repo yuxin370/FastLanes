@@ -7,6 +7,7 @@
 #define ENGINE_RUNTIME_WORKSET_MODEL_CUH
 
 #include "cuda/memory/cuda_raii.cuh"
+#include "core/data/model.cuh"
 #include "engine/config.cuh"
 #include "engine/operators/batch.cuh"
 #include "engine/operators/expr_ops.cuh"
@@ -31,6 +32,19 @@ struct UploadBreakdown {
 	galp::memory::ArenaUploadMetrics arena {};
 };
 
+struct DeviceScatterCopy {
+	const std::byte* source      = nullptr;
+	std::byte*       destination = nullptr;
+	size_t           size        = 0;
+};
+
+struct PendingDeviceScatter {
+	std::shared_ptr<const galp::execution::PackedRowgroupDevicePayload> payload;
+	std::byte*       device_packed  = nullptr;
+	std::byte*       device_logical = nullptr;
+	size_t           copy_begin     = 0;
+};
+
 struct WorksetBuffers {
 	using HostBatches   = typename galp::execution::BatchSetFromList<galp::execution::SupportedTypes>::type;
 	using DeviceBatches = typename galp::execution::DeviceBatchSetFromList<galp::execution::SupportedTypes>::type;
@@ -39,6 +53,9 @@ struct WorksetBuffers {
 	DeviceBatches                              device_batches;
 	std::unique_ptr<galp::memory::DeviceArena> chunk_arena;
 	size_t                                     payload_arena_bytes = 0;
+	std::vector<DeviceScatterCopy>             device_scatter_copies;
+	std::vector<PendingDeviceScatter>          pending_device_scatters;
+	DeviceScatterCopy*                         d_device_scatter_copies = nullptr;
 };
 
 struct WorksetOutputs {

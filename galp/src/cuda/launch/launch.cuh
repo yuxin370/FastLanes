@@ -65,9 +65,13 @@ inline void launch_mixed_slots(const galp::execution::DeviceExpression<int8_t>* 
 	runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, auto unpack_n_values) {
 		constexpr unsigned UNPACK_N_VECTORS = decltype(unpack_n_vectors)::value;
 		constexpr unsigned UNPACK_N_VALUES  = decltype(unpack_n_values)::value;
-		galp::kernels::device::decompress_dispatch_mixed<UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
-		    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, slots, n_slots);
-		CUDA_SAFE_CALL(cudaGetLastError());
+		runtime::with_delta_decoder(cfg, [&](auto delta_decoder) {
+			constexpr auto DELTA_DECODER = decltype(delta_decoder)::value;
+			galp::kernels::device::
+			    decompress_dispatch_mixed<UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, DELTA_DECODER>
+			    <<<grid, block, 0, stream>>>(exprs_i8, exprs_i16, slots, n_slots);
+			CUDA_SAFE_CALL(cudaGetLastError());
+		});
 	});
 }
 
@@ -79,11 +83,11 @@ inline void launch_mixed_dispatch(ExecutionWorkset& workset, const ExecutionConf
 	auto scalar_tail_cfg             = cfg;
 	scalar_tail_cfg.unpack_n_vectors = 1;
 	launch_mixed_slots<WRITE_OUT>(exprs_i8,
-	                               exprs_i16,
-	                               workset.slots.d_scalar_tail,
-	                               workset.slots.scalar_tail_mixed.size(),
-	                               scalar_tail_cfg,
-	                               stream);
+	                              exprs_i16,
+	                              workset.slots.d_scalar_tail,
+	                              workset.slots.scalar_tail_mixed.size(),
+	                              scalar_tail_cfg,
+	                              stream);
 }
 
 template <LaunchStrategy Strategy, bool WRITE_OUT>
@@ -113,7 +117,7 @@ inline size_t typed_launches_per_sample(const ExecutionWorkset& workset) {
 inline size_t typed_total_items_per_sample(const ExecutionWorkset& workset) {
 	size_t items = 0;
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
-		using T = typename decltype(tag)::type;
+		using T       = typename decltype(tag)::type;
 		const auto& d = workset.buffers.device_batches.template get<T>();
 		items += d.n_items + d.n_scalar_tail_items;
 	});
@@ -131,16 +135,16 @@ inline bool has_any_expr(const ExecutionWorkset& workset) {
 }
 
 struct AsyncWorksetRun {
-	cudaStream_t             stream                  = nullptr;
-	galp::memory::CudaEvent* queued                  = nullptr;
-	galp::memory::CudaEvent* start                   = nullptr;
-	galp::memory::CudaEvent* stop                    = nullptr;
-	double                   elapsed_ms              = 0.0;
-	double                   pre_kernel_event_ms     = 0.0;
-	double                   event_sync_wall_ms      = 0.0;
-	double                   timing_event_create_ms  = 0.0;
-	double                   warmup_wall_ms          = 0.0;
-	bool                     active                  = false;
+	cudaStream_t             stream                 = nullptr;
+	galp::memory::CudaEvent* queued                 = nullptr;
+	galp::memory::CudaEvent* start                  = nullptr;
+	galp::memory::CudaEvent* stop                   = nullptr;
+	double                   elapsed_ms             = 0.0;
+	double                   pre_kernel_event_ms    = 0.0;
+	double                   event_sync_wall_ms     = 0.0;
+	double                   timing_event_create_ms = 0.0;
+	double                   warmup_wall_ms         = 0.0;
+	bool                     active                 = false;
 };
 
 inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
@@ -160,9 +164,8 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 	const size_t launches_per_sample = typed_launches_per_sample(workset);
 	const size_t total_items         = typed_total_items_per_sample(workset);
 	const bool   mixed_dispatch      = uses_mixed_dispatch(cfg.launch_strategy);
-	const bool   has_mixed_items =
-	    workset.slots.d != nullptr && !workset.slots.mixed.empty();
-	const bool has_mixed_tail_items =
+	const bool   has_mixed_items     = workset.slots.d != nullptr && !workset.slots.mixed.empty();
+	const bool   has_mixed_tail_items =
 	    workset.slots.d_scalar_tail != nullptr && !workset.slots.scalar_tail_mixed.empty();
 	const size_t mixed_launches_per_sample = (has_mixed_items ? 1U : 0U) + (has_mixed_tail_items ? 1U : 0U);
 
@@ -190,7 +193,8 @@ inline AsyncWorksetRun run_workset_async(ExecutionWorkset&      workset,
 		}
 	}
 	if (out_launches) {
-		*out_launches = (mixed_dispatch ? mixed_launches_per_sample : launches_per_sample) * static_cast<size_t>(samples);
+		*out_launches =
+		    (mixed_dispatch ? mixed_launches_per_sample : launches_per_sample) * static_cast<size_t>(samples);
 	}
 
 	if (!workset.transfer.h2d_stream) {
@@ -279,14 +283,14 @@ inline void wait_workset_async(AsyncWorksetRun& handle) {
 	}
 	const auto sync_start = std::chrono::steady_clock::now();
 	handle.stop->synchronize();
-	const auto sync_end            = std::chrono::steady_clock::now();
-	handle.event_sync_wall_ms      = std::chrono::duration<double, std::milli>(sync_end - sync_start).count();
-	handle.pre_kernel_event_ms     = static_cast<double>(handle.start->elapsed_since(*handle.queued));
-	handle.elapsed_ms              = static_cast<double>(handle.stop->elapsed_since(*handle.start));
-	handle.queued = nullptr;
-	handle.start  = nullptr;
-	handle.stop   = nullptr;
-	handle.active = false;
+	const auto sync_end        = std::chrono::steady_clock::now();
+	handle.event_sync_wall_ms  = std::chrono::duration<double, std::milli>(sync_end - sync_start).count();
+	handle.pre_kernel_event_ms = static_cast<double>(handle.start->elapsed_since(*handle.queued));
+	handle.elapsed_ms          = static_cast<double>(handle.stop->elapsed_since(*handle.start));
+	handle.queued              = nullptr;
+	handle.start               = nullptr;
+	handle.stop                = nullptr;
+	handle.active              = false;
 }
 
 inline double run_workset(ExecutionWorkset&      workset,

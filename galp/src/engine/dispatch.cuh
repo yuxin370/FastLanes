@@ -11,6 +11,7 @@
 #include "core/expression.cuh"
 #include "core/lane_policy.cuh"
 #include "cuda/device_utils.cuh"
+#include "engine/config.cuh"
 
 namespace galp::kernels::detail {
 
@@ -43,7 +44,37 @@ __device__ __forceinline__ void run_decompressor(DecompressorT&& iterator, const
 	}
 }
 
-template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
+template <typename T, int UNPACK_N_VECTORS, bool WRITE_OUT = true, typename DecompressorT>
+__device__ __forceinline__ void
+run_delta_register_decompressor(DecompressorT&& iterator, const lane_t lane, T* __restrict out) {
+	using UIntT = typename galp::codec::utils::same_width_uint<T>::type;
+	constexpr int N_VALUES = galp::codec::utils::get_values_per_lane<T>();
+	constexpr int N_LANES  = galp::codec::utils::get_n_lanes<T>();
+	UIntT        registers[N_VALUES * UNPACK_N_VECTORS];
+
+	iterator.decode_lane_into(registers);
+	if constexpr (WRITE_OUT) {
+		write_registers_to_global<T,
+		                          UNPACK_N_VECTORS,
+		                          N_VALUES,
+		                          N_LANES,
+		                          galp::codec::device::FastLanes1024InputUntransposer>(lane, 0, registers, out);
+	} else {
+		uint32_t acc = 2166136261u;
+#pragma unroll
+		for (int index = 0; index < N_VALUES * UNPACK_N_VECTORS; ++index) {
+			acc ^= static_cast<uint32_t>(registers[index]);
+		}
+		(void)out;
+		asm volatile("" : : "r"(acc) : "memory");
+	}
+}
+
+template <typename T,
+          int                           UNPACK_N_VECTORS,
+          int                           UNPACK_N_VALUES,
+          bool                          WRITE_OUT     = true,
+	          galp::execution::DeltaDecoder DELTA_DECODER = galp::execution::DeltaDecoder::Register>
 __device__ __forceinline__ void execute_plan(const galp::execution::DeviceExpression<T>& expr,
                                              const vi_t                                  vector_index,
                                              const lane_t                                lane,
@@ -66,22 +97,34 @@ __device__ __forceinline__ void execute_plan(const galp::execution::DeviceExpres
 		break;
 	}
 	case galp::execution::PlanKind::DELTA: {
-		using UIntT = typename galp::codec::utils::same_width_uint<T>::type;
-		using UnpackerT = galp::codec::device::BitUnpackerStatefulBranchless<
-		    UIntT,
-		    UNPACK_N_VECTORS,
-		    UNPACK_N_VALUES,
-		    galp::codec::device::FFORFunctor<UIntT, UNPACK_N_VECTORS>>;
+		using UIntT   = typename galp::codec::utils::same_width_uint<T>::type;
 		using ColumnT = galp::codec::device::DELTAColumn<T>;
-		using DecompressorT =
-		    galp::codec::device::DELTADecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT>;
-		auto iterator = DecompressorT(expr.col.delta, vector_index, lane);
-		run_decompressor<T,
-		                 UNPACK_N_VECTORS,
-		                 UNPACK_N_VALUES,
-		                 WRITE_OUT,
-		                 T,
-		                 galp::codec::device::FastLanes1024InputUntransposer>(iterator, lane, out);
+		if constexpr (DELTA_DECODER == galp::execution::DeltaDecoder::Register) {
+			constexpr int REGISTER_N_VALUES = galp::codec::utils::get_values_per_lane<T>();
+			using UnpackerT                 = galp::codec::device::BitUnpackerLaneTile<
+			                    UIntT,
+			                    UNPACK_N_VECTORS,
+			                    REGISTER_N_VALUES,
+			                    galp::codec::device::FFORFunctor<UIntT, UNPACK_N_VECTORS>>;
+			using DecompressorT =
+			    galp::codec::device::DELTARegisterDecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT>;
+			auto iterator = DecompressorT(expr.col.delta, vector_index, lane);
+			run_delta_register_decompressor<T, UNPACK_N_VECTORS, WRITE_OUT>(iterator, lane, out);
+		} else {
+			using UnpackerT = galp::codec::device::BitUnpackerStatefulBranchless<
+			    UIntT,
+			    UNPACK_N_VECTORS,
+			    UNPACK_N_VALUES,
+			    galp::codec::device::FFORFunctor<UIntT, UNPACK_N_VECTORS>>;
+			using DecompressorT = galp::codec::device::DELTADecompressor<T, UNPACK_N_VECTORS, UnpackerT, ColumnT>;
+			auto iterator       = DecompressorT(expr.col.delta, vector_index, lane);
+			run_decompressor<T,
+			                 UNPACK_N_VECTORS,
+			                 UNPACK_N_VALUES,
+			                 WRITE_OUT,
+			                 T,
+			                 galp::codec::device::FastLanes1024InputUntransposer>(iterator, lane, out);
+		}
 		break;
 	}
 	case galp::execution::PlanKind::UNFFOR: {
@@ -244,19 +287,19 @@ __device__ __forceinline__ void execute_plan(const galp::execution::DeviceExpres
 		                      UNPACK_N_VECTORS,
 		                      RLE_UNPACK_N_VALUES,
 		                      galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
-		using PatcherT = galp::codec::device::
-		    StatefulSLPATCHExceptionPatcher<IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
-		using ExpanderT     = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
-		using DecompressorT = galp::codec::device::RLESLPATCHDecompressor<T,
-		                                                                  IndexT,
-		                                                                  UNPACK_N_VECTORS,
-		                                                                  RLE_UNPACK_N_VALUES,
-		                                                                  UnpackerT,
-		                                                                  PatcherT,
-		                                                                  ExpanderT,
-		                                                                  galp::codec::device::
-		                                                                      RLESLPATCHColumn<T, IndexT>>;
-		auto iterator       = DecompressorT(expr.col.rle_slpatch_u16, vector_index, lane);
+		using PatcherT =
+		    galp::codec::device::StatefulSLPATCHExceptionPatcher<IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
+		using ExpanderT = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
+		using DecompressorT =
+		    galp::codec::device::RLESLPATCHDecompressor<T,
+		                                                IndexT,
+		                                                UNPACK_N_VECTORS,
+		                                                RLE_UNPACK_N_VALUES,
+		                                                UnpackerT,
+		                                                PatcherT,
+		                                                ExpanderT,
+		                                                galp::codec::device::RLESLPATCHColumn<T, IndexT>>;
+		auto iterator = DecompressorT(expr.col.rle_slpatch_u16, vector_index, lane);
 		run_decompressor<T,
 		                 UNPACK_N_VECTORS,
 		                 RLE_UNPACK_N_VALUES,
@@ -274,7 +317,11 @@ __device__ __forceinline__ void execute_plan(const galp::execution::DeviceExpres
 
 namespace galp::kernels { namespace device {
 
-template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
+template <typename T,
+          int                           UNPACK_N_VECTORS,
+          int                           UNPACK_N_VALUES,
+          bool                          WRITE_OUT     = true,
+	          galp::execution::DeltaDecoder DELTA_DECODER = galp::execution::DeltaDecoder::Register>
 __device__ __forceinline__ void execute_typed_work_item(const galp::execution::DeviceExpression<T>* exprs,
                                                         const galp::execution::WorkItemAny          work,
                                                         const lane_t                                lane) {
@@ -299,11 +346,15 @@ __device__ __forceinline__ void execute_typed_work_item(const galp::execution::D
 	if constexpr (WRITE_OUT) {
 		out = expr->out + static_cast<size_t>(work.output_vector_index) * galp::codec::consts::VALUES_PER_VECTOR;
 	}
-	galp::kernels::detail::execute_plan<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(
+	galp::kernels::detail::execute_plan<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, DELTA_DECODER>(
 	    *expr, vector_index, lane, out);
 }
 
-template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
+template <typename T,
+          int                           UNPACK_N_VECTORS,
+          int                           UNPACK_N_VALUES,
+          bool                          WRITE_OUT     = true,
+	          galp::execution::DeltaDecoder DELTA_DECODER = galp::execution::DeltaDecoder::Register>
 __global__ void decompress_dispatch_typed(const galp::execution::DeviceExpression<T>* exprs,
                                           const galp::execution::WorkItemAny*         work_items,
                                           const size_t                                n_items) {
@@ -323,10 +374,13 @@ __global__ void decompress_dispatch_typed(const galp::execution::DeviceExpressio
 			return;
 		}
 	}
-	execute_typed_work_item<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(exprs, work, lane);
+	execute_typed_work_item<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, DELTA_DECODER>(exprs, work, lane);
 }
 
-template <int UNPACK_N_VECTORS, int UNPACK_N_VALUES, bool WRITE_OUT = true>
+template <int                           UNPACK_N_VECTORS,
+          int                           UNPACK_N_VALUES,
+          bool                          WRITE_OUT     = true,
+	          galp::execution::DeltaDecoder DELTA_DECODER = galp::execution::DeltaDecoder::Register>
 __global__ void decompress_dispatch_mixed(const galp::execution::DeviceExpression<int8_t>*  exprs_i8,
                                           const galp::execution::DeviceExpression<int16_t>* exprs_i16,
                                           const galp::execution::MixedWorkSlot*             slots,
@@ -345,10 +399,12 @@ __global__ void decompress_dispatch_mixed(const galp::execution::DeviceExpressio
 		}
 		switch (work.type) {
 		case galp::execution::TypeTag::I8:
-			execute_typed_work_item<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(exprs_i8, work, work_lane);
+			execute_typed_work_item<int8_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, DELTA_DECODER>(
+			    exprs_i8, work, work_lane);
 			break;
 		case galp::execution::TypeTag::I16:
-			execute_typed_work_item<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>(exprs_i16, work, work_lane);
+			execute_typed_work_item<int16_t, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, DELTA_DECODER>(
+			    exprs_i16, work, work_lane);
 			break;
 		default:
 			break;

@@ -45,6 +45,33 @@ launch_decompress_column_sample(const ColumnT column, T* out, const size_t n_vec
 	}
 }
 
+template <typename T,
+          unsigned UNPACK_N_VECTORS,
+          typename DecompressorT,
+          typename ColumnT,
+          typename UntransposerT>
+__host__ void launch_delta_register_column_sample(const ColumnT column, T* out, const size_t n_vecs) {
+	if constexpr (UNPACK_N_VECTORS == 1) {
+		const ThreadblockMapping<T> mapping(UNPACK_N_VECTORS, n_vecs);
+		device::decompress_delta_register_column<T, UNPACK_N_VECTORS, DecompressorT, ColumnT, UntransposerT>
+		    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK>>>(column, out, n_vecs, 0);
+	} else {
+		const size_t full_n_vecs = full_vector_count(n_vecs, UNPACK_N_VECTORS);
+		if (full_n_vecs != 0) {
+			const ThreadblockMapping<T> mapping(UNPACK_N_VECTORS, full_n_vecs);
+			device::decompress_delta_register_column<T, UNPACK_N_VECTORS, DecompressorT, ColumnT, UntransposerT>
+			    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK>>>(column, out, full_n_vecs, 0);
+		}
+		if (full_n_vecs != n_vecs) {
+			using TailDecompressorT = ScalarTailDecompressorT<DecompressorT>;
+			const size_t tail_n_vecs = n_vecs - full_n_vecs;
+			const ThreadblockMapping<T> mapping(1, tail_n_vecs);
+			device::decompress_delta_register_column<T, 1, TailDecompressorT, ColumnT, UntransposerT>
+			    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK>>>(column, out, tail_n_vecs, full_n_vecs);
+		}
+	}
+}
+
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
 __host__ void launch_query_column_sample(const ColumnT column, bool* out, const T magic_value, const size_t n_vecs) {
 	if constexpr (UNPACK_N_VECTORS == 1) {
@@ -137,6 +164,44 @@ __host__ T* decompress_column(const ColumnT column, const uint32_t n_samples) {
 	       (unsigned)UNPACK_N_VECTORS,
 	       UNPACK_N_VALUES,
 	       (double)ms,
+	       n_samples,
+	       avg_us);
+
+	T* out = new T[column.n_values];
+	device_out.copy_to_host(out);
+	return out;
+}
+
+template <typename T,
+          unsigned UNPACK_N_VECTORS,
+          typename DecompressorT,
+          typename ColumnT,
+          typename UntransposerT = galp::codec::device::IdentityUntransposer>
+__host__ T* decompress_delta_register_column(const ColumnT column, const uint32_t n_samples) {
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(column.n_values);
+	GPUArray<T>  device_out(column.n_values);
+
+	cudaEvent_t ev_start {}, ev_stop {};
+	CUDA_SAFE_CALL(cudaEventCreate(&ev_start));
+	CUDA_SAFE_CALL(cudaEventCreate(&ev_stop));
+	CUDA_SAFE_CALL(cudaEventRecord(ev_start, 0));
+	for (uint32_t sample = 0; sample < n_samples; ++sample) {
+		detail::launch_delta_register_column_sample<
+		    T, UNPACK_N_VECTORS, DecompressorT, ColumnT, UntransposerT>(column, device_out.get(), n_vecs);
+		CUDA_SAFE_CALL(cudaGetLastError());
+	}
+	CUDA_SAFE_CALL(cudaEventRecord(ev_stop, 0));
+	CUDA_SAFE_CALL(cudaEventSynchronize(ev_stop));
+
+	float ms = 0.0f;
+	CUDA_SAFE_CALL(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+	CUDA_SAFE_CALL(cudaEventDestroy(ev_start));
+	CUDA_SAFE_CALL(cudaEventDestroy(ev_stop));
+	const double avg_us = n_samples > 0 ? ms * 1000.0 / static_cast<double>(n_samples) : 0.0;
+	printf("[Decompress KERNEL TIME] unpack_vecs=%u unpack_vals=%u total=%.3f ms n_samples=%u avg=%.3f us\n",
+	       UNPACK_N_VECTORS,
+	       galp::codec::utils::get_values_per_lane<T>(),
+	       static_cast<double>(ms),
 	       n_samples,
 	       avg_us);
 

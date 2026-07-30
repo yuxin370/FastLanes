@@ -52,7 +52,7 @@ DeviceArena::~DeviceArena() {
 	} catch (const std::exception& e) { std::fprintf(stderr, "DeviceArena destructor: %s\n", e.what()); }
 }
 
-void DeviceArena::register_backing(const void* base, size_t bytes) {
+void DeviceArena::register_backing(const void* base, size_t bytes, const bool upload) {
 	if (base == nullptr || bytes == 0) {
 		return;
 	}
@@ -60,10 +60,13 @@ void DeviceArena::register_backing(const void* base, size_t bytes) {
 	const auto* b = reinterpret_cast<const std::byte*>(base);
 	for (const auto& r : regions_) {
 		if (r.base == b && r.bytes == bytes) {
+			if (r.upload != upload) {
+				throw std::invalid_argument("DeviceArena backing registered with conflicting upload policies");
+			}
 			return;
 		}
 	}
-	regions_.push_back(BackingRegion {b, bytes, bytes, 0});
+	regions_.push_back(BackingRegion {b, bytes, bytes, 0, upload});
 }
 
 void DeviceArena::coalesce_backing_regions() {
@@ -79,7 +82,7 @@ void DeviceArena::coalesce_backing_regions() {
 	merged.reserve(regions_.size());
 	for (const auto& region : regions_) {
 		if (merged.empty()) {
-			merged.push_back(BackingRegion {region.base, region.bytes, region.bytes, 0});
+			merged.push_back(BackingRegion {region.base, region.bytes, region.bytes, 0, region.upload});
 			continue;
 		}
 
@@ -88,14 +91,14 @@ void DeviceArena::coalesce_backing_regions() {
 		const auto cur_end      = checked_ptr_end(cur_begin, cur.bytes, "DeviceArena coalesced range overflow");
 		const auto region_begin = reinterpret_cast<std::uintptr_t>(region.base);
 		const auto region_end   = checked_ptr_end(region_begin, region.bytes, "DeviceArena backing range overflow");
-		if (region_begin <= cur_end) {
+		if (region_begin <= cur_end && region.upload == cur.upload) {
 			if (region_end > cur_end) {
 				cur.bytes = static_cast<size_t>(region_end - cur_begin);
 			}
 			cur.slab_bytes = cur.bytes;
 			continue;
 		}
-		merged.push_back(BackingRegion {region.base, region.bytes, region.bytes, 0});
+		merged.push_back(BackingRegion {region.base, region.bytes, region.bytes, 0, region.upload});
 	}
 
 	regions_ = std::move(merged);
@@ -276,7 +279,7 @@ void DeviceArena::pack_staged_area() {
 DeviceArena::DmaIssueStats DeviceArena::issue_dma(size_t staged_device_base) {
 	DmaIssueStats stats {};
 	for (const auto& region : regions_) {
-		if (region.bytes == 0) {
+		if (region.bytes == 0 || !region.upload) {
 			continue;
 		}
 		stats.bytes += region.bytes;

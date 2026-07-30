@@ -65,6 +65,57 @@ decompress_column(const ColumnT column, T* out, const size_t scheduled_n_vecs = 
 	}
 }
 
+// Standalone whole-lane DELTA kernel. The generic iterator kernel uses a
+// signed output tile in addition to DELTARegisterDecompressor's unsigned
+// transform tile. This specialization keeps unpack, FFOR restoration, prefix,
+// untranspose and bounded tail stores on a single unsigned register tile.
+template <typename T,
+          int UNPACK_N_VECTORS,
+          typename DecompressorT,
+          typename ColumnT,
+          typename UntransposerT = galp::codec::device::IdentityUntransposer>
+__global__ void decompress_delta_register_column(const ColumnT column,
+	                                                T* __restrict out,
+	                                                const size_t scheduled_n_vecs = 0,
+	                                                const size_t vector_offset    = 0) {
+	using UIntT = typename galp::codec::utils::same_width_uint<T>::type;
+	constexpr int N_VALUES = galp::codec::utils::get_values_per_lane<T>();
+	const auto    mapping  = VectorToWarpMapping<T, UNPACK_N_VECTORS>();
+	const lane_t  lane     = mapping.get_lane();
+	const size_t  local_vector_index = static_cast<size_t>(mapping.get_vector_index());
+
+	const size_t n_vecs = galp::codec::utils::get_n_vecs_from_size(column.n_values);
+	const size_t default_active_n_vecs =
+	    UNPACK_N_VECTORS <= 1 ? n_vecs : (n_vecs / static_cast<size_t>(UNPACK_N_VECTORS)) * UNPACK_N_VECTORS;
+	const size_t active_n_vecs = scheduled_n_vecs != 0 ? scheduled_n_vecs : default_active_n_vecs;
+	if (local_vector_index >= active_n_vecs) {
+		return;
+	}
+
+	const size_t vector_index_size = vector_offset + local_vector_index;
+	if (vector_index_size >= n_vecs) {
+		return;
+	}
+	const auto vector_index = static_cast<vi_t>(vector_index_size);
+	UIntT     registers[N_VALUES * UNPACK_N_VECTORS];
+	auto      decoder = DecompressorT(column, vector_index, lane);
+	decoder.decode_lane_into(registers);
+
+#pragma unroll
+	for (int vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+#pragma unroll
+		for (int position = 0; position < N_VALUES; ++position) {
+			const uint32_t in_idx = static_cast<uint32_t>(lane) + static_cast<uint32_t>(position) * mapping.N_LANES;
+			const size_t output_index =
+			    (vector_index_size + static_cast<size_t>(vector)) * galp::codec::consts::VALUES_PER_VECTOR +
+			    UntransposerT::map_index(in_idx);
+			if (output_index < column.n_values) {
+				out[output_index] = static_cast<T>(registers[position + vector * N_VALUES]);
+			}
+		}
+	}
+}
+
 template <typename T, int UNPACK_N_VECTORS, int UNPACK_N_VALUES, typename DecompressorT, typename ColumnT>
 __global__ void query_column(const ColumnT column,
                              bool*         out,

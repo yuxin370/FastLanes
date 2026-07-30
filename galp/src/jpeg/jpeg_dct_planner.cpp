@@ -1,29 +1,17 @@
-#include "galp/jpeg_dct.hpp"
-#include "core/operator_capabilities.hpp"
-#include "fls/connection.hpp"
-#include "fls/expression/rpn.hpp"
-#include "fls/file/file_footer.hpp"
-#include "fls/file/file_header.hpp"
-#include "fls/footer/table_descriptor.hpp"
-#include "fls/io/file.hpp"
-#include "fls/reader/rowgroup_reader.hpp"
-#include "fls/table/memory_table.hpp"
-#include "fls/table/rowgroup.hpp"
-#include "jpeg/jpeg_dct_device.cuh"
-#include "jpeg/jpeg_dct_expression_validation.hpp"
+#include "fls/cfg/cfg.hpp"
+#include "galp/jpeg_dct_diagnostics.hpp"
+#include "galp/jpeg_dct_storage.hpp"
+#include "jpeg/jpeg_dct_device_bridge.hpp"
+#include "jpeg/jpeg_dct_metadata.hpp"
 #include "jpeg/jpeg_dct_order.hpp"
+#include "jpeg/jpeg_dct_policy.hpp"
+#include "jpeg/jpeg_dct_prepared_plan.hpp"
+#include "jpeg/jpeg_dct_shard_reader.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <csetjmp>
-#include <cstdio>
 #include <deque>
-#include <fstream>
-#include <future>
-#include <iomanip>
-#include <iterator>
-#include <jpeglib.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -31,2155 +19,45 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 namespace galp::jpeg {
-
 namespace {
 
-constexpr uint16_t kMetadataLayoutZigzagColumns       = 1U << 0U;
-constexpr uint16_t kMetadataLayoutLegacyZOrder        = 1U << 1U;
-constexpr uint16_t kMetadataLayoutSpatialOrderPresent = 1U << 2U;
-constexpr uint16_t kMetadataLayoutSpatialOrderShift   = 3U;
-constexpr uint16_t kMetadataLayoutSpatialOrderMask    = 3U << kMetadataLayoutSpatialOrderShift;
-constexpr uint16_t kMetadataLayoutKnownMask           = kMetadataLayoutZigzagColumns | kMetadataLayoutLegacyZOrder |
-                                              kMetadataLayoutSpatialOrderPresent | kMetadataLayoutSpatialOrderMask;
-
-uint16_t spatial_order_id(const JpegDctSpatialOrder order) {
-	switch (order) {
-	case JpegDctSpatialOrder::kRaster:
-		return 0;
-	case JpegDctSpatialOrder::kTiledRaster32:
-		return 1;
-	case JpegDctSpatialOrder::kZOrder:
-		return 2;
-	case JpegDctSpatialOrder::kTiledZ32:
-		return 3;
-	default:
-		throw std::runtime_error("unknown JPEG DCT spatial order");
+void configure_crop_execution_mode(detail::JpegDctDeviceRowgroupPlan& rowgroup,
+                                   const JpegDctCropExecutionMode      mode) {
+	const auto automatic = detail::choose_jpeg_dct_runtime_policy(
+	    rowgroup.selected_vector_count, rowgroup.full_vector_count, rowgroup.selected_chunks_fit);
+	const bool selected_decode_possible = rowgroup.selected_chunks_fit && rowgroup.full_vector_count != 0U &&
+	                                      rowgroup.selected_vector_count < rowgroup.full_vector_count;
+	rowgroup.sparse_storage_read                 = false;
+	rowgroup.automatic_sparse_storage_candidate = false;
+	switch (mode) {
+	case JpegDctCropExecutionMode::kAutomatic:
+		rowgroup.runtime_policy = automatic;
+		rowgroup.automatic_sparse_storage_candidate =
+		    automatic.decision == detail::JpegDctRuntimePolicyDecision::kSelectedVectors;
+		break;
+	case JpegDctCropExecutionMode::kFullRowgroupDecode:
+		rowgroup.runtime_policy = {detail::JpegDctRuntimePolicyDecision::kFullRowgroup,
+		                           detail::JpegDctRuntimePolicyReason::kForcedFullRowgroup};
+		break;
+	case JpegDctCropExecutionMode::kRowgroupReadSelectedDecode:
+	case JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode:
+		if (!selected_decode_possible) {
+			rowgroup.runtime_policy = automatic;
+			break;
+		}
+		rowgroup.runtime_policy = {detail::JpegDctRuntimePolicyDecision::kSelectedVectors,
+		                           detail::JpegDctRuntimePolicyReason::kForcedSelectedVectors};
+		rowgroup.sparse_storage_read = mode == JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode;
+		break;
 	}
-}
-
-JpegDctSpatialOrder spatial_order_from_id(const uint16_t id) {
-	switch (id) {
-	case 0:
-		return JpegDctSpatialOrder::kRaster;
-	case 1:
-		return JpegDctSpatialOrder::kTiledRaster32;
-	case 2:
-		return JpegDctSpatialOrder::kZOrder;
-	case 3:
-		return JpegDctSpatialOrder::kTiledZ32;
-	default:
-		throw std::runtime_error("unknown JPEG DCT spatial order id in metadata");
-	}
-}
-
-uint16_t metadata_layout_flags(const JpegDctDatasetMetadata& metadata, const bool sectioned) {
-	uint16_t flags = 0;
-	if (metadata.zigzag_columns) {
-		flags |= kMetadataLayoutZigzagColumns;
-	}
-	if (metadata.z_curve_block_order) {
-		flags |= kMetadataLayoutLegacyZOrder;
-	}
-	if (sectioned && metadata.row_ordering == JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor) {
-		flags |= kMetadataLayoutSpatialOrderPresent;
-		flags |= static_cast<uint16_t>(spatial_order_id(metadata.image_major_spatial_order)
-		                               << kMetadataLayoutSpatialOrderShift);
-	}
-	return flags;
 }
 
 } // namespace
-
-bool parse_jpeg_dct_coefficient_selection(const std::string_view spec, JpegDctCoefficientSelection& selection) {
-	JpegDctCoefficientSelection parsed;
-	if (spec == "all") {
-		selection = std::move(parsed);
-		return true;
-	}
-
-	const auto parse_coeff = [](const std::string_view token, uint8_t& out) -> bool {
-		if (token.empty()) {
-			return false;
-		}
-		try {
-			size_t     parsed_chars = 0;
-			const auto value        = std::stoull(std::string(token), &parsed_chars);
-			if (parsed_chars != token.size() || value >= detail::kJpegDctCoefficientCount) {
-				return false;
-			}
-			out = static_cast<uint8_t>(value);
-			return true;
-		} catch (...) { return false; }
-	};
-
-	constexpr std::string_view first_prefix = "first:";
-	constexpr std::string_view list_prefix  = "list:";
-	if (spec.substr(0, first_prefix.size()) == first_prefix) {
-		size_t     count    = 0;
-		const auto count_sv = spec.substr(first_prefix.size());
-		try {
-			size_t parsed_chars = 0;
-			count               = std::stoull(std::string(count_sv), &parsed_chars);
-			if (parsed_chars != count_sv.size()) {
-				return false;
-			}
-		} catch (...) { return false; }
-		if (count == 0 || count > detail::kJpegDctCoefficientCount) {
-			return false;
-		}
-		parsed.coefficients.reserve(count);
-		for (size_t coeff = 0; coeff < count; ++coeff) {
-			parsed.coefficients.push_back(static_cast<uint8_t>(coeff));
-		}
-		selection = std::move(parsed);
-		return true;
-	}
-
-	if (spec.substr(0, list_prefix.size()) == list_prefix) {
-		auto list = spec.substr(list_prefix.size());
-		if (list.empty()) {
-			return false;
-		}
-		while (!list.empty()) {
-			const auto comma = list.find(',');
-			const auto token = comma == std::string_view::npos ? list : list.substr(0, comma);
-			uint8_t    coeff = 0;
-			if (!parse_coeff(token, coeff)) {
-				return false;
-			}
-			if (std::find(parsed.coefficients.begin(), parsed.coefficients.end(), coeff) != parsed.coefficients.end()) {
-				return false;
-			}
-			parsed.coefficients.push_back(coeff);
-			if (comma == std::string_view::npos) {
-				break;
-			}
-			list = list.substr(comma + 1);
-		}
-		selection = std::move(parsed);
-		return true;
-	}
-
-	return false;
-}
-
-namespace {
-
-using DctRow = std::array<int16_t, 64>;
-
-struct DecodedComponent {
-	JpegComponentMetadata metadata;
-	std::vector<DctRow>   blocks;
-	std::vector<size_t>   coord_to_block_index;
-};
-
-struct DecodedImage {
-	JpegImageMetadata             metadata;
-	std::vector<DecodedComponent> components;
-};
-
-struct ComponentSlot {
-	uint32_t semantic_slot_id     = 0;
-	size_t   component_index      = 0;
-	int      component_id         = 0;
-	uint32_t max_width_in_blocks  = 0;
-	uint32_t max_height_in_blocks = 0;
-};
-
-struct DatasetLayout {
-	std::vector<ComponentSlot>                        slots;
-	std::vector<std::vector<const DecodedComponent*>> image_slot_components;
-};
-
-struct FileCloser {
-	void operator()(FILE* file) const {
-		if (file != nullptr) {
-			std::fclose(file);
-		}
-	}
-};
-
-using FilePtr = std::unique_ptr<FILE, FileCloser>;
-
-struct JpegErrorManager {
-	jpeg_error_mgr pub;
-	jmp_buf        setjmp_buffer;
-	char           message[JMSG_LENGTH_MAX] {};
-	uint32_t       warning_count = 0;
-};
-
-extern "C" void jpeg_error_exit_bridge(j_common_ptr cinfo) {
-	auto* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
-	(*cinfo->err->format_message)(cinfo, err->message);
-	longjmp(err->setjmp_buffer, 1);
-}
-
-extern "C" void jpeg_emit_message_bridge(j_common_ptr cinfo, int msg_level) {
-	auto* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
-	if (msg_level < 0) {
-		++err->warning_count;
-	}
-}
-
-FilePtr open_jpeg_file(const std::filesystem::path& path);
-
-struct JpegDecoder {
-	explicit JpegDecoder(std::filesystem::path input_path)
-	    : path(std::move(input_path))
-	    , file(open_jpeg_file(path)) {
-		cinfo.err             = jpeg_std_error(&jerr.pub);
-		jerr.pub.error_exit   = jpeg_error_exit_bridge;
-		jerr.pub.emit_message = jpeg_emit_message_bridge;
-		checked_void([&] { jpeg_create_decompress(&cinfo); });
-		created = true;
-	}
-
-	JpegDecoder(const JpegDecoder&)            = delete;
-	JpegDecoder& operator=(const JpegDecoder&) = delete;
-
-	~JpegDecoder() {
-		if (created) {
-			jpeg_destroy_decompress(&cinfo);
-		}
-	}
-
-	void set_stdio_src() {
-		checked_void([&] { jpeg_stdio_src(&cinfo, file.get()); });
-	}
-
-	void save_metadata_markers() {
-		checked_void([&] {
-			jpeg_save_markers(&cinfo, JPEG_COM, 0xffff);
-			for (int marker = 0; marker < 16; ++marker) {
-				jpeg_save_markers(&cinfo, JPEG_APP0 + marker, 0xffff);
-			}
-		});
-	}
-
-	void read_header() {
-		checked_void([&] { jpeg_read_header(&cinfo, TRUE); });
-	}
-
-	jvirt_barray_ptr* read_coefficients() {
-		return checked_value([&] { return jpeg_read_coefficients(&cinfo); });
-	}
-
-	JBLOCKARRAY access_virt_barray(const jvirt_barray_ptr coefficient_array, const JDIMENSION start_row) {
-		return checked_value([&] {
-			return (*cinfo.mem->access_virt_barray)(
-			    reinterpret_cast<j_common_ptr>(&cinfo), coefficient_array, start_row, 1, FALSE);
-		});
-	}
-
-	void finish_decompress() {
-		checked_void([&] { jpeg_finish_decompress(&cinfo); });
-	}
-
-	uint32_t warning_count() const {
-		return jerr.warning_count;
-	}
-
-	jpeg_decompress_struct cinfo {};
-
-private:
-	[[noreturn]] void throw_error() const {
-		throw std::runtime_error("libjpeg failed while reading '" + path.string() + "': " + jerr.message);
-	}
-
-	template <typename Fn>
-	void checked_void(Fn&& fn) {
-		if (setjmp(jerr.setjmp_buffer) != 0) {
-			throw_error();
-		}
-		fn();
-	}
-
-	template <typename Fn>
-	auto checked_value(Fn&& fn) -> decltype(fn()) {
-		if (setjmp(jerr.setjmp_buffer) != 0) {
-			throw_error();
-		}
-		return fn();
-	}
-
-	std::filesystem::path path;
-	FilePtr               file;
-	JpegErrorManager      jerr {};
-	bool                  created = false;
-};
-
-FilePtr open_jpeg_file(const std::filesystem::path& path) {
-	FILE* file = std::fopen(path.string().c_str(), "rb");
-	if (file == nullptr) {
-		throw std::runtime_error("failed to open JPEG file: " + path.string());
-	}
-	return FilePtr(file);
-}
-
-std::vector<size_t> selected_component_indices(const int num_components, const JpegDctReaderOptions& options) {
-	if (options.component_mode == JpegComponentMode::kAllComponents) {
-		std::vector<size_t> indices(static_cast<size_t>(num_components));
-		for (size_t i = 0; i < indices.size(); ++i) {
-			indices[i] = i;
-		}
-		return indices;
-	}
-
-	if (options.selected_component_index < 0 || options.selected_component_index >= num_components) {
-		std::ostringstream msg;
-		msg << "selected JPEG component index " << options.selected_component_index << " is outside [0, "
-		    << num_components << ")";
-		throw std::runtime_error(msg.str());
-	}
-	return {static_cast<size_t>(options.selected_component_index)};
-}
-
-DctRow block_to_row(const JCOEF* block, const bool use_zigzag_columns) {
-	DctRow row {};
-	for (size_t col = 0; col < row.size(); ++col) {
-		const auto natural_idx = use_zigzag_columns ? detail::kZigzagColumnToNaturalIndex[col] : col;
-		const auto value       = block[natural_idx];
-		if (value < std::numeric_limits<int16_t>::min() || value > std::numeric_limits<int16_t>::max()) {
-			throw std::runtime_error("JPEG DCT coefficient is outside int16_t range");
-		}
-		row[col] = static_cast<int16_t>(value);
-	}
-	return row;
-}
-
-std::vector<size_t> make_coord_to_index(const uint32_t                               width_in_blocks,
-                                        const uint32_t                               height_in_blocks,
-                                        const std::vector<detail::MortonBlockCoord>& order) {
-	std::vector<size_t> coord_to_index(static_cast<size_t>(width_in_blocks) * height_in_blocks);
-	for (size_t block_idx = 0; block_idx < order.size(); ++block_idx) {
-		const auto& coord                                                        = order[block_idx];
-		coord_to_index[static_cast<size_t>(coord.y) * width_in_blocks + coord.x] = block_idx;
-	}
-	return coord_to_index;
-}
-
-const JpegQuantTableMetadata* find_quant_table(const JpegImageMetadata& image, const int quant_tbl_no) {
-	if (quant_tbl_no < 0) {
-		return nullptr;
-	}
-	for (const auto& table : image.quant_tables) {
-		if (table.table_id == static_cast<uint8_t>(quant_tbl_no)) {
-			return &table;
-		}
-	}
-	return nullptr;
-}
-
-uint64_t quant_table_fingerprint(const JpegImageMetadata& image, const int quant_tbl_no) {
-	const auto* table = find_quant_table(image, quant_tbl_no);
-	if (table == nullptr) {
-		return 0;
-	}
-	uint64_t hash = 1469598103934665603ULL;
-	for (const auto value : table->values) {
-		hash ^= static_cast<uint64_t>(value & 0xffU);
-		hash *= 1099511628211ULL;
-		hash ^= static_cast<uint64_t>((value >> 8U) & 0xffU);
-		hash *= 1099511628211ULL;
-	}
-	return hash;
-}
-
-DecodedImage decode_jpeg_coefficients(const std::filesystem::path& path, const JpegDctReaderOptions& options) {
-	static_assert(sizeof(JCOEF) <= sizeof(int16_t), "JCOEF wider than int16_t requires explicit conversion policy");
-
-	JpegDecoder decoder(path);
-	decoder.set_stdio_src();
-	if (options.capture_metadata_markers) {
-		decoder.save_metadata_markers();
-	}
-	decoder.read_header();
-	auto& cinfo = decoder.cinfo;
-	// libjpeg-turbo exposes the libjpeg-compatible coefficient API. This path reads the compressed-domain,
-	// quantized DCT coefficient arrays directly; it does not hand-roll JPEG entropy decode, IDCT, or RGB decode.
-	auto** coefficient_arrays = decoder.read_coefficients();
-
-	DecodedImage image;
-	image.metadata.source_path      = path;
-	image.metadata.image_width      = cinfo.image_width;
-	image.metadata.image_height     = cinfo.image_height;
-	image.metadata.data_precision   = static_cast<uint8_t>(cinfo.data_precision);
-	image.metadata.jpeg_color_space = static_cast<int>(cinfo.jpeg_color_space);
-	image.metadata.progressive      = jpeg_has_multiple_scans(&cinfo) != 0;
-	for (int table_id = 0; table_id < NUM_QUANT_TBLS; ++table_id) {
-		const auto* quant_table = cinfo.quant_tbl_ptrs[table_id];
-		if (quant_table == nullptr) {
-			continue;
-		}
-		JpegQuantTableMetadata metadata;
-		metadata.table_id = static_cast<uint8_t>(table_id);
-		for (size_t i = 0; i < metadata.values.size(); ++i) {
-			metadata.values[i] = quant_table->quantval[i];
-		}
-		image.metadata.quant_tables.push_back(metadata);
-	}
-	for (jpeg_saved_marker_ptr marker = cinfo.marker_list; marker != nullptr; marker = marker->next) {
-		JpegMarkerMetadata metadata;
-		metadata.marker = static_cast<uint8_t>(marker->marker);
-		metadata.payload.assign(marker->data, marker->data + marker->data_length);
-		image.metadata.markers.push_back(std::move(metadata));
-	}
-
-	const auto indices = selected_component_indices(cinfo.num_components, options);
-	image.components.reserve(indices.size());
-	image.metadata.components.reserve(indices.size());
-
-	for (const auto component_index : indices) {
-		const auto& comp = cinfo.comp_info[component_index];
-
-		DecodedComponent component;
-		component.metadata.semantic_slot_id        = static_cast<uint32_t>(component_index);
-		component.metadata.component_index         = component_index;
-		component.metadata.local_component_index   = component_index;
-		component.metadata.component_id            = comp.component_id;
-		component.metadata.width_in_blocks         = comp.width_in_blocks;
-		component.metadata.height_in_blocks        = comp.height_in_blocks;
-		component.metadata.padded_width_in_blocks  = comp.width_in_blocks;
-		component.metadata.padded_height_in_blocks = comp.height_in_blocks;
-		component.metadata.h_samp_factor           = comp.h_samp_factor;
-		component.metadata.v_samp_factor           = comp.v_samp_factor;
-		component.metadata.quant_tbl_no            = comp.quant_tbl_no;
-		component.metadata.quant_table_fingerprint = quant_table_fingerprint(image.metadata, comp.quant_tbl_no);
-
-		const auto order =
-		    detail::make_block_order(comp.width_in_blocks, comp.height_in_blocks, options.use_z_curve_block_order);
-		component.blocks.resize(order.size());
-		component.coord_to_block_index = make_coord_to_index(comp.width_in_blocks, comp.height_in_blocks, order);
-		for (JDIMENSION y = 0; y < comp.height_in_blocks; ++y) {
-			JBLOCKARRAY block_rows = decoder.access_virt_barray(coefficient_arrays[component_index], y);
-			for (JDIMENSION x = 0; x < comp.width_in_blocks; ++x) {
-				const auto block_index =
-				    component.coord_to_block_index[static_cast<size_t>(y) * comp.width_in_blocks + x];
-				component.blocks[block_index] = block_to_row(block_rows[0][x], options.use_zigzag_columns);
-			}
-		}
-
-		image.metadata.components.push_back(component.metadata);
-		image.components.push_back(std::move(component));
-	}
-
-	decoder.finish_decompress();
-	image.metadata.warning_count = decoder.warning_count();
-	return image;
-}
-
-DecodedImage decode_jpeg_layout(const std::filesystem::path& path, const JpegDctReaderOptions& options) {
-	JpegDecoder decoder(path);
-	decoder.set_stdio_src();
-	decoder.read_header();
-	auto& cinfo = decoder.cinfo;
-
-	DecodedImage image;
-	image.metadata.source_path      = path;
-	image.metadata.image_width      = cinfo.image_width;
-	image.metadata.image_height     = cinfo.image_height;
-	image.metadata.data_precision   = static_cast<uint8_t>(cinfo.data_precision);
-	image.metadata.jpeg_color_space = static_cast<int>(cinfo.jpeg_color_space);
-	image.metadata.progressive      = jpeg_has_multiple_scans(&cinfo) != 0;
-
-	const auto indices = selected_component_indices(cinfo.num_components, options);
-	image.components.reserve(indices.size());
-	image.metadata.components.reserve(indices.size());
-	for (const auto component_index : indices) {
-		const auto& comp = cinfo.comp_info[component_index];
-
-		DecodedComponent component;
-		component.metadata.semantic_slot_id        = static_cast<uint32_t>(component_index);
-		component.metadata.component_index         = component_index;
-		component.metadata.local_component_index   = component_index;
-		component.metadata.component_id            = comp.component_id;
-		component.metadata.width_in_blocks         = comp.width_in_blocks;
-		component.metadata.height_in_blocks        = comp.height_in_blocks;
-		component.metadata.padded_width_in_blocks  = comp.width_in_blocks;
-		component.metadata.padded_height_in_blocks = comp.height_in_blocks;
-		component.metadata.h_samp_factor           = comp.h_samp_factor;
-		component.metadata.v_samp_factor           = comp.v_samp_factor;
-		component.metadata.quant_tbl_no            = comp.quant_tbl_no;
-
-		image.metadata.components.push_back(component.metadata);
-		image.components.push_back(std::move(component));
-	}
-	image.metadata.warning_count = decoder.warning_count();
-	return image;
-}
-
-template <typename Fn>
-std::vector<DecodedImage> decode_jpeg_images_parallel(const std::vector<std::filesystem::path>& paths,
-                                                      const JpegDctReaderOptions&               options,
-                                                      const size_t                              requested_threads,
-                                                      Fn&&                                      decode) {
-	if (paths.empty()) {
-		return {};
-	}
-	const size_t thread_count = std::max<size_t>(1, std::min(requested_threads, paths.size()));
-	if (thread_count == 1) {
-		std::vector<DecodedImage> images;
-		images.reserve(paths.size());
-		for (const auto& path : paths) {
-			images.push_back(decode(path, options));
-		}
-		return images;
-	}
-
-	std::vector<DecodedImage>      images(paths.size());
-	std::vector<std::future<void>> futures;
-	futures.reserve(thread_count);
-	for (size_t worker = 0; worker < thread_count; ++worker) {
-		futures.push_back(std::async(std::launch::async, [&, worker] {
-			for (size_t index = worker; index < paths.size(); index += thread_count) {
-				images[index] = decode(paths[index], options);
-			}
-		}));
-	}
-	for (auto& future : futures) {
-		future.get();
-	}
-	return images;
-}
-
-void append_row(JpegDctTable& table, const DctRow& row) {
-	for (size_t col = 0; col < row.size(); ++col) {
-		table.columns[col].push_back(row[col]);
-	}
-	++table.row_count;
-	++table.real_row_count;
-}
-
-uint32_t encoding_profile_id(std::vector<JpegEncodingProfileMetadata>& profiles,
-                             const JpegImageMetadata&                  image,
-                             const JpegComponentMetadata&              component);
-
-void validate_supported_layout_options(const JpegDctReaderOptions& options) {
-	if (options.compression_partition_policy != JpegCompressionPartitionPolicy::kBySemanticSlot) {
-		throw std::runtime_error("JPEG DCT compression partition policy is not implemented yet; "
-		                         "only kBySemanticSlot is currently supported");
-	}
-	if (options.coefficient_encoding != JpegDctCoefficientEncoding::kDense64FastLanes) {
-		throw std::runtime_error("JPEG DCT coefficient encoding is not implemented yet; "
-		                         "only kDense64FastLanes is currently supported");
-	}
-}
-
-JpegDctTable make_single_image_table(DecodedImage image, const JpegDctReaderOptions& options) {
-	validate_supported_layout_options(options);
-	JpegDctTable table;
-	for (size_t component_idx = 0; component_idx < image.metadata.components.size(); ++component_idx) {
-		auto& component                 = image.metadata.components[component_idx];
-		component.semantic_slot_id      = static_cast<uint32_t>(component_idx);
-		component.local_component_index = component.component_index;
-		component.encoding_profile_id =
-		    encoding_profile_id(table.metadata.encoding_profiles, image.metadata, component);
-		if (component_idx < image.components.size()) {
-			image.components[component_idx].metadata = component;
-		}
-		table.metadata.semantic_components.push_back(component);
-	}
-	table.metadata.images.push_back(std::move(image.metadata));
-	table.metadata.row_ordering                 = JpegDctRowOrdering::kSingleImageComponentMajorBlockMajor;
-	table.metadata.compression_partition_policy = options.compression_partition_policy;
-	table.metadata.coefficient_encoding         = options.coefficient_encoding;
-	table.metadata.zigzag_columns               = options.use_zigzag_columns;
-	table.metadata.z_curve_block_order          = options.use_z_curve_block_order;
-	table.metadata.image_count                  = 1;
-
-	for (const auto& component : image.components) {
-		const auto block_order = detail::make_block_order(
-		    component.metadata.width_in_blocks, component.metadata.height_in_blocks, options.use_z_curve_block_order);
-		for (size_t block_idx = 0; block_idx < component.blocks.size(); ++block_idx) {
-			const auto&            row = component.blocks[block_idx];
-			JpegDctBlockGroupIndex group;
-			group.semantic_slot_id = static_cast<uint32_t>(component.metadata.semantic_slot_id);
-			group.z_order_index    = static_cast<uint32_t>(block_idx);
-			if (block_idx < block_order.size()) {
-				group.block_x = block_order[block_idx].x;
-				group.block_y = block_order[block_idx].y;
-			}
-			group.row_start = table.row_count;
-			group.row_count = 1;
-			table.metadata.block_group_index.push_back(group);
-			append_row(table, row);
-		}
-	}
-	table.block_group_count = table.metadata.block_group_index.size();
-	return table;
-}
-
-bool same_semantic_slot(const JpegComponentMetadata& metadata, const ComponentSlot& slot) {
-	return metadata.component_id == slot.component_id;
-}
-
-const DecodedComponent* find_component_for_slot(const DecodedImage& image, const ComponentSlot& slot) {
-	for (const auto& component : image.components) {
-		if (same_semantic_slot(component.metadata, slot)) {
-			return &component;
-		}
-	}
-	return nullptr;
-}
-
-std::vector<std::vector<const DecodedComponent*>> make_image_slot_components(const std::vector<DecodedImage>&  images,
-                                                                             const std::vector<ComponentSlot>& slots) {
-	std::vector<std::vector<const DecodedComponent*>> result;
-	result.reserve(images.size());
-	for (const auto& image : images) {
-		auto& row = result.emplace_back(slots.size(), nullptr);
-		for (size_t slot_idx = 0; slot_idx < slots.size(); ++slot_idx) {
-			row[slot_idx] = find_component_for_slot(image, slots[slot_idx]);
-		}
-	}
-	return result;
-}
-
-// Builds dataset-wide semantic component slots keyed by JPEG component_id. Sampling and quantization differences are
-// represented by per-image component encoding profiles, not by splitting semantic slots.
-std::vector<ComponentSlot> normalize_component_slots(const std::vector<DecodedImage>& images) {
-	std::vector<ComponentSlot> slots;
-	if (images.empty()) {
-		return slots;
-	}
-
-	auto find_slot = [&](const JpegComponentMetadata& metadata) -> ComponentSlot* {
-		for (auto& slot : slots) {
-			if (same_semantic_slot(metadata, slot)) {
-				return &slot;
-			}
-		}
-		return nullptr;
-	};
-
-	for (const auto& image : images) {
-		for (const auto& component : image.components) {
-			auto* slot = find_slot(component.metadata);
-			if (slot == nullptr) {
-				ComponentSlot new_slot;
-				new_slot.semantic_slot_id     = static_cast<uint32_t>(slots.size());
-				new_slot.component_index      = slots.size();
-				new_slot.component_id         = component.metadata.component_id;
-				new_slot.max_width_in_blocks  = component.metadata.width_in_blocks;
-				new_slot.max_height_in_blocks = component.metadata.height_in_blocks;
-				slots.push_back(new_slot);
-				continue;
-			}
-
-			slot->max_width_in_blocks  = std::max(slot->max_width_in_blocks, component.metadata.width_in_blocks);
-			slot->max_height_in_blocks = std::max(slot->max_height_in_blocks, component.metadata.height_in_blocks);
-		}
-	}
-	return slots;
-}
-
-uint32_t encoding_profile_id(std::vector<JpegEncodingProfileMetadata>& profiles,
-                             const JpegImageMetadata&                  image,
-                             const JpegComponentMetadata&              component) {
-	const auto* table = find_quant_table(image, component.quant_tbl_no);
-	for (const auto& profile : profiles) {
-		if (profile.h_samp_factor == component.h_samp_factor && profile.v_samp_factor == component.v_samp_factor &&
-		    profile.quant_tbl_no == component.quant_tbl_no &&
-		    profile.quant_table_fingerprint == component.quant_table_fingerprint) {
-			return profile.profile_id;
-		}
-	}
-
-	JpegEncodingProfileMetadata profile;
-	profile.profile_id              = static_cast<uint32_t>(profiles.size());
-	profile.h_samp_factor           = component.h_samp_factor;
-	profile.v_samp_factor           = component.v_samp_factor;
-	profile.quant_tbl_no            = component.quant_tbl_no;
-	profile.quant_table_fingerprint = component.quant_table_fingerprint;
-	if (table != nullptr) {
-		profile.quant_table_values = table->values;
-	}
-	profiles.push_back(profile);
-	return profile.profile_id;
-}
-
-JpegImageMetadata normalized_image_metadata(const JpegImageMetadata&                    image_metadata,
-                                            const std::vector<ComponentSlot>&           slots,
-                                            const std::vector<const DecodedComponent*>& slot_components,
-                                            std::vector<JpegEncodingProfileMetadata>&   profiles) {
-	JpegImageMetadata out;
-	out.source_path      = image_metadata.source_path;
-	out.image_width      = image_metadata.image_width;
-	out.image_height     = image_metadata.image_height;
-	out.data_precision   = image_metadata.data_precision;
-	out.jpeg_color_space = image_metadata.jpeg_color_space;
-	out.progressive      = image_metadata.progressive;
-	out.warning_count    = image_metadata.warning_count;
-	out.quant_tables     = image_metadata.quant_tables;
-	out.markers          = image_metadata.markers;
-	out.components.reserve(slots.size());
-	for (size_t slot_idx = 0; slot_idx < slots.size(); ++slot_idx) {
-		const auto&           slot = slots[slot_idx];
-		JpegComponentMetadata metadata;
-		metadata.semantic_slot_id        = slot.semantic_slot_id;
-		metadata.component_index         = slot.component_index;
-		metadata.component_id            = slot.component_id;
-		metadata.padded_width_in_blocks  = slot.max_width_in_blocks;
-		metadata.padded_height_in_blocks = slot.max_height_in_blocks;
-
-		if (const auto* component = slot_components[slot_idx]) {
-			metadata.local_component_index   = component->metadata.local_component_index;
-			metadata.component_id            = component->metadata.component_id;
-			metadata.width_in_blocks         = component->metadata.width_in_blocks;
-			metadata.height_in_blocks        = component->metadata.height_in_blocks;
-			metadata.h_samp_factor           = component->metadata.h_samp_factor;
-			metadata.v_samp_factor           = component->metadata.v_samp_factor;
-			metadata.quant_tbl_no            = component->metadata.quant_tbl_no;
-			metadata.quant_table_fingerprint = component->metadata.quant_table_fingerprint;
-			metadata.encoding_profile_id     = encoding_profile_id(profiles, image_metadata, component->metadata);
-			metadata.present                 = true;
-		} else {
-			metadata.width_in_blocks  = 0;
-			metadata.height_in_blocks = 0;
-			metadata.present          = false;
-		}
-		out.components.push_back(metadata);
-	}
-	return out;
-}
-
-std::vector<JpegComponentMetadata> dataset_component_metadata(const std::vector<ComponentSlot>& slots) {
-	std::vector<JpegComponentMetadata> components;
-	components.reserve(slots.size());
-	for (const auto& slot : slots) {
-		JpegComponentMetadata metadata;
-		metadata.semantic_slot_id        = slot.semantic_slot_id;
-		metadata.component_index         = slot.component_index;
-		metadata.component_id            = slot.component_id;
-		metadata.width_in_blocks         = slot.max_width_in_blocks;
-		metadata.height_in_blocks        = slot.max_height_in_blocks;
-		metadata.padded_width_in_blocks  = slot.max_width_in_blocks;
-		metadata.padded_height_in_blocks = slot.max_height_in_blocks;
-		metadata.present                 = true;
-		components.push_back(metadata);
-	}
-	return components;
-}
-
-void validate_dataset(const std::vector<DecodedImage>& images, const JpegDctReaderOptions& /*options*/) {
-	if (images.empty()) {
-		throw std::runtime_error("JPEG DCT dataset requires at least one image");
-	}
-}
-
-const DctRow* find_component_block(const DecodedComponent& component, const uint32_t x, const uint32_t y) {
-	if (x >= component.metadata.width_in_blocks || y >= component.metadata.height_in_blocks) {
-		return nullptr;
-	}
-	const size_t flat_index = static_cast<size_t>(y) * component.metadata.width_in_blocks + x;
-	if (flat_index >= component.coord_to_block_index.size()) {
-		return nullptr;
-	}
-	const size_t block_index = component.coord_to_block_index[flat_index];
-	if (block_index >= component.blocks.size()) {
-		return nullptr;
-	}
-	return &component.blocks[block_index];
-}
-
-DatasetLayout make_dataset_layout(const std::vector<DecodedImage>& images) {
-	DatasetLayout layout;
-	layout.slots                 = normalize_component_slots(images);
-	layout.image_slot_components = make_image_slot_components(images, layout.slots);
-	return layout;
-}
-
-DatasetLayout make_dataset_layout(const std::vector<DecodedImage>& images, const std::vector<ComponentSlot>& slots) {
-	DatasetLayout layout;
-	layout.slots                 = slots;
-	layout.image_slot_components = make_image_slot_components(images, layout.slots);
-	return layout;
-}
-
-JpegDctTable make_dataset_table(std::vector<DecodedImage>         images,
-                                const JpegDctReaderOptions&       options,
-                                const std::vector<ComponentSlot>* global_slots,
-                                const JpegDctPhysicalLayout       physical_layout) {
-	validate_supported_layout_options(options);
-	if (global_slots == nullptr) {
-		validate_dataset(images, options);
-	}
-	const auto layout =
-	    global_slots == nullptr ? make_dataset_layout(images) : make_dataset_layout(images, *global_slots);
-
-	JpegDctTable table;
-	table.metadata.row_ordering                 = physical_layout == JpegDctPhysicalLayout::kImageMajor
-	                                                  ? JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor
-	                                                  : JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor;
-	table.metadata.compression_partition_policy = options.compression_partition_policy;
-	table.metadata.coefficient_encoding         = options.coefficient_encoding;
-	table.metadata.zigzag_columns               = options.use_zigzag_columns;
-	table.metadata.image_major_spatial_order    = options.image_major_spatial_order;
-	table.metadata.z_curve_block_order          = physical_layout == JpegDctPhysicalLayout::kImageMajor
-	                                                  ? options.image_major_spatial_order == JpegDctSpatialOrder::kZOrder
-	                                                  : options.use_z_curve_block_order;
-	table.metadata.image_count                  = images.size();
-
-	table.metadata.semantic_components = dataset_component_metadata(layout.slots);
-	table.metadata.images.reserve(images.size());
-	for (size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
-		table.metadata.images.push_back(normalized_image_metadata(images[image_idx].metadata,
-		                                                          layout.slots,
-		                                                          layout.image_slot_components[image_idx],
-		                                                          table.metadata.encoding_profiles));
-	}
-
-	if (physical_layout == JpegDctPhysicalLayout::kImageMajor) {
-		table.metadata.image_group_index.reserve(images.size());
-		for (size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
-			JpegDctImageGroupIndex image_group;
-			image_group.local_image_index = static_cast<uint32_t>(image_idx);
-			image_group.row_start         = table.row_count;
-			for (size_t slot_idx = 0; slot_idx < layout.slots.size(); ++slot_idx) {
-				const auto* component = layout.image_slot_components[image_idx][slot_idx];
-				if (component == nullptr) {
-					continue;
-				}
-				const auto block_order = detail::make_block_order(component->metadata.width_in_blocks,
-				                                                  component->metadata.height_in_blocks,
-				                                                  options.image_major_spatial_order);
-				for (const auto& block_coord : block_order) {
-					const auto* row = find_component_block(*component, block_coord.x, block_coord.y);
-					if (row == nullptr) {
-						throw std::runtime_error("JPEG DCT image-major writer found a hole in a component grid");
-					}
-					append_row(table, *row);
-					++image_group.row_count;
-				}
-			}
-			table.metadata.image_group_index.push_back(image_group);
-		}
-		table.block_group_count = 0;
-		return table;
-	}
-
-	for (size_t slot_idx = 0; slot_idx < layout.slots.size(); ++slot_idx) {
-		const auto& slot        = layout.slots[slot_idx];
-		const auto  block_order = detail::make_block_order(
-            slot.max_width_in_blocks, slot.max_height_in_blocks, options.use_z_curve_block_order);
-		for (size_t z_order_index = 0; z_order_index < block_order.size(); ++z_order_index) {
-			const auto&            block_coord = block_order[z_order_index];
-			JpegDctBlockGroupIndex group;
-			group.semantic_slot_id = slot.semantic_slot_id;
-			group.z_order_index    = static_cast<uint32_t>(z_order_index);
-			group.block_x          = block_coord.x;
-			group.block_y          = block_coord.y;
-			group.row_start        = table.row_count;
-			for (const auto& slot_components : layout.image_slot_components) {
-				const auto* component = slot_components[slot_idx];
-				const auto* row =
-				    component == nullptr ? nullptr : find_component_block(*component, block_coord.x, block_coord.y);
-				if (row != nullptr) {
-					append_row(table, *row);
-					++group.row_count;
-				}
-			}
-			if (group.row_count != 0) {
-				table.metadata.block_group_index.push_back(group);
-			}
-		}
-	}
-	table.block_group_count = table.metadata.block_group_index.size();
-	return table;
-}
-
-JpegDctTable make_dataset_table(std::vector<DecodedImage> images, const JpegDctReaderOptions& options) {
-	return make_dataset_table(std::move(images), options, nullptr, JpegDctPhysicalLayout::kSpatialMajorImageMinor);
-}
-
-int row_ordering_id(const JpegDctRowOrdering ordering) {
-	switch (ordering) {
-	case JpegDctRowOrdering::kSingleImageComponentMajorBlockMajor:
-		return 0;
-	case JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor:
-		return 1;
-	case JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor:
-		return 2;
-	}
-	return -1;
-}
-
-// Metadata and shard manifests retain a reserved validation-mode slot for backward compatibility. New files always
-// write the ragged id, and readers ignore older strict/padded ids because ragged is now the only supported layout.
-constexpr uint16_t kRaggedValidationModeOnDiskId = 2;
-
-uint16_t metadata_profile_id(const JpegMetadataProfile profile) {
-	switch (profile) {
-	case JpegMetadataProfile::kDctDatasetOnly:
-		return 0;
-	case JpegMetadataProfile::kReconstructableJpeg:
-		return 1;
-	case JpegMetadataProfile::kPreserveOriginalMarkers:
-		return 2;
-	}
-	return 0;
-}
-
-struct BinaryWriter {
-	explicit BinaryWriter(std::ostream& output)
-	    : out(output) {
-	}
-
-	void u8(const uint8_t value) {
-		out.put(static_cast<char>(value));
-	}
-
-	void u16(const uint16_t value) {
-		u8(static_cast<uint8_t>(value & 0xffU));
-		u8(static_cast<uint8_t>((value >> 8U) & 0xffU));
-	}
-
-	void u32(const uint32_t value) {
-		for (unsigned shift = 0; shift < 32; shift += 8) {
-			u8(static_cast<uint8_t>((value >> shift) & 0xffU));
-		}
-	}
-
-	void u64(const uint64_t value) {
-		for (unsigned shift = 0; shift < 64; shift += 8) {
-			u8(static_cast<uint8_t>((value >> shift) & 0xffU));
-		}
-	}
-
-	void i32(const int32_t value) {
-		u32(static_cast<uint32_t>(value));
-	}
-
-	std::ostream& out;
-};
-
-struct BinaryReader {
-	explicit BinaryReader(std::vector<uint8_t> input)
-	    : data(std::move(input)) {
-	}
-
-	bool eof() const {
-		return pos == data.size();
-	}
-
-	size_t remaining() const {
-		return data.size() - pos;
-	}
-
-	uint8_t u8() {
-		require(1);
-		return data[pos++];
-	}
-
-	uint16_t u16() {
-		uint16_t value = 0;
-		for (unsigned shift = 0; shift < 16; shift += 8) {
-			value |= static_cast<uint16_t>(u8()) << shift;
-		}
-		return value;
-	}
-
-	uint32_t u32() {
-		uint32_t value = 0;
-		for (unsigned shift = 0; shift < 32; shift += 8) {
-			value |= static_cast<uint32_t>(u8()) << shift;
-		}
-		return value;
-	}
-
-	uint64_t u64() {
-		uint64_t value = 0;
-		for (unsigned shift = 0; shift < 64; shift += 8) {
-			value |= static_cast<uint64_t>(u8()) << shift;
-		}
-		return value;
-	}
-
-	int32_t i32() {
-		return static_cast<int32_t>(u32());
-	}
-
-	std::vector<uint8_t> bytes(const size_t n) {
-		require(n);
-		std::vector<uint8_t> out(data.begin() + static_cast<std::ptrdiff_t>(pos),
-		                         data.begin() + static_cast<std::ptrdiff_t>(pos + n));
-		pos += n;
-		return out;
-	}
-
-	std::string string() {
-		const auto n = u32();
-		require(n);
-		std::string out(reinterpret_cast<const char*>(data.data() + pos), n);
-		pos += n;
-		return out;
-	}
-
-private:
-	void require(const size_t n) const {
-		if (n > remaining()) {
-			throw std::runtime_error("truncated JPEG DCT binary metadata");
-		}
-	}
-
-	std::vector<uint8_t> data;
-	size_t               pos = 0;
-};
-
-enum class MetadataSection : uint16_t {
-	kComponentGrid            = 1,
-	kPerImageGrid             = 2,
-	kReconstructableImageInfo = 3,
-	kOriginalMarkers          = 4,
-	kEncodingProfiles         = 5,
-	kBlockGroupIndex          = 6,
-	kImageGroupIndex          = 7,
-};
-
-template <typename Fn>
-std::vector<uint8_t> build_section(Fn&& fn) {
-	std::ostringstream payload(std::ios::binary);
-	BinaryWriter       writer(payload);
-	fn(writer);
-	const auto str = payload.str();
-	return std::vector<uint8_t>(str.begin(), str.end());
-}
-
-void write_section(BinaryWriter& writer, const MetadataSection section_id, const std::vector<uint8_t>& payload) {
-	writer.u16(static_cast<uint16_t>(section_id));
-	writer.u64(static_cast<uint64_t>(payload.size()));
-	writer.out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-}
-
-std::string dct_column_name(const size_t col) {
-	std::ostringstream out;
-	out << "dct_zz_" << std::setw(2) << std::setfill('0') << col;
-	return out.str();
-}
-
-class StagedFileCleanup {
-public:
-	explicit StagedFileCleanup(std::vector<std::filesystem::path> paths)
-	    : paths_(std::move(paths)) {
-	}
-
-	~StagedFileCleanup() {
-		if (!active_) {
-			return;
-		}
-		for (const auto& path : paths_) {
-			std::error_code ignored;
-			std::filesystem::remove(path, ignored);
-		}
-	}
-
-	void release() noexcept {
-		active_ = false;
-	}
-
-private:
-	std::vector<std::filesystem::path> paths_;
-	bool                               active_ = true;
-};
-
-struct DatasetGenerationPaths {
-	std::string           name;
-	std::filesystem::path staged_dir;
-	std::filesystem::path final_dir;
-};
-
-class DatasetGenerationCleanup {
-public:
-	explicit DatasetGenerationCleanup(DatasetGenerationPaths paths)
-	    : paths_(std::move(paths)) {
-	}
-
-	~DatasetGenerationCleanup() {
-		if (!active_) {
-			return;
-		}
-		std::error_code ignored;
-		std::filesystem::remove_all(paths_.staged_dir, ignored);
-		if (published_) {
-			ignored.clear();
-			std::filesystem::remove_all(paths_.final_dir, ignored);
-		}
-	}
-
-	void mark_published() noexcept {
-		published_ = true;
-	}
-
-	void release() noexcept {
-		active_ = false;
-	}
-
-private:
-	DatasetGenerationPaths paths_;
-	bool                   active_    = true;
-	bool                   published_ = false;
-};
-
-DatasetGenerationPaths create_dataset_generation(const std::filesystem::path& output_dir) {
-	const auto timestamp =
-	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-	        .count();
-	for (size_t attempt = 0; attempt < 1024U; ++attempt) {
-		DatasetGenerationPaths paths;
-		paths.name       = "generation_" + std::to_string(timestamp) + "_" + std::to_string(attempt);
-		paths.final_dir  = output_dir / paths.name;
-		paths.staged_dir = output_dir / (paths.name + ".tmp");
-
-		std::error_code error;
-		const bool      final_exists = std::filesystem::exists(paths.final_dir, error);
-		if (error) {
-			throw std::runtime_error("failed to inspect JPEG DCT generation path '" + paths.final_dir.string() +
-			                         "': " + error.message());
-		}
-		if (final_exists) {
-			continue;
-		}
-		if (std::filesystem::create_directory(paths.staged_dir, error)) {
-			return paths;
-		}
-		if (error) {
-			throw std::runtime_error("failed to create staged JPEG DCT generation directory '" +
-			                         paths.staged_dir.string() + "': " + error.message());
-		}
-	}
-	throw std::runtime_error("failed to allocate a unique JPEG DCT dataset generation");
-}
-
-void replace_with_staged_file(const std::filesystem::path& staged_path, const std::filesystem::path& final_path) {
-	std::error_code error;
-	std::filesystem::rename(staged_path, final_path, error);
-	if (error) {
-		throw std::runtime_error("failed to commit staged JPEG DCT file '" + staged_path.string() + "' as '" +
-		                         final_path.string() + "': " + error.message());
-	}
-}
-
-void publish_staged_generation(const DatasetGenerationPaths& paths) {
-	std::error_code error;
-	std::filesystem::rename(paths.staged_dir, paths.final_dir, error);
-	if (error) {
-		throw std::runtime_error("failed to publish staged JPEG DCT generation '" + paths.staged_dir.string() +
-		                         "' as '" + paths.final_dir.string() + "': " + error.message());
-	}
-}
-
-std::vector<uint64_t> make_block_group_aligned_rowgroups(JpegDctDatasetMetadata& metadata,
-                                                         const size_t            row_count,
-                                                         const uint32_t          rowgroup_vectors) {
-	if (rowgroup_vectors == 0) {
-		throw std::runtime_error("JPEG DCT shard rowgroup_vectors must be greater than zero");
-	}
-	const uint64_t        target_rows = static_cast<uint64_t>(rowgroup_vectors) * fastlanes::CFG::VEC_SZ;
-	std::vector<uint64_t> rowgroups;
-	uint64_t              current_rowgroup_rows = 0;
-
-	for (auto& group : metadata.block_group_index) {
-		if (group.row_count == 0) {
-			continue;
-		}
-		if (current_rowgroup_rows != 0 && current_rowgroup_rows + group.row_count > target_rows) {
-			rowgroups.push_back(current_rowgroup_rows);
-			current_rowgroup_rows = 0;
-		}
-		group.fls_rowgroup_index    = static_cast<uint32_t>(rowgroups.size());
-		group.row_start_in_rowgroup = static_cast<uint32_t>(current_rowgroup_rows);
-		current_rowgroup_rows += group.row_count;
-	}
-	if (current_rowgroup_rows != 0) {
-		rowgroups.push_back(current_rowgroup_rows);
-	}
-
-	uint64_t sum = 0;
-	for (const auto n_tuples : rowgroups) {
-		sum += n_tuples;
-	}
-	if (sum != row_count) {
-		std::ostringstream msg;
-		msg << "JPEG DCT rowgroup layout covers " << sum << " rows; expected " << row_count;
-		throw std::runtime_error(msg.str());
-	}
-	return rowgroups;
-}
-
-std::vector<uint64_t> make_image_aligned_rowgroups(JpegDctDatasetMetadata& metadata,
-                                                   const size_t            row_count,
-                                                   const uint32_t          rowgroup_vectors) {
-	if (rowgroup_vectors == 0) {
-		throw std::runtime_error("JPEG DCT shard rowgroup_vectors must be greater than zero");
-	}
-	const uint64_t        max_rows = static_cast<uint64_t>(rowgroup_vectors) * fastlanes::CFG::VEC_SZ;
-	std::vector<uint64_t> rowgroups;
-	rowgroups.reserve(metadata.image_group_index.size());
-	uint64_t covered_rows = 0;
-	for (auto& image_group : metadata.image_group_index) {
-		if (image_group.local_image_index != rowgroups.size()) {
-			throw std::runtime_error("JPEG DCT image-major index is not dense and ordered");
-		}
-		if (image_group.row_count == 0) {
-			throw std::runtime_error("JPEG DCT image-major record must contain at least one DCT block");
-		}
-		if (image_group.row_count > max_rows) {
-			std::ostringstream msg;
-			msg << "JPEG DCT image-major record " << image_group.local_image_index << " contains "
-			    << image_group.row_count << " rows, exceeding rowgroup capacity " << max_rows;
-			throw std::runtime_error(msg.str());
-		}
-		image_group.fls_rowgroup_index    = static_cast<uint32_t>(rowgroups.size());
-		image_group.row_start_in_rowgroup = 0;
-		rowgroups.push_back(image_group.row_count);
-		covered_rows += image_group.row_count;
-	}
-	if (covered_rows != row_count) {
-		std::ostringstream msg;
-		msg << "JPEG DCT image-major rowgroups cover " << covered_rows << " rows; expected " << row_count;
-		throw std::runtime_error(msg.str());
-	}
-	return rowgroups;
-}
-
-uint32_t image_major_rowgroup_vectors(const std::vector<DecodedImage>& images, const uint32_t configured_minimum) {
-	uint64_t max_image_rows = 0;
-	for (const auto& image : images) {
-		uint64_t image_rows = 0;
-		for (const auto& component : image.components) {
-			const auto component_rows =
-			    static_cast<uint64_t>(component.metadata.width_in_blocks) * component.metadata.height_in_blocks;
-			if (component_rows > std::numeric_limits<uint64_t>::max() - image_rows) {
-				throw std::runtime_error("JPEG DCT image-major row count overflow");
-			}
-			image_rows += component_rows;
-		}
-		max_image_rows = std::max(max_image_rows, image_rows);
-	}
-
-	const auto required_vectors = (max_image_rows + fastlanes::CFG::VEC_SZ - 1U) / fastlanes::CFG::VEC_SZ;
-	uint64_t   capacity_vectors = std::max<uint64_t>(1, configured_minimum);
-	while (capacity_vectors < required_vectors) {
-		if (capacity_vectors > std::numeric_limits<uint32_t>::max() / 2U) {
-			throw std::runtime_error("JPEG DCT image-major rowgroup capacity exceeds the supported range");
-		}
-		capacity_vectors *= 2U;
-	}
-	return static_cast<uint32_t>(capacity_vectors);
-}
-
-// Precomputed data for shard-boundary sizing. Building the block orders and per-image slot grid dimensions once (rather
-// than re-deriving them for every binary-search probe) turns shard sizing from O(slots * global_max_grid * images) per
-// probe into O(images + slots * global_max_grid). For large heterogeneous datasets (e.g. ImageNet, whose largest image
-// inflates the global max grid) the old cost dominated the whole shard writer and looked like a hang.
-struct ShardSizingContext {
-	std::vector<std::vector<detail::MortonBlockCoord>> block_orders; // [slot]
-	std::vector<std::vector<uint32_t>>                 slot_width;   // [slot][image] (0 when component absent)
-	std::vector<std::vector<uint32_t>>                 slot_height;  // [slot][image] (0 when component absent)
-	std::vector<uint32_t>                              max_width;    // [slot]
-	std::vector<uint32_t>                              max_height;   // [slot]
-	uint64_t                                           target_rows = 0;
-};
-
-ShardSizingContext build_shard_sizing_context(const std::vector<DecodedImage>&  layout_images,
-                                              const std::vector<ComponentSlot>& global_slots,
-                                              const JpegDctReaderOptions&       options,
-                                              const uint32_t                    rowgroup_vectors) {
-	ShardSizingContext ctx;
-	ctx.target_rows      = static_cast<uint64_t>(rowgroup_vectors) * fastlanes::CFG::VEC_SZ;
-	const size_t n_slots = global_slots.size();
-	ctx.block_orders.resize(n_slots);
-	ctx.slot_width.assign(n_slots, std::vector<uint32_t>(layout_images.size(), 0));
-	ctx.slot_height.assign(n_slots, std::vector<uint32_t>(layout_images.size(), 0));
-	ctx.max_width.resize(n_slots);
-	ctx.max_height.resize(n_slots);
-	for (size_t slot_idx = 0; slot_idx < n_slots; ++slot_idx) {
-		const auto& slot           = global_slots[slot_idx];
-		ctx.max_width[slot_idx]    = slot.max_width_in_blocks;
-		ctx.max_height[slot_idx]   = slot.max_height_in_blocks;
-		ctx.block_orders[slot_idx] = detail::make_block_order(
-		    slot.max_width_in_blocks, slot.max_height_in_blocks, options.use_z_curve_block_order);
-		for (size_t image_idx = 0; image_idx < layout_images.size(); ++image_idx) {
-			const auto* component = find_component_for_slot(layout_images[image_idx], slot);
-			if (component != nullptr) {
-				ctx.slot_width[slot_idx][image_idx]  = component->metadata.width_in_blocks;
-				ctx.slot_height[slot_idx][image_idx] = component->metadata.height_in_blocks;
-			}
-		}
-	}
-	return ctx;
-}
-
-// Mirrors the greedy packing in make_block_group_aligned_rowgroups. For each slot the per-block-group row count is the
-// number of images in [first_image, first_image + image_count) whose component reaches that block. We obtain those
-// counts in O(1) via a 2D suffix histogram over (width_in_blocks, height_in_blocks): group_row_count(x, y) is the
-// number of images with width > x and height > y. `scratch` is reused across probes to avoid per-call allocation.
-size_t estimate_shard_rowgroup_count(const ShardSizingContext& ctx,
-                                     const size_t              first_image,
-                                     const size_t              image_count,
-                                     std::vector<uint64_t>&    scratch) {
-	const uint64_t target_rows           = ctx.target_rows;
-	size_t         rowgroup_count        = 0;
-	uint64_t       current_rowgroup_rows = 0;
-
-	const auto pack_group = [&](const uint64_t group_row_count) {
-		if (group_row_count == 0) {
-			return;
-		}
-		if (current_rowgroup_rows != 0 && current_rowgroup_rows + group_row_count > target_rows) {
-			++rowgroup_count;
-			current_rowgroup_rows = 0;
-		}
-		current_rowgroup_rows += group_row_count;
-	};
-
-	for (size_t slot_idx = 0; slot_idx < ctx.block_orders.size(); ++slot_idx) {
-		const uint32_t max_w  = ctx.max_width[slot_idx];
-		const uint32_t max_h  = ctx.max_height[slot_idx];
-		const size_t   stride = static_cast<size_t>(max_h) + 2;
-		scratch.assign((static_cast<size_t>(max_w) + 2) * stride, 0);
-		const auto& widths  = ctx.slot_width[slot_idx];
-		const auto& heights = ctx.slot_height[slot_idx];
-		for (size_t image_idx = first_image; image_idx < first_image + image_count; ++image_idx) {
-			const uint32_t w = widths[image_idx];
-			const uint32_t h = heights[image_idx];
-			if (w == 0 || h == 0) {
-				continue;
-			}
-			const size_t cw = w > max_w ? max_w : w;
-			const size_t ch = h > max_h ? max_h : h;
-			++scratch[cw * stride + ch];
-		}
-		// Suffix sum so that scratch[x][y] becomes the number of images with width >= x and height >= y.
-		for (size_t x = static_cast<size_t>(max_w) + 1; x-- > 0;) {
-			for (size_t y = static_cast<size_t>(max_h) + 1; y-- > 0;) {
-				scratch[x * stride + y] +=
-				    scratch[(x + 1) * stride + y] + scratch[x * stride + (y + 1)] - scratch[(x + 1) * stride + (y + 1)];
-			}
-		}
-		for (const auto& block_coord : ctx.block_orders[slot_idx]) {
-			// group_row_count(x, y) = images with width > x and height > y = suffix at (x + 1, y + 1).
-			pack_group(scratch[(static_cast<size_t>(block_coord.x) + 1) * stride + (block_coord.y + 1)]);
-		}
-	}
-	if (current_rowgroup_rows != 0) {
-		++rowgroup_count;
-	}
-	return rowgroup_count;
-}
-
-size_t choose_shard_image_count(const ShardSizingContext&  ctx,
-                                const size_t               first_image,
-                                const size_t               max_image_count,
-                                const JpegDctShardOptions& shard_options,
-                                std::vector<uint64_t>&     scratch) {
-	if (estimate_shard_rowgroup_count(ctx, first_image, max_image_count, scratch) <=
-	    shard_options.rowgroups_per_shard) {
-		return max_image_count;
-	}
-
-	size_t lo = 1;
-	size_t hi = max_image_count;
-	while (lo < hi) {
-		const auto mid = lo + (hi - lo + 1) / 2;
-		if (estimate_shard_rowgroup_count(ctx, first_image, mid, scratch) <= shard_options.rowgroups_per_shard) {
-			lo = mid;
-		} else {
-			hi = mid - 1;
-		}
-	}
-
-	if (estimate_shard_rowgroup_count(ctx, first_image, lo, scratch) > shard_options.rowgroups_per_shard) {
-		std::ostringstream msg;
-		msg << "JPEG DCT single-image shard at global image index " << first_image << " requires more than "
-		    << shard_options.rowgroups_per_shard << " rowgroups; increase --rowgroups-per-shard or --rowgroup-vectors";
-		throw std::runtime_error(msg.str());
-	}
-	return lo;
-}
-
-void write_jpeg_dct_fls_data(const JpegDctTable&                  table,
-                             const std::filesystem::path&         fls_output_path,
-                             const fastlanes::MemoryTableOptions& options       = {},
-                             const bool                           inline_footer = false) {
-	std::array<fastlanes::MemoryColumn, 64> columns;
-	for (size_t col = 0; col < columns.size(); ++col) {
-		columns[col].name = dct_column_name(col);
-		columns[col].data = std::span<const int16_t>(table.columns[col].data(), table.columns[col].size());
-	}
-
-	const fastlanes::MemoryTable memory_table {
-	    std::span<const fastlanes::MemoryColumn>(columns.data(), columns.size())};
-	fastlanes::Connection connection;
-	fastlanes::load_memory_table(connection, memory_table, options);
-	if (inline_footer) {
-		connection.inline_footer();
-	}
-	connection.to_fls(fls_output_path);
-}
-
-std::string shard_file_name(const uint32_t shard_id, const std::string_view suffix) {
-	std::ostringstream out;
-	out << "shard_" << std::setw(6) << std::setfill('0') << shard_id << suffix;
-	return out.str();
-}
-
-JpegDctShardOptions effective_shard_options(JpegDctShardOptions options) {
-	constexpr size_t   kBalancedShardImages       = 8192;
-	constexpr uint32_t kBalancedRowgroupVectors   = 128;
-	constexpr uint32_t kBalancedRowgroupsPerShard = 256;
-	size_t             preset_shard_images        = kBalancedShardImages;
-	uint32_t           preset_rowgroup_vectors    = kBalancedRowgroupVectors;
-	uint32_t           preset_rowgroups_per_shard = kBalancedRowgroupsPerShard;
-
-	switch (options.preset) {
-	case JpegDctShardPreset::kCropLatency:
-		preset_shard_images     = 4096;
-		preset_rowgroup_vectors = 64;
-		break;
-	case JpegDctShardPreset::kBalanced:
-		break;
-	case JpegDctShardPreset::kThroughput:
-		preset_rowgroup_vectors = 256;
-		break;
-	case JpegDctShardPreset::kRandomAccess:
-		// One independently addressable rowgroup per image. Keep a large shard
-		// so globally shuffled batches still span only a small number of files.
-		preset_shard_images        = 8192;
-		preset_rowgroup_vectors    = 128;
-		preset_rowgroups_per_shard = 8192;
-		break;
-	}
-
-	if (!options.shard_images_specified && options.shard_images == kBalancedShardImages) {
-		options.shard_images = preset_shard_images;
-	}
-	if (!options.rowgroup_vectors_specified && options.rowgroup_vectors == kBalancedRowgroupVectors) {
-		options.rowgroup_vectors = preset_rowgroup_vectors;
-	}
-	if (!options.rowgroups_per_shard_specified && options.rowgroups_per_shard == kBalancedRowgroupsPerShard) {
-		options.rowgroups_per_shard = preset_rowgroups_per_shard;
-	}
-	if (!options.physical_layout_specified && options.preset == JpegDctShardPreset::kRandomAccess) {
-		options.physical_layout = JpegDctPhysicalLayout::kImageMajor;
-	}
-	return options;
-}
-
-std::vector<uint8_t> read_binary_file(const std::filesystem::path& path) {
-	std::ifstream in(path, std::ios::binary);
-	if (!in) {
-		throw std::runtime_error("failed to open binary file: " + path.string());
-	}
-	return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-}
-
-void expect_magic(BinaryReader& reader, const std::array<uint8_t, 8>& expected, const char* label) {
-	for (const auto byte : expected) {
-		if (reader.u8() != byte) {
-			throw std::runtime_error(std::string("invalid ") + label + " magic");
-		}
-	}
-}
-
-JpegDctRowOrdering row_ordering_from_id(const uint16_t id) {
-	switch (id) {
-	case 0:
-		return JpegDctRowOrdering::kSingleImageComponentMajorBlockMajor;
-	case 1:
-		return JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor;
-	case 2:
-		return JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor;
-	default:
-		throw std::runtime_error("unknown JPEG DCT row ordering id in metadata");
-	}
-}
-
-JpegCompressionPartitionPolicy partition_policy_from_id(const uint16_t id) {
-	switch (id) {
-	case 0:
-		return JpegCompressionPartitionPolicy::kBySemanticSlot;
-	case 1:
-		return JpegCompressionPartitionPolicy::kByEncodingProfile;
-	default:
-		throw std::runtime_error("unknown JPEG DCT compression partition policy id in metadata");
-	}
-}
-
-JpegDctCoefficientEncoding coefficient_encoding_from_id(const uint16_t id) {
-	switch (id) {
-	case 0:
-		return JpegDctCoefficientEncoding::kDense64FastLanes;
-	case 1:
-		return JpegDctCoefficientEncoding::kExpCrossRleI16;
-	case 2:
-		return JpegDctCoefficientEncoding::kDcDeltaDense64FastLanes;
-	case 3:
-		return JpegDctCoefficientEncoding::kDcDeltaAcSparseRle;
-	case 4:
-		return JpegDctCoefficientEncoding::kJpegLikeRunLength;
-	default:
-		throw std::runtime_error("unknown JPEG DCT coefficient encoding id in metadata");
-	}
-}
-
-JpegDctShardManifest read_jpeg_dct_shard_manifest_file(const std::filesystem::path& path) {
-	BinaryReader reader(read_binary_file(path));
-	expect_magic(reader, {'G', 'J', 'D', 'C', 'T', 'S', 'H', '1'}, "JPEG DCT shard manifest");
-
-	JpegDctShardManifest manifest;
-	manifest.version = reader.u32();
-	static_cast<void>(reader.u16()); // reserved validation-mode id (always ragged)
-	manifest.rowgroup_vectors    = reader.u32();
-	manifest.rowgroups_per_shard = reader.u32();
-	manifest.image_count         = reader.u64();
-	const auto shard_count       = reader.u32();
-	manifest.shards.reserve(shard_count);
-	for (uint32_t shard_idx = 0; shard_idx < shard_count; ++shard_idx) {
-		JpegDctShardManifestEntry entry;
-		entry.shard_id                 = reader.u32();
-		entry.first_global_image_index = reader.u64();
-		entry.image_count              = reader.u32();
-		entry.real_row_count           = reader.u64();
-		entry.padding_row_count        = reader.u64();
-		entry.physical_row_count       = reader.u64();
-		entry.rowgroup_count           = reader.u32();
-		entry.block_group_count        = reader.u32();
-		entry.fls_file_size            = reader.u64();
-		entry.metadata_file_size       = reader.u64();
-		entry.fls_file_name            = reader.string();
-		entry.metadata_file_name       = reader.string();
-		manifest.shards.push_back(std::move(entry));
-	}
-	return manifest;
-}
-
-template <typename ColT>
-const ColT* typed_column_ptr(const fastlanes::col_pt& column) {
-	const auto* holder = std::get_if<fastlanes::up<ColT>>(&column);
-	if (holder == nullptr || !*holder) {
-		return nullptr;
-	}
-	return holder->get();
-}
-
-template <typename T>
-int16_t checked_dct_value(const T value) {
-	return static_cast<int16_t>(value);
-}
-
-int16_t coefficient_value(const fastlanes::col_pt& column, const size_t row_idx) {
-	if (const auto* col = typed_column_ptr<fastlanes::col_i08>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	if (const auto* col = typed_column_ptr<fastlanes::col_i16>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	if (const auto* col = typed_column_ptr<fastlanes::col_i32>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	if (const auto* col = typed_column_ptr<fastlanes::col_i64>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	if (const auto* col = typed_column_ptr<fastlanes::u08_col_t>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	if (const auto* col = typed_column_ptr<fastlanes::u16_col_t>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	if (const auto* col = typed_column_ptr<fastlanes::u32_col_t>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	if (const auto* col = typed_column_ptr<fastlanes::u64_col_t>(column)) {
-		return checked_dct_value(col->data.at(row_idx));
-	}
-	throw std::runtime_error("JPEG DCT FLS column materialized to an unsupported type");
-}
-
-} // namespace
-
-namespace detail {
-
-void validate_jpeg_dct_fls_gpu_expressions(const std::filesystem::path& fls_path, const uint32_t shard_id) {
-	fastlanes::File       file(fls_path);
-	fastlanes::FileHeader header {};
-	fastlanes::FileFooter footer {};
-	fastlanes::FileHeader::Load(header, file);
-	fastlanes::FileFooter::Load(footer, file);
-	if (!header.settings.inline_footer) {
-		throw std::runtime_error("JPEG DCT GPU expression validation requires an inline footer: " + fls_path.string());
-	}
-	const auto descriptor = fastlanes::TableDescriptorHandle::FromFileSlice(
-	    file, footer.table_descriptor_offset, footer.table_descriptor_size, true);
-	const auto* table = descriptor.Get();
-	if (table == nullptr || table->m_rowgroup_descriptors() == nullptr) {
-		throw std::runtime_error("missing JPEG DCT table/rowgroup descriptor while validating staged shard " +
-		                         std::to_string(shard_id));
-	}
-
-	const auto fail = [&](const size_t       rowgroup_index,
-	                      const size_t       column_index,
-	                      const std::string& token,
-	                      const std::string& reason) -> void {
-		std::ostringstream message;
-		message << "JPEG DCT GPU expression validation failed: shard=" << shard_id << " rowgroup=" << rowgroup_index
-		        << " column=" << column_index << " coefficient=" << column_index << " token=" << token << ": "
-		        << reason;
-		throw std::runtime_error(message.str());
-	};
-
-	for (size_t rowgroup_index = 0; rowgroup_index < table->m_rowgroup_descriptors()->size(); ++rowgroup_index) {
-		const auto* rowgroup =
-		    table->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_index));
-		if (rowgroup == nullptr || rowgroup->m_column_descriptors() == nullptr) {
-			fail(rowgroup_index, 0, "<missing>", "missing rowgroup/column descriptor");
-		}
-		if (rowgroup->m_column_descriptors()->size() != detail::kJpegDctCoefficientCount) {
-			fail(rowgroup_index,
-			     rowgroup->m_column_descriptors()->size(),
-			     "<missing>",
-			     "expected exactly 64 JPEG DCT coefficient columns");
-		}
-		for (size_t column_index = 0; column_index < rowgroup->m_column_descriptors()->size(); ++column_index) {
-			const auto* column =
-			    rowgroup->m_column_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(column_index));
-			if (column == nullptr || column->encoding_rpn() == nullptr ||
-			    column->encoding_rpn()->operator_tokens() == nullptr ||
-			    column->encoding_rpn()->operator_tokens()->size() != 1U) {
-				fail(rowgroup_index, column_index, "<missing>", "expected exactly one root operator token");
-			}
-			const auto token = column->encoding_rpn()->operator_tokens()->Get(0);
-			if (!galp::expression::is_supported_token(token)) {
-				fail(rowgroup_index,
-				     column_index,
-				     fastlanes::token_to_string(token),
-				     "operator is not supported by the GALP GPU runtime");
-			}
-		}
-	}
-}
-
-} // namespace detail
-
-JpegDctTable read_jpeg_dct_file(const std::filesystem::path& path, const JpegDctReaderOptions& options) {
-	return make_single_image_table(decode_jpeg_coefficients(path, options), options);
-}
-
-JpegDctTable read_jpeg_dct_dataset(const std::vector<std::filesystem::path>& paths,
-                                   const JpegDctReaderOptions&               options) {
-	std::vector<DecodedImage> images;
-	images.reserve(paths.size());
-	for (const auto& path : paths) {
-		images.push_back(decode_jpeg_coefficients(path, options));
-	}
-	return make_dataset_table(std::move(images), options);
-}
-
-const std::vector<JpegComponentMetadata>* legacy_metadata_components(const JpegDctDatasetMetadata& metadata) {
-	if (!metadata.images.empty()) {
-		return &metadata.images.front().components;
-	}
-	if (!metadata.semantic_components.empty()) {
-		return &metadata.semantic_components;
-	}
-	return nullptr;
-}
-
-void write_jpeg_dct_metadata(const JpegDctDatasetMetadata& metadata, const std::filesystem::path& output_path) {
-	std::ofstream out(output_path, std::ios::binary);
-	if (!out) {
-		throw std::runtime_error("failed to open JPEG DCT metadata output: " + output_path.string());
-	}
-
-	const auto* components      = legacy_metadata_components(metadata);
-	const auto  component_count = components == nullptr ? 0 : components->size();
-
-	BinaryWriter  writer(out);
-	const uint8_t magic[8] {'G', 'J', 'D', 'C', 'T', 'M', 'D', '1'};
-	out.write(reinterpret_cast<const char*>(magic), sizeof(magic));
-	writer.u16(1);
-	writer.u16(static_cast<uint16_t>(row_ordering_id(metadata.row_ordering)));
-	writer.u16(kRaggedValidationModeOnDiskId);
-	writer.u16(metadata_layout_flags(metadata, /*sectioned=*/false));
-	writer.u64(static_cast<uint64_t>(metadata.image_count));
-	writer.u32(static_cast<uint32_t>(component_count));
-
-	for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
-		const auto& component = (*components)[component_idx];
-		writer.u32(static_cast<uint32_t>(component.component_index));
-		writer.i32(static_cast<int32_t>(component.component_id));
-		writer.u32(component.width_in_blocks);
-		writer.u32(component.height_in_blocks);
-		writer.u32(component.padded_width_in_blocks);
-		writer.u32(component.padded_height_in_blocks);
-		writer.i32(static_cast<int32_t>(component.h_samp_factor));
-		writer.i32(static_cast<int32_t>(component.v_samp_factor));
-	}
-
-	uint8_t has_image_records = 0;
-	if (metadata.row_ordering == JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor ||
-	    metadata.row_ordering == JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor) {
-		has_image_records = 1;
-	}
-	writer.u8(has_image_records);
-
-	if (has_image_records != 0) {
-		for (const auto& image : metadata.images) {
-			for (const auto& component : image.components) {
-				writer.u8(component.present ? 1 : 0);
-				writer.u32(component.width_in_blocks);
-				writer.u32(component.height_in_blocks);
-			}
-		}
-	}
-}
-
-void write_jpeg_dct_metadata(const JpegDctDatasetMetadata&       metadata,
-                             const std::filesystem::path&        output_path,
-                             const JpegDctMetadataWriterOptions& options) {
-	std::ofstream out(output_path, std::ios::binary);
-	if (!out) {
-		throw std::runtime_error("failed to open JPEG DCT metadata output: " + output_path.string());
-	}
-
-	const auto* components = metadata.semantic_components.empty() ? nullptr : &metadata.semantic_components;
-	if (components == nullptr && !metadata.images.empty()) {
-		components = &metadata.images.front().components;
-	}
-	const auto component_count = components == nullptr ? 0 : components->size();
-
-	BinaryWriter  writer(out);
-	const uint8_t magic[8] {'G', 'J', 'D', 'C', 'T', 'M', 'D', '3'};
-	out.write(reinterpret_cast<const char*>(magic), sizeof(magic));
-	const uint16_t version             = 3;
-	const uint16_t row_ordering        = static_cast<uint16_t>(row_ordering_id(metadata.row_ordering));
-	const uint16_t validation_mode     = kRaggedValidationModeOnDiskId;
-	const uint16_t profile             = metadata_profile_id(options.profile);
-	const uint16_t layout_flags        = metadata_layout_flags(metadata, /*sectioned=*/true);
-	const uint64_t image_count         = static_cast<uint64_t>(metadata.image_count);
-	const uint32_t n_components        = static_cast<uint32_t>(component_count);
-	const uint32_t n_encoding_profiles = static_cast<uint32_t>(metadata.encoding_profiles.size());
-	writer.u16(version);
-	writer.u16(profile);
-	writer.u16(row_ordering);
-	writer.u16(validation_mode);
-	writer.u16(layout_flags);
-	writer.u64(image_count);
-	writer.u32(n_components);
-	writer.u32(n_encoding_profiles);
-	writer.u16(static_cast<uint16_t>(metadata.compression_partition_policy));
-	writer.u16(static_cast<uint16_t>(metadata.coefficient_encoding));
-
-	const auto component_section = build_section([&](BinaryWriter& section) {
-		for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
-			const auto& component = (*components)[component_idx];
-			section.u32(component.semantic_slot_id);
-			section.u32(static_cast<uint32_t>(component.component_index));
-			section.i32(static_cast<int32_t>(component.component_id));
-			section.u32(component.width_in_blocks);
-			section.u32(component.height_in_blocks);
-			section.u32(component.padded_width_in_blocks);
-			section.u32(component.padded_height_in_blocks);
-		}
-	});
-	write_section(writer, MetadataSection::kComponentGrid, component_section);
-
-	const auto encoding_profile_section = build_section([&](BinaryWriter& section) {
-		for (const auto& encoding_profile : metadata.encoding_profiles) {
-			section.u32(encoding_profile.profile_id);
-			section.i32(encoding_profile.h_samp_factor);
-			section.i32(encoding_profile.v_samp_factor);
-			section.i32(encoding_profile.quant_tbl_no);
-			section.u64(encoding_profile.quant_table_fingerprint);
-			for (const auto value : encoding_profile.quant_table_values) {
-				section.u16(value);
-			}
-		}
-	});
-	write_section(writer, MetadataSection::kEncodingProfiles, encoding_profile_section);
-
-	const auto block_group_index_section = build_section([&](BinaryWriter& section) {
-		for (const auto& group : metadata.block_group_index) {
-			section.u32(group.semantic_slot_id);
-			section.u32(group.z_order_index);
-			section.u32(group.block_x);
-			section.u32(group.block_y);
-			section.u64(group.row_start);
-			section.u32(group.row_count);
-			section.u32(group.fls_rowgroup_index);
-			section.u32(group.row_start_in_rowgroup);
-		}
-	});
-	write_section(writer, MetadataSection::kBlockGroupIndex, block_group_index_section);
-
-	const auto image_group_index_section = build_section([&](BinaryWriter& section) {
-		for (const auto& group : metadata.image_group_index) {
-			section.u32(group.local_image_index);
-			section.u64(group.row_start);
-			section.u32(group.row_count);
-			section.u32(group.fls_rowgroup_index);
-			section.u32(group.row_start_in_rowgroup);
-		}
-	});
-	write_section(writer, MetadataSection::kImageGroupIndex, image_group_index_section);
-
-	const size_t first_image_idx   = 0;
-	bool         has_image_records = !metadata.images.empty();
-	if (has_image_records) {
-		const auto per_image_section = build_section([&](BinaryWriter& section) {
-			for (size_t image_idx = first_image_idx; image_idx < metadata.images.size(); ++image_idx) {
-				const auto& image = metadata.images[image_idx];
-				section.u32(image.image_width);
-				section.u32(image.image_height);
-				section.u8(image.data_precision);
-				section.i32(image.jpeg_color_space);
-				section.u32(image.warning_count);
-				for (const auto& component : image.components) {
-					section.u8(component.present ? 1 : 0);
-					section.u32(component.semantic_slot_id);
-					section.u32(static_cast<uint32_t>(component.local_component_index));
-					section.i32(component.component_id);
-					section.u32(component.width_in_blocks);
-					section.u32(component.height_in_blocks);
-					section.u32(component.encoding_profile_id);
-				}
-			}
-		});
-		write_section(writer, MetadataSection::kPerImageGrid, per_image_section);
-	}
-
-	if (options.profile == JpegMetadataProfile::kReconstructableJpeg ||
-	    options.profile == JpegMetadataProfile::kPreserveOriginalMarkers) {
-		const auto reconstruction_section = build_section([&](BinaryWriter& section) {
-			section.u64(static_cast<uint64_t>(metadata.images.size() - first_image_idx));
-			for (size_t image_idx = first_image_idx; image_idx < metadata.images.size(); ++image_idx) {
-				const auto& image = metadata.images[image_idx];
-				section.u32(image.image_width);
-				section.u32(image.image_height);
-				section.u8(image.data_precision);
-				section.i32(image.jpeg_color_space);
-				section.u32(static_cast<uint32_t>(image.quant_tables.size()));
-				for (const auto& table : image.quant_tables) {
-					section.u8(table.table_id);
-					for (const auto value : table.values) {
-						section.u16(value);
-					}
-				}
-			}
-		});
-		write_section(writer, MetadataSection::kReconstructableImageInfo, reconstruction_section);
-	}
-
-	if (options.profile == JpegMetadataProfile::kPreserveOriginalMarkers) {
-		const auto marker_section = build_section([&](BinaryWriter& section) {
-			section.u64(static_cast<uint64_t>(metadata.images.size() - first_image_idx));
-			for (size_t image_idx = first_image_idx; image_idx < metadata.images.size(); ++image_idx) {
-				const auto& image = metadata.images[image_idx];
-				section.u32(static_cast<uint32_t>(image.markers.size()));
-				for (const auto& marker : image.markers) {
-					section.u8(marker.marker);
-					section.u64(static_cast<uint64_t>(marker.payload.size()));
-					section.out.write(reinterpret_cast<const char*>(marker.payload.data()),
-					                  static_cast<std::streamsize>(marker.payload.size()));
-				}
-			}
-		});
-		write_section(writer, MetadataSection::kOriginalMarkers, marker_section);
-	}
-}
-
-void write_jpeg_dct_shard_manifest(const JpegDctShardManifest& manifest, const std::filesystem::path& output_path) {
-	std::ofstream out(output_path, std::ios::binary);
-	if (!out) {
-		throw std::runtime_error("failed to open JPEG DCT shard manifest output: " + output_path.string());
-	}
-
-	BinaryWriter  writer(out);
-	const uint8_t magic[8] {'G', 'J', 'D', 'C', 'T', 'S', 'H', '1'};
-	out.write(reinterpret_cast<const char*>(magic), sizeof(magic));
-	writer.u32(manifest.version);
-	writer.u16(kRaggedValidationModeOnDiskId);
-	writer.u32(manifest.rowgroup_vectors);
-	writer.u32(manifest.rowgroups_per_shard);
-	writer.u64(manifest.image_count);
-	writer.u32(static_cast<uint32_t>(manifest.shards.size()));
-
-	const auto write_string = [&](const std::string& value) {
-		writer.u32(static_cast<uint32_t>(value.size()));
-		out.write(value.data(), static_cast<std::streamsize>(value.size()));
-	};
-
-	for (const auto& shard : manifest.shards) {
-		writer.u32(shard.shard_id);
-		writer.u64(shard.first_global_image_index);
-		writer.u32(shard.image_count);
-		writer.u64(shard.real_row_count);
-		writer.u64(shard.padding_row_count);
-		writer.u64(shard.physical_row_count);
-		writer.u32(shard.rowgroup_count);
-		writer.u32(shard.block_group_count);
-		writer.u64(shard.fls_file_size);
-		writer.u64(shard.metadata_file_size);
-		write_string(shard.fls_file_name);
-		write_string(shard.metadata_file_name);
-	}
-}
-
-void compress_jpeg_dct_to_fls(const JpegDctTable&                 table,
-                              const std::filesystem::path&        fls_output_path,
-                              const std::filesystem::path&        metadata_output_path,
-                              const JpegDctMetadataWriterOptions& metadata_options) {
-	write_jpeg_dct_fls_data(table, fls_output_path);
-	write_jpeg_dct_metadata(table.metadata, metadata_output_path, metadata_options);
-}
-
-void compress_jpeg_dct_to_fls(const JpegDctTable&          table,
-                              const std::filesystem::path& fls_output_path,
-                              const std::filesystem::path& metadata_output_path) {
-	write_jpeg_dct_fls_data(table, fls_output_path);
-	write_jpeg_dct_metadata(table.metadata, metadata_output_path);
-}
-
-void compress_jpeg_dct_file_to_fls(const std::filesystem::path&        jpeg_path,
-                                   const std::filesystem::path&        fls_output_path,
-                                   const std::filesystem::path&        metadata_output_path,
-                                   const JpegDctReaderOptions&         options,
-                                   const JpegDctMetadataWriterOptions& metadata_options) {
-	auto read_options = options;
-	if (metadata_options.profile == JpegMetadataProfile::kPreserveOriginalMarkers) {
-		read_options.capture_metadata_markers = true;
-	}
-	compress_jpeg_dct_to_fls(
-	    read_jpeg_dct_file(jpeg_path, read_options), fls_output_path, metadata_output_path, metadata_options);
-}
-
-void compress_jpeg_dct_file_to_fls(const std::filesystem::path& jpeg_path,
-                                   const std::filesystem::path& fls_output_path,
-                                   const std::filesystem::path& metadata_output_path,
-                                   const JpegDctReaderOptions&  options) {
-	compress_jpeg_dct_to_fls(read_jpeg_dct_file(jpeg_path, options), fls_output_path, metadata_output_path);
-}
-
-void compress_jpeg_dct_dataset_to_fls(const std::vector<std::filesystem::path>& jpeg_paths,
-                                      const std::filesystem::path&              fls_output_path,
-                                      const std::filesystem::path&              metadata_output_path,
-                                      const JpegDctReaderOptions&               options,
-                                      const JpegDctMetadataWriterOptions&       metadata_options) {
-	auto read_options = options;
-	if (metadata_options.profile == JpegMetadataProfile::kPreserveOriginalMarkers) {
-		read_options.capture_metadata_markers = true;
-	}
-	compress_jpeg_dct_to_fls(
-	    read_jpeg_dct_dataset(jpeg_paths, read_options), fls_output_path, metadata_output_path, metadata_options);
-}
-
-void compress_jpeg_dct_dataset_to_fls(const std::vector<std::filesystem::path>& jpeg_paths,
-                                      const std::filesystem::path&              fls_output_path,
-                                      const std::filesystem::path&              metadata_output_path,
-                                      const JpegDctReaderOptions&               options) {
-	compress_jpeg_dct_to_fls(read_jpeg_dct_dataset(jpeg_paths, options), fls_output_path, metadata_output_path);
-}
-
-JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<std::filesystem::path>& jpeg_paths,
-                                                              const std::filesystem::path&              output_dir,
-                                                              const JpegDctReaderOptions&               options,
-                                                              const JpegDctShardOptions&                shard_options,
-                                                              const JpegDctMetadataWriterOptions& metadata_options) {
-	auto effective_options = effective_shard_options(shard_options);
-	if (jpeg_paths.empty()) {
-		throw std::runtime_error("JPEG DCT sharded dataset requires at least one image");
-	}
-	if (effective_options.shard_images == 0) {
-		throw std::runtime_error("JPEG DCT shard_images must be greater than zero");
-	}
-	if (effective_options.rowgroup_vectors == 0) {
-		throw std::runtime_error("JPEG DCT rowgroup_vectors must be greater than zero");
-	}
-	if (effective_options.rowgroups_per_shard == 0) {
-		throw std::runtime_error("JPEG DCT rowgroups_per_shard must be greater than zero");
-	}
-	if (effective_options.threads == 0) {
-		throw std::runtime_error("JPEG DCT shard threads must be greater than zero");
-	}
-	if (effective_options.shard_workers == 0) {
-		throw std::runtime_error("JPEG DCT shard workers must be greater than zero");
-	}
-
-	std::filesystem::create_directories(output_dir);
-
-	auto read_options = options;
-	if (metadata_options.profile == JpegMetadataProfile::kPreserveOriginalMarkers) {
-		read_options.capture_metadata_markers = true;
-	}
-	auto global_layout_images =
-	    decode_jpeg_images_parallel(jpeg_paths, read_options, effective_options.threads, decode_jpeg_layout);
-	validate_supported_layout_options(read_options);
-	validate_dataset(global_layout_images, read_options);
-	const auto global_slots = normalize_component_slots(global_layout_images);
-	if (effective_options.physical_layout == JpegDctPhysicalLayout::kImageMajor) {
-		// An image is the random-access storage atom. Derive a dataset-wide capacity from the decoded JPEG layouts so
-		// even unusually large images remain one independently addressable FLS rowgroup. The configured value is a
-		// minimum, not a correctness-sensitive knob; the effective value is persisted in the manifest.
-		effective_options.rowgroup_vectors =
-		    image_major_rowgroup_vectors(global_layout_images, effective_options.rowgroup_vectors);
-	}
-
-	JpegDctShardManifest manifest;
-	manifest.version             = effective_options.physical_layout == JpegDctPhysicalLayout::kImageMajor ? 2U : 1U;
-	manifest.rowgroup_vectors    = effective_options.rowgroup_vectors;
-	manifest.rowgroups_per_shard = effective_options.rowgroups_per_shard;
-	manifest.image_count         = jpeg_paths.size();
-
-	struct ShardWorkItem {
-		size_t first_image = 0;
-		size_t image_count = 0;
-	};
-	std::vector<ShardWorkItem>        shard_work_items;
-	std::optional<ShardSizingContext> sizing_ctx;
-	if (effective_options.physical_layout == JpegDctPhysicalLayout::kSpatialMajorImageMinor) {
-		sizing_ctx.emplace(build_shard_sizing_context(
-		    global_layout_images, global_slots, read_options, effective_options.rowgroup_vectors));
-	}
-	std::vector<uint64_t> sizing_scratch;
-	for (size_t first_image = 0; first_image < jpeg_paths.size();) {
-		const auto max_shard_image_count = std::min(effective_options.shard_images, jpeg_paths.size() - first_image);
-		const auto shard_image_count =
-		    effective_options.physical_layout == JpegDctPhysicalLayout::kImageMajor
-		        ? std::min(max_shard_image_count, static_cast<size_t>(effective_options.rowgroups_per_shard))
-		        : choose_shard_image_count(
-		              *sizing_ctx, first_image, max_shard_image_count, effective_options, sizing_scratch);
-		if (shard_image_count == 0) {
-			throw std::runtime_error("JPEG DCT shard sizing produced an empty shard");
-		}
-		shard_work_items.push_back(ShardWorkItem {first_image, shard_image_count});
-		first_image += shard_image_count;
-	}
-
-	struct ShardOutputPaths {
-		std::string           fls_name;
-		std::string           metadata_name;
-		std::filesystem::path fls_staged;
-		std::filesystem::path metadata_staged;
-	};
-	const auto                    generation = create_dataset_generation(output_dir);
-	DatasetGenerationCleanup      generation_cleanup(generation);
-	std::vector<ShardOutputPaths> shard_output_paths;
-	shard_output_paths.reserve(shard_work_items.size());
-	for (size_t shard_id = 0; shard_id < shard_work_items.size(); ++shard_id) {
-		ShardOutputPaths paths;
-		const auto       fls_base      = shard_file_name(static_cast<uint32_t>(shard_id), ".fls");
-		const auto       metadata_base = shard_file_name(static_cast<uint32_t>(shard_id), ".meta.bin");
-		paths.fls_name                 = (std::filesystem::path(generation.name) / fls_base).generic_string();
-		paths.metadata_name            = (std::filesystem::path(generation.name) / metadata_base).generic_string();
-		paths.fls_staged               = generation.staged_dir / fls_base;
-		paths.metadata_staged          = generation.staged_dir / metadata_base;
-		shard_output_paths.push_back(std::move(paths));
-	}
-	const auto        manifest_path        = output_dir / "manifest.bin";
-	const auto        manifest_staged_path = output_dir / ("manifest.bin." + generation.name + ".tmp");
-	StagedFileCleanup manifest_cleanup({manifest_staged_path});
-
-	std::vector<JpegDctShardManifestEntry> shard_entries(shard_work_items.size());
-	const auto                             process_shard = [&](const size_t shard_id) {
-        const auto&                        work              = shard_work_items[shard_id];
-        const auto                         first_image       = work.first_image;
-        const auto                         shard_image_count = work.image_count;
-        const auto                         shard_begin = jpeg_paths.begin() + static_cast<std::ptrdiff_t>(first_image);
-        const auto                         shard_end = shard_begin + static_cast<std::ptrdiff_t>(shard_image_count);
-        std::vector<std::filesystem::path> shard_paths(shard_begin, shard_end);
-
-        auto shard_images =
-            decode_jpeg_images_parallel(shard_paths, read_options, effective_options.threads, decode_jpeg_coefficients);
-        auto table =
-            make_dataset_table(std::move(shard_images), read_options, &global_slots, effective_options.physical_layout);
-        table.rowgroup_n_tuples =
-            effective_options.physical_layout == JpegDctPhysicalLayout::kImageMajor
-		                                    ? make_image_aligned_rowgroups(table.metadata, table.row_count, effective_options.rowgroup_vectors)
-		                                    : make_block_group_aligned_rowgroups(
-                      table.metadata, table.row_count, effective_options.rowgroup_vectors);
-        if (table.rowgroup_n_tuples.size() > effective_options.rowgroups_per_shard) {
-            std::ostringstream msg;
-            msg << "JPEG DCT shard produced " << table.rowgroup_n_tuples.size()
-                << " rowgroups after layout estimation selected " << shard_image_count
-                << " images; configured maximum is " << effective_options.rowgroups_per_shard;
-            throw std::runtime_error(msg.str());
-        }
-
-        const auto& output_paths = shard_output_paths[shard_id];
-
-        fastlanes::MemoryTableOptions memory_options;
-        memory_options.n_vectors_per_rowgroup = effective_options.rowgroup_vectors;
-        memory_options.rowgroup_n_tuples =
-            std::span<const fastlanes::n_t>(table.rowgroup_n_tuples.data(), table.rowgroup_n_tuples.size());
-        // JPEG-DCT production storage always uses the default FastLanes wizard.
-        // Tests that need a specific root token exercise MemoryTableOptions
-        // directly instead of exposing a force-schema switch in this API.
-        write_jpeg_dct_fls_data(table, output_paths.fls_staged, memory_options, true);
-        detail::validate_jpeg_dct_fls_gpu_expressions(output_paths.fls_staged, static_cast<uint32_t>(shard_id));
-        write_jpeg_dct_metadata(table.metadata, output_paths.metadata_staged, metadata_options);
-
-        JpegDctShardManifestEntry entry;
-        entry.shard_id                 = static_cast<uint32_t>(shard_id);
-        entry.first_global_image_index = first_image;
-        entry.image_count              = static_cast<uint32_t>(shard_image_count);
-        entry.real_row_count           = table.real_row_count;
-        entry.padding_row_count        = table.padding_row_count;
-        entry.physical_row_count       = table.row_count;
-        entry.rowgroup_count     = static_cast<uint32_t>(table.rowgroup_n_tuples.size());
-        entry.block_group_count  = static_cast<uint32_t>(table.block_group_count);
-        entry.fls_file_size      = std::filesystem::file_size(output_paths.fls_staged);
-        entry.metadata_file_size = std::filesystem::file_size(output_paths.metadata_staged);
-        entry.fls_file_name      = output_paths.fls_name;
-        entry.metadata_file_name = output_paths.metadata_name;
-        shard_entries[shard_id]  = std::move(entry);
-	};
-
-	const size_t shard_worker_count =
-	    std::max<size_t>(1, std::min(effective_options.shard_workers, shard_work_items.size()));
-	if (shard_worker_count == 1) {
-		for (size_t shard_id = 0; shard_id < shard_work_items.size(); ++shard_id) {
-			process_shard(shard_id);
-		}
-	} else {
-		std::vector<std::future<void>> futures;
-		futures.reserve(shard_worker_count);
-		for (size_t worker = 0; worker < shard_worker_count; ++worker) {
-			futures.push_back(std::async(std::launch::async, [&, worker] {
-				for (size_t shard_id = worker; shard_id < shard_work_items.size(); shard_id += shard_worker_count) {
-					process_shard(shard_id);
-				}
-			}));
-		}
-		for (auto& future : futures) {
-			future.get();
-		}
-	}
-
-	manifest.shards = std::move(shard_entries);
-	// Build the complete manifest before changing any final path. Unsupported
-	// expressions and serialization failures therefore leave the previous
-	// committed dataset untouched.
-	write_jpeg_dct_shard_manifest(manifest, manifest_staged_path);
-	// Publish this immutable generation under names that no committed manifest
-	// references yet. Existing readers therefore continue to resolve every shard
-	// from the previous generation until the manifest replacement below.
-	publish_staged_generation(generation);
-	generation_cleanup.mark_published();
-	// The manifest replacement is the only visibility/commit point. If it fails,
-	// generation_cleanup removes the unreferenced published generation while the
-	// previous manifest and all of its shards remain untouched.
-	replace_with_staged_file(manifest_staged_path, manifest_path);
-	manifest_cleanup.release();
-	generation_cleanup.release();
-	return manifest;
-}
 
 struct JpegDctShardDatasetReader::Impl {
 	struct BlockGroupKey {
@@ -2232,6 +110,7 @@ struct JpegDctShardDatasetReader::Impl {
 		std::unordered_map<BlockGroupKey, size_t, BlockGroupKeyHash> block_group_lookup;
 		uint32_t planless_direct_layout_index    = std::numeric_limits<uint32_t>::max();
 		bool     planless_direct_image_rowgroups = false;
+		bool     vector_rowgroups                = false;
 	};
 
 	struct PlanlessStaticComponentDescriptor {
@@ -2272,7 +151,8 @@ struct JpegDctShardDatasetReader::Impl {
 		uint32_t fls_rowgroup_index    = 0;
 		uint32_t row_start_in_rowgroup = 0;
 		uint32_t layout_index          = 0;
-		uint32_t reserved              = 0;
+		uint16_t image_width           = 0;
+		uint16_t image_height          = 0;
 	};
 
 	struct PlanlessStaticShardDescriptor {
@@ -2290,15 +170,17 @@ struct JpegDctShardDatasetReader::Impl {
 
 	explicit Impl(const std::filesystem::path& manifest_path)
 	    : root_dir(manifest_path.parent_path())
-	    , manifest(read_jpeg_dct_shard_manifest_file(manifest_path)) {
+	    , manifest(detail::read_jpeg_dct_shard_manifest_file(manifest_path)) {
 		shards.reserve(manifest.shards.size());
 		for (const auto& entry : manifest.shards) {
 			ShardState state;
 			state.entry             = entry;
 			state.fls_path          = root_dir / entry.fls_file_name;
 			state.metadata_path     = root_dir / entry.metadata_file_name;
-			state.metadata          = read_metadata(state.metadata_path);
-			state.rowgroup_n_tuples = derive_rowgroup_n_tuples(state.metadata, entry.rowgroup_count);
+			state.metadata          = detail::read_jpeg_dct_metadata_file(state.metadata_path);
+			state.vector_rowgroups  = manifest.uses_independent_vector_rowgroups();
+			state.rowgroup_n_tuples =
+			    derive_rowgroup_n_tuples(state.metadata, entry.rowgroup_count, state.vector_rowgroups);
 			if (state.metadata.row_ordering == JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor) {
 				if (state.metadata.image_group_index.size() != entry.image_count ||
 				    state.metadata.images.size() != entry.image_count) {
@@ -2321,6 +203,10 @@ struct JpegDctShardDatasetReader::Impl {
 			shards.push_back(std::move(state));
 		}
 		planless_static_images.resize(manifest.image_count);
+		if (manifest.image_count > std::numeric_limits<size_t>::max() / 3U) {
+			throw std::runtime_error("JPEG DCT image count exceeds the compiled access profile cache range");
+		}
+		compiled_fixed_access_profiles.resize(static_cast<size_t>(manifest.image_count) * 3U);
 		planless_static_shards.resize(shards.size());
 		planless_shard_indices_valid = !shards.empty() && shards.size() <= std::numeric_limits<uint16_t>::max();
 		uint64_t expected_first_global_image_index = 0U;
@@ -2340,7 +226,7 @@ struct JpegDctShardDatasetReader::Impl {
 			bool       uniform      = shard_stride > 0U;
 			for (size_t shard_index = 0; uniform && shard_index < shards.size(); ++shard_index) {
 				const auto& entry = shards[shard_index].entry;
-				uniform = shard_index <= std::numeric_limits<uint64_t>::max() / shard_stride &&
+				uniform           = shard_index <= std::numeric_limits<uint64_t>::max() / shard_stride &&
 				          entry.first_global_image_index == shard_index * shard_stride &&
 				          (shard_index + 1U == shards.size() ? entry.image_count <= shard_stride
 				                                             : entry.image_count == shard_stride);
@@ -2365,14 +251,21 @@ struct JpegDctShardDatasetReader::Impl {
 				}
 				const auto& image      = shard.metadata.images[local_image_index];
 				auto&       descriptor = planless_static_images[global_image_index];
+				if (image.image_width > std::numeric_limits<uint16_t>::max() ||
+				    image.image_height > std::numeric_limits<uint16_t>::max()) {
+					throw std::runtime_error("JPEG DCT image dimensions exceed compact planless descriptor range");
+				}
+				descriptor.image_width  = static_cast<uint16_t>(image.image_width);
+				descriptor.image_height = static_cast<uint16_t>(image.image_height);
 				if (!planless_shard_indices.empty()) {
 					planless_shard_indices[global_image_index] = static_cast<uint16_t>(shard_index);
 				}
 				PlanlessStaticLayoutDescriptor layout;
 				layout.zigzag_columns = static_cast<uint8_t>(shard.metadata.zigzag_columns ? 1U : 0U);
 				layout.spatial_order  = static_cast<uint8_t>(shard.metadata.image_major_spatial_order);
-				layout.image_major    = static_cast<uint8_t>(shard.metadata.row_ordering ==
-                                                          JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor);
+				layout.image_major    = static_cast<uint8_t>(
+				    !shard.vector_rowgroups &&
+				    shard.metadata.row_ordering == JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor);
 				if (layout.image_major) {
 					const auto& group                = shard.metadata.image_group_index.at(local_image_index);
 					descriptor.fls_rowgroup_index    = group.fls_rowgroup_index;
@@ -2504,12 +397,26 @@ struct JpegDctShardDatasetReader::Impl {
 	}
 
 	static std::vector<uint64_t> derive_rowgroup_n_tuples(const JpegDctDatasetMetadata& metadata,
-	                                                      const uint32_t                rowgroup_count) {
+	                                                      const uint32_t                rowgroup_count,
+	                                                      const bool vector_rowgroups) {
 		std::vector<uint64_t> rowgroup_n_tuples(rowgroup_count, 0);
 		if (metadata.row_ordering == JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor) {
 			for (const auto& group : metadata.image_group_index) {
 				if (group.fls_rowgroup_index >= rowgroup_n_tuples.size()) {
 					throw std::runtime_error("JPEG DCT image index exceeds shard manifest rowgroup count");
+				}
+				if (vector_rowgroups) {
+					uint64_t remaining = group.row_count;
+					uint64_t rowgroup_index = group.fls_rowgroup_index;
+					while (remaining != 0U) {
+						if (rowgroup_index >= rowgroup_n_tuples.size()) {
+							throw std::runtime_error("JPEG DCT manifest-v3 image exceeds shard rowgroup count");
+						}
+						const auto chunk_rows = std::min<uint64_t>(fastlanes::CFG::VEC_SZ, remaining);
+						rowgroup_n_tuples[rowgroup_index++] = chunk_rows;
+						remaining -= chunk_rows;
+					}
+					continue;
 				}
 				const uint64_t row_end = static_cast<uint64_t>(group.row_start_in_rowgroup) + group.row_count;
 				rowgroup_n_tuples[group.fls_rowgroup_index] =
@@ -2531,196 +438,6 @@ struct JpegDctShardDatasetReader::Impl {
 
 	static size_t row_count_to_vector_count(const uint64_t row_count) {
 		return static_cast<size_t>((row_count + fastlanes::CFG::VEC_SZ - 1U) / fastlanes::CFG::VEC_SZ);
-	}
-
-	static JpegDctDatasetMetadata read_metadata(const std::filesystem::path& path) {
-		BinaryReader reader(read_binary_file(path));
-		expect_magic(reader, {'G', 'J', 'D', 'C', 'T', 'M', 'D', '3'}, "JPEG DCT metadata");
-
-		JpegDctDatasetMetadata metadata;
-		const auto             version = reader.u16();
-		if (version != 3U) {
-			throw std::runtime_error("unsupported JPEG DCT metadata version");
-		}
-		[[maybe_unused]] const auto profile = reader.u16();
-		metadata.row_ordering               = row_ordering_from_id(reader.u16());
-		static_cast<void>(reader.u16()); // reserved validation-mode id (always ragged)
-		const auto layout_flags = reader.u16();
-		if ((layout_flags & ~kMetadataLayoutKnownMask) != 0) {
-			throw std::runtime_error("JPEG DCT metadata contains unknown layout flags");
-		}
-		metadata.zigzag_columns               = (layout_flags & kMetadataLayoutZigzagColumns) != 0;
-		metadata.z_curve_block_order          = (layout_flags & kMetadataLayoutLegacyZOrder) != 0;
-		const bool has_explicit_spatial_order = (layout_flags & kMetadataLayoutSpatialOrderPresent) != 0;
-		if (has_explicit_spatial_order) {
-			if (metadata.row_ordering != JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor) {
-				throw std::runtime_error("JPEG DCT spatial order flag is only valid for image-major metadata");
-			}
-			metadata.image_major_spatial_order = spatial_order_from_id(static_cast<uint16_t>(
-			    (layout_flags & kMetadataLayoutSpatialOrderMask) >> kMetadataLayoutSpatialOrderShift));
-		} else if (metadata.row_ordering == JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor) {
-			// Historical manifest-v2 metadata predates the explicit field. Its
-			// writer invariant was raster, regardless of the legacy v1 Z flag.
-			metadata.image_major_spatial_order = JpegDctSpatialOrder::kRaster;
-		}
-		metadata.image_count                  = reader.u64();
-		const auto component_count            = reader.u32();
-		const auto profile_count              = reader.u32();
-		metadata.compression_partition_policy = partition_policy_from_id(reader.u16());
-		metadata.coefficient_encoding         = coefficient_encoding_from_id(reader.u16());
-		metadata.encoding_profiles.reserve(profile_count);
-
-		while (!reader.eof()) {
-			const auto section_id   = static_cast<MetadataSection>(reader.u16());
-			const auto payload_size = reader.u64();
-			if (payload_size > std::numeric_limits<size_t>::max()) {
-				throw std::runtime_error("JPEG DCT metadata section is too large");
-			}
-			BinaryReader section(reader.bytes(static_cast<size_t>(payload_size)));
-			switch (section_id) {
-			case MetadataSection::kComponentGrid:
-				while (!section.eof()) {
-					JpegComponentMetadata component;
-					component.semantic_slot_id        = section.u32();
-					component.component_index         = section.u32();
-					component.component_id            = section.i32();
-					component.width_in_blocks         = section.u32();
-					component.height_in_blocks        = section.u32();
-					component.padded_width_in_blocks  = section.u32();
-					component.padded_height_in_blocks = section.u32();
-					metadata.semantic_components.push_back(component);
-				}
-				break;
-			case MetadataSection::kPerImageGrid:
-				metadata.images.reserve(metadata.image_count);
-				for (uint64_t image_idx = 0; image_idx < metadata.image_count; ++image_idx) {
-					JpegImageMetadata image;
-					image.image_width      = section.u32();
-					image.image_height     = section.u32();
-					image.data_precision   = section.u8();
-					image.jpeg_color_space = section.i32();
-					image.warning_count    = section.u32();
-					image.components.reserve(component_count);
-					for (uint32_t component_idx = 0; component_idx < component_count; ++component_idx) {
-						JpegComponentMetadata component;
-						component.present               = section.u8() != 0;
-						component.semantic_slot_id      = section.u32();
-						component.local_component_index = section.u32();
-						component.component_id          = section.i32();
-						component.width_in_blocks       = section.u32();
-						component.height_in_blocks      = section.u32();
-						component.encoding_profile_id   = section.u32();
-						image.components.push_back(component);
-					}
-					metadata.images.push_back(std::move(image));
-				}
-				break;
-			case MetadataSection::kBlockGroupIndex:
-				while (!section.eof()) {
-					JpegDctBlockGroupIndex group;
-					group.semantic_slot_id = section.u32();
-					group.z_order_index    = section.u32();
-					group.block_x          = section.u32();
-					group.block_y          = section.u32();
-					group.row_start        = section.u64();
-					group.row_count        = section.u32();
-					if (section.remaining() >= 8) {
-						group.fls_rowgroup_index    = section.u32();
-						group.row_start_in_rowgroup = section.u32();
-					}
-					metadata.block_group_index.push_back(group);
-				}
-				break;
-			case MetadataSection::kImageGroupIndex:
-				while (!section.eof()) {
-					JpegDctImageGroupIndex group;
-					group.local_image_index     = section.u32();
-					group.row_start             = section.u64();
-					group.row_count             = section.u32();
-					group.fls_rowgroup_index    = section.u32();
-					group.row_start_in_rowgroup = section.u32();
-					metadata.image_group_index.push_back(group);
-				}
-				break;
-			case MetadataSection::kEncodingProfiles:
-				while (!section.eof()) {
-					JpegEncodingProfileMetadata encoding_profile;
-					encoding_profile.profile_id              = section.u32();
-					encoding_profile.h_samp_factor           = section.i32();
-					encoding_profile.v_samp_factor           = section.i32();
-					encoding_profile.quant_tbl_no            = section.i32();
-					encoding_profile.quant_table_fingerprint = section.u64();
-					for (auto& value : encoding_profile.quant_table_values) {
-						value = section.u16();
-					}
-					metadata.encoding_profiles.push_back(encoding_profile);
-				}
-				break;
-			case MetadataSection::kReconstructableImageInfo: {
-				const auto reconstruct_image_count = section.u64();
-				if (reconstruct_image_count != metadata.image_count) {
-					throw std::runtime_error("JPEG DCT reconstructable metadata image count mismatch");
-				}
-				if (metadata.images.empty()) {
-					metadata.images.resize(static_cast<size_t>(metadata.image_count));
-				}
-				for (uint64_t image_idx = 0; image_idx < reconstruct_image_count; ++image_idx) {
-					auto& image                  = metadata.images.at(static_cast<size_t>(image_idx));
-					image.image_width            = section.u32();
-					image.image_height           = section.u32();
-					image.data_precision         = section.u8();
-					image.jpeg_color_space       = section.i32();
-					const auto quant_table_count = section.u32();
-					image.quant_tables.clear();
-					image.quant_tables.reserve(quant_table_count);
-					for (uint32_t table_idx = 0; table_idx < quant_table_count; ++table_idx) {
-						JpegQuantTableMetadata table;
-						table.table_id = section.u8();
-						for (auto& value : table.values) {
-							value = section.u16();
-						}
-						image.quant_tables.push_back(table);
-					}
-				}
-				break;
-			}
-			case MetadataSection::kOriginalMarkers:
-				break;
-			}
-		}
-		for (auto& image : metadata.images) {
-			for (auto& component : image.components) {
-				if (component.encoding_profile_id == std::numeric_limits<uint32_t>::max()) {
-					continue;
-				}
-				const auto found = std::find_if(metadata.encoding_profiles.begin(),
-				                                metadata.encoding_profiles.end(),
-				                                [&component](const JpegEncodingProfileMetadata& profile) {
-					                                return profile.profile_id == component.encoding_profile_id;
-				                                });
-				if (found == metadata.encoding_profiles.end()) {
-					continue;
-				}
-				component.h_samp_factor           = found->h_samp_factor;
-				component.v_samp_factor           = found->v_samp_factor;
-				component.quant_tbl_no            = found->quant_tbl_no;
-				component.quant_table_fingerprint = found->quant_table_fingerprint;
-				if (found->quant_tbl_no >= 0 && found->quant_tbl_no <= std::numeric_limits<uint8_t>::max()) {
-					const auto table_id    = static_cast<uint8_t>(found->quant_tbl_no);
-					const auto table_found = std::find_if(
-					    image.quant_tables.begin(),
-					    image.quant_tables.end(),
-					    [table_id](const JpegQuantTableMetadata& table) { return table.table_id == table_id; });
-					if (table_found == image.quant_tables.end()) {
-						JpegQuantTableMetadata table;
-						table.table_id = table_id;
-						table.values   = found->quant_table_values;
-						image.quant_tables.push_back(table);
-					}
-				}
-			}
-		}
-		return metadata;
 	}
 
 	const ShardState& shard_for_global_image(const uint32_t global_image_index) const {
@@ -3266,9 +983,16 @@ struct JpegDctShardDatasetReader::Impl {
 				if (row_offset >= image_group.row_count || row_offset > std::numeric_limits<uint32_t>::max()) {
 					throw std::runtime_error("JPEG DCT image-major row offset is outside its image record");
 				}
-				ref.fls_rowgroup_index        = image_group.fls_rowgroup_index;
-				ref.row_start_in_rowgroup     = image_group.row_start_in_rowgroup;
-				ref.row_offset_in_block_group = static_cast<uint32_t>(row_offset);
+				if (shard.vector_rowgroups) {
+					ref.fls_rowgroup_index = image_group.fls_rowgroup_index +
+					                           static_cast<uint32_t>(row_offset / fastlanes::CFG::VEC_SZ);
+					ref.row_start_in_rowgroup     = 0U;
+					ref.row_offset_in_block_group = static_cast<uint32_t>(row_offset % fastlanes::CFG::VEC_SZ);
+				} else {
+					ref.fls_rowgroup_index        = image_group.fls_rowgroup_index;
+					ref.row_start_in_rowgroup     = image_group.row_start_in_rowgroup;
+					ref.row_offset_in_block_group = static_cast<uint32_t>(row_offset);
+				}
 				ref.present                   = true;
 				ref.physical_row_index        = image_group.row_start + row_offset;
 				return ref;
@@ -3386,11 +1110,132 @@ struct JpegDctShardDatasetReader::Impl {
 		return static_cast<size_t>(planless_shard_indices[global_image_index]);
 	}
 
+	struct CompiledAccessProfileLookup {
+		std::shared_ptr<const std::vector<uint32_t>> selected_chunks;
+		bool                                         cache_hit = false;
+	};
+	struct CompiledAccessProfileKey {
+		uint32_t global_image_index = 0;
+		uint32_t component_slot     = 0;
+		uint32_t crop_x             = 0;
+		uint32_t crop_y             = 0;
+		uint32_t crop_width         = 0;
+		uint32_t crop_height        = 0;
+
+		bool operator==(const CompiledAccessProfileKey&) const = default;
+	};
+	struct CompiledAccessProfileKeyHash {
+		size_t operator()(const CompiledAccessProfileKey& key) const noexcept {
+			uint64_t hash = 1469598103934665603ULL;
+			const auto mix = [&hash](const uint32_t value) {
+				hash ^= value;
+				hash *= 1099511628211ULL;
+			};
+			mix(key.global_image_index);
+			mix(key.component_slot);
+			mix(key.crop_x);
+			mix(key.crop_y);
+			mix(key.crop_width);
+			mix(key.crop_height);
+			return static_cast<size_t>(hash);
+		}
+	};
+	struct CompiledAccessProfileSlot {
+		CompiledAccessProfileKey                         key {};
+		std::shared_ptr<const std::vector<uint32_t>>     selected_chunks;
+	};
+
+	CompiledAccessProfileLookup compiled_access_profile(
+	    const uint32_t global_image_index,
+	    const size_t component_slot,
+	    const uint32_t clipped_x,
+	    const uint32_t clipped_y,
+	    const uint32_t clipped_width,
+	    const uint32_t clipped_height,
+	    const PlanlessStaticComponentDescriptor& source,
+	    const PlanlessStaticLayoutDescriptor& layout,
+	    const uint32_t row_start_in_rowgroup) const {
+		if (component_slot > std::numeric_limits<uint32_t>::max()) {
+			throw std::runtime_error("JPEG DCT component slot exceeds the compiled access profile key");
+		}
+		const CompiledAccessProfileKey key {global_image_index,
+		                                    static_cast<uint32_t>(component_slot),
+		                                    clipped_x,
+		                                    clipped_y,
+		                                    clipped_width,
+		                                    clipped_height};
+		const auto direct_slot_index = static_cast<size_t>(global_image_index) * 3U + component_slot;
+		if (direct_slot_index >= compiled_fixed_access_profiles.size()) {
+			throw std::runtime_error("JPEG DCT compiled access profile slot is outside the dataset index");
+		}
+		{
+			std::lock_guard<std::mutex> lock(compiled_access_profile_mutex);
+			const auto& direct = compiled_fixed_access_profiles[direct_slot_index];
+			if (direct.selected_chunks && direct.key == key) {
+				return {direct.selected_chunks, true};
+			}
+			const auto found = compiled_access_profiles.find(key);
+			if (found != compiled_access_profiles.end()) {
+				return {found->second, true};
+			}
+		}
+		auto chunks = std::make_shared<std::vector<uint32_t>>();
+		const auto rank_intervals = detail::block_order_rectangle_rank_intervals(
+		    source.width_in_blocks,
+		    source.height_in_blocks,
+		    clipped_x,
+		    clipped_y,
+		    clipped_width,
+		    clipped_height,
+		    static_cast<JpegDctSpatialOrder>(layout.spatial_order));
+		const uint64_t logical_base = static_cast<uint64_t>(row_start_in_rowgroup) + source.component_row_offset;
+		for (const auto& interval : rank_intervals) {
+			const auto first_vector = (logical_base + interval.begin) / fastlanes::CFG::VEC_SZ;
+			const auto vector_end =
+			    (logical_base + interval.end + fastlanes::CFG::VEC_SZ - 1U) / fastlanes::CFG::VEC_SZ;
+			const auto first_chunk =
+			    (first_vector / detail::kJpegDctDeviceUnpackNVectors) * detail::kJpegDctDeviceUnpackNVectors;
+			for (uint64_t vector = first_chunk; vector < vector_end;
+			     vector += detail::kJpegDctDeviceUnpackNVectors) {
+				if (vector >= layout.full_vector_count || vector > std::numeric_limits<uint32_t>::max()) {
+					throw std::runtime_error("JPEG DCT compiled access profile exceeds its rowgroup");
+				}
+				chunks->push_back(static_cast<uint32_t>(vector));
+			}
+		}
+		std::sort(chunks->begin(), chunks->end());
+		chunks->erase(std::unique(chunks->begin(), chunks->end()), chunks->end());
+		{
+			std::lock_guard<std::mutex> lock(compiled_access_profile_mutex);
+			auto& direct = compiled_fixed_access_profiles[direct_slot_index];
+			if (direct.selected_chunks && direct.key == key) {
+				return {direct.selected_chunks, true};
+			}
+			const auto concurrent = compiled_access_profiles.find(key);
+			if (concurrent != compiled_access_profiles.end()) {
+				return {concurrent->second, true};
+			}
+			if (!direct.selected_chunks) {
+				direct.key             = key;
+				direct.selected_chunks = chunks;
+				return {std::move(chunks), false};
+			}
+			while (compiled_access_profiles.size() >= kCompiledAccessProfileFallbackCapacity &&
+			       !compiled_access_profile_order.empty()) {
+				compiled_access_profiles.erase(compiled_access_profile_order.front());
+				compiled_access_profile_order.pop_front();
+			}
+			compiled_access_profile_order.push_back(key);
+			compiled_access_profiles.emplace(key, chunks);
+		}
+		return {std::move(chunks), false};
+	}
+
 	std::optional<detail::JpegDctDeviceBatchPlan>
 	try_planless_device_batch(const std::vector<JpegDctImageCropRequest>& requests,
 	                          const JpegDctDeviceBatchOptions&            options) const {
 		if (!options.enable_planless_execution || options.layout != JpegDctDeviceLayout::kTransformedDctGrid ||
-		    !options.grid_transform.has_value() || manifest.version < 2U || !planless_shard_indices_valid) {
+		    !options.grid_transform.has_value() || manifest.version != 2U || !planless_shard_indices_valid) {
 			return std::nullopt;
 		}
 		const auto&                    transform                    = *options.grid_transform;
@@ -3413,7 +1258,7 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.transform_blocks_per_launch = options.transform_blocks_per_launch;
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
-		plan.rowgroup_prefetch.enabled = options.enable_rowgroup_prefetch;
+		plan.rowgroup_prefetch.enabled   = options.enable_rowgroup_prefetch;
 		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0 ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
 		                                                                    : options.rowgroup_prefetch_depth;
 		plan.rowgroup_prefetch.workers            = options.rowgroup_prefetch_workers == 0
@@ -3445,12 +1290,12 @@ struct JpegDctShardDatasetReader::Impl {
 			}
 			return AxisRelation {static_cast<uint16_t>(up_factor), static_cast<uint16_t>(down_factor)};
 		};
-		const auto supported_axis = [&](const int32_t  crop_origin,
-		                                const uint32_t crop_extent,
-		                                const uint32_t source_extent,
-		                                const uint32_t output_extent) {
-			return crop_origin >= 0 && static_cast<uint64_t>(crop_origin) + crop_extent <= source_extent &&
-			       reduced_axis_relation(crop_extent, output_extent).has_value();
+		const auto supported_axis = [&](const uint32_t crop_extent, const uint32_t output_extent) {
+			// RGB-no-more keeps the requested crop geometry and zero-pads source
+			// blocks which lie outside a component.  This matters for uncommon
+			// sampling layouts such as 4:1:1 and 4:4:0, whose chroma plane can be
+			// smaller than the profile's fixed half-resolution crop.
+			return reduced_axis_relation(crop_extent, output_extent).has_value();
 		};
 		const auto sampling_ratio_allowed_compact = [&](const PlanlessStaticComponentDescriptor& reference,
 		                                                const PlanlessStaticComponentDescriptor& component) {
@@ -3481,17 +1326,17 @@ struct JpegDctShardDatasetReader::Impl {
 			rowgroup_slot_count *= 2U;
 		}
 		std::vector<RowgroupPlanSlot> rowgroup_plan_slots(rowgroup_slot_count);
-		const auto rowgroup_plan_slot = [&](const uint64_t key) -> RowgroupPlanSlot& {
-			auto hash = key;
-			hash      = (hash ^ (hash >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-			hash      = (hash ^ (hash >> 27U)) * 0x94d049bb133111ebULL;
-			hash ^= hash >> 31U;
-			auto slot = static_cast<size_t>(hash) & (rowgroup_slot_count - 1U);
-			while (rowgroup_plan_slots[slot].key != std::numeric_limits<uint64_t>::max() &&
-			       rowgroup_plan_slots[slot].key != key) {
-				slot = (slot + 1U) & (rowgroup_slot_count - 1U);
-			}
-			return rowgroup_plan_slots[slot];
+		const auto                    rowgroup_plan_slot = [&](const uint64_t key) -> RowgroupPlanSlot& {
+            auto hash = key;
+            hash      = (hash ^ (hash >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+            hash      = (hash ^ (hash >> 27U)) * 0x94d049bb133111ebULL;
+            hash ^= hash >> 31U;
+            auto slot = static_cast<size_t>(hash) & (rowgroup_slot_count - 1U);
+            while (rowgroup_plan_slots[slot].key != std::numeric_limits<uint64_t>::max() &&
+                   rowgroup_plan_slots[slot].key != key) {
+                slot = (slot + 1U) & (rowgroup_slot_count - 1U);
+            }
+            return rowgroup_plan_slots[slot];
 		};
 		std::unordered_map<uint32_t, uint32_t> batch_quant_table_indices;
 		batch_quant_table_indices.reserve(std::min(planless_quant_tables.size(), requests.size() * 3U));
@@ -3538,22 +1383,23 @@ struct JpegDctShardDatasetReader::Impl {
 		logical_shard.rowgroups.reserve(requests.size());
 
 		for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
-			const auto& request = requests[request_index];
+			const auto& request     = requests[request_index];
 			const auto  shard_index = planless_shard_index_for(request.global_image_index);
 			if (shard_index >= planless_static_shards.size()) {
 				throw std::runtime_error("JPEG DCT compact shard index is invalid");
 			}
-			const auto& shard             = planless_static_shards[shard_index];
+			const auto& shard = planless_static_shards[shard_index];
 			if (request_index == 0U) {
 				logical_shard.shard_id = shard.shard_id;
 				logical_shard.fls_path = shard.fls_path;
 			} else if (logical_shard.shard_id != shard.shard_id) {
 				logical_shard.mixed_physical_shards = true;
 			}
-			const auto  local_image_index = request.global_image_index - shard.first_global_image_index;
+			const auto local_image_index = request.global_image_index - shard.first_global_image_index;
 			if (local_image_index > std::numeric_limits<uint32_t>::max()) {
 				return std::nullopt;
 			}
+			const auto& image_descriptor = planless_static_images[request.global_image_index];
 			uint32_t layout_index;
 			uint32_t fls_rowgroup_index;
 			uint32_t row_start_in_rowgroup;
@@ -3562,10 +1408,9 @@ struct JpegDctShardDatasetReader::Impl {
 				fls_rowgroup_index    = static_cast<uint32_t>(local_image_index);
 				row_start_in_rowgroup = 0U;
 			} else {
-				const auto& image     = planless_static_images[request.global_image_index];
-				layout_index          = image.layout_index;
-				fls_rowgroup_index    = image.fls_rowgroup_index;
-				row_start_in_rowgroup = image.row_start_in_rowgroup;
+				layout_index          = image_descriptor.layout_index;
+				fls_rowgroup_index    = image_descriptor.fls_rowgroup_index;
+				row_start_in_rowgroup = image_descriptor.row_start_in_rowgroup;
 			}
 			if (layout_index >= planless_static_layouts.size()) {
 				throw std::runtime_error("JPEG DCT compact layout index is invalid");
@@ -3580,34 +1425,81 @@ struct JpegDctShardDatasetReader::Impl {
 			                    !sampling_ratio_allowed_compact(y, cb)))) {
 				return std::nullopt;
 			}
-			const auto y_crop_w = closest_aligned_crop_extent(y.width_in_blocks,
-			                                                  transform.y_output_width_blocks,
-			                                                  transform.crop_reference_width_blocks,
-			                                                  transform.preferred_small_crop_width_blocks);
-			const auto y_crop_h = closest_aligned_crop_extent(y.height_in_blocks,
-			                                                  transform.y_output_height_blocks,
-			                                                  transform.crop_reference_height_blocks,
-			                                                  transform.preferred_small_crop_height_blocks);
-			auto y_crop_x = floor_div_i32(static_cast<int32_t>(y.width_in_blocks) - static_cast<int32_t>(y_crop_w), 2);
-			auto y_crop_y = floor_div_i32(static_cast<int32_t>(y.height_in_blocks) - static_cast<int32_t>(y_crop_h), 2);
-			const auto alignment     = static_cast<int32_t>(transform.crop_origin_alignment_blocks);
-			y_crop_x                 = floor_div_i32(y_crop_x, alignment) * alignment;
-			y_crop_y                 = floor_div_i32(y_crop_y, alignment) * alignment;
-			const auto chroma_crop_x = floor_div_i32(y_crop_x, static_cast<int32_t>(transform.chroma_crop_scale_x));
-			const auto chroma_crop_y = floor_div_i32(y_crop_y, static_cast<int32_t>(transform.chroma_crop_scale_y));
-			const auto chroma_crop_w = std::max<uint32_t>(1U, y_crop_w / transform.chroma_crop_scale_x);
-			const auto chroma_crop_h = std::max<uint32_t>(1U, y_crop_h / transform.chroma_crop_scale_y);
-			if (!supported_axis(y_crop_x, y_crop_w, y.width_in_blocks, transform.y_output_width_blocks) ||
-			    !supported_axis(y_crop_y, y_crop_h, y.height_in_blocks, transform.y_output_height_blocks) ||
+			int32_t  y_crop_x      = 0;
+			int32_t  y_crop_y      = 0;
+			uint32_t y_crop_w      = 0;
+			uint32_t y_crop_h      = 0;
+			int32_t  chroma_crop_x = 0;
+			int32_t  chroma_crop_y = 0;
+			uint32_t chroma_crop_w = 0;
+			uint32_t chroma_crop_h = 0;
+			const bool explicit_crop = request.source_crop.width != 0U && request.source_crop.height != 0U;
+			if (explicit_crop) {
+				if (image_descriptor.image_width == 0U || image_descriptor.image_height == 0U) {
+					throw std::runtime_error("JPEG DCT compact crop requires exact JPEG pixel dimensions");
+				}
+				auto crop = request.source_crop;
+				if (crop.x >= image_descriptor.image_width || crop.y >= image_descriptor.image_height) {
+					throw std::out_of_range("JPEG DCT crop starts outside the source image");
+				}
+				crop.width  = std::min<uint32_t>(crop.width, image_descriptor.image_width - crop.x);
+				crop.height = std::min<uint32_t>(crop.height, image_descriptor.image_height - crop.y);
+				struct ComponentCrop {
+					int32_t  x = 0;
+					int32_t  y = 0;
+					uint32_t width  = 0;
+					uint32_t height = 0;
+				};
+				const auto component_crop = [&](const PlanlessStaticComponentDescriptor& component) {
+					const auto x0 = floor_mul_div_u32(crop.x, component.width_in_blocks, image_descriptor.image_width);
+					const auto y0 = floor_mul_div_u32(crop.y, component.height_in_blocks, image_descriptor.image_height);
+					const auto x1 = std::min<uint32_t>(
+					    component.width_in_blocks,
+					    ceil_mul_div_u32(crop.x + crop.width, component.width_in_blocks, image_descriptor.image_width));
+					const auto y1 = std::min<uint32_t>(
+					    component.height_in_blocks,
+					    ceil_mul_div_u32(crop.y + crop.height, component.height_in_blocks, image_descriptor.image_height));
+					return ComponentCrop {static_cast<int32_t>(x0),
+					                      static_cast<int32_t>(y0),
+					                      std::max<uint32_t>(1U, x1 - x0),
+					                      std::max<uint32_t>(1U, y1 - y0)};
+				};
+				const auto y_box = component_crop(y);
+				y_crop_x = y_box.x;
+				y_crop_y = y_box.y;
+				y_crop_w = y_box.width;
+				y_crop_h = y_box.height;
+				if (cb.present) {
+					const auto chroma_box = component_crop(cb);
+					chroma_crop_x = chroma_box.x;
+					chroma_crop_y = chroma_box.y;
+					chroma_crop_w = chroma_box.width;
+					chroma_crop_h = chroma_box.height;
+				}
+			} else {
+				y_crop_w = closest_aligned_crop_extent(y.width_in_blocks,
+				                                              transform.y_output_width_blocks,
+				                                              transform.crop_reference_width_blocks,
+				                                              transform.preferred_small_crop_width_blocks);
+				y_crop_h = closest_aligned_crop_extent(y.height_in_blocks,
+				                                              transform.y_output_height_blocks,
+				                                              transform.crop_reference_height_blocks,
+				                                              transform.preferred_small_crop_height_blocks);
+				y_crop_x = floor_div_i32(static_cast<int32_t>(y.width_in_blocks) - static_cast<int32_t>(y_crop_w), 2);
+				y_crop_y = floor_div_i32(static_cast<int32_t>(y.height_in_blocks) - static_cast<int32_t>(y_crop_h), 2);
+				const auto alignment = static_cast<int32_t>(transform.crop_origin_alignment_blocks);
+				y_crop_x = floor_div_i32(y_crop_x, alignment) * alignment;
+				y_crop_y = floor_div_i32(y_crop_y, alignment) * alignment;
+				chroma_crop_x = floor_div_i32(y_crop_x, static_cast<int32_t>(transform.chroma_crop_scale_x));
+				chroma_crop_y = floor_div_i32(y_crop_y, static_cast<int32_t>(transform.chroma_crop_scale_y));
+				chroma_crop_w = std::max<uint32_t>(1U, y_crop_w / transform.chroma_crop_scale_x);
+				chroma_crop_h = std::max<uint32_t>(1U, y_crop_h / transform.chroma_crop_scale_y);
+			}
+			if (!supported_axis(y_crop_w, transform.y_output_width_blocks) ||
+			    !supported_axis(y_crop_h, transform.y_output_height_blocks) ||
 			    (cb.present &&
-			     (!supported_axis(
-			          chroma_crop_x, chroma_crop_w, cb.width_in_blocks, transform.cbcr_output_width_blocks) ||
-			      !supported_axis(
-			          chroma_crop_y, chroma_crop_h, cb.height_in_blocks, transform.cbcr_output_height_blocks) ||
-			      !supported_axis(
-			          chroma_crop_x, chroma_crop_w, cr.width_in_blocks, transform.cbcr_output_width_blocks) ||
-			      !supported_axis(
-			          chroma_crop_y, chroma_crop_h, cr.height_in_blocks, transform.cbcr_output_height_blocks)))) {
+			     (!supported_axis(chroma_crop_w, transform.cbcr_output_width_blocks) ||
+			      !supported_axis(chroma_crop_h, transform.cbcr_output_height_blocks)))) {
 				return std::nullopt;
 			}
 
@@ -3616,7 +1508,9 @@ struct JpegDctShardDatasetReader::Impl {
 			launch.row_start_in_rowgroup = row_start_in_rowgroup;
 			launch.zigzag_columns        = layout.zigzag_columns;
 			launch.spatial_order         = layout.spatial_order;
-			uint64_t source_blocks       = 0;
+			launch.horizontal_flip       = request.horizontal_flip ? 1U : 0U;
+			uint64_t              source_blocks = 0;
+			std::vector<uint32_t> image_selected_vectors;
 			for (size_t slot = 0; slot < launch.components.size(); ++slot) {
 				const auto& source = layout.components[slot];
 				if (!source.present) {
@@ -3655,46 +1549,87 @@ struct JpegDctShardDatasetReader::Impl {
 				component.y_phase_matrix_base  = *y_program_base;
 				component.quant_table_index    = batch_quant_table_index(source.quant_table_index);
 				component.present              = 1U;
-				source_blocks += static_cast<uint64_t>(crop_w) * crop_h;
+				const auto clip_coordinate = [](const int64_t value, const uint32_t extent) {
+					return static_cast<uint32_t>(std::clamp<int64_t>(value, 0, extent));
+				};
+				const auto clipped_x0 = clip_coordinate(crop_x, source.width_in_blocks);
+				const auto clipped_y0 = clip_coordinate(crop_y, source.height_in_blocks);
+				const auto clipped_x1 =
+				    clip_coordinate(static_cast<int64_t>(crop_x) + crop_w, source.width_in_blocks);
+				const auto clipped_y1 =
+				    clip_coordinate(static_cast<int64_t>(crop_y) + crop_h, source.height_in_blocks);
+				if (clipped_x0 < clipped_x1 && clipped_y0 < clipped_y1) {
+					const auto profile = compiled_access_profile(request.global_image_index,
+					                                             slot,
+					                                             clipped_x0,
+					                                             clipped_y0,
+					                                             clipped_x1 - clipped_x0,
+					                                             clipped_y1 - clipped_y0,
+					                                             source,
+					                                             layout,
+					                                             row_start_in_rowgroup);
+					image_selected_vectors.insert(image_selected_vectors.end(),
+					                              profile.selected_chunks->begin(),
+					                              profile.selected_chunks->end());
+					plan.compiled_access_profile_hits += profile.cache_hit ? 1U : 0U;
+					plan.compiled_access_profile_misses += profile.cache_hit ? 0U : 1U;
+					source_blocks += static_cast<uint64_t>(clipped_x1 - clipped_x0) * (clipped_y1 - clipped_y0);
+				}
 				++plan.fixed_transform_component_count;
 			}
 
-			const auto rowgroup_key = (static_cast<uint64_t>(shard_index) << 32U) | fls_rowgroup_index;
-			auto&      rowgroup_slot = rowgroup_plan_slot(rowgroup_key);
+			const auto rowgroup_key        = (static_cast<uint64_t>(shard_index) << 32U) | fls_rowgroup_index;
+			auto&      rowgroup_slot       = rowgroup_plan_slot(rowgroup_key);
 			size_t     rowgroup_plan_index = 0U;
 			if (rowgroup_slot.key == std::numeric_limits<uint64_t>::max()) {
 				rowgroup_plan_index = logical_shard.rowgroups.size();
-				rowgroup_slot.key    = rowgroup_key;
-				rowgroup_slot.index  = rowgroup_plan_index;
+				rowgroup_slot.key   = rowgroup_key;
+				rowgroup_slot.index = rowgroup_plan_index;
 				detail::JpegDctDeviceRowgroupPlan rowgroup_plan;
-				rowgroup_plan.rowgroup_index   = fls_rowgroup_index;
-				rowgroup_plan.source_shard_id  = shard.shard_id;
-				rowgroup_plan.source_fls_path  = shard.fls_path;
+				rowgroup_plan.rowgroup_index  = fls_rowgroup_index;
+				rowgroup_plan.source_shard_id = shard.shard_id;
+				rowgroup_plan.source_fls_path = shard.fls_path;
 				if (fls_rowgroup_index >= shard.rowgroup_count) {
 					throw std::runtime_error("JPEG DCT compact rowgroup exceeds shard metadata");
 				}
-				const auto full_vectors             = static_cast<size_t>(layout.full_vector_count);
-				rowgroup_plan.selected_vector_count = full_vectors;
-				rowgroup_plan.full_vector_count     = full_vectors;
-				rowgroup_plan.selected_chunks_fit   = true;
-				rowgroup_plan.runtime_policy =
-				    detail::JpegDctRuntimePolicyResult {detail::JpegDctRuntimePolicyDecision::kFullRowgroup,
-				                                        detail::JpegDctRuntimePolicyReason::kSelectedCoversMostVectors};
+				const auto full_vectors         = static_cast<size_t>(layout.full_vector_count);
+				rowgroup_plan.full_vector_count = full_vectors;
 				rowgroup_plan.has_vector_plan = true;
 				logical_shard.rowgroups.push_back(std::move(rowgroup_plan));
 				plan.rowgroups.push_back(JpegDctDeviceRowgroupMetadata {shard.shard_id, fls_rowgroup_index});
-				plan.full_vector_count += full_vectors;
-				plan.planned_selected_vector_count += full_vectors;
-				plan.estimated_selected_vector_count += full_vectors;
 			} else {
 				rowgroup_plan_index = rowgroup_slot.index;
 			}
-			logical_shard.rowgroups[rowgroup_plan_index].planless_images.push_back(launch);
+			auto& rowgroup_plan = logical_shard.rowgroups[rowgroup_plan_index];
+			rowgroup_plan.planless_images.push_back(launch);
+			rowgroup_plan.selected_vectors.insert(rowgroup_plan.selected_vectors.end(),
+			                                      image_selected_vectors.begin(),
+			                                      image_selected_vectors.end());
 			if (source_blocks > std::numeric_limits<uint32_t>::max()) {
 				throw std::runtime_error("JPEG DCT compact image source block count overflow");
 			}
 			plan.image_layouts[request_index] =
 			    JpegDctDeviceImageLayout {request.global_image_index, 0U, static_cast<uint32_t>(source_blocks)};
+		}
+		for (auto& rowgroup_plan : logical_shard.rowgroups) {
+			auto& selected_vectors = rowgroup_plan.selected_vectors;
+			std::sort(selected_vectors.begin(), selected_vectors.end());
+			selected_vectors.erase(std::unique(selected_vectors.begin(), selected_vectors.end()), selected_vectors.end());
+			if (selected_vectors.empty()) {
+				throw std::runtime_error("JPEG DCT compact crop selected no source vectors");
+			}
+			const auto planned_selected_vector_count = detail::selected_decode_vector_count(
+			    selected_vectors, rowgroup_plan.full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
+			rowgroup_plan.selected_vector_count = planned_selected_vector_count;
+			rowgroup_plan.selected_chunks_fit = detail::selected_decode_chunks_fit(
+			    selected_vectors, rowgroup_plan.full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
+			configure_crop_execution_mode(rowgroup_plan, options.crop_execution_mode);
+			plan.planned_selected_vector_count += planned_selected_vector_count;
+			plan.estimated_selected_vector_count +=
+			    rowgroup_plan.runtime_policy.decision == detail::JpegDctRuntimePolicyDecision::kFullRowgroup
+			        ? rowgroup_plan.full_vector_count
+			        : planned_selected_vector_count;
+			plan.full_vector_count += rowgroup_plan.full_vector_count;
 		}
 		for (auto& image_layout : plan.image_layouts) {
 			image_layout.block_offset = plan.fixed_transform_source_block_count;
@@ -3702,10 +1637,17 @@ struct JpegDctShardDatasetReader::Impl {
 		}
 		plan.fixed_transform_output_block_count =
 		    (plan.ycbcr_dct_grid_shape.y_count() + plan.ycbcr_dct_grid_shape.cbcr_count()) / 64U;
-		plan.planned_saved_vector_count      = 0U;
-		plan.estimated_saved_vector_count    = 0U;
-		plan.planned_selected_vector_ratio   = plan.full_vector_count == 0U ? 0.0 : 1.0;
-		plan.estimated_selected_vector_ratio = plan.planned_selected_vector_ratio;
+		plan.planned_saved_vector_count = plan.full_vector_count - plan.planned_selected_vector_count;
+		plan.estimated_saved_vector_count = plan.full_vector_count - plan.estimated_selected_vector_count;
+		plan.planned_selected_vector_ratio =
+		    plan.full_vector_count == 0U
+		        ? 0.0
+		        : static_cast<double>(plan.planned_selected_vector_count) / static_cast<double>(plan.full_vector_count);
+		plan.estimated_selected_vector_ratio =
+		    plan.full_vector_count == 0U
+		        ? 0.0
+		        : static_cast<double>(plan.estimated_selected_vector_count) /
+		              static_cast<double>(plan.full_vector_count);
 		const auto resize_cache_delta =
 		    dct_resize_cache_counter_delta(resize_cache_counters_before, dct_resize_cache_counters());
 		plan.resize_weight_build_ms             = resize_cache_delta.resize_weight_build_ms;
@@ -3764,7 +1706,7 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.transform_blocks_per_launch = options.transform_blocks_per_launch;
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
-		plan.rowgroup_prefetch.enabled = options.enable_rowgroup_prefetch;
+		plan.rowgroup_prefetch.enabled   = options.enable_rowgroup_prefetch;
 		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0 ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
 		                                                                    : options.rowgroup_prefetch_depth;
 		plan.rowgroup_prefetch.workers            = options.rowgroup_prefetch_workers == 0
@@ -3849,14 +1791,23 @@ struct JpegDctShardDatasetReader::Impl {
 		const auto                             fixed_axis_matrix_index_for = [&](const uint16_t up_factor,
                                                      const uint16_t down_factor,
                                                      const uint16_t source_block,
-                                                     const uint16_t output_block) {
+                                                     const uint16_t output_block,
+                                                     const bool     horizontal_flip) {
             const auto key = (static_cast<uint64_t>(up_factor) << 48U) | (static_cast<uint64_t>(down_factor) << 32U) |
-                             (static_cast<uint64_t>(source_block) << 16U) | static_cast<uint64_t>(output_block);
+                             (static_cast<uint64_t>(source_block) << 16U) |
+                             (static_cast<uint64_t>(output_block) << 1U) | static_cast<uint64_t>(horizontal_flip);
             const auto found = fixed_axis_matrix_indices.find(key);
             if (found != fixed_axis_matrix_indices.end()) {
                 return found->second;
             }
-            const auto matrix = transformed_dct_grid_axis_matrix(up_factor, down_factor, source_block, output_block);
+            auto matrix = transformed_dct_grid_axis_matrix(up_factor, down_factor, source_block, output_block);
+            if (horizontal_flip) {
+                for (uint32_t out_coefficient = 1U; out_coefficient < 8U; out_coefficient += 2U) {
+                    for (uint32_t in_coefficient = 0U; in_coefficient < 8U; ++in_coefficient) {
+                        matrix[out_coefficient * 8U + in_coefficient] = -matrix[out_coefficient * 8U + in_coefficient];
+                    }
+                }
+            }
             const auto index = static_cast<uint32_t>(plan.fixed_resize_weight_matrices.size() / 64U);
             plan.fixed_resize_weight_matrices.insert(
                 plan.fixed_resize_weight_matrices.end(), matrix.begin(), matrix.end());
@@ -4050,16 +2001,18 @@ struct JpegDctShardDatasetReader::Impl {
 					}
 				}
 				if (output_transformed_dct_grid) {
-					int32_t  crop_x0 = static_cast<int32_t>(x0);
-					int32_t  crop_y0 = static_cast<int32_t>(y0);
-					uint32_t crop_w  = x1 - x0;
-					uint32_t crop_h  = y1 - y0;
-					if (fixed_component_y) {
+					int32_t    crop_x0 = static_cast<int32_t>(x0);
+					int32_t    crop_y0 = static_cast<int32_t>(y0);
+					uint32_t   crop_w  = x1 - x0;
+					uint32_t   crop_h  = y1 - y0;
+					const bool explicit_request_crop =
+					    request.source_crop.width != 0U && request.source_crop.height != 0U;
+					if (fixed_component_y && !explicit_request_crop) {
 						crop_x0 = fixed_y_x0;
 						crop_y0 = fixed_y_y0;
 						crop_w  = std::max<uint32_t>(1U, fixed_y_w);
 						crop_h  = std::max<uint32_t>(1U, fixed_y_h);
-					} else if (fixed_component_cb || fixed_component_cr) {
+					} else if ((fixed_component_cb || fixed_component_cr) && !explicit_request_crop) {
 						crop_x0 = fixed_chroma_x0;
 						crop_y0 = fixed_chroma_y0;
 						crop_w  = fixed_chroma_w;
@@ -4150,31 +2103,35 @@ struct JpegDctShardDatasetReader::Impl {
 									for (uint32_t output_x = static_cast<uint32_t>(output_x0);
 									     output_x <= std::min<uint32_t>(static_cast<uint32_t>(output_x1), out_w - 1U);
 									     ++output_x) {
+										const auto stored_output_x =
+										    request.horizontal_flip ? out_w - 1U - output_x : output_x;
 										uint64_t output_block_index = 0;
 										if (fixed_component_y) {
 											output_block_index = (static_cast<uint64_t>(request_idx) *
 											                          grid_transform->y_output_height_blocks +
 											                      output_y) *
 											                         grid_transform->y_output_width_blocks +
-											                     output_x;
+											                     stored_output_x;
 										} else {
 											const auto channel = fixed_component_cb ? 0ULL : 1ULL;
 											output_block_index = ((static_cast<uint64_t>(request_idx) * 2U + channel) *
 											                          grid_transform->cbcr_output_height_blocks +
 											                      output_y) *
 											                         grid_transform->cbcr_output_width_blocks +
-											                     output_x;
+											                     stored_output_x;
 										}
 										const auto x_weight_matrix_index =
 										    fixed_axis_matrix_index_for(x_relation.up_factor,
 										                                x_relation.down_factor,
 										                                static_cast<uint16_t>(local_x),
-										                                static_cast<uint16_t>(output_x));
+										                                static_cast<uint16_t>(output_x),
+										                                request.horizontal_flip);
 										const auto y_weight_matrix_index =
 										    fixed_axis_matrix_index_for(y_relation.up_factor,
 										                                y_relation.down_factor,
 										                                static_cast<uint16_t>(local_y),
-										                                static_cast<uint16_t>(output_y));
+										                                static_cast<uint16_t>(output_y),
+										                                false);
 										rowgroup_plan.fixed_transform_items.push_back(
 										    detail::JpegDctDeviceFixedTransformItem {
 										        ref.fls_rowgroup_index,
@@ -4183,7 +2140,7 @@ struct JpegDctShardDatasetReader::Impl {
 										        static_cast<uint32_t>(request_idx),
 										        static_cast<uint16_t>(local_x),
 										        static_cast<uint16_t>(local_y),
-										        static_cast<uint16_t>(output_x),
+										        static_cast<uint16_t>(stored_output_x),
 										        static_cast<uint16_t>(output_y),
 										        static_cast<uint8_t>(
 										            fixed_component_y ? 0U : (fixed_component_cb ? 1U : 2U)),
@@ -4417,13 +2374,12 @@ struct JpegDctShardDatasetReader::Impl {
 				    selected_vectors, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
 				const auto selected_chunks_fit = detail::selected_decode_chunks_fit(
 				    selected_vectors, full_vector_count, detail::kJpegDctDeviceUnpackNVectors);
-				const auto runtime_policy = detail::choose_jpeg_dct_runtime_policy(
-				    planned_selected_vector_count, full_vector_count, selected_chunks_fit);
 				rowgroup_plan.selected_vector_count = planned_selected_vector_count;
 				rowgroup_plan.full_vector_count     = full_vector_count;
 				rowgroup_plan.selected_chunks_fit   = selected_chunks_fit;
-				rowgroup_plan.runtime_policy        = runtime_policy;
 				rowgroup_plan.has_vector_plan       = true;
+				configure_crop_execution_mode(rowgroup_plan, options.crop_execution_mode);
+				const auto runtime_policy = rowgroup_plan.runtime_policy;
 				if (runtime_policy.decision == detail::JpegDctRuntimePolicyDecision::kSelectedVectors) {
 					rowgroup_plan.selected_gather_items = detail::remap_items_to_selected_vectors(
 					    rowgroup_plan.items, selected_vectors, detail::kJpegDctDeviceUnpackNVectors);
@@ -4529,7 +2485,7 @@ struct JpegDctShardDatasetReader::Impl {
 		    << options.rowgroup_prefetch_workers << ':' << options.rowgroup_prefetch_min_decode_batches << ':'
 		    << options.enable_planless_execution << ':' << static_cast<int>(options.scheduling_policy) << ':'
 		    << options.transform_blocks_per_launch << ':' << options.transform_ctas_per_launch << ':'
-		    << options.use_low_priority_streams << ':';
+		    << options.use_low_priority_streams << ':' << static_cast<int>(options.crop_execution_mode) << ':';
 		if (options.grid_transform.has_value()) {
 			const auto& spec = *options.grid_transform;
 			key << spec.y_output_width_blocks << ',' << spec.y_output_height_blocks << ','
@@ -4538,8 +2494,8 @@ struct JpegDctShardDatasetReader::Impl {
 			    << spec.crop_origin_alignment_blocks << ',' << spec.chroma_crop_scale_x << ','
 			    << spec.chroma_crop_scale_y << ',' << spec.clamp_min << ',' << spec.clamp_max << ','
 			    << static_cast<int>(spec.output_data_type) << ',' << std::hexfloat << spec.output_add << ','
-			    << spec.output_scale << std::defaultfloat << ',' << spec.dequantize
-			    << ',' << spec.require_all_coefficients << ',' << spec.allow_grayscale << ':';
+			    << spec.output_scale << std::defaultfloat << ',' << spec.dequantize << ','
+			    << spec.require_all_coefficients << ',' << spec.allow_grayscale << ':';
 			for (const auto value : spec.preferred_small_crop_width_blocks) {
 				key << value << ',';
 			}
@@ -4563,7 +2519,8 @@ struct JpegDctShardDatasetReader::Impl {
 		key << ';';
 		for (const auto& request : requests) {
 			key << request.global_image_index << ',' << request.source_crop.x << ',' << request.source_crop.y << ','
-			    << request.source_crop.width << ',' << request.source_crop.height << ';';
+			    << request.source_crop.width << ',' << request.source_crop.height << ',' << request.horizontal_flip
+			    << ';';
 		}
 		return key.str();
 	}
@@ -4739,9 +2696,23 @@ struct JpegDctShardDatasetReader::Impl {
 						throw std::runtime_error("JPEG DCT estimated block count overflow");
 					}
 					estimate.block_count += static_cast<size_t>(block_count);
-					if (block_count != 0U) {
+					if (block_count != 0U && !shard.vector_rowgroups) {
 						const auto& image_group = shard.metadata.image_group_index.at(local_image_index);
 						add_rowgroup(shard, image_group.fls_rowgroup_index);
+					} else if (block_count != 0U) {
+						for (uint32_t block_y = y0; block_y < y1; ++block_y) {
+							for (uint32_t block_x = x0; block_x < x1; ++block_x) {
+								const auto ref = locate_row_in_shard(shard,
+								                                     local_image_index,
+								                                     component.semantic_slot_id,
+								                                     block_x,
+								                                     block_y);
+								if (!ref.present) {
+									throw std::runtime_error("JPEG DCT manifest-v3 crop block is missing");
+								}
+								add_rowgroup(shard, ref.fls_rowgroup_index);
+							}
+						}
 					}
 					continue;
 				}
@@ -4768,51 +2739,29 @@ struct JpegDctShardDatasetReader::Impl {
 		return estimate;
 	}
 
-	void attach_device_runtime_resources(detail::JpegDctDeviceBatchPlan&  plan,
-	                                     const JpegDctDeviceBatchOptions& options) const {
-		if (!device_scratch) {
-			device_scratch = detail::make_jpeg_dct_device_scratch();
-		}
-		plan.scratch = device_scratch.get();
-		// The compact transformed path deliberately has no decoded-rowgroup
-		// cache mode.  Supporting hits would require a second dense-source
-		// execution branch and would make the production architecture depend on
-		// hidden retained batch state.  A nonzero historical option is ignored
-		// and any legacy cache is retired instead.
-		const bool cache_compatible = !plan.uses_planless_fixed_transform &&
-		                              (options.layout == JpegDctDeviceLayout::kImageMajorComponentBlockCoeff ||
-		                               options.layout == JpegDctDeviceLayout::kTransformedDctGrid) &&
-		                              detail::selects_all_coefficients(plan.selected_coefficients);
-		plan.cache_enabled = options.cache_capacity_bytes > 0 && cache_compatible;
-		if (options.cache_capacity_bytes > 0 && cache_compatible) {
-			if (device_cache == nullptr) {
-				device_cache = std::make_unique<detail::JpegDctDeviceDecodedRowgroupCache>();
-			}
-			device_cache->set_capacity(options.cache_capacity_bytes);
-			plan.cache = device_cache.get();
-		} else if (device_cache != nullptr) {
-			device_cache->set_capacity(0);
-			plan.cache = nullptr;
-		}
-	}
-
-	std::filesystem::path                                              root_dir;
-	JpegDctShardManifest                                               manifest;
-	std::vector<ShardState>                                            shards;
-	std::vector<PlanlessStaticImageDescriptor>                         planless_static_images;
-	std::vector<PlanlessStaticShardDescriptor>                         planless_static_shards;
-	std::vector<PlanlessStaticLayoutDescriptor>                        planless_static_layouts;
-	std::vector<std::array<uint16_t, 64>>                              planless_quant_tables;
-	std::vector<uint16_t>                                              planless_shard_indices;
-	uint64_t                                                           planless_uniform_shard_image_count = 0U;
-	bool                                                               planless_shard_indices_valid = false;
-	std::shared_ptr<const uint8_t>                                     plan_owner_token = std::make_shared<uint8_t>(0);
-	mutable std::unique_ptr<detail::JpegDctDeviceDecodedRowgroupCache> device_cache;
-	mutable detail::JpegDctDeviceScratchPtr                            device_scratch;
-	mutable std::mutex                                                 device_plan_cache_mutex;
-	mutable std::unordered_map<std::string, detail::JpegDctDeviceBatchPlan>                 device_plan_cache;
-	mutable std::mutex                                                                      storage_audit_reader_mutex;
-	mutable std::unordered_map<uint32_t, std::shared_ptr<fastlanes::TableDescriptorHandle>> storage_audit_descriptors;
+	std::filesystem::path                       root_dir;
+	JpegDctShardManifest                        manifest;
+	std::vector<ShardState>                     shards;
+	std::vector<PlanlessStaticImageDescriptor>  planless_static_images;
+	std::vector<PlanlessStaticShardDescriptor>  planless_static_shards;
+	std::vector<PlanlessStaticLayoutDescriptor> planless_static_layouts;
+	std::vector<std::array<uint16_t, 64>>       planless_quant_tables;
+	std::vector<uint16_t>                       planless_shard_indices;
+	uint64_t                                    planless_uniform_shard_image_count = 0U;
+	bool                                        planless_shard_indices_valid       = false;
+	std::shared_ptr<const uint8_t>              plan_owner_token                   = std::make_shared<uint8_t>(0);
+	detail::JpegDctShardCpuReader               cpu_reader;
+	detail::JpegDctDeviceHostBridge             device_bridge;
+	mutable std::mutex                          device_plan_cache_mutex;
+	mutable std::unordered_map<std::string, detail::JpegDctDeviceBatchPlan> device_plan_cache;
+	static constexpr size_t kCompiledAccessProfileFallbackCapacity = 8192U;
+	mutable std::mutex compiled_access_profile_mutex;
+	mutable std::vector<CompiledAccessProfileSlot> compiled_fixed_access_profiles;
+	mutable std::unordered_map<CompiledAccessProfileKey,
+	                           std::shared_ptr<const std::vector<uint32_t>>,
+	                           CompiledAccessProfileKeyHash>
+	    compiled_access_profiles;
+	mutable std::deque<CompiledAccessProfileKey> compiled_access_profile_order;
 };
 
 JpegDctShardDatasetReader::JpegDctShardDatasetReader(const std::filesystem::path& manifest_path)
@@ -4824,109 +2773,6 @@ JpegDctShardDatasetReader::~JpegDctShardDatasetReader() = default;
 JpegDctShardDatasetReader::JpegDctShardDatasetReader(JpegDctShardDatasetReader&&) noexcept = default;
 
 JpegDctShardDatasetReader& JpegDctShardDatasetReader::operator=(JpegDctShardDatasetReader&&) noexcept = default;
-
-struct JpegDctDeviceBatchPreparedPlan::Impl {
-	Impl(detail::JpegDctDeviceBatchPlan plan_in,
-	     JpegDctDeviceBatchOptions      options_in,
-	     std::shared_ptr<const uint8_t> owner_token_in)
-	    : plan(std::move(plan_in))
-	    , options(options_in)
-	    , owner_token(std::move(owner_token_in)) {
-	}
-
-	detail::JpegDctDeviceBatchPlan plan;
-	JpegDctDeviceBatchOptions      options;
-	std::shared_ptr<const uint8_t> owner_token;
-};
-
-JpegDctDeviceBatchPreparedPlan::JpegDctDeviceBatchPreparedPlan() noexcept = default;
-
-JpegDctDeviceBatchPreparedPlan::JpegDctDeviceBatchPreparedPlan(std::unique_ptr<Impl> impl) noexcept
-    : impl_(std::move(impl)) {
-}
-
-JpegDctDeviceBatchPreparedPlan::~JpegDctDeviceBatchPreparedPlan() = default;
-
-JpegDctDeviceBatchPreparedPlan::JpegDctDeviceBatchPreparedPlan(JpegDctDeviceBatchPreparedPlan&&) noexcept = default;
-
-JpegDctDeviceBatchPreparedPlan&
-JpegDctDeviceBatchPreparedPlan::operator=(JpegDctDeviceBatchPreparedPlan&&) noexcept = default;
-
-bool JpegDctDeviceBatchPreparedPlan::empty() const noexcept {
-	return impl_ == nullptr;
-}
-
-JpegDctDeviceLayout JpegDctDeviceBatchPreparedPlan::layout() const noexcept {
-	return impl_ ? impl_->plan.layout : JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
-}
-
-const std::vector<JpegDctDeviceImageLayout>& JpegDctDeviceBatchPreparedPlan::image_layouts() const noexcept {
-	static const std::vector<JpegDctDeviceImageLayout> empty;
-	return impl_ ? impl_->plan.image_layouts : empty;
-}
-
-const std::vector<JpegDctDeviceBlockMetadata>& JpegDctDeviceBatchPreparedPlan::block_metadata() const noexcept {
-	static const std::vector<JpegDctDeviceBlockMetadata> empty;
-	return impl_ ? impl_->plan.block_metadata : empty;
-}
-
-const std::vector<JpegDctDeviceRowgroupMetadata>& JpegDctDeviceBatchPreparedPlan::rowgroups() const noexcept {
-	static const std::vector<JpegDctDeviceRowgroupMetadata> empty;
-	return impl_ ? impl_->plan.rowgroups : empty;
-}
-
-size_t JpegDctDeviceBatchPreparedPlan::planned_selected_vector_count() const noexcept {
-	return impl_ ? impl_->plan.planned_selected_vector_count : 0;
-}
-
-size_t JpegDctDeviceBatchPreparedPlan::estimated_selected_vector_count() const noexcept {
-	return impl_ ? impl_->plan.estimated_selected_vector_count : 0;
-}
-
-size_t JpegDctDeviceBatchPreparedPlan::full_vector_count() const noexcept {
-	return impl_ ? impl_->plan.full_vector_count : 0;
-}
-
-size_t JpegDctDeviceBatchPreparedPlan::planned_saved_vector_count() const noexcept {
-	return impl_ ? impl_->plan.planned_saved_vector_count : 0;
-}
-
-size_t JpegDctDeviceBatchPreparedPlan::estimated_saved_vector_count() const noexcept {
-	return impl_ ? impl_->plan.estimated_saved_vector_count : 0;
-}
-
-const std::vector<uint8_t>& JpegDctDeviceBatchPreparedPlan::selected_coefficients() const noexcept {
-	static const std::vector<uint8_t> empty;
-	return impl_ ? impl_->plan.selected_coefficients : empty;
-}
-
-size_t JpegDctDeviceBatchPreparedPlan::coefficients_per_block() const noexcept {
-	return impl_ ? impl_->plan.coefficients_per_block : detail::kJpegDctCoefficientCount;
-}
-
-double JpegDctDeviceBatchPreparedPlan::planned_selected_vector_ratio() const noexcept {
-	return impl_ ? impl_->plan.planned_selected_vector_ratio : 0.0;
-}
-
-double JpegDctDeviceBatchPreparedPlan::estimated_selected_vector_ratio() const noexcept {
-	return impl_ ? impl_->plan.estimated_selected_vector_ratio : 0.0;
-}
-
-double JpegDctDeviceBatchPreparedPlan::planning_ms() const noexcept {
-	return impl_ ? impl_->plan.planning_ms : 0.0;
-}
-
-bool JpegDctDeviceBatchPreparedPlan::uses_planless_fixed_transform() const noexcept {
-	return impl_ != nullptr && impl_->plan.uses_planless_fixed_transform;
-}
-
-bool JpegDctDeviceBatchPreparedPlan::exact_batch_plan_cache_enabled() const noexcept {
-	return impl_ != nullptr && impl_->plan.exact_batch_plan_cache_enabled;
-}
-
-bool JpegDctDeviceBatchPreparedPlan::decoded_rowgroup_cache_enabled() const noexcept {
-	return impl_ != nullptr && impl_->plan.cache_enabled;
-}
 
 uint64_t JpegDctShardDatasetReader::image_count() const noexcept {
 	return impl_ == nullptr ? 0 : impl_->manifest.image_count;
@@ -4949,41 +2795,8 @@ uint64_t JpegDctShardDatasetReader::RowgroupStorageBytes(const uint32_t         
 	if (impl_ == nullptr) {
 		throw std::runtime_error("JPEG DCT shard dataset reader is not initialized");
 	}
-	const auto&                 shard = impl_->shard_by_id(shard_id);
-	std::lock_guard<std::mutex> guard(impl_->storage_audit_reader_mutex);
-	auto&                       descriptor = impl_->storage_audit_descriptors[shard_id];
-	if (!descriptor) {
-		fastlanes::File       file(shard.fls_path);
-		fastlanes::FileHeader header {};
-		fastlanes::FileFooter footer {};
-		fastlanes::FileHeader::Load(header, file);
-		fastlanes::FileFooter::Load(footer, file);
-		if (header.settings.inline_footer) {
-			descriptor =
-			    std::make_shared<fastlanes::TableDescriptorHandle>(fastlanes::TableDescriptorHandle::FromFileSlice(
-			        file, footer.table_descriptor_offset, footer.table_descriptor_size, true));
-		} else {
-			descriptor = std::make_shared<fastlanes::TableDescriptorHandle>(fastlanes::TableDescriptorHandle::FromFile(
-			    shard.fls_path.parent_path() / "table_descriptor.fbb", true));
-		}
-	}
-	const auto* table = descriptor->Get();
-	if (table == nullptr || table->m_rowgroup_descriptors() == nullptr) {
-		throw std::runtime_error("JPEG DCT storage audit could not load rowgroup descriptors");
-	}
-	uint64_t bytes = 0U;
-	for (const auto rowgroup_index : rowgroup_indices) {
-		if (rowgroup_index >= table->m_rowgroup_descriptors()->size()) {
-			throw std::out_of_range("JPEG DCT storage audit rowgroup index is out of range");
-		}
-		const auto* rowgroup       = table->m_rowgroup_descriptors()->Get(rowgroup_index);
-		const auto  rowgroup_bytes = static_cast<uint64_t>(rowgroup->m_size());
-		if (rowgroup_bytes > std::numeric_limits<uint64_t>::max() - bytes) {
-			throw std::runtime_error("JPEG DCT rowgroup storage-byte audit overflow");
-		}
-		bytes += rowgroup_bytes;
-	}
-	return bytes;
+	const auto& shard = impl_->shard_by_id(shard_id);
+	return impl_->cpu_reader.RowgroupStorageBytes(shard_id, shard.fls_path, rowgroup_indices);
 }
 
 JpegDctDeviceBatchPlanPreview
@@ -4997,6 +2810,14 @@ JpegDctShardDatasetReader::PlanDeviceDctBatch(const std::vector<JpegDctImageCrop
 	const auto plan_end   = std::chrono::steady_clock::now();
 
 	JpegDctDeviceBatchPlanPreview preview;
+	for (const auto& shard_plan : *plan.shards) {
+		for (const auto& rowgroup_plan : shard_plan.rowgroups) {
+			preview.rowgroup_vector_plans.push_back(JpegDctDeviceRowgroupVectorPlan {
+			    JpegDctDeviceRowgroupMetadata {shard_plan.shard_id, rowgroup_plan.rowgroup_index},
+			    rowgroup_plan.full_vector_count,
+			    rowgroup_plan.selected_vectors});
+		}
+	}
 	preview.layout                             = plan.layout;
 	preview.image_layouts                      = std::move(plan.image_layouts);
 	preview.block_metadata                     = std::move(plan.block_metadata);
@@ -5021,6 +2842,8 @@ JpegDctShardDatasetReader::PlanDeviceDctBatch(const std::vector<JpegDctImageCrop
 	preview.host_global_transform_sort_items       = plan.host_global_transform_sort_items;
 	preview.planless_axis_program_count            = plan.planless_axis_program_count;
 	preview.planless_axis_phase_matrix_count       = plan.planless_axis_phase_matrix_count;
+	preview.compiled_access_profile_hits           = plan.compiled_access_profile_hits;
+	preview.compiled_access_profile_misses         = plan.compiled_access_profile_misses;
 	preview.planless_axis_program_bytes            = plan.fixed_resize_weight_matrices.size() * sizeof(float);
 	preview.exact_batch_plan_cache_enabled         = plan.exact_batch_plan_cache_enabled;
 	preview.compact_reader_image_locator_bytes =
@@ -5067,10 +2890,24 @@ JpegDctShardDatasetReader::PrepareDeviceDctBatch(const std::vector<JpegDctImageC
 	}
 	const auto plan_start = std::chrono::steady_clock::now();
 	auto       plan       = impl_->cached_device_batch_plan(requests, options);
+	impl_->device_bridge.CompileIoPlan(plan);
 	const auto plan_end   = std::chrono::steady_clock::now();
 	plan.planning_ms      = std::chrono::duration<double, std::milli>(plan_end - plan_start).count();
 	return JpegDctDeviceBatchPreparedPlan(
 	    std::make_unique<JpegDctDeviceBatchPreparedPlan::Impl>(std::move(plan), options, impl_->plan_owner_token));
+}
+
+void JpegDctShardDatasetReader::StagePreparedDeviceDctBatchIo(JpegDctDeviceBatchPreparedPlan& plan) {
+	if (impl_ == nullptr) {
+		throw std::runtime_error("JPEG DCT shard dataset reader is not initialized");
+	}
+	if (plan.impl_ == nullptr) {
+		throw std::runtime_error("JPEG DCT prepared device batch plan is empty");
+	}
+	if (plan.impl_->owner_token != impl_->plan_owner_token) {
+		throw std::runtime_error("JPEG DCT prepared device batch plan belongs to a different reader");
+	}
+	impl_->device_bridge.StageIo(plan.impl_->plan);
 }
 
 JpegDctDeviceBatch JpegDctShardDatasetReader::ReadPreparedDeviceDctBatch(JpegDctDeviceBatchPreparedPlan plan) {
@@ -5083,14 +2920,16 @@ JpegDctDeviceBatch JpegDctShardDatasetReader::ReadPreparedDeviceDctBatch(JpegDct
 	if (plan.impl_->owner_token != impl_->plan_owner_token) {
 		throw std::runtime_error("JPEG DCT prepared device batch plan belongs to a different reader");
 	}
+	StagePreparedDeviceDctBatchIo(plan);
 	auto       detail_plan         = std::move(plan.impl_->plan);
 	const auto requested_selection = detail::normalize_coefficient_selection(plan.impl_->options.coefficient_selection);
 	if (requested_selection != detail_plan.selected_coefficients) {
 		throw std::runtime_error("JPEG DCT prepared device batch coefficient selection was modified");
 	}
-	impl_->attach_device_runtime_resources(detail_plan, plan.impl_->options);
+	auto options = plan.impl_->options;
 	plan.impl_.reset();
-	return detail::execute_jpeg_dct_device_batch_plan(std::move(detail_plan));
+	auto batch = impl_->device_bridge.Execute(std::move(detail_plan), options);
+	return batch;
 }
 
 JpegDctDeviceBatch JpegDctShardDatasetReader::ReadDeviceDctBatch(const std::vector<JpegDctImageCropRequest>& requests,
@@ -5113,49 +2952,12 @@ JpegDctBlockGroup JpegDctShardDatasetReader::ReadBlockGroup(const uint32_t shard
                                                             const uint32_t block_y) {
 	const auto& shard = impl_->shard_by_id(shard_id);
 	const auto& group = Impl::find_group(shard.metadata, semantic_slot_id, block_x, block_y);
-
-	fastlanes::Connection connection;
-	auto                  table_reader    = connection.read_fls(shard.fls_path);
-	auto                  rowgroup_reader = table_reader->get_rowgroup_reader(group.fls_rowgroup_index);
-	auto                  rowgroup        = rowgroup_reader->materialize();
-	if (rowgroup->internal_rowgroup.size() < 64) {
-		throw std::runtime_error("JPEG DCT FLS shard has fewer than 64 coefficient columns");
-	}
-
-	JpegDctBlockGroup block_group;
-	block_group.index = group;
-	block_group.rows.reserve(group.row_count);
-	for (uint32_t row_idx = 0; row_idx < group.row_count; ++row_idx) {
-		const auto            materialized_row_idx = static_cast<size_t>(group.row_start_in_rowgroup) + row_idx;
-		JpegDctCoefficientRow row {};
-		for (size_t col_idx = 0; col_idx < row.size(); ++col_idx) {
-			row[col_idx] = coefficient_value(rowgroup->internal_rowgroup[col_idx], materialized_row_idx);
-		}
-		block_group.rows.push_back(row);
-	}
-	return block_group;
+	return impl_->cpu_reader.ReadBlockGroup(shard.fls_path, group);
 }
 
 MaterializedJpegDctImage JpegDctShardDatasetReader::MaterializeImageDct(const uint32_t global_image_index) {
-	const auto&           shard = impl_->shard_for_global_image(global_image_index);
-	fastlanes::Connection connection;
-	auto                  table_reader = connection.read_fls(shard.fls_path);
-	std::unordered_map<uint32_t, fastlanes::up<fastlanes::Rowgroup>> rowgroups;
-
-	const auto materialized_rowgroup = [&](const uint32_t rowgroup_index) -> fastlanes::Rowgroup& {
-		auto [it, inserted] = rowgroups.try_emplace(rowgroup_index);
-		if (inserted) {
-			auto rowgroup_reader = table_reader->get_rowgroup_reader(rowgroup_index);
-			it->second           = rowgroup_reader->materialize();
-			if (it->second->internal_rowgroup.size() < 64) {
-				throw std::runtime_error("JPEG DCT FLS shard has fewer than 64 coefficient columns");
-			}
-		}
-		return *it->second;
-	};
-
-	MaterializedJpegDctImage image;
-	image.global_image_index = global_image_index;
+	const auto&                                     shard = impl_->shard_for_global_image(global_image_index);
+	std::vector<detail::JpegDctMaterializeBlockRef> blocks;
 	if (shard.metadata.row_ordering == JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor) {
 		const auto local_image_index = static_cast<uint32_t>(global_image_index - shard.entry.first_global_image_index);
 		const auto& image_metadata   = shard.metadata.images.at(local_image_index);
@@ -5165,45 +2967,25 @@ MaterializedJpegDctImage JpegDctShardDatasetReader::MaterializeImageDct(const ui
 			}
 			for (uint32_t block_y = 0; block_y < component.height_in_blocks; ++block_y) {
 				for (uint32_t block_x = 0; block_x < component.width_in_blocks; ++block_x) {
-					const auto ref = LocateRow(global_image_index, component.semantic_slot_id, block_x, block_y);
-					if (!ref.present) {
-						throw std::runtime_error("JPEG DCT image-major materialization lost a present block");
-					}
-					const auto& rowgroup = materialized_rowgroup(ref.fls_rowgroup_index);
-					const auto  materialized_row_idx =
-					    static_cast<size_t>(ref.row_start_in_rowgroup) + ref.row_offset_in_block_group;
-					MaterializedJpegDctBlock block;
-					block.semantic_slot_id = component.semantic_slot_id;
-					block.block_x          = block_x;
-					block.block_y          = block_y;
-					for (size_t col_idx = 0; col_idx < block.coefficients.size(); ++col_idx) {
-						block.coefficients[col_idx] =
-						    coefficient_value(rowgroup.internal_rowgroup[col_idx], materialized_row_idx);
-					}
-					image.blocks.push_back(block);
+					blocks.push_back(detail::JpegDctMaterializeBlockRef {
+					    component.semantic_slot_id,
+					    block_x,
+					    block_y,
+					    LocateRow(global_image_index, component.semantic_slot_id, block_x, block_y)});
 				}
 			}
 		}
-		return image;
+		return impl_->cpu_reader.MaterializeImage(shard.fls_path, global_image_index, blocks);
 	}
 	for (const auto& group : shard.metadata.block_group_index) {
 		auto ref = LocateRow(global_image_index, group.semantic_slot_id, group.block_x, group.block_y);
 		if (!ref.present || ref.row_offset_in_block_group >= group.row_count) {
 			continue;
 		}
-		const auto& rowgroup = materialized_rowgroup(ref.fls_rowgroup_index);
-		const auto  materialized_row_idx =
-		    static_cast<size_t>(ref.row_start_in_rowgroup) + ref.row_offset_in_block_group;
-		MaterializedJpegDctBlock block;
-		block.semantic_slot_id = group.semantic_slot_id;
-		block.block_x          = group.block_x;
-		block.block_y          = group.block_y;
-		for (size_t col_idx = 0; col_idx < block.coefficients.size(); ++col_idx) {
-			block.coefficients[col_idx] = coefficient_value(rowgroup.internal_rowgroup[col_idx], materialized_row_idx);
-		}
-		image.blocks.push_back(block);
+		blocks.push_back(
+		    detail::JpegDctMaterializeBlockRef {group.semantic_slot_id, group.block_x, group.block_y, ref});
 	}
-	return image;
+	return impl_->cpu_reader.MaterializeImage(shard.fls_path, global_image_index, blocks);
 }
 
 } // namespace galp::jpeg

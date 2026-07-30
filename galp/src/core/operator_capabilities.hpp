@@ -47,6 +47,10 @@ struct OperatorCapability {
 	galp::execution::TypeTag type;
 	bool                     has_static_plan;
 	galp::execution::PlanKind plan;
+	// Sparse range reads use the same per-vector segment entrypoints as GPU
+	// materialization.  Keep the capability explicit so a future operator can
+	// remain GPU-decodable while requiring a full-rowgroup storage fallback.
+	bool sparse_read_supported = gpu_supported;
 };
 
 inline constexpr std::array<OperatorCapability, 29> kOperatorCapabilities {{
@@ -129,6 +133,11 @@ constexpr const OperatorCapability* capability_for_token(const fastlanes::Operat
 constexpr bool is_supported_token(const fastlanes::OperatorToken token) {
 	const auto* capability = capability_for_token(token);
 	return capability != nullptr && capability->gpu_supported;
+}
+
+constexpr bool is_sparse_read_supported_token(const fastlanes::OperatorToken token) {
+	const auto* capability = capability_for_token(token);
+	return capability != nullptr && capability->sparse_read_supported;
 }
 
 } // namespace galp::expression

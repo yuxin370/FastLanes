@@ -619,6 +619,7 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 		}
 	}
 	out.backing_storage = std::move(storage);
+	out.packed_device_payload = std::move(zero_copy.packed_device_payload);
 	return out;
 }
 
@@ -634,6 +635,7 @@ void release_transient_materialized_rowgroup(Rowgroup& rowgroup) {
 	}
 	rowgroup.columns.clear();
 	rowgroup.backing_storage.reset();
+	rowgroup.packed_device_payload.reset();
 }
 
 Rowgroup make_owning_rowgroup(Rowgroup rowgroup) {

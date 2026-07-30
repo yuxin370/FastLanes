@@ -3,14 +3,14 @@
 // ────────────────────────────────────────────────────────
 // galp/src/engine/operators/column.cu
 // ────────────────────────────────────────────────────────
+#include "codecs/device_ops.cuh"
 #include "core/data/value_store.cuh"
+#include "cuda/launch/dispatch.cuh"
 #include "engine/operators/column.cuh"
 #include "engine/operators/column_traits.cuh"
 #include "engine/operators/expr_ops.cuh"
 #include "engine/unpack_dispatch.cuh"
-#include "cuda/launch/dispatch.cuh"
 #include "format/reader.cuh"
-#include "codecs/device_ops.cuh"
 #include <cstring>
 #include <memory>
 #include <type_traits>
@@ -19,21 +19,22 @@ namespace galp::execution {
 namespace detail {
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-using BPUnpacker =
-    galp::codec::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, galp::codec::device::BPFunctor<T>>;
+using BPUnpacker = galp::codec::device::
+    BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, galp::codec::device::BPFunctor<T>>;
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-using FFORUnpacker = galp::codec::device::BitUnpackerStatefulBranchless<T,
-                                                                   UNPACK_N_VECTORS,
-                                                                   UNPACK_N_VALUES,
-                                                                   galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>;
+using FFORUnpacker =
+    galp::codec::device::BitUnpackerStatefulBranchless<T,
+                                                       UNPACK_N_VECTORS,
+                                                       UNPACK_N_VALUES,
+                                                       galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>;
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 using DELTAUnpacker = galp::codec::device::BitUnpackerStatefulBranchless<
-	    typename galp::codec::utils::same_width_uint<T>::type,
-	    UNPACK_N_VECTORS,
-	    UNPACK_N_VALUES,
-	    galp::codec::device::FFORFunctor<typename galp::codec::utils::same_width_uint<T>::type, UNPACK_N_VECTORS>>;
+    typename galp::codec::utils::same_width_uint<T>::type,
+    UNPACK_N_VECTORS,
+    UNPACK_N_VALUES,
+    galp::codec::device::FFORFunctor<typename galp::codec::utils::same_width_uint<T>::type, UNPACK_N_VECTORS>>;
 
 template <typename T,
           unsigned UNPACK_N_VECTORS,
@@ -41,10 +42,10 @@ template <typename T,
           typename IndexT = typename galp::codec::utils::same_width_uint<T>::type>
 using DICTUnpacker =
     galp::codec::device::BitUnpackerStatefulBranchless<T,
-                                                  UNPACK_N_VECTORS,
-                                                  UNPACK_N_VALUES,
-                                                  galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>,
-                                                  IndexT>;
+                                                       UNPACK_N_VECTORS,
+                                                       UNPACK_N_VALUES,
+                                                       galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>,
+                                                       IndexT>;
 
 template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 using DefaultFREQPatcher = galp::codec::device::StatefulFREQExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
@@ -53,28 +54,27 @@ template <typename T, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
 using DefaultCROSSRLEExpander = galp::codec::device::StatefulCROSSRLEExpander<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
 
 template <typename ColumnT, unsigned UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES>
-auto decompress_device_tiled(const ColumnT& column) ->
-    typename column_value_type<ColumnT>::type* {
+auto decompress_device_tiled(const ColumnT& column) -> typename column_value_type<ColumnT>::type* {
 	using T = typename column_value_type<ColumnT>::type;
 
 	if constexpr (std::is_same_v<ColumnT, galp::codec::device::BPColumn<T>>) {
 		using DecompressorT = galp::codec::device::BPDecompressor<T,
-		                                                     UNPACK_N_VECTORS,
-		                                                     BPUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
-		                                                     galp::codec::device::BPColumn<T>>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		                                                          UNPACK_N_VECTORS,
+		                                                          BPUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                                          galp::codec::device::BPColumn<T>>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::CONSTANTColumn<T>>) {
 		using DecompressorT = galp::codec::device::
 		    CONSTANTDecompressor<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, galp::codec::device::CONSTANTColumn<T>>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::DELTAColumn<T>>) {
-		using DecompressorT = galp::codec::device::DELTADecompressor<
-		    T,
-		    UNPACK_N_VECTORS,
-		    DELTAUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
-		    galp::codec::device::DELTAColumn<T>>;
+		using DecompressorT =
+		    galp::codec::device::DELTADecompressor<T,
+		                                           UNPACK_N_VECTORS,
+		                                           DELTAUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                           galp::codec::device::DELTAColumn<T>>;
 		return galp::kernels::host::decompress_column<T,
 		                                              UNPACK_N_VECTORS,
 		                                              UNPACK_N_VALUES,
@@ -83,46 +83,47 @@ auto decompress_device_tiled(const ColumnT& column) ->
 		                                              galp::codec::device::FastLanes1024InputUntransposer>(column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::FFORColumn<T>>) {
 		using DecompressorT = galp::codec::device::FFORDecompressor<T,
-		                                                       UNPACK_N_VECTORS,
-		                                                       FFORUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
-		                                                       galp::codec::device::FFORColumn<T>>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		                                                            UNPACK_N_VECTORS,
+		                                                            FFORUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                                            galp::codec::device::FFORColumn<T>>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::DICTFFORColumn<T, uint8_t>>) {
 		using IndexT     = uint8_t;
 		using ProcessorT = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
 		using DecompressorT =
 		    galp::codec::device::DICTDecompressor<T,
-		                                     UNPACK_N_VECTORS,
-		                                     DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, IndexT>,
-		                                     galp::codec::device::DICTFFORColumn<T, IndexT>,
-		                                     ProcessorT>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		                                          UNPACK_N_VECTORS,
+		                                          DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, IndexT>,
+		                                          galp::codec::device::DICTFFORColumn<T, IndexT>,
+		                                          ProcessorT>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::DICTFFORColumn<T, uint16_t>>) {
 		using ProcessorT    = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS>;
 		using DecompressorT = galp::codec::device::DICTDecompressor<T,
-		                                                       UNPACK_N_VECTORS,
-		                                                       DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
-		                                                       galp::codec::device::DICTFFORColumn<T, uint16_t>,
-		                                                       ProcessorT>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		                                                            UNPACK_N_VECTORS,
+		                                                            DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                                            galp::codec::device::DICTFFORColumn<T, uint16_t>,
+		                                                            ProcessorT>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::DICTSLPATCHColumn<T, uint8_t>>) {
 		using IndexT     = uint8_t;
 		using ProcessorT = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS, IndexT>;
 		using UnpackerT  = DICTUnpacker<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, IndexT>;
 		using PatcherT =
 		    galp::codec::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-		using DecompressorT = galp::codec::device::DICTSLPATCHDecompressor<T,
-		                                                              UNPACK_N_VECTORS,
-		                                                              UNPACK_N_VALUES,
-		                                                              UnpackerT,
-		                                                              PatcherT,
-		                                                              galp::codec::device::DICTSLPATCHColumn<T, IndexT>,
-		                                                              ProcessorT>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		using DecompressorT =
+		    galp::codec::device::DICTSLPATCHDecompressor<T,
+		                                                 UNPACK_N_VECTORS,
+		                                                 UNPACK_N_VALUES,
+		                                                 UnpackerT,
+		                                                 PatcherT,
+		                                                 galp::codec::device::DICTSLPATCHColumn<T, IndexT>,
+		                                                 ProcessorT>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::DICTSLPATCHColumn<T, uint16_t>>) {
 		using IndexT     = uint16_t;
 		using ProcessorT = galp::codec::device::DICTFunctor<T, UNPACK_N_VECTORS>;
@@ -130,72 +131,74 @@ auto decompress_device_tiled(const ColumnT& column) ->
 		    galp::codec::device::BitUnpackerStatefulBranchless<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, ProcessorT>;
 		using PatcherT =
 		    galp::codec::device::StatefulSLPATCHDictExceptionPatcher<T, IndexT, UNPACK_N_VECTORS, UNPACK_N_VALUES>;
-		using DecompressorT = galp::codec::device::DICTSLPATCHDecompressor<T,
-		                                                              UNPACK_N_VECTORS,
-		                                                              UNPACK_N_VALUES,
-		                                                              UnpackerT,
-		                                                              PatcherT,
-		                                                              galp::codec::device::DICTSLPATCHColumn<T, uint16_t>,
-		                                                              ProcessorT>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		using DecompressorT =
+		    galp::codec::device::DICTSLPATCHDecompressor<T,
+		                                                 UNPACK_N_VECTORS,
+		                                                 UNPACK_N_VALUES,
+		                                                 UnpackerT,
+		                                                 PatcherT,
+		                                                 galp::codec::device::DICTSLPATCHColumn<T, uint16_t>,
+		                                                 ProcessorT>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::FREQColumn<T>>) {
-		using DecompressorT = galp::codec::device::FREQDecompressor<T,
-		                                                       UNPACK_N_VECTORS,
-		                                                       DefaultFREQPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
-		                                                       galp::codec::device::FREQColumn<T>>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		using DecompressorT =
+		    galp::codec::device::FREQDecompressor<T,
+		                                          UNPACK_N_VECTORS,
+		                                          DefaultFREQPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                          galp::codec::device::FREQColumn<T>>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::CROSSRLEColumn<T>>) {
 		using DecompressorT =
 		    galp::codec::device::CROSSRLEDecompressor<T,
-		                                         UNPACK_N_VECTORS,
-		                                         DefaultCROSSRLEExpander<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
-		                                         galp::codec::device::CROSSRLEColumn<T>>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		                                              UNPACK_N_VECTORS,
+		                                              DefaultCROSSRLEExpander<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
+		                                              galp::codec::device::CROSSRLEColumn<T>>;
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::SLPATCHColumn<T>>) {
 		using DecompressorT = galp::codec::device::SLPATCHDecompressor<
 		    T,
 		    UNPACK_N_VECTORS,
 		    galp::codec::device::BitUnpackerStatefulBranchless<T,
-		                                                  UNPACK_N_VECTORS,
-		                                                  UNPACK_N_VALUES,
-		                                                  galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>,
+		                                                       UNPACK_N_VECTORS,
+		                                                       UNPACK_N_VALUES,
+		                                                       galp::codec::device::FFORFunctor<T, UNPACK_N_VECTORS>>,
 		    galp::codec::device::StatefulSLPATCHExceptionPatcher<T, UNPACK_N_VECTORS, UNPACK_N_VALUES>,
 		    galp::codec::device::SLPATCHColumn<T>>;
-		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(column,
-		                                                                                                      1);
+		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, DecompressorT, ColumnT>(
+		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::RLEColumn<T, uint8_t>> ||
 	                     std::is_same_v<ColumnT, galp::codec::device::RLEColumn<T, uint16_t>>) {
 		using IndexT =
 		    std::conditional_t<std::is_same_v<ColumnT, galp::codec::device::RLEColumn<T, uint8_t>>, uint8_t, uint16_t>;
 		constexpr unsigned RLE_UNPACK_N_VALUES = galp::codec::utils::get_values_per_lane<IndexT>();
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<IndexT,
-		                                                  UNPACK_N_VECTORS,
-		                                                  RLE_UNPACK_N_VALUES,
-		                                                  galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
+		using UnpackerT                        = galp::codec::device::BitUnpackerStatefulBranchless<
+		                           IndexT,
+		                           UNPACK_N_VECTORS,
+		                           RLE_UNPACK_N_VALUES,
+		                           galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
 		using ExpanderT     = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
 		using DecompressorT = galp::codec::device::RLEDecompressor<T,
-		                                                      IndexT,
-		                                                      UNPACK_N_VECTORS,
-		                                                      RLE_UNPACK_N_VALUES,
-		                                                      UnpackerT,
-		                                                      ExpanderT,
-		                                                      galp::codec::device::RLEColumn<T, IndexT>>;
+		                                                           IndexT,
+		                                                           UNPACK_N_VECTORS,
+		                                                           RLE_UNPACK_N_VALUES,
+		                                                           UnpackerT,
+		                                                           ExpanderT,
+		                                                           galp::codec::device::RLEColumn<T, IndexT>>;
 		return galp::kernels::host::decompress_column<T, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES, DecompressorT, ColumnT>(
 		    column, 1);
 	} else if constexpr (std::is_same_v<ColumnT, galp::codec::device::RLESLPATCHColumn<T, uint16_t>>) {
-		using IndexT = uint16_t;
+		using IndexT                           = uint16_t;
 		constexpr unsigned RLE_UNPACK_N_VALUES = galp::codec::utils::get_values_per_lane<IndexT>();
-		using UnpackerT =
-		    galp::codec::device::BitUnpackerStatefulBranchless<IndexT,
-		                                                  UNPACK_N_VECTORS,
-		                                                  RLE_UNPACK_N_VALUES,
-		                                                  galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
-		using PatcherT = galp::codec::device::
-		    StatefulSLPATCHExceptionPatcher<IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
+		using UnpackerT                        = galp::codec::device::BitUnpackerStatefulBranchless<
+		                           IndexT,
+		                           UNPACK_N_VECTORS,
+		                           RLE_UNPACK_N_VALUES,
+		                           galp::codec::device::FFORFunctor<IndexT, UNPACK_N_VECTORS>>;
+		using PatcherT =
+		    galp::codec::device::StatefulSLPATCHExceptionPatcher<IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
 		using ExpanderT     = galp::codec::device::DummyRLEExpander<T, IndexT, UNPACK_N_VECTORS, RLE_UNPACK_N_VALUES>;
 		using DecompressorT = galp::codec::device::RLESLPATCHDecompressor<T,
 		                                                                  IndexT,
@@ -216,10 +219,33 @@ auto decompress_device_tiled(const ColumnT& column) ->
 template <typename ColumnT>
 auto decompress_device(const ColumnT& column, const ExecutionConfig& cfg) ->
     typename column_value_type<ColumnT>::type* {
+	using T = typename column_value_type<ColumnT>::type;
+	if constexpr (std::is_same_v<ColumnT, galp::codec::device::DELTAColumn<T>>) {
+		if (delta_uses_register(cfg.delta_decoder)) {
+			return runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, [[maybe_unused]] auto unpack_n_values) {
+				constexpr unsigned UNPACK_N_VECTORS  = decltype(unpack_n_vectors)::value;
+				constexpr unsigned REGISTER_N_VALUES = galp::codec::utils::get_values_per_lane<T>();
+				using UIntT                          = typename galp::codec::utils::same_width_uint<T>::type;
+				using UnpackerT                      = galp::codec::device::BitUnpackerLaneTile<
+				                         UIntT,
+				                         UNPACK_N_VECTORS,
+				                         REGISTER_N_VALUES,
+				                         galp::codec::device::FFORFunctor<UIntT, UNPACK_N_VECTORS>>;
+				using DecompressorT = galp::codec::device::
+				    DELTARegisterDecompressor<T, UNPACK_N_VECTORS, UnpackerT, galp::codec::device::DELTAColumn<T>>;
+				return galp::kernels::host::decompress_delta_register_column<
+				    T,
+				    UNPACK_N_VECTORS,
+				    DecompressorT,
+				    ColumnT,
+				    galp::codec::device::FastLanes1024InputUntransposer>(
+				    column, 1);
+			});
+		}
+	}
 	return runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, auto unpack_n_values) {
-		return decompress_device_tiled<ColumnT,
-		                               decltype(unpack_n_vectors)::value,
-		                               decltype(unpack_n_values)::value>(column);
+		return decompress_device_tiled<ColumnT, decltype(unpack_n_vectors)::value, decltype(unpack_n_values)::value>(
+		    column);
 	});
 }
 
@@ -370,8 +396,9 @@ template ValueStore
 detail::decompress_host(const galp::codec::host::DELTAColumn<int16_t>&, const PlanKind, const ExecutionConfig&);
 template ValueStore
 detail::decompress_host(const galp::codec::host::DICTFFORColumn<int16_t>&, const PlanKind, const ExecutionConfig&);
-template ValueStore
-detail::decompress_host(const galp::codec::host::DICTFFORColumn<int16_t, uint8_t>&, const PlanKind, const ExecutionConfig&);
+template ValueStore detail::decompress_host(const galp::codec::host::DICTFFORColumn<int16_t, uint8_t>&,
+                                            const PlanKind,
+                                            const ExecutionConfig&);
 template ValueStore
 detail::decompress_host(const galp::codec::host::DICTSLPATCHColumn<int16_t>&, const PlanKind, const ExecutionConfig&);
 template ValueStore detail::decompress_host(const galp::codec::host::DICTSLPATCHColumn<int16_t, uint8_t>&,

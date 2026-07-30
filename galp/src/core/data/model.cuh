@@ -89,12 +89,31 @@ struct MaterializedColumn {
 	ColumnMeta meta;
 };
 
+struct PackedRowgroupScatterRange {
+	size_t packed_offset  = 0;
+	size_t logical_offset = 0;
+	size_t size           = 0;
+};
+
+// A sparse vector-bundle read keeps its transfer payload in the same compact
+// order as on disk. The GPU upload path scatters these ranges into an
+// allocation-only logical rowgroup before launching the existing decoders.
+struct PackedRowgroupDevicePayload {
+	std::shared_ptr<void>                    packed_owner;
+	const std::byte*                         packed_data   = nullptr;
+	size_t                                   packed_bytes  = 0;
+	const std::byte*                         logical_data  = nullptr;
+	size_t                                   logical_bytes = 0;
+	std::vector<PackedRowgroupScatterRange> ranges;
+};
+
 struct Rowgroup {
 	size_t              n_values = 0;
 	size_t              n_vecs   = 0;
 	size_t              n_tuples = 0;
 	std::vector<Column> columns;
 	std::shared_ptr<void> backing_storage;
+	std::shared_ptr<const PackedRowgroupDevicePayload> packed_device_payload;
 };
 
 struct Table {

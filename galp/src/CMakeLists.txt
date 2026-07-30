@@ -5,7 +5,18 @@ configure_file(
         @ONLY
 )
 
-set(GALP_CORE_SOURCES
+function(galp_configure_library target)
+        target_include_directories(${target} PUBLIC
+                $<BUILD_INTERFACE:${GALP_GENERATED_INCLUDE_DIR}>
+                $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+        target_include_directories(${target} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}
+                ${CUDAToolkit_INCLUDE_DIRS})
+        apply_warnings(${target})
+endfunction()
+
+set(GALP_ENGINE_SOURCES
         api/table.cu
         core/enums.cu
         core/expression.cu
@@ -23,41 +34,80 @@ set(GALP_CORE_SOURCES
         format/rowgroup_io.cu
         format/schema_plan.cu
         engine/materialization/zero_copy_materializer.cu
-        jpeg/jpeg_dct_order.cpp
 )
-if (GALP_WITH_JPEG_DCT)
-        list(APPEND GALP_CORE_SOURCES
-                api/direct_dct.cpp
-                jpeg/jpeg_dct.cpp
-                jpeg/jpeg_dct_device.cu
-        )
-endif ()
-add_library(galp_core STATIC ${GALP_CORE_SOURCES})
-add_library(Galp::core ALIAS galp_core)
-set_target_properties(galp_core PROPERTIES
-        EXPORT_NAME core
+
+add_library(galp_engine STATIC ${GALP_ENGINE_SOURCES})
+add_library(Galp::engine ALIAS galp_engine)
+set_target_properties(galp_engine PROPERTIES
+        EXPORT_NAME engine
+        CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_include_directories(galp_core PUBLIC
-        $<BUILD_INTERFACE:${GALP_GENERATED_INCLUDE_DIR}>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_include_directories(galp_core PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CUDAToolkit_INCLUDE_DIRS})
-target_link_libraries(galp_core PUBLIC
+galp_configure_library(galp_engine)
+target_link_libraries(galp_engine PUBLIC
         CUDA::cudart
         Thrust::Thrust
         $<BUILD_INTERFACE:FastLanes::core>
         $<INSTALL_INTERFACE:FLS::FastLanes>)
+
 if (GALP_WITH_JPEG_DCT)
-        target_link_libraries(galp_core PRIVATE JPEG::JPEG)
-        target_compile_definitions(galp_core PRIVATE GALP_WITH_JPEG_DCT=1)
+	set_source_files_properties(engine/materialization/selected_vector_compactor.cpp PROPERTIES LANGUAGE CUDA)
+		add_library(galp_jpeg_dct_storage STATIC
+				jpeg/jpeg_dct_decode.cpp
+				jpeg/jpeg_dct_expression_validation.cpp
+                jpeg/jpeg_dct_metadata.cpp
+                jpeg/jpeg_dct_order.cpp
+                jpeg/jpeg_dct_policy.cpp
+                jpeg/jpeg_dct_shard_reader.cpp
+                jpeg/jpeg_dct_shard_writer.cpp)
+        add_library(Galp::jpeg_dct_storage ALIAS galp_jpeg_dct_storage)
+        set_target_properties(galp_jpeg_dct_storage PROPERTIES EXPORT_NAME jpeg_dct_storage)
+        galp_configure_library(galp_jpeg_dct_storage)
+        target_compile_definitions(galp_jpeg_dct_storage PRIVATE GALP_WITH_JPEG_DCT=1)
+        target_link_libraries(galp_jpeg_dct_storage PUBLIC
+                JPEG::JPEG
+                $<BUILD_INTERFACE:FastLanes::core>
+                $<INSTALL_INTERFACE:FLS::FastLanes>)
+
+        add_library(galp_jpeg_dct_device STATIC
+                api/direct_dct.cpp
+                engine/materialization/selected_vector_compactor.cpp
+                jpeg/jpeg_dct_device_bridge.cpp
+                jpeg/jpeg_dct_prepared_plan.cpp
+                jpeg/jpeg_dct_planner.cpp
+                jpeg/jpeg_dct_device.cu
+                jpeg/jpeg_dct_gather_kernels.cu
+                jpeg/jpeg_dct_transform_kernels.cu)
+        add_library(Galp::jpeg_dct_device ALIAS galp_jpeg_dct_device)
+        set_target_properties(galp_jpeg_dct_device PROPERTIES
+                EXPORT_NAME jpeg_dct_device
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+        galp_configure_library(galp_jpeg_dct_device)
+        target_compile_definitions(galp_jpeg_dct_device PRIVATE GALP_WITH_JPEG_DCT=1)
+        target_link_libraries(galp_jpeg_dct_device PUBLIC
+                galp_engine
+                galp_jpeg_dct_storage)
 endif ()
-apply_warnings(galp_core)
+
+# Compatibility umbrella: existing consumers of Galp::core retain the complete
+# feature set, while internal non-JPEG targets can link Galp::engine directly
+# and avoid the JPEG CUDA archive and its device-link requirements.
+add_library(galp_core STATIC core/compatibility.cpp)
+add_library(Galp::core ALIAS galp_core)
+set_target_properties(galp_core PROPERTIES EXPORT_NAME core)
+galp_configure_library(galp_core)
+target_link_libraries(galp_core PUBLIC galp_engine)
+if (GALP_WITH_JPEG_DCT)
+        target_link_libraries(galp_core PUBLIC galp_jpeg_dct_device)
+endif ()
 
 if (GALP_ENABLE_INSTALL)
+        set(GALP_INSTALL_TARGETS galp_core galp_engine)
+        if (GALP_WITH_JPEG_DCT)
+                list(APPEND GALP_INSTALL_TARGETS galp_jpeg_dct_storage galp_jpeg_dct_device)
+        endif ()
         install(
-                TARGETS galp_core
+                TARGETS ${GALP_INSTALL_TARGETS}
                 EXPORT GalpTargets
                 ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
                 LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -84,7 +134,6 @@ if (GALP_ENABLE_INSTALL)
                 NAMESPACE Galp::
                 DESTINATION ${CMAKE_INSTALL_LIBDIR}/Galp
         )
-
         export(
                 EXPORT GalpTargets
                 FILE "${CMAKE_BINARY_DIR}/GalpTargets.cmake"

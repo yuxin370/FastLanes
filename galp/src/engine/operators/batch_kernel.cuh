@@ -38,7 +38,7 @@ void launch_batch_no_sync(const galp::execution::Batch<T>& batch,
 	if (batch.device_exprs.empty() || !d_exprs || !d_items || n_items == 0) {
 		return;
 	}
-	uint32_t threads = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<T>());
+	uint32_t   threads        = static_cast<uint32_t>(galp::codec::utils::get_n_lanes<T>());
 	const auto update_threads = [&](const WorkItemAny& work) {
 		threads = std::max(
 		    threads, galp::execution::semantic_lane_count(type_tag_for<T>(), batch.device_exprs[work.expr_index].plan));
@@ -55,9 +55,13 @@ void launch_batch_no_sync(const galp::execution::Batch<T>& batch,
 	runtime::with_unpack_config(cfg, [&](auto unpack_n_vectors, auto unpack_n_values) {
 		constexpr unsigned UNPACK_N_VECTORS = decltype(unpack_n_vectors)::value;
 		constexpr unsigned UNPACK_N_VALUES  = decltype(unpack_n_values)::value;
-		galp::kernels::device::decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT>
-		    <<<grid, block, 0, stream>>>(d_exprs, d_items, n_items);
-		CUDA_SAFE_CALL(cudaGetLastError());
+		runtime::with_delta_decoder(cfg, [&](auto delta_decoder) {
+			constexpr auto DELTA_DECODER = decltype(delta_decoder)::value;
+			galp::kernels::device::
+			    decompress_dispatch_typed<T, UNPACK_N_VECTORS, UNPACK_N_VALUES, WRITE_OUT, DELTA_DECODER>
+			    <<<grid, block, 0, stream>>>(d_exprs, d_items, n_items);
+			CUDA_SAFE_CALL(cudaGetLastError());
+		});
 	});
 }
 

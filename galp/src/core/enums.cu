@@ -102,6 +102,7 @@ Encoding string_to_encoding(const std::string& str) {
 	    {"bit-packing", Encoding::BIT_PACKING},
 	    {"ffor", Encoding::FFOR},
 	    {"delta", Encoding::DELTA},
+	    {"delta-register", Encoding::DELTA_REGISTER},
 	    {"frequency", Encoding::FREQUENCY},
 	    {"cross-rle", Encoding::CROSS_RLE},
 	    {"dictionary", Encoding::DICTIONARY},
@@ -129,6 +130,8 @@ std::string encoding_to_string(const Encoding type) {
 		return "ffor";
 	case Encoding::DELTA:
 		return "delta";
+	case Encoding::DELTA_REGISTER:
+		return "delta-register";
 	case Encoding::FREQUENCY:
 		return "frequency";
 	case Encoding::CROSS_RLE:

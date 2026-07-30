@@ -6,8 +6,8 @@
 #ifndef GALP_ENGINE_UNPACK_DISPATCH_CUH
 #define GALP_ENGINE_UNPACK_DISPATCH_CUH
 
-#include "engine/config.cuh"
 #include "codecs/consts.cuh"
+#include "engine/config.cuh"
 #include <stdexcept>
 #include <type_traits>
 
@@ -45,6 +45,21 @@ decltype(auto) with_unpack_config(const ExecutionConfig& cfg, Fn&& fn) {
 	default:
 		throw std::invalid_argument("unsupported unpack config: supported tuples are (1,1), (2,1), and (4,1)");
 	}
+}
+
+template <typename Fn>
+decltype(auto) with_delta_decoder(const ExecutionConfig& cfg, Fn&& fn) {
+	switch (galp::execution::resolve_delta_decoder(cfg.delta_decoder)) {
+	case galp::execution::DeltaDecoder::Stateful:
+		return fn(std::integral_constant<galp::execution::DeltaDecoder, galp::execution::DeltaDecoder::Stateful> {});
+	case galp::execution::DeltaDecoder::Register:
+		return fn(std::integral_constant<galp::execution::DeltaDecoder, galp::execution::DeltaDecoder::Register> {});
+	case galp::execution::DeltaDecoder::Auto:
+		break;
+	default:
+		break;
+	}
+	throw std::invalid_argument("unsupported DELTA decoder");
 }
 
 } // namespace galp::runtime

@@ -29,10 +29,7 @@ uint64_t rectangle_intersection_count(const uint64_t width,
 	return std::min(size, width - origin_x) * std::min(size, height - origin_y);
 }
 
-uint64_t morton_rank_in_rectangle(const uint32_t width,
-                                  const uint32_t height,
-                                  const uint32_t x,
-                                  const uint32_t y) {
+uint64_t morton_rank_in_rectangle(const uint32_t width, const uint32_t height, const uint32_t x, const uint32_t y) {
 	uint64_t size = 1;
 	while (size < std::max<uint64_t>(width, height)) {
 		size <<= 1U;
@@ -42,9 +39,9 @@ uint64_t morton_rank_in_rectangle(const uint32_t width,
 	uint64_t origin_x = 0;
 	uint64_t origin_y = 0;
 	while (size > 1) {
-		const auto half = size >> 1U;
-		const auto qx   = static_cast<uint32_t>(x >= origin_x + half);
-		const auto qy   = static_cast<uint32_t>(y >= origin_y + half);
+		const auto half            = size >> 1U;
+		const auto qx              = static_cast<uint32_t>(x >= origin_x + half);
+		const auto qy              = static_cast<uint32_t>(y >= origin_y + half);
 		const auto target_quadrant = qx | (qy << 1U);
 		for (uint32_t quadrant = 0; quadrant < target_quadrant; ++quadrant) {
 			const auto child_x = origin_x + ((quadrant & 1U) != 0 ? half : 0);
@@ -62,11 +59,89 @@ uint64_t morton_rank_in_rectangle(const uint32_t width,
 	return rank;
 }
 
+void append_rank_interval(std::vector<BlockRankInterval>& intervals, const uint64_t begin, const uint64_t end) {
+	if (begin >= end) {
+		return;
+	}
+	if (!intervals.empty() && begin <= intervals.back().end) {
+		intervals.back().end = std::max(intervals.back().end, end);
+		return;
+	}
+	intervals.push_back(BlockRankInterval {begin, end});
+}
+
+void append_morton_rectangle_intervals(std::vector<BlockRankInterval>& intervals,
+	                                   const uint32_t                 domain_width,
+	                                   const uint32_t                 domain_height,
+	                                   const uint32_t                 crop_x,
+	                                   const uint32_t                 crop_y,
+	                                   const uint32_t                 crop_end_x,
+	                                   const uint32_t                 crop_end_y,
+	                                   const uint64_t                 origin_x,
+	                                   const uint64_t                 origin_y,
+	                                   const uint64_t                 size,
+	                                   uint64_t&                      rank_cursor) {
+	const auto node_width  = origin_x >= domain_width ? 0U : std::min<uint64_t>(size, domain_width - origin_x);
+	const auto node_height = origin_y >= domain_height ? 0U : std::min<uint64_t>(size, domain_height - origin_y);
+	const auto node_count  = node_width * node_height;
+	if (node_count == 0U) {
+		return;
+	}
+	const auto node_end_x = origin_x + node_width;
+	const auto node_end_y = origin_y + node_height;
+	const bool disjoint = node_end_x <= crop_x || node_end_y <= crop_y || origin_x >= crop_end_x || origin_y >= crop_end_y;
+	if (disjoint) {
+		rank_cursor += node_count;
+		return;
+	}
+	const bool contained = origin_x >= crop_x && origin_y >= crop_y && node_end_x <= crop_end_x && node_end_y <= crop_end_y;
+	if (contained || size == 1U) {
+		append_rank_interval(intervals, rank_cursor, rank_cursor + node_count);
+		rank_cursor += node_count;
+		return;
+	}
+	const auto half = size >> 1U;
+	for (uint32_t quadrant = 0; quadrant < 4U; ++quadrant) {
+		append_morton_rectangle_intervals(intervals,
+		                                  domain_width,
+		                                  domain_height,
+		                                  crop_x,
+		                                  crop_y,
+		                                  crop_end_x,
+		                                  crop_end_y,
+		                                  origin_x + ((quadrant & 1U) != 0U ? half : 0U),
+		                                  origin_y + ((quadrant & 2U) != 0U ? half : 0U),
+		                                  half,
+		                                  rank_cursor);
+	}
+}
+
+void append_local_morton_rectangle_intervals(std::vector<BlockRankInterval>& intervals,
+	                                         const uint32_t                 width,
+	                                         const uint32_t                 height,
+	                                         const uint32_t                 x,
+	                                         const uint32_t                 y,
+	                                         const uint32_t                 crop_width,
+	                                         const uint32_t                 crop_height,
+	                                         const uint64_t                 rank_base) {
+	uint64_t size = 1U;
+	while (size < std::max<uint64_t>(width, height)) {
+		size <<= 1U;
+	}
+	uint64_t cursor = 0U;
+	std::vector<BlockRankInterval> local;
+	append_morton_rectangle_intervals(
+	    local, width, height, x, y, x + crop_width, y + crop_height, 0U, 0U, size, cursor);
+	for (const auto& interval : local) {
+		append_rank_interval(intervals, rank_base + interval.begin, rank_base + interval.end);
+	}
+}
+
 void append_raster_tile(std::vector<MortonBlockCoord>& order,
-                        const uint32_t                  tile_x,
-                        const uint32_t                  tile_y,
-                        const uint32_t                  tile_width,
-                        const uint32_t                  tile_height) {
+                        const uint32_t                 tile_x,
+                        const uint32_t                 tile_y,
+                        const uint32_t                 tile_width,
+                        const uint32_t                 tile_height) {
 	for (uint32_t local_y = 0; local_y < tile_height; ++local_y) {
 		for (uint32_t local_x = 0; local_x < tile_width; ++local_x) {
 			const auto x = tile_x + local_x;
@@ -77,10 +152,10 @@ void append_raster_tile(std::vector<MortonBlockCoord>& order,
 }
 
 void append_z_tile(std::vector<MortonBlockCoord>& order,
-                   const uint32_t                  tile_x,
-                   const uint32_t                  tile_y,
-                   const uint32_t                  tile_width,
-                   const uint32_t                  tile_height) {
+                   const uint32_t                 tile_x,
+                   const uint32_t                 tile_y,
+                   const uint32_t                 tile_width,
+                   const uint32_t                 tile_height) {
 	const auto begin = order.size();
 	append_raster_tile(order, tile_x, tile_y, tile_width, tile_height);
 	std::stable_sort(order.begin() + static_cast<std::ptrdiff_t>(begin),
@@ -104,9 +179,8 @@ uint64_t morton_key(const uint32_t x, const uint32_t y) {
 	return part_1_by_1(x) | (part_1_by_1(y) << 1U);
 }
 
-std::vector<MortonBlockCoord> make_block_order(const uint32_t width_in_blocks,
-                                               const uint32_t height_in_blocks,
-                                               const bool     use_z_curve_order) {
+std::vector<MortonBlockCoord>
+make_block_order(const uint32_t width_in_blocks, const uint32_t height_in_blocks, const bool use_z_curve_order) {
 	return make_block_order(width_in_blocks,
 	                        height_in_blocks,
 	                        use_z_curve_order ? JpegDctSpatialOrder::kZOrder : JpegDctSpatialOrder::kRaster);
@@ -163,24 +237,91 @@ uint64_t block_order_rank(const uint32_t            width_in_blocks,
 	case JpegDctSpatialOrder::kZOrder:
 		return morton_rank_in_rectangle(width_in_blocks, height_in_blocks, x, y);
 	case JpegDctSpatialOrder::kTiledRaster32:
-	case JpegDctSpatialOrder::kTiledZ32:
-	{
-		const auto tile_x      = (x / kSpatialTileBlocks) * kSpatialTileBlocks;
-		const auto tile_y      = (y / kSpatialTileBlocks) * kSpatialTileBlocks;
-		const auto tile_width  = std::min(kSpatialTileBlocks, width_in_blocks - tile_x);
-		const auto tile_height = std::min(kSpatialTileBlocks, height_in_blocks - tile_y);
+	case JpegDctSpatialOrder::kTiledZ32: {
+		const auto tile_x          = (x / kSpatialTileBlocks) * kSpatialTileBlocks;
+		const auto tile_y          = (y / kSpatialTileBlocks) * kSpatialTileBlocks;
+		const auto tile_width      = std::min(kSpatialTileBlocks, width_in_blocks - tile_x);
+		const auto tile_height     = std::min(kSpatialTileBlocks, height_in_blocks - tile_y);
 		const auto before_tile_row = static_cast<uint64_t>(tile_y) * width_in_blocks;
 		const auto before_tile     = static_cast<uint64_t>(tile_height) * tile_x;
 		const auto local_x         = x - tile_x;
 		const auto local_y         = y - tile_y;
-		const auto within_tile = spatial_order == JpegDctSpatialOrder::kTiledRaster32
-		                             ? static_cast<uint64_t>(local_y) * tile_width + local_x
-		                             : morton_rank_in_rectangle(tile_width, tile_height, local_x, local_y);
+		const auto within_tile     = spatial_order == JpegDctSpatialOrder::kTiledRaster32
+		                                 ? static_cast<uint64_t>(local_y) * tile_width + local_x
+		                                 : morton_rank_in_rectangle(tile_width, tile_height, local_x, local_y);
 		return before_tile_row + before_tile + within_tile;
 	}
 	default:
 		throw std::runtime_error("unknown JPEG DCT spatial order");
 	}
+}
+
+std::vector<BlockRankInterval> block_order_rectangle_rank_intervals(const uint32_t            width_in_blocks,
+	                                                                const uint32_t            height_in_blocks,
+	                                                                const uint32_t            x,
+	                                                                const uint32_t            y,
+	                                                                const uint32_t            width,
+	                                                                const uint32_t            height,
+	                                                                const JpegDctSpatialOrder spatial_order) {
+	std::vector<BlockRankInterval> intervals;
+	if (width_in_blocks == 0U || height_in_blocks == 0U || width == 0U || height == 0U || x >= width_in_blocks ||
+	    y >= height_in_blocks) {
+		return intervals;
+	}
+	const auto crop_end_x = static_cast<uint32_t>(
+	    std::min<uint64_t>(width_in_blocks, static_cast<uint64_t>(x) + width));
+	const auto crop_end_y = static_cast<uint32_t>(
+	    std::min<uint64_t>(height_in_blocks, static_cast<uint64_t>(y) + height));
+	switch (spatial_order) {
+	case JpegDctSpatialOrder::kRaster:
+		for (uint32_t row = y; row < crop_end_y; ++row) {
+			append_rank_interval(intervals,
+			                     static_cast<uint64_t>(row) * width_in_blocks + x,
+			                     static_cast<uint64_t>(row) * width_in_blocks + crop_end_x);
+		}
+		break;
+	case JpegDctSpatialOrder::kZOrder:
+		append_local_morton_rectangle_intervals(
+		    intervals, width_in_blocks, height_in_blocks, x, y, crop_end_x - x, crop_end_y - y, 0U);
+		break;
+	case JpegDctSpatialOrder::kTiledRaster32:
+	case JpegDctSpatialOrder::kTiledZ32: {
+		const auto first_tile_x = (x / kSpatialTileBlocks) * kSpatialTileBlocks;
+		const auto first_tile_y = (y / kSpatialTileBlocks) * kSpatialTileBlocks;
+		for (uint32_t tile_y = first_tile_y; tile_y < crop_end_y; tile_y += kSpatialTileBlocks) {
+			for (uint32_t tile_x = first_tile_x; tile_x < crop_end_x; tile_x += kSpatialTileBlocks) {
+				const auto tile_width  = std::min(kSpatialTileBlocks, width_in_blocks - tile_x);
+				const auto tile_height = std::min(kSpatialTileBlocks, height_in_blocks - tile_y);
+				const auto local_x      = std::max(x, tile_x) - tile_x;
+				const auto local_y      = std::max(y, tile_y) - tile_y;
+				const auto local_end_x  = std::min(crop_end_x, tile_x + tile_width) - tile_x;
+				const auto local_end_y  = std::min(crop_end_y, tile_y + tile_height) - tile_y;
+				const auto rank_base = static_cast<uint64_t>(tile_y) * width_in_blocks +
+				                       static_cast<uint64_t>(tile_height) * tile_x;
+				if (spatial_order == JpegDctSpatialOrder::kTiledRaster32) {
+					for (uint32_t row = local_y; row < local_end_y; ++row) {
+						append_rank_interval(intervals,
+						                     rank_base + static_cast<uint64_t>(row) * tile_width + local_x,
+						                     rank_base + static_cast<uint64_t>(row) * tile_width + local_end_x);
+					}
+				} else {
+					append_local_morton_rectangle_intervals(intervals,
+					                                        tile_width,
+					                                        tile_height,
+					                                        local_x,
+					                                        local_y,
+					                                        local_end_x - local_x,
+					                                        local_end_y - local_y,
+					                                        rank_base);
+				}
+			}
+		}
+		break;
+	}
+	default:
+		throw std::runtime_error("unknown JPEG DCT spatial order");
+	}
+	return intervals;
 }
 
 } // namespace galp::jpeg::detail

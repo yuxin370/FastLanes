@@ -11,6 +11,7 @@
 #include "codecs/utils.cuh"
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace galp::codec::device {
 
@@ -38,8 +39,7 @@ private:
 
 public:
 	template <typename ColumnT>
-	__device__ __forceinline__
-	RLEUnsumer(const ColumnT column, const vi_t vector_index, const lane_t lane) {
+	__device__ __forceinline__ RLEUnsumer(const ColumnT column, const vi_t vector_index, const lane_t lane) {
 #pragma unroll
 		for (unsigned v = 0; v < UNPACK_N_VECTORS; ++v) {
 			const IndexT* base_ptr = column.rsum_bases + (vector_index + v) * N_LANES;
@@ -71,9 +71,9 @@ struct DeltaUnsumer;
 template <unsigned UNPACK_N_VECTORS>
 struct DeltaUnsumer<int8_t, UNPACK_N_VECTORS> {
 private:
-	using UIntT = uint8_t;
+	using UIntT                      = uint8_t;
 	static constexpr int32_t N_LANES = galp::codec::utils::get_n_lanes<int8_t>();
-	UIntT                   prefixes[UNPACK_N_VECTORS];
+	UIntT                    prefixes[UNPACK_N_VECTORS];
 
 public:
 	template <typename ColumnT>
@@ -102,13 +102,13 @@ public:
 template <unsigned UNPACK_N_VECTORS>
 struct DeltaUnsumer<int16_t, UNPACK_N_VECTORS> {
 private:
-	using UIntT = uint16_t;
+	using UIntT                                 = uint16_t;
 	static constexpr unsigned N_VALUES_PER_LANE = galp::codec::utils::get_values_per_lane<int16_t>();
 	static constexpr int32_t  N_LANES           = galp::codec::utils::get_n_lanes<int16_t>();
 	static_assert(N_VALUES_PER_LANE == 16);
 
-	UIntT   values[UNPACK_N_VECTORS * N_VALUES_PER_LANE];
-	UIntT   prefixes[UNPACK_N_VECTORS];
+	UIntT    values[UNPACK_N_VECTORS * N_VALUES_PER_LANE];
+	UIntT    prefixes[UNPACK_N_VECTORS];
 	unsigned cursor      = 0;
 	bool     initialized = false;
 
@@ -137,7 +137,7 @@ private:
 			for (unsigned logical_position = 0; logical_position < N_VALUES_PER_LANE; ++logical_position) {
 				const unsigned index = vector * N_VALUES_PER_LANE + code_index(logical_position);
 				prefix               = static_cast<UIntT>(prefix + values[index]);
-				values[index]         = prefix;
+				values[index]        = prefix;
 			}
 		}
 		initialized = true;
@@ -160,6 +160,84 @@ public:
 			out[vector] = static_cast<int16_t>(values[vector * N_VALUES_PER_LANE + cursor]);
 		}
 		++cursor;
+	}
+};
+
+// Whole-lane DELTA unsumer used by DELTARegisterDecompressor. The input and
+// output are vector-major lane tiles. All positions are compile-time constants
+// after unrolling, so the caller's tile can be scalarized into registers.
+template <typename T, unsigned UNPACK_N_VECTORS>
+struct DeltaRegisterUnsumer {
+	using UIntT                                 = typename galp::codec::utils::same_width_uint<T>::type;
+	static constexpr unsigned N_VALUES_PER_LANE = galp::codec::utils::get_values_per_lane<T>();
+	static constexpr int32_t  N_LANES           = galp::codec::utils::get_n_lanes<T>();
+
+	UIntT bases[UNPACK_N_VECTORS];
+
+	__device__ __forceinline__ static constexpr unsigned code_index(const unsigned logical_position) {
+		if constexpr (std::is_same_v<T, int16_t>) {
+			static_assert(N_VALUES_PER_LANE == 16);
+			return logical_position < 8U ? logical_position * 2U : (logical_position - 8U) * 2U + 1U;
+		}
+		return logical_position;
+	}
+
+	template <typename ColumnT>
+	__device__ __forceinline__ DeltaRegisterUnsumer(const ColumnT column, const vi_t vector_index, const lane_t lane) {
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			bases[vector] = column.rsum_bases[(vector_index + vector) * N_LANES + lane];
+		}
+	}
+
+	__device__ __forceinline__ void unsum_inplace(UIntT* __restrict values) const {
+		static_assert(N_VALUES_PER_LANE % 2U == 0U);
+		constexpr unsigned SEGMENT_SIZE = N_VALUES_PER_LANE / 2U;
+		UIntT             first_prefix[UNPACK_N_VECTORS];
+		UIntT             second_prefix[UNPACK_N_VECTORS];
+
+#pragma unroll
+		for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+			first_prefix[vector]  = bases[vector];
+			second_prefix[vector] = UIntT {0};
+		}
+
+		// The two half-lane scans are independent. Keeping vector as the inner
+		// loop exposes the U=2/U=4 chains as instruction-level parallelism while
+		// reducing the critical dependency depth from 8/16 to 4/8 additions.
+#pragma unroll
+		for (unsigned logical_position = 0; logical_position < SEGMENT_SIZE; ++logical_position) {
+#pragma unroll
+			for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+				const unsigned physical_position = code_index(logical_position);
+				const unsigned index             = vector * N_VALUES_PER_LANE + physical_position;
+				first_prefix[vector] = static_cast<UIntT>(first_prefix[vector] + values[index]);
+				values[index]       = first_prefix[vector];
+			}
+		}
+
+#pragma unroll
+		for (unsigned logical_position = SEGMENT_SIZE; logical_position < N_VALUES_PER_LANE;
+		     ++logical_position) {
+#pragma unroll
+			for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+				const unsigned physical_position = code_index(logical_position);
+				const unsigned index             = vector * N_VALUES_PER_LANE + physical_position;
+				second_prefix[vector] = static_cast<UIntT>(second_prefix[vector] + values[index]);
+				values[index]        = second_prefix[vector];
+			}
+		}
+
+#pragma unroll
+		for (unsigned logical_position = SEGMENT_SIZE; logical_position < N_VALUES_PER_LANE;
+		     ++logical_position) {
+#pragma unroll
+			for (unsigned vector = 0; vector < UNPACK_N_VECTORS; ++vector) {
+				const unsigned physical_position = code_index(logical_position);
+				const unsigned index             = vector * N_VALUES_PER_LANE + physical_position;
+				values[index] = static_cast<UIntT>(values[index] + first_prefix[vector]);
+			}
+		}
 	}
 };
 

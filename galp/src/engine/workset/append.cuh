@@ -53,6 +53,49 @@ inline bool begin_workset_chunk_arena(ExecutionWorkset& workset, const size_t ad
 	return true;
 }
 
+inline void append_packed_rowgroup_device_scatter(ExecutionWorkset&                workset,
+                                                  const galp::execution::Rowgroup& rowgroup,
+                                                  galp::memory::DeviceArena&       arena) {
+	const auto& payload = rowgroup.packed_device_payload;
+	if (!payload) {
+		return;
+	}
+	if (payload->packed_data == nullptr || payload->packed_bytes == 0U || payload->logical_data == nullptr ||
+	    payload->logical_bytes == 0U || payload->ranges.empty()) {
+		throw std::runtime_error("packed rowgroup device payload is incomplete");
+	}
+
+	arena.register_backing(payload->logical_data, payload->logical_bytes, /*upload=*/false);
+	const auto logical_entry = arena.add<std::byte>(payload->logical_bytes, payload->logical_data);
+	const auto packed_entry  = arena.add<std::byte>(payload->packed_bytes, payload->packed_data);
+
+	const size_t plan_index = workset.buffers.pending_device_scatters.size();
+	const size_t copy_begin = workset.buffers.device_scatter_copies.size();
+	workset.buffers.pending_device_scatters.push_back(
+	    PendingDeviceScatter {payload, nullptr, nullptr, copy_begin});
+	workset.buffers.device_scatter_copies.resize(copy_begin + payload->ranges.size());
+	auto& plan = workset.buffers.pending_device_scatters.back();
+	arena.resolve_to(reinterpret_cast<void**>(&plan.device_logical), logical_entry);
+	arena.resolve_to(reinterpret_cast<void**>(&plan.device_packed), packed_entry);
+	arena.add_resolver([&workset, plan_index]() {
+		auto& resolved = workset.buffers.pending_device_scatters.at(plan_index);
+		const auto& ranges = resolved.payload->ranges;
+		for (size_t index = 0; index < ranges.size(); ++index) {
+			const auto& range = ranges[index];
+			if (range.packed_offset > resolved.payload->packed_bytes ||
+			    range.size > resolved.payload->packed_bytes - range.packed_offset ||
+			    range.logical_offset > resolved.payload->logical_bytes ||
+			    range.size > resolved.payload->logical_bytes - range.logical_offset) {
+				throw std::runtime_error("packed rowgroup device scatter range exceeds its backing");
+			}
+			workset.buffers.device_scatter_copies[resolved.copy_begin + index] = DeviceScatterCopy {
+			    resolved.device_packed + range.packed_offset,
+			    resolved.device_logical + range.logical_offset,
+			    range.size};
+		}
+	});
+}
+
 template <typename T>
 inline size_t reserve_workset_output_bytes(ExecutionWorkset& workset, const size_t n_values) {
 	if (n_values == 0) {
@@ -267,7 +310,6 @@ inline void append_rowgroup_columns(ExecutionWorkset&                workset,
 	workset.outputs.required = workset.outputs.required || cfg.write_out;
 	begin_workset_chunk_arena(workset, rowgroup.columns.size());
 	galp::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
-
 	size_t      active_expr_count  = 0;
 	const void* last_backing_base  = nullptr;
 	size_t      last_backing_bytes = 0;
@@ -306,6 +348,12 @@ inline void append_rowgroup_columns_selected_vectors(ExecutionWorkset&          
 	workset.outputs.required = workset.outputs.required || cfg.write_out;
 	begin_workset_chunk_arena(workset, rowgroup.columns.size());
 	galp::memory::DeviceArena* active_chunk_arena = workset.buffers.chunk_arena.get();
+	workset.buffers.pending_device_scatters.reserve(workset.buffers.pending_device_scatters.size() + 1U);
+	if (rowgroup.packed_device_payload) {
+		workset.buffers.device_scatter_copies.reserve(
+		    workset.buffers.device_scatter_copies.size() + rowgroup.packed_device_payload->ranges.size());
+	}
+	append_packed_rowgroup_device_scatter(workset, rowgroup, *active_chunk_arena);
 
 	size_t      active_expr_count  = 0;
 	const void* last_backing_base  = nullptr;

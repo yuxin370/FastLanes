@@ -10,6 +10,7 @@
 #include "format/reader.cuh"
 #include <chrono>
 #include <cstddef>
+#include <string>
 
 namespace galp::runtime {
 
@@ -66,6 +67,14 @@ struct RowgroupReadResult {
 	size_t                 rowgroup_index = 0;
 	galp::format::Rowgroup       rowgroup {};
 	size_t                 storage_bytes = 0;
+	size_t                 full_storage_bytes = 0;
+	size_t                 pread_count = 0;
+	bool                   sparse_read_supported = false;
+	bool                   used_sparse_read = false;
+	bool                   used_pinned_backing = false;
+	bool                   used_vector_bundle_read = false;
+	bool                   used_vector_bundle_envelope_read = false;
+	std::string            sparse_fallback_reason;
 	RowgroupReadTiming     timing {};
 	RowgroupPrefetchTiming prefetch {};
 };

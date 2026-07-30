@@ -8,6 +8,7 @@
 
 #include "codecs/encodings/all.cuh"
 #include "core/data/model.cuh"
+#include "core/expression.cuh"
 #include "engine/config.cuh"
 #include "format/reader.cuh"
 
@@ -30,6 +31,7 @@ inline void free_rowgroup(galp::format::Rowgroup& rowgroup) {
 	if (rowgroup.backing_storage) {
 		rowgroup.backing_storage.reset();
 	}
+	rowgroup.packed_device_payload.reset();
 }
 
 RowgroupData decompress_rowgroup(std::vector<galp::expression::Expression>& expressions, const ExecutionConfig& cfg = {});

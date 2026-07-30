@@ -79,6 +79,24 @@ struct RebindUnpackVectors<
 	    InT>;
 };
 
+template <typename OutT,
+          unsigned OLD_UNPACK_N_VECTORS,
+          unsigned UNPACK_N_VALUES,
+          typename OutputProcessor,
+          typename InT,
+          unsigned NEW_UNPACK_N_VECTORS>
+struct RebindUnpackVectors<
+    galp::codec::device::BitUnpackerLaneTile<
+        OutT, OLD_UNPACK_N_VECTORS, UNPACK_N_VALUES, OutputProcessor, InT>,
+    NEW_UNPACK_N_VECTORS> {
+	using type = galp::codec::device::BitUnpackerLaneTile<
+	    OutT,
+	    NEW_UNPACK_N_VECTORS,
+	    UNPACK_N_VALUES,
+	    typename RebindUnpackVectors<OutputProcessor, NEW_UNPACK_N_VECTORS>::type,
+	    InT>;
+};
+
 #define GALP_REBIND_T_UV(TypeName)                                                                                     \
 	template <typename T, unsigned OLD_UNPACK_N_VECTORS, unsigned UNPACK_N_VALUES, unsigned NEW_UNPACK_N_VECTORS>      \
 	struct RebindUnpackVectors<galp::codec::device::TypeName<T, OLD_UNPACK_N_VECTORS, UNPACK_N_VALUES>,                \
@@ -179,17 +197,31 @@ struct RebindUnpackVectors<galp::codec::device::FFORDecompressor<T, OLD_UNPACK_N
 };
 
 template <typename T,
-	      unsigned OLD_UNPACK_N_VECTORS,
-	      typename UnpackerT,
-	      typename ColumnT,
-	      unsigned NEW_UNPACK_N_VECTORS>
+          unsigned OLD_UNPACK_N_VECTORS,
+          typename UnpackerT,
+          typename ColumnT,
+          unsigned NEW_UNPACK_N_VECTORS>
 struct RebindUnpackVectors<galp::codec::device::DELTADecompressor<T, OLD_UNPACK_N_VECTORS, UnpackerT, ColumnT>,
-	                       NEW_UNPACK_N_VECTORS> {
+                           NEW_UNPACK_N_VECTORS> {
 	using type =
 	    galp::codec::device::DELTADecompressor<T,
-	                                          NEW_UNPACK_N_VECTORS,
-	                                          typename RebindUnpackVectors<UnpackerT, NEW_UNPACK_N_VECTORS>::type,
-	                                          ColumnT>;
+	                                           NEW_UNPACK_N_VECTORS,
+	                                           typename RebindUnpackVectors<UnpackerT, NEW_UNPACK_N_VECTORS>::type,
+	                                           ColumnT>;
+};
+
+template <typename T,
+          unsigned OLD_UNPACK_N_VECTORS,
+          typename UnpackerT,
+          typename ColumnT,
+          unsigned NEW_UNPACK_N_VECTORS>
+struct RebindUnpackVectors<galp::codec::device::DELTARegisterDecompressor<T, OLD_UNPACK_N_VECTORS, UnpackerT, ColumnT>,
+                           NEW_UNPACK_N_VECTORS> {
+	using type = galp::codec::device::DELTARegisterDecompressor<
+	    T,
+	    NEW_UNPACK_N_VECTORS,
+	    typename RebindUnpackVectors<UnpackerT, NEW_UNPACK_N_VECTORS>::type,
+	    ColumnT>;
 };
 
 template <typename T,
@@ -313,17 +345,15 @@ template <typename ValueT,
           typename ExpanderT,
           typename ColumnT,
           unsigned NEW_UNPACK_N_VECTORS>
-struct RebindUnpackVectors<
-    galp::codec::device::
-        RLESLPATCHDecompressor<ValueT,
-                               IndexT,
-                               OLD_UNPACK_N_VECTORS,
-                               UNPACK_N_VALUES,
-                               UnpackerT,
-                               PatcherT,
-                               ExpanderT,
-                               ColumnT>,
-    NEW_UNPACK_N_VECTORS> {
+struct RebindUnpackVectors<galp::codec::device::RLESLPATCHDecompressor<ValueT,
+                                                                       IndexT,
+                                                                       OLD_UNPACK_N_VECTORS,
+                                                                       UNPACK_N_VALUES,
+                                                                       UnpackerT,
+                                                                       PatcherT,
+                                                                       ExpanderT,
+                                                                       ColumnT>,
+                           NEW_UNPACK_N_VECTORS> {
 	using type =
 	    galp::codec::device::RLESLPATCHDecompressor<ValueT,
 	                                                IndexT,

@@ -316,7 +316,7 @@ RowgroupReadResult read_rowgroup(galp::format::FlsReader&                       
 	std::chrono::steady_clock::time_point file_read_start {};
 	const size_t                          storage_bytes = rdr.rowgroup_storage_bytes(rowgroup_index);
 	result.rowgroup_index                               = rowgroup_index;
-	result.storage_bytes                                = storage_bytes;
+	result.full_storage_bytes                           = storage_bytes;
 	if (pinned_pool) {
 		const auto acquire_start = std::chrono::steady_clock::now();
 		auto       lease         = pinned_pool->acquire(storage_bytes);
@@ -341,6 +341,15 @@ RowgroupReadResult read_rowgroup(galp::format::FlsReader&                       
 	result.timing.file_read_ms = std::chrono::duration<double, std::milli>(file_read_end - file_read_start).count();
 	result.timing.rowgroup_build_ms       = std::chrono::duration<double, std::milli>(build_end - build_start).count();
 	result.timing.pread_ms                = io_timing.pread_ms;
+	result.storage_bytes                  = io_timing.storage_bytes;
+	result.full_storage_bytes             = io_timing.full_storage_bytes;
+	result.pread_count                    = io_timing.pread_count;
+	result.sparse_read_supported          = io_timing.sparse_read_supported;
+	result.used_sparse_read               = io_timing.used_sparse_read;
+	result.used_pinned_backing             = io_timing.used_pinned_backing;
+	result.used_vector_bundle_read        = io_timing.used_vector_bundle_read;
+	result.used_vector_bundle_envelope_read = io_timing.used_vector_bundle_envelope_read;
+	result.sparse_fallback_reason         = io_timing.sparse_fallback_reason;
 	result.timing.zero_copy_view_setup_ms = io_timing.zero_copy_view_setup_ms;
 	result.timing.timeline.pread_start    = io_timing.pread_start;
 	result.timing.timeline.pread_end      = io_timing.pread_end;

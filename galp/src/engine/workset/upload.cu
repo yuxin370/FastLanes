@@ -8,10 +8,22 @@
 #include "engine/workset/streams.cuh"
 #include "engine/workset/upload.cuh"
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 
 namespace galp::runtime {
 namespace {
+
+__global__ void scatter_packed_rowgroup_ranges_kernel(const DeviceScatterCopy* copies, const size_t copy_count) {
+	const size_t copy_index = static_cast<size_t>(blockIdx.x);
+	if (copy_index >= copy_count) {
+		return;
+	}
+	const auto copy = copies[copy_index];
+	for (size_t offset = threadIdx.x; offset < copy.size; offset += blockDim.x) {
+		copy.destination[offset] = copy.source[offset];
+	}
+}
 
 size_t round_up_capacity_bytes(const size_t bytes, const size_t alignment = 65536U) {
 	if (bytes == 0) {
@@ -189,6 +201,7 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 		clear_mixed_slots(workset.slots);
 	}
 	workset.buffers.payload_arena_bytes = 0;
+	workset.buffers.d_device_scatter_copies = nullptr;
 
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {
 		using T         = typename decltype(tag)::type;
@@ -260,12 +273,28 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 			    workset.slots.scalar_tail_mixed.size(), workset.slots.scalar_tail_mixed.data());
 			arena.resolve_to(reinterpret_cast<void**>(&workset.slots.d_scalar_tail), slot_idx);
 		}
+		if (!workset.buffers.device_scatter_copies.empty()) {
+			auto& arena = *workset.buffers.chunk_arena;
+			const auto scatter_idx = arena.template add<DeviceScatterCopy>(
+			    workset.buffers.device_scatter_copies.size(), workset.buffers.device_scatter_copies.data());
+			arena.resolve_to(reinterpret_cast<void**>(&workset.buffers.d_device_scatter_copies), scatter_idx);
+		}
 		const auto t2             = clock::now();
 		breakdown.arena_pack_ms   = ms(t1, t2);
 		breakdown.arena           = workset.buffers.chunk_arena->upload(/*resolve_before_pack=*/true,
                                                               /*backing_regions_coalesced=*/true);
 		const auto t3             = clock::now();
 		breakdown.arena_upload_ms = ms(t2, t3);
+		if (!workset.buffers.device_scatter_copies.empty()) {
+			if (workset.buffers.device_scatter_copies.size() > std::numeric_limits<unsigned>::max()) {
+				throw std::runtime_error("packed rowgroup device scatter count exceeds CUDA grid range");
+			}
+			constexpr unsigned kScatterThreads = 128U;
+			scatter_packed_rowgroup_ranges_kernel<<<
+			    static_cast<unsigned>(workset.buffers.device_scatter_copies.size()), kScatterThreads, 0, h2d_stream>>>(
+			    workset.buffers.d_device_scatter_copies, workset.buffers.device_scatter_copies.size());
+			CUDA_SAFE_CALL(cudaGetLastError());
+		}
 	}
 
 	const auto t4 = clock::now();

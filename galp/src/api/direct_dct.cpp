@@ -33,9 +33,11 @@ DirectDctBatch::DirectDctBatch() noexcept = default;
 
 DirectDctBatch::DirectDctBatch(JpegDctDeviceBatch    batch,
                                std::vector<uint32_t> global_image_ids,
+                               std::vector<JpegDctImageCropRequest> transform_requests,
                                const int             cuda_device) noexcept
     : batch_(std::move(batch))
     , global_image_ids_(std::move(global_image_ids))
+	, transform_requests_(std::move(transform_requests))
     , cuda_device_(cuda_device) {
 }
 
@@ -45,15 +47,15 @@ DirectDctBatch::DirectDctBatch(DirectDctBatch&&) noexcept = default;
 
 DirectDctBatch& DirectDctBatch::operator=(DirectDctBatch&&) noexcept = default;
 
-const int16_t* DirectDctBatch::device_data() const noexcept {
+const int16_t* DirectDctBatch::device_data() const {
 	return batch_.device_coefficients();
 }
 
-const int16_t* DirectDctBatch::y_device_data() const noexcept {
+const int16_t* DirectDctBatch::y_device_data() const {
 	return batch_.y_coefficients();
 }
 
-const int16_t* DirectDctBatch::cbcr_device_data() const noexcept {
+const int16_t* DirectDctBatch::cbcr_device_data() const {
 	return batch_.cbcr_coefficients();
 }
 
@@ -69,11 +71,11 @@ const int16_t* DirectDctBatch::cbcr_device_data_async() const noexcept {
 	return batch_.cbcr_coefficients_async();
 }
 
-const float* DirectDctBatch::y_float_device_data() const noexcept {
+const float* DirectDctBatch::y_float_device_data() const {
 	return batch_.y_float_coefficients();
 }
 
-const float* DirectDctBatch::cbcr_float_device_data() const noexcept {
+const float* DirectDctBatch::cbcr_float_device_data() const {
 	return batch_.cbcr_float_coefficients();
 }
 
@@ -259,6 +261,10 @@ const std::vector<uint32_t>& DirectDctBatch::global_image_ids() const noexcept {
 	return global_image_ids_;
 }
 
+const std::vector<JpegDctImageCropRequest>& DirectDctBatch::transform_requests() const noexcept {
+	return transform_requests_;
+}
+
 const std::vector<JpegDctDeviceImageLayout>& DirectDctBatch::image_layouts() const noexcept {
 	return batch_.image_layouts();
 }
@@ -279,7 +285,7 @@ JpegDctDeviceCacheStats DirectDctBatch::cache_stats() const noexcept {
 	return batch_.cache_stats();
 }
 
-JpegDctDeviceExecutionStats DirectDctBatch::execution_stats() const noexcept {
+JpegDctDeviceExecutionStats DirectDctBatch::execution_stats() const {
 	return batch_.execution_stats();
 }
 
@@ -293,6 +299,20 @@ const JpegDctDeviceExecutionStats& DirectDctBatch::execution_stats_ref() const n
 
 const JpegDctDeviceBatch& DirectDctBatch::device_batch() const noexcept {
 	return batch_;
+}
+
+DirectDctPreparedBatch::DirectDctPreparedBatch() noexcept = default;
+DirectDctPreparedBatch::~DirectDctPreparedBatch() = default;
+DirectDctPreparedBatch::DirectDctPreparedBatch(DirectDctPreparedBatch&&) noexcept = default;
+DirectDctPreparedBatch& DirectDctPreparedBatch::operator=(DirectDctPreparedBatch&&) noexcept = default;
+
+DirectDctPreparedBatch::DirectDctPreparedBatch(JpegDctDeviceBatchPreparedPlan         plan,
+	                                           std::vector<JpegDctImageCropRequest> requests) noexcept
+	: plan_(std::move(plan)), requests_(std::move(requests)) {
+}
+
+bool DirectDctPreparedBatch::empty() const noexcept {
+	return plan_.empty();
 }
 
 DirectDctRuntime::DirectDctRuntime(const std::filesystem::path& manifest_path)
@@ -320,10 +340,31 @@ uint64_t DirectDctRuntime::RowgroupStorageBytes(
 
 DirectDctBatch DirectDctRuntime::ReadBatch(const std::vector<JpegDctImageCropRequest>& requests,
                                            const JpegDctDeviceBatchOptions&            options) {
-	auto       batch  = reader_.ReadDeviceDctBatch(requests, options);
-	auto       ids    = request_global_image_ids(requests);
+	return ReadPreparedBatch(PrepareBatch(requests, options));
+}
+
+DirectDctPreparedBatch DirectDctRuntime::PrepareBatch(
+	const std::vector<JpegDctImageCropRequest>& requests, const JpegDctDeviceBatchOptions& options) {
+	return DirectDctPreparedBatch(reader_.PrepareDeviceDctBatch(requests, options), requests);
+}
+
+void DirectDctRuntime::StageBatchIo(DirectDctPreparedBatch& prepared) {
+	if (prepared.empty()) {
+		throw std::invalid_argument("DirectDct prepared batch is empty");
+	}
+	reader_.StagePreparedDeviceDctBatchIo(prepared.plan_);
+}
+
+DirectDctBatch DirectDctRuntime::ReadPreparedBatch(DirectDctPreparedBatch prepared) {
+	if (prepared.empty()) {
+		throw std::invalid_argument("DirectDct prepared batch is empty");
+	}
+	StageBatchIo(prepared);
+	auto       ids      = request_global_image_ids(prepared.requests_);
+	auto       requests = std::move(prepared.requests_);
+	auto       batch    = reader_.ReadPreparedDeviceDctBatch(std::move(prepared.plan_));
 	const auto device = batch.cuda_device();
-	return DirectDctBatch(std::move(batch), std::move(ids), device);
+	return DirectDctBatch(std::move(batch), std::move(ids), std::move(requests), device);
 }
 
 DirectDctBatch DirectDctRuntime::ReadBatch(const std::vector<uint32_t>&     global_image_ids,
@@ -333,7 +374,7 @@ DirectDctBatch DirectDctRuntime::ReadBatch(const std::vector<uint32_t>&     glob
 	auto       batch    = reader_.ReadDeviceDctBatch(requests, options);
 	auto       ids      = std::vector<uint32_t>(global_image_ids.begin(), global_image_ids.end());
 	const auto device   = batch.cuda_device();
-	return DirectDctBatch(std::move(batch), std::move(ids), device);
+	return DirectDctBatch(std::move(batch), std::move(ids), std::move(requests), device);
 }
 
 JpegDctDeviceBatchPlanPreview DirectDctRuntime::PlanBatch(const std::vector<JpegDctImageCropRequest>& requests,

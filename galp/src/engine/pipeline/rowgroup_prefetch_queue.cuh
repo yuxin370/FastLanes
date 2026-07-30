@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -44,13 +45,15 @@ public:
 	                      const size_t                              depth,
 	                      const size_t                              num_workers,
 	                      std::shared_ptr<PinnedRowgroupBufferPool> pinned_pool                = {},
-	                      const size_t                              max_inflight_storage_bytes = 0)
+	                      const size_t                              max_inflight_storage_bytes = 0,
+	                      std::vector<std::vector<uint32_t>>        selected_vectors            = {})
 	    : RowgroupPrefetchQueue(std::move(shared_reader),
 	                            make_contiguous_rowgroup_schedule(start, end),
 	                            depth,
 	                            num_workers,
 	                            std::move(pinned_pool),
-	                            max_inflight_storage_bytes) {
+	                            max_inflight_storage_bytes,
+	                            std::move(selected_vectors)) {
 	}
 
 	RowgroupPrefetchQueue(std::shared_ptr<galp::format::FlsReader>  shared_reader,
@@ -58,8 +61,10 @@ public:
 	                      const size_t                              depth,
 	                      const size_t                              num_workers,
 	                      std::shared_ptr<PinnedRowgroupBufferPool> pinned_pool                = {},
-	                      const size_t                              max_inflight_storage_bytes = 0)
+	                      const size_t                              max_inflight_storage_bytes = 0,
+	                      std::vector<std::vector<uint32_t>>        selected_vectors            = {})
 	    : rowgroups_(std::move(rowgroups))
+	    , selected_vectors_(std::move(selected_vectors))
 	    , depth_(std::max<size_t>(1, depth))
 	    , max_inflight_storage_bytes_(max_inflight_storage_bytes)
 	    , next_claim_(0)
@@ -70,6 +75,9 @@ public:
 	    , shared_reader_(std::move(shared_reader)) {
 		if (!shared_reader_) {
 			throw std::runtime_error("RowgroupPrefetchQueue: shared reader is null");
+		}
+		if (!selected_vectors_.empty() && selected_vectors_.size() != rowgroups_.size()) {
+			throw std::invalid_argument("RowgroupPrefetchQueue: selected-vector schedule size mismatch");
 		}
 		const size_t reader_rowgroups = shared_reader_->rowgroup_count();
 		for (const size_t rowgroup_index : rowgroups_) {
@@ -134,15 +142,24 @@ public:
 						galp::format::ZeroCopyRowgroup        zero_copy {};
 						galp::format::ZeroCopyReadTiming      io_timing {};
 						std::chrono::steady_clock::time_point file_read_start {};
-						prefetched.rowgroup_index = rg_idx;
-						prefetched.storage_bytes  = storage_bytes;
+						prefetched.rowgroup_index      = rg_idx;
+						prefetched.full_storage_bytes = storage_bytes;
 						prefetched.prefetch.depth_block_ms =
 						    std::chrono::duration<double, std::milli>(depth_block_end - depth_block_start).count();
 						if (blocked_by_bytes) {
 							prefetched.prefetch.byte_block_ms = prefetched.prefetch.depth_block_ms;
 						}
 						prefetched.prefetch.worker_id = w;
-						if (pinned_pool) {
+						const auto* selected = selected_vectors_.empty() || selected_vectors_[schedule_pos].empty()
+						                           ? nullptr
+						                           : &selected_vectors_[schedule_pos];
+						const bool use_packed_device_scatter =
+						    selected != nullptr && std::getenv("GALP_VECTOR_BUNDLE_DEVICE_SCATTER") != nullptr;
+						if (use_packed_device_scatter) {
+							file_read_start = std::chrono::steady_clock::now();
+							zero_copy = rdr.read_rowgroup_zero_copy_selected_vectors_packed(
+							    rg_idx, *selected, &io_timing);
+						} else if (pinned_pool) {
 							const auto                             acquire_start = std::chrono::steady_clock::now();
 							PinnedRowgroupBufferPool::AcquireStats acquire_stats {};
 							auto                                   lease = pinned_pool->acquire_for_owner_cancelable(
@@ -154,15 +171,25 @@ public:
 							prefetched.prefetch.pool_slot_owner_migrated = acquire_stats.owner_migrated;
 							prefetched.prefetch.pool_slot_allocated      = acquire_stats.allocated;
 							file_read_start                              = acquire_end;
-							zero_copy                                    = rdr.read_rowgroup_zero_copy_into(rg_idx,
-                                                                         std::move(lease.owner),
-                                                                         lease.data,
-                                                                         lease.capacity,
-                                                                         /*backing_is_pinned=*/true,
-                                                                         &io_timing);
+							zero_copy = selected != nullptr
+							                ? rdr.read_rowgroup_zero_copy_selected_vectors_into(rg_idx,
+							                                                                    *selected,
+							                                                                    std::move(lease.owner),
+							                                                                    lease.data,
+							                                                                    lease.capacity,
+							                                                                    /*backing_is_pinned=*/true,
+							                                                                    &io_timing)
+							                : rdr.read_rowgroup_zero_copy_into(rg_idx,
+							                                                     std::move(lease.owner),
+							                                                     lease.data,
+							                                                     lease.capacity,
+							                                                     /*backing_is_pinned=*/true,
+							                                                     &io_timing);
 						} else {
 							file_read_start = std::chrono::steady_clock::now();
-							zero_copy       = rdr.read_rowgroup_zero_copy(rg_idx, &io_timing);
+							zero_copy = selected != nullptr
+							                ? rdr.read_rowgroup_zero_copy_selected_vectors(rg_idx, *selected, &io_timing)
+							                : rdr.read_rowgroup_zero_copy(rg_idx, &io_timing);
 						}
 
 						const auto file_read_end = std::chrono::steady_clock::now();
@@ -174,6 +201,15 @@ public:
 						prefetched.timing.rowgroup_build_ms =
 						    std::chrono::duration<double, std::milli>(build_end - build_start).count();
 						prefetched.timing.pread_ms                = io_timing.pread_ms;
+						prefetched.storage_bytes                  = io_timing.storage_bytes;
+						prefetched.full_storage_bytes             = io_timing.full_storage_bytes;
+						prefetched.pread_count                    = io_timing.pread_count;
+						prefetched.sparse_read_supported          = io_timing.sparse_read_supported;
+						prefetched.used_sparse_read               = io_timing.used_sparse_read;
+						prefetched.used_pinned_backing             = io_timing.used_pinned_backing;
+						prefetched.used_vector_bundle_read        = io_timing.used_vector_bundle_read;
+						prefetched.used_vector_bundle_envelope_read = io_timing.used_vector_bundle_envelope_read;
+						prefetched.sparse_fallback_reason         = io_timing.sparse_fallback_reason;
 						prefetched.timing.zero_copy_view_setup_ms = io_timing.zero_copy_view_setup_ms;
 						prefetched.timing.timeline.pread_start    = io_timing.pread_start;
 						prefetched.timing.timeline.pread_end      = io_timing.pread_end;
@@ -258,8 +294,11 @@ public:
 				item.timing.timeline.consumer_pop        = wait_end;
 				slots_[slot].reset();
 				--ready_count_;
-				inflight_storage_bytes_ =
-				    item.storage_bytes < inflight_storage_bytes_ ? inflight_storage_bytes_ - item.storage_bytes : 0;
+				const size_t reserved_storage_bytes =
+				    item.full_storage_bytes != 0 ? item.full_storage_bytes : item.storage_bytes;
+				inflight_storage_bytes_ = reserved_storage_bytes < inflight_storage_bytes_
+				                              ? inflight_storage_bytes_ - reserved_storage_bytes
+				                              : 0;
 				next_out_.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
@@ -280,6 +319,7 @@ public:
 
 private:
 	const std::vector<size_t>                      rowgroups_;
+	const std::vector<std::vector<uint32_t>>       selected_vectors_;
 	const size_t                                   depth_                      = 1;
 	const size_t                                   max_inflight_storage_bytes_ = 0;
 	std::atomic<size_t>                            next_claim_;
