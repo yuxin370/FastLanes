@@ -5,10 +5,10 @@ add_executable(galp_tests
 		delta_test.cu
         reader_test.cu
         workset_selected_vectors_test.cu
-        jpeg_dct_order_test.cpp
 )
 if (GALP_WITH_JPEG_DCT)
         target_sources(galp_tests PRIVATE
+                jpeg_dct_order_test.cpp
                 jpeg_dct_test.cpp
         )
 endif ()
@@ -16,6 +16,13 @@ endif ()
 add_executable(galp_public_api_smoke
         public_api_smoke.cpp
 )
+if (GALP_WITH_JPEG_DCT)
+        target_sources(galp_public_api_smoke PRIVATE
+                jpeg_dct_format_header_smoke.cpp
+                jpeg_dct_storage_header_smoke.cpp
+                jpeg_dct_device_header_smoke.cpp
+                jpeg_dct_diagnostics_header_smoke.cpp)
+endif ()
 
 set(GALP_TEST_DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/data")
 file(MAKE_DIRECTORY
@@ -45,9 +52,11 @@ endif ()
 
 apply_warnings(galp_tests)
 
-target_link_libraries(galp_public_api_smoke PRIVATE
-        Galp::core
-)
+if (GALP_WITH_JPEG_DCT)
+        target_link_libraries(galp_public_api_smoke PRIVATE Galp::jpeg_dct_device)
+else ()
+        target_link_libraries(galp_public_api_smoke PRIVATE Galp::engine)
+endif ()
 apply_warnings(galp_public_api_smoke)
 
 add_test(NAME GalpPublicApiSmoke COMMAND galp_public_api_smoke)
@@ -78,11 +87,38 @@ if (GALP_WITH_JPEG_DCT)
 endif ()
 
 if (GALP_ENABLE_INSTALL)
+        set(GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS)
+        if (CMAKE_CUDA_ARCHITECTURES)
+                list(APPEND GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS
+                        -DGALP_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES})
+        endif ()
+        if (CMAKE_CUDA_COMPILER)
+                list(APPEND GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS
+                        -DGALP_CUDA_COMPILER=${CMAKE_CUDA_COMPILER})
+        endif ()
+        if (CMAKE_CUDA_HOST_COMPILER)
+                list(APPEND GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS
+                        -DGALP_CUDA_HOST_COMPILER=${CMAKE_CUDA_HOST_COMPILER})
+        endif ()
+        if (CMAKE_CXX_COMPILER)
+                list(APPEND GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS
+                        -DGALP_CXX_COMPILER=${CMAKE_CXX_COMPILER})
+        endif ()
+        if (GALP_WITH_JPEG_DCT AND JPEG_INCLUDE_DIR AND JPEG_LIBRARY)
+                list(APPEND GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS
+                        -DGALP_JPEG_INCLUDE_DIR=${JPEG_INCLUDE_DIR}
+                        -DGALP_JPEG_LIBRARY=${JPEG_LIBRARY})
+        endif ()
+        if (THRUST_INCLUDE_DIR)
+                list(APPEND GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS
+                        -DGALP_THRUST_INCLUDE_DIR=${THRUST_INCLUDE_DIR})
+        endif ()
         add_test(
                 NAME GalpPackageConsumerSmoke
                 COMMAND ${CMAKE_COMMAND}
 	                -DGALP_PACKAGE_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/../src
 	                -DGALP_CONSUMER_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/package-consumer
+	                ${GALP_PACKAGE_CONSUMER_CONFIGURE_ARGS}
 	                -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/GalpPackageConsumerSmoke.cmake
         )
         set_tests_properties(GalpPackageConsumerSmoke PROPERTIES LABELS "galp;public-api;package")

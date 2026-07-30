@@ -24,12 +24,13 @@ BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "benchmarks/system_rgbnomo
 if str(BENCHMARK_DIR) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_DIR))
 
-from common import (  # noqa: E402
+from shared.common import (  # noqa: E402
     cached_file_fingerprints,
     distribution,
     galp_manifest_payloads,
     load_sample_manifest,
     sample_trace,
+    sha256_json,
     source_tree_metadata,
     verify_file_fingerprint,
 )
@@ -39,22 +40,23 @@ from diagnostics.direct_dct import (  # noqa: E402
     _scale_to_rgbnomore_dct_range,
     adapt_galp_batch_to_rgbnomore,
 )
-from manifest import build_manifest, collect_dataset, validate_galp_label_map  # noqa: E402
-from pipeline import (  # noqa: E402
+from dataset.manifest import build_manifest, collect_dataset, validate_galp_label_map  # noqa: E402
+from inference.pipeline import (  # noqa: E402
     GalpAdapter,
     GalpLegacyAdapter,
     _process_memory_snapshot,
     _resolve_model_stream_priority,
 )
-from prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
-from run import (  # noqa: E402
+from dataset.prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
+from inference.run import (  # noqa: E402
     E2E_MAX_HOT_THROUGHPUT_CV,
     E2E_PIPELINES,
     GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO,
     PRESETS,
     _parse_args as _parse_run_args,
+    _source_revision_policy,
 )
-from scheduler_matrix import (  # noqa: E402
+from diagnostics.scheduler_matrix import (  # noqa: E402
     _invariant_counter,
     _normalize_limited_candidates,
     _normalize_transform_blocks,
@@ -62,10 +64,177 @@ from scheduler_matrix import (  # noqa: E402
     _policy_specs,
     _residency_bounds,
 )
-from validate import _aggregate_pipeline, _evaluate_performance_gates, _semantic_compare  # noqa: E402
+from inference.validate import (  # noqa: E402
+    _aggregate_pipeline,
+    _evaluate_performance_gates,
+    _semantic_compare,
+    _validate_crop_pushdown_accounting,
+)
+from inference.crop_io_ab import validate_crop_io_ab_results  # noqa: E402
 
 
 class SystemBenchmarkTest(unittest.TestCase):
+    def test_crop_io_ab_accepts_same_outputs_and_real_physical_byte_reduction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_contract = {
+                "pipelines": {
+                    "galp": {
+                        "manifest": "fixture",
+                        "preprocess": "rgbnomore-val-pushdown",
+                        "cache_capacity_mib": 0,
+                        "plan_cache_capacity": 0,
+                    }
+                },
+                "semantic_validation": {"prediction_agreement_sample_count": 50_000},
+            }
+            modes = {
+                "full_decode": ("full-rowgroup-decode", 8, 100, "rowgroup", "rowgroup"),
+                "crop_rowgroup": (
+                    "rowgroup-read-selected-decode",
+                    4,
+                    100,
+                    "rowgroup",
+                    "selected-vector",
+                ),
+                "crop_vector": (
+                    "vector-range-read-selected-decode",
+                    4,
+                    50,
+                    "selected-vector-range",
+                    "selected-vector",
+                ),
+            }
+            results = {}
+            for name, (execution_mode, actual_vectors, physical_bytes, storage, decode) in modes.items():
+                artifact = root / f"{name}.npz"
+                np.savez_compressed(
+                    artifact,
+                    input_0=np.arange(8, dtype=np.float32).reshape(2, 4),
+                    input_1=np.arange(4, dtype=np.float32).reshape(2, 2),
+                    logits=np.arange(12, dtype=np.float32).reshape(2, 6),
+                    top1_predictions=np.arange(50_000, dtype=np.int64) % 1000,
+                )
+                results[name] = {
+                    "pipeline": "galp",
+                    "pipeline_config": {
+                        **base_contract["pipelines"]["galp"],
+                        "crop_execution_mode": execution_mode,
+                    },
+                    "semantic_artifact": str(artifact),
+                    "repeats": [
+                        {
+                            "images": 4,
+                            "seconds": 1.0,
+                            "throughput_images_per_s": 4.0,
+                            "correct_top1": 3,
+                            "correct_top5": 4,
+                            "native_counters": {
+                                "planned_vector_count": 4,
+                                "actual_vector_count": actual_vectors,
+                                "full_vector_count": 8,
+                                "compressed_payload_bytes_read": physical_bytes,
+                                "full_compressed_payload_bytes": 100,
+                                "pread_count": 3,
+                                "vector_bundle_rowgroup_count": 0,
+                                "vector_bundle_envelope_rowgroup_count": 0,
+                                "vector_bundle_pread_count": 0,
+                                "requested_source_block_count": 12,
+                                "source_blocks_transformed": 12,
+                                "rowgroups": 4,
+                                "sparse_read_fallback_rowgroup_count": 0,
+                            },
+                            "native_properties": {
+                                "storage_read_granularity": storage,
+                                "decode_granularity": decode,
+                                "read_amplification": physical_bytes / 100.0,
+                                "sparse_read_supported": storage == "selected-vector-range",
+                                "sparse_read_fallback_reason": "",
+                            },
+                            "stage_breakdown_ms": {
+                                "native_totals_seconds": {
+                                    "decode_seconds": 0.1,
+                                    "fixed_transform_kernel_seconds": 0.2,
+                                }
+                            },
+                        }
+                    ],
+                }
+            summary = validate_crop_io_ab_results(base_contract, results)
+            self.assertTrue(summary["ok"], summary["failures"])
+            self.assertEqual(summary["top1_agreement"]["crop_vector"], 1.0)
+            self.assertLess(
+                summary["modes"]["crop_vector"]["compressed_payload_bytes_read"],
+                summary["modes"]["crop_rowgroup"]["compressed_payload_bytes_read"],
+            )
+
+    def test_crop_accounting_rejects_full_vector_pushdown_claim(self) -> None:
+        failures: list[str] = []
+        _validate_crop_pushdown_accounting(
+            {
+                "planned_vector_count": 8,
+                "actual_vector_count": 8,
+                "full_vector_count": 8,
+                "compressed_payload_bytes_read": 100,
+                "full_compressed_payload_bytes": 100,
+                "pread_count": 1,
+                "source_blocks_transformed": 10,
+            },
+            {
+                "storage_read_granularity": "rowgroup",
+                "decode_granularity": "selected-vector",
+                "read_amplification": 1.0,
+            },
+            "test",
+            failures,
+        )
+        self.assertTrue(any("vector pushdown claimed" in failure for failure in failures))
+
+    def test_crop_accounting_rejects_false_physical_io_reduction(self) -> None:
+        failures: list[str] = []
+        _validate_crop_pushdown_accounting(
+            {
+                "planned_vector_count": 4,
+                "actual_vector_count": 4,
+                "full_vector_count": 8,
+                "compressed_payload_bytes_read": 100,
+                "full_compressed_payload_bytes": 100,
+                "pread_count": 12,
+                "source_blocks_transformed": 10,
+            },
+            {
+                "storage_read_granularity": "selected-vector-range",
+                "decode_granularity": "selected-vector",
+                "read_amplification": 1.0,
+            },
+            "test",
+            failures,
+        )
+        self.assertTrue(any("lower I/O claimed" in failure for failure in failures))
+        self.assertTrue(any("transform block reduction" in failure for failure in failures))
+
+    def test_crop_accounting_accepts_honest_rowgroup_crop(self) -> None:
+        failures: list[str] = []
+        _validate_crop_pushdown_accounting(
+            {
+                "planned_vector_count": 8,
+                "actual_vector_count": 8,
+                "full_vector_count": 8,
+                "compressed_payload_bytes_read": 100,
+                "full_compressed_payload_bytes": 100,
+                "pread_count": 1,
+                "source_blocks_transformed": 10,
+            },
+            {
+                "storage_read_granularity": "rowgroup",
+                "decode_granularity": "rowgroup",
+                "read_amplification": 1.0,
+            },
+            "test",
+            failures,
+        )
+        self.assertEqual(failures, [])
+
     def test_measured_limited_overlap_is_the_production_default(self) -> None:
         with mock.patch.object(
             sys, "argv", ["run.py", "--output-dir", "/tmp/galp-default-contract-test"]
@@ -223,6 +392,27 @@ class SystemBenchmarkTest(unittest.TestCase):
             dirty = source_tree_metadata(root, ["runtime.py"])
             self.assertFalse(dirty["benchmark_source_clean"])
             self.assertTrue(dirty["runtime_git_status"])
+
+    def test_dirty_runtime_sources_are_recorded_as_warning_policy(self) -> None:
+        policy = _source_revision_policy(
+            {
+                "fastlanes": {
+                    "benchmark_source_clean": False,
+                    "runtime_git_status": [" M runtime.py"],
+                },
+                "rgbnomore": {
+                    "benchmark_source_clean": True,
+                    "runtime_git_status": [],
+                },
+            }
+        )
+        self.assertEqual(policy["cleanliness_enforcement"], "warning")
+        self.assertEqual(
+            policy["dirty_sources_at_contract_creation"],
+            {"fastlanes": [" M runtime.py"]},
+        )
+        self.assertTrue(policy["runtime_file_hashes_recorded"])
+        self.assertTrue(policy["runtime_file_changes_during_benchmark_are_errors"])
 
     def test_process_memory_snapshot_reports_linux_rss_and_peak(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -422,8 +612,8 @@ class SystemBenchmarkTest(unittest.TestCase):
             "rgbnomore_dct_profile.py",
         ):
             self.assertFalse((examples / filename).exists(), filename)
-        self.assertTrue((galp_root / "benchmarks/system_rgbnomore/run.py").is_file())
-        self.assertTrue((galp_root / "benchmarks/system_rgbnomore/prepare_dataset.py").is_file())
+        self.assertTrue((galp_root / "benchmarks/system_rgbnomore/inference/run.py").is_file())
+        self.assertTrue((galp_root / "benchmarks/system_rgbnomore/dataset/prepare_dataset.py").is_file())
         self.assertTrue((galp_root / "benchmarks/system_rgbnomore/diagnostics/direct_dct.py").is_file())
         self.assertTrue((galp_root / "benchmarks/system_rgbnomore/diagnostics/validate_pushdown.py").is_file())
         self.assertTrue((galp_root / "benchmarks/system_rgbnomore/diagnostics/scan_manifests.py").is_file())
@@ -591,7 +781,7 @@ class SystemBenchmarkTest(unittest.TestCase):
                 cached_file_fingerprints(files, cache, allow_hash_misses=False, **kwargs)
 
             cached_file_fingerprints(files, cache, allow_hash_misses=True, **kwargs)
-            with mock.patch("common.fingerprint_file", side_effect=AssertionError("unexpected rehash")):
+            with mock.patch("shared.common.fingerprint_file", side_effect=AssertionError("unexpected rehash")):
                 fingerprints = cached_file_fingerprints(files, cache, allow_hash_misses=False, **kwargs)
             self.assertEqual(len(fingerprints), 1)
 

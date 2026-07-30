@@ -10,7 +10,7 @@
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/io/file.hpp"
 #include "fls/table/memory_table.hpp"
-#include "jpeg/jpeg_dct_device.cuh"
+#include "jpeg/jpeg_dct_cuda_internal.cuh"
 #include "jpeg/jpeg_dct_expression_validation.hpp"
 #include "jpeg/jpeg_dct_order.hpp"
 #include <algorithm>
@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <gtest/gtest.h>
 #include <jpeglib.h>
 #include <map>
@@ -67,6 +68,9 @@ struct ShardManifestHeader {
 enum class TestJpegFormat {
 	kDefault420,
 	kYcbcr444,
+	kYcbcr422,
+	kYcbcr440,
+	kYcbcr411,
 	kGrayscale,
 };
 
@@ -90,10 +94,18 @@ void write_test_jpeg(const std::filesystem::path& path,
 	cinfo.input_components = format == TestJpegFormat::kGrayscale ? 1 : 3;
 	cinfo.in_color_space   = format == TestJpegFormat::kGrayscale ? JCS_GRAYSCALE : JCS_RGB;
 	jpeg_set_defaults(&cinfo);
-	if (format == TestJpegFormat::kYcbcr444) {
+	if (format == TestJpegFormat::kYcbcr444 || format == TestJpegFormat::kYcbcr422 ||
+	    format == TestJpegFormat::kYcbcr440 || format == TestJpegFormat::kYcbcr411) {
 		for (int component = 0; component < cinfo.num_components; ++component) {
 			cinfo.comp_info[component].h_samp_factor = 1;
 			cinfo.comp_info[component].v_samp_factor = 1;
+		}
+		if (format == TestJpegFormat::kYcbcr422) {
+			cinfo.comp_info[0].h_samp_factor = 2;
+		} else if (format == TestJpegFormat::kYcbcr440) {
+			cinfo.comp_info[0].v_samp_factor = 2;
+		} else if (format == TestJpegFormat::kYcbcr411) {
+			cinfo.comp_info[0].h_samp_factor = 4;
 		}
 	}
 	jpeg_set_quality(&cinfo, 90, TRUE);
@@ -370,6 +382,91 @@ TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {
 	EXPECT_EQ(legacy_prefetch_options.rowgroup_prefetch_workers, 3U);
 	EXPECT_EQ(legacy_prefetch_options.rowgroup_prefetch_min_decode_batches, 4U);
 	EXPECT_TRUE(legacy_prefetch_options.coefficient_selection.empty());
+}
+
+TEST(JpegDct, SynchronousDeviceAccessPropagatesStoredCompletionFailure) {
+	auto batch = galp::jpeg::detail::make_failed_device_batch_for_testing("controlled completion failure");
+
+	EXPECT_EQ(batch.device_coefficients_async(), nullptr);
+	EXPECT_EQ(batch.y_coefficients_async(), nullptr);
+	EXPECT_EQ(batch.cbcr_coefficients_async(), nullptr);
+	EXPECT_EQ(batch.y_float_coefficients_async(), nullptr);
+	EXPECT_EQ(batch.cbcr_float_coefficients_async(), nullptr);
+	EXPECT_NO_THROW(static_cast<void>(batch.execution_stats_ref()));
+
+	const auto expect_controlled_failure = [](const auto& operation) {
+		try {
+			operation();
+			FAIL() << "synchronous access unexpectedly ignored the completion failure";
+		} catch (const std::runtime_error& error) {
+			EXPECT_STREQ(error.what(), "controlled completion failure");
+		}
+	};
+	expect_controlled_failure([&] { static_cast<void>(batch.device_coefficients()); });
+	expect_controlled_failure([&] { static_cast<void>(batch.y_coefficients()); });
+	expect_controlled_failure([&] { static_cast<void>(batch.cbcr_coefficients()); });
+	expect_controlled_failure([&] { static_cast<void>(batch.y_float_coefficients()); });
+	expect_controlled_failure([&] { static_cast<void>(batch.cbcr_float_coefficients()); });
+	expect_controlled_failure([&] { static_cast<void>(batch.execution_stats()); });
+	expect_controlled_failure([&] { batch.synchronize(); });
+}
+
+TEST(JpegDct, SharedReaderSerializesDeviceSubmissionAcrossHostThreads) {
+	int        device_count  = 0;
+	const auto device_status = cudaGetDeviceCount(&device_count);
+	if (device_status != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
+	}
+	int device = 0;
+	ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir =
+	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_concurrent_reader_" + std::to_string(suffix));
+	const auto path0 = dir / "input0.jpg";
+	const auto path1 = dir / "input1.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path0, 16, 16);
+	write_test_jpeg(path1, 16, 16);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 2;
+	shard_options.rowgroup_vectors    = 1;
+	shard_options.rowgroups_per_shard = 256;
+	const auto output_dir             = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    {path0, path1}, output_dir, reader_options, shard_options);
+
+	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
+	galp::jpeg::JpegDctDeviceBatchOptions  options;
+	options.cache_capacity_bytes = 1U << 20U;
+
+	std::promise<void> start_promise;
+	auto               start = start_promise.get_future().share();
+	const auto submit = [&](const uint32_t image_index) {
+		return std::async(std::launch::async, [&, image_index] {
+			if (cudaSetDevice(device) != cudaSuccess) {
+				throw std::runtime_error("failed to select the CUDA device in the reader test worker");
+			}
+			start.wait();
+			auto batch = reader.ReadDeviceDctBatch(
+			    {galp::jpeg::JpegDctImageCropRequest {image_index, galp::jpeg::JpegDctCropBox {0, 0, 8, 8}}},
+			    options);
+			const auto* coefficients = batch.device_coefficients();
+			if (coefficients == nullptr || batch.coefficient_count() == 0U) {
+				throw std::runtime_error("concurrent reader submission produced an empty device batch");
+			}
+			return batch.coefficient_count();
+		});
+	};
+	auto first  = submit(0U);
+	auto second = submit(1U);
+	start_promise.set_value();
+	EXPECT_GT(first.get(), 0U);
+	EXPECT_GT(second.get(), 0U);
+	std::filesystem::remove_all(dir);
 }
 
 TEST(JpegDct, SpatialOrderRanksMatchWriterOrderOnRaggedTiles) {
@@ -1034,6 +1131,134 @@ TEST(JpegDct, DeviceBatchReadsTransformedGridWithRgbNoMoreProfile) {
 	std::filesystem::remove_all(dir);
 }
 
+TEST(JpegDct, TransformedGridHonorsExplicitPerImageTrainingCrops) {
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir =
+	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_training_crop_plan_" + std::to_string(suffix));
+	const auto path0 = dir / "input0.jpg";
+	const auto path1 = dir / "input1.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path0, 64, 64);
+	write_test_jpeg(path1, 64, 64);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 2;
+	shard_options.rowgroup_vectors    = 1;
+	shard_options.rowgroups_per_shard = 256;
+	const auto output_dir             = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    {path0, path1}, output_dir, reader_options, shard_options);
+
+	galp::jpeg::JpegDctDeviceBatchOptions options;
+	options.layout         = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	options.grid_transform = galp::profiles::rgbnomore_val_dct_grid_transform();
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
+	    {0U, {0U, 0U, 32U, 32U}, false, "train/zero.jpg", "augmentation-zero"},
+	    {1U, {32U, 32U, 32U, 32U}, true, "train/one.jpg", "augmentation-one"},
+	};
+	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
+	const auto preview = reader.PlanDeviceDctBatch(requests, options);
+	bool       first_has_top_left_y     = false;
+	bool       second_has_bottom_right_y = false;
+	for (const auto& block : preview.block_metadata) {
+		if (block.request_index == 0U && block.semantic_slot_id == 0U && block.block_x == 0U && block.block_y == 0U) {
+			first_has_top_left_y = true;
+		}
+		if (block.request_index == 1U && block.semantic_slot_id == 0U && block.block_x == 7U && block.block_y == 7U) {
+			second_has_bottom_right_y = true;
+		}
+	}
+	EXPECT_TRUE(first_has_top_left_y);
+	EXPECT_TRUE(second_has_bottom_right_y);
+	std::filesystem::remove_all(dir);
+}
+
+TEST(JpegDct, DirectDctTrainingFlipMatchesDctRuleAndPreservesProvenance) {
+	int        device_count  = 0;
+	const auto device_status = cudaGetDeviceCount(&device_count);
+	if (device_status != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
+	}
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir =
+	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_training_flip_" + std::to_string(suffix));
+	const auto path = dir / "input.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path, 64, 64);
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 1;
+	shard_options.rowgroup_vectors    = 1;
+	shard_options.rowgroups_per_shard = 256;
+	const auto output_dir             = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({path}, output_dir, reader_options, shard_options);
+
+	galp::jpeg::JpegDctDeviceBatchOptions options;
+	options.layout                 = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	options.grid_transform         = galp::profiles::rgbnomore_val_dct_grid_transform();
+	options.plan_cache_capacity    = 0;
+	options.enable_planless_execution = true;
+	galp::jpeg::DirectDctRuntime runtime(output_dir / "manifest.bin");
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> plain_request {
+	    {0U, {0U, 0U, 64U, 64U}, false, "train/sample.jpg", "plain-key"},
+	};
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> flipped_request {
+	    {0U, {0U, 0U, 64U, 64U}, true, "train/sample.jpg", "flipped-key"},
+	};
+	auto plain   = runtime.ReadBatch(plain_request, options);
+	auto flipped = runtime.ReadBatch(flipped_request, options);
+	ASSERT_EQ(flipped.transform_requests().size(), 1U);
+	EXPECT_TRUE(flipped.transform_requests()[0].horizontal_flip);
+	EXPECT_EQ(flipped.transform_requests()[0].logical_sample_id, "train/sample.jpg");
+	EXPECT_EQ(flipped.transform_requests()[0].augmentation_key, "flipped-key");
+
+	std::vector<int16_t> plain_y(plain.y_coefficient_count());
+	std::vector<int16_t> flipped_y(flipped.y_coefficient_count());
+	std::vector<int16_t> plain_cbcr(plain.cbcr_coefficient_count());
+	std::vector<int16_t> flipped_cbcr(flipped.cbcr_coefficient_count());
+	ASSERT_EQ(cudaMemcpy(plain_y.data(), plain.y_device_data(), plain_y.size() * sizeof(int16_t), cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(cudaMemcpy(flipped_y.data(), flipped.y_device_data(), flipped_y.size() * sizeof(int16_t), cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(cudaMemcpy(plain_cbcr.data(), plain.cbcr_device_data(), plain_cbcr.size() * sizeof(int16_t), cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(cudaMemcpy(flipped_cbcr.data(), flipped.cbcr_device_data(), flipped_cbcr.size() * sizeof(int16_t), cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	const auto check_flip = [](const std::vector<int16_t>& source,
+	                           const std::vector<int16_t>& actual,
+	                           const uint32_t channels,
+	                           const uint32_t height,
+	                           const uint32_t width) {
+		for (uint32_t channel = 0; channel < channels; ++channel) {
+			for (uint32_t y = 0; y < height; ++y) {
+				for (uint32_t x = 0; x < width; ++x) {
+					for (uint32_t coefficient = 0; coefficient < 64U; ++coefficient) {
+						const auto source_index =
+						    ((static_cast<size_t>(channel) * height + y) * width + (width - 1U - x)) * 64U + coefficient;
+						const auto actual_index =
+						    ((static_cast<size_t>(channel) * height + y) * width + x) * 64U + coefficient;
+						const auto sign = coefficient % 8U % 2U == 0U ? 1 : -1;
+						const auto expected = static_cast<int16_t>(sign * source[source_index]);
+						if (actual[actual_index] != expected) {
+							ADD_FAILURE() << "DCT horizontal flip mismatch at channel=" << channel << ", y=" << y
+							              << ", x=" << x << ", coefficient=" << coefficient << ": expected "
+							              << expected << ", got " << actual[actual_index];
+							return;
+						}
+					}
+				}
+			}
+		}
+	};
+	check_flip(plain_y, flipped_y, 1U, 28U, 28U);
+	check_flip(plain_cbcr, flipped_cbcr, 2U, 14U, 14U);
+	std::filesystem::remove_all(dir);
+}
+
 TEST(JpegDct, DirectDctRuntimeExposesStayOnGpuTensorDescriptor) {
 	int        device_count  = 0;
 	const auto device_status = cudaGetDeviceCount(&device_count);
@@ -1608,8 +1833,10 @@ TEST(JpegDct, CanonicalImageMajorFixedGridUsesCompactPlanlessDescriptors) {
 	const auto path0 = dir / "input0.jpg";
 	const auto path1 = dir / "input1.jpg";
 	std::filesystem::create_directories(dir);
-	write_test_jpeg(path0, 512, 512);
-	write_test_jpeg(path1, 512, 512);
+	// Keep enough vectors outside the 448x448 source crop to prove that the
+	// compact planless descriptor now selects a strict vector subset.
+	write_test_jpeg(path0, 1024, 1024);
+	write_test_jpeg(path1, 1024, 1024);
 
 	galp::jpeg::JpegDctReaderOptions reader_options;
 	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
@@ -1634,10 +1861,17 @@ TEST(JpegDct, CanonicalImageMajorFixedGridUsesCompactPlanlessDescriptors) {
 	options.grid_transform       = galp::profiles::rgbnomore_val_dct_grid_transform();
 	options.cache_capacity_bytes = 0U;
 	options.plan_cache_capacity  = 0U;
-	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {{1U, {}}, {0U, {}}};
+	const auto exact_crop = galp::jpeg::JpegDctCropBox {288U, 288U, 448U, 448U};
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {{1U, exact_crop}, {0U, exact_crop}};
 
 	const auto preview = reader.PlanDeviceDctBatch(requests, options);
 	EXPECT_TRUE(preview.uses_planless_fixed_transform);
+	EXPECT_EQ(preview.compiled_access_profile_hits, 0U);
+	EXPECT_EQ(preview.compiled_access_profile_misses, 6U);
+	const auto repeated_preview = reader.PlanDeviceDctBatch(requests, options);
+	EXPECT_EQ(repeated_preview.compiled_access_profile_hits, 6U);
+	EXPECT_EQ(repeated_preview.compiled_access_profile_misses, 0U);
+	EXPECT_EQ(repeated_preview.planned_selected_vector_count, preview.planned_selected_vector_count);
 	EXPECT_EQ(preview.compact_image_descriptor_count, requests.size());
 	EXPECT_TRUE(preview.block_metadata.empty());
 	ASSERT_EQ(preview.image_layouts.size(), requests.size());
@@ -1668,26 +1902,70 @@ TEST(JpegDct, CanonicalImageMajorFixedGridUsesCompactPlanlessDescriptors) {
 		planned_storage_bytes += reader.RowgroupStorageBytes(rowgroup.shard_id, {rowgroup.rowgroup_index});
 	}
 	EXPECT_GT(planned_storage_bytes, 0U);
-	EXPECT_EQ(preview.planned_selected_vector_count, preview.full_vector_count);
-	EXPECT_EQ(preview.estimated_selected_vector_count, preview.full_vector_count);
-	EXPECT_EQ(preview.planned_saved_vector_count, 0U);
+	EXPECT_GT(preview.planned_selected_vector_count, 0U);
+	EXPECT_LT(preview.planned_selected_vector_count, preview.full_vector_count);
+	EXPECT_EQ(preview.estimated_selected_vector_count, preview.planned_selected_vector_count);
+	EXPECT_EQ(preview.planned_saved_vector_count,
+	          preview.full_vector_count - preview.planned_selected_vector_count);
+	EXPECT_GT(preview.planned_saved_vector_count, 0U);
 	EXPECT_EQ(preview.resize_weight_build_ms, 0.0);
 	EXPECT_EQ(preview.dct_resize_weight_cache_misses, 0U);
 	EXPECT_EQ(preview.dct_conversion_matrix_cache_misses, 0U);
+
+	auto full_decode_options = options;
+	full_decode_options.crop_execution_mode = galp::jpeg::JpegDctCropExecutionMode::kFullRowgroupDecode;
+	const auto full_decode_preview = reader.PlanDeviceDctBatch(requests, full_decode_options);
+	EXPECT_EQ(full_decode_preview.planned_selected_vector_count, preview.planned_selected_vector_count);
+	EXPECT_EQ(full_decode_preview.estimated_selected_vector_count, full_decode_preview.full_vector_count);
+	auto rowgroup_crop_options = options;
+	rowgroup_crop_options.crop_execution_mode =
+	    galp::jpeg::JpegDctCropExecutionMode::kRowgroupReadSelectedDecode;
+	const auto rowgroup_crop_preview = reader.PlanDeviceDctBatch(requests, rowgroup_crop_options);
+	EXPECT_EQ(rowgroup_crop_preview.estimated_selected_vector_count,
+	          rowgroup_crop_preview.planned_selected_vector_count);
+	auto vector_crop_options = options;
+	vector_crop_options.crop_execution_mode =
+	    galp::jpeg::JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode;
+	const auto vector_crop_preview = reader.PlanDeviceDctBatch(requests, vector_crop_options);
+	EXPECT_EQ(vector_crop_preview.estimated_selected_vector_count,
+	          vector_crop_preview.planned_selected_vector_count);
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> random_crop_requests {
+	    {1U, galp::jpeg::JpegDctCropBox {64U, 160U, 448U, 448U}, true, "sample-1", "crop-a"},
+	    {0U, galp::jpeg::JpegDctCropBox {384U, 96U, 448U, 448U}, false, "sample-0", "crop-b"},
+	};
+	const auto random_crop_preview = reader.PlanDeviceDctBatch(random_crop_requests, vector_crop_options);
+	EXPECT_TRUE(random_crop_preview.uses_planless_fixed_transform);
+	EXPECT_EQ(random_crop_preview.compact_image_descriptor_count, random_crop_requests.size());
+	EXPECT_TRUE(random_crop_preview.block_metadata.empty());
+	EXPECT_GT(random_crop_preview.planned_selected_vector_count, 0U);
+	EXPECT_LT(random_crop_preview.planned_selected_vector_count, random_crop_preview.full_vector_count);
 
 	// Compact production planning bypasses the legacy exact-batch cache even
 	// and decoded-rowgroup cache even when a caller leaves historical nonzero
 	// defaults configured.
 	options.plan_cache_capacity  = 128U;
 	options.cache_capacity_bytes = 128U * 1024U * 1024U;
-	const auto prepared0         = reader.PrepareDeviceDctBatch(requests, options);
-	const auto prepared1         = reader.PrepareDeviceDctBatch(requests, options);
+	auto       prepared0         = reader.PrepareDeviceDctBatch(requests, options);
+	auto       prepared1         = reader.PrepareDeviceDctBatch(requests, options);
 	EXPECT_TRUE(prepared0.uses_planless_fixed_transform());
 	EXPECT_TRUE(prepared1.uses_planless_fixed_transform());
 	EXPECT_FALSE(prepared0.exact_batch_plan_cache_enabled());
 	EXPECT_FALSE(prepared1.exact_batch_plan_cache_enabled());
 	EXPECT_FALSE(prepared0.decoded_rowgroup_cache_enabled());
 	EXPECT_FALSE(prepared1.decoded_rowgroup_cache_enabled());
+	EXPECT_FALSE(prepared0.host_io_staged());
+	EXPECT_FALSE(prepared1.host_io_staged());
+	auto stage0 = std::async(std::launch::async, [&] { reader.StagePreparedDeviceDctBatchIo(prepared0); });
+	auto stage1 = std::async(std::launch::async, [&] { reader.StagePreparedDeviceDctBatchIo(prepared1); });
+	EXPECT_NO_THROW(stage0.get());
+	EXPECT_NO_THROW(stage1.get());
+	EXPECT_TRUE(prepared0.host_io_staged());
+	EXPECT_TRUE(prepared1.host_io_staged());
+	EXPECT_EQ(prepared0.host_io_staged_rowgroups(), requests.size());
+	EXPECT_EQ(prepared1.host_io_staged_rowgroups(), requests.size());
+	EXPECT_GT(prepared0.host_io_staging_ms(), 0.0);
+	EXPECT_GT(prepared1.host_io_staging_ms(), 0.0);
+	EXPECT_NO_THROW(reader.StagePreparedDeviceDctBatchIo(prepared1));
 
 	std::filesystem::remove_all(dir);
 }
@@ -1782,6 +2060,151 @@ TEST(JpegDct, PlanlessRationalProgramsCoverSamplingShapesShardsAndSpatialOrders)
 	std::filesystem::remove_all(dir);
 }
 
+TEST(JpegDct, ManifestV3UsesIndependentVectorRowgroupsForCropUpperBound) {
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir =
+	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_manifest_v3_vectors_" + std::to_string(suffix));
+	const auto input_path = dir / "input.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(input_path, 1024, 1024);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images                  = 1U;
+	shard_options.shard_images_specified        = true;
+	shard_options.rowgroup_vectors              = 64U; // v3 deliberately overrides this to one vector.
+	shard_options.rowgroup_vectors_specified    = true;
+	shard_options.rowgroups_per_shard           = 64U;
+	shard_options.rowgroups_per_shard_specified = true;
+	shard_options.physical_layout               = galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
+	shard_options.physical_layout_specified     = true;
+	const auto output_dir                       = dir / "out";
+	const auto manifest =
+	    galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({input_path}, output_dir, reader_options, shard_options);
+	ASSERT_EQ(manifest.version, 3U);
+	EXPECT_TRUE(manifest.uses_independent_vector_rowgroups());
+	EXPECT_EQ(manifest.rowgroup_vectors, 1U);
+	ASSERT_EQ(manifest.shards.size(), 1U);
+	EXPECT_EQ(manifest.shards[0].rowgroup_count, 24U);
+
+	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
+	galp::jpeg::JpegDctDeviceBatchOptions options;
+	options.layout                    = galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+	options.enable_planless_execution = true;
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> full_requests {{0U, {}}};
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> crop_requests {
+	    {0U, galp::jpeg::JpegDctCropBox {0U, 0U, 256U, 256U}}};
+	const auto full_preview = reader.PlanDeviceDctBatch(full_requests, options);
+	const auto crop_preview = reader.PlanDeviceDctBatch(crop_requests, options);
+	EXPECT_FALSE(full_preview.uses_planless_fixed_transform);
+	EXPECT_FALSE(crop_preview.uses_planless_fixed_transform);
+	EXPECT_EQ(full_preview.rowgroups.size(), 24U);
+	EXPECT_LT(crop_preview.rowgroups.size(), full_preview.rowgroups.size());
+	EXPECT_EQ(crop_preview.rowgroups.size(), 3U);
+	EXPECT_EQ(crop_preview.full_vector_count, 3U);
+	EXPECT_EQ(crop_preview.planned_selected_vector_count, 3U);
+
+	std::filesystem::remove_all(dir);
+}
+
+TEST(JpegDct, CropExecutionModesMatchAndVectorRangeReadsFewerPhysicalBytes) {
+	const auto* run_gpu_tests = std::getenv("GALP_RUN_GPU_TESTS");
+	if (run_gpu_tests == nullptr || std::string(run_gpu_tests) != "1") {
+		GTEST_SKIP() << "set GALP_RUN_GPU_TESTS=1 on the target-GPU host";
+	}
+	int device_count = 0;
+	if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
+	}
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir =
+	    std::filesystem::temp_directory_path() / ("galp_jpeg_dct_crop_execution_modes_" + std::to_string(suffix));
+	const auto input_path = dir / "input.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(input_path, 1024, 1024);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images                  = 1U;
+	shard_options.shard_images_specified        = true;
+	shard_options.rowgroup_vectors              = 8U;
+	shard_options.rowgroup_vectors_specified    = true;
+	shard_options.rowgroups_per_shard           = 1U;
+	shard_options.rowgroups_per_shard_specified = true;
+	shard_options.physical_layout               = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
+	shard_options.physical_layout_specified     = true;
+	const auto output_dir                       = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls({input_path}, output_dir, reader_options, shard_options);
+
+	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
+	    {0U, galp::jpeg::JpegDctCropBox {288U, 288U, 448U, 448U}}};
+	galp::jpeg::JpegDctDeviceBatchOptions base_options;
+	base_options.layout                    = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	base_options.grid_transform            = galp::profiles::rgbnomore_val_dct_grid_transform();
+	base_options.cache_capacity_bytes      = 0U;
+	base_options.plan_cache_capacity       = 0U;
+	base_options.enable_rowgroup_prefetch  = false;
+	base_options.enable_planless_execution = true;
+	auto full_options                      = base_options;
+	full_options.crop_execution_mode       = galp::jpeg::JpegDctCropExecutionMode::kFullRowgroupDecode;
+	auto rowgroup_options                  = base_options;
+	rowgroup_options.crop_execution_mode =
+	    galp::jpeg::JpegDctCropExecutionMode::kRowgroupReadSelectedDecode;
+	auto vector_options = base_options;
+	vector_options.crop_execution_mode =
+	    galp::jpeg::JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode;
+
+	auto full     = reader.ReadDeviceDctBatch(requests, full_options);
+	auto rowgroup = reader.ReadDeviceDctBatch(requests, rowgroup_options);
+	auto vector   = reader.ReadDeviceDctBatch(requests, vector_options);
+	const auto copy_grid = [](const galp::jpeg::JpegDctDeviceBatch& batch) {
+		std::pair<std::vector<int16_t>, std::vector<int16_t>> host {
+		    std::vector<int16_t>(batch.y_coefficient_count()), std::vector<int16_t>(batch.cbcr_coefficient_count())};
+		EXPECT_EQ(cudaMemcpy(host.first.data(),
+		                     batch.y_coefficients(),
+		                     host.first.size() * sizeof(int16_t),
+		                     cudaMemcpyDeviceToHost),
+		          cudaSuccess);
+		EXPECT_EQ(cudaMemcpy(host.second.data(),
+		                     batch.cbcr_coefficients(),
+		                     host.second.size() * sizeof(int16_t),
+		                     cudaMemcpyDeviceToHost),
+		          cudaSuccess);
+		return host;
+	};
+	const auto full_grid = copy_grid(full);
+	EXPECT_EQ(copy_grid(rowgroup), full_grid);
+	EXPECT_EQ(copy_grid(vector), full_grid);
+
+	const auto full_stats     = full.execution_stats();
+	const auto rowgroup_stats = rowgroup.execution_stats();
+	const auto vector_stats   = vector.execution_stats();
+	EXPECT_EQ(full_stats.actual_vector_count, full_stats.full_vector_count);
+	EXPECT_EQ(full_stats.decode_granularity, "rowgroup");
+	EXPECT_EQ(full_stats.storage_read_granularity, "rowgroup");
+	EXPECT_EQ(full_stats.compressed_payload_bytes_read, full_stats.full_compressed_payload_bytes);
+	EXPECT_GT(rowgroup_stats.actual_vector_count, 0U);
+	EXPECT_LT(rowgroup_stats.actual_vector_count, rowgroup_stats.full_vector_count);
+	EXPECT_EQ(rowgroup_stats.decode_granularity, "selected-vector");
+	EXPECT_EQ(rowgroup_stats.storage_read_granularity, "rowgroup");
+	EXPECT_EQ(rowgroup_stats.compressed_payload_bytes_read, rowgroup_stats.full_compressed_payload_bytes);
+	EXPECT_EQ(vector_stats.actual_vector_count, rowgroup_stats.actual_vector_count);
+	EXPECT_EQ(vector_stats.decode_granularity, "selected-vector");
+	EXPECT_EQ(vector_stats.storage_read_granularity, "selected-vector-range")
+	    << vector_stats.sparse_read_fallback_reason;
+	EXPECT_TRUE(vector_stats.sparse_read_supported) << vector_stats.sparse_read_fallback_reason;
+	EXPECT_EQ(vector_stats.sparse_read_fallback_rowgroup_count, 0U)
+	    << vector_stats.sparse_read_fallback_reason;
+	EXPECT_GT(vector_stats.pread_count, 1U);
+	EXPECT_LT(vector_stats.compressed_payload_bytes_read, vector_stats.full_compressed_payload_bytes);
+	EXPECT_LT(vector_stats.compressed_payload_bytes_read, rowgroup_stats.compressed_payload_bytes_read);
+
+	std::filesystem::remove_all(dir);
+}
+
 TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 	const auto* run_gpu_tests = std::getenv("GALP_RUN_GPU_TESTS");
 	if (run_gpu_tests == nullptr || std::string(run_gpu_tests) != "1") {
@@ -1799,10 +2222,16 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 	    dir / "ycbcr420.jpg",
 	    dir / "ycbcr444.jpg",
 	    dir / "grayscale.jpg",
+	    dir / "ycbcr422.jpg",
+	    dir / "ycbcr440.jpg",
+	    dir / "ycbcr411.jpg",
 	};
 	write_test_jpeg(paths[0], 536, 280, TestJpegFormat::kDefault420);
 	write_test_jpeg(paths[1], 408, 264, TestJpegFormat::kYcbcr444);
 	write_test_jpeg(paths[2], 344, 248, TestJpegFormat::kGrayscale);
+	write_test_jpeg(paths[3], 520, 296, TestJpegFormat::kYcbcr422);
+	write_test_jpeg(paths[4], 456, 312, TestJpegFormat::kYcbcr440);
+	write_test_jpeg(paths[5], 640, 320, TestJpegFormat::kYcbcr411);
 
 	auto rational_transform                               = galp::profiles::rgbnomore_val_dct_grid_transform();
 	rational_transform.y_output_width_blocks              = 7U;
@@ -1827,7 +2256,8 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
         {"z_order", galp::jpeg::JpegDctSpatialOrder::kZOrder},
         {"tiled_z_32", galp::jpeg::JpegDctSpatialOrder::kTiledZ32},
     }};
-	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {{2U, {}}, {0U, {}}, {1U, {}}};
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
+	    {2U, {}}, {5U, {}}, {0U, {}}, {3U, {}}, {1U, {}}, {4U, {}}};
 	const auto                                             copy_grid = [](const galp::jpeg::JpegDctDeviceBatch& batch) {
         std::pair<std::vector<int16_t>, std::vector<int16_t>> host {
             std::vector<int16_t>(batch.y_coefficient_count()), std::vector<int16_t>(batch.cbcr_coefficient_count())};
@@ -1950,6 +2380,8 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			const auto legacy_stats   = legacy.execution_stats();
 			const auto chunked_stats  = chunked.execution_stats();
 			EXPECT_EQ(planless_stats.planless_image_descriptor_count, requests.size()) << test_case.name;
+			EXPECT_EQ(planless_stats.host_io_staged_rowgroups, requests.size()) << test_case.name;
+			EXPECT_GT(planless_stats.host_io_staging_ms, 0.0) << test_case.name;
 			EXPECT_EQ(planless_stats.fixed_transform_item_count, 0U) << test_case.name;
 			EXPECT_EQ(planless_stats.host_expanded_transform_items_created, 0U) << test_case.name;
 			EXPECT_EQ(planless_stats.host_output_block_source_lists_created, 0U) << test_case.name;
@@ -2251,6 +2683,35 @@ TEST(JpegDct, RuntimePolicyUsesVectorPushdownOnlyForMeaningfulSavings) {
 		EXPECT_EQ(policy.decision, JpegDctRuntimePolicyDecision::kFullRowgroup);
 		EXPECT_EQ(policy.reason, JpegDctRuntimePolicyReason::kTailChunkWouldOverrun);
 	}
+}
+
+TEST(JpegDct, SparseStoragePolicyPricesFragmentationAndMaterialization) {
+	using galp::jpeg::detail::choose_jpeg_dct_sparse_storage_policy;
+	using galp::jpeg::detail::JpegDctSparseStorageCost;
+	using galp::jpeg::detail::JpegDctSparseStoragePolicyReason;
+
+	// Representative of the measured source-range path: modest byte savings
+	// cannot pay for hundreds of physical reads per rowgroup.
+	const auto fragmented = choose_jpeg_dct_sparse_storage_policy(
+	    JpegDctSparseStorageCost {226020U, 181660U, 902U, true});
+	EXPECT_FALSE(fragmented.use_sparse_read);
+	EXPECT_EQ(fragmented.reason, JpegDctSparseStoragePolicyReason::kFragmentationDominates);
+	EXPECT_GT(fragmented.sparse_estimated_ns, fragmented.full_estimated_ns);
+
+	// A compact contiguous representation with substantial byte savings is a
+	// legitimate automatic sparse backend even after reconstruction is priced.
+	const auto compact = choose_jpeg_dct_sparse_storage_policy(
+	    JpegDctSparseStorageCost {1024U * 1024U, 256U * 1024U, 1U, true});
+	EXPECT_TRUE(compact.use_sparse_read);
+	EXPECT_EQ(compact.reason, JpegDctSparseStoragePolicyReason::kPredictedFaster);
+	EXPECT_LT(compact.sparse_estimated_ns, compact.full_estimated_ns);
+
+	// One pread is not sufficient by itself: an envelope that saves few bytes
+	// still loses to the required logical-rowgroup clear/scatter pass.
+	const auto marginal_envelope = choose_jpeg_dct_sparse_storage_policy(
+	    JpegDctSparseStorageCost {226020U, 199600U, 1U, true});
+	EXPECT_FALSE(marginal_envelope.use_sparse_read);
+	EXPECT_EQ(marginal_envelope.reason, JpegDctSparseStoragePolicyReason::kFragmentationDominates);
 }
 
 TEST(JpegDct, BatchUnpackWidthFallsBackBeforeBuildingAWorkset) {
@@ -2756,6 +3217,26 @@ TEST(JpegDct, AutoPipelineExtraPlanMsDoesNotDoubleCountPreparedPlan) {
 	EXPECT_DOUBLE_EQ(external_plan_overhead_ms(/*measured_plan_ms=*/12.5, /*executed_plan_planning_ms=*/7.0), 5.5);
 	EXPECT_DOUBLE_EQ(external_plan_overhead_ms(/*measured_plan_ms=*/7.0, /*executed_plan_planning_ms=*/7.0), 0.0);
 	EXPECT_DOUBLE_EQ(external_plan_overhead_ms(/*measured_plan_ms=*/6.5, /*executed_plan_planning_ms=*/7.0), 0.0);
+}
+
+TEST(JpegDct, SelectedDecodeChunksExpandToPhysicalVectorsForSparseReads) {
+	using galp::jpeg::detail::expand_selected_decode_chunks;
+
+	EXPECT_EQ(expand_selected_decode_chunks({0U, 8U}, /*rowgroup_n_vecs=*/12, /*unpack_n_vectors=*/4),
+	          (std::vector<uint32_t> {0U, 1U, 2U, 3U, 8U, 9U, 10U, 11U}));
+	EXPECT_EQ(expand_selected_decode_chunks({8U}, /*rowgroup_n_vecs=*/10, /*unpack_n_vectors=*/4),
+	          (std::vector<uint32_t> {8U, 9U}));
+}
+
+TEST(JpegDct, LogicalVectorRemapRetainsSelectedTailBeyondCompactCount) {
+	using galp::jpeg::detail::build_logical_to_compact_vector_remap;
+	const auto missing = std::numeric_limits<uint32_t>::max();
+	EXPECT_EQ(build_logical_to_compact_vector_remap(
+	              {0U, 1U, 2U, 3U, 5U, 6U}, /*logical_rowgroup_n_vecs=*/9U, /*unpack_n_vectors=*/1U),
+	          (std::vector<uint32_t> {0U, 1U, 2U, 3U, missing, 4U, 5U, missing, missing}));
+	EXPECT_EQ(build_logical_to_compact_vector_remap(
+	              {0U, 8U}, /*logical_rowgroup_n_vecs=*/12U, /*unpack_n_vectors=*/4U),
+	          (std::vector<uint32_t> {0U, 1U, 2U, 3U, missing, missing, missing, missing, 4U, 5U, 6U, 7U}));
 }
 
 TEST(JpegDct, DevicePrefetchPolicyRequiresStructuralOverlap) {
@@ -3324,6 +3805,66 @@ TEST(JpegDct, ImageMajorShardsUseOneDirectlyAddressableRowgroupPerImage) {
 	}
 
 	std::filesystem::remove_all(dir);
+}
+
+TEST(JpegDct, RectangleRankIntervalsMatchBlockEnumerationForEverySpatialOrder) {
+	using galp::jpeg::detail::block_order_rank;
+	using galp::jpeg::detail::block_order_rectangle_rank_intervals;
+	const std::array<galp::jpeg::JpegDctSpatialOrder, 4> orders {
+	    galp::jpeg::JpegDctSpatialOrder::kRaster,
+	    galp::jpeg::JpegDctSpatialOrder::kTiledRaster32,
+	    galp::jpeg::JpegDctSpatialOrder::kZOrder,
+	    galp::jpeg::JpegDctSpatialOrder::kTiledZ32,
+	};
+	struct RectangleCase {
+		uint32_t grid_width;
+		uint32_t grid_height;
+		uint32_t x;
+		uint32_t y;
+		uint32_t width;
+		uint32_t height;
+	};
+	const std::array<RectangleCase, 8> cases {{
+	    {5U, 3U, 0U, 0U, 5U, 3U},
+	    {5U, 3U, 1U, 1U, 3U, 1U},
+	    {33U, 35U, 0U, 0U, 1U, 35U},
+	    {33U, 35U, 30U, 30U, 3U, 5U},
+	    {67U, 35U, 17U, 9U, 41U, 23U},
+	    {67U, 35U, 31U, 0U, 34U, 35U},
+	    {67U, 35U, 66U, 34U, 8U, 8U},
+	    {67U, 35U, 67U, 35U, 1U, 1U},
+	}};
+	for (const auto order : orders) {
+		for (const auto& test_case : cases) {
+			std::vector<bool> expected(static_cast<size_t>(test_case.grid_width) * test_case.grid_height, false);
+			const auto end_x = std::min<uint64_t>(test_case.grid_width, static_cast<uint64_t>(test_case.x) + test_case.width);
+			const auto end_y = std::min<uint64_t>(test_case.grid_height, static_cast<uint64_t>(test_case.y) + test_case.height);
+			for (uint32_t y = test_case.y; y < end_y; ++y) {
+				for (uint32_t x = test_case.x; x < end_x; ++x) {
+					expected.at(block_order_rank(test_case.grid_width, test_case.grid_height, x, y, order)) = true;
+				}
+			}
+			std::vector<bool> actual(expected.size(), false);
+			const auto intervals = block_order_rectangle_rank_intervals(test_case.grid_width,
+			                                                            test_case.grid_height,
+			                                                            test_case.x,
+			                                                            test_case.y,
+			                                                            test_case.width,
+			                                                            test_case.height,
+			                                                            order);
+			uint64_t previous_end = 0U;
+			for (const auto& interval : intervals) {
+				EXPECT_LT(interval.begin, interval.end);
+				EXPECT_GE(interval.begin, previous_end);
+				ASSERT_LE(interval.end, actual.size());
+				for (uint64_t rank = interval.begin; rank < interval.end; ++rank) {
+					actual[rank] = true;
+				}
+				previous_end = interval.end;
+			}
+			EXPECT_EQ(actual, expected);
+		}
+	}
 }
 
 TEST(JpegDct, ImageMajorSpatialOrdersRoundtripWithoutChangingDecodeAtoms) {

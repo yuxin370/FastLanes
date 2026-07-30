@@ -1,7 +1,8 @@
 #include "engine/workset/append.cuh"
 #include "galp/config.hpp"
 #if GALP_WITH_JPEG_DCT
-#include "jpeg/jpeg_dct_device.cuh"
+#include "galp/jpeg_dct_diagnostics.hpp"
+#include "jpeg/jpeg_dct_cuda_internal.cuh"
 #endif
 #include <algorithm>
 #include <array>
