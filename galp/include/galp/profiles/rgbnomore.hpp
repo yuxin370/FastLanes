@@ -1,7 +1,7 @@
 #ifndef GALP_PROFILES_RGBNOMORE_HPP
 #define GALP_PROFILES_RGBNOMORE_HPP
 
-#include "galp/jpeg_dct.hpp"
+#include "galp/jpeg_dct_device.hpp"
 
 namespace galp::profiles {
 
@@ -28,6 +28,9 @@ inline jpeg::JpegDctGridTransformSpec rgbnomore_val_dct_grid_transform() {
 	spec.allowed_chroma_sampling_ratios = {
 	    jpeg::JpegDctSamplingRatio {1, 1, 1, 1},
 	    jpeg::JpegDctSamplingRatio {1, 2, 1, 2},
+	    jpeg::JpegDctSamplingRatio {1, 2, 1, 1},
+	    jpeg::JpegDctSamplingRatio {1, 1, 1, 2},
+	    jpeg::JpegDctSamplingRatio {1, 4, 1, 1},
 	};
 	return spec;
 }
