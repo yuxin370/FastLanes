@@ -3,23 +3,23 @@
 // ────────────────────────────────────────────────────────
 // galp/benchmarks/micro_bench.cu
 // ────────────────────────────────────────────────────────
-#include "galp_bench/data.cuh"
-#include "core/enums.cuh"
-#include "cuda/launch/dispatch.cuh"
-#include "core/types.cuh"
 #include "codecs/decode/alp.cuh"
-#include "cuda/memory/device_pool.cuh"
+#include "core/enums.cuh"
+#include "core/types.cuh"
+#include "cuda/launch/dispatch.cuh"
 #include "cuda/launch/launch.cuh"
+#include "cuda/memory/device_pool.cuh"
 #include "engine/materialization/metadata.cuh"
 #include "engine/workset/append.cuh"
 #include "engine/workset/upload.cuh"
+#include "galp_bench/data.cuh"
 #include "galp_bench/generated/kernel_bindings.cuh"
 #include "galp_bench/verification.cuh"
 #include <chrono>
-#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <exception>
 #include <fstream>
@@ -42,15 +42,15 @@ struct ProgramParameters {
 	galp::format::DataType            data_type;
 	galp::format::Encoding            encoding_type;
 	galp::format::Kernel              kernel;
-	uint32_t                   unpack_n_vecs;
-	uint32_t                   unpack_n_vals;
+	uint32_t                          unpack_n_vecs;
+	uint32_t                          unpack_n_vals;
 	galp::format::Unpacker            unpacker;
 	galp::format::Patcher             patcher;
 	galp::format::Expander            expander;
 	galp::bench::ValueRange<vbw_t>    bit_width_range;
 	galp::bench::ValueRange<uint16_t> ec_range;
-	size_t                     n_values;
-	uint32_t                   n_samples;
+	size_t                            n_values;
+	uint32_t                          n_samples;
 	galp::format::Print               print_option;
 	std::string                       benchmark_mode;
 	std::string                       output_path;
@@ -70,7 +70,7 @@ static void print_usage(const char* program_name, const char* error = nullptr) {
 	             "Values:\n"
 	             "  data_type: i8, i16, u32, u64, f32, f64\n"
 	             "  encoding: alp, bit-packing, ffor, frequency, cross-rle, dictionary, slpatch, "
-	             "constant, delta, rle, dict-slpatch\n"
+	             "constant, delta, delta-register, rle, dict-slpatch\n"
 	             "  kernel: decompress, query\n"
 	             "  unpacker: none, dummy, old-fls, switch-case, stateless, stateless-branchless, "
 	             "stateful-cache, stateful-local-1, stateful-local-2, stateful-local-4, "
@@ -168,12 +168,12 @@ galp::bench::verification::ExecutionResult<T> decompress_column(const ColumnT& c
 	T* out;
 
 	out = galp::bench::bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
-	                                                                      params.unpack_n_vecs,
-	                                                                      params.unpack_n_vals,
-	                                                                      params.unpacker,
-	                                                                      params.patcher,
-	                                                                      params.expander,
-	                                                                      params.n_samples);
+	                                                                                   params.unpack_n_vecs,
+	                                                                                   params.unpack_n_vals,
+	                                                                                   params.unpacker,
+	                                                                                   params.patcher,
+	                                                                                   params.expander,
+	                                                                                   params.n_samples);
 
 	galp::codec::host::free_column(column_device);
 
@@ -193,28 +193,30 @@ galp::bench::verification::ExecutionResult<T> decompress_column(const ColumnT& c
 }
 
 template <typename T, typename ColumnT>
-galp::bench::verification::ExecutionResult<T> decompress_column_time(const ColumnT column, const ProgramParameters params) {
+galp::bench::verification::ExecutionResult<T> decompress_column_time(const ColumnT           column,
+                                                                     const ProgramParameters params) {
 	auto column_device = column.copy_to_device();
 	galp::memory::sync_h2d();
 
 	{
-		const T* warm = galp::bench::bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
-		                                                                                params.unpack_n_vecs,
-		                                                                                params.unpack_n_vals,
-		                                                                                params.unpacker,
-		                                                                                params.patcher,
-		                                                                                /*n_samples=*/1);
+		const T* warm =
+		    galp::bench::bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
+		                                                                                 params.unpack_n_vecs,
+		                                                                                 params.unpack_n_vals,
+		                                                                                 params.unpacker,
+		                                                                                 params.patcher,
+		                                                                                 /*n_samples=*/1);
 		CUDA_CHECK(cudaDeviceSynchronize(), "warmup sync");
 		delete[] warm;
 	}
 
 	const T* out = galp::bench::bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(column_device,
-	                                                                               params.unpack_n_vecs,
-	                                                                               params.unpack_n_vals,
-	                                                                               params.unpacker,
-	                                                                               params.patcher,
-	                                                                               params.expander,
-	                                                                               params.n_samples);
+	                                                                                            params.unpack_n_vecs,
+	                                                                                            params.unpack_n_vals,
+	                                                                                            params.unpacker,
+	                                                                                            params.patcher,
+	                                                                                            params.expander,
+	                                                                                            params.n_samples);
 
 	printf("[KERNEL TIME] unpack_vecs=%u unpack_vals=%u patcher= %d n_samples=%u \n",
 	       params.unpack_n_vecs,
@@ -235,12 +237,12 @@ query_column(const ColumnT& column, const ProgramParameters params, const bool q
 	auto column_device = column.copy_to_device();
 	galp::memory::sync_h2d();
 	const bool answer = galp::bench::bindings::query_column<T, typename ColumnT::DeviceColumnT>(column_device,
-	                                                                               params.unpack_n_vecs,
-	                                                                               params.unpack_n_vals,
-	                                                                               params.unpacker,
-	                                                                               params.patcher,
-	                                                                               magic_value,
-	                                                                               params.n_samples);
+	                                                                                            params.unpack_n_vecs,
+	                                                                                            params.unpack_n_vals,
+	                                                                                            params.unpacker,
+	                                                                                            params.patcher,
+	                                                                                            magic_value,
+	                                                                                            params.n_samples);
 	galp::codec::host::free_column(column_device);
 
 	// Weird hack to avoid refactor_
@@ -267,19 +269,18 @@ execute_kernel(const ColumnT& column, const ProgramParameters params, const bool
 }
 
 template <typename T, typename ColumnT>
-bool verify_generated_decompress_binding(const ColumnT&             column,
-                                         const std::vector<T>&      expected,
+bool verify_generated_decompress_binding(const ColumnT&           column,
+                                         const std::vector<T>&    expected,
                                          const ProgramParameters& params) {
 	auto device_column = column.copy_to_device();
 	galp::memory::sync_h2d();
-	T* output = galp::bench::bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(
-	    device_column,
-	    params.unpack_n_vecs,
-	    params.unpack_n_vals,
-	    params.unpacker,
-	    params.patcher,
-	    params.expander,
-	    1U);
+	T* output = galp::bench::bindings::decompress_column<T, typename ColumnT::DeviceColumnT>(device_column,
+	                                                                                         params.unpack_n_vecs,
+	                                                                                         params.unpack_n_vals,
+	                                                                                         params.unpacker,
+	                                                                                         params.patcher,
+	                                                                                         params.expander,
+	                                                                                         1U);
 	galp::codec::host::free_column(device_column);
 	const auto result = galp::bench::verification::compare_data(expected.data(), output, expected.size());
 	delete[] output;
@@ -287,13 +288,14 @@ bool verify_generated_decompress_binding(const ColumnT&             column,
 }
 
 template <typename T, typename ColumnT>
-int run_controlled_column_benchmark(ColumnT                       column,
-                                    const std::vector<T>&          full_expected,
-                                    const fastlanes::OperatorToken token,
-                                    const std::string&              encoding_name,
-                                    const vbw_t                     bit_width,
-                                    const ProgramParameters&        params,
-                                    std::ostream&                    csv) {
+int run_controlled_column_benchmark(ColumnT                             column,
+                                    const std::vector<T>&               full_expected,
+                                    const fastlanes::OperatorToken      token,
+                                    const std::string&                  encoding_name,
+                                    const vbw_t                         bit_width,
+                                    const ProgramParameters&            params,
+                                    const galp::execution::DeltaDecoder delta_decoder,
+                                    std::ostream&                       csv) {
 	const std::string mode = params.benchmark_mode == "legacy" ? "full" : params.benchmark_mode;
 	if (mode != "full" && mode != "tail" && mode != "selected") {
 		throw std::invalid_argument("controlled codec benchmark mode must be full, tail, or selected");
@@ -311,8 +313,7 @@ int run_controlled_column_benchmark(ColumnT                       column,
 	}
 
 	const size_t n_vecs = column.get_n_vecs();
-	if (mode == "tail" &&
-	    (params.unpack_n_vecs == 1U || n_vecs % static_cast<size_t>(params.unpack_n_vecs) == 0U)) {
+	if (mode == "tail" && (params.unpack_n_vecs == 1U || n_vecs % static_cast<size_t>(params.unpack_n_vecs) == 0U)) {
 		throw std::invalid_argument("tail mode requires unpack_n_vecs > 1 and n_vecs not divisible by it");
 	}
 	if (!verify_generated_decompress_binding<T>(column, full_expected, params)) {
@@ -324,8 +325,8 @@ int run_controlled_column_benchmark(ColumnT                       column,
 	rowgroup.n_values = column.get_n_values();
 	rowgroup.n_vecs   = n_vecs;
 	rowgroup.n_tuples = column.get_n_values();
-	rowgroup.columns.push_back(galp::execution::Column {
-	    "benchmark", token, galp::execution::EncodedPayload {std::move(column)}});
+	rowgroup.columns.push_back(
+	    galp::execution::Column {"benchmark", token, galp::execution::EncodedPayload {std::move(column)}});
 	auto expressions = galp::expression::assemble(rowgroup);
 
 	galp::execution::ExecutionConfig config {};
@@ -333,6 +334,7 @@ int run_controlled_column_benchmark(ColumnT                       column,
 	config.unpack_n_values  = params.unpack_n_vals;
 	config.launch_strategy  = galp::execution::LaunchStrategy::MixedDispatch;
 	config.write_out        = true;
+	config.delta_decoder    = delta_decoder;
 
 	std::vector<uint32_t> selected_vectors;
 	std::vector<T>        expected;
@@ -341,9 +343,10 @@ int run_controlled_column_benchmark(ColumnT                       column,
 		for (size_t vector = 0; vector + width <= n_vecs; vector += width * 2U) {
 			selected_vectors.push_back(static_cast<uint32_t>(vector));
 			expected.insert(expected.end(),
-			                full_expected.begin() + static_cast<std::ptrdiff_t>(vector * galp::codec::consts::VALUES_PER_VECTOR),
-			                full_expected.begin() + static_cast<std::ptrdiff_t>(
-			                                            (vector + width) * galp::codec::consts::VALUES_PER_VECTOR));
+			                full_expected.begin() +
+			                    static_cast<std::ptrdiff_t>(vector * galp::codec::consts::VALUES_PER_VECTOR),
+			                full_expected.begin() +
+			                    static_cast<std::ptrdiff_t>((vector + width) * galp::codec::consts::VALUES_PER_VECTOR));
 		}
 		if (selected_vectors.empty()) {
 			throw std::invalid_argument("selected mode has no complete selected vector chunk");
@@ -367,12 +370,8 @@ int run_controlled_column_benchmark(ColumnT                       column,
 	for (uint32_t sample = 0; sample < params.n_samples; ++sample) {
 		const double elapsed_ms = galp::runtime::run_workset(workset, 1U, config);
 		const double kernel_us  = elapsed_ms * 1000.0;
-		const double gvalues_s = elapsed_ms == 0.0
-		                             ? 0.0
-		                             : static_cast<double>(measured_values) / (elapsed_ms * 1.0e6);
-		const double ns_value = measured_values == 0
-		                            ? 0.0
-		                            : elapsed_ms * 1.0e6 / static_cast<double>(measured_values);
+		const double gvalues_s  = elapsed_ms == 0.0 ? 0.0 : static_cast<double>(measured_values) / (elapsed_ms * 1.0e6);
+		const double ns_value = measured_values == 0 ? 0.0 : elapsed_ms * 1.0e6 / static_cast<double>(measured_values);
 		csv << encoding_name << ',' << (std::is_same_v<T, int8_t> ? "i8" : "i16") << ','
 		    << static_cast<unsigned>(bit_width) << ',' << mode << ',' << params.unpack_n_vecs << ',' << n_vecs << ','
 		    << selected_vectors.size() << ',' << sample << ',' << std::fixed << std::setprecision(6) << kernel_us << ','
@@ -386,7 +385,7 @@ int run_controlled_column_benchmark(ColumnT                       column,
 		return 1;
 	}
 	const auto& output = std::get<std::shared_ptr<T[]>>(materialized.columns[0]->values);
-	const auto result = galp::bench::verification::compare_data(expected.data(), output.get(), expected.size());
+	const auto  result = galp::bench::verification::compare_data(expected.data(), output.get(), expected.size());
 	if (!result.success) {
 		std::cerr << "[error] controlled " << encoding_name << ' ' << mode
 		          << " output failed CPU-oracle verification\n";
@@ -396,7 +395,10 @@ int run_controlled_column_benchmark(ColumnT                       column,
 }
 
 template <typename T>
-int execute_controlled_integer_codec(const ProgramParameters& params, const bool delta) {
+int execute_controlled_integer_codec(
+    const ProgramParameters&            params,
+    const bool                          delta,
+    const galp::execution::DeltaDecoder delta_decoder = galp::execution::DeltaDecoder::Stateful) {
 	std::ofstream file;
 	if (!params.output_path.empty()) {
 		file.open(params.output_path, std::ios::out | std::ios::trunc);
@@ -411,17 +413,25 @@ int execute_controlled_integer_codec(const ProgramParameters& params, const bool
 	int failures = 0;
 	for (vbw_t bit_width = params.bit_width_range.min; bit_width <= params.bit_width_range.max; ++bit_width) {
 		if (delta) {
-			auto data = galp::bench::columns::generate_delta_column<T>(params.n_values, bit_width);
-			const auto token = std::is_same_v<T, int8_t> ? fastlanes::OperatorToken::EXP_DELTA_I08
+			auto        data  = galp::bench::columns::generate_delta_column<T>(params.n_values, bit_width);
+			const auto  token = std::is_same_v<T, int8_t> ? fastlanes::OperatorToken::EXP_DELTA_I08
 			                                              : fastlanes::OperatorToken::EXP_DELTA_I16;
+			const char* encoding_name =
+			    delta_decoder == galp::execution::DeltaDecoder::Register ? "delta-register" : "delta";
 			failures += run_controlled_column_benchmark<T>(
-			    std::move(data.column), data.expected, token, "delta", bit_width, params, csv);
+			    std::move(data.column), data.expected, token, encoding_name, bit_width, params, delta_decoder, csv);
 		} else {
-			auto data = galp::bench::columns::generate_ffor_column<T>(params.n_values, bit_width);
+			auto       data  = galp::bench::columns::generate_ffor_column<T>(params.n_values, bit_width);
 			const auto token = std::is_same_v<T, int8_t> ? fastlanes::OperatorToken::EXP_FFOR_I08
-			                                              : fastlanes::OperatorToken::EXP_FFOR_I16;
-			failures += run_controlled_column_benchmark<T>(
-			    std::move(data.column), data.expected, token, "ffor", bit_width, params, csv);
+			                                             : fastlanes::OperatorToken::EXP_FFOR_I16;
+			failures += run_controlled_column_benchmark<T>(std::move(data.column),
+			                                               data.expected,
+			                                               token,
+			                                               "ffor",
+			                                               bit_width,
+			                                               params,
+			                                               galp::execution::DeltaDecoder::Stateful,
+			                                               csv);
 		}
 	}
 	return failures;
@@ -438,8 +448,8 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_bp(const Prog
 		if (params.kernel == galp::format::Kernel::Query) {
 			throw std::invalid_argument("Query not supported for Bit-Packing columns.\n");
 		}
-		bool                      query_result = false;
-		T                         magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
+		bool                           query_result = false;
+		T                              magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
 		galp::codec::host::BPColumn<T> column;
 
 		column = galp::bench::columns::generate_random_bp_column<T>(params.n_values, vbw_range, params.unpack_n_vecs);
@@ -459,16 +469,16 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_ffor(const Pr
 
 	for (vbw_t vbw {params.bit_width_range.min}; vbw <= params.bit_width_range.max; ++vbw) {
 		printf("processing bitwidth = %d\n", vbw);
-		auto vbw_range = galp::bench::ValueRange<vbw_t>(vbw);
-		bool                        query_result = false;
-		T                           magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
+		auto                             vbw_range    = galp::bench::ValueRange<vbw_t>(vbw);
+		bool                             query_result = false;
+		T                                magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
 		galp::codec::host::FFORColumn<T> column;
 
 		if (params.kernel == galp::format::Kernel::Query) {
 			auto [_query_result, _column] =
 			    galp::bench::columns::generate_binary_ffor_column<T>(params.n_values, vbw_range, params.unpack_n_vecs);
-				query_result = _query_result;
-				column       = std::move(_column);
+			query_result = _query_result;
+			column       = std::move(_column);
 		} else {
 			column = galp::bench::columns::generate_random_ffor_column<T>(
 			    params.n_values, vbw_range, galp::bench::ValueRange<T>(0, 100), params.unpack_n_vecs);
@@ -478,7 +488,6 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_ffor(const Pr
 		    execute_kernel<T, galp::codec::host::FFORColumn<T>, true>(column, params, query_result, magic_value));
 
 		galp::codec::host::free_column(column);
-
 	}
 
 	return results;
@@ -509,8 +518,8 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_alp(const Pro
 
 			if (params.patcher == galp::format::Patcher::Dummy || params.patcher == galp::format::Patcher::Stateless ||
 			    params.patcher == galp::format::Patcher::Stateful) {
-				results.push_back(
-				    execute_kernel<T, galp::codec::host::ALPColumn<T>, true>(column, params, query_result, magic_value));
+				results.push_back(execute_kernel<T, galp::codec::host::ALPColumn<T>, true>(
+				    column, params, query_result, magic_value));
 			} else {
 				auto column_extended = column.create_extended_column();
 
@@ -537,7 +546,8 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_freq(const Pr
 		bool query_result = false;
 		T    magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
 
-		auto column = galp::bench::columns::generate_freq_column<T>(params.n_values, galp::bench::ValueRange<uint16_t>(0));
+		auto column =
+		    galp::bench::columns::generate_freq_column<T>(params.n_values, galp::bench::ValueRange<uint16_t>(0));
 		for (uint16_t ec {params.ec_range.min}; ec <= params.ec_range.max; ++ec) {
 			column = galp::bench::columns::modify_freq_exception_count(std::move(column), ec);
 
@@ -605,10 +615,11 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_slpatch(const
 		bool query_result = false;
 		T    magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
 
-		auto column =
-		    galp::bench::columns::generate_slpatch_column<T>(params.n_values, galp::bench::ValueRange<vbw_t>(vbw), params.ec_range);
+		auto column = galp::bench::columns::generate_slpatch_column<T>(
+		    params.n_values, galp::bench::ValueRange<vbw_t>(vbw), params.ec_range);
 
-		results.push_back(execute_kernel<T, galp::codec::host::SLPATCHColumn<T>>(column, params, query_result, magic_value));
+		results.push_back(
+		    execute_kernel<T, galp::codec::host::SLPATCHColumn<T>>(column, params, query_result, magic_value));
 		galp::codec::host::free_column(column);
 	}
 
@@ -654,8 +665,9 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_rle(const Pro
 
 		auto column = galp::bench::columns::generate_rle_column<T>(params.n_values);
 
-		results.push_back(execute_kernel<T, galp::codec::host::RLEColumn<T, typename galp::codec::utils::same_width_uint<T>::type>>(
-		    column, params, query_result, magic_value));
+		results.push_back(
+		    execute_kernel<T, galp::codec::host::RLEColumn<T, typename galp::codec::utils::same_width_uint<T>::type>>(
+		        column, params, query_result, magic_value));
 		galp::codec::host::free_column(column);
 	}
 
@@ -674,7 +686,8 @@ std::vector<galp::bench::verification::ExecutionResult<T>> execute_constant(cons
 	T    magic_value  = galp::codec::consts::as<T>::MAGIC_NUMBER;
 
 	auto column = galp::bench::columns::generate_constant_column<T>(params.n_values);
-	results.push_back(execute_kernel<T, galp::codec::host::CONSTANTColumn<T>>(column, params, query_result, magic_value));
+	results.push_back(
+	    execute_kernel<T, galp::codec::host::CONSTANTColumn<T>>(column, params, query_result, magic_value));
 	galp::codec::host::free_column(column);
 
 	return results;
@@ -777,6 +790,13 @@ static int32_t run_by_encoding_type(const ProgramParameters& params, bool print_
 			return execute_controlled_integer_codec<T>(params, true);
 		} else {
 			std::cerr << "[error] delta only supports i8/i16.\n";
+			return 1;
+		}
+	case galp::format::Encoding::DELTA_REGISTER:
+		if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>) {
+			return execute_controlled_integer_codec<T>(params, true, galp::execution::DeltaDecoder::Register);
+		} else {
+			std::cerr << "[error] delta-register only supports i8/i16.\n";
 			return 1;
 		}
 	case galp::format::Encoding::SLPATCH:

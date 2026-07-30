@@ -34,6 +34,10 @@ CSV_COLUMNS = [
     "ns_per_value",
 ]
 
+# Per type and bit width: full/selected each use u1/u2/u4 (6 points),
+# tail uses u2/u4 (2 points). I8 has 8 widths and I16 has 16.
+EXPECTED_REGISTER_PAIR_COUNT = (8 + 16) * 8
+
 
 def run(
     command: list[str],
@@ -159,6 +163,7 @@ def parse_ptxas_output(output: str, data_type: str, architecture: str) -> list[d
             if unpack_match is None:
                 raise RuntimeError(f"could not decode DELTA unpack width from {symbol}")
             current = {
+                "decoder": "stateful",
                 "data_type": data_type,
                 "unpack_n_vectors": int(unpack_match.group(1)),
                 "architecture": function_match.group(2),
@@ -189,7 +194,75 @@ def parse_ptxas_output(output: str, data_type: str, architecture: str) -> list[d
     return sorted(results, key=lambda item: item["unpack_n_vectors"])
 
 
-def collect_resource_metrics(build_dir: Path, output_dir: Path) -> dict[str, Any]:
+def parse_register_ptxas_output(output: str, architecture: str) -> list[dict[str, Any]]:
+    function_pattern = re.compile(r"Compiling entry function '([^']+)' for '([^']+)'")
+    probe_pattern = re.compile(r"delta_register_(i8|i16)_u(1|2|4)")
+    stack_pattern = re.compile(r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads")
+    register_pattern = re.compile(r"Used (\d+) registers")
+
+    current: dict[str, Any] | None = None
+    results: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        function_match = function_pattern.search(line)
+        if function_match:
+            probe_match = probe_pattern.search(function_match.group(1))
+            if probe_match is None:
+                current = None
+                continue
+            current = {
+                "decoder": "register",
+                "data_type": probe_match.group(1),
+                "unpack_n_vectors": int(probe_match.group(2)),
+                "architecture": function_match.group(2),
+                "symbol": function_match.group(1),
+                "stack_bytes_per_thread": 0,
+                "spill_store_bytes": 0,
+                "spill_load_bytes": 0,
+            }
+            continue
+        if current is None:
+            continue
+        stack_match = stack_pattern.search(line)
+        if stack_match:
+            current.update(
+                {
+                    "stack_bytes_per_thread": int(stack_match.group(1)),
+                    "spill_store_bytes": int(stack_match.group(2)),
+                    "spill_load_bytes": int(stack_match.group(3)),
+                }
+            )
+            continue
+        register_match = register_pattern.search(line)
+        if register_match:
+            current["registers_per_thread"] = int(register_match.group(1))
+            current["shared_bytes_per_block"] = 0
+            current["occupancy"] = occupancy_model(
+                architecture, current["registers_per_thread"], current["shared_bytes_per_block"]
+            )
+            results.append(current)
+            current = None
+    return sorted(results, key=lambda item: (item["data_type"], item["unpack_n_vectors"]))
+
+
+def set_cuda_architecture(command: list[str], architecture: str | None) -> None:
+    if architecture is None:
+        return
+    for index, argument in enumerate(command):
+        if argument.startswith("--generate-code=arch=compute_"):
+            command[index] = (
+                f"--generate-code=arch=compute_{architecture},"
+                f"code=[compute_{architecture},sm_{architecture}]"
+            )
+            return
+    raise RuntimeError("compile command does not contain a CUDA --generate-code argument")
+
+
+def collect_resource_metrics(
+    repo: Path,
+    build_dir: Path,
+    output_dir: Path,
+    architecture_override: str | None = None,
+) -> dict[str, Any]:
     commands_path = build_dir / "compile_commands.json"
     if not commands_path.is_file():
         raise RuntimeError(f"missing {commands_path}; configure CMake with CMAKE_EXPORT_COMPILE_COMMANDS=ON")
@@ -211,6 +284,7 @@ def collect_resource_metrics(build_dir: Path, output_dir: Path) -> dict[str, Any
         source = Path(entry["file"])
         data_type = "i8" if "int8_t" in source.name else "i16"
         command = shlex.split(entry["command"])
+        set_cuda_architecture(command, architecture_override)
         output_index = command.index("-o") + 1
         command[output_index] = str(resource_dir / f"delta_{data_type}.o")
         command.insert(command.index("-x"), "-Xptxas=-v")
@@ -218,20 +292,40 @@ def collect_resource_metrics(build_dir: Path, output_dir: Path) -> dict[str, Any
         log_path = resource_dir / f"delta_{data_type}.ptxas.txt"
         log_path.write_text(completed.stdout)
         raw_logs.append(str(log_path))
-        architecture_match = re.search(r"arch=compute_(\d+)", entry["command"])
+        architecture_match = re.search(r"arch=compute_(\d+)", " ".join(command))
         architecture = f"sm_{architecture_match.group(1)}" if architecture_match else "unknown"
         all_metrics.extend(parse_ptxas_output(completed.stdout, data_type, architecture))
 
-    if {(row["data_type"], row["unpack_n_vectors"]) for row in all_metrics} != {
-        (data_type, unpack) for data_type in ("i8", "i16") for unpack in (1, 2, 4)
+    probe_source = repo / "galp/benchmarks/delta_register_resource_probe.cu"
+    probe_entry = selected[0]
+    probe_command = shlex.split(probe_entry["command"])
+    set_cuda_architecture(probe_command, architecture_override)
+    original_source = probe_entry["file"]
+    probe_command[probe_command.index(original_source)] = str(probe_source)
+    output_index = probe_command.index("-o") + 1
+    probe_command[output_index] = str(resource_dir / "delta_register.o")
+    probe_command.insert(probe_command.index("-x"), "-Xptxas=-v")
+    completed = run(probe_command, cwd=Path(probe_entry["directory"]))
+    register_log = resource_dir / "delta_register.ptxas.txt"
+    register_log.write_text(completed.stdout)
+    raw_logs.append(str(register_log))
+    all_metrics.extend(parse_register_ptxas_output(completed.stdout, architecture))
+
+    if {(row["decoder"], row["data_type"], row["unpack_n_vectors"]) for row in all_metrics} != {
+        (decoder, data_type, unpack)
+        for decoder in ("stateful", "register")
+        for data_type in ("i8", "i16")
+        for unpack in (1, 2, 4)
     }:
-        raise RuntimeError("PTXAS resource probe did not report all DELTA I8/I16 unpack=1/2/4 kernels")
+        raise RuntimeError("PTXAS resource probe did not report both DELTA decoders for I8/I16 unpack=1/2/4")
     return {"architecture": architecture, "kernels": all_metrics, "raw_logs": raw_logs}
 
 
-def benchmark_matrix(full_vectors: int, tail_vectors: int) -> Iterable[tuple[str, str, int, int, str, int, int]]:
+def benchmark_matrix(
+    full_vectors: int, tail_vectors: int, encodings: Iterable[str]
+) -> Iterable[tuple[str, str, int, int, str, int, int]]:
     widths = {"i8": (1, 8), "i16": (1, 16)}
-    for encoding in ("delta", "ffor"):
+    for encoding in encodings:
         for data_type in ("i8", "i16"):
             start_width, end_width = widths[data_type]
             for mode in ("full", "selected"):
@@ -280,6 +374,121 @@ def summarize(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
         )
         output.append(summary)
     return output
+
+
+def summarize_register_speedups(summary_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    key_columns = [
+        "data_type",
+        "bit_width",
+        "mode",
+        "unpack_n_vectors",
+        "n_vectors",
+        "selected_chunks",
+    ]
+    stateful = {
+        tuple(str(row[column]) for column in key_columns): row
+        for row in summary_rows
+        if row["encoding"] == "delta"
+    }
+    register = {
+        tuple(str(row[column]) for column in key_columns): row
+        for row in summary_rows
+        if row["encoding"] == "delta-register"
+    }
+    output: list[dict[str, Any]] = []
+    for key in sorted(set(stateful) & set(register)):
+        stateful_row = stateful[key]
+        register_row = register[key]
+        stateful_ns = float(stateful_row["median_ns_per_value"])
+        register_ns = float(register_row["median_ns_per_value"])
+        row: dict[str, Any] = dict(zip(key_columns, key))
+        row.update(
+            {
+                "stateful_median_ns_per_value": stateful_ns,
+                "register_median_ns_per_value": register_ns,
+                "register_speedup": stateful_ns / register_ns if register_ns else 0.0,
+            }
+        )
+        output.append(row)
+    return output
+
+
+def compare_encoding_throughput(
+    summary_rows: list[dict[str, Any]], numerator_encoding: str, denominator_encoding: str
+) -> list[dict[str, Any]]:
+    key_columns = [
+        "data_type",
+        "bit_width",
+        "mode",
+        "unpack_n_vectors",
+        "n_vectors",
+        "selected_chunks",
+    ]
+    numerator = {
+        tuple(str(row[column]) for column in key_columns): row
+        for row in summary_rows
+        if row["encoding"] == numerator_encoding
+    }
+    denominator = {
+        tuple(str(row[column]) for column in key_columns): row
+        for row in summary_rows
+        if row["encoding"] == denominator_encoding
+    }
+    output: list[dict[str, Any]] = []
+    for key in sorted(set(numerator) & set(denominator)):
+        numerator_ns = float(numerator[key]["median_ns_per_value"])
+        denominator_ns = float(denominator[key]["median_ns_per_value"])
+        row: dict[str, Any] = dict(zip(key_columns, key))
+        row.update(
+            {
+                "numerator_encoding": numerator_encoding,
+                "denominator_encoding": denominator_encoding,
+                "numerator_median_ns_per_value": numerator_ns,
+                "denominator_median_ns_per_value": denominator_ns,
+                "throughput_ratio": denominator_ns / numerator_ns if numerator_ns else 0.0,
+            }
+        )
+        output.append(row)
+    return output
+
+
+def evaluate_register_default(
+    speedup_rows: list[dict[str, Any]],
+    max_regression_percent: float,
+    min_geomean_speedup: float,
+    expected_pair_count: int = EXPECTED_REGISTER_PAIR_COUNT,
+) -> dict[str, Any]:
+    if not speedup_rows:
+        return {
+            "available": False,
+            "success": False,
+            "decision": "insufficient-data",
+            "reason": "both delta and delta-register results are required",
+        }
+
+    minimum_allowed_speedup = 1.0 / (1.0 + max_regression_percent / 100.0)
+    speedups = [float(row["register_speedup"]) for row in speedup_rows]
+    geomean = math.exp(statistics.fmean(math.log(speedup) for speedup in speedups if speedup > 0.0))
+    regressions = [row for row in speedup_rows if float(row["register_speedup"]) < minimum_allowed_speedup]
+    missing_pair_count = max(0, expected_pair_count - len(speedup_rows))
+    success = not regressions and missing_pair_count == 0 and geomean >= min_geomean_speedup
+    return {
+        "available": True,
+        "success": success,
+        "decision": "register" if success else "review-or-stateful",
+        "paired_points": len(speedup_rows),
+        "expected_paired_points": expected_pair_count,
+        "missing_paired_points": missing_pair_count,
+        "max_allowed_regression_percent": max_regression_percent,
+        "minimum_allowed_speedup": minimum_allowed_speedup,
+        "min_geomean_speedup": min_geomean_speedup,
+        "geomean_speedup": geomean,
+        "median_speedup": statistics.median(speedups),
+        "minimum_speedup": min(speedups),
+        "maximum_speedup": max(speedups),
+        "regression_count": len(regressions),
+        "regressions": regressions,
+    }
 
 
 def compare_summaries(
@@ -349,10 +558,20 @@ def main() -> int:
     parser.add_argument("--samples", type=int, default=11)
     parser.add_argument("--full-vectors", type=int, default=4096)
     parser.add_argument("--tail-vectors", type=int)
+    parser.add_argument(
+        "--encodings",
+        nargs="+",
+        choices=("delta", "delta-register", "ffor"),
+        default=("delta", "delta-register", "ffor"),
+    )
     parser.add_argument("--compare-to", type=Path, help="Baseline summary JSON created by this script")
     parser.add_argument("--max-regression-percent", type=float, default=5.0)
+    parser.add_argument("--max-register-regression-percent", type=float, default=5.0)
+    parser.add_argument("--min-register-geomean-speedup", type=float, default=1.05)
     parser.add_argument("--skip-codegen-check", action="store_true")
     parser.add_argument("--skip-resource-probe", action="store_true")
+    parser.add_argument("--resource-probe-only", action="store_true")
+    parser.add_argument("--resource-architecture", choices=("89", "90"))
     args = parser.parse_args()
 
     if args.samples < 5:
@@ -368,15 +587,15 @@ def main() -> int:
         parser.error(
             "full-vectors must be a positive multiple of 4 and tail-vectors must be positive and odd"
         )
-    if not micro_bench.is_file():
+    if not args.resource_probe_only and not micro_bench.is_file():
         parser.error(f"micro_bench not found: {micro_bench}")
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.device
     rows: list[dict[str, str]] = []
     commands: list[list[str]] = []
-    for encoding, data_type, start_width, end_width, mode, unpack, n_vectors in benchmark_matrix(
-        args.full_vectors, tail_vectors
+    for encoding, data_type, start_width, end_width, mode, unpack, n_vectors in (
+        [] if args.resource_probe_only else benchmark_matrix(args.full_vectors, tail_vectors, args.encodings)
     ):
         csv_path = raw_dir / f"{encoding}_{data_type}_{mode}_u{unpack}.csv"
         command = [
@@ -416,9 +635,17 @@ def main() -> int:
         codegen = check_generated_bindings(repo, build_dir)
     resources: dict[str, Any] = {"skipped": True}
     if not args.skip_resource_probe:
-        resources = collect_resource_metrics(build_dir, output_dir)
+        resources = collect_resource_metrics(
+            repo, build_dir, output_dir, architecture_override=args.resource_architecture
+        )
 
     summary_rows = summarize(rows)
+    register_speedups = summarize_register_speedups(summary_rows)
+    register_default = evaluate_register_default(
+        register_speedups,
+        args.max_register_regression_percent,
+        args.min_register_geomean_speedup,
+    )
     report: dict[str, Any] = {
         "label": args.label,
         "aggregate_csv": str(aggregate_csv),
@@ -429,6 +656,7 @@ def main() -> int:
             "delta_bit_widths": {"i8": [1, 8], "i16": [1, 16]},
             "unpack_n_vectors": [1, 2, 4],
             "modes": ["full", "tail", "selected"],
+            "encodings": list(args.encodings),
             "timing_scope": "CUDA event time around production workset kernels only",
         },
         "machine": collect_machine_metadata(repo, env),
@@ -436,10 +664,19 @@ def main() -> int:
         "resources": resources,
         "commands": commands,
         "summary": summary_rows,
+        "register_vs_stateful": register_speedups,
+        "register_default_gate": register_default,
+        "encoding_throughput_comparisons": {
+            "register_vs_ffor": compare_encoding_throughput(summary_rows, "delta-register", "ffor"),
+            "stateful_vs_ffor": compare_encoding_throughput(summary_rows, "delta", "ffor"),
+        },
     }
     exit_code = 0
     if not codegen.get("success", False):
         exit_code = 1
+    if "delta" in args.encodings and "delta-register" in args.encodings and not args.resource_probe_only:
+        if not register_default["success"]:
+            exit_code = 1
     if args.compare_to:
         baseline_report = json.loads(args.compare_to.read_text())
         comparison = compare_summaries(
