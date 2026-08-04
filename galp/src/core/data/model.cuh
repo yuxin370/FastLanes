@@ -113,6 +113,10 @@ struct Rowgroup {
 	size_t              n_tuples = 0;
 	std::vector<Column> columns;
 	std::shared_ptr<void> backing_storage;
+	// Empty means every column is materialized. A non-empty list identifies
+	// the logical columns materialized by a coefficient-range read; the
+	// columns vector retains its original indexing for aliases/dictionaries.
+	std::vector<uint8_t> materialized_column_indices;
 	std::shared_ptr<const PackedRowgroupDevicePayload> packed_device_payload;
 };
 

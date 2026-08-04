@@ -22,6 +22,7 @@ inline constexpr size_t kDefaultJpegDctDevicePlanCacheCapacity                = 
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchDepth            = 4;
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchWorkers          = 1;
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches = 2;
+inline constexpr size_t kDefaultJpegDctDeviceDecodeWorksetCapacityBytes       = size_t {512U} * 1024U * 1024U;
 
 class JpegDctShardDatasetReader;
 struct JpegDctDeviceCacheStats;
@@ -129,6 +130,12 @@ enum class JpegDctSchedulingPolicy {
 	kSerial,
 };
 
+enum class JpegDctBlockMajorDoubleBufferPolicy {
+	kAutomatic,
+	kEnabled,
+	kDisabled,
+};
+
 // Controls the storage/decode granularity for crop A/B measurements. All
 // modes preserve the same crop transform and output contract.
 enum class JpegDctCropExecutionMode {
@@ -154,7 +161,10 @@ struct JpegDctDeviceBatchOptions {
 	size_t                      transform_blocks_per_launch = 0;
 	size_t                      transform_ctas_per_launch   = 0;
 	bool                        use_low_priority_streams    = false;
+	JpegDctBlockMajorDoubleBufferPolicy block_major_double_buffer_policy =
+	    JpegDctBlockMajorDoubleBufferPolicy::kAutomatic;
 	JpegDctCropExecutionMode    crop_execution_mode         = JpegDctCropExecutionMode::kAutomatic;
+	size_t                      decode_workset_capacity_bytes = kDefaultJpegDctDeviceDecodeWorksetCapacityBytes;
 };
 
 struct JpegDctDeviceImageLayout {
@@ -221,6 +231,14 @@ struct JpegDctDeviceBatchPlanPreview {
 	size_t                                     compiled_access_profile_hits                = 0;
 	size_t                                     compiled_access_profile_misses              = 0;
 	size_t                                     planless_axis_program_bytes                 = 0;
+	size_t                                     compact_plan_bytes                          = 0;
+	size_t                                     compact_plan_peak_bytes                     = 0;
+	size_t                                     coordinate_group_lookup_count               = 0;
+	size_t                                     coordinate_group_index_entries              = 0;
+	size_t                                     coordinate_group_index_populated            = 0;
+	size_t                                     coordinate_group_index_holes                = 0;
+	size_t                                     coordinate_group_index_bytes                = 0;
+	double                                     coordinate_group_index_density              = 0.0;
 	bool                                       exact_batch_plan_cache_enabled              = false;
 	size_t                                     compact_reader_image_locator_bytes          = 0;
 	size_t                                     compact_reader_shard_index_bytes            = 0;
@@ -229,6 +247,9 @@ struct JpegDctDeviceBatchPlanPreview {
 	size_t                                     compact_reader_total_bytes                  = 0;
 	size_t                                     compact_reader_shard_descriptor_bytes       = 0;
 	bool                                       compact_reader_shard_index_derived          = false;
+	size_t                                     decode_workset_capacity_bytes               = 0U;
+	size_t                                     estimated_max_decode_workset_bytes           = 0U;
+	size_t                                     estimated_oversized_decode_rowgroups         = 0U;
 };
 
 struct JpegDctDeviceBatchPlanEstimate {

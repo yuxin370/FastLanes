@@ -129,16 +129,15 @@ enum class JpegDctRowOrdering {
 enum class JpegDctPhysicalLayout {
 	kSpatialMajorImageMinor,
 	kImageMajor,
-	// Experimental manifest-v3 upper-bound layout: image-major rows remain
-	// contiguous, but every FastLanes vector is an independently addressable
-	// rowgroup. Production datasets should normally use kImageMajor together
-	// with the sparse vector-range reader.
+	// Canonical manifest-v3 layout: image-major rows remain contiguous, every
+	// FastLanes vector is an independently addressable rowgroup, and GALP's
+	// compact descriptor supplies crop and coefficient-range locality without
+	// a sparse-vector sidecar.
 	kImageMajorVectorRowgroups,
 };
 
 [[nodiscard]] constexpr bool is_image_major_physical_layout(const JpegDctPhysicalLayout layout) noexcept {
-	return layout == JpegDctPhysicalLayout::kImageMajor ||
-	       layout == JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
+	return layout == JpegDctPhysicalLayout::kImageMajor || layout == JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
 }
 
 struct JpegDctBlockGroupIndex {

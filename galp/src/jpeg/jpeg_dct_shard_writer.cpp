@@ -1,6 +1,7 @@
 #include "fls/cfg/cfg.hpp"
 #include "fls/connection.hpp"
 #include "fls/table/memory_table.hpp"
+#include "format/compact_descriptor_v3.hpp"
 #include "galp/jpeg_dct_storage.hpp"
 #include "jpeg/jpeg_dct_decode.hpp"
 #include "jpeg/jpeg_dct_expression_validation.hpp"
@@ -249,6 +250,59 @@ std::vector<uint64_t> make_image_vector_rowgroups(JpegDctDatasetMetadata& metada
 	return rowgroups;
 }
 
+galp::format::CompactV3BuildOptions make_compact_v3_options(const JpegDctDatasetMetadata& metadata,
+	                                                        const size_t rowgroup_count) {
+	galp::format::CompactV3BuildOptions options;
+	options.vector_size   = fastlanes::CFG::VEC_SZ;
+	options.spatial_order = static_cast<uint32_t>(metadata.image_major_spatial_order);
+	options.images.reserve(metadata.image_group_index.size());
+	for (size_t image_index = 0U; image_index < metadata.image_group_index.size(); ++image_index) {
+		const auto& group = metadata.image_group_index[image_index];
+		if (group.local_image_index != image_index || image_index >= metadata.images.size()) {
+			throw std::runtime_error("JPEG DCT Compact v3 image metadata is not dense and ordered");
+		}
+		const size_t next_rowgroup = image_index + 1U < metadata.image_group_index.size()
+		                                 ? metadata.image_group_index[image_index + 1U].fls_rowgroup_index
+		                                 : rowgroup_count;
+		if (group.fls_rowgroup_index >= next_rowgroup || next_rowgroup > rowgroup_count) {
+			throw std::runtime_error("JPEG DCT Compact v3 image rowgroup range is invalid");
+		}
+		if (group.row_count == 0U || group.row_count > std::numeric_limits<uint32_t>::max()) {
+			throw std::runtime_error("JPEG DCT Compact v3 image row count exceeds uint32 range");
+		}
+		galp::format::CompactV3ImageInput image;
+		image.first_rowgroup     = group.fls_rowgroup_index;
+		image.rowgroup_count     = static_cast<uint32_t>(next_rowgroup - group.fls_rowgroup_index);
+		image.real_row_count     = group.row_count;
+		image.first_physical_row = group.row_start;
+		uint64_t component_row_offset = 0U;
+		for (const auto& component : metadata.images[image_index].components) {
+			if (!component.present) {
+				continue;
+			}
+			if (component_row_offset > std::numeric_limits<uint32_t>::max()) {
+				throw std::runtime_error("JPEG DCT Compact v3 component row offset exceeds uint32 range");
+			}
+			galp::format::CompactV3ComponentInput compact_component;
+			compact_component.semantic_slot_id        = component.semantic_slot_id;
+			compact_component.width_in_blocks         = component.width_in_blocks;
+			compact_component.height_in_blocks        = component.height_in_blocks;
+			compact_component.padded_width_in_blocks  = component.padded_width_in_blocks;
+			compact_component.padded_height_in_blocks = component.padded_height_in_blocks;
+			compact_component.row_offset              = static_cast<uint32_t>(component_row_offset);
+			compact_component.component_index = static_cast<uint32_t>(component.component_index);
+			image.components.push_back(compact_component);
+			component_row_offset +=
+			    static_cast<uint64_t>(component.width_in_blocks) * component.height_in_blocks;
+		}
+		if (component_row_offset != group.row_count) {
+			throw std::runtime_error("JPEG DCT Compact v3 component grids do not cover the image record");
+		}
+		options.images.push_back(std::move(image));
+	}
+	return options;
+}
+
 uint64_t decoded_image_vector_count(const DecodedImage& image) {
 	uint64_t image_rows = 0U;
 	for (const auto& component : image.components) {
@@ -421,7 +475,8 @@ size_t choose_shard_image_count(const ShardSizingContext&  ctx,
 void write_jpeg_dct_fls_data(const JpegDctTable&                  table,
                              const std::filesystem::path&         fls_output_path,
                              const fastlanes::MemoryTableOptions& options       = {},
-                             const bool                           inline_footer = false) {
+                             const bool                           inline_footer = false,
+                             const fastlanes::EncodingOptions&    encoding_options = {}) {
 	std::array<fastlanes::MemoryColumn, 64> columns;
 	for (size_t col = 0; col < columns.size(); ++col) {
 		columns[col].name = dct_column_name(col);
@@ -435,7 +490,7 @@ void write_jpeg_dct_fls_data(const JpegDctTable&                  table,
 	if (inline_footer) {
 		connection.inline_footer();
 	}
-	connection.to_fls(fls_output_path);
+	connection.to_fls(fls_output_path, encoding_options);
 }
 
 std::string shard_file_name(const uint32_t shard_id, const std::string_view suffix) {
@@ -482,6 +537,21 @@ JpegDctShardOptions effective_shard_options(JpegDctShardOptions options) {
 	}
 	if (!options.physical_layout_specified && options.preset == JpegDctShardPreset::kRandomAccess) {
 		options.physical_layout = JpegDctPhysicalLayout::kImageMajor;
+	}
+
+	const bool legacy_threads_selected = options.threads_specified || options.threads != 1U;
+	const bool layout_threads_selected = options.layout_threads_specified || options.layout_threads != 1U;
+	const bool decode_threads_selected =
+	    options.shard_decode_threads_specified || options.shard_decode_threads != 1U;
+	if (legacy_threads_selected) {
+		if (layout_threads_selected && options.layout_threads != options.threads) {
+			throw std::invalid_argument("legacy threads conflict with layout_threads");
+		}
+		if (decode_threads_selected && options.shard_decode_threads != options.threads) {
+			throw std::invalid_argument("legacy threads conflict with shard_decode_threads");
+		}
+		options.layout_threads       = options.threads;
+		options.shard_decode_threads = options.threads;
 	}
 	return options;
 }
@@ -560,11 +630,24 @@ JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<
 	if (effective_options.rowgroups_per_shard == 0) {
 		throw std::runtime_error("JPEG DCT rowgroups_per_shard must be greater than zero");
 	}
-	if (effective_options.threads == 0) {
-		throw std::runtime_error("JPEG DCT shard threads must be greater than zero");
+	if (effective_options.layout_threads == 0) {
+		throw std::runtime_error("JPEG DCT layout threads must be greater than zero");
+	}
+	if (effective_options.shard_decode_threads == 0) {
+		throw std::runtime_error("JPEG DCT shard decode threads must be greater than zero");
 	}
 	if (effective_options.shard_workers == 0) {
 		throw std::runtime_error("JPEG DCT shard workers must be greater than zero");
+	}
+	if (effective_options.encoding_workers_per_shard == 0) {
+		throw std::runtime_error("JPEG DCT encoding workers per shard must be greater than zero");
+	}
+	constexpr size_t kMaxConcurrentPipelineThreads = 256U;
+	const auto per_shard_threads =
+	    std::max(effective_options.shard_decode_threads, effective_options.encoding_workers_per_shard);
+	if (effective_options.layout_threads > kMaxConcurrentPipelineThreads ||
+	    effective_options.shard_workers > kMaxConcurrentPipelineThreads / per_shard_threads) {
+		throw std::runtime_error("JPEG DCT configured pipeline parallelism exceeds the 256-thread safety bound");
 	}
 
 	std::filesystem::create_directories(output_dir);
@@ -573,8 +656,11 @@ JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<
 	if (metadata_options.profile == JpegMetadataProfile::kPreserveOriginalMarkers) {
 		read_options.capture_metadata_markers = true;
 	}
+	if (effective_options.physical_layout == JpegDctPhysicalLayout::kImageMajorVectorRowgroups) {
+		read_options.image_major_spatial_order = JpegDctSpatialOrder::kTiledZ32;
+	}
 	auto global_layout_images =
-	    detail::decode_jpeg_layouts_parallel(jpeg_paths, read_options, effective_options.threads);
+	    detail::decode_jpeg_layouts_parallel(jpeg_paths, read_options, effective_options.layout_threads);
 	detail::validate_supported_layout_options(read_options);
 	detail::validate_decoded_dataset(global_layout_images);
 	const auto global_slots = detail::normalize_component_slots(global_layout_images);
@@ -589,6 +675,12 @@ JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<
 		// one FastLanes vector. The caller's configured value is ignored and the
 		// effective value is persisted in the manifest for reproducibility.
 		effective_options.rowgroup_vectors = 1U;
+		// A legacy 256-rowgroup cap would repeat the shared schema dictionary
+		// across thousands of tiny shards at 50K-image scale. Keep explicit
+		// caller limits, but use a scale-oriented v3 default.
+		if (!shard_options.rowgroups_per_shard_specified) {
+			effective_options.rowgroups_per_shard = 8192U;
+		}
 	}
 
 	JpegDctShardManifest manifest;
@@ -599,6 +691,13 @@ JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<
 	manifest.rowgroup_vectors    = effective_options.rowgroup_vectors;
 	manifest.rowgroups_per_shard = effective_options.rowgroups_per_shard;
 	manifest.image_count         = jpeg_paths.size();
+	if (manifest.version == 3U) {
+		manifest.physical_layout = "image-major-vector-rowgroups";
+		manifest.descriptor_kind = "galp-compact-v1";
+		manifest.vector_size     = fastlanes::CFG::VEC_SZ;
+		manifest.spatial_order_name = "tiled-z32";
+		manifest.spatial_order   = read_options.image_major_spatial_order;
+	}
 
 	struct ShardWorkItem {
 		size_t first_image = 0;
@@ -675,8 +774,8 @@ JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<
         const auto                         shard_end = shard_begin + static_cast<std::ptrdiff_t>(shard_image_count);
         std::vector<std::filesystem::path> shard_paths(shard_begin, shard_end);
 
-        auto shard_images =
-            detail::decode_jpeg_coefficients_parallel(shard_paths, read_options, effective_options.threads);
+        auto shard_images = detail::decode_jpeg_coefficients_parallel(
+            shard_paths, read_options, effective_options.shard_decode_threads);
         auto table = detail::make_dataset_table(
             std::move(shard_images), read_options, &global_slots, effective_options.physical_layout);
 		if (effective_options.physical_layout == JpegDctPhysicalLayout::kImageMajor) {
@@ -705,8 +804,28 @@ JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<
         // JPEG-DCT production storage always uses the default FastLanes wizard.
         // Tests that need a specific root token exercise MemoryTableOptions
         // directly instead of exposing a force-schema switch in this API.
-        write_jpeg_dct_fls_data(table, output_paths.fls_staged, memory_options, true);
-        detail::validate_jpeg_dct_fls_gpu_expressions(output_paths.fls_staged, static_cast<uint32_t>(shard_id));
+		fastlanes::EncodingOptions encoding_options;
+		encoding_options.worker_count = effective_options.encoding_workers_per_shard;
+		galp::format::CompactV3Report compact_report;
+		if (manifest.version == 3U) {
+			const auto standard_path = std::filesystem::path(output_paths.fls_staged.string() + ".standard.tmp");
+			write_jpeg_dct_fls_data(table, standard_path, memory_options, true, encoding_options);
+			detail::validate_jpeg_dct_fls_gpu_expressions(standard_path, static_cast<uint32_t>(shard_id));
+			compact_report = galp::format::compact_standard_fls_to_v3(
+			    standard_path,
+			    output_paths.fls_staged,
+			    make_compact_v3_options(table.metadata, table.rowgroup_n_tuples.size()));
+			std::error_code remove_error;
+			std::filesystem::remove(standard_path, remove_error);
+			if (remove_error) {
+				throw std::runtime_error("failed to remove temporary standard FLS shard: " + remove_error.message());
+			}
+			static_cast<void>(galp::format::CompactDescriptorV3::Open(output_paths.fls_staged));
+		} else {
+			write_jpeg_dct_fls_data(table, output_paths.fls_staged, memory_options, true, encoding_options);
+			detail::validate_jpeg_dct_fls_gpu_expressions(
+			    output_paths.fls_staged, static_cast<uint32_t>(shard_id));
+		}
         write_jpeg_dct_metadata(table.metadata, output_paths.metadata_staged, metadata_options);
 
         JpegDctShardManifestEntry entry;
@@ -720,6 +839,10 @@ JpegDctShardManifest compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<
         entry.block_group_count  = static_cast<uint32_t>(table.block_group_count);
         entry.fls_file_size      = std::filesystem::file_size(output_paths.fls_staged);
         entry.metadata_file_size = std::filesystem::file_size(output_paths.metadata_staged);
+		entry.payload_size             = compact_report.payload_bytes;
+		entry.payload_crc64            = compact_report.payload_crc64;
+		entry.compact_descriptor_size  = compact_report.compact_descriptor_bytes;
+		entry.source_descriptor_size   = compact_report.source_descriptor_bytes;
         entry.fls_file_name      = output_paths.fls_name;
         entry.metadata_file_name = output_paths.metadata_name;
         shard_entries[shard_id]  = std::move(entry);

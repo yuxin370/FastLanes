@@ -317,7 +317,7 @@ RowgroupReadResult read_rowgroup(galp::format::FlsReader&                       
 	const size_t                          storage_bytes = rdr.rowgroup_storage_bytes(rowgroup_index);
 	result.rowgroup_index                               = rowgroup_index;
 	result.full_storage_bytes                           = storage_bytes;
-	if (pinned_pool) {
+	if (pinned_pool && storage_bytes != 0U) {
 		const auto acquire_start = std::chrono::steady_clock::now();
 		auto       lease         = pinned_pool->acquire(storage_bytes);
 		const auto acquire_end   = std::chrono::steady_clock::now();

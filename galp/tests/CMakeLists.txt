@@ -6,7 +6,68 @@ add_executable(galp_tests
         reader_test.cu
         workset_selected_vectors_test.cu
 )
+
+add_executable(galp_compact_format_tests
+        compact_descriptor_v3_test.cpp)
+target_link_libraries(galp_compact_format_tests PRIVATE
+        galp_compact_format
+        GTest::gtest_main
+        FastLanes::core)
+target_include_directories(galp_compact_format_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+apply_warnings(galp_compact_format_tests)
+gtest_discover_tests(galp_compact_format_tests
+        DISCOVERY_TIMEOUT 60
+        PROPERTIES LABELS "galp;compact-v3;cpu")
+if (Python3_Interpreter_FOUND)
+        add_test(
+                NAME GalpCompactV3AcceptancePython
+                COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_compact_v3_acceptance.py)
+        set_tests_properties(GalpCompactV3AcceptancePython PROPERTIES LABELS "galp;compact-v3;cpu")
+        add_test(
+                NAME GalpPrepareImagenet512ParallelismPython
+                COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_prepare_imagenet512_v3_train.py)
+        set_tests_properties(GalpPrepareImagenet512ParallelismPython PROPERTIES LABELS "galp;jpeg-dct;pipeline;cpu")
+endif ()
 if (GALP_WITH_JPEG_DCT)
+        add_executable(galp_jpeg_dct_decode_memory_tests
+                jpeg_dct_decode_memory_test.cpp)
+        target_link_libraries(galp_jpeg_dct_decode_memory_tests PRIVATE
+                galp_jpeg_dct_storage
+                GTest::gtest_main)
+        target_include_directories(galp_jpeg_dct_decode_memory_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+        apply_warnings(galp_jpeg_dct_decode_memory_tests)
+        gtest_discover_tests(galp_jpeg_dct_decode_memory_tests
+                DISCOVERY_TIMEOUT 60
+                PROPERTIES LABELS "galp;jpeg-dct;memory;cpu")
+
+        add_executable(galp_jpeg_dct_exact_verifier_tests
+                jpeg_dct_exact_verifier_test.cpp)
+        target_link_libraries(galp_jpeg_dct_exact_verifier_tests PRIVATE
+                galp_core
+                GTest::gtest_main
+                JPEG::JPEG)
+        target_include_directories(galp_jpeg_dct_exact_verifier_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+        apply_warnings(galp_jpeg_dct_exact_verifier_tests)
+        gtest_discover_tests(galp_jpeg_dct_exact_verifier_tests
+                DISCOVERY_TIMEOUT 60
+                PROPERTIES LABELS "galp;jpeg-dct;exact-verifier;cpu")
+
+        add_executable(galp_block_major_access_tests
+                jpeg_dct_block_major_access_test.cpp)
+        target_link_libraries(galp_block_major_access_tests PRIVATE
+				galp_core
+                GTest::gtest_main
+                FastLanes::core)
+        target_include_directories(galp_block_major_access_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+        apply_warnings(galp_block_major_access_tests)
+        gtest_discover_tests(galp_block_major_access_tests
+                DISCOVERY_TIMEOUT 60
+                PROPERTIES LABELS "galp;jpeg-dct;block-major-access;cpu")
+
         target_sources(galp_tests PRIVATE
                 jpeg_dct_order_test.cpp
                 jpeg_dct_test.cpp

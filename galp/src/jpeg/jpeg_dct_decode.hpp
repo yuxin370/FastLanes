@@ -31,6 +31,17 @@ struct ComponentSlot {
 	uint32_t max_height_in_blocks = 0;
 };
 
+// Internal build diagnostics used by the large-shard regression tests. A row
+// slot represents one decoded 64-coefficient block or one populated table row.
+struct JpegDctTableBuildStats {
+	size_t expected_table_rows        = 0;
+	size_t initial_decoded_rows       = 0;
+	size_t released_decoded_rows      = 0;
+	size_t remaining_decoded_rows     = 0;
+	size_t peak_coefficient_row_slots = 0;
+	size_t column_capacity_growths    = 0;
+};
+
 DecodedImage decode_jpeg_coefficients(const std::filesystem::path& path, const JpegDctReaderOptions& options);
 DecodedImage decode_jpeg_layout(const std::filesystem::path& path, const JpegDctReaderOptions& options);
 
@@ -51,7 +62,8 @@ JpegDctTable make_dataset_table(std::vector<DecodedImage> images, const JpegDctR
 JpegDctTable make_dataset_table(std::vector<DecodedImage>         images,
                                 const JpegDctReaderOptions&       options,
                                 const std::vector<ComponentSlot>* global_slots,
-                                JpegDctPhysicalLayout             physical_layout);
+                                JpegDctPhysicalLayout             physical_layout,
+                                JpegDctTableBuildStats*           build_stats = nullptr);
 
 } // namespace galp::jpeg::detail
 

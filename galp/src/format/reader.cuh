@@ -20,6 +20,12 @@
 
 namespace galp::format {
 
+// DeviceArena places independently registered backing regions on 256-byte
+// boundaries. Compact batch reads preserve the same boundary between
+// rowgroups so coalescing adjacent host regions cannot turn a later rowgroup
+// into a misaligned device subspan.
+inline constexpr size_t kCompactBatchRowgroupAlignment = 256U;
+
 class SparseVectorReadPlan {
 public:
 	enum class Backend {
@@ -60,6 +66,8 @@ struct SparseVectorBundleIndex;
 
 } // namespace detail
 
+class CompactDescriptorV3;
+
 struct FlsReaderOptions {
 	bool load_column_names                 = true;
 	bool enable_sparse_vector_reads         = true;
@@ -77,6 +85,9 @@ public:
 	size_t                            rowgroup_count() const;
 	size_t                            rowgroup_storage_bytes(size_t rowgroup_idx) const;
 	bool                              has_sparse_vector_bundle() const noexcept;
+	bool                              is_compact_v3() const noexcept;
+	size_t                            compact_batch_backing_bytes(
+	                               const std::vector<size_t>& rowgroup_indices) const;
 	bool                              sparse_vector_read_supported(size_t rowgroup_idx,
 	                                                              std::string* reason = nullptr) const;
 	SparseVectorReadPlan compile_sparse_vector_read_plan(size_t                       rowgroup_idx,
@@ -92,13 +103,19 @@ public:
 	                                               std::byte*                   backing_data,
 	                                               size_t                       backing_capacity,
 	                                               ZeroCopyReadTiming*          timing = nullptr);
+	void read_rowgroup_bytes_selected_columns_into(size_t                      rowgroup_idx,
+	                                               const std::vector<uint8_t>& selected_columns,
+	                                               std::byte*                  backing_data,
+	                                               size_t                      backing_capacity,
+	                                               ZeroCopyReadTiming*         timing = nullptr);
 
 	ZeroCopyRowgroup make_zero_copy_rowgroup_from_backing(size_t                rowgroup_idx,
 	                                                      std::shared_ptr<void> backing_owner,
 	                                                      std::byte*            backing_data,
 	                                                      size_t                backing_capacity,
 	                                                      bool                  backing_is_pinned = false,
-	                                                      ZeroCopyReadTiming*   timing            = nullptr);
+	                                                      ZeroCopyReadTiming*   timing            = nullptr,
+	                                                      bool                  prefer_compact_direct_geometry = false);
 
 	ZeroCopyRowgroup read_rowgroup_zero_copy_into(size_t                rowgroup_idx,
 	                                              std::shared_ptr<void> backing_owner,
@@ -114,14 +131,56 @@ public:
 	    size_t                       backing_capacity,
 	    bool                         backing_is_pinned = false,
 	    ZeroCopyReadTiming*          timing            = nullptr);
+	ZeroCopyRowgroup read_rowgroup_zero_copy_selected_columns_into(
+	    size_t                      rowgroup_idx,
+	    const std::vector<uint8_t>& selected_columns,
+	    std::shared_ptr<void>       backing_owner,
+	    std::byte*                  backing_data,
+	    size_t                      backing_capacity,
+	    bool                        backing_is_pinned = false,
+	    ZeroCopyReadTiming*         timing            = nullptr);
 
-	ZeroCopyRowgroup      read_rowgroup_zero_copy(size_t rowgroup_idx = 0, ZeroCopyReadTiming* timing = nullptr);
-	ZeroCopyRowgroup      read_rowgroup_zero_copy_selected_vectors(
-	         size_t rowgroup_idx, const std::vector<uint32_t>& selected_vectors, ZeroCopyReadTiming* timing = nullptr);
-	ZeroCopyRowgroup read_rowgroup_zero_copy_selected_vectors_packed(
-	    size_t rowgroup_idx, const std::vector<uint32_t>& selected_vectors, ZeroCopyReadTiming* timing = nullptr);
-	ZeroCopyRowgroup read_rowgroup_zero_copy_compiled(const SparseVectorReadPlan& plan,
-	                                                  ZeroCopyReadTiming* timing = nullptr);
+	ZeroCopyRowgroup read_rowgroup_zero_copy(size_t rowgroup_idx = 0, ZeroCopyReadTiming* timing = nullptr);
+	ZeroCopyRowgroup read_rowgroup_zero_copy_selected_vectors(size_t                       rowgroup_idx,
+	                                                          const std::vector<uint32_t>& selected_vectors,
+	                                                          ZeroCopyReadTiming*          timing = nullptr);
+	ZeroCopyRowgroup read_rowgroup_zero_copy_selected_columns(size_t                      rowgroup_idx,
+	                                                          const std::vector<uint8_t>& selected_columns,
+	                                                          ZeroCopyReadTiming*         timing = nullptr);
+	// Compact-v3 payloads are physically ordered by rowgroup. Sort the requested
+	// rowgroups by payload offset, join adjacent payloads into preadv runs, and
+	// preserve the caller's rowgroup order in the returned views.
+	std::vector<ZeroCopyRowgroup>
+	read_compact_rowgroups_zero_copy_scatter(const std::vector<size_t>&       rowgroup_indices,
+	                                         std::vector<ZeroCopyReadTiming>* timings = nullptr,
+	                                         size_t                           view_workers = 1U);
+	std::vector<ZeroCopyRowgroup> read_compact_rowgroups_zero_copy_scatter_into(
+	    const std::vector<size_t>&       rowgroup_indices,
+	    std::shared_ptr<void>            backing_owner,
+	    std::byte*                       backing_data,
+	    size_t                           backing_capacity,
+	    bool                             backing_is_pinned = false,
+	    std::vector<ZeroCopyReadTiming>* timings           = nullptr,
+	    size_t                           view_workers      = 1U);
+	std::vector<ZeroCopyRowgroup>
+	read_compact_rowgroups_zero_copy_selected_columns(const std::vector<size_t>&       rowgroup_indices,
+	                                                  const std::vector<uint8_t>&      selected_columns,
+	                                                  std::vector<ZeroCopyReadTiming>* timings = nullptr,
+	                                                  size_t                           view_workers = 1U);
+	std::vector<ZeroCopyRowgroup> read_compact_rowgroups_zero_copy_selected_columns_into(
+	    const std::vector<size_t>&       rowgroup_indices,
+	    const std::vector<uint8_t>&      selected_columns,
+	    std::shared_ptr<void>            backing_owner,
+	    std::byte*                       backing_data,
+	    size_t                           backing_capacity,
+	    bool                             backing_is_pinned = false,
+	    std::vector<ZeroCopyReadTiming>* timings           = nullptr,
+	    size_t                           view_workers      = 1U);
+	ZeroCopyRowgroup      read_rowgroup_zero_copy_selected_vectors_packed(size_t                       rowgroup_idx,
+	                                                                      const std::vector<uint32_t>& selected_vectors,
+	                                                                      ZeroCopyReadTiming*          timing = nullptr);
+	ZeroCopyRowgroup      read_rowgroup_zero_copy_compiled(const SparseVectorReadPlan& plan,
+	                                                       ZeroCopyReadTiming*         timing = nullptr);
 	Rowgroup              materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) const;
 	Rowgroup              read_rowgroup_zero_copy_materialized(size_t rowgroup_idx = 0);
 	Rowgroup              read_rowgroup(size_t rowgroup_idx = 0);
@@ -132,6 +191,7 @@ private:
 
 	std::shared_ptr<fastlanes::File>                        m_file;
 	std::shared_ptr<const fastlanes::TableDescriptorHandle> m_table_descriptor;
+	std::shared_ptr<CompactDescriptorV3>                    m_compact_descriptor;
 	std::shared_ptr<const detail::SparseVectorBundleIndex>  m_sparse_vector_bundle;
 	std::shared_ptr<const detail::SparseDatasetAccessIndex> m_sparse_access_index;
 	bool                                                    m_load_column_names = true;

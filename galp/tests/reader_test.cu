@@ -3,8 +3,13 @@
 // ────────────────────────────────────────────────────────
 // galp/tests/reader_test.cu
 // ────────────────────────────────────────────────────────
-#include "engine/materialization/pinned_d2h.cuh"
+#include "codecs/encodings/all.cuh"
+#include "cuda/launch/launch.cuh"
+#include "cuda/memory/cuda_raii.cuh"
+#include "cuda/memory/device_pool.cuh"
+#include "cuda/memory/pinned_host_pool.cuh"
 #include "engine/materialization/metadata.cuh"
+#include "engine/materialization/pinned_d2h.cuh"
 #include "engine/materialization/selected_vector_compactor.hpp"
 #include "engine/operators/column.cuh"
 #include "engine/operators/rowgroup.cuh"
@@ -12,21 +17,21 @@
 #include "engine/table/table.cuh"
 #include "engine/workset/append.cuh"
 #include "engine/workset/upload.cuh"
-#include "cuda/launch/launch.cuh"
-#include "cuda/memory/pinned_host_pool.cuh"
-#include "format/reader.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/table/memory_table.hpp"
 #include "fls/table/rowgroup.hpp"
-#include "codecs/encodings/all.cuh"
+#include "format/compact_descriptor_v3.hpp"
+#include "format/compact_read_plan.hpp"
+#include "format/reader.cuh"
 #include "galp/galp.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +39,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -84,6 +90,28 @@ TEST(PinnedHostPool, ReusesBestFitAndBoundsReleasedMemory) {
 
 	pool.set_cache_limit_bytes(4096);
 	EXPECT_EQ(pool.stats().cached_bytes, 0U);
+}
+
+TEST(DevicePool, CallerOwnedPinnedUploadUsesTrackedStreamWithoutRestaging) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for caller-owned pinned upload test.";
+	}
+	auto& pool = galp::memory::DevicePool::instance();
+	galp::memory::CudaStream stream(cudaStreamNonBlocking);
+	auto* const host = static_cast<uint32_t*>(pool.alloc_pinned(sizeof(uint32_t)));
+	auto* const device = static_cast<uint32_t*>(galp::memory::device_malloc(sizeof(uint32_t)));
+	ASSERT_NE(host, nullptr);
+	ASSERT_NE(device, nullptr);
+	*host = 0x5A17C0DEU;
+
+	galp::memory::device_memcpy_pinned_h2d_async(device, host, sizeof(uint32_t), stream.get());
+	galp::memory::sync_h2d(stream.get());
+	uint32_t roundtrip = 0U;
+	ASSERT_EQ(cudaMemcpy(&roundtrip, device, sizeof(uint32_t), cudaMemcpyDeviceToHost), cudaSuccess);
+	EXPECT_EQ(roundtrip, *host);
+
+	pool.release_pinned(host);
+	galp::memory::device_free(device);
 }
 
 class ScopedEnvironmentVariable {
@@ -233,12 +261,432 @@ std::filesystem::path make_sparse_vector_bundle_fixture() {
 	return fls_path;
 }
 
+std::filesystem::path make_compact_coefficient_read_fixture() {
+	const std::filesystem::path root =
+	    std::filesystem::path {GALP_TEST_DATA_DIR} / "compact_coefficient_ranges";
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto standard_path = root / "standard.fls";
+	const auto compact_path  = root / "compact.fls";
+
+	std::array<std::vector<int16_t>, 8> values;
+	std::array<fastlanes::MemoryColumn, 8> columns;
+	for (size_t column = 0U; column < columns.size(); ++column) {
+		values[column].reserve(3U * galp::codec::consts::VALUES_PER_VECTOR);
+		for (size_t row = 0U; row < 3U * galp::codec::consts::VALUES_PER_VECTOR; ++row) {
+			values[column].push_back(static_cast<int16_t>((row * 17U + column * 29U) % 509U));
+		}
+		columns[column].name = "dct_zz_" + std::to_string(column);
+		columns[column].data = std::span<const int16_t>(values[column]);
+	}
+	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 1U;
+	options.force_schema           = true;
+	options.forced_schema.assign(columns.size(), fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+	fastlanes::Connection writer;
+	fastlanes::load_memory_table(writer, table, options);
+	writer.inline_footer();
+	writer.to_fls(standard_path);
+
+	galp::format::CompactV3BuildOptions compact_options;
+	compact_options.vector_size   = galp::codec::consts::VALUES_PER_VECTOR;
+	compact_options.spatial_order = 3U;
+	(void)galp::format::compact_standard_fls_to_v3(
+	    standard_path, compact_path, compact_options);
+	return compact_path;
+}
+
+std::filesystem::path make_compact_mixed_payload_fixture() {
+	const std::filesystem::path root =
+	    std::filesystem::path {GALP_TEST_DATA_DIR} / "compact_mixed_payload_rowgroups";
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto standard_path = root / "standard.fls";
+	const auto compact_path  = root / "compact.fls";
+
+	std::array<std::vector<int16_t>, 2> values;
+	for (size_t row = 0U; row < 3U * galp::codec::consts::VALUES_PER_VECTOR; ++row) {
+		const size_t rowgroup = row / galp::codec::consts::VALUES_PER_VECTOR;
+		const size_t local    = row % galp::codec::consts::VALUES_PER_VECTOR;
+		if (rowgroup == 1U) {
+			values[0].push_back(17);
+			values[1].push_back(-23);
+		} else {
+			values[0].push_back(
+			    static_cast<int16_t>(static_cast<int>((local * 17U + rowgroup * 31U) % 509U) - 254));
+			values[1].push_back(
+			    static_cast<int16_t>(static_cast<int>((local * 29U + rowgroup * 47U) % 997U) - 498));
+		}
+	}
+	std::array<fastlanes::MemoryColumn, 2> columns;
+	columns[0].name = "dct_zz_00";
+	columns[0].data = std::span<const int16_t>(values[0]);
+	columns[1].name = "dct_zz_01";
+	columns[1].data = std::span<const int16_t>(values[1]);
+	const fastlanes::MemoryTable        table {std::span<const fastlanes::MemoryColumn>(columns)};
+	const std::array<fastlanes::n_t, 3> rowgroup_rows {{galp::codec::consts::VALUES_PER_VECTOR,
+	                                                   galp::codec::consts::VALUES_PER_VECTOR,
+	                                                   galp::codec::consts::VALUES_PER_VECTOR}};
+	fastlanes::MemoryTableOptions       options;
+	options.n_vectors_per_rowgroup = 1U;
+	options.rowgroup_n_tuples      = std::span<const fastlanes::n_t>(rowgroup_rows);
+	fastlanes::Connection writer;
+	fastlanes::load_memory_table(writer, table, options);
+	writer.inline_footer();
+	writer.to_fls(standard_path);
+
+	galp::format::CompactV3BuildOptions compact_options;
+	compact_options.vector_size   = galp::codec::consts::VALUES_PER_VECTOR;
+	compact_options.spatial_order = 3U;
+	(void)galp::format::compact_standard_fls_to_v3(standard_path, compact_path, compact_options);
+	return compact_path;
+}
+
 size_t get_n_values(const galp::format::HostColumnVariant& host) {
 	return std::visit([](auto&& col) { return col.get_n_values(); }, host);
 }
 
+TEST(Reader, CompactV3CoefficientPrefixReadsExactPhysicalRanges) {
+	const auto compact_path = make_compact_coefficient_read_fixture();
+	galp::format::FlsReader reader(compact_path);
+	ASSERT_TRUE(reader.is_compact_v3());
+	EXPECT_FALSE(reader.has_sparse_vector_bundle());
+	EXPECT_THROW((void)reader.table_descriptor(), std::runtime_error);
+
+	galp::format::ZeroCopyReadTiming full_timing {};
+	auto full = reader.read_rowgroup_zero_copy(0U, &full_timing);
+	galp::format::ZeroCopyReadTiming prefix_timing {};
+	auto prefix = reader.read_rowgroup_zero_copy_selected_columns(0U, {0U, 1U, 2U, 3U}, &prefix_timing);
+	EXPECT_TRUE(prefix_timing.sparse_read_supported);
+	EXPECT_TRUE(prefix_timing.used_sparse_read);
+	EXPECT_TRUE(prefix_timing.used_coefficient_range_read);
+	EXPECT_EQ(prefix_timing.selected_coefficient_count, 4U);
+	EXPECT_EQ(prefix_timing.full_coefficient_count, 8U);
+	EXPECT_EQ(prefix_timing.pread_count, prefix_timing.coalesced_read_run_count);
+	EXPECT_LT(prefix_timing.storage_bytes, full_timing.storage_bytes);
+	EXPECT_LE(prefix_timing.logical_storage_bytes, prefix_timing.storage_bytes);
+	EXPECT_LE(prefix_timing.physical_page_bytes, prefix_timing.full_physical_page_bytes);
+
+	const auto* descriptors = prefix.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(descriptors, nullptr);
+	ASSERT_EQ(descriptors->size(), 8U);
+	for (size_t column = 0U; column < 4U; ++column) {
+		const auto* descriptor = descriptors->Get(static_cast<flatbuffers::uoffset_t>(column));
+		ASSERT_NE(descriptor, nullptr);
+		ASSERT_LE(static_cast<size_t>(descriptor->column_offset()) + descriptor->total_size(),
+		          prefix.backing_span.size());
+		EXPECT_EQ(std::memcmp(prefix.backing_span.data() + descriptor->column_offset(),
+		                      full.backing_span.data() + descriptor->column_offset(),
+		                      descriptor->total_size()),
+		          0)
+		    << "column=" << column;
+	}
+
+	auto materialized_prefix = reader.materialize_zero_copy_rowgroup(std::move(prefix));
+	EXPECT_EQ(materialized_prefix.materialized_column_indices, (std::vector<uint8_t> {0U, 1U, 2U, 3U}));
+	ASSERT_EQ(materialized_prefix.columns.size(), 8U);
+	for (size_t column = 0U; column < 4U; ++column) {
+		EXPECT_EQ(materialized_prefix.columns[column].token, fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+		EXPECT_EQ(get_n_values(materialized_prefix.columns[column].host), materialized_prefix.n_values);
+	}
+}
+
+TEST(Reader, CompactV3FullRowgroupsUseScatterReadsAndPreserveCallerOrder) {
+	const auto              compact_path = make_compact_coefficient_read_fixture();
+	galp::format::FlsReader reader(compact_path);
+	ASSERT_TRUE(reader.is_compact_v3());
+	ASSERT_EQ(reader.rowgroup_count(), 3U);
+
+	std::vector<galp::format::ZeroCopyReadTiming> scatter_timings;
+	auto scatter = reader.read_compact_rowgroups_zero_copy_scatter({2U, 0U, 1U}, &scatter_timings);
+	ASSERT_EQ(scatter.size(), 3U);
+	ASSERT_EQ(scatter_timings.size(), 3U);
+	EXPECT_EQ(scatter[0].rowgroup_index, 2U);
+	EXPECT_EQ(scatter[1].rowgroup_index, 0U);
+	EXPECT_EQ(scatter[2].rowgroup_index, 1U);
+	for (const auto& rowgroup : scatter) {
+		EXPECT_NE(rowgroup.compact_direct_owner, nullptr);
+		EXPECT_EQ(rowgroup.rowgroup_descriptor, nullptr);
+	}
+
+	size_t scatter_bytes   = 0U;
+	size_t scatter_preads  = 0U;
+	size_t scatter_preadvs = 0U;
+	size_t scatter_runs    = 0U;
+	for (size_t index = 0U; index < scatter.size(); ++index) {
+		scatter_bytes += scatter_timings[index].storage_bytes;
+		scatter_preads += scatter_timings[index].pread_count;
+		scatter_preadvs += scatter_timings[index].preadv_count;
+		scatter_runs += scatter_timings[index].coalesced_read_run_count;
+		galp::format::ZeroCopyReadTiming individual_timing {};
+		auto individual = reader.read_rowgroup_zero_copy(scatter[index].rowgroup_index, &individual_timing);
+		ASSERT_EQ(scatter[index].backing_span.size(), individual.backing_span.size());
+		EXPECT_EQ(std::memcmp(scatter[index].backing_span.data(),
+		                      individual.backing_span.data(),
+		                      scatter[index].backing_span.size()),
+		          0);
+	}
+	EXPECT_EQ(scatter_preads, 1U);
+	EXPECT_EQ(scatter_preadvs, 1U);
+	EXPECT_EQ(scatter_runs, 1U);
+	EXPECT_EQ(scatter_bytes,
+	          reader.rowgroup_storage_bytes(0U) + reader.rowgroup_storage_bytes(1U) +
+	              reader.rowgroup_storage_bytes(2U));
+	ASSERT_NE(scatter[0].backing_owner, nullptr);
+	EXPECT_EQ(scatter[0].backing_owner.get(), scatter[1].backing_owner.get());
+	EXPECT_EQ(scatter[0].backing_owner.get(), scatter[2].backing_owner.get());
+
+	std::vector<galp::format::ZeroCopyReadTiming> parallel_timings;
+	auto parallel =
+	    reader.read_compact_rowgroups_zero_copy_scatter({2U, 0U, 1U}, &parallel_timings, /*view_workers=*/4U);
+	ASSERT_EQ(parallel.size(), scatter.size());
+	ASSERT_EQ(parallel_timings.size(), scatter_timings.size());
+	for (size_t index = 0U; index < parallel.size(); ++index) {
+		EXPECT_EQ(parallel[index].rowgroup_index, scatter[index].rowgroup_index);
+		ASSERT_EQ(parallel[index].backing_span.size(), scatter[index].backing_span.size());
+		EXPECT_EQ(std::memcmp(parallel[index].backing_span.data(),
+		                      scatter[index].backing_span.data(),
+		                      scatter[index].backing_span.size()),
+		          0);
+	}
+	ASSERT_NE(parallel[0].backing_owner, nullptr);
+	EXPECT_EQ(parallel[0].backing_owner.get(), parallel[1].backing_owner.get());
+	EXPECT_EQ(parallel[0].backing_owner.get(), parallel[2].backing_owner.get());
+
+	galp::format::FlsReaderOptions runtime_options;
+	runtime_options.load_column_names                  = false;
+	runtime_options.enable_sparse_vector_reads         = false;
+	runtime_options.build_shared_zero_copy_schema_plan = false;
+	galp::format::FlsReader runtime_reader(compact_path, runtime_options);
+	auto runtime_views = runtime_reader.read_compact_rowgroups_zero_copy_scatter(
+	    {2U, 0U, 1U}, nullptr, /*view_workers=*/4U);
+	ASSERT_EQ(runtime_views.size(), scatter.size());
+	for (size_t index = 0U; index < runtime_views.size(); ++index) {
+		EXPECT_EQ(runtime_views[index].rowgroup_index, scatter[index].rowgroup_index);
+		EXPECT_NE(runtime_views[index].schema_plan, nullptr);
+		EXPECT_EQ(runtime_views[index].rowgroup_view, nullptr);
+		EXPECT_TRUE(runtime_views[index].columns.empty());
+	}
+
+	const std::vector<size_t> scatter_order {2U, 0U, 1U};
+	const size_t external_capacity = reader.compact_batch_backing_bytes(scatter_order);
+	ASSERT_GE(external_capacity, scatter_bytes);
+	auto external_backing = std::make_shared<std::vector<std::byte>>(external_capacity);
+	std::vector<galp::format::ZeroCopyReadTiming> external_timings;
+	auto external = reader.read_compact_rowgroups_zero_copy_scatter_into(
+	    scatter_order,
+	    std::static_pointer_cast<void>(external_backing),
+	    external_backing->data(),
+	    external_backing->size(),
+	    /*backing_is_pinned=*/true,
+	    &external_timings);
+	ASSERT_EQ(external.size(), scatter.size());
+	ASSERT_EQ(external_timings.size(), scatter.size());
+	for (size_t index = 0U; index < external.size(); ++index) {
+		EXPECT_TRUE(external[index].backing_is_pinned);
+		EXPECT_TRUE(external_timings[index].used_pinned_backing);
+		EXPECT_EQ(external[index].backing_owner.get(), external_backing.get());
+		ASSERT_EQ(external[index].backing_span.size(), scatter[index].backing_span.size());
+		EXPECT_EQ(std::memcmp(external[index].backing_span.data(),
+		                      scatter[index].backing_span.data(),
+		                      scatter[index].backing_span.size()),
+		          0);
+	}
+	const auto* const first_backing = external.front().backing_span.data();
+	bool              observed_alignment_padding = false;
+	size_t            previous_end = external.front().backing_span.size();
+	for (size_t index = 1U; index < external.size(); ++index) {
+		const size_t offset = static_cast<size_t>(external[index].backing_span.data() - first_backing);
+		EXPECT_EQ(offset % galp::format::kCompactBatchRowgroupAlignment, 0U);
+		EXPECT_GE(offset, previous_end);
+		observed_alignment_padding = observed_alignment_padding || offset > previous_end;
+		previous_end = offset + external[index].backing_span.size();
+	}
+	EXPECT_TRUE(observed_alignment_padding);
+	size_t registered_columns = 0U;
+	for (auto& rowgroup : external) {
+		auto materialized = reader.materialize_zero_copy_rowgroup(std::move(rowgroup));
+		for (const auto& column : materialized.columns) {
+			if (!column.host_owned_by_backing) {
+				continue;
+			}
+			++registered_columns;
+			EXPECT_TRUE(column.backing_is_pinned);
+			EXPECT_EQ(column.backing_base, external_backing->data());
+			EXPECT_EQ(column.backing_bytes, external_capacity);
+		}
+	}
+	EXPECT_GT(registered_columns, 0U);
+
+	const std::vector<uint8_t>                    selected_columns {0U, 1U, 2U, 3U};
+	std::vector<galp::format::ZeroCopyReadTiming> prefix_timings;
+	auto                                          prefix =
+	    reader.read_compact_rowgroups_zero_copy_selected_columns({2U, 0U, 1U}, selected_columns, &prefix_timings);
+	ASSERT_EQ(prefix.size(), 3U);
+	ASSERT_EQ(prefix_timings.size(), 3U);
+	for (const auto& rowgroup : prefix) {
+		EXPECT_NE(rowgroup.compact_direct_owner, nullptr);
+		EXPECT_EQ(rowgroup.rowgroup_descriptor, nullptr);
+	}
+	const auto   descriptor   = galp::format::CompactDescriptorV3::Open(compact_path);
+	const auto   prefix_plan  = galp::format::compile_compact_read_plan(descriptor, {0U, 1U, 2U}, selected_columns);
+	const size_t prefix_bytes = std::accumulate(
+	    prefix_timings.begin(), prefix_timings.end(), size_t {0U}, [](const size_t sum, const auto& timing) {
+		    return sum + timing.storage_bytes;
+	    });
+	const size_t prefix_pages = std::accumulate(
+	    prefix_timings.begin(), prefix_timings.end(), size_t {0U}, [](const size_t sum, const auto& timing) {
+		    return sum + timing.physical_page_bytes;
+	    });
+	EXPECT_EQ(prefix_bytes, prefix_plan.stats().read_bytes);
+	EXPECT_EQ(prefix_pages, prefix_plan.stats().physical_page_bytes);
+	EXPECT_LT(prefix_bytes, scatter_bytes);
+	EXPECT_TRUE(std::all_of(prefix_timings.begin(), prefix_timings.end(), [](const auto& timing) {
+		return timing.preadv_count == 0U && timing.used_coefficient_range_read;
+	}));
+}
+
+TEST(Reader, CompactV3MetadataOnlyRowgroupsUseValidatedZeroIoPaths) {
+	const auto compact_path = make_compact_mixed_payload_fixture();
+	const auto descriptor   = galp::format::CompactDescriptorV3::Open(compact_path);
+	ASSERT_EQ(descriptor.rowgroup_count(), 3U);
+	EXPECT_GT(descriptor.rowgroup(0U).payload_size, 0U);
+	EXPECT_EQ(descriptor.rowgroup(1U).payload_size, 0U);
+	EXPECT_GT(descriptor.rowgroup(2U).payload_size, 0U);
+
+	galp::format::FlsReader reader(compact_path);
+	EXPECT_EQ(reader.rowgroup_storage_bytes(1U), 0U);
+	galp::format::ZeroCopyReadTiming full_timing {};
+	auto full = reader.read_rowgroup_zero_copy(1U, &full_timing);
+	EXPECT_EQ(full.backing_span.size(), 0U);
+	EXPECT_NE(full.backing_span.data(), nullptr);
+	EXPECT_FALSE(full.backing_is_pinned);
+	EXPECT_EQ(full_timing.storage_bytes, 0U);
+	EXPECT_EQ(full_timing.pread_count, 0U);
+	EXPECT_EQ(full_timing.preadv_count, 0U);
+	EXPECT_EQ(full_timing.coalesced_read_run_count, 0U);
+	EXPECT_EQ(full_timing.selected_coefficient_count, 2U);
+	const auto materialized = reader.materialize_zero_copy_rowgroup(std::move(full));
+	ASSERT_EQ(materialized.columns.size(), 2U);
+	const auto constant_value = [](const galp::format::Column& column) -> int16_t {
+		if (const auto* value = std::get_if<galp::codec::host::CONSTANTColumn<int8_t>>(&column.host)) {
+			return value->value;
+		}
+		if (const auto* value = std::get_if<galp::codec::host::CONSTANTColumn<int16_t>>(&column.host)) {
+			return value->value;
+		}
+		throw std::runtime_error("metadata-only test column did not materialize as an I8/I16 constant");
+	};
+	EXPECT_EQ(constant_value(materialized.columns[0]), 17);
+	EXPECT_EQ(constant_value(materialized.columns[1]), -23);
+
+	galp::format::ZeroCopyReadTiming vector_timing {};
+	auto selected_vector = reader.read_rowgroup_zero_copy_selected_vectors(1U, {0U}, &vector_timing);
+	EXPECT_EQ(selected_vector.backing_span.size(), 0U);
+	EXPECT_EQ(vector_timing.pread_count, 0U);
+
+	galp::format::ZeroCopyReadTiming column_timing {};
+	auto selected_columns = reader.read_rowgroup_zero_copy_selected_columns(1U, {0U, 1U}, &column_timing);
+	EXPECT_EQ(selected_columns.backing_span.size(), 0U);
+	EXPECT_EQ(selected_columns.materialized_column_indices, (std::vector<uint8_t> {0U, 1U}));
+	EXPECT_EQ(column_timing.storage_bytes, 0U);
+	EXPECT_EQ(column_timing.pread_count, 0U);
+	EXPECT_TRUE(column_timing.used_coefficient_range_read);
+	EXPECT_EQ(column_timing.sparse_fallback_reason, "metadata-only-rowgroup-zero-io");
+
+	std::vector<galp::format::ZeroCopyReadTiming> scatter_timings;
+	auto scatter = reader.read_compact_rowgroups_zero_copy_scatter({2U, 1U, 0U}, &scatter_timings);
+	ASSERT_EQ(scatter.size(), 3U);
+	ASSERT_EQ(scatter_timings.size(), 3U);
+	EXPECT_EQ(scatter[0].rowgroup_index, 2U);
+	EXPECT_EQ(scatter[1].rowgroup_index, 1U);
+	EXPECT_EQ(scatter[2].rowgroup_index, 0U);
+	EXPECT_GT(scatter[0].backing_span.size(), 0U);
+	EXPECT_EQ(scatter[1].backing_span.size(), 0U);
+	EXPECT_GT(scatter[2].backing_span.size(), 0U);
+	EXPECT_EQ(scatter_timings[1].storage_bytes, 0U);
+	EXPECT_EQ(scatter_timings[1].physical_page_bytes, 0U);
+	EXPECT_EQ(scatter_timings[1].pread_count, 0U);
+	const size_t total_preads = scatter_timings[0].pread_count + scatter_timings[1].pread_count +
+	                            scatter_timings[2].pread_count;
+	const size_t total_preadvs = scatter_timings[0].preadv_count + scatter_timings[1].preadv_count +
+	                             scatter_timings[2].preadv_count;
+	EXPECT_EQ(total_preads, 1U);
+	EXPECT_EQ(total_preadvs, 1U);
+	EXPECT_THROW((void)reader.read_compact_rowgroups_zero_copy_scatter({1U, 1U}), std::invalid_argument);
+
+	std::vector<galp::format::ZeroCopyReadTiming> batch_column_timings;
+	auto batch_columns =
+	    reader.read_compact_rowgroups_zero_copy_selected_columns({2U, 1U, 0U}, {0U}, &batch_column_timings);
+	ASSERT_EQ(batch_columns.size(), 3U);
+	ASSERT_EQ(batch_column_timings.size(), 3U);
+	EXPECT_EQ(batch_columns[1].backing_span.size(), 0U);
+	EXPECT_EQ(batch_column_timings[1].pread_count, 0U);
+	EXPECT_EQ(batch_column_timings[1].sparse_fallback_reason, "metadata-only-rowgroup-zero-io");
+
+	auto prefetch_reader = std::make_shared<galp::format::FlsReader>(compact_path);
+	auto pinned_pool     = galp::runtime::PinnedRowgroupBufferPool::create(1U);
+	galp::runtime::RowgroupPrefetchQueue queue(prefetch_reader,
+	                                           std::vector<size_t> {1U},
+	                                           /*depth=*/1U,
+	                                           /*num_workers=*/1U,
+	                                           pinned_pool);
+	auto prefetched = queue.pop();
+	EXPECT_EQ(prefetched.rowgroup_index, 1U);
+	EXPECT_EQ(prefetched.storage_bytes, 0U);
+	EXPECT_EQ(prefetched.pread_count, 0U);
+	EXPECT_FALSE(prefetched.used_pinned_backing);
+	EXPECT_EQ(prefetched.timing.pinned_acquire_ms, 0.0);
+	galp::execution::free_rowgroup(prefetched.rowgroup);
+}
+
+TEST(Reader, CompactV3Strict1kMetadataOnlyIntegration) {
+	const char* const path = std::getenv("GALP_COMPACT_V3_ZERO_PAYLOAD_TEST_FILE");
+	if (path == nullptr || *path == '\0') {
+		GTEST_SKIP() << "GALP_COMPACT_V3_ZERO_PAYLOAD_TEST_FILE is not set";
+	}
+	const auto descriptor = galp::format::CompactDescriptorV3::Open(path);
+	std::vector<size_t>   zero_rowgroups;
+	std::vector<uint32_t> image_indices;
+	for (size_t rowgroup_index = 0U; rowgroup_index < descriptor.rowgroup_count(); ++rowgroup_index) {
+		const auto record = descriptor.rowgroup(rowgroup_index);
+		if (record.payload_size == 0U) {
+			zero_rowgroups.push_back(rowgroup_index);
+			image_indices.push_back(record.local_image_index);
+		}
+	}
+	ASSERT_EQ(zero_rowgroups.size(), 6U);
+	std::sort(image_indices.begin(), image_indices.end());
+	image_indices.erase(std::unique(image_indices.begin(), image_indices.end()), image_indices.end());
+	EXPECT_EQ(image_indices, (std::vector<uint32_t> {6U, 106U, 286U, 917U}));
+
+	galp::format::FlsReader reader(path);
+	std::vector<galp::format::ZeroCopyReadTiming> scatter_timings;
+	auto scatter = reader.read_compact_rowgroups_zero_copy_scatter(zero_rowgroups, &scatter_timings);
+	ASSERT_EQ(scatter.size(), zero_rowgroups.size());
+	ASSERT_EQ(scatter_timings.size(), zero_rowgroups.size());
+	for (size_t position = 0U; position < scatter.size(); ++position) {
+		EXPECT_EQ(scatter[position].rowgroup_index, zero_rowgroups[position]);
+		EXPECT_EQ(scatter[position].backing_span.size(), 0U);
+		EXPECT_NE(scatter[position].backing_span.data(), nullptr);
+		EXPECT_EQ(scatter_timings[position].storage_bytes, 0U);
+		EXPECT_EQ(scatter_timings[position].physical_page_bytes, 0U);
+		EXPECT_EQ(scatter_timings[position].pread_count, 0U);
+		auto materialized = reader.materialize_zero_copy_rowgroup(std::move(scatter[position]));
+		ASSERT_EQ(materialized.columns.size(), descriptor.column_count());
+		for (const auto& column : materialized.columns) {
+			EXPECT_TRUE((std::holds_alternative<galp::codec::host::CONSTANTColumn<int8_t>>(column.host) ||
+			             std::holds_alternative<galp::codec::host::CONSTANTColumn<int16_t>>(column.host)));
+			EXPECT_TRUE(column.token == fastlanes::OperatorToken::EXP_CONSTANT_I08 ||
+			            column.token == fastlanes::OperatorToken::EXP_CONSTANT_I16 ||
+			            column.token == fastlanes::OperatorToken::EXP_EQUAL);
+		}
+	}
+}
+
 TEST(Reader, SparseVectorReadUsesPhysicalSegmentRangesAndReportsFallback) {
-	const auto fls_path = make_sparse_vector_read_fixture();
+	const auto              fls_path = make_sparse_vector_read_fixture();
 	galp::format::FlsReader reader(fls_path);
 	ASSERT_EQ(reader.rowgroup_count(), 1U);
 	std::string capability_reason;
@@ -247,9 +695,9 @@ TEST(Reader, SparseVectorReadUsesPhysicalSegmentRangesAndReportsFallback) {
 	galp::format::ZeroCopyReadTiming sparse_timing {};
 	auto sparse = reader.read_rowgroup_zero_copy_selected_vectors(0, {1U, 6U}, &sparse_timing);
 	galp::format::ZeroCopyReadTiming full_timing {};
-	auto full = reader.read_rowgroup_zero_copy(0, &full_timing);
-	const auto external_bytes = reader.rowgroup_storage_bytes(0);
-	auto external_backing = std::make_shared<std::vector<std::byte>>(external_bytes);
+	auto                             full             = reader.read_rowgroup_zero_copy(0, &full_timing);
+	const auto                       external_bytes   = reader.rowgroup_storage_bytes(0);
+	auto                             external_backing = std::make_shared<std::vector<std::byte>>(external_bytes);
 	galp::format::ZeroCopyReadTiming external_timing {};
 	auto external = reader.read_rowgroup_zero_copy_into(0,
 	                                                   std::static_pointer_cast<void>(external_backing),

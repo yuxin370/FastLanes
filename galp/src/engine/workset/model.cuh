@@ -29,6 +29,7 @@ struct UploadBreakdown {
 	double                           arena_pack_ms        = 0.0;
 	double                           arena_upload_ms      = 0.0;
 	double                           event_record_ms      = 0.0;
+	galp::memory::ArenaCapacityMetrics output_arena {};
 	galp::memory::ArenaUploadMetrics arena {};
 };
 
@@ -61,6 +62,7 @@ struct WorksetBuffers {
 struct WorksetOutputs {
 	std::optional<GPUArray<uint8_t>> arena;
 	size_t                           capacity_bytes = 0;
+	size_t                           minimum_capacity_bytes = 0;
 	size_t                           used_bytes     = 0;
 	bool                             required       = false;
 };

@@ -296,11 +296,15 @@ private:
 	}
 
 	static size_t round_up_capacity(const size_t bytes) {
-		constexpr size_t kAlign = 64U * 1024U;
-		if (bytes == 0) {
-			return kAlign;
+		constexpr size_t kMinimum = 64U * 1024U;
+		size_t           capacity = kMinimum;
+		while (capacity < bytes) {
+			if (capacity > std::numeric_limits<size_t>::max() / 2U) {
+				throw std::overflow_error("pinned rowgroup buffer capacity overflow");
+			}
+			capacity *= 2U;
 		}
-		return ((bytes + kAlign - 1U) / kAlign) * kAlign;
+		return capacity;
 	}
 
 	static size_t prewarm_byte_budget() {

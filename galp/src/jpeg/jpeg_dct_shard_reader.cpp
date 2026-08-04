@@ -1,14 +1,18 @@
 #include "jpeg/jpeg_dct_shard_reader.hpp"
+#include "format/compact_descriptor_v3.hpp"
 #include "fls/connection.hpp"
 #include "fls/file/file_footer.hpp"
 #include "fls/file/file_header.hpp"
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/io/file.hpp"
 #include "fls/reader/rowgroup_reader.hpp"
+#include "fls/reader/table_reader.hpp"
 #include "fls/table/rowgroup.hpp"
+#include "flatbuffers/flatbuffer_builder.h"
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <list>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -96,11 +100,58 @@ void append_selected_column(const fastlanes::col_pt&        column,
 	throw std::runtime_error("JPEG DCT FLS column materialized to an unsupported type");
 }
 
+fastlanes::up<fastlanes::Rowgroup>
+materialize_compact_rowgroup(const std::filesystem::path&              fls_path,
+	                          const galp::format::CompactDescriptorV3& descriptor,
+	                          const uint32_t                           rowgroup_index) {
+	auto native = descriptor.unpack_rowgroup(rowgroup_index);
+	flatbuffers::FlatBufferBuilder builder;
+	const auto root = fastlanes::RowgroupDescriptor::Pack(builder, native.get());
+	fastlanes::FinishRowgroupDescriptorBuffer(builder, root);
+	const auto* rowgroup_descriptor = fastlanes::GetRowgroupDescriptor(builder.GetBufferPointer());
+	if (rowgroup_descriptor == nullptr) {
+		throw std::runtime_error("failed to reconstruct compact JPEG DCT rowgroup descriptor");
+	}
+	fastlanes::Connection     connection;
+	fastlanes::RowgroupReader reader(fls_path, *rowgroup_descriptor, connection);
+	return reader.materialize();
+}
+
+std::string normalized_path_key(const std::filesystem::path& path) {
+	return std::filesystem::absolute(path).lexically_normal().string();
+}
+
 } // namespace
 
 struct JpegDctShardCpuReader::Impl {
+	struct CachedCompactDescriptor {
+		std::shared_ptr<galp::format::CompactDescriptorV3> descriptor;
+		std::list<std::string>::iterator                   lru_position;
+	};
+
+	std::shared_ptr<galp::format::CompactDescriptorV3>
+	compact_descriptor(const std::filesystem::path& fls_path) {
+		const auto key = normalized_path_key(fls_path);
+		if (const auto found = compact_paths.find(key); found != compact_paths.end()) {
+			compact_lru.splice(compact_lru.begin(), compact_lru, found->second.lru_position);
+			return found->second.descriptor;
+		}
+		auto descriptor = std::make_shared<galp::format::CompactDescriptorV3>(
+		    galp::format::CompactDescriptorV3::Open(fls_path));
+		constexpr size_t kCompactDescriptorCacheCapacity = 8U;
+		if (compact_paths.size() >= kCompactDescriptorCacheCapacity) {
+			compact_paths.erase(compact_lru.back());
+			compact_lru.pop_back();
+		}
+		compact_lru.push_front(key);
+		compact_paths.emplace(key, CachedCompactDescriptor {descriptor, compact_lru.begin()});
+		return descriptor;
+	}
+
 	mutable std::mutex                                                                      descriptor_mutex;
 	mutable std::unordered_map<uint32_t, std::shared_ptr<fastlanes::TableDescriptorHandle>> descriptors;
+	std::list<std::string>                                                                  compact_lru;
+	std::unordered_map<std::string, CachedCompactDescriptor>                                compact_paths;
 };
 
 JpegDctShardCpuReader::JpegDctShardCpuReader()
@@ -113,6 +164,18 @@ uint64_t JpegDctShardCpuReader::RowgroupStorageBytes(const uint32_t             
                                                      const std::filesystem::path& fls_path,
                                                      const std::vector<uint32_t>& rowgroup_indices) const {
 	std::lock_guard<std::mutex> guard(impl_->descriptor_mutex);
+	if (galp::format::is_compact_v3_fls(fls_path)) {
+		const auto descriptor = impl_->compact_descriptor(fls_path);
+		uint64_t bytes = 0U;
+		for (const auto rowgroup_index : rowgroup_indices) {
+			const auto rowgroup_bytes = descriptor->rowgroup(rowgroup_index).payload_size;
+			if (rowgroup_bytes > std::numeric_limits<uint64_t>::max() - bytes) {
+				throw std::runtime_error("JPEG DCT rowgroup storage-byte audit overflow");
+			}
+			bytes += rowgroup_bytes;
+		}
+		return bytes;
+	}
 	auto&                       descriptor = impl_->descriptors[shard_id];
 	if (!descriptor) {
 		fastlanes::File       file(fls_path);
@@ -150,10 +213,20 @@ uint64_t JpegDctShardCpuReader::RowgroupStorageBytes(const uint32_t             
 
 JpegDctBlockGroup JpegDctShardCpuReader::ReadBlockGroup(const std::filesystem::path&  fls_path,
                                                         const JpegDctBlockGroupIndex& group) const {
-	fastlanes::Connection connection;
-	auto                  table_reader    = connection.read_fls(fls_path);
-	auto                  rowgroup_reader = table_reader->get_rowgroup_reader(group.fls_rowgroup_index);
-	auto                  rowgroup        = rowgroup_reader->materialize();
+	fastlanes::up<fastlanes::Rowgroup> rowgroup;
+	if (galp::format::is_compact_v3_fls(fls_path)) {
+		std::shared_ptr<galp::format::CompactDescriptorV3> descriptor;
+		{
+			std::lock_guard<std::mutex> guard(impl_->descriptor_mutex);
+			descriptor = impl_->compact_descriptor(fls_path);
+		}
+		rowgroup = materialize_compact_rowgroup(fls_path, *descriptor, group.fls_rowgroup_index);
+	} else {
+		fastlanes::Connection connection;
+		auto table_reader = connection.read_fls(fls_path);
+		auto rowgroup_reader = table_reader->get_rowgroup_reader(group.fls_rowgroup_index);
+		rowgroup = rowgroup_reader->materialize();
+	}
 	if (rowgroup->internal_rowgroup.size() < 64) {
 		throw std::runtime_error("JPEG DCT FLS rowgroup has fewer than 64 coefficient columns");
 	}
@@ -176,14 +249,26 @@ MaterializedJpegDctImage
 JpegDctShardCpuReader::MaterializeImage(const std::filesystem::path&                   fls_path,
                                         const uint32_t                                 global_image_index,
                                         const std::vector<JpegDctMaterializeBlockRef>& blocks) const {
-	fastlanes::Connection                                            connection;
-	auto                                                             table_reader = connection.read_fls(fls_path);
+	const bool compact = galp::format::is_compact_v3_fls(fls_path);
+	fastlanes::Connection connection;
+	auto table_reader = compact ? fastlanes::up<fastlanes::TableReader> {} : connection.read_fls(fls_path);
+	std::shared_ptr<galp::format::CompactDescriptorV3> compact_descriptor;
+	if (compact) {
+		std::lock_guard<std::mutex> guard(impl_->descriptor_mutex);
+		compact_descriptor = impl_->compact_descriptor(fls_path);
+	}
 	std::unordered_map<uint32_t, fastlanes::up<fastlanes::Rowgroup>> rowgroups;
 	const auto materialized_rowgroup = [&](const uint32_t rowgroup_index) -> fastlanes::Rowgroup& {
 		auto found = rowgroups.find(rowgroup_index);
 		if (found == rowgroups.end()) {
-			auto reader = table_reader->get_rowgroup_reader(rowgroup_index);
-			found       = rowgroups.emplace(rowgroup_index, reader->materialize()).first;
+			if (compact) {
+				found = rowgroups.emplace(
+				    rowgroup_index,
+				    materialize_compact_rowgroup(fls_path, *compact_descriptor, rowgroup_index)).first;
+			} else {
+				auto reader = table_reader->get_rowgroup_reader(rowgroup_index);
+				found       = rowgroups.emplace(rowgroup_index, reader->materialize()).first;
+			}
 		}
 		if (found->second->internal_rowgroup.size() < 64) {
 			throw std::runtime_error("JPEG DCT FLS rowgroup has fewer than 64 coefficient columns");
@@ -216,9 +301,17 @@ JpegDctShardCpuReader::MaterializeImage(const std::filesystem::path&            
 struct JpegDctSelectedVectorProfileReader::Impl {
 	fastlanes::Connection                 connection;
 	fastlanes::up<fastlanes::TableReader> table_reader;
+	std::filesystem::path                 fls_path;
+	std::shared_ptr<galp::format::CompactDescriptorV3> compact_descriptor;
 
 	explicit Impl(const std::filesystem::path& fls_path)
-	    : table_reader(connection.read_fls(fls_path)) {
+	    : fls_path(fls_path) {
+		if (galp::format::is_compact_v3_fls(fls_path)) {
+			compact_descriptor = std::make_shared<galp::format::CompactDescriptorV3>(
+			    galp::format::CompactDescriptorV3::Open(fls_path));
+		} else {
+			table_reader = connection.read_fls(fls_path);
+		}
 	}
 };
 
@@ -239,8 +332,17 @@ void JpegDctSelectedVectorProfileReader::AppendRowgroupSelectedVectors(
 	    std::adjacent_find(selected_vectors.begin(), selected_vectors.end()) != selected_vectors.end()) {
 		throw std::invalid_argument("JPEG DCT crop profile selected vectors must be strictly increasing");
 	}
-	auto rowgroup_reader = impl_->table_reader->get_rowgroup_reader(rowgroup_index);
-	auto rowgroup        = rowgroup_reader->materialize();
+	fastlanes::up<fastlanes::Rowgroup> rowgroup;
+	if (impl_->compact_descriptor) {
+		if (selected_vectors.size() != 1U || selected_vectors.front() != 0U) {
+			throw std::out_of_range("Compact v3 rowgroup contains exactly one vector");
+		}
+		rowgroup = materialize_compact_rowgroup(
+		    impl_->fls_path, *impl_->compact_descriptor, rowgroup_index);
+	} else {
+		auto rowgroup_reader = impl_->table_reader->get_rowgroup_reader(rowgroup_index);
+		rowgroup = rowgroup_reader->materialize();
+	}
 	if (rowgroup->internal_rowgroup.size() < columns.size()) {
 		throw std::runtime_error("JPEG DCT FLS rowgroup has fewer than 64 coefficient columns");
 	}

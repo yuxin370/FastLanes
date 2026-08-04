@@ -167,6 +167,7 @@ void release_workset(ExecutionWorkset& workset,
 	if (!preserve_resources) {
 		workset.outputs.arena.reset();
 		workset.outputs.capacity_bytes = 0;
+		workset.outputs.minimum_capacity_bytes = 0;
 	}
 	if (!preserve_resources) {
 		workset.transfer.h2d_ready_event.reset();

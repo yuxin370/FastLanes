@@ -27,6 +27,7 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 
 	Rowgroup out {zero_copy.n_values, zero_copy.n_vecs, zero_copy.n_tuples, {}};
 	out.columns.resize(column_count);
+	out.materialized_column_indices = zero_copy.materialized_column_indices;
 	SmallBuildState build_state(column_count);
 
 	const auto get_zero_copy_column = [&](const size_t col_idx) -> ZeroCopyColumn {
@@ -82,6 +83,16 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				    << ", token=" << fastlanes::token_to_string(zcol.token) << ")";
 				throw std::runtime_error(msg.str());
 			}
+			const bool references_external_column =
+			    zcol.token == fastlanes::OperatorToken::EXP_DICT_I08_U08 ||
+			    zcol.token == fastlanes::OperatorToken::EXP_DICT_I16_U08 ||
+			    zcol.token == fastlanes::OperatorToken::EXP_DICT_I16_U16;
+			if (references_external_column) {
+				if (zero_copy_operand_count(zcol) < 1U) {
+					throw std::runtime_error("zero-copy external column reference is missing its source operand");
+				}
+				(void)self(self, static_cast<size_t>(zero_copy_operand(zcol, 0U)));
+			}
 			switch (zcol.token) {
 				using enum fastlanes::OperatorToken;
 			case EXP_UNCOMPRESSED_I08: {
@@ -105,31 +116,32 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 				break;
 			}
 			case EXP_CONSTANT_I08: {
-				if (zcol.column_descriptor == nullptr || !zcol.column_descriptor->max()) {
+				if (zcol.column_descriptor == nullptr) {
 					throw std::runtime_error("EXP_CONSTANT_I08: missing max value");
 				}
-				const auto* bin = zcol.column_descriptor->max()->binary_data();
-				if (bin == nullptr || bin->size() != sizeof(int8_t)) {
+				const auto* bin = zero_copy_maximum_data(zcol);
+				if (bin == nullptr || zero_copy_maximum_size(zcol) != sizeof(int8_t)) {
 					throw std::runtime_error("EXP_CONSTANT_I08: invalid constant size");
 				}
-				const auto value             = *reinterpret_cast<const int8_t*>(bin->data());
+				const auto value             = *reinterpret_cast<const int8_t*>(bin);
 				result.host                  = galp::codec::host::CONSTANTColumn<int8_t> {zero_copy.n_values, value};
 				result.host_owned_by_backing = false;
 				break;
 			}
 			case EXP_CONSTANT_I16: {
-				if (zcol.column_descriptor == nullptr || !zcol.column_descriptor->max()) {
+				if (zcol.column_descriptor == nullptr) {
 					throw std::runtime_error("EXP_CONSTANT_I16: missing max value");
 				}
-				const auto* bin = zcol.column_descriptor->max()->binary_data();
-				if (bin == nullptr || bin->size() != sizeof(int16_t)) {
+				const auto* bin      = zero_copy_maximum_data(zcol);
+				const auto  bin_size = zero_copy_maximum_size(zcol);
+				if (bin == nullptr || bin_size != sizeof(int16_t)) {
 					std::ostringstream msg;
 					msg << "EXP_CONSTANT_I16: invalid constant size (expected=" << sizeof(int16_t)
-					    << ", actual=" << (bin == nullptr ? 0 : bin->size()) << ")";
+					    << ", actual=" << bin_size << ")";
 					throw std::runtime_error(msg.str());
 				}
 				int16_t value {};
-				std::memcpy(&value, bin->data(), sizeof(value));
+				std::memcpy(&value, bin, sizeof(value));
 				result.host                  = galp::codec::host::CONSTANTColumn<int16_t> {zero_copy.n_values, value};
 				result.host_owned_by_backing = false;
 				break;
@@ -593,7 +605,10 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 			}
 
 			if (result.host_owned_by_backing && zero_copy.backing_is_pinned) {
-				if (zcol.column_view != nullptr && !zcol.column_view->column_span.empty()) {
+				if (!zero_copy.transfer_backing_span.empty()) {
+					result.backing_base  = zero_copy.transfer_backing_span.data();
+					result.backing_bytes = zero_copy.transfer_backing_span.size();
+				} else if (zcol.column_view != nullptr && !zcol.column_view->column_span.empty()) {
 					result.backing_base  = zcol.column_view->column_span.data();
 					result.backing_bytes = zcol.column_view->column_span.size();
 				} else {
@@ -609,7 +624,14 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 		return out.columns[col_idx];
 	};
 
-	if (use_schema_plan) {
+	if (!zero_copy.materialized_column_indices.empty()) {
+		for (const uint8_t column_index : zero_copy.materialized_column_indices) {
+			if (static_cast<size_t>(column_index) >= column_count) {
+				throw std::out_of_range("selected zero-copy materialization column is out of range");
+			}
+			(void)build_column(build_column, static_cast<size_t>(column_index));
+		}
+	} else if (use_schema_plan) {
 		for (const size_t i : schema_plan->build_order) {
 			(void)build_column(build_column, i);
 		}
@@ -635,12 +657,14 @@ void release_transient_materialized_rowgroup(Rowgroup& rowgroup) {
 	}
 	rowgroup.columns.clear();
 	rowgroup.backing_storage.reset();
+	rowgroup.materialized_column_indices.clear();
 	rowgroup.packed_device_payload.reset();
 }
 
 Rowgroup make_owning_rowgroup(Rowgroup rowgroup) {
 	Rowgroup out {rowgroup.n_values, rowgroup.n_vecs, rowgroup.n_tuples, {}};
 	out.columns.resize(rowgroup.columns.size());
+	out.materialized_column_indices = rowgroup.materialized_column_indices;
 
 	SmallBuildState build_state(rowgroup.columns.size());
 	auto            clone_column_to_output = [&](auto&& self, const size_t col_idx) -> Column& {

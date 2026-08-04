@@ -31,6 +31,7 @@ inline void free_rowgroup(galp::format::Rowgroup& rowgroup) {
 	if (rowgroup.backing_storage) {
 		rowgroup.backing_storage.reset();
 	}
+	rowgroup.materialized_column_indices.clear();
 	rowgroup.packed_device_payload.reset();
 }
 

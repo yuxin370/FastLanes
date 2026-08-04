@@ -329,6 +329,10 @@ uint64_t DirectDctRuntime::image_count() const noexcept {
 	return reader_.image_count();
 }
 
+JpegDctReaderInitializationStats DirectDctRuntime::InitializationStats() const noexcept {
+	return reader_.InitializationStats();
+}
+
 JpegImageMetadata DirectDctRuntime::ImageMetadata(const uint32_t global_image_index) const {
 	return reader_.ImageMetadata(global_image_index);
 }

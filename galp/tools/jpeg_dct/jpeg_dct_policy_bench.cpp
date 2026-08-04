@@ -1,14 +1,16 @@
-#include "galp/jpeg_dct.hpp"
 #include "core/operator_capabilities.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/file/file_footer.hpp"
 #include "fls/file/file_header.hpp"
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/io/file.hpp"
+#include "format/compact_descriptor_v3.hpp"
+#include "galp/jpeg_dct.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -41,6 +43,7 @@ struct Options {
 	bool                           rowgroups_per_shard_specified = false;
 	galp::jpeg::JpegDctSpatialOrder spatial_order                 = galp::jpeg::JpegDctSpatialOrder::kTiledZ32;
 	bool                             spatial_order_specified       = false;
+	bool                            compact_v3                    = false;
 };
 
 struct TokenStat {
@@ -57,6 +60,12 @@ struct BenchmarkResult {
 	uintmax_t   compressed_data_size       = 0;
 	uintmax_t   metadata_size              = 0;
 	uintmax_t   source_jpeg_size           = 0;
+	uintmax_t                  raw_dct_size                     = 0;
+	uintmax_t                  compressed_payload_size          = 0;
+	uintmax_t                  source_descriptor_size           = 0;
+	uintmax_t                  compact_descriptor_size          = 0;
+	uintmax_t                  temporary_build_peak_disk_size   = 0;
+	uintmax_t                  projected_50000_image_total_size = 0;
 	uint64_t    real_row_count             = 0;
 	uint64_t    padding_row_count          = 0;
 	uint64_t    physical_row_count         = 0;
@@ -68,8 +77,13 @@ struct BenchmarkResult {
 	double      expansion_vs_jpeg          = 0.0;
 	double      encode_ms                  = 0.0;
 	double      decode_ms                  = 0.0;
+	double                     reader_startup_ms                = 0.0;
+	double                     first_access_ms                  = 0.0;
+	double                     hot_decode_ms                    = 0.0;
 	double      crop_lookup_latency_ns     = 0.0;
 	uint64_t    peak_rss_bytes             = 0;
+	uint64_t                   encode_peak_rss_bytes            = 0;
+	uint64_t                   first_decode_peak_rss_bytes      = 0;
 	bool        decode_supported           = true;
 	std::string decode_error;
 	TokenStats                 token_stats;
@@ -81,7 +95,8 @@ void print_usage(const char* prog) {
 	          << "  " << prog << " --input jpeg_dir [--out-dir output_dir] [--csv]\n"
 	          << "      [--preset crop-latency|balanced|throughput|random-access]\n"
 	          << "      [--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N]\n"
-	          << "      [--spatial-order raster|tiled-raster-32|z-order|tiled-z-32]\n";
+	          << "      [--spatial-order raster|tiled-raster-32|z-order|tiled-z-32]\n"
+	          << "      [--compact-v3]\n";
 }
 
 uint32_t parse_u32_arg(const std::string_view name, const char* value) {
@@ -144,6 +159,10 @@ bool parse_args(const int argc, char** argv, Options& options) {
 		}
 		if (arg == "--csv") {
 			options.csv = true;
+			continue;
+		}
+		if (arg == "--compact-v3") {
+			options.compact_v3 = true;
 			continue;
 		}
 		if (arg == "--spatial-order" && i + 1 < argc) {
@@ -306,7 +325,12 @@ galp::jpeg::JpegDctShardOptions make_shard_options(const Options& options) {
 	shard_options.shard_images_specified        = options.shard_images_specified;
 	shard_options.rowgroup_vectors_specified    = options.rowgroup_vectors_specified;
 	shard_options.rowgroups_per_shard_specified = options.rowgroups_per_shard_specified;
-	if (options.spatial_order_specified) {
+	if (options.compact_v3) {
+		shard_options.physical_layout            = galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
+		shard_options.physical_layout_specified  = true;
+		shard_options.rowgroup_vectors           = 1U;
+		shard_options.rowgroup_vectors_specified = true;
+	} else if (options.spatial_order_specified) {
 		shard_options.physical_layout           = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
 		shard_options.physical_layout_specified = true;
 	}
@@ -329,16 +353,47 @@ std::string spatial_order_name(const galp::jpeg::JpegDctSpatialOrder order) {
 }
 
 void scan_expression_stats(const std::filesystem::path& fls_path, BenchmarkResult& result) {
+	if (galp::format::is_compact_v3_fls(fls_path)) {
+		auto descriptor = galp::format::CompactDescriptorV3::Open(fls_path);
+		for (size_t rowgroup_index = 0U; rowgroup_index < descriptor.rowgroup_count(); ++rowgroup_index) {
+			auto rowgroup = descriptor.unpack_rowgroup(rowgroup_index);
+			if (rowgroup->m_column_descriptors.size() > result.coefficient_token_stats.size()) {
+				throw std::runtime_error("JPEG DCT audit found more than 64 coefficient columns");
+			}
+			std::set<fastlanes::OperatorToken> rowgroup_tokens;
+			for (size_t coeff_id = 0U; coeff_id < rowgroup->m_column_descriptors.size(); ++coeff_id) {
+				const auto& column = rowgroup->m_column_descriptors[coeff_id];
+				if (column == nullptr || column->encoding_rpn == nullptr ||
+				    column->encoding_rpn->operator_tokens.empty()) {
+					throw std::runtime_error("missing operator token while scanning " + fls_path.string());
+				}
+				const auto token = column->encoding_rpn->operator_tokens.front();
+				const auto bytes = static_cast<uint64_t>(column->total_size);
+				auto&      total = result.token_stats[token];
+				++total.column_count;
+				total.compressed_bytes += bytes;
+				auto& by_coefficient = result.coefficient_token_stats[coeff_id][token];
+				++by_coefficient.column_count;
+				++by_coefficient.rowgroup_count;
+				by_coefficient.compressed_bytes += bytes;
+				rowgroup_tokens.insert(token);
+			}
+			for (const auto token : rowgroup_tokens) {
+				++result.token_stats[token].rowgroup_count;
+			}
+		}
+		return;
+	}
 	fastlanes::File       file(fls_path);
 	fastlanes::FileHeader header {};
 	fastlanes::FileFooter footer {};
 	fastlanes::FileHeader::Load(header, file);
 	fastlanes::FileFooter::Load(footer, file);
-	const auto handle = header.settings.inline_footer
+	const auto handle =
+	    header.settings.inline_footer
 	                        ? fastlanes::TableDescriptorHandle::FromFileSlice(
 	                              file, footer.table_descriptor_offset, footer.table_descriptor_size, true)
-	                        : fastlanes::TableDescriptorHandle::FromFile(
-	                              fls_path.parent_path() / "table_descriptor.fbb", true);
+	        : fastlanes::TableDescriptorHandle::FromFile(fls_path.parent_path() / "table_descriptor.fbb", true);
 	const auto* table  = handle.Get();
 	if (table == nullptr || table->m_rowgroup_descriptors() == nullptr) {
 		throw std::runtime_error("missing table/rowgroup descriptor while scanning " + fls_path.string());
@@ -423,9 +478,20 @@ BenchmarkResult run_benchmark(const std::vector<std::filesystem::path>& paths,
 	result.source_jpeg_size = total_source_jpeg_size(paths);
 	result.encode_ms        = elapsed_ms(encode_start, encode_end);
 	result.shard_count      = static_cast<uint32_t>(manifest.shards.size());
+	result.encode_peak_rss_bytes = peak_rss_bytes();
 
+	uintmax_t completed_runtime_bytes = 0U;
 	for (const auto& shard : manifest.shards) {
+		if (cli_options.compact_v3) {
+			constexpr uintmax_t fls_envelope_bytes = 48U;
+			const auto standard_temporary_size = fls_envelope_bytes + shard.payload_size + shard.source_descriptor_size;
+			const auto concurrent_peak = completed_runtime_bytes + standard_temporary_size + shard.fls_file_size;
+			result.temporary_build_peak_disk_size = std::max(result.temporary_build_peak_disk_size, concurrent_peak);
+		}
 		result.compressed_data_size += shard.fls_file_size;
+		result.compressed_payload_size += shard.payload_size;
+		result.source_descriptor_size += shard.source_descriptor_size;
+		result.compact_descriptor_size += shard.compact_descriptor_size;
 		result.metadata_size += shard.metadata_file_size;
 		result.real_row_count += shard.real_row_count;
 		result.padding_row_count += shard.padding_row_count;
@@ -433,9 +499,21 @@ BenchmarkResult run_benchmark(const std::vector<std::filesystem::path>& paths,
 		result.rowgroup_count += shard.rowgroup_count;
 		result.block_group_count += shard.block_group_count;
 		scan_expression_stats(dataset_dir / shard.fls_file_name, result);
+		completed_runtime_bytes += shard.fls_file_size + shard.metadata_file_size;
 	}
 	result.metadata_size += std::filesystem::file_size(dataset_dir / "manifest.bin");
 	result.total_output_size = result.compressed_data_size + result.metadata_size;
+	result.temporary_build_peak_disk_size = std::max(result.temporary_build_peak_disk_size, result.total_output_size);
+	for (const auto& entry : std::filesystem::recursive_directory_iterator(dataset_dir)) {
+		if (entry.is_regular_file() && entry.path().extension() == ".svb") {
+			throw std::runtime_error("Compact-v3 benchmark output unexpectedly contains an .svb sidecar");
+		}
+	}
+	result.raw_dct_size = static_cast<uintmax_t>(result.real_row_count) * 64U * sizeof(int16_t);
+	if (!paths.empty()) {
+		result.projected_50000_image_total_size = static_cast<uintmax_t>(std::ceil(
+		    static_cast<long double>(result.total_output_size) * 50000.0L / static_cast<long double>(paths.size())));
+	}
 
 	const double physical_uncompressed = static_cast<double>(result.physical_row_count) * 64.0 * sizeof(int16_t);
 	const double semantic_uncompressed = static_cast<double>(result.real_row_count) * 64.0 * sizeof(int16_t);
@@ -449,39 +527,59 @@ BenchmarkResult run_benchmark(const std::vector<std::filesystem::path>& paths,
 	}
 
 	try {
+		const auto                            reader_start = Clock::now();
 		galp::jpeg::JpegDctShardDatasetReader reader(dataset_dir / "manifest.bin");
+		const auto                            reader_ready = Clock::now();
 		const auto                            decode_start = Clock::now();
 		auto                                  image        = reader.MaterializeImageDct(0);
 		if (image.blocks.empty()) {
 			std::cerr << "";
 		}
 		const auto decode_end         = Clock::now();
+		const auto hot_decode_start = Clock::now();
+		auto       hot_image        = reader.MaterializeImageDct(0);
+		const auto hot_decode_end   = Clock::now();
+		if (hot_image.blocks.empty()) {
+			std::cerr << "";
+		}
+		result.reader_startup_ms      = elapsed_ms(reader_start, reader_ready);
 		result.decode_ms              = elapsed_ms(decode_start, decode_end);
+		result.first_access_ms        = elapsed_ms(reader_start, decode_end);
+		result.hot_decode_ms          = elapsed_ms(hot_decode_start, hot_decode_end);
 		result.crop_lookup_latency_ns = measure_crop_lookup_latency_ns(reader);
 	} catch (const std::exception& e) {
 		result.decode_supported = false;
 		result.decode_error     = e.what();
 	}
 	result.peak_rss_bytes = peak_rss_bytes();
+	result.first_decode_peak_rss_bytes = result.peak_rss_bytes;
 	return result;
 }
 
 void write_result_csv_files(const std::filesystem::path& output_dir, const BenchmarkResult& result) {
 	{
 		std::ofstream out(output_dir / (result.label + "_summary.csv"));
-		out << "layout,compressed_data_size,total_output_size,semantic_compression_ratio,"
-		       "encode_ms,decode_ms,row_lookup_ns,rowgroup_count,shard_count\n";
-		out << result.label << ',' << result.compressed_data_size << ',' << result.total_output_size << ','
-		    << result.semantic_compression_ratio << ',' << result.encode_ms << ',' << result.decode_ms << ','
-		    << result.crop_lookup_latency_ns << ',' << result.rowgroup_count << ',' << result.shard_count << '\n';
+		out << "layout,raw_dct_size,compressed_payload_size,source_descriptor_size,compact_descriptor_size,"
+		       "temporary_build_peak_disk_size,projected_50000_image_total_size,"
+		       "compressed_data_size,total_output_size,semantic_compression_ratio,encode_ms,reader_startup_ms,"
+		       "first_access_ms,decode_ms,hot_decode_ms,row_lookup_ns,"
+		       "encode_peak_rss_bytes,first_decode_peak_rss_bytes,rowgroup_count,shard_count\n";
+		out << result.label << ',' << result.raw_dct_size << ',' << result.compressed_payload_size << ','
+		    << result.source_descriptor_size << ',' << result.compact_descriptor_size << ','
+		    << result.temporary_build_peak_disk_size << ',' << result.projected_50000_image_total_size << ','
+		    << result.compressed_data_size << ',' << result.total_output_size << ','
+		    << result.semantic_compression_ratio << ',' << result.encode_ms << ',' << result.reader_startup_ms << ','
+		    << result.first_access_ms << ',' << result.decode_ms << ',' << result.hot_decode_ms << ','
+		    << result.crop_lookup_latency_ns << ',' << result.encode_peak_rss_bytes << ','
+		    << result.first_decode_peak_rss_bytes << ',' << result.rowgroup_count << ',' << result.shard_count << '\n';
 	}
 	{
 		std::ofstream out(output_dir / (result.label + "_tokens.csv"));
 		out << "layout,token,gpu_supported,rowgroup_count,column_count,compressed_bytes\n";
 		for (const auto& [token, stat] : result.token_stats) {
 			out << result.label << ',' << fastlanes::token_to_string(token) << ','
-			    << (galp::expression::is_supported_token(token) ? "true" : "false") << ',' << stat.rowgroup_count
-			    << ',' << stat.column_count << ',' << stat.compressed_bytes << '\n';
+			    << (galp::expression::is_supported_token(token) ? "true" : "false") << ',' << stat.rowgroup_count << ','
+			    << stat.column_count << ',' << stat.compressed_bytes << '\n';
 		}
 	}
 	{
@@ -490,8 +588,8 @@ void write_result_csv_files(const std::filesystem::path& output_dir, const Bench
 		for (size_t coefficient = 0; coefficient < result.coefficient_token_stats.size(); ++coefficient) {
 			for (const auto& [token, stat] : result.coefficient_token_stats[coefficient]) {
 				out << result.label << ',' << coefficient << ',' << fastlanes::token_to_string(token) << ','
-				    << (galp::expression::is_supported_token(token) ? "true" : "false") << ','
-				    << stat.rowgroup_count << ',' << stat.column_count << ',' << stat.compressed_bytes << '\n';
+				    << (galp::expression::is_supported_token(token) ? "true" : "false") << ',' << stat.rowgroup_count
+				    << ',' << stat.column_count << ',' << stat.compressed_bytes << '\n';
 			}
 		}
 	}
@@ -508,17 +606,25 @@ void print_wizard_expression_stats(const BenchmarkResult& result) {
 }
 
 void print_csv_header() {
-	std::cout << "layout,total_output_size,semantic_compression_ratio,encode_ms,decode_ms,"
-	             "crop_lookup_latency_ns,expansion_vs_jpeg,peak_rss_bytes,"
+	std::cout << "layout,total_output_size,raw_dct_size,compressed_payload_size,source_descriptor_size,"
+	             "compact_descriptor_size,temporary_build_peak_disk_size,projected_50000_image_total_size,"
+	             "semantic_compression_ratio,encode_ms,decode_ms,"
+	             "reader_startup_ms,first_access_ms,hot_decode_ms,crop_lookup_latency_ns,"
+	             "expansion_vs_jpeg,peak_rss_bytes,encode_peak_rss_bytes,"
+	             "first_decode_peak_rss_bytes,"
 	             "compressed_data_size,metadata_size,source_jpeg_size,real_row_count,padding_row_count,"
 	             "physical_row_count,shard_count,rowgroup_count,block_group_count,physical_compression_ratio,"
 	             "decode_supported,decode_error\n";
 }
 
 void print_csv_row(const BenchmarkResult& r) {
-	std::cout << r.label << ',' << r.total_output_size << ',' << r.semantic_compression_ratio << ',' << r.encode_ms
-	          << ',' << r.decode_ms << ',' << r.crop_lookup_latency_ns << ',' << r.expansion_vs_jpeg << ','
-	          << r.peak_rss_bytes << ',' << r.compressed_data_size << ',' << r.metadata_size << ','
+	std::cout << r.label << ',' << r.total_output_size << ',' << r.raw_dct_size << ',' << r.compressed_payload_size
+	          << ',' << r.source_descriptor_size << ',' << r.compact_descriptor_size << ','
+	          << r.temporary_build_peak_disk_size << ',' << r.projected_50000_image_total_size << ','
+	          << r.semantic_compression_ratio << ',' << r.encode_ms << ',' << r.decode_ms << ',' << r.reader_startup_ms
+	          << ',' << r.first_access_ms << ',' << r.hot_decode_ms << ',' << r.crop_lookup_latency_ns << ','
+	          << r.expansion_vs_jpeg << ',' << r.peak_rss_bytes << ',' << r.encode_peak_rss_bytes << ','
+	          << r.first_decode_peak_rss_bytes << ',' << r.compressed_data_size << ',' << r.metadata_size << ','
 	          << r.source_jpeg_size << ',' << r.real_row_count << ',' << r.padding_row_count << ','
 	          << r.physical_row_count << ',' << r.shard_count << ',' << r.rowgroup_count << ',' << r.block_group_count
 	          << ',' << r.physical_compression_ratio << ',' << (r.decode_supported ? "true" : "false") << ',' << '"'
@@ -538,15 +644,27 @@ void print_human_report(const std::vector<std::filesystem::path>& paths,
 	std::cout << std::left << std::setw(30) << "metric" << std::right << std::setw(18) << result.label << '\n';
 	std::cout << std::string(48, '-') << '\n';
 	print_human_metric("total output", format_bytes(result.total_output_size));
+	print_human_metric("original raw DCT", format_bytes(result.raw_dct_size));
+	print_human_metric("compressed payload", format_bytes(result.compressed_payload_size));
+	print_human_metric("source descriptor", format_bytes(result.source_descriptor_size));
+	print_human_metric("compact descriptor", format_bytes(result.compact_descriptor_size));
+	print_human_metric("temporary build peak", format_bytes(result.temporary_build_peak_disk_size));
+	print_human_metric("50K projected total", format_bytes(result.projected_50000_image_total_size));
 	print_human_metric("compressed data", format_bytes(result.compressed_data_size));
 	print_human_metric("metadata", format_bytes(result.metadata_size));
 	print_human_metric("source JPEG", format_bytes(result.source_jpeg_size));
 	print_human_metric("expansion vs JPEG", format_ratio(result.expansion_vs_jpeg));
 	print_human_metric("semantic ratio", format_ratio(result.semantic_compression_ratio));
 	print_human_metric("encode", format_ms(result.encode_ms));
+	print_human_metric("reader startup", result.decode_supported ? format_ms(result.reader_startup_ms) : "unsupported");
+	print_human_metric("first access", result.decode_supported ? format_ms(result.first_access_ms) : "unsupported");
 	print_human_metric("decode", result.decode_supported ? format_ms(result.decode_ms) : "unsupported");
-	print_human_metric("crop lookup", result.decode_supported ? format_ns(result.crop_lookup_latency_ns) : "unsupported");
+	print_human_metric("hot decode", result.decode_supported ? format_ms(result.hot_decode_ms) : "unsupported");
+	print_human_metric("crop lookup",
+	                   result.decode_supported ? format_ns(result.crop_lookup_latency_ns) : "unsupported");
 	print_human_metric("peak RSS", format_bytes(result.peak_rss_bytes));
+	print_human_metric("encode peak RSS", format_bytes(result.encode_peak_rss_bytes));
+	print_human_metric("first decode peak RSS", format_bytes(result.first_decode_peak_rss_bytes));
 	print_human_metric("real rows", format_count(result.real_row_count));
 	print_human_metric("padding rows", format_count(result.padding_row_count));
 	print_human_metric("physical rows", format_count(result.physical_row_count));
@@ -570,13 +688,18 @@ int main(const int argc, char** argv) {
 			print_usage(argv[0]);
 			return 1;
 		}
+		if (options.compact_v3 && options.spatial_order != galp::jpeg::JpegDctSpatialOrder::kTiledZ32) {
+			throw std::invalid_argument("--compact-v3 requires --spatial-order tiled-z-32");
+		}
 
 		std::filesystem::create_directories(options.output_dir);
 		const auto paths = collect_jpegs(options.input);
 
-		const bool image_major = options.spatial_order_specified ||
+		const bool image_major = options.compact_v3 || options.spatial_order_specified ||
 		                         options.preset == galp::jpeg::JpegDctShardPreset::kRandomAccess;
-		const auto label  = image_major ? spatial_order_name(options.spatial_order) : "spatial_major";
+		const auto label  = options.compact_v3 ? "compact_v3_" + spatial_order_name(options.spatial_order)
+		                    : image_major      ? spatial_order_name(options.spatial_order)
+		                                       : "spatial_major";
 		const auto result = run_benchmark(paths, options.output_dir, options, label);
 		write_result_csv_files(options.output_dir, result);
 		if (options.csv) {
@@ -584,6 +707,39 @@ int main(const int argc, char** argv) {
 			print_csv_row(result);
 		} else {
 			print_human_report(paths, options.output_dir, result);
+		}
+		if (options.compact_v3) {
+			constexpr uintmax_t kV2HundredImageBytes            = 26914204U;
+			constexpr uintmax_t kProjected50000ImageBudgetBytes = 13244000000ULL;
+			constexpr uint64_t  kPeakRssBudgetBytes             = 1000000000ULL;
+			constexpr double    kColdAccessBudgetMs             = 500.0;
+			constexpr double    kLookupBudgetNs                 = 200000.0;
+			if (result.source_descriptor_size == 0U ||
+			    result.compact_descriptor_size > result.source_descriptor_size / 5U) {
+				std::cerr << "compact-v3 gate failed: descriptor reduction is below 80%\n";
+				return 3;
+			}
+			if (paths.size() == 100U && result.total_output_size > kV2HundredImageBytes) {
+				std::cerr << "compact-v3 gate failed: 100-image total exceeds the 26,914,204-byte v2 baseline\n";
+				return 3;
+			}
+			if (result.projected_50000_image_total_size > kProjected50000ImageBudgetBytes) {
+				std::cerr << "compact-v3 gate failed: projected 50K total exceeds 13.244 GB\n";
+				return 3;
+			}
+			if (!result.decode_supported || result.reader_startup_ms >= kColdAccessBudgetMs ||
+			    result.first_access_ms >= kColdAccessBudgetMs) {
+				std::cerr << "compact-v3 gate failed: cold reader startup/first access is not below 500 ms\n";
+				return 3;
+			}
+			if (result.crop_lookup_latency_ns >= kLookupBudgetNs) {
+				std::cerr << "compact-v3 gate failed: crop lookup is not below 200 us\n";
+				return 3;
+			}
+			if (result.peak_rss_bytes >= kPeakRssBudgetBytes) {
+				std::cerr << "compact-v3 gate failed: measured peak RSS is not below 1 GB\n";
+				return 3;
+			}
 		}
 		return 0;
 	} catch (const std::exception& e) {

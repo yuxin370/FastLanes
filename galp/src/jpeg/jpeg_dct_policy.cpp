@@ -2,6 +2,7 @@
 #include "codecs/consts.cuh"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -97,6 +98,97 @@ JpegDctSparseStoragePolicyResult choose_jpeg_dct_sparse_storage_policy(const Jpe
 	                         result.full_estimated_ns * (1.0 - kMinimumPredictedSavingRatio);
 	result.reason = result.use_sparse_read ? JpegDctSparseStoragePolicyReason::kPredictedFaster
 	                                       : JpegDctSparseStoragePolicyReason::kFragmentationDominates;
+	return result;
+}
+
+JpegDctAdaptiveReadPolicyResult choose_jpeg_dct_adaptive_read_policy(const JpegDctAdaptiveReadCost& cost) {
+	constexpr double kStorageBytesPerSecond = 1.0 * 1024.0 * 1024.0 * 1024.0;
+	constexpr double kDecodeBytesPerSecond  = 12.0 * 1024.0 * 1024.0 * 1024.0;
+	constexpr double kMemoryBytesPerSecond  = 20.0 * 1024.0 * 1024.0 * 1024.0;
+	constexpr double kPreadFixedCostNs      = 2000.0;
+	constexpr double kRunPlannerItemNs      = 35.0;
+	// Bitmap-exact still pays one host-side selection/materialization action per
+	// decoded vector.  Pricing that work as a near-free integer operation makes
+	// a 15/16-vector bitmap look faster than a straight full-rowgroup decode,
+	// even though it only saves one vector and adds an extra indirection pass.
+	constexpr double kBitmapPlannerItemNs   = 1200.0;
+	constexpr double kFullPlannerNs         = 50.0;
+	const auto transfer_ns = [](const size_t bytes, const double bytes_per_second) {
+		return static_cast<double>(bytes) * 1.0e9 / bytes_per_second;
+	};
+	const auto saturating_multiply = [](const size_t lhs, const size_t rhs) {
+		return rhs != 0U && lhs > std::numeric_limits<size_t>::max() / rhs
+		           ? std::numeric_limits<size_t>::max()
+		           : lhs * rhs;
+	};
+	const auto saturating_add = [](const size_t lhs, const size_t rhs) {
+		return rhs > std::numeric_limits<size_t>::max() - lhs ? std::numeric_limits<size_t>::max()
+		                                                        : lhs + rhs;
+	};
+
+	JpegDctAdaptiveReadPolicyResult result;
+	const auto source_resident = saturating_multiply(cost.full_vector_count, cost.decoded_bytes_per_vector);
+	const auto selected_decoded = saturating_multiply(cost.selected_vector_count, cost.decoded_bytes_per_vector);
+	const auto full_decoded = saturating_multiply(cost.full_vector_count, cost.decoded_bytes_per_vector);
+	result.selected_resident_bytes = saturating_add(source_resident, selected_decoded);
+	result.full_resident_bytes     = saturating_add(source_resident, full_decoded);
+	result.selected_fits_memory = cost.decode_workset_capacity_bytes == 0U ||
+	                              result.selected_resident_bytes <= cost.decode_workset_capacity_bytes;
+	result.full_fits_memory = cost.decode_workset_capacity_bytes == 0U ||
+	                          result.full_resident_bytes <= cost.decode_workset_capacity_bytes;
+
+	const auto full_storage_ns = transfer_ns(cost.full_storage_bytes, kStorageBytesPerSecond) + kPreadFixedCostNs;
+	result.full_rowgroup_estimated_ns = full_storage_ns + transfer_ns(full_decoded, kDecodeBytesPerSecond) +
+	                                    transfer_ns(result.full_resident_bytes, kMemoryBytesPerSecond) +
+	                                    kFullPlannerNs;
+	result.bitmap_estimated_ns = full_storage_ns + transfer_ns(selected_decoded, kDecodeBytesPerSecond) +
+	                             transfer_ns(result.selected_resident_bytes, kMemoryBytesPerSecond) +
+	                             static_cast<double>(cost.selected_vector_count) * kBitmapPlannerItemNs;
+	result.run_interval_estimated_ns =
+	    transfer_ns(cost.run_interval_storage_bytes, kStorageBytesPerSecond) +
+	    static_cast<double>(cost.run_interval_pread_count) * kPreadFixedCostNs +
+	    transfer_ns(selected_decoded, kDecodeBytesPerSecond) +
+	    transfer_ns(result.selected_resident_bytes, kMemoryBytesPerSecond) +
+	    static_cast<double>(cost.run_interval_pread_count + cost.selected_vector_count) * kRunPlannerItemNs;
+	if (cost.run_requires_full_materialization) {
+		result.run_interval_estimated_ns +=
+		    transfer_ns(saturating_add(cost.full_storage_bytes, cost.run_interval_storage_bytes),
+		                kMemoryBytesPerSecond);
+	}
+
+	const bool selected_eligible = cost.selected_decode_supported &&
+	                               cost.selected_vector_count < cost.full_vector_count;
+	const bool run_eligible = selected_eligible && cost.run_interval_supported &&
+	                          cost.run_interval_pread_count != 0U &&
+	                          cost.run_interval_storage_bytes < cost.full_storage_bytes;
+	const double infinity = std::numeric_limits<double>::infinity();
+	double full_choice = result.full_fits_memory ? result.full_rowgroup_estimated_ns : infinity;
+	double bitmap_choice = selected_eligible && result.selected_fits_memory ? result.bitmap_estimated_ns : infinity;
+	double run_choice = run_eligible && result.selected_fits_memory ? result.run_interval_estimated_ns : infinity;
+
+	if (!std::isfinite(full_choice) && !std::isfinite(bitmap_choice) && !std::isfinite(run_choice)) {
+		// A single oversized rowgroup is executed alone and reported separately.
+		// Prefer the smaller selected-vector resident set whenever it is legal;
+		// never choose an even larger full decode merely to simplify execution.
+		if (selected_eligible) {
+			bitmap_choice = result.bitmap_estimated_ns;
+			if (run_eligible) {
+				run_choice = result.run_interval_estimated_ns;
+			}
+		} else {
+			full_choice = result.full_rowgroup_estimated_ns;
+		}
+	}
+
+	result.strategy = JpegDctReadStrategy::kFullRowgroup;
+	double best = full_choice;
+	if (bitmap_choice <= best) {
+		result.strategy = JpegDctReadStrategy::kBitmapExact;
+		best = bitmap_choice;
+	}
+	if (run_choice < best) {
+		result.strategy = JpegDctReadStrategy::kRunIntervalExact;
+	}
 	return result;
 }
 

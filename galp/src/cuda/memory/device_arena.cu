@@ -136,6 +136,7 @@ void DeviceArena::reset(const bool preserve_capacity) {
 	if (!preserve_capacity) {
 		release_device_base();
 		release_pinned_base();
+		minimum_capacity_bytes_ = 0U;
 	}
 	run_deferred_frees();
 	staged_bytes_ = 0;
@@ -152,6 +153,11 @@ ArenaUploadMetrics DeviceArena::upload(bool resolve_before_pack, bool backing_re
 		return std::chrono::duration<double, std::milli>(b - a).count();
 	};
 	ArenaUploadMetrics metrics {};
+	metrics.device_capacity.minimum_capacity_bytes = minimum_capacity_bytes_;
+	metrics.device_capacity.capacity_before_bytes  = capacity_bytes_;
+	metrics.device_capacity.capacity_bytes         = capacity_bytes_;
+	metrics.pinned_capacity.capacity_before_bytes  = pinned_capacity_bytes_;
+	metrics.pinned_capacity.capacity_bytes         = pinned_capacity_bytes_;
 
 	const auto finalize = [&]() {
 		run_deferred_frees();
@@ -169,6 +175,7 @@ ArenaUploadMetrics DeviceArena::upload(bool resolve_before_pack, bool backing_re
 		coalesce_backing_regions();
 	}
 	const auto plan = plan_layout();
+	metrics.device_capacity.requested_bytes = plan.total_bytes;
 	if (plan.total_bytes == 0) {
 		run_resolvers();
 		finalize();
@@ -177,10 +184,24 @@ ArenaUploadMetrics DeviceArena::upload(bool resolve_before_pack, bool backing_re
 	const auto t1     = clock::now();
 	metrics.layout_ms = ms(t0, t1);
 
-	ensure_capacity(round_up_pow2(plan.total_bytes, 65536U));
+	const size_t device_alloc_bytes =
+	    round_up_pow2(std::max(plan.total_bytes, minimum_capacity_bytes_), 65536U);
+	if (ensure_capacity(device_alloc_bytes)) {
+		metrics.device_capacity.growth_count = 1U;
+		metrics.device_capacity.growth_bytes =
+		    device_alloc_bytes - std::min(device_alloc_bytes, metrics.device_capacity.capacity_before_bytes);
+	}
+	metrics.device_capacity.capacity_bytes = capacity_bytes_;
 	if (staged_bytes_ > 0) {
 		const size_t staged_floor = staged_bytes_ >= 192U * 1024U ? 512U * 1024U : 65536U;
-		ensure_pinned_capacity(round_up_pow2(staged_bytes_, staged_floor));
+		const size_t pinned_alloc_bytes = round_up_pow2(staged_bytes_, staged_floor);
+		metrics.pinned_capacity.requested_bytes = staged_bytes_;
+		if (ensure_pinned_capacity(pinned_alloc_bytes)) {
+			metrics.pinned_capacity.growth_count = 1U;
+			metrics.pinned_capacity.growth_bytes =
+			    pinned_alloc_bytes - std::min(pinned_alloc_bytes, metrics.pinned_capacity.capacity_before_bytes);
+		}
+		metrics.pinned_capacity.capacity_bytes = pinned_capacity_bytes_;
 	}
 	const auto t2    = clock::now();
 	metrics.alloc_ms = ms(t1, t2);
@@ -237,6 +258,18 @@ size_t DeviceArena::total_bytes() const {
 
 size_t DeviceArena::entry_count() const {
 	return entries_.size();
+}
+
+size_t DeviceArena::capacity_bytes() const noexcept {
+	return capacity_bytes_;
+}
+
+size_t DeviceArena::pinned_capacity_bytes() const noexcept {
+	return pinned_capacity_bytes_;
+}
+
+void DeviceArena::set_minimum_capacity_bytes(const size_t bytes) {
+	minimum_capacity_bytes_ = std::max(minimum_capacity_bytes_, bytes);
 }
 
 DeviceArena::LayoutPlan DeviceArena::plan_layout() {
@@ -325,24 +358,26 @@ int DeviceArena::find_region(const void* host_src, size_t bytes) const {
 	return -1;
 }
 
-void DeviceArena::ensure_capacity(const size_t alloc_bytes) {
+bool DeviceArena::ensure_capacity(const size_t alloc_bytes) {
 	if (device_base_ != nullptr && capacity_bytes_ >= alloc_bytes) {
-		return;
+		return false;
 	}
 	release_device_base();
 	auto& pool      = DevicePool::instance();
 	device_base_    = reinterpret_cast<char*>(pool.alloc_on_stream(alloc_bytes, stream_));
 	capacity_bytes_ = alloc_bytes;
+	return true;
 }
 
-void DeviceArena::ensure_pinned_capacity(const size_t alloc_bytes) {
+bool DeviceArena::ensure_pinned_capacity(const size_t alloc_bytes) {
 	if (pinned_base_ != nullptr && pinned_capacity_bytes_ >= alloc_bytes) {
-		return;
+		return false;
 	}
 	release_pinned_base();
 	auto& pool             = DevicePool::instance();
 	pinned_base_           = reinterpret_cast<char*>(pool.alloc_pinned(alloc_bytes));
 	pinned_capacity_bytes_ = alloc_bytes;
+	return true;
 }
 
 void DeviceArena::release_device_base() {

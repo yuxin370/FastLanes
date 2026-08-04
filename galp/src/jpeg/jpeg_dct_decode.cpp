@@ -251,6 +251,104 @@ void append_row(JpegDctTable& table, const DecodedDctRow& row) {
 	++table.real_row_count;
 }
 
+size_t checked_add_rows(const size_t accumulated, const size_t rows) {
+	if (rows > std::numeric_limits<size_t>::max() - accumulated) {
+		throw std::runtime_error("JPEG DCT table row count overflow");
+	}
+	return accumulated + rows;
+}
+
+size_t decoded_image_row_count(const DecodedImage& image) {
+	size_t row_count = 0;
+	for (const auto& component : image.components) {
+		row_count = checked_add_rows(row_count, component.blocks.size());
+	}
+	return row_count;
+}
+
+size_t decoded_row_count(const std::vector<DecodedImage>& images) {
+	size_t row_count = 0;
+	for (const auto& image : images) {
+		row_count = checked_add_rows(row_count, decoded_image_row_count(image));
+	}
+	return row_count;
+}
+
+size_t layout_row_count(const DatasetLayout& layout) {
+	size_t row_count = 0;
+	for (const auto& components : layout.image_slot_components) {
+		for (const auto* component : components) {
+			if (component != nullptr) {
+				row_count = checked_add_rows(row_count, component->blocks.size());
+			}
+		}
+	}
+	return row_count;
+}
+
+std::array<size_t, 64> reserve_table_rows(JpegDctTable& table, const size_t row_count) {
+	std::array<size_t, 64> reserved_capacities {};
+	for (size_t column = 0; column < table.columns.size(); ++column) {
+		table.columns[column].reserve(row_count);
+		reserved_capacities[column] = table.columns[column].capacity();
+	}
+	return reserved_capacities;
+}
+
+void update_peak_row_slots(const JpegDctTable& table, JpegDctTableBuildStats* stats) {
+	if (stats == nullptr) {
+		return;
+	}
+	stats->peak_coefficient_row_slots =
+	    std::max(stats->peak_coefficient_row_slots, checked_add_rows(table.row_count, stats->remaining_decoded_rows));
+}
+
+void release_component_storage(DecodedComponent& component, JpegDctTableBuildStats* stats) {
+	const auto decoded_rows = component.blocks.size();
+	std::vector<DecodedDctRow>().swap(component.blocks);
+	std::vector<size_t>().swap(component.coord_to_block_index);
+	if (stats == nullptr) {
+		return;
+	}
+	if (decoded_rows > stats->remaining_decoded_rows) {
+		throw std::runtime_error("JPEG DCT decoded-row accounting underflow");
+	}
+	stats->remaining_decoded_rows -= decoded_rows;
+	stats->released_decoded_rows = checked_add_rows(stats->released_decoded_rows, decoded_rows);
+}
+
+void release_image_storage(DecodedImage& image, JpegDctTableBuildStats* stats) {
+	for (auto& component : image.components) {
+		release_component_storage(component, stats);
+	}
+}
+
+DecodedComponent* find_mutable_component_for_slot(DecodedImage& image, const ComponentSlot& slot) {
+	for (auto& component : image.components) {
+		if (component.metadata.component_id == slot.component_id) {
+			return &component;
+		}
+	}
+	return nullptr;
+}
+
+void finalize_build_stats(const JpegDctTable&           table,
+                          const std::array<size_t, 64>& reserved_capacities,
+                          const size_t                  expected_rows,
+                          JpegDctTableBuildStats*       stats) {
+	if (table.row_count != expected_rows) {
+		throw std::runtime_error("JPEG DCT table row count changed after exact preallocation");
+	}
+	if (stats == nullptr) {
+		return;
+	}
+	for (size_t column = 0; column < table.columns.size(); ++column) {
+		if (table.columns[column].capacity() != reserved_capacities[column]) {
+			++stats->column_capacity_growths;
+		}
+	}
+}
+
 uint32_t encoding_profile_id(std::vector<JpegEncodingProfileMetadata>& profiles,
                              const JpegImageMetadata&                  image,
                              const JpegComponentMetadata&              component) {
@@ -547,6 +645,8 @@ std::vector<ComponentSlot> normalize_component_slots(const std::vector<DecodedIm
 JpegDctTable make_single_image_table(DecodedImage image, const JpegDctReaderOptions& options) {
 	validate_supported_layout_options(options);
 	JpegDctTable table;
+	const auto   expected_rows       = decoded_image_row_count(image);
+	const auto   reserved_capacities = reserve_table_rows(table, expected_rows);
 	for (size_t index = 0; index < image.metadata.components.size(); ++index) {
 		auto& component                 = image.metadata.components[index];
 		component.semantic_slot_id      = static_cast<uint32_t>(index);
@@ -565,7 +665,7 @@ JpegDctTable make_single_image_table(DecodedImage image, const JpegDctReaderOpti
 	table.metadata.zigzag_columns               = options.use_zigzag_columns;
 	table.metadata.z_curve_block_order          = options.use_z_curve_block_order;
 	table.metadata.image_count                  = 1;
-	for (const auto& component : image.components) {
+	for (auto& component : image.components) {
 		const auto order = make_block_order(
 		    component.metadata.width_in_blocks, component.metadata.height_in_blocks, options.use_z_curve_block_order);
 		for (size_t block_index = 0; block_index < component.blocks.size(); ++block_index) {
@@ -579,21 +679,33 @@ JpegDctTable make_single_image_table(DecodedImage image, const JpegDctReaderOpti
 			table.metadata.block_group_index.push_back(group);
 			append_row(table, component.blocks[block_index]);
 		}
+		release_component_storage(component, nullptr);
 	}
 	table.block_group_count = table.metadata.block_group_index.size();
+	finalize_build_stats(table, reserved_capacities, expected_rows, nullptr);
 	return table;
 }
 
 JpegDctTable make_dataset_table(std::vector<DecodedImage>         images,
                                 const JpegDctReaderOptions&       options,
                                 const std::vector<ComponentSlot>* global_slots,
-                                const JpegDctPhysicalLayout       physical_layout) {
+                                JpegDctPhysicalLayout             physical_layout,
+                                JpegDctTableBuildStats*           build_stats) {
 	validate_supported_layout_options(options);
 	if (global_slots == nullptr) {
 		validate_decoded_dataset(images);
 	}
 	const auto   layout = make_dataset_layout(images, global_slots);
 	JpegDctTable table;
+	const auto   expected_rows       = layout_row_count(layout);
+	const auto   reserved_capacities = reserve_table_rows(table, expected_rows);
+	if (build_stats != nullptr) {
+		*build_stats                            = {};
+		build_stats->expected_table_rows        = expected_rows;
+		build_stats->initial_decoded_rows       = decoded_row_count(images);
+		build_stats->remaining_decoded_rows     = build_stats->initial_decoded_rows;
+		build_stats->peak_coefficient_row_slots = build_stats->initial_decoded_rows;
+	}
 	table.metadata.row_ordering                 = is_image_major_physical_layout(physical_layout)
 	                                                  ? JpegDctRowOrdering::kDatasetImageMajorComponentBlockMajor
 	                                                  : JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor;
@@ -637,7 +749,10 @@ JpegDctTable make_dataset_table(std::vector<DecodedImage>         images,
 				}
 			}
 			table.metadata.image_group_index.push_back(group);
+			update_peak_row_slots(table, build_stats);
+			release_image_storage(images[image_index], build_stats);
 		}
+		finalize_build_stats(table, reserved_capacities, expected_rows, build_stats);
 		return table;
 	}
 
@@ -665,13 +780,24 @@ JpegDctTable make_dataset_table(std::vector<DecodedImage>         images,
 				table.metadata.block_group_index.push_back(group);
 			}
 		}
+		update_peak_row_slots(table, build_stats);
+		for (auto& image : images) {
+			if (auto* component = find_mutable_component_for_slot(image, slot)) {
+				release_component_storage(*component, build_stats);
+			}
+		}
+	}
+	for (auto& image : images) {
+		release_image_storage(image, build_stats);
 	}
 	table.block_group_count = table.metadata.block_group_index.size();
+	finalize_build_stats(table, reserved_capacities, expected_rows, build_stats);
 	return table;
 }
 
 JpegDctTable make_dataset_table(std::vector<DecodedImage> images, const JpegDctReaderOptions& options) {
-	return make_dataset_table(std::move(images), options, nullptr, JpegDctPhysicalLayout::kSpatialMajorImageMinor);
+	return make_dataset_table(
+	    std::move(images), options, nullptr, JpegDctPhysicalLayout::kSpatialMajorImageMinor, nullptr);
 }
 
 } // namespace galp::jpeg::detail

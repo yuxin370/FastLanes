@@ -5,7 +5,10 @@
 // ────────────────────────────────────────────────────────
 #include "engine/materialization/zero_copy_materializer.cuh"
 #include "core/operator_capabilities.hpp"
+#include "format/compact_descriptor_v3.hpp"
+#include "format/compact_read_plan.hpp"
 #include "format/reader.cuh"
+#include "flatbuffers/flatbuffer_builder.h"
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/file/file_footer.hpp"
@@ -15,15 +18,18 @@
 #include "galp/errors.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <flatbuffers/base.h>
 #include <fstream>
 #include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace galp::format::detail {
@@ -519,6 +525,128 @@ load_sparse_vector_bundle_index(const std::filesystem::path&                 bun
 
 namespace galp::format {
 
+namespace {
+
+size_t align_compact_batch_offset(const size_t offset) {
+	constexpr size_t alignment = kCompactBatchRowgroupAlignment;
+	static_assert(alignment != 0U && (alignment & (alignment - 1U)) == 0U);
+	if (offset > std::numeric_limits<size_t>::max() - (alignment - 1U)) {
+		throw std::overflow_error("Compact v3 batch backing alignment overflow");
+	}
+	return (offset + alignment - 1U) & ~(alignment - 1U);
+}
+
+struct OwnedCompactRowgroupDescriptor {
+	std::shared_ptr<const std::vector<uint8_t>> owner;
+	const fastlanes::RowgroupDescriptor*        descriptor = nullptr;
+};
+
+OwnedCompactRowgroupDescriptor make_compact_rowgroup_descriptor(const CompactDescriptorV3& compact,
+	                                                            const size_t rowgroup_index) {
+	const auto native = compact.unpack_rowgroup(rowgroup_index);
+	flatbuffers::FlatBufferBuilder builder;
+	const auto root = fastlanes::RowgroupDescriptor::Pack(builder, native.get());
+	fastlanes::FinishRowgroupDescriptorBuffer(builder, root);
+	auto detached = builder.Release();
+	auto bytes = std::make_shared<std::vector<uint8_t>>(detached.data(), detached.data() + detached.size());
+	const auto* descriptor = fastlanes::GetRowgroupDescriptor(bytes->data());
+	return {std::move(bytes), descriptor};
+}
+
+bool compact_direct_rowgroup_matches_plan(const CompactV3DirectRowgroup&          rowgroup,
+	                                      const std::vector<ZeroCopyColumnPlan>& plan) {
+	if (rowgroup.columns.size() != plan.size()) {
+		return false;
+	}
+	for (size_t column_index = 0U; column_index < plan.size(); ++column_index) {
+		const auto* schema = rowgroup.columns[column_index].schema;
+		const auto* rpn    = schema == nullptr ? nullptr : schema->encoding_rpn();
+		const auto* ops    = rpn == nullptr ? nullptr : rpn->operator_tokens();
+		const auto* operands = rpn == nullptr ? nullptr : rpn->operand_tokens();
+		if (ops == nullptr || ops->size() != 1U || ops->Get(0U) != plan[column_index].token) {
+			return false;
+		}
+		const size_t operand_count = operands == nullptr ? 0U : operands->size();
+		if (operand_count != plan[column_index].operand_ids.size()) {
+			return false;
+		}
+		for (size_t operand_index = 0U; operand_index < operand_count; ++operand_index) {
+			if (operands->Get(static_cast<flatbuffers::uoffset_t>(operand_index)) !=
+			    plan[column_index].operand_ids[operand_index]) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+// std::span permits an empty range, but RowgroupView and ColumnView retain a
+// pointer even when a metadata-only rowgroup owns no physical bytes. Keep one
+// process-lifetime, suitably aligned address for that empty range. No read or
+// write is ever issued against this byte.
+alignas(std::max_align_t) std::byte kMetadataOnlyBacking {};
+
+std::byte* metadata_only_backing() noexcept {
+	return &kMetadataOnlyBacking;
+}
+
+template <typename Callback>
+void parallel_for_compact_views(const size_t count, const size_t requested_workers, Callback&& callback) {
+	const size_t worker_count = std::min(count, std::max<size_t>(1U, requested_workers));
+	if (worker_count <= 1U) {
+		for (size_t index = 0U; index < count; ++index) {
+			callback(index);
+		}
+		return;
+	}
+	std::atomic<size_t>        next {0U};
+	std::vector<std::thread>   workers;
+	std::vector<std::exception_ptr> errors(worker_count);
+	workers.reserve(worker_count);
+	for (size_t worker = 0U; worker < worker_count; ++worker) {
+		workers.emplace_back([&, worker]() {
+			try {
+				while (true) {
+					const auto index = next.fetch_add(1U, std::memory_order_relaxed);
+					if (index >= count) {
+						return;
+					}
+					callback(index);
+				}
+			} catch (...) { errors[worker] = std::current_exception(); }
+		});
+	}
+	for (auto& worker : workers) {
+		worker.join();
+	}
+	for (const auto& error : errors) {
+		if (error) {
+			std::rethrow_exception(error);
+		}
+	}
+}
+
+} // namespace
+
+size_t FlsReader::compact_batch_backing_bytes(const std::vector<size_t>& rowgroup_indices) const {
+	if (m_compact_descriptor == nullptr) {
+		throw std::invalid_argument("compact batch backing sizing requires Compact v3");
+	}
+	size_t cursor = 0U;
+	for (const size_t rowgroup_index : rowgroup_indices) {
+		const auto record = m_compact_descriptor->rowgroup(rowgroup_index);
+		if (record.payload_size == 0U) {
+			continue;
+		}
+		cursor = align_compact_batch_offset(cursor);
+		if (record.payload_size > std::numeric_limits<size_t>::max() - cursor) {
+			throw std::overflow_error("Compact v3 batch backing size overflow");
+		}
+		cursor += record.payload_size;
+	}
+	return cursor;
+}
+
 struct SparseVectorReadPlan::Impl {
 	enum class Strategy {
 		kFullRowgroup,
@@ -758,21 +886,36 @@ FlsReader::FlsReader(const std::filesystem::path& file_path,
 
 FlsReader::FlsReader(const std::filesystem::path& file_path, const FlsReaderOptions& options)
     : m_file(std::make_shared<fastlanes::File>(file_path))
-    , m_table_descriptor(
-	      std::make_shared<fastlanes::TableDescriptorHandle>(
-	          detail::load_table_descriptor(*m_file, file_path)))
     , m_load_column_names(options.load_column_names) {
-	if (options.enable_sparse_vector_reads) {
+	if (is_compact_v3_fls(file_path)) {
+		m_compact_descriptor =
+		    std::make_shared<CompactDescriptorV3>(CompactDescriptorV3::Open(file_path));
+	} else {
+		m_table_descriptor = std::make_shared<fastlanes::TableDescriptorHandle>(
+		    detail::load_table_descriptor(*m_file, file_path));
+	}
+	if (options.enable_sparse_vector_reads && m_table_descriptor != nullptr) {
 		m_sparse_vector_bundle = detail::load_sparse_vector_bundle_index(
 		    sparse_vector_bundle_path(file_path), *table_descriptor(), m_file->Size());
 		m_sparse_access_index = detail::build_sparse_dataset_access_index(*m_file, *table_descriptor());
 	}
-	if (options.build_shared_zero_copy_schema_plan) {
+	// Compact-v3 reconstructs per-rowgroup geometry on demand.  Always retain
+	// the shared expression/schema plan so the hot rowgroup-only training path
+	// does not also allocate a RowgroupView and a ZeroCopyColumn vector for all
+	// coefficient columns.  Each reconstructed rowgroup is still checked
+	// against the plan before the fast path is used.
+	if (options.build_shared_zero_copy_schema_plan || m_compact_descriptor != nullptr) {
 		m_zero_copy_schema_plan = std::make_shared<ZeroCopySchemaPlan>(build_shared_zero_copy_schema_plan());
 	}
 }
 
 const fastlanes::TableDescriptor* FlsReader::table_descriptor() const {
+	if (m_compact_descriptor != nullptr) {
+		throw std::runtime_error("Compact v3 reader does not load or expose a FastLanes TableDescriptor");
+	}
+	if (m_table_descriptor == nullptr) {
+		throw std::runtime_error("TableDescriptor owner is not initialized");
+	}
 	const auto* td = m_table_descriptor->Get();
 	if (!td) {
 		throw std::runtime_error("TableDescriptor not loaded");
@@ -781,11 +924,17 @@ const fastlanes::TableDescriptor* FlsReader::table_descriptor() const {
 }
 
 size_t FlsReader::rowgroup_count() const {
+	if (m_compact_descriptor != nullptr) {
+		return m_compact_descriptor->rowgroup_count();
+	}
 	const auto* td = table_descriptor();
 	return static_cast<size_t>(td->m_rowgroup_descriptors()->size());
 }
 
 size_t FlsReader::rowgroup_storage_bytes(const size_t rowgroup_idx) const {
+	if (m_compact_descriptor != nullptr) {
+		return m_compact_descriptor->rowgroup(rowgroup_idx).payload_size;
+	}
 	const auto* td = m_table_descriptor->Get();
 	if (!td) {
 		throw std::runtime_error("TableDescriptor not loaded");
@@ -802,7 +951,20 @@ bool FlsReader::has_sparse_vector_bundle() const noexcept {
 	return static_cast<bool>(m_sparse_vector_bundle);
 }
 
+bool FlsReader::is_compact_v3() const noexcept {
+	return static_cast<bool>(m_compact_descriptor);
+}
+
 bool FlsReader::sparse_vector_read_supported(const size_t rowgroup_idx, std::string* const reason) const {
+	if (m_compact_descriptor != nullptr) {
+		if (rowgroup_idx >= m_compact_descriptor->rowgroup_count()) {
+			throw std::out_of_range("rowgroup_idx out of range");
+		}
+		if (reason != nullptr) {
+			*reason = "compact-v3-rowgroup-is-one-vector";
+		}
+		return false;
+	}
 	if (!m_sparse_access_index) {
 		if (reason != nullptr) {
 			*reason = "sparse-access-index-disabled";
@@ -821,6 +983,30 @@ bool FlsReader::sparse_vector_read_supported(const size_t rowgroup_idx, std::str
 
 SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	const size_t rowgroup_idx, const std::vector<uint32_t>& selected_vectors, const bool packed_device_scatter) const {
+	if (m_compact_descriptor != nullptr) {
+		if (rowgroup_idx >= m_compact_descriptor->rowgroup_count()) {
+			throw std::out_of_range("rowgroup_idx out of range");
+		}
+		if (selected_vectors.empty()) {
+			throw std::invalid_argument("selected vector read requires at least one vector");
+		}
+		if (std::any_of(selected_vectors.begin(), selected_vectors.end(), [](const uint32_t vector) {
+			    return vector != 0U;
+		    })) {
+			throw std::out_of_range("Compact v3 rowgroup contains exactly one vector");
+		}
+		const auto record = m_compact_descriptor->rowgroup(rowgroup_idx);
+		auto plan = std::make_shared<SparseVectorReadPlan::Impl>();
+		plan->owner                  = m_sparse_plan_owner;
+		plan->rowgroup_index         = rowgroup_idx;
+		plan->rowgroup_bytes         = record.payload_size;
+		plan->full_vector_count      = 1U;
+		plan->selected_vector_count  = 1U;
+		plan->storage_bytes          = record.payload_size;
+		plan->fallback_reason        = "compact-v3-rowgroup-is-one-vector";
+		static_cast<void>(packed_device_scatter);
+		return SparseVectorReadPlan(std::move(plan));
+	}
 	const auto* td = m_table_descriptor->Get();
 	if (td == nullptr) {
 		throw std::runtime_error("TableDescriptor not loaded");
@@ -966,6 +1152,42 @@ void FlsReader::read_rowgroup_bytes_into(const size_t        rowgroup_idx,
                                          std::byte* const    backing_data,
                                          const size_t        backing_capacity,
                                          ZeroCopyReadTiming* timing) {
+	if (m_compact_descriptor != nullptr) {
+		const auto record = m_compact_descriptor->rowgroup(rowgroup_idx);
+		if ((record.payload_size != 0U && backing_data == nullptr) || backing_capacity < record.payload_size) {
+			throw std::runtime_error("external rowgroup backing is null or too small");
+		}
+		if (timing != nullptr) {
+			timing->storage_bytes              = record.payload_size;
+			timing->logical_storage_bytes      = record.payload_size;
+			timing->full_storage_bytes         = record.payload_size;
+			timing->selected_coefficient_count = m_compact_descriptor->column_count();
+			timing->full_coefficient_count     = m_compact_descriptor->column_count();
+		}
+		if (record.payload_size == 0U) {
+			return;
+		}
+		const auto pread_start = std::chrono::steady_clock::now();
+		m_file->ReadRangeUnchecked(backing_data, record.payload_offset, record.payload_size);
+		const auto pread_end = std::chrono::steady_clock::now();
+		if (timing != nullptr) {
+			constexpr size_t page_size = 4096U;
+			const auto first_page = record.payload_offset / page_size;
+			const auto last_page = (record.payload_offset + record.payload_size - 1U) / page_size;
+			timing->physical_page_bytes       = (last_page - first_page + 1U) * page_size;
+			timing->full_physical_page_bytes  = timing->physical_page_bytes;
+			timing->coalesced_read_run_count  = 1U;
+			timing->pread_count += 1U;
+			timing->pread_ms += std::chrono::duration<double, std::milli>(pread_end - pread_start).count();
+			if (timing->pread_start == std::chrono::steady_clock::time_point {} || pread_start < timing->pread_start) {
+				timing->pread_start = pread_start;
+			}
+			if (pread_end > timing->pread_end) {
+				timing->pread_end = pread_end;
+			}
+		}
+		return;
+	}
 	const auto* td = m_table_descriptor->Get();
 	if (!td) {
 		throw std::runtime_error("TableDescriptor not loaded");
@@ -977,16 +1199,21 @@ void FlsReader::read_rowgroup_bytes_into(const size_t        rowgroup_idx,
 
 	const auto*  rg       = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
 	const size_t rg_bytes = static_cast<size_t>(rg->m_size());
-	if (backing_data == nullptr || backing_capacity < rg_bytes) {
+	if ((rg_bytes != 0U && backing_data == nullptr) || backing_capacity < rg_bytes) {
 		throw std::runtime_error("external rowgroup backing is null or too small");
+	}
+	if (timing != nullptr) {
+		timing->storage_bytes      = rg_bytes;
+		timing->full_storage_bytes = rg_bytes;
+	}
+	if (rg_bytes == 0U) {
+		return;
 	}
 
 	const auto pread_start = std::chrono::steady_clock::now();
 	m_file->ReadRangeUnchecked(backing_data, rg->m_offset(), rg->m_size());
 	const auto pread_end = std::chrono::steady_clock::now();
 	if (timing != nullptr) {
-		timing->storage_bytes = rg_bytes;
-		timing->full_storage_bytes = rg_bytes;
 		timing->pread_count += 1U;
 		timing->pread_ms += std::chrono::duration<double, std::milli>(pread_end - pread_start).count();
 		if (timing->pread_start == std::chrono::steady_clock::time_point {} || pread_start < timing->pread_start) {
@@ -1003,6 +1230,21 @@ void FlsReader::read_rowgroup_bytes_selected_vectors_into(const size_t          
 	                                                      std::byte* const             backing_data,
 	                                                      const size_t                 backing_capacity,
 	                                                      ZeroCopyReadTiming*          timing) {
+	if (m_compact_descriptor != nullptr) {
+		if (selected_vectors.empty()) {
+			throw std::invalid_argument("selected vector read requires at least one vector");
+		}
+		if (std::any_of(selected_vectors.begin(), selected_vectors.end(), [](const uint32_t vector) {
+			    return vector != 0U;
+		    })) {
+			throw std::out_of_range("Compact v3 rowgroup contains exactly one vector");
+		}
+		if (timing != nullptr) {
+			timing->sparse_fallback_reason = "compact-v3-rowgroup-is-one-vector";
+		}
+		read_rowgroup_bytes_into(rowgroup_idx, backing_data, backing_capacity, timing);
+		return;
+	}
 	const auto* td = m_table_descriptor->Get();
 	if (!td) {
 		throw std::runtime_error("TableDescriptor not loaded");
@@ -1240,39 +1482,142 @@ void FlsReader::read_rowgroup_bytes_selected_vectors_into(const size_t          
 	}
 }
 
+void FlsReader::read_rowgroup_bytes_selected_columns_into(const size_t                rowgroup_idx,
+	                                                       const std::vector<uint8_t>& selected_columns,
+	                                                       std::byte* const           backing_data,
+	                                                       const size_t               backing_capacity,
+	                                                       ZeroCopyReadTiming*        timing) {
+	if (selected_columns.empty()) {
+		throw std::invalid_argument("selected-column read requires at least one column");
+	}
+	if (m_compact_descriptor == nullptr) {
+		if (timing != nullptr) {
+			timing->sparse_fallback_reason = "coefficient-range-read-requires-compact-v3";
+		}
+		read_rowgroup_bytes_into(rowgroup_idx, backing_data, backing_capacity, timing);
+		return;
+	}
+
+	const auto record = m_compact_descriptor->rowgroup(rowgroup_idx);
+	if ((record.payload_size != 0U && backing_data == nullptr) || backing_capacity < record.payload_size) {
+		throw std::runtime_error("external rowgroup backing is null or too small");
+	}
+	if (rowgroup_idx > std::numeric_limits<uint32_t>::max()) {
+		throw std::out_of_range("Compact v3 selected rowgroup exceeds uint32 range");
+	}
+	const auto plan = compile_compact_read_plan(
+	    *m_compact_descriptor, {static_cast<uint32_t>(rowgroup_idx)}, selected_columns);
+	if (record.payload_size != 0U) {
+		std::memset(backing_data, 0, record.payload_size);
+	}
+	for (const auto& range : plan.ranges()) {
+		const auto pread_start = std::chrono::steady_clock::now();
+		m_file->ReadRangeUnchecked(backing_data + range.backing_offset, range.file_offset, range.size);
+		const auto pread_end = std::chrono::steady_clock::now();
+		if (timing != nullptr) {
+			timing->storage_bytes += range.size;
+			++timing->pread_count;
+			timing->pread_ms += std::chrono::duration<double, std::milli>(pread_end - pread_start).count();
+			if (timing->pread_start == std::chrono::steady_clock::time_point {} ||
+			    pread_start < timing->pread_start) {
+				timing->pread_start = pread_start;
+			}
+			if (pread_end > timing->pread_end) {
+				timing->pread_end = pread_end;
+			}
+		}
+	}
+	if (timing != nullptr) {
+		const auto& stats = plan.stats();
+		timing->logical_storage_bytes       = static_cast<size_t>(stats.logical_bytes);
+		timing->full_storage_bytes          = static_cast<size_t>(stats.full_rowgroup_bytes);
+		timing->physical_page_bytes         = static_cast<size_t>(stats.physical_page_bytes);
+		timing->full_physical_page_bytes    = static_cast<size_t>(stats.full_physical_page_bytes);
+		timing->coalesced_read_run_count    = static_cast<size_t>(stats.coalesced_run_count);
+		timing->selected_coefficient_count  = static_cast<size_t>(stats.selected_coefficient_count);
+		timing->full_coefficient_count      = static_cast<size_t>(stats.full_coefficient_count);
+		timing->sparse_read_supported       = true;
+		timing->used_sparse_read            = stats.read_bytes < stats.full_rowgroup_bytes;
+		timing->used_coefficient_range_read = true;
+		if (record.payload_size == 0U) {
+			timing->sparse_fallback_reason = "metadata-only-rowgroup-zero-io";
+		} else if (!timing->used_sparse_read) {
+			timing->sparse_fallback_reason = "selected-columns-cover-full-rowgroup";
+		}
+	}
+}
+
 ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t          rowgroup_idx,
                                                                  std::shared_ptr<void> backing_owner,
                                                                  std::byte* const      backing_data,
                                                                  const size_t          backing_capacity,
                                                                  const bool            backing_is_pinned,
-                                                                 ZeroCopyReadTiming*   timing) {
+	                                                             ZeroCopyReadTiming*   timing,
+	                                                             const bool prefer_compact_direct_geometry) {
 	const auto  setup_start = std::chrono::steady_clock::now();
-	const auto* td          = m_table_descriptor->Get();
-	if (!td) {
-		throw std::runtime_error("TableDescriptor not loaded");
+	OwnedCompactRowgroupDescriptor compact_rowgroup;
+	std::shared_ptr<const CompactV3DirectRowgroup> compact_direct;
+	const fastlanes::RowgroupDescriptor* rg = nullptr;
+	if (m_compact_descriptor != nullptr) {
+		if (rowgroup_idx >= m_compact_descriptor->rowgroup_count()) {
+			throw std::out_of_range("rowgroup_idx out of range");
+		}
+		if (prefer_compact_direct_geometry && m_compact_descriptor->supports_direct_rowgroup_geometry() &&
+		    m_zero_copy_schema_plan != nullptr &&
+		    m_zero_copy_schema_plan->enabled) {
+			auto decoded = std::make_shared<CompactV3DirectRowgroup>(
+			    m_compact_descriptor->decode_direct_rowgroup(rowgroup_idx));
+			if (compact_direct_rowgroup_matches_plan(*decoded, m_zero_copy_schema_plan->columns)) {
+				compact_direct = std::move(decoded);
+			}
+		}
+		if (compact_direct == nullptr) {
+			compact_rowgroup = make_compact_rowgroup_descriptor(*m_compact_descriptor, rowgroup_idx);
+			rg               = compact_rowgroup.descriptor;
+		}
+	} else {
+		const auto* td = m_table_descriptor != nullptr ? m_table_descriptor->Get() : nullptr;
+		if (td == nullptr) {
+			throw std::runtime_error("TableDescriptor not loaded");
+		}
+		const auto n_rgs = td->m_rowgroup_descriptors()->size();
+		if (rowgroup_idx >= n_rgs) {
+			throw std::out_of_range("rowgroup_idx out of range");
+		}
+		rg = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
 	}
-	const auto n_rgs = td->m_rowgroup_descriptors()->size();
-	if (rowgroup_idx >= n_rgs) {
-		throw std::out_of_range("rowgroup_idx out of range");
+	if (rg == nullptr && compact_direct == nullptr) {
+		throw std::runtime_error("rowgroup descriptor is missing");
 	}
-
-	const auto*  rg       = td->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
-	const size_t rg_bytes = static_cast<size_t>(rg->m_size());
-	if (backing_data == nullptr || backing_capacity < rg_bytes) {
+	const size_t rg_bytes = compact_direct != nullptr ? compact_direct->record.payload_size
+	                                                : static_cast<size_t>(rg->m_size());
+	if ((rg_bytes != 0U && backing_data == nullptr) || backing_capacity < rg_bytes) {
 		throw std::runtime_error("external rowgroup backing is null or too small");
 	}
+	std::byte* const effective_backing_data = rg_bytes == 0U ? metadata_only_backing() : backing_data;
+	const bool       effective_pinned       = rg_bytes != 0U && backing_is_pinned;
+	if (rg_bytes == 0U) {
+		backing_owner.reset();
+	}
 
-	const size_t n_vecs   = static_cast<size_t>(rg->m_n_vec());
+	const size_t n_vecs   = compact_direct != nullptr ? 1U : static_cast<size_t>(rg->m_n_vec());
 	const size_t n_values = n_vecs * galp::codec::consts::VALUES_PER_VECTOR;
-	const size_t n_tuples = static_cast<size_t>(rg->m_n_tuples());
+	const size_t n_tuples = compact_direct != nullptr ? compact_direct->record.real_row_count
+	                                                : static_cast<size_t>(rg->m_n_tuples());
 
-	auto        backing_span    = fastlanes::span<std::byte> {backing_data, rg_bytes};
-	const auto& col_descs       = *rg->m_column_descriptors();
-	const bool  use_schema_plan = m_zero_copy_schema_plan && m_zero_copy_schema_plan->enabled &&
-	                             m_zero_copy_schema_plan->columns.size() == col_descs.size();
+	auto backing_span = fastlanes::span<std::byte> {effective_backing_data, rg_bytes};
+	const auto* col_descs = rg == nullptr ? nullptr : rg->m_column_descriptors();
+	const bool use_schema_plan = compact_direct != nullptr ||
+	    (m_zero_copy_schema_plan && m_zero_copy_schema_plan->enabled && col_descs != nullptr &&
+	     m_zero_copy_schema_plan->columns.size() == col_descs->size() &&
+	     (m_compact_descriptor == nullptr ||
+	      detail::rowgroup_matches_zero_copy_plan(*rg, m_zero_copy_schema_plan->columns)));
 
 	std::shared_ptr<fastlanes::RowgroupView> view;
 	if (!use_schema_plan) {
+		if (rg == nullptr) {
+			throw std::runtime_error("zero-copy rowgroup fallback descriptor is missing");
+		}
 		view = std::make_shared<fastlanes::RowgroupView>(backing_span, *rg);
 	}
 
@@ -1282,13 +1627,17 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 	out.n_vecs                 = n_vecs;
 	out.n_tuples               = n_tuples;
 	out.table_descriptor_owner = m_table_descriptor;
+	out.rowgroup_descriptor_owner = std::move(compact_rowgroup.owner);
+	out.compact_descriptor_owner = m_compact_descriptor;
+	out.compact_direct_owner     = std::move(compact_direct);
 	out.rowgroup_descriptor    = rg;
 	out.backing_owner          = std::move(backing_owner);
 	out.backing_span           = backing_span;
-	out.backing_is_pinned      = backing_is_pinned;
+	out.transfer_backing_span  = effective_pinned ? backing_span : fastlanes::span<std::byte> {};
+	out.backing_is_pinned      = effective_pinned;
 	out.rowgroup_view          = view;
 	if (timing != nullptr) {
-		timing->used_pinned_backing = backing_is_pinned;
+		timing->used_pinned_backing = effective_pinned;
 	}
 
 	const auto record_timing = [&](const std::chrono::steady_clock::time_point setup_end) {
@@ -1309,9 +1658,12 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 		return out;
 	}
 
-	out.columns.reserve(col_descs.size());
-	for (size_t col_idx = 0; col_idx < col_descs.size(); ++col_idx) {
-		const auto& col_desc = *col_descs.Get(static_cast<flatbuffers::uoffset_t>(col_idx));
+	if (col_descs == nullptr) {
+		throw std::runtime_error("zero-copy rowgroup column descriptors are missing");
+	}
+	out.columns.reserve(col_descs->size());
+	for (size_t col_idx = 0; col_idx < col_descs->size(); ++col_idx) {
+		const auto& col_desc = *col_descs->Get(static_cast<flatbuffers::uoffset_t>(col_idx));
 		const auto* rpn      = col_desc.encoding_rpn();
 		if (!rpn || !rpn->operator_tokens()) {
 			throw std::runtime_error("missing encoding_rpn/operator_tokens");
@@ -1376,8 +1728,29 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors_into(
 	    rowgroup_idx, std::move(backing_owner), backing_data, backing_capacity, backing_is_pinned, timing);
 }
 
+ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_columns_into(
+	const size_t                rowgroup_idx,
+	const std::vector<uint8_t>& selected_columns,
+	std::shared_ptr<void>       backing_owner,
+	std::byte* const            backing_data,
+	const size_t                backing_capacity,
+	const bool                  backing_is_pinned,
+	ZeroCopyReadTiming*         timing) {
+	read_rowgroup_bytes_selected_columns_into(
+	    rowgroup_idx, selected_columns, backing_data, backing_capacity, timing);
+	auto rowgroup = make_zero_copy_rowgroup_from_backing(
+	    rowgroup_idx, std::move(backing_owner), backing_data, backing_capacity, backing_is_pinned, timing);
+	rowgroup.materialized_column_indices = selected_columns;
+	return rowgroup;
+}
+
 ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy(const size_t rowgroup_idx, ZeroCopyReadTiming* timing) {
-	auto backing = std::make_shared<fastlanes::Buf>(rowgroup_storage_bytes(rowgroup_idx));
+	const size_t storage_bytes = rowgroup_storage_bytes(rowgroup_idx);
+	if (storage_bytes == 0U) {
+		return read_rowgroup_zero_copy_into(
+		    rowgroup_idx, {}, nullptr, 0U, /*backing_is_pinned=*/false, timing);
+	}
+	auto backing = std::make_shared<fastlanes::Buf>(storage_bytes);
 	return read_rowgroup_zero_copy_into(rowgroup_idx,
 	                                    std::static_pointer_cast<void>(backing),
 	                                    reinterpret_cast<std::byte*>(backing->mutable_data()),
@@ -1388,7 +1761,12 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy(const size_t rowgroup_idx, Z
 
 ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors(
 	const size_t rowgroup_idx, const std::vector<uint32_t>& selected_vectors, ZeroCopyReadTiming* timing) {
-	auto backing = std::make_shared<fastlanes::Buf>(rowgroup_storage_bytes(rowgroup_idx));
+	const size_t storage_bytes = rowgroup_storage_bytes(rowgroup_idx);
+	if (storage_bytes == 0U) {
+		return read_rowgroup_zero_copy_selected_vectors_into(
+		    rowgroup_idx, selected_vectors, {}, nullptr, 0U, /*backing_is_pinned=*/false, timing);
+	}
+	auto backing = std::make_shared<fastlanes::Buf>(storage_bytes);
 	return read_rowgroup_zero_copy_selected_vectors_into(rowgroup_idx,
 	                                                     selected_vectors,
 	                                                     std::static_pointer_cast<void>(backing),
@@ -1398,8 +1776,384 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors(
 	                                                     timing);
 }
 
+ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_columns(
+	const size_t rowgroup_idx, const std::vector<uint8_t>& selected_columns, ZeroCopyReadTiming* timing) {
+	const size_t storage_bytes = rowgroup_storage_bytes(rowgroup_idx);
+	if (storage_bytes == 0U) {
+		return read_rowgroup_zero_copy_selected_columns_into(
+		    rowgroup_idx, selected_columns, {}, nullptr, 0U, /*backing_is_pinned=*/false, timing);
+	}
+	auto backing = std::make_shared<fastlanes::Buf>(storage_bytes);
+	return read_rowgroup_zero_copy_selected_columns_into(rowgroup_idx,
+	                                                    selected_columns,
+	                                                    std::static_pointer_cast<void>(backing),
+	                                                    reinterpret_cast<std::byte*>(backing->mutable_data()),
+	                                                    backing->Capacity(),
+	                                                    /*backing_is_pinned=*/false,
+	                                                    timing);
+}
+
+std::vector<ZeroCopyRowgroup>
+FlsReader::read_compact_rowgroups_zero_copy_scatter(const std::vector<size_t>&             rowgroup_indices,
+	                                                std::vector<ZeroCopyReadTiming>* const timings,
+	                                                const size_t view_workers) {
+	if (m_compact_descriptor == nullptr) {
+		throw std::invalid_argument("scatter rowgroup reads require Compact v3");
+	}
+	const size_t storage_bytes = compact_batch_backing_bytes(rowgroup_indices);
+	auto backing = storage_bytes == 0U ? std::shared_ptr<fastlanes::Buf> {}
+	                                  : std::make_shared<fastlanes::Buf>(storage_bytes);
+	return read_compact_rowgroups_zero_copy_scatter_into(
+	    rowgroup_indices,
+	    std::static_pointer_cast<void>(backing),
+	    backing == nullptr ? nullptr : reinterpret_cast<std::byte*>(backing->mutable_data()),
+	    backing == nullptr ? 0U : backing->Capacity(),
+	    /*backing_is_pinned=*/false,
+	    timings,
+	    view_workers);
+}
+
+std::vector<ZeroCopyRowgroup> FlsReader::read_compact_rowgroups_zero_copy_scatter_into(
+	const std::vector<size_t>&             rowgroup_indices,
+	std::shared_ptr<void>                  backing_owner,
+	std::byte* const                       backing_data,
+	const size_t                           backing_capacity,
+	const bool                             backing_is_pinned,
+	std::vector<ZeroCopyReadTiming>* const timings,
+	const size_t                           view_workers) {
+	if (m_compact_descriptor == nullptr) {
+		throw std::invalid_argument("scatter rowgroup reads require Compact v3");
+	}
+	if (timings != nullptr) {
+		timings->assign(rowgroup_indices.size(), ZeroCopyReadTiming {});
+	}
+	if (rowgroup_indices.empty()) {
+		return {};
+	}
+
+	struct ReadEntry {
+		 size_t                          output_index   = 0U;
+		 size_t                          rowgroup_index = 0U;
+		 CompactV3RowgroupRecord         record {};
+		 size_t                          backing_offset = 0U;
+	};
+	std::vector<ReadEntry> entries;
+	entries.reserve(rowgroup_indices.size());
+	std::vector<size_t> output_index_by_rowgroup(m_compact_descriptor->rowgroup_count(),
+	                                             std::numeric_limits<size_t>::max());
+	std::vector<size_t> read_order;
+	read_order.reserve(rowgroup_indices.size());
+	size_t backing_cursor = 0U;
+	for (size_t output_index = 0U; output_index < rowgroup_indices.size(); ++output_index) {
+		const size_t rowgroup_index = rowgroup_indices[output_index];
+		const auto   record         = m_compact_descriptor->rowgroup(rowgroup_index);
+		if (output_index_by_rowgroup[rowgroup_index] != std::numeric_limits<size_t>::max()) {
+			throw std::invalid_argument("Compact v3 scatter read contains a duplicate rowgroup");
+		}
+		output_index_by_rowgroup[rowgroup_index] = output_index;
+		if (record.payload_size > std::numeric_limits<uint64_t>::max() - record.payload_offset ||
+		    record.payload_offset + record.payload_size > m_file->Size()) {
+			throw std::runtime_error("Compact v3 rowgroup payload exceeds the shard bounds");
+		}
+		const size_t backing_offset = record.payload_size == 0U ? 0U : align_compact_batch_offset(backing_cursor);
+		if (record.payload_size > std::numeric_limits<size_t>::max() - backing_offset) {
+			throw std::overflow_error("Compact v3 scatter backing size overflow");
+		}
+		if (record.payload_size != 0U) {
+			backing_cursor = backing_offset + record.payload_size;
+		}
+		entries.push_back({output_index, rowgroup_index, record, backing_offset});
+		if (record.payload_size != 0U) {
+			read_order.push_back(output_index);
+		}
+		if (timings != nullptr) {
+			auto& timing                      = timings->at(output_index);
+			timing.storage_bytes              = record.payload_size;
+			timing.logical_storage_bytes      = record.payload_size;
+			timing.full_storage_bytes         = record.payload_size;
+			timing.selected_coefficient_count = m_compact_descriptor->column_count();
+			timing.full_coefficient_count     = m_compact_descriptor->column_count();
+		}
+	}
+	const size_t required_capacity = backing_cursor;
+	if ((required_capacity != 0U && (backing_owner == nullptr || backing_data == nullptr)) ||
+	    backing_capacity < required_capacity) {
+		throw std::invalid_argument("Compact v3 scatter external backing is null or too small");
+	}
+	std::sort(read_order.begin(), read_order.end(), [&](const size_t left, const size_t right) {
+		return entries[left].record.payload_offset < entries[right].record.payload_offset;
+	});
+
+	struct ScatterRun {
+		size_t   begin       = 0U;
+		size_t   end         = 0U;
+		uint64_t file_offset = 0U;
+	};
+	std::vector<ScatterRun> runs;
+	runs.reserve(read_order.size());
+	size_t run_begin = 0U;
+	while (run_begin < read_order.size()) {
+		size_t   run_end         = run_begin + 1U;
+		const auto& first_entry  = entries[read_order[run_begin]];
+		uint64_t expected_offset = first_entry.record.payload_offset + first_entry.record.payload_size;
+		while (run_end < read_order.size() &&
+		       entries[read_order[run_end]].record.payload_offset == expected_offset) {
+			const auto& entry = entries[read_order[run_end]];
+			if (entry.record.payload_size > std::numeric_limits<uint64_t>::max() - expected_offset) {
+				throw std::overflow_error("Compact v3 scatter run exceeds uint64 range");
+			}
+			expected_offset += entry.record.payload_size;
+			++run_end;
+		}
+		runs.push_back(ScatterRun {run_begin, run_end, first_entry.record.payload_offset});
+		run_begin = run_end;
+	}
+
+	// Preserve physical-page accounting in file order. The actual preadv calls
+	// below write disjoint backing spans and can therefore run independently.
+	constexpr uint64_t page_size        = 4096U;
+	uint64_t           covered_page_end = 0U;
+	for (const auto& run : runs) {
+		for (size_t read_position = run.begin; read_position < run.end; ++read_position) {
+			const auto& entry = entries[read_order[read_position]];
+			if (timings == nullptr) {
+				continue;
+			}
+			auto&          timing = timings->at(entry.output_index);
+			const uint64_t first_page = entry.record.payload_offset / page_size;
+			const uint64_t last_page_exclusive =
+			    (entry.record.payload_offset + entry.record.payload_size - 1U) / page_size + 1U;
+			const uint64_t newly_covered_begin = std::max(first_page, covered_page_end);
+			if (newly_covered_begin < last_page_exclusive) {
+				timing.physical_page_bytes =
+				    static_cast<size_t>((last_page_exclusive - newly_covered_begin) * page_size);
+			}
+			timing.full_physical_page_bytes = timing.physical_page_bytes;
+			covered_page_end                = std::max(covered_page_end, last_page_exclusive);
+		}
+	}
+
+	parallel_for_compact_views(runs.size(), view_workers, [&](const size_t run_index) {
+		const auto& run         = runs[run_index];
+		const auto& first_entry = entries[read_order[run.begin]];
+		std::vector<fastlanes::FileScatterReadTarget> targets;
+		targets.reserve(run.end - run.begin);
+		for (size_t read_position = run.begin; read_position < run.end; ++read_position) {
+			auto& entry = entries[read_order[read_position]];
+			targets.push_back({backing_data + entry.backing_offset, entry.record.payload_size});
+		}
+		const auto pread_start = std::chrono::steady_clock::now();
+		const auto pread_count = m_file->ReadScatterUnchecked(targets, run.file_offset);
+		const auto pread_end   = std::chrono::steady_clock::now();
+
+		if (timings != nullptr) {
+			auto& run_timing       = timings->at(first_entry.output_index);
+			run_timing.pread_count = pread_count;
+#if !defined(_WIN32)
+			run_timing.preadv_count = pread_count;
+#endif
+			run_timing.coalesced_read_run_count = pread_count;
+			run_timing.pread_ms    = std::chrono::duration<double, std::milli>(pread_end - pread_start).count();
+			run_timing.pread_start = pread_start;
+			run_timing.pread_end   = pread_end;
+		}
+	});
+
+	std::vector<ZeroCopyRowgroup> rowgroups(rowgroup_indices.size());
+	parallel_for_compact_views(entries.size(), view_workers, [&](const size_t entry_index) {
+		auto&       entry  = entries[entry_index];
+		auto* const timing = timings == nullptr ? nullptr : &timings->at(entry.output_index);
+		auto* const rowgroup_backing =
+		    entry.record.payload_size == 0U ? nullptr : backing_data + entry.backing_offset;
+		rowgroups[entry.output_index] =
+		    make_zero_copy_rowgroup_from_backing(entry.rowgroup_index,
+		                                         backing_owner,
+		                                         rowgroup_backing,
+		                                         entry.record.payload_size,
+		                                         backing_is_pinned,
+		                                         timing,
+		                                         /*prefer_compact_direct_geometry=*/true);
+		if (backing_is_pinned && required_capacity != 0U) {
+			rowgroups[entry.output_index].transfer_backing_span =
+			    fastlanes::span<std::byte> {backing_data, required_capacity};
+		}
+	});
+	return rowgroups;
+}
+
+std::vector<ZeroCopyRowgroup>
+FlsReader::read_compact_rowgroups_zero_copy_selected_columns(const std::vector<size_t>&             rowgroup_indices,
+                                                             const std::vector<uint8_t>&            selected_columns,
+	                                                         std::vector<ZeroCopyReadTiming>* const timings,
+	                                                         const size_t view_workers) {
+	if (m_compact_descriptor == nullptr) {
+		throw std::invalid_argument("batched selected-column reads require Compact v3");
+	}
+	const size_t storage_bytes = compact_batch_backing_bytes(rowgroup_indices);
+	auto backing = storage_bytes == 0U ? std::shared_ptr<fastlanes::Buf> {}
+	                                  : std::make_shared<fastlanes::Buf>(storage_bytes);
+	return read_compact_rowgroups_zero_copy_selected_columns_into(
+	    rowgroup_indices,
+	    selected_columns,
+	    std::static_pointer_cast<void>(backing),
+	    backing == nullptr ? nullptr : reinterpret_cast<std::byte*>(backing->mutable_data()),
+	    backing == nullptr ? 0U : backing->Capacity(),
+	    /*backing_is_pinned=*/false,
+	    timings,
+	    view_workers);
+}
+
+std::vector<ZeroCopyRowgroup> FlsReader::read_compact_rowgroups_zero_copy_selected_columns_into(
+	const std::vector<size_t>&             rowgroup_indices,
+	const std::vector<uint8_t>&            selected_columns,
+	std::shared_ptr<void>                  backing_owner,
+	std::byte* const                       backing_data,
+	const size_t                           backing_capacity,
+	const bool                             backing_is_pinned,
+	std::vector<ZeroCopyReadTiming>* const timings,
+	const size_t                           view_workers) {
+	if (m_compact_descriptor == nullptr) {
+		throw std::invalid_argument("batched selected-column reads require Compact v3");
+	}
+	if (selected_columns.empty()) {
+		throw std::invalid_argument("batched selected-column read requires at least one column");
+	}
+	if (timings != nullptr) {
+		timings->assign(rowgroup_indices.size(), ZeroCopyReadTiming {});
+	}
+	if (rowgroup_indices.empty()) {
+		return {};
+	}
+
+	struct ReadEntry {
+		size_t                          rowgroup_index = 0U;
+		CompactV3RowgroupRecord         record {};
+		size_t                          backing_offset = 0U;
+	};
+	std::vector<ReadEntry> entries;
+	entries.reserve(rowgroup_indices.size());
+	std::vector<size_t>   output_index_by_rowgroup(m_compact_descriptor->rowgroup_count(),
+                                                 std::numeric_limits<size_t>::max());
+	std::vector<uint32_t> plan_rowgroups;
+	plan_rowgroups.reserve(rowgroup_indices.size());
+	size_t backing_cursor = 0U;
+	for (size_t output_index = 0U; output_index < rowgroup_indices.size(); ++output_index) {
+		const size_t rowgroup_index = rowgroup_indices[output_index];
+		if (rowgroup_index > std::numeric_limits<uint32_t>::max()) {
+			throw std::out_of_range("Compact v3 batched rowgroup exceeds uint32 range");
+		}
+		const auto record = m_compact_descriptor->rowgroup(rowgroup_index);
+		if (output_index_by_rowgroup[rowgroup_index] != std::numeric_limits<size_t>::max()) {
+			throw std::invalid_argument("Compact v3 selected-column batch contains a duplicate rowgroup");
+		}
+		output_index_by_rowgroup[rowgroup_index] = output_index;
+		plan_rowgroups.push_back(static_cast<uint32_t>(rowgroup_index));
+		const size_t backing_offset = record.payload_size == 0U ? 0U : align_compact_batch_offset(backing_cursor);
+		if (record.payload_size > std::numeric_limits<size_t>::max() - backing_offset) {
+			throw std::overflow_error("Compact v3 selected-column backing size overflow");
+		}
+		if (record.payload_size != 0U) {
+			backing_cursor = backing_offset + record.payload_size;
+		}
+		entries.push_back({rowgroup_index, record, backing_offset});
+	}
+	const size_t required_capacity = backing_cursor;
+	if ((required_capacity != 0U && (backing_owner == nullptr || backing_data == nullptr)) ||
+	    backing_capacity < required_capacity) {
+		throw std::invalid_argument("Compact v3 selected-column external backing is null or too small");
+	}
+	if (required_capacity != 0U) {
+		std::memset(backing_data, 0, required_capacity);
+	}
+
+	const auto plan = compile_compact_read_plan(*m_compact_descriptor, plan_rowgroups, selected_columns);
+	for (const auto& range : plan.ranges()) {
+		if (range.rowgroup_index >= output_index_by_rowgroup.size()) {
+			throw std::runtime_error("Compact v3 selected-column plan references an unknown rowgroup");
+		}
+		const size_t output_index = output_index_by_rowgroup[range.rowgroup_index];
+		if (output_index == std::numeric_limits<size_t>::max()) {
+			throw std::runtime_error("Compact v3 selected-column plan references an unrequested rowgroup");
+		}
+		auto& entry = entries[output_index];
+		if (range.backing_offset > entry.record.payload_size ||
+		    range.size > entry.record.payload_size - range.backing_offset) {
+			throw std::runtime_error("Compact v3 selected-column range exceeds its rowgroup backing");
+		}
+		const auto pread_start = std::chrono::steady_clock::now();
+			m_file->ReadRangeUnchecked(backing_data + entry.backing_offset + range.backing_offset,
+		                           range.file_offset,
+		                           range.size);
+		const auto pread_end = std::chrono::steady_clock::now();
+		if (timings != nullptr) {
+			auto& timing = timings->at(output_index);
+			timing.storage_bytes += range.size;
+			++timing.pread_count;
+			++timing.coalesced_read_run_count;
+			timing.pread_ms += std::chrono::duration<double, std::milli>(pread_end - pread_start).count();
+			if (timing.pread_start == std::chrono::steady_clock::time_point {} || pread_start < timing.pread_start) {
+				timing.pread_start = pread_start;
+			}
+			if (pread_end > timing.pread_end) {
+				timing.pread_end = pread_end;
+			}
+		}
+	}
+	if (timings != nullptr) {
+		const auto& stats = plan.stats();
+		if (stats.logical_bytes > std::numeric_limits<size_t>::max() ||
+		    stats.physical_page_bytes > std::numeric_limits<size_t>::max() ||
+		    stats.full_physical_page_bytes > std::numeric_limits<size_t>::max()) {
+			throw std::overflow_error("Compact v3 selected-column metrics exceed addressable memory");
+		}
+		auto& aggregate_timing                    = timings->front();
+		aggregate_timing.logical_storage_bytes    = static_cast<size_t>(stats.logical_bytes);
+		aggregate_timing.physical_page_bytes      = static_cast<size_t>(stats.physical_page_bytes);
+		aggregate_timing.full_physical_page_bytes = static_cast<size_t>(stats.full_physical_page_bytes);
+		for (size_t output_index = 0U; output_index < entries.size(); ++output_index) {
+			auto& timing                       = timings->at(output_index);
+			timing.full_storage_bytes          = entries[output_index].record.payload_size;
+			timing.selected_coefficient_count  = static_cast<size_t>(stats.selected_coefficient_count);
+			timing.full_coefficient_count      = static_cast<size_t>(stats.full_coefficient_count);
+			timing.sparse_read_supported       = true;
+			timing.used_sparse_read            = timing.storage_bytes < timing.full_storage_bytes;
+			timing.used_coefficient_range_read = true;
+			if (entries[output_index].record.payload_size == 0U) {
+				timing.sparse_fallback_reason = "metadata-only-rowgroup-zero-io";
+			} else if (!timing.used_sparse_read) {
+				timing.sparse_fallback_reason = "selected-columns-cover-full-rowgroup";
+			}
+		}
+	}
+
+	std::vector<ZeroCopyRowgroup> rowgroups(rowgroup_indices.size());
+	parallel_for_compact_views(entries.size(), view_workers, [&](const size_t output_index) {
+		auto&       entry  = entries[output_index];
+		auto* const timing = timings == nullptr ? nullptr : &timings->at(output_index);
+		auto* const rowgroup_backing =
+		    entry.record.payload_size == 0U ? nullptr : backing_data + entry.backing_offset;
+		rowgroups[output_index] =
+		    make_zero_copy_rowgroup_from_backing(entry.rowgroup_index,
+		                                         backing_owner,
+		                                         rowgroup_backing,
+		                                         entry.record.payload_size,
+		                                         backing_is_pinned,
+		                                         timing,
+		                                         /*prefer_compact_direct_geometry=*/true);
+		if (backing_is_pinned && required_capacity != 0U) {
+			rowgroups[output_index].transfer_backing_span =
+			    fastlanes::span<std::byte> {backing_data, required_capacity};
+		}
+		rowgroups[output_index].materialized_column_indices = selected_columns;
+	});
+	return rowgroups;
+}
+
 ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors_packed(
-	const size_t rowgroup_idx, const std::vector<uint32_t>& selected_vectors, ZeroCopyReadTiming* timing) {
+    const size_t rowgroup_idx, const std::vector<uint32_t>& selected_vectors, ZeroCopyReadTiming* timing) {
+	if (m_compact_descriptor != nullptr) {
+		return read_rowgroup_zero_copy_selected_vectors(rowgroup_idx, selected_vectors, timing);
+	}
 	const auto* td = m_table_descriptor->Get();
 	if (td == nullptr) {
 		throw std::runtime_error("TableDescriptor not loaded");
@@ -1411,9 +2165,9 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors_packed(
 	if (selected_vectors.empty()) {
 		throw std::invalid_argument("selected vector read requires at least one vector");
 	}
-	const auto* rowgroup = rowgroups->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
-	const size_t rowgroup_bytes = static_cast<size_t>(rowgroup->m_size());
-	const size_t vector_count   = static_cast<size_t>(rowgroup->m_n_vec());
+	const auto*           rowgroup       = rowgroups->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
+	const size_t          rowgroup_bytes = static_cast<size_t>(rowgroup->m_size());
+	const size_t          vector_count   = static_cast<size_t>(rowgroup->m_n_vec());
 	std::vector<uint32_t> unique_vectors = selected_vectors;
 	std::sort(unique_vectors.begin(), unique_vectors.end());
 	unique_vectors.erase(std::unique(unique_vectors.begin(), unique_vectors.end()), unique_vectors.end());
@@ -1421,9 +2175,9 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors_packed(
 		throw std::out_of_range("selected vector exceeds rowgroup vector count");
 	}
 
-	const auto segments = detail::rowgroup_segment_descriptors(*rowgroup);
+	const auto  segments = detail::rowgroup_segment_descriptors(*rowgroup);
 	std::string capability_reason;
-	const bool supported = detail::validate_sparse_vector_segments(*rowgroup, segments, &capability_reason);
+	const bool  supported = detail::validate_sparse_vector_segments(*rowgroup, segments, &capability_reason);
 	if (!m_sparse_vector_bundle || !supported || unique_vectors.size() >= vector_count) {
 		return read_rowgroup_zero_copy_selected_vectors(rowgroup_idx, selected_vectors, timing);
 	}
@@ -1741,6 +2495,24 @@ std::vector<Rowgroup> FlsReader::read_table() {
 
 ZeroCopySchemaPlan FlsReader::build_shared_zero_copy_schema_plan() const {
 	ZeroCopySchemaPlan plan {};
+	if (m_compact_descriptor != nullptr) {
+		if (m_compact_descriptor->rowgroup_count() == 0U) {
+			return plan;
+		}
+		const auto first = make_compact_rowgroup_descriptor(*m_compact_descriptor, 0U);
+		if (first.descriptor == nullptr) {
+			return plan;
+		}
+		try {
+			plan.columns     = detail::build_zero_copy_column_plan(*first.descriptor, m_load_column_names);
+			plan.build_order = detail::build_zero_copy_column_order(plan.columns);
+			plan.enabled     = true;
+		} catch (const std::exception&) {
+			plan.columns.clear();
+			plan.build_order.clear();
+		}
+		return plan;
+	}
 	const auto*        td = m_table_descriptor->Get();
 	if (!td || !td->m_rowgroup_descriptors() || td->m_rowgroup_descriptors()->size() == 0) {
 		return plan;

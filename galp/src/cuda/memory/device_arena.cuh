@@ -96,6 +96,7 @@ public:
 	void               resolve_to(void** dst, size_t entry_idx);
 	void               defer_free(std::function<void()> fn);
 	void               reset(bool preserve_capacity = false);
+	void               set_minimum_capacity_bytes(size_t bytes);
 	ArenaUploadMetrics upload(bool resolve_before_pack = false, bool backing_regions_coalesced = false);
 
 	template <typename T>
@@ -105,6 +106,8 @@ public:
 
 	size_t total_bytes() const;
 	size_t entry_count() const;
+	size_t capacity_bytes() const noexcept;
+	size_t pinned_capacity_bytes() const noexcept;
 
 private:
 	struct DmaIssueStats {
@@ -122,8 +125,8 @@ private:
 	DmaIssueStats issue_dma(size_t staged_device_base);
 	void          run_resolvers();
 	int           find_region(const void* host_src, size_t bytes) const;
-	void          ensure_capacity(size_t alloc_bytes);
-	void          ensure_pinned_capacity(size_t alloc_bytes);
+	bool          ensure_capacity(size_t alloc_bytes);
+	bool          ensure_pinned_capacity(size_t alloc_bytes);
 	void          release_device_base();
 	void          release_pinned_base();
 	void          run_deferred_frees();
@@ -135,6 +138,7 @@ private:
 	char*                              pinned_base_           = nullptr;
 	size_t                             capacity_bytes_        = 0;
 	size_t                             pinned_capacity_bytes_ = 0;
+	size_t                             minimum_capacity_bytes_ = 0;
 	size_t                             staged_bytes_          = 0;
 	std::vector<Entry>                 entries_;
 	std::vector<size_t>                staged_entry_indices_;

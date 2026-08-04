@@ -170,6 +170,7 @@ public:
 	DirectDctRuntime& operator=(DirectDctRuntime&&) noexcept;
 
 	[[nodiscard]] uint64_t          image_count() const noexcept;
+	[[nodiscard]] JpegDctReaderInitializationStats InitializationStats() const noexcept;
 	[[nodiscard]] JpegImageMetadata ImageMetadata(uint32_t global_image_index) const;
 	[[nodiscard]] uint64_t RowgroupStorageBytes(uint32_t                     shard_id,
 	                                            const std::vector<uint32_t>& rowgroup_indices) const;

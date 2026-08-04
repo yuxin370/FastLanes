@@ -37,10 +37,39 @@ struct JpegDctSparseStoragePolicyResult {
 	double                           sparse_estimated_ns   = 0.0;
 };
 
+// Unified automatic comparison for the three observable read strategies. The
+// model prices planning work, pread fragmentation, physical bytes, decoded
+// bytes and resident workset bytes. A strategy that exceeds the workset budget
+// is never selected while a budget-fitting candidate exists.
+struct JpegDctAdaptiveReadCost {
+	size_t full_storage_bytes              = 0U;
+	size_t run_interval_storage_bytes      = 0U;
+	size_t run_interval_pread_count        = 0U;
+	size_t selected_vector_count           = 0U;
+	size_t full_vector_count               = 0U;
+	size_t decoded_bytes_per_vector        = 0U;
+	size_t decode_workset_capacity_bytes   = 0U;
+	bool   selected_decode_supported       = false;
+	bool   run_interval_supported          = false;
+	bool   run_requires_full_materialization = true;
+};
+
+struct JpegDctAdaptiveReadPolicyResult {
+	JpegDctReadStrategy strategy = JpegDctReadStrategy::kFullRowgroup;
+	double run_interval_estimated_ns = 0.0;
+	double bitmap_estimated_ns       = 0.0;
+	double full_rowgroup_estimated_ns = 0.0;
+	size_t selected_resident_bytes = 0U;
+	size_t full_resident_bytes     = 0U;
+	bool   selected_fits_memory    = false;
+	bool   full_fits_memory        = false;
+};
+
 JpegDctRuntimePolicyResult
 choose_jpeg_dct_runtime_policy(size_t selected_vector_count, size_t full_vector_count, bool selected_chunks_fit);
 
 JpegDctSparseStoragePolicyResult choose_jpeg_dct_sparse_storage_policy(const JpegDctSparseStorageCost& cost);
+JpegDctAdaptiveReadPolicyResult choose_jpeg_dct_adaptive_read_policy(const JpegDctAdaptiveReadCost& cost);
 
 std::vector<uint8_t>             normalize_coefficient_selection(const JpegDctCoefficientSelection& selection);
 bool                             selects_all_coefficients(const std::vector<uint8_t>& selected_coefficients);

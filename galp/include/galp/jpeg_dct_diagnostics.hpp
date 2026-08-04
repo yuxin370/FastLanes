@@ -14,6 +14,8 @@ struct JpegDctDeviceCacheStats {
 	size_t capacity_bytes     = 0;
 	size_t resident_bytes     = 0;
 	size_t resident_rowgroups = 0;
+	size_t peak_resident_bytes = 0;
+	size_t peak_resident_rowgroups = 0;
 	size_t hits               = 0;
 	size_t misses             = 0;
 	size_t inserts            = 0;
@@ -26,6 +28,7 @@ struct JpegDctDeviceExecutionStats {
 	size_t      full_vector_count                             = 0;
 	size_t      planned_saved_vector_count                    = 0;
 	size_t      actual_saved_vector_count                     = 0;
+	size_t      decoded_coefficient_bytes                     = 0;
 	size_t      rowgroup_count                                = 0;
 	size_t      workset_count                                 = 0;
 	size_t      decode_kernel_launch_count                    = 0;
@@ -121,14 +124,30 @@ struct JpegDctDeviceExecutionStats {
 	// Phase-2 architecture counters are appended to preserve the positional
 	// initialization order of the legacy public aggregate.
 	bool   exact_batch_plan_cache_enabled           = false;
+	bool   uses_planless_fixed_transform            = false;
 	size_t host_expanded_transform_items_created    = 0;
 	size_t host_output_block_source_lists_created   = 0;
 	size_t host_global_transform_sort_items         = 0;
 	size_t planless_image_descriptor_count          = 0;
 	size_t planless_transform_output_block_count    = 0;
+	size_t planless_transform_full_scan_output_block_count = 0;
+	size_t planless_transform_skipped_output_block_count   = 0;
+	size_t planless_transform_active_output_index_bytes    = 0;
+	size_t planless_transform_active_output_offset_bytes   = 0;
+	size_t planless_transform_active_output_schedule_peak_bytes = 0;
+	size_t planless_transform_source_contribution_count    = 0;
+	size_t planless_transform_active_output_workset_count  = 0;
+	size_t planless_transform_active_output_schedule_build_count = 0;
+	bool   planless_transform_active_output_offsets_valid  = false;
+	double planless_transform_active_output_planning_ms    = 0.0;
+	double planless_transform_gpu_kernel_ms                = 0.0;
 	size_t planless_axis_program_count              = 0;
 	size_t planless_axis_phase_matrix_count         = 0;
 	size_t planless_axis_program_bytes              = 0;
+	// Runtime-owned compact plan storage, excluding persistent reader
+	// dictionaries and decode worksets. Keep this separate from allocator RSS.
+	size_t compact_plan_bytes                       = 0;
+	size_t compact_plan_peak_bytes                  = 0;
 	size_t rowgroup_storage_bytes_read              = 0;
 	size_t galp_native_device_in_use_bytes          = 0;
 	size_t galp_native_device_peak_in_use_bytes     = 0;
@@ -173,36 +192,62 @@ struct JpegDctDeviceExecutionStats {
 	// runtime fallback.  Physical I/O is reported independently from decode
 	// and transform work so a transform reduction cannot be presented as a
 	// storage-read reduction.
-	std::string storage_read_granularity = "rowgroup";
-	std::string decode_granularity       = "rowgroup";
-	size_t      requested_source_block_count       = 0;
-	size_t      planned_vector_count                = 0;
-	size_t      actual_vector_count                 = 0;
-	size_t      compressed_payload_bytes_read       = 0;
-	size_t      full_compressed_payload_bytes       = 0;
-	size_t      pread_count                         = 0;
-	size_t      vector_bundle_rowgroup_count        = 0;
+	std::string storage_read_granularity              = "rowgroup";
+	std::string decode_granularity                    = "rowgroup";
+	size_t      requested_source_block_count          = 0;
+	size_t      planned_vector_count                  = 0;
+	size_t      actual_vector_count                   = 0;
+	size_t      compressed_payload_bytes_read         = 0;
+	size_t      full_compressed_payload_bytes         = 0;
+	size_t      pread_count                           = 0;
+	size_t      preadv_count                          = 0;
+	size_t      vector_bundle_rowgroup_count          = 0;
 	size_t      vector_bundle_envelope_rowgroup_count = 0;
-	size_t      vector_bundle_pread_count           = 0;
-	double      read_amplification                  = 0.0;
-	size_t      source_blocks_transformed           = 0;
-	bool        sparse_read_supported               = false;
-	size_t      sparse_read_fallback_rowgroup_count = 0;
+	size_t      vector_bundle_pread_count             = 0;
+	double      read_amplification                    = 0.0;
+	size_t      source_blocks_transformed             = 0;
+	bool        sparse_read_supported                 = false;
+	size_t      sparse_read_fallback_rowgroup_count   = 0;
 	std::string sparse_read_fallback_reason;
 	// Cost-model decisions for automatic physical sparse reads. Decode
 	// selection is accounted separately above.
 	size_t automatic_sparse_storage_candidate_rowgroup_count = 0;
 	size_t automatic_sparse_storage_selected_rowgroup_count  = 0;
 	size_t automatic_sparse_storage_rejected_rowgroup_count  = 0;
+	size_t automatic_sparse_storage_early_rejected_rowgroup_count = 0;
 	size_t automatic_sparse_storage_full_bytes               = 0;
 	size_t automatic_sparse_storage_candidate_bytes          = 0;
 	size_t automatic_sparse_storage_candidate_pread_count    = 0;
+	size_t automatic_sparse_storage_optimistic_bytes         = 0;
+	size_t automatic_sparse_storage_optimistic_pread_count   = 0;
 	double automatic_sparse_storage_full_estimated_ns        = 0.0;
 	double automatic_sparse_storage_candidate_estimated_ns   = 0.0;
+	double adaptive_run_interval_estimated_ns                 = 0.0;
+	double adaptive_bitmap_estimated_ns                       = 0.0;
+	double adaptive_full_rowgroup_estimated_ns                = 0.0;
+	size_t adaptive_selected_memory_fit_rowgroup_count        = 0U;
+	size_t adaptive_full_memory_fit_rowgroup_count            = 0U;
+	// Final adaptive strategy after comparing exact sparse intervals, exact
+	// selected-vector decode over a full physical rowgroup, and full decode.
+	size_t run_interval_exact_rowgroup_count = 0U;
+	size_t bitmap_exact_rowgroup_count       = 0U;
+	size_t full_rowgroup_strategy_count      = 0U;
 	// Rowgroups read directly into CUDA-pinned host backing. These bytes can
 	// be DMA-uploaded without repacking through DeviceArena's staging buffer.
 	size_t pinned_rowgroup_read_count = 0;
 	size_t pinned_rowgroup_read_bytes = 0;
+	// Compact-v3 batches lease one shared pinned arena per physical shard.
+	// Growth is a high-water event; later batches should reuse an existing
+	// slot when its capacity already covers the requested shard payload.
+	size_t compact_batch_buffer_acquire_count    = 0;
+	size_t compact_batch_buffer_growth_count     = 0;
+	size_t compact_batch_buffer_reuse_count      = 0;
+	size_t compact_batch_buffer_requested_bytes  = 0;
+	size_t compact_batch_buffer_capacity_bytes   = 0;
+	size_t compact_batch_buffer_high_water_bytes = 0;
+	size_t compact_batch_buffer_pageable_fallback_count = 0;
+	size_t compact_batch_read_group_count        = 0;
+	size_t compact_batch_read_worker_count       = 0;
 	// Process-global pinned host pool gauges/counters sampled after execution.
 	size_t galp_native_pinned_in_use_bytes          = 0;
 	size_t galp_native_pinned_peak_in_use_bytes     = 0;
@@ -210,6 +255,62 @@ struct JpegDctDeviceExecutionStats {
 	size_t galp_native_pinned_allocation_requests   = 0;
 	size_t galp_native_pinned_cuda_allocation_count = 0;
 	size_t galp_native_pinned_cuda_allocation_bytes = 0;
+	// Compact-v3 coefficient pushdown accounting. Logical bytes exclude
+	// same-page gaps; range bytes are the actual bytes requested with pread.
+	size_t coefficient_range_rowgroup_count       = 0;
+	size_t coefficient_logical_bytes_requested    = 0;
+	size_t coefficient_range_bytes_read           = 0;
+	size_t physical_page_bytes_covered            = 0;
+	size_t full_physical_page_bytes                = 0;
+	size_t coalesced_read_run_count                = 0;
+	size_t selected_coefficient_count              = 0;
+	size_t full_coefficient_count                  = 0;
+	double selected_coefficient_ratio              = 0.0;
+	double physical_page_coverage_ratio            = 0.0;
+	// Decode worksets are bounded independently of the decoded-rowgroup cache.
+	// A single rowgroup may exceed the configured budget and is then executed
+	// alone; that exceptional case is counted explicitly.
+	size_t decode_workset_capacity_bytes          = 0U;
+	size_t max_estimated_decode_workset_bytes      = 0U;
+	size_t oversized_decode_rowgroup_count         = 0U;
+	// The persistent output and chunk arenas have independent capacity plans
+	// and growth counters. This separates high-water expansion from unrelated
+	// process-global allocator activity.
+	size_t decode_workset_capacity_plan_image_count          = 0U;
+	size_t decode_workset_output_arena_capacity_plan_bytes   = 0U;
+	size_t decode_workset_output_arena_requested_bytes       = 0U;
+	size_t decode_workset_output_arena_capacity_bytes        = 0U;
+	size_t decode_workset_output_arena_growth_count          = 0U;
+	size_t decode_workset_output_arena_growth_bytes          = 0U;
+	size_t decode_workset_chunk_arena_capacity_plan_bytes    = 0U;
+	size_t decode_workset_chunk_arena_requested_bytes        = 0U;
+	size_t decode_workset_chunk_arena_capacity_bytes         = 0U;
+	size_t decode_workset_chunk_arena_growth_count           = 0U;
+	size_t decode_workset_chunk_arena_growth_bytes           = 0U;
+	bool   bounded_double_buffer_enabled            = false;
+	std::string bounded_double_buffer_policy         = "automatic";
+	bool   bounded_double_buffer_candidate           = false;
+	size_t bounded_double_buffer_workset_count      = 0U;
+	size_t bounded_double_buffer_peak_estimated_bytes = 0U;
+	// Column binding is constructed once per decode batch. The expression
+	// scan count makes the intended O(expressions + rowgroups) path auditable.
+	double column_binding_ms                    = 0.0;
+	size_t column_binding_expression_scan_count = 0U;
+	size_t column_binding_rowgroup_count         = 0U;
+	// Block-major plan-lifetime coordinate index and deterministic two-pass
+	// active-output scheduler diagnostics. Appended for aggregate compatibility.
+	size_t coordinate_group_lookup_count          = 0U;
+	size_t coordinate_group_index_entries         = 0U;
+	size_t coordinate_group_index_populated       = 0U;
+	size_t coordinate_group_index_holes           = 0U;
+	size_t coordinate_group_index_bytes           = 0U;
+	double coordinate_group_index_density         = 0.0;
+	size_t planless_transform_source_contribution_visit_count = 0U;
+	size_t planless_transform_output_workset_ownership_count   = 0U;
+	double planless_transform_group_workset_build_ms           = 0.0;
+	double planless_transform_active_output_count_ms           = 0.0;
+	double planless_transform_active_output_prefix_ms          = 0.0;
+	double planless_transform_active_output_fill_ms            = 0.0;
 };
 
 } // namespace galp::jpeg

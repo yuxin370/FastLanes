@@ -25,25 +25,42 @@ __global__ void scatter_packed_rowgroup_ranges_kernel(const DeviceScatterCopy* c
 	}
 }
 
-size_t round_up_capacity_bytes(const size_t bytes, const size_t alignment = 65536U) {
+size_t round_up_capacity_bytes(const size_t bytes, const size_t minimum_capacity = 65536U) {
 	if (bytes == 0) {
 		return 0;
 	}
-	return ((bytes + alignment - 1U) / alignment) * alignment;
+	size_t capacity = minimum_capacity;
+	while (capacity < bytes) {
+		if (capacity > std::numeric_limits<size_t>::max() / 2U) {
+			throw std::overflow_error("workset output arena capacity overflow");
+		}
+		capacity *= 2U;
+	}
+	return capacity;
 }
 
-void ensure_workset_output_arena(ExecutionWorkset& workset) {
+galp::memory::ArenaCapacityMetrics ensure_workset_output_arena(ExecutionWorkset& workset) {
+	galp::memory::ArenaCapacityMetrics metrics {};
+	metrics.requested_bytes        = workset.outputs.used_bytes;
+	metrics.minimum_capacity_bytes = workset.outputs.minimum_capacity_bytes;
+	metrics.capacity_before_bytes  = workset.outputs.capacity_bytes;
 	if (workset.outputs.used_bytes == 0) {
 		workset.outputs.arena.reset();
 		workset.outputs.capacity_bytes = 0;
-		return;
+		return metrics;
 	}
-	if (workset.outputs.arena.has_value() && workset.outputs.capacity_bytes >= workset.outputs.used_bytes) {
-		return;
+	const size_t required_bytes = std::max(workset.outputs.used_bytes, workset.outputs.minimum_capacity_bytes);
+	if (workset.outputs.arena.has_value() && workset.outputs.capacity_bytes >= required_bytes) {
+		metrics.capacity_bytes = workset.outputs.capacity_bytes;
+		return metrics;
 	}
-	const size_t alloc_bytes = round_up_capacity_bytes(workset.outputs.used_bytes);
+	const size_t alloc_bytes = round_up_capacity_bytes(required_bytes);
 	workset.outputs.arena.emplace(alloc_bytes, ensure_workset_h2d_stream(workset));
 	workset.outputs.capacity_bytes = alloc_bytes;
+	metrics.capacity_bytes = alloc_bytes;
+	metrics.growth_count   = 1U;
+	metrics.growth_bytes   = alloc_bytes - std::min(alloc_bytes, metrics.capacity_before_bytes);
+	return metrics;
 }
 
 template <typename T>
@@ -218,7 +235,7 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 	const auto t0a          = clock::now();
 	breakdown.prep_reset_ms = ms(t0, t0a);
 
-	ensure_workset_output_arena(workset);
+	breakdown.output_arena = ensure_workset_output_arena(workset);
 	const auto t0b                 = clock::now();
 	breakdown.prep_output_arena_ms = ms(t0a, t0b);
 	galp::execution::for_each_type(galp::execution::SupportedTypes {}, [&](auto tag) {

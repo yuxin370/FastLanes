@@ -159,7 +159,7 @@ public:
 							file_read_start = std::chrono::steady_clock::now();
 							zero_copy = rdr.read_rowgroup_zero_copy_selected_vectors_packed(
 							    rg_idx, *selected, &io_timing);
-						} else if (pinned_pool) {
+						} else if (pinned_pool && storage_bytes != 0U) {
 							const auto                             acquire_start = std::chrono::steady_clock::now();
 							PinnedRowgroupBufferPool::AcquireStats acquire_stats {};
 							auto                                   lease = pinned_pool->acquire_for_owner_cancelable(

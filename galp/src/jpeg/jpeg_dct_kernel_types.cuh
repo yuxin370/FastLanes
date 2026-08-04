@@ -37,6 +37,7 @@ struct JpegDctDeviceFixedTransformBatchItem {
 	uint64_t output_block_index    = 0;
 	uint8_t  component             = 0;
 	uint8_t  zigzag_columns        = 0;
+	uint8_t  horizontal_flip       = 0;
 	uint16_t x_factor              = 2;
 	uint16_t y_factor              = 2;
 	uint8_t  x_subblock            = 0;

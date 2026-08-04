@@ -488,6 +488,23 @@ void write_jpeg_dct_shard_manifest(const JpegDctShardManifest& manifest, const s
 		writer.string(shard.fls_file_name);
 		writer.string(shard.metadata_file_name);
 	}
+	if (manifest.version == 3U && !manifest.descriptor_kind.empty()) {
+		const uint8_t extension_magic[8] {'G', 'J', 'D', 'C', 'C', 'V', '3', '1'};
+		writer.bytes(extension_magic, sizeof(extension_magic));
+		writer.string(manifest.physical_layout);
+		writer.string(manifest.descriptor_kind);
+		writer.u32(manifest.vector_size);
+		writer.string(manifest.spatial_order_name);
+		writer.u16(spatial_order_id(manifest.spatial_order));
+		writer.u32(static_cast<uint32_t>(manifest.shards.size()));
+		for (const auto& shard : manifest.shards) {
+			writer.u32(shard.shard_id);
+			writer.u64(shard.payload_size);
+			writer.u64(shard.payload_crc64);
+			writer.u64(shard.compact_descriptor_size);
+			writer.u64(shard.source_descriptor_size);
+		}
+	}
 }
 
 namespace detail {
@@ -518,6 +535,32 @@ JpegDctShardManifest read_jpeg_dct_shard_manifest_file(const std::filesystem::pa
 		entry.fls_file_name            = reader.string();
 		entry.metadata_file_name       = reader.string();
 		manifest.shards.push_back(std::move(entry));
+	}
+	if (!reader.eof()) {
+		expect_magic(reader, {'G', 'J', 'D', 'C', 'C', 'V', '3', '1'}, "JPEG DCT Compact v3 extension");
+		manifest.physical_layout = reader.string();
+		manifest.descriptor_kind = reader.string();
+		manifest.vector_size     = reader.u32();
+		manifest.spatial_order_name = reader.string();
+		manifest.spatial_order   = spatial_order_from_id(reader.u16());
+		const auto extension_shard_count = reader.u32();
+		if (extension_shard_count != manifest.shards.size()) {
+			throw std::runtime_error("JPEG DCT Compact v3 extension shard count mismatch");
+		}
+		for (uint32_t index = 0U; index < extension_shard_count; ++index) {
+			const auto shard_id = reader.u32();
+			if (shard_id != manifest.shards[index].shard_id) {
+				throw std::runtime_error("JPEG DCT Compact v3 extension shard id mismatch");
+			}
+			auto& shard                     = manifest.shards[index];
+			shard.payload_size              = reader.u64();
+			shard.payload_crc64             = reader.u64();
+			shard.compact_descriptor_size   = reader.u64();
+			shard.source_descriptor_size    = reader.u64();
+		}
+		if (!reader.eof()) {
+			throw std::runtime_error("JPEG DCT Compact v3 extension has trailing bytes");
+		}
 	}
 	return manifest;
 }

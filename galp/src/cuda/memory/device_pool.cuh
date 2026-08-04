@@ -186,6 +186,22 @@ public:
 		tracker_.register_transfer(stream, pinned);
 	}
 
+	// Issue an async upload from storage whose pinned lifetime is owned by the
+	// caller.  Unlike copy_h2d_on_stream(), this path must not acquire another
+	// staging allocation or copy the source again.  The transfer tracker still
+	// owns stream completion, while the caller keeps the source alive until the
+	// corresponding stream work has completed.
+	void copy_pinned_h2d_on_stream(void* dst, const void* pinned_src, size_t bytes, cudaStream_t stream) {
+		if (bytes == 0) {
+			return;
+		}
+		if (dst == nullptr || pinned_src == nullptr) {
+			throw std::invalid_argument("DevicePool::copy_pinned_h2d_on_stream received a null pointer");
+		}
+		CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned_src, bytes, cudaMemcpyHostToDevice, stream));
+		tracker_.register_external(stream);
+	}
+
 	void sync_h2d() {
 		tracker_.sync_all(make_release_pinned_fn());
 	}
@@ -503,6 +519,10 @@ inline void device_memcpy_h2d(void* dst, const void* src, size_t bytes) {
 
 inline void device_memcpy_h2d_async(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
 	DevicePool::instance().copy_h2d_on_stream(dst, src, bytes, stream);
+}
+
+inline void device_memcpy_pinned_h2d_async(void* dst, const void* pinned_src, size_t bytes, cudaStream_t stream) {
+	DevicePool::instance().copy_pinned_h2d_on_stream(dst, pinned_src, bytes, stream);
 }
 
 inline void sync_h2d() {

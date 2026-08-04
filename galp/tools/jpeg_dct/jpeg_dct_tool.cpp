@@ -2,8 +2,10 @@
 #include "galp/profiles/rgbnomore.hpp"
 #include "galp/sparse_vector_bundle.hpp"
 #include "jpeg/jpeg_dct_expression_validation.hpp"
+#include "jpeg/jpeg_dct_exact_verifier.hpp"
 #include "jpeg/jpeg_dct_metadata.hpp"
 #include "jpeg/jpeg_dct_shard_reader.hpp"
+#include "format/compact_descriptor_v3.hpp"
 #include "fls/connection.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/file/file_footer.hpp"
@@ -43,6 +45,10 @@ struct Options {
 	std::filesystem::path                 sparse_bundle_output;
 	std::filesystem::path                 inspect_crop_manifest;
 	std::filesystem::path                 benchmark_rowgroup_read_source;
+	std::filesystem::path                 compact_v3_source;
+	std::filesystem::path                 compact_v3_output;
+	std::filesystem::path                 expand_v3_source;
+	std::filesystem::path                 expand_v3_output;
 	std::vector<std::filesystem::path>    inputs;
 	galp::jpeg::JpegMetadataProfile       metadata_profile = galp::jpeg::JpegMetadataProfile::kDctDatasetOnly;
 	galp::jpeg::JpegDctShardPreset        shard_preset     = galp::jpeg::JpegDctShardPreset::kBalanced;
@@ -52,9 +58,16 @@ struct Options {
 	uint32_t                              rowgroup_vectors = 128;
 	uint32_t                              rowgroups_per_shard           = 256;
 	size_t                                threads                       = 1;
+	size_t                                layout_threads                = 1;
+	size_t                                shard_decode_threads          = 1;
 	size_t                                shard_workers                 = 1;
+	size_t                                encoding_workers_per_shard    = 1;
+	size_t                                verify_workers                = 1;
 	bool                                  shard_mode                    = false;
 	bool                                  threads_specified             = false;
+	bool                                  layout_threads_specified      = false;
+	bool                                  shard_decode_threads_specified = false;
+	bool                                  encoding_workers_per_shard_specified = false;
 	bool                                  metadata_profile_specified    = false;
 	bool                                  shard_images_specified        = false;
 	bool                                  rowgroup_vectors_specified    = false;
@@ -66,6 +79,8 @@ struct Options {
 	bool                                  inspect_encodings_mode          = false;
 	bool                                  inspect_crop_plan_mode           = false;
 	bool                                  benchmark_rowgroup_read_mode       = false;
+	bool                                  compact_v3_mode                    = false;
+	bool                                  expand_v3_mode                     = false;
 	size_t                                benchmark_repeats                  = 5U;
 	uint32_t                              verify_image_index             = 0;
 	bool                                  verify_image_index_specified   = false;
@@ -88,14 +103,17 @@ void print_usage(const char* prog) {
 	       "[--physical-layout spatial-major|image-major|image-major-vector-rowgroups] "
 		       "[--spatial-order raster|tiled-raster-32|z-order|tiled-z-32] "
 	       "[--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N] [--threads N] "
-	       "[--shard-workers N] input_dir\n"
+	       "[--layout-threads N] [--shard-decode-threads N] [--shard-workers N] "
+	       "[--encoding-workers-per-shard N] input_dir\n"
 	    << "  " << prog
 		    << " --verify-manifest manifest.bin [--image-index N] source.jpg\n"
-	    << "  " << prog << " --verify-manifest manifest.bin source_dir\n"
+	    << "  " << prog << " --verify-manifest manifest.bin [--verify-workers N] source_dir\n"
 	    << "  " << prog << " --build-sparse-bundle input.fls --bundle-output output.svb\n"
 	    << "  " << prog << " --inspect-encodings input.fls [input1.fls ...]\n"
 	    << "  " << prog << " --inspect-crop-plan manifest.bin [--image-index N]\n"
 	    << "  " << prog << " --benchmark-rowgroup-read input.fls [--repeats N]\n"
+	    << "  " << prog << " --compact-v3 input.fls --compact-output output.fls\n"
+	    << "  " << prog << " --expand-compact-v3 input.fls --expanded-output output.fls\n"
 	    << "Default: ragged DCT block layout and the legacy metadata format.\n"
 	    << "  --threads defaults to all available cores when not set.\n"
 	    << "  --metadata-profile writes the sectioned metadata format; use reconstruct to persist image dimensions "
@@ -202,117 +220,26 @@ int verify_manifest_image(const std::filesystem::path& manifest_path,
 }
 
 int verify_manifest_dataset(const std::filesystem::path&              manifest_path,
-                            const std::vector<std::filesystem::path>& source_paths) {
-	using BlockKey = std::tuple<uint32_t, uint32_t, uint32_t>;
-	using BlockMap = std::map<BlockKey, galp::jpeg::JpegDctCoefficientRow>;
-
-	galp::jpeg::JpegDctShardDatasetReader reader(manifest_path);
-	if (source_paths.size() != reader.image_count()) {
-		throw std::runtime_error("source JPEG count does not match the manifest image count");
-	}
-
-	size_t total_expected_blocks    = 0;
-	size_t total_actual_blocks      = 0;
-	size_t missing_blocks           = 0;
-	size_t extra_blocks             = 0;
-	size_t coefficient_mismatches   = 0;
-	int    max_abs_difference       = 0;
-	bool   have_first_mismatch      = false;
-	uint32_t first_mismatch_image   = 0;
-	BlockKey first_mismatch_key {};
-	size_t first_mismatch_coeff     = 0;
-	int16_t first_mismatch_expected = 0;
-	int16_t first_mismatch_actual   = 0;
-
-	for (size_t image_index = 0; image_index < source_paths.size(); ++image_index) {
-		const auto source_table = galp::jpeg::read_jpeg_dct_file(source_paths[image_index]);
-		BlockMap   expected;
-		for (const auto& group : source_table.metadata.block_group_index) {
-			for (uint32_t row_offset = 0; row_offset < group.row_count; ++row_offset) {
-				const auto row = static_cast<size_t>(group.row_start + row_offset);
-				if (row >= source_table.row_count) {
-					throw std::runtime_error("source JPEG block-group row is outside the coefficient table");
-				}
-				galp::jpeg::JpegDctCoefficientRow coefficients {};
-				for (size_t coefficient = 0; coefficient < coefficients.size(); ++coefficient) {
-					coefficients[coefficient] = source_table.columns[coefficient].at(row);
-				}
-				if (!expected.emplace(BlockKey {group.semantic_slot_id, group.block_y, group.block_x}, coefficients).second) {
-					throw std::runtime_error("source JPEG contains a duplicate component/block coordinate");
-				}
-			}
-		}
-
-		const auto materialized = reader.MaterializeImageDct(static_cast<uint32_t>(image_index));
-		BlockMap   actual;
-		for (const auto& block : materialized.blocks) {
-			if (!actual.emplace(BlockKey {block.semantic_slot_id, block.block_y, block.block_x}, block.coefficients).second) {
-				throw std::runtime_error("manifest image contains a duplicate component/block coordinate");
-			}
-		}
-		total_expected_blocks += expected.size();
-		total_actual_blocks += actual.size();
-
-		for (const auto& [key, expected_coefficients] : expected) {
-			const auto actual_it = actual.find(key);
-			if (actual_it == actual.end()) {
-				++missing_blocks;
-				if (!have_first_mismatch) {
-					have_first_mismatch    = true;
-					first_mismatch_image    = static_cast<uint32_t>(image_index);
-					first_mismatch_key      = key;
-				}
-				continue;
-			}
-			for (size_t coefficient = 0; coefficient < expected_coefficients.size(); ++coefficient) {
-				const auto expected_value = expected_coefficients[coefficient];
-				const auto actual_value   = actual_it->second[coefficient];
-				if (expected_value == actual_value) {
-					continue;
-				}
-				++coefficient_mismatches;
-				max_abs_difference = std::max(
-				    max_abs_difference, std::abs(static_cast<int>(expected_value) - static_cast<int>(actual_value)));
-				if (!have_first_mismatch) {
-					have_first_mismatch      = true;
-					first_mismatch_image      = static_cast<uint32_t>(image_index);
-					first_mismatch_key        = key;
-					first_mismatch_coeff      = coefficient;
-					first_mismatch_expected   = expected_value;
-					first_mismatch_actual     = actual_value;
-				}
-			}
-		}
-		for (const auto& [key, coefficients] : actual) {
-			(void)coefficients;
-			if (!expected.contains(key)) {
-				++extra_blocks;
-				if (!have_first_mismatch) {
-					have_first_mismatch = true;
-					first_mismatch_image = static_cast<uint32_t>(image_index);
-					first_mismatch_key   = key;
-				}
-			}
-		}
-	}
-
-	const bool exact = missing_blocks == 0 && extra_blocks == 0 && coefficient_mismatches == 0;
+                            const std::vector<std::filesystem::path>& source_paths,
+                            const size_t                              verify_workers) {
+	const auto result = galp::jpeg::verify_jpeg_dct_manifest_exact(manifest_path, source_paths, verify_workers);
 	std::cout << "manifest: " << manifest_path << '\n'
-	          << "source_images: " << source_paths.size() << '\n'
-	          << "expected_blocks: " << total_expected_blocks << '\n'
-	          << "actual_blocks: " << total_actual_blocks << '\n'
-	          << "missing_blocks: " << missing_blocks << '\n'
-	          << "extra_blocks: " << extra_blocks << '\n'
-	          << "coefficient_mismatches: " << coefficient_mismatches << '\n'
-	          << "max_abs_difference: " << max_abs_difference << '\n';
-	if (have_first_mismatch) {
-		const auto [component, block_y, block_x] = first_mismatch_key;
-		std::cout << "first_mismatch: image=" << first_mismatch_image << " component=" << component
-		          << " block_y=" << block_y << " block_x=" << block_x << " coefficient=" << first_mismatch_coeff
-		          << " expected=" << first_mismatch_expected << " actual=" << first_mismatch_actual << '\n';
+	          << "source_images: " << result.source_images << '\n'
+	          << "expected_blocks: " << result.expected_blocks << '\n'
+	          << "actual_blocks: " << result.actual_blocks << '\n'
+	          << "missing_blocks: " << result.missing_blocks << '\n'
+	          << "extra_blocks: " << result.extra_blocks << '\n'
+	          << "coefficient_mismatches: " << result.coefficient_mismatches << '\n'
+	          << "max_abs_difference: " << result.max_abs_difference << '\n';
+	if (result.first_mismatch.present) {
+		const auto& mismatch = result.first_mismatch;
+		std::cout << "first_mismatch: image=" << mismatch.global_image_index
+		          << " component=" << mismatch.semantic_slot_id << " block_y=" << mismatch.block_y
+		          << " block_x=" << mismatch.block_x << " coefficient=" << mismatch.coefficient
+		          << " expected=" << mismatch.expected << " actual=" << mismatch.actual << '\n';
 	}
-	std::cout << "exact: " << (exact ? "true" : "false") << '\n';
-	return exact ? 0 : 3;
+	std::cout << "exact: " << (result.exact() ? "true" : "false") << '\n';
+	return result.exact() ? 0 : 3;
 }
 
 bool is_jpeg_path(const std::filesystem::path& path) {
@@ -366,6 +293,24 @@ int inspect_encodings(const std::vector<std::filesystem::path>& paths) {
 	size_t                        column_count   = 0;
 
 	for (const auto& path : paths) {
+		if (galp::format::is_compact_v3_fls(path)) {
+			auto descriptor = galp::format::CompactDescriptorV3::Open(path);
+			for (size_t rowgroup_index = 0U; rowgroup_index < descriptor.rowgroup_count(); ++rowgroup_index) {
+				auto rowgroup = descriptor.unpack_rowgroup(rowgroup_index);
+				for (const auto& column : rowgroup->m_column_descriptors) {
+					if (column == nullptr || column->encoding_rpn == nullptr ||
+					    column->encoding_rpn->operator_tokens.empty()) {
+						throw std::runtime_error("missing encoding tokens in " + path.string());
+					}
+					for (const auto token : column->encoding_rpn->operator_tokens) {
+						++token_counts[fastlanes::token_to_string(token)];
+					}
+				}
+				++rowgroup_count;
+				column_count += rowgroup->m_column_descriptors.size();
+			}
+			continue;
+		}
 		fastlanes::FileHeader header {};
 		fastlanes::FileFooter footer {};
 		fastlanes::FileHeader::Load(header, path);
@@ -448,6 +393,29 @@ int benchmark_rowgroup_read(const std::filesystem::path& path, const size_t repe
 		throw std::invalid_argument("--repeats must be greater than zero");
 	}
 	fastlanes::File       file(path);
+	if (galp::format::is_compact_v3_fls(path)) {
+		auto descriptor = galp::format::CompactDescriptorV3::Open(path);
+		size_t max_rowgroup_bytes = 0U;
+		for (size_t rowgroup = 0U; rowgroup < descriptor.rowgroup_count(); ++rowgroup) {
+			max_rowgroup_bytes = std::max(
+			    max_rowgroup_bytes, static_cast<size_t>(descriptor.rowgroup(rowgroup).payload_size));
+		}
+		std::vector<std::byte> backing(max_rowgroup_bytes);
+		for (size_t repeat = 0; repeat < repeats; ++repeat) {
+			size_t bytes = 0U;
+			const auto start = std::chrono::steady_clock::now();
+			for (size_t rowgroup = 0U; rowgroup < descriptor.rowgroup_count(); ++rowgroup) {
+				const auto entry = descriptor.rowgroup(rowgroup);
+				file.ReadRangeUnchecked(backing.data(), entry.payload_offset, entry.payload_size);
+				bytes += entry.payload_size;
+			}
+			const auto end = std::chrono::steady_clock::now();
+			std::cout << "repeat=" << repeat
+			          << " wall_ms=" << std::chrono::duration<double, std::milli>(end - start).count()
+			          << " bytes=" << bytes << " preads=" << descriptor.rowgroup_count() << '\n';
+		}
+		return 0;
+	}
 	fastlanes::FileHeader header {};
 	fastlanes::FileFooter footer {};
 	fastlanes::FileHeader::Load(header, file);
@@ -480,6 +448,35 @@ int benchmark_rowgroup_read(const std::filesystem::path& path, const size_t repe
 		          << " preads=" << rowgroups->size() << '\n';
 	}
 	return 0;
+}
+
+void print_compact_report(const std::string_view mode,
+	                      const std::filesystem::path& source,
+	                      const std::filesystem::path& output,
+	                      const galp::format::CompactV3Report& report,
+	                      const galp::format::CompactV3PayloadAudit& audit,
+	                      const galp::format::CompactDescriptorV3& descriptor) {
+	std::cout << "mode: " << mode << '\n'
+	          << "source: " << source << '\n'
+	          << "output: " << output << '\n'
+	          << "source_file_bytes: " << report.source_file_bytes << '\n'
+	          << "output_file_bytes: " << report.output_file_bytes << '\n'
+	          << "payload_bytes: " << report.payload_bytes << '\n'
+	          << "source_descriptor_bytes: " << report.source_descriptor_bytes << '\n'
+	          << "compact_descriptor_bytes: " << report.compact_descriptor_bytes << '\n'
+	          << "descriptor_reduction: " << report.descriptor_reduction << '\n'
+	          << "expected_payload_crc64: " << audit.expected_payload_crc64 << '\n'
+	          << "actual_payload_crc64: " << audit.actual_payload_crc64 << '\n'
+	          << "payload_exact: " << (audit.exact() ? "true" : "false") << '\n'
+	          << "rowgroup_crc_mismatches: " << audit.rowgroup_crc_mismatches.size() << '\n';
+	for (size_t rowgroup_index = 0U; rowgroup_index < descriptor.rowgroup_count(); ++rowgroup_index) {
+		const auto rowgroup = descriptor.rowgroup(rowgroup_index);
+		std::cout << "rowgroup=" << rowgroup_index << " payload_offset=" << rowgroup.payload_offset
+		          << " payload_size=" << rowgroup.payload_size << " expected_payload_crc64="
+		          << rowgroup.payload_crc64 << " actual_payload_crc64="
+		          << audit.actual_rowgroup_crc64.at(rowgroup_index)
+		          << '\n';
+	}
 }
 
 void apply_shard_preset(Options& options) {
@@ -516,12 +513,14 @@ void apply_shard_preset(Options& options) {
 		options.physical_layout = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
 	}
 	if (options.spatial_order_specified) {
-		if (options.physical_layout_specified &&
-		    !galp::jpeg::is_image_major_physical_layout(options.physical_layout)) {
-			throw std::runtime_error("--spatial-order requires the image-major physical layout");
+		if (options.physical_layout_specified) {
+			if (!galp::jpeg::is_image_major_physical_layout(options.physical_layout)) {
+				throw std::runtime_error("--spatial-order requires the image-major physical layout");
+			}
+		} else {
+			options.physical_layout           = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
+			options.physical_layout_specified = true;
 		}
-		options.physical_layout           = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
-		options.physical_layout_specified = true;
 	}
 }
 
@@ -556,6 +555,24 @@ bool parse_args(const int argc, char** argv, Options& options) {
 			options.benchmark_rowgroup_read_mode = true;
 			continue;
 		}
+		if (arg == "--compact-v3" && i + 1 < argc) {
+			options.compact_v3_source = argv[++i];
+			options.compact_v3_mode   = true;
+			continue;
+		}
+		if (arg == "--compact-output" && i + 1 < argc) {
+			options.compact_v3_output = argv[++i];
+			continue;
+		}
+		if (arg == "--expand-compact-v3" && i + 1 < argc) {
+			options.expand_v3_source = argv[++i];
+			options.expand_v3_mode   = true;
+			continue;
+		}
+		if (arg == "--expanded-output" && i + 1 < argc) {
+			options.expand_v3_output = argv[++i];
+			continue;
+		}
 		if (arg == "--repeats" && i + 1 < argc) {
 			options.benchmark_repeats = parse_size_arg(arg, argv[++i]);
 			continue;
@@ -567,6 +584,14 @@ bool parse_args(const int argc, char** argv, Options& options) {
 		if (arg == "--image-index" && i + 1 < argc) {
 			options.verify_image_index = parse_u32_arg(arg, argv[++i]);
 			options.verify_image_index_specified = true;
+			continue;
+		}
+		if (arg == "--verify-workers" && i + 1 < argc) {
+			options.verify_workers = parse_size_arg(arg, argv[++i]);
+			if (options.verify_workers == 0U ||
+			    options.verify_workers > galp::jpeg::kMaxJpegDctExactVerificationWorkers) {
+				throw std::runtime_error("--verify-workers must be in [1, 16]");
+			}
 			continue;
 		}
 		if ((arg == "--out" || arg == "-o") && i + 1 < argc) {
@@ -674,10 +699,34 @@ bool parse_args(const int argc, char** argv, Options& options) {
 			}
 			continue;
 		}
+		if (arg == "--layout-threads" && i + 1 < argc) {
+			options.layout_threads           = parse_size_arg(arg, argv[++i]);
+			options.layout_threads_specified = true;
+			if (options.layout_threads == 0U) {
+				throw std::runtime_error("--layout-threads must be greater than zero");
+			}
+			continue;
+		}
+		if (arg == "--shard-decode-threads" && i + 1 < argc) {
+			options.shard_decode_threads           = parse_size_arg(arg, argv[++i]);
+			options.shard_decode_threads_specified = true;
+			if (options.shard_decode_threads == 0U) {
+				throw std::runtime_error("--shard-decode-threads must be greater than zero");
+			}
+			continue;
+		}
 		if (arg == "--shard-workers" && i + 1 < argc) {
 			options.shard_workers = parse_size_arg(arg, argv[++i]);
 			if (options.shard_workers == 0) {
 				throw std::runtime_error("--shard-workers must be greater than zero");
+			}
+			continue;
+		}
+		if (arg == "--encoding-workers-per-shard" && i + 1 < argc) {
+			options.encoding_workers_per_shard           = parse_size_arg(arg, argv[++i]);
+			options.encoding_workers_per_shard_specified = true;
+			if (options.encoding_workers_per_shard == 0U) {
+				throw std::runtime_error("--encoding-workers-per-shard must be greater than zero");
 			}
 			continue;
 		}
@@ -688,10 +737,24 @@ bool parse_args(const int argc, char** argv, Options& options) {
 	}
 
 	apply_shard_preset(options);
-	if (!options.threads_specified) {
-		// Default to saturating all available cores when --threads is not set.
-		const unsigned hw = std::thread::hardware_concurrency();
-		options.threads    = hw == 0 ? 1 : static_cast<size_t>(hw);
+	const unsigned hw              = std::thread::hardware_concurrency();
+	const size_t   default_threads = hw == 0U ? 1U : static_cast<size_t>(hw);
+	if (options.threads_specified) {
+		if (options.layout_threads_specified && options.layout_threads != options.threads) {
+			throw std::runtime_error("--threads conflicts with --layout-threads");
+		}
+		if (options.shard_decode_threads_specified && options.shard_decode_threads != options.threads) {
+			throw std::runtime_error("--threads conflicts with --shard-decode-threads");
+		}
+		options.layout_threads       = options.threads;
+		options.shard_decode_threads = options.threads;
+	} else {
+		if (!options.layout_threads_specified) {
+			options.layout_threads = default_threads;
+		}
+		if (!options.shard_decode_threads_specified) {
+			options.shard_decode_threads = default_threads;
+		}
 	}
 	if (options.shard_mode) {
 		return !options.output_dir.empty() && !options.inputs.empty();
@@ -710,6 +773,12 @@ bool parse_args(const int argc, char** argv, Options& options) {
 	}
 	if (options.benchmark_rowgroup_read_mode) {
 		return !options.benchmark_rowgroup_read_source.empty();
+	}
+	if (options.compact_v3_mode) {
+		return !options.compact_v3_source.empty() && !options.compact_v3_output.empty();
+	}
+	if (options.expand_v3_mode) {
+		return !options.expand_v3_source.empty() && !options.expand_v3_output.empty();
 	}
 	return !options.output_fls.empty() && !options.output_metadata.empty() && !options.inputs.empty();
 }
@@ -737,17 +806,52 @@ int main(const int argc, char** argv) {
 		if (options.benchmark_rowgroup_read_mode) {
 			return benchmark_rowgroup_read(options.benchmark_rowgroup_read_source, options.benchmark_repeats);
 		}
+		if (options.compact_v3_mode) {
+			const auto report = galp::format::compact_standard_fls_to_v3(
+			    options.compact_v3_source, options.compact_v3_output);
+			const auto audit = galp::format::verify_compact_v3_payload(options.compact_v3_output);
+			auto descriptor = galp::format::CompactDescriptorV3::Open(options.compact_v3_output);
+			print_compact_report("compact-v3",
+			                     options.compact_v3_source,
+			                     options.compact_v3_output,
+			                     report,
+			                     audit,
+			                     descriptor);
+			return audit.exact() ? 0 : 3;
+		}
+		if (options.expand_v3_mode) {
+			const auto audit = galp::format::verify_compact_v3_payload(options.expand_v3_source);
+			auto descriptor = galp::format::CompactDescriptorV3::Open(options.expand_v3_source);
+			const auto report = galp::format::expand_compact_fls_v3(
+			    options.expand_v3_source, options.expand_v3_output);
+			print_compact_report("expand-compact-v3",
+			                     options.expand_v3_source,
+			                     options.expand_v3_output,
+			                     report,
+			                     audit,
+			                     descriptor);
+			return audit.exact() ? 0 : 3;
+		}
+		if (options.shard_mode &&
+		    options.physical_layout == galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups &&
+		    options.spatial_order != galp::jpeg::JpegDctSpatialOrder::kTiledZ32) {
+			throw std::invalid_argument(
+			    "image-major-vector-rowgroups requires --spatial-order tiled-z-32");
+		}
 
 		options.inputs = expand_inputs(options.inputs);
 		if (options.verify_mode) {
-			if (options.inputs.size() == 1) {
+			if (options.verify_image_index_specified && options.verify_workers != 1U) {
+				throw std::runtime_error("--verify-workers cannot be combined with --image-index");
+			}
+			if (options.inputs.size() == 1 && options.verify_workers == 1U) {
 				return verify_manifest_image(
 				    options.verify_manifest, options.verify_image_index, options.inputs.front());
 			}
 			if (options.verify_image_index_specified) {
 				throw std::runtime_error("--image-index cannot be combined with multi-image verification");
 			}
-			return verify_manifest_dataset(options.verify_manifest, options.inputs);
+			return verify_manifest_dataset(options.verify_manifest, options.inputs, options.verify_workers);
 		}
 
 		galp::jpeg::JpegDctReaderOptions reader_options;
@@ -762,7 +866,15 @@ int main(const int argc, char** argv) {
 			shard_options.rowgroup_vectors    = options.rowgroup_vectors;
 			shard_options.rowgroups_per_shard = options.rowgroups_per_shard;
 			shard_options.threads             = options.threads;
+			shard_options.layout_threads      = options.layout_threads;
+			shard_options.shard_decode_threads = options.shard_decode_threads;
 			shard_options.shard_workers       = options.shard_workers;
+			shard_options.encoding_workers_per_shard = options.encoding_workers_per_shard;
+			shard_options.threads_specified             = options.threads_specified;
+			shard_options.layout_threads_specified      = options.layout_threads_specified;
+			shard_options.shard_decode_threads_specified = options.shard_decode_threads_specified;
+			shard_options.encoding_workers_per_shard_specified =
+			    options.encoding_workers_per_shard_specified;
 			shard_options.preset              = options.shard_preset;
 			shard_options.shard_images_specified        = options.shard_images_specified;
 			shard_options.rowgroup_vectors_specified    = options.rowgroup_vectors_specified;
