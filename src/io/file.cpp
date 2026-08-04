@@ -88,6 +88,9 @@ void File::Write(const Buf& buf) {
 	}
 	//
 	m_of_stream->write(reinterpret_cast<char*>(buf.data()), static_cast<int64_t>(buf.Size()));
+	if (!*m_of_stream) {
+		throw std::runtime_error("write failed: " + m_path.string());
+	}
 	invalidate_size_cache();
 }
 
@@ -242,6 +245,9 @@ void File::Append(const Buf& buf) {
 		m_of_stream = std::make_unique<std::ofstream>(m_path.string(), std::ios::binary | std::ios::app);
 	}
 	m_of_stream->write(reinterpret_cast<char*>(buf.data()), static_cast<int64_t>(buf.Size()));
+	if (!*m_of_stream) {
+		throw std::runtime_error("append failed: " + m_path.string());
+	}
 	invalidate_size_cache();
 }
 
@@ -251,6 +257,9 @@ void File::Append(const char* pointer, n_t size) {
 		m_of_stream = std::make_unique<std::ofstream>(m_path.string(), std::ios::binary | std::ios::app);
 	}
 	m_of_stream->write(pointer, static_cast<int64_t>(size));
+	if (!*m_of_stream) {
+		throw std::runtime_error("append failed: " + m_path.string());
+	}
 	invalidate_size_cache();
 }
 

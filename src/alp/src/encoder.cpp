@@ -75,9 +75,9 @@ void encoder<PT, IS_NULL>::encode_simdized(const PT*      data_p,
                                            state<PT>&     stt,
                                            const uint8_t* null_map) {
 
-	alignas(64) static PT ENCODED_VALUE_ARR[config::VECTOR_SIZE];
-	alignas(64) static PT VALUE_ARR_WITHOUT_SPECIALS[config::VECTOR_SIZE];
-	alignas(64) static UT TMP_INDEX_ARR[config::VECTOR_SIZE];
+	alignas(64) PT ENCODED_VALUE_ARR[config::VECTOR_SIZE];
+	alignas(64) PT VALUE_ARR_WITHOUT_SPECIALS[config::VECTOR_SIZE];
+	alignas(64) UT TMP_INDEX_ARR[config::VECTOR_SIZE];
 
 	exp_p_t  current_exceptions_count {0};
 	uint64_t exceptions_idx {0};
@@ -140,13 +140,22 @@ void encoder<PT, IS_NULL>::encode_simdized(const PT*      data_p,
 	}
 #endif
 
-	ST a_non_exception_value = 0;
-	for (uint64_t i {0}; i < config::VECTOR_SIZE; i++) {
-		if (i != TMP_INDEX_ARR[i]) {
-			a_non_exception_value = encoded_integers[i];
+	// TMP_INDEX_ARR is a compact, ordered list: only [0, exceptions_idx)
+	// contains values.  Do not index it by the input position; apart from
+	// reading unwritten stack storage, that made the result depend on scratch
+	// contents left by a previous vector.  Walk the initialized exception
+	// prefix instead and find the first gap in the ordered positions.
+	uint64_t first_non_exception_idx {0};
+	for (uint64_t exception_idx {0}; exception_idx < exceptions_idx; ++exception_idx) {
+		const auto exception_position = static_cast<uint64_t>(TMP_INDEX_ARR[exception_idx]);
+		if (exception_position != first_non_exception_idx) {
 			break;
 		}
+		++first_non_exception_idx;
 	}
+	const ST a_non_exception_value = first_non_exception_idx < config::VECTOR_SIZE
+	                                     ? encoded_integers[first_non_exception_idx]
+	                                     : ST {0};
 
 	for (exp_p_t j {0}; j < exceptions_idx; j++) {
 		auto       i                                   = static_cast<exp_p_t>(TMP_INDEX_ARR[j]);

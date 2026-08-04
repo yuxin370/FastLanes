@@ -8,6 +8,7 @@
 
 #include "fls/cfg/cfg.hpp"
 #include "fls/cor/prm/fsst/fsst.h"
+#include "fls/expression/fsst_dictionary_input.hpp"
 #include "fls/reader/segment.hpp"
 #include "fls/table/chunk.hpp"
 #include "fls/table/rowgroup.hpp"
@@ -35,16 +36,14 @@ struct enc_fsst_dict_opr {
 	void Finalize();
 
 public:
-	up<Buf>          length_buf;
-	up<Buf>          bytes_buf;
-	up<Buf>          string_p_buf;
-	up<Buf>          fsst_bytes_buf;
-	up<Buf>          out_offset_buf;
-	up<Segment>      fsst_header_segment;
-	up<Segment>      fsst_bytes_segment;
-	up<Segment>      fsst_offset_segment;
-	uint8_t          fsst_header[CFG::FSST::MAX_HEADER_SIZE];
-	FlsStrColumnView col_view;
+	FsstDictionaryInput dictionary_input;
+	up<Buf>             fsst_bytes_buf;
+	up<Buf>             out_offset_buf;
+	up<Segment>         fsst_header_segment;
+	up<Segment>         fsst_bytes_segment;
+	up<Segment>         fsst_offset_segment;
+	uint8_t             fsst_header[CFG::FSST::MAX_HEADER_SIZE];
+	FlsStrColumnView    col_view;
 };
 
 template <typename INDEX_PT>

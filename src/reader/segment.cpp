@@ -23,6 +23,12 @@
 
 namespace fastlanes {
 
+namespace {
+
+constexpr n_t INITIAL_SEGMENT_BUFFER_CAPACITY = 64U * 1024U;
+
+} // namespace
+
 /*--------------------------------------------------------------------------------------------------------------------*\
  * EntryPointView
 \*--------------------------------------------------------------------------------------------------------------------*/
@@ -106,7 +112,7 @@ Segment& Segment::operator=(Segment&&) noexcept = default;
 Segment::Segment()
     : persistent(true)
     , is_block_based(false) {
-	buf = make_unique<Buf>();
+	buf = make_unique<Buf>(INITIAL_SEGMENT_BUFFER_CAPACITY);
 	//
 }
 

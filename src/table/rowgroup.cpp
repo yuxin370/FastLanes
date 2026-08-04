@@ -531,9 +531,19 @@ void cast_from_logical_to_physical(const Rowgroup& old_table, Rowgroup& new_tabl
 }
 
 struct rowgroup_equality_visitor {
+	explicit rowgroup_equality_visitor(const n_t logical_row_count)
+	    : logical_row_count(logical_row_count) {
+	}
+
 	template <typename PT>
 	bool operator()(const up<TypedCol<PT>>& org_col, const up<TypedCol<PT>>& decoded_col) const {
-		for (idx_t idx {0}; idx < org_col->data.size(); ++idx) {
+		// Rowgroups are physically padded to whole vectors.  Equality is a table
+		// semantic and therefore compares only the n_tup logical rows; encodings
+		// are free to choose different values for the inaccessible padding tail.
+		if (org_col->data.size() < logical_row_count || decoded_col->data.size() < logical_row_count) {
+			return false;
+		}
+		for (idx_t idx {0}; idx < logical_row_count; ++idx) {
 			if (idx < org_col->null_map_arr.size() && org_col->null_map_arr[idx]) {
 				continue;
 			}
@@ -553,7 +563,9 @@ struct rowgroup_equality_visitor {
 
 		for (idx_t col_idx {0}; col_idx < left->internal_rowgroup.size(); ++col_idx) {
 			const auto result = visit(
-			    rowgroup_equality_visitor {}, left->internal_rowgroup[col_idx], right->internal_rowgroup[col_idx]);
+			    rowgroup_equality_visitor {logical_row_count},
+			    left->internal_rowgroup[col_idx],
+			    right->internal_rowgroup[col_idx]);
 
 			if (result == false) {
 				return false;
@@ -563,11 +575,11 @@ struct rowgroup_equality_visitor {
 	}
 
 	bool operator()(const up<FLSStrColumn>& org_col, const up<FLSStrColumn>& decoded_col) const {
-		if (org_col->length_arr.size() != decoded_col->length_arr.size()) {
+		if (org_col->length_arr.size() < logical_row_count || decoded_col->length_arr.size() < logical_row_count) {
 			return false;
 		}
 
-		for (idx_t idx {0}; idx < org_col->length_arr.size(); ++idx) {
+		for (idx_t idx {0}; idx < logical_row_count; ++idx) {
 			if (idx < org_col->null_map_arr.size() && org_col->null_map_arr[idx]) {
 				continue;
 			}
@@ -584,6 +596,8 @@ struct rowgroup_equality_visitor {
 	bool operator()(const auto& arg1, const auto& arg2) const {
 		FLS_UNREACHABLE_WITH_TYPES(arg1, arg2)
 	}
+
+	n_t logical_row_count;
 };
 
 RowgroupComparisonResult Rowgroup::operator==(const Rowgroup& other_rowgroup) const {
@@ -602,7 +616,9 @@ RowgroupComparisonResult Rowgroup::operator==(const Rowgroup& other_rowgroup) co
 
 	for (n_t col_idx {0}; col_idx < this->internal_rowgroup.size(); col_idx++) {
 		const auto is_this_col_equal = visit(
-		    rowgroup_equality_visitor {}, this->internal_rowgroup[col_idx], other_rowgroup.internal_rowgroup[col_idx]);
+		    rowgroup_equality_visitor {n_tup},
+		    this->internal_rowgroup[col_idx],
+		    other_rowgroup.internal_rowgroup[col_idx]);
 		if (is_this_col_equal == false) {
 			result.is_equal                = false;
 			result.first_failed_column_idx = col_idx;

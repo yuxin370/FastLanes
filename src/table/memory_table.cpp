@@ -76,6 +76,11 @@ constexpr DataType data_type_for<double>() {
 	return DataType::DOUBLE;
 }
 
+template <>
+constexpr DataType data_type_for<string>() {
+	return DataType::FLS_STR;
+}
+
 size_t column_size(const MemoryColumn& column) {
 	return std::visit([](const auto span) { return span.size(); }, column.data);
 }
@@ -177,6 +182,46 @@ void assign_typed_column(Rowgroup&          rowgroup,
 	}
 }
 
+void append_string(FLSStrColumn& column, const string& value) {
+	if (value.size() > CFG::String::max_bytes_per_string) {
+		std::ostringstream msg;
+		msg << "Memory string value has " << value.size() << " bytes; maximum is " << CFG::String::max_bytes_per_string;
+		throw std::runtime_error(msg.str());
+	}
+	if (value.size() > std::numeric_limits<len_t>::max()) {
+		throw std::runtime_error("Memory string value cannot be represented by the FastLanes length type");
+	}
+
+	column.ofs_arr.push_back(static_cast<ofs_t>(column.byte_arr.size()));
+	column.byte_arr.insert(column.byte_arr.end(), value.begin(), value.end());
+	column.length_arr.push_back(static_cast<len_t>(value.size()));
+	column.fsst_byte_arr.insert(column.fsst_byte_arr.end(), value.begin(), value.end());
+	column.fsst_length_arr.push_back(static_cast<len_t>(value.size()));
+	column.m_stats.maximum_n_bytes_p_value =
+	    std::max<n_t>(column.m_stats.maximum_n_bytes_p_value, static_cast<n_t>(value.size()));
+}
+
+void assign_string_column(Rowgroup&               rowgroup,
+                          const size_t            col_idx,
+                          std::span<const string> values,
+                          const size_t            padded_size) {
+	auto* string_column = std::get_if<up<FLSStrColumn>>(&rowgroup.internal_rowgroup[col_idx]);
+	if (string_column == nullptr || !*string_column) {
+		std::ostringstream msg;
+		msg << "MemoryColumn " << col_idx << " could not be mapped to the FastLanes string type";
+		throw std::runtime_error(msg.str());
+	}
+	if (values.empty() && padded_size != 0) {
+		throw std::runtime_error("memory table cannot pad an empty string rowgroup");
+	}
+	for (const auto& value : values) {
+		append_string(**string_column, value);
+	}
+	for (size_t value_idx = values.size(); value_idx < padded_size; ++value_idx) {
+		append_string(**string_column, values.back());
+	}
+}
+
 void assign_column_slice(Rowgroup&           rowgroup,
                          const size_t        col_idx,
                          const MemoryColumn& column,
@@ -187,7 +232,11 @@ void assign_column_slice(Rowgroup&           rowgroup,
 	    [&](const auto span) {
 		    using SpanT = decltype(span);
 		    using T     = std::remove_cv_t<typename SpanT::element_type>;
-		    assign_typed_column<T>(rowgroup, col_idx, span.subspan(offset, n), padded_size);
+		    if constexpr (std::is_same_v<T, string>) {
+			    assign_string_column(rowgroup, col_idx, span.subspan(offset, n), padded_size);
+		    } else {
+			    assign_typed_column<T>(rowgroup, col_idx, span.subspan(offset, n), padded_size);
+		    }
 	    },
 	    column.data);
 }

@@ -74,6 +74,8 @@ add_subdirectory(wizard)
 ###########################################################################
 # 3. Core FastLanes library
 ###########################################################################
+find_package(Threads REQUIRED)
+
 if (FLS_BUILD_SHARED_LIBS)
     add_library(FastLanes SHARED
             connection.cpp
@@ -91,6 +93,7 @@ target_compile_features(FastLanes PUBLIC cxx_std_20)
 target_link_libraries(FastLanes
         PUBLIC
         FastLanes::headers
+        Threads::Threads
 )
 
 # Let consumers know whether they are linking against a static or shared build.

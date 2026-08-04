@@ -12,13 +12,12 @@
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
 class FlsStrColumnView;
-class Buf;
 /*--------------------------------------------------------------------------------------------------------------------*/
 class fsst_helper {
 public:
 	static fsst_encoder_t* make_fsst(const FlsStrColumnView& col);
 
-	static fsst_encoder_t* make_fsst(n_t n_vals, Buf& length_buf, Buf& string_p_buf);
+	static fsst_encoder_t* make_fsst(n_t n_vals, len_t* lengths, uint8_t** strings);
 
 	static size_t fsst_compress(
 	    fsst_encoder_t* encoder,    /* IN: encoder obtained from fsst_create(). */

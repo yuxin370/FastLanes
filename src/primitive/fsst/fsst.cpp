@@ -6,7 +6,6 @@
 #include "fls/primitive/fsst/fsst.hpp"
 #include "fls/cfg/cfg.hpp"
 #include "fls/common/alias.hpp"
-#include "fls/cor/lyt/buf.hpp"
 #include "fls/cor/prm/fsst/fsst.h"
 #include "fls/cor/prm/fsst/libfsst.hpp"
 #include "fls/table/rowgroup.hpp"
@@ -21,11 +20,8 @@ fsst_encoder_t* fsst_helper::make_fsst(const FlsStrColumnView& col) {
 	return fsst_create(n_vals, col.fsst_length_ptr, col.fsst_string_p, CFG::FSST::NULL_TERMINATED);
 }
 
-fsst_encoder_t* fsst_helper::make_fsst(n_t n_vals, Buf& length_buf, Buf& string_p_buf) {
-	auto* lengths_p = reinterpret_cast<len_t*>(length_buf.data());
-	auto* strings_p = reinterpret_cast<uint8_t**>(string_p_buf.data());
-
-	return fsst_create(n_vals, lengths_p, strings_p, CFG::FSST::NULL_TERMINATED);
+fsst_encoder_t* fsst_helper::make_fsst(n_t n_vals, len_t* lengths, uint8_t** strings) {
+	return fsst_create(n_vals, lengths, strings, CFG::FSST::NULL_TERMINATED);
 }
 
 inline uint64_t fsst_unaligned_load(u8 const* v) {

@@ -25,12 +25,127 @@
 #include "fls/table/table.hpp"         // for Table
 #include "fls/wizard/wizard.hpp"       // for Wizard
 #include <algorithm>                   // for std::ranges::none_of
-#include <cstdint>                     // for uint64_t
+#include <atomic>
+#include <chrono>
+#include <cstdint> // for uint64_t
 #include <filesystem>
 #include <memory>    // for std::make_unique, unique_ptr
 #include <stdexcept> // for std::runtime_error
+#include <system_error>
+#include <utility>
 
 namespace fastlanes {
+
+namespace {
+
+constexpr auto TABLE_DESCRIPTOR_FILE_NAME = "table_descriptor.fbb";
+
+path make_staging_directory(const path& final_path) {
+	static std::atomic<uint64_t> counter {0};
+	const auto parent = final_path.parent_path().empty() ? std::filesystem::current_path() : final_path.parent_path();
+	const auto stamp  = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+
+	for (uint64_t attempt = 0; attempt < 1024; ++attempt) {
+		const auto id = stamp + counter.fetch_add(1, std::memory_order_relaxed) + attempt;
+		const path candidate =
+		    parent / (".fastlanes-stage-" + final_path.filename().string() + "-" + std::to_string(id));
+		std::error_code ec;
+		if (std::filesystem::create_directory(candidate, ec)) {
+			return candidate;
+		}
+		if (ec && ec != std::errc::file_exists) {
+			throw std::filesystem::filesystem_error("failed to create FastLanes staging directory", candidate, ec);
+		}
+	}
+	throw std::runtime_error("failed to allocate a unique FastLanes staging directory");
+}
+
+class StagedOutput {
+public:
+	explicit StagedOutput(path final_path)
+	    : m_final_path(std::move(final_path))
+	    , m_directory(make_staging_directory(m_final_path))
+	    , m_file_path(m_directory / m_final_path.filename()) {
+	}
+
+	~StagedOutput() {
+		if (!m_published) {
+			std::error_code ec;
+			std::filesystem::remove_all(m_directory, ec);
+		}
+	}
+
+	[[nodiscard]] const path& file_path() const {
+		return m_file_path;
+	}
+
+	void publish(const bool has_external_footer, const bool has_json) {
+		struct SidecarMove {
+			path source;
+			path target;
+			path backup;
+			bool target_was_backed_up = false;
+			bool source_was_published = false;
+		};
+
+		vector<SidecarMove> sidecars;
+		const auto          final_parent =
+            m_final_path.parent_path().empty() ? std::filesystem::current_path() : m_final_path.parent_path();
+		if (has_external_footer) {
+			sidecars.push_back(
+			    {m_directory / TABLE_DESCRIPTOR_FILE_NAME, final_parent / TABLE_DESCRIPTOR_FILE_NAME, {}});
+		}
+		if (has_json) {
+			path source = m_file_path;
+			source += ".json";
+			path target = m_final_path;
+			target += ".json";
+			sidecars.push_back({std::move(source), std::move(target), {}});
+		}
+
+		try {
+			for (std::size_t idx = 0; idx < sidecars.size(); ++idx) {
+				auto& move = sidecars[idx];
+				if (exists(move.target)) {
+					move.backup = m_directory / ("sidecar-backup-" + std::to_string(idx));
+					std::filesystem::rename(move.target, move.backup);
+					move.target_was_backed_up = true;
+				}
+				std::filesystem::rename(move.source, move.target);
+				move.source_was_published = true;
+			}
+
+			if (exists(m_final_path)) {
+				throw std::runtime_error("Fastlanes file already exists at: " + m_final_path.string());
+			}
+			std::filesystem::rename(m_file_path, m_final_path);
+		} catch (...) {
+			for (auto move = sidecars.rbegin(); move != sidecars.rend(); ++move) {
+				std::error_code ec;
+				if (move->source_was_published) {
+					std::filesystem::remove(move->target, ec);
+				}
+				if (move->target_was_backed_up) {
+					ec.clear();
+					std::filesystem::rename(move->backup, move->target, ec);
+				}
+			}
+			throw;
+		}
+
+		m_published = true;
+		std::error_code ec;
+		std::filesystem::remove_all(m_directory, ec);
+	}
+
+private:
+	path m_final_path;
+	path m_directory;
+	path m_file_path;
+	bool m_published = false;
+};
+
+} // namespace
 
 Connection::Connection() {
 	m_config = make_unique<Config>();
@@ -113,6 +228,11 @@ Connection& Connection::spell() {
 }
 
 Connection& Connection::to_fls(const path& file_path) {
+	return to_fls(file_path, EncodingOptions {});
+}
+
+Connection& Connection::to_fls(const path& file_path, const EncodingOptions& options) {
+	const auto total_started = std::chrono::steady_clock::now();
 	if (exists(file_path)) {
 		throw std::runtime_error("Fastlanes file already exists at: " + file_path.string());
 	}
@@ -128,20 +248,34 @@ Connection& Connection::to_fls(const path& file_path) {
 	if (m_table_descriptor == nullptr) {
 		spell();
 	}
+	const auto preparation_finished = std::chrono::steady_clock::now();
 
-	FileHeader::Write(*this, file_path);
+	m_last_encoding_stats = {};
+	StagedOutput staged_output(file_path);
+	FileHeader::Write(*this, staged_output.file_path());
 
 	// encode
-	Encoder::encode(*this, file_path);
+	const auto encoding_started  = std::chrono::steady_clock::now();
+	m_last_encoding_stats        = Encoder::encode(*this, staged_output.file_path(), options);
+	const auto encoding_finished = std::chrono::steady_clock::now();
 
 	if (m_config->enable_verbose) {
-		fs::path json_file = file_path;
+		fs::path json_file = staged_output.file_path();
 		json_file += ".json";
 		JSON::write(*this, json_file, *m_table_descriptor);
 	}
 
 	// write the footer
-	write_footer(file_path);
+	write_footer(staged_output.file_path());
+	staged_output.publish(!static_cast<bool>(m_config->inline_footer), m_config->enable_verbose);
+	const auto total_finished = std::chrono::steady_clock::now();
+	m_last_encoding_stats.preparation_wall_seconds =
+	    std::chrono::duration<double>(preparation_finished - total_started).count();
+	m_last_encoding_stats.encoding_wall_seconds =
+	    std::chrono::duration<double>(encoding_finished - encoding_started).count();
+	m_last_encoding_stats.finalization_wall_seconds =
+	    std::chrono::duration<double>(total_finished - encoding_finished).count();
+	m_last_encoding_stats.total_wall_seconds = std::chrono::duration<double>(total_finished - total_started).count();
 
 	return *this;
 }
@@ -264,6 +398,10 @@ Connection& Connection::inline_footer() {
 
 string_view Connection::get_version() const {
 	return Info::get_version();
+}
+
+const EncodingStats& Connection::get_last_encoding_stats() const {
+	return m_last_encoding_stats;
 }
 
 /*--------------------------------------------------------------------------------------------------------------------*\

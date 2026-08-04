@@ -60,9 +60,6 @@ enc_fsst_dict_opr::enc_fsst_dict_opr(const PhysicalExpr& expr,
 	fsst_bytes_segment->MakeBlockBased();
 	fsst_offset_segment = make_unique<Segment>();
 	fsst_offset_segment->MakeBlockBased();
-	length_buf     = make_unique<Buf>();
-	bytes_buf      = make_unique<Buf>();
-	string_p_buf   = make_unique<Buf>();
 	fsst_bytes_buf = make_unique<Buf>();
 	out_offset_buf = make_unique<Buf>();
 
@@ -95,22 +92,23 @@ void enc_fsst_dict_opr::Finalize() {
 
 	for (n_t dict_value_idx {0}; dict_value_idx < bimap.size(); dict_value_idx++) {
 		const fls_string_t& current_fls_string = bimap.get_key(dict_value_idx);
-		bytes_buf->Append(current_fls_string.p, current_fls_string.length);
-		length_buf->Append(&current_fls_string.length, sizeof(ofs_t));
-		uint8_t* string_p = bytes_buf->end() - current_fls_string.length;
-		string_p_buf->Append(&string_p, sizeof(uint8_t*));
+		dictionary_input.Append(current_fls_string);
 	}
+	dictionary_input.FinalizePointers();
+	FLS_ASSERT_E(dictionary_input.Count(), n_dict_vals)
 
 	// fsst header
-	auto*      fsst_encoder_p = fsst_helper::make_fsst(n_dict_vals, *length_buf, *string_p_buf);
-	const auto size           = fsst_export(fsst_encoder_p, fsst_header);
+	auto* fsst_encoder_p = fsst_helper::make_fsst(n_dict_vals, dictionary_input.Lengths(), dictionary_input.Strings());
+	const auto size      = fsst_export(fsst_encoder_p, fsst_header);
 	fsst_header_segment->Flush(fsst_header, size);
 
 	// encode
+	fsst_bytes_buf->Resize(dictionary_input.EncodedCapacityUpperBound());
+	out_offset_buf->Resize(dictionary_input.OffsetCapacityBytes());
 	const auto n_encoded_vals = fsst_helper::fsst_compress(fsst_encoder_p,
 	                                                       n_dict_vals,
-	                                                       length_buf->mutable_data<len_t>(),
-	                                                       string_p_buf->mutable_data<uint8_t*>(),
+	                                                       dictionary_input.Lengths(),
+	                                                       dictionary_input.Strings(),
 	                                                       fsst_bytes_buf->Capacity(),
 	                                                       fsst_bytes_buf->mutable_data<uint8_t>(),
 	                                                       out_offset_buf->mutable_data<ofs_t>());

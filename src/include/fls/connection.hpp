@@ -9,6 +9,7 @@
 #include "fls/api/api.hpp"
 #include "fls/common/alias.hpp" // for up, idx_t
 #include "fls/common/status.hpp"
+#include "fls/encoder/encoding_options.hpp"
 #include "fls/footer/rowgroup_descriptor.hpp" // for Footer
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/reader/column_view.hpp" //
@@ -83,6 +84,8 @@ public:
 	Connection& spell();
 	///!
 	Connection& to_fls(const path& dir_path);
+	///! Encode using explicitly configured generic rowgroup parallelism.
+	Connection& to_fls(const path& dir_path, const EncodingOptions& options);
 	//
 	Status verify_fls(const path& file_path);
 
@@ -129,6 +132,8 @@ public:
 	Connection& inline_footer();
 	//
 	string_view get_version() const;
+	//
+	[[nodiscard]] const EncodingStats& get_last_encoding_stats() const;
 
 private:
 	void prepare_table() const;
@@ -139,6 +144,7 @@ private:
 	up<Config>           m_config;
 	up<Table>            m_table;
 	up<TableDescriptorT> m_table_descriptor;
+	EncodingStats        m_last_encoding_stats {};
 };
 
 constexpr static auto const* FASTLANES_FILE_NAME {"data.fls"};

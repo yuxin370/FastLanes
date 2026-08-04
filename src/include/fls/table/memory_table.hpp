@@ -30,7 +30,8 @@ using MemoryColumnData = std::variant<std::span<const int8_t>,
                                       std::span<const uint32_t>,
                                       std::span<const uint64_t>,
                                       std::span<const float>,
-                                      std::span<const double>>;
+                                      std::span<const double>,
+                                      std::span<const string>>;
 
 struct MemoryColumn {
 	string           name;
