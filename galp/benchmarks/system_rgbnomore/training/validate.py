@@ -15,6 +15,7 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from training.artifacts import read_json, sha256_file, sha256_json, verify_artifact_hashes, write_json
+from training.manifest_preflight import DATASET_KIND, SUPPORTED_LAYOUTS
 from training.schema import (
     COMPARISON_GROUPS,
     PIPELINES,
@@ -72,6 +73,13 @@ def _all_finite(values: Iterable[Any]) -> bool:
         return False
 
 
+def _finite_number(value: Any, *, minimum: float | None = None) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    numeric = float(value)
+    return math.isfinite(numeric) and (minimum is None or numeric >= minimum)
+
+
 def _validate_repeat(
     pipeline: str,
     phase: str,
@@ -109,12 +117,108 @@ def _validate_repeat(
         failures.append(f"{prefix} optimizer-consumed sample order gate failed")
     if order.get("prefetch_overrun", 0) < 0:
         failures.append(f"{prefix} prefetch overrun is negative")
+    for hash_name in ("shuffle_order_sha256", "transform_descriptor_sha256"):
+        value = order.get(hash_name)
+        if not isinstance(value, str) or len(value) != 64:
+            failures.append(f"{prefix} is missing reproducibility hash {hash_name}")
+    sample_order_contract = contract.get("sample_order", {})
+    for field in ("distributed_rank", "distributed_world_size"):
+        if order.get(field) != sample_order_contract.get(field, 0 if field.endswith("rank") else 1):
+            failures.append(f"{prefix} sample-order {field} mismatch")
     if repeat.get("model_parameters_finite") is not True:
         failures.append(f"{prefix} model parameters are not finite")
     if repeat.get("optimizer_state_finite") is not True:
         failures.append(f"{prefix} optimizer state is not finite")
     if repeat.get("scheduler_progress_correct") is not True:
         failures.append(f"{prefix} scheduler progression gate failed")
+    common = repeat.get("common_statistics", {})
+    for field in (
+        "samples",
+        "batches",
+        "elapsed_seconds",
+        "samples_per_second",
+        "reader_wait_seconds",
+        "training_step_seconds",
+        "peak_host_queue_depth",
+        "peak_device_memory",
+        "loss_summary",
+    ):
+        if field not in common:
+            failures.append(f"{prefix} common statistics are missing {field}")
+    samples = common.get("samples")
+    batches = common.get("batches")
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples <= 0:
+        failures.append(f"{prefix} common samples must be a positive integer")
+    if not isinstance(batches, int) or isinstance(batches, bool) or batches <= 0:
+        failures.append(f"{prefix} common batches must be a positive integer")
+    if samples != repeat.get("processed_images"):
+        failures.append(f"{prefix} common samples disagree with processed_images")
+    if batches != repeat.get("measured_steps"):
+        failures.append(f"{prefix} common batches disagree with measured_steps")
+    for field, minimum in (
+        ("elapsed_seconds", 0.0),
+        ("samples_per_second", 0.0),
+        ("reader_wait_seconds", 0.0),
+        ("training_step_seconds", 0.0),
+    ):
+        if not _finite_number(common.get(field), minimum=minimum):
+            failures.append(f"{prefix} common {field} must be finite and non-negative")
+    elapsed = common.get("elapsed_seconds")
+    if _finite_number(elapsed, minimum=0.0) and elapsed == 0:
+        failures.append(f"{prefix} common elapsed_seconds must be positive")
+    throughput = common.get("samples_per_second")
+    if _finite_number(throughput, minimum=0.0) and throughput == 0:
+        failures.append(f"{prefix} common samples_per_second must be positive")
+    for common_name, repeat_name in (
+        ("elapsed_seconds", "measured_region_wall_clock_seconds"),
+        ("samples_per_second", "throughput_images_per_s"),
+    ):
+        common_value = common.get(common_name)
+        repeat_value = repeat.get(repeat_name)
+        if (
+            _finite_number(common_value)
+            and _finite_number(repeat_value)
+            and not math.isclose(float(common_value), float(repeat_value), rel_tol=1e-12, abs_tol=1e-12)
+        ):
+            failures.append(f"{prefix} common {common_name} disagrees with {repeat_name}")
+    peak_queue = common.get("peak_host_queue_depth")
+    if peak_queue is not None and (
+        not isinstance(peak_queue, int) or isinstance(peak_queue, bool) or peak_queue < 0
+    ):
+        failures.append(f"{prefix} common peak_host_queue_depth must be null or non-negative integer")
+    if pipeline == "galp" and peak_queue is None:
+        failures.append(f"{prefix} GALP common peak_host_queue_depth is missing")
+    queue_capacity = repeat.get("loader_metrics", {}).get("capacity_batches")
+    if (
+        isinstance(peak_queue, int)
+        and not isinstance(peak_queue, bool)
+        and isinstance(queue_capacity, int)
+        and not isinstance(queue_capacity, bool)
+        and peak_queue > queue_capacity
+    ):
+        failures.append(f"{prefix} peak host queue depth exceeds its hard capacity")
+    peak_device = common.get("peak_device_memory")
+    if peak_device is not None and (
+        not isinstance(peak_device, int) or isinstance(peak_device, bool) or peak_device < 0
+    ):
+        failures.append(f"{prefix} common peak_device_memory must be null or non-negative integer")
+    if str(contract.get("model", {}).get("device", "")).startswith("cuda") and peak_device is None:
+        failures.append(f"{prefix} CUDA common peak_device_memory is missing")
+    loss_summary = common.get("loss_summary")
+    if not isinstance(loss_summary, dict):
+        failures.append(f"{prefix} common loss_summary is not an object")
+    else:
+        if loss_summary.get("count") != batches:
+            failures.append(f"{prefix} common loss_summary count disagrees with batches")
+        for field in ("mean", "p50", "p95", "max"):
+            if not _finite_number(loss_summary.get(field)):
+                failures.append(f"{prefix} common loss_summary {field} is not finite")
+    if pipeline == "galp":
+        native = repeat.get("native_execution_stats")
+        if not isinstance(native, dict):
+            failures.append(f"{prefix} native execution stats namespace is missing")
+        elif native.get("optional") is not True or native.get("correctness_dependency") is not False:
+            failures.append(f"{prefix} native execution stats changed correctness semantics")
     instrumentation = repeat.get("measurement_instrumentation", {})
     synchronization = repeat.get("synchronization_accounting", {})
     if mode == "runtime":
@@ -324,6 +428,82 @@ def validate_output(output_dir: Path, *, write_result: bool = True) -> dict[str,
                 )
 
     enabled = list(contract.get("enabled_pipelines", []))
+    if "galp" in enabled:
+        preflight_path = output_dir / "manifest_preflight.json"
+        if not preflight_path.is_file():
+            failures.append("enabled GALP pipeline is missing manifest_preflight.json")
+        else:
+            preflight = _load(preflight_path, failures)
+            contracted = contract.get("pipelines", {}).get("galp_manifest_preflight")
+            if preflight != contracted:
+                failures.append("manifest_preflight.json differs from the GALP contract")
+            version = preflight.get("version")
+            layout = preflight.get("physical_layout")
+            if preflight.get("dataset_kind") != DATASET_KIND:
+                failures.append("GALP manifest preflight dataset kind mismatch")
+            if version not in SUPPORTED_LAYOUTS or SUPPORTED_LAYOUTS.get(version) != layout:
+                failures.append("GALP manifest preflight version/layout is unsupported")
+            expectations = contract.get("pipelines", {}).get(
+                "galp_manifest_expectations", {}
+            )
+            for expected_key, actual_key in (
+                ("version", "version"),
+                ("physical_layout", "physical_layout"),
+                ("spatial_order", "spatial_order"),
+                ("image_count", "image_count"),
+            ):
+                expected_value = expectations.get(expected_key)
+                if expected_value is not None and preflight.get(actual_key) != expected_value:
+                    failures.append(
+                        f"GALP manifest preflight {actual_key} differs from requested expectation"
+                    )
+        pipelines = contract.get("pipelines", {})
+        validation_preflight_path = output_dir / "manifest_preflight_validation.json"
+        validation_contract_present = "galp_validation_manifest_preflight" in pipelines
+        if validation_contract_present and not validation_preflight_path.is_file():
+            failures.append(
+                "enabled GALP pipeline is missing manifest_preflight_validation.json"
+            )
+        elif validation_preflight_path.is_file():
+            validation_preflight = _load(validation_preflight_path, failures)
+            validation_contracted = pipelines.get(
+                "galp_validation_manifest_preflight",
+                pipelines.get("galp_manifest_preflight"),
+            )
+            if validation_preflight != validation_contracted:
+                failures.append(
+                    "manifest_preflight_validation.json differs from the GALP contract"
+                )
+            validation_version = validation_preflight.get("version")
+            validation_layout = validation_preflight.get("physical_layout")
+            if validation_preflight.get("dataset_kind") != DATASET_KIND:
+                failures.append("GALP validation manifest preflight dataset kind mismatch")
+            if (
+                validation_version not in SUPPORTED_LAYOUTS
+                or SUPPORTED_LAYOUTS.get(validation_version) != validation_layout
+            ):
+                failures.append(
+                    "GALP validation manifest preflight version/layout is unsupported"
+                )
+            validation_expectations = pipelines.get(
+                "galp_validation_manifest_expectations",
+                pipelines.get("galp_manifest_expectations", {}),
+            )
+            for expected_key, actual_key in (
+                ("version", "version"),
+                ("physical_layout", "physical_layout"),
+                ("spatial_order", "spatial_order"),
+                ("image_count", "image_count"),
+            ):
+                expected_value = validation_expectations.get(expected_key)
+                if (
+                    expected_value is not None
+                    and validation_preflight.get(actual_key) != expected_value
+                ):
+                    failures.append(
+                        "GALP validation manifest preflight "
+                        f"{actual_key} differs from requested expectation"
+                    )
     required_groups = list(contract.get("required_comparison_groups", []))
     pipeline_payloads: dict[str, dict[str, Any]] = {}
     for pipeline in PIPELINES:

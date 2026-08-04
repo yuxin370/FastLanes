@@ -20,10 +20,13 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from shared.common import (
+    CANONICAL_GALP_PIPELINES,
     CONTRACT_SCHEMA,
     CONTRACT_PIPELINES,
-    PIPELINES,
+    GALP_PIPELINES,
+    INFERENCE_PIPELINES,
     cached_file_fingerprints,
+    canonical_pipeline_name,
     checkpoint_metadata,
     fingerprint_file,
     galp_manifest_payloads,
@@ -40,12 +43,13 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[3]
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
 DEFAULT_E2E_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2"
-DEFAULT_DATA_ROOT = DEFAULT_E2E_DATA_ROOT / "imagenet"
+DEFAULT_E2E_V3_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v3"
+DEFAULT_DATA_ROOT = DEFAULT_E2E_V3_ROOT / "imagenet_512"
 DEFAULT_INDEX_CSV = DEFAULT_E2E_DATA_ROOT / "indexbase_val.csv"
 DEFAULT_RGB_CHECKPOINT = DEFAULT_E2E_DATA_ROOT / "checkpoints/imgnetRGBViTTi_ep300_74.1.pth"
 DEFAULT_DCT_CHECKPOINT = DEFAULT_E2E_DATA_ROOT / "checkpoints/imgnetDCTViTTi_ep300_75.1.pth"
-DEFAULT_GALP_MANIFEST = DEFAULT_E2E_DATA_ROOT / "dct/manifest.bin"
-DEFAULT_GALP_LABEL_MAP = DEFAULT_E2E_DATA_ROOT / "dct/labels.json"
+DEFAULT_GALP_MANIFEST = DEFAULT_E2E_V3_ROOT / "compact_v3_tiled_z32_rgbnomore512/manifest.bin"
+DEFAULT_GALP_LABEL_MAP = DEFAULT_E2E_V3_ROOT / "compact_v3_tiled_z32_rgbnomore512/labels.json"
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_BENCHMARK_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
 
@@ -56,7 +60,7 @@ PRESETS = {
 }
 GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO = 1.10
 E2E_MAX_HOT_THROUGHPUT_CV = 0.05
-E2E_PIPELINES = ("galp", "galp_legacy", "rgbnomore", "dali")
+E2E_PIPELINES = (*CANONICAL_GALP_PIPELINES, "rgbnomore", "dali")
 
 
 def _value(args: argparse.Namespace, key: str) -> int:
@@ -229,7 +233,9 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
     if "dali" in args.pipelines and workers <= 0:
         raise ValueError("DALI requires workers/num_threads > 0")
     if args.preset == "e2e" and not set(E2E_PIPELINES).issubset(args.pipelines):
-        raise ValueError("e2e requires same-round galp, galp_legacy, rgbnomore, and dali pipelines")
+        raise ValueError(
+            "e2e requires same-round galp_planless, galp_fixed_items, rgbnomore, and dali pipelines"
+        )
     if args.preset == "e2e" and (
         args.galp_cache_capacity_mib != 0 or args.galp_plan_cache_capacity != 0
     ):
@@ -247,6 +253,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         sample_count=sample_count,
         seed=args.seed,
         output=sample_manifest_path,
+        expected_image_size=args.dct_source_image_size or None,
     )
     canonical_index_csv = output_dir / "canonical_rgbnomore_index.csv"
     _write_canonical_index(canonical_index_csv, sample_manifest["samples"])
@@ -263,7 +270,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
     galp_vector_bundle_fingerprints: list[dict[str, Any]] = []
     galp_payload_cache: Path | None = None
     galp_native_binary: dict[str, Any] | None = None
-    if {"galp", "galp_legacy"}.intersection(args.pipelines):
+    if set(GALP_PIPELINES).intersection(args.pipelines):
         galp_payload_cache = galp_manifest.with_name(galp_manifest.name + ".payload_fingerprints.json")
         galp_payload_fingerprints = cached_file_fingerprints(
             galp_manifest_payloads(galp_manifest),
@@ -299,6 +306,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "canonical_index_sha256": sha256_file(canonical_index_csv),
             "sample_order": "sample_manifest.ordinal",
             "label_mapping": "RGB-no-more ImageNet-1K index CSV; never ImageFolder class ordinals",
+            "source_image_geometry": sample_manifest["source_geometry"],
         },
         "execution": {
             "batch_size": batch_size,
@@ -355,7 +363,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         },
         "pipelines": {
             "enabled": list(args.pipelines),
-            "galp": {
+            "galp_planless": {
                 "manifest": str(galp_manifest),
                 "manifest_version": galp_manifest_version,
                 "manifest_sha256": galp_manifest_fingerprint["sha256"],
@@ -381,7 +389,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
-                "enable_planless_execution": True,
+                "transform_execution_mode": "require-planless",
                 "crop_execution_mode": args.galp_crop_execution_mode,
                 "scheduling_policy": args.galp_scheduling_policy,
                 "transform_blocks_per_launch": (
@@ -396,7 +404,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 ),
                 "use_low_priority_streams": True,
             },
-            "galp_legacy": {
+            "galp_fixed_items": {
                 "manifest": str(galp_manifest),
                 "manifest_version": galp_manifest_version,
                 "manifest_sha256": galp_manifest_fingerprint["sha256"],
@@ -422,7 +430,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
-                "enable_planless_execution": False,
+                "transform_execution_mode": "require-fixed-items",
                 "crop_execution_mode": args.galp_crop_execution_mode,
                 "scheduling_policy": args.galp_scheduling_policy,
                 "transform_blocks_per_launch": 0,
@@ -451,7 +459,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "os_page_cache_policy": "uncontrolled; e2e aggregate excludes repeat 0 and reports every repeat",
         },
         "performance_gates": {
-            "galp": {
+            "galp_planless": {
                 "minimum_median_throughput_images_per_s": None,
                 "minimum_hot_median_to_dali_hot_median_ratio": (
                     GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO if args.preset == "e2e" else None
@@ -463,7 +471,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "device_mapping_median_ms_max": 1.0 if args.preset == "e2e" else None,
                 "device_mapping_plus_fixed_transform_median_ms_max": 6.5 if args.preset == "e2e" else None,
                 "image_major_manifest_minimum_version": 2,
-                "rowgroups_per_image": 1,
+                "manifest_v2_rowgroups_per_image": 1,
                 "worksets_per_batch": 1,
                 "internal_syncs_per_batch": 1,
                 "decode_kernels_per_batch": 1,
@@ -475,7 +483,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "identity_checks": ["sample_id", "ordinal", "label", "measured_trace_sha256"],
             "comparison_groups": [
                 {
-                    "pipelines": ["galp", "rgbnomore"],
+                    "pipelines": ["galp_planless", "rgbnomore"],
                     "domain": "dct",
                     "enforcement": "strict",
                     "thresholds": {
@@ -488,7 +496,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     },
                 },
                 {
-                    "pipelines": ["galp", "galp_legacy"],
+                    "pipelines": ["galp_planless", "galp_fixed_items"],
                     "domain": "dct",
                     "enforcement": "strict",
                     "thresholds": {
@@ -626,13 +634,13 @@ def run(args: argparse.Namespace) -> int:
             str(output_dir / f"pipeline_{pipeline}.json"),
         ]
         pipeline_env = dict(env)
-        if pipeline in ("galp", "galp_legacy"):
+        if pipeline in GALP_PIPELINES:
             binding = contract["pipelines"][pipeline]["torch_binding_dir"]
             pipeline_env["PYTHONPATH"] = binding + (os.pathsep + pipeline_env["PYTHONPATH"] if pipeline_env.get("PYTHONPATH") else "")
         command_record = {
             "name": pipeline,
             "command": command,
-            "env_overrides": {"PYTHONPATH": pipeline_env.get("PYTHONPATH")} if pipeline in ("galp", "galp_legacy") else {},
+            "env_overrides": {"PYTHONPATH": pipeline_env.get("PYTHONPATH")} if pipeline in GALP_PIPELINES else {},
             "system_state_before": _system_state_snapshot(dry_run=args.dry_run),
         }
         commands.append(command_record)
@@ -766,13 +774,28 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int)
     parser.add_argument("--semantic-samples", type=int)
     parser.add_argument("--seed", type=int, default=11997733)
+    parser.add_argument(
+        "--dct-source-image-size",
+        type=int,
+        default=512,
+        help=(
+            "Required square JPEG source size before DCT extraction. The published RGB-no-more "
+            "DCT checkpoints require 512; use 0 only for a custom checkpoint with a different recipe."
+        ),
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--precision", choices=("fp32", "amp_fp16", "amp_bf16"), default="fp32")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.pipelines is None:
-        args.pipelines = list(E2E_PIPELINES if args.preset == "e2e" else PIPELINES)
+        args.pipelines = list(E2E_PIPELINES if args.preset == "e2e" else INFERENCE_PIPELINES)
+    else:
+        args.pipelines = [canonical_pipeline_name(name) for name in args.pipelines]
+        if len(set(args.pipelines)) != len(args.pipelines):
+            parser.error("--pipelines contains duplicate canonical names after alias normalization")
+    if args.dct_source_image_size < 0:
+        parser.error("--dct-source-image-size must be non-negative")
     return args
 
 

@@ -283,7 +283,8 @@ def _policy_contract(
 ) -> dict[str, Any]:
     contract = copy.deepcopy(base)
     contract["benchmark_id"] = f'{base.get("benchmark_id", "benchmark")}-scheduler-{policy_label}'
-    galp = contract["pipelines"]["galp"]
+    pipeline = "galp_planless" if "galp_planless" in contract["pipelines"] else "galp"
+    galp = contract["pipelines"][pipeline]
     galp["scheduling_policy"] = policy
     galp["transform_blocks_per_launch"] = transform_blocks if policy == "limited-overlap" else 0
     galp["transform_ctas_per_launch"] = transform_ctas if policy == "limited-overlap" else 0
@@ -297,8 +298,10 @@ def _policy_contract(
 
 def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     base_contract = json.loads(args.contract.read_text(encoding="utf-8"))
-    if "galp" not in base_contract.get("pipelines", {}).get("enabled", []):
-        raise ValueError("base contract must enable the galp pipeline")
+    enabled = base_contract.get("pipelines", {}).get("enabled", [])
+    pipeline = next((name for name in ("galp_planless", "galp") if name in enabled), None)
+    if pipeline is None:
+        raise ValueError("base contract must enable the galp_planless pipeline")
     limited_candidates = _normalize_limited_candidates(args.transform_blocks, args.transform_ctas)
     policy_specs = _policy_specs(limited_candidates)
     limited_labels = [label for label, policy, _, _ in policy_specs if policy == "limited-overlap"]
@@ -322,7 +325,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
             binding_candidates[0],
         )
         contract_path = policy_dir / "contract.json"
-        output_path = policy_dir / "pipeline_galp.json"
+        output_path = policy_dir / f"pipeline_{pipeline}.json"
         _write_json(contract_path, contract)
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(
@@ -333,7 +336,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.python),
                 str(INFERENCE_DIR / "pipeline.py"),
                 "--pipeline",
-                "galp",
+                pipeline,
                 "--contract",
                 str(contract_path),
                 "--output",

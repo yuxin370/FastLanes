@@ -26,6 +26,7 @@ if str(BENCHMARK_DIR) not in sys.path:
 
 from shared.common import (  # noqa: E402
     cached_file_fingerprints,
+    contract_pipeline_name,
     distribution,
     galp_manifest_payloads,
     load_sample_manifest,
@@ -40,12 +41,14 @@ from diagnostics.direct_dct import (  # noqa: E402
     _scale_to_rgbnomore_dct_range,
     adapt_galp_batch_to_rgbnomore,
 )
-from dataset.manifest import build_manifest, collect_dataset, validate_galp_label_map  # noqa: E402
+from dataset.manifest import build_manifest, collect_dataset, jpeg_frame, validate_galp_label_map  # noqa: E402
 from inference.pipeline import (  # noqa: E402
     GalpAdapter,
-    GalpLegacyAdapter,
+    GalpFixedItemsAdapter,
+    _accumulate_native_counter,
     _process_memory_snapshot,
     _resolve_model_stream_priority,
+    _validate_transform_capability,
 )
 from dataset.prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
 from inference.run import (  # noqa: E402
@@ -69,6 +72,7 @@ from inference.validate import (  # noqa: E402
     _evaluate_performance_gates,
     _semantic_compare,
     _validate_crop_pushdown_accounting,
+    _validate_planless_structural_accounting,
 )
 from inference.crop_io_ab import validate_crop_io_ab_results  # noqa: E402
 
@@ -79,11 +83,12 @@ class SystemBenchmarkTest(unittest.TestCase):
             root = Path(temporary)
             base_contract = {
                 "pipelines": {
-                    "galp": {
+                    "galp_fixed_items": {
                         "manifest": "fixture",
                         "preprocess": "rgbnomore-val-pushdown",
                         "cache_capacity_mib": 0,
                         "plan_cache_capacity": 0,
+                        "transform_execution_mode": "require-fixed-items",
                     }
                 },
                 "semantic_validation": {"prediction_agreement_sample_count": 50_000},
@@ -116,9 +121,9 @@ class SystemBenchmarkTest(unittest.TestCase):
                     top1_predictions=np.arange(50_000, dtype=np.int64) % 1000,
                 )
                 results[name] = {
-                    "pipeline": "galp",
+                    "pipeline": "galp_fixed_items",
                     "pipeline_config": {
-                        **base_contract["pipelines"]["galp"],
+                        **base_contract["pipelines"]["galp_fixed_items"],
                         "crop_execution_mode": execution_mode,
                     },
                     "semantic_artifact": str(artifact),
@@ -235,6 +240,88 @@ class SystemBenchmarkTest(unittest.TestCase):
         )
         self.assertEqual(failures, [])
 
+    def test_manifest_v3_planless_rowgroups_match_selected_vectors(self) -> None:
+        failures: list[str] = []
+        _validate_planless_structural_accounting(
+            {
+                "rowgroups": 300_000,
+                "actual_vector_count": 300_000,
+                "worksets": 1_000,
+                "internal_syncs": 1_000,
+                "decode_kernels": 1_000,
+            },
+            manifest_version=3,
+            expected_images=50_000,
+            expected_batches=1_000,
+            gate={"image_major_manifest_minimum_version": 2},
+            label="planless",
+            failures=failures,
+        )
+        self.assertEqual(failures, [])
+
+    def test_manifest_v3_planless_rejects_image_count_as_rowgroup_count(self) -> None:
+        failures: list[str] = []
+        _validate_planless_structural_accounting(
+            {
+                "rowgroups": 50_000,
+                "actual_vector_count": 300_000,
+                "worksets": 1_000,
+                "internal_syncs": 1_000,
+                "decode_kernels": 1_000,
+            },
+            manifest_version=3,
+            expected_images=50_000,
+            expected_batches=1_000,
+            gate={"image_major_manifest_minimum_version": 2},
+            label="planless",
+            failures=failures,
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("expected actual_vector_count=300000", failures[0])
+
+    def test_manifest_v2_planless_keeps_one_image_rowgroup_contract(self) -> None:
+        failures: list[str] = []
+        _validate_planless_structural_accounting(
+            {
+                "rowgroups": 50_000,
+                "actual_vector_count": 300_000,
+                "worksets": 1_000,
+                "internal_syncs": 1_000,
+                "decode_kernels": 1_000,
+            },
+            manifest_version=2,
+            expected_images=50_000,
+            expected_batches=1_000,
+            gate={
+                "image_major_manifest_minimum_version": 2,
+                "manifest_v2_rowgroups_per_image": 1,
+            },
+            label="planless",
+            failures=failures,
+        )
+        self.assertEqual(failures, [])
+
+    def test_native_snapshot_gauges_take_max_while_work_counters_sum(self) -> None:
+        totals: dict[str, int] = {}
+        for value in (64, 96, 80):
+            _accumulate_native_counter(totals, "galp_native_pinned_peak_in_use_bytes", value)
+        for value in (4, 7, 6):
+            _accumulate_native_counter(totals, "galp_native_pinned_cuda_allocation_count", value)
+        for value in (1024, 2048, 1536):
+            _accumulate_native_counter(totals, "compact_batch_buffer_capacity_bytes", value)
+        for value in (1200, 2200, 1800):
+            _accumulate_native_counter(totals, "compact_batch_buffer_high_water_bytes", value)
+        for value in (100, 200, 300):
+            _accumulate_native_counter(totals, "compact_batch_buffer_requested_bytes", value)
+            _accumulate_native_counter(totals, "rowgroups", value // 100)
+
+        self.assertEqual(totals["galp_native_pinned_peak_in_use_bytes"], 96)
+        self.assertEqual(totals["galp_native_pinned_cuda_allocation_count"], 7)
+        self.assertEqual(totals["compact_batch_buffer_capacity_bytes"], 2048)
+        self.assertEqual(totals["compact_batch_buffer_high_water_bytes"], 2200)
+        self.assertEqual(totals["compact_batch_buffer_requested_bytes"], 600)
+        self.assertEqual(totals["rowgroups"], 6)
+
     def test_measured_limited_overlap_is_the_production_default(self) -> None:
         with mock.patch.object(
             sys, "argv", ["run.py", "--output-dir", "/tmp/galp-default-contract-test"]
@@ -243,6 +330,56 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(args.galp_scheduling_policy, "limited-overlap")
         self.assertEqual(args.galp_transform_blocks_per_launch, 512)
         self.assertEqual(args.galp_transform_ctas_per_launch, 512)
+        self.assertEqual(args.pipelines[0], "galp_planless")
+        self.assertEqual(args.dct_source_image_size, 512)
+
+    def test_transform_capability_preflight_enforces_strict_modes_before_runtime(self) -> None:
+        fixed_preview = {
+            "uses_planless_fixed_transform": False,
+            "layout": "transformed_dct_grid",
+            "image_count": 2,
+        }
+        planless_preview = {**fixed_preview, "uses_planless_fixed_transform": True}
+        fixed = _validate_transform_capability(
+            "require-fixed-items", fixed_preview, context="test"
+        )
+        self.assertEqual(fixed["observed_transform_execution"], "fixed-items")
+        auto = _validate_transform_capability("auto", fixed_preview, context="test")
+        self.assertEqual(auto["observed_transform_execution"], "fixed-items")
+        with self.assertRaisesRegex(RuntimeError, "require-planless"):
+            _validate_transform_capability("require-planless", fixed_preview, context="test")
+        with self.assertRaisesRegex(RuntimeError, "require-fixed-items"):
+            _validate_transform_capability("require-fixed-items", planless_preview, context="test")
+
+    def test_legacy_inference_pipeline_names_normalize_to_explicit_modes(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run.py",
+                "--output-dir",
+                "/tmp/galp-alias-contract-test",
+                "--pipelines",
+                "galp",
+                "galp_legacy",
+            ],
+        ):
+            args = _parse_run_args()
+        self.assertEqual(args.pipelines, ["galp_planless", "galp_fixed_items"])
+
+    def test_contract_pipeline_resolution_prefers_canonical_and_reads_legacy(self) -> None:
+        current = {
+            "pipelines": {
+                "enabled": ["galp_planless"],
+                "galp_planless": {},
+                "galp": {},
+            }
+        }
+        self.assertEqual(contract_pipeline_name(current, "galp"), "galp_planless")
+        legacy = {"pipelines": {"enabled": ["galp"], "galp": {}}}
+        self.assertEqual(contract_pipeline_name(legacy, "galp_planless"), "galp")
+        with self.assertRaisesRegex(ValueError, "no contract configuration"):
+            contract_pipeline_name(legacy, "galp_fixed_items")
 
     def test_model_stream_priority_resolves_framework_range(self) -> None:
         self.assertEqual(_resolve_model_stream_priority("greatest", (0, -3)), -3)
@@ -537,7 +674,10 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(PRESETS["e2e"]["warmup_batches"], 0)
         self.assertEqual(PRESETS["e2e"]["measurement_batches"], 1000)
         self.assertEqual(PRESETS["e2e"]["repeats"], 5)
-        self.assertEqual(E2E_PIPELINES, ("galp", "galp_legacy", "rgbnomore", "dali"))
+        self.assertEqual(
+            E2E_PIPELINES,
+            ("galp_planless", "galp_fixed_items", "rgbnomore", "dali"),
+        )
         self.assertGreater(PRESETS["e2e"]["measurement_batches"], PRESETS["smoke"]["measurement_batches"])
         self.assertEqual(GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, 1.10)
         self.assertEqual(E2E_MAX_HOT_THROUGHPUT_CV, 0.05)
@@ -683,7 +823,10 @@ class SystemBenchmarkTest(unittest.TestCase):
             )
             loaded, samples = load_sample_manifest(output, digest)
             self.assertEqual(loaded["full_dataset_size"], 3)
+            self.assertEqual(loaded["source_geometry"]["validation"], "not_enforced")
             self.assertEqual({sample["galp_image_id"] for sample in samples}, {0, 1, 2})
+            self.assertEqual({sample["image_width"] for sample in samples}, {1})
+            self.assertEqual({sample["image_height"] for sample in samples}, {1})
             self.assertTrue(all(len(sample["sha256"]) == 64 for sample in samples))
             self.assertEqual({sample["label"] for sample in samples}, {10, 20})
             self.assertEqual(payload, loaded)
@@ -695,6 +838,44 @@ class SystemBenchmarkTest(unittest.TestCase):
             os.utime(selected_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
             with self.assertRaisesRegex(ValueError, "SHA-256 changed"):
                 load_sample_manifest(output, digest)
+
+    def test_manifest_rejects_native_geometry_for_rgbnomore_512_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "imagenet"
+            path = data_root / "val/n00000001/a.JPEG"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(bytes.fromhex("ffd8ffc00011080001000103011100021100031100ffd9"))
+            self.assertEqual(jpeg_frame(path), {"width": 1, "height": 1, "sampling": "4:4:4"})
+
+            index_csv = root / "index.csv"
+            with index_csv.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=("Filepath", "Label"))
+                writer.writeheader()
+                writer.writerow({"Filepath": "val/n00000001/a.JPEG", "Label": 10})
+            label_map = root / "labels.json"
+            label_map.write_text(
+                json.dumps(
+                    {
+                        "format": "galp_rgbnomore_label_map_v1",
+                        "image_count": 1,
+                        "labels": [10],
+                        "sample_ids": ["val/n00000001/a.JPEG"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "expected every source JPEG to be 512x512"):
+                build_manifest(
+                    data_root=data_root,
+                    split="val",
+                    index_csv=index_csv,
+                    galp_label_map_json=label_map,
+                    sample_count=1,
+                    seed=7,
+                    output=root / "manifest.json",
+                    expected_image_size=512,
+                )
 
     def test_galp_identity_validation_rejects_same_label_reordering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -875,6 +1056,7 @@ class SystemBenchmarkTest(unittest.TestCase):
         adapter.module = Module()
         adapter.reader = object()
         adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
+        adapter.transform_execution_mode = "require-planless"
         adapter.device = torch.device("cpu")
         adapter.transform = None
         adapter.batch_size = 2
@@ -956,6 +1138,7 @@ class SystemBenchmarkTest(unittest.TestCase):
         adapter.module = Module()
         adapter.reader = object()
         adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
+        adapter.transform_execution_mode = "require-planless"
         adapter.device = torch.device("cpu")
         adapter.transform = None
         adapter.batch_size = 2
@@ -982,7 +1165,7 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(prefetch_calls, [[30, 31], [32, 33]])
         self.assertEqual(list(adapter.pending_batches), [])
 
-    def test_galp_legacy_adapter_uses_same_prefetch_path_and_expanded_graph(self) -> None:
+    def test_galp_fixed_items_adapter_uses_same_prefetch_path_and_expanded_graph(self) -> None:
         prefetch_calls: list[list[int]] = []
 
         class Pending:
@@ -1018,7 +1201,7 @@ class SystemBenchmarkTest(unittest.TestCase):
 
             @staticmethod
             def read_and_adapt_batch(*args, **kwargs):
-                raise AssertionError("legacy A/B must use the same prefetch path")
+                raise AssertionError("fixed-items A/B must use the same prefetch path")
 
             @staticmethod
             def _empty_totals():
@@ -1028,10 +1211,11 @@ class SystemBenchmarkTest(unittest.TestCase):
             def _accumulate_many_stats(totals, batches):
                 totals["fixed_transform_items"] += len(batches)
 
-        adapter = object.__new__(GalpLegacyAdapter)
+        adapter = object.__new__(GalpFixedItemsAdapter)
         adapter.module = Module()
         adapter.reader = object()
         adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
+        adapter.transform_execution_mode = "require-fixed-items"
         adapter.device = torch.device("cpu")
         adapter.transform = None
         adapter.batch_size = 2

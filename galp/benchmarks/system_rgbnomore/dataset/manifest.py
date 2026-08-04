@@ -57,8 +57,8 @@ def load_label_index(index_csv: Path) -> dict[str, int]:
     return labels
 
 
-def jpeg_sampling(path: Path) -> str:
-    """Return the JPEG component sampling mode without a Pillow dependency."""
+def jpeg_frame(path: Path) -> dict[str, int | str]:
+    """Return JPEG dimensions and component sampling without decoding pixels."""
     with path.open("rb") as stream:
         if stream.read(2) != b"\xff\xd8":
             raise ValueError(f"not a JPEG file: {path}")
@@ -85,30 +85,43 @@ def jpeg_sampling(path: Path) -> str:
             segment = stream.read(length - 2)
             if len(segment) < 6:
                 raise ValueError(f"short JPEG SOF segment in {path}")
+            height = int.from_bytes(segment[1:3], "big")
+            width = int.from_bytes(segment[3:5], "big")
+            if width <= 0 or height <= 0:
+                raise ValueError(f"invalid JPEG dimensions {width}x{height} in {path}")
             component_count = int(segment[5])
             if component_count == 1:
-                return "grayscale"
+                sampling = "grayscale"
+                return {"width": width, "height": height, "sampling": sampling}
             if component_count != 3 or len(segment) < 6 + 3 * component_count:
-                return f"components:{component_count}"
+                sampling = f"components:{component_count}"
+                return {"width": width, "height": height, "sampling": sampling}
             factors = []
             for component in range(component_count):
                 sampling = int(segment[6 + 3 * component + 1])
                 factors.append((sampling >> 4, sampling & 0x0F))
             y, cb, cr = factors
             if cb != cr:
-                return "mismatched_chroma"
-            if y == cb:
-                return "4:4:4"
-            if y[0] == cb[0] * 2 and y[1] == cb[1] * 2:
-                return "4:2:0"
-            if y[0] == cb[0] * 2 and y[1] == cb[1]:
-                return "4:2:2"
-            if y[0] == cb[0] and y[1] == cb[1] * 2:
-                return "4:4:0"
-            if y[0] == cb[0] * 4 and y[1] == cb[1]:
-                return "4:1:1"
-            return "unsupported"
+                sampling = "mismatched_chroma"
+            elif y == cb:
+                sampling = "4:4:4"
+            elif y[0] == cb[0] * 2 and y[1] == cb[1] * 2:
+                sampling = "4:2:0"
+            elif y[0] == cb[0] * 2 and y[1] == cb[1]:
+                sampling = "4:2:2"
+            elif y[0] == cb[0] and y[1] == cb[1] * 2:
+                sampling = "4:4:0"
+            elif y[0] == cb[0] * 4 and y[1] == cb[1]:
+                sampling = "4:1:1"
+            else:
+                sampling = "unsupported"
+            return {"width": width, "height": height, "sampling": sampling}
     raise ValueError(f"JPEG SOF marker not found: {path}")
+
+
+def jpeg_sampling(path: Path) -> str:
+    """Return the JPEG component sampling mode without a Pillow dependency."""
+    return str(jpeg_frame(path)["sampling"])
 
 
 def collect_dataset(data_root: Path, split: str, index_csv: Path) -> list[dict[str, Any]]:
@@ -126,6 +139,7 @@ def collect_dataset(data_root: Path, split: str, index_csv: Path) -> list[dict[s
         sample_id = _normalize_relative(path.relative_to(data_root).as_posix())
         if sample_id not in labels:
             raise ValueError(f"dataset file is missing from RGB-no-more index: {sample_id}")
+        frame = jpeg_frame(path)
         seen.add(sample_id)
         entries.append(
             {
@@ -134,7 +148,9 @@ def collect_dataset(data_root: Path, split: str, index_csv: Path) -> list[dict[s
                 "label": labels[sample_id],
                 "galp_image_id": galp_image_id,
                 "size_bytes": path.stat().st_size,
-                "jpeg_sampling": jpeg_sampling(path),
+                "image_width": int(frame["width"]),
+                "image_height": int(frame["height"]),
+                "jpeg_sampling": str(frame["sampling"]),
             }
         )
     missing = sorted(set(labels) - seen)
@@ -187,8 +203,31 @@ def build_manifest(
     sample_count: int,
     seed: int,
     output: Path,
+    expected_image_size: int | None = None,
 ) -> tuple[dict[str, Any], str]:
     full_entries = collect_dataset(data_root, split, index_csv)
+    if expected_image_size is not None:
+        if expected_image_size <= 0:
+            raise ValueError("expected_image_size must be positive when set")
+        mismatches = [
+            entry
+            for entry in full_entries
+            if entry["image_width"] != expected_image_size
+            or entry["image_height"] != expected_image_size
+        ]
+        if mismatches:
+            preview = ", ".join(
+                f"{entry['sample_id']}={entry['image_width']}x{entry['image_height']}"
+                for entry in mismatches[:3]
+            )
+            raise ValueError(
+                "RGB-no-more JPEG checkpoint source-geometry mismatch: "
+                f"expected every source JPEG to be {expected_image_size}x{expected_image_size} "
+                "before DCT extraction, but "
+                f"{len(mismatches)}/{len(full_entries)} differ; first: {preview}. "
+                "Resize and re-encode the ImageNet JPEGs with the RGB-no-more data preparation "
+                "before building the GALP manifest."
+            )
     eligible_entries = [entry for entry in full_entries if entry["jpeg_sampling"] in SUPPORTED_JPEG_SAMPLING]
     if sample_count <= 0 or sample_count > len(eligible_entries):
         raise ValueError(f"sample_count must be in [1,{len(eligible_entries)}], got {sample_count}")
@@ -200,6 +239,8 @@ def build_manifest(
             "label": entry["label"],
             "galp_image_id": entry["galp_image_id"],
             "size_bytes": entry["size_bytes"],
+            "image_width": entry["image_width"],
+            "image_height": entry["image_height"],
             "jpeg_sampling": entry["jpeg_sampling"],
         }
         for entry in full_entries
@@ -225,6 +266,10 @@ def build_manifest(
         "full_dataset_size": len(full_entries),
         "eligible_dataset_size": len(eligible_entries),
         "full_index_sha256": sha256_json(full_index_rows),
+        "source_geometry": {
+            "expected_square_size": expected_image_size,
+            "validation": "all_source_jpeg_sof_headers" if expected_image_size is not None else "not_enforced",
+        },
         "galp_label_map": label_map,
         "selection": {
             "algorithm": "python_random_v1_full_permutation_prefix",
@@ -251,6 +296,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--galp-label-map-json", type=Path, required=True)
     parser.add_argument("--sample-count", type=int, required=True)
     parser.add_argument("--seed", type=int, default=11997733)
+    parser.add_argument(
+        "--expected-image-size",
+        type=int,
+        help="Require every source JPEG SOF header to have this square size (512 for the published RGB-no-more checkpoints).",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -265,6 +315,7 @@ def main() -> None:
         sample_count=args.sample_count,
         seed=args.seed,
         output=args.output,
+        expected_image_size=args.expected_image_size,
     )
     print(
         json.dumps(

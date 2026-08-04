@@ -18,7 +18,74 @@ CONTRACT_SCHEMA = "galp_system_benchmark_contract_v2"
 MANIFEST_SCHEMA = "galp_system_benchmark_manifest_v2"
 RESULT_SCHEMA = "galp_system_benchmark_result_v2"
 PIPELINES = ("galp", "rgbnomore", "dali", "pytorch")
-CONTRACT_PIPELINES = PIPELINES + ("galp_legacy",)
+CANONICAL_GALP_PIPELINES = ("galp_planless", "galp_fixed_items")
+INFERENCE_PIPELINES = (CANONICAL_GALP_PIPELINES[0], "rgbnomore", "dali", "pytorch")
+PIPELINE_ALIASES = {
+    "galp": "galp_planless",
+    "galp_legacy": "galp_fixed_items",
+}
+GALP_PIPELINES = CANONICAL_GALP_PIPELINES + tuple(PIPELINE_ALIASES)
+CONTRACT_PIPELINES = INFERENCE_PIPELINES + (CANONICAL_GALP_PIPELINES[1],) + tuple(PIPELINE_ALIASES)
+TRANSFORM_EXECUTION_MODES = ("require-planless", "require-fixed-items", "auto")
+
+
+def canonical_pipeline_name(name: str) -> str:
+    return PIPELINE_ALIASES.get(name, name)
+
+
+def contract_pipeline_name(
+    contract: dict[str, Any],
+    requested: str,
+    *,
+    require_enabled: bool = True,
+) -> str:
+    """Resolve a canonical request against current or legacy contract keys.
+
+    New contracts use ``galp_planless`` and ``galp_fixed_items``.  Historical
+    contracts may instead contain ``galp`` or ``galp_legacy``; readers accept
+    those aliases without allowing them to leak into newly generated
+    contracts.
+    """
+    pipelines = contract.get("pipelines")
+    require(isinstance(pipelines, dict), "contract.pipelines must be an object")
+    enabled = pipelines.get("enabled")
+    require(isinstance(enabled, list), "contract.pipelines.enabled must be a list")
+    canonical = canonical_pipeline_name(requested)
+    aliases = tuple(
+        alias for alias, target in PIPELINE_ALIASES.items() if target == canonical
+    )
+    for candidate in (canonical, *aliases):
+        if candidate not in pipelines:
+            continue
+        if require_enabled and candidate not in enabled:
+            continue
+        return candidate
+    qualifier = "enabled " if require_enabled else ""
+    raise ValueError(
+        f"{qualifier}pipeline {requested!r} has no contract configuration; "
+        f"canonical name is {canonical!r}"
+    )
+
+
+def transform_execution_mode(config: dict[str, Any], pipeline: str) -> str:
+    """Return the explicit transform planner policy, with legacy-contract compatibility."""
+    mode = config.get("transform_execution_mode")
+    if mode is None:
+        if pipeline in ("galp_fixed_items", "galp_legacy"):
+            mode = "require-fixed-items"
+        elif pipeline in ("galp_planless", "galp"):
+            mode = (
+                "require-planless"
+                if bool(config.get("enable_planless_execution", True))
+                else "require-fixed-items"
+            )
+    require(mode in TRANSFORM_EXECUTION_MODES, f"unsupported transform_execution_mode for {pipeline}: {mode!r}")
+    return str(mode)
+
+
+def transform_mode_enables_planless(mode: str) -> bool:
+    require(mode in TRANSFORM_EXECUTION_MODES, f"unsupported transform_execution_mode: {mode!r}")
+    return mode != "require-fixed-items"
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -128,8 +195,10 @@ def galp_manifest_payloads(manifest_path: Path) -> list[dict[str, Any]]:
     (shard_count,) = take("<I")
     root = manifest_path.parent
     payloads: list[dict[str, Any]] = []
+    shard_ids: list[int] = []
     for _ in range(shard_count):
-        take("<IQIQQQII")
+        shard_id = take("<IQIQQQII")[0]
+        shard_ids.append(shard_id)
         fls_size, metadata_size = take("<QQ")
         fls_name = take_string()
         metadata_name = take_string()
@@ -157,6 +226,33 @@ def galp_manifest_payloads(manifest_path: Path) -> list[dict[str, Any]]:
                     "path": bundle_path,
                     "expected_size": bundle_path.stat().st_size,
                 }
+            )
+    if offset < len(data):
+        extension_magic = b"GJDCCV31"
+        require(
+            offset + len(extension_magic) <= len(data),
+            f"truncated GALP Compact-v3 manifest extension: {manifest_path}",
+        )
+        require(
+            data[offset : offset + len(extension_magic)] == extension_magic,
+            f"unexpected GALP shard manifest extension: {manifest_path}",
+        )
+        offset += len(extension_magic)
+        take_string()  # physical layout
+        take_string()  # descriptor kind
+        take("<I")  # vector size
+        take_string()  # spatial order name
+        take("<H")  # spatial order id
+        (extension_shard_count,) = take("<I")
+        require(
+            extension_shard_count == shard_count,
+            f"GALP Compact-v3 extension shard count mismatch: {manifest_path}",
+        )
+        for expected_shard_id in shard_ids:
+            shard_id, _, _, _, _ = take("<IQQQQ")
+            require(
+                shard_id == expected_shard_id,
+                f"GALP Compact-v3 extension shard id mismatch: {manifest_path}",
             )
     require(offset == len(data), f"GALP shard manifest has trailing bytes: {manifest_path}")
     return payloads
@@ -243,9 +339,22 @@ def load_contract(path: Path) -> dict[str, Any]:
     require(isinstance(configured, list) and configured, "pipelines.enabled must be a non-empty list")
     require(len(set(configured)) == len(configured), "pipelines.enabled contains duplicates")
     require(all(item in CONTRACT_PIPELINES for item in configured), f"pipelines.enabled must be a subset of {CONTRACT_PIPELINES}")
-    if "galp" in configured:
-        galp = payload["pipelines"].get("galp")
-        require(isinstance(galp, dict), "pipelines.galp must be an object")
+    for pipeline in configured:
+        if pipeline not in GALP_PIPELINES:
+            continue
+        galp = payload["pipelines"].get(pipeline)
+        require(isinstance(galp, dict), f"pipelines.{pipeline} must be an object")
+        mode = transform_execution_mode(galp, pipeline)
+        if pipeline in ("galp_planless", "galp_fixed_items"):
+            require(
+                "transform_execution_mode" in galp,
+                f"pipelines.{pipeline}.transform_execution_mode must be explicit",
+            )
+        if "enable_planless_execution" in galp and mode != "auto":
+            require(
+                bool(galp["enable_planless_execution"]) == transform_mode_enables_planless(mode),
+                f"pipelines.{pipeline}.enable_planless_execution contradicts transform_execution_mode",
+            )
         require(isinstance(galp.get("manifest_fingerprint"), dict), "GALP manifest fingerprint is missing")
         fingerprints = galp.get("payload_fingerprints")
         require(isinstance(fingerprints, list) and fingerprints, "GALP payload fingerprints are missing")

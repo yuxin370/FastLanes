@@ -19,7 +19,7 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from shared.common import (
-    PIPELINES,
+    GALP_PIPELINES,
     RESULT_SCHEMA,
     distribution,
     finite_number,
@@ -30,6 +30,7 @@ from shared.common import (
     sha256_file,
     sha256_json,
     source_tree_metadata,
+    transform_execution_mode,
     write_json,
 )
 
@@ -90,6 +91,57 @@ def _validate_crop_pushdown_accounting(
         )
 
 
+def _validate_planless_structural_accounting(
+    counters: dict[str, Any],
+    *,
+    manifest_version: int,
+    expected_images: int,
+    expected_batches: int,
+    gate: dict[str, Any],
+    label: str,
+    failures: list[str],
+) -> None:
+    minimum_version = int(gate.get("image_major_manifest_minimum_version", 2))
+    if manifest_version < minimum_version:
+        return
+
+    if manifest_version >= 3:
+        # Manifest-v3 stores one independently addressable rowgroup per
+        # FastLanes vector. Images can therefore have different rowgroup counts
+        # depending on dimensions and JPEG sampling; there is no valid fixed
+        # rowgroups-per-image expectation. The runtime must instead report one
+        # touched rowgroup for every selected/decoded vector.
+        actual_vectors = int(counters.get("actual_vector_count", -1))
+        rowgroups = int(counters.get("rowgroups", -1))
+        _require(
+            actual_vectors > 0 and rowgroups == actual_vectors,
+            failures,
+            f"{label}: rowgroups={counters.get('rowgroups')}; expected "
+            f"actual_vector_count={counters.get('actual_vector_count')} for manifest-v3",
+        )
+    else:
+        expected_rowgroups = expected_images * int(
+            gate.get("manifest_v2_rowgroups_per_image", gate.get("rowgroups_per_image", 1))
+        )
+        _require(
+            int(counters.get("rowgroups", -1)) == expected_rowgroups,
+            failures,
+            f"{label}: rowgroups={counters.get('rowgroups')}; expected {expected_rowgroups}",
+        )
+
+    structural_expectations = {
+        "worksets": expected_batches * int(gate.get("worksets_per_batch", 1)),
+        "internal_syncs": expected_batches * int(gate.get("internal_syncs_per_batch", 1)),
+        "decode_kernels": expected_batches * int(gate.get("decode_kernels_per_batch", 1)),
+    }
+    for counter, expected in structural_expectations.items():
+        _require(
+            int(counters.get(counter, -1)) == expected,
+            failures,
+            f"{label}: {counter}={counters.get(counter)}; expected {expected}",
+        )
+
+
 def _load_result(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -113,7 +165,7 @@ def _validate_pipeline_result(
         failures,
         f"{label}: sample manifest hash mismatch",
     )
-    expected_domain = "dct" if pipeline in ("galp", "galp_legacy", "rgbnomore") else "rgb"
+    expected_domain = "dct" if pipeline in GALP_PIPELINES or pipeline == "rgbnomore" else "rgb"
     _require(payload.get("domain") == expected_domain, failures, f"{label}: expected domain {expected_domain}")
     _require(payload.get("execution") == contract["execution"], failures, f"{label}: execution contract mismatch")
     model = payload.get("model", {})
@@ -184,14 +236,20 @@ def _validate_pipeline_result(
         _require(isinstance(native_counters, dict), failures, f"{record_label}: native counters missing")
         native_properties = record.get("native_properties")
         _require(isinstance(native_properties, dict), failures, f"{record_label}: native properties missing")
-        if pipeline == "galp" and contract["pipelines"]["galp"]["preprocess"] == "rgbnomore-val-pushdown":
-            if isinstance(native_counters, dict):
-                _validate_crop_pushdown_accounting(
-                    native_counters,
-                    native_properties if isinstance(native_properties, dict) else {},
-                    record_label,
-                    failures,
-                )
+        if (
+            pipeline in GALP_PIPELINES
+            and contract["pipelines"][pipeline]["preprocess"] == "rgbnomore-val-pushdown"
+            and isinstance(native_counters, dict)
+        ):
+            config = contract["pipelines"][pipeline]
+            mode = transform_execution_mode(config, pipeline)
+            _validate_crop_pushdown_accounting(
+                native_counters,
+                native_properties if isinstance(native_properties, dict) else {},
+                record_label,
+                failures,
+            )
+            if mode == "require-planless":
                 _require(
                     int(native_counters.get("fixed_transform_items", -1)) == 0
                     and int(native_counters.get("planless_image_descriptors", 0)) == expected_images
@@ -240,22 +298,20 @@ def _validate_pipeline_result(
                     failures,
                     f"{record_label}: generic projection fallback was used",
                 )
-                gate = contract.get("performance_gates", {}).get("galp", {})
-                manifest_version = int(contract["pipelines"]["galp"].get("manifest_version", 1))
-                if manifest_version >= int(gate.get("image_major_manifest_minimum_version", 2)):
-                    expected_batches = int(contract["execution"]["measurement_batches"])
-                    structural_expectations = {
-                        "rowgroups": expected_images * int(gate.get("rowgroups_per_image", 1)),
-                        "worksets": expected_batches * int(gate.get("worksets_per_batch", 1)),
-                        "internal_syncs": expected_batches * int(gate.get("internal_syncs_per_batch", 1)),
-                        "decode_kernels": expected_batches * int(gate.get("decode_kernels_per_batch", 1)),
-                    }
-                    for counter, expected in structural_expectations.items():
-                        _require(
-                            int(native_counters.get(counter, -1)) == expected,
-                            failures,
-                            f"{record_label}: {counter}={native_counters.get(counter)}; expected {expected}",
-                        )
+                gate = contract.get("performance_gates", {}).get(
+                    "galp_planless",
+                    contract.get("performance_gates", {}).get("galp", {}),
+                )
+                manifest_version = int(config.get("manifest_version", 1))
+                _validate_planless_structural_accounting(
+                    native_counters,
+                    manifest_version=manifest_version,
+                    expected_images=expected_images,
+                    expected_batches=int(contract["execution"]["measurement_batches"]),
+                    gate=gate,
+                    label=record_label,
+                    failures=failures,
+                )
                 native_per_batch = record.get("stage_breakdown_ms", {}).get("native_per_batch_ms", {})
                 stage_gates = (
                     ("planning_seconds", "p50", gate.get("planning_median_ms_max")),
@@ -283,29 +339,25 @@ def _validate_pipeline_result(
                         f"{record_label}: {stage} per-batch distribution is incomplete",
                     )
 
-        if (
-            pipeline == "galp_legacy"
-            and contract["pipelines"]["galp_legacy"]["preprocess"] == "rgbnomore-val-pushdown"
-            and isinstance(native_counters, dict)
-        ):
-            _require(
-                int(native_counters.get("planless_image_descriptors", -1)) == 0
-                and int(native_counters.get("fixed_transform_items", 0)) > 0
-                and int(native_counters.get("host_expanded_transform_items_created", 0)) > 0
-                and int(native_counters.get("host_global_transform_sort_items", 0)) > 0,
-                failures,
-                f"{record_label}: legacy A/B expanded-graph structural counters failed",
-            )
-            _require(
-                int(native_counters.get("exact_batch_plan_cache_enabled_batches", -1)) == 0,
-                failures,
-                f"{record_label}: legacy A/B exact-batch cache must remain disabled",
-            )
-            _require(
-                int(native_counters.get("decoded_rowgroup_cache_enabled_batches", -1)) == 0,
-                failures,
-                f"{record_label}: legacy A/B decoded-rowgroup cache must remain disabled",
-            )
+            elif mode == "require-fixed-items":
+                _require(
+                    int(native_counters.get("planless_image_descriptors", -1)) == 0
+                    and int(native_counters.get("fixed_transform_items", 0)) > 0
+                    and int(native_counters.get("host_expanded_transform_items_created", 0)) > 0
+                    and int(native_counters.get("host_global_transform_sort_items", 0)) > 0,
+                    failures,
+                    f"{record_label}: fixed-items transformed-grid structural counters failed",
+                )
+                _require(
+                    int(native_counters.get("exact_batch_plan_cache_enabled_batches", -1)) == 0,
+                    failures,
+                    f"{record_label}: fixed-items exact-batch cache must remain disabled",
+                )
+                _require(
+                    int(native_counters.get("decoded_rowgroup_cache_enabled_batches", -1)) == 0,
+                    failures,
+                    f"{record_label}: fixed-items decoded-rowgroup cache must remain disabled",
+                )
 
 
 def _array_diff(expected: np.ndarray, actual: np.ndarray) -> dict[str, Any]:
@@ -485,10 +537,21 @@ def _aggregate_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
 def _evaluate_performance_gates(
     contract: dict[str, Any], aggregates: Sequence[dict[str, Any]], failures: list[str]
 ) -> list[dict[str, Any]]:
-    configured = contract.get("performance_gates", {}).get("galp", {})
-    if "galp" not in contract["pipelines"]["enabled"]:
+    planless_pipeline = next(
+        (
+            name
+            for name in ("galp_planless", "galp")
+            if name in contract["pipelines"]["enabled"]
+        ),
+        None,
+    )
+    if planless_pipeline is None:
         return []
-    galp = next((item for item in aggregates if item["pipeline"] == "galp"), None)
+    configured = contract.get("performance_gates", {}).get(
+        planless_pipeline,
+        contract.get("performance_gates", {}).get("galp", {}),
+    )
+    galp = next((item for item in aggregates if item["pipeline"] == planless_pipeline), None)
     if galp is None:
         return []
     dali = next((item for item in aggregates if item["pipeline"] == "dali"), None)
@@ -499,7 +562,7 @@ def _evaluate_performance_gates(
             failures.append(message)
         gates.append(
             {
-                "pipeline": "galp",
+                "pipeline": planless_pipeline,
                 "metric": metric,
                 "target": target,
                 "actual": actual,
@@ -517,7 +580,7 @@ def _evaluate_performance_gates(
             actual,
             target,
             actual >= target,
-            f"pipeline galp: median throughput {actual:.3f} img/s is below required {target:.3f} img/s",
+            f"pipeline {planless_pipeline}: median throughput {actual:.3f} img/s is below required {target:.3f} img/s",
             ">=",
         )
 
@@ -535,7 +598,7 @@ def _evaluate_performance_gates(
             actual,
             target,
             actual >= target,
-            f"pipeline galp: hot median ratio to same-round DALI {actual:.4f} is below {target:.4f}",
+            f"pipeline {planless_pipeline}: hot median ratio to same-round DALI {actual:.4f} is below {target:.4f}",
             ">=",
         )
 
@@ -547,14 +610,14 @@ def _evaluate_performance_gates(
             actual,
             target,
             actual > target,
-            f"pipeline galp: hot minimum {actual:.3f} img/s does not exceed DALI hot median {target:.3f} img/s",
+            f"pipeline {planless_pipeline}: hot minimum {actual:.3f} img/s does not exceed DALI hot median {target:.3f} img/s",
             ">",
         )
 
     cv_maximum = configured.get("maximum_hot_throughput_cv")
     if cv_maximum is not None:
         target = float(cv_maximum)
-        for pipeline_name, aggregate in (("galp", galp), ("dali", dali)):
+        for pipeline_name, aggregate in ((planless_pipeline, galp), ("dali", dali)):
             actual = (
                 float(aggregate["throughput_images_per_s"].get("cv_population", math.inf))
                 if aggregate is not None
@@ -769,9 +832,14 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
     performance_gates = _evaluate_performance_gates(contract, aggregates, failures)
 
     architecture_ab: dict[str, Any] | None = None
-    if "galp" in results and "galp_legacy" in results:
-        planless_aggregate = next(item for item in aggregates if item["pipeline"] == "galp")
-        legacy_aggregate = next(item for item in aggregates if item["pipeline"] == "galp_legacy")
+    planless_name = next((name for name in ("galp_planless", "galp") if name in results), None)
+    fixed_items_name = next(
+        (name for name in ("galp_fixed_items", "galp_legacy") if name in results),
+        None,
+    )
+    if planless_name is not None and fixed_items_name is not None:
+        planless_aggregate = next(item for item in aggregates if item["pipeline"] == planless_name)
+        fixed_items_aggregate = next(item for item in aggregates if item["pipeline"] == fixed_items_name)
 
         def hot_stage_distribution(pipeline: str, stage: str, statistic: str) -> dict[str, Any]:
             indices = set(
@@ -789,26 +857,28 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
             return distribution(values)
 
         planless_throughput = float(planless_aggregate["throughput_images_per_s"]["p50"])
-        legacy_throughput = float(legacy_aggregate["throughput_images_per_s"]["p50"])
+        fixed_items_throughput = float(fixed_items_aggregate["throughput_images_per_s"]["p50"])
         architecture_ab = {
-            "pipelines": ["galp", "galp_legacy"],
+            "pipelines": [planless_name, fixed_items_name],
             "same_contract_except_execution_representation": True,
-            "shared_native_binary_sha256": contract["pipelines"]["galp"]["native_binary_fingerprint"]["sha256"],
+            "shared_native_binary_sha256": contract["pipelines"][planless_name]["native_binary_fingerprint"]["sha256"],
             "semantic_classification": (
                 "strict"
-                if semantic_by_pair.get(("galp", "galp_legacy"), {}).get("ok", False)
+                if semantic_by_pair.get((planless_name, fixed_items_name), {}).get("ok", False)
                 else "unproven"
             ),
             "planless_hot_median_throughput_images_per_s": planless_throughput,
-            "legacy_hot_median_throughput_images_per_s": legacy_throughput,
-            "planless_to_legacy_hot_median_speedup": (
-                planless_throughput / legacy_throughput if legacy_throughput > 0.0 else math.inf
+            "fixed_items_hot_median_throughput_images_per_s": fixed_items_throughput,
+            "planless_to_fixed_items_hot_median_speedup": (
+                planless_throughput / fixed_items_throughput
+                if fixed_items_throughput > 0.0
+                else math.inf
             ),
             "planless_planning_p50_ms_across_hot_repeats": hot_stage_distribution(
-                "galp", "planning_seconds", "p50"
+                planless_name, "planning_seconds", "p50"
             ),
-            "legacy_planning_p50_ms_across_hot_repeats": hot_stage_distribution(
-                "galp_legacy", "planning_seconds", "p50"
+            "fixed_items_planning_p50_ms_across_hot_repeats": hot_stage_distribution(
+                fixed_items_name, "planning_seconds", "p50"
             ),
         }
 
@@ -827,12 +897,15 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
     comparability = [
         {
             "pair": "GALP vs RGB-no-more",
-            "classification": classification("galp", "rgbnomore"),
+            "classification": classification(planless_name or "galp_planless", "rgbnomore"),
             "reason": "Same canonical samples/order/labels, DCT preprocessing contract, architecture, DCT checkpoint and precision; tensors/logits are validated numerically.",
         },
         {
-            "pair": "GALP planless vs GALP legacy",
-            "classification": classification("galp", "galp_legacy"),
+            "pair": "GALP planless vs GALP fixed-items",
+            "classification": classification(
+                planless_name or "galp_planless",
+                fixed_items_name or "galp_fixed_items",
+            ),
             "reason": "Same compressed data, sample order, model, checkpoint, precision, cache/prefetch contract, and native binary; only the execution-representation switch differs.",
         },
         {

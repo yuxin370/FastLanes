@@ -9,21 +9,25 @@ PYTHONPATH=build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   galp/benchmarks/system_rgbnomore/inference/run.py \
   --preset e2e \
-  --pipelines galp galp_legacy rgbnomore dali \
+  --pipelines galp_planless galp_fixed_items rgbnomore dali \
   --output-dir /tmp/galp-e2e \
-  --data-root galp/data/system_rgbnomore/e2e_v2/imagenet \
+  --data-root galp/data/system_rgbnomore/e2e_v3/imagenet_512 \
   --index-csv galp/data/system_rgbnomore/e2e_v2/indexbase_val.csv \
   --rgb-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth \
   --dct-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth \
-  --galp-manifest galp/data/system_rgbnomore/e2e_v2/dct/manifest.bin \
-  --galp-label-map-json galp/data/system_rgbnomore/e2e_v2/dct/labels.json \
+  --galp-manifest galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/manifest.bin \
+  --galp-label-map-json galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
   --torch-binding-dir build/galp/torch \
   --refresh-galp-payload-fingerprints
 ```
 
-该命令固定使用 `galp/data/system_rgbnomore/e2e_v2` 中配套的 JPEG、manifest v2、
-label sidecar、index 和 checkpoints，避免混用不同数据生成批次。benchmark 实现、
-contract、pipeline 和校验仍全部位于本 benchmark 目录中。
+发布的 RGB-no-more JPEG-Ti checkpoint 在预先双线性 resize 并重新编码为
+`512×512` JPEG 的 ImageNet 上训练；直接压缩原始非方形 JPEG 会改变 checkpoint 的
+输入数据语义。正式 runner 默认以 `--dct-source-image-size 512` 扫描所有 JPEG SOF
+头并硬性拒绝这种混用。`e2e_v2` 继续提供 index 和 checkpoints；正确的 JPEG 与
+Compact-v3 manifest 写在 `e2e_v3/imagenet_512` 和
+`e2e_v3/compact_v3_tiled_z32_rgbnomore512`。只有自定义 checkpoint/recipe 才能显式
+传 `--dct-source-image-size 0` 关闭这个检查。
 
 这套 benchmark 只测完整推理路径，不再把 loader、forward-only、kernel
 或训练 step 和端到端数据放在同一张对比表中。旧的独立 RGB/DCT/DALI
@@ -52,14 +56,15 @@ A/B 模式和验收命令见
 
 | Pipeline | 输入域 | 数据路径 | 模型 |
 | --- | --- | --- | --- |
-| `galp` | JPEG DCT | GALP sharded Direct-DCT、融合 transformed-grid pushdown、有界有序 batch prefetch | RGB-no-more JPEG-Ti |
+| `galp_planless` | JPEG DCT | GALP sharded Direct-DCT、要求 planless transformed-grid、有界有序 batch prefetch | RGB-no-more JPEG-Ti |
+| `galp_fixed_items` | JPEG DCT | 同一 GALP 存储与 transform，强制 fixed-item planner | RGB-no-more JPEG-Ti |
 | `rgbnomore` | JPEG DCT | RGB-no-more 原生 DCT reader 与验证变换 | 同一 DCT checkpoint |
 | `dali` | RGB | DALI file reader、mixed JPEG decode、GPU resize/crop/normalize | RGB-no-more RGB ViT-Ti |
 | `pytorch` | RGB | canonical manifest、PyTorch DataLoader、RGB-no-more 验证变换 | 同一 RGB checkpoint |
 
 这四条路径覆盖两组有意义的对比：
 
-- `galp` 与 `rgbnomore`：相同 DCT 模型、checkpoint、样本和语义；
+- `galp_planless` 与 `rgbnomore`：相同 DCT 模型、checkpoint、样本和语义；
 - `dali` 与 `pytorch`：相同 RGB 模型、checkpoint、样本和高层预处理契约。
 
 DCT 与 RGB 使用输入域专用 checkpoint，只做系统级参考，不做逐元素跨域比较。
@@ -104,8 +109,9 @@ DCT 与 RGB 使用输入域专用 checkpoint，只做系统级参考，不做逐
 - `manifest.bin` 引用的每个 FLS/metadata payload 摘要；
 - 语义阈值和计时边界。
 
-GALP 正式路径默认使用 `rgbnomore-val-pushdown`。运行时强制检查融合
-transformed-grid 路径被使用，并拒绝 generic projection fallback。
+GALP 正式路径默认使用 `rgbnomore-val-pushdown`。contract 显式记录
+`transform_execution_mode`；adapter 在任何 GPU batch 前通过 native `plan_batch`
+完成 capability preflight，严格模式不允许静默回退。
 
 大文件摘要在数据准备或显式 `--refresh-galp-payload-fingerprints` 时只生成一次，
 并缓存于 `manifest.bin.payload_fingerprints.json`。正式 benchmark 默认只做
@@ -140,14 +146,14 @@ PYTHONPATH=build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   galp/benchmarks/system_rgbnomore/inference/run.py \
   --preset e2e \
-  --pipelines galp galp_legacy rgbnomore dali \
+  --pipelines galp_planless galp_fixed_items rgbnomore dali \
   --output-dir /tmp/galp-system-e2e \
-  --data-root galp/data/system_rgbnomore/e2e_v2/imagenet \
+  --data-root galp/data/system_rgbnomore/e2e_v3/imagenet_512 \
   --index-csv galp/data/system_rgbnomore/e2e_v2/indexbase_val.csv \
   --rgb-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth \
   --dct-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth \
-  --galp-manifest galp/data/system_rgbnomore/e2e_v2/dct/manifest.bin \
-  --galp-label-map-json galp/data/system_rgbnomore/e2e_v2/dct/labels.json \
+  --galp-manifest galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/manifest.bin \
+  --galp-label-map-json galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
   --torch-binding-dir build/galp/torch \
   --refresh-galp-payload-fingerprints
 ```
@@ -157,7 +163,7 @@ PYTHONPATH=build/galp/torch \
 ```bash
 python3 galp/benchmarks/system_rgbnomore/inference/run.py \
   --preset e2e \
-  --pipelines galp rgbnomore \
+  --pipelines galp_planless rgbnomore \
   --output-dir /tmp/galp-dct-e2e
 ```
 
@@ -213,6 +219,19 @@ python3 galp/benchmarks/system_rgbnomore/inference/run.py \
 `--execution-mode runtime`。mode 会写入 contract、commands、pipeline 和 results，resume
 不能跨 mode。runtime loader 诊断和当前环境限制见
 [`docs/TRAINING_RUNTIME_BOTTLENECK_REPORT_2026-07-21.md`](docs/TRAINING_RUNTIME_BOTTLENECK_REPORT_2026-07-21.md)。
+
+正式四路 benchmark 使用 RGB-no-more 512×512 输入数据和官方独立 train/val split：
+
+- JPEG：`e2e_v3/imagenet_512/{train,val}`；
+- GALP train：`e2e_v3/compact_v3_tiled_z32_rgbnomore512_train/manifest.bin`；
+- GALP validation：`e2e_v3/compact_v3_tiled_z32_rgbnomore512/manifest.bin`；
+- benchmark JSON：`e2e_v3/training_manifests_official_v3/{train,val}.json`。
+
+runner 中 `--galp-manifest` 指向 train，`--galp-validation-manifest` 指向 validation。
+省略后者会复用 train manifest，只适用于从同一 population 切分的旧 canary，不能用于
+官方 validation accuracy。
+`e2e_v3` 的生产保留集合、前置验收和可恢复隔离步骤见
+[`docs/E2E_V3_DATA_CLEANUP.md`](docs/E2E_V3_DATA_CLEANUP.md)。
 
 ```bash
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \

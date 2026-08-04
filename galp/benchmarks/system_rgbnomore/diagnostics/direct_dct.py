@@ -758,6 +758,21 @@ def _accumulate_stats(totals: dict[str, int | float | str], batch: Any) -> None:
     totals["vector_bundle_pread_count"] += int(stats.get("vector_bundle_pread_count", 0))
     totals["pinned_rowgroup_read_count"] += int(stats.get("pinned_rowgroup_read_count", 0))
     totals["pinned_rowgroup_read_bytes"] += int(stats.get("pinned_rowgroup_read_bytes", 0))
+    for key in (
+        "compact_batch_buffer_acquire_count",
+        "compact_batch_buffer_growth_count",
+        "compact_batch_buffer_reuse_count",
+        "compact_batch_buffer_requested_bytes",
+        "compact_batch_buffer_capacity_bytes",
+        "compact_batch_buffer_pageable_fallback_count",
+        "compact_batch_read_group_count",
+    ):
+        totals[key] += int(stats.get(key, 0))
+    for key in (
+        "compact_batch_buffer_high_water_bytes",
+        "compact_batch_read_worker_count",
+    ):
+        totals[key] = max(int(totals[key]), int(stats.get(key, 0)))
     totals["requested_source_block_count"] += int(
         stats.get("requested_source_block_count", stats.get("fixed_transform_source_block_count", 0))
     )
@@ -912,6 +927,15 @@ def _empty_totals() -> dict[str, int | float | str]:
         "vector_bundle_pread_count": 0,
         "pinned_rowgroup_read_count": 0,
         "pinned_rowgroup_read_bytes": 0,
+        "compact_batch_buffer_acquire_count": 0,
+        "compact_batch_buffer_growth_count": 0,
+        "compact_batch_buffer_reuse_count": 0,
+        "compact_batch_buffer_requested_bytes": 0,
+        "compact_batch_buffer_capacity_bytes": 0,
+        "compact_batch_buffer_high_water_bytes": 0,
+        "compact_batch_buffer_pageable_fallback_count": 0,
+        "compact_batch_read_group_count": 0,
+        "compact_batch_read_worker_count": 0,
         "requested_source_block_count": 0,
         "source_blocks_transformed": 0,
         "sparse_read_supported_batches": 0,
@@ -1236,27 +1260,43 @@ def read_and_adapt_batch(
     return input_y, input_cbcr, [batch]
 
 
-def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: list[int]) -> Any:
-    return reader.prefetch_batch(
-        image_ids,
-        crop=None,
-        dct_coeffs="all",
-        cache_capacity_mib=args.cache_capacity_mib,
-        decode_batch_rowgroups=int(getattr(args, "decode_batch_rowgroups", 2)),
-        rowgroup_prefetch_depth=int(getattr(args, "rowgroup_prefetch_depth", 16)),
-        rowgroup_prefetch_workers=int(getattr(args, "rowgroup_prefetch_workers", 4)),
-        rowgroup_prefetch_min_decode_batches=int(
+def _pushdown_batch_arguments(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "crop": None,
+        "dct_coeffs": "all",
+        "cache_capacity_mib": args.cache_capacity_mib,
+        "decode_batch_rowgroups": int(getattr(args, "decode_batch_rowgroups", 2)),
+        "rowgroup_prefetch_depth": int(getattr(args, "rowgroup_prefetch_depth", 16)),
+        "rowgroup_prefetch_workers": int(getattr(args, "rowgroup_prefetch_workers", 4)),
+        "rowgroup_prefetch_min_decode_batches": int(
             getattr(args, "rowgroup_prefetch_min_decode_batches", 2)
         ),
-        plan_cache_capacity=int(getattr(args, "plan_cache_capacity", 128)),
-        enable_planless_execution=bool(getattr(args, "enable_planless_execution", True)),
-        scheduling_policy=str(getattr(args, "scheduling_policy", "fully-overlapped")),
-        transform_blocks_per_launch=int(getattr(args, "transform_blocks_per_launch", 0)),
-        transform_ctas_per_launch=int(getattr(args, "transform_ctas_per_launch", 0)),
-        use_low_priority_streams=bool(getattr(args, "use_low_priority_streams", False)),
-        crop_execution_mode=str(getattr(args, "crop_execution_mode", "auto")),
-        layout="transformed_dct_grid",
-        grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32,
+        "plan_cache_capacity": int(getattr(args, "plan_cache_capacity", 128)),
+        "enable_planless_execution": bool(getattr(args, "enable_planless_execution", True)),
+        "crop_execution_mode": str(getattr(args, "crop_execution_mode", "auto")),
+        "layout": "transformed_dct_grid",
+        "grid_transform": RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32,
+    }
+
+
+def _plan_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: list[int]) -> dict[str, Any]:
+    """Compile the exact production request without staging storage or launching CUDA work."""
+    return dict(reader.plan_batch(image_ids, **_pushdown_batch_arguments(args)))
+
+
+def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: list[int]) -> Any:
+    arguments = _pushdown_batch_arguments(args)
+    arguments.update(
+        {
+            "scheduling_policy": str(getattr(args, "scheduling_policy", "fully-overlapped")),
+            "transform_blocks_per_launch": int(getattr(args, "transform_blocks_per_launch", 0)),
+            "transform_ctas_per_launch": int(getattr(args, "transform_ctas_per_launch", 0)),
+            "use_low_priority_streams": bool(getattr(args, "use_low_priority_streams", False)),
+        }
+    )
+    return reader.prefetch_batch(
+        image_ids,
+        **arguments,
     )
 
 

@@ -527,6 +527,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more"))
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument(
+        "--image-ids",
+        type=int,
+        nargs="+",
+        help="Validate these exact manifest image ids as one batch instead of generated step batches.",
+    )
     parser.add_argument("--cache-capacity-mib", type=int, default=1024)
     parser.add_argument("--tolerance", type=int, default=1)
     parser.add_argument("--jpeg-tool", type=Path, default=DEFAULT_JPEG_TOOL)
@@ -551,8 +557,21 @@ def main() -> None:
     transform = _build_rgbnomore_val_crop_transform(args.rgbnomore_root)
     results: list[dict[str, Any]] = []
 
-    for step in range(args.steps):
-        image_ids = _make_image_ids(step, args.batch_size, int(reader.image_count))
+    if args.image_ids is not None:
+        image_ids = [int(image_id) for image_id in args.image_ids]
+        if len(set(image_ids)) != len(image_ids):
+            raise ValueError("--image-ids must not contain duplicates")
+        invalid = [image_id for image_id in image_ids if image_id < 0 or image_id >= int(reader.image_count)]
+        if invalid:
+            raise ValueError(f"--image-ids outside [0,{int(reader.image_count)}): {invalid}")
+        step_image_ids = [image_ids]
+    else:
+        step_image_ids = [
+            _make_image_ids(step, args.batch_size, int(reader.image_count))
+            for step in range(args.steps)
+        ]
+
+    for step, image_ids in enumerate(step_image_ids):
         modes = {image_id: _component_mode(reader, image_id) for image_id in image_ids}
         sampling_modes = {image_id: _sampling_mode(reader, image_id) for image_id in image_ids}
         supported_color_ids = [
@@ -721,6 +740,7 @@ def main() -> None:
         "rgbnomore_root": str(args.rgbnomore_root),
         "batch_size": args.batch_size,
         "steps": args.steps,
+        "requested_image_ids": args.image_ids,
         "tolerance": args.tolerance,
         "synthetic_fixtures": not args.skip_synthetic_fixtures,
         "synthetic_fixture_dir": str(args.synthetic_fixture_dir),

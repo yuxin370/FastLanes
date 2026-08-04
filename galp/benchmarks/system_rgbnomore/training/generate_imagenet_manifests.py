@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Generate disjoint train/validation JSON files for the training benchmark.
 
-The current four-pipeline runner accepts one GALP manifest.  This generator
-therefore selects both splits from the JPEG population used to create that
-manifest, preserving the original sorted-path GALP image IDs.  The validation
-split is a deterministic held-out subset of ImageNet train, not official
-ImageNet validation accuracy.
+Two modes are supported:
+
+* legacy held-out mode uses one JPEG/GALP population and deterministically
+  splits it into train/validation subsets;
+* official-split mode accepts independent ImageNet train and validation JPEG
+  roots plus their independent GALP manifests.  This is the production mode
+  that matches RGB-no-more training/evaluation dataset semantics.
+
+In both modes ``galp_image_id`` is the sorted-path ordinal in the corresponding
+GALP manifest, never a cross-manifest global ID.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from dataset.manifest import jpeg_sampling
+from training.manifest_preflight import preflight_manifest
 
 
 JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe"}
@@ -78,13 +84,9 @@ def _collect_jpegs(jpeg_root: Path) -> list[Path]:
 
 
 def _galp_image_count(manifest: Path) -> int:
-    data = manifest.read_bytes()[:30]
-    if len(data) < 30 or data[:8] != b"GJDCTSH1":
-        raise ValueError(f"unexpected GALP shard manifest format: {manifest}")
-    _version, _reserved, _rowgroup_vectors, _rowgroups_per_shard, image_count = struct.unpack_from(
-        "<IHIIQ", data, 8
-    )
-    return int(image_count)
+    # Manifest-envelope knowledge is centralized in manifest_preflight.  This
+    # generator only consumes its stable semantic result.
+    return preflight_manifest(manifest).image_count
 
 
 def _selection_sha256(indices: Sequence[int]) -> str:
@@ -147,6 +149,58 @@ def _select_indices(
     return train_indices, val_indices, selected_sampling
 
 
+def _select_split_indices(
+    paths: Sequence[Path], *, count: int, seed: int, split: str
+) -> tuple[list[int], dict[int, str]]:
+    """Select one independent split while preserving manifest-local IDs."""
+
+    if count < 0:
+        raise ValueError(f"{split}-count must be non-negative; use 0 for all samples")
+    population = len(paths)
+    if count > population:
+        raise ValueError(
+            f"{split}-count {count} exceeds the {population}-image population"
+        )
+    if count == 0:
+        indices = list(range(population))
+        sampling = {image_id: jpeg_sampling(paths[image_id]) for image_id in indices}
+        unsupported = [
+            image_id
+            for image_id, mode in sampling.items()
+            if mode not in SUPPORTED_JPEG_SAMPLING
+        ]
+        if unsupported:
+            preview = ", ".join(
+                f"{paths[image_id]}={sampling[image_id]}" for image_id in unsupported[:5]
+            )
+            raise ValueError(
+                f"official {split} split contains {len(unsupported)} JPEGs outside "
+                f"the supported sampling contract {sorted(SUPPORTED_JPEG_SAMPLING)}; "
+                f"first: {preview}"
+            )
+        return indices, sampling
+
+    rng = random.Random(seed)
+    indices: list[int] = []
+    sampling: dict[int, str] = {}
+    seen: set[int] = set()
+    while len(indices) < count and len(seen) < population:
+        image_id = rng.randrange(population)
+        if image_id in seen:
+            continue
+        seen.add(image_id)
+        mode = jpeg_sampling(paths[image_id])
+        sampling[image_id] = mode
+        if mode in SUPPORTED_JPEG_SAMPLING:
+            indices.append(image_id)
+    if len(indices) != count:
+        raise ValueError(
+            f"requested {count} {split} samples, but found only {len(indices)} "
+            "eligible JPEGs"
+        )
+    return indices, {image_id: sampling[image_id] for image_id in indices}
+
+
 def _sample_id(path: Path, jpeg_root: Path, source_split: str) -> str:
     return f"{source_split}/{path.relative_to(jpeg_root).as_posix()}"
 
@@ -198,15 +252,27 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jpeg-root", type=Path, required=True)
     parser.add_argument("--index-csv", type=Path, required=True)
     parser.add_argument("--galp-manifest", type=Path, required=True)
+    parser.add_argument("--validation-jpeg-root", type=Path)
+    parser.add_argument("--validation-index-csv", type=Path)
+    parser.add_argument("--galp-validation-manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-split", default="train")
+    parser.add_argument("--validation-source-split", default="val")
     parser.add_argument(
         "--train-count",
         type=int,
         default=100_000,
         help="Number of training samples; use 0 for every sample not held out for validation.",
     )
-    parser.add_argument("--val-count", type=int, default=10_000)
+    parser.add_argument(
+        "--val-count",
+        type=int,
+        default=10_000,
+        help=(
+            "Validation samples; in official-split mode use 0 for the complete "
+            "independent validation population."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=11_997_733)
     parser.add_argument(
         "--probe-dimensions",
@@ -224,6 +290,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     jpeg_root = args.jpeg_root.resolve()
     index_csv = args.index_csv.resolve()
     galp_manifest = args.galp_manifest.resolve()
+    official_values = (
+        args.validation_jpeg_root,
+        args.validation_index_csv,
+        args.galp_validation_manifest,
+    )
+    official_mode = any(value is not None for value in official_values)
+    if official_mode and not all(value is not None for value in official_values):
+        raise ValueError(
+            "official-split mode requires --validation-jpeg-root, "
+            "--validation-index-csv, and --galp-validation-manifest together"
+        )
     if not jpeg_root.is_dir():
         raise FileNotFoundError(jpeg_root)
     if not index_csv.is_file():
@@ -249,51 +326,143 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"JPEG root has {len(paths)}"
         )
 
-    train_indices, val_indices, sampling = _select_indices(
-        paths, train_count=args.train_count, val_count=args.val_count, seed=args.seed
-    )
     common = {
         "format": MANIFEST_FORMAT,
         "label_mapping": LABEL_MAPPING,
-        "source_split": args.source_split,
-        "validation_semantics": "deterministic-heldout-from-imagenet-train",
-        "jpeg_root": str(jpeg_root),
-        "source_index_csv": str(index_csv),
-        "galp_manifest": str(galp_manifest),
-        "population_count": len(paths),
         "selection_seed": args.seed,
         "jpeg_sampling_eligibility": sorted(SUPPORTED_JPEG_SAMPLING),
     }
-    train_payload = {
-        **common,
-        "split": "train",
-        "selection_sha256": _selection_sha256(train_indices),
-        "samples": _build_samples(
-            train_indices,
-            paths=paths,
-            labels=labels,
-            jpeg_root=jpeg_root,
-            source_split=args.source_split,
-            sampling=sampling,
-            probe_dimensions=args.probe_dimensions,
-            progress_interval=args.progress_interval,
-        ),
-    }
-    val_payload = {
-        **common,
-        "split": "val",
-        "selection_sha256": _selection_sha256(val_indices),
-        "samples": _build_samples(
-            val_indices,
-            paths=paths,
-            labels=labels,
-            jpeg_root=jpeg_root,
-            source_split=args.source_split,
-            sampling=sampling,
-            probe_dimensions=args.probe_dimensions,
-            progress_interval=args.progress_interval,
-        ),
-    }
+    if official_mode:
+        validation_jpeg_root = args.validation_jpeg_root.resolve()
+        validation_index_csv = args.validation_index_csv.resolve()
+        validation_galp_manifest = args.galp_validation_manifest.resolve()
+        if not validation_jpeg_root.is_dir():
+            raise FileNotFoundError(validation_jpeg_root)
+        if not validation_index_csv.is_file():
+            raise FileNotFoundError(validation_index_csv)
+        if not validation_galp_manifest.is_file():
+            raise FileNotFoundError(validation_galp_manifest)
+
+        validation_paths = _collect_jpegs(validation_jpeg_root)
+        validation_labels = _load_labels(validation_index_csv)
+        if len(validation_labels) != len(validation_paths):
+            raise ValueError(
+                "validation JPEG/index population mismatch: "
+                f"{len(validation_paths)} files versus {len(validation_labels)} index rows"
+            )
+        for path in validation_paths:
+            sample_id = _sample_id(
+                path, validation_jpeg_root, args.validation_source_split
+            )
+            if sample_id not in validation_labels:
+                raise ValueError(
+                    f"validation JPEG is missing from label index: {sample_id}"
+                )
+        validation_manifest_count = _galp_image_count(validation_galp_manifest)
+        if validation_manifest_count != len(validation_paths):
+            raise ValueError(
+                "validation GALP/JPEG population mismatch: manifest has "
+                f"{validation_manifest_count} images, JPEG root has "
+                f"{len(validation_paths)}"
+            )
+
+        train_indices, train_sampling = _select_split_indices(
+            paths, count=args.train_count, seed=args.seed, split="train"
+        )
+        val_indices, val_sampling = _select_split_indices(
+            validation_paths,
+            count=args.val_count,
+            seed=args.seed ^ 0x9E3779B9,
+            split="validation",
+        )
+        train_payload = {
+            **common,
+            "split": "train",
+            "source_split": args.source_split,
+            "validation_semantics": "official-imagenet-validation",
+            "jpeg_root": str(jpeg_root),
+            "source_index_csv": str(index_csv),
+            "galp_manifest": str(galp_manifest),
+            "population_count": len(paths),
+            "selection_sha256": _selection_sha256(train_indices),
+            "samples": _build_samples(
+                train_indices,
+                paths=paths,
+                labels=labels,
+                jpeg_root=jpeg_root,
+                source_split=args.source_split,
+                sampling=train_sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
+        val_payload = {
+            **common,
+            "split": "val",
+            "source_split": args.validation_source_split,
+            "validation_semantics": "official-imagenet-validation",
+            "jpeg_root": str(validation_jpeg_root),
+            "source_index_csv": str(validation_index_csv),
+            "galp_manifest": str(validation_galp_manifest),
+            "population_count": len(validation_paths),
+            "selection_sha256": _selection_sha256(val_indices),
+            "samples": _build_samples(
+                val_indices,
+                paths=validation_paths,
+                labels=validation_labels,
+                jpeg_root=validation_jpeg_root,
+                source_split=args.validation_source_split,
+                sampling=val_sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
+    else:
+        train_indices, val_indices, sampling = _select_indices(
+            paths,
+            train_count=args.train_count,
+            val_count=args.val_count,
+            seed=args.seed,
+        )
+        heldout_common = {
+            **common,
+            "source_split": args.source_split,
+            "validation_semantics": "deterministic-heldout-from-imagenet-train",
+            "jpeg_root": str(jpeg_root),
+            "source_index_csv": str(index_csv),
+            "galp_manifest": str(galp_manifest),
+            "population_count": len(paths),
+        }
+        train_payload = {
+            **heldout_common,
+            "split": "train",
+            "selection_sha256": _selection_sha256(train_indices),
+            "samples": _build_samples(
+                train_indices,
+                paths=paths,
+                labels=labels,
+                jpeg_root=jpeg_root,
+                source_split=args.source_split,
+                sampling=sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
+        val_payload = {
+            **heldout_common,
+            "split": "val",
+            "selection_sha256": _selection_sha256(val_indices),
+            "samples": _build_samples(
+                val_indices,
+                paths=paths,
+                labels=labels,
+                jpeg_root=jpeg_root,
+                source_split=args.source_split,
+                sampling=sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
     output_dir = args.output_dir.resolve()
     train_path = output_dir / "train.json"
     val_path = output_dir / "val.json"
@@ -306,7 +475,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "train_samples": len(train_indices),
                 "val_json": str(val_path),
                 "val_samples": len(val_indices),
-                "validation_semantics": common["validation_semantics"],
+                "validation_semantics": train_payload["validation_semantics"],
             },
             sort_keys=True,
         )

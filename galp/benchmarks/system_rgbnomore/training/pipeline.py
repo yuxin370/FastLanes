@@ -29,6 +29,11 @@ from training.augmentation import (
     apply_rgb_augmentation_staged,
     horizontal_flip_dct,
 )
+from training.direct_dct_reader import (
+    DirectDctTrainingReader,
+    optional_native_execution_stats,
+    optional_native_execution_stats_snapshot,
+)
 from training.sample_order import SampleIdentity
 from training.schema import DOMAINS, PIPELINES
 
@@ -64,6 +69,8 @@ class TrainingBatch:
     on_device: bool
     stage_seconds: dict[str, float] = field(default_factory=dict)
     native_counters: dict[str, int | float] = field(default_factory=dict)
+    native_execution_stats: dict[str, Any] = field(default_factory=dict)
+    native_stats_finalized: bool = False
     keepalive: list[Any] = field(default_factory=list)
     native_stats_source: Any | None = None
 
@@ -95,6 +102,9 @@ class OrderedAsyncPrefetchQueue:
             "backpressure_events": 0,
             "producer_submit_seconds": 0.0,
             "producer_active_seconds": 0.0,
+            "producer_planning_seconds": 0.0,
+            "producer_io_staging_seconds": 0.0,
+            "producer_ordered_submission_seconds": 0.0,
             "consumer_wait_seconds": 0.0,
             "async_worker_started_batches": 0,
             "cancelled_batches": 0,
@@ -112,6 +122,20 @@ class OrderedAsyncPrefetchQueue:
     def _numeric_property(handle: Any, name: str, default: float = 0.0) -> float:
         value = getattr(handle, name, default)
         return float(value() if callable(value) else value)
+
+    def _accumulate_completed_handle_metrics(self, handle: Any) -> None:
+        self._metrics["producer_active_seconds"] += (
+            self._numeric_property(handle, "producer_active_ms") / 1000.0
+        )
+        self._metrics["producer_planning_seconds"] += (
+            self._numeric_property(handle, "planning_ms") / 1000.0
+        )
+        self._metrics["producer_io_staging_seconds"] += (
+            self._numeric_property(handle, "io_staging_ms") / 1000.0
+        )
+        self._metrics["producer_ordered_submission_seconds"] += (
+            self._numeric_property(handle, "ordered_submission_ms") / 1000.0
+        )
 
     def submit(self, metadata: Any, factory: Callable[[], Any]) -> None:
         if self._closed:
@@ -144,9 +168,7 @@ class OrderedAsyncPrefetchQueue:
             self._metrics["consumer_wait_seconds"] += time.perf_counter() - begin
             if self._boolean_property(entry.handle, "started"):
                 self._metrics["async_worker_started_batches"] += 1
-            self._metrics["producer_active_seconds"] += (
-                self._numeric_property(entry.handle, "producer_active_ms") / 1000.0
-            )
+            self._accumulate_completed_handle_metrics(entry.handle)
         self._metrics["consumed_batches"] += 1
         return entry.metadata, value
 
@@ -179,9 +201,7 @@ class OrderedAsyncPrefetchQueue:
                     self._metrics["close_errors"] += 1
             if self._boolean_property(entry.handle, "started"):
                 self._metrics["async_worker_started_batches"] += 1
-            self._metrics["producer_active_seconds"] += (
-                self._numeric_property(entry.handle, "producer_active_ms") / 1000.0
-            )
+            self._accumulate_completed_handle_metrics(entry.handle)
         self._metrics["closed"] = True
 
     def metrics(self) -> dict[str, Any]:
@@ -278,6 +298,19 @@ def load_training_manifest(path: Path, *, root: Path | None, expected_split: str
         "index_sha256": sha256_json(index_rows),
         "payload_fingerprint_sha256": sha256_json(payload_records),
         "label_mapping": label_mapping,
+        "source_split": payload.get("source_split"),
+        "validation_semantics": payload.get("validation_semantics"),
+        "declared_galp_manifest": (
+            None
+            if payload.get("galp_manifest") is None
+            else str(
+                (
+                    Path(str(payload["galp_manifest"]))
+                    if Path(str(payload["galp_manifest"])).is_absolute()
+                    else path.parent / Path(str(payload["galp_manifest"]))
+                ).resolve()
+            )
+        ),
     }
     return samples, metadata
 
@@ -392,6 +425,11 @@ class TrainingPipelineAdapter:
 
     def finalize_batch_metrics(self, batch: TrainingBatch) -> None:
         """Materialize metrics that may synchronize a device, after timing."""
+
+    def snapshot_batch_metrics(self, batch: TrainingBatch) -> None:
+        """Capture metrics without retaining a device batch when supported."""
+
+        self.finalize_batch_metrics(batch)
 
     def loader_metrics(self) -> dict[str, Any]:
         return {
@@ -513,6 +551,42 @@ class _RgbNoMoreDctDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.plan)
 
+    @staticmethod
+    def _component_crop(
+        decision: AugmentationDecision,
+        *,
+        block_width: int,
+        block_height: int,
+    ) -> tuple[int, int, int, int]:
+        """Map a source-pixel crop to one JPEG component's padded block grid."""
+
+        if block_width <= 0 or block_height <= 0:
+            raise ValueError("DCT component block dimensions must be positive")
+
+        def axis(origin: int, extent: int, blocks: int, pixels: int) -> tuple[int, int]:
+            begin = origin * blocks // pixels
+            end = min(
+                blocks,
+                ((origin + extent) * blocks + pixels - 1) // pixels,
+            )
+            if begin >= end:
+                raise ValueError("source-pixel crop maps to an empty DCT component")
+            return begin, end - begin
+
+        left, width = axis(
+            decision.crop_x,
+            decision.crop_width,
+            block_width,
+            decision.source_width,
+        )
+        top, height = axis(
+            decision.crop_y,
+            decision.crop_height,
+            block_height,
+            decision.source_height,
+        )
+        return top, left, height, width
+
     def __getitem__(self, index: int):
         sample, _identity, decision = self.plan[index]
         start = time.perf_counter()
@@ -527,26 +601,18 @@ class _RgbNoMoreDctDataset(torch.utils.data.Dataset):
             cbcr = torch.zeros((2, y.shape[1] // 2, y.shape[2] // 2, 8, 8), dtype=y.dtype)
         else:
             cbcr = torch.clamp(cbcr * quantization[1:3, None, None], min=-1024, max=1016)
-        i = decision.crop_y // 8
-        j = decision.crop_x // 8
-        h = max(1, decision.crop_height // 8)
-        w = max(1, decision.crop_width // 8)
-        y_block_height = int(y.shape[1])
-        y_block_width = int(y.shape[2])
-        cbcr_block_height = int(cbcr.shape[1])
-        cbcr_block_width = int(cbcr.shape[2])
-        cbcr_i = i * cbcr_block_height // y_block_height
-        cbcr_j = j * cbcr_block_width // y_block_width
-        cbcr_end_i = (i + h) * cbcr_block_height // y_block_height
-        cbcr_end_j = (j + w) * cbcr_block_width // y_block_width
-        y = dops.crop_dct(y, i, j, h, w)
-        cbcr = dops.crop_dct(
-            cbcr,
-            cbcr_i,
-            cbcr_j,
-            max(1, cbcr_end_i - cbcr_i),
-            max(1, cbcr_end_j - cbcr_j),
+        y_crop = self._component_crop(
+            decision,
+            block_width=int(y.shape[2]),
+            block_height=int(y.shape[1]),
         )
+        cbcr_crop = self._component_crop(
+            decision,
+            block_width=int(cbcr.shape[2]),
+            block_height=int(cbcr.shape[1]),
+        )
+        y = dops.crop_dct(y, *y_crop)
+        cbcr = dops.crop_dct(cbcr, *cbcr_crop)
         y = dops.resize_dct(y, 28, dtype=torch.float32)
         cbcr = dops.resize_dct(cbcr, 14, dtype=torch.float32)
         if decision.horizontal_flip:
@@ -629,13 +695,14 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        if self.device.type != "cuda":
+        injected_reader = self.config.get("_direct_dct_training_reader")
+        if self.device.type != "cuda" and injected_reader is None:
             raise RuntimeError("GALP training adapter requires a CUDA device")
         module_path = self.config.get("galp_torch_module_path")
-        if module_path and str(module_path) not in sys.path:
-            sys.path.insert(0, str(module_path))
-        native = importlib.import_module("_galp_direct_dct")
-        self.reader = native.DirectDctReader(str(Path(self.config["galp_manifest"]).resolve()))
+        self.reader = injected_reader or DirectDctTrainingReader(
+            Path(self.config["galp_manifest"]),
+            module_path=None if module_path is None else Path(module_path),
+        )
         self._read_indices = []
         self.execution_mode = str(self.config.get("execution_mode", "audit"))
         if self.execution_mode not in ("audit", "runtime"):
@@ -741,7 +808,16 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         ):
             self._enqueue_next()
         actual_descriptors = list(batch.transform_descriptors)
-        for actual, expected, image_id in zip(actual_descriptors, transforms, image_ids):
+        actual_image_ids = list(batch.global_image_ids)
+        if len(actual_descriptors) != len(transforms) or len(actual_image_ids) != len(image_ids):
+            self._queue.close()
+            raise RuntimeError("GALP native batch changed the requested batch cardinality")
+        for actual, actual_image_id, expected, image_id in zip(
+            actual_descriptors, actual_image_ids, transforms, image_ids
+        ):
+            if int(actual_image_id) != int(image_id):
+                self._queue.close()
+                raise RuntimeError("GALP native batch changed the requested image ID order")
             if int(actual["global_image_id"]) != int(image_id):
                 self._queue.close()
                 raise RuntimeError("GALP native transform provenance changed the requested image ID")
@@ -749,12 +825,13 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
                 if actual[field] != expected[field]:
                     self._queue.close()
                     raise RuntimeError(f"GALP native transform provenance mismatch for {field}")
+        inputs = tuple(batch.tensors)
         training_batch = TrainingBatch(
-            inputs=(batch.y, batch.cbcr),
+            inputs=inputs,
             labels=torch.tensor([item[0].label for item in plan], dtype=torch.long, device=self.device),
             identities=[item[1] for item in plan],
             augmentations=[item[2].as_dict() for item in plan],
-            on_device=True,
+            on_device=all(getattr(value, "device", None) == self.device for value in inputs),
             stage_seconds={
                 "loader_data_wait": wait,
             },
@@ -765,11 +842,12 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             self.finalize_batch_metrics(training_batch)
         return training_batch
 
-    def finalize_batch_metrics(self, batch: TrainingBatch) -> None:
-        source = batch.native_stats_source
-        if source is None or batch.native_counters:
-            return
-        execution_stats = dict(source.execution_stats)
+    @staticmethod
+    def _apply_batch_metrics(
+        batch: TrainingBatch, execution_stats: dict[str, Any]
+    ) -> None:
+        batch.native_execution_stats = execution_stats
+        batch.native_stats_finalized = True
         projection = float(execution_stats.get("projection_ms", 0.0)) / 1000.0
         batch.stage_seconds.update(
             {
@@ -787,14 +865,68 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             "cached_gather_sync_count",
             "decoded_batch_sync_count",
             "rowgroup_storage_bytes_read",
+            "pinned_rowgroup_read_count",
+            "pinned_rowgroup_read_bytes",
+            "compact_batch_buffer_acquire_count",
+            "compact_batch_buffer_growth_count",
+            "compact_batch_buffer_reuse_count",
+            "compact_batch_buffer_requested_bytes",
+            "compact_batch_buffer_capacity_bytes",
+            "compact_batch_buffer_high_water_bytes",
+            "compact_batch_buffer_pageable_fallback_count",
+            "compact_batch_read_group_count",
+            "compact_batch_read_worker_count",
+            "decode_workset_capacity_plan_image_count",
+            "decode_workset_output_arena_capacity_plan_bytes",
+            "decode_workset_output_arena_requested_bytes",
+            "decode_workset_output_arena_capacity_bytes",
+            "decode_workset_output_arena_growth_count",
+            "decode_workset_output_arena_growth_bytes",
+            "decode_workset_chunk_arena_capacity_plan_bytes",
+            "decode_workset_chunk_arena_requested_bytes",
+            "decode_workset_chunk_arena_capacity_bytes",
+            "decode_workset_chunk_arena_growth_count",
+            "decode_workset_chunk_arena_growth_bytes",
             "galp_native_device_in_use_bytes",
             "galp_native_device_peak_in_use_bytes",
             "galp_native_device_cached_bytes",
             "galp_native_device_allocation_requests",
             "galp_native_device_cuda_allocation_count",
             "galp_native_device_cuda_allocation_bytes",
+            "galp_native_pinned_in_use_bytes",
+            "galp_native_pinned_peak_in_use_bytes",
+            "galp_native_pinned_cached_bytes",
+            "galp_native_pinned_allocation_requests",
+            "galp_native_pinned_cuda_allocation_count",
+            "galp_native_pinned_cuda_allocation_bytes",
         ):
-            batch.native_counters[name] = int(execution_stats.get(name, 0))
+            value = execution_stats.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                batch.native_counters[name] = value
+
+    def finalize_batch_metrics(self, batch: TrainingBatch) -> None:
+        source = batch.native_stats_source
+        if source is None or batch.native_stats_finalized:
+            return
+        stats_method = getattr(source, "native_execution_stats", None)
+        execution_stats = (
+            dict(stats_method())
+            if callable(stats_method)
+            else optional_native_execution_stats(source)
+        )
+        self._apply_batch_metrics(batch, execution_stats)
+
+    def snapshot_batch_metrics(self, batch: TrainingBatch) -> None:
+        source = batch.native_stats_source
+        if source is None or batch.native_stats_finalized:
+            return
+        stats_method = getattr(source, "native_execution_stats_snapshot", None)
+        execution_stats = (
+            dict(stats_method())
+            if callable(stats_method)
+            else optional_native_execution_stats_snapshot(source)
+        )
+        self._apply_batch_metrics(batch, execution_stats)
 
     def loader_metrics(self) -> dict[str, Any]:
         metrics = self._queue.metrics() if self._queue is not None else {}

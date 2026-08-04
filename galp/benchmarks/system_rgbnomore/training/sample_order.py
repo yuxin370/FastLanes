@@ -36,20 +36,49 @@ def _epoch_seed(seed: int, epoch: int) -> int:
     return int.from_bytes(digest[:8], "little")
 
 
-def canonical_epoch_order(logical_sample_ids: Sequence[str], seed: int, epoch: int) -> list[SampleIdentity]:
+def _validate_distributed_rank(distributed_rank: int, distributed_world_size: int) -> None:
+    if distributed_world_size <= 0:
+        raise ValueError("distributed_world_size must be positive")
+    if distributed_rank < 0 or distributed_rank >= distributed_world_size:
+        raise ValueError(
+            f"distributed_rank must be in [0, {distributed_world_size}); got {distributed_rank}"
+        )
+
+
+def canonical_epoch_order(
+    logical_sample_ids: Sequence[str],
+    seed: int,
+    epoch: int,
+    *,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+) -> list[SampleIdentity]:
     if len(set(logical_sample_ids)) != len(logical_sample_ids):
         raise ValueError("canonical train manifest contains duplicate logical_sample_id values")
+    _validate_distributed_rank(distributed_rank, distributed_world_size)
     shuffled = list(map(str, logical_sample_ids))
     random.Random(_epoch_seed(seed, epoch)).shuffle(shuffled)
-    return [SampleIdentity(epoch, position, sample_id) for position, sample_id in enumerate(shuffled)]
+    rank_local = shuffled[distributed_rank::distributed_world_size]
+    return [SampleIdentity(epoch, position, sample_id) for position, sample_id in enumerate(rank_local)]
 
 
 def canonical_stream(
-    logical_sample_ids: Sequence[str], seed: int, *, start_epoch: int = 0
+    logical_sample_ids: Sequence[str],
+    seed: int,
+    *,
+    start_epoch: int = 0,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
 ) -> Iterator[SampleIdentity]:
     epoch = start_epoch
     while True:
-        yield from canonical_epoch_order(logical_sample_ids, seed, epoch)
+        yield from canonical_epoch_order(
+            logical_sample_ids,
+            seed,
+            epoch,
+            distributed_rank=distributed_rank,
+            distributed_world_size=distributed_world_size,
+        )
         epoch += 1
 
 
@@ -60,12 +89,21 @@ def batch_stream(
     *,
     drop_last: bool,
     start_epoch: int = 0,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
 ) -> Iterator[tuple[list[SampleIdentity], int]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    _validate_distributed_rank(distributed_rank, distributed_world_size)
     epoch = start_epoch
     while True:
-        values = canonical_epoch_order(logical_sample_ids, seed, epoch)
+        values = canonical_epoch_order(
+            logical_sample_ids,
+            seed,
+            epoch,
+            distributed_rank=distributed_rank,
+            distributed_world_size=distributed_world_size,
+        )
         complete = len(values) // batch_size
         limit = complete * batch_size if drop_last else len(values)
         for begin in range(0, limit, batch_size):

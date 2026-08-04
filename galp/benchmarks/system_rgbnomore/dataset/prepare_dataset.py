@@ -25,6 +25,7 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from shared.common import cached_file_fingerprints, galp_manifest_payloads
+from dataset.manifest import jpeg_frame
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -68,6 +69,38 @@ def _is_jpeg(path: Path) -> bool:
 
 def _collect_jpegs(input_dir: Path) -> list[Path]:
     return sorted(path for path in input_dir.rglob("*") if path.is_file() and _is_jpeg(path))
+
+
+def _source_geometry_summary(paths: list[Path], expected_image_size: int | None) -> dict[str, Any]:
+    dimensions: dict[str, int] = {}
+    mismatches: list[tuple[Path, int, int]] = []
+    for path in paths:
+        frame = jpeg_frame(path)
+        width = int(frame["width"])
+        height = int(frame["height"])
+        key = f"{width}x{height}"
+        dimensions[key] = dimensions.get(key, 0) + 1
+        if expected_image_size is not None and (width != expected_image_size or height != expected_image_size):
+            mismatches.append((path, width, height))
+    summary = {
+        "inspected_images": len(paths),
+        "expected_square_size": expected_image_size,
+        "dimension_counts": dict(sorted(dimensions.items())),
+        "mismatch_count": len(mismatches),
+        "matches_expected": not mismatches,
+        "first_mismatches": [
+            {"path": str(path), "width": width, "height": height}
+            for path, width, height in mismatches[:8]
+        ],
+    }
+    if mismatches:
+        preview = ", ".join(f"{path}={width}x{height}" for path, width, height in mismatches[:3])
+        raise RuntimeError(
+            "RGB-no-more JPEG checkpoint source-geometry mismatch: "
+            f"expected all {len(paths)} source JPEGs to be {expected_image_size}x{expected_image_size} "
+            f"before DCT extraction, but {len(mismatches)} differ; first: {preview}"
+        )
+    return summary
 
 
 def _load_label_index(index_file: Path) -> dict[str, int]:
@@ -320,6 +353,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rowgroup-vectors", type=int)
     parser.add_argument("--rowgroups-per-shard", type=int)
     parser.add_argument("--limit", type=int, help="Use the first N JPEGs after deterministic path sorting.")
+    parser.add_argument(
+        "--expected-image-size",
+        type=int,
+        default=512,
+        help=(
+            "Require every source JPEG to have this square SOF size before compression. "
+            "The published RGB-no-more DCT checkpoints require 512; use 0 for a custom recipe."
+        ),
+    )
     parser.add_argument("--validate-sample-images", type=int, default=8)
     parser.add_argument("--manifest", type=Path, help="Existing manifest.bin to validate with --verify-only.")
     parser.add_argument("--expected-image-count", type=int, help="Assert the manifest image_count matches this value.")
@@ -358,6 +400,9 @@ def _fingerprint_payloads(manifest: Path) -> dict[str, Any]:
 
 def main() -> None:
     args = _parse_args()
+    if args.expected_image_size < 0:
+        raise ValueError("--expected-image-size must be non-negative")
+    expected_image_size = args.expected_image_size or None
     explicit_manifest = args.manifest is not None
     if args.input_dir is None:
         args.input_dir = _default_input_dir(args.data_root, args.split)
@@ -381,6 +426,7 @@ def main() -> None:
             if len(paths) < args.limit:
                 raise RuntimeError(f"requested --limit {args.limit}, but only found {len(paths)} JPEG files")
             paths = paths[: args.limit]
+        source_geometry = _source_geometry_summary(paths, expected_image_size)
         if args.expected_image_count is not None and len(paths) != args.expected_image_count:
             raise RuntimeError(f"label path count {len(paths)} does not match expected {args.expected_image_count}")
         summary = {
@@ -389,6 +435,7 @@ def main() -> None:
             "split": args.split,
             "input_dir": str(args.input_dir),
             "expected_image_count": args.expected_image_count,
+            "source_geometry": source_geometry,
             **_write_label_map(
                 paths,
                 args.index_file,
@@ -420,6 +467,11 @@ def main() -> None:
                 args.expected_image_count,
             ),
         }
+        if args.input_dir.exists():
+            paths = _collect_jpegs(args.input_dir)
+            if args.limit is not None:
+                paths = paths[: args.limit]
+            summary["source_geometry"] = _source_geometry_summary(paths, expected_image_size)
         validation = summary["metadata_validation"]
         failures = []
         if not validation["image_count_matches_expected"]:
@@ -457,21 +509,21 @@ def main() -> None:
             shutil.rmtree(args.out_dir)
 
     input_args: list[str]
-    input_count: int | None = None
+    paths = _collect_jpegs(args.input_dir)
+    if args.limit is not None:
+        if len(paths) < args.limit:
+            raise RuntimeError(f"requested --limit {args.limit}, but only found {len(paths)} JPEG files")
+        paths = paths[: args.limit]
+    input_count: int | None = len(paths)
+    source_geometry = _source_geometry_summary(paths, expected_image_size)
     selected_paths_for_label_map: list[Path] | None = None
     if args.limit is None:
         input_args = [str(args.input_dir)]
         if args.index_file is not None:
-            selected_paths_for_label_map = _collect_jpegs(args.input_dir)
-            input_count = len(selected_paths_for_label_map)
+            selected_paths_for_label_map = paths
     else:
-        paths = _collect_jpegs(args.input_dir)
-        if len(paths) < args.limit:
-            raise RuntimeError(f"requested --limit {args.limit}, but only found {len(paths)} JPEG files")
-        selected = paths[: args.limit]
-        input_count = len(selected)
-        selected_paths_for_label_map = selected
-        input_args = [str(path) for path in selected]
+        selected_paths_for_label_map = paths
+        input_args = [str(path) for path in paths]
 
     command = [
         str(args.tool),
@@ -503,6 +555,7 @@ def main() -> None:
         "expected_image_count": args.expected_image_count,
         "limit": args.limit,
         "input_count": input_count,
+        "source_geometry": source_geometry,
         "metadata_profile": "reconstruct",
         "storage_preset": args.preset,
         "physical_layout": args.physical_layout or "preset-default",

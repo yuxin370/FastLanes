@@ -18,7 +18,13 @@ BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from shared.common import load_contract, sha256_json, source_tree_metadata, write_json
+from shared.common import (
+    load_contract,
+    sha256_json,
+    source_tree_metadata,
+    transform_execution_mode,
+    write_json,
+)
 
 
 MODES: tuple[tuple[str, str], ...] = (
@@ -26,6 +32,8 @@ MODES: tuple[tuple[str, str], ...] = (
     ("crop_rowgroup", "rowgroup-read-selected-decode"),
     ("crop_vector", "vector-range-read-selected-decode"),
 )
+CROP_PIPELINE = "galp_fixed_items"
+CROP_TRANSFORM_EXECUTION_MODE = "require-fixed-items"
 REQUIRED_COUNTERS = (
     "planned_vector_count",
     "actual_vector_count",
@@ -52,6 +60,18 @@ def _load_result(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"result is not an object: {path}")
     return payload
+
+
+def _fixed_items_config(contract: dict[str, Any]) -> dict[str, Any]:
+    pipelines = contract["pipelines"]
+    for name in (CROP_PIPELINE, "galp_planless", "galp_legacy", "galp"):
+        config = pipelines.get(name)
+        if isinstance(config, dict):
+            result = copy.deepcopy(config)
+            result.pop("enable_planless_execution", None)
+            result["transform_execution_mode"] = CROP_TRANSFORM_EXECUTION_MODE
+            return result
+    raise ValueError("contract does not contain a GALP pipeline configuration")
 
 
 def _first_repeat(result: dict[str, Any], mode: str, failures: list[str]) -> dict[str, Any]:
@@ -98,6 +118,9 @@ def _mode_metrics(result: dict[str, Any], mode: str, failures: list[str]) -> dic
     sparse_fallback_count = int(counters.get("sparse_read_fallback_rowgroup_count", 0))
     return {
         "crop_execution_mode": result.get("pipeline_config", {}).get("crop_execution_mode"),
+        "transform_execution_mode": result.get("pipeline_config", {}).get(
+            "transform_execution_mode"
+        ),
         "storage_read_granularity": properties.get("storage_read_granularity"),
         "decode_granularity": properties.get("decode_granularity"),
         "planned_vector_count": int(counters.get("planned_vector_count", 0)),
@@ -139,7 +162,7 @@ def validate_crop_io_ab_results(
     failures: list[str] = []
     metrics = {mode: _mode_metrics(results[mode], mode, failures) for mode, _ in MODES}
     reference_result = results["full_decode"]
-    base_galp_config = base_contract["pipelines"]["galp"]
+    base_galp_config = _fixed_items_config(base_contract)
     _require(
         int(base_galp_config.get("cache_capacity_mib", -1)) == 0,
         failures,
@@ -152,11 +175,20 @@ def validate_crop_io_ab_results(
     )
     for mode, execution_mode in MODES:
         result = results[mode]
-        _require(result.get("pipeline") == "galp", failures, f"{mode}: result is not the GALP pipeline")
+        _require(
+            result.get("pipeline") == CROP_PIPELINE,
+            failures,
+            f"{mode}: result is not the {CROP_PIPELINE} pipeline",
+        )
         config = copy.deepcopy(result.get("pipeline_config", {}))
         observed_mode = config.pop("crop_execution_mode", None)
         _require(observed_mode == execution_mode, failures, f"{mode}: crop execution mode is {observed_mode!r}")
-        expected_config = copy.deepcopy(base_contract["pipelines"]["galp"])
+        _require(
+            transform_execution_mode(config, CROP_PIPELINE) == CROP_TRANSFORM_EXECUTION_MODE,
+            failures,
+            f"{mode}: transform execution mode is not fixed-items",
+        )
+        expected_config = copy.deepcopy(base_galp_config)
         expected_config.pop("crop_execution_mode", None)
         _require(config == expected_config, failures, f"{mode}: non-mode GALP contract fields changed")
         _require(result.get("execution") == reference_result.get("execution"), failures, f"{mode}: execution contract changed")
@@ -303,10 +335,12 @@ def validate_crop_io_ab_results(
         )
 
     return {
-        "schema_version": "galp_crop_io_ab_v1",
+        "schema_version": "galp_crop_io_ab_v2",
         "ok": not failures,
         "failures": failures,
         "base_contract_sha256": sha256_json(base_contract),
+        "pipeline": CROP_PIPELINE,
+        "transform_execution_mode": CROP_TRANSFORM_EXECUTION_MODE,
         "semantic_tolerance": semantic_tolerance,
         "semantic_max_abs": semantic_diffs,
         "prediction_agreement_sample_count": int(reference_predictions.size),
@@ -326,6 +360,8 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         "# GALP crop I/O three-way A/B",
         "",
         f"Validation: **{'PASS' if summary['ok'] else 'FAIL'}**",
+        "",
+        f"Transform execution: `{summary['transform_execution_mode']}` (`{summary['pipeline']}`).",
         "",
         "| Mode | Requested / transformed blocks | Planned / actual / full vectors | Physical bytes | pread | Sparse fallback rowgroups | Decode ms | Transform ms | E2E s |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -356,7 +392,8 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
 def _run_modes(base_contract_path: Path, output_dir: Path, python: str) -> dict[str, dict[str, Any]]:
     base_contract = load_contract(base_contract_path)
     pipeline_script = Path(__file__).with_name("pipeline.py")
-    binding_dir = str(base_contract["pipelines"]["galp"]["torch_binding_dir"])
+    fixed_items_config = _fixed_items_config(base_contract)
+    binding_dir = str(fixed_items_config["torch_binding_dir"])
     child_env = os.environ.copy()
     existing_pythonpath = child_env.get("PYTHONPATH", "")
     child_env["PYTHONPATH"] = (
@@ -367,12 +404,23 @@ def _run_modes(base_contract_path: Path, output_dir: Path, python: str) -> dict[
         mode_dir = output_dir / mode
         mode_dir.mkdir(parents=True, exist_ok=True)
         contract = copy.deepcopy(base_contract)
-        contract["pipelines"]["galp"]["crop_execution_mode"] = execution_mode
+        contract["pipelines"]["enabled"] = [CROP_PIPELINE]
+        contract["pipelines"][CROP_PIPELINE] = copy.deepcopy(fixed_items_config)
+        contract["pipelines"][CROP_PIPELINE]["crop_execution_mode"] = execution_mode
         contract_path = mode_dir / "contract.json"
         result_path = mode_dir / "result.json"
         write_json(contract_path, contract)
         subprocess.run(
-            [python, str(pipeline_script), "--pipeline", "galp", "--contract", str(contract_path), "--output", str(result_path)],
+            [
+                python,
+                str(pipeline_script),
+                "--pipeline",
+                CROP_PIPELINE,
+                "--contract",
+                str(contract_path),
+                "--output",
+                str(result_path),
+            ],
             check=True,
             env=child_env,
         )

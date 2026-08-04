@@ -21,7 +21,7 @@ BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from shared.common import cached_file_fingerprints, galp_manifest_payloads
+from shared.common import cached_file_fingerprints
 
 from training.artifacts import (
     nested_state_sha256,
@@ -35,6 +35,12 @@ from training.artifacts import (
     write_json,
 )
 from training.augmentation import AugmentationDecision, augmentation_contract, derive_augmentation
+from training.direct_dct_reader import (
+    NativeExecutionStatsAccumulator,
+    merge_native_counter_snapshot,
+    native_allocation_stability,
+)
+from training.manifest_preflight import SUPPORTED_LAYOUTS, ManifestPreflight, preflight_manifest
 from training.metrics import (
     coefficient_of_variation,
     distribution,
@@ -139,15 +145,46 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-root", type=Path)
     parser.add_argument("--val-root", type=Path)
     parser.add_argument("--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more"))
-    parser.add_argument("--galp-manifest", type=Path)
+    parser.add_argument(
+        "--galp-manifest",
+        type=Path,
+        help="GALP training manifest; retained as the stable train-side option name.",
+    )
+    parser.add_argument(
+        "--galp-validation-manifest",
+        type=Path,
+        help=(
+            "Independent GALP validation manifest. If omitted, validation reuses "
+            "--galp-manifest for legacy held-out/canary runs."
+        ),
+    )
     parser.add_argument("--galp-torch-module-path", type=Path, default=FASTLANES_ROOT / "build/galp/torch")
     parser.add_argument("--galp-cache-capacity-mib", type=int, default=0)
     parser.add_argument("--refresh-galp-payload-fingerprints", action="store_true")
+    parser.add_argument(
+        "--allow-galp-layout-manifest-rebinding",
+        action="store_true",
+        help=(
+            "Allow a training JSON bound to one GALP manifest to be used with an "
+            "explicitly supplied layout-equivalent manifest. Intended for audited "
+            "v2/v3 physical-layout comparisons; image-ID bounds are still checked."
+        ),
+    )
+    parser.add_argument("--expected-manifest-version", type=int, choices=tuple(sorted(SUPPORTED_LAYOUTS)))
+    parser.add_argument(
+        "--expected-physical-layout",
+        choices=tuple(SUPPORTED_LAYOUTS[version] for version in sorted(SUPPORTED_LAYOUTS)),
+    )
+    parser.add_argument("--expected-spatial-order")
+    parser.add_argument("--expected-image-count", type=int)
+    parser.add_argument("--expected-validation-image-count", type=int)
 
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefetch-depth", type=int, default=2)
+    parser.add_argument("--distributed-rank", type=int, default=0)
+    parser.add_argument("--distributed-world-size", type=int, default=1)
 
     parser.add_argument("--seed", type=int, default=11997733)
     parser.add_argument("--seeds")
@@ -178,7 +215,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--precision", choices=("fp32",), default="fp32")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--throughput-cv-limit", type=float, default=DEFAULT_THROUGHPUT_CV_LIMIT)
-    parser.add_argument("--dct-semantic-atol", type=float, default=1e-5)
+    parser.add_argument(
+        "--dct-semantic-atol",
+        type=float,
+        default=1.0 / 1020.0 + 1e-7,
+        help="absolute DCT gate; default permits one normalized integer-coefficient step",
+    )
     parser.add_argument("--dct-semantic-rtol", type=float, default=1e-4)
     parser.add_argument("--rgb-semantic-warning-atol", type=float, default=0.10)
     parser.add_argument("--rgb-semantic-failure-atol", type=float, default=0.50)
@@ -205,6 +247,34 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--train-manifest and --val-manifest are required")
     if args.batch_size <= 0 or args.workers < 0 or args.prefetch_depth < 0:
         raise ValueError("batch-size must be positive; workers/prefetch-depth must be non-negative")
+    if args.distributed_world_size <= 0:
+        raise ValueError("--distributed-world-size must be positive")
+    if args.distributed_rank < 0 or args.distributed_rank >= args.distributed_world_size:
+        raise ValueError("--distributed-rank must be in [0, --distributed-world-size)")
+    for name in ("expected_image_count", "expected_validation_image_count"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.galp_cache_capacity_mib < 0:
+        raise ValueError("--galp-cache-capacity-mib must be non-negative")
+    for name in (
+        "throughput_cv_limit",
+        "dct_semantic_atol",
+        "dct_semantic_rtol",
+        "rgb_semantic_warning_atol",
+        "rgb_semantic_failure_atol",
+    ):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and non-negative")
+    if args.rgb_semantic_failure_atol < args.rgb_semantic_warning_atol:
+        raise ValueError(
+            "--rgb-semantic-failure-atol must be at least --rgb-semantic-warning-atol"
+        )
+    for name in ("semantic_gradient_cosine_dct", "semantic_gradient_cosine_rgb"):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and in [0,1]")
     if "galp" in args.enabled and args.workers == 0:
         raise ValueError(
             "GALP --workers controls native rowgroup-prefetch workers and must be at least 1"
@@ -218,6 +288,38 @@ def _validate_args(args: argparse.Namespace) -> None:
     if "galp" in args.enabled:
         if args.galp_manifest is None or not args.galp_manifest.is_file():
             raise ValueError("the GALP pipeline requires --galp-manifest")
+        if args.galp_validation_manifest is None:
+            args.galp_validation_manifest = args.galp_manifest
+        if not args.galp_validation_manifest.is_file():
+            raise ValueError(
+                "the GALP pipeline requires a valid --galp-validation-manifest"
+            )
+        args.galp_manifest_preflight = preflight_manifest(
+            args.galp_manifest,
+            expected_manifest_version=args.expected_manifest_version,
+            expected_physical_layout=args.expected_physical_layout,
+            expected_spatial_order=args.expected_spatial_order,
+            expected_image_count=args.expected_image_count,
+        )
+        args.galp_validation_manifest_preflight = preflight_manifest(
+            args.galp_validation_manifest,
+            expected_manifest_version=args.expected_manifest_version,
+            expected_physical_layout=args.expected_physical_layout,
+            expected_spatial_order=args.expected_spatial_order,
+            expected_image_count=(
+                args.expected_validation_image_count
+                if args.expected_validation_image_count is not None
+                else (
+                    args.expected_image_count
+                    if args.galp_validation_manifest.resolve()
+                    == args.galp_manifest.resolve()
+                    else None
+                )
+            ),
+        )
+    else:
+        args.galp_manifest_preflight = None
+        args.galp_validation_manifest_preflight = None
     if args.init_mode == "random" and any((args.rgb_init_checkpoint, args.dct_init_checkpoint, args.resume_checkpoint)):
         raise ValueError("random init mode cannot be combined with initialization/resume checkpoints")
     for name in ("rgb_init_checkpoint", "dct_init_checkpoint", "resume_checkpoint"):
@@ -257,7 +359,7 @@ def _phase_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "smoke": {
             "enabled": args.phase in ("smoke", "all"),
-            "repeats": 1,
+            "repeats": args.repeats if args.repeats is not None else 1,
             "warmup_steps": smoke_warmup,
             "measured_steps": args.measured_steps if args.measured_steps is not None else 100,
         },
@@ -288,6 +390,8 @@ def _runtime_files(rgbnomore_root: Path) -> tuple[list[Path], list[Path]]:
             "optimizer.py",
             "augmentation.py",
             "sample_order.py",
+            "manifest_preflight.py",
+            "direct_dct_reader.py",
             "metrics.py",
             "artifacts.py",
             "schema.py",
@@ -297,6 +401,8 @@ def _runtime_files(rgbnomore_root: Path) -> tuple[list[Path], list[Path]]:
     local.extend(
         path
         for path in (
+            FASTLANES_ROOT / "galp/benchmarks/system_rgbnomore/shared/common.py",
+            FASTLANES_ROOT / "galp/benchmarks/system_rgbnomore/shared/manifest_contract.py",
             FASTLANES_ROOT / "galp/torch/direct_dct_torch.cpp",
             FASTLANES_ROOT / "galp/include/galp/direct_dct.hpp",
             FASTLANES_ROOT / "galp/include/galp/jpeg_dct.hpp",
@@ -353,14 +459,21 @@ def _build_contract(
     galp_payload_cache = None
     galp_payload_fingerprints: list[dict[str, Any]] = []
     galp_native_binary = None
+    galp_manifest_preflight = None
+    galp_validation_manifest_sha256 = None
+    galp_validation_payload_cache = None
+    galp_validation_payload_fingerprints: list[dict[str, Any]] = []
+    galp_validation_manifest_preflight = None
     if "galp" in args.enabled:
+        preflight: ManifestPreflight = args.galp_manifest_preflight
         galp_manifest = args.galp_manifest.resolve()
         galp_manifest_sha256 = sha256_file(galp_manifest)
+        galp_manifest_preflight = preflight.as_dict()
         cache_path = galp_manifest.with_name(
             galp_manifest.name + ".payload_fingerprints.json"
         )
         galp_payload_fingerprints = cached_file_fingerprints(
-            galp_manifest_payloads(galp_manifest),
+            preflight.fingerprint_inputs(),
             cache_path,
             cache_format="galp_shard_payload_fingerprints_v1",
             allow_hash_misses=args.refresh_galp_payload_fingerprints,
@@ -369,6 +482,31 @@ def _build_contract(
             "path": str(cache_path.resolve()),
             "sha256": sha256_file(cache_path),
         }
+        validation_preflight: ManifestPreflight = (
+            args.galp_validation_manifest_preflight
+        )
+        validation_manifest = args.galp_validation_manifest.resolve()
+        if validation_manifest == galp_manifest:
+            galp_validation_manifest_sha256 = galp_manifest_sha256
+            galp_validation_manifest_preflight = galp_manifest_preflight
+            galp_validation_payload_cache = galp_payload_cache
+            galp_validation_payload_fingerprints = galp_payload_fingerprints
+        else:
+            galp_validation_manifest_sha256 = sha256_file(validation_manifest)
+            galp_validation_manifest_preflight = validation_preflight.as_dict()
+            validation_cache_path = validation_manifest.with_name(
+                validation_manifest.name + ".payload_fingerprints.json"
+            )
+            galp_validation_payload_fingerprints = cached_file_fingerprints(
+                validation_preflight.fingerprint_inputs(),
+                validation_cache_path,
+                cache_format="galp_shard_payload_fingerprints_v1",
+                allow_hash_misses=args.refresh_galp_payload_fingerprints,
+            )
+            galp_validation_payload_cache = {
+                "path": str(validation_cache_path.resolve()),
+                "sha256": sha256_file(validation_cache_path),
+            }
         binding_candidates = sorted(args.galp_torch_module_path.glob("_galp_direct_dct*.so"))
         if len(binding_candidates) != 1:
             raise FileNotFoundError(
@@ -429,7 +567,11 @@ def _build_contract(
         "validation_augmentation": {
             "recipe": "deterministic-centered-square-resize-range-v1",
             "horizontal_flip": False,
-            "independent_imagenet_validation": True,
+            "dataset_semantics": val_meta.get("validation_semantics"),
+            "independent_imagenet_validation": (
+                val_meta.get("validation_semantics")
+                == "official-imagenet-validation"
+            ),
         },
         "sample_order": {
             "algorithm": "sha256-derived-python-random-full-permutation-v1",
@@ -439,6 +581,9 @@ def _build_contract(
             "prefetch_depth_batches": args.prefetch_depth,
             "validation_basis": "optimizer_consumed_ids",
             "repeat_cursor_reset": True,
+            "distributed_rank": args.distributed_rank,
+            "distributed_world_size": args.distributed_world_size,
+            "distributed_partition": "global permutation followed by rank-strided logical-ID partition",
         },
         "datasets": {"train": train_meta, "validation": val_meta, "separation": separation},
         "execution": {
@@ -466,8 +611,41 @@ def _build_contract(
             "rgbnomore_root": str(rgbnomore_root),
             "galp_manifest": None if args.galp_manifest is None else str(args.galp_manifest.resolve()),
             "galp_manifest_sha256": galp_manifest_sha256,
+            "galp_manifest_preflight": galp_manifest_preflight,
+            "galp_manifest_expectations": {
+                "version": args.expected_manifest_version,
+                "physical_layout": args.expected_physical_layout,
+                "spatial_order": args.expected_spatial_order,
+                "image_count": args.expected_image_count,
+            },
             "galp_payload_fingerprint_cache": galp_payload_cache,
             "galp_payload_fingerprints": galp_payload_fingerprints,
+            "galp_validation_manifest": (
+                None
+                if args.galp_validation_manifest is None
+                else str(args.galp_validation_manifest.resolve())
+            ),
+            "galp_validation_manifest_sha256": galp_validation_manifest_sha256,
+            "galp_validation_manifest_preflight": galp_validation_manifest_preflight,
+            "galp_validation_manifest_expectations": {
+                "version": args.expected_manifest_version,
+                "physical_layout": args.expected_physical_layout,
+                "spatial_order": args.expected_spatial_order,
+                "image_count": (
+                    args.expected_validation_image_count
+                    if args.expected_validation_image_count is not None
+                    else (
+                        args.expected_image_count
+                        if args.galp_validation_manifest is not None
+                        and args.galp_manifest is not None
+                        and args.galp_validation_manifest.resolve()
+                        == args.galp_manifest.resolve()
+                        else None
+                    )
+                ),
+            },
+            "galp_validation_payload_fingerprint_cache": galp_validation_payload_cache,
+            "galp_validation_payload_fingerprints": galp_validation_payload_fingerprints,
             "galp_native_binary": galp_native_binary,
             "galp_torch_module_path": str(args.galp_torch_module_path.resolve()),
             "galp_cache_capacity_mib": args.galp_cache_capacity_mib,
@@ -604,12 +782,29 @@ def _collect_batches(
     batch_count: int,
     drop_last: bool,
     start_cursor: dict[str, Any] | None = None,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
 ) -> tuple[list[list[SampleIdentity]], dict[int, int]]:
     if not samples:
         raise ValueError("training dataset is empty")
-    if drop_last and len(samples) < batch_size:
+    rank_sample_count = len(
+        canonical_epoch_order(
+            [sample.logical_sample_id for sample in samples],
+            seed,
+            0,
+            distributed_rank=distributed_rank,
+            distributed_world_size=distributed_world_size,
+        )
+    )
+    if rank_sample_count == 0:
         raise ValueError(
-            f"drop_last=True cannot produce a batch: dataset has {len(samples)} samples, "
+            f"distributed rank {distributed_rank} receives no samples from a "
+            f"{len(samples)}-sample dataset at world size {distributed_world_size}"
+        )
+    if drop_last and rank_sample_count < batch_size:
+        raise ValueError(
+            f"drop_last=True cannot produce a batch: rank {distributed_rank} has "
+            f"{rank_sample_count} samples, "
             f"batch_size is {batch_size}"
         )
     cursor = start_cursor or {"epoch": 0, "position": -1}
@@ -619,7 +814,11 @@ def _collect_batches(
         raise ValueError(f"invalid sample-order cursor: {cursor}")
     if last_position >= 0:
         epoch_order = canonical_epoch_order(
-            [sample.logical_sample_id for sample in samples], seed, start_epoch
+            [sample.logical_sample_id for sample in samples],
+            seed,
+            start_epoch,
+            distributed_rank=distributed_rank,
+            distributed_world_size=distributed_world_size,
         )
         if last_position >= len(epoch_order):
             raise ValueError(f"sample-order cursor position is outside the epoch: {cursor}")
@@ -635,6 +834,8 @@ def _collect_batches(
         batch_size,
         drop_last=drop_last,
         start_epoch=start_epoch,
+        distributed_rank=distributed_rank,
+        distributed_world_size=distributed_world_size,
     )
     batches: list[list[SampleIdentity]] = []
     dropped: dict[int, int] = {}
@@ -682,6 +883,74 @@ def _augmentation_batches(
 
 def _flatten(values: Sequence[Sequence[Any]]) -> list[Any]:
     return [item for batch in values for item in batch]
+
+
+def _adapter_pipeline_config(
+    contract: dict[str, Any], args: argparse.Namespace, *, split: str
+) -> dict[str, Any]:
+    if split not in {"train", "validation"}:
+        raise ValueError(f"unknown adapter dataset split {split!r}")
+    config = {
+        **contract["pipelines"],
+        "prefetch_depth": args.prefetch_depth,
+        "execution_mode": args.execution_mode,
+    }
+    if split == "validation":
+        config["galp_manifest"] = contract["pipelines"].get(
+            "galp_validation_manifest", contract["pipelines"].get("galp_manifest")
+        )
+    return config
+
+
+def _validate_galp_dataset_binding(
+    samples: Sequence[TrainingSample],
+    metadata: dict[str, Any],
+    manifest: Path,
+    preflight: ManifestPreflight,
+    *,
+    split: str,
+    allow_layout_manifest_rebinding: bool = False,
+) -> None:
+    declared = metadata.get("declared_galp_manifest")
+    if (
+        declared is not None
+        and Path(str(declared)).resolve() != manifest.resolve()
+        and not allow_layout_manifest_rebinding
+    ):
+        raise ValueError(
+            f"{split} training JSON was generated for GALP manifest {declared}, "
+            f"but the runner received {manifest.resolve()}"
+        )
+    image_ids = [sample.galp_image_id for sample in samples]
+    if any(image_id is None for image_id in image_ids):
+        raise ValueError(f"{split} GALP samples must all declare galp_image_id")
+    concrete_ids = [int(image_id) for image_id in image_ids if image_id is not None]
+    if len(set(concrete_ids)) != len(concrete_ids):
+        raise ValueError(f"{split} GALP samples contain duplicate galp_image_id values")
+    outside = [
+        image_id
+        for image_id in concrete_ids
+        if image_id < 0 or image_id >= preflight.image_count
+    ]
+    if outside:
+        raise ValueError(
+            f"{split} GALP image IDs fall outside manifest population "
+            f"[0,{preflight.image_count}): {outside[:8]}"
+        )
+
+
+def _reproducibility_hashes(
+    batches: Sequence[Sequence[SampleIdentity]],
+    decisions: Sequence[Sequence[AugmentationDecision]],
+) -> dict[str, str]:
+    return {
+        "shuffle_order_sha256": sha256_json(
+            [identity.as_dict() for identity in _flatten(batches)]
+        ),
+        "transform_descriptor_sha256": sha256_json(
+            [decision.as_dict() for decision in _flatten(decisions)]
+        ),
+    }
 
 
 class _SyncLedger:
@@ -990,6 +1259,8 @@ def _first_step_probe(
         batch_count=1 + args.prefetch_depth,
         drop_last=args.drop_last,
         start_cursor=initial["sample_order_cursor"],
+        distributed_rank=args.distributed_rank,
+        distributed_world_size=args.distributed_world_size,
     )
     decisions = _augmentation_batches(
         batches,
@@ -997,17 +1268,14 @@ def _first_step_probe(
         seed=args.seed,
         domain=domain,
     )
+    reproducibility = _reproducibility_hashes(batches[:1], decisions[:1])
     adapter = build_training_adapter(
         pipeline,
         train_samples,
         batch_size=args.batch_size,
         workers=args.workers,
         device=device,
-        config={
-            **contract["pipelines"],
-            "prefetch_depth": args.prefetch_depth,
-            "execution_mode": args.execution_mode,
-        },
+        config=_adapter_pipeline_config(contract, args, split="train"),
     )
     adapter.begin(_flatten(batches), _flatten(decisions), [len(batch) for batch in batches])
     before_model_hash = tensor_state_sha256(model.state_dict())
@@ -1049,6 +1317,12 @@ def _first_step_probe(
         "model_configuration": model_configuration(domain),
         "optimizer_configuration_sha256": sha256_json(contract["optimizer"]),
         "sample_ids": [identity.as_dict() for identity in batches[0]],
+        "reproducibility": {
+            "seed": args.seed,
+            "distributed_rank": args.distributed_rank,
+            "distributed_world_size": args.distributed_world_size,
+            **reproducibility,
+        },
         "prefetched_read_ids": [identity.as_dict() for identity in read],
         "augmentation_decisions": batch.augmentations,
         "labels": labels.detach().cpu().tolist(),
@@ -1138,6 +1412,8 @@ def _run_repeat(
         batch_count=total_consumed_batches + args.prefetch_depth,
         drop_last=args.drop_last,
         start_cursor=initial["sample_order_cursor"],
+        distributed_rank=args.distributed_rank,
+        distributed_world_size=args.distributed_world_size,
     )
     decisions = _augmentation_batches(
         all_batches,
@@ -1145,17 +1421,16 @@ def _run_repeat(
         seed=args.seed,
         domain=domain,
     )
+    reproducibility = _reproducibility_hashes(
+        all_batches[:total_consumed_batches], decisions[:total_consumed_batches]
+    )
     adapter = build_training_adapter(
         pipeline,
         train_samples,
         batch_size=args.batch_size,
         workers=args.workers,
         device=device,
-        config={
-            **contract["pipelines"],
-            "prefetch_depth": args.prefetch_depth,
-            "execution_mode": args.execution_mode,
-        },
+        config=_adapter_pipeline_config(contract, args, split="train"),
     )
     adapter.begin(_flatten(all_batches), _flatten(decisions), [len(batch) for batch in all_batches])
     ledger = SampleOrderLedger(pipeline)
@@ -1164,30 +1439,42 @@ def _run_repeat(
         ledger.record_dropped(epoch, count)
     failures: list[str] = []
     warmup_losses: list[float] = []
-    native_counter_totals: dict[str, float] = {}
+    warmup_native_stats: list[dict[str, Any]] = []
+    measured_native_stats: list[dict[str, Any]] = []
+    warmup_native_counters: list[dict[str, int | float]] = []
+    measured_native_counters: list[dict[str, int | float]] = []
     measurement_syncs = _SyncLedger()
     loader_before_measurement: dict[str, Any] = {}
     loader_after_measurement: dict[str, Any] = {}
 
-    def record_batch(batch: TrainingBatch) -> None:
+    def record_batch(
+        batch: TrainingBatch,
+        *,
+        phase: str,
+        runtime_record: dict[str, Any] | None = None,
+    ) -> None:
         ledger.record_emitted(batch.identities)
         ledger.record_consumed(batch.identities)
-        for name, value in batch.native_counters.items():
-            if name in (
-                "galp_native_device_in_use_bytes",
-                "galp_native_device_peak_in_use_bytes",
-                "galp_native_device_cached_bytes",
-            ):
-                native_counter_totals[name] = max(
-                    native_counter_totals.get(name, 0.0), float(value)
-                )
-            else:
-                native_counter_totals[name] = native_counter_totals.get(name, 0.0) + float(value)
+        if args.execution_mode == "runtime":
+            adapter.snapshot_batch_metrics(batch)
+        else:
+            adapter.finalize_batch_metrics(batch)
+        if runtime_record is not None:
+            runtime_record["stage_seconds"].update(batch.stage_seconds)
+        stats = dict(batch.native_execution_stats)
+        counters = dict(batch.native_counters)
+        if phase == "warmup":
+            warmup_native_stats.append(stats)
+            warmup_native_counters.append(counters)
+        elif phase == "measured":
+            measured_native_stats.append(stats)
+            measured_native_counters.append(counters)
+        else:
+            raise ValueError(f"unknown training phase {phase!r}")
 
     step_records: list[dict[str, Any]] = []
     if args.execution_mode == "runtime":
         warmup_records: list[dict[str, Any]] = []
-        runtime_batches: list[TrainingBatch] = []
         for step in range(warmup_steps):
             record, batch = _train_one_step_runtime(
                 model=model,
@@ -1203,9 +1490,9 @@ def _run_repeat(
             failures.extend(
                 f"warmup step {step}: {value}" for value in record["batch_failures"]
             )
-            record_batch(batch)
+            record_batch(batch, phase="warmup", runtime_record=record)
             warmup_records.append(record)
-            runtime_batches.append(batch)
+            del batch
 
         loader_before_measurement = adapter.loader_metrics()
         _sync(device, measurement_syncs, "measured_region_start")
@@ -1227,9 +1514,9 @@ def _run_repeat(
                 f"measured step {measured}: {value}"
                 for value in record["batch_failures"]
             )
-            record_batch(batch)
+            record_batch(batch, phase="measured", runtime_record=record)
             step_records.append(record)
-            runtime_batches.append(batch)
+            del batch
         _sync(device, measurement_syncs, "measured_region_end")
         measured_elapsed = time.perf_counter() - measured_begin
         loader_after_measurement = adapter.loader_metrics()
@@ -1251,25 +1538,6 @@ def _run_repeat(
                 region = "warmup" if index < warmup_steps else "measured"
                 failures.append(f"{region} step {index}: non-finite loss")
         warmup_losses = [record["loss"] for record in warmup_records]
-        for record, batch in zip(all_runtime_records, runtime_batches):
-            adapter.finalize_batch_metrics(batch)
-            record["stage_seconds"].update(batch.stage_seconds)
-        # Deferred native statistics are now safe to fold into the totals.
-        native_counter_totals.clear()
-        for batch in runtime_batches:
-            for name, value in batch.native_counters.items():
-                if name in (
-                    "galp_native_device_in_use_bytes",
-                    "galp_native_device_peak_in_use_bytes",
-                    "galp_native_device_cached_bytes",
-                ):
-                    native_counter_totals[name] = max(
-                        native_counter_totals.get(name, 0.0), float(value)
-                    )
-                else:
-                    native_counter_totals[name] = (
-                        native_counter_totals.get(name, 0.0) + float(value)
-                    )
     else:
         for step in range(warmup_steps):
             record, batch, _inputs, _labels, _logits = _train_one_step(
@@ -1284,7 +1552,7 @@ def _run_repeat(
                 gradient_clipping=contract["optimizer"]["gradient_clipping_norm"],
                 collect_numerics=step == 0,
             )
-            record_batch(batch)
+            record_batch(batch, phase="warmup")
             warmup_losses.append(record["loss"])
             failures.extend(
                 f"warmup step {step}: {value}" for value in record["batch_failures"]
@@ -1312,7 +1580,7 @@ def _run_repeat(
                 collect_numerics=measured == 0,
                 sync_ledger=measurement_syncs,
             )
-            record_batch(batch)
+            record_batch(batch, phase="measured")
             failures.extend(
                 f"measured step {measured}: {value}"
                 for value in record["batch_failures"]
@@ -1336,6 +1604,25 @@ def _run_repeat(
         )
         loader_after_measurement = adapter.loader_metrics()
 
+    native_execution_stats = NativeExecutionStatsAccumulator()
+    warmup_native_execution_stats = NativeExecutionStatsAccumulator()
+    measured_native_execution_stats = NativeExecutionStatsAccumulator()
+    warmup_native_counter_totals: dict[str, float] = {}
+    measured_native_counter_totals: dict[str, float] = {}
+    for stats, counters in zip(warmup_native_stats, warmup_native_counters):
+        native_execution_stats.observe(stats)
+        warmup_native_execution_stats.observe(stats)
+        merge_native_counter_snapshot(warmup_native_counter_totals, counters)
+    for stats, counters in zip(measured_native_stats, measured_native_counters):
+        native_execution_stats.observe(stats)
+        measured_native_execution_stats.observe(stats)
+        merge_native_counter_snapshot(measured_native_counter_totals, counters)
+    native_counter_totals = measured_native_counter_totals
+    allocation_stability = native_allocation_stability(
+        warmup_native_stats,
+        measured_native_stats,
+    )
+
     ledger.record_prefetched(adapter.prefetched_read_identities())
     adapter.end()
     loader_metrics = adapter.loader_metrics()
@@ -1347,6 +1634,9 @@ def _run_repeat(
         "queue_miss_batches",
         "producer_submit_seconds",
         "producer_active_seconds",
+        "producer_planning_seconds",
+        "producer_io_staging_seconds",
+        "producer_ordered_submission_seconds",
         "consumer_wait_seconds",
     ):
         if name in loader_after_measurement:
@@ -1410,6 +1700,15 @@ def _run_repeat(
     }
     accounted_native_syncs = int(native_counter_totals.get("internal_sync_count", 0))
     memory = process_memory()
+    sample_order_artifact = ledger.as_dict(expected_consumed)
+    sample_order_artifact.update(
+        {
+            "seed": args.seed,
+            "distributed_rank": args.distributed_rank,
+            "distributed_world_size": args.distributed_world_size,
+            **reproducibility,
+        }
+    )
     repeat_result = {
         "repeat": repeat,
         "execution_mode": args.execution_mode,
@@ -1437,7 +1736,7 @@ def _run_repeat(
         "step_latency_method": step_latency_method,
         "stage_latency_ms": stage_metrics,
         "stage_timing_note": contract["execution"]["stage_timing_note"],
-        "sample_order": ledger.as_dict(expected_consumed),
+        "sample_order": sample_order_artifact,
         "prefetch_overrun": order_validation["prefetch_overrun"],
         "loader_metrics": loader_metrics,
         "loader_measured_metrics": {
@@ -1455,7 +1754,7 @@ def _run_repeat(
             "explicit_host_device": measurement_syncs.as_dict(),
             "galp_native_internal_count": accounted_native_syncs,
             "galp_native_internal_reasons": native_sync_reasons,
-            "scope": "measured train region for explicit syncs; consumed repeat batches for native counters",
+            "scope": "measured train region for explicit syncs and native counters",
         },
         "measurement_instrumentation": {
             "deep_gradient_scans_in_measured_path": (
@@ -1480,7 +1779,40 @@ def _run_repeat(
             name: int(value) if value.is_integer() else value
             for name, value in sorted(native_counter_totals.items())
         },
-        "native_allocator_scope": "galp_runtime_per-batch_counters" if pipeline == "galp" else "not_applicable",
+        "native_allocator_scope": (
+            "measured batches: per-batch counters are summed; galp_native process-global snapshots use the maximum"
+            if pipeline == "galp"
+            else "not_applicable"
+        ),
+        "native_warmup_allocator_metrics": {
+            name: int(value) if value.is_integer() else value
+            for name, value in sorted(warmup_native_counter_totals.items())
+        },
+        "native_allocation_stability": allocation_stability if pipeline == "galp" else None,
+        "native_execution_stats": (
+            native_execution_stats.as_dict() if pipeline == "galp" else None
+        ),
+        "native_execution_stats_by_phase": (
+            {
+                "warmup": warmup_native_execution_stats.as_dict(),
+                "measured": measured_native_execution_stats.as_dict(),
+            }
+            if pipeline == "galp"
+            else None
+        ),
+        "common_statistics": {
+            "samples": processed,
+            "batches": measured_steps,
+            "elapsed_seconds": elapsed,
+            "samples_per_second": processed / elapsed if elapsed else None,
+            "reader_wait_seconds": measured_wait,
+            "training_step_seconds": compute_seconds,
+            "peak_host_queue_depth": loader_metrics.get("max_queue_depth_batches"),
+            "peak_device_memory": (
+                int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else None
+            ),
+            "loss_summary": distribution([record["loss"] for record in step_records]),
+        },
         "model_parameters_finite": model_finite,
         "optimizer_state_finite": optimizer_finite,
         "scheduler_last_epoch": scheduler.last_epoch,
@@ -1543,11 +1875,7 @@ def _evaluate_validation(
         batch_size=args.batch_size,
         workers=args.workers,
         device=device,
-        config={
-            **contract["pipelines"],
-            "prefetch_depth": args.prefetch_depth,
-            "execution_mode": args.execution_mode,
-        },
+        config=_adapter_pipeline_config(contract, args, split="validation"),
     )
     adapter.begin(identities, decisions, batch_lengths)
     model.eval()
@@ -1665,6 +1993,8 @@ def _run_convergence_seed(
         batch_count=args.train_steps + args.prefetch_depth,
         drop_last=args.drop_last,
         start_cursor=initial["sample_order_cursor"],
+        distributed_rank=args.distributed_rank,
+        distributed_world_size=args.distributed_world_size,
     )
     decisions = _augmentation_batches(
         batches,
@@ -1672,17 +2002,16 @@ def _run_convergence_seed(
         seed=seed,
         domain=domain,
     )
+    reproducibility = _reproducibility_hashes(
+        batches[: args.train_steps], decisions[: args.train_steps]
+    )
     adapter = build_training_adapter(
         pipeline,
         train_samples,
         batch_size=args.batch_size,
         workers=args.workers,
         device=device,
-        config={
-            **contract["pipelines"],
-            "prefetch_depth": args.prefetch_depth,
-            "execution_mode": args.execution_mode,
-        },
+        config=_adapter_pipeline_config(contract, args, split="train"),
     )
     adapter.begin(_flatten(batches), _flatten(decisions), [len(batch) for batch in batches])
     ledger = SampleOrderLedger(pipeline)
@@ -1786,6 +2115,15 @@ def _run_convergence_seed(
         )
         for threshold in thresholds
     }
+    sample_order_artifact = ledger.as_dict(expected)
+    sample_order_artifact.update(
+        {
+            "seed": seed,
+            "distributed_rank": args.distributed_rank,
+            "distributed_world_size": args.distributed_world_size,
+            **reproducibility,
+        }
+    )
     result = {
         "seed": seed,
         "classification": "from_scratch_short_convergence" if args.init_mode == "random" else ("fine_tuning" if args.init_mode == "weights" else "resumed_training"),
@@ -1797,7 +2135,7 @@ def _run_convergence_seed(
         "train_curve": curve,
         "validation": validation_events,
         "time_to_accuracy": time_to_accuracy,
-        "sample_order": ledger.as_dict(expected),
+        "sample_order": sample_order_artifact,
         "model_parameters_finite": model_finite,
         "optimizer_state_finite": optimizer_finite,
         "scheduler_last_epoch": int(scheduler.last_epoch),
@@ -2204,24 +2542,28 @@ def _run_pipeline(
 
     phases = contract["execution"]["phases"]
     if phases["smoke"]["enabled"]:
-        result = progress["smoke_repeats"].get("0")
-        if result is None:
-            result = _run_repeat(
-                args,
-                contract,
-                pipeline,
-                train_samples,
-                initial,
-                repeat=0,
-                warmup_steps=phases["smoke"]["warmup_steps"],
-                measured_steps=phases["smoke"]["measured_steps"],
-            )
-            progress["smoke_repeats"]["0"] = result
-            _write_pipeline_progress(output_dir, pipeline, progress)
-        artifact["phase_results"]["smoke"] = {"repeats": [result]}
-        artifact["sample_order"]["smoke"] = [result["sample_order"]]
-        artifact["failures"].extend(result["failures"])
-        artifact["status"]["correctness"] = "passed" if result["ok"] else "failed"
+        repeats = []
+        for repeat in range(phases["smoke"]["repeats"]):
+            result = progress["smoke_repeats"].get(str(repeat))
+            if result is None:
+                result = _run_repeat(
+                    args,
+                    contract,
+                    pipeline,
+                    train_samples,
+                    initial,
+                    repeat=repeat,
+                    warmup_steps=phases["smoke"]["warmup_steps"],
+                    measured_steps=phases["smoke"]["measured_steps"],
+                )
+                progress["smoke_repeats"][str(repeat)] = result
+                _write_pipeline_progress(output_dir, pipeline, progress)
+            repeats.append(result)
+        artifact["phase_results"]["smoke"] = {"repeats": repeats}
+        artifact["sample_order"]["smoke"] = [result["sample_order"] for result in repeats]
+        failures = [failure for result in repeats for failure in result["failures"]]
+        artifact["failures"].extend(failures)
+        artifact["status"]["correctness"] = "passed" if not failures else "failed"
     if phases["step"]["enabled"]:
         repeats = []
         for repeat in range(phases["step"]["repeats"]):
@@ -2332,14 +2674,30 @@ def _hydrate_resume_args(args: argparse.Namespace, contract: dict[str, Any]) -> 
     args.val_root = None
     args.rgbnomore_root = Path(contract["pipelines"]["rgbnomore_root"])
     args.galp_manifest = _path_or_none(contract["pipelines"].get("galp_manifest"))
+    args.galp_validation_manifest = _path_or_none(
+        contract["pipelines"].get("galp_validation_manifest")
+    ) or args.galp_manifest
     args.galp_torch_module_path = Path(contract["pipelines"]["galp_torch_module_path"])
     args.galp_cache_capacity_mib = int(contract["pipelines"]["galp_cache_capacity_mib"])
     args.refresh_galp_payload_fingerprints = False
+    expectations = contract["pipelines"].get("galp_manifest_expectations", {})
+    args.expected_manifest_version = expectations.get("version")
+    args.expected_physical_layout = expectations.get("physical_layout")
+    args.expected_spatial_order = expectations.get("spatial_order")
+    args.expected_image_count = expectations.get("image_count")
+    validation_expectations = contract["pipelines"].get(
+        "galp_validation_manifest_expectations", {}
+    )
+    args.expected_validation_image_count = validation_expectations.get("image_count")
     args.batch_size = int(contract["execution"]["batch_size"])
     args.workers = int(contract["execution"]["workers"])
     args.execution_mode = str(contract["execution"].get("mode", "audit"))
     args.drop_last = bool(contract["sample_order"]["drop_last"])
     args.prefetch_depth = int(contract["sample_order"]["prefetch_depth_batches"])
+    args.distributed_rank = int(contract["sample_order"].get("distributed_rank", 0))
+    args.distributed_world_size = int(
+        contract["sample_order"].get("distributed_world_size", 1)
+    )
     convergence = contract["execution"]["phases"]["convergence"]
     args.train_steps = int(convergence["train_steps"])
     args.eval_interval = int(convergence["eval_interval"])
@@ -2406,10 +2764,63 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    if "galp" in args.enabled:
+        preflights = (
+            (
+                "train",
+                args.galp_manifest_preflight.as_dict(),
+                "galp_manifest_preflight",
+                output_dir / "manifest_preflight.json",
+            ),
+            (
+                "validation",
+                args.galp_validation_manifest_preflight.as_dict(),
+                "galp_validation_manifest_preflight",
+                output_dir / "manifest_preflight_validation.json",
+            ),
+        )
+        for split, preflight_payload, contract_key, preflight_path in preflights:
+            if args.resume_run is None:
+                write_json(preflight_path, preflight_payload)
+                continue
+            contracted = contract["pipelines"].get(contract_key)
+            if contracted is None and split == "validation":
+                contracted = contract["pipelines"].get("galp_manifest_preflight")
+            if contracted != preflight_payload:
+                raise ValueError(
+                    f"resume GALP {split} manifest preflight differs from the immutable contract"
+                )
+            if not preflight_path.is_file():
+                raise ValueError(
+                    f"resume run is missing {preflight_path.name}"
+                )
+            persisted = json.loads(preflight_path.read_text(encoding="utf-8"))
+            if persisted != preflight_payload:
+                raise ValueError(
+                    f"resume {preflight_path.name} differs from current preflight"
+                )
+
     train_samples, train_meta = load_training_manifest(
         args.train_manifest, root=args.train_root, expected_split="train"
     )
     val_samples, val_meta = load_training_manifest(args.val_manifest, root=args.val_root, expected_split="val")
+    if "galp" in args.enabled:
+        _validate_galp_dataset_binding(
+            train_samples,
+            train_meta,
+            args.galp_manifest,
+            args.galp_manifest_preflight,
+            split="train",
+            allow_layout_manifest_rebinding=args.allow_galp_layout_manifest_rebinding,
+        )
+        _validate_galp_dataset_binding(
+            val_samples,
+            val_meta,
+            args.galp_validation_manifest,
+            args.galp_validation_manifest_preflight,
+            split="validation",
+            allow_layout_manifest_rebinding=args.allow_galp_layout_manifest_rebinding,
+        )
     separation = validate_dataset_separation(train_samples, val_samples)
     if not separation["ok"]:
         raise ValueError(f"train/validation dataset contamination: {separation}")

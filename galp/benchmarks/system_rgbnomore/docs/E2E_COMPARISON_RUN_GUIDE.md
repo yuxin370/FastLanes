@@ -63,7 +63,7 @@ numactl --cpunodebind=0 --membind=0 env \
   --preset e2e \
   --output-dir "$OUT" \
   --benchmark-id galp-e2e-compare-latest \
-  --pipelines galp rgbnomore \
+  --pipelines galp_planless rgbnomore \
   --data-root /tmp/galp-image-major-1024-dataset \
   --split val \
   --index-csv /tmp/galp-image-major-1024-fixed/index.csv \
@@ -130,10 +130,10 @@ nvidia-smi topo -m
 ## 6. Pipeline 字段
 
 ```text
---pipelines galp rgbnomore
+--pipelines galp_planless rgbnomore
 ```
 
-`galp` 路径：
+`galp_planless` 路径：
 
 ```text
 FLS shard
@@ -157,7 +157,7 @@ JPEG
 如需额外运行 RGB 域诊断，可改成：
 
 ```text
---pipelines galp rgbnomore dali pytorch
+--pipelines galp_planless rgbnomore dali pytorch
 ```
 
 DALI/PyTorch 使用 RGB 模型，与 DCT 模型只能做 system-level reference，不能跨域逐元素比较。
@@ -271,7 +271,7 @@ sed -n '1,200p' \
 | `results.json` | 聚合指标、性能门槛和合同快照 |
 | `results.csv` | 表格形式的结果 |
 | `validation.json` | 性能与语义验证结论 |
-| `pipeline_galp.json` | GALP 每轮、每 batch 和 native counters |
+| `pipeline_galp_planless.json` | GALP planless 每轮、每 batch 和 native counters |
 | `pipeline_rgbnomore.json` | RGB-no-more 每轮详细结果 |
 | `contract.json` | 完整、不可歧义的实验配置 |
 | `commands.json` | 实际执行的 pipeline 子进程命令 |
