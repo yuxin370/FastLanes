@@ -1,5 +1,9 @@
 # DCT / Block-major 端到端实验汇总（2026-08-04）
 
+> **历史实验快照。** 本文中的六路 pipeline 名称、full/legacy 对照和 runtime
+> 调优参数仅用于复原 2026-08-04 的实验合同，当前 runner 已不再接受。当前可执行
+> 矩阵与命令见 [README](../README.md) 和 [运行指南](RUN_GUIDE.md)。
+
 ## 1. 结论摘要
 
 目前最新、全绿、最适合作为当前代码基线的是物理 GPU 0（NVIDIA GeForce RTX

@@ -13,6 +13,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from common import (
+    BLOCK_MAJOR_RUNTIME_PROFILE,
     PIPELINE_RESULT_SCHEMA,
     SUMMARY_SCHEMA,
     distribution,
@@ -360,7 +361,12 @@ def _validate_result(
                 f"{name}: missing steady-state throughput",
             )
         pipeline_config = contract["pipelines"].get(name, {})
-        if pipeline_config.get("segment_mode") == "manifest-shard":
+        if name == "dct_major_pushdown":
+            _require(
+                pipeline_config.get("runtime_profile") == BLOCK_MAJOR_RUNTIME_PROFILE,
+                failures,
+                "dct_major_pushdown: missing current native runtime profile",
+            )
             native = repeat.get("native_totals", {})
             native_segments = repeat.get("native_segments", [])
             _require(
@@ -592,197 +598,122 @@ def _validate_result(
                 failures,
                 "dct_major_pushdown: adaptive strategy counts do not cover every rowgroup",
             )
-            crop_execution_mode = contract["pipelines"][name].get("crop_execution_mode")
-            if crop_execution_mode in (
-                "vector-range-read-selected-decode",
-                "bounded-range-read-selected-decode",
-                "bounded-io-uring-range-read-selected-decode",
-                "bounded-io-uring-scheduled-range-read-selected-decode",
-            ):
-                planned_vectors = int(native.get("planned_vector_count", -1))
-                actual_vectors = int(native.get("actual_vector_count", -2))
-                _require(
-                    planned_vectors > 0 and planned_vectors == actual_vectors,
-                    failures,
-                    "dct_major_pushdown: explicit selected decode requires positive planned=actual vectors, "
-                    f"got {planned_vectors}/{actual_vectors}",
-                )
-                _require(
-                    int(native.get("sparse_read_fallback_rowgroup_count", -1)) == 0,
-                    failures,
-                    "dct_major_pushdown: explicit selected-range mode used sparse fallback",
-                )
-            if crop_execution_mode in (
-                "bounded-range-read-selected-decode",
-                "bounded-io-uring-range-read-selected-decode",
-                "bounded-io-uring-scheduled-range-read-selected-decode",
-            ):
-                scheduled_mode = (
-                    crop_execution_mode
-                    == "bounded-io-uring-scheduled-range-read-selected-decode"
-                )
-                io_uring_mode = crop_execution_mode in (
-                    "bounded-io-uring-range-read-selected-decode",
-                    "bounded-io-uring-scheduled-range-read-selected-decode",
-                )
-                cap_ppm = int(math.floor(float(contract["pipelines"][name].get(
-                    "bounded_read_amplification_cap", 1.0
-                )) * 1_000_000 + 0.5))
-                local_cap = float(contract["pipelines"][name].get(
-                    "bounded_read_local_amplification_cap", 0.0
-                ))
-                local_cap_ppm = (
-                    0 if local_cap == 0.0 else int(math.floor(local_cap * 1_000_000 + 0.5))
-                )
-                max_run_bytes = int(contract["pipelines"][name].get(
-                    "bounded_read_max_run_bytes", 0
-                ))
-                _require(
-                    1_000_000 <= cap_ppm <= 1_100_000,
-                    failures,
-                    f"dct_major_pushdown: bounded amplification cap is outside [1.0, 1.10]: {cap_ppm}",
-                )
-                _require(
-                    int(native.get("bounded_read_amplification_ppm", -1)) == cap_ppm
-                    and int(native.get("bounded_read_local_amplification_ppm", -1)) == local_cap_ppm
-                    and int(native.get("bounded_read_max_run_bytes", -1)) == max_run_bytes,
-                    failures,
-                    "dct_major_pushdown: runtime bounded-read configuration differs from the contract",
-                )
-                exact_bytes = int(native.get("bounded_exact_storage_bytes", -1))
-                physical_bytes = int(native.get("bounded_physical_storage_bytes", -1))
-                gap_bytes = int(native.get("bounded_merged_gap_bytes", -1))
-                full_bytes = int(native.get("full_compressed_payload_bytes", -1))
-                selected_bytes = int(native.get("selected_compressed_payload_bytes", -1))
-                actual_read_bytes = int(native.get("compressed_payload_bytes_read", -1))
-                _require(
-                    exact_bytes > 0
-                    and exact_bytes == selected_bytes
-                    and physical_bytes == actual_read_bytes
-                    and gap_bytes == physical_bytes - exact_bytes,
-                    failures,
-                    "dct_major_pushdown: bounded exact/physical/gap byte accounting is inconsistent",
-                )
-                _require(
-                    physical_bytes <= (exact_bytes * cap_ppm) // 1_000_000
-                    and physical_bytes <= full_bytes,
-                    failures,
-                    "dct_major_pushdown: bounded physical bytes exceed the whole-run cap or full payload",
-                )
-                expected_read_amplification = (
-                    physical_bytes / exact_bytes if exact_bytes > 0 else 0.0
-                )
-                _require(
-                    math.isclose(
-                        float(native.get("read_amplification", math.nan)),
-                        expected_read_amplification,
-                        rel_tol=1.0e-12,
-                        abs_tol=1.0e-12,
-                    ),
-                    failures,
-                    "dct_major_pushdown: read amplification is not the whole-run physical/exact ratio",
-                )
-                _require(
-                    int(native.get("merged_gap_bytes", -1)) == gap_bytes
-                    and int(native.get("hole_clear_bytes", -1)) == gap_bytes
-                    and int(native.get("static_prefix_restore_bytes", 0)) > 0,
-                    failures,
-                    "dct_major_pushdown: bounded hole clear/static-prefix accounting is inconsistent",
-                )
-                physical_runs = int(native.get("bounded_physical_run_count", -1))
-                exact_extents = int(native.get("bounded_exact_extent_count", -1))
-                _require(
-                    0 < physical_runs <= exact_extents
-                    and (
-                        physical_runs <= int(native.get("io_uring_read_request_count", -2))
-                        if io_uring_mode
-                        else physical_runs == int(native.get("pread_count", -2))
-                    ),
-                    failures,
-                    "dct_major_pushdown: bounded physical run/submission accounting is inconsistent",
-                )
-                if io_uring_mode:
-                    io_requests = int(native.get("io_uring_read_request_count", -1))
-                    io_completions = int(native.get("io_uring_completion_count", -2))
-                    io_submits = int(native.get("io_uring_submit_syscall_count", -1))
-                    _require(
-                        native.get("bounded_io_backend") == "io-uring"
-                        and int(native.get("bounded_io_uring_queue_depth", -1)) == 256
-                        and int(native.get("pread_count", -1)) == 0
-                        and io_requests == io_completions
-                        and io_requests >= physical_runs
-                        and 0 < io_submits < io_requests
-                        and int(native.get("io_uring_setup_count", 0)) > 0
-                        and int(native.get("io_uring_ring_mapped_bytes", 0)) > 0
-                        and int(native.get("io_uring_fallback_count", -1)) == 0,
-                        failures,
-                        "dct_major_pushdown: explicit io_uring mode did not use valid batched submissions",
-                    )
-                else:
-                    _require(
-                        native.get("bounded_io_backend", "sync-pread") == "sync-pread"
-                        and int(native.get("bounded_io_uring_queue_depth", 0)) == 0
-                        and int(native.get("io_uring_read_request_count", 0)) == 0
-                        and int(native.get("io_uring_fallback_count", 0)) == 0,
-                        failures,
-                        "dct_major_pushdown: synchronous bounded mode reported io_uring activity",
-                    )
-                if scheduled_mode:
-                    segment_count = int(native.get("segment_count", 0))
-                    sidecar_hits = int(native.get("active_output_schedule_sidecar_hit_count", 0))
-                    sidecar_misses = int(native.get("active_output_schedule_sidecar_miss_count", 0))
-                    schedule_builds = int(
-                        native.get("planless_transform_active_output_schedule_build_count", -1)
-                    )
-                    _require(
-                        segment_count > 0
-                        and sidecar_hits == segment_count
-                        and sidecar_misses == 0
-                        and schedule_builds == 0
-                        and int(native.get("active_output_schedule_sidecar_reject_count", -1)) == 0
-                        and int(native.get("active_output_schedule_sidecar_persist_count", -1)) == 0
-                        and int(native.get("active_output_schedule_sidecar_bytes", 0)) > 0
-                        and int(native.get("active_output_schedule_interval_count", 0)) > 0
-                        and int(native.get("active_output_schedule_mmap_capacity_bytes", 0))
-                        == 16 * 1024 * 1024
-                        and int(native.get("active_output_schedule_mmap_window_count", 0)) == 2
-                        and int(native.get("active_output_schedule_mapped_bytes_peak", 0)) > 0,
-                        failures,
-                        "dct_major_pushdown: frozen schedule sidecar evidence is inconsistent",
-                    )
-                _require(
-                    int(native.get("run_interval_bounded_rowgroup_count", 0))
-                    == int(native.get("rowgroup_count", -1))
-                    and native.get("storage_read_granularity") == "bounded-selected-vector-range"
-                    and native.get("decode_granularity") == "selected-vector",
-                    failures,
-                    "dct_major_pushdown: bounded mode did not remain bounded-read + selected-decode",
-                )
-            if contract["pipelines"][name].get("crop_execution_mode") == "auto":
-                adaptive_candidates = int(
-                    native.get("automatic_sparse_storage_candidate_rowgroup_count", 0)
-                )
-                _require(
-                    adaptive_candidates > 0,
-                    failures,
-                    "dct_major_pushdown: auto mode did not evaluate any three-strategy candidates",
-                )
-                for counter in (
-                    "adaptive_run_interval_estimated_ns",
-                    "adaptive_bitmap_estimated_ns",
-                    "adaptive_full_rowgroup_estimated_ns",
-                ):
-                    _require(
-                        float(native.get(counter, 0.0)) > 0.0,
-                        failures,
-                        f"dct_major_pushdown: auto mode did not report {counter}",
-                    )
-            capacity = int(native.get("decode_workset_capacity_bytes", 0))
-            expected_capacity = (
-                int(contract["pipelines"][name]["decode_workset_capacity_mib"])
-                * 1024
-                * 1024
+            planned_vectors = int(native.get("planned_vector_count", -1))
+            actual_vectors = int(native.get("actual_vector_count", -2))
+            _require(
+                planned_vectors > 0 and planned_vectors == actual_vectors,
+                failures,
+                "dct_major_pushdown: selected decode requires positive planned=actual vectors, "
+                f"got {planned_vectors}/{actual_vectors}",
             )
+            _require(
+                int(native.get("sparse_read_fallback_rowgroup_count", -1)) == 0,
+                failures,
+                "dct_major_pushdown: selected-range execution used sparse fallback",
+            )
+            cap_ppm = 1_100_000
+            local_cap_ppm = 0
+            max_run_bytes = 0
+            _require(
+                int(native.get("bounded_read_amplification_ppm", -1)) == cap_ppm
+                and int(native.get("bounded_read_local_amplification_ppm", -1)) == local_cap_ppm
+                and int(native.get("bounded_read_max_run_bytes", -1)) == max_run_bytes,
+                failures,
+                "dct_major_pushdown: runtime bounded-read configuration differs from the native profile",
+            )
+            exact_bytes = int(native.get("bounded_exact_storage_bytes", -1))
+            physical_bytes = int(native.get("bounded_physical_storage_bytes", -1))
+            gap_bytes = int(native.get("bounded_merged_gap_bytes", -1))
+            full_bytes = int(native.get("full_compressed_payload_bytes", -1))
+            selected_bytes = int(native.get("selected_compressed_payload_bytes", -1))
+            actual_read_bytes = int(native.get("compressed_payload_bytes_read", -1))
+            _require(
+                exact_bytes > 0
+                and exact_bytes == selected_bytes
+                and physical_bytes == actual_read_bytes
+                and gap_bytes == physical_bytes - exact_bytes,
+                failures,
+                "dct_major_pushdown: bounded exact/physical/gap byte accounting is inconsistent",
+            )
+            _require(
+                physical_bytes <= (exact_bytes * cap_ppm) // 1_000_000
+                and physical_bytes <= full_bytes,
+                failures,
+                "dct_major_pushdown: bounded physical bytes exceed the whole-run cap or full payload",
+            )
+            expected_read_amplification = physical_bytes / exact_bytes if exact_bytes > 0 else 0.0
+            _require(
+                math.isclose(
+                    float(native.get("read_amplification", math.nan)),
+                    expected_read_amplification,
+                    rel_tol=1.0e-12,
+                    abs_tol=1.0e-12,
+                ),
+                failures,
+                "dct_major_pushdown: read amplification is not the whole-run physical/exact ratio",
+            )
+            _require(
+                int(native.get("merged_gap_bytes", -1)) == gap_bytes
+                and int(native.get("hole_clear_bytes", -1)) == gap_bytes
+                and int(native.get("static_prefix_restore_bytes", 0)) > 0,
+                failures,
+                "dct_major_pushdown: bounded hole clear/static-prefix accounting is inconsistent",
+            )
+            physical_runs = int(native.get("bounded_physical_run_count", -1))
+            exact_extents = int(native.get("bounded_exact_extent_count", -1))
+            io_requests = int(native.get("io_uring_read_request_count", -1))
+            io_completions = int(native.get("io_uring_completion_count", -2))
+            io_submits = int(native.get("io_uring_submit_syscall_count", -1))
+            _require(
+                0 < physical_runs <= exact_extents and physical_runs <= io_requests,
+                failures,
+                "dct_major_pushdown: bounded physical run/submission accounting is inconsistent",
+            )
+            _require(
+                native.get("bounded_io_backend") == "io-uring"
+                and int(native.get("bounded_io_uring_queue_depth", -1)) == 256
+                and int(native.get("pread_count", -1)) == 0
+                and io_requests == io_completions
+                and io_requests >= physical_runs
+                and 0 < io_submits < io_requests
+                and int(native.get("io_uring_setup_count", 0)) > 0
+                and int(native.get("io_uring_ring_mapped_bytes", 0)) > 0
+                and int(native.get("io_uring_fallback_count", -1)) == 0,
+                failures,
+                "dct_major_pushdown: native profile did not use valid batched io_uring submissions",
+            )
+            segment_count = int(native.get("segment_count", 0))
+            sidecar_hits = int(native.get("active_output_schedule_sidecar_hit_count", 0))
+            sidecar_misses = int(native.get("active_output_schedule_sidecar_miss_count", 0))
+            schedule_builds = int(
+                native.get("planless_transform_active_output_schedule_build_count", -1)
+            )
+            _require(
+                segment_count > 0
+                and sidecar_hits == segment_count
+                and sidecar_misses == 0
+                and schedule_builds == 0
+                and int(native.get("active_output_schedule_sidecar_reject_count", -1)) == 0
+                and int(native.get("active_output_schedule_sidecar_persist_count", -1)) == 0
+                and int(native.get("active_output_schedule_sidecar_bytes", 0)) > 0
+                and int(native.get("active_output_schedule_interval_count", 0)) > 0
+                and int(native.get("active_output_schedule_mmap_capacity_bytes", 0))
+                == 16 * 1024 * 1024
+                and int(native.get("active_output_schedule_mmap_window_count", 0)) == 2
+                and int(native.get("active_output_schedule_mapped_bytes_peak", 0)) > 0,
+                failures,
+                "dct_major_pushdown: frozen schedule sidecar evidence is inconsistent",
+            )
+            _require(
+                int(native.get("run_interval_bounded_rowgroup_count", 0))
+                == int(native.get("rowgroup_count", -1))
+                and native.get("storage_read_granularity") == "bounded-selected-vector-range"
+                and native.get("decode_granularity") == "selected-vector",
+                failures,
+                "dct_major_pushdown: native profile did not remain bounded-read + selected-decode",
+            )
+            capacity = int(native.get("decode_workset_capacity_bytes", 0))
+            expected_capacity = 512 * 1024 * 1024
             estimated_peak = max(
                 int(native.get("max_estimated_decode_workset_bytes", 0)),
                 int(native.get("bounded_double_buffer_peak_estimated_bytes", 0)),
@@ -825,12 +756,6 @@ def _validate_result(
                 f"or inconsistent across {segment_count} segments",
             )
 
-            pipeline_contract = contract["pipelines"][name]
-            _require(
-                int(pipeline_contract.get("plan_cache_capacity", -1)) == 0,
-                failures,
-                "dct_major_pushdown: count-bounded exact plan cache must be disabled",
-            )
             _require(
                 int(native.get("exact_batch_plan_cache_enabled", 0)) == 0,
                 failures,
@@ -863,7 +788,7 @@ def _validate_result(
                 )
 
             decoded_capacity = int(native.get("decoded_rowgroup_cache_capacity_bytes", 0))
-            expected_decoded_capacity = int(pipeline_contract.get("cache_capacity_mib", 0)) * 1024 * 1024
+            expected_decoded_capacity = 0
             decoded_current = int(native.get("decoded_rowgroup_cache_current_bytes", 0))
             decoded_peak = int(native.get("decoded_rowgroup_cache_peak_bytes", 0))
             decoded_entries = int(native.get("decoded_rowgroup_cache_current_rowgroups", 0))
@@ -895,144 +820,6 @@ def _validate_result(
                         failures,
                         f"dct_major_pushdown: disabled decoded-rowgroup cache reported {counter}",
                     )
-
-
-def _physical_evidence(
-    contract: dict[str, Any],
-    aggregates: dict[str, dict[str, Any]],
-    failures: list[str],
-) -> dict[str, Any] | None:
-    if "dct_major_full" not in aggregates or "dct_major_pushdown" not in aggregates:
-        return None
-    full = aggregates["dct_major_full"]["native_hot_mean"]
-    push = aggregates["dct_major_pushdown"]["native_hot_mean"]
-
-    def metric(payload: dict[str, float], *names: str) -> float:
-        for name in names:
-            if name in payload:
-                value = float(payload[name])
-                if value > 0.0:
-                    return value
-        return 0.0
-
-    full_bytes = metric(full, "compressed_payload_bytes_read", "rowgroup_storage_bytes_read")
-    push_bytes = metric(push, "compressed_payload_bytes_read", "rowgroup_storage_bytes_read")
-    full_selected_bytes = metric(full, "selected_compressed_payload_bytes")
-    push_selected_bytes = metric(push, "selected_compressed_payload_bytes")
-    full_available_bytes = metric(full, "full_compressed_payload_bytes")
-    push_available_bytes = metric(push, "full_compressed_payload_bytes")
-    full_vectors = metric(full, "actual_vector_count", "selected_vector_count")
-    push_vectors = metric(push, "actual_vector_count", "selected_vector_count")
-    full_blocks = metric(
-        full,
-        "requested_source_block_count",
-        "source_blocks_transformed",
-        "fixed_transform_source_block_count",
-        "block_count",
-        "planned_selected_vector_count",
-        "planned_vector_count",
-    )
-    push_blocks = metric(
-        push,
-        "requested_source_block_count",
-        "source_blocks_transformed",
-        "fixed_transform_source_block_count",
-        "block_count",
-        "planned_selected_vector_count",
-        "planned_vector_count",
-    )
-    bytes_reduced = 0.0 < push_bytes < full_bytes
-    vectors_reduced = 0.0 < push_vectors < full_vectors
-    blocks_reduced = 0.0 < push_blocks < full_blocks
-    _require(bytes_reduced, failures, f"DCT-major pushdown did not reduce physical bytes: {push_bytes} vs {full_bytes}")
-    _require(vectors_reduced, failures, f"DCT-major pushdown did not reduce decoded vectors: {push_vectors} vs {full_vectors}")
-    _require(blocks_reduced, failures, f"DCT-major pushdown did not reduce transformed source blocks: {push_blocks} vs {full_blocks}")
-    return {
-        "full_compressed_payload_bytes_read": full_bytes,
-        "pushdown_compressed_payload_bytes_read": push_bytes,
-        "full_selected_compressed_payload_bytes": full_selected_bytes,
-        "pushdown_selected_compressed_payload_bytes": push_selected_bytes,
-        "full_available_compressed_payload_bytes": full_available_bytes,
-        "pushdown_available_compressed_payload_bytes": push_available_bytes,
-        "full_read_amplification": (
-            full_bytes / full_selected_bytes if full_selected_bytes else 0.0
-        ),
-        "pushdown_read_amplification": (
-            push_bytes / push_selected_bytes if push_selected_bytes else 0.0
-        ),
-        "physical_bytes_saved_percent": 100.0 * (1.0 - push_bytes / full_bytes) if full_bytes else 0.0,
-        "full_actual_vector_count": full_vectors,
-        "pushdown_actual_vector_count": push_vectors,
-        "decoded_vectors_saved_percent": 100.0 * (1.0 - push_vectors / full_vectors) if full_vectors else 0.0,
-        "full_source_blocks": full_blocks,
-        "pushdown_source_blocks": push_blocks,
-        "source_blocks_saved_percent": 100.0 * (1.0 - push_blocks / full_blocks) if full_blocks else 0.0,
-        "full_pread_count": metric(full, "pread_count"),
-        "pushdown_pread_count": metric(push, "pread_count"),
-        "full_repeat_counters": {
-            name: float(full.get(name, 0.0))
-            for name in (
-                "segment_cross_shard_count",
-                "shard_reactivation_count",
-                "duplicate_physical_read_count",
-                "rowgroup_revisit_count",
-                "vector_run_revisit_count",
-                "physical_read_order_inversions",
-            )
-        },
-        "pushdown_repeat_counters": {
-            name: float(push.get(name, 0.0))
-            for name in (
-                "segment_cross_shard_count",
-                "shard_reactivation_count",
-                "duplicate_physical_read_count",
-                "rowgroup_revisit_count",
-                "vector_run_revisit_count",
-                "physical_read_order_inversions",
-            )
-        },
-        "ok": bytes_reduced and vectors_reduced and blocks_reduced,
-    }
-
-
-def _planless_resource_evidence(
-    aggregates: dict[str, dict[str, Any]],
-    failures: list[str],
-) -> dict[str, Any] | None:
-    legacy = aggregates.get("dct_major_legacy_pushdown")
-    planless = aggregates.get("dct_major_pushdown")
-    if legacy is None or planless is None:
-        return None
-
-    metric_names = (
-        "host_peak_rss_bytes",
-        "galp_native_pinned_peak_in_use_bytes",
-        "galp_native_device_peak_in_use_bytes",
-        "peak_torch_gpu_allocated_bytes",
-        "peak_torch_gpu_reserved_bytes",
-    )
-    comparisons: dict[str, dict[str, float | bool]] = {}
-    for name in metric_names:
-        legacy_distribution = legacy.get(name)
-        planless_distribution = planless.get(name)
-        available = isinstance(legacy_distribution, dict) and isinstance(planless_distribution, dict)
-        legacy_peak = float(legacy_distribution.get("max", 0.0)) if available else 0.0
-        planless_peak = float(planless_distribution.get("max", 0.0)) if available else 0.0
-        ok = available and planless_peak <= legacy_peak
-        _require(available, failures, f"planless/legacy memory comparison is missing {name}")
-        if available:
-            _require(
-                ok,
-                failures,
-                f"planless {name} exceeds legacy pushdown: {planless_peak:.0f} vs {legacy_peak:.0f}",
-            )
-        comparisons[name] = {
-            "legacy_peak_bytes": legacy_peak,
-            "planless_peak_bytes": planless_peak,
-            "planless_over_legacy": planless_peak / legacy_peak if legacy_peak else 0.0,
-            "ok": ok,
-        }
-    return {"ok": all(bool(item["ok"]) for item in comparisons.values()), "metrics": comparisons}
 
 
 def _write_csv(
@@ -1478,33 +1265,6 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
             f"`{aggregate['throughput_images_per_s']['cv_population']:.6f}`, endpoint drift="
             f"`{aggregate['throughput_endpoint_drift']:.6f}`."
         )
-    lines.extend(["", "## Physical crop evidence", ""])
-    if summary["physical_evidence"] is None:
-        lines.append("- DCT-major full/pushdown pair was not run.")
-    else:
-        evidence = summary["physical_evidence"]
-        lines.extend(
-            [
-                f"- Compressed bytes: `{evidence['full_compressed_payload_bytes_read']:.0f}` -> `{evidence['pushdown_compressed_payload_bytes_read']:.0f}` (`-{evidence['physical_bytes_saved_percent']:.3f}%`).",
-                f"- Full/selected/actual compressed bytes (full): `{evidence['full_available_compressed_payload_bytes']:.0f}` / `{evidence['full_selected_compressed_payload_bytes']:.0f}` / `{evidence['full_compressed_payload_bytes_read']:.0f}`; read amplification=`{evidence['full_read_amplification']:.6f}x`.",
-                f"- Full/selected/actual compressed bytes (pushdown): `{evidence['pushdown_available_compressed_payload_bytes']:.0f}` / `{evidence['pushdown_selected_compressed_payload_bytes']:.0f}` / `{evidence['pushdown_compressed_payload_bytes_read']:.0f}`; read amplification=`{evidence['pushdown_read_amplification']:.6f}x`.",
-                f"- Decoded vectors: `{evidence['full_actual_vector_count']:.0f}` -> `{evidence['pushdown_actual_vector_count']:.0f}` (`-{evidence['decoded_vectors_saved_percent']:.3f}%`).",
-                f"- Source blocks: `{evidence['full_source_blocks']:.0f}` -> `{evidence['pushdown_source_blocks']:.0f}` (`-{evidence['source_blocks_saved_percent']:.3f}%`).",
-                f"- Preads: `{evidence['full_pread_count']:.0f}` -> `{evidence['pushdown_pread_count']:.0f}`.",
-                "- Full repeat counters: "
-                + ", ".join(
-                    f"`{name}={value:.0f}`"
-                    for name, value in evidence["full_repeat_counters"].items()
-                )
-                + ".",
-                "- Pushdown repeat counters: "
-                + ", ".join(
-                    f"`{name}={value:.0f}`"
-                    for name, value in evidence["pushdown_repeat_counters"].items()
-                )
-                + ".",
-            ]
-        )
     lines.extend(["", "## Semantic comparisons", ""])
     for comparison in summary["semantic_comparisons"]:
         if comparison["ok"]:
@@ -1550,17 +1310,6 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
                 f"`{total_storage['relative_to_raw_rgb']:.6f}x` raw RGB).",
             ]
         )
-    lines.extend(["", "## Planless versus legacy memory", ""])
-    resource = summary["planless_resource_evidence"]
-    if resource is None:
-        lines.append("- Planless and legacy crop-pushdown pair was not run.")
-    else:
-        for name, comparison in resource["metrics"].items():
-            lines.append(
-                f"- `{name}`: `{comparison['legacy_peak_bytes']:.0f}` -> "
-                f"`{comparison['planless_peak_bytes']:.0f}` bytes "
-                f"(`{comparison['planless_over_legacy']:.6f}x`)."
-            )
     if summary["failures"]:
         lines.extend(["", "## Failures", ""])
         lines.extend(f"- {failure}" for failure in summary["failures"])
@@ -1569,7 +1318,7 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
             "",
             "## Comparability boundary",
             "",
-            "- DCT-major full/pushdown, image-major v2/v3 pushdown, and RGB-no-more use the DCT checkpoint and are strict same-domain comparisons.",
+            "- GALP DCT-major and RGB-no-more use the DCT checkpoint and are a strict same-domain comparison.",
             "- DALI and PyTorch use the RGB checkpoint. Their comparison is same-domain; ratios against GALP are deployment-level context only.",
         ]
     )
@@ -1635,12 +1384,6 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
     )
 
     semantic_pairs = [
-        ("dct_major_full", "dct_major_pushdown", True),
-        ("dct_major_legacy_pushdown", "dct_major_pushdown", True),
-        ("dct_major_pushdown", "image_major_pushdown", True),
-        ("dct_major_pushdown", "image_major_v2_pushdown", True),
-        ("dct_major_pushdown", "image_major_v3_pushdown", True),
-        ("image_major_v2_pushdown", "image_major_v3_pushdown", True),
         ("dct_major_pushdown", "rgbnomore", True),
         ("dali", "pytorch", False),
     ]
@@ -1662,9 +1405,6 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
             failures,
             f"{name}: throughput endpoint drift {endpoint_drift:.6f} exceeds {maximum_endpoint_drift:.6f}",
         )
-    physical_evidence = _physical_evidence(contract, aggregates, failures)
-    planless_resource_evidence = _planless_resource_evidence(aggregates, failures)
-
     speedups: dict[str, float] = {}
     throughput = {name: float(item["throughput_images_per_s"]["p50"]) for name, item in aggregates.items()}
     cold_throughput = {
@@ -1676,12 +1416,6 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         if numerator in throughput and denominator in throughput and throughput[denominator] > 0.0:
             speedups[label] = throughput[numerator] / throughput[denominator]
 
-    ratio("crop_pushdown_over_full", "dct_major_pushdown", "dct_major_full")
-    ratio("planless_over_legacy_pushdown", "dct_major_pushdown", "dct_major_legacy_pushdown")
-    ratio("dct_major_over_image_major", "dct_major_pushdown", "image_major_pushdown")
-    ratio("dct_major_over_image_major_v2", "dct_major_pushdown", "image_major_v2_pushdown")
-    ratio("dct_major_over_image_major_v3", "dct_major_pushdown", "image_major_v3_pushdown")
-    ratio("image_major_v3_over_v2", "image_major_v3_pushdown", "image_major_v2_pushdown")
     ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
     ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
     ratio("dali_over_pytorch", "dali", "pytorch")
@@ -1692,12 +1426,6 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         if numerator in cold_throughput and denominator in cold_throughput and cold_throughput[denominator] > 0.0:
             cold_speedups[label] = cold_throughput[numerator] / cold_throughput[denominator]
 
-    cold_ratio("crop_pushdown_over_full", "dct_major_pushdown", "dct_major_full")
-    cold_ratio("planless_over_legacy_pushdown", "dct_major_pushdown", "dct_major_legacy_pushdown")
-    cold_ratio("dct_major_over_image_major", "dct_major_pushdown", "image_major_pushdown")
-    cold_ratio("dct_major_over_image_major_v2", "dct_major_pushdown", "image_major_v2_pushdown")
-    cold_ratio("dct_major_over_image_major_v3", "dct_major_pushdown", "image_major_v3_pushdown")
-    cold_ratio("image_major_v3_over_v2", "image_major_v3_pushdown", "image_major_v2_pushdown")
     cold_ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
     cold_ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
     cold_ratio("dali_over_pytorch", "dali", "pytorch")
@@ -1749,8 +1477,6 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         "aggregates": aggregate_list,
         "speedups": speedups,
         "cold_speedups": cold_speedups,
-        "physical_evidence": physical_evidence,
-        "planless_resource_evidence": planless_resource_evidence,
         "block_major_access_storage": contract["dataset"].get("block_major_access"),
         "storage_evidence": storage_evidence,
         "semantic_comparisons": semantic_comparisons,
@@ -1763,8 +1489,6 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         {
             "ok": summary["ok"],
             "failures": failures,
-            "physical_evidence": physical_evidence,
-            "planless_resource_evidence": planless_resource_evidence,
             "block_major_access_storage": contract["dataset"].get("block_major_access"),
             "semantic_comparisons": semantic_comparisons,
         },

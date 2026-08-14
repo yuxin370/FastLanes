@@ -233,18 +233,6 @@ def run(args: argparse.Namespace) -> int:
             if float(item["throughput_images_per_s"]["cv_population"]) > 0.05
         ]
     )
-    cold_speedups: dict[str, float] = {}
-    if "dct_major_pushdown" in pipelines and "dct_major_full" in pipelines:
-        full_throughput = float(pipelines["dct_major_full"]["throughput_images_per_s"]["median"])
-        pushdown_throughput = float(
-            pipelines["dct_major_pushdown"]["throughput_images_per_s"]["median"]
-        )
-        speedup = pushdown_throughput / full_throughput if full_throughput else 0.0
-        cold_speedups["crop_pushdown_over_full"] = speedup
-        if speedup <= 1.0:
-            failures.append(
-                f"dct_major_pushdown process-cold median did not exceed full: {speedup:.6f}x"
-            )
     result = {
         "schema_version": SCHEMA,
         "ok": not failures,
@@ -252,11 +240,9 @@ def run(args: argparse.Namespace) -> int:
         "process_repeats": args.process_repeats,
         "cold_protocol": args.protocol,
         "cache_protocol": "per-pipeline posix_fadvise(DONTNEED); no global drop_caches",
-        "model_prime": (
-            "disabled" if "--no-cold-start-model-prime" in run_arguments else "enabled"
-        ),
+        "runtime_policy": "owned-by-native-profile",
         "pipelines": pipelines,
-        "cold_speedups": cold_speedups,
+        "cold_speedups": {},
         "round_directories": [str((output_dir / f"round_{index + 1:02d}").resolve()) for index in range(args.process_repeats)],
         "round_validation": [
             {

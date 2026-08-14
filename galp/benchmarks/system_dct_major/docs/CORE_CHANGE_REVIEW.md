@@ -1,5 +1,10 @@
 # Core-change review record
 
+> **Historical implementation review.** This records the boundary approved
+> during block-major development. Current runtime selection is frozen in
+> `block-major-p4-scheduled-bounded-110-v1`; use [README](../README.md) and
+> [RUN_GUIDE](RUN_GUIDE.md) for the supported interface.
+
 ## Approved implementation boundary
 
 The earlier benchmark-only audit established that manifest-v1 DCT-major

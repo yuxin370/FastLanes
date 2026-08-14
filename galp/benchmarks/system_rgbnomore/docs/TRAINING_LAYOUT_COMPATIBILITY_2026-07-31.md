@@ -1,5 +1,9 @@
 # Direct-DCT training layout compatibility — 2026-07-31
 
+> **Historical compatibility record.** Layout conclusions remain useful, but
+> commands must be checked against the current training and DCT-major guides.
+> Low-level GALP runtime choices are now owned by native profiles.
+
 ## Decision
 
 The training loop is shared by image-major v2 and
@@ -395,20 +399,19 @@ Do not pass a block-major/spatial-major manifest to the training runner.  Its
 preflight deliberately accepts only v2 and v3, and adding a layout branch in
 the train loop would defeat the public-reader compatibility boundary.
 
-While block-major code is changing, run only the bounded gates owned by its
-isolated benchmark:
+Inspect the current isolated block-major suite without starting GPU work:
 
 ```bash
 PYTHONPATH=build/galp/torch:galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   galp/benchmarks/system_dct_major/run_suite.py \
   --block-major-access-dir /tmp/galp-block-major-access-v1-real \
-  --output-dir /tmp/galp-dct-major-planless-gates-20260731 \
-  --gates-only
+  --output-dir /tmp/galp-dct-major-suite-dryrun \
+  --dry-run
 ```
 
 Training adoption becomes safe when block-major is exposed through the same
-public `DirectDctReader.prefetch_batch(...).read()` semantic batch surface and
+stable high-level Pipeline/Iterator semantic batch surface and
 passes identity/order, transform provenance, missing/new stats, 3+10 GPU smoke,
 and checkpoint-resume gates without a train-loop layout conditional.
 

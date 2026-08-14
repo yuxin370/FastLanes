@@ -196,10 +196,11 @@ still require the caller to control and record page-cache state.
 each variant has at least five fresh processes. It verifies that repeat zero is
 included, warmup is zero, baseline source revisions are clean and hashed, and
 the hardware, dataset, sample order, model, and execution configuration match.
-The adapter and A/B runner use the same canonical contract names as the system
-runner: `galp_planless` and `galp_fixed_items`. The old `galp` and
-`galp_legacy` spellings are accepted only when consuming historical contracts;
-adapted contracts are always written with canonical names.
+The current system runner exposes one canonical production name: `galp`. The
+old `galp_planless`, `galp_fixed_items` and `galp_legacy` spellings survive only
+inside historical artifacts and are rejected by current production contracts.
+Raw fixed-items/planless selection remains an internal diagnostic concern, not
+a benchmark pipeline choice.
 Its GPU gate counts Torch-reserved plus GALP-native device memory, while the
 process-tree PSS gate includes worker processes and pinned host allocations.
 Both variants require passing semantic validator JSON bound to the identical

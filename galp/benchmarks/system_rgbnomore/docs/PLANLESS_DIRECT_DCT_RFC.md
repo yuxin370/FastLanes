@@ -1,8 +1,17 @@
 # Planless Direct-DCT Execution RFC
 
-Status: Milestone 3 general compact planner and CPU structural gates implemented; target-GPU gates pending  
-Scope: image-major Direct-DCT transformed-grid execution  
-Last updated: 2026-07-18
+Status: historical implementation RFC; compact/planless foundation implemented, production selection superseded by named native profiles
+
+Scope: image-major Direct-DCT transformed-grid execution
+
+Last updated: 2026-08-14
+
+> This RFC explains the implementation lineage. It is not the current Python
+> API or benchmark CLI. Production uses pipeline name `galp` and native profile
+> `compact-v3-planless-limited-o512-c512-v1`; fixed-items/planless selection and
+> launch/resource knobs are no longer user options. See
+> [benchmark README](../README.md) and
+> [Python API refactor status](../../../PYTHON_API_REFACTOR_PLAN.md).
 
 ## 1. Decision
 

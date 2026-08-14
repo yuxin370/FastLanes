@@ -22,11 +22,12 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 BENCHMARK_ROOT = HERE.parent
 REPO_ROOT = BENCHMARK_ROOT.parents[2]
-for path in (BENCHMARK_ROOT, REPO_ROOT / "galp/torch"):
+for path in (BENCHMARK_ROOT, REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 from common import parse_manifest, write_json  # noqa: E402
+from galp.torch import DirectDctReader  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,17 +57,12 @@ def main() -> None:
     args = parse_args()
     if args.rank_checkpoint_images <= 0 or args.topology_checkpoint_groups <= 0:
         raise ValueError("checkpoint intervals must be positive")
-    binding_dir = args.torch_binding_dir.resolve()
-    if str(binding_dir) not in sys.path:
-        sys.path.insert(0, str(binding_dir))
-    from _galp_direct_dct import DirectDctReader  # type: ignore  # noqa: PLC0415
-
     manifest_path = args.manifest.resolve()
     manifest = parse_manifest(manifest_path)
     if int(manifest["version"]) != 1 or manifest["physical_layout"] != "dct-major/spatial-major-image-minor":
         raise ValueError("descriptor estimate requires a version-1 spatial-major/image-minor manifest")
 
-    reader = DirectDctReader(str(manifest_path))
+    reader = DirectDctReader(manifest_path, module_path=args.torch_binding_dir)
     metadata_started = time.perf_counter()
     images: list[dict[int, tuple[int, int]]] = []
     quant_tables: list[set[tuple[int, ...]]] = [set() for _ in manifest["shards"]]

@@ -139,8 +139,8 @@ enum class JpegDctBlockMajorDoubleBufferPolicy {
 	kDisabled,
 };
 
-// Controls the storage/decode granularity for crop A/B measurements. All
-// modes preserve the same crop transform and output contract.
+// Controls the storage/decode granularity for crop requests. All modes
+// preserve the same crop transform and output contract.
 enum class JpegDctCropExecutionMode {
 	kAutomatic,
 	kFullRowgroupDecode,

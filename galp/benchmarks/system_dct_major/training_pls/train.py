@@ -272,13 +272,11 @@ def _adapter_config(
     reader: DirectDctTrainingReader,
     galp_manifest: Path,
     module_path: Path,
-    cache_capacity_mib: int,
     prefetch_depth: int,
 ) -> dict[str, Any]:
     return {
         "galp_manifest": str(galp_manifest.resolve()),
         "galp_torch_module_path": str(module_path.resolve()),
-        "galp_cache_capacity_mib": int(cache_capacity_mib),
         "prefetch_depth": int(prefetch_depth),
         "execution_mode": "runtime",
         "_direct_dct_training_reader": reader,
@@ -398,7 +396,6 @@ def _run_validation(
     reader: DirectDctTrainingReader,
     galp_manifest: Path,
     module_path: Path,
-    cache_capacity_mib: int,
     prefetch_depth: int,
     workers: int,
     device: torch.device,
@@ -419,7 +416,6 @@ def _run_validation(
         reader=reader,
         galp_manifest=galp_manifest,
         module_path=module_path,
-        cache_capacity_mib=cache_capacity_mib,
         prefetch_depth=prefetch_depth,
     )
     batch_count = (len(samples) + 63) // 64
@@ -702,7 +698,7 @@ def _final_metrics_from_file(path: Path) -> dict[str, Any]:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    recipe = assert_recipe_overrides(recipe=args.recipe, epochs=args.epochs)
+    recipe = assert_recipe_overrides(recipe=RECIPE_NAME, epochs=args.epochs)
     condition = resolve_condition(args.condition)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -874,7 +870,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             reader=val_reader,
             galp_manifest=val_galp_manifest,
             module_path=args.galp_torch_module_path,
-            cache_capacity_mib=args.galp_cache_capacity_mib,
             prefetch_depth=args.prefetch_depth,
             workers=args.workers,
             device=device,
@@ -918,7 +913,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         reader=train_reader,
         galp_manifest=train_galp_manifest,
         module_path=args.galp_torch_module_path,
-        cache_capacity_mib=args.galp_cache_capacity_mib,
         prefetch_depth=args.prefetch_depth,
     )
     pending_validation_epoch = resume_bookkeeping.get("pending_validation_epoch")
@@ -932,7 +926,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             reader=val_reader,
             galp_manifest=val_galp_manifest,
             module_path=args.galp_torch_module_path,
-            cache_capacity_mib=args.galp_cache_capacity_mib,
             prefetch_depth=args.prefetch_depth,
             workers=args.workers,
             device=device,
@@ -1239,7 +1232,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 reader=val_reader,
                 galp_manifest=val_galp_manifest,
                 module_path=args.galp_torch_module_path,
-                cache_capacity_mib=args.galp_cache_capacity_mib,
                 prefetch_depth=args.prefetch_depth,
                 workers=args.workers,
                 device=device,
@@ -1378,7 +1370,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--layout-plan", type=Path, required=True)
     parser.add_argument("--condition-contract", type=Path, required=True)
-    parser.add_argument("--recipe", default=RECIPE_NAME, choices=(RECIPE_NAME,))
     parser.add_argument("--condition", required=True, choices=("A0", "A1", "B2", "B6"))
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--epochs", type=int, default=300)
@@ -1386,7 +1377,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--prefetch-depth", type=int, default=2)
-    parser.add_argument("--galp-cache-capacity-mib", type=int, default=0)
     parser.add_argument(
         "--galp-torch-module-path", type=Path, default=REPO_ROOT / "build/galp/torch"
     )
@@ -1405,9 +1395,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     if args.workers <= 0:
-        raise ValueError("GALP rowgroup-prefetch workers must be positive")
-    if args.prefetch_depth < 0 or args.galp_cache_capacity_mib < 0:
-        raise ValueError("prefetch depth and cache capacity must be non-negative")
+        raise ValueError("workers must be positive")
+    if args.prefetch_depth < 0:
+        raise ValueError("prefetch depth must be non-negative")
     if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch < 300:
         raise ValueError("--stop-after-epoch must be in [1, 299]")
     return args

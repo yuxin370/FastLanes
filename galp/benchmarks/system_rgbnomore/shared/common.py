@@ -18,19 +18,39 @@ CONTRACT_SCHEMA = "galp_system_benchmark_contract_v2"
 MANIFEST_SCHEMA = "galp_system_benchmark_manifest_v2"
 RESULT_SCHEMA = "galp_system_benchmark_result_v2"
 PIPELINES = ("galp", "rgbnomore", "dali", "pytorch")
-CANONICAL_GALP_PIPELINES = ("galp_planless", "galp_fixed_items")
-INFERENCE_PIPELINES = (CANONICAL_GALP_PIPELINES[0], "rgbnomore", "dali", "pytorch")
-PIPELINE_ALIASES = {
-    "galp": "galp_planless",
-    "galp_legacy": "galp_fixed_items",
-}
-GALP_PIPELINES = CANONICAL_GALP_PIPELINES + tuple(PIPELINE_ALIASES)
-CONTRACT_PIPELINES = INFERENCE_PIPELINES + (CANONICAL_GALP_PIPELINES[1],) + tuple(PIPELINE_ALIASES)
-TRANSFORM_EXECUTION_MODES = ("require-planless", "require-fixed-items", "auto")
+INFERENCE_PIPELINES = PIPELINES
+GALP_PIPELINES = ("galp",)
+CONTRACT_PIPELINES = INFERENCE_PIPELINES
+GALP_RUNTIME_PROFILE = "compact-v3-planless-limited-o512-c512-v1"
+GALP_RUNTIME_IMPLEMENTATION_FIELDS = frozenset(
+    {
+        "cache_capacity_mib",
+        "plan_cache_capacity",
+        "decode_batch_rowgroups",
+        "decode_workset_capacity_mib",
+        "enable_planless_execution",
+        "async_planless_completion",
+        "rowgroup_prefetch_depth",
+        "rowgroup_prefetch_workers",
+        "rowgroup_prefetch_min_decode_batches",
+        "transform_execution_mode",
+        "crop_execution_mode",
+        "scheduling_policy",
+        "transform_blocks_per_launch",
+        "transform_ctas_per_launch",
+        "use_low_priority_streams",
+        "block_major_double_buffer",
+        "batch_prefetch_depth",
+        "output_prefetch_policy",
+        "bounded_read_amplification_cap",
+        "bounded_read_local_amplification_cap",
+        "bounded_read_max_run_bytes",
+    }
+)
 
 
 def canonical_pipeline_name(name: str) -> str:
-    return PIPELINE_ALIASES.get(name, name)
+    return name
 
 
 def contract_pipeline_name(
@@ -39,53 +59,16 @@ def contract_pipeline_name(
     *,
     require_enabled: bool = True,
 ) -> str:
-    """Resolve a canonical request against current or legacy contract keys.
-
-    New contracts use ``galp_planless`` and ``galp_fixed_items``.  Historical
-    contracts may instead contain ``galp`` or ``galp_legacy``; readers accept
-    those aliases without allowing them to leak into newly generated
-    contracts.
-    """
+    """Resolve a production pipeline without historical aliases."""
     pipelines = contract.get("pipelines")
     require(isinstance(pipelines, dict), "contract.pipelines must be an object")
     enabled = pipelines.get("enabled")
     require(isinstance(enabled, list), "contract.pipelines.enabled must be a list")
-    canonical = canonical_pipeline_name(requested)
-    aliases = tuple(
-        alias for alias, target in PIPELINE_ALIASES.items() if target == canonical
-    )
-    for candidate in (canonical, *aliases):
-        if candidate not in pipelines:
-            continue
-        if require_enabled and candidate not in enabled:
-            continue
-        return candidate
-    qualifier = "enabled " if require_enabled else ""
-    raise ValueError(
-        f"{qualifier}pipeline {requested!r} has no contract configuration; "
-        f"canonical name is {canonical!r}"
-    )
-
-
-def transform_execution_mode(config: dict[str, Any], pipeline: str) -> str:
-    """Return the explicit transform planner policy, with legacy-contract compatibility."""
-    mode = config.get("transform_execution_mode")
-    if mode is None:
-        if pipeline in ("galp_fixed_items", "galp_legacy"):
-            mode = "require-fixed-items"
-        elif pipeline in ("galp_planless", "galp"):
-            mode = (
-                "require-planless"
-                if bool(config.get("enable_planless_execution", True))
-                else "require-fixed-items"
-            )
-    require(mode in TRANSFORM_EXECUTION_MODES, f"unsupported transform_execution_mode for {pipeline}: {mode!r}")
-    return str(mode)
-
-
-def transform_mode_enables_planless(mode: str) -> bool:
-    require(mode in TRANSFORM_EXECUTION_MODES, f"unsupported transform_execution_mode: {mode!r}")
-    return mode != "require-fixed-items"
+    require(requested in CONTRACT_PIPELINES, f"unsupported production pipeline: {requested!r}")
+    require(requested in pipelines, f"pipeline {requested!r} has no contract configuration")
+    if require_enabled:
+        require(requested in enabled, f"pipeline {requested!r} is not enabled")
+    return requested
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -369,17 +352,15 @@ def load_contract(path: Path) -> dict[str, Any]:
             continue
         galp = payload["pipelines"].get(pipeline)
         require(isinstance(galp, dict), f"pipelines.{pipeline} must be an object")
-        mode = transform_execution_mode(galp, pipeline)
-        if pipeline in ("galp_planless", "galp_fixed_items"):
-            require(
-                "transform_execution_mode" in galp,
-                f"pipelines.{pipeline}.transform_execution_mode must be explicit",
-            )
-        if "enable_planless_execution" in galp and mode != "auto":
-            require(
-                bool(galp["enable_planless_execution"]) == transform_mode_enables_planless(mode),
-                f"pipelines.{pipeline}.enable_planless_execution contradicts transform_execution_mode",
-            )
+        require(
+            galp.get("runtime_profile") == GALP_RUNTIME_PROFILE,
+            f"pipelines.{pipeline}.runtime_profile must be {GALP_RUNTIME_PROFILE!r}",
+        )
+        leaked = sorted(GALP_RUNTIME_IMPLEMENTATION_FIELDS.intersection(galp))
+        require(
+            not leaked,
+            f"pipelines.{pipeline} exposes native runtime fields: {leaked}",
+        )
         require(isinstance(galp.get("manifest_fingerprint"), dict), "GALP manifest fingerprint is missing")
         fingerprints = galp.get("payload_fingerprints")
         require(isinstance(fingerprints, list) and fingerprints, "GALP payload fingerprints are missing")

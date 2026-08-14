@@ -77,7 +77,7 @@ if (BUILD_TESTING)
                 COMMAND ${CMAKE_COMMAND} -E env
                         "PYTHONPATH=$<TARGET_FILE_DIR:_galp_direct_dct>"
                         ${Python3_EXECUTABLE}
-                        -c "import torch; import _galp_direct_dct as m; print(torch.__version__); print(torch.cuda.is_available()); assert m.DirectDctReader; assert m.DirectDctBatch"
+                        -c "import torch; import _galp_direct_dct as m; print(torch.__version__); print(torch.cuda.is_available()); assert m.DirectDctReader; assert m.DirectDctBatch; assert m.DIRECT_DCT_PROFILE_SCHEMA == 'galp-direct-dct-profile-v1'; assert m.available_direct_dct_profiles()"
         )
         set_tests_properties(GalpDirectDctTorchImport PROPERTIES
                 LABELS "galp;jpeg-dct;direct-dct;torch;smoke"

@@ -93,7 +93,7 @@ def _state_difference(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    recipe = recipe_contract(args.recipe)
+    recipe = recipe_contract(RECIPE_NAME)
     mapping = load_layout_mapping(args.layout_plan)
     train_samples, train_meta = _load_manifest_fast(
         args.train_manifest, expected_split="train"
@@ -201,7 +201,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             reader=reader,
             galp_manifest=galp_manifest,
             module_path=args.galp_torch_module_path,
-            cache_capacity_mib=0,
             prefetch_depth=2,
         ),
     )
@@ -465,7 +464,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--layout-plan", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--recipe", choices=(RECIPE_NAME,), default=RECIPE_NAME)
     parser.add_argument("--seed", type=int, default=11997733)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--workers", type=int, default=4)

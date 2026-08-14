@@ -43,7 +43,6 @@ python -m training_pls.plan_layout \
   --train-manifest "$TRAIN_JSON" \
   --output-dir /tmp/pls-layout \
   --segment-images 1024 \
-  --organization current \
   --organization-seed 20260810
 ```
 
@@ -55,7 +54,6 @@ python -m training_pls.run_matrix \
   --train-manifest "$TRAIN_JSON" \
   --val-manifest "$VAL_JSON" \
   --layout-plan /tmp/pls-layout/physical_layout_plan.json \
-  --recipe rgbnomore-vitti-dct-published-v1 \
   --conditions A0,A1,B2,B6 \
   --seeds 11997733,11997734,11997735,11997736 \
   --epochs 300 \
@@ -80,7 +78,6 @@ python -m training_pls.sanity_check \
   --train-manifest "$TRAIN_JSON" \
   --layout-plan /tmp/pls-layout/physical_layout_plan.json \
   --output /tmp/pls-core/a0_reference_sanity.json \
-  --recipe rgbnomore-vitti-dct-published-v1 \
   --seed 11997733 \
   --device cuda:0
 ```

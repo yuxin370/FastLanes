@@ -4,9 +4,8 @@
 This tool lives in the GALP JPEG-DCT boundary, parses the Compact-v3 trailer
 strictly, refreshes immutable file fingerprints in an existing same-dataset
 contract, and can execute alternating v2/v3 pipeline legs while sampling the
-complete Linux process tree.  New contracts use the canonical inference names
-``galp_planless`` and ``galp_fixed_items``; the historical ``galp`` and
-``galp_legacy`` keys are accepted only when reading older contracts.
+complete Linux process tree. Production contracts expose one ``galp`` pipeline;
+the native runtime profile owns the chosen execution representation.
 
 It intentionally does not turn missing evidence into a pass.  In particular,
 the current inference pipeline stores latency distributions rather than the
@@ -40,13 +39,14 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from shared.common import (  # noqa: E402
-    CANONICAL_GALP_PIPELINES,
-    PIPELINE_ALIASES,
+    GALP_PIPELINES,
+    GALP_RUNTIME_IMPLEMENTATION_FIELDS,
+    GALP_RUNTIME_PROFILE,
     canonical_pipeline_name,
     contract_pipeline_name,
 )
 
-ACCEPTANCE_GALP_PIPELINES = CANONICAL_GALP_PIPELINES + tuple(PIPELINE_ALIASES)
+ACCEPTANCE_GALP_PIPELINES = GALP_PIPELINES
 DEFAULT_PIPELINE = REPO_ROOT / "galp/benchmarks/system_rgbnomore/inference/pipeline.py"
 DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
 DEFAULT_RUNTIME_AUDIT = (
@@ -707,54 +707,19 @@ def _binding_binary(config: dict[str, Any]) -> Path:
 
 
 def _canonicalize_contract_pipeline_names(contract: dict[str, Any]) -> None:
-    """Migrate inference pipeline references while retaining old-contract input."""
+    """Require the single production GALP pipeline and strip native knobs."""
     pipelines = contract.get("pipelines")
     require(isinstance(pipelines, dict), "bad contract.pipelines section")
     enabled = pipelines.get("enabled")
     require(isinstance(enabled, list), "bad contract.pipelines.enabled section")
 
-    for alias, canonical in PIPELINE_ALIASES.items():
-        legacy_config = pipelines.get(alias)
-        if canonical not in pipelines and isinstance(legacy_config, dict):
-            pipelines[canonical] = copy.deepcopy(legacy_config)
-        pipelines.pop(alias, None)
-
-    canonical_enabled: list[str] = []
-    for name in enabled:
-        canonical = canonical_pipeline_name(str(name))
-        if canonical not in canonical_enabled:
-            canonical_enabled.append(canonical)
-    pipelines["enabled"] = canonical_enabled
-
-    for name in CANONICAL_GALP_PIPELINES:
-        config = pipelines.get(name)
-        if not isinstance(config, dict):
-            continue
-        mode = "require-planless" if name == "galp_planless" else "require-fixed-items"
-        config.setdefault("transform_execution_mode", mode)
-        if "enable_planless_execution" in config:
-            config["enable_planless_execution"] = mode == "require-planless"
-
-    performance_gates = contract.get("performance_gates")
-    if isinstance(performance_gates, dict):
-        for alias, canonical in PIPELINE_ALIASES.items():
-            if canonical not in performance_gates and alias in performance_gates:
-                performance_gates[canonical] = copy.deepcopy(performance_gates[alias])
-            performance_gates.pop(alias, None)
-
-    semantic = contract.get("semantic_validation")
-    if isinstance(semantic, dict):
-        groups = semantic.get("comparison_groups")
-        if isinstance(groups, list):
-            for group in groups:
-                if not isinstance(group, dict) or not isinstance(group.get("pipelines"), list):
-                    continue
-                canonical_group: list[str] = []
-                for name in group["pipelines"]:
-                    canonical = canonical_pipeline_name(str(name))
-                    if canonical not in canonical_group:
-                        canonical_group.append(canonical)
-                group["pipelines"] = canonical_group
+    require(all(str(name) in GALP_PIPELINES or str(name) in {"rgbnomore", "dali", "pytorch"} for name in enabled),
+            "contract contains a removed historical pipeline")
+    config = pipelines.get("galp")
+    require(isinstance(config, dict), "contract has no pipelines.galp configuration")
+    for field in GALP_RUNTIME_IMPLEMENTATION_FIELDS:
+        config.pop(field, None)
+    config["runtime_profile"] = GALP_RUNTIME_PROFILE
 
 
 def adapt_contract(args: argparse.Namespace) -> None:
@@ -805,8 +770,8 @@ def adapt_contract(args: argparse.Namespace) -> None:
     require(enabled, "at least one enabled pipeline is required")
     require(len(set(enabled)) == len(enabled), "enabled pipelines contain duplicate canonical names")
     require(
-        all(name in CANONICAL_GALP_PIPELINES for name in enabled),
-        "adapter only supports canonical GALP inference pipelines",
+        all(name in GALP_PIPELINES for name in enabled),
+        "adapter only supports the GALP production pipeline",
     )
     contract["pipelines"]["enabled"] = enabled
 
@@ -1658,9 +1623,9 @@ def _parser() -> argparse.ArgumentParser:
     adapt.add_argument(
         "--enabled-pipelines",
         nargs="+",
-        default=("galp_planless",),
+        default=("galp",),
         choices=ACCEPTANCE_GALP_PIPELINES,
-        help="canonical GALP inference pipelines; galp/galp_legacy are legacy input aliases",
+        help="GALP production pipeline",
     )
     adapt.add_argument("--repeats", type=int)
     adapt.add_argument("--measurement-batches", type=int)
@@ -1671,7 +1636,7 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--pipeline",
         choices=ACCEPTANCE_GALP_PIPELINES,
-        default="galp_planless",
+        default="galp",
     )
     run_parser.add_argument("--output", type=Path, required=True)
     run_parser.add_argument("--resource-output", type=Path, required=True)
@@ -1690,7 +1655,7 @@ def _parser() -> argparse.ArgumentParser:
     ab.add_argument(
         "--pipeline",
         choices=ACCEPTANCE_GALP_PIPELINES,
-        default="galp_planless",
+        default="galp",
     )
     ab.add_argument("--legs", type=int, default=10)
     ab.add_argument("--seed", type=int, default=11997733)

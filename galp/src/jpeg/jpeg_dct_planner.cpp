@@ -34,10 +34,10 @@ namespace {
 
 // Match the float32 torch.mm conversion used by the CUDA reference-down2
 // path. Tiny non-zero entries are observable at round-to-even boundaries.
-constexpr float kRgbNoMoreDown2Conversion[] = {
+constexpr float kReferenceDown2Conversion[] = {
 #include "jpeg/jpeg_dct_reference_down2.inc"
 };
-static_assert(sizeof(kRgbNoMoreDown2Conversion) / sizeof(kRgbNoMoreDown2Conversion[0]) == 8U * 16U);
+static_assert(sizeof(kReferenceDown2Conversion) / sizeof(kReferenceDown2Conversion[0]) == 8U * 16U);
 
 std::filesystem::path resolve_manifest_member(const std::filesystem::path& root,
 	                                          const std::string&           member,
@@ -1421,7 +1421,7 @@ struct JpegDctShardDatasetReader::Impl {
 			for (size_t out_coeff = 0U; out_coeff < 8U; ++out_coeff) {
 				for (size_t in_coeff = 0U; in_coeff < 8U; ++in_coeff) {
 					matrix[out_coeff * 8U + in_coeff] =
-					    kRgbNoMoreDown2Conversion[out_coeff * 16U + subblock * 8U + in_coeff] /
+					    kReferenceDown2Conversion[out_coeff * 16U + subblock * 8U + in_coeff] /
 					    0x1.6a09e60000000p+0F;
 				}
 			}
@@ -2506,7 +2506,7 @@ struct JpegDctShardDatasetReader::Impl {
 			return AxisRelation {static_cast<uint16_t>(up_factor), static_cast<uint16_t>(down_factor)};
 		};
 		const auto supported_axis = [&](const uint32_t crop_extent, const uint32_t output_extent) {
-			// RGB-no-more keeps the requested crop geometry and zero-pads source
+			// Fixed-grid profiles keep the requested crop geometry and zero-pad source
 			// blocks which lie outside a component.  This matters for uncommon
 			// sampling layouts such as 4:1:1 and 4:4:0, whose chroma plane can be
 			// smaller than the profile's fixed half-resolution crop.

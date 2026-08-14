@@ -18,6 +18,7 @@ from unittest import mock
 
 import numpy as np
 import torch
+from galp.torch import DirectDctFuture
 
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "benchmarks/system_rgbnomore"
@@ -45,7 +46,6 @@ from diagnostics.direct_dct import (  # noqa: E402
 from dataset.manifest import build_manifest, collect_dataset, jpeg_frame, validate_galp_label_map  # noqa: E402
 from inference.pipeline import (  # noqa: E402
     GalpAdapter,
-    GalpFixedItemsAdapter,
     _accumulate_native_counter,
     _process_memory_snapshot,
     _resolve_model_stream_priority,
@@ -60,15 +60,6 @@ from inference.run import (  # noqa: E402
     _parse_args as _parse_run_args,
     _source_revision_policy,
 )
-from diagnostics.scheduler_matrix import (  # noqa: E402
-    _invariant_counter,
-    _normalize_limited_candidates,
-    _normalize_transform_blocks,
-    _pareto_frontier,
-    _policy_specs,
-    _residency_bounds,
-    _serial_model_reference,
-)
 from inference.validate import (  # noqa: E402
     _aggregate_pipeline,
     _evaluate_performance_gates,
@@ -76,117 +67,15 @@ from inference.validate import (  # noqa: E402
     _validate_crop_pushdown_accounting,
     _validate_planless_structural_accounting,
 )
-from inference.crop_io_ab import validate_crop_io_ab_results  # noqa: E402
 
 
 class SystemBenchmarkTest(unittest.TestCase):
-    def test_scheduler_rejects_slower_serial_model_as_model_only_ceiling(self) -> None:
-        reference = _serial_model_reference(50, 9.8, 11.0)
-        self.assertFalse(reference["consistent_with_model_only_upper_bound"])
-        self.assertIsNone(reference["model_only_ceiling_images_per_s_from_serial_p50"])
-        self.assertAlmostEqual(reference["serial_model_period_ceiling_images_per_s"], 50_000 / 11.0)
-
     def test_direct_dct_latency_distribution_uses_interpolated_percentiles(self) -> None:
         summary = _latency_distribution_ms([4.0, 1.0, 3.0, 2.0])
         self.assertEqual(summary["count"], 4)
         self.assertEqual(summary["mean"], 2.5)
         self.assertEqual(summary["p50"], 2.5)
         self.assertAlmostEqual(summary["p95"], 3.85)
-
-    def test_crop_io_ab_accepts_same_outputs_and_real_physical_byte_reduction(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            base_contract = {
-                "pipelines": {
-                    "galp_fixed_items": {
-                        "manifest": "fixture",
-                        "preprocess": "rgbnomore-val-pushdown",
-                        "cache_capacity_mib": 0,
-                        "plan_cache_capacity": 0,
-                        "transform_execution_mode": "require-fixed-items",
-                    }
-                },
-                "semantic_validation": {"prediction_agreement_sample_count": 50_000},
-            }
-            modes = {
-                "full_decode": ("full-rowgroup-decode", 8, 100, "rowgroup", "rowgroup"),
-                "crop_rowgroup": (
-                    "rowgroup-read-selected-decode",
-                    4,
-                    100,
-                    "rowgroup",
-                    "selected-vector",
-                ),
-                "crop_vector": (
-                    "vector-range-read-selected-decode",
-                    4,
-                    50,
-                    "selected-vector-range",
-                    "selected-vector",
-                ),
-            }
-            results = {}
-            for name, (execution_mode, actual_vectors, physical_bytes, storage, decode) in modes.items():
-                artifact = root / f"{name}.npz"
-                np.savez_compressed(
-                    artifact,
-                    input_0=np.arange(8, dtype=np.float32).reshape(2, 4),
-                    input_1=np.arange(4, dtype=np.float32).reshape(2, 2),
-                    logits=np.arange(12, dtype=np.float32).reshape(2, 6),
-                    top1_predictions=np.arange(50_000, dtype=np.int64) % 1000,
-                )
-                results[name] = {
-                    "pipeline": "galp_fixed_items",
-                    "pipeline_config": {
-                        **base_contract["pipelines"]["galp_fixed_items"],
-                        "crop_execution_mode": execution_mode,
-                    },
-                    "semantic_artifact": str(artifact),
-                    "repeats": [
-                        {
-                            "images": 4,
-                            "seconds": 1.0,
-                            "throughput_images_per_s": 4.0,
-                            "correct_top1": 3,
-                            "correct_top5": 4,
-                            "native_counters": {
-                                "planned_vector_count": 4,
-                                "actual_vector_count": actual_vectors,
-                                "full_vector_count": 8,
-                                "compressed_payload_bytes_read": physical_bytes,
-                                "full_compressed_payload_bytes": 100,
-                                "pread_count": 3,
-                                "vector_bundle_rowgroup_count": 0,
-                                "vector_bundle_envelope_rowgroup_count": 0,
-                                "vector_bundle_pread_count": 0,
-                                "requested_source_block_count": 12,
-                                "source_blocks_transformed": 12,
-                                "rowgroups": 4,
-                                "sparse_read_fallback_rowgroup_count": 0,
-                            },
-                            "native_properties": {
-                                "storage_read_granularity": storage,
-                                "decode_granularity": decode,
-                                "read_amplification": physical_bytes / 100.0,
-                                "sparse_read_supported": storage == "selected-vector-range",
-                                "sparse_read_fallback_reason": "",
-                            },
-                            "stage_breakdown_ms": {
-                                "native_totals_seconds": {
-                                    "decode_seconds": 0.1,
-                                    "fixed_transform_kernel_seconds": 0.2,
-                                }
-                            },
-                        }
-                    ],
-                }
-            summary = validate_crop_io_ab_results(base_contract, results)
-            self.assertTrue(summary["ok"], summary["failures"])
-            self.assertEqual(summary["top1_agreement"]["crop_vector"], 1.0)
-            self.assertLess(
-                summary["modes"]["crop_vector"]["compressed_payload_bytes_read"],
-                summary["modes"]["crop_rowgroup"]["compressed_payload_bytes_read"],
-            )
 
     def test_crop_accounting_rejects_full_vector_pushdown_claim(self) -> None:
         failures: list[str] = []
@@ -342,31 +231,25 @@ class SystemBenchmarkTest(unittest.TestCase):
             sys, "argv", ["run.py", "--output-dir", "/tmp/galp-default-contract-test"]
         ):
             args = _parse_run_args()
-        self.assertEqual(args.galp_scheduling_policy, "limited-overlap")
-        self.assertEqual(args.galp_transform_blocks_per_launch, 512)
-        self.assertEqual(args.galp_transform_ctas_per_launch, 512)
-        self.assertEqual(args.pipelines[0], "galp_planless")
+        self.assertFalse(hasattr(args, "galp_scheduling_policy"))
+        self.assertFalse(hasattr(args, "galp_transform_blocks_per_launch"))
+        self.assertFalse(hasattr(args, "galp_transform_ctas_per_launch"))
+        self.assertEqual(args.pipelines[0], "galp")
         self.assertEqual(args.dct_source_image_size, 512)
 
-    def test_transform_capability_preflight_enforces_strict_modes_before_runtime(self) -> None:
+    def test_transform_capability_preflight_requires_production_planless_path(self) -> None:
         fixed_preview = {
             "uses_planless_fixed_transform": False,
             "layout": "transformed_dct_grid",
             "image_count": 2,
         }
         planless_preview = {**fixed_preview, "uses_planless_fixed_transform": True}
-        fixed = _validate_transform_capability(
-            "require-fixed-items", fixed_preview, context="test"
-        )
-        self.assertEqual(fixed["observed_transform_execution"], "fixed-items")
-        auto = _validate_transform_capability("auto", fixed_preview, context="test")
-        self.assertEqual(auto["observed_transform_execution"], "fixed-items")
-        with self.assertRaisesRegex(RuntimeError, "require-planless"):
-            _validate_transform_capability("require-planless", fixed_preview, context="test")
-        with self.assertRaisesRegex(RuntimeError, "require-fixed-items"):
-            _validate_transform_capability("require-fixed-items", planless_preview, context="test")
+        accepted = _validate_transform_capability(planless_preview, context="test")
+        self.assertEqual(accepted["observed_transform_execution"], "planless")
+        with self.assertRaisesRegex(RuntimeError, "requires planless"):
+            _validate_transform_capability(fixed_preview, context="test")
 
-    def test_legacy_inference_pipeline_names_normalize_to_explicit_modes(self) -> None:
+    def test_production_cli_rejects_historical_galp_pipeline_names(self) -> None:
         with mock.patch.object(
             sys,
             "argv",
@@ -378,23 +261,19 @@ class SystemBenchmarkTest(unittest.TestCase):
                 "galp",
                 "galp_legacy",
             ],
-        ):
-            args = _parse_run_args()
-        self.assertEqual(args.pipelines, ["galp_planless", "galp_fixed_items"])
+        ), self.assertRaises(SystemExit):
+            _parse_run_args()
 
-    def test_contract_pipeline_resolution_prefers_canonical_and_reads_legacy(self) -> None:
+    def test_contract_pipeline_resolution_is_strict(self) -> None:
         current = {
             "pipelines": {
-                "enabled": ["galp_planless"],
-                "galp_planless": {},
+                "enabled": ["galp"],
                 "galp": {},
             }
         }
-        self.assertEqual(contract_pipeline_name(current, "galp"), "galp_planless")
-        legacy = {"pipelines": {"enabled": ["galp"], "galp": {}}}
-        self.assertEqual(contract_pipeline_name(legacy, "galp_planless"), "galp")
-        with self.assertRaisesRegex(ValueError, "no contract configuration"):
-            contract_pipeline_name(legacy, "galp_fixed_items")
+        self.assertEqual(contract_pipeline_name(current, "galp"), "galp")
+        with self.assertRaisesRegex(ValueError, "unsupported production pipeline"):
+            contract_pipeline_name(current, "galp_fixed_items")
 
     def test_model_stream_priority_resolves_framework_range(self) -> None:
         self.assertEqual(_resolve_model_stream_priority("greatest", (0, -3)), -3)
@@ -402,84 +281,6 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(_resolve_model_stream_priority(-1, (0, -3)), -1)
         with self.assertRaisesRegex(ValueError, "invalid model stream priority"):
             _resolve_model_stream_priority("high", (0, -3))
-
-    def test_scheduler_matrix_expands_limited_overlap_sweep(self) -> None:
-        self.assertEqual(_normalize_transform_blocks([1024, 256, 1024]), [256, 1024])
-        candidates = _normalize_limited_candidates(
-            [1024, 256, 1024], [128, 64, 128]
-        )
-        self.assertEqual(candidates, [(256, 64), (1024, 128)])
-        self.assertEqual(
-            _policy_specs(candidates),
-            [
-                ("fully-overlapped", "fully-overlapped", 0, 0),
-                ("limited-overlap-o256-c64", "limited-overlap", 256, 64),
-                ("limited-overlap-o1024-c128", "limited-overlap", 1024, 128),
-                ("serial", "serial", 0, 0),
-            ],
-        )
-        self.assertEqual(
-            _policy_specs(_normalize_limited_candidates(64, None))[1],
-            ("limited-overlap", "limited-overlap", 64, 64),
-        )
-        with self.assertRaisesRegex(ValueError, "positive integers"):
-            _normalize_transform_blocks([0])
-        with self.assertRaisesRegex(ValueError, "equal counts"):
-            _normalize_limited_candidates([256, 512], [64, 128, 256])
-
-    def test_scheduler_matrix_computes_limited_pareto_frontier(self) -> None:
-        summaries = {
-            "a": {
-                "throughput_images_per_s_median": 4500.0,
-                "model_extra_p50_ms_vs_serial": 0.30,
-            },
-            "b": {
-                "throughput_images_per_s_median": 4400.0,
-                "model_extra_p50_ms_vs_serial": 0.20,
-            },
-            "dominated": {
-                "throughput_images_per_s_median": 4300.0,
-                "model_extra_p50_ms_vs_serial": 0.35,
-            },
-        }
-        self.assertEqual(_pareto_frontier(summaries, ["a", "b", "dominated"]), ["a", "b"])
-
-    def test_scheduler_matrix_computes_resource_limited_residency(self) -> None:
-        one_cta_per_sm = _residency_bounds(
-            submitted_ctas=128,
-            sm_count=128,
-            max_active_ctas_per_sm=10,
-            threads_per_cta=64,
-            max_threads_per_sm=1536,
-        )
-        self.assertEqual(one_cta_per_sm["max_resident_ctas_per_launch"], 128)
-        self.assertEqual(one_cta_per_sm["average_resident_ctas_per_sm_upper_bound"], 1.0)
-        self.assertEqual(one_cta_per_sm["sm_coverage_fraction_upper_bound"], 1.0)
-        self.assertAlmostEqual(
-            one_cta_per_sm["thread_occupancy_fraction_upper_bound"], 1.0 / 24.0
-        )
-        saturated = _residency_bounds(
-            submitted_ctas=2048,
-            sm_count=128,
-            max_active_ctas_per_sm=10,
-            threads_per_cta=64,
-            max_threads_per_sm=1536,
-        )
-        self.assertEqual(saturated["max_resident_ctas_per_launch"], 1280)
-        self.assertEqual(saturated["resident_cta_capacity_fraction_upper_bound"], 1.0)
-        self.assertAlmostEqual(
-            saturated["thread_occupancy_fraction_upper_bound"], 10.0 / 24.0
-        )
-
-    def test_scheduler_matrix_requires_invariant_native_priority_counters(self) -> None:
-        repeats = [
-            {"native_counters": {"direct_dct_stream_priority": 0}},
-            {"native_counters": {"direct_dct_stream_priority": 0}},
-        ]
-        self.assertEqual(_invariant_counter(repeats, "direct_dct_stream_priority"), 0)
-        repeats[1]["native_counters"]["direct_dct_stream_priority"] = -1
-        with self.assertRaisesRegex(RuntimeError, "not invariant"):
-            _invariant_counter(repeats, "direct_dct_stream_priority")
 
     def test_in_place_rgbnomore_range_scale_matches_reference(self) -> None:
         values = torch.arange(-1024, 1017, dtype=torch.float32)
@@ -691,7 +492,7 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(PRESETS["e2e"]["repeats"], 5)
         self.assertEqual(
             E2E_PIPELINES,
-            ("galp_planless", "pytorch", "rgbnomore", "dali"),
+            ("galp", "pytorch", "rgbnomore", "dali"),
         )
         self.assertGreater(PRESETS["e2e"]["measurement_batches"], PRESETS["smoke"]["measurement_batches"])
         self.assertEqual(GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, 1.10)
@@ -772,7 +573,13 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertTrue((galp_root / "benchmarks/system_rgbnomore/diagnostics/direct_dct.py").is_file())
         self.assertTrue((galp_root / "benchmarks/system_rgbnomore/diagnostics/validate_pushdown.py").is_file())
         self.assertTrue((galp_root / "benchmarks/system_rgbnomore/diagnostics/scan_manifests.py").is_file())
-        self.assertTrue((galp_root / "torch/rgbnomore_dct_profile.py").is_file())
+        self.assertTrue(
+            (
+                galp_root
+                / "benchmarks/system_rgbnomore/diagnostics/rgbnomore_dct_profile.py"
+            ).is_file()
+        )
+        self.assertFalse((galp_root / "torch/rgbnomore_dct_profile.py").exists())
 
     def test_distribution_and_trace_are_deterministic(self) -> None:
         self.assertEqual(distribution([1.0, 2.0, 3.0])["p50"], 2.0)
@@ -1026,8 +833,29 @@ class SystemBenchmarkTest(unittest.TestCase):
         prefetch_calls: list[list[int]] = []
 
         class Pending:
+            ready = True
+            started = True
+            active = False
+            finished = True
+            producer_active_ms = 0.0
+            planning_ms = 0.0
+            io_staging_ms = 0.0
+            ordered_submission_ms = 0.0
+
             def __init__(self, image_ids: list[int]) -> None:
                 self.image_ids = image_ids
+
+            def release_submission(self) -> bool:
+                return True
+
+            def read(self):
+                return SourceBatch(self.image_ids)
+
+        class Reader:
+            @staticmethod
+            def prefetch(image_ids, profile):
+                prefetch_calls.append(list(image_ids))
+                return DirectDctFuture(Pending(list(image_ids)), profile.id)
 
         class SourceBatch:
             execution_stats = {
@@ -1045,37 +873,17 @@ class SystemBenchmarkTest(unittest.TestCase):
                 "fixed_grid_finalize_kernel_launch_count": 1,
             }
 
-        class Module:
-            @staticmethod
-            def _prefetch_pushdown_batch(reader, args, image_ids):
-                del reader, args
-                prefetch_calls.append(list(image_ids))
-                return Pending(list(image_ids))
-
-            @staticmethod
-            def _adapt_prefetched_pushdown_batch(reader, args, image_ids, pending):
-                del reader, args
-                self.assertEqual(pending.image_ids, image_ids)
+            def __init__(self, image_ids: list[int]) -> None:
                 count = len(image_ids)
-                return torch.zeros((count, 1)), torch.zeros((count, 2)), [SourceBatch()]
-
-            @staticmethod
-            def _empty_totals():
-                return {"fixed_transform_items": 0, "projection_items": 0}
-
-            @staticmethod
-            def _accumulate_many_stats(totals, batches):
-                totals["fixed_transform_items"] += len(batches)
+                self.global_image_ids = image_ids
+                self.layout = "transformed_dct_grid"
+                self.y = torch.zeros((count, 1, 28, 28, 8, 8), dtype=torch.float32)
+                self.cbcr = torch.zeros((count, 2, 14, 14, 8, 8), dtype=torch.float32)
 
         adapter = object.__new__(GalpAdapter)
-        adapter.module = Module()
-        adapter.reader = object()
-        adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
-        adapter.transform_execution_mode = "require-planless"
+        adapter.reader = Reader()
         adapter.device = torch.device("cpu")
-        adapter.transform = None
         adapter.batch_size = 2
-        adapter.batch_prefetch_depth = 2
         adapter.pending_batches = deque()
         adapter.next_prefetch_batch_index = 0
 
@@ -1103,153 +911,6 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(second_batch.ordinals, [2, 3])
         self.assertEqual(third_batch.ordinals, [4, 5])
         self.assertEqual(list(adapter.pending_batches), [])
-
-    def test_galp_serial_policy_defers_next_prefetch_until_next_load(self) -> None:
-        prefetch_calls: list[list[int]] = []
-
-        class Pending:
-            def __init__(self, image_ids: list[int]) -> None:
-                self.image_ids = image_ids
-
-        class SourceBatch:
-            execution_stats = {
-                "fixed_transform_item_count": 0,
-                "planless_image_descriptor_count": 2,
-                "host_expanded_transform_items_created": 0,
-                "host_output_block_source_lists_created": 0,
-                "host_global_transform_sort_items": 0,
-                "device_mapping_fused": True,
-                "projection_item_count": 0,
-                "decoded_projection_item_count": 0,
-                "project_decoded_ycbcr_grid_launch_count": 0,
-                "fixed_grid_output_float32": True,
-                "fixed_grid_output_affine_applied": True,
-                "fixed_grid_finalize_kernel_launch_count": 1,
-            }
-
-        class Module:
-            @staticmethod
-            def _prefetch_pushdown_batch(reader, args, image_ids):
-                del reader, args
-                prefetch_calls.append(list(image_ids))
-                return Pending(list(image_ids))
-
-            @staticmethod
-            def _adapt_prefetched_pushdown_batch(reader, args, image_ids, pending):
-                del reader, args
-                self.assertEqual(pending.image_ids, image_ids)
-                count = len(image_ids)
-                return torch.zeros((count, 1)), torch.zeros((count, 2)), [SourceBatch()]
-
-            @staticmethod
-            def _empty_totals():
-                return {"fixed_transform_items": 0, "projection_items": 0}
-
-            @staticmethod
-            def _accumulate_many_stats(totals, batches):
-                totals["fixed_transform_items"] += len(batches)
-
-        adapter = object.__new__(GalpAdapter)
-        adapter.module = Module()
-        adapter.reader = object()
-        adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
-        adapter.transform_execution_mode = "require-planless"
-        adapter.device = torch.device("cpu")
-        adapter.transform = None
-        adapter.batch_size = 2
-        adapter.batch_prefetch_depth = 2
-        adapter.scheduling_policy = "serial"
-        adapter.pending_batches = deque()
-        adapter.next_prefetch_batch_index = 0
-        first = [
-            {"galp_image_id": 30, "label": 1, "ordinal": 0},
-            {"galp_image_id": 31, "label": 2, "ordinal": 1},
-        ]
-        second = [
-            {"galp_image_id": 32, "label": 3, "ordinal": 2},
-            {"galp_image_id": 33, "label": 4, "ordinal": 3},
-        ]
-        adapter.samples = first + second
-        adapter.total_batches = 2
-
-        adapter.begin_repeat()
-        self.assertEqual(prefetch_calls, [[30, 31]])
-        adapter.load(first, second)
-        self.assertEqual(prefetch_calls, [[30, 31]])
-        adapter.load(second, None)
-        self.assertEqual(prefetch_calls, [[30, 31], [32, 33]])
-        self.assertEqual(list(adapter.pending_batches), [])
-
-    def test_galp_fixed_items_adapter_uses_same_prefetch_path_and_expanded_graph(self) -> None:
-        prefetch_calls: list[list[int]] = []
-
-        class Pending:
-            def __init__(self, image_ids: list[int]) -> None:
-                self.image_ids = image_ids
-
-        class SourceBatch:
-            execution_stats = {
-                "fixed_transform_item_count": 8,
-                "planless_image_descriptor_count": 0,
-                "host_expanded_transform_items_created": 8,
-                "host_global_transform_sort_items": 8,
-                "exact_batch_plan_cache_enabled": False,
-                "cache_enabled": False,
-                "fixed_grid_output_float32": True,
-                "fixed_grid_output_affine_applied": True,
-                "fixed_grid_finalize_kernel_launch_count": 1,
-            }
-
-        class Module:
-            @staticmethod
-            def _prefetch_pushdown_batch(reader, args, image_ids):
-                del reader, args
-                prefetch_calls.append(list(image_ids))
-                return Pending(list(image_ids))
-
-            @staticmethod
-            def _adapt_prefetched_pushdown_batch(reader, args, image_ids, pending):
-                del reader, args
-                self.assertEqual(pending.image_ids, image_ids)
-                count = len(image_ids)
-                return torch.zeros((count, 1)), torch.zeros((count, 2)), [SourceBatch()]
-
-            @staticmethod
-            def read_and_adapt_batch(*args, **kwargs):
-                raise AssertionError("fixed-items A/B must use the same prefetch path")
-
-            @staticmethod
-            def _empty_totals():
-                return {"fixed_transform_items": 0, "projection_items": 0}
-
-            @staticmethod
-            def _accumulate_many_stats(totals, batches):
-                totals["fixed_transform_items"] += len(batches)
-
-        adapter = object.__new__(GalpFixedItemsAdapter)
-        adapter.module = Module()
-        adapter.reader = object()
-        adapter.args = SimpleNamespace(preprocess="rgbnomore-val-pushdown")
-        adapter.transform_execution_mode = "require-fixed-items"
-        adapter.device = torch.device("cpu")
-        adapter.transform = None
-        adapter.batch_size = 2
-        adapter.batch_prefetch_depth = 1
-        adapter.pending_batches = deque()
-        adapter.next_prefetch_batch_index = 0
-        adapter.samples = [
-            {"galp_image_id": 20, "label": 1, "ordinal": 0},
-            {"galp_image_id": 21, "label": 2, "ordinal": 1},
-        ]
-        adapter.total_batches = 1
-
-        adapter.begin_repeat()
-        loaded = adapter.load(adapter.samples, None)
-
-        self.assertEqual(prefetch_calls, [[20, 21]])
-        self.assertEqual(loaded.ordinals, [0, 1])
-        self.assertEqual(list(adapter.pending_batches), [])
-
 
 if __name__ == "__main__":
     unittest.main()

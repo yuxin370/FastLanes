@@ -21,11 +21,10 @@ if str(BENCHMARK_ROOT) not in sys.path:
 
 from shared.common import (
     CONTRACT_SCHEMA,
-    CONTRACT_PIPELINES,
     GALP_PIPELINES,
+    GALP_RUNTIME_PROFILE,
     INFERENCE_PIPELINES,
     cached_file_fingerprints,
-    canonical_pipeline_name,
     checkpoint_metadata,
     fingerprint_file,
     galp_manifest_payloads,
@@ -59,7 +58,7 @@ PRESETS = {
 }
 GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO = 1.10
 E2E_MAX_HOT_THROUGHPUT_CV = 0.05
-E2E_PIPELINES = ("galp_planless", "pytorch", "rgbnomore", "dali")
+E2E_PIPELINES = ("galp", "pytorch", "rgbnomore", "dali")
 
 
 def _value(args: argparse.Namespace, key: str) -> int:
@@ -213,32 +212,12 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
     semantic_samples = _value(args, "semantic_samples")
     if batch_size <= 0 or measurement_batches <= 0 or repeats <= 0 or workers < 0 or warmup_batches < 0:
         raise ValueError("invalid execution dimensions")
-    if (
-        args.galp_cache_capacity_mib < 0
-        or args.galp_plan_cache_capacity < 0
-        or args.galp_decode_batch_rowgroups <= 0
-        or args.galp_batch_prefetch_depth <= 0
-        or args.galp_rowgroup_prefetch_depth <= 0
-        or args.galp_rowgroup_prefetch_workers <= 0
-        or args.galp_rowgroup_prefetch_min_decode_batches <= 0
-        or args.galp_transform_blocks_per_launch < 0
-        or args.galp_transform_ctas_per_launch < 0
-    ):
-        raise ValueError("invalid GALP cache/decode dimensions")
-    if args.galp_scheduling_policy == "limited-overlap" and args.galp_transform_blocks_per_launch <= 0:
-        raise ValueError("limited-overlap requires --galp-transform-blocks-per-launch > 0")
-    if args.galp_scheduling_policy == "limited-overlap" and args.galp_transform_ctas_per_launch <= 0:
-        raise ValueError("limited-overlap requires --galp-transform-ctas-per-launch > 0")
     if "dali" in args.pipelines and workers <= 0:
         raise ValueError("DALI requires workers/num_threads > 0")
     if args.preset == "e2e" and not set(E2E_PIPELINES).issubset(args.pipelines):
         raise ValueError(
-            "e2e requires same-round galp_planless, pytorch, rgbnomore, and dali pipelines"
+            "e2e requires same-round galp, pytorch, rgbnomore, and dali pipelines"
         )
-    if args.preset == "e2e" and (
-        args.galp_cache_capacity_mib != 0 or args.galp_plan_cache_capacity != 0
-    ):
-        raise ValueError("e2e requires decoded-rowgroup cache=0 and exact-batch plan cache=0")
     if semantic_samples <= 0 or semantic_samples > batch_size * measurement_batches:
         raise ValueError("semantic_samples must be within the measured subset")
 
@@ -362,7 +341,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         },
         "pipelines": {
             "enabled": list(args.pipelines),
-            "galp_planless": {
+            "galp": {
                 "manifest": str(galp_manifest),
                 "manifest_version": galp_manifest_version,
                 "manifest_sha256": galp_manifest_fingerprint["sha256"],
@@ -380,62 +359,8 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "label_map_json": str(galp_label_map),
                 "label_map_sha256": sha256_file(galp_label_map),
                 "torch_binding_dir": str(args.torch_binding_dir.resolve()),
-                "preprocess": args.galp_preprocess,
-                "cache_capacity_mib": args.galp_cache_capacity_mib,
-                "plan_cache_capacity": args.galp_plan_cache_capacity,
-                "decode_batch_rowgroups": args.galp_decode_batch_rowgroups,
-                "batch_prefetch_depth": args.galp_batch_prefetch_depth,
-                "async_planless_completion": args.galp_async_planless_completion,
-                "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
-                "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
-                "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
-                "transform_execution_mode": "require-planless",
-                "crop_execution_mode": args.galp_crop_execution_mode,
-                "scheduling_policy": args.galp_scheduling_policy,
-                "transform_blocks_per_launch": (
-                    args.galp_transform_blocks_per_launch
-                    if args.galp_scheduling_policy == "limited-overlap"
-                    else 0
-                ),
-                "transform_ctas_per_launch": (
-                    args.galp_transform_ctas_per_launch
-                    if args.galp_scheduling_policy == "limited-overlap"
-                    else 0
-                ),
-                "use_low_priority_streams": True,
-            },
-            "galp_fixed_items": {
-                "manifest": str(galp_manifest),
-                "manifest_version": galp_manifest_version,
-                "manifest_sha256": galp_manifest_fingerprint["sha256"],
-                "manifest_fingerprint": galp_manifest_fingerprint,
-                "payload_fingerprints": galp_payload_fingerprints,
-                "payload_fingerprint_cache": str(galp_payload_cache) if galp_payload_cache is not None else None,
-                "vector_bundle_payload_count": len(galp_vector_bundle_fingerprints),
-                "vector_bundle_payload_bytes": sum(
-                    int(item["size_bytes"]) for item in galp_vector_bundle_fingerprints
-                ),
-                "vector_bundle_read_supported": bool(galp_vector_bundle_fingerprints)
-                and len(galp_vector_bundle_fingerprints)
-                == sum(item.get("kind") == "fls" for item in galp_payload_fingerprints),
-                "native_binary_fingerprint": galp_native_binary,
-                "label_map_json": str(galp_label_map),
-                "label_map_sha256": sha256_file(galp_label_map),
-                "torch_binding_dir": str(args.torch_binding_dir.resolve()),
-                "preprocess": args.galp_preprocess,
-                "cache_capacity_mib": args.galp_cache_capacity_mib,
-                "plan_cache_capacity": 0,
-                "decode_batch_rowgroups": args.galp_decode_batch_rowgroups,
-                "batch_prefetch_depth": args.galp_batch_prefetch_depth,
-                "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
-                "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
-                "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
-                "transform_execution_mode": "require-fixed-items",
-                "crop_execution_mode": args.galp_crop_execution_mode,
-                "scheduling_policy": args.galp_scheduling_policy,
-                "transform_blocks_per_launch": 0,
-                "transform_ctas_per_launch": 0,
-                "use_low_priority_streams": True,
+                "preprocess": "rgbnomore-val-pushdown",
+                "runtime_profile": GALP_RUNTIME_PROFILE,
             },
             "rgbnomore": {"root": str(rgbnomore_root), "adapter_policy": "reuse_external_model_dataset_and_transform_code"},
             "dali": {
@@ -452,14 +377,13 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "cuda_sync_per_batch": True,
             "cuda_sync_scope": "model_stream_only",
             "cuda_device_sync_per_batch": False,
-            "next_batch_prefetch_overlap": args.galp_scheduling_policy != "serial",
-            "galp_batch_prefetch_depth": args.galp_batch_prefetch_depth,
+            "next_batch_prefetch_overlap": True,
             "latency_unit": "milliseconds_per_batch",
             "throughput_unit": "images_per_second",
             "os_page_cache_policy": "uncontrolled; e2e aggregate excludes repeat 0 and reports every repeat",
         },
         "performance_gates": {
-            "galp_planless": {
+            "galp": {
                 "minimum_median_throughput_images_per_s": None,
                 "minimum_hot_median_to_dali_hot_median_ratio": (
                     GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO if args.preset == "e2e" else None
@@ -473,10 +397,8 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "image_major_manifest_minimum_version": 2,
                 "manifest_v2_rowgroups_per_image": 1,
                 "worksets_per_batch": 1,
-                "internal_syncs_per_batch": 0 if args.galp_async_planless_completion else 1,
-                "async_planless_completion_batches_per_batch": (
-                    1 if args.galp_async_planless_completion else 0
-                ),
+                "internal_syncs_per_batch": 0,
+                "async_planless_completion_batches_per_batch": 1,
                 "decode_kernels_per_batch": 1,
             }
         },
@@ -486,27 +408,13 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "identity_checks": ["sample_id", "ordinal", "label", "measured_trace_sha256"],
             "comparison_groups": [
                 {
-                    "pipelines": ["galp_planless", "rgbnomore"],
+                    "pipelines": ["galp", "rgbnomore"],
                     "domain": "dct",
                     "enforcement": "strict",
                     "thresholds": {
                         "input_max_abs": 0.001,
                         "input_mean_abs": 0.0001,
                         "logit_cosine_min": 0.999,
-                        "logit_top1_agreement_min": 1.0,
-                        "full_prediction_top1_agreement_min": 1.0,
-                        "full_prediction_sample_count": batch_size * measurement_batches,
-                    },
-                },
-                {
-                    "pipelines": ["galp_planless", "galp_fixed_items"],
-                    "domain": "dct",
-                    "enforcement": "strict",
-                    "thresholds": {
-                        "input_max_abs": 0.0,
-                        "input_mean_abs": 0.0,
-                        "logit_max_abs": 0.0,
-                        "logit_cosine_min": 0.999999999,
                         "logit_top1_agreement_min": 1.0,
                         "full_prediction_top1_agreement_min": 1.0,
                         "full_prediction_sample_count": batch_size * measurement_batches,
@@ -528,7 +436,6 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/benchmarks/system_rgbnomore/shared/common.py",
                     "galp/benchmarks/system_rgbnomore/dataset/manifest.py",
                     "galp/benchmarks/system_rgbnomore/inference/model_factory.py",
-                    "galp/benchmarks/system_rgbnomore/inference/crop_io_ab.py",
                     "galp/benchmarks/system_rgbnomore/inference/pipeline.py",
                     "galp/benchmarks/system_rgbnomore/inference/validate.py",
                     "galp/benchmarks/system_rgbnomore/inference/run.py",
@@ -536,10 +443,12 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/benchmarks/system_rgbnomore/diagnostics/audit_planless_storage_io.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/benchmark_planless_planning.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/direct_dct.py",
-                    "galp/benchmarks/system_rgbnomore/diagnostics/scheduler_matrix.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/validate_pushdown.py",
                     "galp/include/galp/direct_dct.hpp",
                     "galp/include/galp/jpeg_dct_device.hpp",
+                    "galp/include/galp/profiles/direct_dct.hpp",
+                    "galp/include/galp/profiles/registry.hpp",
+                    "galp/include/galp/profiles/rgbnomore.hpp",
                     "galp/include/galp/jpeg_dct_diagnostics.hpp",
                     "galp/include/galp/jpeg_dct_format.hpp",
                     "galp/include/galp/jpeg_dct_storage.hpp",
@@ -577,7 +486,11 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/tests/jpeg_dct_test.cpp",
                     "galp/tests/test_system_benchmark.py",
                     "galp/torch/direct_dct_torch.cpp",
-                    "galp/torch/rgbnomore_dct_profile.py",
+                    "galp/torch/direct_dct.py",
+                    "galp/torch/diagnostics.py",
+                    "galp/profiles/_base.py",
+                    "galp/profiles/rgbnomore.py",
+                    "galp/benchmarks/system_rgbnomore/diagnostics/rgbnomore_dct_profile.py",
                 ],
             ),
             "rgbnomore": source_tree_metadata(
@@ -695,7 +608,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pipelines",
         nargs="+",
-        choices=CONTRACT_PIPELINES,
+        choices=INFERENCE_PIPELINES,
         default=None,
     )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
@@ -708,81 +621,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--galp-label-map-json", type=Path, default=DEFAULT_GALP_LABEL_MAP)
     parser.add_argument("--torch-binding-dir", type=Path, default=DEFAULT_BINDING_DIR)
     parser.add_argument(
-        "--galp-cache-capacity-mib",
-        type=int,
-        default=0,
-        help="Decoded-rowgroup cache size; random-access image-major training defaults to zero-copy streaming.",
-    )
-    parser.add_argument(
-        "--galp-plan-cache-capacity",
-        type=int,
-        default=0,
-        help="Number of transformed batch plans retained; canonical runs disable the batch-plan cache.",
-    )
-    parser.add_argument(
-        "--galp-decode-batch-rowgroups",
-        type=int,
-        default=64,
-        help="Legacy-layout compatibility limit; the image-major production path submits one logical batch.",
-    )
-    parser.add_argument(
-        "--galp-batch-prefetch-depth",
-        type=int,
-        default=2,
-        help="Ordered GALP batch lookahead; depth 2 overlaps two native reads with the current model forward.",
-    )
-    parser.add_argument(
-        "--galp-async-planless-completion",
-        action="store_true",
-        help="Return planless batches after event-owned submission and serialize their transform after the prior model.",
-    )
-    parser.add_argument(
-        "--galp-scheduling-policy",
-        choices=("fully-overlapped", "limited-overlap", "serial"),
-        default="limited-overlap",
-        help="Direct-DCT/model overlap policy; production defaults to the measured 512-output/512-CTA limited point.",
-    )
-    parser.add_argument(
-        "--galp-crop-execution-mode",
-        choices=(
-            "auto",
-            "full-rowgroup-decode",
-            "rowgroup-read-selected-decode",
-            "vector-range-read-selected-decode",
-        ),
-        default="auto",
-        help="Select a storage/decode granularity for same-contract crop A/B measurements.",
-    )
-    parser.add_argument(
-        "--galp-transform-blocks-per-launch",
-        type=int,
-        default=512,
-        help="Maximum planless output blocks per limited-overlap launch; CTA concurrency is configured separately.",
-    )
-    parser.add_argument(
-        "--galp-transform-ctas-per-launch",
-        type=int,
-        default=512,
-        help="Maximum planless CUDA CTAs per limited-overlap launch (measured production default: 512).",
-    )
-    parser.add_argument("--galp-rowgroup-prefetch-depth", type=int, default=16)
-    parser.add_argument("--galp-rowgroup-prefetch-workers", type=int, default=4)
-    parser.add_argument(
-        "--galp-rowgroup-prefetch-min-decode-batches",
-        type=int,
-        default=1,
-        help="Enable parallel rowgroup reads for a single image-major decode workset.",
-    )
-    parser.add_argument(
         "--refresh-galp-payload-fingerprints",
         action="store_true",
         help="Explicitly hash missing/stale GALP payloads once; normal benchmark runs never scan them implicitly.",
-    )
-    parser.add_argument(
-        "--galp-preprocess",
-        choices=("rgbnomore-val-pushdown", "rgbnomore-val"),
-        default="rgbnomore-val-pushdown",
-        help="GALP DCT implementation; pushdown is the canonical end-to-end path, rgbnomore-val is a diagnostic reference.",
     )
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--warmup-batches", type=int)
@@ -807,10 +648,8 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.pipelines is None:
         args.pipelines = list(E2E_PIPELINES if args.preset == "e2e" else INFERENCE_PIPELINES)
-    else:
-        args.pipelines = [canonical_pipeline_name(name) for name in args.pipelines]
-        if len(set(args.pipelines)) != len(args.pipelines):
-            parser.error("--pipelines contains duplicate canonical names after alias normalization")
+    elif len(set(args.pipelines)) != len(args.pipelines):
+        parser.error("--pipelines contains duplicates")
     if args.dct_source_image_size < 0:
         parser.error("--dct-source-image-size must be non-negative")
     return args

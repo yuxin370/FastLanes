@@ -1,5 +1,13 @@
 # Block-major compact/planless design
 
+> **Historical design and measurement record (2026-08-01).** The descriptor
+> design remains relevant, but the CLI, fallback policy and tuning commands in
+> this document are not the current production interface. Production now uses
+> only `dct_major_pushdown` with native profile
+> `block-major-p4-scheduled-bounded-110-v1`. See
+> [README](../README.md), [run guide](RUN_GUIDE.md) and
+> [complete suite](COMPLETE_TEST.md) for executable commands.
+
 ## Status and boundary
 
 This document is the design and implementation record for the existing manifest-v1
@@ -118,12 +126,12 @@ they do not prove the final no-shuffle model throughput or Host RSS condition.
 A 1K six-pipeline feature/evaluation screening and then a separate-process
 legacy/planless ABBA remain required before any formal 5K/50K claim.
 
-`run_suite.py --gates-only` packages the five device audits into a 23-request
-fail-fast run and exits before any model or 5K/50K phase. The historical bundle
+The then-current suite's removed `--gates-only` mode packaged the five device
+audits into a 23-request fail-fast run. The historical bundle
 `/tmp/galp-dct-major-planless-gates-user-20260731-r1` reports `ok=true` and zero
 model invocations, but predates the current binding and is provenance only. A
-fresh gate bundle bound to the final extension SHA is required before current
-performance evidence is accepted.
+current run must use `run_suite.py --dry-run` to inspect the complete supported
+matrix and then execute that matrix in a fresh output directory.
 
 ## Measured source geometry
 

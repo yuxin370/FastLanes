@@ -124,17 +124,18 @@ class OrderedAsyncPrefetchQueue:
         return float(value() if callable(value) else value)
 
     def _accumulate_completed_handle_metrics(self, handle: Any) -> None:
+        telemetry = getattr(handle, "telemetry", {})
         self._metrics["producer_active_seconds"] += (
-            self._numeric_property(handle, "producer_active_ms") / 1000.0
+            float(telemetry.get("producer_active_ms", 0.0)) / 1000.0
         )
         self._metrics["producer_planning_seconds"] += (
-            self._numeric_property(handle, "planning_ms") / 1000.0
+            float(telemetry.get("planning_ms", 0.0)) / 1000.0
         )
         self._metrics["producer_io_staging_seconds"] += (
-            self._numeric_property(handle, "io_staging_ms") / 1000.0
+            float(telemetry.get("io_staging_ms", 0.0)) / 1000.0
         )
         self._metrics["producer_ordered_submission_seconds"] += (
-            self._numeric_property(handle, "ordered_submission_ms") / 1000.0
+            float(telemetry.get("ordered_submission_ms", 0.0)) / 1000.0
         )
 
     def submit(self, metadata: Any, factory: Callable[[], Any]) -> None:
@@ -707,10 +708,6 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self.execution_mode = str(self.config.get("execution_mode", "audit"))
         if self.execution_mode not in ("audit", "runtime"):
             raise ValueError(f"invalid GALP execution mode {self.execution_mode!r}")
-        if self.workers <= 0:
-            raise ValueError(
-                "GALP --workers controls native rowgroup-prefetch workers and must be at least 1"
-            )
         self._queue: OrderedAsyncPrefetchQueue | None = None
         self._reported_consumer_wait = 0.0
         pls_pool_config = self.config.get("pls_gpu_pool") or {}
@@ -736,36 +733,6 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             "simultaneously_active_pool_limit": 1 if self._pls_gpu_pool else 0,
         }
 
-    def _native_arguments(self) -> dict[str, Any]:
-        return {
-            "dct_coeffs": "all",
-            "layout": "transformed-dct-grid",
-            "grid_transform": {
-                "y_output_width_blocks": 28,
-                "y_output_height_blocks": 28,
-                "cbcr_output_width_blocks": 14,
-                "cbcr_output_height_blocks": 14,
-                "crop_reference_width_blocks": 32,
-                "crop_reference_height_blocks": 32,
-                "crop_origin_alignment_blocks": 2,
-                "chroma_crop_scale_x": 2,
-                "chroma_crop_scale_y": 2,
-                "clamp_min": -1024,
-                "clamp_max": 1016,
-                "output_dtype": "float32",
-                "output_add": 4.0,
-                "output_scale": 1.0 / 1020.0,
-                "dequantize": True,
-                "require_all_coefficients": True,
-                "allow_grayscale": True,
-                "preferred_small_crop_width_blocks": [2, 4, 14, 28],
-                "preferred_small_crop_height_blocks": [2, 4, 14, 28],
-                "allowed_chroma_sampling_ratios": [[1, 1, 1, 1], [1, 2, 1, 2]],
-            },
-            "cache_capacity_mib": int(self.config.get("galp_cache_capacity_mib", 0)),
-            "rowgroup_prefetch_workers": self.workers,
-        }
-
     def _enqueue_next(self) -> None:
         ranges = self._pls_pool_ranges if self._pls_gpu_pool else self._batch_ranges
         if self._next_enqueue >= len(ranges):
@@ -784,7 +751,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self._queue.submit(
             (indices, image_ids, transforms),
             lambda: self.reader.prefetch_batch(
-                image_ids, transforms=transforms, **self._native_arguments()
+                image_ids, transforms=transforms
             ),
         )
         self._read_indices.extend(indices)
@@ -1121,11 +1088,10 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         metrics.update(
             {
                 "worker_semantics": (
-                    "native rowgroup-prefetch workers within one ordered GALP producer"
+                    "native runtime profile; --workers is not forwarded to GALP"
                 ),
                 "configured_workers": self.workers,
                 "actual_batch_producer_workers": 1,
-                "native_rowgroup_prefetch_workers": self.workers,
                 "execution_mode": self.execution_mode,
                 "physical_load_segment_gpu_pool": dict(self._pls_pool_metrics),
             }

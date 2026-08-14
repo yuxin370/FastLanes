@@ -13,7 +13,6 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Iterator, Sequence
 
 import numpy as np
@@ -22,11 +21,19 @@ import torch
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from galp.profiles.rgbnomore import VALIDATION
+from galp.torch import DirectDctReader
+from galp.torch.diagnostics import execution_stats, execution_stats_snapshot, prefetch_stats
 
 from shared.common import (
     RESULT_SCHEMA,
-    CONTRACT_PIPELINES,
     GALP_PIPELINES,
+    GALP_RUNTIME_PROFILE,
+    INFERENCE_PIPELINES,
     contract_pipeline_name,
     distribution,
     load_contract,
@@ -37,8 +44,6 @@ from shared.common import (
     sample_trace,
     sha256_file,
     sha256_json,
-    transform_execution_mode,
-    transform_mode_enables_planless,
     verify_file_fingerprint,
     write_json,
 )
@@ -443,27 +448,20 @@ class DaliAdapter(PipelineAdapter):
 
 
 def _validate_transform_capability(
-    mode: str,
     preview: dict[str, Any],
     *,
     context: str,
 ) -> dict[str, Any]:
     uses_planless = bool(preview.get("uses_planless_fixed_transform", False))
-    observed = "planless" if uses_planless else "fixed-items"
-    if mode == "require-planless" and not uses_planless:
+    if not uses_planless:
         raise RuntimeError(
             f"GALP transform capability preflight failed for {context}: "
-            "transform_execution_mode=require-planless, but the native planner selected fixed-items"
-        )
-    if mode == "require-fixed-items" and uses_planless:
-        raise RuntimeError(
-            f"GALP transform capability preflight failed for {context}: "
-            "transform_execution_mode=require-fixed-items, but the native planner selected planless"
+            "the production runtime profile requires planless execution"
         )
     return {
         "status": "passed",
-        "requested_mode": mode,
-        "observed_transform_execution": observed,
+        "runtime_profile": GALP_RUNTIME_PROFILE,
+        "observed_transform_execution": "planless",
         "uses_planless_fixed_transform": uses_planless,
         "layout": preview.get("layout"),
         "image_count": int(preview.get("image_count", 0)),
@@ -474,122 +472,75 @@ def _validate_transform_capability(
 
 
 def _validate_transform_execution_stats(
-    mode: str,
     stats: dict[str, Any],
     image_count: int,
 ) -> None:
-    if mode == "auto":
-        return
-    if mode == "require-planless":
-        planless = (
-            int(stats.get("planless_image_descriptor_count", 0)) == image_count
-            and int(stats.get("fixed_transform_item_count", 0)) == 0
-            and int(stats.get("host_expanded_transform_items_created", 0)) == 0
-            and int(stats.get("host_output_block_source_lists_created", 0)) == 0
-            and int(stats.get("host_global_transform_sort_items", 0)) == 0
-            and bool(stats.get("device_mapping_fused", False))
-        )
-        if not planless:
-            raise RuntimeError(
-                "GALP runtime violated transform_execution_mode=require-planless: "
-                f"descriptors={stats.get('planless_image_descriptor_count', 0)} "
-                f"items={stats.get('fixed_transform_item_count', 0)}"
-            )
-        if (
-            int(stats.get("projection_item_count", 0)) != 0
-            or int(stats.get("decoded_projection_item_count", 0)) != 0
-            or int(stats.get("project_decoded_ycbcr_grid_launch_count", 0)) != 0
-        ):
-            raise RuntimeError("GALP planless benchmark unexpectedly used generic projection")
-        return
-    fixed_items = (
-        int(stats.get("planless_image_descriptor_count", 0)) == 0
-        and int(stats.get("fixed_transform_item_count", 0)) > 0
-        and int(stats.get("host_expanded_transform_items_created", 0)) > 0
-        and int(stats.get("host_global_transform_sort_items", 0)) > 0
+    planless = (
+        int(stats.get("planless_image_descriptor_count", 0)) == image_count
+        and int(stats.get("fixed_transform_item_count", 0)) == 0
+        and int(stats.get("host_expanded_transform_items_created", 0)) == 0
+        and int(stats.get("host_output_block_source_lists_created", 0)) == 0
+        and int(stats.get("host_global_transform_sort_items", 0)) == 0
+        and bool(stats.get("device_mapping_fused", False))
     )
-    if not fixed_items:
+    if not planless:
         raise RuntimeError(
-            "GALP runtime violated transform_execution_mode=require-fixed-items: "
+            "GALP runtime violated the planless production profile: "
             f"descriptors={stats.get('planless_image_descriptor_count', 0)} "
             f"items={stats.get('fixed_transform_item_count', 0)}"
         )
+    if (
+        int(stats.get("projection_item_count", 0)) != 0
+        or int(stats.get("decoded_projection_item_count", 0)) != 0
+        or int(stats.get("project_decoded_ycbcr_grid_launch_count", 0)) != 0
+    ):
+        raise RuntimeError("GALP planless benchmark unexpectedly used generic projection")
 
 
 class GalpAdapter(PipelineAdapter):
     domain = "dct"
     worker_semantics = "galp_internal_runtime_not_configured_by_worker_count"
-    config_name = "galp_planless"
+    config_name = "galp"
 
     def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device) -> None:
         super().__init__(contract, samples, device)
         if device.type != "cuda":
             raise ValueError("GALP pipeline requires a CUDA device")
         _add_diagnostics_to_path()
-        self.module = importlib.import_module("direct_dct")
-        galp_dct = importlib.import_module("_galp_direct_dct")
+        self.stats_module = importlib.import_module("direct_dct")
         config = contract["pipelines"][self.config_name]
-        self.scheduling_policy = str(config.get("scheduling_policy", "fully-overlapped"))
-        if self.scheduling_policy not in ("fully-overlapped", "limited-overlap", "serial"):
-            raise ValueError(f"invalid GALP scheduling policy: {self.scheduling_policy}")
-        self.reader = galp_dct.DirectDctReader(str(config["manifest"]))
-        self.transform_execution_mode = transform_execution_mode(config, self.config_name)
-        self.args = SimpleNamespace(
-            preprocess=config["preprocess"],
-            cache_capacity_mib=int(config["cache_capacity_mib"]),
-            plan_cache_capacity=int(config.get("plan_cache_capacity", 0)),
-            decode_batch_rowgroups=int(config.get("decode_batch_rowgroups", 64)),
-            rowgroup_prefetch_depth=int(config.get("rowgroup_prefetch_depth", 16)),
-            rowgroup_prefetch_workers=int(config.get("rowgroup_prefetch_workers", 4)),
-            rowgroup_prefetch_min_decode_batches=int(
-                config.get("rowgroup_prefetch_min_decode_batches", 1)
-            ),
-            no_dequantize=False,
-            no_scale=False,
-            enable_planless_execution=transform_mode_enables_planless(self.transform_execution_mode),
-            crop_execution_mode=str(config.get("crop_execution_mode", "auto")),
-            scheduling_policy=self.scheduling_policy,
-            transform_blocks_per_launch=int(config.get("transform_blocks_per_launch", 0)),
-            transform_ctas_per_launch=int(config.get("transform_ctas_per_launch", 0)),
-            use_low_priority_streams=bool(config.get("use_low_priority_streams", False)),
-        )
-        self.transform = (
-            self.module.build_rgbnomore_dct_val_transform(Path(contract["pipelines"]["rgbnomore"]["root"]))
-            if config["preprocess"] == "rgbnomore-val"
-            else None
-        )
+        if config.get("runtime_profile") != GALP_RUNTIME_PROFILE:
+            raise ValueError(
+                f"GALP production pipeline requires runtime_profile={GALP_RUNTIME_PROFILE!r}"
+            )
+        self.reader = DirectDctReader(config["manifest"])
+        profile_info = self.reader.profile_info(VALIDATION)
+        if profile_info["runtime_policy_id"] != GALP_RUNTIME_PROFILE:
+            raise RuntimeError("GALP native profile does not match the benchmark contract")
+        if config.get("preprocess") != "rgbnomore-val-pushdown":
+            raise ValueError("GALP production pipeline supports only native RGB-no-more preprocessing")
         self.batch_size = int(contract["execution"]["batch_size"])
-        self.batch_prefetch_depth = int(config.get("batch_prefetch_depth", 2))
-        self.async_planless_completion = bool(config.get("async_planless_completion", False))
-        self.args.async_planless_completion = self.async_planless_completion
         self.total_batches = len(self.samples) // self.batch_size
         self.pending_batches: deque[tuple[list[int], Any]] = deque()
         self.next_prefetch_batch_index = 0
         self.last_batch_prefetch_metrics: dict[str, float | int] = {}
-        if self.args.preprocess == "rgbnomore-val-pushdown":
-            preflight_samples = self.samples[: self.batch_size]
-            if len(preflight_samples) != self.batch_size:
-                raise RuntimeError("GALP transform capability preflight requires one complete batch")
-            preview = self.module._plan_pushdown_batch(
-                self.reader,
-                self.args,
+        preflight_samples = self.samples[: self.batch_size]
+        if len(preflight_samples) != self.batch_size:
+            raise RuntimeError("GALP transform capability preflight requires one complete batch")
+        preview = dict(
+            self.reader.plan(
                 [int(sample["galp_image_id"]) for sample in preflight_samples],
+                VALIDATION,
             )
-            context = (
-                f"pipeline={self.config_name}, manifest_version={config.get('manifest_version', 'unknown')}, "
-                f"crop_execution_mode={self.args.crop_execution_mode}"
-            )
-            self.setup_metrics["transform_capability_preflight"] = _validate_transform_capability(
-                self.transform_execution_mode,
-                preview,
-                context=context,
-            )
-        else:
-            self.setup_metrics["transform_capability_preflight"] = {
-                "status": "not_applicable",
-                "requested_mode": self.transform_execution_mode,
-                "reason": "preprocess is not rgbnomore-val-pushdown",
-            }
+        )
+        context = (
+            f"pipeline={self.config_name}, manifest_version={config.get('manifest_version', 'unknown')}, "
+            f"runtime_profile={GALP_RUNTIME_PROFILE}"
+        )
+        self.setup_metrics["transform_capability_preflight"] = _validate_transform_capability(
+            preview,
+            context=context,
+        )
 
     def _enqueue_next_pushdown_batch(self) -> None:
         if self.next_prefetch_batch_index >= self.total_batches:
@@ -599,7 +550,7 @@ class GalpAdapter(PipelineAdapter):
         if len(expected) != self.batch_size:
             raise RuntimeError("GALP prefetch encountered an incomplete batch")
         image_ids = [int(sample["galp_image_id"]) for sample in expected]
-        pending = self.module._prefetch_pushdown_batch(self.reader, self.args, image_ids)
+        pending = self.reader.prefetch(image_ids, VALIDATION)
         self.pending_batches.append((image_ids, pending))
         self.next_prefetch_batch_index += 1
 
@@ -607,17 +558,14 @@ class GalpAdapter(PipelineAdapter):
         self.pending_batches.clear()
         self.next_prefetch_batch_index = 0
         self.last_batch_prefetch_metrics = {}
-        if self.args.preprocess == "rgbnomore-val-pushdown":
-            policy = getattr(self, "scheduling_policy", "fully-overlapped")
-            initial_depth = 1 if policy == "serial" else self.batch_prefetch_depth
-            for _ in range(min(initial_depth, self.total_batches)):
-                self._enqueue_next_pushdown_batch()
-            if getattr(self, "async_planless_completion", False) and self.pending_batches:
-                self.pending_batches[0][1].release_submission()
+        for _ in range(min(2, self.total_batches)):
+            self._enqueue_next_pushdown_batch()
+        if self.pending_batches:
+            self.pending_batches[0][1]._release_submission()
 
     def after_model_complete(self) -> None:
-        if getattr(self, "async_planless_completion", False) and self.pending_batches:
-            self.pending_batches[0][1].release_submission()
+        if self.pending_batches:
+            self.pending_batches[0][1]._release_submission()
 
     def load(
         self,
@@ -625,62 +573,49 @@ class GalpAdapter(PipelineAdapter):
         next_expected: Sequence[dict[str, Any]] | None = None,
     ) -> LoadedBatch:
         image_ids = [int(sample["galp_image_id"]) for sample in expected]
-        if self.args.preprocess == "rgbnomore-val-pushdown":
-            policy = getattr(self, "scheduling_policy", "fully-overlapped")
-            if not self.pending_batches and policy == "serial":
-                # The previous iteration synchronizes the model stream before
-                # load() is called again, so creating this batch here prohibits
-                # Direct-DCT/model overlap while retaining the native event graph.
-                self._enqueue_next_pushdown_batch()
-            if not self.pending_batches:
-                raise RuntimeError("GALP pushdown prefetch queue is empty")
-            queued_image_ids, pending = self.pending_batches.popleft()
-            if queued_image_ids != image_ids:
-                raise RuntimeError(
-                    f"GALP pending batch mismatch: expected {image_ids}, queued {queued_image_ids}"
-                )
-            # Telemetry was added after the prefetch handle itself. Keep the
-            # adapter compatible with older bindings and lightweight unit-test
-            # doubles while production bindings still report every field.
-            ready_before_read = bool(getattr(pending, "ready", False))
-            prefetch_read_started = time.perf_counter()
-            input_y, input_cbcr, source_batches = self.module._adapt_prefetched_pushdown_batch(
-                self.reader,
-                self.args,
-                image_ids,
-                pending,
+        if not self.pending_batches:
+            raise RuntimeError("GALP pushdown prefetch queue is empty")
+        queued_image_ids, pending = self.pending_batches.popleft()
+        if queued_image_ids != image_ids:
+            raise RuntimeError(
+                f"GALP pending batch mismatch: expected {image_ids}, queued {queued_image_ids}"
             )
-            prefetch_read_seconds = time.perf_counter() - prefetch_read_started
-            self.last_batch_prefetch_metrics = {
-                "batch_prefetch_read_wait_seconds": prefetch_read_seconds,
-                "batch_prefetch_producer_active_seconds": float(
-                    getattr(pending, "producer_active_ms", 0.0)
-                )
-                / 1000.0,
-                "batch_prefetch_planning_seconds": float(
-                    getattr(pending, "planning_ms", 0.0)
-                )
-                / 1000.0,
-                "batch_prefetch_io_staging_seconds": float(
-                    getattr(pending, "io_staging_ms", 0.0)
-                )
-                / 1000.0,
-                "batch_prefetch_ordered_submission_seconds": float(
-                    getattr(pending, "ordered_submission_ms", 0.0)
-                )
-                / 1000.0,
-                "batch_prefetch_ready_before_read": int(ready_before_read),
-            }
-            if policy != "serial":
-                self._enqueue_next_pushdown_batch()
-        else:
-            input_y, input_cbcr, source_batches = self.module.read_and_adapt_batch(
-                self.reader,
-                self.args,
-                image_ids,
-                None,
-                self.transform,
+        ready_before_read = bool(getattr(pending, "ready", False))
+        prefetch_read_started = time.perf_counter()
+        native_batch = pending.read()
+        prefetch_read_seconds = time.perf_counter() - prefetch_read_started
+        observed_image_ids = [int(value) for value in native_batch.global_image_ids]
+        if observed_image_ids != image_ids:
+            raise RuntimeError(
+                f"GALP native batch mismatch: expected {image_ids}, got {observed_image_ids}"
             )
+        input_y = native_batch.y
+        input_cbcr = native_batch.cbcr
+        if (
+            native_batch.layout != "transformed_dct_grid"
+            or input_y.dtype != torch.float32
+            or input_cbcr.dtype != torch.float32
+            or tuple(input_y.shape[1:]) != (1, 28, 28, 8, 8)
+            or tuple(input_cbcr.shape[1:]) != (2, 14, 14, 8, 8)
+        ):
+            raise RuntimeError("GALP production profile returned an invalid model-ready DCT batch")
+        source_batches = [native_batch]
+        prefetch_telemetry = prefetch_stats(pending)
+        self.last_batch_prefetch_metrics = {
+            "batch_prefetch_read_wait_seconds": prefetch_read_seconds,
+            "batch_prefetch_producer_active_seconds": prefetch_telemetry[
+                "producer_active_ms"
+            ] / 1000.0,
+            "batch_prefetch_planning_seconds": prefetch_telemetry["planning_ms"]
+            / 1000.0,
+            "batch_prefetch_io_staging_seconds": prefetch_telemetry["io_staging_ms"]
+            / 1000.0,
+            "batch_prefetch_ordered_submission_seconds": prefetch_telemetry[
+                "ordered_submission_ms"
+            ] / 1000.0,
+            "batch_prefetch_ready_before_read": int(ready_before_read),
+        }
+        self._enqueue_next_pushdown_batch()
         if not self.audit_enabled:
             return LoadedBatch(
                 inputs=(input_y, input_cbcr),
@@ -714,29 +649,22 @@ class GalpAdapter(PipelineAdapter):
             return
         source_execution_stats: list[dict[str, Any]] = []
         for source_batch in batch.keepalive:
-            complete = getattr(source_batch, "execution_stats", None)
-            snapshot = getattr(source_batch, "execution_stats_snapshot", None)
-            stats = dict(complete if complete is not None else snapshot)
+            try:
+                stats = execution_stats(source_batch)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                stats = execution_stats_snapshot(source_batch)
             source_execution_stats.append(stats)
-            if self.args.preprocess == "rgbnomore-val-pushdown":
-                _validate_transform_execution_stats(
-                    self.transform_execution_mode,
-                    stats,
-                    len(batch.ordinals),
+            _validate_transform_execution_stats(stats, len(batch.ordinals))
+            if (
+                not bool(stats.get("fixed_grid_output_float32", False))
+                or not bool(stats.get("fixed_grid_output_affine_applied", False))
+                or int(stats.get("fixed_grid_finalize_kernel_launch_count", 0)) != 1
+            ):
+                raise RuntimeError(
+                    "GALP transformed-grid output did not use the required native FP32 finalize"
                 )
-                if (
-                    not bool(stats.get("fixed_grid_output_float32", False))
-                    or not bool(stats.get("fixed_grid_output_affine_applied", False))
-                    or int(stats.get("fixed_grid_finalize_kernel_launch_count", 0)) != 1
-                ):
-                    raise RuntimeError(
-                        "GALP transformed-grid output did not use the required generic FP32 finalize: "
-                        f"float32={stats.get('fixed_grid_output_float32', False)} "
-                        f"affine_applied={stats.get('fixed_grid_output_affine_applied', False)} "
-                        f"finalize_launches={stats.get('fixed_grid_finalize_kernel_launch_count', 0)}"
-                    )
-        totals = self.module._empty_totals()
-        self.module._accumulate_many_stats(totals, source_execution_stats)
+        totals = self.stats_module._empty_totals()
+        self.stats_module._accumulate_many_stats(totals, source_execution_stats)
         batch.native_stage_seconds.update(
             {
                 key: float(value)
@@ -771,20 +699,6 @@ class GalpAdapter(PipelineAdapter):
         self.next_prefetch_batch_index = 0
 
 
-class GalpFixedItemsAdapter(GalpAdapter):
-    config_name = "galp_fixed_items"
-
-
-class GalpAliasAdapter(GalpAdapter):
-    config_name = "galp"
-
-
-class GalpLegacyAdapter(GalpAdapter):
-    """Compatibility adapter for contracts created before the fixed-items rename."""
-
-    config_name = "galp_legacy"
-
-
 def _make_adapter(
     name: str,
     contract: dict[str, Any],
@@ -794,10 +708,7 @@ def _make_adapter(
     audit_enabled: bool = True,
 ) -> PipelineAdapter:
     adapters = {
-        "galp_planless": GalpAdapter,
-        "galp_fixed_items": GalpFixedItemsAdapter,
-        "galp": GalpAliasAdapter,
-        "galp_legacy": GalpLegacyAdapter,
+        "galp": GalpAdapter,
         "rgbnomore": RgbNoMoreAdapter,
         "dali": DaliAdapter,
         "pytorch": PyTorchAdapter,
@@ -945,14 +856,7 @@ def run_pipeline(
     runtime_tail_batches = 0
     adapter_samples = list(samples)
     if runtime_profile:
-        galp_prefetch_depth = max(
-            (
-                int(contract["pipelines"][pipeline]["batch_prefetch_depth"])
-                for pipeline in contract["pipelines"]["enabled"]
-                if pipeline in GALP_PIPELINES
-            ),
-            default=0,
-        )
+        galp_prefetch_depth = 2 if "galp" in contract["pipelines"]["enabled"] else 0
         runtime_tail_batches = max(
             int(contract["pipelines"]["dali"]["prefetch_queue_depth"]),
             galp_prefetch_depth,
@@ -1318,7 +1222,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pipeline",
-        choices=CONTRACT_PIPELINES,
+        choices=INFERENCE_PIPELINES,
         required=True,
     )
     parser.add_argument("--contract", type=Path, required=True)

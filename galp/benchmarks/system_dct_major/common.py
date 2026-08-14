@@ -19,23 +19,16 @@ CONTRACT_SCHEMA = "galp_dct_major_contract_v1"
 SAMPLE_MANIFEST_SCHEMA = "galp_dct_major_samples_v1"
 PIPELINE_RESULT_SCHEMA = "galp_dct_major_pipeline_v1"
 SUMMARY_SCHEMA = "galp_dct_major_summary_v1"
+BLOCK_MAJOR_RUNTIME_PROFILE = "block-major-p4-scheduled-bounded-110-v1"
 
 PIPELINES = (
-    "dct_major_full",
-    "dct_major_legacy_pushdown",
     "dct_major_pushdown",
-    "image_major_pushdown",
-    "image_major_v2_pushdown",
-    "image_major_v3_pushdown",
     "rgbnomore",
     "dali",
     "pytorch",
 )
 DEFAULT_PIPELINES = (
-    "dct_major_full",
-    "dct_major_legacy_pushdown",
     "dct_major_pushdown",
-    "image_major_pushdown",
     "rgbnomore",
     "dali",
     "pytorch",
@@ -514,6 +507,36 @@ def load_contract(path: Path) -> dict[str, Any]:
     require(isinstance(enabled, list) and enabled, "pipelines.enabled must be a non-empty list")
     require(len(enabled) == len(set(enabled)), "pipelines.enabled contains duplicates")
     require(all(item in PIPELINES for item in enabled), f"unknown pipeline; expected subset of {PIPELINES}")
+    if "dct_major_pushdown" in enabled:
+        galp = contract["pipelines"].get("dct_major_pushdown")
+        require(isinstance(galp, dict), "pipelines.dct_major_pushdown must be an object")
+        require(
+            galp.get("runtime_profile") == BLOCK_MAJOR_RUNTIME_PROFILE,
+            "dct_major_pushdown must use the canonical block-major runtime profile",
+        )
+        internal_fields = {
+            "cache_capacity_mib",
+            "plan_cache_capacity",
+            "decode_batch_rowgroups",
+            "decode_workset_capacity_mib",
+            "rowgroup_prefetch_depth",
+            "rowgroup_prefetch_workers",
+            "rowgroup_prefetch_min_decode_batches",
+            "enable_planless_execution",
+            "scheduling_policy",
+            "transform_blocks_per_launch",
+            "transform_ctas_per_launch",
+            "use_low_priority_streams",
+            "block_major_double_buffer",
+            "crop_execution_mode",
+            "bounded_read_amplification_cap",
+            "bounded_read_local_amplification_cap",
+            "bounded_read_max_run_bytes",
+            "segment_mode",
+            "output_prefetch_policy",
+        }
+        leaked = sorted(internal_fields.intersection(galp))
+        require(not leaked, f"dct_major_pushdown exposes native runtime fields: {leaked}")
     manifest_path = Path(str(contract["dataset"].get("sample_manifest", "")))
     require(manifest_path.is_file(), f"sample manifest does not exist: {manifest_path}")
     load_sample_manifest(manifest_path, str(contract["dataset"]["sample_manifest_sha256"]))

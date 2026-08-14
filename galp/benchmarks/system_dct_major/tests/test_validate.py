@@ -13,11 +13,9 @@ BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from common import PIPELINE_RESULT_SCHEMA, sha256_json  # noqa: E402
+from common import BLOCK_MAJOR_RUNTIME_PROFILE, PIPELINE_RESULT_SCHEMA, sha256_json  # noqa: E402
 from validate import (  # noqa: E402
     _compact_plan_memory_is_consistent,
-    _physical_evidence,
-    _planless_resource_evidence,
     _semantic_compare,
     _validate_result,
     _write_csv,
@@ -37,10 +35,7 @@ class PlanlessResultGateTest(unittest.TestCase):
             "execution": {"repeats": 1},
             "pipelines": {
                 "dct_major_pushdown": {
-                    "decode_workset_capacity_mib": 1,
-                    "crop_execution_mode": "auto",
-                    "cache_capacity_mib": 0,
-                    "plan_cache_capacity": 0,
+                    "runtime_profile": BLOCK_MAJOR_RUNTIME_PROFILE,
                 }
             },
         }
@@ -57,6 +52,8 @@ class PlanlessResultGateTest(unittest.TestCase):
                     "images": 1,
                     "batches": 1,
                     "time_to_first_batch_ms": 1.0,
+                    "first_shard_ready_ms": 0.5,
+                    "native_segments": [{"segment_shard_id": 0}],
                     "native_totals": {
                         "host_expanded_transform_items_created": 0,
                         "host_output_block_source_lists_created": 0,
@@ -64,6 +61,12 @@ class PlanlessResultGateTest(unittest.TestCase):
                         "planless_transform_kernel_launch_count": 1,
                         "planless_image_descriptor_count": 1,
                         "segment_count": 1,
+                        "segment_cross_shard_count": 0,
+                        "shard_reactivation_count": 0,
+                        "duplicate_physical_read_count": 0,
+                        "rowgroup_revisit_count": 0,
+                        "vector_run_revisit_count": 0,
+                        "physical_read_order_inversions": 0,
                         "workset_count": 2,
                         "planless_transform_full_scan_output_block_count": 10,
                         "planless_transform_output_block_count": 4,
@@ -75,7 +78,16 @@ class PlanlessResultGateTest(unittest.TestCase):
                         "planless_transform_source_contribution_visit_count": 16,
                         "planless_transform_output_workset_ownership_count": 4,
                         "planless_transform_active_output_workset_count": 2,
-                        "planless_transform_active_output_schedule_build_count": 1,
+                        "planless_transform_active_output_schedule_build_count": 0,
+                        "active_output_schedule_sidecar_hit_count": 1,
+                        "active_output_schedule_sidecar_miss_count": 0,
+                        "active_output_schedule_sidecar_reject_count": 0,
+                        "active_output_schedule_sidecar_persist_count": 0,
+                        "active_output_schedule_sidecar_bytes": 512,
+                        "active_output_schedule_interval_count": 4,
+                        "active_output_schedule_mapped_bytes_peak": 512,
+                        "active_output_schedule_mmap_capacity_bytes": 16 * 1024 * 1024,
+                        "active_output_schedule_mmap_window_count": 2,
                         "planless_transform_active_output_offsets_valid": 1,
                         "planless_transform_active_output_planning_ms": 0.01,
                         "planless_transform_group_workset_build_ms": 0.001,
@@ -90,14 +102,41 @@ class PlanlessResultGateTest(unittest.TestCase):
                         "coordinate_group_index_bytes": 128,
                         "coordinate_group_index_density": 0.8,
                         "rowgroup_count": 3,
-                        "run_interval_exact_rowgroup_count": 1,
-                        "bitmap_exact_rowgroup_count": 1,
-                        "full_rowgroup_strategy_count": 1,
-                        "automatic_sparse_storage_candidate_rowgroup_count": 2,
-                        "adaptive_run_interval_estimated_ns": 10.0,
-                        "adaptive_bitmap_estimated_ns": 11.0,
-                        "adaptive_full_rowgroup_estimated_ns": 12.0,
-                        "decode_workset_capacity_bytes": 1024 * 1024,
+                        "run_interval_exact_rowgroup_count": 0,
+                        "run_interval_bounded_rowgroup_count": 3,
+                        "bitmap_exact_rowgroup_count": 0,
+                        "full_rowgroup_strategy_count": 0,
+                        "planned_vector_count": 57,
+                        "actual_vector_count": 57,
+                        "sparse_read_fallback_rowgroup_count": 0,
+                        "bounded_read_amplification_ppm": 1_100_000,
+                        "bounded_read_local_amplification_ppm": 0,
+                        "bounded_read_max_run_bytes": 0,
+                        "bounded_io_backend": "io-uring",
+                        "bounded_io_uring_queue_depth": 256,
+                        "bounded_exact_storage_bytes": 100,
+                        "bounded_physical_storage_bytes": 110,
+                        "bounded_merged_gap_bytes": 10,
+                        "full_compressed_payload_bytes": 150,
+                        "selected_compressed_payload_bytes": 100,
+                        "compressed_payload_bytes_read": 110,
+                        "read_amplification": 1.10,
+                        "merged_gap_bytes": 10,
+                        "hole_clear_bytes": 10,
+                        "static_prefix_restore_bytes": 10,
+                        "bounded_exact_extent_count": 10,
+                        "bounded_physical_run_count": 8,
+                        "bounded_selected_gap_count": 2,
+                        "pread_count": 0,
+                        "io_uring_read_request_count": 8,
+                        "io_uring_completion_count": 8,
+                        "io_uring_submit_syscall_count": 2,
+                        "io_uring_setup_count": 1,
+                        "io_uring_ring_mapped_bytes": 16384,
+                        "io_uring_fallback_count": 0,
+                        "storage_read_granularity": "bounded-selected-vector-range",
+                        "decode_granularity": "selected-vector",
+                        "decode_workset_capacity_bytes": 512 * 1024 * 1024,
                         "max_estimated_decode_workset_bytes": 768,
                         "bounded_double_buffer_peak_estimated_bytes": 896,
                         "oversized_decode_rowgroup_count": 0,
@@ -131,7 +170,7 @@ class PlanlessResultGateTest(unittest.TestCase):
             ],
         }
 
-    def test_accepts_bounded_compact_planless_execution(self) -> None:
+    def test_accepts_current_native_profile_execution(self) -> None:
         contract = self._contract()
         failures: list[str] = []
         _validate_result(
@@ -164,8 +203,8 @@ class PlanlessResultGateTest(unittest.TestCase):
         result = self._result(contract)
         native = result["repeats"][0]["native_totals"]
         native["host_expanded_transform_items_created"] = 1
-        native["full_rowgroup_strategy_count"] = 0
-        native["bounded_double_buffer_peak_estimated_bytes"] = 2 * 1024 * 1024
+        native["run_interval_bounded_rowgroup_count"] = 2
+        native["bounded_double_buffer_peak_estimated_bytes"] = 513 * 1024 * 1024
         native["host_io_staged_rowgroups"] = 3
         failures: list[str] = []
         _validate_result(
@@ -180,237 +219,16 @@ class PlanlessResultGateTest(unittest.TestCase):
         self.assertTrue(any("exceeds capacity" in item for item in failures))
         self.assertTrue(any("host I/O staging" in item for item in failures))
 
-    def test_accepts_explicit_bounded_read_accounting(self) -> None:
-        contract = self._contract()
-        pipeline = contract["pipelines"]["dct_major_pushdown"]
-        pipeline.update(
-            {
-                "crop_execution_mode": "bounded-range-read-selected-decode",
-                "bounded_read_amplification_cap": 1.02,
-                "bounded_read_local_amplification_cap": 0.0,
-                "bounded_read_max_run_bytes": 0,
-            }
-        )
-        result = self._result(contract)
-        native = result["repeats"][0]["native_totals"]
-        native.update(
-            {
-                "run_interval_exact_rowgroup_count": 0,
-                "run_interval_bounded_rowgroup_count": 3,
-                "bitmap_exact_rowgroup_count": 0,
-                "full_rowgroup_strategy_count": 0,
-                "planned_vector_count": 57,
-                "actual_vector_count": 57,
-                "sparse_read_fallback_rowgroup_count": 0,
-                "bounded_read_amplification_ppm": 1_020_000,
-                "bounded_read_local_amplification_ppm": 0,
-                "bounded_read_max_run_bytes": 0,
-                "bounded_exact_storage_bytes": 100,
-                "bounded_physical_storage_bytes": 102,
-                "bounded_merged_gap_bytes": 2,
-                "full_compressed_payload_bytes": 150,
-                "selected_compressed_payload_bytes": 100,
-                "compressed_payload_bytes_read": 102,
-                "read_amplification": 1.02,
-                "merged_gap_bytes": 2,
-                "hole_clear_bytes": 2,
-                "static_prefix_restore_bytes": 10,
-                "bounded_exact_extent_count": 10,
-                "bounded_physical_run_count": 8,
-                "bounded_selected_gap_count": 2,
-                "pread_count": 8,
-                "storage_read_granularity": "bounded-selected-vector-range",
-                "decode_granularity": "selected-vector",
-            }
-        )
-        failures: list[str] = []
-        _validate_result(
-            "dct_major_pushdown",
-            result,
-            contract,
-            [{"ordinal": 0, "label": 7}],
-            failures,
-        )
-        self.assertEqual(failures, [])
-
-    def test_accepts_explicit_bounded_io_uring_accounting(self) -> None:
-        contract = self._contract()
-        pipeline = contract["pipelines"]["dct_major_pushdown"]
-        pipeline.update(
-            {
-                "crop_execution_mode": "bounded-io-uring-range-read-selected-decode",
-                "bounded_read_amplification_cap": 1.10,
-                "bounded_read_local_amplification_cap": 0.0,
-                "bounded_read_max_run_bytes": 0,
-            }
-        )
-        result = self._result(contract)
-        native = result["repeats"][0]["native_totals"]
-        native.update(
-            {
-                "run_interval_exact_rowgroup_count": 0,
-                "run_interval_bounded_rowgroup_count": 3,
-                "bitmap_exact_rowgroup_count": 0,
-                "full_rowgroup_strategy_count": 0,
-                "planned_vector_count": 57,
-                "actual_vector_count": 57,
-                "sparse_read_fallback_rowgroup_count": 0,
-                "bounded_read_amplification_ppm": 1_100_000,
-                "bounded_read_local_amplification_ppm": 0,
-                "bounded_read_max_run_bytes": 0,
-                "bounded_io_backend": "io-uring",
-                "bounded_io_uring_queue_depth": 256,
-                "bounded_exact_storage_bytes": 100,
-                "bounded_physical_storage_bytes": 110,
-                "bounded_merged_gap_bytes": 10,
-                "full_compressed_payload_bytes": 150,
-                "selected_compressed_payload_bytes": 100,
-                "compressed_payload_bytes_read": 110,
-                "read_amplification": 1.10,
-                "merged_gap_bytes": 10,
-                "hole_clear_bytes": 10,
-                "static_prefix_restore_bytes": 10,
-                "bounded_exact_extent_count": 10,
-                "bounded_physical_run_count": 8,
-                "bounded_selected_gap_count": 2,
-                "pread_count": 0,
-                "io_uring_read_request_count": 9,
-                "io_uring_completion_count": 9,
-                "io_uring_submit_syscall_count": 2,
-                "io_uring_wait_syscall_count": 1,
-                "io_uring_setup_count": 1,
-                "io_uring_ring_mapped_bytes": 16384,
-                "io_uring_fallback_count": 0,
-                "storage_read_granularity": "bounded-selected-vector-range",
-                "decode_granularity": "selected-vector",
-            }
-        )
-        failures: list[str] = []
-        _validate_result(
-            "dct_major_pushdown",
-            result,
-            contract,
-            [{"ordinal": 0, "label": 7}],
-            failures,
-        )
-        self.assertEqual(failures, [])
-
-    def test_accepts_first_shard_active_output_schedule_sidecar(self) -> None:
-        contract = self._contract()
-        pipeline = contract["pipelines"]["dct_major_pushdown"]
-        pipeline.update(
-            {
-                "crop_execution_mode": (
-                    "bounded-io-uring-scheduled-range-read-selected-decode"
-                ),
-                "bounded_read_amplification_cap": 1.10,
-                "bounded_read_local_amplification_cap": 0.0,
-                "bounded_read_max_run_bytes": 0,
-            }
-        )
-        result = self._result(contract)
-        native = result["repeats"][0]["native_totals"]
-        native.update(
-            {
-                "run_interval_exact_rowgroup_count": 0,
-                "run_interval_bounded_rowgroup_count": 3,
-                "bitmap_exact_rowgroup_count": 0,
-                "full_rowgroup_strategy_count": 0,
-                "planned_vector_count": 57,
-                "actual_vector_count": 57,
-                "sparse_read_fallback_rowgroup_count": 0,
-                "bounded_read_amplification_ppm": 1_100_000,
-                "bounded_read_local_amplification_ppm": 0,
-                "bounded_read_max_run_bytes": 0,
-                "bounded_io_backend": "io-uring",
-                "bounded_io_uring_queue_depth": 256,
-                "bounded_exact_storage_bytes": 100,
-                "bounded_physical_storage_bytes": 110,
-                "bounded_merged_gap_bytes": 10,
-                "full_compressed_payload_bytes": 150,
-                "selected_compressed_payload_bytes": 100,
-                "compressed_payload_bytes_read": 110,
-                "read_amplification": 1.10,
-                "merged_gap_bytes": 10,
-                "hole_clear_bytes": 10,
-                "static_prefix_restore_bytes": 10,
-                "bounded_exact_extent_count": 10,
-                "bounded_physical_run_count": 8,
-                "bounded_selected_gap_count": 2,
-                "pread_count": 0,
-                "io_uring_read_request_count": 8,
-                "io_uring_completion_count": 8,
-                "io_uring_submit_syscall_count": 2,
-                "io_uring_wait_syscall_count": 1,
-                "io_uring_setup_count": 1,
-                "io_uring_ring_mapped_bytes": 16384,
-                "io_uring_fallback_count": 0,
-                "storage_read_granularity": "bounded-selected-vector-range",
-                "decode_granularity": "selected-vector",
-                "active_output_schedule_sidecar_hit_count": 1,
-                "active_output_schedule_sidecar_miss_count": 0,
-                "active_output_schedule_sidecar_reject_count": 0,
-                "active_output_schedule_sidecar_persist_count": 0,
-                "active_output_schedule_sidecar_bytes": 512,
-                "active_output_schedule_interval_count": 4,
-                "active_output_schedule_mapped_bytes_peak": 512,
-                "active_output_schedule_mmap_capacity_bytes": 16 * 1024 * 1024,
-                "active_output_schedule_mmap_window_count": 2,
-                "planless_transform_active_output_schedule_build_count": 0,
-            }
-        )
-        failures: list[str] = []
-        _validate_result(
-            "dct_major_pushdown",
-            result,
-            contract,
-            [{"ordinal": 0, "label": 7}],
-            failures,
-        )
-        self.assertEqual(failures, [])
-
     def test_rejects_bounded_read_above_whole_run_cap(self) -> None:
         contract = self._contract()
-        pipeline = contract["pipelines"]["dct_major_pushdown"]
-        pipeline.update(
-            {
-                "crop_execution_mode": "bounded-range-read-selected-decode",
-                "bounded_read_amplification_cap": 1.02,
-                "bounded_read_local_amplification_cap": 0.0,
-                "bounded_read_max_run_bytes": 0,
-            }
-        )
         result = self._result(contract)
         native = result["repeats"][0]["native_totals"]
-        native.update(
-            {
-                "run_interval_exact_rowgroup_count": 0,
-                "run_interval_bounded_rowgroup_count": 3,
-                "bitmap_exact_rowgroup_count": 0,
-                "full_rowgroup_strategy_count": 0,
-                "planned_vector_count": 57,
-                "actual_vector_count": 57,
-                "sparse_read_fallback_rowgroup_count": 0,
-                "bounded_read_amplification_ppm": 1_020_000,
-                "bounded_read_local_amplification_ppm": 0,
-                "bounded_read_max_run_bytes": 0,
-                "bounded_exact_storage_bytes": 100,
-                "bounded_physical_storage_bytes": 103,
-                "bounded_merged_gap_bytes": 3,
-                "full_compressed_payload_bytes": 150,
-                "selected_compressed_payload_bytes": 100,
-                "compressed_payload_bytes_read": 103,
-                "read_amplification": 1.03,
-                "merged_gap_bytes": 3,
-                "hole_clear_bytes": 3,
-                "static_prefix_restore_bytes": 10,
-                "bounded_exact_extent_count": 10,
-                "bounded_physical_run_count": 8,
-                "pread_count": 8,
-                "storage_read_granularity": "bounded-selected-vector-range",
-                "decode_granularity": "selected-vector",
-            }
-        )
+        native["bounded_physical_storage_bytes"] = 111
+        native["bounded_merged_gap_bytes"] = 11
+        native["compressed_payload_bytes_read"] = 111
+        native["read_amplification"] = 1.11
+        native["merged_gap_bytes"] = 11
+        native["hole_clear_bytes"] = 11
         failures: list[str] = []
         _validate_result(
             "dct_major_pushdown",
@@ -460,9 +278,8 @@ class PlanlessResultGateTest(unittest.TestCase):
         self.assertTrue(any("CPU schedule timing" in item for item in failures))
         self.assertTrue(any("CUDA kernel elapsed" in item for item in failures))
 
-    def test_rejects_count_bounded_plan_cache_and_unbounded_decoded_cache(self) -> None:
+    def test_rejects_runtime_cache_activity_and_unbounded_decoded_cache(self) -> None:
         contract = self._contract()
-        contract["pipelines"]["dct_major_pushdown"]["plan_cache_capacity"] = 2
         result = self._result(contract)
         native = result["repeats"][0]["native_totals"]
         native["exact_batch_plan_cache_enabled"] = 1
@@ -479,46 +296,10 @@ class PlanlessResultGateTest(unittest.TestCase):
             [{"ordinal": 0, "label": 7}],
             failures,
         )
-        self.assertTrue(any("count-bounded" in item for item in failures))
         self.assertTrue(any("exact expanded-plan cache" in item for item in failures))
         self.assertTrue(any("persistent helper cache" in item for item in failures))
         self.assertTrue(any("cache current/peak" in item for item in failures))
         self.assertTrue(any("retained entries" in item for item in failures))
-
-
-class PlanlessResourceGateTest(unittest.TestCase):
-    def _aggregates(self, *, planless_multiplier: float) -> dict:
-        names = (
-            "host_peak_rss_bytes",
-            "galp_native_pinned_peak_in_use_bytes",
-            "galp_native_device_peak_in_use_bytes",
-            "peak_torch_gpu_allocated_bytes",
-            "peak_torch_gpu_reserved_bytes",
-        )
-        legacy = {name: {"max": 1000.0} for name in names}
-        planless = {name: {"max": 1000.0 * planless_multiplier} for name in names}
-        return {
-            "dct_major_legacy_pushdown": legacy,
-            "dct_major_pushdown": planless,
-        }
-
-    def test_accepts_planless_peaks_no_higher_than_legacy(self) -> None:
-        failures: list[str] = []
-        evidence = _planless_resource_evidence(
-            self._aggregates(planless_multiplier=0.8), failures
-        )
-        self.assertEqual(failures, [])
-        assert evidence is not None
-        self.assertTrue(evidence["ok"])
-
-    def test_rejects_any_planless_peak_above_legacy(self) -> None:
-        aggregates = self._aggregates(planless_multiplier=0.8)
-        aggregates["dct_major_pushdown"]["galp_native_pinned_peak_in_use_bytes"]["max"] = 1001.0
-        failures: list[str] = []
-        evidence = _planless_resource_evidence(aggregates, failures)
-        assert evidence is not None
-        self.assertFalse(evidence["ok"])
-        self.assertTrue(any("pinned" in item and "exceeds" in item for item in failures))
 
 
 class CompleteCsvTest(unittest.TestCase):
@@ -584,107 +365,6 @@ class CompleteCsvTest(unittest.TestCase):
         self.assertEqual(row["dct_resize_weight_cache_hits"], "0")
         self.assertEqual(row["dct_resize_weight_cache_misses"], "0")
         self.assertEqual(row["total_storage_bytes_with_descriptor"], "1010")
-
-
-class PhysicalEvidenceTest(unittest.TestCase):
-    def test_requires_bytes_vectors_and_blocks_to_fall(self) -> None:
-        aggregates = {
-            "dct_major_full": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 1000,
-                    "actual_vector_count": 100,
-                    "requested_source_block_count": 10000,
-                    "pread_count": 10,
-                }
-            },
-            "dct_major_pushdown": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 600,
-                    "actual_vector_count": 70,
-                    "requested_source_block_count": 5000,
-                    "pread_count": 8,
-                }
-            },
-        }
-        failures: list[str] = []
-        evidence = _physical_evidence({}, aggregates, failures)
-        self.assertEqual(failures, [])
-        self.assertIsNotNone(evidence)
-        assert evidence is not None
-        self.assertTrue(evidence["ok"])
-        self.assertAlmostEqual(evidence["physical_bytes_saved_percent"], 40.0)
-
-    def test_logical_only_crop_is_rejected(self) -> None:
-        aggregates = {
-            "dct_major_full": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 1000,
-                    "actual_vector_count": 100,
-                    "requested_source_block_count": 10000,
-                }
-            },
-            "dct_major_pushdown": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 1000,
-                    "actual_vector_count": 70,
-                    "requested_source_block_count": 5000,
-                }
-            },
-        }
-        failures: list[str] = []
-        evidence = _physical_evidence({}, aggregates, failures)
-        self.assertIsNotNone(evidence)
-        self.assertTrue(any("physical bytes" in item for item in failures))
-
-    def test_full_control_accepts_generic_block_count_alias(self) -> None:
-        aggregates = {
-            "dct_major_full": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 1000,
-                    "actual_vector_count": 100,
-                    "block_count": 900,
-                }
-            },
-            "dct_major_pushdown": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 600,
-                    "actual_vector_count": 50,
-                    "requested_source_block_count": 200,
-                }
-            },
-        }
-        failures: list[str] = []
-        evidence = _physical_evidence({}, aggregates, failures)
-        self.assertEqual(failures, [])
-        self.assertIsNotNone(evidence)
-        assert evidence is not None
-        self.assertEqual(evidence["full_source_blocks"], 900)
-        self.assertEqual(evidence["pushdown_source_blocks"], 200)
-
-    def test_full_control_skips_zero_counter_and_uses_planned_vectors(self) -> None:
-        aggregates = {
-            "dct_major_full": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 1000,
-                    "actual_vector_count": 100,
-                    "requested_source_block_count": 0,
-                    "fixed_transform_source_block_count": 0,
-                    "planned_selected_vector_count": 900,
-                }
-            },
-            "dct_major_pushdown": {
-                "native_hot_mean": {
-                    "compressed_payload_bytes_read": 600,
-                    "actual_vector_count": 50,
-                    "requested_source_block_count": 200,
-                }
-            },
-        }
-        failures: list[str] = []
-        evidence = _physical_evidence({}, aggregates, failures)
-        self.assertEqual(failures, [])
-        assert evidence is not None
-        self.assertEqual(evidence["full_source_blocks"], 900)
 
 
 class SemanticToleranceTest(unittest.TestCase):

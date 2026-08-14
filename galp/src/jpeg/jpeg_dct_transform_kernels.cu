@@ -4,9 +4,9 @@
 
 namespace galp::jpeg::detail {
 
-// Match the float32 torch.mm conversion used by RGB-no-more exactly. The
-// tiny non-zero entries are observable at round-to-even boundaries.
-__device__ __constant__ float kRgbNoMoreDown2Conversion[8U * 16U] = {
+// Stable 2:1 DCT-domain reference conversion. Tiny non-zero entries are
+// observable at round-to-even boundaries.
+__device__ __constant__ float kReferenceDown2Conversion[8U * 16U] = {
 #include "jpeg/jpeg_dct_reference_down2.inc"
 };
 
@@ -430,7 +430,7 @@ __device__ float planless_axis_phase_weight(const float* __restrict phase_matric
 	}
 	if (up_factor == 1U && down_factor == 2U) {
 		const auto subblock = source_block - output_block * 2U;
-		return kRgbNoMoreDown2Conversion[out_coeff * 16U + subblock * 8U + in_coeff] / 0x1.6a09e60000000p+0F;
+		return kReferenceDown2Conversion[out_coeff * 16U + subblock * 8U + in_coeff] / 0x1.6a09e60000000p+0F;
 	}
 	return 0.0F;
 }
@@ -572,7 +572,7 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 				} else {
 #pragma unroll
 					for (uint32_t source_y = 0; source_y < 16U; ++source_y) {
-						sum = dct_grid_madd_rn(kRgbNoMoreDown2Conversion[out_y * 16U + source_y],
+						sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
 						                       composed[source_y * source_width + source_x],
 						                       sum);
 					}
@@ -590,7 +590,7 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 #pragma unroll
 					for (uint32_t source_x = 0; source_x < 16U; ++source_x) {
 						sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
-						                       kRgbNoMoreDown2Conversion[out_x * 16U + source_x],
+						                       kReferenceDown2Conversion[out_x * 16U + source_x],
 						                       sum);
 					}
 				}
@@ -868,7 +868,7 @@ __global__ void transformed_dct_grid_grouped_kernel(const DeviceCoeffBinding* __
 			} else {
 #pragma unroll
 				for (uint32_t source_y = 0; source_y < 16U; ++source_y) {
-						sum = dct_grid_madd_rn(kRgbNoMoreDown2Conversion[out_y * 16U + source_y],
+						sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
 						                       composed[source_y * source_width + source_x],
 						                       sum);
 				}
@@ -886,7 +886,7 @@ __global__ void transformed_dct_grid_grouped_kernel(const DeviceCoeffBinding* __
 #pragma unroll
 				for (uint32_t source_x = 0; source_x < 16U; ++source_x) {
 						sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
-						                       kRgbNoMoreDown2Conversion[out_x * 16U + source_x],
+						                       kReferenceDown2Conversion[out_x * 16U + source_x],
 						                       sum);
 				}
 			}

@@ -317,17 +317,17 @@ class CompactV3AcceptanceTest(unittest.TestCase):
                 )
             )
             adapted = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(adapted["pipelines"]["enabled"], ["galp_planless"])
-            self.assertNotIn("galp", adapted["pipelines"])
+            self.assertEqual(adapted["pipelines"]["enabled"], ["galp"])
+            self.assertNotIn("transform_execution_mode", adapted["pipelines"]["galp"])
+            self.assertNotIn("enable_planless_execution", adapted["pipelines"]["galp"])
             self.assertEqual(
-                adapted["pipelines"]["galp_planless"]["transform_execution_mode"],
-                "require-planless",
+                adapted["pipelines"]["galp"]["runtime_profile"],
+                "compact-v3-planless-limited-o512-c512-v1",
             )
-            self.assertIn("galp_planless", adapted["performance_gates"])
-            self.assertNotIn("galp", adapted["performance_gates"])
+            self.assertIn("galp", adapted["performance_gates"])
             self.assertEqual(
                 adapted["semantic_validation"]["comparison_groups"][0]["pipelines"],
-                ["galp_planless", "rgbnomore"],
+                ["galp", "rgbnomore"],
             )
 
     def test_acceptance_cli_defaults_to_canonical_planless_pipeline(self) -> None:
@@ -346,7 +346,7 @@ class CompactV3AcceptanceTest(unittest.TestCase):
                 "out",
             ]
         )
-        self.assertEqual(args.pipeline, "galp_planless")
+        self.assertEqual(args.pipeline, "galp")
 
     def test_ab_summary_accepts_single_batch_ordered_latency(self) -> None:
         legs = []

@@ -99,7 +99,15 @@ PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 - `runtime` 仍先在 fresh clone 上执行同一个 audit first-step probe，但 probe 不进入 warmup 或 measured window。正式 measured loop 不调用逐参数统计或逐 step `.item()`；CUDA wall-clock 只在 measured region 前后各同步一次，stage 用 CUDA event 在 region 结束后解析。
 - `--resume-run` 只能恢复相同 mode；显式传入不同 mode 会立即失败。
 
-GALP 的 `--workers N` 明确表示一个有序 batch producer 内部的 native rowgroup-prefetch worker 数，不表示 N 个 batch producer。`N=0` 会失败。`--prefetch-depth D` 对应最多 `D+1` 个 in-flight batch（当前 batch 加 D 个 ahead batch），队列保持 FIFO、施加硬 backpressure，并在 close 时 cancel 或 drain 全部未消费任务。
+`--workers N` 是训练 workload 的外层数据 worker 参数，不再转发为 native
+rowgroup-prefetch worker 数；native I/O 并行度由 production profile 固定。
+`N=0` 会失败。`--prefetch-depth D` 对应最多 `D+1` 个 in-flight batch（当前
+batch 加 D 个 ahead batch），队列保持 FIFO、施加硬 backpressure，并在 close 时
+cancel 或 drain 全部未消费任务。
+
+模型固定为 RGB-no-more ViT-Ti，augmentation 固定为 published recipe，precision
+固定为 FP32。因为三者都只有一个生产值，`--model-architecture`、
+`--augmentation-recipe` 和 `--precision` 已从训练入口删除。
 
 下列短命令使用当前正式数据路径：
 

@@ -229,7 +229,7 @@ def _append_failure(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
-    recipe = assert_recipe_overrides(recipe=args.recipe, epochs=args.epochs)
+    recipe = assert_recipe_overrides(recipe=RECIPE_NAME, epochs=args.epochs)
     conditions = _condition_ids(args.conditions)
     seeds = _seeds(args.seeds)
     seed_devices = _seed_devices(
@@ -371,8 +371,6 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             str(args.layout_plan.resolve()),
             "--condition-contract",
             str(contract_paths[(seed, condition_id)].resolve()),
-            "--recipe",
-            args.recipe,
             "--condition",
             condition_id,
             "--seed",
@@ -387,8 +385,6 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             str(args.workers),
             "--prefetch-depth",
             str(args.prefetch_depth),
-            "--galp-cache-capacity-mib",
-            str(args.galp_cache_capacity_mib),
             "--galp-torch-module-path",
             str(args.galp_torch_module_path.resolve()),
             "--rgbnomore-root",
@@ -495,7 +491,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--layout-plan", type=Path, required=True)
-    parser.add_argument("--recipe", default=RECIPE_NAME, choices=(RECIPE_NAME,))
     parser.add_argument("--conditions", default=",".join(CORE_CONDITION_IDS))
     parser.add_argument(
         "--seeds", default=",".join(str(seed) for seed in PAIRED_SEEDS)
@@ -511,7 +506,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--prefetch-depth", type=int, default=2)
-    parser.add_argument("--galp-cache-capacity-mib", type=int, default=0)
     parser.add_argument(
         "--galp-torch-module-path", type=Path, default=REPO_ROOT / "build/galp/torch"
     )
@@ -523,8 +517,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.workers <= 0:
         raise ValueError("workers must be positive")
-    if args.prefetch_depth < 0 or args.galp_cache_capacity_mib < 0:
-        raise ValueError("prefetch/cache options must be non-negative")
+    if args.prefetch_depth < 0:
+        raise ValueError("prefetch depth must be non-negative")
     for path in (args.train_manifest, args.val_manifest, args.layout_plan):
         if not path.is_file():
             raise FileNotFoundError(path)

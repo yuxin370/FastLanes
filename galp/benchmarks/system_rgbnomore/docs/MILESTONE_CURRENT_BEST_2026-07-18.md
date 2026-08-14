@@ -1,5 +1,9 @@
 # GALP Direct-DCT 当前最佳里程碑报告
 
+> **历史里程碑。** 标题中的“当前最佳”仅指 2026-07-18；本文不是当前运行手册，
+> 当时的 pipeline/参数需按原始合同理解。当前入口见 [README](../README.md) 和
+> [推理运行指南](E2E_COMPARISON_RUN_GUIDE.md)。
+
 日期：2026-07-18
 
 状态：当前最佳里程碑候选（milestone candidate），不是稳定版本

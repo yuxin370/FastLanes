@@ -340,7 +340,6 @@ def _parse_args() -> argparse.Namespace:
         default="random-access",
         help="Storage architecture preset; random-access is the production path for globally shuffled batches.",
     )
-    parser.add_argument("--policy", choices=("ragged",), default="ragged")
     parser.add_argument(
         "--physical-layout",
         choices=("image-major", "image-major-vector-rowgroups"),
@@ -531,7 +530,7 @@ def main() -> None:
         "--out-dir",
         str(args.out_dir),
         "--policy",
-        args.policy,
+        "ragged",
         "--preset",
         args.preset,
         "--metadata-profile",

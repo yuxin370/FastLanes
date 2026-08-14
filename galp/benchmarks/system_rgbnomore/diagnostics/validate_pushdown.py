@@ -22,10 +22,8 @@ import torch
 import _galp_direct_dct as galp_dct
 
 EXAMPLES_DIR = REPO_ROOT / "galp/examples"
-TORCH_SOURCE_DIR = REPO_ROOT / "galp/torch"
-for source_dir in (EXAMPLES_DIR, TORCH_SOURCE_DIR):
-    if str(source_dir) not in sys.path:
-        sys.path.insert(0, str(source_dir))
+if str(EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(EXAMPLES_DIR))
 
 from direct_dct_torch_end_to_end_demo import (
     _build_rgbnomore_val_crop_transform,
@@ -33,7 +31,10 @@ from direct_dct_torch_end_to_end_demo import (
     _read_batch,
 )
 from direct_dct import _component_quant_tables
-from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+try:
+    from .rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+except ImportError:  # Direct script execution.
+    from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 
 DEFAULT_JPEG_TOOL = REPO_ROOT / "build/galp/tools/jpeg_dct/galp_jpeg_dct_tool"

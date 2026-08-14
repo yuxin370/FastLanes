@@ -81,106 +81,46 @@ class RunContractTest(unittest.TestCase):
             self.assertEqual(result["required_active_output_schedule_shard_ids"], [0, 4])
             self.assertEqual(len(result["active_output_schedules"]), 2)
 
-    def test_default_matrix_includes_same_crop_legacy_baseline(self) -> None:
+    def test_default_matrix_uses_the_best_measured_production_profile(self) -> None:
         args = parse_args(
             ["--output-dir", "/tmp/unused-dct-major-test-output"]
         )
-        self.assertIn("dct_major_legacy_pushdown", args.pipelines)
         self.assertIn("dct_major_pushdown", args.pipelines)
-        self.assertEqual(args.decode_workset_capacity_mib, 512)
-        self.assertEqual(args.block_major_double_buffer, "auto")
-        self.assertEqual(args.dct_major_output_prefetch_policy, "overlapped")
-        self.assertEqual(args.dct_major_segment_mode, "fixed")
-        self.assertTrue(args.cold_start_model_prime)
+        self.assertNotIn("dct_major_legacy_pushdown", args.pipelines)
+        self.assertNotIn("dct_major_full", args.pipelines)
+        for field in (
+            "decode_workset_capacity_mib",
+            "block_major_double_buffer",
+            "dct_major_output_prefetch_policy",
+            "dct_major_segment_mode",
+            "dct_major_crop_execution_mode",
+            "bounded_read_amplification_cap",
+            "rowgroup_prefetch_workers",
+            "cold_start_model_prime",
+            "preprocess_profile",
+        ):
+            self.assertFalse(hasattr(args, field), field)
         self.assertFalse(args.evict_pipeline_file_cache)
-        self.assertEqual(args.preprocess_profile, "rgbnomore-resize256-center224")
         self.assertEqual(args.cold_protocol, "application-overlapped")
 
-    def test_manifest_shard_cli_mode_is_accepted(self) -> None:
-        args = parse_args(
-            [
-                "--output-dir",
-                "/tmp/unused-dct-major-test-output",
-                "--dct-major-segment-mode",
-                "manifest-shard",
-                "--dct-major-crop-execution-mode",
-                "vector-range-read-selected-decode",
-            ]
-        )
-        self.assertEqual(args.dct_major_segment_mode, "manifest-shard")
-
-    def test_deferred_output_allocation_policy_is_explicitly_accepted(self) -> None:
-        args = parse_args(
-            [
-                "--output-dir",
-                "/tmp/unused-dct-major-test-output",
-                "--dct-major-segment-mode",
-                "manifest-shard",
-                "--dct-major-output-prefetch-policy",
-                "deferred-allocation",
-            ]
-        )
-        self.assertEqual(args.dct_major_output_prefetch_policy, "deferred-allocation")
-
-    def test_bounded_selected_mode_and_integer_budget_controls_are_accepted(self) -> None:
-        args = parse_args(
-            [
-                "--output-dir",
-                "/tmp/unused-dct-major-test-output",
-                "--dct-major-segment-mode",
-                "manifest-shard",
-                "--dct-major-crop-execution-mode",
-                "bounded-range-read-selected-decode",
-                "--bounded-read-amplification-cap",
-                "1.02",
-                "--bounded-read-local-amplification-cap",
-                "1.05",
-                "--bounded-read-max-run-bytes",
-                "4194304",
-            ]
-        )
-        self.assertEqual(args.dct_major_crop_execution_mode, "bounded-range-read-selected-decode")
-        self.assertEqual(args.bounded_read_amplification_cap, 1.02)
-        self.assertEqual(args.bounded_read_local_amplification_cap, 1.05)
-        self.assertEqual(args.bounded_read_max_run_bytes, 4 * 1024 * 1024)
-
-    def test_bounded_io_uring_mode_is_explicitly_accepted(self) -> None:
-        args = parse_args(
-            [
-                "--output-dir",
-                "/tmp/unused-dct-major-test-output",
-                "--dct-major-segment-mode",
-                "manifest-shard",
-                "--dct-major-crop-execution-mode",
-                "bounded-io-uring-range-read-selected-decode",
-                "--bounded-read-amplification-cap",
-                "1.10",
-            ]
-        )
-        self.assertEqual(
-            args.dct_major_crop_execution_mode,
-            "bounded-io-uring-range-read-selected-decode",
-        )
-        self.assertEqual(args.bounded_read_amplification_cap, 1.10)
-
-    def test_bounded_io_uring_scheduled_mode_is_explicitly_accepted(self) -> None:
-        args = parse_args(
-            [
-                "--output-dir",
-                "/tmp/unused-dct-major-test-output",
-                "--dct-major-segment-mode",
-                "manifest-shard",
-                "--dct-major-crop-execution-mode",
-                "bounded-io-uring-scheduled-range-read-selected-decode",
-                "--bounded-read-amplification-cap",
-                "1.10",
-            ]
-        )
-        self.assertEqual(
-            args.dct_major_crop_execution_mode,
-            "bounded-io-uring-scheduled-range-read-selected-decode",
-        )
-        self.assertEqual(args.bounded_read_amplification_cap, 1.10)
+    def test_frozen_runtime_policy_is_not_exposed_as_cli_options(self) -> None:
+        for option, value in (
+            ("--dct-major-segment-mode", "fixed"),
+            ("--dct-major-output-prefetch-policy", "overlapped"),
+            ("--dct-major-crop-execution-mode", "vector-range-read-selected-decode"),
+            ("--bounded-read-amplification-cap", "1.02"),
+            ("--rowgroup-prefetch-workers", "4"),
+            ("--scheduling-policy", "serial"),
+        ):
+            with self.subTest(option=option), self.assertRaises(SystemExit):
+                parse_args(
+                    [
+                        "--output-dir",
+                        "/tmp/unused-dct-major-test-output",
+                        option,
+                        value,
+                    ]
+                )
 
     def test_per_pipeline_file_cache_eviction_cli_is_accepted(self) -> None:
         args = parse_args(
@@ -191,46 +131,6 @@ class RunContractTest(unittest.TestCase):
             ]
         )
         self.assertTrue(args.evict_pipeline_file_cache)
-
-    def test_fixed_512_center_crop_profile_is_accepted(self) -> None:
-        args = parse_args(
-            [
-                "--output-dir",
-                "/tmp/unused-dct-major-test-output",
-                "--preprocess-profile",
-                "fixed-center-224-from-512",
-            ]
-        )
-        self.assertEqual(args.preprocess_profile, "fixed-center-224-from-512")
-
-    def test_unified_layout_matrix_accepts_explicit_v2_and_v3_pipelines(self) -> None:
-        args = parse_args(
-            [
-                "--output-dir",
-                "/tmp/unused-dct-major-test-output",
-                "--pipelines",
-                "dct_major_pushdown",
-                "image_major_v2_pushdown",
-                "image_major_v3_pushdown",
-                "rgbnomore",
-                "dali",
-                "pytorch",
-            ]
-        )
-        self.assertEqual(
-            args.pipelines,
-            [
-                "dct_major_pushdown",
-                "image_major_v2_pushdown",
-                "image_major_v3_pushdown",
-                "rgbnomore",
-                "dali",
-                "pytorch",
-            ],
-        )
-        self.assertEqual(args.image_major_manifest_version, 2)
-        self.assertEqual(args.image_major_v3_manifest.name, "manifest.bin")
-        self.assertEqual(args.image_major_v3_manifest.parent.name, "compact_v3_tiled_z32")
 
     def test_explicit_sample_count_preserves_partial_tail(self) -> None:
         args = parse_args(
@@ -243,7 +143,7 @@ class RunContractTest(unittest.TestCase):
                 "5",
             ]
         )
-        self.assertEqual(_sample_plan(args), (2, 1, 2, 5))
+        self.assertEqual(_sample_plan(args), (2, 0, 3, 5))
 
     def test_explicit_batch_count_must_cover_sample_count(self) -> None:
         args = parse_args(

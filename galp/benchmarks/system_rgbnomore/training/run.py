@@ -21,7 +21,7 @@ BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from shared.common import cached_file_fingerprints
+from shared.common import GALP_RUNTIME_PROFILE, cached_file_fingerprints
 
 from training.artifacts import (
     nested_state_sha256,
@@ -139,7 +139,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="audit preserves exhaustive per-step checks; runtime minimizes measured-path synchronization",
     )
 
-    parser.add_argument("--model-architecture", choices=(MODEL_ARCHITECTURE,), default=MODEL_ARCHITECTURE)
     parser.add_argument("--init-mode", choices=("random", "weights", "full-checkpoint"), default="random")
     parser.add_argument("--rgb-init-checkpoint", type=Path)
     parser.add_argument("--dct-init-checkpoint", type=Path)
@@ -165,7 +164,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--galp-torch-module-path", type=Path, default=FASTLANES_ROOT / "build/galp/torch")
-    parser.add_argument("--galp-cache-capacity-mib", type=int, default=0)
     parser.add_argument("--refresh-galp-payload-fingerprints", action="store_true")
     parser.add_argument(
         "--allow-galp-layout-manifest-rebinding",
@@ -246,13 +244,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient-clipping", type=float)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
 
-    parser.add_argument("--augmentation-recipe", choices=("deterministic-rrc-hflip-range-v1",), default="deterministic-rrc-hflip-range-v1")
     parser.add_argument("--mixup", type=float, default=0.0)
     parser.add_argument("--cutmix", type=float, default=0.0)
     parser.add_argument("--randaugment", type=int, default=0)
 
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--precision", choices=("fp32",), default="fp32")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--throughput-cv-limit", type=float, default=DEFAULT_THROUGHPUT_CV_LIMIT)
     parser.add_argument(
@@ -329,8 +325,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None and value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.galp_cache_capacity_mib < 0:
-        raise ValueError("--galp-cache-capacity-mib must be non-negative")
     for name in (
         "throughput_cv_limit",
         "dct_semantic_atol",
@@ -349,10 +343,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         value = float(getattr(args, name))
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and in [0,1]")
-    if "galp" in args.enabled and args.workers == 0:
-        raise ValueError(
-            "GALP --workers controls native rowgroup-prefetch workers and must be at least 1"
-        )
     for name in ("warmup_steps", "measured_steps", "train_steps", "eval_interval", "repeats"):
         value = getattr(args, name)
         if value is not None and value <= 0:
@@ -423,8 +413,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise RuntimeError(
             "CUDA was requested but is unavailable; this is an environment skip, not a training correctness failure"
         )
-    if args.precision != "fp32":
-        raise ValueError("rgbnomore-vitti-v1 v1 benchmark is fixed to FP32")
 
 
 def _phase_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -481,7 +469,14 @@ def _runtime_files(rgbnomore_root: Path) -> tuple[list[Path], list[Path]]:
             FASTLANES_ROOT / "galp/benchmarks/system_rgbnomore/shared/common.py",
             FASTLANES_ROOT / "galp/benchmarks/system_rgbnomore/shared/manifest_contract.py",
             FASTLANES_ROOT / "galp/torch/direct_dct_torch.cpp",
+            FASTLANES_ROOT / "galp/torch/direct_dct.py",
+            FASTLANES_ROOT / "galp/torch/diagnostics.py",
+            FASTLANES_ROOT / "galp/profiles/_base.py",
+            FASTLANES_ROOT / "galp/profiles/rgbnomore.py",
             FASTLANES_ROOT / "galp/include/galp/direct_dct.hpp",
+            FASTLANES_ROOT / "galp/include/galp/profiles/direct_dct.hpp",
+            FASTLANES_ROOT / "galp/include/galp/profiles/registry.hpp",
+            FASTLANES_ROOT / "galp/include/galp/profiles/rgbnomore.hpp",
             FASTLANES_ROOT / "galp/include/galp/jpeg_dct.hpp",
             FASTLANES_ROOT / "galp/src/api/direct_dct.cpp",
             FASTLANES_ROOT / "galp/src/jpeg/jpeg_dct_planner.cpp",
@@ -655,7 +650,7 @@ def _build_contract(
             for name, pipelines in COMPARISON_GROUPS.items()
         },
         "model": {
-            "architecture": args.model_architecture,
+            "architecture": MODEL_ARCHITECTURE,
             "domains": {domain: model_configuration(domain) for domain in ("rgb", "dct")},
             "execution": "pytorch-eager",
             "device": args.device,
@@ -780,7 +775,7 @@ def _build_contract(
             "galp_validation_payload_fingerprints": galp_validation_payload_fingerprints,
             "galp_native_binary": galp_native_binary,
             "galp_torch_module_path": str(args.galp_torch_module_path.resolve()),
-            "galp_cache_capacity_mib": args.galp_cache_capacity_mib,
+            "runtime_profile": GALP_RUNTIME_PROFILE,
         },
         "gates": {
             "throughput_cv_limit": args.throughput_cv_limit,
@@ -2986,13 +2981,11 @@ def _hydrate_resume_args(args: argparse.Namespace, contract: dict[str, Any]) -> 
     args.pipeline = list(contract["enabled_pipelines"])
     args.enabled_pipelines = None
     args.required_comparison_groups = list(contract["required_comparison_groups"])
-    args.model_architecture = contract["model"]["architecture"]
     args.init_mode = contract["initialization"]["mode"]
     args.rgb_init_checkpoint = _path_or_none(contract["initialization"].get("rgb_checkpoint"))
     args.dct_init_checkpoint = _path_or_none(contract["initialization"].get("dct_checkpoint"))
     args.resume_checkpoint = _path_or_none(contract["initialization"].get("resume_checkpoint"))
     args.device = contract["model"]["device"]
-    args.precision = contract["model"]["precision"]
     args.seed = int(contract["sample_order"]["seed"])
     args.train_manifest = Path(contract["datasets"]["train"]["path"])
     args.val_manifest = Path(contract["datasets"]["validation"]["path"])
@@ -3004,7 +2997,6 @@ def _hydrate_resume_args(args: argparse.Namespace, contract: dict[str, Any]) -> 
         contract["pipelines"].get("galp_validation_manifest")
     ) or args.galp_manifest
     args.galp_torch_module_path = Path(contract["pipelines"]["galp_torch_module_path"])
-    args.galp_cache_capacity_mib = int(contract["pipelines"]["galp_cache_capacity_mib"])
     args.refresh_galp_payload_fingerprints = False
     expectations = contract["pipelines"].get("galp_manifest_expectations", {})
     args.expected_manifest_version = expectations.get("version")

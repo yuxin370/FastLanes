@@ -1,5 +1,10 @@
 # GALP training runtime bottleneck report — 2026-07-21
 
+> **Historical diagnostic snapshot.** The audit/runtime timing distinction is
+> still supported, but the low-level worker/prefetch/runtime descriptions below
+> predate native production profiles. Current commands are in
+> [TRAINING_BENCHMARK_RUN_GUIDE](TRAINING_BENCHMARK_RUN_GUIDE.md).
+
 ## Outcome
 
 The benchmark now has an immutable `--execution-mode audit|runtime` contract. `audit` remains the default and preserves the exhaustive behavior. `runtime` keeps the same fresh-clone first-step semantic probe outside timing, then measures real `zero_grad -> forward -> loss -> backward -> optimizer.step -> scheduler.step` training without per-step parameter scans, `.item()`, or stage synchronizations.

@@ -11,10 +11,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BENCHMARK_ROOT = HERE.parent
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
+REPO_ROOT = BENCHMARK_ROOT.parents[2]
+for path in (BENCHMARK_ROOT, REPO_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from common import parse_manifest  # noqa: E402
+from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512  # noqa: E402
+from galp.torch import DirectDctReader  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,7 +26,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--torch-binding-dir", type=Path)
     parser.add_argument("--segment-size", type=int, default=50)
-    parser.add_argument("--crop-execution-mode", default="rowgroup-read-selected-decode")
     return parser.parse_args()
 
 
@@ -39,24 +42,14 @@ def main() -> None:
         "persistent_metadata_bytes": sum(int(item["metadata_file_size"]) for item in metadata["shards"]),
     }
     if args.torch_binding_dir is not None:
-        binding = str(args.torch_binding_dir.resolve())
-        torch_profile = str((BENCHMARK_ROOT.parents[1] / "torch").resolve())
-        for path in (binding, torch_profile):
-            if path not in sys.path:
-                sys.path.insert(0, path)
-        from _galp_direct_dct import DirectDctReader  # type: ignore  # noqa: PLC0415
-        from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32  # type: ignore  # noqa: PLC0415
-
         image_count = min(args.segment_size, int(metadata["image_count"]))
-        reader = DirectDctReader(str(args.manifest.resolve()))
-        preview = reader.plan_batch(
+        reader = DirectDctReader(
+            args.manifest,
+            module_path=args.torch_binding_dir,
+        )
+        preview = reader.plan(
             list(range(image_count)),
-            layout="transformed_dct_grid",
-            grid_transform=RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32,
-            cache_capacity_mib=0,
-            plan_cache_capacity=0,
-            enable_planless_execution=True,
-            crop_execution_mode=args.crop_execution_mode,
+            VALIDATION_CENTER_CROP_512,
         )
         summary["plan"] = {
             key: preview[key]

@@ -15,18 +15,16 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Iterator, Sequence
 
 import numpy as np
 import torch
 
 from common import (
+    BLOCK_MAJOR_RUNTIME_PROFILE,
     PIPELINES,
     PIPELINE_RESULT_SCHEMA,
     REPO_ROOT,
-    RGBNOMORE_BENCHMARK_ROOT,
-    chunked,
     distribution,
     file_identity,
     load_contract,
@@ -38,6 +36,12 @@ from common import (
     sha256_json,
     write_json,
 )
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
+from galp.torch import DirectDctReader
+from galp.torch.diagnostics import cache_stats, execution_stats, prefetch_stats
 from feature_model import build_workload_model, expected_output_width
 
 
@@ -424,69 +428,9 @@ class DaliAdapter(Adapter):
         self.iterator = None
 
 
-def _load_direct_dct_modules(
-    binding_dir: Path,
-    *,
-    load_postdecode_diagnostics: bool,
-) -> tuple[Any, Any | None, dict[str, Any], dict[str, Any]]:
-    diagnostics = RGBNOMORE_BENCHMARK_ROOT / "diagnostics"
-    torch_source = REPO_ROOT / "galp/torch"
-    for path in (binding_dir.resolve(), torch_source.resolve(), diagnostics.resolve()):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
-    binding_started_ns = time.perf_counter_ns()
-    binding = importlib.import_module("_galp_direct_dct")
-    binding_ready_ns = time.perf_counter_ns()
-    profile = importlib.import_module("rgbnomore_dct_profile")
-    profile_ready_ns = time.perf_counter_ns()
-    direct_dct = None
-    if load_postdecode_diagnostics:
-        direct_dct = importlib.import_module("direct_dct")
-    diagnostics_ready_ns = time.perf_counter_ns()
-    return (
-        binding,
-        direct_dct,
-        dict(profile.RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32),
-        {
-            "binding_extension_import_ms": (binding_ready_ns - binding_started_ns) / 1.0e6,
-            "direct_dct_profile_import_ms": (profile_ready_ns - binding_ready_ns) / 1.0e6,
-            "postdecode_diagnostics_import_ms": (diagnostics_ready_ns - profile_ready_ns) / 1.0e6,
-            "postdecode_diagnostics_imported": load_postdecode_diagnostics,
-        },
-    )
-
-
-def _native_args(config: dict[str, Any], preprocess: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        preprocess=preprocess,
-        cache_capacity_mib=int(config.get("cache_capacity_mib", 0)),
-        plan_cache_capacity=int(config.get("plan_cache_capacity", 0)),
-        decode_batch_rowgroups=int(config.get("decode_batch_rowgroups", 64)),
-        decode_workset_capacity_mib=int(config.get("decode_workset_capacity_mib", 512)),
-        rowgroup_prefetch_depth=int(config.get("rowgroup_prefetch_depth", 16)),
-        rowgroup_prefetch_workers=int(config.get("rowgroup_prefetch_workers", 4)),
-        rowgroup_prefetch_min_decode_batches=int(config.get("rowgroup_prefetch_min_decode_batches", 1)),
-        no_dequantize=False,
-        no_scale=False,
-        enable_planless_execution=bool(config.get("enable_planless_execution", True)),
-        crop_execution_mode=str(config.get("crop_execution_mode", "auto")),
-        bounded_read_amplification_cap=float(config.get("bounded_read_amplification_cap", 1.0)),
-        bounded_read_local_amplification_cap=float(
-            config.get("bounded_read_local_amplification_cap", 0.0)
-        ),
-        bounded_read_max_run_bytes=int(config.get("bounded_read_max_run_bytes", 0)),
-        scheduling_policy=str(config.get("scheduling_policy", "limited-overlap")),
-        transform_blocks_per_launch=int(config.get("transform_blocks_per_launch", 0)),
-        transform_ctas_per_launch=int(config.get("transform_ctas_per_launch", 0)),
-        use_low_priority_streams=bool(config.get("use_low_priority_streams", True)),
-        block_major_double_buffer=str(config.get("block_major_double_buffer", "auto")),
-        output_prefetch_policy=str(config.get("output_prefetch_policy", "overlapped")),
-    )
-
-
 def _batch_native_stats(batch: Any) -> dict[str, Any]:
-    stats = dict(batch.execution_stats)
-    cache = dict(getattr(batch, "cache_stats", {}))
+    stats = execution_stats(batch)
+    cache = cache_stats(batch)
     if cache:
         stats.update(
             {
@@ -508,94 +452,6 @@ def _batch_native_stats(batch: Any) -> dict[str, Any]:
     return stats
 
 
-def _present_component_by_slot(metadata: dict[str, Any]) -> dict[int, dict[str, Any]]:
-    components = [item for item in metadata.get("components", []) if bool(item.get("present"))]
-    by_slot = {
-        int(item.get("semantic_slot_id", -1)): item
-        for item in components
-        if int(item.get("semantic_slot_id", -1)) in (0, 1, 2)
-    }
-    if 0 not in by_slot:
-        by_slot = {
-            int(item.get("local_component_index", -1)): item
-            for item in components
-            if int(item.get("local_component_index", -1)) in (0, 1, 2)
-        }
-    return by_slot
-
-
-def _is_grayscale_metadata(metadata: dict[str, Any]) -> bool:
-    by_slot = _present_component_by_slot(metadata)
-    return 0 in by_slot and 1 not in by_slot and 2 not in by_slot
-
-
-def _rebuild_grayscale_full_grid(
-    batch: Any,
-    metadata: dict[str, Any],
-    image_id: int,
-) -> tuple[SimpleNamespace, int]:
-    """Rebuild a full Y grid from a compact full decode and synthesize zero chroma."""
-
-    if batch.layout != "compact":
-        raise RuntimeError(f"grayscale full fallback requires compact layout, got {batch.layout!r}")
-    if list(batch.selected_coefficients) != list(range(64)):
-        raise RuntimeError("grayscale full fallback requires all 64 DCT coefficients")
-    by_slot = _present_component_by_slot(metadata)
-    if not _is_grayscale_metadata(metadata):
-        raise RuntimeError(f"image_id={image_id} is not a grayscale Y-only JPEG")
-    y_component = by_slot[0]
-    height = int(y_component.get("height_in_blocks", 0))
-    width = int(y_component.get("width_in_blocks", 0))
-    if height < 2 or width < 2:
-        raise RuntimeError(f"image_id={image_id} has invalid grayscale Y grid {height}x{width}")
-
-    coefficients = batch.coefficients
-    blocks = list(batch.block_metadata)
-    expected_blocks = height * width
-    if coefficients.ndim != 2 or tuple(coefficients.shape) != (expected_blocks, 64):
-        raise RuntimeError(
-            f"image_id={image_id} compact full decode returned coefficients {tuple(coefficients.shape)}, "
-            f"expected ({expected_blocks},64)"
-        )
-    if len(blocks) != expected_blocks:
-        raise RuntimeError(
-            f"image_id={image_id} compact full decode returned {len(blocks)} block metadata entries, "
-            f"expected {expected_blocks}"
-        )
-
-    coordinates: list[tuple[int, int]] = []
-    for block in blocks:
-        request_index = int(block.get("request_index", -1))
-        global_image_index = int(block.get("global_image_index", -1))
-        semantic_slot = int(block.get("semantic_slot_id", -1))
-        block_y = int(block.get("block_y", -1))
-        block_x = int(block.get("block_x", -1))
-        if request_index != 0 or global_image_index != image_id or semantic_slot != 0:
-            raise RuntimeError(f"image_id={image_id} compact fallback contains a non-Y or foreign block: {block}")
-        if not (0 <= block_y < height and 0 <= block_x < width):
-            raise RuntimeError(f"image_id={image_id} compact fallback block is outside the Y grid: {block}")
-        coordinates.append((block_y, block_x))
-    if len(set(coordinates)) != expected_blocks:
-        raise RuntimeError(f"image_id={image_id} compact fallback Y block coordinates are not complete and unique")
-
-    block_y = torch.tensor([item[0] for item in coordinates], dtype=torch.long, device=coefficients.device)
-    block_x = torch.tensor([item[1] for item in coordinates], dtype=torch.long, device=coefficients.device)
-    y = torch.empty((1, 1, height, width, 8, 8), dtype=coefficients.dtype, device=coefficients.device)
-    y[0, 0, block_y, block_x] = coefficients.reshape(expected_blocks, 8, 8)
-    cbcr = torch.zeros(
-        (1, 2, height // 2, width // 2, 8, 8),
-        dtype=coefficients.dtype,
-        device=coefficients.device,
-    )
-    return (
-        SimpleNamespace(
-            layout="ycbcr_dct_grid",
-            selected_coefficients=list(range(64)),
-            y=y,
-            cbcr=cbcr,
-        ),
-        expected_blocks,
-    )
 
 
 def _manifest_shard_segments(
@@ -648,22 +504,10 @@ class GalpAdapter(Adapter):
             raise ValueError("GALP Direct-DCT requires CUDA")
         self.config = contract["pipelines"][name]
         self.preprocess = str(self.config["preprocess"])
-        self.segment_mode = str(self.config.get("segment_mode", "fixed"))
-        if self.segment_mode not in {"fixed", "manifest-shard"}:
-            raise ValueError(f"unsupported GALP segment mode: {self.segment_mode}")
-        self.output_prefetch_policy = str(
-            self.config.get("output_prefetch_policy", "overlapped")
-        )
-        if self.output_prefetch_policy not in {"overlapped", "deferred-allocation"}:
+        self.runtime_profile = str(self.config.get("runtime_profile", ""))
+        if self.runtime_profile != BLOCK_MAJOR_RUNTIME_PROFILE:
             raise ValueError(
-                f"unsupported GALP output prefetch policy: {self.output_prefetch_policy}"
-            )
-        if (
-            self.output_prefetch_policy == "deferred-allocation"
-            and self.segment_mode != "manifest-shard"
-        ):
-            raise ValueError(
-                "deferred-allocation output prefetch requires manifest-shard mode"
+                f"GALP block-major pipeline requires runtime_profile={BLOCK_MAJOR_RUNTIME_PROFILE!r}"
             )
         block_major_access_dir = self.config.get("block_major_access_dir")
         if block_major_access_dir is not None:
@@ -674,50 +518,24 @@ class GalpAdapter(Adapter):
                     f"configured block-major access companion index is missing: {companion_index}"
                 )
             os.environ["GALP_BLOCK_MAJOR_ACCESS_DIR"] = str(access_dir)
-        binding, self.direct_dct, self.grid_transform, self.startup_timings = _load_direct_dct_modules(
-            Path(self.config["torch_binding_dir"]),
-            load_postdecode_diagnostics=self.preprocess == "rgbnomore-val",
-        )
-        crop_reference = contract["preprocess"]["dct"].get("crop_reference_size_blocks")
-        if crop_reference is not None:
-            self.grid_transform["crop_reference_width_blocks"] = int(crop_reference[1])
-            self.grid_transform["crop_reference_height_blocks"] = int(crop_reference[0])
         reader_started_ns = time.perf_counter_ns()
-        self.reader = binding.DirectDctReader(str(Path(self.config["manifest"]).resolve()))
+        self.reader = DirectDctReader(
+            self.config["manifest"],
+            module_path=self.config["torch_binding_dir"],
+        )
+        profile_info = self.reader.profile_info(VALIDATION_CENTER_CROP_512)
+        if profile_info["runtime_policy_id"] != BLOCK_MAJOR_RUNTIME_PROFILE:
+            raise RuntimeError("GALP native profile does not match the benchmark contract")
         reader_ready_ns = time.perf_counter_ns()
+        self.startup_timings = {
+            "binding_extension_import_ms": self.reader.binding_import_ms,
+        }
         self.startup_timings["direct_dct_reader_python_constructor_ms"] = (
             reader_ready_ns - reader_started_ns
         ) / 1.0e6
         self.startup_timings["native_reader_initialization"] = dict(self.reader.initialization_stats)
         if int(self.reader.image_count) < len(samples):
             raise ValueError(f"GALP manifest has {self.reader.image_count} images for {len(samples)} samples")
-        self.args = _native_args(self.config, self.preprocess)
-        self._uses_native_segment_stream = (
-            self.preprocess == "rgbnomore-val-pushdown"
-            or self.segment_mode == "manifest-shard"
-        )
-        if not self._uses_native_segment_stream:
-            if contract["preprocess"]["profile"] == "fixed-center-224-from-512":
-                root = str(Path(contract["models"]["rgbnomore_root"]))
-                if root not in sys.path:
-                    sys.path.insert(0, root)
-                ctrans = importlib.import_module("utils.custom_transforms")
-                self.rgbnomore_transform = torch.nn.Sequential(
-                    ctrans.CenterCrop_DCT(28),
-                    ctrans.ToRange(
-                        val_min=-1,
-                        val_max=1,
-                        orig_min=-1024,
-                        orig_max=1016,
-                        dtype=torch.float32,
-                    ),
-                )
-            else:
-                self.rgbnomore_transform = self.direct_dct.build_rgbnomore_dct_val_transform(
-                    Path(contract["models"]["rgbnomore_root"])
-                )
-        else:
-            self.rgbnomore_transform = None
         warmup_images = int(contract["execution"]["batch_size"]) * int(
             contract["execution"]["warmup_batches"]
         )
@@ -728,21 +546,12 @@ class GalpAdapter(Adapter):
             end = first + int(shard["image_count"])
             for image_id in range(first, min(end, len(self.samples))):
                 self._shard_by_image_id[image_id] = int(shard["shard_id"])
-        if self.segment_mode == "manifest-shard":
-            if warmup_images != 0:
-                raise ValueError(
-                    "manifest-shard mode requires zero warmup images to preserve one activation per shard"
-                )
-            self.segment_size = None
-            self._warmup_segments = []
-            self._measurement_segments = _manifest_shard_segments(self.samples, parsed_manifest)
-        else:
-            segment_size = int(
-                self.config.get("segment_size") or contract["execution"]["batch_size"]
+        if warmup_images != 0:
+            raise ValueError(
+                "block-major production profile requires zero warmup images to preserve one activation per shard"
             )
-            self.segment_size = max(1, segment_size)
-            self._warmup_segments = list(chunked(self.samples[:warmup_images], self.segment_size))
-            self._measurement_segments = list(chunked(self.samples[warmup_images:], self.segment_size))
+        self._warmup_segments = []
+        self._measurement_segments = _manifest_shard_segments(self.samples, parsed_manifest)
         self.segments: list[list[dict[str, Any]]] = []
         self._next_segment = 0
         self._pending: Any | None = None
@@ -786,33 +595,7 @@ class GalpAdapter(Adapter):
 
     def _prefetch(self, segment: Sequence[dict[str, Any]]) -> Any:
         image_ids = [int(sample["galp_image_id"]) for sample in segment]
-        return self.reader.prefetch_batch(
-            image_ids,
-            crop=None,
-            dct_coeffs="all",
-            cache_capacity_mib=self.args.cache_capacity_mib,
-            decode_batch_rowgroups=self.args.decode_batch_rowgroups,
-            decode_workset_capacity_mib=getattr(self.args, "decode_workset_capacity_mib", 512),
-            rowgroup_prefetch_depth=self.args.rowgroup_prefetch_depth,
-            rowgroup_prefetch_workers=self.args.rowgroup_prefetch_workers,
-            rowgroup_prefetch_min_decode_batches=self.args.rowgroup_prefetch_min_decode_batches,
-            plan_cache_capacity=self.args.plan_cache_capacity,
-            enable_planless_execution=self.args.enable_planless_execution,
-            scheduling_policy=self.args.scheduling_policy,
-            transform_blocks_per_launch=self.args.transform_blocks_per_launch,
-            transform_ctas_per_launch=self.args.transform_ctas_per_launch,
-            use_low_priority_streams=self.args.use_low_priority_streams,
-            block_major_double_buffer=getattr(self.args, "block_major_double_buffer", "auto"),
-            async_planless_completion=(
-                self.output_prefetch_policy == "deferred-allocation"
-            ),
-            crop_execution_mode=self.args.crop_execution_mode,
-            bounded_read_amplification_cap=self.args.bounded_read_amplification_cap,
-            bounded_read_local_amplification_cap=self.args.bounded_read_local_amplification_cap,
-            bounded_read_max_run_bytes=self.args.bounded_read_max_run_bytes,
-            layout="transformed_dct_grid",
-            grid_transform=self.grid_transform,
-        )
+        return self.reader.prefetch(image_ids, VALIDATION_CENTER_CROP_512)
 
     def _start_next_prefetch(self) -> None:
         if self._next_segment >= len(self.segments):
@@ -851,6 +634,7 @@ class GalpAdapter(Adapter):
         if shard_id is not None:
             self._seen_segment_shards.add(shard_id)
             self._last_segment_shard = shard_id
+        native_prefetch_stats = prefetch_stats(pending)
         self._current = {
             "image_ids": image_ids,
             "y": y,
@@ -859,10 +643,7 @@ class GalpAdapter(Adapter):
             "batch": batch,
             "stats_pending": True,
             "prefetch_telemetry": {
-                "producer_active_ms": float(pending.producer_active_ms),
-                "planning_ms": float(pending.planning_ms),
-                "io_staging_ms": float(pending.io_staging_ms),
-                "ordered_submission_ms": float(pending.ordered_submission_ms),
+                **native_prefetch_stats,
                 "submit_to_ready_ms": (
                     (ready_ns - submit_ns) / 1.0e6 if submit_ns is not None else 0.0
                 ),
@@ -878,8 +659,10 @@ class GalpAdapter(Adapter):
                 ),
             },
             "scheduler_stats": {
-                "segment_mode": self.segment_mode,
-                "output_prefetch_policy": self.output_prefetch_policy,
+                # This path is intrinsically manifest-shard scheduled.  Keep
+                # its identity as result telemetry (not as a user option) so
+                # readiness aggregation can recognize the first shard.
+                "segment_mode": "manifest-shard",
                 "segment_shard_id": shard_id if shard_id is not None else -1,
                 "segment_cross_shard_count": cross_shard,
                 "shard_reactivation_count": reactivation,
@@ -895,9 +678,6 @@ class GalpAdapter(Adapter):
             raise RuntimeError("cannot release a GALP segment before it is consumed")
         self._current = None
         del current
-        reclaim = getattr(self.reader, "manual_reclaim", None)
-        if callable(reclaim):
-            reclaim()
 
     def _stitch_consumed_parts_before_deferred_allocation(
         self,
@@ -952,10 +732,7 @@ class GalpAdapter(Adapter):
         keepalive: list[Any] = []
         while remaining:
             if self._current is None or int(self._current["offset"]) >= len(self._current["image_ids"]):
-                if (
-                    self._current is not None
-                    and self.output_prefetch_policy == "deferred-allocation"
-                ):
+                if self._current is not None:
                     self._stitch_consumed_parts_before_deferred_allocation(
                         y_parts,
                         cbcr_parts,
@@ -1000,92 +777,8 @@ class GalpAdapter(Adapter):
             keepalive=keepalive,
         )
 
-    def _load_postdecode(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
-        image_ids = [int(sample["galp_image_id"]) for sample in expected]
-        y_items: list[torch.Tensor] = []
-        cbcr_items: list[torch.Tensor] = []
-        source_batches: list[Any] = []
-        native_stats: list[dict[str, Any]] = []
-        for image_id in image_ids:
-            grayscale_full_blocks = 0
-            try:
-                image_y, image_cbcr, image_batches = self.direct_dct.read_and_adapt_batch(
-                    self.reader,
-                    self.args,
-                    [image_id],
-                    None,
-                    self.rgbnomore_transform,
-                )
-            except RuntimeError as error:
-                if "YCbCr DCT grid layout requires Y, Cb, and Cr components per image" not in str(error):
-                    raise
-                metadata = self.reader.image_metadata(image_id)
-                if not _is_grayscale_metadata(metadata):
-                    raise
-                full_batch = self.reader.read_batch(
-                    [image_id],
-                    crop=None,
-                    dct_coeffs="all",
-                    cache_capacity_mib=self.args.cache_capacity_mib,
-                    decode_batch_rowgroups=self.args.decode_batch_rowgroups,
-                    decode_workset_capacity_mib=getattr(self.args, "decode_workset_capacity_mib", 512),
-                    rowgroup_prefetch_depth=self.args.rowgroup_prefetch_depth,
-                    rowgroup_prefetch_workers=self.args.rowgroup_prefetch_workers,
-                    rowgroup_prefetch_min_decode_batches=self.args.rowgroup_prefetch_min_decode_batches,
-                    plan_cache_capacity=self.args.plan_cache_capacity,
-                    enable_planless_execution=self.args.enable_planless_execution,
-                    scheduling_policy=self.args.scheduling_policy,
-                    transform_blocks_per_launch=self.args.transform_blocks_per_launch,
-                    transform_ctas_per_launch=self.args.transform_ctas_per_launch,
-                    use_low_priority_streams=self.args.use_low_priority_streams,
-                    crop_execution_mode="full-rowgroup-decode",
-                    layout="compact",
-                )
-                full_grid, grayscale_full_blocks = _rebuild_grayscale_full_grid(
-                    full_batch,
-                    metadata,
-                    image_id,
-                )
-                image_y, image_cbcr = self.direct_dct.adapt_galp_batch_to_rgbnomore(
-                    self.reader,
-                    full_grid,
-                    [image_id],
-                    dequantize=not self.args.no_dequantize,
-                    scale=not self.args.no_scale,
-                    preprocess=self.args.preprocess,
-                    rgbnomore_dct_val_transform=self.rgbnomore_transform,
-                )
-                image_batches = [full_batch]
-            y_items.append(image_y[0])
-            cbcr_items.append(image_cbcr[0])
-            source_batches.extend(image_batches)
-            for batch in image_batches:
-                stats = _batch_native_stats(batch)
-                if grayscale_full_blocks:
-                    stats["grayscale_full_fallback_count"] = 1
-                    stats["grayscale_zero_chroma_image_count"] = 1
-                    stats["grayscale_full_y_block_count"] = grayscale_full_blocks
-                native_stats.append(stats)
-        y = torch.stack(y_items, dim=0)
-        cbcr = torch.stack(cbcr_items, dim=0)
-        label_values = [int(sample["label"]) for sample in expected]
-        labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
-        return LoadedBatch(
-            inputs=(y, cbcr),
-            labels=labels,
-            ordinals=[int(sample["ordinal"]) for sample in expected],
-            label_values=label_values,
-            on_device=True,
-            native_stats=native_stats,
-            keepalive=list(source_batches),
-        )
-
     def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
-        if self._uses_native_segment_stream:
-            return self._load_pushdown(expected)
-        if self.preprocess == "rgbnomore-val":
-            return self._load_postdecode(expected)
-        raise RuntimeError(f"unsupported GALP preprocess: {self.preprocess}")
+        return self._load_pushdown(expected)
 
     def end_repeat(self) -> None:
         self._pending = None
@@ -1095,7 +788,7 @@ class GalpAdapter(Adapter):
 
 
 def _is_galp_pipeline(name: str) -> bool:
-    return name.startswith("dct_major_") or name.startswith("image_major_")
+    return name == "dct_major_pushdown"
 
 
 def make_adapter(name: str, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device) -> Adapter:
@@ -1350,13 +1043,10 @@ def _verify_runtime_inputs(name: str, contract: dict[str, Any]) -> None:
     if _is_galp_pipeline(name):
         config = contract["pipelines"][name]
         observed = parse_manifest(Path(config["manifest"]))
-        expected_version = 1 if name.startswith("dct_major") else int(config["manifest_version"])
+        expected_version = 1
         if int(observed["version"]) != expected_version:
             raise RuntimeError(f"{name} manifest version changed: {observed['version']} != {expected_version}")
-        snapshot_key = config.get(
-            "storage_snapshot_key",
-            "dct_major_storage" if name.startswith("dct_major") else "image_major_storage",
-        )
+        snapshot_key = "dct_major_storage"
         snapshot = contract["dataset"][snapshot_key]
         if not isinstance(snapshot, dict):
             raise RuntimeError(f"{name} storage snapshot is missing: {snapshot_key}")

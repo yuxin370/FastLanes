@@ -33,11 +33,10 @@ import torch
 
 import _galp_direct_dct as galp_dct
 
-TORCH_SOURCE_DIR = REPO_ROOT / "galp/torch"
-if str(TORCH_SOURCE_DIR) not in sys.path:
-    sys.path.insert(0, str(TORCH_SOURCE_DIR))
-
-from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
+try:
+    from .rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
+except ImportError:  # Direct script execution.
+    from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
 
 
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")

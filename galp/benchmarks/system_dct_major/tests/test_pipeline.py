@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import sys
 import unittest
-from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from galp.torch import DirectDctFuture
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
@@ -17,53 +17,14 @@ from pipeline import (  # noqa: E402
     GalpAdapter,
     LoadedBatch,
     _accumulate_native,
-    _is_grayscale_metadata,
-    _load_direct_dct_modules,
     _manifest_shard_segments,
     _process_io_delta,
     _process_io_snapshot,
-    _rebuild_grayscale_full_grid,
     _validate_identity,
 )
 
 
 class PipelineControlTest(unittest.TestCase):
-    @staticmethod
-    def _grayscale_metadata(height: int = 2, width: int = 3) -> dict:
-        return {
-            "components": [
-                {
-                    "present": True,
-                    "semantic_slot_id": 0,
-                    "local_component_index": 0,
-                    "height_in_blocks": height,
-                    "width_in_blocks": width,
-                },
-                {"present": False, "semantic_slot_id": 1},
-                {"present": False, "semantic_slot_id": 2},
-            ]
-        }
-
-    def test_pushdown_module_loader_skips_postdecode_diagnostics(self) -> None:
-        modules = {
-            "_galp_direct_dct": SimpleNamespace(name="binding"),
-            "rgbnomore_dct_profile": SimpleNamespace(
-                RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32={"output": "fp32"}
-            ),
-        }
-        with patch("pipeline.importlib.import_module", side_effect=lambda name: modules[name]) as imported:
-            binding, diagnostics, profile, timings = _load_direct_dct_modules(
-                Path("/tmp/binding"), load_postdecode_diagnostics=False
-            )
-        self.assertEqual(binding.name, "binding")
-        self.assertIsNone(diagnostics)
-        self.assertEqual(profile, {"output": "fp32"})
-        self.assertFalse(timings["postdecode_diagnostics_imported"])
-        self.assertEqual(
-            [call.args[0] for call in imported.call_args_list],
-            ["_galp_direct_dct", "rgbnomore_dct_profile"],
-        )
-
     def test_manifest_shard_segments_use_exact_manifest_ranges(self) -> None:
         samples = [{"galp_image_id": image_id} for image_id in range(9)]
         manifest = {
@@ -297,18 +258,19 @@ class PipelineControlTest(unittest.TestCase):
             [{"galp_image_id": image_id} for image_id in range(3)],
             [{"galp_image_id": image_id} for image_id in range(3, 6)],
         ]
-        pending = [FakePending([0, 1, 2], 1.0), FakePending([3, 4, 5], 2.0)]
+        native_pending = [
+            FakePending([0, 1, 2], 1.0),
+            FakePending([3, 4, 5], 2.0),
+        ]
+        pending = [
+            DirectDctFuture(item, "test-profile") for item in native_pending
+        ]
 
         class FakeReader:
-            def __init__(self) -> None:
-                self.reclaim_calls = 0
-
-            def manual_reclaim(self) -> None:
-                self.reclaim_calls += 1
+            pass
 
         adapter = object.__new__(GalpAdapter)
         adapter.segment_mode = "manifest-shard"
-        adapter.output_prefetch_policy = "deferred-allocation"
         adapter.device = torch.device("cpu")
         adapter.reader = FakeReader()
         adapter._shard_by_image_id = {image_id: image_id // 3 for image_id in range(6)}
@@ -323,9 +285,10 @@ class PipelineControlTest(unittest.TestCase):
                 {"galp_image_id": 1, "label": 11, "ordinal": 1},
             ]
         )
-        self.assertEqual(pending[0].read_calls, 1)
-        self.assertEqual(pending[1].read_calls, 0)
+        self.assertEqual(native_pending[0].read_calls, 1)
+        self.assertEqual(native_pending[1].read_calls, 0)
         self.assertIs(adapter._pending, pending[1])
+        self.assertEqual(first.native_stats[0]["segment_mode"], "manifest-shard")
         self.assertEqual(first.native_stats[0]["segment_shard_id"], 0)
         self.assertEqual(first.native_stats[0]["segment_cross_shard_count"], 0)
         self.assertGreaterEqual(first.native_stats[0]["prefetch_consumer_wait_ms"], 0.0)
@@ -336,18 +299,13 @@ class PipelineControlTest(unittest.TestCase):
                 {"galp_image_id": 3, "label": 13, "ordinal": 3},
             ]
         )
-        self.assertEqual(pending[1].read_calls, 1)
+        self.assertEqual(native_pending[1].read_calls, 1)
         self.assertEqual(tuple(boundary.inputs[0].shape), (2, 1, 28, 28, 8, 8))
         self.assertEqual(boundary.ordinals, [2, 3])
         self.assertEqual(boundary.label_values, [12, 13])
         self.assertEqual(float(boundary.inputs[0][0, 0, 0, 0, 0, 0]), 1.0)
         self.assertEqual(float(boundary.inputs[0][1, 0, 0, 0, 0, 0]), 2.0)
         self.assertEqual(boundary.native_stats[0]["segment_shard_id"], 1)
-        self.assertEqual(adapter.reader.reclaim_calls, 1)
-        self.assertEqual(
-            boundary.native_stats[0]["output_prefetch_policy"],
-            "deferred-allocation",
-        )
         self.assertEqual(boundary.native_stats[0]["segment_cross_shard_count"], 0)
         self.assertEqual(boundary.native_stats[0]["shard_reactivation_count"], 0)
 
@@ -367,128 +325,6 @@ class PipelineControlTest(unittest.TestCase):
         batch.label_values[1] = 9
         with self.assertRaisesRegex(RuntimeError, "label mismatch"):
             _validate_identity(batch, expected)
-
-    def test_grayscale_metadata_requires_y_without_chroma(self) -> None:
-        metadata = self._grayscale_metadata()
-        self.assertTrue(_is_grayscale_metadata(metadata))
-        metadata["components"][1] = {"present": True, "semantic_slot_id": 1}
-        self.assertFalse(_is_grayscale_metadata(metadata))
-
-    def test_rebuild_grayscale_full_grid_preserves_block_coordinates(self) -> None:
-        coordinates = [(1, 2), (0, 1), (1, 0), (0, 0), (1, 1), (0, 2)]
-        coefficients = torch.arange(6 * 64, dtype=torch.int16).reshape(6, 64)
-        batch = type(
-            "FakeBatch",
-            (),
-            {
-                "layout": "compact",
-                "selected_coefficients": list(range(64)),
-                "coefficients": coefficients,
-                "block_metadata": [
-                    {
-                        "request_index": 0,
-                        "global_image_index": 239,
-                        "semantic_slot_id": 0,
-                        "block_y": block_y,
-                        "block_x": block_x,
-                    }
-                    for block_y, block_x in coordinates
-                ],
-            },
-        )()
-
-        grid, block_count = _rebuild_grayscale_full_grid(
-            batch,
-            self._grayscale_metadata(),
-            239,
-        )
-
-        self.assertEqual(block_count, 6)
-        self.assertEqual(tuple(grid.y.shape), (1, 1, 2, 3, 8, 8))
-        self.assertEqual(tuple(grid.cbcr.shape), (1, 2, 1, 1, 8, 8))
-        self.assertTrue(torch.count_nonzero(grid.cbcr).item() == 0)
-        for source_index, (block_y, block_x) in enumerate(coordinates):
-            torch.testing.assert_close(
-                grid.y[0, 0, block_y, block_x],
-                coefficients[source_index].reshape(8, 8),
-            )
-
-    def test_full_adapter_falls_back_to_compact_and_preserves_native_stats(self) -> None:
-        coefficients = torch.arange(6 * 64, dtype=torch.int16).reshape(6, 64)
-        coordinates = [(y, x) for y in range(2) for x in range(3)]
-        compact_batch = SimpleNamespace(
-            layout="compact",
-            selected_coefficients=list(range(64)),
-            coefficients=coefficients,
-            block_metadata=[
-                {
-                    "request_index": 0,
-                    "global_image_index": 239,
-                    "semantic_slot_id": 0,
-                    "block_y": block_y,
-                    "block_x": block_x,
-                }
-                for block_y, block_x in coordinates
-            ],
-            execution_stats={"compressed_payload_bytes_read": 1234, "actual_vector_count": 11},
-        )
-
-        class FakeReader:
-            def image_metadata(self, image_id: int) -> dict:
-                self.image_id = image_id
-                return PipelineControlTest._grayscale_metadata()
-
-            def read_batch(self, image_ids: list[int], **kwargs):
-                self.read_image_ids = image_ids
-                self.read_kwargs = kwargs
-                return compact_batch
-
-        class FakeDirectDct:
-            @staticmethod
-            def read_and_adapt_batch(*args, **kwargs):
-                raise RuntimeError("YCbCr DCT grid layout requires Y, Cb, and Cr components per image")
-
-            @staticmethod
-            def adapt_galp_batch_to_rgbnomore(reader, grid, image_ids, **kwargs):
-                self_grid = grid
-                self_image_ids = image_ids
-                assert torch.count_nonzero(self_grid.cbcr).item() == 0
-                assert self_image_ids == [239]
-                return grid.y, grid.cbcr
-
-        adapter = object.__new__(GalpAdapter)
-        adapter.reader = FakeReader()
-        adapter.direct_dct = FakeDirectDct()
-        adapter.args = SimpleNamespace(
-            cache_capacity_mib=0,
-            decode_batch_rowgroups=64,
-            rowgroup_prefetch_depth=16,
-            rowgroup_prefetch_workers=4,
-            rowgroup_prefetch_min_decode_batches=1,
-            plan_cache_capacity=0,
-            enable_planless_execution=True,
-            scheduling_policy="limited-overlap",
-            transform_blocks_per_launch=0,
-            transform_ctas_per_launch=0,
-            use_low_priority_streams=True,
-            no_dequantize=False,
-            no_scale=False,
-            preprocess="rgbnomore-val",
-            block_major_double_buffer="auto",
-        )
-        adapter.rgbnomore_transform = object()
-        adapter.device = torch.device("cpu")
-
-        loaded = adapter._load_postdecode([{"galp_image_id": 239, "label": 7, "ordinal": 239}])
-
-        self.assertEqual(adapter.reader.read_kwargs["layout"], "compact")
-        self.assertEqual(adapter.reader.read_kwargs["crop_execution_mode"], "full-rowgroup-decode")
-        self.assertEqual(loaded.label_values, [7])
-        self.assertEqual(loaded.native_stats[0]["compressed_payload_bytes_read"], 1234)
-        self.assertEqual(loaded.native_stats[0]["actual_vector_count"], 11)
-        self.assertEqual(loaded.native_stats[0]["grayscale_full_y_block_count"], 6)
-        self.assertEqual(loaded.native_stats[0]["grayscale_full_fallback_count"], 1)
-
 
 if __name__ == "__main__":
     unittest.main()

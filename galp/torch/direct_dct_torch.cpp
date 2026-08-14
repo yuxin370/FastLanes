@@ -1,4 +1,5 @@
 #include "galp/direct_dct.hpp"
+#include "galp/profiles/registry.hpp"
 #include <ATen/cuda/CUDAEvent.h>
 #include <atomic>
 #include <c10/cuda/CUDAException.h>
@@ -360,6 +361,28 @@ std::string layout_to_string(const galp::jpeg::JpegDctDeviceLayout layout) {
 		return "transformed_dct_grid";
 	}
 	return "unknown";
+}
+
+py::dict direct_dct_profile_info(const galp::profiles::RegisteredDirectDctProfile& profile) {
+	py::dict out;
+	out["schema"]            = "galp-direct-dct-profile-v1";
+	out["id"]                = profile.id;
+	out["output_profile_id"] = profile.output.id;
+	out["runtime_policy_id"] = profile.runtime.id;
+	out["layout"]            = layout_to_string(profile.output.layout);
+	if (profile.output.grid_transform.has_value()) {
+		const auto& transform = *profile.output.grid_transform;
+		out["output_dtype"] = transform.output_data_type == galp::jpeg::JpegDctGridOutputDataType::kFloat32
+		                          ? "float32"
+		                          : "int16";
+		out["crop_reference_blocks"] =
+		    py::make_tuple(transform.crop_reference_width_blocks, transform.crop_reference_height_blocks);
+		out["y_output_blocks"] =
+		    py::make_tuple(transform.y_output_width_blocks, transform.y_output_height_blocks);
+		out["cbcr_output_blocks"] =
+		    py::make_tuple(transform.cbcr_output_width_blocks, transform.cbcr_output_height_blocks);
+	}
+	return out;
 }
 
 py::dict image_layout_to_dict(const galp::jpeg::JpegDctDeviceImageLayout& layout) {
@@ -1579,8 +1602,14 @@ public:
 		if (!future_.valid()) {
 			throw std::runtime_error("DirectDctPrefetch has already been consumed");
 		}
+		// A production consumer should not need to know about the deferred
+		// arena-release queue.  Reclaim batches whose model stream has finished
+		// before opening the next transform submission gate.
+		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
 		release_submission();
-		return future_.get();
+		auto batch = future_.get();
+		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
+		return batch;
 	}
 
 private:
@@ -1842,6 +1871,54 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def(py::init<const std::string&>(), py::arg("manifest_path"))
 	    .def_property_readonly("image_count", &TorchDirectDctReader::image_count)
 	    .def_property_readonly("initialization_stats", &TorchDirectDctReader::initialization_stats)
+	    .def(
+	        "plan",
+	        [](TorchDirectDctReader&        reader,
+	           const std::vector<uint32_t>& image_ids,
+	           const std::string&           profile_id,
+	           const py::object&            transforms) {
+		        const auto requests = parse_transform_requests(
+		            image_ids, transforms, galp::jpeg::JpegDctCropBox {});
+		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
+		        return reader.plan_batch(requests, galp::profiles::materialize_direct_dct_options(profile));
+	        },
+	        py::arg("image_ids"),
+	        py::arg("profile_id"),
+	        py::arg("transforms") = py::none(),
+	        "Plan a registered semantic Direct-DCT profile using its native-owned runtime policy.")
+	    .def(
+	        "prefetch",
+	        [](TorchDirectDctReader& reader,
+	           std::vector<uint32_t> image_ids,
+	           const std::string&    profile_id,
+	           const py::object&     transforms) {
+		        auto requests = parse_transform_requests(
+		            image_ids, transforms, galp::jpeg::JpegDctCropBox {});
+		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
+		        return reader.prefetch_batch(
+		            std::move(requests), galp::profiles::materialize_direct_dct_options(profile));
+	        },
+	        py::arg("image_ids"),
+	        py::arg("profile_id"),
+	        py::arg("transforms") = py::none(),
+	        "Prefetch a registered semantic Direct-DCT profile using its native-owned runtime policy.")
+	    .def(
+	        "read",
+	        [](TorchDirectDctReader& reader,
+	           std::vector<uint32_t> image_ids,
+	           const std::string&    profile_id,
+	           const py::object&     transforms) {
+		        auto requests = parse_transform_requests(
+		            image_ids, transforms, galp::jpeg::JpegDctCropBox {});
+		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
+		        const auto options = galp::profiles::materialize_direct_dct_options(profile);
+		        py::gil_scoped_release release;
+		        return reader.read_batch(std::move(requests), options);
+	        },
+	        py::arg("image_ids"),
+	        py::arg("profile_id"),
+	        py::arg("transforms") = py::none(),
+	        "Read a registered semantic Direct-DCT profile synchronously.")
 	    .def("image_metadata",
 	         &TorchDirectDctReader::image_metadata,
 	         py::arg("global_image_index"),
@@ -2223,5 +2300,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 
 	m.attr("DEFAULT_CACHE_CAPACITY_MIB")  = kDefaultDirectDctCacheCapacityMiB;
 	m.attr("DEFAULT_PLAN_CACHE_CAPACITY") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity;
+	m.attr("DIRECT_DCT_PROFILE_SCHEMA") = "galp-direct-dct-profile-v1";
+	m.def("available_direct_dct_profiles", &galp::profiles::available_direct_dct_profile_ids);
+	m.def("direct_dct_profile_info", [](const std::string& profile_id) {
+		return direct_dct_profile_info(galp::profiles::resolve_direct_dct_profile(profile_id));
+	}, py::arg("profile_id"));
 	m.def("manual_reclaim", []() { return DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished(); });
 }

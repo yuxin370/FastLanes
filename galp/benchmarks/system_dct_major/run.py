@@ -17,6 +17,7 @@ from typing import Any, Sequence
 from PIL import Image
 
 from common import (
+    BLOCK_MAJOR_RUNTIME_PROFILE,
     CONTRACT_SCHEMA,
     DEFAULT_PIPELINES,
     HERE,
@@ -25,7 +26,6 @@ from common import (
     RGBNOMORE_BENCHMARK_ROOT,
     collect_sequential_samples,
     fingerprint_file,
-    load_label_map,
     load_sample_manifest,
     manifest_snapshot,
     parse_manifest,
@@ -41,18 +41,11 @@ DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
 DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
 DEFAULT_DCT_MAJOR_MANIFEST = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/manifest.bin"
 DEFAULT_DCT_MAJOR_LABELS = DEFAULT_DCT_MAJOR_MANIFEST.with_name("labels.json")
-DEFAULT_IMAGE_MAJOR_MANIFEST = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2/dct/manifest.bin"
-DEFAULT_IMAGE_MAJOR_LABELS = DEFAULT_IMAGE_MAJOR_MANIFEST.with_name("labels.json")
-DEFAULT_IMAGE_MAJOR_V3_MANIFEST = (
-    REPO_ROOT
-    / "galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32/manifest.bin"
-)
-DEFAULT_IMAGE_MAJOR_V3_LABELS = DEFAULT_IMAGE_MAJOR_V3_MANIFEST.with_name("labels.json")
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
 
 PRESETS = {
-    "smoke": {"batch_size": 2, "warmup_batches": 1, "measurement_batches": 2, "repeats": 1, "workers": 2},
+    "smoke": {"batch_size": 2, "warmup_batches": 0, "measurement_batches": 2, "repeats": 1, "workers": 2},
     "e2e": {"batch_size": 50, "warmup_batches": 0, "measurement_batches": 1000, "repeats": 5, "workers": 8},
 }
 
@@ -246,130 +239,30 @@ def _block_major_access_contract(
     }
 
 
-def _validate_cross_layout_labels(
-    dct_major_labels: Path,
-    image_major_labels: Path,
-    expected_images: int,
-) -> dict[str, Any]:
-    left = load_label_map(dct_major_labels, expected_images)
-    right = load_label_map(image_major_labels, expected_images)
-    if left["labels"] != right["labels"]:
-        raise ValueError("DCT-major and image-major label arrays differ")
-    if left["sample_ids"] and right["sample_ids"] and left["sample_ids"] != right["sample_ids"]:
-        raise ValueError("DCT-major and image-major sample-id arrays differ")
-    return {
-        "labels_identical": True,
-        "sample_ids_compared": bool(left["sample_ids"] and right["sample_ids"]),
-        "dct_major_label_map_sha256": left["sha256"],
-        "image_major_label_map_sha256": right["sha256"],
-    }
-
-
 def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str, Any], Path]:
     batch_size, warmup_batches, measurement_batches, sample_count = _sample_plan(args)
     repeats = _setting(args, "repeats")
     workers = _setting(args, "workers")
-    if int(args.decode_workset_capacity_mib) <= 0:
-        raise ValueError("decode_workset_capacity_mib must be positive")
-    if not 1.0 <= float(args.bounded_read_amplification_cap) <= 1.10:
-        raise ValueError("bounded_read_amplification_cap must be in [1.0, 1.10]")
-    if float(args.bounded_read_local_amplification_cap) != 0.0 and not (
-        1.0 <= float(args.bounded_read_local_amplification_cap) <= 1.10
-    ):
-        raise ValueError("bounded_read_local_amplification_cap must be 0 or in [1.0, 1.10]")
-    if int(args.bounded_read_max_run_bytes) < 0:
-        raise ValueError("bounded_read_max_run_bytes must be non-negative")
-    if (
-        args.dct_major_output_prefetch_policy == "deferred-allocation"
-        and args.dct_major_segment_mode != "manifest-shard"
-    ):
+    if warmup_batches != 0:
         raise ValueError(
-            "deferred-allocation output prefetch requires --dct-major-segment-mode manifest-shard"
+            "block-major production profile requires warmup_batches=0 so a boundary "
+            "cannot split and reactivate a physical shard"
         )
-    if args.dct_major_segment_mode == "manifest-shard":
-        if args.dct_major_segment_size is not None:
-            raise ValueError(
-                "dct_major_segment_size is not used in manifest-shard mode; "
-                "select --dct-major-segment-mode fixed for the fixed-segment ablation"
-            )
-        if warmup_batches != 0:
-            raise ValueError(
-                "manifest-shard mode requires warmup_batches=0 so a warmup/measurement "
-                "boundary cannot split and reactivate a physical shard"
-            )
-        if args.block_major_access_dir is None:
-            raise ValueError("manifest-shard mode requires --block-major-access-dir")
-        if (
-            "dct_major_pushdown" in args.pipelines
-            and args.dct_major_crop_execution_mode
-            not in (
-                "vector-range-read-selected-decode",
-                "bounded-range-read-selected-decode",
-                "bounded-io-uring-range-read-selected-decode",
-                "bounded-io-uring-scheduled-range-read-selected-decode",
-            )
-        ):
-            raise ValueError(
-                "manifest-shard dct_major_pushdown requires an explicit selected-range mode"
-            )
+    if "dct_major_pushdown" in args.pipelines and args.block_major_access_dir is None:
+        raise ValueError("dct_major_pushdown requires --block-major-access-dir")
 
     dct_major = _manifest_contract(
         args.dct_major_manifest,
         expected_version=1,
         hash_payloads=args.hash_payloads,
     )
-    uses_image_major = any(
-        name in args.pipelines
-        for name in ("image_major_pushdown", "image_major_v2_pushdown")
-    )
-    image_major: dict[str, Any] | None = None
-    if uses_image_major:
-        image_major = _manifest_contract(
-            args.image_major_manifest,
-            expected_version=int(args.image_major_manifest_version),
-            hash_payloads=args.hash_payloads,
-        )
-    image_major_v3: dict[str, Any] | None = None
-    if "image_major_v3_pushdown" in args.pipelines:
-        image_major_v3 = _manifest_contract(
-            args.image_major_v3_manifest,
-            expected_version=3,
-            hash_payloads=args.hash_payloads,
-        )
     image_count = int(dct_major["header"]["image_count"])
-    if image_major is not None and int(image_major["header"]["image_count"]) != image_count:
-        raise ValueError("DCT-major and image-major manifests contain different image counts")
-    if image_major_v3 is not None and int(image_major_v3["header"]["image_count"]) != image_count:
-        raise ValueError("DCT-major and image-major v3 manifests contain different image counts")
-    label_equivalence = (
-        _validate_cross_layout_labels(
-            args.dct_major_label_map,
-            args.image_major_label_map,
-            image_count,
-        )
-        if image_major is not None
-        else None
-    )
-    label_equivalence_v3 = (
-        _validate_cross_layout_labels(
-            args.dct_major_label_map,
-            args.image_major_v3_label_map,
-            image_count,
-        )
-        if image_major_v3 is not None
-        else None
-    )
     block_major_access_dir = getattr(args, "block_major_access_dir", None)
     block_major_access: dict[str, Any] | None = None
     if block_major_access_dir is not None:
         parsed_dct_major = parse_manifest(args.dct_major_manifest)
         required_schedule_shard_ids: list[int] = []
-        if (
-            args.dct_major_segment_mode == "manifest-shard"
-            and args.dct_major_crop_execution_mode
-            == "bounded-io-uring-scheduled-range-read-selected-decode"
-            and "dct_major_pushdown" in args.pipelines
-        ):
+        if "dct_major_pushdown" in args.pipelines:
             selected_end = sample_count
             consumed = 0
             for shard in parsed_dct_major["shards"]:
@@ -404,11 +297,7 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         sample_count=sample_count,
         hash_samples=args.hash_samples,
     )
-    fixed_geometry = (
-        _validate_fixed_source_geometry(samples)
-        if args.preprocess_profile == "fixed-center-224-from-512"
-        else None
-    )
+    fixed_geometry = _validate_fixed_source_geometry(samples)
     sample_manifest_path = output_dir / "sample_manifest.json"
     sample_manifest_sha256 = write_sample_manifest(sample_manifest_path, samples, sample_provenance)
     canonical_index = output_dir / "canonical_index.csv"
@@ -422,141 +311,20 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
     torch_binding_artifact_path = _resolve_torch_binding_artifact(args.torch_binding_dir)
     torch_binding_artifact = fingerprint_file(torch_binding_artifact_path)
 
-    default_segment = max(batch_size, (1024 // batch_size) * batch_size)
-    dct_major_segment_size = int(args.dct_major_segment_size or default_segment)
-    image_major_segment_size = int(args.image_major_segment_size or batch_size)
-    shared_galp = {
-        "torch_binding_dir": str(args.torch_binding_dir.resolve()),
-        "torch_binding_artifact": torch_binding_artifact,
-        "cache_capacity_mib": 0,
-        "plan_cache_capacity": 0,
-        "decode_batch_rowgroups": int(args.decode_batch_rowgroups),
-        "decode_workset_capacity_mib": int(args.decode_workset_capacity_mib),
-        "rowgroup_prefetch_depth": int(args.rowgroup_prefetch_depth),
-        "rowgroup_prefetch_workers": int(args.rowgroup_prefetch_workers),
-        "rowgroup_prefetch_min_decode_batches": int(args.rowgroup_prefetch_min_decode_batches),
-        "enable_planless_execution": True,
-        "scheduling_policy": args.scheduling_policy,
-        "transform_blocks_per_launch": 0,
-        "transform_ctas_per_launch": 0,
-        "use_low_priority_streams": bool(args.use_low_priority_streams),
-        "block_major_double_buffer": str(args.block_major_double_buffer),
-        "bounded_read_amplification_cap": float(args.bounded_read_amplification_cap),
-        "bounded_read_local_amplification_cap": float(args.bounded_read_local_amplification_cap),
-        "bounded_read_max_run_bytes": int(args.bounded_read_max_run_bytes),
-    }
     pipeline_configs: dict[str, Any] = {
         "enabled": list(args.pipelines),
-        "dct_major_full": {
-            **shared_galp,
-            "output_prefetch_policy": str(args.dct_major_output_prefetch_policy),
-            "enable_planless_execution": args.dct_major_segment_mode == "manifest-shard",
-            "manifest": str(args.dct_major_manifest.resolve()),
-            "manifest_version": 1,
-            "physical_layout": "dct-major/spatial-major-image-minor",
-            "preprocess": (
-                "rgbnomore-val-pushdown"
-                if args.dct_major_segment_mode == "manifest-shard"
-                else "rgbnomore-val"
-            ),
-            "crop_execution_mode": "full-rowgroup-decode",
-            "segment_mode": args.dct_major_segment_mode,
-            "segment_size": (
-                None if args.dct_major_segment_mode == "manifest-shard" else batch_size
-            ),
-            "block_major_access_dir": (
-                str(block_major_access_dir) if block_major_access_dir is not None else None
-            ),
-            "role": (
-                "manifest-shard full physical read with the same shard lifecycle as pushdown"
-                if args.dct_major_segment_mode == "manifest-shard"
-                else "full-image decode followed by RGB-no-more validation crop"
-            ),
-        },
         "dct_major_pushdown": {
-            **shared_galp,
-            "output_prefetch_policy": str(args.dct_major_output_prefetch_policy),
+            "torch_binding_dir": str(args.torch_binding_dir.resolve()),
+            "torch_binding_artifact": torch_binding_artifact,
+            "runtime_profile": BLOCK_MAJOR_RUNTIME_PROFILE,
             "manifest": str(args.dct_major_manifest.resolve()),
             "manifest_version": 1,
             "physical_layout": "dct-major/spatial-major-image-minor",
             "preprocess": "rgbnomore-val-pushdown",
-            "crop_execution_mode": args.dct_major_crop_execution_mode,
-            "segment_mode": args.dct_major_segment_mode,
-            "segment_size": (
-                None
-                if args.dct_major_segment_mode == "manifest-shard"
-                else dct_major_segment_size
-            ),
             "block_major_access_dir": (
                 str(block_major_access_dir) if block_major_access_dir is not None else None
             ),
-            "vector_alignment_target": 1024,
-            "role": (
-                "native fixed-grid crop pushdown with one plan/read/assembly lifecycle per manifest shard"
-                if args.dct_major_segment_mode == "manifest-shard"
-                else "native fixed-grid crop pushdown with contiguous fixed-size image segments"
-            ),
-        },
-        "dct_major_legacy_pushdown": {
-            **shared_galp,
-            "enable_planless_execution": False,
-            "manifest": str(args.dct_major_manifest.resolve()),
-            "manifest_version": 1,
-            "physical_layout": "dct-major/spatial-major-image-minor",
-            "preprocess": "rgbnomore-val-pushdown",
-            "crop_execution_mode": args.dct_major_crop_execution_mode,
-            "segment_mode": "fixed",
-            "segment_size": dct_major_segment_size,
-            "block_major_access_dir": (
-                str(block_major_access_dir) if block_major_access_dir is not None else None
-            ),
-            "vector_alignment_target": 1024,
-            "role": "legacy eager fixed-grid crop pushdown control with planless execution disabled",
-        },
-        "image_major_pushdown": {
-            **shared_galp,
-            "manifest": str(args.image_major_manifest.resolve()),
-            "manifest_version": int(args.image_major_manifest_version),
-            "physical_layout": (
-                image_major["header"]["physical_layout"]
-                if image_major is not None
-                else "image-major"
-            ),
-            "storage_snapshot_key": "image_major_storage",
-            "preprocess": "rgbnomore-val-pushdown",
-            "crop_execution_mode": args.image_major_crop_execution_mode,
-            "segment_size": image_major_segment_size,
-            "role": "current image-major crop-pushdown layout control",
-        },
-        "image_major_v2_pushdown": {
-            **shared_galp,
-            "manifest": str(args.image_major_manifest.resolve()),
-            "manifest_version": int(args.image_major_manifest_version),
-            "physical_layout": (
-                image_major["header"]["physical_layout"]
-                if image_major is not None
-                else "image-major"
-            ),
-            "storage_snapshot_key": "image_major_v2_storage",
-            "preprocess": "rgbnomore-val-pushdown",
-            "crop_execution_mode": args.image_major_crop_execution_mode,
-            "segment_size": image_major_segment_size,
-            "role": "explicit image-major v2 crop-pushdown comparison",
-        },
-        "image_major_v3_pushdown": {
-            **shared_galp,
-            "manifest": str(args.image_major_v3_manifest.resolve()),
-            "manifest_version": 3,
-            "physical_layout": (
-                image_major_v3["header"]["physical_layout"]
-                if image_major_v3 is not None
-                else "image-major-vector-rowgroups"
-            ),
-            "storage_snapshot_key": "image_major_v3_storage",
-            "preprocess": "rgbnomore-val-pushdown",
-            "crop_execution_mode": args.image_major_crop_execution_mode,
-            "segment_size": image_major_segment_size,
-            "role": "explicit Compact-v3 tiled-z32 crop-pushdown comparison",
+            "role": "native scheduled bounded-I/O RGB-no-more profile per manifest shard",
         },
         "rgbnomore": {
             "root": str(args.rgbnomore_root.resolve()),
@@ -580,10 +348,15 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         HERE / "pipeline.py",
         HERE / "run.py",
         HERE / "validate.py",
+        REPO_ROOT / "galp/torch/direct_dct.py",
+        REPO_ROOT / "galp/torch/diagnostics.py",
+        REPO_ROOT / "galp/profiles/_base.py",
+        REPO_ROOT / "galp/profiles/rgbnomore.py",
+        REPO_ROOT / "galp/include/galp/profiles/direct_dct.hpp",
+        REPO_ROOT / "galp/include/galp/profiles/registry.hpp",
+        REPO_ROOT / "galp/include/galp/profiles/rgbnomore.hpp",
         RGBNOMORE_BENCHMARK_ROOT / "shared/manifest_contract.py",
         RGBNOMORE_BENCHMARK_ROOT / "inference/model_factory.py",
-        RGBNOMORE_BENCHMARK_ROOT / "diagnostics/direct_dct.py",
-        REPO_ROOT / "galp/torch/rgbnomore_dct_profile.py",
         torch_binding_artifact_path,
         args.rgbnomore_root / "models/plainvit.py",
         args.rgbnomore_root / "datasets.py",
@@ -612,17 +385,8 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "raw_rgb_selected_bytes": sample_count * 512 * 512 * 3,
             "sample_order": "galp_image_id_ascending",
             "shuffle": False,
-            "cross_layout_label_equivalence": label_equivalence,
-            "cross_layout_label_equivalence_by_pipeline": {
-                "image_major_pushdown": label_equivalence,
-                "image_major_v2_pushdown": label_equivalence,
-                "image_major_v3_pushdown": label_equivalence_v3,
-            },
             "dct_major_storage": dct_major,
             "block_major_access": block_major_access,
-            "image_major_storage": image_major,
-            "image_major_v2_storage": image_major,
-            "image_major_v3_storage": image_major_v3,
         },
         "execution": {
             "batch_size": batch_size,
@@ -637,7 +401,7 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "drop_last": False,
             "aggregate_exclude_first_repeat": repeats > 1,
             "model_stream_priority": "greatest",
-            "cold_start_model_prime": bool(args.cold_start_model_prime),
+            "cold_start_model_prime": True,
             "cold_file_cache_eviction": bool(args.evict_pipeline_file_cache),
             "cold_protocol": args.cold_protocol,
         },
@@ -648,33 +412,17 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "feature_output": "[N,192] after classhead.ch_tanh" if args.feature_stage == "penultimate" else "[N,192] after LayerNorm+mean pool",
         },
         "preprocess": {
-            "profile": args.preprocess_profile,
+            "profile": "fixed-center-224-from-512",
             "rgb": {
-                "resize_shorter": (
-                    None
-                    if args.preprocess_profile == "fixed-center-224-from-512"
-                    else 256
-                ),
+                "resize_shorter": None,
                 "crop": "center",
                 "crop_size": [224, 224],
-                "crop_origin": (
-                    [144, 144]
-                    if args.preprocess_profile == "fixed-center-224-from-512"
-                    else None
-                ),
+                "crop_origin": [144, 144],
                 "range": [-1.0, 1.0],
             },
             "dct": {
-                "profile": (
-                    "RGB-no-more CenterCrop_DCT(28) from fixed 64x64 Y-block source"
-                    if args.preprocess_profile == "fixed-center-224-from-512"
-                    else "RGB-no-more ResizedCenterCrop_DCT(32,28)"
-                ),
-                "crop_reference_size_blocks": (
-                    [64, 64]
-                    if args.preprocess_profile == "fixed-center-224-from-512"
-                    else None
-                ),
+                "profile": "RGB-no-more CenterCrop_DCT(28) from fixed 64x64 Y-block source",
+                "crop_reference_size_blocks": [64, 64],
                 "y_shape": [1, 28, 28, 8, 8],
                 "cbcr_shape": [2, 14, 14, 8, 8],
                 "coefficients": "all-64",
@@ -761,9 +509,8 @@ def _pipeline_cache_paths(contract: dict[str, Any], pipeline: str) -> list[Path]
     }
     model_key = "rgb" if pipeline in {"dali", "pytorch"} else "dct"
     paths.add(Path(contract["models"][model_key]["checkpoint"]))
-    if pipeline.startswith("dct_major_") or pipeline.startswith("image_major_"):
-        snapshot_key = config.get("storage_snapshot_key", "dct_major_storage")
-        snapshot = contract["dataset"][snapshot_key]
+    if pipeline == "dct_major_pushdown":
+        snapshot = contract["dataset"]["dct_major_storage"]
         paths.add(Path(snapshot["manifest"]["path"]))
         paths.update(Path(payload["path"]) for payload in snapshot["payloads"])
         if config.get("block_major_access_dir") is not None:
@@ -885,12 +632,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preset", choices=tuple(PRESETS), default="smoke")
     parser.add_argument("--workload", choices=("feature-extraction", "evaluation"), default="feature-extraction")
     parser.add_argument("--feature-stage", choices=("pooled", "penultimate"), default="penultimate")
-    parser.add_argument(
-        "--preprocess-profile",
-        choices=("rgbnomore-resize256-center224", "fixed-center-224-from-512"),
-        default="rgbnomore-resize256-center224",
-        help="select the exact deterministic validation crop geometry",
-    )
     parser.add_argument("--materialize-features", action="store_true")
     parser.add_argument("--pipelines", choices=PIPELINES, nargs="+", default=list(DEFAULT_PIPELINES))
     parser.add_argument("--benchmark-id")
@@ -900,14 +641,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--block-major-access-dir",
         type=Path,
-        help="validated BLOCK_MAJOR_ACCESS_V1 sidecar directory; omit only for an intentional legacy fallback",
+        help="validated BLOCK_MAJOR_ACCESS_V1 sidecar directory required by the GALP production profile",
     )
     parser.add_argument("--dct-major-label-map", type=Path, default=DEFAULT_DCT_MAJOR_LABELS)
-    parser.add_argument("--image-major-manifest", type=Path, default=DEFAULT_IMAGE_MAJOR_MANIFEST)
-    parser.add_argument("--image-major-label-map", type=Path, default=DEFAULT_IMAGE_MAJOR_LABELS)
-    parser.add_argument("--image-major-manifest-version", type=int, choices=(2, 3), default=2)
-    parser.add_argument("--image-major-v3-manifest", type=Path, default=DEFAULT_IMAGE_MAJOR_V3_MANIFEST)
-    parser.add_argument("--image-major-v3-label-map", type=Path, default=DEFAULT_IMAGE_MAJOR_V3_LABELS)
     parser.add_argument("--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT)
     parser.add_argument("--rgb-checkpoint", type=Path)
     parser.add_argument("--dct-checkpoint", type=Path)
@@ -922,53 +658,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int)
     parser.add_argument("--sample-count", type=int)
     parser.add_argument("--semantic-samples", type=int, default=32)
-    parser.add_argument(
-        "--dct-major-segment-mode",
-        choices=("fixed", "manifest-shard"),
-        default="fixed",
-        help="derive DCT-major execution units from a fixed image count or exact manifest shard ranges",
-    )
-    parser.add_argument("--dct-major-segment-size", type=int)
-    parser.add_argument(
-        "--dct-major-output-prefetch-policy",
-        choices=("overlapped", "deferred-allocation"),
-        default="overlapped",
-        help=(
-            "overlap the next full-shard GPU output with model consumption, or overlap only "
-            "CPU planning/I/O and defer next output allocation until the current shard is consumed"
-        ),
-    )
-    parser.add_argument("--image-major-segment-size", type=int)
-    parser.add_argument(
-        "--dct-major-crop-execution-mode",
-        choices=(
-            "auto",
-            "full-rowgroup-decode",
-            "rowgroup-read-selected-decode",
-            "vector-range-read-selected-decode",
-            "bounded-range-read-selected-decode",
-            "bounded-io-uring-range-read-selected-decode",
-            "bounded-io-uring-scheduled-range-read-selected-decode",
-        ),
-        default="auto",
-    )
-    parser.add_argument(
-        "--image-major-crop-execution-mode",
-        choices=("auto", "full-rowgroup-decode", "rowgroup-read-selected-decode", "vector-range-read-selected-decode"),
-        default="rowgroup-read-selected-decode",
-    )
-    parser.add_argument("--decode-batch-rowgroups", type=int, default=64)
-    parser.add_argument("--decode-workset-capacity-mib", type=int, default=512)
-    parser.add_argument("--bounded-read-amplification-cap", type=float, default=1.0)
-    parser.add_argument("--bounded-read-local-amplification-cap", type=float, default=0.0)
-    parser.add_argument("--bounded-read-max-run-bytes", type=int, default=0)
-    parser.add_argument("--block-major-double-buffer", choices=("auto", "on", "off"), default="auto")
-    parser.add_argument("--rowgroup-prefetch-depth", type=int, default=16)
-    parser.add_argument("--rowgroup-prefetch-workers", type=int, default=4)
-    parser.add_argument("--rowgroup-prefetch-min-decode-batches", type=int, default=1)
-    parser.add_argument("--scheduling-policy", choices=("fully-overlapped", "limited-overlap", "serial"), default="limited-overlap")
-    parser.add_argument("--use-low-priority-streams", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--cold-start-model-prime", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--cold-protocol",
         choices=("application-overlapped", "controlled-io"),

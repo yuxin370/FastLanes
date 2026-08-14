@@ -17,12 +17,11 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_TORCH_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 if DEFAULT_TORCH_BINDING_DIR.is_dir() and str(DEFAULT_TORCH_BINDING_DIR) not in sys.path:
     sys.path.append(str(DEFAULT_TORCH_BINDING_DIR))
-TORCH_SOURCE_DIR = REPO_ROOT / "galp/torch"
-if str(TORCH_SOURCE_DIR) not in sys.path:
-    sys.path.insert(0, str(TORCH_SOURCE_DIR))
-
 import _galp_direct_dct as galp_dct
-from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+try:
+    from .rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+except ImportError:  # Direct script execution.
+    from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 
 def _require(condition: bool, message: str) -> None:

@@ -1,5 +1,9 @@
 # Planless Direct-DCT Phase 2：固定合同吞吐上限分析
 
+> **历史实验快照。** 本文保留当时的合同、数字和诊断方法用于追溯；其中旧
+> pipeline 名称、调度矩阵脚本及 runtime 参数不是当前可执行接口。当前命令见
+> [benchmark README](../README.md) 和 [推理运行指南](E2E_COMPARISON_RUN_GUIDE.md)。
+
 日期：2026-07-19
 
 ## 1. 结论

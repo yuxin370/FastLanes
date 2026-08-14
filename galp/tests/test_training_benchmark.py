@@ -241,6 +241,15 @@ class _FakeAsyncHandle:
         self.read_count = 0
         self.cancel_count = 0
 
+    @property
+    def telemetry(self):
+        return {
+            "producer_active_ms": self.producer_active_ms,
+            "planning_ms": 0.0,
+            "io_staging_ms": 0.0,
+            "ordered_submission_ms": 0.0,
+        }
+
     def read(self):
         self.read_count += 1
         if self.error is not None:
@@ -250,6 +259,9 @@ class _FakeAsyncHandle:
     def cancel(self) -> bool:
         self.cancel_count += 1
         return False
+
+    def release_submission(self) -> bool:
+        return True
 
 
 class _FakeNativeTrainingBatch:
@@ -674,19 +686,28 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 constructed.append(path)
                 self.image_count = 9
 
-            def prefetch_batch(self, image_ids, *, transforms, **_options):
+            def prefetch(self, image_ids, profile_id, *, transforms):
+                self.assert_profile_id = profile_id
                 return _FakeAsyncHandle(
                     _FakeNativeTrainingBatch(
                         list(image_ids), list(transforms), {"future_counter": 11}
                     )
                 )
 
-        native_module = SimpleNamespace(DirectDctReader=NativeReader)
+        native_module = SimpleNamespace(
+            DirectDctReader=NativeReader,
+            DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
+            direct_dct_profile_info=lambda profile_id: {
+                "schema": "galp-direct-dct-profile-v1",
+                "id": profile_id,
+                "runtime_policy_id": "compact-v3-planless-limited-o512-c512-v1",
+            },
+        )
         for name in ("v2.bin", "v3.bin"):
             reader = DirectDctTrainingReader(Path(name), native_module=native_module)
             self.assertEqual(reader.image_count, 9)
             handle = reader.prefetch_batch(
-                [3], transforms=[{"global_image_id": 3}], cache_capacity_mib=0
+                [3], transforms=[{"global_image_id": 3}]
             )
             batch = handle.read()
             self.assertEqual(batch.global_image_ids, [3])
@@ -695,6 +716,29 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 batch.native_execution_stats_snapshot()["future_counter"], 11
             )
         self.assertEqual(len(constructed), 2)
+
+    def test_public_direct_dct_training_reader_rejects_runtime_policy_mismatch(
+        self,
+    ) -> None:
+        class NativeReader:
+            def __init__(self, path: str) -> None:
+                self.image_count = 9
+
+        native_module = SimpleNamespace(
+            DirectDctReader=NativeReader,
+            DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
+            direct_dct_profile_info=lambda profile_id: {
+                "schema": "galp-direct-dct-profile-v1",
+                "id": profile_id,
+                "runtime_policy_id": "alternate-runtime-policy-v1",
+            },
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "native profile does not match the training contract",
+        ):
+            DirectDctTrainingReader(Path("v3.bin"), native_module=native_module)
 
     def test_repository_v2_v3_manifests_open_through_same_public_reader(self) -> None:
         repository = BENCHMARK_DIR.parents[2]
@@ -1592,7 +1636,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
             ("--dct-semantic-atol", "nan", "finite and non-negative"),
             ("--throughput-cv-limit", "-0.1", "finite and non-negative"),
             ("--semantic-gradient-cosine-dct", "1.1", "finite and in"),
-            ("--galp-cache-capacity-mib", "-1", "must be non-negative"),
         ):
             with self.subTest(option=option), self.assertRaisesRegex(ValueError, message):
                 _validate_args(_parse_args([*base, option, value]))
@@ -1754,7 +1797,7 @@ class TrainingBenchmarkTest(unittest.TestCase):
             )
         self.assertEqual(outputs[0], outputs[1])
 
-    def test_galp_zero_workers_has_explicit_failure_semantics(self) -> None:
+    def test_galp_workers_no_longer_configure_native_rowgroup_prefetch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = root / "manifest.bin"
@@ -1778,8 +1821,8 @@ class TrainingBenchmarkTest(unittest.TestCase):
                     "--dry-run-contract",
                 ]
             )
-            with self.assertRaisesRegex(ValueError, "rowgroup-prefetch workers"):
-                _validate_args(args)
+            self.assertEqual(args.workers, 0)
+
     def test_formal_rgb_and_dct_models_execute_real_optimizer_steps(self) -> None:
         if not RGBNOMORE_ROOT.is_dir():
             self.skipTest("external RGB-no-more checkout is unavailable")

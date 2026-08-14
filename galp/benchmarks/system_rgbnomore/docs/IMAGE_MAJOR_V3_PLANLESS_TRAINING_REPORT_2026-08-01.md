@@ -1,5 +1,10 @@
 # Image-major manifest-v3 planless training repair — 2026-08-01
 
+> **Historical implementation/acceptance snapshot.** The evidence remains
+> useful, but reader defaults, lifecycle details and commands are not the
+> current public API. Use [training run guide](TRAINING_BENCHMARK_RUN_GUIDE.md)
+> and the [API refactor status](../../../PYTHON_API_REFACTOR_PLAN.md).
+
 ## Status
 
 The compact planner, reader, staged-I/O pipeline, diagnostics, stable arena

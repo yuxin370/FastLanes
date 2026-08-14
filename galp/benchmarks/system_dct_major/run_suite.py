@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Run the complete, no-shuffle DCT-major publication benchmark suite.
-
-The suite first measures DCT-major segment locality, selects the segment with
-the best end-to-end median throughput, and then uses that segment for the crop
-ABBA and formal feature/evaluation runs.  Long GPU work is never started by a
-dry run.  Successful phases are resumable; an incomplete non-empty phase is
-left untouched for inspection.
-"""
+"""Run the no-shuffle DCT-major production-profile benchmark suite."""
 
 from __future__ import annotations
 
@@ -28,21 +21,15 @@ DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
 DEFAULT_DCT_MAJOR_MANIFEST = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/manifest.bin"
 DEFAULT_DCT_MAJOR_LABELS = DEFAULT_DCT_MAJOR_MANIFEST.with_name("labels.json")
-DEFAULT_IMAGE_MAJOR_MANIFEST = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2/dct/manifest.bin"
-DEFAULT_IMAGE_MAJOR_LABELS = DEFAULT_IMAGE_MAJOR_MANIFEST.with_name("labels.json")
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
-DEFAULT_PLAN_AUDIT_TOOL = REPO_ROOT / "build/galp/tools/jpeg_dct/galp_block_major_plan_audit"
 
-PIPELINES_WITHOUT_FULL = (
-    "dct_major_legacy_pushdown",
+ALL_PIPELINES = (
     "dct_major_pushdown",
-    "image_major_pushdown",
     "rgbnomore",
     "dali",
     "pytorch",
 )
-ALL_PIPELINES = ("dct_major_full", *PIPELINES_WITHOUT_FULL)
 SUITE_SCHEMA = "galp_dct_major_complete_suite_v1"
 
 
@@ -62,13 +49,6 @@ class Phase:
         }
 
 
-def _parse_segment_sizes(value: str) -> tuple[int, ...]:
-    values = tuple(int(item) for item in value.split(",") if item.strip())
-    if not values or any(item <= 0 for item in values) or len(set(values)) != len(values):
-        raise argparse.ArgumentTypeError("segment sizes must be unique positive comma-separated integers")
-    return values
-
-
 def _common_run_args(args: argparse.Namespace) -> list[str]:
     result = [
         "--data-root",
@@ -77,12 +57,6 @@ def _common_run_args(args: argparse.Namespace) -> list[str]:
         str(args.dct_major_manifest.resolve()),
         "--dct-major-label-map",
         str(args.dct_major_label_map.resolve()),
-        "--image-major-manifest",
-        str(args.image_major_manifest.resolve()),
-        "--image-major-label-map",
-        str(args.image_major_label_map.resolve()),
-        "--image-major-manifest-version",
-        str(args.image_major_manifest_version),
         "--rgbnomore-root",
         str(args.rgbnomore_root.resolve()),
         "--torch-binding-dir",
@@ -93,10 +67,6 @@ def _common_run_args(args: argparse.Namespace) -> list[str]:
         args.device,
         "--workers",
         str(args.workers),
-        "--decode-workset-capacity-mib",
-        str(args.decode_workset_capacity_mib),
-        "--block-major-double-buffer",
-        args.block_major_double_buffer,
     ]
     if args.rgb_checkpoint is not None:
         result.extend(("--rgb-checkpoint", str(args.rgb_checkpoint.resolve())))
@@ -121,8 +91,6 @@ def _run_phase(
     pipelines: Sequence[str],
     sample_count: int | None = None,
     repeats: int | None = None,
-    segment_size: int | None = None,
-    dry_contract: bool = False,
 ) -> Phase:
     target = output_dir / name
     command = [
@@ -151,145 +119,30 @@ def _run_phase(
         )
     if repeats is not None:
         command.extend(("--repeats", str(repeats)))
-    if segment_size is not None:
-        command.extend(("--dct-major-segment-size", str(segment_size)))
-    if dry_contract:
-        command.append("--dry-run")
-    return Phase(name=name, command=tuple(command), target=target, gpu=not dry_contract)
-
-
-def _preflight_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
-    planning_output = output_dir / "00_segment_planning.json"
-    phases: list[Phase] = [
-        Phase(
-            name="00_segment_planning",
-            command=(
-                str(args.python.resolve()),
-                str(DIAGNOSTICS / "segment_sweep.py"),
-                str(args.dct_major_manifest.resolve()),
-                "--torch-binding-dir",
-                str(args.torch_binding_dir.resolve()),
-                "--block-major-access-dir",
-                str(args.block_major_access_dir.resolve()),
-                "--segment-sizes",
-                *(str(item) for item in args.segment_sizes),
-                "--output-json",
-                str(planning_output),
-            ),
-            target=planning_output,
-            gpu=False,
-        ),
-    ]
-    gate_specs = (
-        ("sequential", ("--count", "2")),
-        ("random", ("--count", "8", "--pattern", "random", "--seed", "20260731")),
-        (
-            "duplicates_explicit",
-            ("--image-ids", "0,0,0,1,1,1,0,0", "--explicit-crops"),
-        ),
-        (
-            "cross_shard",
-            ("--image-ids", "1527,1528,1529,1530", "--require-cross-shard"),
-        ),
-        ("grayscale", ("--image-ids", "239", "--require-grayscale")),
-    )
-    for gate_name, gate_arguments in gate_specs:
-        gpu_gate_output = output_dir / f"00_planless_gpu_gate_{gate_name}.json"
-        phases.append(
-            Phase(
-                name=f"00_planless_gpu_gate_{gate_name}",
-                command=(
-                    str(args.plan_audit_tool.resolve()),
-                    str(args.dct_major_manifest.resolve()),
-                    "--descriptor-dir",
-                    str(args.block_major_access_dir.resolve()),
-                    *gate_arguments,
-                    "--compare-legacy",
-                    "--execute",
-                    "--decode-batch-rowgroups",
-                    "64",
-                    "--prefetch-workers",
-                    "2",
-                    "--workset-capacity-mib",
-                    str(args.decode_workset_capacity_mib),
-                    "--output-json",
-                    str(gpu_gate_output),
-                ),
-                target=gpu_gate_output,
-                gpu=True,
-            )
-        )
-    return phases
+    return Phase(name=name, command=tuple(command), target=target, gpu=True)
 
 
 def _initial_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
-    phases = _preflight_phases(args, output_dir)
-    phases.extend(
-        (
-            _run_phase(
-                args,
-                "01_feature_smoke",
-                output_dir,
-                workload="feature-extraction",
-                pipelines=ALL_PIPELINES,
-            ),
-            _run_phase(
-                args,
-                "02_evaluation_smoke",
-                output_dir,
-                workload="evaluation",
-                pipelines=ALL_PIPELINES,
-            ),
-        )
-    )
-    for segment_size in args.segment_sizes:
-        phases.append(
-            _run_phase(
-                args,
-                f"03_locality_segment_{segment_size:04d}",
-                output_dir,
-                workload="feature-extraction",
-                pipelines=("dct_major_pushdown",),
-                sample_count=args.locality_samples,
-                repeats=args.locality_repeats,
-                segment_size=segment_size,
-            )
-        )
-    return phases
-
-
-def _selected_phases(args: argparse.Namespace, output_dir: Path, segment_size: int) -> list[Phase]:
-    contract_phase = _run_phase(
-        args,
-        "04_crop_abba_contract",
-        output_dir,
-        workload="feature-extraction",
-        pipelines=("dct_major_legacy_pushdown", "dct_major_pushdown"),
-        sample_count=args.crop_samples,
-        repeats=1,
-        segment_size=segment_size,
-        dry_contract=True,
-    )
-    abba_target = output_dir / "05_crop_abba"
-    phases = [
-        contract_phase,
-        Phase(
-            name="05_crop_abba",
-            command=(
-                str(args.python.resolve()),
-                str(DIAGNOSTICS / "run_crop_abba.py"),
-                "--contract",
-                str(contract_phase.target / "contract.json"),
-                "--output-dir",
-                str(abba_target),
-                "--python",
-                str(args.python.resolve()),
-            ),
-            target=abba_target,
-            gpu=True,
+    return [
+        _run_phase(
+            args,
+            "01_feature_smoke",
+            output_dir,
+            workload="feature-extraction",
+            pipelines=ALL_PIPELINES,
+        ),
+        _run_phase(
+            args,
+            "02_evaluation_smoke",
+            output_dir,
+            workload="evaluation",
+            pipelines=ALL_PIPELINES,
         ),
     ]
-    formal_pipelines = ALL_PIPELINES if args.include_full_in_formal else PIPELINES_WITHOUT_FULL
+
+
+def _formal_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
+    phases: list[Phase] = []
     for prefix, workload in (("06", "feature-extraction"), ("07", "evaluation")):
         phases.append(
             _run_phase(
@@ -297,10 +150,9 @@ def _selected_phases(args: argparse.Namespace, output_dir: Path, segment_size: i
                 f"{prefix}_formal_{workload.replace('-', '_')}",
                 output_dir,
                 workload=workload,
-                pipelines=formal_pipelines,
+                pipelines=ALL_PIPELINES,
                 sample_count=args.formal_samples,
                 repeats=args.formal_repeats,
-                segment_size=segment_size,
             )
         )
 
@@ -413,75 +265,15 @@ def _execute_phase(
         raise RuntimeError(f"phase failed with exit code {exit_code}: {phase.name}")
 
 
-def _select_best_segment(
-    output_dir: Path,
-    segment_sizes: Sequence[int],
-) -> tuple[int, list[dict[str, float | int]]]:
-    records: list[dict[str, float | int]] = []
-    for segment_size in segment_sizes:
-        path = output_dir / f"03_locality_segment_{segment_size:04d}" / "results.json"
-        result = json.loads(path.read_text(encoding="utf-8"))
-        if not result.get("ok"):
-            raise RuntimeError(f"locality candidate failed validation: segment={segment_size}")
-        aggregate = next(
-            item for item in result["aggregates"] if item["pipeline"] == "dct_major_pushdown"
-        )
-        cold = aggregate.get("cold_start") or {
-            "throughput_images_per_s": float(aggregate["throughput_images_per_s"]["p50"]),
-            "time_to_first_batch_ms": float(aggregate["time_to_first_batch_ms"]["p50"]),
-        }
-        records.append(
-            {
-                "segment_size": segment_size,
-                "cold_end_to_end_images_per_s": float(
-                    cold["throughput_images_per_s"]
-                ),
-                "cold_time_to_first_batch_ms": float(
-                    cold["time_to_first_batch_ms"]
-                ),
-                "end_to_end_p50_images_per_s": float(aggregate["throughput_images_per_s"]["p50"]),
-                "steady_p50_images_per_s": float(aggregate["steady_throughput_images_per_s"]["p50"]),
-                "time_to_first_batch_p50_ms": float(aggregate["time_to_first_batch_ms"]["p50"]),
-            }
-        )
-    best = max(
-        records,
-        key=lambda item: (
-            item["cold_end_to_end_images_per_s"],
-            -item["cold_time_to_first_batch_ms"],
-            -item["segment_size"],
-        ),
-    )
-    return int(best["segment_size"]), records
-
-
 def _volume(args: argparse.Namespace) -> dict[str, int]:
-    smoke = 2 * len(ALL_PIPELINES) * 6
-    locality = len(args.segment_sizes) * args.locality_samples * args.locality_repeats
-    crop_abba = 4 * args.crop_samples
-    formal_pipeline_count = len(ALL_PIPELINES) if args.include_full_in_formal else len(PIPELINES_WITHOUT_FULL)
-    formal = 2 * formal_pipeline_count * args.formal_samples * args.formal_repeats
+    smoke = 2 * len(ALL_PIPELINES) * 4
+    formal = 2 * len(ALL_PIPELINES) * args.formal_samples * args.formal_repeats
     model_ceiling = 4 * args.batch_size * args.ceiling_steps
     return {
-        "gpu_gate_requests": 23,
         "smoke_pipeline_images": smoke,
-        "locality_pipeline_images": locality,
-        "crop_abba_pipeline_images": crop_abba,
         "formal_pipeline_images": formal,
         "synthetic_model_ceiling_images": model_ceiling,
-        "total_model_invocations": smoke + locality + crop_abba + formal + model_ceiling,
-    }
-
-
-def _gates_only_volume() -> dict[str, int]:
-    return {
-        "gpu_gate_requests": 23,
-        "smoke_pipeline_images": 0,
-        "locality_pipeline_images": 0,
-        "crop_abba_pipeline_images": 0,
-        "formal_pipeline_images": 0,
-        "synthetic_model_ceiling_images": 0,
-        "total_model_invocations": 0,
+        "total_model_invocations": smoke + formal + model_ceiling,
     }
 
 
@@ -504,47 +296,27 @@ def run(args: argparse.Namespace) -> int:
     _prepare_output_dir(output_dir, resume=args.resume)
     if not args.python.is_file():
         raise FileNotFoundError(args.python)
-    if not args.plan_audit_tool.is_file():
-        raise FileNotFoundError(args.plan_audit_tool)
     if not args.block_major_access_dir.is_dir():
         raise NotADirectoryError(args.block_major_access_dir)
 
-    initial = (
-        _preflight_phases(args, output_dir)
-        if args.gates_only
-        else _initial_phases(args, output_dir)
-    )
-    dry_selected = (
-        []
-        if args.gates_only
-        else _selected_phases(args, output_dir, args.formal_segment_fallback)
-    )
-    volume = _gates_only_volume() if args.gates_only else _volume(args)
+    phases = [*_initial_phases(args, output_dir), *_formal_phases(args, output_dir)]
+    volume = _volume(args)
     plan = {
         "schema_version": SUITE_SCHEMA,
         "dry_run": bool(args.dry_run),
-        "gates_only": bool(args.gates_only),
-        "selection_rule": "maximum locality end-to-end p50; smaller segment wins an exact tie",
-        "formal_segment_fallback_for_dry_run": args.formal_segment_fallback,
-        "segment_candidates": list(args.segment_sizes),
+        "runtime_policy": "native block-major production profile",
         "volume": volume,
-        "initial_phases": [phase.as_json() for phase in initial],
-        "selected_phase_template": [phase.as_json() for phase in dry_selected],
+        "phases": [phase.as_json() for phase in phases],
     }
     plan_path = output_dir / "suite_plan.json"
     if args.resume and plan_path.is_file():
         existing = json.loads(plan_path.read_text(encoding="utf-8"))
-        comparable_existing = {
-            key: value
-            for key, value in existing.items()
-            if key not in {"selected_segment_size", "selected_phases"}
-        }
-        if comparable_existing != plan:
+        if existing != plan:
             raise ValueError("resume arguments differ from the existing suite plan")
     else:
         _write_json(plan_path, plan)
 
-    for phase in (*initial, *dry_selected):
+    for phase in phases:
         print(("GPU " if phase.gpu else "CPU ") + "COMMAND " + shlex.join(phase.command), flush=True)
     if args.dry_run:
         print("RESULT_JSON " + json.dumps({"dry_run": True, "plan": str(plan_path)}, sort_keys=True))
@@ -556,41 +328,13 @@ def run(args: argparse.Namespace) -> int:
         pythonpath += os.pathsep + environment["PYTHONPATH"]
     environment["PYTHONPATH"] = pythonpath
 
-    for phase in initial:
-        _execute_phase(phase, output_dir, environment=environment, resume=args.resume)
-    if args.gates_only:
-        gate_outputs = [
-            str(phase.target.resolve())
-            for phase in initial
-            if phase.name.startswith("00_planless_gpu_gate_") and phase.target is not None
-        ]
-        result = {
-            "schema_version": SUITE_SCHEMA,
-            "ok": True,
-            "gates_only": True,
-            "segment_planning": str((output_dir / "00_segment_planning.json").resolve()),
-            "gpu_gate_outputs": gate_outputs,
-            "volume": volume,
-        }
-        _write_json(output_dir / "suite_results.json", result)
-        print("RESULT_JSON " + json.dumps(result, sort_keys=True))
-        return 0
-    selected_segment, locality_records = _select_best_segment(output_dir, args.segment_sizes)
-    selected = _selected_phases(args, output_dir, selected_segment)
-    plan["selected_segment_size"] = selected_segment
-    plan["selected_phases"] = [phase.as_json() for phase in selected]
-    _write_json(plan_path, plan)
-    for phase in selected:
+    for phase in phases:
         _execute_phase(phase, output_dir, environment=environment, resume=args.resume)
 
     result = {
         "schema_version": SUITE_SCHEMA,
         "ok": True,
-        "selected_segment_size": selected_segment,
-        "selection_metric": "cold_end_to_end_images_per_s_then_cold_ttft",
-        "locality_records": locality_records,
         "volume": volume,
-        "crop_abba": str((output_dir / "05_crop_abba/abba_results.json").resolve()),
         "feature_results": str((output_dir / "06_formal_feature_extraction/results.json").resolve()),
         "evaluation_results": str((output_dir / "07_formal_evaluation/results.json").resolve()),
     }
@@ -607,54 +351,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dct-major-manifest", type=Path, default=DEFAULT_DCT_MAJOR_MANIFEST)
     parser.add_argument("--block-major-access-dir", type=Path, required=True)
     parser.add_argument("--dct-major-label-map", type=Path, default=DEFAULT_DCT_MAJOR_LABELS)
-    parser.add_argument("--image-major-manifest", type=Path, default=DEFAULT_IMAGE_MAJOR_MANIFEST)
-    parser.add_argument("--image-major-label-map", type=Path, default=DEFAULT_IMAGE_MAJOR_LABELS)
-    parser.add_argument("--image-major-manifest-version", type=int, choices=(2, 3), default=2)
     parser.add_argument("--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT)
     parser.add_argument("--rgb-checkpoint", type=Path)
     parser.add_argument("--dct-checkpoint", type=Path)
     parser.add_argument("--torch-binding-dir", type=Path, default=DEFAULT_BINDING_DIR)
-    parser.add_argument("--plan-audit-tool", type=Path, default=DEFAULT_PLAN_AUDIT_TOOL)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=50)
-    parser.add_argument("--decode-workset-capacity-mib", type=int, default=512)
-    parser.add_argument(
-        "--block-major-double-buffer",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="bounded block-major decode double-buffer policy",
-    )
-    parser.add_argument("--segment-sizes", type=_parse_segment_sizes, default=(50, 250, 500, 1000, 1024))
-    parser.add_argument("--locality-samples", type=int, default=5000)
-    parser.add_argument("--locality-repeats", type=int, default=3)
-    parser.add_argument("--crop-samples", type=int, default=1000)
     parser.add_argument("--formal-samples", type=int, default=50000)
     parser.add_argument("--formal-repeats", type=int, default=5)
-    parser.add_argument("--formal-segment-fallback", type=int, default=1000)
     parser.add_argument("--ceiling-warmup", type=int, default=20)
     parser.add_argument("--ceiling-steps", type=int, default=300)
-    parser.add_argument("--include-full-in-formal", action="store_true")
     parser.add_argument("--hash-samples", action="store_true")
     parser.add_argument("--hash-payloads", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--gates-only",
-        action="store_true",
-        help="run segment planning and the five bounded planless GPU gates, then stop",
-    )
     args = parser.parse_args(argv)
     for name in (
         "workers",
         "batch_size",
-        "decode_workset_capacity_mib",
-        "locality_samples",
-        "locality_repeats",
-        "crop_samples",
         "formal_samples",
         "formal_repeats",
-        "formal_segment_fallback",
         "ceiling_steps",
     ):
         if int(getattr(args, name)) <= 0:

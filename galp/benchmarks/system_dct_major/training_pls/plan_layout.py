@@ -16,14 +16,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--segment-images", type=int, default=1024)
-    parser.add_argument("--organization", choices=("current",), default="current")
     parser.add_argument("--organization-seed", type=int, default=20260810)
     args = parser.parse_args(argv)
     plan = create_layout_plan(
         args.train_manifest,
         args.output_dir,
         segment_images=args.segment_images,
-        organization=args.organization,
+        organization="current",
         organization_seed=args.organization_seed,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))

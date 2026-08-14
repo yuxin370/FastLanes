@@ -3,13 +3,25 @@
 
 from __future__ import annotations
 
-import importlib
 import math
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from galp.profiles.rgbnomore import VALIDATION
+from galp.benchmarks.system_rgbnomore.shared.common import GALP_RUNTIME_PROFILE
+from galp.torch import DirectDctReader
+from galp.torch.diagnostics import (
+    execution_stats as public_execution_stats,
+    execution_stats_snapshot as public_execution_stats_snapshot,
+    prefetch_stats,
+)
 
 
 def _json_compatible(value: Any) -> Any:
@@ -44,12 +56,20 @@ def _optional_native_execution_stats_attribute(
 def optional_native_execution_stats(source: Any) -> dict[str, Any]:
     """Return complete optional stats, allowing the native completion wait."""
 
+    try:
+        return _json_compatible(public_execution_stats(source))
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        pass
     return _optional_native_execution_stats_attribute(source, "execution_stats")
 
 
 def optional_native_execution_stats_snapshot(source: Any) -> dict[str, Any]:
     """Return a non-blocking native stats snapshot when the runtime exposes it."""
 
+    try:
+        return _json_compatible(public_execution_stats_snapshot(source))
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        pass
     return _optional_native_execution_stats_attribute(
         source, "execution_stats_snapshot"
     )
@@ -81,13 +101,22 @@ class DirectDctTrainingBatch:
 
 
 class DirectDctTrainingHandle:
-    """Preserve the native asynchronous-handle surface while wrapping its result."""
+    """Small training-facing future; native scheduling details stay private."""
 
     def __init__(self, native_handle: Any) -> None:
         self._native_handle = native_handle
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._native_handle, name)
+    @property
+    def ready(self) -> bool:
+        return bool(getattr(self._native_handle, "ready", False))
+
+    @property
+    def started(self) -> bool:
+        return bool(getattr(self._native_handle, "started", False))
+
+    @property
+    def telemetry(self) -> dict[str, float]:
+        return prefetch_stats(self._native_handle)
 
     def read(self) -> DirectDctTrainingBatch:
         return DirectDctTrainingBatch(self._native_handle.read())
@@ -107,12 +136,18 @@ class DirectDctTrainingReader:
         module_path: Path | None = None,
         native_module: Any | None = None,
     ) -> None:
-        if module_path is not None:
-            resolved = str(module_path.resolve())
-            if resolved not in sys.path:
-                sys.path.insert(0, resolved)
-        module = native_module or importlib.import_module("_galp_direct_dct")
-        self._reader = module.DirectDctReader(str(manifest_path.resolve()))
+        self._reader = DirectDctReader(
+            manifest_path,
+            module_path=module_path,
+            native_module=native_module,
+        )
+        profile_info = self._reader.profile_info(VALIDATION)
+        runtime_policy_id = str(profile_info.get("runtime_policy_id", ""))
+        if runtime_policy_id != GALP_RUNTIME_PROFILE:
+            raise RuntimeError(
+                "GALP native profile does not match the training contract: "
+                f"expected {GALP_RUNTIME_PROFILE!r}, got {runtime_policy_id!r}"
+            )
 
     @property
     def image_count(self) -> int:
@@ -123,13 +158,16 @@ class DirectDctTrainingReader:
         image_ids: Sequence[int],
         *,
         transforms: Sequence[dict[str, Any]],
-        **reader_options: Any,
     ) -> DirectDctTrainingHandle:
-        native_handle = self._reader.prefetch_batch(
-            [int(value) for value in image_ids],
+        native_handle = self._reader.prefetch(
+            image_ids,
+            VALIDATION,
             transforms=[dict(value) for value in transforms],
-            **reader_options,
         )
+        # Training has no preceding model whose completion must gate this
+        # submission.  Release the profile's event-owned handoff inside the
+        # facade so callers never manipulate the native submission gate.
+        native_handle._release_submission()
         return DirectDctTrainingHandle(native_handle)
 
 

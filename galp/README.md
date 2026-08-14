@@ -177,19 +177,40 @@ block_to_image_tensor: int64 CUDA tensor [total_blocks]
 ```
 
 Use these tensors for per-image pooling or token packing on CUDA. The legacy
-`image_layouts`, `block_metadata`, `rowgroups`, and `execution_stats`
-properties still materialize Python list/dict objects and are intended for
-debugging, logging, and compatibility.
+The private native batch's `image_layouts`, `block_metadata`, `rowgroups`, and
+`execution_stats` properties materialize Python list/dict objects and are
+intended for debugging and compatibility. The stable `galp.torch.DirectDctBatch`
+does not expose them; benchmark tools opt into `galp.torch.diagnostics`.
 
-The Python binding defaults `cache_capacity_mib` to `1024`; pass `0` to
-disable the decoded rowgroup cache explicitly. For double buffering, use
-`reader.prefetch_batch(...)` (or `read_batch_async(...)`) and consume the handle
-with `reader.read_prefetched(handle)`.
+Applications should use the stable Python facade rather than importing the
+private `_galp_direct_dct` extension.  The caller chooses a semantic output
+profile; cache, planning, prefetch, stream, I/O, and launch policies remain
+native-owned:
 
-The runtime keeps the existing JPEG DCT crop pushdown, DCT coefficient
-selection pushdown, rowgroup cache, prefetch, and decode-batch behavior. It
-does not perform IDCT, RGB reconstruction, torchvision-equivalent transforms,
-or detection/segmentation collation.
+```python
+from galp.profiles.rgbnomore import VALIDATION
+from galp.torch import DirectDctReader
+
+reader = DirectDctReader(
+    "/path/to/manifest.bin",
+    module_path="build/galp/torch",
+)
+preview = reader.plan([0, 1, 2, 3], VALIDATION)
+pending = reader.prefetch([0, 1, 2, 3], VALIDATION)
+batch = pending.read()
+output = model(batch.y, batch.cbcr)
+batch.record_stream()
+```
+
+`galp.profiles.rgbnomore` owns RGB-no-more geometry, normalization, and crop
+reference semantics.  Generic native runtime policies are defined separately
+and are observable through `reader.profile_info(profile)` but are not Python
+tuning options.
+
+The runtime keeps the existing JPEG DCT crop and coefficient-selection
+pushdown, cache, prefetch, and decode-batch behavior. Registered profiles may
+also fuse DCT-grid transforms and model-ready affine conversion. It does not
+perform IDCT, RGB reconstruction, or detection/segmentation collation.
 
 The first runtime API does not accept a caller-owned CUDA stream. It delegates
 planning, compressed rowgroup upload, GPU FastLanes decode, gather/projection,
