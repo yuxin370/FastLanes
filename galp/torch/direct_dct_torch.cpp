@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -213,9 +214,36 @@ galp::jpeg::JpegDctCropExecutionMode parse_crop_execution_mode(const std::string
 	if (mode == "vector-range-read-selected-decode" || mode == "vector_range_read_selected_decode") {
 		return galp::jpeg::JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode;
 	}
+	if (mode == "bounded-range-read-selected-decode" || mode == "bounded_range_read_selected_decode") {
+		return galp::jpeg::JpegDctCropExecutionMode::kBoundedRangeReadSelectedDecode;
+	}
+	if (mode == "bounded-io-uring-range-read-selected-decode" ||
+	    mode == "bounded_io_uring_range_read_selected_decode") {
+		return galp::jpeg::JpegDctCropExecutionMode::kBoundedIoUringRangeReadSelectedDecode;
+	}
+	if (mode == "bounded-io-uring-scheduled-range-read-selected-decode" ||
+	    mode == "bounded_io_uring_scheduled_range_read_selected_decode") {
+		return galp::jpeg::JpegDctCropExecutionMode::kBoundedIoUringScheduledRangeReadSelectedDecode;
+	}
 	throw std::invalid_argument(
 	    "invalid crop_execution_mode; expected auto, full-rowgroup-decode, "
-	    "rowgroup-read-selected-decode, or vector-range-read-selected-decode");
+	    "rowgroup-read-selected-decode, vector-range-read-selected-decode, or "
+	    "bounded-range-read-selected-decode, bounded-io-uring-range-read-selected-decode, or "
+	    "bounded-io-uring-scheduled-range-read-selected-decode");
+}
+
+uint32_t amplification_cap_to_ppm(const double cap, const bool allow_inherit, const char* const label) {
+	if (allow_inherit && cap == 0.0) {
+		return 0U;
+	}
+	if (!std::isfinite(cap) || cap < 1.0 || cap > 1.10) {
+		throw std::invalid_argument(std::string(label) + " must be in [1.0, 1.10]");
+	}
+	const auto scaled = std::llround(cap * 1'000'000.0);
+	if (scaled < 1'000'000LL || scaled > 1'100'000LL) {
+		throw std::invalid_argument(std::string(label) + " is outside the supported integer cap range");
+	}
+	return static_cast<uint32_t>(scaled);
 }
 
 galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_coeffs,
@@ -235,7 +263,11 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
                                                          const size_t       transform_blocks_per_launch = 0,
                                                          const size_t       transform_ctas_per_launch = 0,
 	                                                     const bool         use_low_priority_streams = false,
-	                                                     const std::string& block_major_double_buffer = "auto") {
+	                                                     const std::string& block_major_double_buffer = "auto",
+	                                                     const bool         async_planless_completion = false,
+	                                                     const double       bounded_read_amplification_cap = 1.0,
+	                                                     const double       bounded_read_local_amplification_cap = 0.0,
+	                                                     const size_t       bounded_read_max_run_bytes = 0U) {
 	galp::jpeg::JpegDctDeviceBatchOptions options;
 	options.coefficient_selection                = parse_coefficients(dct_coeffs);
 	options.layout                               = parse_layout(layout);
@@ -253,9 +285,17 @@ galp::jpeg::JpegDctDeviceBatchOptions make_batch_options(const std::string& dct_
 	options.transform_blocks_per_launch          = transform_blocks_per_launch;
 	options.transform_ctas_per_launch            = transform_ctas_per_launch;
 	options.use_low_priority_streams              = use_low_priority_streams;
+	options.async_planless_completion             = async_planless_completion;
 	options.block_major_double_buffer_policy      =
 	    parse_block_major_double_buffer_policy(block_major_double_buffer);
 	options.crop_execution_mode                   = parse_crop_execution_mode(crop_execution_mode);
+	options.bounded_read_amplification_ppm = amplification_cap_to_ppm(
+	    bounded_read_amplification_cap, /*allow_inherit=*/false, "bounded_read_amplification_cap");
+	options.bounded_read_local_amplification_ppm = amplification_cap_to_ppm(
+	    bounded_read_local_amplification_cap,
+	    /*allow_inherit=*/true,
+	    "bounded_read_local_amplification_cap");
+	options.bounded_read_max_run_bytes = bounded_read_max_run_bytes;
 	return options;
 }
 
@@ -390,6 +430,10 @@ py::dict block_metadata_to_dict(const galp::jpeg::JpegDctDeviceBlockMetadata& bl
 	    out["compiled_access_profile_hits"]                = preview.compiled_access_profile_hits;
 	    out["compiled_access_profile_misses"]              = preview.compiled_access_profile_misses;
 	    out["planless_axis_program_bytes"]                 = preview.planless_axis_program_bytes;
+	    out["planless_axis_program_capacity_contract_bytes"] =
+	        preview.planless_axis_program_capacity_contract_bytes;
+	    out["planless_axis_program_capacity_contract_complete"] =
+	        preview.planless_axis_program_capacity_contract_complete;
 	    out["compact_plan_bytes"]                          = preview.compact_plan_bytes;
 	    out["compact_plan_peak_bytes"]                     = preview.compact_plan_peak_bytes;
 	    out["coordinate_group_lookup_count"]               = preview.coordinate_group_lookup_count;
@@ -591,7 +635,28 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	    stats.planless_transform_active_output_prefix_ms;
 	out["planless_transform_active_output_fill_ms"] =
 	    stats.planless_transform_active_output_fill_ms;
+	out["active_output_schedule_sidecar_hit_count"] =
+	    stats.active_output_schedule_sidecar_hit_count;
+	out["active_output_schedule_sidecar_miss_count"] =
+	    stats.active_output_schedule_sidecar_miss_count;
+	out["active_output_schedule_sidecar_reject_count"] =
+	    stats.active_output_schedule_sidecar_reject_count;
+	out["active_output_schedule_sidecar_persist_count"] =
+	    stats.active_output_schedule_sidecar_persist_count;
+	out["active_output_schedule_sidecar_bytes"] = stats.active_output_schedule_sidecar_bytes;
+	out["active_output_schedule_interval_count"] = stats.active_output_schedule_interval_count;
+	out["active_output_schedule_mapped_bytes_peak"] =
+	    stats.active_output_schedule_mapped_bytes_peak;
+	out["active_output_schedule_mmap_capacity_bytes"] =
+	    stats.active_output_schedule_mmap_capacity_bytes;
+	out["active_output_schedule_mmap_window_count"] =
+	    stats.active_output_schedule_mmap_window_count;
+	out["active_output_schedule_load_ms"] = stats.active_output_schedule_load_ms;
+	out["active_output_schedule_validation_ms"] = stats.active_output_schedule_validation_ms;
+	out["active_output_schedule_materialize_ms"] = stats.active_output_schedule_materialize_ms;
+	out["active_output_schedule_persist_ms"] = stats.active_output_schedule_persist_ms;
 	out["planless_transform_gpu_kernel_ms"] = stats.planless_transform_gpu_kernel_ms;
+	out["async_planless_completion_batch_count"] = stats.async_planless_completion_batch_count;
 	out["coordinate_group_lookup_count"] = stats.coordinate_group_lookup_count;
 	out["coordinate_group_index_entries"] = stats.coordinate_group_index_entries;
 	out["coordinate_group_index_populated"] = stats.coordinate_group_index_populated;
@@ -605,9 +670,15 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["planned_vector_count"]                         = stats.planned_vector_count;
 	out["actual_vector_count"]                          = stats.actual_vector_count;
 	out["compressed_payload_bytes_read"]                = stats.compressed_payload_bytes_read;
+	out["selected_compressed_payload_bytes"]            = stats.selected_compressed_payload_bytes;
 	out["full_compressed_payload_bytes"]                = stats.full_compressed_payload_bytes;
 	out["pread_count"]                                  = stats.pread_count;
 	out["preadv_count"]                                 = stats.preadv_count;
+	out["merged_gap_bytes"]                             = stats.merged_gap_bytes;
+	out["hole_clear_bytes"]                             = stats.hole_clear_bytes;
+	out["static_prefix_restore_bytes"]                  = stats.static_prefix_restore_bytes;
+	out["hole_clear_ms"]                                = stats.hole_clear_ms;
+	out["static_prefix_restore_ms"]                     = stats.static_prefix_restore_ms;
 	out["vector_bundle_rowgroup_count"]                 = stats.vector_bundle_rowgroup_count;
 	out["vector_bundle_envelope_rowgroup_count"]        = stats.vector_bundle_envelope_rowgroup_count;
 	out["vector_bundle_pread_count"]                    = stats.vector_bundle_pread_count;
@@ -620,6 +691,21 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["compact_batch_buffer_capacity_bytes"]         = stats.compact_batch_buffer_capacity_bytes;
 	out["compact_batch_buffer_high_water_bytes"]       = stats.compact_batch_buffer_high_water_bytes;
 	out["compact_batch_buffer_pageable_fallback_count"] = stats.compact_batch_buffer_pageable_fallback_count;
+	out["compact_batch_pool_prewarm_performed"]          = stats.compact_batch_pool_prewarm_performed;
+	out["compact_batch_pool_prewarmed_slots"]            = stats.compact_batch_pool_prewarmed_slots;
+	out["compact_batch_pool_prewarmed_bytes"]            = stats.compact_batch_pool_prewarmed_bytes;
+	out["compact_batch_pool_largest_size_class_bytes"]   =
+	    stats.compact_batch_pool_largest_size_class_bytes;
+	out["compact_batch_pool_capacity_contract_complete"] =
+	    stats.compact_batch_pool_capacity_contract_complete;
+	out["compact_batch_pool_capacity_contract_images"] =
+	    stats.compact_batch_pool_capacity_contract_images;
+	out["compact_batch_pool_capacity_contract_groups"] =
+	    stats.compact_batch_pool_capacity_contract_groups;
+	out["compact_batch_pool_capacity_contract_batches"] =
+	    stats.compact_batch_pool_capacity_contract_batches;
+	out["compact_batch_pool_capacity_contract_bytes"] =
+	    stats.compact_batch_pool_capacity_contract_bytes;
 	out["compact_batch_read_group_count"]              = stats.compact_batch_read_group_count;
 	out["compact_batch_read_worker_count"]             = stats.compact_batch_read_worker_count;
 	out["galp_native_pinned_in_use_bytes"]             = stats.galp_native_pinned_in_use_bytes;
@@ -639,6 +725,10 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["selected_coefficient_ratio"]                  = stats.selected_coefficient_ratio;
 	out["physical_page_coverage_ratio"]                = stats.physical_page_coverage_ratio;
 	out["read_amplification"]                           = stats.read_amplification;
+	out["duplicate_physical_read_count"]                = stats.duplicate_physical_read_count;
+	out["rowgroup_revisit_count"]                       = stats.rowgroup_revisit_count;
+	out["vector_run_revisit_count"]                     = stats.vector_run_revisit_count;
+	out["physical_read_order_inversions"]               = stats.physical_read_order_inversions;
 	out["source_blocks_transformed"]                    = stats.source_blocks_transformed;
 	out["sparse_read_supported"]                        = stats.sparse_read_supported;
 	out["sparse_read_fallback_rowgroup_count"]          = stats.sparse_read_fallback_rowgroup_count;
@@ -668,8 +758,31 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	    stats.adaptive_selected_memory_fit_rowgroup_count;
 	out["adaptive_full_memory_fit_rowgroup_count"] = stats.adaptive_full_memory_fit_rowgroup_count;
 	out["run_interval_exact_rowgroup_count"] = stats.run_interval_exact_rowgroup_count;
+	out["run_interval_bounded_rowgroup_count"] = stats.run_interval_bounded_rowgroup_count;
 	out["bitmap_exact_rowgroup_count"]       = stats.bitmap_exact_rowgroup_count;
 	out["full_rowgroup_strategy_count"]      = stats.full_rowgroup_strategy_count;
+	out["bounded_read_amplification_ppm"] = stats.bounded_read_amplification_ppm;
+	out["bounded_read_local_amplification_ppm"] = stats.bounded_read_local_amplification_ppm;
+	out["bounded_read_max_run_bytes"] = stats.bounded_read_max_run_bytes;
+	out["bounded_io_backend"] = stats.bounded_io_backend;
+	out["bounded_io_uring_queue_depth"] = stats.bounded_io_uring_queue_depth;
+	out["bounded_exact_storage_bytes"] = stats.bounded_exact_storage_bytes;
+	out["bounded_physical_storage_bytes"] = stats.bounded_physical_storage_bytes;
+	out["bounded_merged_gap_bytes"] = stats.bounded_merged_gap_bytes;
+	out["bounded_exact_extent_count"] = stats.bounded_exact_extent_count;
+	out["bounded_physical_run_count"] = stats.bounded_physical_run_count;
+	out["bounded_selected_gap_count"] = stats.bounded_selected_gap_count;
+	out["bounded_max_run_rejected_gap_count"] = stats.bounded_max_run_rejected_gap_count;
+	out["bounded_budget_rejected_gap_count"] = stats.bounded_budget_rejected_gap_count;
+	out["io_uring_read_request_count"] = stats.io_uring_read_request_count;
+	out["io_uring_completion_count"] = stats.io_uring_completion_count;
+	out["io_uring_submit_syscall_count"] = stats.io_uring_submit_syscall_count;
+	out["io_uring_wait_syscall_count"] = stats.io_uring_wait_syscall_count;
+	out["io_uring_setup_count"] = stats.io_uring_setup_count;
+	out["io_uring_ring_mapped_bytes"] = stats.io_uring_ring_mapped_bytes;
+	out["io_uring_fallback_count"] = stats.io_uring_fallback_count;
+	out["io_uring_read_ms"] = stats.io_uring_read_ms;
+	out["bounded_coalesce_ms"] = stats.bounded_coalesce_ms;
 	out["decode_workset_capacity_bytes"]     = stats.decode_workset_capacity_bytes;
 	out["max_estimated_decode_workset_bytes"] = stats.max_estimated_decode_workset_bytes;
 	out["oversized_decode_rowgroup_count"]    = stats.oversized_decode_rowgroup_count;
@@ -700,6 +813,27 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["bounded_double_buffer_workset_count"] = stats.bounded_double_buffer_workset_count;
 	out["bounded_double_buffer_peak_estimated_bytes"] =
 	    stats.bounded_double_buffer_peak_estimated_bytes;
+	out["actual_transient_current_chunk_compressed_peak_bytes"] =
+	    stats.actual_transient_current_chunk_compressed_peak_bytes;
+	out["actual_transient_next_chunk_compressed_peak_bytes"] =
+	    stats.actual_transient_next_chunk_compressed_peak_bytes;
+	out["actual_transient_compressed_backing_live_peak_bytes"] =
+	    stats.actual_transient_compressed_backing_live_peak_bytes;
+	out["actual_transient_decoded_arena_used_peak_bytes"] =
+	    stats.actual_transient_decoded_arena_used_peak_bytes;
+	out["actual_transient_decoded_arena_capacity_peak_bytes"] =
+	    stats.actual_transient_decoded_arena_capacity_peak_bytes;
+	out["actual_transient_ring_fixed_buffer_peak_bytes"] =
+	    stats.actual_transient_ring_fixed_buffer_peak_bytes;
+	out["actual_transient_active_schedule_peak_bytes"] =
+	    stats.actual_transient_active_schedule_peak_bytes;
+	out["actual_transient_kernel_referenced_backing_peak_bytes"] =
+	    stats.actual_transient_kernel_referenced_backing_peak_bytes;
+	out["actual_transient_total_used_high_water_bytes"] =
+	    stats.actual_transient_total_used_high_water_bytes;
+	out["actual_transient_total_allocated_high_water_bytes"] =
+	    stats.actual_transient_total_allocated_high_water_bytes;
+	out["actual_transient_memory_gate_passed"] = stats.actual_transient_memory_gate_passed;
 	out["galp_native_device_in_use_bytes"]               = stats.galp_native_device_in_use_bytes;
 	out["galp_native_device_peak_in_use_bytes"]          = stats.galp_native_device_peak_in_use_bytes;
 	out["galp_native_device_cached_bytes"]               = stats.galp_native_device_cached_bytes;
@@ -711,6 +845,18 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["planless_axis_program_count"]                   = stats.planless_axis_program_count;
 	out["planless_axis_phase_matrix_count"]              = stats.planless_axis_phase_matrix_count;
 	out["planless_axis_program_bytes"]                   = stats.planless_axis_program_bytes;
+	out["planless_axis_program_capacity_contract_bytes"] =
+	    stats.planless_axis_program_capacity_contract_bytes;
+	out["planless_axis_program_capacity_contract_complete"] =
+	    stats.planless_axis_program_capacity_contract_complete;
+	out["planless_axis_program_device_capacity_bytes"] =
+	    stats.planless_axis_program_device_capacity_bytes;
+	out["planless_axis_program_pinned_capacity_bytes"] =
+	    stats.planless_axis_program_pinned_capacity_bytes;
+	out["planless_axis_program_device_growth_count"] =
+	    stats.planless_axis_program_device_growth_count;
+	out["planless_axis_program_pinned_growth_count"] =
+	    stats.planless_axis_program_pinned_growth_count;
 	out["compact_plan_bytes"]                            = stats.compact_plan_bytes;
 	out["compact_plan_peak_bytes"]                       = stats.compact_plan_peak_bytes;
 	out["project_decoded_ycbcr_grid_launch_count"]       = stats.project_decoded_ycbcr_grid_launch_count;
@@ -780,6 +926,75 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["prefetch_consumed_as_hit_read_ms"]              = stats.prefetch_consumed_as_hit_read_ms;
 	out["prefetch_consumed_as_hit_wait_ms"]              = stats.prefetch_consumed_as_hit_wait_ms;
 	out["planning_ms"]                                   = stats.planning_ms;
+	out["plan_device_batch_ms"]                          = stats.plan_device_batch_ms;
+	out["compile_io_plan_ms"]                            = stats.compile_io_plan_ms;
+	out["reader_lookup_ms"]                              = stats.reader_lookup_ms;
+	out["descriptor_open_ms"]                            = stats.descriptor_open_ms;
+	out["schema_plan_build_ms"]                          = stats.schema_plan_build_ms;
+	out["static_metadata_wait_ms"]                       = stats.static_metadata_wait_ms;
+	out["reader_cache_hit_count"]                        = stats.reader_cache_hit_count;
+	out["reader_cache_miss_count"]                       = stats.reader_cache_miss_count;
+	out["reader_cache_eviction_count"]                   = stats.reader_cache_eviction_count;
+	out["static_metadata_cache_hit_count"]               = stats.static_metadata_cache_hit_count;
+	out["static_metadata_cache_miss_count"]              = stats.static_metadata_cache_miss_count;
+	out["descriptor_map_count"]                          = stats.descriptor_map_count;
+	out["static_metadata_wait_count"]                    = stats.static_metadata_wait_count;
+	out["parallel_reader_resolve_ms"]                    = stats.parallel_reader_resolve_ms;
+	out["parallel_reader_resolve_workers"]               = stats.parallel_reader_resolve_workers;
+	out["dynamic_image_planning_ms"]                      = stats.dynamic_image_planning_ms;
+	out["crop_geometry_planning_ms"]                      = stats.crop_geometry_planning_ms;
+	out["crop_interval_planning_ms"]                      = stats.crop_interval_planning_ms;
+	out["axis_program_planning_ms"]                       = stats.axis_program_planning_ms;
+	out["rowgroup_binding_planning_ms"]                   = stats.rowgroup_binding_planning_ms;
+	out["plan_finalize_ms"]                               = stats.plan_finalize_ms;
+	out["active_reader_count"]                           = stats.active_reader_count;
+	out["active_reader_peak_count"]                      = stats.active_reader_peak_count;
+	out["static_metadata_count"]                         = stats.static_metadata_count;
+	out["static_metadata_peak_count"]                    = stats.static_metadata_peak_count;
+	out["static_metadata_bytes"]                         = stats.static_metadata_bytes;
+	out["static_metadata_peak_bytes"]                    = stats.static_metadata_peak_bytes;
+	out["planning_unique_shard_count"]                   = stats.planning_unique_shard_count;
+	out["planning_rowgroup_binding_count"]               = stats.planning_rowgroup_binding_count;
+	out["static_metadata_prewarm_performed"]             = stats.static_metadata_prewarm_performed;
+	out["static_metadata_prewarm_ms"]                    = stats.static_metadata_prewarm_ms;
+	out["static_metadata_prewarm_shards"]                = stats.static_metadata_prewarm_shards;
+	out["static_metadata_prewarm_workers"]               = stats.static_metadata_prewarm_workers;
+	out["payload_fd_current_count"]                      = stats.payload_fd_current_count;
+	out["payload_fd_peak_count"]                         = stats.payload_fd_peak_count;
+	out["payload_fd_open_count"]                         = stats.payload_fd_open_count;
+	out["payload_fd_close_count"]                        = stats.payload_fd_close_count;
+	out["descriptor_unmap_count"]                        = stats.descriptor_unmap_count;
+	out["descriptor_mapping_current_count"]              = stats.descriptor_mapping_current_count;
+	out["descriptor_mapping_peak_count"]                 = stats.descriptor_mapping_peak_count;
+	out["descriptor_map_process_count"]                  = stats.descriptor_map_process_count;
+	out["descriptor_mapped_current_bytes"]               = stats.descriptor_mapped_current_bytes;
+	out["descriptor_mapped_peak_bytes"]                  = stats.descriptor_mapped_peak_bytes;
+	out["canonical_template_hit_count"]                  = stats.canonical_template_hit_count;
+	out["canonical_template_miss_count"]                 = stats.canonical_template_miss_count;
+	out["canonical_template_sidecar_bytes"]              = stats.canonical_template_sidecar_bytes;
+	out["canonical_template_audit_digest"]               = stats.canonical_template_audit_digest;
+	out["canonical_template_load_ms"]                    = stats.canonical_template_load_ms;
+	out["canonical_template_validation_ms"]              = stats.canonical_template_validation_ms;
+	out["sparse_recipe_reader_hit_count"]                 = stats.sparse_recipe_reader_hit_count;
+	out["sparse_recipe_reader_miss_count"]                = stats.sparse_recipe_reader_miss_count;
+	out["sparse_recipe_rowgroup_hit_count"]               = stats.sparse_recipe_rowgroup_hit_count;
+	out["sparse_recipe_rowgroup_miss_count"]              = stats.sparse_recipe_rowgroup_miss_count;
+	out["sparse_recipe_sidecar_bytes"]                    = stats.sparse_recipe_sidecar_bytes;
+	out["sparse_recipe_record_count"]                     = stats.sparse_recipe_record_count;
+	out["sparse_recipe_source_metadata_bytes"]            = stats.sparse_recipe_source_metadata_bytes;
+	out["sparse_recipe_source_metadata_pread_count"]      = stats.sparse_recipe_source_metadata_pread_count;
+	out["sparse_descriptor_open_ms"]                      = stats.sparse_descriptor_open_ms;
+	out["sparse_source_validation_ms"]                    = stats.sparse_source_validation_ms;
+	out["sparse_access_index_build_ms"]                   = stats.sparse_access_index_build_ms;
+	out["sparse_recipe_load_ms"]                          = stats.sparse_recipe_load_ms;
+	out["sparse_recipe_validation_ms"]                    = stats.sparse_recipe_validation_ms;
+	out["sparse_recipe_lookup_ms"]                        = stats.sparse_recipe_lookup_ms;
+	out["sparse_recipe_rehydrate_ms"]                     = stats.sparse_recipe_rehydrate_ms;
+	out["sparse_recipe_rehydrate_service_ms"]             = stats.sparse_recipe_rehydrate_service_ms;
+	out["sparse_recipe_rehydrate_workers"]                = stats.sparse_recipe_rehydrate_workers;
+	out["sparse_endpoint_resolution_ms"]                  = stats.sparse_endpoint_resolution_ms;
+	out["sparse_range_gather_ms"]                         = stats.sparse_range_gather_ms;
+	out["sparse_range_sort_exact_coalesce_ms"]            = stats.sparse_range_sort_exact_coalesce_ms;
 	out["host_io_staging_ms"]                            = stats.host_io_staging_ms;
 	out["host_io_staged_rowgroups"]                      = stats.host_io_staged_rowgroups;
 	out["workset_build_ms"]                              = stats.workset_build_ms;
@@ -814,6 +1029,7 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["prefetch_rowgroup_read_ms"]                     = stats.prefetch_rowgroup_read_ms;
 	out["prefetch_ready_ahead_ms"]                       = stats.prefetch_ready_ahead_ms;
 	out["sync_rowgroup_read_ms"]                         = stats.sync_rowgroup_read_ms;
+	out["compact_read_group_planning_ms"]                = stats.compact_read_group_planning_ms;
 	out["column_binding_ms"]                            = stats.column_binding_ms;
 	out["column_binding_expression_scan_count"]         = stats.column_binding_expression_scan_count;
 	out["column_binding_rowgroup_count"]                = stats.column_binding_rowgroup_count;
@@ -1074,10 +1290,10 @@ struct TorchDirectDctBatch {
 
 	[[nodiscard]] py::dict execution_stats_snapshot() const {
 		// Runtime benchmarks need the host-populated counters without turning
-		// every training step into a cudaEventSynchronize.  All counters except
-		// the completion-event-derived fixed-grid rounding duration are complete
-		// before the batch is returned; that duration remains optional in this
-		// explicitly non-blocking snapshot.
+		// every training step into a cudaEventSynchronize. Completion-event-derived
+		// decode, fixed-transform, and rounding durations remain optional in this
+		// explicitly non-blocking snapshot; execution_stats() finalizes them after
+		// the consumer has already waited for batch completion.
 		return execution_stats_to_dict(batch->execution_stats_ref());
 	}
 
@@ -1293,8 +1509,14 @@ struct TorchDirectDctPrefetchTelemetry {
 class TorchDirectDctPrefetch {
 public:
 	explicit TorchDirectDctPrefetch(std::future<TorchDirectDctBatch>                 future,
-	                                std::shared_ptr<TorchDirectDctPrefetchTelemetry> telemetry)
-	    : future_(std::move(future)), telemetry_(std::move(telemetry)) {
+	                                std::shared_ptr<TorchDirectDctPrefetchTelemetry> telemetry,
+	                                std::shared_ptr<galp::jpeg::JpegDctDeviceTransformSubmissionGate> submission_gate = nullptr)
+	    : future_(std::move(future)), telemetry_(std::move(telemetry)), submission_gate_(std::move(submission_gate)),
+	      submission_released_(submission_gate_ == nullptr) {
+	}
+
+	~TorchDirectDctPrefetch() {
+		release_submission();
 	}
 
 	[[nodiscard]] bool ready() const {
@@ -1335,21 +1557,37 @@ public:
 	}
 
 	bool cancel() noexcept {
+		release_submission();
 		int queued = 0;
 		return telemetry_->state.compare_exchange_strong(
 		    queued, 3, std::memory_order_acq_rel, std::memory_order_acquire);
+	}
+
+	bool release_submission() noexcept {
+		bool expected = false;
+		if (!submission_released_.compare_exchange_strong(
+		        expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+			return false;
+		}
+		if (submission_gate_) {
+			submission_gate_->release();
+		}
+		return true;
 	}
 
 	TorchDirectDctBatch read() {
 		if (!future_.valid()) {
 			throw std::runtime_error("DirectDctPrefetch has already been consumed");
 		}
+		release_submission();
 		return future_.get();
 	}
 
 private:
 	std::future<TorchDirectDctBatch>                 future_;
 	std::shared_ptr<TorchDirectDctPrefetchTelemetry> telemetry_;
+	std::shared_ptr<galp::jpeg::JpegDctDeviceTransformSubmissionGate> submission_gate_;
+	std::atomic<bool>                                submission_released_ {true};
 };
 
 class TorchDirectDctReader {
@@ -1391,11 +1629,15 @@ public:
 
 	std::shared_ptr<TorchDirectDctPrefetch> prefetch_batch(
 	                                                       std::vector<galp::jpeg::JpegDctImageCropRequest> requests,
-	                                                       const galp::jpeg::JpegDctDeviceBatchOptions options) {
+	                                                       galp::jpeg::JpegDctDeviceBatchOptions options) {
 		const auto               device_index = c10::cuda::current_device();
 		auto                     state_copy   = state;
 		auto                     completion   = std::make_shared<std::promise<void>>();
 		auto                     telemetry    = std::make_shared<TorchDirectDctPrefetchTelemetry>();
+		auto submission_gate = options.async_planless_completion
+		                           ? std::make_shared<galp::jpeg::JpegDctDeviceTransformSubmissionGate>()
+		                           : nullptr;
+		options.transform_submission_gate = submission_gate;
 		std::shared_future<void> predecessor;
 		{
 			std::lock_guard<std::mutex> lock(state->prefetch_mutex);
@@ -1474,7 +1716,8 @@ public:
 			completion->set_value();
 			throw;
 		}
-		return std::make_shared<TorchDirectDctPrefetch>(std::move(future), std::move(telemetry));
+		return std::make_shared<TorchDirectDctPrefetch>(
+		    std::move(future), std::move(telemetry), std::move(submission_gate));
 	}
 
 	TorchDirectDctBatch read_prefetched(const std::shared_ptr<TorchDirectDctPrefetch>& prefetch) {
@@ -1588,6 +1831,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("planning_ms", &TorchDirectDctPrefetch::planning_ms)
 	    .def_property_readonly("io_staging_ms", &TorchDirectDctPrefetch::io_staging_ms)
 	    .def_property_readonly("ordered_submission_ms", &TorchDirectDctPrefetch::ordered_submission_ms)
+	    .def("release_submission", &TorchDirectDctPrefetch::release_submission)
 	    .def("cancel", &TorchDirectDctPrefetch::cancel)
 	    .def("read",
 	         &TorchDirectDctPrefetch::read,
@@ -1625,7 +1869,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		           const bool                   enable_planless_execution,
 		           const py::object&            transforms,
 		           const std::string&           crop_execution_mode,
-		           const size_t                 decode_workset_capacity_mib) {
+		           const size_t                 decode_workset_capacity_mib,
+		           const double                 bounded_read_amplification_cap,
+		           const double                 bounded_read_local_amplification_cap,
+		           const size_t                 bounded_read_max_run_bytes) {
 		        const auto crop_box = parse_crop(crop);
 		        const auto requests = parse_transform_requests(image_ids, transforms, crop_box);
 		        const auto options  = make_batch_options(dct_coeffs,
@@ -1640,7 +1887,16 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		                                                    plan_cache_capacity,
 		                                                    enable_planless_execution,
 		                                                    decode_workset_capacity_mib,
-		                                                    crop_execution_mode);
+		                                                    crop_execution_mode,
+		                                                    "fully-overlapped",
+		                                                    0U,
+		                                                    0U,
+		                                                    false,
+		                                                    "auto",
+		                                                    false,
+		                                                    bounded_read_amplification_cap,
+		                                                    bounded_read_local_amplification_cap,
+		                                                    bounded_read_max_run_bytes);
 		        return reader.plan_batch(requests, options);
 	        },
 	        py::arg("image_ids"),
@@ -1659,7 +1915,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("enable_planless_execution") = true,
 	        py::arg("transforms")                = py::none(),
 		        py::arg("crop_execution_mode")        = "auto",
-	        py::arg("decode_workset_capacity_mib") = kDefaultDirectDctDecodeWorksetCapacityMiB)
+	        py::arg("decode_workset_capacity_mib") = kDefaultDirectDctDecodeWorksetCapacityMiB,
+	        py::arg("bounded_read_amplification_cap") = 1.0,
+	        py::arg("bounded_read_local_amplification_cap") = 0.0,
+	        py::arg("bounded_read_max_run_bytes") = 0U)
 	    .def(
 	        "prepare_batch_ms",
 	        [](TorchDirectDctReader&        reader,
@@ -1678,7 +1937,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	           const bool                   enable_planless_execution,
 	           const py::object&            transforms,
 	           const std::string&           crop_execution_mode,
-	           const size_t                 decode_workset_capacity_mib) {
+	           const size_t                 decode_workset_capacity_mib,
+	           const double                 bounded_read_amplification_cap,
+	           const double                 bounded_read_local_amplification_cap,
+	           const size_t                 bounded_read_max_run_bytes) {
 		        const auto crop_box = parse_crop(crop);
 		        const auto requests = parse_transform_requests(image_ids, transforms, crop_box);
 		        const auto options  = make_batch_options(dct_coeffs,
@@ -1693,7 +1955,16 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		                                                 plan_cache_capacity,
 		                                                 enable_planless_execution,
 		                                                 decode_workset_capacity_mib,
-		                                                 crop_execution_mode);
+		                                                 crop_execution_mode,
+		                                                 "fully-overlapped",
+		                                                 0U,
+		                                                 0U,
+		                                                 false,
+		                                                 "auto",
+		                                                 false,
+		                                                 bounded_read_amplification_cap,
+		                                                 bounded_read_local_amplification_cap,
+		                                                 bounded_read_max_run_bytes);
 		        return reader.prepare_batch_ms(requests, options);
 	        },
 	        py::arg("image_ids"),
@@ -1713,6 +1984,9 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("transforms")                = py::none(),
 	        py::arg("crop_execution_mode")        = "auto",
 	        py::arg("decode_workset_capacity_mib") = kDefaultDirectDctDecodeWorksetCapacityMiB,
+	        py::arg("bounded_read_amplification_cap") = 1.0,
+	        py::arg("bounded_read_local_amplification_cap") = 0.0,
+	        py::arg("bounded_read_max_run_bytes") = 0U,
 	        "Measure production PrepareBatch, including I/O-plan compilation, without staging storage or using CUDA.")
 	    .def(
 	        "read_batch",
@@ -1737,7 +2011,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		           const py::object&            transforms,
 		           const std::string&           crop_execution_mode,
 		           const size_t                 decode_workset_capacity_mib,
-		           const std::string&           block_major_double_buffer) {
+		           const std::string&           block_major_double_buffer,
+		           const double                 bounded_read_amplification_cap,
+		           const double                 bounded_read_local_amplification_cap,
+		           const size_t                 bounded_read_max_run_bytes) {
 		        const auto             crop_box = parse_crop(crop);
 		        auto                   requests = parse_transform_requests(image_ids, transforms, crop_box);
 		        const auto             options  = make_batch_options(dct_coeffs,
@@ -1757,7 +2034,11 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
                                                         transform_blocks_per_launch,
                                                         transform_ctas_per_launch,
 	                                                        use_low_priority_streams,
-	                                                        block_major_double_buffer);
+	                                                        block_major_double_buffer,
+	                                                        /*async_planless_completion=*/false,
+	                                                        bounded_read_amplification_cap,
+	                                                        bounded_read_local_amplification_cap,
+	                                                        bounded_read_max_run_bytes);
 		        py::gil_scoped_release release;
 		        return reader.read_batch(std::move(requests), options);
 	        },
@@ -1782,7 +2063,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		        py::arg("transforms")                 = py::none(),
 	        py::arg("crop_execution_mode")        = "auto",
 	        py::arg("decode_workset_capacity_mib") = kDefaultDirectDctDecodeWorksetCapacityMiB,
-	        py::arg("block_major_double_buffer")   = "auto")
+	        py::arg("block_major_double_buffer")   = "auto",
+	        py::arg("bounded_read_amplification_cap") = 1.0,
+	        py::arg("bounded_read_local_amplification_cap") = 0.0,
+	        py::arg("bounded_read_max_run_bytes") = 0U)
 	    .def(
 	        "prefetch_batch",
 	        [](TorchDirectDctReader& reader,
@@ -1802,11 +2086,15 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	           const std::string&    scheduling_policy,
 	           const size_t          transform_blocks_per_launch,
 	           const size_t          transform_ctas_per_launch,
-		           const bool            use_low_priority_streams,
-		           const py::object&     transforms,
-		           const std::string&    crop_execution_mode,
+	           const bool            use_low_priority_streams,
+	           const py::object&     transforms,
+	           const std::string&    crop_execution_mode,
 		           const size_t          decode_workset_capacity_mib,
-		           const std::string&    block_major_double_buffer) {
+		           const std::string&    block_major_double_buffer,
+		           const bool            async_planless_completion,
+		           const double          bounded_read_amplification_cap,
+		           const double          bounded_read_local_amplification_cap,
+		           const size_t          bounded_read_max_run_bytes) {
 		        const auto crop_box = parse_crop(crop);
 		        auto       requests = parse_transform_requests(image_ids, transforms, crop_box);
 		        const auto options  = make_batch_options(dct_coeffs,
@@ -1824,9 +2112,13 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		                                                    crop_execution_mode,
 	                                                        scheduling_policy,
                                                         transform_blocks_per_launch,
-                                                        transform_ctas_per_launch,
+	                                                        transform_ctas_per_launch,
 	                                                        use_low_priority_streams,
-	                                                        block_major_double_buffer);
+	                                                        block_major_double_buffer,
+	                                                        async_planless_completion,
+	                                                        bounded_read_amplification_cap,
+	                                                        bounded_read_local_amplification_cap,
+	                                                        bounded_read_max_run_bytes);
 		        return reader.prefetch_batch(std::move(requests), options);
 	        },
 	        py::arg("image_ids"),
@@ -1850,7 +2142,11 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		        py::arg("transforms")                 = py::none(),
 	        py::arg("crop_execution_mode")        = "auto",
 	        py::arg("decode_workset_capacity_mib") = kDefaultDirectDctDecodeWorksetCapacityMiB,
-	        py::arg("block_major_double_buffer")   = "auto")
+	        py::arg("block_major_double_buffer")   = "auto",
+	        py::arg("async_planless_completion")   = false,
+	        py::arg("bounded_read_amplification_cap") = 1.0,
+	        py::arg("bounded_read_local_amplification_cap") = 0.0,
+	        py::arg("bounded_read_max_run_bytes") = 0U)
 	    .def(
 	        "read_batch_async",
 	        [](TorchDirectDctReader& reader,
@@ -1869,7 +2165,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		           const bool            enable_planless_execution,
 		           const py::object&     transforms,
 		           const std::string&    crop_execution_mode,
-		           const size_t          decode_workset_capacity_mib) {
+		           const size_t          decode_workset_capacity_mib,
+		           const double          bounded_read_amplification_cap,
+		           const double          bounded_read_local_amplification_cap,
+		           const size_t          bounded_read_max_run_bytes) {
 		        const auto crop_box = parse_crop(crop);
 		        auto       requests = parse_transform_requests(image_ids, transforms, crop_box);
 		        const auto options  = make_batch_options(dct_coeffs,
@@ -1884,7 +2183,16 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		                                                    plan_cache_capacity,
 		                                                    enable_planless_execution,
 		                                                    decode_workset_capacity_mib,
-		                                                    crop_execution_mode);
+		                                                    crop_execution_mode,
+		                                                    "fully-overlapped",
+		                                                    0U,
+		                                                    0U,
+		                                                    false,
+		                                                    "auto",
+		                                                    false,
+		                                                    bounded_read_amplification_cap,
+		                                                    bounded_read_local_amplification_cap,
+		                                                    bounded_read_max_run_bytes);
 		        return reader.prefetch_batch(std::move(requests), options);
 	        },
 	        py::arg("image_ids"),
@@ -1903,7 +2211,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("enable_planless_execution") = true,
 		        py::arg("transforms")                = py::none(),
 		        py::arg("crop_execution_mode")        = "auto",
-		        py::arg("decode_workset_capacity_mib") = kDefaultDirectDctDecodeWorksetCapacityMiB)
+		        py::arg("decode_workset_capacity_mib") = kDefaultDirectDctDecodeWorksetCapacityMiB,
+		        py::arg("bounded_read_amplification_cap") = 1.0,
+		        py::arg("bounded_read_local_amplification_cap") = 0.0,
+		        py::arg("bounded_read_max_run_bytes") = 0U)
 	    .def("read_prefetched",
 	         &TorchDirectDctReader::read_prefetched,
 	         py::arg("prefetch"),

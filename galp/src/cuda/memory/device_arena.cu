@@ -36,8 +36,11 @@ std::uintptr_t DeviceArena::checked_ptr_end(const std::uintptr_t begin, const si
 	return begin + bytes;
 }
 
-size_t DeviceArena::align_staged_offset(const size_t value) {
-	return checked_add(value, 255U, "DeviceArena staged offset overflow") & ~size_t(255U);
+size_t DeviceArena::align_staged_offset(const size_t value, const size_t alignment) {
+	if (alignment == 0U || (alignment & (alignment - 1U)) != 0U) {
+		throw std::invalid_argument("DeviceArena staged alignment must be a non-zero power of two");
+	}
+	return checked_add(value, alignment - 1U, "DeviceArena staged offset overflow") & ~(alignment - 1U);
 }
 
 DeviceArena::DeviceArena(cudaStream_t stream)
@@ -58,19 +61,81 @@ void DeviceArena::register_backing(const void* base, size_t bytes, const bool up
 	}
 	(void)checked_ptr_end(reinterpret_cast<std::uintptr_t>(base), bytes, "DeviceArena backing range overflow");
 	const auto* b = reinterpret_cast<const std::byte*>(base);
-	for (const auto& r : regions_) {
+	for (size_t index = regions_.size(); index > 0; --index) {
+		const auto& r = regions_[index - 1U];
 		if (r.base == b && r.bytes == bytes) {
 			if (r.upload != upload) {
 				throw std::invalid_argument("DeviceArena backing registered with conflicting upload policies");
 			}
+			last_region_index_ = index - 1U;
 			return;
 		}
 	}
 	regions_.push_back(BackingRegion {b, bytes, bytes, 0, upload});
+	last_region_index_ = regions_.size() - 1U;
+	index_new_region(last_region_index_);
+}
+
+void DeviceArena::index_new_region(const size_t region_index) {
+	const auto begin = reinterpret_cast<std::uintptr_t>(regions_.at(region_index).base);
+	const auto end = checked_ptr_end(begin, regions_[region_index].bytes, "DeviceArena backing range overflow");
+	const auto position = std::lower_bound(region_order_.begin(),
+	                                       region_order_.end(),
+	                                       begin,
+	                                       [&](const size_t existing, const std::uintptr_t address) {
+		                                       return reinterpret_cast<std::uintptr_t>(regions_[existing].base) < address;
+	                                       });
+	if (position != region_order_.begin()) {
+		const auto previous = *(position - 1);
+		const auto previous_begin = reinterpret_cast<std::uintptr_t>(regions_[previous].base);
+		const auto previous_end = checked_ptr_end(
+		    previous_begin, regions_[previous].bytes, "DeviceArena backing range overflow");
+		regions_disjoint_ = regions_disjoint_ && previous_end <= begin;
+	}
+	if (position != region_order_.end()) {
+		const auto next_begin = reinterpret_cast<std::uintptr_t>(regions_[*position].base);
+		regions_disjoint_ = regions_disjoint_ && end <= next_begin;
+	}
+	region_order_.insert(position, region_index);
+}
+
+void DeviceArena::rebuild_region_index() {
+	region_order_.clear();
+	region_order_.reserve(regions_.size());
+	regions_disjoint_ = true;
+	for (size_t region_index = 0U; region_index < regions_.size(); ++region_index) {
+		index_new_region(region_index);
+	}
 }
 
 void DeviceArena::coalesce_backing_regions() {
 	if (regions_.size() <= 1) {
+		return;
+	}
+
+	// The Compact-v3 reader normally registers one already-disjoint pinned
+	// buffer per source shard. Sorting those regions cannot coalesce anything,
+	// but it invalidates every entry's region index and forces a full re-scan of
+	// the (much larger) codec-entry list. Detect that common case while the
+	// region set is still small and keep the existing indices intact.
+	bool has_mergeable_regions = false;
+	for (size_t lhs = 0; lhs < regions_.size() && !has_mergeable_regions; ++lhs) {
+		const auto lhs_begin = reinterpret_cast<std::uintptr_t>(regions_[lhs].base);
+		const auto lhs_end = checked_ptr_end(lhs_begin, regions_[lhs].bytes, "DeviceArena backing range overflow");
+		for (size_t rhs = lhs + 1U; rhs < regions_.size(); ++rhs) {
+			if (regions_[lhs].upload != regions_[rhs].upload) {
+				continue;
+			}
+			const auto rhs_begin = reinterpret_cast<std::uintptr_t>(regions_[rhs].base);
+			const auto rhs_end =
+			    checked_ptr_end(rhs_begin, regions_[rhs].bytes, "DeviceArena backing range overflow");
+			if (lhs_begin <= rhs_end && rhs_begin <= lhs_end) {
+				has_mergeable_regions = true;
+				break;
+			}
+		}
+	}
+	if (!has_mergeable_regions) {
 		return;
 	}
 
@@ -102,6 +167,8 @@ void DeviceArena::coalesce_backing_regions() {
 	}
 
 	regions_ = std::move(merged);
+	rebuild_region_index();
+	last_region_index_ = static_cast<size_t>(-1);
 	for (auto& e : entries_) {
 		if (e.region_idx < 0) {
 			continue;
@@ -143,6 +210,9 @@ void DeviceArena::reset(const bool preserve_capacity) {
 	entries_.clear();
 	staged_entry_indices_.clear();
 	regions_.clear();
+	region_order_.clear();
+	regions_disjoint_ = true;
+	last_region_index_ = static_cast<size_t>(-1);
 	resolvers_.clear();
 	resolver_targets_.clear();
 }
@@ -162,6 +232,9 @@ ArenaUploadMetrics DeviceArena::upload(bool resolve_before_pack, bool backing_re
 	const auto finalize = [&]() {
 		run_deferred_frees();
 		regions_.clear();
+		region_order_.clear();
+		regions_disjoint_ = true;
+		last_region_index_ = static_cast<size_t>(-1);
 	};
 
 	if (entries_.empty()) {
@@ -339,23 +412,6 @@ void DeviceArena::run_resolvers() {
 		fn();
 	}
 	resolvers_.clear();
-}
-
-int DeviceArena::find_region(const void* host_src, size_t bytes) const {
-	if (host_src == nullptr || bytes == 0 || regions_.empty()) {
-		return -1;
-	}
-	const auto src     = reinterpret_cast<std::uintptr_t>(host_src);
-	const auto src_end = checked_ptr_end(src, bytes, "DeviceArena source range overflow");
-	for (size_t i = 0; i < regions_.size(); ++i) {
-		const auto& r        = regions_[i];
-		const auto  base     = reinterpret_cast<std::uintptr_t>(r.base);
-		const auto  base_end = checked_ptr_end(base, r.bytes, "DeviceArena backing range overflow");
-		if (src >= base && src_end <= base_end) {
-			return static_cast<int>(i);
-		}
-	}
-	return -1;
 }
 
 bool DeviceArena::ensure_capacity(const size_t alloc_bytes) {

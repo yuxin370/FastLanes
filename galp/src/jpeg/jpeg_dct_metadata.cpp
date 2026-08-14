@@ -562,6 +562,15 @@ JpegDctShardManifest read_jpeg_dct_shard_manifest_file(const std::filesystem::pa
 			throw std::runtime_error("JPEG DCT Compact v3 extension has trailing bytes");
 		}
 	}
+	// Manifest v1/v2 predate the explicit layout string carried by the v3
+	// extension. Normalize their version-defined layouts at the reader boundary
+	// so consumers cannot accidentally treat an empty legacy field as an
+	// unknown or different physical layout.
+	if (manifest.version == 1U && manifest.physical_layout.empty()) {
+		manifest.physical_layout = "dct-major/spatial-major-image-minor";
+	} else if (manifest.version == 2U && manifest.physical_layout.empty()) {
+		manifest.physical_layout = "image-major";
+	}
 	return manifest;
 }
 

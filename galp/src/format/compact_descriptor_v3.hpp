@@ -115,6 +115,17 @@ struct CompactV3PayloadAudit {
 	}
 };
 
+struct CompactDescriptorV3MappingStats {
+	size_t current_mapping_count = 0U;
+	size_t peak_mapping_count    = 0U;
+	size_t map_count             = 0U;
+	size_t unmap_count           = 0U;
+	size_t current_mapped_bytes  = 0U;
+	size_t peak_mapped_bytes     = 0U;
+};
+
+[[nodiscard]] CompactDescriptorV3MappingStats compact_descriptor_v3_mapping_stats() noexcept;
+
 class CompactDescriptorV3 {
 public:
 	static CompactDescriptorV3 Open(const std::filesystem::path& shard_path);
@@ -135,6 +146,10 @@ public:
 	[[nodiscard]] size_t   image_count() const noexcept;
 	[[nodiscard]] size_t   schema_count() const noexcept;
 	[[nodiscard]] size_t   descriptor_bytes() const noexcept;
+	// Drop resident file-backed descriptor pages after validation/prewarm while
+	// preserving the immutable mapping and all pointer identities. Pages needed
+	// by a later rowgroup fault back in from the verified file.
+	void release_resident_pages() const noexcept;
 
 	[[nodiscard]] CompactV3RowgroupRecord                rowgroup(size_t rowgroup_index) const;
 	[[nodiscard]] CompactV3ImageRecord                   image(size_t image_index) const;

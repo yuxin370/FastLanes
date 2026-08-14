@@ -111,6 +111,10 @@ struct JpegDctBlockMajorCompactPlanStats {
 	uint64_t selected_rowgroups             = 0U;
 	uint64_t selected_vector_runs           = 0U;
 	uint64_t selected_vectors               = 0U;
+	uint64_t duplicate_physical_read_count  = 0U;
+	uint64_t rowgroup_revisit_count         = 0U;
+	uint64_t vector_run_revisit_count       = 0U;
+	uint64_t physical_read_order_inversions = 0U;
 	uint64_t touched_rank_cells             = 0U;
 	uint64_t rank_payload_bytes             = 0U;
 	uint64_t touched_quant_tables           = 0U;
@@ -118,6 +122,12 @@ struct JpegDctBlockMajorCompactPlanStats {
 	uint64_t global_transform_sort_items    = 0U;
 	uint64_t compact_plan_bytes             = 0U;
 	uint64_t compact_plan_peak_bytes        = 0U;
+	uint64_t canonical_template_hit_count   = 0U;
+	uint64_t canonical_template_miss_count  = 0U;
+	uint64_t canonical_template_sidecar_bytes = 0U;
+	uint64_t canonical_template_audit_digest  = 0U;
+	double   canonical_template_load_ms       = 0.0;
+	double   canonical_template_validation_ms = 0.0;
 	bool     input_was_shard_local_monotonic = false;
 };
 
@@ -135,6 +145,15 @@ struct JpegDctBlockMajorCompactPlan {
 	JpegDctBlockMajorCompactPlanStats stats;
 };
 
+struct JpegDctCanonicalPlanTemplateWriteStats {
+	uint64_t sidecar_bytes       = 0U;
+	uint64_t plan_audit_digest   = 0U;
+	uint64_t request_count       = 0U;
+	uint64_t rowgroup_count      = 0U;
+	uint64_t vector_run_count    = 0U;
+	bool     reused_existing     = false;
+};
+
 class JpegDctBlockMajorCompactPlanner {
 public:
 	JpegDctBlockMajorCompactPlanner(const std::filesystem::path& manifest_path,
@@ -147,6 +166,8 @@ public:
 	JpegDctBlockMajorCompactPlanner& operator=(JpegDctBlockMajorCompactPlanner&&) noexcept;
 
 	[[nodiscard]] uint64_t image_count() const noexcept;
+	[[nodiscard]] std::filesystem::path source_fls_path(uint32_t shard_id) const;
+	[[nodiscard]] uint64_t source_payload_crc64(uint32_t shard_id) const;
 	[[nodiscard]] size_t   loaded_descriptor_count() const noexcept;
 	[[nodiscard]] uint64_t loaded_descriptor_bytes() const noexcept;
 	[[nodiscard]] uint64_t descriptor_cache_byte_bound() const noexcept;
@@ -155,11 +176,19 @@ public:
 	[[nodiscard]] JpegDctBlockMajorCompactPlan Plan(
 	    const std::vector<JpegDctImageCropRequest>& requests,
 	    const std::optional<JpegDctGridTransformSpec>& grid_transform = std::nullopt) const;
+	[[nodiscard]] JpegDctCanonicalPlanTemplateWriteStats WriteCanonicalShardPlanTemplate(
+	    uint32_t shard_id,
+	    const JpegDctGridTransformSpec& transform,
+	    const std::filesystem::path& output_directory) const;
 
 private:
 	struct Impl;
 	std::unique_ptr<Impl> impl_;
 };
+
+[[nodiscard]] std::filesystem::path canonical_shard_crop_plan_template_path(
+	const std::filesystem::path& directory,
+	uint32_t shard_id);
 
 } // namespace galp::jpeg
 

@@ -74,6 +74,15 @@ struct WorksetSlots {
 	std::optional<GPUArray<galp::execution::MixedWorkSlot>> owned_scalar_tail;
 	galp::execution::MixedWorkSlot*                         d = nullptr;
 	galp::execution::MixedWorkSlot*                         d_scalar_tail = nullptr;
+
+	void reserve_host_slots(const size_t mixed_required, const size_t scalar_tail_required) {
+		if (mixed_required > mixed.capacity()) {
+			mixed.reserve(mixed_required);
+		}
+		if (scalar_tail_required > scalar_tail_mixed.capacity()) {
+			scalar_tail_mixed.reserve(scalar_tail_required);
+		}
+	}
 };
 
 struct WorksetTransfer {

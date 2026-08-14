@@ -67,6 +67,7 @@ struct RowgroupReadResult {
 	size_t                 rowgroup_index = 0;
 	galp::format::Rowgroup       rowgroup {};
 	size_t                 storage_bytes = 0;
+	size_t                 selected_storage_bytes = 0;
 	size_t                 full_storage_bytes = 0;
 	size_t                 pread_count = 0;
 	bool                   sparse_read_supported = false;

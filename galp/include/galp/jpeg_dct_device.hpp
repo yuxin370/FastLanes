@@ -6,10 +6,12 @@
 #if GALP_WITH_JPEG_DCT
 
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -23,6 +25,7 @@ inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchDepth            = 
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchWorkers          = 1;
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches = 2;
 inline constexpr size_t kDefaultJpegDctDeviceDecodeWorksetCapacityBytes       = size_t {512U} * 1024U * 1024U;
+inline constexpr uint32_t kDefaultJpegDctBoundedIoUringQueueDepth              = 256U;
 
 class JpegDctShardDatasetReader;
 struct JpegDctDeviceCacheStats;
@@ -143,6 +146,30 @@ enum class JpegDctCropExecutionMode {
 	kFullRowgroupDecode,
 	kRowgroupReadSelectedDecode,
 	kVectorRangeReadSelectedDecode,
+	kBoundedRangeReadSelectedDecode,
+	kBoundedIoUringRangeReadSelectedDecode,
+	kBoundedIoUringScheduledRangeReadSelectedDecode,
+};
+
+class JpegDctDeviceTransformSubmissionGate {
+public:
+	void release() {
+		{
+			std::lock_guard lock(mutex_);
+			released_ = true;
+		}
+		ready_.notify_all();
+	}
+
+	void wait() {
+		std::unique_lock lock(mutex_);
+		ready_.wait(lock, [this] { return released_; });
+	}
+
+private:
+	std::mutex              mutex_;
+	std::condition_variable ready_;
+	bool                    released_ = false;
 };
 
 struct JpegDctDeviceBatchOptions {
@@ -161,10 +188,18 @@ struct JpegDctDeviceBatchOptions {
 	size_t                      transform_blocks_per_launch = 0;
 	size_t                      transform_ctas_per_launch   = 0;
 	bool                        use_low_priority_streams    = false;
+	bool                        async_planless_completion   = false;
+	std::shared_ptr<JpegDctDeviceTransformSubmissionGate> transform_submission_gate;
 	JpegDctBlockMajorDoubleBufferPolicy block_major_double_buffer_policy =
 	    JpegDctBlockMajorDoubleBufferPolicy::kAutomatic;
 	JpegDctCropExecutionMode    crop_execution_mode         = JpegDctCropExecutionMode::kAutomatic;
 	size_t                      decode_workset_capacity_bytes = kDefaultJpegDctDeviceDecodeWorksetCapacityBytes;
+	// Integer millionths keep cap-boundary decisions deterministic.  A value
+	// of 1'020'000 is amplification 1.02.  Zero local cap inherits the global
+	// whole-run/per-shard cap.  The implementation rejects values above 1.10.
+	uint32_t                    bounded_read_amplification_ppm = 1'000'000U;
+	uint32_t                    bounded_read_local_amplification_ppm = 0U;
+	size_t                      bounded_read_max_run_bytes = 0U;
 };
 
 struct JpegDctDeviceImageLayout {
@@ -250,6 +285,11 @@ struct JpegDctDeviceBatchPlanPreview {
 	size_t                                     decode_workset_capacity_bytes               = 0U;
 	size_t                                     estimated_max_decode_workset_bytes           = 0U;
 	size_t                                     estimated_oversized_decode_rowgroups         = 0U;
+	// Dataset-layout-derived upper bound for all planless rational-axis
+	// programs accepted by this transform. A complete contract can be reserved
+	// on the first execution independently of which crops happen to warm up.
+	size_t                                     planless_axis_program_capacity_contract_bytes = 0U;
+	bool                                       planless_axis_program_capacity_contract_complete = false;
 };
 
 struct JpegDctDeviceBatchPlanEstimate {

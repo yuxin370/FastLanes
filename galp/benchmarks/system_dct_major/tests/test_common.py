@@ -15,6 +15,7 @@ if str(BENCHMARK_ROOT) not in sys.path:
 from common import (  # noqa: E402
     SAMPLE_MANIFEST_SCHEMA,
     chunked,
+    collect_sequential_samples,
     load_sample_manifest,
     manifest_snapshot,
     parse_manifest,
@@ -169,6 +170,39 @@ class CommonTest(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "not sequential"):
                 load_sample_manifest(path)
+
+    def test_collect_samples_preserves_logical_ids_for_symlink_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.JPEG"
+            source.write_bytes(b"jpeg-placeholder")
+            logical = root / "prefix" / "val" / "n00000001" / "sample.JPEG"
+            logical.parent.mkdir(parents=True)
+            logical.symlink_to(source)
+            labels = root / "labels.json"
+            labels.write_text(
+                json.dumps(
+                    {
+                        "format": "galp_rgbnomore_label_map_v1",
+                        "image_count": 1,
+                        "labels": [7],
+                        "sample_ids": ["val/n00000001/sample.JPEG"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            samples, _ = collect_sequential_samples(
+                data_root=root / "prefix",
+                split="val",
+                label_map_json=labels,
+                expected_images=1,
+                sample_count=1,
+                hash_samples=False,
+            )
+
+            self.assertEqual(samples[0]["sample_id"], "val/n00000001/sample.JPEG")
+            self.assertEqual(samples[0]["path"], str(source.resolve()))
 
     def test_chunk_and_trace_preserve_partial_tail(self) -> None:
         samples = [

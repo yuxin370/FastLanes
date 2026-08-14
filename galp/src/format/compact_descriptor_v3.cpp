@@ -12,6 +12,7 @@
 #include "fls/io/file.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +55,34 @@ constexpr size_t   kRowgroupRecordBytes    = 48U;
 constexpr size_t   kCoefficientRecordBytes = 8U;
 constexpr size_t   kMaxColumnDepth         = 128U;
 constexpr size_t   kMaxDecodedPageBytes    = 64U * 1024U * 1024U;
+
+std::atomic<size_t> g_compact_mapping_count {0U};
+std::atomic<size_t> g_compact_mapping_peak {0U};
+std::atomic<size_t> g_compact_map_count {0U};
+std::atomic<size_t> g_compact_unmap_count {0U};
+std::atomic<size_t> g_compact_mapped_bytes {0U};
+std::atomic<size_t> g_compact_mapped_bytes_peak {0U};
+
+void update_peak(std::atomic<size_t>& peak_value, const size_t value) noexcept {
+	auto peak = peak_value.load(std::memory_order_relaxed);
+	while (value > peak &&
+	       !peak_value.compare_exchange_weak(peak, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+	}
+}
+
+void record_compact_mapping(const size_t bytes) noexcept {
+	const auto mappings = g_compact_mapping_count.fetch_add(1U, std::memory_order_relaxed) + 1U;
+	const auto mapped_bytes = g_compact_mapped_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+	g_compact_map_count.fetch_add(1U, std::memory_order_relaxed);
+	update_peak(g_compact_mapping_peak, mappings);
+	update_peak(g_compact_mapped_bytes_peak, mapped_bytes);
+}
+
+void record_compact_unmapping(const size_t bytes) noexcept {
+	g_compact_mapping_count.fetch_sub(1U, std::memory_order_relaxed);
+	g_compact_mapped_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+	g_compact_unmap_count.fetch_add(1U, std::memory_order_relaxed);
+}
 
 struct Section {
 	uint64_t offset = 0U;
@@ -705,6 +734,7 @@ struct CompactDescriptorV3::Impl {
 	~Impl() {
 		if (mapping != MAP_FAILED) {
 			::munmap(mapping, mapping_size);
+			record_compact_unmapping(mapping_size);
 		}
 	}
 
@@ -787,6 +817,15 @@ CompactDescriptorV3::CompactDescriptorV3(CompactDescriptorV3&&) noexcept        
 CompactDescriptorV3& CompactDescriptorV3::operator=(CompactDescriptorV3&&) noexcept = default;
 CompactDescriptorV3::~CompactDescriptorV3()                                         = default;
 
+CompactDescriptorV3MappingStats compact_descriptor_v3_mapping_stats() noexcept {
+	return {g_compact_mapping_count.load(std::memory_order_relaxed),
+	        g_compact_mapping_peak.load(std::memory_order_relaxed),
+	        g_compact_map_count.load(std::memory_order_relaxed),
+	        g_compact_unmap_count.load(std::memory_order_relaxed),
+	        g_compact_mapped_bytes.load(std::memory_order_relaxed),
+	        g_compact_mapped_bytes_peak.load(std::memory_order_relaxed)};
+}
+
 CompactDescriptorV3 CompactDescriptorV3::Open(const std::filesystem::path& shard_path) {
 	fastlanes::File       file(shard_path);
 	fastlanes::FileFooter footer {};
@@ -834,6 +873,7 @@ CompactDescriptorV3 CompactDescriptorV3::Open(const std::filesystem::path& shard
 	auto impl          = std::make_unique<Impl>();
 	impl->mapping      = mapping;
 	impl->mapping_size = static_cast<size_t>(map_bytes);
+	record_compact_mapping(impl->mapping_size);
 	impl->data         = static_cast<const uint8_t*>(mapping) + static_cast<size_t>(delta);
 	impl->size         = checked_size(footer.table_descriptor_size, "descriptor size");
 	const auto* data   = impl->data;
@@ -1078,7 +1118,6 @@ CompactDescriptorV3 CompactDescriptorV3::Open(const std::filesystem::path& shard
 	if (impl->images == 0U && impl->components != 0U) {
 		fail("component directory requires an image directory");
 	}
-
 	CompactDescriptorV3 result(std::move(impl));
 	for (size_t rowgroup_index = 0U; rowgroup_index < result.rowgroup_count(); ++rowgroup_index) {
 		if (result.rowgroup(rowgroup_index).payload_size == 0U) {
@@ -1114,6 +1153,14 @@ size_t CompactDescriptorV3::schema_count() const noexcept {
 }
 size_t CompactDescriptorV3::descriptor_bytes() const noexcept {
 	return impl_->size;
+}
+
+void CompactDescriptorV3::release_resident_pages() const noexcept {
+#if defined(MADV_DONTNEED)
+	if (impl_ != nullptr && impl_->mapping != MAP_FAILED && impl_->mapping_size != 0U) {
+		(void)::madvise(impl_->mapping, impl_->mapping_size, MADV_DONTNEED);
+	}
+#endif
 }
 
 CompactV3RowgroupRecord CompactDescriptorV3::rowgroup(const size_t rowgroup_index) const {

@@ -1908,6 +1908,8 @@ TEST(JpegDct, CanonicalImageMajorFixedGridUsesCompactPlanlessDescriptors) {
 	EXPECT_EQ(preview.host_output_block_source_lists_created, 0U);
 	EXPECT_EQ(preview.host_global_transform_sort_items, 0U);
 	EXPECT_FALSE(preview.exact_batch_plan_cache_enabled);
+	EXPECT_TRUE(preview.planless_axis_program_capacity_contract_complete);
+	EXPECT_GT(preview.planless_axis_program_capacity_contract_bytes, preview.planless_axis_program_bytes);
 	// The formal v3-capable locator also retains each image's vector-rowgroup
 	// count and exact pixel dimensions for image-local binding and crop mapping.
 	EXPECT_EQ(preview.compact_reader_image_locator_bytes, 2U * 32U);
@@ -1956,6 +1958,11 @@ TEST(JpegDct, CanonicalImageMajorFixedGridUsesCompactPlanlessDescriptors) {
 	EXPECT_TRUE(random_crop_preview.uses_planless_fixed_transform);
 	EXPECT_EQ(random_crop_preview.compact_image_descriptor_count, random_crop_requests.size());
 	EXPECT_TRUE(random_crop_preview.block_metadata.empty());
+	EXPECT_TRUE(random_crop_preview.planless_axis_program_capacity_contract_complete);
+	EXPECT_EQ(random_crop_preview.planless_axis_program_capacity_contract_bytes,
+	          preview.planless_axis_program_capacity_contract_bytes);
+	EXPECT_GE(random_crop_preview.planless_axis_program_capacity_contract_bytes,
+	          random_crop_preview.planless_axis_program_bytes);
 	EXPECT_GT(random_crop_preview.planned_selected_vector_count, 0U);
 	EXPECT_LT(random_crop_preview.planned_selected_vector_count, random_crop_preview.full_vector_count);
 	// 536 source pixels map to 67 luma blocks in this 1024-pixel fixture.
@@ -1966,6 +1973,11 @@ TEST(JpegDct, CanonicalImageMajorFixedGridUsesCompactPlanlessDescriptors) {
 	const auto large_factor_preview = reader.PlanDeviceDctBatch(large_factor_requests, vector_crop_options);
 	EXPECT_TRUE(large_factor_preview.uses_planless_fixed_transform);
 	EXPECT_EQ(large_factor_preview.host_expanded_transform_items_created, 0U);
+	EXPECT_TRUE(large_factor_preview.planless_axis_program_capacity_contract_complete);
+	EXPECT_EQ(large_factor_preview.planless_axis_program_capacity_contract_bytes,
+	          preview.planless_axis_program_capacity_contract_bytes);
+	EXPECT_GE(large_factor_preview.planless_axis_program_capacity_contract_bytes,
+	          large_factor_preview.planless_axis_program_bytes);
 	const auto cross_thread_large_factor_preview = std::async(std::launch::async, [&] {
 		galp::jpeg::JpegDctShardDatasetReader thread_reader(output_dir / "manifest.bin");
 		return thread_reader.PlanDeviceDctBatch(large_factor_requests, vector_crop_options);

@@ -63,6 +63,9 @@ JpegDctDeviceBatch JpegDctDeviceHostBridge::Execute(JpegDctDeviceBatchPlan      
 		impl_->execution_fence = make_jpeg_dct_device_execution_fence();
 	}
 	wait_jpeg_dct_device_execution_fence(*impl_->execution_fence);
+	if (impl_->scratch) {
+		prepare_jpeg_dct_device_scratch_for_reuse(*impl_->scratch);
+	}
 	impl_->AttachRuntimeResources(plan, options);
 	auto batch = execute_jpeg_dct_device_batch_plan(std::move(plan), impl_->execution_fence.get());
 	return batch;

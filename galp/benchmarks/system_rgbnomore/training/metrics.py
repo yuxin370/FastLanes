@@ -122,8 +122,18 @@ def parameter_update_summary(before: dict[str, Any], model: Any) -> dict[str, An
 
 
 def process_memory() -> dict[str, int | None]:
+    """Return process-lifetime memory plus point-in-time FD/mapping gauges.
+
+    The extra gauges make long training repeats able to distinguish native
+    pool reuse from resource leakage.  They are best-effort on non-Linux
+    hosts, preserving the previous ``None`` behavior when procfs is absent.
+    """
     rss = None
     peak = None
+    virtual = None
+    threads = None
+    open_fds = None
+    mappings = None
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as stream:
             for line in stream:
@@ -131,9 +141,44 @@ def process_memory() -> dict[str, int | None]:
                     rss = int(line.split()[1]) * 1024
                 elif line.startswith("VmHWM:"):
                     peak = int(line.split()[1]) * 1024
+                elif line.startswith("VmSize:"):
+                    virtual = int(line.split()[1]) * 1024
+                elif line.startswith("Threads:"):
+                    threads = int(line.split()[1])
     except OSError:
         pass
-    return {"rss_bytes": rss, "peak_rss_bytes": peak}
+    try:
+        # The transient directory descriptor used by listdir is already closed
+        # when readlink runs.  Its stale entry is therefore naturally excluded.
+        fd_root = "/proc/self/fd"
+        open_fds = sum(
+            1
+            for name in os.listdir(fd_root)
+            if _proc_fd_entry_exists(fd_root, name)
+        )
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/maps", "r", encoding="utf-8") as stream:
+            mappings = sum(1 for _ in stream)
+    except OSError:
+        pass
+    return {
+        "rss_bytes": rss,
+        "peak_rss_bytes": peak,
+        "virtual_memory_bytes": virtual,
+        "thread_count": threads,
+        "open_fd_count": open_fds,
+        "memory_mapping_count": mappings,
+    }
+
+
+def _proc_fd_entry_exists(root: str, name: str) -> bool:
+    try:
+        os.readlink(os.path.join(root, name))
+    except OSError:
+        return False
+    return True
 
 
 def topk_accuracy(logits: Any, labels: Any, topk: Iterable[int] = (1, 5)) -> dict[str, float]:

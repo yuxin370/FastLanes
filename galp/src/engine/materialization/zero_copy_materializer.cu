@@ -641,7 +641,11 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 		}
 	}
 	out.backing_storage = std::move(storage);
+	out.backing_storage_capacity_bytes = zero_copy.backing_capacity_bytes;
 	out.packed_device_payload = std::move(zero_copy.packed_device_payload);
+	if (out.packed_device_payload) {
+		out.backing_storage_capacity_bytes += out.packed_device_payload->packed_capacity_bytes;
+	}
 	return out;
 }
 
@@ -657,6 +661,8 @@ void release_transient_materialized_rowgroup(Rowgroup& rowgroup) {
 	}
 	rowgroup.columns.clear();
 	rowgroup.backing_storage.reset();
+	rowgroup.backing_storage_capacity_bytes = 0U;
+	rowgroup.transient_memory_accounting.reset();
 	rowgroup.materialized_column_indices.clear();
 	rowgroup.packed_device_payload.reset();
 }

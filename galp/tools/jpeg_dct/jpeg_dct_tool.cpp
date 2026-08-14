@@ -590,7 +590,7 @@ bool parse_args(const int argc, char** argv, Options& options) {
 			options.verify_workers = parse_size_arg(arg, argv[++i]);
 			if (options.verify_workers == 0U ||
 			    options.verify_workers > galp::jpeg::kMaxJpegDctExactVerificationWorkers) {
-				throw std::runtime_error("--verify-workers must be in [1, 16]");
+				throw std::runtime_error("--verify-workers must be in [1, 32]");
 			}
 			continue;
 		}

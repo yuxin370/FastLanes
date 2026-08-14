@@ -269,6 +269,12 @@ class PipelineAdapter:
     ) -> LoadedBatch:
         raise NotImplementedError
 
+    def after_model_complete(self) -> None:
+        """Release GPU work intentionally serialized after the current model."""
+
+    def finalize_batch_metrics(self, batch: LoadedBatch) -> None:
+        """Collect audit-only metrics outside the timed loader/model interval."""
+
     def end_repeat(self) -> None:
         self._iterator = None
 
@@ -554,9 +560,12 @@ class GalpAdapter(PipelineAdapter):
         )
         self.batch_size = int(contract["execution"]["batch_size"])
         self.batch_prefetch_depth = int(config.get("batch_prefetch_depth", 2))
+        self.async_planless_completion = bool(config.get("async_planless_completion", False))
+        self.args.async_planless_completion = self.async_planless_completion
         self.total_batches = len(self.samples) // self.batch_size
         self.pending_batches: deque[tuple[list[int], Any]] = deque()
         self.next_prefetch_batch_index = 0
+        self.last_batch_prefetch_metrics: dict[str, float | int] = {}
         if self.args.preprocess == "rgbnomore-val-pushdown":
             preflight_samples = self.samples[: self.batch_size]
             if len(preflight_samples) != self.batch_size:
@@ -597,11 +606,18 @@ class GalpAdapter(PipelineAdapter):
     def begin_repeat(self) -> None:
         self.pending_batches.clear()
         self.next_prefetch_batch_index = 0
+        self.last_batch_prefetch_metrics = {}
         if self.args.preprocess == "rgbnomore-val-pushdown":
             policy = getattr(self, "scheduling_policy", "fully-overlapped")
             initial_depth = 1 if policy == "serial" else self.batch_prefetch_depth
             for _ in range(min(initial_depth, self.total_batches)):
                 self._enqueue_next_pushdown_batch()
+            if getattr(self, "async_planless_completion", False) and self.pending_batches:
+                self.pending_batches[0][1].release_submission()
+
+    def after_model_complete(self) -> None:
+        if getattr(self, "async_planless_completion", False) and self.pending_batches:
+            self.pending_batches[0][1].release_submission()
 
     def load(
         self,
@@ -623,12 +639,38 @@ class GalpAdapter(PipelineAdapter):
                 raise RuntimeError(
                     f"GALP pending batch mismatch: expected {image_ids}, queued {queued_image_ids}"
                 )
+            # Telemetry was added after the prefetch handle itself. Keep the
+            # adapter compatible with older bindings and lightweight unit-test
+            # doubles while production bindings still report every field.
+            ready_before_read = bool(getattr(pending, "ready", False))
+            prefetch_read_started = time.perf_counter()
             input_y, input_cbcr, source_batches = self.module._adapt_prefetched_pushdown_batch(
                 self.reader,
                 self.args,
                 image_ids,
                 pending,
             )
+            prefetch_read_seconds = time.perf_counter() - prefetch_read_started
+            self.last_batch_prefetch_metrics = {
+                "batch_prefetch_read_wait_seconds": prefetch_read_seconds,
+                "batch_prefetch_producer_active_seconds": float(
+                    getattr(pending, "producer_active_ms", 0.0)
+                )
+                / 1000.0,
+                "batch_prefetch_planning_seconds": float(
+                    getattr(pending, "planning_ms", 0.0)
+                )
+                / 1000.0,
+                "batch_prefetch_io_staging_seconds": float(
+                    getattr(pending, "io_staging_ms", 0.0)
+                )
+                / 1000.0,
+                "batch_prefetch_ordered_submission_seconds": float(
+                    getattr(pending, "ordered_submission_ms", 0.0)
+                )
+                / 1000.0,
+                "batch_prefetch_ready_before_read": int(ready_before_read),
+            }
             if policy != "serial":
                 self._enqueue_next_pushdown_batch()
         else:
@@ -639,14 +681,6 @@ class GalpAdapter(PipelineAdapter):
                 None,
                 self.transform,
             )
-        if self.args.preprocess == "rgbnomore-val-pushdown":
-            for source_batch in source_batches:
-                stats = dict(source_batch.execution_stats)
-                _validate_transform_execution_stats(
-                    self.transform_execution_mode,
-                    stats,
-                    len(image_ids),
-                )
         if not self.audit_enabled:
             return LoadedBatch(
                 inputs=(input_y, input_cbcr),
@@ -655,11 +689,41 @@ class GalpAdapter(PipelineAdapter):
                 on_device=True,
                 keepalive=source_batches,
             )
-        totals = self.module._empty_totals()
-        self.module._accumulate_many_stats(totals, source_batches)
-        if self.args.preprocess == "rgbnomore-val-pushdown":
-            for source_batch in source_batches:
-                stats = dict(source_batch.execution_stats)
+        labels = torch.tensor([sample["label"] for sample in expected], dtype=torch.long, device=self.device)
+        native_stage_seconds = {
+            key: float(value)
+            for key, value in self.last_batch_prefetch_metrics.items()
+            if key.endswith("_seconds") and isinstance(value, (int, float))
+        }
+        return LoadedBatch(
+            inputs=(input_y, input_cbcr),
+            labels=labels,
+            ordinals=[int(sample["ordinal"]) for sample in expected],
+            on_device=True,
+            native_stage_seconds=native_stage_seconds,
+            native_counters={
+                "batch_prefetch_ready_before_read": int(
+                    self.last_batch_prefetch_metrics.get("batch_prefetch_ready_before_read", 0)
+                )
+            },
+            keepalive=source_batches,
+        )
+
+    def finalize_batch_metrics(self, batch: LoadedBatch) -> None:
+        if not self.audit_enabled or not batch.keepalive:
+            return
+        source_execution_stats: list[dict[str, Any]] = []
+        for source_batch in batch.keepalive:
+            complete = getattr(source_batch, "execution_stats", None)
+            snapshot = getattr(source_batch, "execution_stats_snapshot", None)
+            stats = dict(complete if complete is not None else snapshot)
+            source_execution_stats.append(stats)
+            if self.args.preprocess == "rgbnomore-val-pushdown":
+                _validate_transform_execution_stats(
+                    self.transform_execution_mode,
+                    stats,
+                    len(batch.ordinals),
+                )
                 if (
                     not bool(stats.get("fixed_grid_output_float32", False))
                     or not bool(stats.get("fixed_grid_output_affine_applied", False))
@@ -671,45 +735,35 @@ class GalpAdapter(PipelineAdapter):
                         f"affine_applied={stats.get('fixed_grid_output_affine_applied', False)} "
                         f"finalize_launches={stats.get('fixed_grid_finalize_kernel_launch_count', 0)}"
                     )
-        labels = torch.tensor([sample["label"] for sample in expected], dtype=torch.long, device=self.device)
-        native_stage_seconds = {
-            key: float(value)
-            for key, value in totals.items()
-            if key.endswith("_seconds") and isinstance(value, (int, float))
-        }
-        native_counters = {
-            key: int(value)
-            for key, value in totals.items()
-            if not key.endswith("_seconds") and isinstance(value, int)
-        }
-        native_properties = {
-            key: value
-            for key, value in totals.items()
-            if key
-            in {
-                "storage_read_granularity",
-                "decode_granularity",
-                "sparse_read_fallback_reason",
+        totals = self.module._empty_totals()
+        self.module._accumulate_many_stats(totals, source_execution_stats)
+        batch.native_stage_seconds.update(
+            {
+                key: float(value)
+                for key, value in totals.items()
+                if key.endswith("_seconds") and isinstance(value, (int, float))
             }
-        }
+        )
+        batch.native_counters.update(
+            {
+                key: int(value)
+                for key, value in totals.items()
+                if not key.endswith("_seconds") and isinstance(value, int)
+            }
+        )
+        batch.native_properties.update(
+            {
+                key: value
+                for key, value in totals.items()
+                if key in {"storage_read_granularity", "decode_granularity", "sparse_read_fallback_reason"}
+            }
+        )
         full_bytes = int(totals.get("full_compressed_payload_bytes", 0))
-        native_properties["read_amplification"] = (
-            int(totals.get("compressed_payload_bytes_read", 0)) / full_bytes
-            if full_bytes > 0
-            else 0.0
+        batch.native_properties["read_amplification"] = (
+            int(totals.get("compressed_payload_bytes_read", 0)) / full_bytes if full_bytes > 0 else 0.0
         )
-        native_properties["sparse_read_supported"] = bool(
+        batch.native_properties["sparse_read_supported"] = bool(
             int(totals.get("sparse_read_supported_batches", 0))
-        )
-        return LoadedBatch(
-            inputs=(input_y, input_cbcr),
-            labels=labels,
-            ordinals=[int(sample["ordinal"]) for sample in expected],
-            on_device=True,
-            native_stage_seconds=native_stage_seconds,
-            native_counters=native_counters,
-            native_properties=native_properties,
-            keepalive=source_batches,
         )
 
     def end_repeat(self) -> None:
@@ -985,6 +1039,7 @@ def run_pipeline(
                 validate_output=not runtime_profile,
             )
             _synchronize_model_stream(device)
+            adapter.after_model_complete()
 
         if device.type == "cuda":
             _synchronize_model_stream(device)
@@ -1051,9 +1106,11 @@ def run_pipeline(
                         else:
                             batch_correct1, batch_correct5 = 0, 0
                         _synchronize_model_stream(device)
+                        adapter.after_model_complete()
                     wall_ended_ns = time.perf_counter_ns()
                     cpu_process_seconds += time.process_time() - process_started
 
+                adapter.finalize_batch_metrics(batch)
                 if not runtime_profile:
                     if repeat == 0 and semantic_captured < semantic_count:
                         semantic_captured += _capture_semantic(

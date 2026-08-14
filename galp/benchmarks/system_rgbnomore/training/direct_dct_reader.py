@@ -200,6 +200,13 @@ _PER_BATCH_STABILITY_FIELDS = (
     "compact_batch_buffer_pageable_fallback_count",
     "decode_workset_output_arena_growth_count",
     "decode_workset_chunk_arena_growth_count",
+    "planless_axis_program_device_growth_count",
+    "planless_axis_program_pinned_growth_count",
+)
+
+_CAPACITY_CONTRACT_FIELDS = (
+    "planless_axis_program_capacity_contract_complete",
+    "compact_batch_pool_capacity_contract_complete",
 )
 
 
@@ -227,8 +234,8 @@ def native_allocation_stability(
     result: dict[str, Any] = {
         "criterion": (
             "zero new native CUDA allocations, zero output/chunk arena growth, and zero "
-            "compact-buffer growth/pageable fallback in measured batches relative to the "
-            "warmup high-water snapshot"
+            "compact/planless-axis buffer growth or pageable fallback in measured batches, "
+            "with complete dataset-derived planless-axis and compact-pool capacity contracts"
         ),
         "warmup_observed_batches": len(warmup),
         "measured_observed_batches": len(measured),
@@ -236,6 +243,7 @@ def native_allocation_stability(
         "measured_per_batch_totals": {},
         "verifiable": False,
         "stable_after_warmup": None,
+        "capacity_contract_complete": None,
         "missing_fields": [],
     }
     if not warmup or not measured:
@@ -260,6 +268,11 @@ def native_allocation_stability(
             for stats in measured
         )
     )
+    missing.extend(
+        name
+        for name in _CAPACITY_CONTRACT_FIELDS
+        if any(not isinstance(stats.get(name), bool) for stats in warmup + measured)
+    )
     result["missing_fields"] = sorted(set(missing))
     if missing:
         result["reason"] = "required native allocation diagnostics are missing"
@@ -281,9 +294,14 @@ def native_allocation_stability(
     }
     result["global_counter_deltas"] = deltas
     result["measured_per_batch_totals"] = per_batch_totals
+    capacity_contract_complete = all(
+        bool(stats[name]) for name in _CAPACITY_CONTRACT_FIELDS for stats in warmup + measured
+    )
+    result["capacity_contract_complete"] = capacity_contract_complete
     result["verifiable"] = True
     result["stable_after_warmup"] = (
         all(deltas[name] == 0.0 for name in _ALLOCATION_STABILITY_FIELDS)
         and all(value == 0.0 for value in per_batch_totals.values())
+        and capacity_contract_complete
     )
     return result

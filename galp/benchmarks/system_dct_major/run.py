@@ -10,8 +10,11 @@ import shlex
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Sequence
+
+from PIL import Image
 
 from common import (
     CONTRACT_SCHEMA,
@@ -23,6 +26,7 @@ from common import (
     collect_sequential_samples,
     fingerprint_file,
     load_label_map,
+    load_sample_manifest,
     manifest_snapshot,
     parse_manifest,
     sha256_file,
@@ -118,10 +122,46 @@ def _manifest_contract(path: Path, *, expected_version: int, hash_payloads: bool
     return manifest_snapshot(path, hash_payloads=hash_payloads)
 
 
+def _validate_fixed_source_geometry(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    expected = (512, 512)
+
+    def dimensions(sample: dict[str, Any]) -> tuple[int, int]:
+        with Image.open(sample["path"]) as image:
+            return tuple(int(item) for item in image.size)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        observed = list(executor.map(dimensions, samples))
+    mismatch = next(
+        (
+            (index, shape, samples[index]["path"])
+            for index, shape in enumerate(observed)
+            if shape != expected
+        ),
+        None,
+    )
+    if mismatch is not None:
+        index, shape, path = mismatch
+        raise ValueError(
+            f"fixed-center-224-from-512 requires every source to be 512x512; "
+            f"sample {index} is {shape[0]}x{shape[1]}: {path}"
+        )
+    return {
+        "validated_image_count": len(observed),
+        "source_width": expected[0],
+        "source_height": expected[1],
+        "crop_width": 224,
+        "crop_height": 224,
+        "crop_origin_x": 144,
+        "crop_origin_y": 144,
+    }
+
+
 def _block_major_access_contract(
     directory: Path,
     dct_major_storage: dict[str, Any],
     shard_ids: Sequence[int],
+    *,
+    required_active_output_schedule_shard_ids: Sequence[int] = (),
 ) -> dict[str, Any]:
     directory = directory.resolve()
     companion_index = directory / "manifest.block_major_access.bin"
@@ -151,16 +191,38 @@ def _block_major_access_contract(
     descriptor_bytes = int(companion["size_bytes"]) + sum(
         int(item["size_bytes"]) for item in descriptors
     )
+    required_schedule_shard_ids = tuple(
+        int(shard_id) for shard_id in required_active_output_schedule_shard_ids
+    )
+    required_schedule_paths = [
+        directory / f"shard_{shard_id:06d}.active_output_schedule.bin"
+        for shard_id in required_schedule_shard_ids
+    ]
+    missing_schedules = [path for path in required_schedule_paths if not path.is_file()]
+    if missing_schedules:
+        raise FileNotFoundError(
+            "scheduled-range benchmark requires a pre-materialized active-output "
+            f"schedule before contract snapshot: {missing_schedules[0]}"
+        )
+    active_output_schedules = [
+        fingerprint_file(path)
+        for path in sorted(directory.glob("shard_*.active_output_schedule.bin"))
+    ]
+    active_output_schedule_bytes = sum(
+        int(item["size_bytes"]) for item in active_output_schedules
+    )
     base_storage_bytes = int(dct_major_storage["persistent_bytes"]) + int(
         dct_major_storage["manifest"]["size_bytes"]
     )
     if base_storage_bytes <= 0:
         raise ValueError("DCT-major base storage is empty")
     storage_increase_ratio = descriptor_bytes / base_storage_bytes
-    if storage_increase_ratio > 0.01:
+    all_sidecar_bytes = descriptor_bytes + active_output_schedule_bytes
+    all_sidecar_storage_increase_ratio = all_sidecar_bytes / base_storage_bytes
+    if all_sidecar_storage_increase_ratio > 0.01:
         raise ValueError(
-            "block-major descriptor exceeds the 1% storage gate: "
-            f"{100.0 * storage_increase_ratio:.6f}%"
+            "block-major sidecar storage exceeds the 1% storage gate: "
+            f"{100.0 * all_sidecar_storage_increase_ratio:.6f}%"
         )
     return {
         "directory": str(directory),
@@ -168,12 +230,19 @@ def _block_major_access_contract(
         "shards": descriptors,
         "shard_count": len(descriptors),
         "descriptor_bytes": descriptor_bytes,
+        "required_active_output_schedule_shard_ids": list(required_schedule_shard_ids),
+        "active_output_schedules": active_output_schedules,
+        "active_output_schedule_bytes": active_output_schedule_bytes,
+        "all_sidecar_bytes": all_sidecar_bytes,
         "base_storage_bytes": base_storage_bytes,
         "total_storage_bytes_with_descriptor": base_storage_bytes + descriptor_bytes,
+        "total_storage_bytes_with_sidecars": base_storage_bytes + all_sidecar_bytes,
         "storage_increase_ratio": storage_increase_ratio,
         "storage_increase_percent": 100.0 * storage_increase_ratio,
+        "all_sidecar_storage_increase_ratio": all_sidecar_storage_increase_ratio,
+        "all_sidecar_storage_increase_percent": 100.0 * all_sidecar_storage_increase_ratio,
         "passes_one_percent": True,
-        "passes_half_percent": storage_increase_ratio <= 0.005,
+        "passes_half_percent": all_sidecar_storage_increase_ratio <= 0.005,
     }
 
 
@@ -202,17 +271,64 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
     workers = _setting(args, "workers")
     if int(args.decode_workset_capacity_mib) <= 0:
         raise ValueError("decode_workset_capacity_mib must be positive")
+    if not 1.0 <= float(args.bounded_read_amplification_cap) <= 1.10:
+        raise ValueError("bounded_read_amplification_cap must be in [1.0, 1.10]")
+    if float(args.bounded_read_local_amplification_cap) != 0.0 and not (
+        1.0 <= float(args.bounded_read_local_amplification_cap) <= 1.10
+    ):
+        raise ValueError("bounded_read_local_amplification_cap must be 0 or in [1.0, 1.10]")
+    if int(args.bounded_read_max_run_bytes) < 0:
+        raise ValueError("bounded_read_max_run_bytes must be non-negative")
+    if (
+        args.dct_major_output_prefetch_policy == "deferred-allocation"
+        and args.dct_major_segment_mode != "manifest-shard"
+    ):
+        raise ValueError(
+            "deferred-allocation output prefetch requires --dct-major-segment-mode manifest-shard"
+        )
+    if args.dct_major_segment_mode == "manifest-shard":
+        if args.dct_major_segment_size is not None:
+            raise ValueError(
+                "dct_major_segment_size is not used in manifest-shard mode; "
+                "select --dct-major-segment-mode fixed for the fixed-segment ablation"
+            )
+        if warmup_batches != 0:
+            raise ValueError(
+                "manifest-shard mode requires warmup_batches=0 so a warmup/measurement "
+                "boundary cannot split and reactivate a physical shard"
+            )
+        if args.block_major_access_dir is None:
+            raise ValueError("manifest-shard mode requires --block-major-access-dir")
+        if (
+            "dct_major_pushdown" in args.pipelines
+            and args.dct_major_crop_execution_mode
+            not in (
+                "vector-range-read-selected-decode",
+                "bounded-range-read-selected-decode",
+                "bounded-io-uring-range-read-selected-decode",
+                "bounded-io-uring-scheduled-range-read-selected-decode",
+            )
+        ):
+            raise ValueError(
+                "manifest-shard dct_major_pushdown requires an explicit selected-range mode"
+            )
 
     dct_major = _manifest_contract(
         args.dct_major_manifest,
         expected_version=1,
         hash_payloads=args.hash_payloads,
     )
-    image_major = _manifest_contract(
-        args.image_major_manifest,
-        expected_version=int(args.image_major_manifest_version),
-        hash_payloads=args.hash_payloads,
+    uses_image_major = any(
+        name in args.pipelines
+        for name in ("image_major_pushdown", "image_major_v2_pushdown")
     )
+    image_major: dict[str, Any] | None = None
+    if uses_image_major:
+        image_major = _manifest_contract(
+            args.image_major_manifest,
+            expected_version=int(args.image_major_manifest_version),
+            hash_payloads=args.hash_payloads,
+        )
     image_major_v3: dict[str, Any] | None = None
     if "image_major_v3_pushdown" in args.pipelines:
         image_major_v3 = _manifest_contract(
@@ -221,14 +337,18 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             hash_payloads=args.hash_payloads,
         )
     image_count = int(dct_major["header"]["image_count"])
-    if int(image_major["header"]["image_count"]) != image_count:
+    if image_major is not None and int(image_major["header"]["image_count"]) != image_count:
         raise ValueError("DCT-major and image-major manifests contain different image counts")
     if image_major_v3 is not None and int(image_major_v3["header"]["image_count"]) != image_count:
         raise ValueError("DCT-major and image-major v3 manifests contain different image counts")
-    label_equivalence = _validate_cross_layout_labels(
-        args.dct_major_label_map,
-        args.image_major_label_map,
-        image_count,
+    label_equivalence = (
+        _validate_cross_layout_labels(
+            args.dct_major_label_map,
+            args.image_major_label_map,
+            image_count,
+        )
+        if image_major is not None
+        else None
     )
     label_equivalence_v3 = (
         _validate_cross_layout_labels(
@@ -243,10 +363,37 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
     block_major_access: dict[str, Any] | None = None
     if block_major_access_dir is not None:
         parsed_dct_major = parse_manifest(args.dct_major_manifest)
+        required_schedule_shard_ids: list[int] = []
+        if (
+            args.dct_major_segment_mode == "manifest-shard"
+            and args.dct_major_crop_execution_mode
+            == "bounded-io-uring-scheduled-range-read-selected-decode"
+            and "dct_major_pushdown" in args.pipelines
+        ):
+            selected_end = sample_count
+            consumed = 0
+            for shard in parsed_dct_major["shards"]:
+                first = int(shard["first_global_image_index"])
+                count = int(shard["image_count"])
+                end = first + count
+                if first >= selected_end:
+                    break
+                if first != consumed or end > selected_end:
+                    raise ValueError(
+                        "scheduled manifest-shard sample_count must cover a contiguous "
+                        "prefix of complete physical shards"
+                    )
+                required_schedule_shard_ids.append(int(shard["shard_id"]))
+                consumed = end
+            if consumed != selected_end:
+                raise ValueError(
+                    "scheduled manifest-shard sample_count is not covered by complete physical shards"
+                )
         block_major_access = _block_major_access_contract(
             block_major_access_dir,
             dct_major,
             [int(item["shard_id"]) for item in parsed_dct_major["shards"]],
+            required_active_output_schedule_shard_ids=required_schedule_shard_ids,
         )
         block_major_access_dir = Path(block_major_access["directory"])
     samples, sample_provenance = collect_sequential_samples(
@@ -256,6 +403,11 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         expected_images=image_count,
         sample_count=sample_count,
         hash_samples=args.hash_samples,
+    )
+    fixed_geometry = (
+        _validate_fixed_source_geometry(samples)
+        if args.preprocess_profile == "fixed-center-224-from-512"
+        else None
     )
     sample_manifest_path = output_dir / "sample_manifest.json"
     sample_manifest_sha256 = write_sample_manifest(sample_manifest_path, samples, sample_provenance)
@@ -289,36 +441,61 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         "transform_ctas_per_launch": 0,
         "use_low_priority_streams": bool(args.use_low_priority_streams),
         "block_major_double_buffer": str(args.block_major_double_buffer),
+        "bounded_read_amplification_cap": float(args.bounded_read_amplification_cap),
+        "bounded_read_local_amplification_cap": float(args.bounded_read_local_amplification_cap),
+        "bounded_read_max_run_bytes": int(args.bounded_read_max_run_bytes),
     }
     pipeline_configs: dict[str, Any] = {
         "enabled": list(args.pipelines),
         "dct_major_full": {
             **shared_galp,
-            "enable_planless_execution": False,
+            "output_prefetch_policy": str(args.dct_major_output_prefetch_policy),
+            "enable_planless_execution": args.dct_major_segment_mode == "manifest-shard",
             "manifest": str(args.dct_major_manifest.resolve()),
             "manifest_version": 1,
             "physical_layout": "dct-major/spatial-major-image-minor",
-            "preprocess": "rgbnomore-val",
+            "preprocess": (
+                "rgbnomore-val-pushdown"
+                if args.dct_major_segment_mode == "manifest-shard"
+                else "rgbnomore-val"
+            ),
             "crop_execution_mode": "full-rowgroup-decode",
-            "segment_size": batch_size,
+            "segment_mode": args.dct_major_segment_mode,
+            "segment_size": (
+                None if args.dct_major_segment_mode == "manifest-shard" else batch_size
+            ),
             "block_major_access_dir": (
                 str(block_major_access_dir) if block_major_access_dir is not None else None
             ),
-            "role": "full-image decode followed by RGB-no-more validation crop",
+            "role": (
+                "manifest-shard full physical read with the same shard lifecycle as pushdown"
+                if args.dct_major_segment_mode == "manifest-shard"
+                else "full-image decode followed by RGB-no-more validation crop"
+            ),
         },
         "dct_major_pushdown": {
             **shared_galp,
+            "output_prefetch_policy": str(args.dct_major_output_prefetch_policy),
             "manifest": str(args.dct_major_manifest.resolve()),
             "manifest_version": 1,
             "physical_layout": "dct-major/spatial-major-image-minor",
             "preprocess": "rgbnomore-val-pushdown",
             "crop_execution_mode": args.dct_major_crop_execution_mode,
-            "segment_size": dct_major_segment_size,
+            "segment_mode": args.dct_major_segment_mode,
+            "segment_size": (
+                None
+                if args.dct_major_segment_mode == "manifest-shard"
+                else dct_major_segment_size
+            ),
             "block_major_access_dir": (
                 str(block_major_access_dir) if block_major_access_dir is not None else None
             ),
             "vector_alignment_target": 1024,
-            "role": "native fixed-grid crop pushdown with contiguous image segments",
+            "role": (
+                "native fixed-grid crop pushdown with one plan/read/assembly lifecycle per manifest shard"
+                if args.dct_major_segment_mode == "manifest-shard"
+                else "native fixed-grid crop pushdown with contiguous fixed-size image segments"
+            ),
         },
         "dct_major_legacy_pushdown": {
             **shared_galp,
@@ -328,6 +505,7 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "physical_layout": "dct-major/spatial-major-image-minor",
             "preprocess": "rgbnomore-val-pushdown",
             "crop_execution_mode": args.dct_major_crop_execution_mode,
+            "segment_mode": "fixed",
             "segment_size": dct_major_segment_size,
             "block_major_access_dir": (
                 str(block_major_access_dir) if block_major_access_dir is not None else None
@@ -339,7 +517,11 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             **shared_galp,
             "manifest": str(args.image_major_manifest.resolve()),
             "manifest_version": int(args.image_major_manifest_version),
-            "physical_layout": image_major["header"]["physical_layout"],
+            "physical_layout": (
+                image_major["header"]["physical_layout"]
+                if image_major is not None
+                else "image-major"
+            ),
             "storage_snapshot_key": "image_major_storage",
             "preprocess": "rgbnomore-val-pushdown",
             "crop_execution_mode": args.image_major_crop_execution_mode,
@@ -350,7 +532,11 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             **shared_galp,
             "manifest": str(args.image_major_manifest.resolve()),
             "manifest_version": int(args.image_major_manifest_version),
-            "physical_layout": image_major["header"]["physical_layout"],
+            "physical_layout": (
+                image_major["header"]["physical_layout"]
+                if image_major is not None
+                else "image-major"
+            ),
             "storage_snapshot_key": "image_major_v2_storage",
             "preprocess": "rgbnomore-val-pushdown",
             "crop_execution_mode": args.image_major_crop_execution_mode,
@@ -415,6 +601,15 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "canonical_index_sha256": sha256_file(canonical_index),
             "sample_count": sample_count,
             "full_image_count": image_count,
+            "source_image_shape_hwc": [512, 512, 3],
+            "source_geometry_validation": fixed_geometry,
+            "jpeg_selected_bytes": sum(int(sample["size_bytes"]) for sample in samples),
+            "jpeg_full_dataset_bytes": (
+                sum(int(sample["size_bytes"]) for sample in samples)
+                if sample_count == image_count
+                else None
+            ),
+            "raw_rgb_selected_bytes": sample_count * 512 * 512 * 3,
             "sample_order": "galp_image_id_ascending",
             "shuffle": False,
             "cross_layout_label_equivalence": label_equivalence,
@@ -443,6 +638,8 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "aggregate_exclude_first_repeat": repeats > 1,
             "model_stream_priority": "greatest",
             "cold_start_model_prime": bool(args.cold_start_model_prime),
+            "cold_file_cache_eviction": bool(args.evict_pipeline_file_cache),
+            "cold_protocol": args.cold_protocol,
         },
         "workload": {
             "kind": args.workload,
@@ -451,9 +648,33 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "feature_output": "[N,192] after classhead.ch_tanh" if args.feature_stage == "penultimate" else "[N,192] after LayerNorm+mean pool",
         },
         "preprocess": {
-            "rgb": {"resize_shorter": 256, "crop": "center", "crop_size": [224, 224], "range": [-1.0, 1.0]},
+            "profile": args.preprocess_profile,
+            "rgb": {
+                "resize_shorter": (
+                    None
+                    if args.preprocess_profile == "fixed-center-224-from-512"
+                    else 256
+                ),
+                "crop": "center",
+                "crop_size": [224, 224],
+                "crop_origin": (
+                    [144, 144]
+                    if args.preprocess_profile == "fixed-center-224-from-512"
+                    else None
+                ),
+                "range": [-1.0, 1.0],
+            },
             "dct": {
-                "profile": "RGB-no-more ResizedCenterCrop_DCT(32,28)",
+                "profile": (
+                    "RGB-no-more CenterCrop_DCT(28) from fixed 64x64 Y-block source"
+                    if args.preprocess_profile == "fixed-center-224-from-512"
+                    else "RGB-no-more ResizedCenterCrop_DCT(32,28)"
+                ),
+                "crop_reference_size_blocks": (
+                    [64, 64]
+                    if args.preprocess_profile == "fixed-center-224-from-512"
+                    else None
+                ),
                 "y_shape": [1, 28, 28, 8, 8],
                 "cbcr_shape": [2, 14, 14, 8, 8],
                 "coefficients": "all-64",
@@ -530,6 +751,65 @@ def _run_streamed(
         return int(process.wait()), time.perf_counter() - started, first_output_seconds
 
 
+def _pipeline_cache_paths(contract: dict[str, Any], pipeline: str) -> list[Path]:
+    """Return immutable inputs whose file-backed pages define this pipeline's cold state."""
+
+    config = contract["pipelines"][pipeline]
+    paths = {
+        Path(contract["dataset"]["sample_manifest"]),
+        Path(contract["dataset"]["canonical_index_csv"]),
+    }
+    model_key = "rgb" if pipeline in {"dali", "pytorch"} else "dct"
+    paths.add(Path(contract["models"][model_key]["checkpoint"]))
+    if pipeline.startswith("dct_major_") or pipeline.startswith("image_major_"):
+        snapshot_key = config.get("storage_snapshot_key", "dct_major_storage")
+        snapshot = contract["dataset"][snapshot_key]
+        paths.add(Path(snapshot["manifest"]["path"]))
+        paths.update(Path(payload["path"]) for payload in snapshot["payloads"])
+        if config.get("block_major_access_dir") is not None:
+            access = contract["dataset"].get("block_major_access") or {}
+            fingerprints = [access.get("companion_index"), *access.get("shards", [])]
+            fingerprints.extend(access.get("active_output_schedules", []))
+            paths.update(
+                Path(item["path"])
+                for item in fingerprints
+                if isinstance(item, dict) and item.get("path")
+            )
+    else:
+        samples = load_sample_manifest(
+            Path(contract["dataset"]["sample_manifest"]),
+            contract["dataset"]["sample_manifest_sha256"],
+        )
+        paths.update(Path(sample["path"]) for sample in samples)
+    return sorted((path.resolve() for path in paths), key=str)
+
+
+def _evict_pipeline_file_cache(contract: dict[str, Any], pipeline: str) -> dict[str, Any]:
+    """Evict only this pipeline's immutable file pages; never use global drop_caches."""
+
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        raise RuntimeError("per-file cold-cache protocol requires os.posix_fadvise(POSIX_FADV_DONTNEED)")
+    paths = _pipeline_cache_paths(contract, pipeline)
+    started = time.perf_counter()
+    total_bytes = 0
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"cold-cache input disappeared: {path}")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(descriptor)
+        total_bytes += path.stat().st_size
+    return {
+        "method": "posix_fadvise(POSIX_FADV_DONTNEED)",
+        "scope": "pipeline immutable data, manifests, descriptors, and checkpoint; no global drop_caches",
+        "file_count": len(paths),
+        "bytes_addressed": total_bytes,
+        "seconds": time.perf_counter() - started,
+    }
+
+
 def run(args: argparse.Namespace) -> int:
     output_dir = args.output_dir.resolve()
     _prepare_output_dir(output_dir)
@@ -555,6 +835,8 @@ def run(args: argparse.Namespace) -> int:
             str(output_dir / f"pipeline_{pipeline}.json"),
         ]
         commands.append({"name": pipeline, "command": command, "env": {"PYTHONPATH": pythonpath}})
+        if args.evict_pipeline_file_cache and not args.dry_run:
+            commands[-1]["file_cache_eviction"] = _evict_pipeline_file_cache(contract, pipeline)
         code, wall_seconds, first_output_seconds = _run_streamed(
             command,
             env=env,
@@ -603,6 +885,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preset", choices=tuple(PRESETS), default="smoke")
     parser.add_argument("--workload", choices=("feature-extraction", "evaluation"), default="feature-extraction")
     parser.add_argument("--feature-stage", choices=("pooled", "penultimate"), default="penultimate")
+    parser.add_argument(
+        "--preprocess-profile",
+        choices=("rgbnomore-resize256-center224", "fixed-center-224-from-512"),
+        default="rgbnomore-resize256-center224",
+        help="select the exact deterministic validation crop geometry",
+    )
     parser.add_argument("--materialize-features", action="store_true")
     parser.add_argument("--pipelines", choices=PIPELINES, nargs="+", default=list(DEFAULT_PIPELINES))
     parser.add_argument("--benchmark-id")
@@ -634,11 +922,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int)
     parser.add_argument("--sample-count", type=int)
     parser.add_argument("--semantic-samples", type=int, default=32)
+    parser.add_argument(
+        "--dct-major-segment-mode",
+        choices=("fixed", "manifest-shard"),
+        default="fixed",
+        help="derive DCT-major execution units from a fixed image count or exact manifest shard ranges",
+    )
     parser.add_argument("--dct-major-segment-size", type=int)
+    parser.add_argument(
+        "--dct-major-output-prefetch-policy",
+        choices=("overlapped", "deferred-allocation"),
+        default="overlapped",
+        help=(
+            "overlap the next full-shard GPU output with model consumption, or overlap only "
+            "CPU planning/I/O and defer next output allocation until the current shard is consumed"
+        ),
+    )
     parser.add_argument("--image-major-segment-size", type=int)
     parser.add_argument(
         "--dct-major-crop-execution-mode",
-        choices=("auto", "full-rowgroup-decode", "rowgroup-read-selected-decode", "vector-range-read-selected-decode"),
+        choices=(
+            "auto",
+            "full-rowgroup-decode",
+            "rowgroup-read-selected-decode",
+            "vector-range-read-selected-decode",
+            "bounded-range-read-selected-decode",
+            "bounded-io-uring-range-read-selected-decode",
+            "bounded-io-uring-scheduled-range-read-selected-decode",
+        ),
         default="auto",
     )
     parser.add_argument(
@@ -648,6 +959,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--decode-batch-rowgroups", type=int, default=64)
     parser.add_argument("--decode-workset-capacity-mib", type=int, default=512)
+    parser.add_argument("--bounded-read-amplification-cap", type=float, default=1.0)
+    parser.add_argument("--bounded-read-local-amplification-cap", type=float, default=0.0)
+    parser.add_argument("--bounded-read-max-run-bytes", type=int, default=0)
     parser.add_argument("--block-major-double-buffer", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--rowgroup-prefetch-depth", type=int, default=16)
     parser.add_argument("--rowgroup-prefetch-workers", type=int, default=4)
@@ -655,6 +969,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scheduling-policy", choices=("fully-overlapped", "limited-overlap", "serial"), default="limited-overlap")
     parser.add_argument("--use-low-priority-streams", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cold-start-model-prime", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--cold-protocol",
+        choices=("application-overlapped", "controlled-io"),
+        default="application-overlapped",
+        help="overlap first data prefetch with startup, or begin cold I/O only after model prime",
+    )
+    parser.add_argument(
+        "--evict-pipeline-file-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="evict only each pipeline's immutable input pages before its independent process",
+    )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--dali-prefetch-depth", type=int, default=2)
     parser.add_argument("--hash-samples", action="store_true")

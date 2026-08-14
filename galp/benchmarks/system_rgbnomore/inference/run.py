@@ -20,7 +20,6 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from shared.common import (
-    CANONICAL_GALP_PIPELINES,
     CONTRACT_SCHEMA,
     CONTRACT_PIPELINES,
     GALP_PIPELINES,
@@ -60,7 +59,7 @@ PRESETS = {
 }
 GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO = 1.10
 E2E_MAX_HOT_THROUGHPUT_CV = 0.05
-E2E_PIPELINES = (*CANONICAL_GALP_PIPELINES, "rgbnomore", "dali")
+E2E_PIPELINES = ("galp_planless", "pytorch", "rgbnomore", "dali")
 
 
 def _value(args: argparse.Namespace, key: str) -> int:
@@ -234,7 +233,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         raise ValueError("DALI requires workers/num_threads > 0")
     if args.preset == "e2e" and not set(E2E_PIPELINES).issubset(args.pipelines):
         raise ValueError(
-            "e2e requires same-round galp_planless, galp_fixed_items, rgbnomore, and dali pipelines"
+            "e2e requires same-round galp_planless, pytorch, rgbnomore, and dali pipelines"
         )
     if args.preset == "e2e" and (
         args.galp_cache_capacity_mib != 0 or args.galp_plan_cache_capacity != 0
@@ -386,6 +385,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "plan_cache_capacity": args.galp_plan_cache_capacity,
                 "decode_batch_rowgroups": args.galp_decode_batch_rowgroups,
                 "batch_prefetch_depth": args.galp_batch_prefetch_depth,
+                "async_planless_completion": args.galp_async_planless_completion,
                 "rowgroup_prefetch_depth": args.galp_rowgroup_prefetch_depth,
                 "rowgroup_prefetch_workers": args.galp_rowgroup_prefetch_workers,
                 "rowgroup_prefetch_min_decode_batches": args.galp_rowgroup_prefetch_min_decode_batches,
@@ -473,7 +473,10 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "image_major_manifest_minimum_version": 2,
                 "manifest_v2_rowgroups_per_image": 1,
                 "worksets_per_batch": 1,
-                "internal_syncs_per_batch": 1,
+                "internal_syncs_per_batch": 0 if args.galp_async_planless_completion else 1,
+                "async_planless_completion_batches_per_batch": (
+                    1 if args.galp_async_planless_completion else 0
+                ),
                 "decode_kernels_per_batch": 1,
             }
         },
@@ -533,6 +536,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/benchmarks/system_rgbnomore/diagnostics/audit_planless_storage_io.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/benchmark_planless_planning.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/direct_dct.py",
+                    "galp/benchmarks/system_rgbnomore/diagnostics/scheduler_matrix.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/validate_pushdown.py",
                     "galp/include/galp/direct_dct.hpp",
                     "galp/include/galp/jpeg_dct_device.hpp",
@@ -542,12 +546,20 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/include/galp/sparse_vector_bundle.hpp",
                     "galp/include/galp/jpeg_dct.hpp",
                     "galp/src/api/direct_dct.cpp",
+                    "galp/src/cuda/memory/device_arena.cu",
+                    "galp/src/cuda/memory/device_arena.cuh",
                     "galp/src/cuda/memory/device_pool.cuh",
+                    "galp/src/cuda/memory/upload_metrics.cuh",
+                    "galp/src/engine/materialization/metadata.cu",
+                    "galp/src/engine/operators/batch.cuh",
                     "galp/src/format/reader.cu",
                     "galp/src/format/reader.cuh",
                     "galp/src/format/rowgroup_io.cuh",
                     "galp/src/engine/pipeline/rowgroup_prefetch_queue.cuh",
                     "galp/src/engine/pipeline/rowgroup_prefetch_types.cuh",
+                    "galp/src/engine/workset/append.cuh",
+                    "galp/src/engine/workset/model.cuh",
+                    "galp/src/engine/workset/upload.cu",
                     "galp/src/jpeg/jpeg_dct_planner.cpp",
                     "galp/src/jpeg/jpeg_dct_shard_reader.cpp",
                     "galp/src/jpeg/jpeg_dct_shard_writer.cpp",
@@ -718,6 +730,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Ordered GALP batch lookahead; depth 2 overlaps two native reads with the current model forward.",
+    )
+    parser.add_argument(
+        "--galp-async-planless-completion",
+        action="store_true",
+        help="Return planless batches after event-owned submission and serialize their transform after the prior model.",
     )
     parser.add_argument(
         "--galp-scheduling-policy",

@@ -66,6 +66,7 @@ if (GALP_WITH_JPEG_DCT)
 	set_source_files_properties(engine/materialization/selected_vector_compactor.cpp PROPERTIES LANGUAGE CUDA)
 		add_library(galp_jpeg_dct_storage STATIC
 				jpeg/jpeg_dct_block_major_access.cpp
+				jpeg/jpeg_dct_canonical_plan.cpp
 				jpeg/jpeg_dct_block_major_plan.cpp
 				jpeg/jpeg_dct_decode.cpp
 				jpeg/jpeg_dct_expression_validation.cpp
@@ -88,6 +89,7 @@ if (GALP_WITH_JPEG_DCT)
                 api/direct_dct.cpp
                 engine/materialization/selected_vector_compactor.cpp
                 jpeg/jpeg_dct_device_bridge.cpp
+				jpeg/jpeg_dct_active_output_schedule.cpp
                 jpeg/jpeg_dct_exact_verifier.cpp
                 jpeg/jpeg_dct_prepared_plan.cpp
                 jpeg/jpeg_dct_planner.cpp

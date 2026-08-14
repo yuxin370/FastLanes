@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -43,6 +44,14 @@ public:
 		bool   owner_reused   = false;
 		bool   owner_migrated = false;
 		bool   allocated      = false;
+	};
+	struct PrewarmStats {
+		size_t requested_slots = 0U;
+		size_t requested_bytes = 0U;
+		size_t warmed_slots    = 0U;
+		size_t warmed_bytes    = 0U;
+		size_t largest_class   = 0U;
+		bool   complete        = false;
 	};
 
 	// Construct only via create() — enable_shared_from_this requires the
@@ -108,7 +117,7 @@ public:
 			throw std::runtime_error("pinned rowgroup buffer acquire cancelled");
 		}
 
-		const size_t idx = choose_slot(owner);
+		const size_t idx = choose_slot(owner, min_bytes);
 		if (idx != kNoOwner) {
 			auto& slot = slots_[idx];
 			if (stats != nullptr) {
@@ -217,6 +226,107 @@ public:
 		return warmed;
 	}
 
+	// Prewarm a reusable best-fit distribution from an observed batch.  The
+	// requested classes repeat deterministically until requested_slots is
+	// reached, and the global byte budget keeps startup memory bounded.
+	PrewarmStats prewarm_size_classes(std::vector<size_t> classes, const size_t requested_slots) {
+		classes.erase(std::remove(classes.begin(), classes.end(), 0U), classes.end());
+		if (classes.empty() || requested_slots == 0U) {
+			return {};
+		}
+		for (auto& bytes : classes) {
+			bytes = round_up_capacity(bytes);
+		}
+		std::sort(classes.begin(), classes.end(), std::greater<size_t> {});
+		std::unique_lock<std::mutex> lock(mutex_);
+		if (stopping_) {
+			throw std::runtime_error("pinned rowgroup buffer pool stopped");
+		}
+		const size_t target = std::min(requested_slots, slots_.size());
+		const size_t budget = prewarm_byte_budget();
+		PrewarmStats result;
+		result.requested_slots = target;
+		for (size_t index = 0U; index < target; ++index) {
+			const size_t desired = classes[index % classes.size()];
+			if (desired > std::numeric_limits<size_t>::max() - result.requested_bytes) {
+				throw std::overflow_error("pinned rowgroup prewarm byte count overflow");
+			}
+			result.requested_bytes += desired;
+			if (desired > budget - std::min(budget, result.warmed_bytes)) {
+				break;
+			}
+			auto& slot = slots_[index];
+			if (slot.in_use) {
+				continue;
+			}
+			if (slot.capacity < desired) {
+				release_slot_allocation(slot);
+				slot.ptr        = galp::memory::DevicePool::instance().alloc_pinned(desired);
+				slot.capacity   = desired;
+				slot.from_slab  = false;
+				slot.slab_index = kNoOwner;
+			}
+			slot.owner = kNoOwner;
+			++result.warmed_slots;
+			result.warmed_bytes += slot.capacity;
+			result.largest_class = std::max(result.largest_class, slot.capacity);
+		}
+		result.complete = result.warmed_slots == result.requested_slots;
+		return result;
+	}
+
+	// Install an exact, dataset-derived capacity profile. Unlike
+	// prewarm_size_classes(), this does not repeat an observed batch pattern;
+	// callers provide every simultaneously reusable slot required by their
+	// formal concurrency contract.
+	PrewarmStats prewarm_capacities(std::vector<size_t> capacities) {
+		capacities.erase(std::remove(capacities.begin(), capacities.end(), 0U), capacities.end());
+		for (auto& bytes : capacities) {
+			bytes = round_up_capacity(bytes);
+		}
+		std::sort(capacities.begin(), capacities.end(), std::greater<size_t> {});
+		std::unique_lock<std::mutex> lock(mutex_);
+		if (stopping_) {
+			throw std::runtime_error("pinned rowgroup buffer pool stopped");
+		}
+
+		PrewarmStats result;
+		result.requested_slots = capacities.size();
+		for (const auto desired : capacities) {
+			if (desired > std::numeric_limits<size_t>::max() - result.requested_bytes) {
+				throw std::overflow_error("pinned rowgroup capacity contract overflow");
+			}
+			result.requested_bytes += desired;
+		}
+		const size_t target = std::min(capacities.size(), slots_.size());
+		const size_t budget = prewarm_byte_budget();
+		for (size_t index = 0U; index < target; ++index) {
+			const size_t desired = capacities[index];
+			if (desired > budget - std::min(budget, result.warmed_bytes)) {
+				break;
+			}
+			auto& slot = slots_[index];
+			if (slot.in_use) {
+				break;
+			}
+			if (slot.capacity < desired) {
+				release_slot_allocation(slot);
+				slot.ptr        = galp::memory::DevicePool::instance().alloc_pinned(desired);
+				slot.capacity   = desired;
+				slot.from_slab  = false;
+				slot.slab_index = kNoOwner;
+			}
+			slot.owner = kNoOwner;
+			++result.warmed_slots;
+			result.warmed_bytes += slot.capacity;
+			result.largest_class = std::max(result.largest_class, slot.capacity);
+		}
+		result.complete = result.requested_slots <= slots_.size() &&
+		                  result.warmed_slots == result.requested_slots &&
+		                  result.requested_bytes <= budget;
+		return result;
+	}
+
 private:
 	explicit PinnedRowgroupBufferPool(const size_t slots) : slots_(std::max<size_t>(1, slots)) {}
 
@@ -266,7 +376,7 @@ private:
 		return kNoOwner;
 	}
 
-	size_t choose_slot(const size_t owner) const {
+	size_t choose_slot(const size_t owner, const size_t min_bytes) const {
 		const auto find_slot = [&](const auto& predicate) {
 			for (size_t idx = 0; idx < slots_.size(); ++idx) {
 				if (!slots_[idx].in_use && predicate(slots_[idx])) {
@@ -275,21 +385,48 @@ private:
 			}
 			return kNoOwner;
 		};
+		const auto find_best_fit = [&](const auto& predicate) {
+			size_t best = kNoOwner;
+			for (size_t idx = 0U; idx < slots_.size(); ++idx) {
+				const auto& slot = slots_[idx];
+				if (slot.in_use || slot.capacity < min_bytes || !predicate(slot)) {
+					continue;
+				}
+				if (best == kNoOwner || slot.capacity < slots_[best].capacity) {
+					best = idx;
+				}
+			}
+			return best;
+		};
 
 		if (owner != kNoOwner) {
-			size_t idx = find_slot([&](const Slot& slot) { return slot.owner == owner; });
+			size_t idx = find_best_fit([&](const Slot& slot) { return slot.owner == owner; });
 			if (idx != kNoOwner) {
 				return idx;
 			}
-			idx = find_slot([](const Slot& slot) { return slot.owner == kNoOwner; });
+			idx = find_best_fit([](const Slot& slot) { return slot.owner == kNoOwner; });
 			if (idx != kNoOwner) {
 				return idx;
 			}
 		} else {
-			const size_t idx = find_slot([](const Slot& slot) { return slot.owner == kNoOwner; });
+			const size_t idx = find_best_fit([](const Slot& slot) { return slot.owner == kNoOwner; });
 			if (idx != kNoOwner) {
 				return idx;
 			}
+		}
+		if (const auto idx = find_best_fit([](const Slot&) { return true; }); idx != kNoOwner) {
+			return idx;
+		}
+
+		// No existing size class fits. Prefer growing an owner-affine/unowned
+		// slot, preserving deterministic ownership without sacrificing reuse.
+		if (owner != kNoOwner) {
+			if (const auto idx = find_slot([&](const Slot& slot) { return slot.owner == owner; }); idx != kNoOwner) {
+				return idx;
+			}
+		}
+		if (const auto idx = find_slot([](const Slot& slot) { return slot.owner == kNoOwner; }); idx != kNoOwner) {
+			return idx;
 		}
 
 		return find_slot([](const Slot&) { return true; });

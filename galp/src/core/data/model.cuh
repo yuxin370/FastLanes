@@ -102,6 +102,7 @@ struct PackedRowgroupDevicePayload {
 	std::shared_ptr<void>                    packed_owner;
 	const std::byte*                         packed_data   = nullptr;
 	size_t                                   packed_bytes  = 0;
+	size_t                                   packed_capacity_bytes = 0;
 	const std::byte*                         logical_data  = nullptr;
 	size_t                                   logical_bytes = 0;
 	std::vector<PackedRowgroupScatterRange> ranges;
@@ -113,6 +114,8 @@ struct Rowgroup {
 	size_t              n_tuples = 0;
 	std::vector<Column> columns;
 	std::shared_ptr<void> backing_storage;
+	size_t                backing_storage_capacity_bytes = 0;
+	std::shared_ptr<void> transient_memory_accounting;
 	// Empty means every column is materialized. A non-empty list identifies
 	// the logical columns materialized by a coefficient-range read; the
 	// columns vector retains its original indexing for aliases/dictionaries.

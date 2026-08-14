@@ -3,6 +3,7 @@
 #include "galp/jpeg_dct_storage.hpp"
 #include "galp/profiles/rgbnomore.hpp"
 #include "jpeg/jpeg_dct_order.hpp"
+#include "jpeg/jpeg_dct_active_output_schedule.hpp"
 #include "jpeg/jpeg_dct_plan_types.hpp"
 #include <algorithm>
 #include <array>
@@ -765,6 +766,23 @@ TEST(JpegDctBlockMajorPlan, SequentialFixedCropUsesRequestRunsWithoutExpandedIte
 	EXPECT_EQ(plan.stats.global_transform_sort_items, 0U);
 	EXPECT_GT(plan.stats.touched_block_groups, 0U);
 	EXPECT_GT(plan.stats.selected_vectors, 0U);
+	EXPECT_EQ(plan.stats.duplicate_physical_read_count, 0U);
+	EXPECT_EQ(plan.stats.rowgroup_revisit_count, 0U);
+	EXPECT_EQ(plan.stats.vector_run_revisit_count, 0U);
+	EXPECT_EQ(plan.stats.physical_read_order_inversions, 0U);
+	EXPECT_TRUE(std::is_sorted(plan.rowgroups.begin(), plan.rowgroups.end(), [](const auto& left, const auto& right) {
+		return std::tie(left.shard_id, left.rowgroup_index) < std::tie(right.shard_id, right.rowgroup_index);
+	}));
+	for (const auto& rowgroup : plan.rowgroups) {
+		uint32_t previous_end = 0U;
+		for (uint32_t run_index = 0U; run_index < rowgroup.vector_run_count; ++run_index) {
+			const auto& run = plan.vector_runs[rowgroup.first_vector_run + run_index];
+			EXPECT_EQ(run.shard_id, rowgroup.shard_id);
+			EXPECT_EQ(run.rowgroup_index, rowgroup.rowgroup_index);
+			EXPECT_GE(run.first_vector, previous_end);
+			previous_end = run.first_vector + run.vector_count;
+		}
+	}
 	EXPECT_EQ(plan.stats.touched_rank_cells, plan.rank_cells.size());
 	EXPECT_EQ(plan.stats.rank_payload_bytes, plan.rank_payload.size());
 	EXPECT_EQ(plan.stats.touched_quant_tables, plan.quant_tables.size());
@@ -787,6 +805,61 @@ TEST(JpegDctBlockMajorPlan, SequentialFixedCropUsesRequestRunsWithoutExpandedIte
 	const auto expected_rows = expected_physical_rows(source, plan);
 	EXPECT_TRUE(plan.rank_runs.empty());
 	EXPECT_EQ(actual_vectors(plan), expected_vectors(source, expected_rows));
+}
+
+TEST(JpegDctBlockMajorPlan, CanonicalTemplateRoundTripsWithStableHitMissDigest) {
+	BlockMajorTemporaryDirectory temporary;
+	const auto source = make_synthetic_dataset(temporary.path());
+	const auto sidecars = temporary.path() / "sidecars";
+	galp::jpeg::build_jpeg_dct_block_major_access_dataset(source.manifest_path, sidecars);
+	galp::jpeg::JpegDctBlockMajorCompactPlanner planner(source.manifest_path, sidecars);
+	const auto transform = galp::profiles::rgbnomore_val_dct_grid_transform();
+	std::vector<galp::jpeg::JpegDctImageCropRequest> requests;
+	for (uint32_t image = 0U; image < source.manifest.shards.front().image_count; ++image) {
+		requests.push_back({image, {}, false, {}, {}});
+	}
+	const auto miss = planner.Plan(requests, transform);
+	EXPECT_EQ(miss.stats.canonical_template_hit_count, 0U);
+	EXPECT_EQ(miss.stats.canonical_template_miss_count, 1U);
+	EXPECT_NE(miss.stats.canonical_template_audit_digest, 0U);
+
+	const auto written = planner.WriteCanonicalShardPlanTemplate(
+	    source.manifest.shards.front().shard_id, transform, sidecars);
+	EXPECT_FALSE(written.reused_existing);
+	EXPECT_GT(written.sidecar_bytes, 0U);
+	EXPECT_EQ(written.plan_audit_digest, miss.stats.canonical_template_audit_digest);
+	EXPECT_EQ(written.request_count, requests.size());
+	EXPECT_EQ(written.rowgroup_count, miss.rowgroups.size());
+	EXPECT_EQ(written.vector_run_count, miss.vector_runs.size());
+
+	const auto hit = planner.Plan(requests, transform);
+	EXPECT_EQ(hit.stats.canonical_template_hit_count, 1U);
+	EXPECT_EQ(hit.stats.canonical_template_miss_count, 0U);
+	EXPECT_EQ(hit.stats.canonical_template_audit_digest, miss.stats.canonical_template_audit_digest);
+	EXPECT_EQ(hit.stats.canonical_template_sidecar_bytes, written.sidecar_bytes);
+	EXPECT_EQ(actual_vectors(hit), actual_vectors(miss));
+	EXPECT_EQ(hit.stats.selected_vectors, miss.stats.selected_vectors);
+	EXPECT_EQ(hit.group_bindings.size(), miss.group_bindings.size());
+	EXPECT_EQ(hit.rank_cells.size(), miss.rank_cells.size());
+	EXPECT_EQ(hit.rank_payload, miss.rank_payload);
+	EXPECT_EQ(hit.quant_tables.size(), miss.quant_tables.size());
+
+	const auto reused = planner.WriteCanonicalShardPlanTemplate(
+	    source.manifest.shards.front().shard_id, transform, sidecars);
+	EXPECT_TRUE(reused.reused_existing);
+	EXPECT_EQ(reused.sidecar_bytes, written.sidecar_bytes);
+	EXPECT_EQ(reused.plan_audit_digest, written.plan_audit_digest);
+
+	auto different_transform = transform;
+	different_transform.output_add = 1.0F;
+	const auto profile_miss = planner.Plan(requests, different_transform);
+	EXPECT_EQ(profile_miss.stats.canonical_template_hit_count, 0U);
+	EXPECT_EQ(profile_miss.stats.canonical_template_miss_count, 1U);
+	// The transform identity is part of the sidecar cache key, so changing it
+	// must miss even when the immutable compact-plan payload is unchanged.
+	// The audit digest intentionally describes that payload and must therefore
+	// remain stable for this output-only transform change.
+	EXPECT_EQ(profile_miss.stats.canonical_template_audit_digest, hit.stats.canonical_template_audit_digest);
 }
 
 TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorksetMajor) {
@@ -883,6 +956,64 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorkse
 		EXPECT_TRUE(std::is_sorted(begin, end));
 		EXPECT_EQ(std::adjacent_find(begin, end), end);
 	}
+}
+
+TEST(JpegDctBlockMajorPlan, ActiveOutputIntervalSidecarRoundTripsAndBindsEveryDecisionKey) {
+	using namespace galp::jpeg;
+	using namespace galp::jpeg::detail;
+	BlockMajorTemporaryDirectory temporary;
+	JpegDctDeviceBlockMajorActiveOutputSchedule schedule;
+	schedule.offsets = {0U, 6U, 10U};
+	schedule.active_output_blocks = {0U, 1U, 2U, 8U, 9U, 15U, 3U, 4U, 12U, 14U};
+	schedule.logical_output_block_count = 16U;
+	schedule.source_contribution_count = 20U;
+	schedule.source_contribution_visit_count = 40U;
+	schedule.output_workset_ownership_count = schedule.active_output_blocks.size();
+
+	JpegDctGridTransformSpec transform;
+	transform.y_output_width_blocks = 4U;
+	transform.y_output_height_blocks = 2U;
+	transform.cbcr_output_width_blocks = 2U;
+	transform.cbcr_output_height_blocks = 2U;
+	const std::vector<JpegDctActiveOutputDecisionRecord> decisions {
+	    {7U, 0U, 0U, 1U, 3U, 1U, 32U, 64U, 4096U, 3U},
+	    {7U, 1U, 1U, 1U, 3U, 1U, 30U, 64U, 3900U, 2U},
+	};
+	JpegDctActiveOutputScheduleKey key {
+	    temporary.path(),
+	    7U,
+	    0x123456789abcdef0ULL,
+	    jpeg_dct_active_output_decision_digest(decisions),
+	    jpeg_dct_active_output_transform_digest(transform),
+	    512U << 20U,
+	    64U,
+	    1U,
+	    2U,
+	    kJpegDctActiveOutputSchedulePlannerAbi};
+
+	const auto persisted = persist_jpeg_dct_active_output_schedule(key, schedule);
+	ASSERT_TRUE(persisted.persisted) << persisted.rejection_reason;
+	EXPECT_FALSE(persisted.rejected);
+	EXPECT_GT(persisted.interval_count, 0U);
+	EXPECT_TRUE(std::filesystem::is_regular_file(jpeg_dct_active_output_schedule_path(key)));
+
+	auto loaded = load_jpeg_dct_active_output_schedule(key);
+	ASSERT_TRUE(loaded.hit) << loaded.rejection_reason;
+	ASSERT_TRUE(loaded.schedule.has_value());
+	EXPECT_EQ(loaded.schedule->offsets, schedule.offsets);
+	EXPECT_EQ(loaded.schedule->active_output_blocks, schedule.active_output_blocks);
+	EXPECT_EQ(loaded.schedule->logical_output_block_count, schedule.logical_output_block_count);
+	EXPECT_EQ(loaded.schedule->source_contribution_count, schedule.source_contribution_count);
+	EXPECT_EQ(loaded.schedule->source_contribution_visit_count, schedule.source_contribution_visit_count);
+	EXPECT_EQ(loaded.schedule->output_workset_ownership_count, schedule.output_workset_ownership_count);
+	EXPECT_TRUE(loaded.schedule->sidecar_mapping);
+	EXPECT_LE(loaded.mapped_bytes, kJpegDctActiveOutputScheduleMmapCapacityBytes);
+
+	auto mismatched = key;
+	mismatched.decision_digest ^= 1U;
+	const auto rejected = load_jpeg_dct_active_output_schedule(mismatched);
+	EXPECT_FALSE(rejected.hit);
+	EXPECT_TRUE(rejected.rejected);
 }
 
 TEST(JpegDctBlockMajorPlan, CoordinateGroupLookupUsesPerShardSlotBoundingBoxesAndPreservesHoles) {

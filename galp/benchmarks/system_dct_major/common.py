@@ -353,17 +353,21 @@ def collect_sequential_samples(
     data_root = data_root.resolve(strict=True)
     split_root = (data_root / split).resolve(strict=True)
     label_map = load_label_map(label_map_json, expected_images)
-    paths = sorted(
-        path.resolve()
+    logical_paths = sorted(
+        path
         for path in split_root.rglob("*")
         if path.is_file() and path.suffix.lower() in JPEG_SUFFIXES
     )
-    require(len(paths) == expected_images, f"found {len(paths)} JPEGs below {split_root}, expected {expected_images}")
+    require(
+        len(logical_paths) == expected_images,
+        f"found {len(logical_paths)} JPEGs below {split_root}, expected {expected_images}",
+    )
     require(0 < sample_count <= expected_images, f"sample_count must be in [1,{expected_images}]")
     samples: list[dict[str, Any]] = []
     label_sample_ids = label_map["sample_ids"]
-    for image_id, path in enumerate(paths[:sample_count]):
-        sample_id = path.relative_to(data_root).as_posix()
+    for image_id, logical_path in enumerate(logical_paths[:sample_count]):
+        sample_id = logical_path.relative_to(data_root).as_posix()
+        path = logical_path.resolve(strict=True)
         if label_sample_ids:
             require(
                 sample_id == label_sample_ids[image_id],

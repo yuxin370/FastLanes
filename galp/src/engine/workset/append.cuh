@@ -27,6 +27,10 @@ inline void reserve_batch_expr_storage(ExecutionWorkset& workset, const size_t a
 		batch.device_exprs.reserve(batch.device_exprs.size() + additional_exprs);
 		batch.output_offsets.reserve(batch.output_offsets.size() + additional_exprs);
 		batch.expr_indices.reserve(batch.expr_indices.size() + additional_exprs);
+		// Selected-vector callers emit at least one explicit work item per
+		// expression. Reserve the batch floor up front so add_expression_to_batch
+		// does not grow and copy the vector once per column.
+		batch.work_items.reserve(batch.work_items.size() + additional_exprs);
 	});
 }
 

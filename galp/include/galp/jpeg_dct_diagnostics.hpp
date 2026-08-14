@@ -6,6 +6,7 @@
 #if GALP_WITH_JPEG_DCT
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace galp::jpeg {
@@ -74,7 +75,71 @@ struct JpegDctDeviceExecutionStats {
 	double      prefetch_consumed_as_hit_read_ms              = 0.0;
 	double      prefetch_consumed_as_hit_wait_ms              = 0.0;
 	double      planning_ms                                   = 0.0;
+	double      plan_device_batch_ms                          = 0.0;
+	double      compile_io_plan_ms                            = 0.0;
+	double      reader_lookup_ms                              = 0.0;
+	double      descriptor_open_ms                            = 0.0;
+	double      schema_plan_build_ms                          = 0.0;
+	double      static_metadata_wait_ms                       = 0.0;
+	size_t      reader_cache_hit_count                        = 0;
+	size_t      reader_cache_miss_count                       = 0;
+	size_t      reader_cache_eviction_count                   = 0;
+	size_t      static_metadata_cache_hit_count               = 0;
+	size_t      static_metadata_cache_miss_count              = 0;
+	size_t      descriptor_map_count                          = 0;
+	size_t      static_metadata_wait_count                    = 0;
+	double      parallel_reader_resolve_ms                    = 0.0;
+	size_t      parallel_reader_resolve_workers               = 0;
+	double      dynamic_image_planning_ms                      = 0.0;
+	double      crop_geometry_planning_ms                      = 0.0;
+	double      crop_interval_planning_ms                      = 0.0;
+	double      axis_program_planning_ms                       = 0.0;
+	double      rowgroup_binding_planning_ms                   = 0.0;
+	double      plan_finalize_ms                               = 0.0;
+	size_t      active_reader_count                           = 0;
+	size_t      active_reader_peak_count                      = 0;
+	size_t      static_metadata_count                         = 0;
+	size_t      static_metadata_peak_count                    = 0;
+	size_t      static_metadata_bytes                         = 0;
+	size_t      static_metadata_peak_bytes                    = 0;
+	size_t      planning_unique_shard_count                   = 0;
+	size_t      planning_rowgroup_binding_count               = 0;
+	bool        static_metadata_prewarm_performed             = false;
+	double      static_metadata_prewarm_ms                    = 0.0;
+	size_t      static_metadata_prewarm_shards                = 0;
+	size_t      static_metadata_prewarm_workers               = 0;
+	size_t      payload_fd_current_count                      = 0;
+	size_t      payload_fd_peak_count                         = 0;
+	size_t      payload_fd_open_count                         = 0;
+	size_t      payload_fd_close_count                        = 0;
+	size_t      descriptor_unmap_count                        = 0;
+	size_t      descriptor_mapping_current_count              = 0;
+	size_t      descriptor_mapping_peak_count                 = 0;
+	size_t      descriptor_map_process_count                  = 0;
+	size_t      descriptor_mapped_current_bytes               = 0;
+	size_t      descriptor_mapped_peak_bytes                  = 0;
+	size_t      sparse_recipe_reader_hit_count                = 0;
+	size_t      sparse_recipe_reader_miss_count               = 0;
+	size_t      sparse_recipe_rowgroup_hit_count              = 0;
+	size_t      sparse_recipe_rowgroup_miss_count             = 0;
+	size_t      sparse_recipe_sidecar_bytes                   = 0;
+	size_t      sparse_recipe_record_count                    = 0;
+	size_t      sparse_recipe_source_metadata_bytes           = 0;
+	size_t      sparse_recipe_source_metadata_pread_count     = 0;
+	double      sparse_descriptor_open_ms                     = 0.0;
+	double      sparse_source_validation_ms                   = 0.0;
+	double      sparse_access_index_build_ms                  = 0.0;
+	double      sparse_recipe_load_ms                         = 0.0;
+	double      sparse_recipe_validation_ms                   = 0.0;
+	double      sparse_recipe_lookup_ms                       = 0.0;
+	double      sparse_recipe_rehydrate_ms                    = 0.0;
+	double      sparse_recipe_rehydrate_service_ms            = 0.0;
+	size_t      sparse_recipe_rehydrate_workers               = 0;
+	double      sparse_endpoint_resolution_ms                 = 0.0;
+	double      sparse_range_gather_ms                        = 0.0;
+	double      sparse_range_sort_exact_coalesce_ms           = 0.0;
 	double      host_io_staging_ms                            = 0.0;
+	double      compact_read_group_planning_ms                = 0.0;
 	size_t      host_io_staged_rowgroups                      = 0;
 	double      workset_build_ms                              = 0.0;
 	double      workset_upload_ms                             = 0.0;
@@ -148,6 +213,12 @@ struct JpegDctDeviceExecutionStats {
 	// dictionaries and decode worksets. Keep this separate from allocator RSS.
 	size_t compact_plan_bytes                       = 0;
 	size_t compact_plan_peak_bytes                  = 0;
+	size_t canonical_template_hit_count             = 0;
+	size_t canonical_template_miss_count            = 0;
+	size_t canonical_template_sidecar_bytes         = 0;
+	uint64_t canonical_template_audit_digest        = 0U;
+	double canonical_template_load_ms               = 0.0;
+	double canonical_template_validation_ms         = 0.0;
 	size_t rowgroup_storage_bytes_read              = 0;
 	size_t galp_native_device_in_use_bytes          = 0;
 	size_t galp_native_device_peak_in_use_bytes     = 0;
@@ -198,13 +269,23 @@ struct JpegDctDeviceExecutionStats {
 	size_t      planned_vector_count                  = 0;
 	size_t      actual_vector_count                   = 0;
 	size_t      compressed_payload_bytes_read         = 0;
+	size_t      selected_compressed_payload_bytes     = 0;
 	size_t      full_compressed_payload_bytes         = 0;
 	size_t      pread_count                           = 0;
 	size_t      preadv_count                          = 0;
+	size_t      merged_gap_bytes                      = 0;
+	size_t      hole_clear_bytes                      = 0;
+	size_t      static_prefix_restore_bytes           = 0;
+	double      hole_clear_ms                         = 0.0;
+	double      static_prefix_restore_ms              = 0.0;
 	size_t      vector_bundle_rowgroup_count          = 0;
 	size_t      vector_bundle_envelope_rowgroup_count = 0;
 	size_t      vector_bundle_pread_count             = 0;
 	double      read_amplification                    = 0.0;
+	size_t      duplicate_physical_read_count         = 0;
+	size_t      rowgroup_revisit_count                = 0;
+	size_t      vector_run_revisit_count              = 0;
+	size_t      physical_read_order_inversions        = 0;
 	size_t      source_blocks_transformed             = 0;
 	bool        sparse_read_supported                 = false;
 	size_t      sparse_read_fallback_rowgroup_count   = 0;
@@ -230,8 +311,31 @@ struct JpegDctDeviceExecutionStats {
 	// Final adaptive strategy after comparing exact sparse intervals, exact
 	// selected-vector decode over a full physical rowgroup, and full decode.
 	size_t run_interval_exact_rowgroup_count = 0U;
+	size_t run_interval_bounded_rowgroup_count = 0U;
 	size_t bitmap_exact_rowgroup_count       = 0U;
 	size_t full_rowgroup_strategy_count      = 0U;
+	uint32_t bounded_read_amplification_ppm      = 1'000'000U;
+	uint32_t bounded_read_local_amplification_ppm = 0U;
+	size_t bounded_read_max_run_bytes             = 0U;
+	std::string bounded_io_backend                 = "sync-pread";
+	uint32_t bounded_io_uring_queue_depth          = 0U;
+	size_t bounded_exact_storage_bytes             = 0U;
+	size_t bounded_physical_storage_bytes          = 0U;
+	size_t bounded_merged_gap_bytes                = 0U;
+	size_t bounded_exact_extent_count              = 0U;
+	size_t bounded_physical_run_count              = 0U;
+	size_t bounded_selected_gap_count              = 0U;
+	size_t bounded_max_run_rejected_gap_count      = 0U;
+	size_t bounded_budget_rejected_gap_count       = 0U;
+	size_t io_uring_read_request_count             = 0U;
+	size_t io_uring_completion_count               = 0U;
+	size_t io_uring_submit_syscall_count           = 0U;
+	size_t io_uring_wait_syscall_count             = 0U;
+	size_t io_uring_setup_count                    = 0U;
+	size_t io_uring_ring_mapped_bytes              = 0U;
+	size_t io_uring_fallback_count                 = 0U;
+	double io_uring_read_ms                         = 0.0;
+	double bounded_coalesce_ms                      = 0.0;
 	// Rowgroups read directly into CUDA-pinned host backing. These bytes can
 	// be DMA-uploaded without repacking through DeviceArena's staging buffer.
 	size_t pinned_rowgroup_read_count = 0;
@@ -248,6 +352,18 @@ struct JpegDctDeviceExecutionStats {
 	size_t compact_batch_buffer_pageable_fallback_count = 0;
 	size_t compact_batch_read_group_count        = 0;
 	size_t compact_batch_read_worker_count       = 0;
+	bool   compact_batch_pool_prewarm_performed  = false;
+	size_t compact_batch_pool_prewarmed_slots    = 0;
+	size_t compact_batch_pool_prewarmed_bytes    = 0;
+	size_t compact_batch_pool_largest_size_class_bytes = 0;
+	// Dataset-derived capacity profile for four concurrent 64-image batch
+	// contracts. A complete profile makes first-use size-class growth a startup
+	// event rather than a measured-batch allocation.
+	bool   compact_batch_pool_capacity_contract_complete = false;
+	size_t compact_batch_pool_capacity_contract_images   = 0;
+	size_t compact_batch_pool_capacity_contract_groups   = 0;
+	size_t compact_batch_pool_capacity_contract_batches  = 0;
+	size_t compact_batch_pool_capacity_contract_bytes    = 0;
 	// Process-global pinned host pool gauges/counters sampled after execution.
 	size_t galp_native_pinned_in_use_bytes          = 0;
 	size_t galp_native_pinned_peak_in_use_bytes     = 0;
@@ -292,6 +408,20 @@ struct JpegDctDeviceExecutionStats {
 	bool   bounded_double_buffer_candidate           = false;
 	size_t bounded_double_buffer_workset_count      = 0U;
 	size_t bounded_double_buffer_peak_estimated_bytes = 0U;
+	// Measured lifetime accounting for the selected block-major bounded path.
+	// "used" counts live logical backing and arena bytes once; allocated
+	// capacity additionally exposes persistent arena reservation overhead.
+	size_t actual_transient_current_chunk_compressed_peak_bytes = 0U;
+	size_t actual_transient_next_chunk_compressed_peak_bytes    = 0U;
+	size_t actual_transient_compressed_backing_live_peak_bytes  = 0U;
+	size_t actual_transient_decoded_arena_used_peak_bytes       = 0U;
+	size_t actual_transient_decoded_arena_capacity_peak_bytes   = 0U;
+	size_t actual_transient_ring_fixed_buffer_peak_bytes        = 0U;
+	size_t actual_transient_active_schedule_peak_bytes          = 0U;
+	size_t actual_transient_kernel_referenced_backing_peak_bytes = 0U;
+	size_t actual_transient_total_used_high_water_bytes         = 0U;
+	size_t actual_transient_total_allocated_high_water_bytes    = 0U;
+	bool   actual_transient_memory_gate_passed                  = false;
 	// Column binding is constructed once per decode batch. The expression
 	// scan count makes the intended O(expressions + rowgroups) path auditable.
 	double column_binding_ms                    = 0.0;
@@ -311,6 +441,34 @@ struct JpegDctDeviceExecutionStats {
 	double planless_transform_active_output_count_ms           = 0.0;
 	double planless_transform_active_output_prefix_ms          = 0.0;
 	double planless_transform_active_output_fill_ms            = 0.0;
+	// P4 immutable interval sidecars. A hit replaces the two-pass ownership
+	// enumeration with mmap validation plus deterministic interval expansion.
+	size_t active_output_schedule_sidecar_hit_count            = 0U;
+	size_t active_output_schedule_sidecar_miss_count           = 0U;
+	size_t active_output_schedule_sidecar_reject_count         = 0U;
+	size_t active_output_schedule_sidecar_persist_count        = 0U;
+	size_t active_output_schedule_sidecar_bytes                = 0U;
+	size_t active_output_schedule_interval_count               = 0U;
+	size_t active_output_schedule_mapped_bytes_peak            = 0U;
+	size_t active_output_schedule_mmap_capacity_bytes          = 0U;
+	size_t active_output_schedule_mmap_window_count            = 0U;
+	double active_output_schedule_load_ms                      = 0.0;
+	double active_output_schedule_validation_ms                = 0.0;
+	double active_output_schedule_materialize_ms               = 0.0;
+	double active_output_schedule_persist_ms                   = 0.0;
+	// Explicitly distinguishes the event-owned asynchronous batch path from
+	// legacy executions that synchronize once before returning.
+	size_t async_planless_completion_batch_count               = 0U;
+	// The planless resize-weight dictionary is data dependent, but its complete
+	// capacity is bounded by immutable component extents and the fixed output
+	// transform. Reserve that contract before measured crops can cross a power-
+	// of-two allocator boundary, and expose both device and pinned growth.
+	size_t planless_axis_program_capacity_contract_bytes        = 0U;
+	bool   planless_axis_program_capacity_contract_complete     = false;
+	size_t planless_axis_program_device_capacity_bytes          = 0U;
+	size_t planless_axis_program_pinned_capacity_bytes          = 0U;
+	size_t planless_axis_program_device_growth_count            = 0U;
+	size_t planless_axis_program_pinned_growth_count            = 0U;
 };
 
 } // namespace galp::jpeg

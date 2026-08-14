@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Diagnostic GALP Direct-DCT phase benchmark for RGB-no-more JPEG-Ti.
-
 Published end-to-end comparisons must use ``../inference/run.py``. This script is
 retained for loader/kernel/overlap diagnosis and is also imported by the
 canonical benchmark's GALP adapter. It requests the
@@ -15,9 +14,12 @@ import argparse
 import csv
 import importlib
 import json
+import math
 import random
+import statistics
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -211,6 +213,34 @@ def _sync(device: torch.device | str) -> None:
     device = torch.device(device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _latency_distribution_ms(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        raise ValueError("cannot summarize an empty latency sequence")
+    ordered = sorted(float(value) for value in values)
+
+    def percentile(quantile: float) -> float:
+        position = (len(ordered) - 1) * quantile
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    mean = statistics.fmean(ordered)
+    return {
+        "count": len(ordered),
+        "mean": mean,
+        "cv_population": statistics.pstdev(ordered) / abs(mean) if mean else 0.0,
+        "min": ordered[0],
+        "p50": percentile(0.50),
+        "p90": percentile(0.90),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+        "max": ordered[-1],
+    }
 
 
 def _load_label_index(index_file: Path) -> dict[str, int]:
@@ -667,8 +697,13 @@ def _uses_fixed_transform(stats: dict[str, Any]) -> bool:
     return _uses_planless_fixed_transform(stats) or int(stats.get("fixed_transform_item_count", 0)) > 0
 
 
+def _execution_stats_snapshot(batch: Any) -> dict[str, Any]:
+    snapshot = getattr(batch, "execution_stats_snapshot", None)
+    return snapshot if snapshot is not None else batch.execution_stats
+
+
 def _accumulate_stats(totals: dict[str, int | float | str], batch: Any) -> None:
-    stats = batch.execution_stats
+    stats = batch if isinstance(batch, dict) else _execution_stats_snapshot(batch)
     totals["selected_vectors"] += int(stats["selected_vector_count"])
     totals["full_vectors"] += int(stats["full_vector_count"])
     totals["planned_vector_count"] += int(
@@ -852,11 +887,31 @@ def _accumulate_stats(totals: dict[str, int | float | str], batch: Any) -> None:
         stats.get("jpeg_dct_projection_items_materialized", stats["projection_item_count"])
     )
     totals["internal_syncs"] += int(stats["internal_sync_count"])
+    totals["async_planless_completion_batches"] += int(
+        stats.get("async_planless_completion_batch_count", 0)
+    )
     totals["planning_seconds"] += float(stats.get("planning_ms", 0.0)) / 1000.0
     totals["workset_build_seconds"] += float(stats.get("workset_build_ms", 0.0)) / 1000.0
     totals["workset_upload_seconds"] += float(stats.get("workset_upload_ms", 0.0)) / 1000.0
+    totals["workset_upload_prep_seconds"] += float(stats.get("workset_upload_prep_ms", 0.0)) / 1000.0
+    totals["workset_upload_arena_seconds"] += float(stats.get("workset_upload_arena_ms", 0.0)) / 1000.0
     totals["workset_upload_arena_pack_seconds"] += (
         float(stats.get("workset_upload_arena_pack_ms", 0.0)) / 1000.0
+    )
+    totals["workset_upload_arena_layout_seconds"] += (
+        float(stats.get("workset_upload_arena_layout_ms", 0.0)) / 1000.0
+    )
+    totals["workset_upload_arena_alloc_seconds"] += (
+        float(stats.get("workset_upload_arena_alloc_ms", 0.0)) / 1000.0
+    )
+    totals["workset_upload_arena_resolve_seconds"] += (
+        float(stats.get("workset_upload_arena_resolve_ms", 0.0)) / 1000.0
+    )
+    totals["workset_upload_dma_issue_seconds"] += (
+        float(stats.get("workset_upload_dma_issue_ms", 0.0)) / 1000.0
+    )
+    totals["workset_upload_event_record_seconds"] += (
+        float(stats.get("workset_upload_event_record_ms", 0.0)) / 1000.0
     )
     totals["workset_upload_dma_bytes"] += int(stats.get("workset_upload_dma_bytes", 0))
     totals["workset_upload_dma_count"] += int(stats.get("workset_upload_dma_count", 0))
@@ -982,10 +1037,18 @@ def _empty_totals() -> dict[str, int | float | str]:
         "project_decoded_ycbcr_grid_launches": 0,
         "jpeg_dct_projection_items_materialized": 0,
         "internal_syncs": 0,
+        "async_planless_completion_batches": 0,
         "planning_seconds": 0.0,
         "workset_build_seconds": 0.0,
         "workset_upload_seconds": 0.0,
+        "workset_upload_prep_seconds": 0.0,
+        "workset_upload_arena_seconds": 0.0,
         "workset_upload_arena_pack_seconds": 0.0,
+        "workset_upload_arena_layout_seconds": 0.0,
+        "workset_upload_arena_alloc_seconds": 0.0,
+        "workset_upload_arena_resolve_seconds": 0.0,
+        "workset_upload_dma_issue_seconds": 0.0,
+        "workset_upload_event_record_seconds": 0.0,
         "workset_upload_dma_bytes": 0,
         "workset_upload_dma_count": 0,
         "decode_seconds": 0.0,
@@ -1127,7 +1190,7 @@ def _projection_counts_for_batches(batches: list[Any]) -> tuple[int, int]:
     projection_items = 0
     materialized_items = 0
     for batch in batches:
-        stats = batch.execution_stats
+        stats = _execution_stats_snapshot(batch)
         projection_items += int(stats.get("projection_item_count", 0))
         materialized_items += int(
             stats.get("jpeg_dct_projection_items_materialized", stats.get("projection_item_count", 0))
@@ -1292,6 +1355,7 @@ def _prefetch_pushdown_batch(reader: Any, args: argparse.Namespace, image_ids: l
             "transform_blocks_per_launch": int(getattr(args, "transform_blocks_per_launch", 0)),
             "transform_ctas_per_launch": int(getattr(args, "transform_ctas_per_launch", 0)),
             "use_low_priority_streams": bool(getattr(args, "use_low_priority_streams", False)),
+            "async_planless_completion": bool(getattr(args, "async_planless_completion", False)),
         }
     )
     return reader.prefetch_batch(
@@ -1357,22 +1421,44 @@ def run_loader_phase(
     )
     started = time.perf_counter()
     scheduled: list[tuple[list[int], list[dict[str, Any]]]] = []
+    pending_batches: deque[Any] = deque()
+    next_prefetch_step = 0
     if async_prefetch:
         for step in range(args.steps):
             scheduled.append(_make_benchmark_image_ids(reader, args, step))
-        pending = _prefetch_pushdown_batch(reader, args, scheduled[0][0]) if scheduled else None
+        initial_depth = min(int(getattr(args, "batch_prefetch_depth", 1)), len(scheduled))
+        for _ in range(initial_depth):
+            pending_batches.append(
+                _prefetch_pushdown_batch(reader, args, scheduled[next_prefetch_step][0])
+            )
+            next_prefetch_step += 1
+        if bool(getattr(args, "async_planless_completion", False)) and pending_batches:
+            pending_batches[0].release_submission()
     for step in range(args.steps):
         image_ids, skipped = scheduled[step] if async_prefetch else _make_benchmark_image_ids(reader, args, step)
         _record_unsupported_sampling_skips(unsupported_sampling_skips, step, skipped)
         if async_prefetch:
-            if pending is None:
+            if not pending_batches:
                 raise RuntimeError("pushdown async prefetch state was not initialized")
-            input_y, input_cbcr, batches = _adapt_prefetched_pushdown_batch(reader, args, image_ids, pending)
-            pending = (
-                _prefetch_pushdown_batch(reader, args, scheduled[step + 1][0])
-                if step + 1 < args.steps
-                else None
+            pending = pending_batches.popleft()
+            input_y, input_cbcr, batches = _adapt_prefetched_pushdown_batch(
+                reader, args, image_ids, pending
             )
+            if next_prefetch_step < len(scheduled):
+                pending_batches.append(
+                    _prefetch_pushdown_batch(
+                        reader, args, scheduled[next_prefetch_step][0]
+                    )
+                )
+                next_prefetch_step += 1
+            if bool(getattr(args, "async_planless_completion", False)):
+                # A preprocess-only tensor is not ready until its completion
+                # event has passed. Retire the current slot before releasing
+                # the next gated GPU submission, matching the bounded
+                # production lifetime without introducing a device-wide wait.
+                torch.cuda.current_stream(device).synchronize()
+                if pending_batches:
+                    pending_batches[0].release_submission()
         else:
             input_y, input_cbcr, batches = read_and_adapt_batch(
                 reader, args, image_ids, crop, rgbnomore_dct_val_transform
@@ -1387,7 +1473,7 @@ def run_loader_phase(
             raise RuntimeError(
                 f"pushdown batch must use exactly one batched read, got {len(batches)} read_batch calls"
             )
-        batch_stats = [dict(batch.execution_stats) for batch in batches]
+        batch_stats = [dict(_execution_stats_snapshot(batch)) for batch in batches]
         execution_path_batches.append(
             {
                 "step": step,
@@ -1435,6 +1521,10 @@ def run_loader_phase(
         "device": str(device),
         "cache_capacity_mib": args.cache_capacity_mib,
         "async_prefetch": async_prefetch,
+        "async_planless_completion": bool(
+            getattr(args, "async_planless_completion", False)
+        ),
+        "batch_prefetch_depth": int(getattr(args, "batch_prefetch_depth", 1)),
         "decode_batch_rowgroups": args.decode_batch_rowgroups,
         "rowgroup_prefetch_depth": args.rowgroup_prefetch_depth,
         "rowgroup_prefetch_workers": args.rowgroup_prefetch_workers,
@@ -1487,10 +1577,24 @@ def run_forward_phase(
     logits_shape: list[int] | None = None
     input_y_shape = list(input_y.shape)
     input_cbcr_shape = list(input_cbcr.shape)
+    forward_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+    forward_wall_ms: list[float] = []
     started = time.perf_counter()
     for step in range(args.steps):
+        step_started = time.perf_counter()
+        start_event: torch.cuda.Event | None = None
+        end_event: torch.cuda.Event | None = None
+        if device.type == "cuda":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
         with torch.no_grad():
             logits = model(input_y, input_cbcr)
+        if start_event is not None and end_event is not None:
+            end_event.record()
+            forward_events.append((start_event, end_event))
+        else:
+            forward_wall_ms.append(1000.0 * (time.perf_counter() - step_started))
         if tuple(logits.shape) != (len(image_ids), 1000):
             raise RuntimeError(f"expected logits shape {(len(image_ids), 1000)}, got {tuple(logits.shape)}")
         logits_shape = list(logits.shape)
@@ -1502,6 +1606,8 @@ def run_forward_phase(
             )
     _sync(device)
     seconds = time.perf_counter() - started
+    if forward_events:
+        forward_wall_ms = [float(start.elapsed_time(end)) for start, end in forward_events]
     result = {
         "backend": "galp_direct_dct_rgbnomore",
         "phase": "forward_step",
@@ -1510,6 +1616,8 @@ def run_forward_phase(
         "images": total_images,
         "seconds": seconds,
         "images_per_s": total_images / seconds if seconds > 0.0 else float("inf"),
+        "steady_period_ms_per_batch": 1000.0 * seconds / args.steps,
+        "forward_gpu_ms": _latency_distribution_ms(forward_wall_ms),
         "batch_size": args.batch_size,
         "steps": args.steps,
         "warmup": args.warmup,
@@ -1612,7 +1720,7 @@ def run_end_to_end_phase(
                 raise RuntimeError(
                     f"pushdown end-to-end batch must use exactly one batched read, got {len(batches)}"
                 )
-            stats = dict(batches[0].execution_stats)
+            stats = dict(_execution_stats_snapshot(batches[0]))
             fixed_path = _uses_fixed_transform(stats)
             generic_projection = (
                 int(stats.get("projection_item_count", 0)) != 0
@@ -1865,6 +1973,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rowgroup-prefetch-depth", type=int, default=16)
     parser.add_argument("--rowgroup-prefetch-workers", type=int, default=4)
     parser.add_argument("--rowgroup-prefetch-min-decode-batches", type=int, default=2)
+    parser.add_argument("--batch-prefetch-depth", type=int, default=1)
+    parser.add_argument(
+        "--scheduling-policy",
+        choices=("fully-overlapped", "limited-overlap", "serial"),
+        default="fully-overlapped",
+    )
+    parser.add_argument("--transform-blocks-per-launch", type=int, default=0)
+    parser.add_argument("--transform-ctas-per-launch", type=int, default=0)
+    parser.add_argument("--use-low-priority-streams", action="store_true")
+    parser.add_argument("--async-planless-completion", action="store_true")
     parser.add_argument(
         "--no-async-prefetch",
         action="store_false",
@@ -1915,8 +2033,12 @@ def main() -> None:
         args.rowgroup_prefetch_depth <= 0
         or args.rowgroup_prefetch_workers <= 0
         or args.rowgroup_prefetch_min_decode_batches <= 0
+        or args.batch_prefetch_depth <= 0
     ):
-        raise ValueError("--rowgroup-prefetch-depth/workers/min-decode-batches must be positive")
+        raise ValueError(
+            "--rowgroup-prefetch-depth/workers/min-decode-batches and "
+            "--batch-prefetch-depth must be positive"
+        )
     if args.train_lr < 0.0:
         raise ValueError("--train-lr must be non-negative")
     if args.preprocess in ("rgbnomore-val", "rgbnomore-val-pushdown") and args.no_scale:

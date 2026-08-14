@@ -147,6 +147,37 @@ TEST(JpegDctExactVerifier, RejectsWorkerCountsOutsideTheBoundBeforeOpeningTheMan
 	             std::invalid_argument);
 }
 
+TEST(JpegDctExactVerifier, SpatialMajorPartialRowgroupUsesPersistedGroupOffsets) {
+	TemporaryDirectory                 temporary;
+	std::vector<std::filesystem::path> source_paths;
+	for (size_t index = 0U; index < 11U; ++index) {
+		const auto source_path = temporary.path() / ("partial_" + std::to_string(index) + ".jpg");
+		write_test_jpeg(source_path, 64, 64, static_cast<int>(index) + 31);
+		source_paths.push_back(source_path);
+	}
+
+	galp::jpeg::JpegDctShardOptions options;
+	options.shard_images                  = source_paths.size();
+	options.shard_images_specified        = true;
+	options.rowgroup_vectors              = 1U;
+	options.rowgroup_vectors_specified    = true;
+	options.rowgroups_per_shard           = 64U;
+	options.rowgroups_per_shard_specified = true;
+	options.threads                       = 2U;
+	options.shard_workers                 = 1U;
+	const auto output_root = temporary.path() / "partial-rowgroup";
+	const auto manifest = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    source_paths, output_root, {}, options, {});
+
+	ASSERT_EQ(manifest.shards.size(), 1U);
+	ASSERT_EQ(manifest.shards.front().rowgroup_count, 2U);
+	ASSERT_NE(manifest.shards.front().physical_row_count % 1024U, 0U);
+	const auto result = galp::jpeg::verify_jpeg_dct_manifest_exact(
+	    output_root / "manifest.bin", source_paths, 4U);
+	EXPECT_TRUE(result.exact());
+	EXPECT_EQ(result.expected_blocks, manifest.shards.front().real_row_count);
+}
+
 TEST_F(JpegDctExactVerifierTest, SerialAndParallelExactResultsAreIdentical) {
 	const auto by_default = galp::jpeg::verify_jpeg_dct_manifest_exact(manifest_path_, source_paths_);
 	const auto serial     = galp::jpeg::verify_jpeg_dct_manifest_exact(manifest_path_, source_paths_, 1U);
@@ -175,6 +206,66 @@ TEST_F(JpegDctExactVerifierTest, ParallelMergeReportsTheGloballyEarliestMismatch
 	ASSERT_TRUE(serial.first_mismatch.present);
 	EXPECT_EQ(serial.first_mismatch.global_image_index, 0U);
 	EXPECT_EQ(serial.first_mismatch.kind, galp::jpeg::JpegDctExactMismatchKind::kCoefficient);
+	expect_same_result(serial, parallel);
+}
+
+TEST_F(JpegDctExactVerifierTest, ImageMajorV2ReadsEachPhysicalRowgroupThroughOneShardReader) {
+	galp::jpeg::JpegDctShardOptions options;
+	options.shard_images                  = 2U;
+	options.shard_images_specified        = true;
+	options.rowgroup_vectors              = 1U;
+	options.rowgroup_vectors_specified    = true;
+	options.rowgroups_per_shard           = 16U;
+	options.rowgroups_per_shard_specified = true;
+	options.physical_layout               = galp::jpeg::JpegDctPhysicalLayout::kImageMajor;
+	options.physical_layout_specified     = true;
+	options.threads                       = 1U;
+	options.shard_workers                 = 1U;
+	const auto output_root = temporary_.path() / "image-major-v2";
+	const auto manifest = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    source_paths_, output_root, {}, options, {});
+
+	ASSERT_EQ(manifest.version, 2U);
+	const auto serial = galp::jpeg::verify_jpeg_dct_manifest_exact(
+	    output_root / "manifest.bin", source_paths_, 1U);
+	const auto parallel = galp::jpeg::verify_jpeg_dct_manifest_exact(
+	    output_root / "manifest.bin", source_paths_, 4U);
+	EXPECT_TRUE(serial.exact());
+	EXPECT_EQ(serial.source_images, source_paths_.size());
+	EXPECT_EQ(serial.expected_blocks, serial.actual_blocks);
+	expect_same_result(serial, parallel);
+
+	auto mismatched_paths = source_paths_;
+	std::swap(mismatched_paths.front(), mismatched_paths.back());
+	const auto mismatch = galp::jpeg::verify_jpeg_dct_manifest_exact(
+	    output_root / "manifest.bin", mismatched_paths, 4U);
+	EXPECT_FALSE(mismatch.exact());
+	ASSERT_TRUE(mismatch.first_mismatch.present);
+	EXPECT_EQ(mismatch.first_mismatch.global_image_index, 0U);
+}
+
+TEST_F(JpegDctExactVerifierTest, ImageMajorV3HandlesIndependentPaddedVectorRowgroups) {
+	galp::jpeg::JpegDctShardOptions options;
+	options.shard_images                  = 2U;
+	options.shard_images_specified        = true;
+	options.rowgroups_per_shard           = 16U;
+	options.rowgroups_per_shard_specified = true;
+	options.physical_layout               = galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
+	options.physical_layout_specified     = true;
+	options.threads                       = 1U;
+	options.shard_workers                 = 1U;
+	const auto output_root = temporary_.path() / "image-major-v3";
+	const auto manifest = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    source_paths_, output_root, {}, options, {});
+
+	ASSERT_EQ(manifest.version, 3U);
+	const auto serial = galp::jpeg::verify_jpeg_dct_manifest_exact(
+	    output_root / "manifest.bin", source_paths_, 1U);
+	const auto parallel = galp::jpeg::verify_jpeg_dct_manifest_exact(
+	    output_root / "manifest.bin", source_paths_, 4U);
+	EXPECT_TRUE(serial.exact());
+	EXPECT_EQ(serial.source_images, source_paths_.size());
+	EXPECT_EQ(serial.expected_blocks, serial.actual_blocks);
 	expect_same_result(serial, parallel);
 }
 

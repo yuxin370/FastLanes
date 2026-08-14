@@ -68,6 +68,7 @@ struct ZeroCopyRowgroup {
 	// so every encoded pointer resolves at its aligned relative offset while
 	// the arena still issues one aggregate H2D copy (including alignment gaps).
 	fastlanes::span<std::byte>                                          transfer_backing_span;
+	size_t                                                              backing_capacity_bytes = 0U;
 	bool                                                                backing_is_pinned = false;
 	std::shared_ptr<fastlanes::RowgroupView>                            rowgroup_view;
 	std::vector<ZeroCopyColumn>                                         columns;
@@ -80,23 +81,40 @@ struct ZeroCopyRowgroup {
 
 struct ZeroCopyReadTiming {
 	size_t                                storage_bytes                    = 0;
+	size_t                                selected_storage_bytes           = 0;
 	size_t                                logical_storage_bytes            = 0;
 	size_t                                full_storage_bytes               = 0;
 	size_t                                physical_page_bytes              = 0;
 	size_t                                full_physical_page_bytes         = 0;
+	size_t                                logical_backing_capacity_bytes    = 0;
+	size_t                                packed_backing_capacity_bytes     = 0;
 	size_t                                pread_count                      = 0;
 	size_t                                preadv_count                     = 0;
+	size_t                                io_uring_read_request_count      = 0;
+	size_t                                io_uring_completion_count        = 0;
+	size_t                                io_uring_submit_syscall_count    = 0;
+	size_t                                io_uring_wait_syscall_count      = 0;
+	size_t                                io_uring_ring_mapped_bytes        = 0;
+	size_t                                io_uring_newly_mapped_ring_bytes  = 0;
 	size_t                                coalesced_read_run_count         = 0;
+	size_t                                merged_gap_bytes                 = 0;
+	size_t                                hole_clear_bytes                 = 0;
+	size_t                                static_prefix_restore_bytes       = 0;
 	size_t                                selected_coefficient_count       = 0;
 	size_t                                full_coefficient_count           = 0;
 	bool                                  sparse_read_supported            = false;
 	bool                                  used_sparse_read        = false;
+	bool                                  used_bounded_gap_read   = false;
+	bool                                  used_io_uring           = false;
 	bool                                  used_coefficient_range_read = false;
 	bool                                  used_pinned_backing     = false;
 	bool                                  used_vector_bundle_read = false;
 	bool                                  used_vector_bundle_envelope_read = false;
 	std::string                           sparse_fallback_reason;
 	double                                pread_ms                = 0.0;
+	double                                io_uring_ms             = 0.0;
+	double                                hole_clear_ms           = 0.0;
+	double                                static_prefix_restore_ms = 0.0;
 	double                                zero_copy_view_setup_ms = 0.0;
 	std::chrono::steady_clock::time_point pread_start {};
 	std::chrono::steady_clock::time_point pread_end {};

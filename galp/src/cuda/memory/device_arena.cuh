@@ -9,10 +9,12 @@
 #include "cuda/cuda_macros.cuh"
 #include "cuda/memory/device_pool.cuh"
 #include "cuda/memory/upload_metrics.cuh"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -45,7 +47,7 @@ class DeviceArena {
 	static size_t         checked_add(size_t a, size_t b, const char* field);
 	static size_t         checked_mul(size_t a, size_t b, const char* field);
 	static std::uintptr_t checked_ptr_end(std::uintptr_t begin, size_t bytes, const char* field);
-	static size_t         align_staged_offset(size_t value);
+	static size_t         align_staged_offset(size_t value, size_t alignment = 256U);
 
 public:
 	explicit DeviceArena(cudaStream_t stream);
@@ -75,7 +77,11 @@ public:
 		e.region_idx  = find_region(host_src, copy_bytes);
 
 		if (e.region_idx < 0) {
-			staged_bytes_   = align_staged_offset(staged_bytes_);
+			// The aggregate staged slab retains a 256-byte-aligned device
+			// base, but individual values only require their C++ type
+			// alignment. Padding every scalar/operand to 256 bytes inflated
+			// JPEG workset H2D traffic by several megabytes per batch.
+			staged_bytes_   = align_staged_offset(staged_bytes_, alignof(T));
 			e.staged_offset = staged_bytes_;
 			staged_bytes_   = checked_add(staged_bytes_, alloc_bytes, "DeviceArena staged area overflow");
 			staged_entry_indices_.push_back(idx);
@@ -124,7 +130,53 @@ private:
 	void          pack_staged_area();
 	DmaIssueStats issue_dma(size_t staged_device_base);
 	void          run_resolvers();
-	int           find_region(const void* host_src, size_t bytes) const;
+	void          index_new_region(size_t region_index);
+	void          rebuild_region_index();
+	int find_region(const void* host_src, const size_t bytes) const {
+		if (host_src == nullptr || bytes == 0 || regions_.empty()) {
+			return -1;
+		}
+		const auto src = reinterpret_cast<std::uintptr_t>(host_src);
+		if (bytes > std::numeric_limits<std::uintptr_t>::max() - src) {
+			throw std::overflow_error("DeviceArena source range overflow");
+		}
+		const auto contains = [&](const BackingRegion& region) {
+			const auto base = reinterpret_cast<std::uintptr_t>(region.base);
+			if (src < base) {
+				return false;
+			}
+			const auto offset = static_cast<size_t>(src - base);
+			return offset <= region.bytes && bytes <= region.bytes - offset;
+		};
+		if (last_region_index_ < regions_.size() && contains(regions_[last_region_index_])) {
+			return static_cast<int>(last_region_index_);
+		}
+		if (regions_disjoint_) {
+			const auto position = std::upper_bound(region_order_.begin(),
+			                                       region_order_.end(),
+			                                       src,
+			                                       [&](const std::uintptr_t address, const size_t region_index) {
+				                                       return address < reinterpret_cast<std::uintptr_t>(
+				                                                            regions_[region_index].base);
+			                                       });
+			if (position == region_order_.begin()) {
+				return -1;
+			}
+			const size_t index = *(position - 1);
+			if (contains(regions_[index])) {
+				last_region_index_ = index;
+				return static_cast<int>(index);
+			}
+			return -1;
+		}
+		for (size_t index = 0U; index < regions_.size(); ++index) {
+			if (contains(regions_[index])) {
+				last_region_index_ = index;
+				return static_cast<int>(index);
+			}
+		}
+		return -1;
+	}
 	bool          ensure_capacity(size_t alloc_bytes);
 	bool          ensure_pinned_capacity(size_t alloc_bytes);
 	void          release_device_base();
@@ -143,6 +195,15 @@ private:
 	std::vector<Entry>                 entries_;
 	std::vector<size_t>                staged_entry_indices_;
 	std::vector<BackingRegion>         regions_;
+	// Stable region indices sorted by host address. Compact-v3 contributes
+	// disjoint pinned shard arenas, while small codec operands often live
+	// outside every arena; indexed negative lookups avoid a full shard scan.
+	std::vector<size_t>                region_order_;
+	bool                               regions_disjoint_ = true;
+	// Workset construction registers one backing and then appends many codec
+	// chunks from that same region. Cache its index so the common containment
+	// lookup is O(1); mutations that can reorder or clear regions invalidate it.
+	mutable size_t                     last_region_index_ = static_cast<size_t>(-1);
 	std::vector<ResolverTarget>        resolver_targets_;
 	std::vector<std::function<void()>> resolvers_;
 	std::vector<std::function<void()>> deferred_frees_;

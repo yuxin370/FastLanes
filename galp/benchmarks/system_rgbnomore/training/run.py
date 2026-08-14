@@ -77,6 +77,12 @@ from training.pipeline import (
     load_training_manifest,
     validate_dataset_separation,
 )
+from training.pls_experiment import (
+    PlsExecutionPlan,
+    augmentation_batches as pls_augmentation_batches,
+    build_execution_plan as build_pls_execution_plan,
+    condition_config as pls_condition_config,
+)
 from training.sample_order import (
     SampleIdentity,
     SampleOrderLedger,
@@ -185,6 +191,40 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prefetch-depth", type=int, default=2)
     parser.add_argument("--distributed-rank", type=int, default=0)
     parser.add_argument("--distributed-world-size", type=int, default=1)
+    parser.add_argument(
+        "--pls-experiment",
+        action="store_true",
+        help=(
+            "enable the PLS training-effect experiment schedule; this runner path "
+            "emulates closed-wave order but does not claim complete GPU-pool materialization"
+        ),
+    )
+    parser.add_argument(
+        "--pls-condition-id",
+        help="pre-registered condition ID (A0-A3, B0-B7, C0-C2, or D0-D3)",
+    )
+    parser.add_argument(
+        "--pls-organization",
+        choices=("current", "storage-hash", "storage-stratified", "runtime-balanced"),
+        default="current",
+    )
+    parser.add_argument(
+        "--pls-crop-policy", choices=("per-sample", "per-shard"), default="per-shard"
+    )
+    parser.add_argument(
+        "--pls-order-policy", choices=("global", "pls-wave"), default="pls-wave"
+    )
+    parser.add_argument("--pls-segment-images", type=int, default=1024)
+    parser.add_argument("--pls-segments-per-pool", type=int, default=4)
+    parser.add_argument("--pls-organization-seed", type=int, default=20260810)
+    parser.add_argument(
+        "--pls-gpu-pool",
+        action="store_true",
+        help=(
+            "materialize each complete scheduled pool in one GALP Direct-DCT request; "
+            "requires a single galp pipeline"
+        ),
+    )
 
     parser.add_argument("--seed", type=int, default=11997733)
     parser.add_argument("--seeds")
@@ -251,6 +291,40 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--distributed-world-size must be positive")
     if args.distributed_rank < 0 or args.distributed_rank >= args.distributed_world_size:
         raise ValueError("--distributed-rank must be in [0, --distributed-world-size)")
+    if args.pls_condition_id is not None:
+        if not args.pls_experiment:
+            raise ValueError("--pls-condition-id requires --pls-experiment")
+        condition = pls_condition_config(args.pls_condition_id)
+        args.pls_organization = condition["organization"]
+        args.pls_crop_policy = condition["crop_policy"]
+        args.pls_order_policy = condition["order_policy"]
+        args.pls_segment_images = int(condition["segment_images"])
+        args.pls_segments_per_pool = int(condition["segments_per_pool"])
+        args.pls_resolved_condition = condition
+    else:
+        args.pls_resolved_condition = None
+    if args.pls_segment_images <= 0 or args.pls_segments_per_pool <= 0:
+        raise ValueError("PLS segment-images and segments-per-pool must be positive")
+    if args.pls_experiment and args.batch_size != 64:
+        raise ValueError("the pre-registered PLS experiment fixes --batch-size=64")
+    if args.pls_experiment and args.distributed_world_size != 1:
+        raise ValueError(
+            "PLS distributed closed-wave ownership is not yet part of the "
+            "pre-registered experiment; use --distributed-world-size=1"
+        )
+    if args.pls_gpu_pool and not args.pls_experiment:
+        raise ValueError("--pls-gpu-pool requires --pls-experiment")
+    if args.pls_gpu_pool and args.enabled != ["galp"]:
+        raise ValueError("--pls-gpu-pool requires exactly --pipeline galp")
+    if args.pls_gpu_pool and args.drop_last:
+        raise ValueError(
+            "--pls-gpu-pool requires --no-drop-last so every materialized pool "
+            "sample is consumed before release"
+        )
+    if args.pls_gpu_pool and args.phase != "convergence":
+        raise ValueError("--pls-gpu-pool currently requires --phase convergence")
+    if args.pls_gpu_pool and args.pls_order_policy != "pls-wave":
+        raise ValueError("--pls-gpu-pool requires bounded --pls-order-policy=pls-wave")
     for name in ("expected_image_count", "expected_validation_image_count"):
         value = getattr(args, name)
         if value is not None and value <= 0:
@@ -390,6 +464,7 @@ def _runtime_files(rgbnomore_root: Path) -> tuple[list[Path], list[Path]]:
             "optimizer.py",
             "augmentation.py",
             "sample_order.py",
+            "pls_experiment.py",
             "manifest_preflight.py",
             "direct_dct_reader.py",
             "metrics.py",
@@ -401,6 +476,8 @@ def _runtime_files(rgbnomore_root: Path) -> tuple[list[Path], list[Path]]:
     local.extend(
         path
         for path in (
+            FASTLANES_ROOT / "galp/benchmarks/system_dct_major/training_pls/schedule.py",
+            FASTLANES_ROOT / "galp/benchmarks/system_dct_major/training_pls/matrix.py",
             FASTLANES_ROOT / "galp/benchmarks/system_rgbnomore/shared/common.py",
             FASTLANES_ROOT / "galp/benchmarks/system_rgbnomore/shared/manifest_contract.py",
             FASTLANES_ROOT / "galp/torch/direct_dct_torch.cpp",
@@ -535,6 +612,40 @@ def _build_contract(
             ("resume", args.resume_checkpoint),
         )
     }
+    pls_contract = {
+        "enabled": bool(args.pls_experiment),
+        "condition": args.pls_resolved_condition,
+        "terminology": "physical load segment (PLS)",
+        "organization": args.pls_organization,
+        "organization_seed": args.pls_organization_seed,
+        "crop_policy": args.pls_crop_policy,
+        "order_policy": args.pls_order_policy,
+        "segment_images": args.pls_segment_images,
+        "segments_per_pool": args.pls_segments_per_pool,
+        "pool_size_definition": (
+            "sum of actual sample counts in every complete PLS loaded into the closed wave; "
+            "equals G*M only when all selected PLSs contain G samples"
+        ),
+        "closed_wave_lifetime": (
+            "materialize complete PLSs, uniformly permute all resident samples, consume the "
+            "pool completely, then release it and advance"
+        ),
+        "crop_scope": (
+            "one crop configuration per source physical shard per epoch"
+            if args.pls_crop_policy == "per-shard"
+            else "one crop configuration per logical sample per epoch"
+        ),
+        "implementation_scope": {
+            "statistical_schedule_emulation": bool(args.pls_experiment),
+            "complete_gpu_pool_materialization_configured": bool(args.pls_gpu_pool),
+            "complete_gpu_pool_materialization_measured": False,
+        },
+        "interpretation_policy": {
+            "primary": "complete convergence curves and final top-1/top-5",
+            "mixing": "explanatory observation with no pass/fail threshold",
+            "runtime": "engineering context with no training-strategy pass/fail threshold",
+        },
+    }
     contract: dict[str, Any] = {
         "schema_version": TRAINING_CONTRACT_SCHEMA,
         "enabled_pipelines": args.enabled,
@@ -563,7 +674,19 @@ def _build_contract(
         },
         "optimizer": optimizer,
         "scheduler": scheduler,
-        "augmentation": augmentation_contract(),
+        "augmentation": {
+            **augmentation_contract(),
+            "physical_load_segment_crop": {
+                "enabled": bool(args.pls_experiment),
+                "policy": args.pls_crop_policy,
+                "shared_key": (
+                    "sha256(seed, epoch, source_physical_shard_id)"
+                    if args.pls_crop_policy == "per-shard"
+                    else "sha256(seed, epoch, logical_sample_id)"
+                ),
+                "horizontal_flip": "independently keyed per sample",
+            },
+        },
         "validation_augmentation": {
             "recipe": "deterministic-centered-square-resize-range-v1",
             "horizontal_flip": False,
@@ -574,7 +697,15 @@ def _build_contract(
             ),
         },
         "sample_order": {
-            "algorithm": "sha256-derived-python-random-full-permutation-v1",
+            "algorithm": (
+                (
+                    "galp-pls-closed-wave-v1"
+                    if args.pls_order_policy == "pls-wave"
+                    else "galp-pls-global-permutation-v1"
+                )
+                if args.pls_experiment
+                else "sha256-derived-python-random-full-permutation-v1"
+            ),
             "identity": ["epoch", "position", "logical_sample_id"],
             "seed": args.seed,
             "drop_last": args.drop_last,
@@ -584,6 +715,7 @@ def _build_contract(
             "distributed_rank": args.distributed_rank,
             "distributed_world_size": args.distributed_world_size,
             "distributed_partition": "global permutation followed by rank-strided logical-ID partition",
+            "physical_load_segment": pls_contract,
         },
         "datasets": {"train": train_meta, "validation": val_meta, "separation": separation},
         "execution": {
@@ -673,6 +805,11 @@ def _build_contract(
             "cross_dct_rgb_tensor_equivalence": False,
             "cross_dct_rgb_weight_equivalence": False,
             "short_convergence_is_final_accuracy": False,
+            "pls_training_effect_measured_when_enabled": bool(args.pls_experiment),
+            "complete_gpu_pool_materialization": False,
+            "complete_gpu_pool_materialization_configured": bool(args.pls_gpu_pool),
+            "mixing_threshold_required": False,
+            "runtime_improvement_required": False,
         },
     }
     contract["contract_sha256"] = sha256_json(contract)
@@ -687,6 +824,15 @@ def _checkpoint_for_domain(args: argparse.Namespace, domain: str) -> Path | None
 
 def _domain_seed(base: int, domain: str) -> int:
     return base ^ (0x524742 if domain == "rgb" else 0x444354)
+
+
+def _augmentation_state(contract: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "stateless_keyed": True,
+        "physical_load_segment": copy.deepcopy(
+            contract["sample_order"].get("physical_load_segment", {"enabled": False})
+        ),
+    }
 
 
 def _prepare_initial_state(
@@ -749,8 +895,19 @@ def _prepare_initial_state(
     initial["checkpoint_epoch"] = checkpoint_epoch
     initial["scheduler_total_steps"] = total_steps
     initial["full_checkpoint_restored"] = full_checkpoint is not None
+    expected_augmentation_state = _augmentation_state(contract)
+    if (
+        full_checkpoint is not None
+        and args.pls_experiment
+        and full_checkpoint["augmentation_state"] != expected_augmentation_state
+    ):
+        raise ValueError(
+            "full checkpoint PLS augmentation/schedule state does not match the run contract"
+        )
     initial["augmentation_state"] = (
-        copy.deepcopy(full_checkpoint["augmentation_state"]) if full_checkpoint is not None else {"stateless_keyed": True}
+        copy.deepcopy(full_checkpoint["augmentation_state"])
+        if full_checkpoint is not None
+        else expected_augmentation_state
     )
     artifact_path = output_dir / f"initial_state_{domain}_seed{seed}.pt"
     torch.save(initial, artifact_path)
@@ -881,12 +1038,76 @@ def _augmentation_batches(
     ]
 
 
+def _collect_training_batches(
+    args: argparse.Namespace,
+    samples: Sequence[TrainingSample],
+    *,
+    seed: int,
+    batch_count: int,
+    start_cursor: dict[str, Any] | None,
+) -> tuple[
+    list[list[SampleIdentity]],
+    dict[int, int],
+    PlsExecutionPlan | None,
+]:
+    """Select either the canonical control or the PLS experimental schedule."""
+
+    if not args.pls_experiment:
+        batches, dropped = _collect_batches(
+            samples,
+            seed=seed,
+            batch_size=args.batch_size,
+            batch_count=batch_count,
+            drop_last=args.drop_last,
+            start_cursor=start_cursor,
+            distributed_rank=args.distributed_rank,
+            distributed_world_size=args.distributed_world_size,
+        )
+        return batches, dropped, None
+    plan = build_pls_execution_plan(
+        samples,
+        seed=seed,
+        batch_count=batch_count,
+        batch_size=args.batch_size,
+        drop_last=args.drop_last,
+        start_cursor=start_cursor,
+        organization=args.pls_organization,
+        crop_policy=args.pls_crop_policy,
+        order_policy=args.pls_order_policy,
+        segment_images=args.pls_segment_images,
+        segments_per_pool=args.pls_segments_per_pool,
+        distributed_rank=args.distributed_rank,
+        distributed_world_size=args.distributed_world_size,
+        complete_final_pool=args.pls_gpu_pool,
+        organization_seed=args.pls_organization_seed,
+    )
+    return plan.batches, plan.dropped_per_epoch, plan
+
+
+def _training_augmentation_batches(
+    plan: PlsExecutionPlan | None,
+    batches: Sequence[Sequence[SampleIdentity]],
+    samples: dict[str, TrainingSample],
+    *,
+    seed: int,
+    domain: str,
+) -> list[list[AugmentationDecision]]:
+    if plan is not None:
+        return pls_augmentation_batches(plan, samples, seed=seed, domain=domain)
+    return _augmentation_batches(batches, samples, seed=seed, domain=domain)
+
+
 def _flatten(values: Sequence[Sequence[Any]]) -> list[Any]:
     return [item for batch in values for item in batch]
 
 
 def _adapter_pipeline_config(
-    contract: dict[str, Any], args: argparse.Namespace, *, split: str
+    contract: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    split: str,
+    pls_plan: PlsExecutionPlan | None = None,
+    enable_pls_gpu_pool: bool = True,
 ) -> dict[str, Any]:
     if split not in {"train", "validation"}:
         raise ValueError(f"unknown adapter dataset split {split!r}")
@@ -899,6 +1120,31 @@ def _adapter_pipeline_config(
         config["galp_manifest"] = contract["pipelines"].get(
             "galp_validation_manifest", contract["pipelines"].get("galp_manifest")
         )
+    elif args.pls_gpu_pool and enable_pls_gpu_pool:
+        if pls_plan is None:
+            raise ValueError("PLS GPU pool execution requires an exact schedule plan")
+        if (
+            args.pls_organization in ("storage-hash", "storage-stratified")
+            and not pls_plan.storage_order_matches_galp_image_ids()
+        ):
+            raise ValueError(
+                f"{args.pls_organization} GPU execution requires a physically rewritten "
+                "GALP manifest and a training manifest whose galp_image_id sequence "
+                "matches the pre-registered storage order"
+            )
+        config["pls_gpu_pool"] = {
+            "enabled": True,
+            "closed_pool_batches": pls_plan.selected_pool_batches(),
+            "lifetime": (
+                "materialize one complete pool, consume every optimizer batch, "
+                "release it, then load the next pool"
+            ),
+        }
+    elif args.pls_gpu_pool:
+        config["pls_gpu_pool"] = {
+            "enabled": False,
+            "reason": "semantic first-step probe uses the ordinary mini-batch path",
+        }
     return config
 
 
@@ -1252,17 +1498,15 @@ def _first_step_probe(
     reset_training_state(model=model, optimizer=optimizer, scheduler=scheduler, scaler=None, initial=initial)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    batches, _ = _collect_batches(
+    batches, _, pls_plan = _collect_training_batches(
+        args,
         train_samples,
         seed=args.seed,
-        batch_size=args.batch_size,
         batch_count=1 + args.prefetch_depth,
-        drop_last=args.drop_last,
         start_cursor=initial["sample_order_cursor"],
-        distributed_rank=args.distributed_rank,
-        distributed_world_size=args.distributed_world_size,
     )
-    decisions = _augmentation_batches(
+    decisions = _training_augmentation_batches(
+        pls_plan,
         batches,
         {sample.logical_sample_id: sample for sample in train_samples},
         seed=args.seed,
@@ -1275,7 +1519,13 @@ def _first_step_probe(
         batch_size=args.batch_size,
         workers=args.workers,
         device=device,
-        config=_adapter_pipeline_config(contract, args, split="train"),
+        config=_adapter_pipeline_config(
+            contract,
+            args,
+            split="train",
+            pls_plan=pls_plan,
+            enable_pls_gpu_pool=False,
+        ),
     )
     adapter.begin(_flatten(batches), _flatten(decisions), [len(batch) for batch in batches])
     before_model_hash = tensor_state_sha256(model.state_dict())
@@ -1325,6 +1575,9 @@ def _first_step_probe(
         },
         "prefetched_read_ids": [identity.as_dict() for identity in read],
         "augmentation_decisions": batch.augmentations,
+        "physical_load_segment": (
+            None if pls_plan is None else pls_plan.selected_summary()
+        ),
         "labels": labels.detach().cpu().tolist(),
         "inputs": [_tensor_record(value) for value in inputs],
         "initial_logits": _tensor_record(logits),
@@ -1405,17 +1658,15 @@ def _run_repeat(
         "scheduler_last_epoch": int(scheduler.last_epoch),
     }
     total_consumed_batches = warmup_steps + measured_steps
-    all_batches, dropped = _collect_batches(
+    all_batches, dropped, pls_plan = _collect_training_batches(
+        args,
         train_samples,
         seed=args.seed,
-        batch_size=args.batch_size,
         batch_count=total_consumed_batches + args.prefetch_depth,
-        drop_last=args.drop_last,
         start_cursor=initial["sample_order_cursor"],
-        distributed_rank=args.distributed_rank,
-        distributed_world_size=args.distributed_world_size,
     )
-    decisions = _augmentation_batches(
+    decisions = _training_augmentation_batches(
+        pls_plan,
         all_batches,
         {sample.logical_sample_id: sample for sample in train_samples},
         seed=args.seed,
@@ -1430,7 +1681,9 @@ def _run_repeat(
         batch_size=args.batch_size,
         workers=args.workers,
         device=device,
-        config=_adapter_pipeline_config(contract, args, split="train"),
+        config=_adapter_pipeline_config(
+            contract, args, split="train", pls_plan=pls_plan
+        ),
     )
     adapter.begin(_flatten(all_batches), _flatten(decisions), [len(batch) for batch in all_batches])
     ledger = SampleOrderLedger(pipeline)
@@ -1563,6 +1816,7 @@ def _run_repeat(
                 failures.append(f"warmup step {step}: non-finite gradient")
             if not record["gradients"]["nonzero"]:
                 failures.append(f"warmup step {step}: zero gradients")
+            del batch, _inputs, _labels, _logits
 
         loader_before_measurement = adapter.loader_metrics()
         for measured in range(measured_steps):
@@ -1599,6 +1853,7 @@ def _run_repeat(
                     f"measured step {measured}: optimizer did not update parameters"
                 )
             step_records.append(record)
+            del batch, _inputs, _labels, _logits
         measured_elapsed = sum(
             record["end_to_end_seconds"] for record in step_records
         )
@@ -1737,6 +1992,9 @@ def _run_repeat(
         "stage_latency_ms": stage_metrics,
         "stage_timing_note": contract["execution"]["stage_timing_note"],
         "sample_order": sample_order_artifact,
+        "physical_load_segment": (
+            None if pls_plan is None else pls_plan.selected_summary()
+        ),
         "prefetch_overrun": order_validation["prefetch_overrun"],
         "loader_metrics": loader_metrics,
         "loader_measured_metrics": {
@@ -1772,7 +2030,9 @@ def _run_repeat(
             "first_step_probe_in_timing": False,
         },
         "host_memory": memory,
-        "host_memory_scope": "process_lifetime_rss_and_peak_rss",
+        "host_memory_scope": (
+            "process_lifetime_rss_peak_plus_end_of_repeat_virtual_memory_fd_thread_and_mapping_snapshot"
+        ),
         "gpu_peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None,
         "gpu_peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else None,
         "native_allocator_metrics": {
@@ -1928,6 +2188,7 @@ def _save_training_checkpoint(
     optimizer_configuration: dict[str, Any],
     scheduler_configuration: dict[str, Any],
     scheduler_total_steps: int,
+    augmentation_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     optimizer_recipe = {
         key: value
@@ -1954,7 +2215,11 @@ def _save_training_checkpoint(
         "global_step": global_step,
         "epoch": epoch,
         "rng_state": capture_training_state(model, optimizer, scheduler)["rng"],
-        "augmentation_state": {"stateless_keyed": True},
+        "augmentation_state": copy.deepcopy(
+            augmentation_state
+            if augmentation_state is not None
+            else {"stateless_keyed": True}
+        ),
         "sample_order_cursor": sample_order_cursor,
     }
     torch.save(payload, path)
@@ -1985,18 +2250,18 @@ def _run_convergence_seed(
         optimizer, contract["scheduler"], total_steps=scheduler_total_steps
     )
     reset_training_state(model=model, optimizer=optimizer, scheduler=scheduler, scaler=None, initial=initial)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     starting_scheduler_last_epoch = int(scheduler.last_epoch)
-    batches, dropped = _collect_batches(
+    batches, dropped, pls_plan = _collect_training_batches(
+        args,
         train_samples,
         seed=seed,
-        batch_size=args.batch_size,
         batch_count=args.train_steps + args.prefetch_depth,
-        drop_last=args.drop_last,
         start_cursor=initial["sample_order_cursor"],
-        distributed_rank=args.distributed_rank,
-        distributed_world_size=args.distributed_world_size,
     )
-    decisions = _augmentation_batches(
+    decisions = _training_augmentation_batches(
+        pls_plan,
         batches,
         {sample.logical_sample_id: sample for sample in train_samples},
         seed=seed,
@@ -2005,13 +2270,33 @@ def _run_convergence_seed(
     reproducibility = _reproducibility_hashes(
         batches[: args.train_steps], decisions[: args.train_steps]
     )
+    if args.pls_gpu_pool and (
+        pls_plan is None or not pls_plan.is_pool_batch_boundary(args.train_steps)
+    ):
+        raise ValueError(
+            "--train-steps must end at an exact closed-pool boundary when "
+            "--pls-gpu-pool is enabled"
+        )
+    if args.pls_gpu_pool and pls_plan is not None:
+        nonboundary_evaluations = [
+            step
+            for step in range(args.eval_interval, args.train_steps, args.eval_interval)
+            if not pls_plan.is_pool_batch_boundary(step)
+        ]
+        if nonboundary_evaluations:
+            raise ValueError(
+                "--eval-interval must place every GPU-pool checkpoint at a closed-pool "
+                f"boundary; first invalid step is {nonboundary_evaluations[0]}"
+            )
     adapter = build_training_adapter(
         pipeline,
         train_samples,
         batch_size=args.batch_size,
         workers=args.workers,
         device=device,
-        config=_adapter_pipeline_config(contract, args, split="train"),
+        config=_adapter_pipeline_config(
+            contract, args, split="train", pls_plan=pls_plan
+        ),
     )
     adapter.begin(_flatten(batches), _flatten(decisions), [len(batch) for batch in batches])
     ledger = SampleOrderLedger(pipeline)
@@ -2052,12 +2337,15 @@ def _run_convergence_seed(
                 "wall_clock_seconds": time.perf_counter() - start,
             }
         )
+        del batch, _inputs, _labels, _logits
         if (step + 1) % args.eval_interval == 0 or step + 1 == args.train_steps:
             evaluation = _evaluate_validation(args, contract, pipeline, model, val_samples)
+            validation_wall_clock_seconds = float(evaluation["wall_clock_seconds"])
             evaluation.update(
                 optimizer_step=step + 1,
                 processed_images=curve[-1]["processed_images"],
                 wall_clock_seconds=time.perf_counter() - start,
+                validation_wall_clock_seconds=validation_wall_clock_seconds,
             )
             validation_events.append(evaluation)
             failures.extend(f"validation step {step + 1}: {value}" for value in evaluation["failures"])
@@ -2076,8 +2364,10 @@ def _run_convergence_seed(
                     optimizer_configuration=contract["optimizer"],
                     scheduler_configuration=contract["scheduler"],
                     scheduler_total_steps=scheduler_total_steps,
+                    augmentation_state=_augmentation_state(contract),
                 )
     ledger.record_prefetched(adapter.prefetched_read_identities())
+    loader_metrics = adapter.loader_metrics()
     adapter.close()
     expected = _flatten(batches[: args.train_steps])
     order_validation = ledger.validate(expected)
@@ -2107,6 +2397,7 @@ def _run_convergence_seed(
         optimizer_configuration=contract["optimizer"],
         scheduler_configuration=contract["scheduler"],
         scheduler_total_steps=scheduler_total_steps,
+        augmentation_state=_augmentation_state(contract),
     )
     thresholds = (0.10, 0.20, 0.30, 0.40, 0.50)
     time_to_accuracy = {
@@ -2124,6 +2415,35 @@ def _run_convergence_seed(
             **reproducibility,
         }
     )
+    pool_metrics = loader_metrics.get("physical_load_segment_gpu_pool", {})
+    materialized_pools = int(pool_metrics.get("materialized_pool_count", 0))
+    fully_emitted_pools = int(
+        pool_metrics.get("fully_emitted_release_eligible_pool_count", 0)
+    )
+    gpu_pool_evidence = {
+        "configured": bool(args.pls_gpu_pool),
+        "observed": bool(
+            args.pls_gpu_pool
+            and materialized_pools > 0
+            and fully_emitted_pools == materialized_pools
+        ),
+        "native_request_granularity": "one complete closed pool",
+        "metrics": pool_metrics,
+    }
+    device_memory = {
+        "device": str(device),
+        "allocated_bytes": None,
+        "reserved_bytes": None,
+        "peak_allocated_bytes": None,
+        "peak_reserved_bytes": None,
+    }
+    if device.type == "cuda":
+        device_memory.update(
+            allocated_bytes=int(torch.cuda.memory_allocated(device)),
+            reserved_bytes=int(torch.cuda.memory_reserved(device)),
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        )
     result = {
         "seed": seed,
         "classification": "from_scratch_short_convergence" if args.init_mode == "random" else ("fine_tuning" if args.init_mode == "weights" else "resumed_training"),
@@ -2136,6 +2456,12 @@ def _run_convergence_seed(
         "validation": validation_events,
         "time_to_accuracy": time_to_accuracy,
         "sample_order": sample_order_artifact,
+        "physical_load_segment": (
+            None if pls_plan is None else pls_plan.selected_summary()
+        ),
+        "gpu_pool_materialization": gpu_pool_evidence,
+        "loader_metrics": loader_metrics,
+        "device_memory": device_memory,
         "model_parameters_finite": model_finite,
         "optimizer_state_finite": optimizer_finite,
         "scheduler_last_epoch": int(scheduler.last_epoch),
@@ -2698,6 +3024,31 @@ def _hydrate_resume_args(args: argparse.Namespace, contract: dict[str, Any]) -> 
     args.distributed_world_size = int(
         contract["sample_order"].get("distributed_world_size", 1)
     )
+    pls = contract["sample_order"].get("physical_load_segment", {})
+    args.pls_experiment = bool(pls.get("enabled", False))
+    condition = pls.get("condition")
+    args.pls_condition_id = (
+        None
+        if not condition
+        else str(condition.get("requested_condition_id", condition["condition_id"]))
+    )
+    args.pls_organization = str(pls.get("organization", "current"))
+    args.pls_organization_seed = int(pls.get("organization_seed", 20260810))
+    args.pls_crop_policy = str(pls.get("crop_policy", "per-shard"))
+    args.pls_order_policy = str(pls.get("order_policy", "pls-wave"))
+    args.pls_segment_images = int(pls.get("segment_images", 1024))
+    args.pls_segments_per_pool = int(pls.get("segments_per_pool", 4))
+    args.pls_gpu_pool = bool(
+        pls.get("implementation_scope", {}).get(
+            "complete_gpu_pool_materialization_configured", False
+        )
+    )
+    enabled_phases = [
+        name
+        for name in PHASES
+        if bool(contract["execution"]["phases"][name].get("enabled", False))
+    ]
+    args.phase = enabled_phases[0] if len(enabled_phases) == 1 else "all"
     convergence = contract["execution"]["phases"]["convergence"]
     args.train_steps = int(convergence["train_steps"])
     args.eval_interval = int(convergence["eval_interval"])

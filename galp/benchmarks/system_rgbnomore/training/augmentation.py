@@ -71,6 +71,13 @@ def _decision_rng(seed: int, epoch: int, logical_sample_id: str) -> random.Rando
     return random.Random(int.from_bytes(digest[:16], "little"))
 
 
+def _shared_crop_rng(seed: int, epoch: int, physical_shard_id: int) -> random.Random:
+    digest = hashlib.sha256(
+        f"galp-pls-shared-crop-v1:{seed}:{epoch}:{physical_shard_id}".encode("utf-8")
+    ).digest()
+    return random.Random(int.from_bytes(digest[:16], "little"))
+
+
 def _random_resized_crop(
     rng: random.Random,
     width: int,
@@ -102,6 +109,34 @@ def _random_resized_crop(
     return (width - crop_width) // 2, (height - crop_height) // 2, crop_width, crop_height
 
 
+def _align_dct_crop_within_source(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    *,
+    source_width: int,
+    source_height: int,
+    alignment: int,
+) -> tuple[int, int, int, int]:
+    if alignment <= 0:
+        raise ValueError("DCT crop alignment must be positive")
+
+    def align_axis(origin: int, extent: int, source_extent: int) -> tuple[int, int]:
+        max_extent = (source_extent // alignment) * alignment
+        aligned_extent = min(
+            max_extent,
+            max(alignment, (extent // alignment) * alignment),
+        )
+        max_origin = ((source_extent - aligned_extent) // alignment) * alignment
+        aligned_origin = min((origin // alignment) * alignment, max_origin)
+        return aligned_origin, aligned_extent
+
+    x, width = align_axis(x, width, source_width)
+    y, height = align_axis(y, height, source_height)
+    return x, y, width, height
+
+
 def derive_augmentation(
     *,
     seed: int,
@@ -119,6 +154,8 @@ def derive_augmentation(
         raise ValueError("source image dimensions must be positive")
     if domain not in ("rgb", "dct"):
         raise ValueError(f"unknown augmentation domain: {domain}")
+    if domain == "dct" and dct_alignment_pixels <= 0:
+        raise ValueError("DCT crop alignment must be positive")
     if domain == "dct" and (
         source_width < dct_alignment_pixels or source_height < dct_alignment_pixels
     ):
@@ -135,14 +172,15 @@ def derive_augmentation(
     alignment: int | None = None
     if domain == "dct":
         alignment = dct_alignment_pixels
-        x = (x // alignment) * alignment
-        y = (y // alignment) * alignment
-        width = max(alignment, (width // alignment) * alignment)
-        height = max(alignment, (height // alignment) * alignment)
-        width = min(width, source_width - x)
-        height = min(height, source_height - y)
-        width = max(alignment, (width // alignment) * alignment)
-        height = max(alignment, (height // alignment) * alignment)
+        x, y, width, height = _align_dct_crop_within_source(
+            x,
+            y,
+            width,
+            height,
+            source_width=source_width,
+            source_height=source_height,
+            alignment=alignment,
+        )
     return AugmentationDecision(
         seed=seed,
         epoch=epoch,
@@ -156,6 +194,88 @@ def derive_augmentation(
         resize_width=output_size,
         resize_height=output_size,
         horizontal_flip=rng.random() < 0.5,
+        interpolation="bilinear",
+        normalization_mean=(0.5, 0.5, 0.5),
+        normalization_std=(0.5, 0.5, 0.5),
+        domain=domain,
+        dct_crop_alignment_pixels=alignment,
+    )
+
+
+def derive_shard_shared_crop_augmentation(
+    *,
+    seed: int,
+    epoch: int,
+    physical_shard_id: int,
+    logical_sample_id: str,
+    source_width: int,
+    source_height: int,
+    domain: str,
+    output_size: int = 224,
+    scale: tuple[float, float] = (0.05, 1.0),
+    rgb_ratio: tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0),
+    dct_alignment_pixels: int = 16,
+) -> AugmentationDecision:
+    """Derive one crop per physical shard/epoch and a per-sample flip.
+
+    Resetting the crop RNG from ``(seed, epoch, physical_shard_id)`` makes
+    equal-sized images in a shard receive exactly the same pixel crop.  For a
+    future ragged source shard, the same stochastic configuration is mapped
+    through each image's dimensions.  Horizontal flip remains keyed by logical
+    sample because it does not change the selected DCT block region.
+    """
+
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("source image dimensions must be positive")
+    if physical_shard_id < 0:
+        raise ValueError("physical_shard_id must be non-negative")
+    if domain not in ("rgb", "dct"):
+        raise ValueError(f"unknown augmentation domain: {domain}")
+    if domain == "dct" and dct_alignment_pixels <= 0:
+        raise ValueError("DCT crop alignment must be positive")
+    if domain == "dct" and (
+        source_width < dct_alignment_pixels or source_height < dct_alignment_pixels
+    ):
+        raise ValueError(
+            "DCT source dimensions must be at least one alignment unit "
+            f"({dct_alignment_pixels}x{dct_alignment_pixels}); got "
+            f"{source_width}x{source_height}"
+        )
+    crop_rng = _shared_crop_rng(seed, epoch, physical_shard_id)
+    ratio = rgb_ratio if domain == "rgb" else (1.0, 1.0)
+    x, y, width, height = _random_resized_crop(
+        crop_rng,
+        source_width,
+        source_height,
+        scale=scale,
+        ratio=ratio,
+    )
+    alignment: int | None = None
+    if domain == "dct":
+        alignment = dct_alignment_pixels
+        x, y, width, height = _align_dct_crop_within_source(
+            x,
+            y,
+            width,
+            height,
+            source_width=source_width,
+            source_height=source_height,
+            alignment=alignment,
+        )
+    flip_rng = _decision_rng(seed, epoch, logical_sample_id)
+    return AugmentationDecision(
+        seed=seed,
+        epoch=epoch,
+        logical_sample_id=str(logical_sample_id),
+        source_width=source_width,
+        source_height=source_height,
+        crop_x=x,
+        crop_y=y,
+        crop_width=width,
+        crop_height=height,
+        resize_width=output_size,
+        resize_height=output_size,
+        horizontal_flip=flip_rng.random() < 0.5,
         interpolation="bilinear",
         normalization_mean=(0.5, 0.5, 0.5),
         normalization_std=(0.5, 0.5, 0.5),

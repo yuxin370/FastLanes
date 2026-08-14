@@ -19,6 +19,7 @@
 #include "engine/workset/upload.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
+#include "fls/io/file.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/table/memory_table.hpp"
@@ -29,6 +30,7 @@
 #include "galp/galp.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +44,7 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 #include <variant>
@@ -292,6 +295,17 @@ std::filesystem::path make_compact_coefficient_read_fixture() {
 	galp::format::CompactV3BuildOptions compact_options;
 	compact_options.vector_size   = galp::codec::consts::VALUES_PER_VECTOR;
 	compact_options.spatial_order = 3U;
+	for (uint32_t image_index = 0U; image_index < 3U; ++image_index) {
+		galp::format::CompactV3ImageInput image;
+		image.first_rowgroup     = image_index;
+		image.rowgroup_count     = 1U;
+		image.real_row_count     = galp::codec::consts::VALUES_PER_VECTOR;
+		image.first_physical_row =
+		    static_cast<uint64_t>(image_index) * galp::codec::consts::VALUES_PER_VECTOR;
+		image.components.push_back(galp::format::CompactV3ComponentInput {
+		    0U, 32U, 32U, 32U, 32U, 0U, 0U});
+		compact_options.images.push_back(std::move(image));
+	}
 	(void)galp::format::compact_standard_fls_to_v3(
 	    standard_path, compact_path, compact_options);
 	return compact_path;
@@ -341,6 +355,49 @@ std::filesystem::path make_compact_mixed_payload_fixture() {
 	compact_options.spatial_order = 3U;
 	(void)galp::format::compact_standard_fls_to_v3(standard_path, compact_path, compact_options);
 	return compact_path;
+}
+
+TEST(Reader, CompactV3StaticMetadataRebindPreservesDescriptorAndBoundsPayloadHandles) {
+	const auto compact_path = make_compact_coefficient_read_fixture();
+	const auto mapping_before = galp::format::compact_descriptor_v3_mapping_stats();
+	const auto handles_before = fastlanes::File::read_handle_stats();
+	{
+		galp::format::FlsReaderOptions options;
+		auto original = std::make_unique<galp::format::FlsReader>(compact_path, options);
+		ASSERT_TRUE(original->is_compact_v3());
+		auto static_metadata = original->share_static_metadata();
+		ASSERT_NE(static_metadata, nullptr);
+		EXPECT_GT(static_metadata->retained_bytes(), 0U);
+		EXPECT_EQ(original->static_metadata_bytes(), static_metadata->retained_bytes());
+
+		const auto mapped = galp::format::compact_descriptor_v3_mapping_stats();
+		EXPECT_EQ(mapped.current_mapping_count, mapping_before.current_mapping_count + 1U);
+		{
+			galp::format::FlsReader rebound(compact_path, options, static_metadata);
+			EXPECT_TRUE(rebound.is_compact_v3());
+			EXPECT_EQ(rebound.share_static_metadata(), static_metadata);
+			EXPECT_EQ(rebound.rowgroup_count(), original->rowgroup_count());
+			EXPECT_EQ(rebound.sparse_initialization_stats().descriptor_open_ms, 0.0);
+			galp::format::ZeroCopyReadTiming timing {};
+			auto rowgroup = rebound.read_rowgroup_zero_copy(0U, &timing);
+			EXPECT_FALSE(rowgroup.backing_span.empty());
+			const auto handles_live = fastlanes::File::read_handle_stats();
+			EXPECT_EQ(handles_live.current_open_handles, handles_before.current_open_handles + 1U);
+		}
+		const auto handles_released = fastlanes::File::read_handle_stats();
+		EXPECT_EQ(handles_released.current_open_handles, handles_before.current_open_handles);
+
+		const auto different_path = compact_path.parent_path() / "different-name.fls";
+		std::filesystem::copy_file(compact_path, different_path,
+		                           std::filesystem::copy_options::overwrite_existing);
+		EXPECT_THROW((void)galp::format::FlsReader(different_path, options, static_metadata),
+		             std::invalid_argument);
+		EXPECT_EQ(galp::format::compact_descriptor_v3_mapping_stats().current_mapping_count,
+		          mapping_before.current_mapping_count + 1U);
+	}
+	const auto mapping_after = galp::format::compact_descriptor_v3_mapping_stats();
+	EXPECT_EQ(mapping_after.current_mapping_count, mapping_before.current_mapping_count);
+	EXPECT_EQ(mapping_after.unmap_count, mapping_before.unmap_count + 1U);
 }
 
 size_t get_n_values(const galp::format::HostColumnVariant& host) {
@@ -397,6 +454,17 @@ TEST(Reader, CompactV3FullRowgroupsUseScatterReadsAndPreserveCallerOrder) {
 	galp::format::FlsReader reader(compact_path);
 	ASSERT_TRUE(reader.is_compact_v3());
 	ASSERT_EQ(reader.rowgroup_count(), 3U);
+	const auto largest_images = reader.compact_largest_image_backing_bytes(2U);
+	ASSERT_EQ(largest_images.size(), 2U);
+	std::vector<size_t> expected_image_bytes;
+	for (size_t rowgroup = 0U; rowgroup < reader.rowgroup_count(); ++rowgroup) {
+		const size_t payload = reader.rowgroup_storage_bytes(rowgroup);
+		constexpr size_t alignment = galp::format::kCompactBatchRowgroupAlignment;
+		expected_image_bytes.push_back((payload + alignment - 1U) & ~(alignment - 1U));
+	}
+	std::sort(expected_image_bytes.begin(), expected_image_bytes.end(), std::greater<size_t> {});
+	EXPECT_EQ(largest_images,
+	          (std::vector<size_t> {expected_image_bytes[0U], expected_image_bytes[1U]}));
 
 	std::vector<galp::format::ZeroCopyReadTiming> scatter_timings;
 	auto scatter = reader.read_compact_rowgroups_zero_copy_scatter({2U, 0U, 1U}, &scatter_timings);
@@ -605,6 +673,11 @@ TEST(Reader, CompactV3MetadataOnlyRowgroupsUseValidatedZeroIoPaths) {
 	EXPECT_GT(scatter[0].backing_span.size(), 0U);
 	EXPECT_EQ(scatter[1].backing_span.size(), 0U);
 	EXPECT_GT(scatter[2].backing_span.size(), 0U);
+	EXPECT_NE(scatter[1].compact_direct_owner, nullptr);
+	EXPECT_EQ(scatter[1].rowgroup_descriptor, nullptr);
+	EXPECT_EQ(scatter[1].schema_plan, nullptr);
+	EXPECT_EQ(scatter[1].rowgroup_view, nullptr);
+	EXPECT_EQ(scatter[1].columns.size(), 2U);
 	EXPECT_EQ(scatter_timings[1].storage_bytes, 0U);
 	EXPECT_EQ(scatter_timings[1].physical_page_bytes, 0U);
 	EXPECT_EQ(scatter_timings[1].pread_count, 0U);
@@ -681,6 +754,194 @@ TEST(Reader, CompactV3Strict1kMetadataOnlyIntegration) {
 			EXPECT_TRUE(column.token == fastlanes::OperatorToken::EXP_CONSTANT_I08 ||
 			            column.token == fastlanes::OperatorToken::EXP_CONSTANT_I16 ||
 			            column.token == fastlanes::OperatorToken::EXP_EQUAL);
+		}
+	}
+}
+
+TEST(SparseReadCoalescer, CanonicalizesRangesAndHonorsExactCap) {
+	galp::format::SparseReadBoundedCoalesceOptions options;
+	const auto result = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{7U, 3U, 100U, {{30U, 10U}, {0U, 0U}, {5U, 10U}, {0U, 10U}, {15U, 5U}}}},
+	    options);
+	ASSERT_EQ(result.rowgroups.size(), 1U);
+	const auto& rowgroup = result.rowgroups.front();
+	ASSERT_EQ(rowgroup.exact_ranges.size(), 2U);
+	EXPECT_EQ(rowgroup.exact_ranges[0].offset, 0U);
+	EXPECT_EQ(rowgroup.exact_ranges[0].size, 20U);
+	EXPECT_EQ(rowgroup.exact_ranges[1].offset, 30U);
+	EXPECT_EQ(rowgroup.exact_ranges[1].size, 10U);
+	EXPECT_EQ(rowgroup.exact_storage_bytes, 30U);
+	EXPECT_EQ(rowgroup.physical_storage_bytes, 30U);
+	EXPECT_EQ(rowgroup.merged_gap_bytes, 0U);
+	EXPECT_EQ(result.exact_extent_count, 2U);
+	EXPECT_EQ(result.physical_run_count, 2U);
+}
+
+TEST(SparseReadCoalescer, CapBoundaryStableTieAndShardBudgetAreDeterministic) {
+	galp::format::SparseReadBoundedCoalesceOptions boundary_options;
+	boundary_options.whole_run_amplification_ppm = 1'100'000U;
+	const auto exact_hit = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, 110U, {{0U, 50U}, {60U, 50U}}}}, boundary_options);
+	EXPECT_EQ(exact_hit.physical_storage_bytes, 110U);
+	EXPECT_EQ(exact_hit.physical_run_count, 1U);
+	EXPECT_EQ(exact_hit.merged_gap_bytes, 10U);
+	const auto one_byte_over = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, 111U, {{0U, 50U}, {61U, 50U}}}}, boundary_options);
+	EXPECT_EQ(one_byte_over.physical_storage_bytes, 100U);
+	EXPECT_EQ(one_byte_over.physical_run_count, 2U);
+
+	galp::format::SparseReadBoundedCoalesceOptions tie_options;
+	tie_options.whole_run_amplification_ppm    = 1'010'000U;
+	tie_options.per_shard_amplification_ppm    = 1'100'000U;
+	tie_options.per_rowgroup_amplification_ppm = 1'100'000U;
+	const auto tied = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{2U, 0U, 102U, {{0U, 50U}, {52U, 50U}}},
+	     {1U, 9U, 102U, {{0U, 50U}, {52U, 50U}}}},
+	    tie_options);
+	ASSERT_EQ(tied.rowgroups.size(), 2U);
+	EXPECT_EQ(tied.rowgroups[0].physical_ranges.size(), 2U);
+	EXPECT_EQ(tied.rowgroups[1].physical_ranges.size(), 1U);
+	EXPECT_EQ(tied.merged_gap_bytes, 2U);
+
+	galp::format::SparseReadBoundedCoalesceOptions shard_options;
+	shard_options.whole_run_amplification_ppm    = 1'100'000U;
+	shard_options.per_shard_amplification_ppm    = 1'050'000U;
+	shard_options.per_rowgroup_amplification_ppm = 1'100'000U;
+	const auto shard_limited = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{4U, 0U, 110U, {{0U, 50U}, {60U, 50U}}},
+	     {4U, 1U, 110U, {{0U, 50U}, {60U, 50U}}}},
+	    shard_options);
+	EXPECT_EQ(shard_limited.merged_gap_bytes, 10U);
+	EXPECT_EQ(shard_limited.rowgroups[0].physical_ranges.size(), 1U);
+	EXPECT_EQ(shard_limited.rowgroups[1].physical_ranges.size(), 2U);
+
+	galp::format::SparseReadBoundedCoalesceOptions rowgroup_options;
+	rowgroup_options.whole_run_amplification_ppm    = 1'100'000U;
+	rowgroup_options.per_shard_amplification_ppm    = 1'100'000U;
+	rowgroup_options.per_rowgroup_amplification_ppm = 1'050'000U;
+	const auto rowgroup_limited = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{4U, 0U, 110U, {{0U, 50U}, {60U, 50U}}},
+	     {4U, 1U, 110U, {{0U, 50U}, {60U, 50U}}}},
+	    rowgroup_options);
+	EXPECT_EQ(rowgroup_limited.merged_gap_bytes, 0U);
+	EXPECT_EQ(rowgroup_limited.physical_run_count, 4U);
+}
+
+TEST(SparseReadCoalescer, MaxRunOverflowAndOutOfBoundsAreChecked) {
+	galp::format::SparseReadBoundedCoalesceOptions options;
+	options.whole_run_amplification_ppm = 1'100'000U;
+	options.max_physical_run_bytes      = 20U;
+	const auto limited = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, 21U, {{0U, 10U}, {11U, 10U}}}}, options);
+	EXPECT_EQ(limited.physical_run_count, 2U);
+	EXPECT_EQ(limited.max_run_rejected_gap_count, 1U);
+	EXPECT_THROW((void)galp::format::coalesce_sparse_read_ranges_bounded(
+	                 {{0U,
+	                   0U,
+	                   std::numeric_limits<size_t>::max(),
+	                   {{std::numeric_limits<size_t>::max() - 2U, 4U}}}},
+	                 options),
+	             std::out_of_range);
+	EXPECT_THROW((void)galp::format::coalesce_sparse_read_ranges_bounded(
+	                 {{0U, 0U, 10U, {{9U, 2U}}}}, options),
+	             std::out_of_range);
+	EXPECT_THROW((void)galp::format::coalesce_sparse_read_ranges_bounded(
+	                 {{0U, 0U, std::numeric_limits<size_t>::max(), {{0U, 1U}}},
+	                  {1U, 0U, std::numeric_limits<size_t>::max(), {{0U, 1U}}}},
+	                 options),
+	             std::overflow_error);
+	options.whole_run_amplification_ppm = 1'100'001U;
+	EXPECT_THROW((void)galp::format::coalesce_sparse_read_ranges_bounded({}, options),
+	             std::invalid_argument);
+}
+
+TEST(SparseReadCoalescer, PropertyPreservesExactCoverageWithoutDuplicatePhysicalBytes) {
+	for (size_t fixture = 0U; fixture < 24U; ++fixture) {
+		std::vector<galp::format::SparseReadRange> exact;
+		size_t cursor = fixture % 5U;
+		for (size_t index = 0U; index < 8U; ++index) {
+			const size_t size = 7U + (fixture * 3U + index * 5U) % 19U;
+			exact.push_back({cursor, size});
+			cursor += size + 1U + (fixture * 11U + index * 7U) % 13U;
+		}
+		const size_t full_bytes = cursor + 17U;
+		const size_t exact_bytes = std::accumulate(
+		    exact.begin(), exact.end(), size_t {0U}, [](const size_t total, const auto& range) {
+			    return total + range.size;
+		    });
+		for (const uint32_t cap_ppm : {1'000'000U, 1'020'000U, 1'050'000U, 1'100'000U}) {
+			galp::format::SparseReadBoundedCoalesceOptions options;
+			options.whole_run_amplification_ppm = cap_ppm;
+			const auto result = galp::format::coalesce_sparse_read_ranges_bounded(
+			    {{3U, fixture, full_bytes, exact}}, options);
+			ASSERT_EQ(result.rowgroups.size(), 1U);
+			const auto& rowgroup = result.rowgroups.front();
+			EXPECT_EQ(rowgroup.exact_storage_bytes, exact_bytes);
+			EXPECT_EQ(rowgroup.physical_storage_bytes,
+			          std::accumulate(rowgroup.physical_ranges.begin(),
+			                          rowgroup.physical_ranges.end(),
+			                          size_t {0U},
+			                          [](const size_t total, const auto& range) {
+				                          return total + range.size;
+			                          }));
+			EXPECT_EQ(rowgroup.merged_gap_bytes,
+			          std::accumulate(rowgroup.merged_holes.begin(),
+			                          rowgroup.merged_holes.end(),
+			                          size_t {0U},
+			                          [](const size_t total, const auto& range) {
+				                          return total + range.size;
+			                          }));
+			EXPECT_LE(rowgroup.physical_storage_bytes,
+			          static_cast<size_t>(static_cast<unsigned __int128>(exact_bytes) * cap_ppm /
+			                              galp::format::kSparseReadAmplificationScale));
+			for (size_t index = 1U; index < rowgroup.physical_ranges.size(); ++index) {
+				const auto& previous = rowgroup.physical_ranges[index - 1U];
+				const auto& current  = rowgroup.physical_ranges[index];
+				EXPECT_LT(previous.offset + previous.size, current.offset);
+			}
+			for (const auto& source : exact) {
+				size_t covering_runs = 0U;
+				for (const auto& physical : rowgroup.physical_ranges) {
+					covering_runs += physical.offset <= source.offset &&
+					                 physical.offset + physical.size >= source.offset + source.size
+					                     ? 1U
+					                     : 0U;
+				}
+				EXPECT_EQ(covering_runs, 1U);
+			}
+		}
+	}
+}
+
+TEST(SparseReadCoalescer, GreedyGapOrderIsOptimalUnderByteOnlyBudget) {
+	const std::vector<galp::format::SparseReadRange> exact {
+	    {0U, 25U}, {26U, 25U}, {53U, 25U}, {82U, 25U}}; // gaps 1, 2, 4; exact=100
+	for (size_t budget = 0U; budget <= 7U; ++budget) {
+		galp::format::SparseReadBoundedCoalesceOptions options;
+		options.whole_run_amplification_ppm =
+		    galp::format::kSparseReadAmplificationScale + static_cast<uint32_t>(budget * 10'000U);
+		const auto result = galp::format::coalesce_sparse_read_ranges_bounded(
+		    {{0U, 0U, 107U, exact}}, options);
+		size_t brute_force_best = 0U;
+		for (size_t mask = 0U; mask < 8U; ++mask) {
+			const size_t bytes = ((mask & 1U) != 0U ? 1U : 0U) +
+			                     ((mask & 2U) != 0U ? 2U : 0U) +
+			                     ((mask & 4U) != 0U ? 4U : 0U);
+			if (bytes <= budget) {
+				brute_force_best = std::max(brute_force_best, static_cast<size_t>(std::popcount(mask)));
+			}
+		}
+		EXPECT_EQ(result.selected_gap_count, brute_force_best) << "budget=" << budget;
+		EXPECT_EQ(result.physical_run_count, exact.size() - brute_force_best) << "budget=" << budget;
+		EXPECT_LE(result.physical_storage_bytes, 100U + budget);
+		const auto& rowgroup = result.rowgroups.front();
+		for (const auto& source : exact) {
+			const size_t source_end = source.offset + source.size;
+			EXPECT_TRUE(std::any_of(rowgroup.physical_ranges.begin(), rowgroup.physical_ranges.end(),
+			                        [&](const auto& physical) {
+				                        return physical.offset <= source.offset &&
+				                               physical.offset + physical.size >= source_end;
+			                        }));
 		}
 	}
 }
@@ -809,6 +1070,274 @@ TEST(Reader, CompiledSparseVectorReadPlanMatchesSourceReadsAndIsReaderBound) {
 	EXPECT_THROW(other_reader.read_rowgroup_zero_copy_compiled(plan), std::invalid_argument);
 }
 
+TEST(Reader, BoundedSparseReadClearsMergedHolesAndRestoresStaticPrefix) {
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	galp::format::FlsReader reader(fls_path);
+	const auto exact_plan = reader.compile_sparse_vector_read_plan(0U, {1U, 3U, 6U});
+	ASSERT_EQ(exact_plan.backend(), galp::format::SparseVectorReadPlan::Backend::kSourceRanges);
+	const auto exact_ranges = exact_plan.exact_source_ranges();
+	ASSERT_GT(exact_ranges.size(), 1U);
+
+	galp::format::SparseReadBoundedCoalesceOptions options;
+	options.whole_run_amplification_ppm = 1'100'000U;
+	const auto coalesced = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{17U, exact_plan.rowgroup_index(), exact_plan.full_storage_bytes(), exact_ranges}}, options);
+	ASSERT_EQ(coalesced.rowgroups.size(), 1U);
+	ASSERT_GT(coalesced.merged_gap_bytes, 0U);
+	const auto bounded_plan = exact_plan.with_bounded_coalescing(coalesced.rowgroups.front());
+	EXPECT_EQ(bounded_plan.backend(), galp::format::SparseVectorReadPlan::Backend::kBoundedSourceRanges);
+	EXPECT_EQ(bounded_plan.storage_bytes(), coalesced.physical_storage_bytes);
+	EXPECT_EQ(bounded_plan.merged_gap_bytes(), coalesced.merged_gap_bytes);
+	EXPECT_EQ(bounded_plan.estimated_pread_count(), coalesced.physical_run_count);
+	EXPECT_EQ(bounded_plan.exact_source_ranges().size(), exact_ranges.size());
+
+	galp::format::ZeroCopyReadTiming exact_timing {};
+	auto exact = reader.read_rowgroup_zero_copy_compiled(exact_plan, &exact_timing);
+	galp::format::ZeroCopyReadTiming bounded_timing {};
+	auto bounded = reader.read_rowgroup_zero_copy_compiled(bounded_plan, &bounded_timing);
+	ASSERT_EQ(bounded.backing_span.size(), exact.backing_span.size());
+	EXPECT_EQ(std::memcmp(bounded.backing_span.data(), exact.backing_span.data(), exact.backing_span.size()), 0);
+	EXPECT_TRUE(bounded_timing.used_bounded_gap_read);
+	EXPECT_EQ(bounded_timing.selected_storage_bytes, exact_plan.storage_bytes());
+	EXPECT_EQ(bounded_timing.storage_bytes, bounded_plan.storage_bytes());
+	EXPECT_EQ(bounded_timing.merged_gap_bytes, bounded_plan.merged_gap_bytes());
+	EXPECT_EQ(bounded_timing.hole_clear_bytes, bounded_plan.merged_gap_bytes());
+	EXPECT_GT(bounded_timing.static_prefix_restore_bytes, 0U);
+	EXPECT_EQ(bounded_timing.pread_count, bounded_plan.estimated_pread_count());
+}
+
+TEST(Reader, BoundedSparseReadIoUringPreservesBackingAndBatchesSubmissions) {
+#if !defined(__linux__)
+	GTEST_SKIP() << "io_uring is Linux-only";
+#else
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	galp::format::FlsReader reader(fls_path);
+	const auto exact_plan = reader.compile_sparse_vector_read_plan(0U, {1U, 3U, 6U});
+	const auto exact_ranges = exact_plan.exact_source_ranges();
+	ASSERT_GT(exact_ranges.size(), 1U);
+
+	galp::format::SparseReadBoundedCoalesceOptions options;
+	options.whole_run_amplification_ppm = 1'100'000U;
+	const auto coalesced = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{17U, exact_plan.rowgroup_index(), exact_plan.full_storage_bytes(), exact_ranges}}, options);
+	ASSERT_EQ(coalesced.rowgroups.size(), 1U);
+	const auto sync_plan = exact_plan.with_bounded_coalescing(coalesced.rowgroups.front());
+	const auto io_uring_plan = exact_plan.with_bounded_coalescing(
+	    coalesced.rowgroups.front(),
+	    galp::format::SparseVectorReadPlan::SubmissionBackend::kIoUring,
+	    /*io_uring_queue_depth=*/8U);
+
+	galp::format::ZeroCopyReadTiming sync_timing {};
+	auto sync = reader.read_rowgroup_zero_copy_compiled(sync_plan, &sync_timing);
+	galp::format::ZeroCopyReadTiming io_uring_timing {};
+	auto io_uring = reader.read_rowgroup_zero_copy_compiled(io_uring_plan, &io_uring_timing);
+	ASSERT_EQ(io_uring.backing_span.size(), sync.backing_span.size());
+	EXPECT_EQ(std::memcmp(io_uring.backing_span.data(), sync.backing_span.data(), sync.backing_span.size()), 0);
+	EXPECT_TRUE(io_uring_timing.used_bounded_gap_read);
+	EXPECT_TRUE(io_uring_timing.used_io_uring);
+	EXPECT_EQ(io_uring_timing.storage_bytes, sync_timing.storage_bytes);
+	EXPECT_EQ(io_uring_timing.pread_count, 0U);
+	EXPECT_GE(io_uring_timing.io_uring_read_request_count, coalesced.physical_run_count);
+	EXPECT_EQ(io_uring_timing.io_uring_completion_count,
+	          io_uring_timing.io_uring_read_request_count);
+	EXPECT_GT(io_uring_timing.io_uring_submit_syscall_count, 0U);
+	EXPECT_LT(io_uring_timing.io_uring_submit_syscall_count, io_uring_timing.io_uring_read_request_count);
+	EXPECT_GT(io_uring_timing.io_uring_ring_mapped_bytes, 0U);
+	EXPECT_EQ(io_uring_timing.io_uring_newly_mapped_ring_bytes,
+	          io_uring_timing.io_uring_ring_mapped_bytes);
+
+	galp::format::ZeroCopyReadTiming reused_timing {};
+	(void)reader.read_rowgroup_zero_copy_compiled(io_uring_plan, &reused_timing);
+	EXPECT_EQ(reused_timing.io_uring_newly_mapped_ring_bytes, 0U);
+#endif
+}
+
+TEST(Reader, SparseReadRecipeRoundTripsAndPreservesReaderBinding) {
+	const auto fls_path    = make_sparse_vector_read_fixture();
+	const auto recipe_path = fls_path.parent_path() / "canonical.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0x1020304050607080);
+
+	galp::format::FlsReader baseline_reader(fls_path);
+	const auto baseline_plan = baseline_reader.compile_sparse_vector_read_plan(0U, {6U, 1U, 6U});
+	ASSERT_FALSE(baseline_plan.recipe_hit());
+	const auto baseline_ranges = baseline_plan.exact_source_ranges();
+	ASSERT_FALSE(baseline_ranges.empty());
+
+	const auto write_stats = galp::format::write_sparse_read_recipe(
+	    fls_path,
+	    recipe_path,
+	    source_fingerprint,
+	    {{0U, {6U, 1U, 6U}}});
+	EXPECT_FALSE(write_stats.reused_existing);
+	EXPECT_EQ(write_stats.rowgroup_count, 1U);
+	EXPECT_EQ(write_stats.selected_vector_count, 2U);
+	EXPECT_EQ(write_stats.sidecar_bytes, std::filesystem::file_size(recipe_path));
+	EXPECT_EQ(write_stats.exact_range_count, baseline_ranges.size());
+	EXPECT_EQ(write_stats.exact_storage_bytes, baseline_plan.storage_bytes());
+
+	galp::format::FlsReaderOptions options;
+	options.sparse_read_recipe_path               = recipe_path;
+	options.sparse_read_recipe_source_fingerprint = source_fingerprint;
+	options.sparse_read_recipe_rehydrate_workers  = 4U;
+	galp::format::FlsReader recipe_reader(fls_path, options);
+	const auto& init = recipe_reader.sparse_initialization_stats();
+	EXPECT_TRUE(init.sparse_recipe_loaded);
+	EXPECT_EQ(init.sparse_recipe_record_count, 1U);
+	EXPECT_EQ(init.sparse_recipe_sidecar_bytes, write_stats.sidecar_bytes);
+	EXPECT_EQ(init.sparse_recipe_rehydrate_workers, 1U);
+	EXPECT_GT(init.sparse_recipe_rehydrate_ms, 0.0);
+	EXPECT_GT(init.sparse_recipe_rehydrate_service_ms, 0.0);
+	EXPECT_GT(init.sparse_recipe_source_metadata_bytes, 0U);
+	EXPECT_GT(init.sparse_recipe_source_metadata_pread_count, 0U);
+	const auto recipe_plan = recipe_reader.compile_sparse_vector_read_plan(0U, {1U, 6U});
+	ASSERT_TRUE(recipe_plan.recipe_hit());
+	EXPECT_EQ(recipe_plan.recipe_rehydrate_ms(), 0.0);
+	EXPECT_EQ(recipe_plan.recipe_source_metadata_bytes(), 0U);
+	EXPECT_EQ(recipe_plan.recipe_source_metadata_pread_count(), 0U);
+	EXPECT_EQ(recipe_plan.storage_bytes(), baseline_plan.storage_bytes());
+	EXPECT_EQ(recipe_plan.estimated_pread_count(), baseline_plan.estimated_pread_count());
+	const auto recipe_ranges = recipe_plan.exact_source_ranges();
+	ASSERT_EQ(recipe_ranges.size(), baseline_ranges.size());
+	for (size_t index = 0U; index < recipe_ranges.size(); ++index) {
+		EXPECT_EQ(recipe_ranges[index].offset, baseline_ranges[index].offset);
+		EXPECT_EQ(recipe_ranges[index].size, baseline_ranges[index].size);
+	}
+
+	auto baseline = baseline_reader.read_rowgroup_zero_copy_compiled(baseline_plan);
+	auto restored = recipe_reader.read_rowgroup_zero_copy_compiled(recipe_plan);
+	ASSERT_EQ(restored.backing_span.size(), baseline.backing_span.size());
+	EXPECT_EQ(std::memcmp(restored.backing_span.data(), baseline.backing_span.data(), baseline.backing_span.size()), 0);
+
+	const auto miss_plan = recipe_reader.compile_sparse_vector_read_plan(0U, {1U, 3U});
+	EXPECT_FALSE(miss_plan.recipe_hit());
+	EXPECT_TRUE(miss_plan.uses_sparse_read());
+	galp::format::FlsReader other_reader(fls_path, options);
+	EXPECT_THROW(other_reader.read_rowgroup_zero_copy_compiled(recipe_plan), std::invalid_argument);
+}
+
+TEST(Reader, SparseReadRecipeRejectsIdentityCorruptionTruncationAndTrailingBytes) {
+	const auto fls_path    = make_sparse_vector_read_fixture();
+	const auto recipe_path = fls_path.parent_path() / "validation.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0xA1B2C3D4E5F60718);
+	(void)galp::format::write_sparse_read_recipe(
+	    fls_path,
+	    recipe_path,
+	    source_fingerprint,
+	    {{0U, {1U, 6U}}});
+
+	const auto expect_rejected = [&](const std::filesystem::path& path, const uint64_t fingerprint) {
+		galp::format::FlsReaderOptions options;
+		options.sparse_read_recipe_path               = path;
+		options.sparse_read_recipe_source_fingerprint = fingerprint;
+		EXPECT_THROW((void)galp::format::FlsReader(fls_path, options), std::runtime_error);
+	};
+	expect_rejected(recipe_path, source_fingerprint ^ 1U);
+
+	const auto read_bytes = [](const std::filesystem::path& path) {
+		std::ifstream input(path, std::ios::binary);
+		return std::vector<char>(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+	};
+	const auto write_bytes = [](const std::filesystem::path& path, const std::vector<char>& bytes) {
+		std::ofstream output(path, std::ios::binary | std::ios::trunc);
+		output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+	};
+	const auto pristine = read_bytes(recipe_path);
+	ASSERT_GT(pristine.size(), 128U);
+
+	auto corrupted = pristine;
+	corrupted.back() ^= 0x01;
+	const auto corrupt_path = recipe_path.parent_path() / "corrupt.sparse_read_recipe.bin";
+	write_bytes(corrupt_path, corrupted);
+	expect_rejected(corrupt_path, source_fingerprint);
+
+	auto truncated = pristine;
+	truncated.pop_back();
+	const auto truncated_path = recipe_path.parent_path() / "truncated.sparse_read_recipe.bin";
+	write_bytes(truncated_path, truncated);
+	expect_rejected(truncated_path, source_fingerprint);
+
+	auto trailing = pristine;
+	trailing.push_back('\0');
+	const auto trailing_path = recipe_path.parent_path() / "trailing.sparse_read_recipe.bin";
+	write_bytes(trailing_path, trailing);
+	expect_rejected(trailing_path, source_fingerprint);
+
+	auto bad_version = pristine;
+	bad_version[8] ^= 0x01;
+	const auto version_path = recipe_path.parent_path() / "version.sparse_read_recipe.bin";
+	write_bytes(version_path, bad_version);
+	expect_rejected(version_path, source_fingerprint);
+
+	auto bad_endian = pristine;
+	bad_endian[12] ^= 0x01;
+	const auto endian_path = recipe_path.parent_path() / "endian.sparse_read_recipe.bin";
+	write_bytes(endian_path, bad_endian);
+	expect_rejected(endian_path, source_fingerprint);
+
+	const auto source_size = std::filesystem::file_size(fls_path);
+	ASSERT_GT(source_size, 256U);
+	{
+		std::fstream source(fls_path, std::ios::binary | std::ios::in | std::ios::out);
+		const auto mutation_offset = static_cast<std::streamoff>(source_size / 2U);
+		source.seekg(mutation_offset);
+		char value = 0;
+		source.read(&value, 1);
+		ASSERT_TRUE(source);
+		value ^= 0x01;
+		source.seekp(mutation_offset);
+		source.write(&value, 1);
+		source.close();
+		ASSERT_TRUE(source);
+	}
+	EXPECT_EQ(std::filesystem::file_size(fls_path), source_size);
+	expect_rejected(recipe_path, source_fingerprint);
+}
+
+TEST(Reader, SparseReadRecipeBuilderIsAtomicAndSingleFlight) {
+	const auto fls_path    = make_sparse_vector_read_fixture();
+	const auto recipe_path = fls_path.parent_path() / "single_flight.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0x3141592653589793);
+	const std::vector<galp::format::SparseReadRecipeSelection> selections {{0U, {1U, 6U}}};
+	const auto first = galp::format::write_sparse_read_recipe(
+	    fls_path, recipe_path, source_fingerprint, selections);
+	ASSERT_FALSE(first.reused_existing);
+	const auto second = galp::format::write_sparse_read_recipe(
+	    fls_path, recipe_path, source_fingerprint, selections);
+	EXPECT_TRUE(second.reused_existing);
+	EXPECT_EQ(second.sidecar_crc64, first.sidecar_crc64);
+	EXPECT_EQ(second.sidecar_bytes, first.sidecar_bytes);
+
+	std::filesystem::remove(recipe_path);
+	std::array<galp::format::SparseReadRecipeWriteStats, 8> stats {};
+	std::array<std::exception_ptr, 8> failures {};
+	std::array<std::thread, 8> writers;
+	for (size_t index = 0U; index < writers.size(); ++index) {
+		writers[index] = std::thread([&, index] {
+			try {
+				stats[index] = galp::format::write_sparse_read_recipe(
+				    fls_path, recipe_path, source_fingerprint, selections);
+			} catch (...) {
+				failures[index] = std::current_exception();
+			}
+		});
+	}
+	for (auto& writer : writers) {
+		writer.join();
+	}
+	size_t created = 0U;
+	for (size_t index = 0U; index < stats.size(); ++index) {
+		ASSERT_EQ(failures[index], nullptr);
+		created += stats[index].reused_existing ? 0U : 1U;
+		EXPECT_EQ(stats[index].sidecar_crc64, first.sidecar_crc64);
+		EXPECT_EQ(stats[index].sidecar_bytes, first.sidecar_bytes);
+	}
+	EXPECT_EQ(created, 1U);
+	for (const auto& entry : std::filesystem::directory_iterator(recipe_path.parent_path())) {
+		EXPECT_EQ(entry.path().filename().string().find("single_flight.sparse_read_recipe.bin.tmp"),
+		          std::string::npos);
+	}
+}
+
 TEST(Reader, SparseVectorBundlePreservesSegmentsAndCollapsesPhysicalReads) {
 	const ScopedEnvironmentVariable bundle_policy("GALP_VECTOR_BUNDLE_READ_POLICY", nullptr);
 	const auto fls_path = make_sparse_vector_bundle_fixture();
@@ -881,7 +1410,10 @@ TEST(Reader, CompiledSparseVectorBundlePlansMatchLogicalPackedAndEnvelopeReads) 
 	};
 
 	const auto logical_plan = reader.compile_sparse_vector_read_plan(0, selected);
-	auto compiled_logical = reader.read_rowgroup_zero_copy_compiled(logical_plan);
+	galp::format::ZeroCopyReadTiming logical_timing {};
+	auto compiled_logical = reader.read_rowgroup_zero_copy_compiled(logical_plan, &logical_timing);
+	EXPECT_GT(logical_timing.selected_storage_bytes, 0U);
+	EXPECT_EQ(logical_timing.selected_storage_bytes, logical_timing.storage_bytes);
 	auto reference_logical = reader.read_rowgroup_zero_copy_selected_vectors(0, selected);
 	expect_selected_segments_equal(compiled_logical, reference_logical);
 
@@ -917,6 +1449,8 @@ TEST(Reader, CompiledSparseVectorBundlePlansMatchLogicalPackedAndEnvelopeReads) 
 	auto reference_envelope = reader.read_rowgroup_zero_copy_selected_vectors(0, selected);
 	EXPECT_TRUE(envelope_timing.used_vector_bundle_envelope_read);
 	EXPECT_EQ(envelope_timing.pread_count, 1U);
+	EXPECT_GT(envelope_timing.selected_storage_bytes, 0U);
+	EXPECT_LT(envelope_timing.selected_storage_bytes, envelope_timing.storage_bytes);
 	expect_selected_segments_equal(compiled_envelope, reference_envelope);
 }
 

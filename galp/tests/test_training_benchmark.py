@@ -38,15 +38,23 @@ from training.artifacts import (  # noqa: E402
 )
 from training.augmentation import (  # noqa: E402
     derive_augmentation,
+    derive_shard_shared_crop_augmentation,
     horizontal_flip_dct,
 )
-from training.metrics import gradient_summary, tensor_is_finite  # noqa: E402
+from training.metrics import gradient_summary, process_memory, tensor_is_finite  # noqa: E402
 from training.direct_dct_reader import (  # noqa: E402
     DirectDctTrainingReader,
     NativeExecutionStatsAccumulator,
     merge_native_counter_snapshot,
     native_allocation_stability,
 )
+from training.gate2_acceptance import evaluate_gate2  # noqa: E402
+from training.gate3_acceptance import (  # noqa: E402
+    _EXACT_REPEAT_RESOURCE_FIELDS,
+    evaluate_gate3,
+)
+from training.strict1k_acceptance import evaluate_strict1k  # noqa: E402
+from training.select_gate3_prefetch import select_gate3_prefetch  # noqa: E402
 from training.manifest_preflight import (  # noqa: E402
     ManifestPreflightError,
     preflight_manifest,
@@ -963,6 +971,10 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 "compact_batch_buffer_pageable_fallback_count": 0,
                 "decode_workset_output_arena_growth_count": 1,
                 "decode_workset_chunk_arena_growth_count": 1,
+                "planless_axis_program_device_growth_count": 1,
+                "planless_axis_program_pinned_growth_count": 1,
+                "planless_axis_program_capacity_contract_complete": True,
+                "compact_batch_pool_capacity_contract_complete": True,
             }
         ]
         measured = [
@@ -973,6 +985,8 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 "compact_batch_buffer_growth_count": 0,
                 "decode_workset_output_arena_growth_count": 0,
                 "decode_workset_chunk_arena_growth_count": 0,
+                "planless_axis_program_device_growth_count": 0,
+                "planless_axis_program_pinned_growth_count": 0,
             },
             {
                 **warmup[-1],
@@ -981,11 +995,14 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 "compact_batch_buffer_growth_count": 0,
                 "decode_workset_output_arena_growth_count": 0,
                 "decode_workset_chunk_arena_growth_count": 0,
+                "planless_axis_program_device_growth_count": 0,
+                "planless_axis_program_pinned_growth_count": 0,
             },
         ]
         stable = native_allocation_stability(warmup, measured)
         self.assertTrue(stable["verifiable"])
         self.assertTrue(stable["stable_after_warmup"])
+        self.assertTrue(stable["capacity_contract_complete"])
         self.assertEqual(
             stable["global_counter_deltas"]["galp_native_device_allocation_requests"],
             6.0,
@@ -994,6 +1011,314 @@ class TrainingBenchmarkTest(unittest.TestCase):
         measured[-1]["galp_native_pinned_cuda_allocation_count"] = 4
         unstable = native_allocation_stability(warmup, measured)
         self.assertFalse(unstable["stable_after_warmup"])
+
+        measured[-1]["galp_native_pinned_cuda_allocation_count"] = 3
+        measured[-1]["planless_axis_program_capacity_contract_complete"] = False
+        incomplete = native_allocation_stability(warmup, measured)
+        self.assertTrue(incomplete["verifiable"])
+        self.assertFalse(incomplete["capacity_contract_complete"])
+        self.assertFalse(incomplete["stable_after_warmup"])
+
+    def test_gate2_acceptance_requires_capacity_contract_and_zero_measured_growth(self) -> None:
+        zero_aggregate_names = (
+            "descriptor_map_count",
+            "descriptor_open_ms",
+            "schema_plan_build_ms",
+            "static_metadata_cache_miss_count",
+            "host_expanded_transform_items_created",
+            "host_output_block_source_lists_created",
+            "host_global_transform_sort_items",
+        )
+        growth_names = (
+            "compact_batch_buffer_growth_count",
+            "compact_batch_buffer_pageable_fallback_count",
+            "decode_workset_output_arena_growth_count",
+            "decode_workset_chunk_arena_growth_count",
+            "planless_axis_program_device_growth_count",
+            "planless_axis_program_pinned_growth_count",
+        )
+        repeat = {
+            "throughput_images_per_s": 1600.0,
+            "loader_measured_metrics": {
+                "submitted_batches": 10,
+                "producer_planning_seconds": 0.05,
+                "consumer_wait_fraction_of_measured_wall": 0.01,
+                "queue_hit_rate": 1.0,
+            },
+            "native_allocation_stability": {
+                "verifiable": True,
+                "stable_after_warmup": True,
+                "capacity_contract_complete": True,
+                "global_counter_deltas": {
+                    "galp_native_device_cuda_allocation_count": 0,
+                    "galp_native_pinned_cuda_allocation_count": 0,
+                },
+                "measured_per_batch_totals": {name: 0 for name in growth_names},
+            },
+            "native_execution_stats_by_phase": {
+                "measured": {
+                    "latest": {
+                        "planless_axis_program_capacity_contract_complete": True,
+                        "planless_axis_program_capacity_contract_bytes": 571648,
+                        "planless_axis_program_device_capacity_bytes": 1048576,
+                        "planless_axis_program_pinned_capacity_bytes": 1048576,
+                        "compact_batch_pool_capacity_contract_complete": True,
+                        "compact_batch_pool_capacity_contract_images": 64,
+                        "compact_batch_pool_capacity_contract_groups": 64,
+                        "compact_batch_pool_capacity_contract_batches": 4,
+                        "compact_batch_pool_capacity_contract_bytes": 32 * 1024 * 1024,
+                        "compact_batch_pool_prewarmed_slots": 256,
+                        "compact_batch_pool_prewarmed_bytes": 32 * 1024 * 1024,
+                    },
+                    "numeric_aggregates": {
+                        name: {"sum": 0.0, "count": 10} for name in zero_aggregate_names
+                    },
+                }
+            },
+            "sample_order": {"validation": {"ok": True}},
+        }
+        passed_status = {
+            "artifact": "passed",
+            "correctness": "passed",
+            "semantic": "passed",
+            "overall": "passed",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            pipeline = {
+                "status": passed_status,
+                "phase_results": {"smoke": {"repeats": [repeat]}},
+            }
+            results = {"pipeline_status": {"galp": passed_status}}
+            for name, value in (
+                ("pipeline_galp.json", pipeline),
+                ("results.json", results),
+                ("contract.json", {}),
+                ("sample_order.json", {}),
+            ):
+                (run_dir / name).write_text(json.dumps(value), encoding="utf-8")
+
+            accepted = evaluate_gate2(run_dir)
+            self.assertTrue(accepted["complete"])
+            self.assertTrue(accepted["ok"])
+            self.assertEqual(accepted["metrics"]["repeats"][0]["planning_ms_per_batch"], 5.0)
+
+            strict_repeat = copy.deepcopy(repeat)
+            strict_repeat["native_execution_stats_by_phase"]["measured"]["latest"].update(
+                {
+                    "uses_planless_fixed_transform": True,
+                    "host_expanded_transform_items_created": 0,
+                    "host_output_block_source_lists_created": 0,
+                    "host_global_transform_sort_items": 0,
+                }
+            )
+            strict_status = {**passed_status, "semantic": "not_applicable"}
+            strict_pipeline = {
+                "status": strict_status,
+                "first_step_semantic_probe": {
+                    "before_warmup": True,
+                    "fresh_clone": True,
+                    "formal_repeat_polluted": False,
+                    "failures": [],
+                },
+                "phase_results": {
+                    "smoke": {
+                        "repeats": [copy.deepcopy(strict_repeat) for _ in range(3)]
+                    }
+                },
+            }
+            (run_dir / "pipeline_galp.json").write_text(
+                json.dumps(strict_pipeline), encoding="utf-8"
+            )
+            (run_dir / "results.json").write_text(
+                json.dumps({"pipeline_status": {"galp": strict_status}}),
+                encoding="utf-8",
+            )
+            strict = evaluate_strict1k(run_dir)
+            self.assertTrue(strict["ok"])
+            self.assertEqual(strict["strict1k"]["throughput_median_images_per_s"], 1600.0)
+            strict_pipeline["phase_results"]["smoke"]["repeats"][-1][
+                "native_execution_stats_by_phase"
+            ]["measured"]["latest"]["host_global_transform_sort_items"] = 1
+            (run_dir / "pipeline_galp.json").write_text(
+                json.dumps(strict_pipeline), encoding="utf-8"
+            )
+            strict_rejected = evaluate_strict1k(run_dir)
+            self.assertFalse(strict_rejected["ok"])
+            self.assertFalse(
+                strict_rejected["checks"]["strict1k.repeat_2.compact_planless_path"]["ok"]
+            )
+
+            repeat["native_allocation_stability"]["stable_after_warmup"] = False
+            repeat["native_allocation_stability"]["global_counter_deltas"][
+                "galp_native_device_cuda_allocation_count"
+            ] = 1
+            (run_dir / "pipeline_galp.json").write_text(json.dumps(pipeline), encoding="utf-8")
+            (run_dir / "results.json").write_text(json.dumps(results), encoding="utf-8")
+            rejected = evaluate_gate2(run_dir)
+            self.assertFalse(rejected["ok"])
+            self.assertIn("repeat_0.allocation_stability", rejected["checks"])
+            self.assertFalse(rejected["checks"]["repeat_0.allocation_stability"]["ok"])
+            self.assertFalse(
+                rejected["checks"]["repeat_0.galp_native_device_cuda_allocation_count_delta"]["ok"]
+            )
+
+    def test_process_memory_includes_repeat_resource_gauges(self) -> None:
+        snapshot = process_memory()
+        self.assertIn("rss_bytes", snapshot)
+        self.assertIn("peak_rss_bytes", snapshot)
+        self.assertIn("virtual_memory_bytes", snapshot)
+        self.assertIn("thread_count", snapshot)
+        self.assertIn("open_fd_count", snapshot)
+        self.assertIn("memory_mapping_count", snapshot)
+        if Path("/proc/self/status").is_file():
+            self.assertGreater(int(snapshot["rss_bytes"] or 0), 0)
+            self.assertGreater(int(snapshot["open_fd_count"] or 0), 0)
+            self.assertGreater(int(snapshot["memory_mapping_count"] or 0), 0)
+
+    def test_gate3_acceptance_requires_repeat_and_process_resource_stability(self) -> None:
+        zero_aggregate_names = (
+            "descriptor_map_count",
+            "descriptor_open_ms",
+            "schema_plan_build_ms",
+            "static_metadata_cache_miss_count",
+            "host_expanded_transform_items_created",
+            "host_output_block_source_lists_created",
+            "host_global_transform_sort_items",
+        )
+        growth_names = (
+            "compact_batch_buffer_growth_count",
+            "compact_batch_buffer_pageable_fallback_count",
+            "decode_workset_output_arena_growth_count",
+            "decode_workset_chunk_arena_growth_count",
+            "planless_axis_program_device_growth_count",
+            "planless_axis_program_pinned_growth_count",
+        )
+
+        def repeat(index: int, throughput: float) -> dict[str, object]:
+            latest = {name: 4096 for name in _EXACT_REPEAT_RESOURCE_FIELDS}
+            latest.update(
+                {
+                    "planless_axis_program_capacity_contract_complete": True,
+                    "planless_axis_program_capacity_contract_bytes": 571648,
+                    "planless_axis_program_device_capacity_bytes": 1048576,
+                    "planless_axis_program_pinned_capacity_bytes": 1048576,
+                }
+            )
+            return {
+                "repeat": index,
+                "ok": True,
+                "failures": [],
+                "throughput_images_per_s": throughput,
+                "loader_measured_metrics": {
+                    "submitted_batches": 500,
+                    "producer_planning_seconds": 2.5,
+                    "consumer_wait_fraction_of_measured_wall": 0.01,
+                    "queue_hit_rate": 1.0,
+                },
+                "sample_order": {"validation": {"ok": True}},
+                "native_allocation_stability": {
+                    "verifiable": True,
+                    "stable_after_warmup": True,
+                    "capacity_contract_complete": True,
+                    "global_counter_deltas": {
+                        "galp_native_device_cuda_allocation_count": 0,
+                        "galp_native_pinned_cuda_allocation_count": 0,
+                    },
+                    "measured_per_batch_totals": {name: 0 for name in growth_names},
+                },
+                "native_execution_stats_by_phase": {
+                    "measured": {
+                        "latest": latest,
+                        "numeric_aggregates": {
+                            name: {"sum": 0.0, "count": 500}
+                            for name in zero_aggregate_names
+                        },
+                    }
+                },
+                "host_memory": {
+                    "rss_bytes": 1024 * 1024 * (1000 + index),
+                    "peak_rss_bytes": 1024 * 1024 * (1100 + index),
+                    "open_fd_count": 300,
+                    "memory_mapping_count": 2400,
+                },
+            }
+
+        passed_status = {
+            "artifact": "passed",
+            "correctness": "passed",
+            "semantic": "passed",
+            "performance": "passed",
+            "overall": "passed",
+        }
+        repeats = [repeat(0, 1600.0), repeat(1, 1601.0), repeat(2, 1599.0)]
+        pipeline = {
+            "status": passed_status,
+            "phase_results": {
+                "step": {
+                    "repeats": repeats,
+                    "aggregate": {"performance_status": "passed"},
+                }
+            },
+        }
+        results = {"pipeline_status": {"galp": passed_status}}
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            for name, value in (
+                ("pipeline_galp.json", pipeline),
+                ("results.json", results),
+                ("contract.json", {}),
+                ("sample_order.json", {}),
+            ):
+                (run_dir / name).write_text(json.dumps(value), encoding="utf-8")
+
+            accepted = evaluate_gate3(run_dir)
+            self.assertTrue(accepted["complete"])
+            self.assertTrue(accepted["ok"])
+            self.assertEqual(accepted["metrics"]["repeat_count"], 3)
+            self.assertEqual(
+                accepted["metrics"]["hot_repeat_throughput"]["median"],
+                1600.0,
+            )
+
+            repeats[-1]["native_execution_stats_by_phase"]["measured"]["latest"][
+                "galp_native_pinned_cuda_allocation_count"
+            ] = 5
+            (run_dir / "pipeline_galp.json").write_text(
+                json.dumps(pipeline), encoding="utf-8"
+            )
+            rejected = evaluate_gate3(run_dir)
+            self.assertFalse(rejected["ok"])
+            self.assertFalse(
+                rejected["checks"][
+                    "repeat_resource_stability.galp_native_pinned_cuda_allocation_count"
+                ]["ok"]
+            )
+
+    def test_gate3_prefetch_selector_requires_gates_and_two_percent_gain(self) -> None:
+        def report(median: float, *, ok: bool = True) -> dict[str, object]:
+            return {
+                "complete": True,
+                "ok": ok,
+                "failures": [] if ok else ["resource growth"],
+                "metrics": {"hot_repeat_throughput": {"median": median}},
+            }
+
+        below_margin = select_gate3_prefetch(
+            {2: report(1000.0), 4: report(1019.0), 8: report(1100.0, ok=False)}
+        )
+        self.assertTrue(below_margin["ok"])
+        self.assertEqual(below_margin["selection"]["prefetch_depth_batches"], 2)
+
+        above_margin = select_gate3_prefetch(
+            {2: report(1000.0), 4: report(1021.0), 8: report(1010.0)}
+        )
+        self.assertTrue(above_margin["ok"])
+        self.assertEqual(above_margin["selection"]["prefetch_depth_batches"], 4)
+
+        missing = select_gate3_prefetch({2: report(1000.0), 4: report(1100.0)})
+        self.assertFalse(missing["complete"])
+        self.assertFalse(missing["ok"])
 
     def test_v3_acceptance_report_combines_planner_reader_and_training_gates(self) -> None:
         def write(path: Path, value: dict[str, object]) -> None:
@@ -1806,9 +2131,51 @@ class TrainingBenchmarkTest(unittest.TestCase):
         self.assertNotEqual(first.augmentation_key, changed.augmentation_key)
         for value in (first.crop_x, first.crop_y, first.crop_width, first.crop_height):
             self.assertEqual(value % 16, 0)
+        self.assertLessEqual(first.crop_x + first.crop_width, first.source_width)
+        self.assertLessEqual(first.crop_y + first.crop_height, first.source_height)
         descriptor = first.native_dct_descriptor()
         self.assertEqual(descriptor["crop"]["unit"], "source_pixels")
         self.assertEqual(descriptor["augmentation_key"], first.augmentation_key)
+
+    def test_dct_aligned_crops_stay_within_non_aligned_sources(self) -> None:
+        for seed in range(16):
+            decisions = (
+                derive_augmentation(
+                    seed=seed,
+                    epoch=0,
+                    logical_sample_id="edge",
+                    source_width=16,
+                    source_height=22,
+                    domain="dct",
+                ),
+                derive_shard_shared_crop_augmentation(
+                    seed=seed,
+                    epoch=0,
+                    physical_shard_id=0,
+                    logical_sample_id="edge",
+                    source_width=16,
+                    source_height=22,
+                    domain="dct",
+                ),
+            )
+            for decision in decisions:
+                for value in (
+                    decision.crop_x,
+                    decision.crop_y,
+                    decision.crop_width,
+                    decision.crop_height,
+                ):
+                    self.assertEqual(value % 16, 0)
+                self.assertGreater(decision.crop_width, 0)
+                self.assertGreater(decision.crop_height, 0)
+                self.assertLessEqual(
+                    decision.crop_x + decision.crop_width,
+                    decision.source_width,
+                )
+                self.assertLessEqual(
+                    decision.crop_y + decision.crop_height,
+                    decision.source_height,
+                )
 
     def test_dct_augmentation_rejects_sources_smaller_than_alignment(self) -> None:
         for width, height in ((15, 32), (32, 15), (8, 8)):

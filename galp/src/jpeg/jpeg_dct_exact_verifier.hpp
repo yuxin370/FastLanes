@@ -12,7 +12,7 @@
 
 namespace galp::jpeg {
 
-inline constexpr size_t kMaxJpegDctExactVerificationWorkers = 16U;
+inline constexpr size_t kMaxJpegDctExactVerificationWorkers = 32U;
 
 enum class JpegDctExactMismatchKind : uint8_t {
 	kMissingBlock = 0,

@@ -99,7 +99,9 @@ void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 	if (total_items == 0) {
 		return;
 	}
-	workset.slots.mixed.reserve((total_items + 1U) / 2U);
+	// Reserve the conservative one-slot-per-item ceiling for both vectors so a
+	// later type mix or scalar tail does not repeatedly grow and copy storage.
+	workset.slots.reserve_host_slots(total_items, total_items);
 
 	// Multi-vector unpack decodes `decode_vector_width` vectors per work item, so synthesized
 	// fallback items must step by that width — matching the chunked items add_expression_to_batch
@@ -298,8 +300,8 @@ UploadBreakdown upload_workset(ExecutionWorkset& workset, const ExecutionConfig&
 		}
 		const auto t2             = clock::now();
 		breakdown.arena_pack_ms   = ms(t1, t2);
-		breakdown.arena           = workset.buffers.chunk_arena->upload(/*resolve_before_pack=*/true,
-                                                              /*backing_regions_coalesced=*/true);
+		breakdown.arena = workset.buffers.chunk_arena->upload(/*resolve_before_pack=*/true,
+		                                                       /*backing_regions_coalesced=*/true);
 		const auto t3             = clock::now();
 		breakdown.arena_upload_ms = ms(t2, t3);
 		if (!workset.buffers.device_scatter_copies.empty()) {

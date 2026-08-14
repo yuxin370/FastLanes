@@ -134,6 +134,10 @@ def _validate_planless_structural_accounting(
         "internal_syncs": expected_batches * int(gate.get("internal_syncs_per_batch", 1)),
         "decode_kernels": expected_batches * int(gate.get("decode_kernels_per_batch", 1)),
     }
+    if "async_planless_completion_batches_per_batch" in gate:
+        structural_expectations["async_planless_completion_batches"] = expected_batches * int(
+            gate["async_planless_completion_batches_per_batch"]
+        )
     for counter, expected in structural_expectations.items():
         _require(
             int(counters.get(counter, -1)) == expected,

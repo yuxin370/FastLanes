@@ -135,6 +135,27 @@ def file_identity(path: Path) -> dict[str, int]:
     }
 
 
+_PERSISTENT_FILE_IDENTITY_FIELDS = ("inode", "size_bytes", "mtime_ns", "ctime_ns")
+
+
+def persistent_file_identity_matches(
+    expected: Any,
+    current: dict[str, int],
+) -> bool:
+    """Compare a file snapshot across remounts without trusting mutable content.
+
+    ``st_dev`` identifies a mounted filesystem inside the current mount namespace;
+    it is not stable across a reboot, remount, or namespace change.  The remaining
+    fields still reject replacement, truncation, and in-place modification without
+    forcing a full payload rehash solely because the mount was renumbered.
+    """
+    return isinstance(expected, dict) and all(
+        isinstance(expected.get(field), int)
+        and expected[field] == current[field]
+        for field in _PERSISTENT_FILE_IDENTITY_FIELDS
+    )
+
+
 def fingerprint_file(path: Path) -> dict[str, Any]:
     path = path.resolve()
     for _ in range(3):
@@ -159,7 +180,7 @@ def verify_file_fingerprint(path: Path, expected: dict[str, Any], label: str) ->
         current_identity["size_bytes"] == expected.get("size_bytes"),
         f"{label} size changed after contract creation: {path}",
     )
-    if current_identity == expected.get("file_identity"):
+    if persistent_file_identity_matches(expected.get("file_identity"), current_identity):
         return
     current = fingerprint_file(path)
     require(
@@ -285,7 +306,7 @@ def cached_file_fingerprints(
         cached = cached_by_path.get(str(path))
         if (
             cached is not None
-            and cached.get("file_identity") == identity
+            and persistent_file_identity_matches(cached.get("file_identity"), identity)
             and isinstance(cached.get("sha256"), str)
             and len(cached["sha256"]) == 64
         ):
@@ -298,8 +319,12 @@ def cached_file_fingerprints(
             )
             fingerprint = fingerprint_file(path)
             cache_changed = True
-        fingerprint["kind"] = spec.get("kind", "payload")
-        fingerprint["relative_path"] = spec.get("relative_path", path.name)
+        kind = spec.get("kind", "payload")
+        relative_path = spec.get("relative_path", path.name)
+        if fingerprint.get("kind") != kind or fingerprint.get("relative_path") != relative_path:
+            cache_changed = True
+        fingerprint["kind"] = kind
+        fingerprint["relative_path"] = relative_path
         fingerprints.append(fingerprint)
 
     if cache_changed or not cache_path.is_file():

@@ -713,6 +713,28 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             )
         self._queue: OrderedAsyncPrefetchQueue | None = None
         self._reported_consumer_wait = 0.0
+        pls_pool_config = self.config.get("pls_gpu_pool") or {}
+        self._pls_gpu_pool = bool(pls_pool_config.get("enabled", False))
+        self._pls_closed_pool_specs = list(
+            pls_pool_config.get("closed_pool_batches", [])
+        )
+        self._pls_pool_ranges: list[list[int]] = []
+        self._active_pls_pool: dict[str, Any] | None = None
+        self._next_emit_batch = 0
+        self._pls_pool_metrics: dict[str, int | bool | str] = {
+            "enabled": self._pls_gpu_pool,
+            "pool_lifetime": (
+                "load-complete-pool; consume-completely; release; load-next"
+                if self._pls_gpu_pool
+                else "not-enabled"
+            ),
+            "configured_pool_count": len(self._pls_closed_pool_specs),
+            "materialized_pool_count": 0,
+            "materialized_sample_count": 0,
+            "fully_emitted_release_eligible_pool_count": 0,
+            "max_materialized_pool_samples": 0,
+            "simultaneously_active_pool_limit": 1 if self._pls_gpu_pool else 0,
+        }
 
     def _native_arguments(self) -> dict[str, Any]:
         return {
@@ -745,9 +767,10 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         }
 
     def _enqueue_next(self) -> None:
-        if self._next_enqueue >= len(self._batch_ranges):
+        ranges = self._pls_pool_ranges if self._pls_gpu_pool else self._batch_ranges
+        if self._next_enqueue >= len(ranges):
             return
-        indices = self._batch_ranges[self._next_enqueue]
+        indices = ranges[self._next_enqueue]
         plan = [self._planned[index] for index in indices]
         image_ids: list[int] = []
         transforms: list[dict[str, Any]] = []
@@ -778,15 +801,143 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self._read_indices = []
         self._reported_consumer_wait = 0.0
         self._prefetch_depth = int(self.config.get("prefetch_depth", 2))
-        capacity = self._prefetch_depth + 1
+        self._active_pls_pool = None
+        self._next_emit_batch = 0
+        self._pls_pool_ranges = []
+        if self._pls_gpu_pool:
+            batch_cursor = 0
+            for spec in self._pls_closed_pool_specs:
+                optimizer_batches = int(spec["optimizer_batches"])
+                if optimizer_batches <= 0:
+                    raise ValueError("PLS pool must contain at least one optimizer batch")
+                selected_ranges = self._batch_ranges[
+                    batch_cursor : batch_cursor + optimizer_batches
+                ]
+                if len(selected_ranges) != optimizer_batches:
+                    raise ValueError("PLS pool specifications exceed the planned batches")
+                indices = [index for values in selected_ranges for index in values]
+                if len(indices) != int(spec["sample_count"]):
+                    raise ValueError("PLS pool sample count does not match optimizer batches")
+                self._pls_pool_ranges.append(indices)
+                batch_cursor += optimizer_batches
+            if batch_cursor != len(self._batch_ranges):
+                raise ValueError("PLS pool specifications do not cover every planned batch")
+        capacity = 1 if self._pls_gpu_pool else self._prefetch_depth + 1
         self._queue = OrderedAsyncPrefetchQueue(capacity)
-        initial_depth = min(len(self._batch_ranges), capacity)
+        initial_depth = min(
+            len(self._pls_pool_ranges if self._pls_gpu_pool else self._batch_ranges),
+            capacity,
+        )
         for _ in range(initial_depth):
             self._enqueue_next()
+
+    @staticmethod
+    def _validate_native_provenance(
+        batch: Any,
+        image_ids: Sequence[int],
+        transforms: Sequence[dict[str, Any]],
+    ) -> None:
+        actual_descriptors = list(batch.transform_descriptors)
+        actual_image_ids = list(batch.global_image_ids)
+        if len(actual_descriptors) != len(transforms) or len(actual_image_ids) != len(image_ids):
+            raise RuntimeError("GALP native batch changed the requested batch cardinality")
+        for actual, actual_image_id, expected, image_id in zip(
+            actual_descriptors, actual_image_ids, transforms, image_ids
+        ):
+            if int(actual_image_id) != int(image_id):
+                raise RuntimeError("GALP native batch changed the requested image ID order")
+            if int(actual["global_image_id"]) != int(image_id):
+                raise RuntimeError("GALP native transform provenance changed the requested image ID")
+            for field in ("crop", "horizontal_flip", "logical_sample_id", "augmentation_key"):
+                if actual[field] != expected[field]:
+                    raise RuntimeError(f"GALP native transform provenance mismatch for {field}")
+
+    def _load_active_pls_pool(self) -> None:
+        if self._queue is None:
+            raise RuntimeError("GALP prefetch queue is not initialized")
+        if int(self._queue.metrics()["current_queue_depth_batches"]) == 0:
+            self._enqueue_next()
+        try:
+            (indices, image_ids, transforms), native_batch = self._queue.pop()
+            self._validate_native_provenance(native_batch, image_ids, transforms)
+        except Exception:
+            self._queue.close()
+            raise
+        queue_wait = float(self._queue.metrics()["consumer_wait_seconds"])
+        wait = queue_wait - self._reported_consumer_wait
+        self._reported_consumer_wait = queue_wait
+        self._active_pls_pool = {
+            "indices": indices,
+            "batch": native_batch,
+            "offset": 0,
+            "consumer_wait_seconds": wait,
+            "native_stats_pending": True,
+        }
+        sample_count = len(indices)
+        self._pls_pool_metrics["materialized_pool_count"] = int(
+            self._pls_pool_metrics["materialized_pool_count"]
+        ) + 1
+        self._pls_pool_metrics["materialized_sample_count"] = int(
+            self._pls_pool_metrics["materialized_sample_count"]
+        ) + sample_count
+        self._pls_pool_metrics["max_materialized_pool_samples"] = max(
+            int(self._pls_pool_metrics["max_materialized_pool_samples"]),
+            sample_count,
+        )
+
+    def _next_pls_pool_batch(self) -> TrainingBatch:
+        if self._active_pls_pool is None:
+            self._load_active_pls_pool()
+        assert self._active_pls_pool is not None
+        if self._next_emit_batch >= len(self._batch_ranges):
+            raise StopIteration
+        expected_indices = self._batch_ranges[self._next_emit_batch]
+        offset = int(self._active_pls_pool["offset"])
+        indices = self._active_pls_pool["indices"]
+        observed_indices = indices[offset : offset + len(expected_indices)]
+        if observed_indices != expected_indices:
+            raise RuntimeError("PLS GPU pool does not preserve the scheduled optimizer order")
+        native_batch = self._active_pls_pool["batch"]
+        plan = [self._planned[index] for index in expected_indices]
+        tensors = tuple(
+            tensor[offset : offset + len(expected_indices)] for tensor in native_batch.tensors
+        )
+        stats_pending = bool(self._active_pls_pool["native_stats_pending"])
+        training_batch = TrainingBatch(
+            inputs=tensors,
+            labels=torch.tensor(
+                [item[0].label for item in plan], dtype=torch.long, device=self.device
+            ),
+            identities=[item[1] for item in plan],
+            augmentations=[item[2].as_dict() for item in plan],
+            on_device=all(getattr(value, "device", None) == self.device for value in tensors),
+            stage_seconds={
+                "loader_data_wait": (
+                    float(self._active_pls_pool["consumer_wait_seconds"])
+                    if stats_pending
+                    else 0.0
+                ),
+            },
+            keepalive=[native_batch],
+            native_stats_source=native_batch if stats_pending else None,
+        )
+        self._active_pls_pool["native_stats_pending"] = False
+        self._active_pls_pool["offset"] = offset + len(expected_indices)
+        self._next_emit_batch += 1
+        if int(self._active_pls_pool["offset"]) == len(indices):
+            self._active_pls_pool = None
+            self._pls_pool_metrics["fully_emitted_release_eligible_pool_count"] = int(
+                self._pls_pool_metrics["fully_emitted_release_eligible_pool_count"]
+            ) + 1
+        if self.execution_mode == "audit":
+            self.finalize_batch_metrics(training_batch)
+        return training_batch
 
     def next_batch(self) -> TrainingBatch:
         if self._queue is None:
             raise RuntimeError("pipeline repeat has not begun")
+        if self._pls_gpu_pool:
+            return self._next_pls_pool_batch()
         if int(self._queue.metrics()["current_queue_depth_batches"]) == 0:
             if self._next_enqueue >= len(self._batch_ranges):
                 raise StopIteration
@@ -807,24 +958,11 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             and self._next_enqueue < len(self._batch_ranges)
         ):
             self._enqueue_next()
-        actual_descriptors = list(batch.transform_descriptors)
-        actual_image_ids = list(batch.global_image_ids)
-        if len(actual_descriptors) != len(transforms) or len(actual_image_ids) != len(image_ids):
+        try:
+            self._validate_native_provenance(batch, image_ids, transforms)
+        except Exception:
             self._queue.close()
-            raise RuntimeError("GALP native batch changed the requested batch cardinality")
-        for actual, actual_image_id, expected, image_id in zip(
-            actual_descriptors, actual_image_ids, transforms, image_ids
-        ):
-            if int(actual_image_id) != int(image_id):
-                self._queue.close()
-                raise RuntimeError("GALP native batch changed the requested image ID order")
-            if int(actual["global_image_id"]) != int(image_id):
-                self._queue.close()
-                raise RuntimeError("GALP native transform provenance changed the requested image ID")
-            for field in ("crop", "horizontal_flip", "logical_sample_id", "augmentation_key"):
-                if actual[field] != expected[field]:
-                    self._queue.close()
-                    raise RuntimeError(f"GALP native transform provenance mismatch for {field}")
+            raise
         inputs = tuple(batch.tensors)
         training_batch = TrainingBatch(
             inputs=inputs,
@@ -876,6 +1014,56 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             "compact_batch_buffer_pageable_fallback_count",
             "compact_batch_read_group_count",
             "compact_batch_read_worker_count",
+            "plan_device_batch_ms",
+            "compile_io_plan_ms",
+            "reader_lookup_ms",
+            "descriptor_open_ms",
+            "schema_plan_build_ms",
+            "static_metadata_wait_ms",
+            "parallel_reader_resolve_ms",
+            "parallel_reader_resolve_workers",
+            "dynamic_image_planning_ms",
+            "crop_geometry_planning_ms",
+            "crop_interval_planning_ms",
+            "axis_program_planning_ms",
+            "rowgroup_binding_planning_ms",
+            "plan_finalize_ms",
+            "reader_cache_hit_count",
+            "reader_cache_miss_count",
+            "reader_cache_eviction_count",
+            "static_metadata_cache_hit_count",
+            "static_metadata_cache_miss_count",
+            "descriptor_map_count",
+            "static_metadata_wait_count",
+            "active_reader_count",
+            "active_reader_peak_count",
+            "static_metadata_count",
+            "static_metadata_peak_count",
+            "static_metadata_bytes",
+            "static_metadata_peak_bytes",
+            "planning_unique_shard_count",
+            "planning_rowgroup_binding_count",
+            "static_metadata_prewarm_ms",
+            "static_metadata_prewarm_shards",
+            "static_metadata_prewarm_workers",
+            "payload_fd_current_count",
+            "payload_fd_peak_count",
+            "payload_fd_open_count",
+            "payload_fd_close_count",
+            "descriptor_mapping_current_count",
+            "descriptor_mapping_peak_count",
+            "descriptor_map_process_count",
+            "descriptor_unmap_count",
+            "descriptor_mapped_current_bytes",
+            "descriptor_mapped_peak_bytes",
+            "compact_batch_pool_prewarmed_slots",
+            "compact_batch_pool_prewarmed_bytes",
+            "compact_batch_pool_largest_size_class_bytes",
+            "compact_batch_pool_capacity_contract_images",
+            "compact_batch_pool_capacity_contract_groups",
+            "compact_batch_pool_capacity_contract_batches",
+            "compact_batch_pool_capacity_contract_bytes",
+            "compact_read_group_planning_ms",
             "decode_workset_capacity_plan_image_count",
             "decode_workset_output_arena_capacity_plan_bytes",
             "decode_workset_output_arena_requested_bytes",
@@ -939,6 +1127,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
                 "actual_batch_producer_workers": 1,
                 "native_rowgroup_prefetch_workers": self.workers,
                 "execution_mode": self.execution_mode,
+                "physical_load_segment_gpu_pool": dict(self._pls_pool_metrics),
             }
         )
         return metrics

@@ -50,6 +50,37 @@ class RunContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exceeds the 1% storage gate"):
                 _block_major_access_contract(root, storage, (0,))
 
+    def test_scheduled_contract_requires_sidecars_before_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.block_major_access.bin").write_bytes(b"index")
+            for shard_id in (0, 4):
+                (root / f"shard_{shard_id:06d}.block_major_access.bin").write_bytes(b"descriptor")
+            storage = {
+                "persistent_bytes": 1_000_000,
+                "manifest": {"size_bytes": 1000},
+            }
+            with self.assertRaisesRegex(FileNotFoundError, "pre-materialized"):
+                _block_major_access_contract(
+                    root,
+                    storage,
+                    (0, 4),
+                    required_active_output_schedule_shard_ids=(0, 4),
+                )
+
+            for shard_id in (0, 4):
+                (root / f"shard_{shard_id:06d}.active_output_schedule.bin").write_bytes(
+                    b"schedule"
+                )
+            result = _block_major_access_contract(
+                root,
+                storage,
+                (0, 4),
+                required_active_output_schedule_shard_ids=(0, 4),
+            )
+            self.assertEqual(result["required_active_output_schedule_shard_ids"], [0, 4])
+            self.assertEqual(len(result["active_output_schedules"]), 2)
+
     def test_default_matrix_includes_same_crop_legacy_baseline(self) -> None:
         args = parse_args(
             ["--output-dir", "/tmp/unused-dct-major-test-output"]
@@ -58,7 +89,119 @@ class RunContractTest(unittest.TestCase):
         self.assertIn("dct_major_pushdown", args.pipelines)
         self.assertEqual(args.decode_workset_capacity_mib, 512)
         self.assertEqual(args.block_major_double_buffer, "auto")
+        self.assertEqual(args.dct_major_output_prefetch_policy, "overlapped")
+        self.assertEqual(args.dct_major_segment_mode, "fixed")
         self.assertTrue(args.cold_start_model_prime)
+        self.assertFalse(args.evict_pipeline_file_cache)
+        self.assertEqual(args.preprocess_profile, "rgbnomore-resize256-center224")
+        self.assertEqual(args.cold_protocol, "application-overlapped")
+
+    def test_manifest_shard_cli_mode_is_accepted(self) -> None:
+        args = parse_args(
+            [
+                "--output-dir",
+                "/tmp/unused-dct-major-test-output",
+                "--dct-major-segment-mode",
+                "manifest-shard",
+                "--dct-major-crop-execution-mode",
+                "vector-range-read-selected-decode",
+            ]
+        )
+        self.assertEqual(args.dct_major_segment_mode, "manifest-shard")
+
+    def test_deferred_output_allocation_policy_is_explicitly_accepted(self) -> None:
+        args = parse_args(
+            [
+                "--output-dir",
+                "/tmp/unused-dct-major-test-output",
+                "--dct-major-segment-mode",
+                "manifest-shard",
+                "--dct-major-output-prefetch-policy",
+                "deferred-allocation",
+            ]
+        )
+        self.assertEqual(args.dct_major_output_prefetch_policy, "deferred-allocation")
+
+    def test_bounded_selected_mode_and_integer_budget_controls_are_accepted(self) -> None:
+        args = parse_args(
+            [
+                "--output-dir",
+                "/tmp/unused-dct-major-test-output",
+                "--dct-major-segment-mode",
+                "manifest-shard",
+                "--dct-major-crop-execution-mode",
+                "bounded-range-read-selected-decode",
+                "--bounded-read-amplification-cap",
+                "1.02",
+                "--bounded-read-local-amplification-cap",
+                "1.05",
+                "--bounded-read-max-run-bytes",
+                "4194304",
+            ]
+        )
+        self.assertEqual(args.dct_major_crop_execution_mode, "bounded-range-read-selected-decode")
+        self.assertEqual(args.bounded_read_amplification_cap, 1.02)
+        self.assertEqual(args.bounded_read_local_amplification_cap, 1.05)
+        self.assertEqual(args.bounded_read_max_run_bytes, 4 * 1024 * 1024)
+
+    def test_bounded_io_uring_mode_is_explicitly_accepted(self) -> None:
+        args = parse_args(
+            [
+                "--output-dir",
+                "/tmp/unused-dct-major-test-output",
+                "--dct-major-segment-mode",
+                "manifest-shard",
+                "--dct-major-crop-execution-mode",
+                "bounded-io-uring-range-read-selected-decode",
+                "--bounded-read-amplification-cap",
+                "1.10",
+            ]
+        )
+        self.assertEqual(
+            args.dct_major_crop_execution_mode,
+            "bounded-io-uring-range-read-selected-decode",
+        )
+        self.assertEqual(args.bounded_read_amplification_cap, 1.10)
+
+    def test_bounded_io_uring_scheduled_mode_is_explicitly_accepted(self) -> None:
+        args = parse_args(
+            [
+                "--output-dir",
+                "/tmp/unused-dct-major-test-output",
+                "--dct-major-segment-mode",
+                "manifest-shard",
+                "--dct-major-crop-execution-mode",
+                "bounded-io-uring-scheduled-range-read-selected-decode",
+                "--bounded-read-amplification-cap",
+                "1.10",
+            ]
+        )
+        self.assertEqual(
+            args.dct_major_crop_execution_mode,
+            "bounded-io-uring-scheduled-range-read-selected-decode",
+        )
+        self.assertEqual(args.bounded_read_amplification_cap, 1.10)
+
+    def test_per_pipeline_file_cache_eviction_cli_is_accepted(self) -> None:
+        args = parse_args(
+            [
+                "--output-dir",
+                "/tmp/unused-dct-major-test-output",
+                "--evict-pipeline-file-cache",
+            ]
+        )
+        self.assertTrue(args.evict_pipeline_file_cache)
+
+    def test_fixed_512_center_crop_profile_is_accepted(self) -> None:
+        args = parse_args(
+            [
+                "--output-dir",
+                "/tmp/unused-dct-major-test-output",
+                "--preprocess-profile",
+                "fixed-center-224-from-512",
+            ]
+        )
+        self.assertEqual(args.preprocess_profile, "fixed-center-224-from-512")
 
     def test_unified_layout_matrix_accepts_explicit_v2_and_v3_pipelines(self) -> None:
         args = parse_args(

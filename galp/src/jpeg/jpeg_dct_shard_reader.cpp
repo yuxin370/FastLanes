@@ -367,4 +367,45 @@ void JpegDctSelectedVectorProfileReader::AppendRowgroupSelectedVectors(
 	}
 }
 
+uint32_t JpegDctSelectedVectorProfileReader::AppendFullRowgroup(
+    const uint32_t                        rowgroup_index,
+    std::array<std::vector<int16_t>, 64>& columns) const {
+	fastlanes::up<fastlanes::Rowgroup> rowgroup;
+	if (impl_->compact_descriptor) {
+		rowgroup = materialize_compact_rowgroup(
+		    impl_->fls_path, *impl_->compact_descriptor, rowgroup_index);
+	} else {
+		auto rowgroup_reader = impl_->table_reader->get_rowgroup_reader(rowgroup_index);
+		rowgroup = rowgroup_reader->materialize();
+	}
+	if (rowgroup->internal_rowgroup.size() < columns.size()) {
+		throw std::runtime_error("JPEG DCT FLS rowgroup has fewer than 64 coefficient columns");
+	}
+	const auto vector_count = rowgroup->m_descriptor.m_n_vec;
+	if (vector_count == 0U || vector_count > std::numeric_limits<uint32_t>::max()) {
+		throw std::runtime_error("JPEG DCT FLS rowgroup has an invalid vector count");
+	}
+	const size_t destination_base = columns.front().size();
+	if (!std::all_of(
+	        columns.begin(), columns.end(), [&](const auto& column) { return column.size() == destination_base; })) {
+		throw std::runtime_error("JPEG DCT crop profile columns have inconsistent lengths");
+	}
+	if (vector_count > (std::numeric_limits<size_t>::max() - destination_base) / fastlanes::CFG::VEC_SZ) {
+		throw std::overflow_error("JPEG DCT full-rowgroup profile output size overflow");
+	}
+	const size_t destination_size = destination_base + vector_count * fastlanes::CFG::VEC_SZ;
+	for (auto& column : columns) {
+		column.resize(destination_size);
+	}
+	std::vector<uint32_t> selected_vectors(static_cast<size_t>(vector_count));
+	for (uint32_t vector = 0U; vector < vector_count; ++vector) {
+		selected_vectors[vector] = vector;
+	}
+	for (size_t column = 0U; column < columns.size(); ++column) {
+		append_selected_column(
+		    rowgroup->internal_rowgroup[column], selected_vectors, destination_base, columns[column]);
+	}
+	return static_cast<uint32_t>(vector_count);
+}
+
 } // namespace galp::jpeg::detail

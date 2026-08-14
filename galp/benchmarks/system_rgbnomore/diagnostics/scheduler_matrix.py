@@ -166,6 +166,30 @@ def _residency_bounds(
     }
 
 
+def _serial_model_reference(
+    batch_size: int, fully_model_p50_ms: float, serial_model_p50_ms: float
+) -> dict[str, Any]:
+    if batch_size <= 0 or fully_model_p50_ms <= 0.0 or serial_model_p50_ms <= 0.0:
+        raise ValueError("serial model reference inputs must be positive")
+    consistent = serial_model_p50_ms <= fully_model_p50_ms
+    return {
+        "consistent_with_model_only_upper_bound": consistent,
+        "serial_model_period_ceiling_images_per_s": batch_size * 1000.0 / serial_model_p50_ms,
+        "model_only_ceiling_images_per_s_from_serial_p50": (
+            batch_size * 1000.0 / serial_model_p50_ms if consistent else None
+        ),
+        "invalid_reason": (
+            None
+            if consistent
+            else (
+                "serial model p50 is slower than the fully-overlapped model p50; "
+                "the serial path is affected by synchronization/clock-state effects and "
+                "cannot serve as a model-only ceiling"
+            )
+        ),
+    }
+
+
 def _pareto_frontier(
     policy_summaries: dict[str, dict[str, Any]], policy_labels: list[str]
 ) -> list[str]:
@@ -352,7 +376,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         policy_summaries[policy_label]["transform_blocks_per_launch"] = transform_blocks
         policy_summaries[policy_label]["transform_ctas_per_launch"] = transform_ctas
         result_paths[policy_label] = str(output_path.resolve())
-        semantic_paths[policy_label] = policy_dir / "semantic_galp.npz"
+        semantic_paths[policy_label] = policy_dir / f"semantic_{pipeline}.npz"
 
     reference_traces = [repeat["sample_trace"]["sha256"] for repeat in result_payloads["serial"]["repeats"]]
     for policy, payload in result_payloads.items():
@@ -524,7 +548,11 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         dali_throughput = _median(
             [float(repeat["throughput_images_per_s"]) for repeat in dali_repeats]
         )
-    model_only_ceiling = batch_size * 1000.0 / serial["model_forward_gpu_p50_ms_median"]
+    serial_reference = _serial_model_reference(
+        batch_size,
+        fully["model_forward_gpu_p50_ms_median"],
+        serial["model_forward_gpu_p50_ms_median"],
+    )
     limited_comparisons: dict[str, dict[str, Any]] = {}
     for policy_label in limited_labels:
         limited = policy_summaries[policy_label]
@@ -577,19 +605,26 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         "binding": str(binding_candidates[0].resolve()),
         "binding_sha256": _sha256(binding_candidates[0]),
         "core_metric": "T_model_with_transform - T_model_only",
-        "model_only_reference": "serial policy under the same contract",
+        "model_only_reference": (
+            "serial policy under the same contract only when its model p50 is no slower "
+            "than fully-overlapped; otherwise run the dedicated fixed-device-tensor "
+            "forward diagnostic"
+        ),
         "semantic_bit_exact_across_policies": True,
         "priority_isolation_verified_across_policies": True,
         "structural_scheduler_counters_verified_across_policies": True,
         "kernel_resource_limits_verified_across_policies": True,
         "comparison": {
-            "model_only_ceiling_images_per_s_from_serial_p50": model_only_ceiling,
+            **serial_reference,
             "dali_reference_throughput_images_per_s": dali_throughput,
             "limited_candidates": limited_comparisons,
             "pareto_frontier_limited_policies": pareto_frontier_limited_policies,
             "recommended_limited_policy": recommended_limited_policy,
         },
         "gates": {
+            "serial_reference_consistent_with_model_only_upper_bound": serial_reference[
+                "consistent_with_model_only_upper_bound"
+            ],
             "at_least_one_limited_candidate_preserves_throughput_and_reduces_model_extra": (
                 recommended_limited_policy is not None
             ),

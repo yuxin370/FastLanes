@@ -37,6 +37,7 @@ JpegDctDeviceDecodedRowgroupCachePtr make_jpeg_dct_device_cache();
 JpegDctHostIoContextPtr              make_jpeg_dct_host_io_context();
 void set_jpeg_dct_device_cache_capacity(JpegDctDeviceDecodedRowgroupCache& cache, size_t bytes);
 void wait_jpeg_dct_device_execution_fence(JpegDctDeviceExecutionFence& fence);
+void prepare_jpeg_dct_device_scratch_for_reuse(JpegDctDeviceScratch& scratch);
 void compile_jpeg_dct_device_batch_io(JpegDctDeviceBatchPlan& plan, JpegDctHostIoContext& context);
 void stage_jpeg_dct_device_batch_io(JpegDctDeviceBatchPlan& plan, JpegDctHostIoContext& context);
 JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan       plan,

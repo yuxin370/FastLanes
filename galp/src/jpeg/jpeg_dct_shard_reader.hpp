@@ -53,6 +53,8 @@ public:
 	void AppendRowgroupSelectedVectors(uint32_t                              rowgroup_index,
 	                                   std::span<const uint32_t>             selected_vectors,
 	                                   std::array<std::vector<int16_t>, 64>& columns) const;
+	uint32_t AppendFullRowgroup(uint32_t                              rowgroup_index,
+	                            std::array<std::vector<int16_t>, 64>& columns) const;
 
 private:
 	struct Impl;

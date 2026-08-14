@@ -53,7 +53,6 @@ struct ExecutionConfig {
 	DeltaDecoder   delta_decoder             = DeltaDecoder::Auto;
 	FreqPatcher    freq_patcher              = FreqPatcher::Stateful;
 	float          freq_branchless_threshold = kFreqHybridBranchlessThreshold;
-
 	constexpr DecodeChunk chunk() const {
 		return DecodeChunk {unpack_n_vectors, unpack_n_values};
 	}

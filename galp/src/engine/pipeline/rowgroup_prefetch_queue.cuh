@@ -201,8 +201,9 @@ public:
 						prefetched.timing.rowgroup_build_ms =
 						    std::chrono::duration<double, std::milli>(build_end - build_start).count();
 						prefetched.timing.pread_ms                = io_timing.pread_ms;
-						prefetched.storage_bytes                  = io_timing.storage_bytes;
-						prefetched.full_storage_bytes             = io_timing.full_storage_bytes;
+							prefetched.storage_bytes                  = io_timing.storage_bytes;
+							prefetched.selected_storage_bytes         = io_timing.selected_storage_bytes;
+							prefetched.full_storage_bytes             = io_timing.full_storage_bytes;
 						prefetched.pread_count                    = io_timing.pread_count;
 						prefetched.sparse_read_supported          = io_timing.sparse_read_supported;
 						prefetched.used_sparse_read               = io_timing.used_sparse_read;

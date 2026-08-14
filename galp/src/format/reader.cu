@@ -19,18 +19,33 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <flatbuffers/base.h>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <numeric>
+#include <optional>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
+#if !defined(_WIN32)
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace galp::format::detail {
 
@@ -50,8 +65,159 @@ struct SparseRowgroupAccessIndex {
 };
 
 struct SparseDatasetAccessIndex {
-	std::vector<SparseRowgroupAccessIndex> rowgroups;
+	size_t rowgroup_count = 0U;
+	mutable std::mutex mutex;
+	mutable std::unordered_map<size_t, std::shared_ptr<const SparseRowgroupAccessIndex>> rowgroups;
 };
+
+struct SparseReadRecipeRecord {
+	uint32_t                     rowgroup_index = 0U;
+	uint64_t                     rowgroup_bytes = 0U;
+	uint64_t                     selected_storage_bytes = 0U;
+	uint64_t                     selection_digest = 0U;
+	std::vector<uint64_t>        selection_words;
+	std::vector<SparseByteRange> index_ranges;
+	std::vector<SparseByteRange> shared_ranges;
+	std::vector<SparseByteRange> source_ranges;
+	mutable std::shared_ptr<const SparseRowgroupAccessIndex> prehydrated_access;
+	mutable size_t metadata_bytes       = 0U;
+	mutable size_t metadata_pread_count = 0U;
+	mutable double rehydrate_service_ms = 0.0;
+};
+
+struct SparseReadRecipeIndex {
+	std::filesystem::path path;
+	uint64_t              source_file_size    = 0U;
+	uint64_t              source_fingerprint  = 0U;
+	uint64_t              source_stat_digest  = 0U;
+	uint64_t              descriptor_digest   = 0U;
+	uint64_t              sidecar_crc64       = 0U;
+	size_t                sidecar_bytes       = 0U;
+	std::vector<SparseReadRecipeRecord> records;
+};
+
+constexpr std::array<std::byte, 8> kSparseReadRecipeMagic {
+    static_cast<std::byte>('F'), static_cast<std::byte>('L'), static_cast<std::byte>('S'),
+    static_cast<std::byte>('S'), static_cast<std::byte>('R'), static_cast<std::byte>('P'),
+	static_cast<std::byte>('0'), static_cast<std::byte>('3')};
+constexpr uint32_t kSparseReadRecipeVersion      = 3U;
+constexpr uint32_t kSparseReadRecipeEndianMarker = UINT32_C(0x01020304);
+constexpr size_t   kSparseReadRecipeHeaderSize   = 128U;
+constexpr size_t   kSparseReadRecipeRecordSize   = 80U;
+constexpr size_t   kSparseReadRecipeChecksumByte = 88U;
+
+constexpr std::array<uint64_t, 256> make_sparse_recipe_crc64_table() {
+	std::array<uint64_t, 256> table {};
+	for (uint64_t value = 0U; value < table.size(); ++value) {
+		uint64_t crc = value;
+		for (uint32_t bit = 0U; bit < 8U; ++bit) {
+			crc = (crc >> 1U) ^ ((crc & 1U) != 0U ? UINT64_C(0xC96C5795D7870F42) : 0U);
+		}
+		table[value] = crc;
+	}
+	return table;
+}
+
+constexpr auto kSparseRecipeCrc64Table = make_sparse_recipe_crc64_table();
+
+uint64_t sparse_recipe_crc64_update(uint64_t crc, const void* const data, const size_t size) {
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	for (size_t index = 0U; index < size; ++index) {
+		crc = kSparseRecipeCrc64Table[(crc ^ bytes[index]) & 0xFFU] ^ (crc >> 8U);
+	}
+	return crc;
+}
+
+uint64_t sparse_recipe_crc64_update_u64_le(uint64_t crc, const uint64_t value) {
+	std::array<std::byte, sizeof(uint64_t)> encoded {};
+	for (size_t byte = 0U; byte < encoded.size(); ++byte) {
+		encoded[byte] = static_cast<std::byte>((value >> (byte * 8U)) & 0xFFU);
+	}
+	return sparse_recipe_crc64_update(crc, encoded.data(), encoded.size());
+}
+
+uint64_t sparse_recipe_source_stat_digest(const std::filesystem::path& path) {
+	uint64_t digest = 0U;
+#if !defined(_WIN32)
+	struct stat status {};
+	if (::stat(path.c_str(), &status) != 0) {
+		throw std::runtime_error("failed to stat sparse read recipe source: " +
+		                         std::string(std::strerror(errno)));
+	}
+	digest = sparse_recipe_crc64_update_u64_le(digest, static_cast<uint64_t>(status.st_dev));
+	digest = sparse_recipe_crc64_update_u64_le(digest, static_cast<uint64_t>(status.st_ino));
+	digest = sparse_recipe_crc64_update_u64_le(digest, static_cast<uint64_t>(status.st_size));
+	digest = sparse_recipe_crc64_update_u64_le(digest, static_cast<uint64_t>(status.st_mtim.tv_sec));
+	digest = sparse_recipe_crc64_update_u64_le(digest, static_cast<uint64_t>(status.st_mtim.tv_nsec));
+	digest = sparse_recipe_crc64_update_u64_le(digest, static_cast<uint64_t>(status.st_ctim.tv_sec));
+	digest = sparse_recipe_crc64_update_u64_le(digest, static_cast<uint64_t>(status.st_ctim.tv_nsec));
+#else
+	digest = sparse_recipe_crc64_update_u64_le(digest, std::filesystem::file_size(path));
+	digest = sparse_recipe_crc64_update_u64_le(
+	    digest,
+	    static_cast<uint64_t>(std::filesystem::last_write_time(path).time_since_epoch().count()));
+#endif
+	return digest;
+}
+
+uint64_t sparse_recipe_crc64_file(fastlanes::File& file) {
+	constexpr size_t kChunkBytes = 4U * 1024U * 1024U;
+	std::vector<std::byte> buffer(kChunkBytes);
+	const auto file_size = file.Size();
+	uint64_t crc = 0U;
+	fastlanes::n_t offset = 0U;
+	while (offset < file_size) {
+		const auto remaining = file_size - offset;
+		const auto chunk = static_cast<size_t>(std::min<fastlanes::n_t>(remaining, kChunkBytes));
+		file.ReadRangeUnchecked(buffer.data(), offset, chunk);
+		crc = sparse_recipe_crc64_update(crc, buffer.data(), chunk);
+		offset += chunk;
+	}
+	return crc;
+}
+
+template <typename T>
+void put_recipe_le(std::vector<std::byte>& bytes, const size_t offset, const T value) {
+	static_assert(std::is_integral_v<T>);
+	if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
+		throw std::runtime_error("sparse read recipe write exceeds its buffer");
+	}
+	using Unsigned = std::make_unsigned_t<T>;
+	const auto encoded = static_cast<Unsigned>(value);
+	for (size_t byte = 0U; byte < sizeof(T); ++byte) {
+		bytes[offset + byte] = static_cast<std::byte>((encoded >> (byte * 8U)) & 0xFFU);
+	}
+}
+
+template <typename T>
+T read_recipe_le(const std::byte* const bytes,
+	             const size_t           size,
+	             const size_t           offset,
+	             const char* const      label) {
+	static_assert(std::is_integral_v<T>);
+	if (offset > size || sizeof(T) > size - offset) {
+		throw std::runtime_error(std::string("truncated sparse read recipe ") + label);
+	}
+	using Unsigned = std::make_unsigned_t<T>;
+	Unsigned value = 0U;
+	for (size_t byte = 0U; byte < sizeof(T); ++byte) {
+		value |= static_cast<Unsigned>(std::to_integer<uint8_t>(bytes[offset + byte])) << (byte * 8U);
+	}
+	return static_cast<T>(value);
+}
+
+uint64_t sparse_recipe_crc64_with_zeroed_checksum(const std::vector<std::byte>& bytes) {
+	if (bytes.size() < kSparseReadRecipeChecksumByte + sizeof(uint64_t)) {
+		throw std::runtime_error("sparse read recipe is shorter than its checksum field");
+	}
+	uint64_t crc = sparse_recipe_crc64_update(0U, bytes.data(), kSparseReadRecipeChecksumByte);
+	const std::array<std::byte, sizeof(uint64_t)> zeros {};
+	crc = sparse_recipe_crc64_update(crc, zeros.data(), zeros.size());
+	return sparse_recipe_crc64_update(
+	    crc,
+	    bytes.data() + kSparseReadRecipeChecksumByte + sizeof(uint64_t),
+	    bytes.size() - kSparseReadRecipeChecksumByte - sizeof(uint64_t));
+}
 
 constexpr std::array<std::byte, 8> kSparseVectorBundleMagic {
     static_cast<std::byte>('F'), static_cast<std::byte>('L'), static_cast<std::byte>('S'),
@@ -359,59 +525,173 @@ void scatter_ranges(const std::byte* const packed,
 	}
 }
 
+template <typename T>
+void sparse_recipe_crc64_scalar(uint64_t& crc, const T value) {
+	static_assert(std::is_integral_v<T> || std::is_enum_v<T>);
+	crc = sparse_recipe_crc64_update(crc, &value, sizeof(value));
+}
+
+void sparse_descriptor_column_digest(uint64_t& crc, const fastlanes::ColumnDescriptor& column) {
+	const auto* rpn = column.encoding_rpn();
+	const auto* operators = rpn == nullptr ? nullptr : rpn->operator_tokens();
+	const uint32_t operator_count = operators == nullptr ? 0U : operators->size();
+	sparse_recipe_crc64_scalar(crc, operator_count);
+	for (uint32_t index = 0U; index < operator_count; ++index) {
+		sparse_recipe_crc64_scalar(crc, static_cast<uint32_t>(operators->Get(index)));
+	}
+	const auto* segments = column.segment_descriptors();
+	const uint32_t segment_count = segments == nullptr ? 0U : segments->size();
+	sparse_recipe_crc64_scalar(crc, segment_count);
+	for (uint32_t index = 0U; index < segment_count; ++index) {
+		const auto* segment = segments->Get(index);
+		const uint8_t present = segment == nullptr ? 0U : 1U;
+		sparse_recipe_crc64_scalar(crc, present);
+		if (segment == nullptr) {
+			continue;
+		}
+		sparse_recipe_crc64_scalar(crc, segment->entrypoint_offset());
+		sparse_recipe_crc64_scalar(crc, segment->entrypoint_size());
+		sparse_recipe_crc64_scalar(crc, segment->data_offset());
+		sparse_recipe_crc64_scalar(crc, segment->data_size());
+		sparse_recipe_crc64_scalar(crc, static_cast<uint32_t>(segment->entry_point_t()));
+	}
+	const auto* children = column.children();
+	const uint32_t child_count = children == nullptr ? 0U : children->size();
+	sparse_recipe_crc64_scalar(crc, child_count);
+	for (uint32_t index = 0U; index < child_count; ++index) {
+		const auto* child = children->Get(index);
+		const uint8_t present = child == nullptr ? 0U : 1U;
+		sparse_recipe_crc64_scalar(crc, present);
+		if (child != nullptr) {
+			sparse_descriptor_column_digest(crc, *child);
+		}
+	}
+}
+
+uint64_t sparse_descriptor_digest(const fastlanes::TableDescriptor& table_descriptor) {
+	uint64_t crc = 0U;
+	const auto* rowgroups = table_descriptor.m_rowgroup_descriptors();
+	const uint32_t rowgroup_count = rowgroups == nullptr ? 0U : rowgroups->size();
+	sparse_recipe_crc64_scalar(crc, rowgroup_count);
+	for (uint32_t rowgroup_index = 0U; rowgroup_index < rowgroup_count; ++rowgroup_index) {
+		const auto* rowgroup = rowgroups->Get(rowgroup_index);
+		const uint8_t present = rowgroup == nullptr ? 0U : 1U;
+		sparse_recipe_crc64_scalar(crc, present);
+		if (rowgroup == nullptr) {
+			continue;
+		}
+		sparse_recipe_crc64_scalar(crc, rowgroup->m_offset());
+		sparse_recipe_crc64_scalar(crc, rowgroup->m_size());
+		sparse_recipe_crc64_scalar(crc, rowgroup->m_n_vec());
+		const auto* columns = rowgroup->m_column_descriptors();
+		const uint32_t column_count = columns == nullptr ? 0U : columns->size();
+		sparse_recipe_crc64_scalar(crc, column_count);
+		for (uint32_t column_index = 0U; column_index < column_count; ++column_index) {
+			const auto* column = columns->Get(column_index);
+			const uint8_t column_present = column == nullptr ? 0U : 1U;
+			sparse_recipe_crc64_scalar(crc, column_present);
+			if (column != nullptr) {
+				sparse_descriptor_column_digest(crc, *column);
+			}
+		}
+	}
+	return crc;
+}
+
+std::vector<uint64_t> sparse_selection_words(const size_t vector_count,
+	                                         const std::vector<uint32_t>& selected_vectors) {
+	std::vector<uint64_t> words((vector_count + 63U) / 64U, 0U);
+	for (const auto vector : selected_vectors) {
+		if (vector >= vector_count) {
+			throw std::out_of_range("sparse recipe selected vector exceeds rowgroup vector count");
+		}
+		words[vector / 64U] |= UINT64_C(1) << (vector % 64U);
+	}
+	return words;
+}
+
+uint64_t sparse_selection_digest(const std::vector<uint64_t>& words) {
+	uint64_t crc = 0U;
+	const uint64_t count = words.size();
+	crc = sparse_recipe_crc64_update(crc, &count, sizeof(count));
+	return sparse_recipe_crc64_update(crc, words.data(), words.size() * sizeof(uint64_t));
+}
+
+std::shared_ptr<const SparseRowgroupAccessIndex>
+build_sparse_rowgroup_access_index(fastlanes::File& file, const fastlanes::RowgroupDescriptor& rowgroup) {
+	auto entry = std::make_shared<SparseRowgroupAccessIndex>();
+	const auto segments = rowgroup_segment_descriptors(rowgroup);
+	if (!validate_sparse_vector_segments(rowgroup, segments, &entry->fallback_reason)) {
+		return entry;
+	}
+	entry->index_ranges = segment_index_ranges(segments);
+	const auto rowgroup_bytes = static_cast<size_t>(rowgroup.m_size());
+	std::vector<std::byte> index_backing(rowgroup_bytes, std::byte {0});
+	for (const auto& range : entry->index_ranges) {
+		file.ReadRangeUnchecked(index_backing.data() + range.offset, rowgroup.m_offset() + range.offset, range.size);
+	}
+	entry->shared_ranges = segment_shared_ranges(segments, index_backing.data());
+	for (const auto& range : entry->shared_ranges) {
+		file.ReadRangeUnchecked(index_backing.data() + range.offset, rowgroup.m_offset() + range.offset, range.size);
+	}
+	entry->static_prefix = pack_ranges(index_backing.data(), entry->index_ranges);
+	const auto shared_prefix = pack_ranges(index_backing.data(), entry->shared_ranges);
+	entry->static_prefix.insert(entry->static_prefix.end(), shared_prefix.begin(), shared_prefix.end());
+	entry->vector_ranges.resize(rowgroup.m_n_vec());
+	entry->vector_storage_bytes.assign(rowgroup.m_n_vec(), 0U);
+	for (const auto* segment : segments) {
+		if (segment_entrypoint_count(*segment) == 1U) {
+			continue;
+		}
+		for (uint32_t vector = 0U; vector < rowgroup.m_n_vec(); ++vector) {
+			const auto range = segment_vector_range(*segment, index_backing.data(), vector);
+			entry->vector_ranges[vector].push_back(range);
+			if (range.size > std::numeric_limits<size_t>::max() - entry->vector_storage_bytes[vector]) {
+				throw std::runtime_error("sparse rowgroup vector byte count overflow");
+			}
+			entry->vector_storage_bytes[vector] += range.size;
+		}
+	}
+	entry->supported = true;
+	entry->fallback_reason.clear();
+	return entry;
+}
+
 std::shared_ptr<const SparseDatasetAccessIndex>
-build_sparse_dataset_access_index(fastlanes::File& file, const fastlanes::TableDescriptor& table_descriptor) {
+build_sparse_dataset_access_index(const fastlanes::TableDescriptor& table_descriptor) {
 	auto index = std::make_shared<SparseDatasetAccessIndex>();
 	const auto* rowgroups = table_descriptor.m_rowgroup_descriptors();
-	if (rowgroups == nullptr) {
-		return index;
-	}
-	index->rowgroups.resize(rowgroups->size());
-	for (flatbuffers::uoffset_t rowgroup_index = 0; rowgroup_index < rowgroups->size(); ++rowgroup_index) {
-		const auto* rowgroup = rowgroups->Get(rowgroup_index);
-		auto&       entry    = index->rowgroups[rowgroup_index];
-		if (rowgroup == nullptr) {
-			entry.fallback_reason = "null-rowgroup-descriptor";
-			continue;
-		}
-		const auto segments = rowgroup_segment_descriptors(*rowgroup);
-		if (!validate_sparse_vector_segments(*rowgroup, segments, &entry.fallback_reason)) {
-			continue;
-		}
-		entry.index_ranges = segment_index_ranges(segments);
-		const auto rowgroup_bytes = static_cast<size_t>(rowgroup->m_size());
-		std::vector<std::byte> index_backing(rowgroup_bytes, std::byte {0});
-		for (const auto& range : entry.index_ranges) {
-			file.ReadRangeUnchecked(
-			    index_backing.data() + range.offset, rowgroup->m_offset() + range.offset, range.size);
-		}
-		entry.shared_ranges = segment_shared_ranges(segments, index_backing.data());
-		for (const auto& range : entry.shared_ranges) {
-			file.ReadRangeUnchecked(
-			    index_backing.data() + range.offset, rowgroup->m_offset() + range.offset, range.size);
-		}
-		entry.static_prefix = pack_ranges(index_backing.data(), entry.index_ranges);
-		const auto shared_prefix = pack_ranges(index_backing.data(), entry.shared_ranges);
-		entry.static_prefix.insert(entry.static_prefix.end(), shared_prefix.begin(), shared_prefix.end());
-		entry.vector_ranges.resize(rowgroup->m_n_vec());
-		entry.vector_storage_bytes.assign(rowgroup->m_n_vec(), 0U);
-		for (const auto* segment : segments) {
-			if (segment_entrypoint_count(*segment) == 1U) {
-				continue;
-			}
-			for (uint32_t vector = 0; vector < rowgroup->m_n_vec(); ++vector) {
-				const auto range = segment_vector_range(*segment, index_backing.data(), vector);
-				entry.vector_ranges[vector].push_back(range);
-				if (range.size > std::numeric_limits<size_t>::max() - entry.vector_storage_bytes[vector]) {
-					throw std::runtime_error("sparse rowgroup vector byte count overflow");
-				}
-				entry.vector_storage_bytes[vector] += range.size;
-			}
-		}
-		entry.supported = true;
-		entry.fallback_reason.clear();
-	}
+	index->rowgroup_count = rowgroups == nullptr ? 0U : rowgroups->size();
 	return index;
+}
+
+std::shared_ptr<const SparseRowgroupAccessIndex> sparse_rowgroup_access(
+	fastlanes::File& file,
+	const fastlanes::TableDescriptor& table_descriptor,
+	const std::shared_ptr<const SparseDatasetAccessIndex>& dataset_index,
+	const size_t rowgroup_index) {
+	if (!dataset_index || rowgroup_index >= dataset_index->rowgroup_count) {
+		throw std::out_of_range("sparse rowgroup access index is out of range");
+	}
+	std::lock_guard<std::mutex> guard(dataset_index->mutex);
+	if (const auto found = dataset_index->rowgroups.find(rowgroup_index);
+	    found != dataset_index->rowgroups.end()) {
+		return found->second;
+	}
+	const auto* rowgroups = table_descriptor.m_rowgroup_descriptors();
+	const auto* rowgroup = rowgroups == nullptr
+	                           ? nullptr
+	                           : rowgroups->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_index));
+	std::shared_ptr<const SparseRowgroupAccessIndex> built;
+	if (rowgroup == nullptr) {
+		auto unsupported = std::make_shared<SparseRowgroupAccessIndex>();
+		unsupported->fallback_reason = "null-rowgroup-descriptor";
+		built = std::move(unsupported);
+	} else {
+		built = build_sparse_rowgroup_access_index(file, *rowgroup);
+	}
+	dataset_index->rowgroups.emplace(rowgroup_index, built);
+	return built;
 }
 
 fastlanes::TableDescriptorHandle load_table_descriptor(fastlanes::File&              file,
@@ -521,9 +801,592 @@ load_sparse_vector_bundle_index(const std::filesystem::path&                 bun
 	return index;
 }
 
+std::vector<SparseByteRange> read_sparse_recipe_ranges(const std::byte* const payload,
+	                                                   const size_t payload_size,
+	                                                   size_t& cursor,
+	                                                   const uint32_t count,
+	                                                   const size_t rowgroup_bytes,
+	                                                   const char* const label) {
+	std::vector<SparseByteRange> ranges;
+	ranges.reserve(count);
+	size_t previous_end = 0U;
+	const auto read_varuint32 = [&](const char* const field) {
+		uint32_t value = 0U;
+		for (uint32_t byte_index = 0U; byte_index < 5U; ++byte_index) {
+			if (cursor >= payload_size) {
+				throw std::runtime_error(std::string("truncated sparse read recipe ") + field);
+			}
+			const auto byte = std::to_integer<uint8_t>(payload[cursor++]);
+			if (byte_index == 4U && (byte & 0xF0U) != 0U) {
+				throw std::runtime_error(std::string("overflowing sparse read recipe ") + field);
+			}
+			value |= static_cast<uint32_t>(byte & 0x7FU) << (byte_index * 7U);
+			if ((byte & 0x80U) == 0U) {
+				if (byte_index != 0U && (byte & 0x7FU) == 0U) {
+					throw std::runtime_error(std::string("non-canonical sparse read recipe ") + field);
+				}
+				return value;
+			}
+		}
+		throw std::runtime_error(std::string("unterminated sparse read recipe ") + field);
+	};
+	for (uint32_t index = 0U; index < count; ++index) {
+		const auto delta = read_varuint32(label);
+		const auto size  = read_varuint32(label);
+		if (delta > rowgroup_bytes - std::min(previous_end, rowgroup_bytes)) {
+			throw std::runtime_error(std::string("sparse read recipe has overflowing ") + label);
+		}
+		const auto offset = previous_end + delta;
+		if (size == 0U || offset > rowgroup_bytes || size > rowgroup_bytes - offset ||
+		    (!ranges.empty() && delta == 0U)) {
+			throw std::runtime_error(std::string("sparse read recipe has invalid/non-monotonic ") + label);
+		}
+		ranges.push_back({offset, size});
+		previous_end = static_cast<size_t>(offset) + size;
+	}
+	return ranges;
+}
+
+std::shared_ptr<const SparseReadRecipeIndex> load_sparse_read_recipe_index(
+	const std::filesystem::path& recipe_path,
+	const std::filesystem::path& source_path,
+	const fastlanes::TableDescriptor& table_descriptor,
+	const uint64_t source_file_size,
+	const uint64_t expected_source_fingerprint,
+	double* const load_ms,
+	double* const validation_ms) {
+	if (recipe_path.empty() || !std::filesystem::exists(recipe_path)) {
+		return nullptr;
+	}
+	const auto load_begin = std::chrono::steady_clock::now();
+	fastlanes::File recipe_file(recipe_path);
+	const auto file_size_u64 = recipe_file.Size();
+	if (file_size_u64 > std::numeric_limits<size_t>::max()) {
+		throw std::runtime_error("sparse read recipe exceeds host address space");
+	}
+	std::vector<std::byte> encoded(static_cast<size_t>(file_size_u64));
+	if (!encoded.empty()) {
+		recipe_file.ReadRangeUnchecked(encoded.data(), 0U, encoded.size());
+	}
+	const auto load_end = std::chrono::steady_clock::now();
+	if (load_ms != nullptr) {
+		*load_ms = std::chrono::duration<double, std::milli>(load_end - load_begin).count();
+	}
+	const auto validation_begin = load_end;
+	if (encoded.size() < kSparseReadRecipeHeaderSize ||
+	    !std::equal(kSparseReadRecipeMagic.begin(), kSparseReadRecipeMagic.end(), encoded.begin())) {
+		throw std::runtime_error("sparse read recipe magic/header mismatch: " + recipe_path.string());
+	}
+	const auto version = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), 8U, "version");
+	const auto endian = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), 12U, "endian marker");
+	const auto header_size = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), 16U, "header size");
+	const auto record_size = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), 20U, "record size");
+	if (version != kSparseReadRecipeVersion || endian != kSparseReadRecipeEndianMarker ||
+	    header_size != kSparseReadRecipeHeaderSize || record_size != kSparseReadRecipeRecordSize) {
+		throw std::runtime_error("unsupported sparse read recipe version/endian/ABI: " + recipe_path.string());
+	}
+	const auto recorded_source_size = read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 24U, "source size");
+	const auto recorded_source_fingerprint =
+	    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 32U, "source fingerprint");
+	const auto recorded_descriptor_digest =
+	    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 40U, "descriptor digest");
+	const auto record_count = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), 48U, "record count");
+	const auto directory_offset =
+	    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 56U, "directory offset");
+	const auto directory_size = read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 64U, "directory size");
+	const auto payload_offset = read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 72U, "payload offset");
+	const auto payload_size = read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 80U, "payload size");
+	const auto recorded_crc = read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 88U, "checksum");
+	const auto recorded_source_stat_digest =
+	    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), 112U, "source stat digest");
+	if (recorded_source_size != source_file_size || recorded_source_fingerprint == 0U ||
+	    recorded_source_stat_digest == 0U ||
+	    recorded_source_stat_digest != sparse_recipe_source_stat_digest(source_path) ||
+	    (expected_source_fingerprint != 0U && recorded_source_fingerprint != expected_source_fingerprint) ||
+	    recorded_descriptor_digest != sparse_descriptor_digest(table_descriptor)) {
+		throw std::runtime_error("sparse read recipe source identity mismatch: " + recipe_path.string());
+	}
+	if (directory_offset != kSparseReadRecipeHeaderSize ||
+	    directory_size != static_cast<uint64_t>(record_count) * kSparseReadRecipeRecordSize ||
+	    payload_offset != directory_offset + directory_size || payload_offset > encoded.size() ||
+	    payload_size != encoded.size() - payload_offset || recorded_crc != sparse_recipe_crc64_with_zeroed_checksum(encoded)) {
+		throw std::runtime_error("sparse read recipe bounds/checksum mismatch: " + recipe_path.string());
+	}
+	const auto* rowgroups = table_descriptor.m_rowgroup_descriptors();
+	if (rowgroups == nullptr) {
+		throw std::runtime_error("sparse read recipe source has no rowgroups");
+	}
+	auto result = std::make_shared<SparseReadRecipeIndex>();
+	result->path               = recipe_path;
+	result->source_file_size   = recorded_source_size;
+	result->source_fingerprint = recorded_source_fingerprint;
+	result->source_stat_digest = recorded_source_stat_digest;
+	result->descriptor_digest  = recorded_descriptor_digest;
+	result->sidecar_crc64      = recorded_crc;
+	result->sidecar_bytes      = encoded.size();
+	result->records.reserve(record_count);
+	uint32_t previous_rowgroup = 0U;
+	bool have_previous = false;
+	for (uint32_t record_index = 0U; record_index < record_count; ++record_index) {
+		const size_t base = static_cast<size_t>(directory_offset) +
+		                    static_cast<size_t>(record_index) * kSparseReadRecipeRecordSize;
+		SparseReadRecipeRecord record;
+		record.rowgroup_index = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), base, "rowgroup index");
+		const auto selected_count =
+		    read_recipe_le<uint32_t>(encoded.data(), encoded.size(), base + 4U, "selected vector count");
+		record.rowgroup_bytes = read_recipe_le<uint64_t>(encoded.data(), encoded.size(), base + 8U, "rowgroup bytes");
+		record.selected_storage_bytes =
+		    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), base + 16U, "selected bytes");
+		const auto selection_word_count =
+		    read_recipe_le<uint32_t>(encoded.data(), encoded.size(), base + 24U, "selection word count");
+		const auto index_count = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), base + 28U, "index range count");
+		const auto shared_count = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), base + 32U, "shared range count");
+		const auto source_count = read_recipe_le<uint32_t>(encoded.data(), encoded.size(), base + 36U, "source range count");
+		const auto record_payload_offset =
+		    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), base + 40U, "record payload offset");
+		const auto record_payload_size =
+		    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), base + 48U, "record payload size");
+		record.selection_digest =
+		    read_recipe_le<uint64_t>(encoded.data(), encoded.size(), base + 56U, "selection digest");
+		const auto record_crc = read_recipe_le<uint64_t>(encoded.data(), encoded.size(), base + 64U, "record checksum");
+		if (record.rowgroup_index >= rowgroups->size() || (have_previous && record.rowgroup_index <= previous_rowgroup)) {
+			throw std::runtime_error("sparse read recipe rowgroups are not strictly monotonic/in range");
+		}
+		const auto* rowgroup = rowgroups->Get(record.rowgroup_index);
+		if (rowgroup == nullptr || record.rowgroup_bytes != rowgroup->m_size() ||
+		    selection_word_count != (static_cast<uint64_t>(rowgroup->m_n_vec()) + 63U) / 64U ||
+		    record_payload_offset < payload_offset || record_payload_offset > encoded.size() ||
+		    record_payload_size > encoded.size() - record_payload_offset) {
+			throw std::runtime_error("sparse read recipe record geometry/bounds mismatch");
+		}
+		const auto* record_payload = encoded.data() + static_cast<size_t>(record_payload_offset);
+		if (record_crc != sparse_recipe_crc64_update(0U, record_payload, static_cast<size_t>(record_payload_size))) {
+			throw std::runtime_error("sparse read recipe record checksum mismatch");
+		}
+		size_t cursor = 0U;
+		record.selection_words.reserve(selection_word_count);
+		for (uint32_t word = 0U; word < selection_word_count; ++word) {
+			record.selection_words.push_back(
+			    read_recipe_le<uint64_t>(record_payload, record_payload_size, cursor, "selection bitmap"));
+			cursor += sizeof(uint64_t);
+		}
+		if (sparse_selection_digest(record.selection_words) != record.selection_digest) {
+			throw std::runtime_error("sparse read recipe selection digest mismatch");
+		}
+		size_t observed_selected = 0U;
+		for (const auto word : record.selection_words) {
+			observed_selected += static_cast<size_t>(std::popcount(word));
+		}
+		if (observed_selected != selected_count || observed_selected == 0U) {
+			throw std::runtime_error("sparse read recipe selected vector count mismatch");
+		}
+		record.index_ranges = read_sparse_recipe_ranges(
+		    record_payload, record_payload_size, cursor, index_count, record.rowgroup_bytes, "index ranges");
+		record.shared_ranges = read_sparse_recipe_ranges(
+		    record_payload, record_payload_size, cursor, shared_count, record.rowgroup_bytes, "shared ranges");
+		record.source_ranges = read_sparse_recipe_ranges(
+		    record_payload, record_payload_size, cursor, source_count, record.rowgroup_bytes, "source ranges");
+		if (cursor != record_payload_size || total_range_bytes(record.source_ranges) != record.selected_storage_bytes) {
+			throw std::runtime_error("sparse read recipe record has trailing bytes or incorrect selected byte count");
+		}
+		previous_rowgroup = record.rowgroup_index;
+		have_previous = true;
+		result->records.push_back(std::move(record));
+	}
+	const auto validation_end = std::chrono::steady_clock::now();
+	if (validation_ms != nullptr) {
+		*validation_ms = std::chrono::duration<double, std::milli>(validation_end - validation_begin).count();
+	}
+	return result;
+}
+
+const SparseReadRecipeRecord* find_sparse_read_recipe_record(
+	const SparseReadRecipeIndex& recipe,
+	const size_t rowgroup_index,
+	const std::vector<uint64_t>& selection_words) {
+	const auto found = std::lower_bound(
+	    recipe.records.begin(), recipe.records.end(), rowgroup_index, [](const auto& record, const size_t index) {
+		    return record.rowgroup_index < index;
+	    });
+	if (found == recipe.records.end() || found->rowgroup_index != rowgroup_index ||
+	    found->selection_digest != sparse_selection_digest(selection_words) ||
+	    found->selection_words != selection_words) {
+		return nullptr;
+	}
+	return &*found;
+}
+
+std::shared_ptr<const SparseRowgroupAccessIndex> rehydrate_sparse_recipe_access(
+	fastlanes::File& file,
+	const fastlanes::RowgroupDescriptor& rowgroup,
+	const SparseReadRecipeRecord& recipe,
+	size_t* const metadata_bytes,
+	size_t* const metadata_pread_count) {
+	auto access = std::make_shared<SparseRowgroupAccessIndex>();
+	access->supported     = true;
+	access->index_ranges  = recipe.index_ranges;
+	access->shared_ranges = recipe.shared_ranges;
+	const size_t index_bytes  = total_range_bytes(access->index_ranges);
+	const size_t shared_bytes = total_range_bytes(access->shared_ranges);
+	if (shared_bytes > std::numeric_limits<size_t>::max() - index_bytes) {
+		throw std::overflow_error("sparse read recipe static prefix byte count overflow");
+	}
+	access->static_prefix.resize(index_bytes + shared_bytes);
+	size_t cursor = 0U;
+	const auto read_ranges = [&](const std::vector<SparseByteRange>& ranges) {
+		for (const auto& range : ranges) {
+			file.ReadRangeUnchecked(
+			    access->static_prefix.data() + cursor, rowgroup.m_offset() + range.offset, range.size);
+			cursor += range.size;
+			if (metadata_bytes != nullptr) {
+				*metadata_bytes += range.size;
+			}
+			if (metadata_pread_count != nullptr) {
+				++*metadata_pread_count;
+			}
+		}
+	};
+	read_ranges(access->index_ranges);
+	read_ranges(access->shared_ranges);
+	if (cursor != access->static_prefix.size()) {
+		throw std::runtime_error("sparse read recipe static prefix rehydration mismatch");
+	}
+	return access;
+}
+
+struct SparseRecipePrehydrateStats {
+	double wall_ms       = 0.0;
+	double service_ms    = 0.0;
+	size_t worker_count  = 0U;
+	size_t metadata_bytes = 0U;
+	size_t metadata_pread_count = 0U;
+};
+
+SparseRecipePrehydrateStats prehydrate_sparse_recipe_access(
+	fastlanes::File& file,
+	const fastlanes::TableDescriptor& table_descriptor,
+	const SparseReadRecipeIndex& recipe,
+	const size_t requested_workers) {
+	SparseRecipePrehydrateStats stats;
+	if (requested_workers == 0U || recipe.records.empty()) {
+		return stats;
+	}
+	const auto* rowgroups = table_descriptor.m_rowgroup_descriptors();
+	if (rowgroups == nullptr) {
+		throw std::runtime_error("sparse read recipe source has no rowgroups");
+	}
+	// Open/cache the descriptor before workers enter ReadRangeUnchecked. pread
+	// itself is offset-based and safe to issue concurrently on the shared fd.
+	(void)file.Size();
+	stats.worker_count = std::min(requested_workers, recipe.records.size());
+	std::atomic<size_t> next_record {0U};
+	std::atomic<bool>   stop {false};
+	std::mutex          failure_mutex;
+	std::exception_ptr  failure;
+	const auto wall_begin = std::chrono::steady_clock::now();
+	std::vector<std::thread> workers;
+	workers.reserve(stats.worker_count);
+	for (size_t worker = 0U; worker < stats.worker_count; ++worker) {
+		workers.emplace_back([&]() {
+			while (!stop.load(std::memory_order_acquire)) {
+				const size_t index = next_record.fetch_add(1U, std::memory_order_relaxed);
+				if (index >= recipe.records.size()) {
+					return;
+				}
+				try {
+					auto& record = recipe.records[index];
+					const auto* rowgroup = rowgroups->Get(record.rowgroup_index);
+					if (rowgroup == nullptr) {
+						throw std::runtime_error("sparse read recipe rowgroup descriptor is missing");
+					}
+					const auto begin = std::chrono::steady_clock::now();
+					record.prehydrated_access = rehydrate_sparse_recipe_access(
+					    file,
+					    *rowgroup,
+					    record,
+					    &record.metadata_bytes,
+					    &record.metadata_pread_count);
+					record.rehydrate_service_ms = std::chrono::duration<double, std::milli>(
+					    std::chrono::steady_clock::now() - begin).count();
+				} catch (...) {
+					{
+						std::lock_guard<std::mutex> guard(failure_mutex);
+						if (!failure) {
+							failure = std::current_exception();
+						}
+					}
+					stop.store(true, std::memory_order_release);
+					return;
+				}
+			}
+		});
+	}
+	for (auto& worker : workers) {
+		worker.join();
+	}
+	stats.wall_ms = std::chrono::duration<double, std::milli>(
+	    std::chrono::steady_clock::now() - wall_begin).count();
+	if (failure) {
+		std::rethrow_exception(failure);
+	}
+	for (const auto& record : recipe.records) {
+		stats.service_ms += record.rehydrate_service_ms;
+		stats.metadata_bytes += record.metadata_bytes;
+		stats.metadata_pread_count += record.metadata_pread_count;
+	}
+	return stats;
+}
+
 } // namespace galp::format::detail
 
 namespace galp::format {
+
+SparseReadBoundedCoalesceResult coalesce_sparse_read_ranges_bounded(
+	const std::vector<SparseReadBoundedRowgroupInput>& inputs,
+	const SparseReadBoundedCoalesceOptions&            options) {
+	constexpr uint32_t kHardMaximumAmplificationPpm = 1'100'000U;
+	const auto whole_ppm = options.whole_run_amplification_ppm;
+	const auto shard_ppm = options.per_shard_amplification_ppm == 0U
+	                           ? whole_ppm
+	                           : options.per_shard_amplification_ppm;
+	const auto rowgroup_ppm = options.per_rowgroup_amplification_ppm == 0U
+	                              ? whole_ppm
+	                              : options.per_rowgroup_amplification_ppm;
+	for (const auto [value, label] :
+	     {std::pair {whole_ppm, "whole-run"}, std::pair {shard_ppm, "per-shard"},
+	      std::pair {rowgroup_ppm, "per-rowgroup"}}) {
+		if (value < kSparseReadAmplificationScale || value > kHardMaximumAmplificationPpm) {
+			throw std::invalid_argument(std::string("bounded sparse read ") + label +
+			                            " amplification must be in [1.0, 1.10]");
+		}
+	}
+
+	const auto checked_add = [](const size_t lhs, const size_t rhs, const char* const label) {
+		if (rhs > std::numeric_limits<size_t>::max() - lhs) {
+			throw std::overflow_error(std::string("bounded sparse read ") + label + " overflow");
+		}
+		return lhs + rhs;
+	};
+	const auto capped_scaled_bytes = [](const size_t exact, const uint32_t ppm, const size_t physical_limit) {
+		using Wide = unsigned __int128;
+		const Wide scaled = static_cast<Wide>(exact) * static_cast<Wide>(ppm) /
+		                    static_cast<Wide>(kSparseReadAmplificationScale);
+		return static_cast<size_t>(std::min<Wide>(scaled, physical_limit));
+	};
+
+	struct WorkingRowgroup {
+		SparseReadBoundedRowgroupResult result;
+		std::vector<bool>                selected_boundaries;
+		std::vector<size_t>              parent;
+		std::vector<size_t>              component_begin;
+		std::vector<size_t>              component_end;
+		size_t                           physical_bytes = 0U;
+		size_t                           target_bytes   = 0U;
+		size_t                           max_run_bytes  = 0U;
+	};
+	struct GapCandidate {
+		size_t   gap_size       = 0U;
+		uint32_t shard_id       = 0U;
+		size_t   rowgroup_id    = 0U;
+		size_t   boundary_id    = 0U;
+		size_t   input_index    = 0U;
+	};
+
+	SparseReadBoundedCoalesceResult aggregate;
+	aggregate.rowgroups.resize(inputs.size());
+	std::vector<WorkingRowgroup> working(inputs.size());
+	std::vector<GapCandidate> candidates;
+	std::set<std::pair<uint32_t, size_t>> identities;
+	std::map<uint32_t, size_t> shard_exact_bytes;
+	std::map<uint32_t, size_t> shard_full_bytes;
+	for (size_t input_index = 0U; input_index < inputs.size(); ++input_index) {
+		const auto& input = inputs[input_index];
+		if (!identities.emplace(input.shard_id, input.rowgroup_id).second) {
+			throw std::invalid_argument("bounded sparse read contains a duplicate shard/rowgroup identity");
+		}
+		auto ranges = input.exact_ranges;
+		ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [](const auto& range) {
+		 return range.size == 0U;
+		}), ranges.end());
+		std::sort(ranges.begin(), ranges.end(), [](const auto& lhs, const auto& rhs) {
+			return lhs.offset < rhs.offset || (lhs.offset == rhs.offset && lhs.size < rhs.size);
+		});
+		std::vector<SparseReadRange> canonical;
+		canonical.reserve(ranges.size());
+		for (const auto& range : ranges) {
+			if (range.offset > input.full_storage_bytes ||
+			    range.size > input.full_storage_bytes - range.offset) {
+				throw std::out_of_range("bounded sparse read exact range exceeds its rowgroup");
+			}
+			const size_t range_end = range.offset + range.size;
+			if (canonical.empty()) {
+				canonical.push_back(range);
+				continue;
+			}
+			auto& previous = canonical.back();
+			const size_t previous_end = previous.offset + previous.size;
+			if (range.offset <= previous_end) {
+				const size_t merged_end = std::max(previous_end, range_end);
+				previous.size = merged_end - previous.offset;
+			} else {
+				canonical.push_back(range);
+			}
+		}
+
+		auto& state = working[input_index];
+		state.result.shard_id              = input.shard_id;
+		state.result.rowgroup_id            = input.rowgroup_id;
+		state.result.full_storage_bytes      = input.full_storage_bytes;
+		state.result.exact_ranges            = std::move(canonical);
+		state.result.exact_storage_bytes     = 0U;
+		for (const auto& range : state.result.exact_ranges) {
+			state.result.exact_storage_bytes = checked_add(
+			    state.result.exact_storage_bytes, range.size, "rowgroup exact byte count");
+		}
+		state.physical_bytes = state.result.exact_storage_bytes;
+		state.target_bytes = capped_scaled_bytes(
+		    state.result.exact_storage_bytes, rowgroup_ppm, input.full_storage_bytes);
+		state.max_run_bytes = options.max_physical_run_bytes == 0U
+		                          ? input.full_storage_bytes
+		                          : std::min(options.max_physical_run_bytes, input.full_storage_bytes);
+		for (const auto& range : state.result.exact_ranges) {
+			if (range.size > state.max_run_bytes) {
+				throw std::invalid_argument("bounded sparse read max run is smaller than an exact extent");
+			}
+		}
+		const size_t range_count = state.result.exact_ranges.size();
+		state.selected_boundaries.assign(range_count > 0U ? range_count - 1U : 0U, false);
+		state.parent.resize(range_count);
+		state.component_begin.resize(range_count);
+		state.component_end.resize(range_count);
+		for (size_t index = 0U; index < range_count; ++index) {
+			state.parent[index]          = index;
+			state.component_begin[index] = state.result.exact_ranges[index].offset;
+			state.component_end[index]   = state.result.exact_ranges[index].offset +
+			                               state.result.exact_ranges[index].size;
+			if (index + 1U < range_count) {
+				const size_t next_offset = state.result.exact_ranges[index + 1U].offset;
+				const size_t gap = next_offset - state.component_end[index];
+				candidates.push_back({gap, input.shard_id, input.rowgroup_id, index, input_index});
+			}
+		}
+
+		aggregate.exact_storage_bytes = checked_add(
+		    aggregate.exact_storage_bytes, state.result.exact_storage_bytes, "whole-run exact bytes");
+		aggregate.full_storage_bytes = checked_add(
+		    aggregate.full_storage_bytes, input.full_storage_bytes, "whole-run full bytes");
+		aggregate.exact_extent_count = checked_add(
+		    aggregate.exact_extent_count, range_count, "whole-run exact extent count");
+		shard_exact_bytes[input.shard_id] = checked_add(
+		    shard_exact_bytes[input.shard_id], state.result.exact_storage_bytes, "shard exact bytes");
+		shard_full_bytes[input.shard_id] = checked_add(
+		    shard_full_bytes[input.shard_id], input.full_storage_bytes, "shard full bytes");
+	}
+
+	const size_t whole_target = capped_scaled_bytes(
+	    aggregate.exact_storage_bytes, whole_ppm, aggregate.full_storage_bytes);
+	size_t whole_physical = aggregate.exact_storage_bytes;
+	std::map<uint32_t, size_t> shard_target;
+	std::map<uint32_t, size_t> shard_physical = shard_exact_bytes;
+	for (const auto& [shard_id, exact_bytes] : shard_exact_bytes) {
+		shard_target[shard_id] = capped_scaled_bytes(exact_bytes, shard_ppm, shard_full_bytes.at(shard_id));
+	}
+	std::stable_sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+		return std::tie(lhs.gap_size, lhs.shard_id, lhs.rowgroup_id, lhs.boundary_id) <
+		       std::tie(rhs.gap_size, rhs.shard_id, rhs.rowgroup_id, rhs.boundary_id);
+	});
+	const auto find_root = [](WorkingRowgroup& state, size_t node) {
+		size_t root = node;
+		while (state.parent[root] != root) {
+			root = state.parent[root];
+		}
+		while (state.parent[node] != node) {
+			const size_t next = state.parent[node];
+			state.parent[node] = root;
+			node = next;
+		}
+		return root;
+	};
+	for (const auto& candidate : candidates) {
+		auto& state = working[candidate.input_index];
+		const bool budget_ok = candidate.gap_size <= whole_target - whole_physical &&
+		                       candidate.gap_size <= shard_target.at(candidate.shard_id) -
+		                                                 shard_physical.at(candidate.shard_id) &&
+		                       candidate.gap_size <= state.target_bytes - state.physical_bytes;
+		if (!budget_ok) {
+			++aggregate.budget_rejected_gap_count;
+			continue;
+		}
+		const size_t left_root  = find_root(state, candidate.boundary_id);
+		const size_t right_root = find_root(state, candidate.boundary_id + 1U);
+		if (left_root == right_root) {
+			throw std::logic_error("bounded sparse read boundary was selected twice");
+		}
+		const size_t merged_begin = std::min(state.component_begin[left_root], state.component_begin[right_root]);
+		const size_t merged_end   = std::max(state.component_end[left_root], state.component_end[right_root]);
+		if (merged_end - merged_begin > state.max_run_bytes) {
+			++aggregate.max_run_rejected_gap_count;
+			continue;
+		}
+		state.selected_boundaries[candidate.boundary_id] = true;
+		state.parent[right_root]          = left_root;
+		state.component_begin[left_root] = merged_begin;
+		state.component_end[left_root]   = merged_end;
+		state.physical_bytes += candidate.gap_size;
+		whole_physical += candidate.gap_size;
+		shard_physical[candidate.shard_id] += candidate.gap_size;
+		++aggregate.selected_gap_count;
+	}
+
+	for (size_t input_index = 0U; input_index < working.size(); ++input_index) {
+		auto& state = working[input_index];
+		auto& output = state.result;
+		if (!output.exact_ranges.empty()) {
+			output.physical_ranges.push_back(output.exact_ranges.front());
+			for (size_t boundary = 0U; boundary < state.selected_boundaries.size(); ++boundary) {
+				const auto& next = output.exact_ranges[boundary + 1U];
+				if (!state.selected_boundaries[boundary]) {
+					output.physical_ranges.push_back(next);
+					continue;
+				}
+				const auto& previous = output.exact_ranges[boundary];
+				const size_t previous_end = previous.offset + previous.size;
+				const size_t gap_size = next.offset - previous_end;
+				output.merged_holes.push_back({previous_end, gap_size});
+				auto& physical = output.physical_ranges.back();
+				physical.size = next.offset + next.size - physical.offset;
+			}
+		}
+		output.physical_storage_bytes = state.physical_bytes;
+		output.merged_gap_bytes = output.physical_storage_bytes - output.exact_storage_bytes;
+		size_t verified_physical_bytes = 0U;
+		for (const auto& range : output.physical_ranges) {
+			verified_physical_bytes = checked_add(
+			    verified_physical_bytes, range.size, "verified physical byte count");
+			if (range.size > state.max_run_bytes) {
+				throw std::logic_error("bounded sparse read emitted an oversized physical run");
+			}
+		}
+		if (verified_physical_bytes != output.physical_storage_bytes ||
+		    output.physical_storage_bytes > state.target_bytes ||
+		    output.physical_storage_bytes > output.full_storage_bytes) {
+			throw std::logic_error("bounded sparse read result violates its byte budget");
+		}
+		aggregate.physical_storage_bytes = checked_add(
+		    aggregate.physical_storage_bytes, output.physical_storage_bytes, "whole-run physical bytes");
+		aggregate.merged_gap_bytes = checked_add(
+		    aggregate.merged_gap_bytes, output.merged_gap_bytes, "whole-run gap bytes");
+		aggregate.physical_run_count = checked_add(
+		    aggregate.physical_run_count, output.physical_ranges.size(), "whole-run physical runs");
+		aggregate.rowgroups[input_index] = std::move(output);
+	}
+	if (aggregate.physical_storage_bytes != whole_physical ||
+	    aggregate.merged_gap_bytes != aggregate.physical_storage_bytes - aggregate.exact_storage_bytes ||
+	    aggregate.physical_storage_bytes > whole_target) {
+		throw std::logic_error("bounded sparse read whole-run accounting mismatch");
+	}
+	return aggregate;
+}
 
 namespace {
 
@@ -626,6 +1489,180 @@ void parallel_for_compact_views(const size_t count, const size_t requested_worke
 	}
 }
 
+void append_recipe_bytes(std::vector<std::byte>& destination, const void* const source, const size_t size) {
+	if (size > std::numeric_limits<size_t>::max() - destination.size()) {
+		throw std::overflow_error("sparse read recipe size overflow");
+	}
+	const auto begin = destination.size();
+	destination.resize(begin + size);
+	if (size != 0U) {
+		std::memcpy(destination.data() + begin, source, size);
+	}
+}
+
+template <typename T>
+void append_recipe_le(std::vector<std::byte>& destination, const T value) {
+	const auto begin = destination.size();
+	destination.resize(begin + sizeof(T));
+	detail::put_recipe_le(destination, begin, value);
+}
+
+void append_recipe_varuint32(std::vector<std::byte>& destination, uint32_t value) {
+	do {
+		auto byte = static_cast<uint8_t>(value & 0x7FU);
+		value >>= 7U;
+		if (value != 0U) {
+			byte |= 0x80U;
+		}
+		destination.push_back(static_cast<std::byte>(byte));
+	} while (value != 0U);
+}
+
+void append_recipe_ranges(std::vector<std::byte>& destination,
+	                      const std::vector<detail::SparseByteRange>& ranges,
+	                      const size_t rowgroup_bytes) {
+	size_t previous_end = 0U;
+	for (const auto& range : ranges) {
+		if (range.size == 0U || range.offset > rowgroup_bytes || range.size > rowgroup_bytes - range.offset ||
+		    range.offset > std::numeric_limits<uint32_t>::max() ||
+		    range.size > std::numeric_limits<uint32_t>::max() ||
+		    (!ranges.empty() && range.offset < previous_end)) {
+			throw std::runtime_error("sparse read recipe range is invalid or exceeds uint32 encoding");
+		}
+		const auto delta = range.offset - previous_end;
+		if (previous_end != 0U && delta == 0U) {
+			throw std::runtime_error("sparse read recipe ranges must not overlap or be adjacent");
+		}
+		append_recipe_varuint32(destination, static_cast<uint32_t>(delta));
+		append_recipe_varuint32(destination, static_cast<uint32_t>(range.size));
+		previous_end = range.offset + range.size;
+	}
+}
+
+class SparseRecipeWriterLock {
+public:
+	explicit SparseRecipeWriterLock(const std::filesystem::path& recipe_path) {
+		if (recipe_path.empty()) {
+			throw std::invalid_argument("sparse read recipe output path is empty");
+		}
+		const auto directory = recipe_path.parent_path().empty()
+		                           ? std::filesystem::current_path()
+		                           : recipe_path.parent_path();
+		std::filesystem::create_directories(directory);
+#if !defined(_WIN32)
+		fd_ = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+		if (fd_ < 0) {
+			throw std::runtime_error("failed to open sparse read recipe directory for single-flight: " +
+			                         std::string(std::strerror(errno)));
+		}
+		while (::flock(fd_, LOCK_EX) != 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			const auto message = std::string(std::strerror(errno));
+			static_cast<void>(::close(fd_));
+			fd_ = -1;
+			throw std::runtime_error("failed to lock sparse read recipe directory: " + message);
+		}
+#endif
+	}
+
+	~SparseRecipeWriterLock() {
+#if !defined(_WIN32)
+		if (fd_ >= 0) {
+			static_cast<void>(::flock(fd_, LOCK_UN));
+			static_cast<void>(::close(fd_));
+		}
+#endif
+	}
+
+	SparseRecipeWriterLock(const SparseRecipeWriterLock&)            = delete;
+	SparseRecipeWriterLock& operator=(const SparseRecipeWriterLock&) = delete;
+
+private:
+#if !defined(_WIN32)
+	int fd_ = -1;
+#endif
+};
+
+void write_recipe_file_atomic(const std::filesystem::path& path, const std::vector<std::byte>& bytes) {
+	if (path.empty()) {
+		throw std::invalid_argument("sparse read recipe output path is empty");
+	}
+	if (!path.parent_path().empty()) {
+		std::filesystem::create_directories(path.parent_path());
+	}
+#if defined(_WIN32)
+	const auto staged = std::filesystem::path(path.string() + ".tmp");
+	{
+		std::ofstream output(staged, std::ios::binary | std::ios::trunc);
+		output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+		output.close();
+		if (!output) {
+			throw std::runtime_error("failed to write sparse read recipe staging file");
+		}
+	}
+	std::filesystem::rename(staged, path);
+#else
+	const auto staged = std::filesystem::path(path.string() + ".tmp." + std::to_string(::getpid()));
+	const int fd = ::open(staged.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	if (fd < 0) {
+		throw std::runtime_error("failed to create sparse read recipe staging file: " +
+		                         std::string(std::strerror(errno)));
+	}
+	bool committed = false;
+	bool fd_open   = true;
+	try {
+		size_t written = 0U;
+		while (written < bytes.size()) {
+			const auto result = ::write(fd, bytes.data() + written, bytes.size() - written);
+			if (result < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				throw std::runtime_error("failed to write sparse read recipe staging file: " +
+				                         std::string(std::strerror(errno)));
+			}
+			if (result == 0) {
+				throw std::runtime_error("short write while writing sparse read recipe staging file");
+			}
+			written += static_cast<size_t>(result);
+		}
+		if (::fsync(fd) != 0) {
+			throw std::runtime_error("failed to fsync sparse read recipe staging file: " +
+			                         std::string(std::strerror(errno)));
+		}
+		if (::close(fd) != 0) {
+			throw std::runtime_error("failed to close sparse read recipe staging file: " +
+			                         std::string(std::strerror(errno)));
+		}
+		fd_open = false;
+		if (::rename(staged.c_str(), path.c_str()) != 0) {
+			throw std::runtime_error("failed to atomically install sparse read recipe: " +
+			                         std::string(std::strerror(errno)));
+		}
+		if (!path.parent_path().empty()) {
+			const int directory_fd = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+			if (directory_fd >= 0) {
+				static_cast<void>(::fsync(directory_fd));
+				static_cast<void>(::close(directory_fd));
+			}
+		}
+		committed = true;
+	} catch (...) {
+		if (fd_open) {
+			static_cast<void>(::close(fd));
+		}
+		std::error_code ignored;
+		std::filesystem::remove(staged, ignored);
+		throw;
+	}
+	if (!committed) {
+		throw std::runtime_error("sparse read recipe atomic commit failed");
+	}
+#endif
+}
+
 } // namespace
 
 size_t FlsReader::compact_batch_backing_bytes(const std::vector<size_t>& rowgroup_indices) const {
@@ -647,10 +1684,54 @@ size_t FlsReader::compact_batch_backing_bytes(const std::vector<size_t>& rowgrou
 	return cursor;
 }
 
+std::vector<size_t> FlsReader::compact_largest_image_backing_bytes(const size_t limit) const {
+	if (m_compact_descriptor == nullptr) {
+		throw std::invalid_argument("compact image backing sizing requires Compact v3");
+	}
+	if (limit == 0U) {
+		return {};
+	}
+	std::vector<size_t> largest;
+	largest.reserve(std::min(limit, m_compact_descriptor->image_count()));
+	for (size_t image_index = 0U; image_index < m_compact_descriptor->image_count(); ++image_index) {
+		const auto image = m_compact_descriptor->image(image_index);
+		size_t     bytes = 0U;
+		for (size_t local = 0U; local < image.rowgroup_count; ++local) {
+			const size_t rowgroup_index = static_cast<size_t>(image.first_rowgroup) + local;
+			const auto   record         = m_compact_descriptor->rowgroup(rowgroup_index);
+			if (record.payload_size == 0U) {
+				continue;
+			}
+			bytes = align_compact_batch_offset(bytes);
+			if (record.payload_size > std::numeric_limits<size_t>::max() - bytes) {
+				throw std::overflow_error("Compact v3 image backing size overflow");
+			}
+			bytes += record.payload_size;
+		}
+		bytes = align_compact_batch_offset(bytes);
+		if (largest.size() < limit) {
+			largest.push_back(bytes);
+			std::push_heap(largest.begin(), largest.end(), std::greater<size_t> {});
+		} else if (bytes > largest.front()) {
+			std::pop_heap(largest.begin(), largest.end(), std::greater<size_t> {});
+			largest.back() = bytes;
+			std::push_heap(largest.begin(), largest.end(), std::greater<size_t> {});
+		}
+	}
+	std::sort(largest.begin(), largest.end(), std::greater<size_t> {});
+	// Static metadata prewarm deliberately evicts descriptor pages after
+	// validation. The dataset-wide contract scan faults image/rowgroup records
+	// back in, so drop those pages again instead of retaining several GiB across
+	// the full training manifest.
+	m_compact_descriptor->release_resident_pages();
+	return largest;
+}
+
 struct SparseVectorReadPlan::Impl {
 	enum class Strategy {
 		kFullRowgroup,
 		kSourceRanges,
+		kBoundedSourceRanges,
 		kBundleRuns,
 		kBundleEnvelope,
 		kBundlePacked,
@@ -668,20 +1749,35 @@ struct SparseVectorReadPlan::Impl {
 	};
 
 	std::shared_ptr<const uint8_t> owner;
+	std::shared_ptr<const detail::SparseRowgroupAccessIndex> access;
 	size_t                         rowgroup_index       = 0U;
 	size_t                         rowgroup_bytes       = 0U;
 	size_t                         full_vector_count    = 0U;
 	size_t                         selected_vector_count = 0U;
 	size_t                         storage_bytes        = 0U;
+	size_t                         selected_storage_bytes = 0U;
 	Strategy                       strategy             = Strategy::kFullRowgroup;
 	std::string                    fallback_reason;
+	std::vector<detail::SparseByteRange> exact_source_ranges;
 	std::vector<detail::SparseByteRange> source_ranges;
+	std::vector<detail::SparseByteRange> merged_holes;
+	size_t                                merged_gap_bytes = 0U;
+	SubmissionBackend                      submission_backend = SubmissionBackend::kSynchronousPread;
+	uint32_t                               io_uring_queue_depth = 0U;
 	std::vector<BundleRun>               bundle_runs;
 	uint64_t                              envelope_file_offset = 0U;
 	size_t                                envelope_size        = 0U;
 	std::vector<EnvelopeCopy>             envelope_copies;
 	size_t                                packed_bytes = 0U;
 	std::vector<galp::execution::PackedRowgroupScatterRange> packed_scatter_ranges;
+	bool                                  recipe_hit              = false;
+	double                                recipe_lookup_ms        = 0.0;
+	double                                recipe_rehydrate_ms     = 0.0;
+	size_t                                recipe_source_metadata_bytes = 0U;
+	size_t                                recipe_source_metadata_pread_count = 0U;
+	double                                endpoint_resolution_ms  = 0.0;
+	double                                range_gather_ms          = 0.0;
+	double                                range_sort_coalesce_ms   = 0.0;
 };
 
 size_t SparseVectorReadPlan::rowgroup_index() const noexcept {
@@ -700,6 +1796,10 @@ size_t SparseVectorReadPlan::full_storage_bytes() const noexcept {
 	return impl_ ? impl_->rowgroup_bytes : 0U;
 }
 
+size_t SparseVectorReadPlan::merged_gap_bytes() const noexcept {
+	return impl_ ? impl_->merged_gap_bytes : 0U;
+}
+
 size_t SparseVectorReadPlan::estimated_pread_count() const noexcept {
 	if (!impl_) {
 		return 0U;
@@ -709,6 +1809,7 @@ size_t SparseVectorReadPlan::estimated_pread_count() const noexcept {
 	case Impl::Strategy::kBundleEnvelope:
 		return 1U;
 	case Impl::Strategy::kSourceRanges:
+	case Impl::Strategy::kBoundedSourceRanges:
 		return impl_->source_ranges.size();
 	case Impl::Strategy::kBundleRuns:
 	case Impl::Strategy::kBundlePacked:
@@ -717,6 +1818,129 @@ size_t SparseVectorReadPlan::estimated_pread_count() const noexcept {
 		return impl_->bundle_runs.size();
 	}
 	return 0U;
+}
+
+bool SparseVectorReadPlan::recipe_hit() const noexcept {
+	return impl_ && impl_->recipe_hit;
+}
+
+double SparseVectorReadPlan::recipe_lookup_ms() const noexcept {
+	return impl_ ? impl_->recipe_lookup_ms : 0.0;
+}
+
+double SparseVectorReadPlan::recipe_rehydrate_ms() const noexcept {
+	return impl_ ? impl_->recipe_rehydrate_ms : 0.0;
+}
+
+size_t SparseVectorReadPlan::recipe_source_metadata_bytes() const noexcept {
+	return impl_ ? impl_->recipe_source_metadata_bytes : 0U;
+}
+
+size_t SparseVectorReadPlan::recipe_source_metadata_pread_count() const noexcept {
+	return impl_ ? impl_->recipe_source_metadata_pread_count : 0U;
+}
+
+double SparseVectorReadPlan::endpoint_resolution_ms() const noexcept {
+	return impl_ ? impl_->endpoint_resolution_ms : 0.0;
+}
+
+double SparseVectorReadPlan::range_gather_ms() const noexcept {
+	return impl_ ? impl_->range_gather_ms : 0.0;
+}
+
+double SparseVectorReadPlan::range_sort_coalesce_ms() const noexcept {
+	return impl_ ? impl_->range_sort_coalesce_ms : 0.0;
+}
+
+std::vector<SparseReadRange> SparseVectorReadPlan::exact_source_ranges() const {
+	std::vector<SparseReadRange> result;
+	if (!impl_) {
+		return result;
+	}
+	const auto& ranges = impl_->exact_source_ranges.empty() ? impl_->source_ranges : impl_->exact_source_ranges;
+	result.reserve(ranges.size());
+	for (const auto& range : ranges) {
+		result.push_back({range.offset, range.size});
+	}
+	return result;
+}
+
+std::vector<SparseReadRange> SparseVectorReadPlan::physical_source_ranges() const {
+	std::vector<SparseReadRange> result;
+	if (!impl_) {
+		return result;
+	}
+	result.reserve(impl_->source_ranges.size());
+	for (const auto& range : impl_->source_ranges) {
+		result.push_back({range.offset, range.size});
+	}
+	return result;
+}
+
+std::vector<SparseReadRange> SparseVectorReadPlan::merged_hole_ranges() const {
+	std::vector<SparseReadRange> result;
+	if (!impl_) {
+		return result;
+	}
+	result.reserve(impl_->merged_holes.size());
+	for (const auto& range : impl_->merged_holes) {
+		result.push_back({range.offset, range.size});
+	}
+	return result;
+}
+
+SparseVectorReadPlan SparseVectorReadPlan::with_bounded_coalescing(
+	const SparseReadBoundedRowgroupResult& result,
+	const SubmissionBackend submission_backend,
+	const uint32_t io_uring_queue_depth) const {
+	if (!impl_) {
+		throw std::invalid_argument("cannot bound an empty sparse vector read plan");
+	}
+	if (impl_->strategy != Impl::Strategy::kSourceRanges) {
+		throw std::invalid_argument("bounded coalescing requires an exact source-range plan");
+	}
+	if (result.rowgroup_id != impl_->rowgroup_index || result.full_storage_bytes != impl_->rowgroup_bytes ||
+	    result.exact_storage_bytes != impl_->selected_storage_bytes) {
+		throw std::invalid_argument("bounded coalescing result does not match its sparse vector read plan");
+	}
+	if ((submission_backend == SubmissionBackend::kIoUring) != (io_uring_queue_depth != 0U)) {
+		throw std::invalid_argument("io_uring bounded reads require a positive queue depth only for io_uring mode");
+	}
+	const auto exact = exact_source_ranges();
+	if (exact.size() != result.exact_ranges.size()) {
+		throw std::invalid_argument("bounded coalescing changed the exact range count");
+	}
+	for (size_t index = 0U; index < exact.size(); ++index) {
+		if (exact[index].offset != result.exact_ranges[index].offset ||
+		    exact[index].size != result.exact_ranges[index].size) {
+			throw std::invalid_argument("bounded coalescing changed an exact source range");
+		}
+	}
+	auto bounded = std::make_shared<Impl>(*impl_);
+	bounded->strategy = Impl::Strategy::kBoundedSourceRanges;
+	bounded->source_ranges.clear();
+	bounded->source_ranges.reserve(result.physical_ranges.size());
+	for (const auto& range : result.physical_ranges) {
+		bounded->source_ranges.push_back({range.offset, range.size});
+	}
+	bounded->merged_holes.clear();
+	bounded->merged_holes.reserve(result.merged_holes.size());
+	for (const auto& range : result.merged_holes) {
+		bounded->merged_holes.push_back({range.offset, range.size});
+	}
+	bounded->storage_bytes   = result.physical_storage_bytes;
+	bounded->merged_gap_bytes = result.merged_gap_bytes;
+	bounded->submission_backend = submission_backend;
+	bounded->io_uring_queue_depth = io_uring_queue_depth;
+	return SparseVectorReadPlan(std::move(bounded));
+}
+
+SparseVectorReadPlan::SubmissionBackend SparseVectorReadPlan::submission_backend() const noexcept {
+	return impl_ ? impl_->submission_backend : SubmissionBackend::kSynchronousPread;
+}
+
+uint32_t SparseVectorReadPlan::io_uring_queue_depth() const noexcept {
+	return impl_ ? impl_->io_uring_queue_depth : 0U;
 }
 
 SparseVectorReadPlan::Backend SparseVectorReadPlan::backend() const noexcept {
@@ -728,6 +1952,8 @@ SparseVectorReadPlan::Backend SparseVectorReadPlan::backend() const noexcept {
 		return Backend::kFullRowgroup;
 	case Impl::Strategy::kSourceRanges:
 		return Backend::kSourceRanges;
+	case Impl::Strategy::kBoundedSourceRanges:
+		return Backend::kBoundedSourceRanges;
 	case Impl::Strategy::kBundleRuns:
 		return Backend::kBundleRuns;
 	case Impl::Strategy::kBundleEnvelope:
@@ -876,6 +2102,222 @@ void write_sparse_vector_bundle(const std::filesystem::path& fls_path,
 	}
 }
 
+SparseReadRecipeWriteStats write_sparse_read_recipe(
+	const std::filesystem::path&                   fls_path,
+	const std::filesystem::path&                   recipe_path,
+	const uint64_t                                 source_fingerprint,
+	const std::vector<SparseReadRecipeSelection>& input_selections) {
+	static std::mutex writer_mutex;
+	std::lock_guard<std::mutex> writer_guard(writer_mutex);
+	if (input_selections.empty()) {
+		throw std::invalid_argument("sparse read recipe requires at least one rowgroup selection");
+	}
+	SparseRecipeWriterLock writer_lock(recipe_path);
+	fastlanes::File source(fls_path);
+	const auto source_stat_digest = detail::sparse_recipe_source_stat_digest(fls_path);
+	auto descriptor_owner = detail::load_table_descriptor(source, fls_path);
+	const auto* table = descriptor_owner.Get();
+	const auto* rowgroups = table == nullptr ? nullptr : table->m_rowgroup_descriptors();
+	if (rowgroups == nullptr) {
+		throw std::runtime_error("sparse read recipe source has no rowgroup descriptors");
+	}
+	auto selections = input_selections;
+	std::sort(selections.begin(), selections.end(), [](const auto& lhs, const auto& rhs) {
+		return lhs.rowgroup_index < rhs.rowgroup_index;
+	});
+	for (size_t index = 0U; index < selections.size(); ++index) {
+		auto& selection = selections[index];
+		if (selection.rowgroup_index >= rowgroups->size() ||
+		    (index != 0U && selection.rowgroup_index == selections[index - 1U].rowgroup_index)) {
+			throw std::invalid_argument("sparse read recipe rowgroups must be unique and in range");
+		}
+		std::sort(selection.selected_vectors.begin(), selection.selected_vectors.end());
+		selection.selected_vectors.erase(
+		    std::unique(selection.selected_vectors.begin(), selection.selected_vectors.end()),
+		    selection.selected_vectors.end());
+		if (selection.selected_vectors.empty()) {
+			throw std::invalid_argument("sparse read recipe rowgroup selection is empty");
+		}
+	}
+
+	// The builder is the only writer. Under the cross-process directory lock,
+	// accept an existing file only when its source identity, descriptor ABI, and
+	// every canonical selection match. Invalid/truncated files are rebuilt below;
+	// runtime readers remain strictly read-only.
+	try {
+		double ignored_load_ms       = 0.0;
+		double ignored_validation_ms = 0.0;
+		const auto existing = detail::load_sparse_read_recipe_index(
+		    recipe_path,
+		    fls_path,
+		    *table,
+		    source.Size(),
+		    source_fingerprint,
+		    &ignored_load_ms,
+		    &ignored_validation_ms);
+		bool selections_match = existing != nullptr &&
+		                        (source_fingerprint == 0U || existing->source_fingerprint == source_fingerprint) &&
+		                        existing->records.size() == selections.size();
+		if (selections_match) {
+			for (size_t index = 0U; index < selections.size(); ++index) {
+				const auto& selection = selections[index];
+				const auto* rowgroup = rowgroups->Get(
+				    static_cast<flatbuffers::uoffset_t>(selection.rowgroup_index));
+				if (rowgroup == nullptr || existing->records[index].rowgroup_index != selection.rowgroup_index ||
+				    existing->records[index].selection_words !=
+				        detail::sparse_selection_words(rowgroup->m_n_vec(), selection.selected_vectors)) {
+					selections_match = false;
+					break;
+				}
+			}
+		}
+		if (selections_match) {
+			SparseReadRecipeWriteStats reused;
+			reused.rowgroup_count       = existing->records.size();
+			reused.sidecar_bytes        = existing->sidecar_bytes;
+			reused.source_fingerprint   = existing->source_fingerprint;
+			reused.source_stat_digest   = existing->source_stat_digest;
+			reused.descriptor_digest    = existing->descriptor_digest;
+			reused.sidecar_crc64        = existing->sidecar_crc64;
+			reused.reused_existing      = true;
+			reused.rowgroups.reserve(existing->records.size());
+			for (const auto& record : existing->records) {
+				for (const auto word : record.selection_words) {
+					reused.selected_vector_count += static_cast<size_t>(std::popcount(word));
+				}
+				reused.exact_range_count += record.source_ranges.size();
+				reused.exact_storage_bytes += record.selected_storage_bytes;
+				SparseReadRecipeRowgroupStats rowgroup_stats;
+				rowgroup_stats.rowgroup_index         = record.rowgroup_index;
+				rowgroup_stats.rowgroup_storage_bytes = record.rowgroup_bytes;
+				rowgroup_stats.exact_ranges.reserve(record.source_ranges.size());
+				for (const auto& range : record.source_ranges) {
+					rowgroup_stats.exact_ranges.push_back({range.offset, range.size});
+				}
+				reused.rowgroups.push_back(std::move(rowgroup_stats));
+			}
+			return reused;
+		}
+	} catch (const std::exception&) {
+		// A builder call is an explicit rebuild request. The staged write below
+		// replaces a rejected file atomically; runtime loading still rejects it.
+	}
+
+	auto lazy_index = detail::build_sparse_dataset_access_index(*table);
+	std::vector<detail::SparseReadRecipeRecord> records;
+	records.reserve(selections.size());
+	SparseReadRecipeWriteStats stats;
+	stats.source_fingerprint = source_fingerprint == 0U
+	                               ? detail::sparse_recipe_crc64_file(source)
+	                               : source_fingerprint;
+	stats.source_stat_digest = source_stat_digest;
+	stats.descriptor_digest  = detail::sparse_descriptor_digest(*table);
+	for (const auto& selection : selections) {
+		const auto* rowgroup = rowgroups->Get(static_cast<flatbuffers::uoffset_t>(selection.rowgroup_index));
+		if (rowgroup == nullptr) {
+			throw std::runtime_error("sparse read recipe selected rowgroup descriptor is null");
+		}
+		auto access = detail::sparse_rowgroup_access(source, *table, lazy_index, selection.rowgroup_index);
+		if (!access->supported) {
+			throw std::runtime_error("sparse read recipe source rowgroup is unsupported: " + access->fallback_reason);
+		}
+		if (selection.selected_vectors.back() >= rowgroup->m_n_vec()) {
+			throw std::out_of_range("sparse read recipe selected vector is out of range");
+		}
+		detail::SparseReadRecipeRecord record;
+		record.rowgroup_index   = static_cast<uint32_t>(selection.rowgroup_index);
+		record.rowgroup_bytes   = rowgroup->m_size();
+		record.selection_words  = detail::sparse_selection_words(rowgroup->m_n_vec(), selection.selected_vectors);
+		record.selection_digest = detail::sparse_selection_digest(record.selection_words);
+		record.index_ranges     = access->index_ranges;
+		record.shared_ranges    = access->shared_ranges;
+		std::vector<detail::SparseByteRange> source_ranges;
+		for (const auto vector : selection.selected_vectors) {
+			const auto& ranges = access->vector_ranges.at(vector);
+			source_ranges.insert(source_ranges.end(), ranges.begin(), ranges.end());
+		}
+		record.source_ranges = detail::coalesce_ranges(std::move(source_ranges));
+		record.selected_storage_bytes = detail::total_range_bytes(record.source_ranges);
+		stats.selected_vector_count += selection.selected_vectors.size();
+		stats.exact_range_count += record.source_ranges.size();
+		stats.exact_storage_bytes += record.selected_storage_bytes;
+		SparseReadRecipeRowgroupStats rowgroup_stats;
+		rowgroup_stats.rowgroup_index         = record.rowgroup_index;
+		rowgroup_stats.rowgroup_storage_bytes = record.rowgroup_bytes;
+		rowgroup_stats.exact_ranges.reserve(record.source_ranges.size());
+		for (const auto& range : record.source_ranges) {
+			rowgroup_stats.exact_ranges.push_back({range.offset, range.size});
+		}
+		stats.rowgroups.push_back(std::move(rowgroup_stats));
+		records.push_back(std::move(record));
+	}
+	stats.rowgroup_count = records.size();
+
+	const size_t directory_bytes = records.size() * detail::kSparseReadRecipeRecordSize;
+	std::vector<std::byte> encoded(detail::kSparseReadRecipeHeaderSize + directory_bytes, std::byte {0});
+	std::copy(detail::kSparseReadRecipeMagic.begin(), detail::kSparseReadRecipeMagic.end(), encoded.begin());
+	detail::put_recipe_le<uint32_t>(encoded, 8U, detail::kSparseReadRecipeVersion);
+	detail::put_recipe_le<uint32_t>(encoded, 12U, detail::kSparseReadRecipeEndianMarker);
+	detail::put_recipe_le<uint32_t>(encoded, 16U, detail::kSparseReadRecipeHeaderSize);
+	detail::put_recipe_le<uint32_t>(encoded, 20U, detail::kSparseReadRecipeRecordSize);
+	detail::put_recipe_le<uint64_t>(encoded, 24U, source.Size());
+	detail::put_recipe_le<uint64_t>(encoded, 32U, stats.source_fingerprint);
+	detail::put_recipe_le<uint64_t>(encoded, 40U, stats.descriptor_digest);
+	detail::put_recipe_le<uint32_t>(encoded, 48U, static_cast<uint32_t>(records.size()));
+	detail::put_recipe_le<uint64_t>(encoded, 56U, detail::kSparseReadRecipeHeaderSize);
+	detail::put_recipe_le<uint64_t>(encoded, 64U, directory_bytes);
+	detail::put_recipe_le<uint64_t>(encoded, 72U, encoded.size());
+	detail::put_recipe_le<uint64_t>(encoded, 96U, stats.exact_storage_bytes);
+	detail::put_recipe_le<uint64_t>(encoded, 104U, stats.exact_range_count);
+	detail::put_recipe_le<uint64_t>(encoded, 112U, stats.source_stat_digest);
+	for (size_t record_index = 0U; record_index < records.size(); ++record_index) {
+		const auto& record = records[record_index];
+		std::vector<std::byte> payload;
+		for (const auto word : record.selection_words) {
+			append_recipe_le<uint64_t>(payload, word);
+		}
+		append_recipe_ranges(payload, record.index_ranges, record.rowgroup_bytes);
+		append_recipe_ranges(payload, record.shared_ranges, record.rowgroup_bytes);
+		append_recipe_ranges(payload, record.source_ranges, record.rowgroup_bytes);
+		const auto payload_offset = encoded.size();
+		append_recipe_bytes(encoded, payload.data(), payload.size());
+		const auto base = detail::kSparseReadRecipeHeaderSize +
+		                  record_index * detail::kSparseReadRecipeRecordSize;
+		detail::put_recipe_le<uint32_t>(encoded, base, record.rowgroup_index);
+		size_t selected_count = 0U;
+		for (const auto word : record.selection_words) {
+			selected_count += static_cast<size_t>(std::popcount(word));
+		}
+		detail::put_recipe_le<uint32_t>(encoded, base + 4U, static_cast<uint32_t>(selected_count));
+		detail::put_recipe_le<uint64_t>(encoded, base + 8U, record.rowgroup_bytes);
+		detail::put_recipe_le<uint64_t>(encoded, base + 16U, record.selected_storage_bytes);
+		detail::put_recipe_le<uint32_t>(encoded, base + 24U, static_cast<uint32_t>(record.selection_words.size()));
+		detail::put_recipe_le<uint32_t>(encoded, base + 28U, static_cast<uint32_t>(record.index_ranges.size()));
+		detail::put_recipe_le<uint32_t>(encoded, base + 32U, static_cast<uint32_t>(record.shared_ranges.size()));
+		detail::put_recipe_le<uint32_t>(encoded, base + 36U, static_cast<uint32_t>(record.source_ranges.size()));
+		detail::put_recipe_le<uint64_t>(encoded, base + 40U, payload_offset);
+		detail::put_recipe_le<uint64_t>(encoded, base + 48U, payload.size());
+		detail::put_recipe_le<uint64_t>(encoded, base + 56U, record.selection_digest);
+		detail::put_recipe_le<uint64_t>(
+		    encoded, base + 64U, detail::sparse_recipe_crc64_update(0U, payload.data(), payload.size()));
+	}
+	detail::put_recipe_le<uint64_t>(
+	    encoded, 80U, encoded.size() - detail::kSparseReadRecipeHeaderSize - directory_bytes);
+	stats.sidecar_crc64 = detail::sparse_recipe_crc64_with_zeroed_checksum(encoded);
+	detail::put_recipe_le<uint64_t>(encoded, detail::kSparseReadRecipeChecksumByte, stats.sidecar_crc64);
+	write_recipe_file_atomic(recipe_path, encoded);
+	stats.sidecar_bytes = encoded.size();
+	return stats;
+}
+
+std::filesystem::path sparse_read_recipe_path(
+	const std::filesystem::path& directory,
+	const uint32_t               shard_id) {
+	std::ostringstream name;
+	name << "shard_" << std::setw(6) << std::setfill('0') << shard_id << ".sparse_read_recipe.bin";
+	return directory / name.str();
+}
+
 FlsReader::FlsReader(const std::filesystem::path& file_path,
                      const bool                   load_column_names,
                      const bool                   enable_sparse_vector_reads)
@@ -884,9 +2326,38 @@ FlsReader::FlsReader(const std::filesystem::path& file_path,
 	                              .enable_sparse_vector_reads = enable_sparse_vector_reads}) {
 }
 
+struct FlsReaderStaticMetadata::Impl {
+	std::string                                             source_path_key;
+	std::shared_ptr<const fastlanes::TableDescriptorHandle> table_descriptor;
+	std::shared_ptr<CompactDescriptorV3>                    compact_descriptor;
+	std::shared_ptr<const detail::SparseVectorBundleIndex>  sparse_vector_bundle;
+	std::shared_ptr<const detail::SparseDatasetAccessIndex> sparse_access_index;
+	std::shared_ptr<const ZeroCopySchemaPlan>               zero_copy_schema_plan;
+	std::shared_ptr<const uint8_t>                          sparse_plan_owner;
+	std::shared_ptr<const detail::SparseReadRecipeIndex>    sparse_read_recipe;
+	SparseReaderInitializationStats                         initialization_stats;
+	bool                                                    load_column_names = true;
+	bool                                                    sparse_vector_reads_enabled = true;
+	bool                                                    build_shared_zero_copy_schema_plan = true;
+	std::string                                             sparse_read_recipe_path_key;
+	uint64_t                                                sparse_read_recipe_source_fingerprint = 0U;
+	size_t                                                  retained_bytes = 0U;
+};
+
+FlsReaderStaticMetadata::FlsReaderStaticMetadata(std::shared_ptr<const Impl> impl) noexcept
+    : impl_(std::move(impl)) {
+}
+
+FlsReaderStaticMetadata::~FlsReaderStaticMetadata() = default;
+
+size_t FlsReaderStaticMetadata::retained_bytes() const noexcept {
+	return impl_ == nullptr ? 0U : impl_->retained_bytes;
+}
+
 FlsReader::FlsReader(const std::filesystem::path& file_path, const FlsReaderOptions& options)
     : m_file(std::make_shared<fastlanes::File>(file_path))
     , m_load_column_names(options.load_column_names) {
+	const auto descriptor_open_begin = std::chrono::steady_clock::now();
 	if (is_compact_v3_fls(file_path)) {
 		m_compact_descriptor =
 		    std::make_shared<CompactDescriptorV3>(CompactDescriptorV3::Open(file_path));
@@ -894,19 +2365,122 @@ FlsReader::FlsReader(const std::filesystem::path& file_path, const FlsReaderOpti
 		m_table_descriptor = std::make_shared<fastlanes::TableDescriptorHandle>(
 		    detail::load_table_descriptor(*m_file, file_path));
 	}
+	m_sparse_initialization_stats.descriptor_open_ms = std::chrono::duration<double, std::milli>(
+	    std::chrono::steady_clock::now() - descriptor_open_begin).count();
 	if (options.enable_sparse_vector_reads && m_table_descriptor != nullptr) {
 		m_sparse_vector_bundle = detail::load_sparse_vector_bundle_index(
 		    sparse_vector_bundle_path(file_path), *table_descriptor(), m_file->Size());
-		m_sparse_access_index = detail::build_sparse_dataset_access_index(*m_file, *table_descriptor());
+		const auto sparse_index_begin = std::chrono::steady_clock::now();
+		m_sparse_access_index = detail::build_sparse_dataset_access_index(*table_descriptor());
+		m_sparse_initialization_stats.sparse_access_index_build_ms =
+		    std::chrono::duration<double, std::milli>(
+		        std::chrono::steady_clock::now() - sparse_index_begin).count();
+		const auto source_validation_begin = std::chrono::steady_clock::now();
+		m_sparse_read_recipe = detail::load_sparse_read_recipe_index(
+		    options.sparse_read_recipe_path,
+		    file_path,
+		    *table_descriptor(),
+		    m_file->Size(),
+		    options.sparse_read_recipe_source_fingerprint,
+		    &m_sparse_initialization_stats.sparse_recipe_load_ms,
+		    &m_sparse_initialization_stats.sparse_recipe_validation_ms);
+		m_sparse_initialization_stats.source_validation_ms = std::chrono::duration<double, std::milli>(
+		    std::chrono::steady_clock::now() - source_validation_begin).count();
+		if (m_sparse_read_recipe) {
+			m_sparse_initialization_stats.sparse_recipe_loaded        = true;
+			m_sparse_initialization_stats.sparse_recipe_sidecar_bytes = m_sparse_read_recipe->sidecar_bytes;
+			m_sparse_initialization_stats.sparse_recipe_record_count  = m_sparse_read_recipe->records.size();
+			const auto prehydrate = detail::prehydrate_sparse_recipe_access(
+			    *m_file,
+			    *table_descriptor(),
+			    *m_sparse_read_recipe,
+			    options.sparse_read_recipe_rehydrate_workers);
+			m_sparse_initialization_stats.sparse_recipe_rehydrate_ms = prehydrate.wall_ms;
+			m_sparse_initialization_stats.sparse_recipe_rehydrate_service_ms = prehydrate.service_ms;
+			m_sparse_initialization_stats.sparse_recipe_rehydrate_workers = prehydrate.worker_count;
+			m_sparse_initialization_stats.sparse_recipe_source_metadata_bytes = prehydrate.metadata_bytes;
+			m_sparse_initialization_stats.sparse_recipe_source_metadata_pread_count =
+			    prehydrate.metadata_pread_count;
+		}
 	}
 	// Compact-v3 reconstructs per-rowgroup geometry on demand.  Always retain
 	// the shared expression/schema plan so the hot rowgroup-only training path
 	// does not also allocate a RowgroupView and a ZeroCopyColumn vector for all
 	// coefficient columns.  Each reconstructed rowgroup is still checked
 	// against the plan before the fast path is used.
+	const auto schema_plan_begin = std::chrono::steady_clock::now();
 	if (options.build_shared_zero_copy_schema_plan || m_compact_descriptor != nullptr) {
 		m_zero_copy_schema_plan = std::make_shared<ZeroCopySchemaPlan>(build_shared_zero_copy_schema_plan());
 	}
+	m_sparse_initialization_stats.zero_copy_schema_plan_build_ms =
+	    std::chrono::duration<double, std::milli>(
+	        std::chrono::steady_clock::now() - schema_plan_begin).count();
+	auto metadata                         = std::make_shared<FlsReaderStaticMetadata::Impl>();
+	metadata->source_path_key             = file_path.lexically_normal().string();
+	metadata->table_descriptor            = m_table_descriptor;
+	metadata->compact_descriptor          = m_compact_descriptor;
+	metadata->sparse_vector_bundle        = m_sparse_vector_bundle;
+	metadata->sparse_access_index         = m_sparse_access_index;
+	metadata->zero_copy_schema_plan       = m_zero_copy_schema_plan;
+	metadata->sparse_plan_owner           = m_sparse_plan_owner;
+	metadata->sparse_read_recipe          = m_sparse_read_recipe;
+	metadata->initialization_stats        = m_sparse_initialization_stats;
+	metadata->load_column_names           = m_load_column_names;
+	metadata->sparse_vector_reads_enabled = options.enable_sparse_vector_reads;
+	metadata->build_shared_zero_copy_schema_plan = options.build_shared_zero_copy_schema_plan;
+	metadata->sparse_read_recipe_path_key = options.sparse_read_recipe_path.lexically_normal().string();
+	metadata->sparse_read_recipe_source_fingerprint = options.sparse_read_recipe_source_fingerprint;
+	// Compact descriptors dominate retained static storage and are mmap-backed.
+	// The small shared schema-plan vectors are accounted separately by their
+	// owned capacities so the cache reports an honest lower-level byte total.
+	metadata->retained_bytes = m_compact_descriptor == nullptr ? 0U : m_compact_descriptor->descriptor_bytes();
+	if (m_zero_copy_schema_plan != nullptr) {
+		metadata->retained_bytes += sizeof(ZeroCopySchemaPlan) +
+		                            m_zero_copy_schema_plan->columns.capacity() * sizeof(ZeroCopyColumnPlan) +
+		                            m_zero_copy_schema_plan->build_order.capacity() * sizeof(size_t);
+		for (const auto& column : m_zero_copy_schema_plan->columns) {
+			metadata->retained_bytes += column.name.capacity() +
+			                            column.operand_ids.capacity() * sizeof(uint32_t);
+		}
+	}
+	m_static_metadata = std::shared_ptr<const FlsReaderStaticMetadata>(
+	    new FlsReaderStaticMetadata(std::move(metadata)));
+	if (m_compact_descriptor != nullptr) {
+		m_compact_descriptor->release_resident_pages();
+	}
+}
+
+FlsReader::FlsReader(const std::filesystem::path&                   file_path,
+                     const FlsReaderOptions&                        options,
+                     std::shared_ptr<const FlsReaderStaticMetadata> static_metadata)
+    : m_file(std::make_shared<fastlanes::File>(file_path))
+    , m_load_column_names(options.load_column_names)
+    , m_static_metadata(std::move(static_metadata)) {
+	if (m_static_metadata == nullptr || m_static_metadata->impl_ == nullptr) {
+		throw std::invalid_argument("FlsReader shared static metadata is empty");
+	}
+	const auto& metadata = *m_static_metadata->impl_;
+	if (metadata.source_path_key != file_path.lexically_normal().string()) {
+		throw std::invalid_argument("FlsReader shared static metadata belongs to a different source path");
+	}
+	if (metadata.load_column_names != options.load_column_names ||
+	    metadata.sparse_vector_reads_enabled != options.enable_sparse_vector_reads ||
+	    metadata.build_shared_zero_copy_schema_plan != options.build_shared_zero_copy_schema_plan ||
+	    metadata.sparse_read_recipe_path_key != options.sparse_read_recipe_path.lexically_normal().string() ||
+	    metadata.sparse_read_recipe_source_fingerprint != options.sparse_read_recipe_source_fingerprint) {
+		throw std::invalid_argument("FlsReader shared static metadata options do not match the payload reader");
+	}
+	m_table_descriptor       = metadata.table_descriptor;
+	m_compact_descriptor     = metadata.compact_descriptor;
+	m_sparse_vector_bundle   = metadata.sparse_vector_bundle;
+	m_sparse_access_index    = metadata.sparse_access_index;
+	m_zero_copy_schema_plan  = metadata.zero_copy_schema_plan;
+	m_sparse_plan_owner      = metadata.sparse_plan_owner;
+	m_sparse_read_recipe     = metadata.sparse_read_recipe;
+	// Rebinding immutable metadata performs no descriptor/index work.  Keep the
+	// per-reader initialization timings at zero so telemetry cannot mistake a
+	// static-cache hit for another descriptor open.
+	m_sparse_initialization_stats = {};
 }
 
 const fastlanes::TableDescriptor* FlsReader::table_descriptor() const {
@@ -955,6 +2529,18 @@ bool FlsReader::is_compact_v3() const noexcept {
 	return static_cast<bool>(m_compact_descriptor);
 }
 
+const SparseReaderInitializationStats& FlsReader::sparse_initialization_stats() const noexcept {
+	return m_sparse_initialization_stats;
+}
+
+std::shared_ptr<const FlsReaderStaticMetadata> FlsReader::share_static_metadata() const noexcept {
+	return m_static_metadata;
+}
+
+size_t FlsReader::static_metadata_bytes() const noexcept {
+	return m_static_metadata == nullptr ? 0U : m_static_metadata->retained_bytes();
+}
+
 bool FlsReader::sparse_vector_read_supported(const size_t rowgroup_idx, std::string* const reason) const {
 	if (m_compact_descriptor != nullptr) {
 		if (rowgroup_idx >= m_compact_descriptor->rowgroup_count()) {
@@ -971,14 +2557,15 @@ bool FlsReader::sparse_vector_read_supported(const size_t rowgroup_idx, std::str
 		}
 		return false;
 	}
-	if (rowgroup_idx >= m_sparse_access_index->rowgroups.size()) {
+	if (rowgroup_idx >= m_sparse_access_index->rowgroup_count) {
 		throw std::out_of_range("rowgroup_idx out of range");
 	}
-	const auto& entry = m_sparse_access_index->rowgroups[rowgroup_idx];
+	const auto entry = detail::sparse_rowgroup_access(
+	    *m_file, *table_descriptor(), m_sparse_access_index, rowgroup_idx);
 	if (reason != nullptr) {
-		*reason = entry.fallback_reason;
+		*reason = entry->fallback_reason;
 	}
-	return entry.supported;
+	return entry->supported;
 }
 
 SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
@@ -1003,6 +2590,7 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 		plan->full_vector_count      = 1U;
 		plan->selected_vector_count  = 1U;
 		plan->storage_bytes          = record.payload_size;
+		plan->selected_storage_bytes = record.payload_size;
 		plan->fallback_reason        = "compact-v3-rowgroup-is-one-vector";
 		static_cast<void>(packed_device_scatter);
 		return SparseVectorReadPlan(std::move(plan));
@@ -1030,33 +2618,78 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	if (vectors.back() >= vector_count) {
 		throw std::out_of_range("selected vector exceeds rowgroup vector count");
 	}
-	if (!m_sparse_access_index || rowgroup_idx >= m_sparse_access_index->rowgroups.size()) {
+	if (!m_sparse_access_index || rowgroup_idx >= m_sparse_access_index->rowgroup_count) {
 		throw std::runtime_error("sparse dataset access index is unavailable");
 	}
-	const auto& access = m_sparse_access_index->rowgroups[rowgroup_idx];
 	auto plan = std::make_shared<SparseVectorReadPlan::Impl>();
 	plan->owner                 = m_sparse_plan_owner;
 	plan->rowgroup_index        = rowgroup_idx;
 	plan->rowgroup_bytes        = rowgroup_bytes;
 	plan->full_vector_count     = vector_count;
 	plan->selected_vector_count = vectors.size();
-	if (!access.supported || vectors.size() >= vector_count) {
-		plan->fallback_reason = access.supported ? "selected-vectors-cover-full-rowgroup" : access.fallback_reason;
+	const auto recipe_lookup_begin = std::chrono::steady_clock::now();
+	const auto selection_words = detail::sparse_selection_words(vector_count, vectors);
+	const detail::SparseReadRecipeRecord* recipe_record = nullptr;
+	if (m_sparse_read_recipe) {
+		recipe_record = detail::find_sparse_read_recipe_record(*m_sparse_read_recipe, rowgroup_idx, selection_words);
+	}
+	plan->recipe_lookup_ms = std::chrono::duration<double, std::milli>(
+	    std::chrono::steady_clock::now() - recipe_lookup_begin).count();
+	if (recipe_record != nullptr && vectors.size() < vector_count && !m_sparse_vector_bundle) {
+		if (recipe_record->prehydrated_access) {
+			plan->access = recipe_record->prehydrated_access;
+		} else {
+			const auto rehydrate_begin = std::chrono::steady_clock::now();
+			plan->access = detail::rehydrate_sparse_recipe_access(
+			    *m_file,
+			    *rowgroup,
+			    *recipe_record,
+			    &plan->recipe_source_metadata_bytes,
+			    &plan->recipe_source_metadata_pread_count);
+			plan->recipe_rehydrate_ms = std::chrono::duration<double, std::milli>(
+			    std::chrono::steady_clock::now() - rehydrate_begin).count();
+		}
+		plan->strategy               = SparseVectorReadPlan::Impl::Strategy::kSourceRanges;
+		plan->source_ranges          = recipe_record->source_ranges;
+		plan->exact_source_ranges    = plan->source_ranges;
+		plan->storage_bytes          = recipe_record->selected_storage_bytes;
+		plan->selected_storage_bytes = recipe_record->selected_storage_bytes;
+		plan->recipe_hit             = true;
+		return SparseVectorReadPlan(std::move(plan));
+	}
+
+	const auto endpoint_begin = std::chrono::steady_clock::now();
+	const auto access = detail::sparse_rowgroup_access(
+	    *m_file, *table_descriptor(), m_sparse_access_index, rowgroup_idx);
+	plan->endpoint_resolution_ms = std::chrono::duration<double, std::milli>(
+	    std::chrono::steady_clock::now() - endpoint_begin).count();
+	plan->access = access;
+	if (!access->supported || vectors.size() >= vector_count) {
+		plan->fallback_reason = access->supported ? "selected-vectors-cover-full-rowgroup" : access->fallback_reason;
 		plan->storage_bytes   = rowgroup_bytes;
+		plan->selected_storage_bytes = rowgroup_bytes;
 		return SparseVectorReadPlan(std::move(plan));
 	}
 
 	if (!m_sparse_vector_bundle) {
 		plan->strategy = SparseVectorReadPlan::Impl::Strategy::kSourceRanges;
 		std::vector<detail::SparseByteRange> ranges;
+		const auto gather_begin = std::chrono::steady_clock::now();
 		for (const auto vector : vectors) {
-			const auto& vector_ranges = access.vector_ranges.at(vector);
+			const auto& vector_ranges = access->vector_ranges.at(vector);
 			ranges.insert(ranges.end(), vector_ranges.begin(), vector_ranges.end());
 		}
+		plan->range_gather_ms = std::chrono::duration<double, std::milli>(
+		    std::chrono::steady_clock::now() - gather_begin).count();
+		const auto coalesce_begin = std::chrono::steady_clock::now();
 		plan->source_ranges = detail::coalesce_ranges(std::move(ranges));
+		plan->exact_source_ranges = plan->source_ranges;
+		plan->range_sort_coalesce_ms = std::chrono::duration<double, std::milli>(
+		    std::chrono::steady_clock::now() - coalesce_begin).count();
 		for (const auto& range : plan->source_ranges) {
 			plan->storage_bytes += range.size;
 		}
+		plan->selected_storage_bytes = plan->storage_bytes;
 		return SparseVectorReadPlan(std::move(plan));
 	}
 
@@ -1066,19 +2699,19 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	const auto& bundle = m_sparse_vector_bundle->rowgroups[rowgroup_idx];
 	if (packed_device_scatter) {
 		plan->strategy     = SparseVectorReadPlan::Impl::Strategy::kBundlePacked;
-		plan->packed_bytes = access.static_prefix.size();
+		plan->packed_bytes = access->static_prefix.size();
 		size_t prefix_cursor = 0U;
-		for (const auto& range : access.index_ranges) {
+		for (const auto& range : access->index_ranges) {
 			plan->packed_scatter_ranges.push_back(
 			    {prefix_cursor, range.offset, range.size});
 			prefix_cursor += range.size;
 		}
-		for (const auto& range : access.shared_ranges) {
+		for (const auto& range : access->shared_ranges) {
 			plan->packed_scatter_ranges.push_back(
 			    {prefix_cursor, range.offset, range.size});
 			prefix_cursor += range.size;
 		}
-		if (prefix_cursor != access.static_prefix.size()) {
+		if (prefix_cursor != access->static_prefix.size()) {
 			throw std::runtime_error("compiled sparse bundle prefix size mismatch");
 		}
 	}
@@ -1093,8 +2726,9 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 		plan->storage_bytes        = plan->envelope_size;
 		for (const auto vector : vectors) {
 			size_t source_cursor = static_cast<size_t>(bundle.vector_offsets.at(vector));
-			for (const auto& range : access.vector_ranges.at(vector)) {
+			for (const auto& range : access->vector_ranges.at(vector)) {
 				plan->envelope_copies.push_back({source_cursor, range.offset, range.size});
+				plan->selected_storage_bytes += range.size;
 				source_cursor += range.size;
 			}
 			if (source_cursor != static_cast<size_t>(bundle.vector_offsets.at(vector + 1U))) {
@@ -1125,7 +2759,7 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 		run.size          = static_cast<size_t>(packed_end - packed_begin);
 		run.packed_offset = plan->packed_bytes;
 		for (uint32_t vector = run_begin; vector < run_end; ++vector) {
-			const auto& ranges = access.vector_ranges.at(vector);
+			const auto& ranges = access->vector_ranges.at(vector);
 			run.logical_ranges.insert(run.logical_ranges.end(), ranges.begin(), ranges.end());
 		}
 		const size_t logical_bytes = std::accumulate(
@@ -1143,6 +2777,7 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 			plan->packed_bytes += run.size;
 		}
 		plan->storage_bytes += run.size;
+		plan->selected_storage_bytes += run.size;
 		plan->bundle_runs.push_back(std::move(run));
 	}
 	return SparseVectorReadPlan(std::move(plan));
@@ -1269,10 +2904,12 @@ void FlsReader::read_rowgroup_bytes_selected_vectors_into(const size_t          
 		throw std::out_of_range("selected vector exceeds rowgroup vector count");
 	}
 
-	if (!m_sparse_access_index || rowgroup_idx >= m_sparse_access_index->rowgroups.size()) {
+	if (!m_sparse_access_index || rowgroup_idx >= m_sparse_access_index->rowgroup_count) {
 		throw std::runtime_error("sparse dataset access index is unavailable");
 	}
-	const auto& access_index = m_sparse_access_index->rowgroups[rowgroup_idx];
+	const auto access_owner = detail::sparse_rowgroup_access(
+	    *m_file, *table_descriptor(), m_sparse_access_index, rowgroup_idx);
+	const auto& access_index = *access_owner;
 	const bool  supported    = access_index.supported;
 	if (timing != nullptr) {
 		timing->full_storage_bytes    = rg_bytes;
@@ -1557,19 +3194,18 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 	const auto  setup_start = std::chrono::steady_clock::now();
 	OwnedCompactRowgroupDescriptor compact_rowgroup;
 	std::shared_ptr<const CompactV3DirectRowgroup> compact_direct;
+	bool compact_direct_matches_schema_plan = false;
 	const fastlanes::RowgroupDescriptor* rg = nullptr;
 	if (m_compact_descriptor != nullptr) {
 		if (rowgroup_idx >= m_compact_descriptor->rowgroup_count()) {
 			throw std::out_of_range("rowgroup_idx out of range");
 		}
-		if (prefer_compact_direct_geometry && m_compact_descriptor->supports_direct_rowgroup_geometry() &&
-		    m_zero_copy_schema_plan != nullptr &&
-		    m_zero_copy_schema_plan->enabled) {
-			auto decoded = std::make_shared<CompactV3DirectRowgroup>(
+		if (prefer_compact_direct_geometry && m_compact_descriptor->supports_direct_rowgroup_geometry()) {
+			compact_direct = std::make_shared<CompactV3DirectRowgroup>(
 			    m_compact_descriptor->decode_direct_rowgroup(rowgroup_idx));
-			if (compact_direct_rowgroup_matches_plan(*decoded, m_zero_copy_schema_plan->columns)) {
-				compact_direct = std::move(decoded);
-			}
+			compact_direct_matches_schema_plan =
+			    m_zero_copy_schema_plan != nullptr && m_zero_copy_schema_plan->enabled &&
+			    compact_direct_rowgroup_matches_plan(*compact_direct, m_zero_copy_schema_plan->columns);
 		}
 		if (compact_direct == nullptr) {
 			compact_rowgroup = make_compact_rowgroup_descriptor(*m_compact_descriptor, rowgroup_idx);
@@ -1607,14 +3243,14 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 
 	auto backing_span = fastlanes::span<std::byte> {effective_backing_data, rg_bytes};
 	const auto* col_descs = rg == nullptr ? nullptr : rg->m_column_descriptors();
-	const bool use_schema_plan = compact_direct != nullptr ||
+	const bool use_schema_plan = compact_direct_matches_schema_plan ||
 	    (m_zero_copy_schema_plan && m_zero_copy_schema_plan->enabled && col_descs != nullptr &&
 	     m_zero_copy_schema_plan->columns.size() == col_descs->size() &&
 	     (m_compact_descriptor == nullptr ||
 	      detail::rowgroup_matches_zero_copy_plan(*rg, m_zero_copy_schema_plan->columns)));
 
 	std::shared_ptr<fastlanes::RowgroupView> view;
-	if (!use_schema_plan) {
+	if (!use_schema_plan && compact_direct == nullptr) {
 		if (rg == nullptr) {
 			throw std::runtime_error("zero-copy rowgroup fallback descriptor is missing");
 		}
@@ -1634,10 +3270,12 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 	out.backing_owner          = std::move(backing_owner);
 	out.backing_span           = backing_span;
 	out.transfer_backing_span  = effective_pinned ? backing_span : fastlanes::span<std::byte> {};
+	out.backing_capacity_bytes = rg_bytes == 0U ? 0U : backing_capacity;
 	out.backing_is_pinned      = effective_pinned;
 	out.rowgroup_view          = view;
 	if (timing != nullptr) {
 		timing->used_pinned_backing = effective_pinned;
+		timing->logical_backing_capacity_bytes = out.backing_capacity_bytes;
 	}
 
 	const auto record_timing = [&](const std::chrono::steady_clock::time_point setup_end) {
@@ -1654,6 +3292,52 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 	if (use_schema_plan) {
 		out.schema_plan_owner = m_zero_copy_schema_plan;
 		out.schema_plan       = out.schema_plan_owner.get();
+		record_timing(std::chrono::steady_clock::now());
+		return out;
+	}
+
+	if (out.compact_direct_owner != nullptr) {
+		out.columns.reserve(out.compact_direct_owner->columns.size());
+		for (size_t col_idx = 0U; col_idx < out.compact_direct_owner->columns.size(); ++col_idx) {
+			const auto& direct_column = out.compact_direct_owner->columns[col_idx];
+			const auto* schema        = direct_column.schema;
+			const auto* rpn           = schema == nullptr ? nullptr : schema->encoding_rpn();
+			const auto* ops           = rpn == nullptr ? nullptr : rpn->operator_tokens();
+			if (ops == nullptr || ops->size() != 1U) {
+				std::ostringstream msg;
+				msg << "only single-op expressions are supported in compact zero-copy reader; got ops=[";
+				if (ops != nullptr) {
+					for (size_t i = 0U; i < ops->size(); ++i) {
+						if (i > 0U) {
+							msg << ", ";
+						}
+						msg << fastlanes::token_to_string(ops->Get(static_cast<flatbuffers::uoffset_t>(i)));
+					}
+				}
+				msg << "]";
+				const std::string col_name =
+				    (m_load_column_names && schema != nullptr && schema->name() != nullptr) ? schema->name()->str()
+				                                                                           : std::string {};
+				throw galp::UnsupportedFormatError(msg.str(), rowgroup_idx, col_idx, col_name);
+			}
+
+			ZeroCopyColumn col {};
+			col.column_index      = col_idx;
+			col.name              = (m_load_column_names && schema->name() != nullptr) ? schema->name()->str()
+			                                                                        : std::string {};
+			col.token             = ops->Get(0U);
+			col.column_descriptor = schema;
+			col.operand_tokens    = rpn->operand_tokens();
+			col.compact_rowgroup  = out.compact_direct_owner.get();
+			col.compact_column    = &direct_column;
+			col.column_span       = backing_span;
+			if (col.token == fastlanes::OperatorToken::EXP_EQUAL && col.operand_tokens != nullptr &&
+			    col.operand_tokens->size() >= 1U) {
+				col.skip_decompress = true;
+				col.alias_of        = static_cast<size_t>(col.operand_tokens->Get(0U));
+			}
+			out.columns.push_back(std::move(col));
+		}
 		record_timing(std::chrono::steady_clock::now());
 		return out;
 	}
@@ -2207,6 +3891,7 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors_packed(
 	device_payload->packed_owner  = std::static_pointer_cast<void>(packed);
 	device_payload->packed_data   = packed_data;
 	device_payload->packed_bytes  = packed_bytes;
+	device_payload->packed_capacity_bytes = packed->capacity();
 	device_payload->logical_data  = logical_data;
 	device_payload->logical_bytes = rowgroup_bytes;
 	device_payload->ranges.reserve(
@@ -2344,10 +4029,10 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 		}
 		return read_rowgroup_zero_copy(plan.rowgroup_index, timing);
 	}
-	if (!m_sparse_access_index || plan.rowgroup_index >= m_sparse_access_index->rowgroups.size()) {
-		throw std::runtime_error("compiled sparse dataset access index is unavailable");
+	if (!plan.access) {
+		throw std::runtime_error("compiled sparse rowgroup access index is unavailable");
 	}
-	const auto& access = m_sparse_access_index->rowgroups[plan.rowgroup_index];
+	const auto& access = *plan.access;
 	const auto* rowgroup = table_descriptor()->m_rowgroup_descriptors()->Get(
 	    static_cast<flatbuffers::uoffset_t>(plan.rowgroup_index));
 	if (rowgroup == nullptr || static_cast<size_t>(rowgroup->m_size()) != plan.rowgroup_bytes) {
@@ -2357,19 +4042,32 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 	auto logical = std::make_shared<fastlanes::Buf>(plan.rowgroup_bytes);
 	auto* const logical_data = reinterpret_cast<std::byte*>(logical->mutable_data());
 	std::memset(logical_data, 0, plan.rowgroup_bytes);
-	size_t prefix_cursor = 0U;
-	detail::scatter_ranges(access.static_prefix.data(),
-	                       access.static_prefix.size(),
-	                       logical_data,
-	                       access.index_ranges,
-	                       prefix_cursor);
-	detail::scatter_ranges(access.static_prefix.data(),
-	                       access.static_prefix.size(),
-	                       logical_data,
-	                       access.shared_ranges,
-	                       prefix_cursor);
-	if (prefix_cursor != access.static_prefix.size()) {
-		throw std::runtime_error("compiled sparse rowgroup prefix size mismatch");
+	const auto restore_static_prefix = [&]() {
+		const auto start = std::chrono::steady_clock::now();
+		size_t prefix_cursor = 0U;
+		detail::scatter_ranges(access.static_prefix.data(),
+		                       access.static_prefix.size(),
+		                       logical_data,
+		                       access.index_ranges,
+		                       prefix_cursor);
+		detail::scatter_ranges(access.static_prefix.data(),
+		                       access.static_prefix.size(),
+		                       logical_data,
+		                       access.shared_ranges,
+		                       prefix_cursor);
+		if (prefix_cursor != access.static_prefix.size()) {
+			throw std::runtime_error("compiled sparse rowgroup prefix size mismatch");
+		}
+		if (timing != nullptr) {
+			timing->static_prefix_restore_bytes += access.static_prefix.size();
+			timing->static_prefix_restore_ms += std::chrono::duration<double, std::milli>(
+			    std::chrono::steady_clock::now() - start).count();
+		}
+	};
+	const bool bounded_source_ranges =
+	    plan.strategy == SparseVectorReadPlan::Impl::Strategy::kBoundedSourceRanges;
+	if (!bounded_source_ranges) {
+		restore_static_prefix();
 	}
 
 	const auto record_read = [&](const std::chrono::steady_clock::time_point start,
@@ -2391,13 +4089,79 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 	};
 
 	std::shared_ptr<galp::execution::PackedRowgroupDevicePayload> device_payload;
-	if (plan.strategy == SparseVectorReadPlan::Impl::Strategy::kSourceRanges) {
+	if (plan.strategy == SparseVectorReadPlan::Impl::Strategy::kSourceRanges || bounded_source_ranges) {
 		for (const auto& range : plan.source_ranges) {
+			if (range.offset > plan.rowgroup_bytes || range.size > plan.rowgroup_bytes - range.offset) {
+				throw std::runtime_error("compiled sparse source range is out of bounds");
+			}
+		}
+		if (bounded_source_ranges &&
+		    plan.submission_backend == SparseVectorReadPlan::SubmissionBackend::kIoUring) {
+			std::vector<fastlanes::FileRangeReadTarget> targets;
+			targets.reserve(plan.source_ranges.size());
+			for (const auto& range : plan.source_ranges) {
+				if (range.offset > std::numeric_limits<uint64_t>::max() - rowgroup->m_offset()) {
+					throw std::overflow_error("compiled sparse io_uring file offset overflow");
+				}
+				targets.push_back({logical_data + range.offset, rowgroup->m_offset() + range.offset, range.size});
+			}
 			const auto start = std::chrono::steady_clock::now();
-			m_file->ReadRangeUnchecked(
-			    logical_data + range.offset, rowgroup->m_offset() + range.offset, range.size);
+			const auto result = m_file->ReadRangesIoUringUnchecked(targets, plan.io_uring_queue_depth);
 			const auto end = std::chrono::steady_clock::now();
-			record_read(start, end, range.size, 1U);
+			const auto initial_request_count =
+			    static_cast<size_t>(std::count_if(targets.begin(), targets.end(), [](const auto& target) {
+				    return target.size != 0U;
+			    }));
+			if (result.bytes != plan.storage_bytes || result.read_request_count < initial_request_count ||
+			    result.completion_count != result.read_request_count) {
+				throw std::runtime_error("compiled sparse io_uring result does not match the frozen physical plan");
+			}
+			if (timing != nullptr) {
+				timing->storage_bytes += result.bytes;
+				timing->io_uring_read_request_count += result.read_request_count;
+				timing->io_uring_completion_count += result.completion_count;
+				timing->io_uring_submit_syscall_count += result.submit_syscall_count;
+				timing->io_uring_wait_syscall_count += result.wait_syscall_count;
+				timing->io_uring_ring_mapped_bytes =
+				    std::max(timing->io_uring_ring_mapped_bytes, static_cast<size_t>(result.ring_mapped_bytes));
+				timing->io_uring_newly_mapped_ring_bytes += result.newly_mapped_ring_bytes;
+				timing->io_uring_ms += std::chrono::duration<double, std::milli>(end - start).count();
+				timing->pread_ms += std::chrono::duration<double, std::milli>(end - start).count();
+				timing->pread_start = start;
+				timing->pread_end = end;
+				timing->used_io_uring = true;
+			}
+		} else {
+			for (const auto& range : plan.source_ranges) {
+				const auto start = std::chrono::steady_clock::now();
+				m_file->ReadRangeUnchecked(
+				    logical_data + range.offset, rowgroup->m_offset() + range.offset, range.size);
+				const auto end = std::chrono::steady_clock::now();
+				record_read(start, end, range.size, 1U);
+			}
+		}
+		if (bounded_source_ranges) {
+			const auto clear_start = std::chrono::steady_clock::now();
+			size_t cleared_bytes = 0U;
+			for (const auto& hole : plan.merged_holes) {
+				if (hole.offset > plan.rowgroup_bytes || hole.size > plan.rowgroup_bytes - hole.offset ||
+				    hole.size > std::numeric_limits<size_t>::max() - cleared_bytes) {
+					throw std::runtime_error("compiled sparse merged hole is out of bounds");
+				}
+				std::memset(logical_data + hole.offset, 0, hole.size);
+				cleared_bytes += hole.size;
+			}
+			if (cleared_bytes != plan.merged_gap_bytes) {
+				throw std::runtime_error("compiled sparse merged-hole byte count mismatch");
+			}
+			if (timing != nullptr) {
+				timing->merged_gap_bytes += plan.merged_gap_bytes;
+				timing->hole_clear_bytes += cleared_bytes;
+				timing->hole_clear_ms += std::chrono::duration<double, std::milli>(
+				    std::chrono::steady_clock::now() - clear_start).count();
+				timing->used_bounded_gap_read = true;
+			}
+			restore_static_prefix();
 		}
 	} else if (plan.strategy == SparseVectorReadPlan::Impl::Strategy::kBundleEnvelope) {
 		auto envelope = std::make_shared<std::vector<std::byte>>(plan.envelope_size);
@@ -2442,6 +4206,7 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 		device_payload->packed_owner  = std::static_pointer_cast<void>(packed);
 		device_payload->packed_data   = packed->data();
 		device_payload->packed_bytes  = packed->size();
+		device_payload->packed_capacity_bytes = packed->capacity();
 		device_payload->logical_data  = logical_data;
 		device_payload->logical_bytes = plan.rowgroup_bytes;
 		device_payload->ranges        = plan.packed_scatter_ranges;
@@ -2455,9 +4220,12 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 	}
 	if (timing != nullptr) {
 		timing->full_storage_bytes      = plan.rowgroup_bytes;
+		timing->selected_storage_bytes  = plan.selected_storage_bytes;
 		timing->sparse_read_supported   = true;
 		timing->used_sparse_read        = true;
-		timing->used_vector_bundle_read = plan.strategy != SparseVectorReadPlan::Impl::Strategy::kSourceRanges;
+		timing->used_vector_bundle_read =
+		    plan.strategy != SparseVectorReadPlan::Impl::Strategy::kSourceRanges &&
+		    plan.strategy != SparseVectorReadPlan::Impl::Strategy::kBoundedSourceRanges;
 		timing->used_vector_bundle_envelope_read =
 		    plan.strategy == SparseVectorReadPlan::Impl::Strategy::kBundleEnvelope;
 	}

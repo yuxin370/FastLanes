@@ -19,6 +19,9 @@ from pipeline import (  # noqa: E402
     _accumulate_native,
     _is_grayscale_metadata,
     _load_direct_dct_modules,
+    _manifest_shard_segments,
+    _process_io_delta,
+    _process_io_snapshot,
     _rebuild_grayscale_full_grid,
     _validate_identity,
 )
@@ -60,6 +63,31 @@ class PipelineControlTest(unittest.TestCase):
             [call.args[0] for call in imported.call_args_list],
             ["_galp_direct_dct", "rgbnomore_dct_profile"],
         )
+
+    def test_manifest_shard_segments_use_exact_manifest_ranges(self) -> None:
+        samples = [{"galp_image_id": image_id} for image_id in range(9)]
+        manifest = {
+            "shards": [
+                {"shard_id": 4, "first_global_image_index": 0, "image_count": 4},
+                {"shard_id": 8, "first_global_image_index": 4, "image_count": 5},
+            ]
+        }
+        segments = _manifest_shard_segments(samples, manifest)
+        self.assertEqual(
+            [[item["galp_image_id"] for item in segment] for segment in segments],
+            [[0, 1, 2, 3], [4, 5, 6, 7, 8]],
+        )
+
+    def test_manifest_shard_segments_reject_partial_tail(self) -> None:
+        samples = [{"galp_image_id": image_id} for image_id in range(6)]
+        manifest = {
+            "shards": [
+                {"shard_id": 0, "first_global_image_index": 0, "image_count": 4},
+                {"shard_id": 1, "first_global_image_index": 4, "image_count": 5},
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "truncates a physical shard"):
+            _manifest_shard_segments(samples, manifest)
 
     def test_native_allocator_snapshots_are_not_summed_across_segments(self) -> None:
         totals: dict[str, object] = {}
@@ -103,6 +131,117 @@ class PipelineControlTest(unittest.TestCase):
         self.assertEqual(totals["galp_native_pinned_cuda_allocation_bytes"], 8192)
         self.assertEqual(totals["planning_ms"], 4.0)
 
+    def test_process_io_snapshot_and_delta_keep_storage_reads_separate(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "io"
+            path.write_text("rchar: 100\nsyscr: 7\nread_bytes: 4096\n", encoding="utf-8")
+            before = _process_io_snapshot(path)
+            path.write_text("rchar: 250\nsyscr: 11\nread_bytes: 12288\n", encoding="utf-8")
+            after = _process_io_snapshot(path)
+
+        self.assertEqual(
+            _process_io_delta(before, after),
+            {
+                "logical_read_bytes": 150,
+                "storage_read_bytes": 8192,
+                "read_syscalls": 4,
+            },
+        )
+        self.assertIsNone(_process_io_delta(None, after))
+
+    def test_actual_transient_high_water_is_maximized_across_segments(self) -> None:
+        totals: dict[str, object] = {}
+        _accumulate_native(
+            totals,
+            {
+                "actual_transient_total_used_high_water_bytes": 96,
+                "actual_transient_total_allocated_high_water_bytes": 128,
+                "actual_transient_memory_gate_passed": True,
+            },
+        )
+        _accumulate_native(
+            totals,
+            {
+                "actual_transient_total_used_high_water_bytes": 80,
+                "actual_transient_total_allocated_high_water_bytes": 112,
+                "actual_transient_memory_gate_passed": True,
+            },
+        )
+
+        self.assertEqual(totals["segment_count"], 2)
+        self.assertEqual(totals["actual_transient_total_used_high_water_bytes"], 96)
+        self.assertEqual(totals["actual_transient_total_allocated_high_water_bytes"], 128)
+        self.assertIs(totals["actual_transient_memory_gate_passed"], True)
+
+    def test_native_ratios_are_recomputed_from_whole_run_totals(self) -> None:
+        totals: dict[str, object] = {}
+        _accumulate_native(
+            totals,
+            {
+                "compressed_payload_bytes_read": 102,
+                "selected_compressed_payload_bytes": 100,
+                "read_amplification": 1.02,
+                "selected_coefficient_count": 1,
+                "full_coefficient_count": 4,
+                "selected_coefficient_ratio": 0.25,
+                "physical_page_bytes_covered": 5,
+                "full_physical_page_bytes": 10,
+                "physical_page_coverage_ratio": 0.5,
+            },
+        )
+        _accumulate_native(
+            totals,
+            {
+                "compressed_payload_bytes_read": 50,
+                "selected_compressed_payload_bytes": 50,
+                "read_amplification": 1.0,
+                "selected_coefficient_count": 3,
+                "full_coefficient_count": 6,
+                "selected_coefficient_ratio": 0.5,
+                "physical_page_bytes_covered": 2,
+                "full_physical_page_bytes": 10,
+                "physical_page_coverage_ratio": 0.2,
+            },
+        )
+
+        self.assertAlmostEqual(totals["read_amplification"], 152 / 150)
+        self.assertAlmostEqual(totals["selected_coefficient_ratio"], 4 / 10)
+        self.assertAlmostEqual(totals["physical_page_coverage_ratio"], 7 / 20)
+
+    def test_bounded_configuration_is_constant_not_summed_across_segments(self) -> None:
+        totals: dict[str, object] = {}
+        configuration = {
+            "bounded_read_amplification_ppm": 1_020_000,
+            "bounded_read_local_amplification_ppm": 1_050_000,
+            "bounded_read_max_run_bytes": 4 * 1024 * 1024,
+            "bounded_io_backend": "io-uring",
+            "bounded_io_uring_queue_depth": 256,
+            "cuda_warp_size": 32,
+            "cuda_least_stream_priority": 0,
+            "cuda_greatest_stream_priority": -5,
+            "direct_dct_low_priority_streams": True,
+            "fixed_grid_output_float32": True,
+            "fixed_grid_output_affine_applied": True,
+            "fixed_grid_output_add": 4.0,
+            "fixed_grid_output_scale": 1.0 / 1020.0,
+        }
+        _accumulate_native(totals, configuration)
+        _accumulate_native(totals, configuration)
+        self.assertEqual(totals["segment_count"], 2)
+        for key, value in configuration.items():
+            self.assertEqual(totals[key], value)
+
+        with self.assertRaisesRegex(RuntimeError, "invariant changed across segments"):
+            _accumulate_native(
+                totals,
+                {
+                    **configuration,
+                    "bounded_read_amplification_ppm": 1_050_000,
+                },
+            )
+
     def test_galp_measurement_does_not_reuse_warmup_segment(self) -> None:
         adapter = object.__new__(GalpAdapter)
         adapter._warmup_segments = [[{"ordinal": 0}]]
@@ -131,6 +270,86 @@ class PipelineControlTest(unittest.TestCase):
         adapter.begin_measurement()
         self.assertIs(adapter._pending, pending)
         self.assertEqual(adapter._next_segment, 1)
+
+    def test_manifest_shard_prefetch_overlaps_and_model_batches_cross_boundary(self) -> None:
+        class FakePending:
+            producer_active_ms = 1.0
+            planning_ms = 2.0
+            io_staging_ms = 3.0
+            ordered_submission_ms = 4.0
+
+            def __init__(self, image_ids: list[int], value: float) -> None:
+                self.read_calls = 0
+                self.batch = SimpleNamespace(
+                    global_image_ids=image_ids,
+                    y=torch.full((len(image_ids), 1, 28, 28, 8, 8), value),
+                    cbcr=torch.full((len(image_ids), 2, 14, 14, 8, 8), value),
+                    layout="transformed_dct_grid",
+                    execution_stats={"actual_vector_count": len(image_ids)},
+                    cache_stats={},
+                )
+
+            def read(self):
+                self.read_calls += 1
+                return self.batch
+
+        segments = [
+            [{"galp_image_id": image_id} for image_id in range(3)],
+            [{"galp_image_id": image_id} for image_id in range(3, 6)],
+        ]
+        pending = [FakePending([0, 1, 2], 1.0), FakePending([3, 4, 5], 2.0)]
+
+        class FakeReader:
+            def __init__(self) -> None:
+                self.reclaim_calls = 0
+
+            def manual_reclaim(self) -> None:
+                self.reclaim_calls += 1
+
+        adapter = object.__new__(GalpAdapter)
+        adapter.segment_mode = "manifest-shard"
+        adapter.output_prefetch_policy = "deferred-allocation"
+        adapter.device = torch.device("cpu")
+        adapter.reader = FakeReader()
+        adapter._shard_by_image_id = {image_id: image_id // 3 for image_id in range(6)}
+        adapter._process_scope_started_ns = None
+        adapter._prefetch = lambda segment: pending[int(segment[0]["galp_image_id"]) // 3]
+        adapter._activate_segments(segments)
+        adapter._start_next_prefetch()
+
+        first = adapter._load_pushdown(
+            [
+                {"galp_image_id": 0, "label": 10, "ordinal": 0},
+                {"galp_image_id": 1, "label": 11, "ordinal": 1},
+            ]
+        )
+        self.assertEqual(pending[0].read_calls, 1)
+        self.assertEqual(pending[1].read_calls, 0)
+        self.assertIs(adapter._pending, pending[1])
+        self.assertEqual(first.native_stats[0]["segment_shard_id"], 0)
+        self.assertEqual(first.native_stats[0]["segment_cross_shard_count"], 0)
+        self.assertGreaterEqual(first.native_stats[0]["prefetch_consumer_wait_ms"], 0.0)
+
+        boundary = adapter._load_pushdown(
+            [
+                {"galp_image_id": 2, "label": 12, "ordinal": 2},
+                {"galp_image_id": 3, "label": 13, "ordinal": 3},
+            ]
+        )
+        self.assertEqual(pending[1].read_calls, 1)
+        self.assertEqual(tuple(boundary.inputs[0].shape), (2, 1, 28, 28, 8, 8))
+        self.assertEqual(boundary.ordinals, [2, 3])
+        self.assertEqual(boundary.label_values, [12, 13])
+        self.assertEqual(float(boundary.inputs[0][0, 0, 0, 0, 0, 0]), 1.0)
+        self.assertEqual(float(boundary.inputs[0][1, 0, 0, 0, 0, 0]), 2.0)
+        self.assertEqual(boundary.native_stats[0]["segment_shard_id"], 1)
+        self.assertEqual(adapter.reader.reclaim_calls, 1)
+        self.assertEqual(
+            boundary.native_stats[0]["output_prefetch_policy"],
+            "deferred-allocation",
+        )
+        self.assertEqual(boundary.native_stats[0]["segment_cross_shard_count"], 0)
+        self.assertEqual(boundary.native_stats[0]["shard_reactivation_count"], 0)
 
     def test_identity_validation_uses_host_labels(self) -> None:
         batch = LoadedBatch(

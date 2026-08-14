@@ -63,6 +63,11 @@ std::filesystem::path resolve_manifest_member(const std::filesystem::path& root,
 	return candidate;
 }
 
+bool uses_bounded_io_uring(const JpegDctCropExecutionMode mode) noexcept {
+	return mode == JpegDctCropExecutionMode::kBoundedIoUringRangeReadSelectedDecode ||
+	       mode == JpegDctCropExecutionMode::kBoundedIoUringScheduledRangeReadSelectedDecode;
+}
+
 void configure_crop_execution_mode(detail::JpegDctDeviceRowgroupPlan& rowgroup,
                                    const JpegDctCropExecutionMode      mode) {
 	const auto automatic = detail::choose_jpeg_dct_runtime_policy(
@@ -91,6 +96,9 @@ void configure_crop_execution_mode(detail::JpegDctDeviceRowgroupPlan& rowgroup,
 		break;
 	case JpegDctCropExecutionMode::kRowgroupReadSelectedDecode:
 	case JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode:
+	case JpegDctCropExecutionMode::kBoundedRangeReadSelectedDecode:
+	case JpegDctCropExecutionMode::kBoundedIoUringRangeReadSelectedDecode:
+	case JpegDctCropExecutionMode::kBoundedIoUringScheduledRangeReadSelectedDecode:
 		if (!selected_decode_possible) {
 			rowgroup.runtime_policy = automatic;
 			rowgroup.read_strategy = automatic.decision == detail::JpegDctRuntimePolicyDecision::kFullRowgroup
@@ -100,9 +108,15 @@ void configure_crop_execution_mode(detail::JpegDctDeviceRowgroupPlan& rowgroup,
 		}
 		rowgroup.runtime_policy = {detail::JpegDctRuntimePolicyDecision::kSelectedVectors,
 		                           detail::JpegDctRuntimePolicyReason::kForcedSelectedVectors};
-		rowgroup.sparse_storage_read = mode == JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode;
-		rowgroup.read_strategy = rowgroup.sparse_storage_read ? detail::JpegDctReadStrategy::kRunIntervalExact
-		                                                       : detail::JpegDctReadStrategy::kBitmapExact;
+		rowgroup.sparse_storage_read = mode == JpegDctCropExecutionMode::kVectorRangeReadSelectedDecode ||
+		                               mode == JpegDctCropExecutionMode::kBoundedRangeReadSelectedDecode ||
+		                               uses_bounded_io_uring(mode);
+		rowgroup.read_strategy =
+		    mode == JpegDctCropExecutionMode::kBoundedRangeReadSelectedDecode ||
+		            uses_bounded_io_uring(mode)
+		        ? detail::JpegDctReadStrategy::kRunIntervalBounded
+		        : (rowgroup.sparse_storage_read ? detail::JpegDctReadStrategy::kRunIntervalExact
+		                                        : detail::JpegDctReadStrategy::kBitmapExact);
 		break;
 	}
 }
@@ -576,6 +590,26 @@ struct JpegDctShardDatasetReader::Impl {
 		uint32_t                     direct_layout_index      = std::numeric_limits<uint32_t>::max();
 		bool                         direct_image_rowgroups   = false;
 	};
+	struct PlanlessAxisCapacityKey {
+		std::array<uint32_t, 4> output_extents {};
+
+		bool operator==(const PlanlessAxisCapacityKey& other) const noexcept {
+			return output_extents == other.output_extents;
+		}
+	};
+	struct PlanlessAxisCapacityKeyHash {
+		size_t operator()(const PlanlessAxisCapacityKey& key) const noexcept {
+			size_t hash = 0U;
+			for (const auto extent : key.output_extents) {
+				hash ^= static_cast<size_t>(extent) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+			}
+			return hash;
+		}
+	};
+	struct PlanlessAxisCapacityContract {
+		size_t float_count = 0U;
+		bool   complete    = false;
+	};
 	static_assert(sizeof(PlanlessStaticComponentDescriptor) == 16U);
 	static_assert(sizeof(PlanlessStaticLayoutDescriptor) == 64U);
 	static_assert(sizeof(PlanlessStaticImageDescriptor) == 32U);
@@ -674,6 +708,14 @@ struct JpegDctShardDatasetReader::Impl {
 			if (!lazy_block_major_metadata) {
 				ensure_shard_metadata(shards.back());
 			}
+		}
+		if (manifest.version == 3U && manifest.uses_compact_descriptor()) {
+			auto paths = std::make_shared<std::vector<std::filesystem::path>>();
+			paths->reserve(shards.size());
+			for (const auto& shard : shards) {
+				paths->push_back(shard.fls_path);
+			}
+			image_major_static_metadata_paths = std::move(paths);
 		}
 		const auto profile_started = std::chrono::steady_clock::now();
 		if (!lazy_block_major_metadata) {
@@ -1432,9 +1474,88 @@ struct JpegDctShardDatasetReader::Impl {
 	// linear in the two factors; 256 keeps each retained program bounded while
 	// avoiding whole-batch fallback to the expanded legacy transform.
 	static constexpr uint16_t kMaxPlanlessRationalAxisFactor = 256U;
+	// The ImageNet-512 28/14-block contract remains below one MiB even when
+	// 4:4:4 layouts are present. Keep a generous but finite ceiling so malformed
+	// or exotic layouts cannot turn a prewarm guarantee into an unbounded eager
+	// allocation.
+	static constexpr size_t kMaxPlanlessAxisCapacityContractBytes = 16U * 1024U * 1024U;
 
 	static bool planless_axis_uses_reference_program(const uint16_t up_factor, const uint16_t down_factor) noexcept {
 		return up_factor == 1U && down_factor >= 1U && down_factor <= 2U;
+	}
+
+	PlanlessAxisCapacityContract
+	planless_axis_capacity_contract(const JpegDctGridTransformSpec& transform) const {
+		const PlanlessAxisCapacityKey cache_key {{transform.y_output_width_blocks,
+		                                                transform.y_output_height_blocks,
+		                                                transform.cbcr_output_width_blocks,
+		                                                transform.cbcr_output_height_blocks}};
+		{
+			const std::lock_guard<std::mutex> lock(planless_axis_capacity_cache_mutex);
+			if (const auto found = planless_axis_capacity_cache.find(cache_key);
+			    found != planless_axis_capacity_cache.end()) {
+				return found->second;
+			}
+		}
+
+		// Explicit crops can produce any positive component-block extent up to
+		// the immutable layout maximum. Enumerating those extents gives a formal
+		// workload bound; it does not depend on sample order or warmup coverage.
+		std::array<uint32_t, 6> max_component_extents {};
+		for (const auto& layout : planless_static_layouts) {
+			for (size_t slot = 0U; slot < layout.components.size(); ++slot) {
+				const auto& component = layout.components[slot];
+				if (!component.present) {
+					continue;
+				}
+				max_component_extents[slot * 2U] =
+				    std::max<uint32_t>(max_component_extents[slot * 2U], component.width_in_blocks);
+				max_component_extents[slot * 2U + 1U] =
+				    std::max<uint32_t>(max_component_extents[slot * 2U + 1U], component.height_in_blocks);
+			}
+		}
+
+		std::unordered_set<uint32_t> relations;
+		const auto collect_relations = [&](const uint32_t max_source_extent, const uint32_t output_extent) {
+			if (output_extent == 0U) {
+				return;
+			}
+			for (uint32_t source_extent = 1U; source_extent <= max_source_extent; ++source_extent) {
+				const auto divisor = std::gcd(source_extent, output_extent);
+				const auto up       = output_extent / divisor;
+				const auto down     = source_extent / divisor;
+				if (up > kMaxPlanlessRationalAxisFactor || down > kMaxPlanlessRationalAxisFactor ||
+				    planless_axis_uses_reference_program(static_cast<uint16_t>(up), static_cast<uint16_t>(down))) {
+					continue;
+				}
+				relations.insert((up << 16U) | down);
+			}
+		};
+		for (size_t slot = 0U; slot < 3U; ++slot) {
+			const auto output_width = slot == 0U ? transform.y_output_width_blocks
+			                                     : transform.cbcr_output_width_blocks;
+			const auto output_height = slot == 0U ? transform.y_output_height_blocks
+			                                      : transform.cbcr_output_height_blocks;
+			collect_relations(max_component_extents[slot * 2U], output_width);
+			collect_relations(max_component_extents[slot * 2U + 1U], output_height);
+		}
+
+		PlanlessAxisCapacityContract contract {0U, true};
+		constexpr size_t max_float_count = kMaxPlanlessAxisCapacityContractBytes / sizeof(float);
+		for (const auto relation : relations) {
+			const size_t phase_count = static_cast<size_t>(relation >> 16U) +
+			                           static_cast<size_t>(relation & 0xffffU) - 1U;
+			if (phase_count > max_float_count / 64U ||
+			    contract.float_count > max_float_count - phase_count * 64U) {
+				contract = PlanlessAxisCapacityContract {0U, false};
+				break;
+			}
+			contract.float_count += phase_count * 64U;
+		}
+		{
+			const std::lock_guard<std::mutex> lock(planless_axis_capacity_cache_mutex);
+			return planless_axis_capacity_cache.emplace(cache_key, contract).first->second;
+		}
 	}
 
 	static std::vector<float> transformed_dct_grid_axis_phase_matrices_uncached(const uint16_t up_factor,
@@ -1927,8 +2048,18 @@ struct JpegDctShardDatasetReader::Impl {
 		const auto& transform = *options.grid_transform;
 		auto compact = block_major_compact_planner->Plan(requests, transform);
 		detail::JpegDctDeviceBatchPlan plan;
-		plan.compact_plan_bytes           = compact.stats.compact_plan_bytes;
-		plan.compact_plan_peak_bytes      = compact.stats.compact_plan_peak_bytes;
+		plan.compact_plan_bytes                     = compact.stats.compact_plan_bytes;
+		plan.compact_plan_peak_bytes                = compact.stats.compact_plan_peak_bytes;
+		plan.canonical_template_hit_count           = compact.stats.canonical_template_hit_count;
+		plan.canonical_template_miss_count          = compact.stats.canonical_template_miss_count;
+		plan.canonical_template_sidecar_bytes       = compact.stats.canonical_template_sidecar_bytes;
+		plan.canonical_template_audit_digest        = compact.stats.canonical_template_audit_digest;
+		plan.canonical_template_load_ms             = compact.stats.canonical_template_load_ms;
+		plan.canonical_template_validation_ms       = compact.stats.canonical_template_validation_ms;
+		plan.duplicate_physical_read_count          = compact.stats.duplicate_physical_read_count;
+		plan.rowgroup_revisit_count                 = compact.stats.rowgroup_revisit_count;
+		plan.vector_run_revisit_count               = compact.stats.vector_run_revisit_count;
+		plan.physical_read_order_inversions         = compact.stats.physical_read_order_inversions;
 		plan.layout                        = options.layout;
 		plan.grid_transform                = transform;
 		plan.unify_rowgroups_across_shards = true;
@@ -1944,10 +2075,19 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.transform_blocks_per_launch = options.transform_blocks_per_launch;
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
+		plan.async_planless_completion  = options.async_planless_completion;
+		plan.transform_submission_gate   = options.transform_submission_gate;
 		plan.block_major_double_buffer_policy = options.block_major_double_buffer_policy;
 		plan.decode_workset_capacity_bytes = options.decode_workset_capacity_bytes == 0U
 		                                         ? kDefaultJpegDctDeviceDecodeWorksetCapacityBytes
 		                                         : options.decode_workset_capacity_bytes;
+		plan.bounded_read_amplification_ppm       = options.bounded_read_amplification_ppm;
+		plan.bounded_read_local_amplification_ppm = options.bounded_read_local_amplification_ppm;
+		plan.bounded_read_max_run_bytes            = options.bounded_read_max_run_bytes;
+		plan.bounded_io_uring_enabled = uses_bounded_io_uring(options.crop_execution_mode);
+		plan.bounded_io_uring_queue_depth = plan.bounded_io_uring_enabled
+		                                           ? kDefaultJpegDctBoundedIoUringQueueDepth
+		                                           : 0U;
 		plan.rowgroup_prefetch.enabled   = options.enable_rowgroup_prefetch;
 		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0U
 		                                   ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
@@ -2009,6 +2149,16 @@ struct JpegDctShardDatasetReader::Impl {
 			plan.fixed_quant_tables.insert(plan.fixed_quant_tables.end(), table.values.begin(), table.values.end());
 		}
 		auto device_plan = std::make_shared<detail::JpegDctDeviceBlockMajorPlanlessPlan>();
+		device_plan->active_output_schedule_sidecar_enabled =
+		    options.crop_execution_mode ==
+		    JpegDctCropExecutionMode::kBoundedIoUringScheduledRangeReadSelectedDecode;
+		if (device_plan->active_output_schedule_sidecar_enabled) {
+			device_plan->active_output_schedule_directory = block_major_access_directory;
+			device_plan->canonical_plan_digest = compact.stats.canonical_template_audit_digest;
+			if (device_plan->canonical_plan_digest == 0U) {
+				throw std::runtime_error("scheduled active-output mode requires a canonical plan audit digest");
+			}
+		}
 		device_plan->images.reserve(compact.requests.size());
 		device_plan->groups.reserve(compact.group_bindings.size());
 		device_plan->rank_cells.reserve(compact.rank_cells.size());
@@ -2160,9 +2310,10 @@ struct JpegDctShardDatasetReader::Impl {
 				throw std::runtime_error("block-major compact rowgroup exceeds source metadata");
 			}
 			detail::JpegDctDeviceRowgroupPlan rowgroup;
-			rowgroup.rowgroup_index        = source_rowgroup.rowgroup_index;
-			rowgroup.source_shard_id       = source_rowgroup.shard_id;
-			rowgroup.source_fls_path       = &source_shard.fls_path;
+			rowgroup.rowgroup_index       = source_rowgroup.rowgroup_index;
+			rowgroup.source_shard_id      = source_rowgroup.shard_id;
+			rowgroup.source_payload_crc64 = source_shard.entry.payload_crc64;
+			rowgroup.source_fls_path      = &source_shard.fls_path;
 			rowgroup.full_vector_count     = row_count_to_vector_count(
 			    source_shard.rowgroup_n_tuples[source_rowgroup.rowgroup_index]);
 			rowgroup.has_vector_plan       = true;
@@ -2267,6 +2418,11 @@ struct JpegDctShardDatasetReader::Impl {
 	std::optional<detail::JpegDctDeviceBatchPlan>
 	try_planless_device_batch(const std::vector<JpegDctImageCropRequest>& requests,
 	                          const JpegDctDeviceBatchOptions&            options) const {
+		using PlanningClock = std::chrono::steady_clock;
+		const auto planning_elapsed_ms = [](const PlanningClock::time_point begin,
+		                                    const PlanningClock::time_point end) {
+			return std::chrono::duration<double, std::milli>(end - begin).count();
+		};
 		const bool image_major_v2 = manifest.version == 2U;
 		const bool compact_v3 = manifest.version == 3U && manifest.uses_compact_descriptor() &&
 		                        manifest.uses_independent_vector_rowgroups() &&
@@ -2285,6 +2441,12 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.unify_rowgroups_across_shards = true;
 		plan.uses_planless_fixed_transform = true;
 		plan.compact_v3_storage             = compact_v3;
+		const auto axis_capacity_contract   = planless_axis_capacity_contract(transform);
+		plan.planless_axis_program_capacity_contract_count = axis_capacity_contract.float_count;
+		plan.planless_axis_program_capacity_contract_complete = axis_capacity_contract.complete;
+		if (compact_v3) {
+			plan.static_metadata_prewarm_paths = image_major_static_metadata_paths;
+		}
 		plan.selected_coefficients         = detail::normalize_coefficient_selection(options.coefficient_selection);
 		plan.coefficient_selection_shape   = detail::classify_coefficient_selection(plan.selected_coefficients);
 		plan.coefficients_per_block        = plan.selected_coefficients.size();
@@ -2297,10 +2459,19 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.decode_workset_capacity_bytes = options.decode_workset_capacity_bytes == 0U
 		                                         ? kDefaultJpegDctDeviceDecodeWorksetCapacityBytes
 		                                         : options.decode_workset_capacity_bytes;
+		plan.bounded_read_amplification_ppm       = options.bounded_read_amplification_ppm;
+		plan.bounded_read_local_amplification_ppm = options.bounded_read_local_amplification_ppm;
+		plan.bounded_read_max_run_bytes            = options.bounded_read_max_run_bytes;
+		plan.bounded_io_uring_enabled = uses_bounded_io_uring(options.crop_execution_mode);
+		plan.bounded_io_uring_queue_depth = plan.bounded_io_uring_enabled
+		                                           ? kDefaultJpegDctBoundedIoUringQueueDepth
+		                                           : 0U;
 		plan.scheduling_policy           = options.scheduling_policy;
 		plan.transform_blocks_per_launch = options.transform_blocks_per_launch;
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
+		plan.async_planless_completion  = options.async_planless_completion;
+		plan.transform_submission_gate   = options.transform_submission_gate;
 		plan.block_major_double_buffer_policy = options.block_major_double_buffer_policy;
 		plan.rowgroup_prefetch.enabled   = options.enable_rowgroup_prefetch;
 		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0 ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
@@ -2469,7 +2640,9 @@ struct JpegDctShardDatasetReader::Impl {
 			configure_crop_execution_mode(compact_vector_policy, options.crop_execution_mode);
 		}
 
+		const auto dynamic_images_begin = PlanningClock::now();
 		for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+			const auto crop_geometry_begin = PlanningClock::now();
 			const auto& request     = requests[request_index];
 			const auto  shard_index = planless_shard_index_for(request.global_image_index);
 			if (shard_index >= planless_static_shards.size()) {
@@ -2589,6 +2762,8 @@ struct JpegDctShardDatasetReader::Impl {
 			      !supported_axis(chroma_crop_h, transform.cbcr_output_height_blocks)))) {
 				return std::nullopt;
 			}
+			plan.crop_geometry_planning_ms +=
+			    planning_elapsed_ms(crop_geometry_begin, PlanningClock::now());
 
 			detail::JpegDctDevicePlanlessImageDescriptor launch;
 			launch.request_index         = static_cast<uint32_t>(request_index);
@@ -2617,8 +2792,11 @@ struct JpegDctShardDatasetReader::Impl {
 				if (!x_relation.has_value() || !y_relation.has_value()) {
 					return std::nullopt;
 				}
+				const auto axis_program_begin = PlanningClock::now();
 				const auto x_program_base = planless_axis_program_base(*x_relation);
 				const auto y_program_base = planless_axis_program_base(*y_relation);
+				plan.axis_program_planning_ms +=
+				    planning_elapsed_ms(axis_program_begin, PlanningClock::now());
 				if (!x_program_base.has_value() || !y_program_base.has_value()) {
 					return std::nullopt;
 				}
@@ -2648,6 +2826,7 @@ struct JpegDctShardDatasetReader::Impl {
 				const auto clipped_y1 =
 				    clip_coordinate(static_cast<int64_t>(crop_y) + crop_h, source.height_in_blocks);
 				if (clipped_x0 < clipped_x1 && clipped_y0 < clipped_y1) {
+					const auto interval_begin = PlanningClock::now();
 					const auto profile = compiled_access_profile(request.global_image_index,
 					                                             slot,
 					                                             clipped_x0,
@@ -2657,6 +2836,8 @@ struct JpegDctShardDatasetReader::Impl {
 					                                             source,
 					                                             layout,
 					                                             row_start_in_rowgroup);
+					plan.crop_interval_planning_ms +=
+					    planning_elapsed_ms(interval_begin, PlanningClock::now());
 					image_selected_vectors.insert(image_selected_vectors.end(),
 					                              profile.selected_chunks->begin(),
 					                              profile.selected_chunks->end());
@@ -2667,6 +2848,7 @@ struct JpegDctShardDatasetReader::Impl {
 				++plan.fixed_transform_component_count;
 			}
 
+			const auto binding_begin = PlanningClock::now();
 			std::sort(image_selected_vectors.begin(), image_selected_vectors.end());
 			image_selected_vectors.erase(
 			    std::unique(image_selected_vectors.begin(), image_selected_vectors.end()), image_selected_vectors.end());
@@ -2734,9 +2916,9 @@ struct JpegDctShardDatasetReader::Impl {
 					rowgroup_slot.key   = rowgroup_key;
 					rowgroup_slot.index = logical_shard.rowgroups.size();
 					detail::JpegDctDeviceRowgroupPlan rowgroup_plan;
-					rowgroup_plan.rowgroup_index  = fls_rowgroup_index;
-					rowgroup_plan.source_shard_id = shard.shard_id;
-					rowgroup_plan.source_fls_path = shard.fls_path;
+					rowgroup_plan.rowgroup_index       = fls_rowgroup_index;
+					rowgroup_plan.source_shard_id      = shard.shard_id;
+					rowgroup_plan.source_fls_path      = shard.fls_path;
 					if (fls_rowgroup_index >= shard.rowgroup_count) {
 						throw std::runtime_error("JPEG DCT compact rowgroup exceeds shard metadata");
 					}
@@ -2756,7 +2938,12 @@ struct JpegDctShardDatasetReader::Impl {
 			}
 			plan.image_layouts[request_index] =
 			    JpegDctDeviceImageLayout {request.global_image_index, 0U, static_cast<uint32_t>(source_blocks)};
+			plan.rowgroup_binding_planning_ms +=
+			    planning_elapsed_ms(binding_begin, PlanningClock::now());
 		}
+		plan.dynamic_image_planning_ms =
+		    planning_elapsed_ms(dynamic_images_begin, PlanningClock::now());
+		const auto finalize_begin = PlanningClock::now();
 		if (!image_major_vector_plan) {
 			for (auto& rowgroup_plan : logical_shard.rowgroups) {
 				auto& selected_vectors = rowgroup_plan.selected_vectors;
@@ -2825,6 +3012,7 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.dct_resize_weight_cache_misses     = resize_cache_delta.resize_weight_misses;
 		plan.dct_conversion_matrix_cache_hits   = resize_cache_delta.conversion_hits;
 		plan.dct_conversion_matrix_cache_misses = resize_cache_delta.conversion_misses;
+		plan.plan_finalize_ms = planning_elapsed_ms(finalize_begin, PlanningClock::now());
 		return plan;
 	}
 
@@ -2882,10 +3070,19 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.decode_workset_capacity_bytes = options.decode_workset_capacity_bytes == 0U
 		                                         ? kDefaultJpegDctDeviceDecodeWorksetCapacityBytes
 		                                         : options.decode_workset_capacity_bytes;
+		plan.bounded_read_amplification_ppm       = options.bounded_read_amplification_ppm;
+		plan.bounded_read_local_amplification_ppm = options.bounded_read_local_amplification_ppm;
+		plan.bounded_read_max_run_bytes            = options.bounded_read_max_run_bytes;
+		plan.bounded_io_uring_enabled = uses_bounded_io_uring(options.crop_execution_mode);
+		plan.bounded_io_uring_queue_depth = plan.bounded_io_uring_enabled
+		                                           ? kDefaultJpegDctBoundedIoUringQueueDepth
+		                                           : 0U;
 		plan.scheduling_policy           = options.scheduling_policy;
 		plan.transform_blocks_per_launch = options.transform_blocks_per_launch;
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
+		plan.async_planless_completion  = options.async_planless_completion;
+		plan.transform_submission_gate   = options.transform_submission_gate;
 		plan.block_major_double_buffer_policy = options.block_major_double_buffer_policy;
 		plan.rowgroup_prefetch.enabled   = options.enable_rowgroup_prefetch;
 		plan.rowgroup_prefetch.depth = options.rowgroup_prefetch_depth == 0 ? kDefaultJpegDctDeviceRowgroupPrefetchDepth
@@ -3679,7 +3876,10 @@ struct JpegDctShardDatasetReader::Impl {
 		    << options.rowgroup_prefetch_workers << ':' << options.rowgroup_prefetch_min_decode_batches << ':'
 		    << options.enable_planless_execution << ':' << static_cast<int>(options.scheduling_policy) << ':'
 		    << options.transform_blocks_per_launch << ':' << options.transform_ctas_per_launch << ':'
-		    << options.use_low_priority_streams << ':' << static_cast<int>(options.crop_execution_mode) << ':';
+		    << options.use_low_priority_streams << ':' << static_cast<int>(options.crop_execution_mode) << ':'
+		    << options.bounded_read_amplification_ppm << ':'
+		    << options.bounded_read_local_amplification_ppm << ':'
+		    << options.bounded_read_max_run_bytes << ':';
 		if (options.grid_transform.has_value()) {
 			const auto& spec = *options.grid_transform;
 			key << spec.y_output_width_blocks << ',' << spec.y_output_height_blocks << ','
@@ -3945,6 +4145,7 @@ struct JpegDctShardDatasetReader::Impl {
 	std::vector<PlanlessStaticLayoutDescriptor> planless_static_layouts;
 	std::vector<std::array<uint16_t, 64>>       planless_quant_tables;
 	std::vector<uint16_t>                       planless_shard_indices;
+	std::shared_ptr<const std::vector<std::filesystem::path>> image_major_static_metadata_paths;
 	uint64_t                                    planless_uniform_shard_image_count = 0U;
 	bool                                        planless_shard_indices_valid       = false;
 	std::unique_ptr<JpegDctBlockMajorCompactPlanner> block_major_compact_planner;
@@ -3961,6 +4162,11 @@ struct JpegDctShardDatasetReader::Impl {
 	                           CompiledAccessProfileKeyHash>
 	    compiled_access_profiles;
 	mutable std::deque<CompiledAccessProfileKey> compiled_access_profile_order;
+	mutable std::mutex planless_axis_capacity_cache_mutex;
+	mutable std::unordered_map<PlanlessAxisCapacityKey,
+	                           PlanlessAxisCapacityContract,
+	                           PlanlessAxisCapacityKeyHash>
+	    planless_axis_capacity_cache;
 };
 
 JpegDctShardDatasetReader::JpegDctShardDatasetReader(const std::filesystem::path& manifest_path)
@@ -4071,6 +4277,10 @@ JpegDctShardDatasetReader::PlanDeviceDctBatch(const std::vector<JpegDctImageCrop
 	preview.compiled_access_profile_hits           = plan.compiled_access_profile_hits;
 	preview.compiled_access_profile_misses         = plan.compiled_access_profile_misses;
 	preview.planless_axis_program_bytes            = plan.fixed_resize_weight_matrices.size() * sizeof(float);
+	preview.planless_axis_program_capacity_contract_bytes =
+	    plan.planless_axis_program_capacity_contract_count * sizeof(float);
+	preview.planless_axis_program_capacity_contract_complete =
+	    plan.planless_axis_program_capacity_contract_complete;
 	preview.compact_plan_bytes                     = plan.compact_plan_bytes;
 	preview.compact_plan_peak_bytes                = plan.compact_plan_peak_bytes;
 	preview.coordinate_group_lookup_count          = plan.coordinate_group_lookup_count;
@@ -4127,8 +4337,13 @@ JpegDctShardDatasetReader::PrepareDeviceDctBatch(const std::vector<JpegDctImageC
 	}
 	const auto plan_start = std::chrono::steady_clock::now();
 	auto       plan       = impl_->cached_device_batch_plan(requests, options);
+	const auto compile_start = std::chrono::steady_clock::now();
+	plan.plan_device_batch_ms =
+	    std::chrono::duration<double, std::milli>(compile_start - plan_start).count();
 	impl_->device_bridge.CompileIoPlan(plan);
 	const auto plan_end   = std::chrono::steady_clock::now();
+	plan.compile_io_plan_ms =
+	    std::chrono::duration<double, std::milli>(plan_end - compile_start).count();
 	plan.planning_ms      = std::chrono::duration<double, std::milli>(plan_end - plan_start).count();
 	return JpegDctDeviceBatchPreparedPlan(
 	    std::make_unique<JpegDctDeviceBatchPreparedPlan::Impl>(std::move(plan), options, impl_->plan_owner_token));

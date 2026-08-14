@@ -3,6 +3,7 @@
 #if GALP_WITH_JPEG_DCT
 
 #include "galp/jpeg_dct_block_major_access.hpp"
+#include "jpeg/jpeg_dct_canonical_plan.hpp"
 #include "jpeg/jpeg_dct_metadata.hpp"
 #include "fls/cfg/cfg.hpp"
 #include <algorithm>
@@ -176,6 +177,8 @@ struct JpegDctBlockMajorCompactPlanner::Impl {
 	JpegDctShardManifest manifest;
 	std::vector<Shard> shards;
 	uint64_t descriptor_cache_byte_bound = 0U;
+	uint64_t manifest_size = 0U;
+	uint64_t manifest_crc64 = 0U;
 
 	[[nodiscard]] std::shared_ptr<const JpegDctBlockMajorAccessDescriptor>
 	descriptor_for(const uint32_t shard_index) const {
@@ -226,6 +229,57 @@ struct JpegDctBlockMajorCompactPlanner::Impl {
 			}
 		}
 		fail("request image index is not covered by a manifest shard");
+	}
+
+	[[nodiscard]] std::optional<uint32_t> canonical_shard_index_for(
+	    const std::vector<JpegDctImageCropRequest>& requests) const {
+		if (requests.empty()) {
+			return std::nullopt;
+		}
+		const auto shard_index = shard_index_for(requests.front().global_image_index);
+		const auto& entry = shards[shard_index].entry;
+		if (requests.size() != entry.image_count || requests.front().global_image_index != entry.first_global_image_index) {
+			return std::nullopt;
+		}
+		for (uint32_t index = 0U; index < entry.image_count; ++index) {
+			const auto& request = requests[index];
+			if (request.global_image_index != entry.first_global_image_index + index || request.source_crop.x != 0U ||
+			    request.source_crop.y != 0U || request.source_crop.width != 0U || request.source_crop.height != 0U ||
+			    request.horizontal_flip || !request.logical_sample_id.empty() || !request.augmentation_key.empty()) {
+				return std::nullopt;
+			}
+		}
+		return shard_index;
+	}
+
+	[[nodiscard]] detail::JpegDctCanonicalPlanIdentity canonical_identity(
+	    const uint32_t shard_index,
+	    const JpegDctGridTransformSpec& transform) const {
+		if (shard_index >= shards.size()) {
+			fail("canonical plan shard index is outside the manifest");
+		}
+		const auto descriptor = descriptor_for(shard_index);
+		const auto& entry = shards[shard_index].entry;
+		const auto source_path = std::filesystem::absolute(manifest_path.parent_path() / entry.fls_file_name)
+		                             .lexically_normal();
+		const auto source_size = std::filesystem::file_size(source_path);
+		if (source_size != entry.fls_file_size) {
+			fail("canonical plan source size does not match the manifest");
+		}
+		detail::JpegDctCanonicalPlanIdentity identity;
+		identity.manifest_size        = manifest_size;
+		identity.manifest_crc64       = manifest_crc64;
+		identity.descriptor_size      = descriptor->descriptor_bytes();
+		identity.descriptor_crc64     = descriptor->descriptor_crc64();
+		identity.source_size          = source_size;
+		identity.source_stat_digest   = detail::jpeg_dct_canonical_source_stat_digest(source_path);
+		identity.source_payload_crc64 = entry.payload_crc64;
+		identity.first_global_image   = entry.first_global_image_index;
+		identity.shard_id             = entry.shard_id;
+		identity.image_count          = entry.image_count;
+		identity.rowgroup_vectors     = manifest.rowgroup_vectors;
+		identity.transform_digest     = detail::jpeg_dct_canonical_transform_digest(transform);
+		return identity;
 	}
 
 	struct ComponentSet {
@@ -432,6 +486,8 @@ JpegDctBlockMajorCompactPlanner::JpegDctBlockMajorCompactPlanner(
 	}
 	const auto companion =
 	    read_jpeg_dct_block_major_access_index(companion_path, manifest_path, impl_->manifest);
+	impl_->manifest_size  = companion.manifest_bytes;
+	impl_->manifest_crc64 = companion.manifest_crc64;
 	impl_->shards.reserve(impl_->manifest.shards.size());
 	uint64_t expected_first_image = 0U;
 	for (size_t shard_index = 0U; shard_index < impl_->manifest.shards.size(); ++shard_index) {
@@ -473,6 +529,26 @@ JpegDctBlockMajorCompactPlanner& JpegDctBlockMajorCompactPlanner::operator=(
 
 uint64_t JpegDctBlockMajorCompactPlanner::image_count() const noexcept {
 	return impl_->manifest.image_count;
+}
+
+std::filesystem::path JpegDctBlockMajorCompactPlanner::source_fls_path(const uint32_t shard_id) const {
+	for (const auto& shard : impl_->shards) {
+		if (shard.entry.shard_id == shard_id) {
+			return std::filesystem::absolute(
+			           impl_->manifest_path.parent_path() / shard.entry.fls_file_name)
+			    .lexically_normal();
+		}
+	}
+	fail("block-major recipe requested an unknown shard id");
+}
+
+uint64_t JpegDctBlockMajorCompactPlanner::source_payload_crc64(const uint32_t shard_id) const {
+	for (const auto& shard : impl_->shards) {
+		if (shard.entry.shard_id == shard_id) {
+			return shard.entry.payload_crc64;
+		}
+	}
+	fail("block-major recipe requested an unknown shard id");
 }
 
 size_t JpegDctBlockMajorCompactPlanner::loaded_descriptor_count() const noexcept {
@@ -525,6 +601,31 @@ JpegDctBlockMajorCompactPlan JpegDctBlockMajorCompactPlanner::Plan(
 	}
 	if (input_requests.size() > std::numeric_limits<uint32_t>::max()) {
 		fail("batch request count exceeds compact-plan limits");
+	}
+	std::optional<uint32_t> canonical_miss_shard;
+	if (grid_transform.has_value()) {
+		canonical_miss_shard = impl_->canonical_shard_index_for(input_requests);
+		if (canonical_miss_shard.has_value()) {
+			const auto& shard = impl_->shards[*canonical_miss_shard];
+			const auto identity = impl_->canonical_identity(*canonical_miss_shard, *grid_transform);
+			const auto path = canonical_shard_crop_plan_template_path(
+			    impl_->descriptor_directory, shard.entry.shard_id);
+			if (std::filesystem::is_regular_file(path)) {
+				try {
+					auto loaded = detail::load_jpeg_dct_canonical_plan_template(path, identity);
+					loaded.plan.stats.canonical_template_hit_count     = 1U;
+					loaded.plan.stats.canonical_template_miss_count    = 0U;
+					loaded.plan.stats.canonical_template_sidecar_bytes = loaded.sidecar_bytes;
+					loaded.plan.stats.canonical_template_audit_digest  = loaded.plan_audit_digest;
+					loaded.plan.stats.canonical_template_load_ms       = loaded.load_ms;
+					loaded.plan.stats.canonical_template_validation_ms = loaded.validation_ms;
+					return std::move(loaded.plan);
+				} catch (const std::exception&) {
+					// Production is read-only: reject an invalid artifact and
+					// deterministically rebuild this plan in memory below.
+				}
+			}
+		}
 	}
 	std::vector<SortedRequest> sorted;
 	sorted.reserve(input_requests.size());
@@ -843,13 +944,39 @@ JpegDctBlockMajorCompactPlan JpegDctBlockMajorCompactPlanner::Plan(
 		}
 	}
 
-	plan.rowgroups.reserve(rowgroup_vector_bits.size());
-	for (const auto& [key, bits] : rowgroup_vector_bits) {
+	std::vector<uint64_t> physical_rowgroup_keys;
+	physical_rowgroup_keys.reserve(rowgroup_vector_bits.size());
+	for (const auto& [key, unused] : rowgroup_vector_bits) {
+		static_cast<void>(unused);
+		physical_rowgroup_keys.push_back(key);
+	}
+	std::sort(physical_rowgroup_keys.begin(), physical_rowgroup_keys.end());
+	plan.rowgroups.reserve(physical_rowgroup_keys.size());
+	uint64_t previous_rowgroup_key = 0U;
+	bool     have_previous_rowgroup = false;
+	for (const auto key : physical_rowgroup_keys) {
+		const auto bits_it = rowgroup_vector_bits.find(key);
+		if (bits_it == rowgroup_vector_bits.end()) {
+			fail("sorted block-major rowgroup key is missing from its selection map");
+		}
+		const auto& bits = bits_it->second;
+		if (have_previous_rowgroup) {
+			if (key == previous_rowgroup_key) {
+				++plan.stats.rowgroup_revisit_count;
+				++plan.stats.duplicate_physical_read_count;
+			} else if (key < previous_rowgroup_key) {
+				++plan.stats.physical_read_order_inversions;
+			}
+		}
+		previous_rowgroup_key = key;
+		have_previous_rowgroup = true;
 		const auto shard_id = static_cast<uint32_t>(key >> 32U);
 		const auto rowgroup_index = static_cast<uint32_t>(key);
 		const auto first_vector_run = static_cast<uint32_t>(plan.vector_runs.size());
 		uint32_t selected_vectors = 0U;
 		uint32_t vector = 0U;
+		uint32_t previous_run_end = 0U;
+		bool     have_previous_run = false;
 		while (vector < impl_->manifest.rowgroup_vectors) {
 			const auto selected = (bits[vector / 64U] & (uint64_t {1U} << (vector % 64U))) != 0U;
 			if (!selected) {
@@ -861,8 +988,14 @@ JpegDctBlockMajorCompactPlan JpegDctBlockMajorCompactPlanner::Plan(
 				++vector;
 			} while (vector < impl_->manifest.rowgroup_vectors &&
 			         (bits[vector / 64U] & (uint64_t {1U} << (vector % 64U))) != 0U);
+			if (have_previous_run && run_begin < previous_run_end) {
+				++plan.stats.vector_run_revisit_count;
+				++plan.stats.duplicate_physical_read_count;
+			}
 			plan.vector_runs.push_back({shard_id, rowgroup_index, run_begin, vector - run_begin});
 			selected_vectors += vector - run_begin;
+			previous_run_end = vector;
+			have_previous_run = true;
 		}
 		plan.rowgroups.push_back({shard_id,
 		                          rowgroup_index,
@@ -885,7 +1018,66 @@ JpegDctBlockMajorCompactPlan JpegDctBlockMajorCompactPlanner::Plan(
 	                                vector_bytes(plan.rowgroups) +
 	                                vector_bytes(plan.vector_runs);
 	plan.stats.compact_plan_peak_bytes = plan.stats.compact_plan_bytes + temporary_peak_bytes;
+	if (canonical_miss_shard.has_value()) {
+		plan.stats.canonical_template_audit_digest = detail::jpeg_dct_canonical_plan_audit_digest(plan);
+		plan.stats.canonical_template_miss_count = 1U;
+	}
 	return plan;
+}
+
+JpegDctCanonicalPlanTemplateWriteStats JpegDctBlockMajorCompactPlanner::WriteCanonicalShardPlanTemplate(
+	const uint32_t shard_id,
+	const JpegDctGridTransformSpec& transform,
+	const std::filesystem::path& output_directory) const {
+	const auto shard_it = std::find_if(impl_->shards.begin(), impl_->shards.end(), [&](const auto& shard) {
+		return shard.entry.shard_id == shard_id;
+	});
+	if (shard_it == impl_->shards.end()) {
+		fail("canonical plan writer requested an unknown shard id");
+	}
+	const auto shard_index = static_cast<uint32_t>(std::distance(impl_->shards.begin(), shard_it));
+	const auto identity = impl_->canonical_identity(shard_index, transform);
+	const auto output_path = canonical_shard_crop_plan_template_path(output_directory, shard_id);
+	try {
+		auto existing = detail::load_jpeg_dct_canonical_plan_template(output_path, identity);
+		return {existing.sidecar_bytes,
+		        existing.plan_audit_digest,
+		        existing.plan.requests.size(),
+		        existing.plan.rowgroups.size(),
+		        existing.plan.vector_runs.size(),
+		        true};
+	} catch (const std::exception&) {
+	}
+	std::vector<JpegDctImageCropRequest> requests;
+	requests.reserve(shard_it->entry.image_count);
+	for (uint32_t index = 0U; index < shard_it->entry.image_count; ++index) {
+		requests.push_back({static_cast<uint32_t>(shard_it->entry.first_global_image_index + index), {}, false, {}, {}});
+	}
+	auto plan = Plan(requests, transform);
+	plan.stats.canonical_template_hit_count       = 0U;
+	plan.stats.canonical_template_miss_count      = 0U;
+	plan.stats.canonical_template_sidecar_bytes   = 0U;
+	plan.stats.canonical_template_audit_digest    = 0U;
+	plan.stats.canonical_template_load_ms         = 0.0;
+	plan.stats.canonical_template_validation_ms   = 0.0;
+	const auto ensured = detail::ensure_jpeg_dct_canonical_plan_template(output_path, identity, plan);
+	return {ensured.sidecar_bytes,
+	        ensured.plan_audit_digest,
+	        plan.requests.size(),
+	        plan.rowgroups.size(),
+	        plan.vector_runs.size(),
+	        ensured.reused_existing};
+}
+
+std::filesystem::path canonical_shard_crop_plan_template_path(
+	const std::filesystem::path& directory,
+	const uint32_t shard_id) {
+	std::array<char, 80> name {};
+	const auto count = std::snprintf(name.data(), name.size(), "shard_%06u.canonical_crop_plan.bin", shard_id);
+	if (count < 0 || static_cast<size_t>(count) >= name.size()) {
+		fail("failed to format canonical plan sidecar name");
+	}
+	return directory / name.data();
 }
 
 } // namespace galp::jpeg

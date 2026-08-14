@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,39 @@ class LoadedBatch:
     keepalive: list[Any] = field(default_factory=list)
 
 
+class _GpuUtilizationSampler:
+    """Sample NVML-backed utilization without placing work on the model stream."""
+
+    def __init__(self, device: torch.device, interval_seconds: float = 0.1) -> None:
+        self.device = device
+        self.interval_seconds = interval_seconds
+        self.values: list[float] = []
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.device.type != "cuda" or not hasattr(torch.cuda, "utilization"):
+            return
+
+        def sample() -> None:
+            while not self._stop.is_set():
+                try:
+                    self.values.append(float(torch.cuda.utilization(self.device)))
+                except Exception as error:  # pragma: no cover - depends on NVML deployment
+                    self.error = f"{type(error).__name__}: {error}"
+                    return
+                self._stop.wait(self.interval_seconds)
+
+        self._thread = threading.Thread(target=sample, name="galp-gpu-utilization", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+
 def _process_memory_snapshot(status_path: Path = Path("/proc/self/status")) -> dict[str, int]:
     values = {"rss_bytes": 0, "peak_rss_bytes": 0}
     if not status_path.is_file():
@@ -64,6 +98,41 @@ def _process_memory_snapshot(status_path: Path = Path("/proc/self/status")) -> d
         if fields:
             values[mapping[name]] = int(fields[0]) * 1024
     return values
+
+
+def _process_io_snapshot(io_path: Path = Path("/proc/self/io")) -> dict[str, int] | None:
+    """Read Linux task-group I/O counters, including storage-layer read bytes."""
+
+    if not io_path.is_file():
+        return None
+    mapping = {
+        "rchar": "logical_read_bytes",
+        "read_bytes": "storage_read_bytes",
+        "syscr": "read_syscalls",
+    }
+    values: dict[str, int] = {}
+    try:
+        lines = io_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        name, _, tail = line.partition(":")
+        if name not in mapping:
+            continue
+        try:
+            values[mapping[name]] = int(tail.strip())
+        except ValueError:
+            return None
+    return values if len(values) == len(mapping) else None
+
+
+def _process_io_delta(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if before is None or after is None or before.keys() != after.keys():
+        return None
+    return {name: max(0, after[name] - before[name]) for name in before}
 
 
 def _loader_kwargs(contract: dict[str, Any], pipeline_name: str) -> dict[str, Any]:
@@ -153,7 +222,18 @@ class PyTorchAdapter(Adapter):
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
         datasets = importlib.import_module("datasets")
-        transform = datasets.get_transform(dataset="imagenet", type="test", dtype=torch.float32)
+        if contract["preprocess"]["profile"] == "fixed-center-224-from-512":
+            transforms = importlib.import_module("torchvision.transforms")
+            ctrans = importlib.import_module("utils.custom_transforms")
+            transform = transforms.Compose(
+                [
+                    transforms.CenterCrop(224),
+                    ctrans.ToTensor_range(val_min=-1, val_max=1),
+                    transforms.ConvertImageDtype(torch.float32),
+                ]
+            )
+        else:
+            transform = datasets.get_transform(dataset="imagenet", type="test", dtype=torch.float32)
         self.loader = torch.utils.data.DataLoader(
             CanonicalRgbDataset(samples, transform),
             **_loader_kwargs(contract, name),
@@ -201,7 +281,20 @@ class RgbNoMoreAdapter(Adapter):
             load_mode="DCT",
             dtype=torch.float32,
         )
-        transform = datasets.get_transform(dataset="imagenet_dct", type="test", dtype=torch.float32)
+        if contract["preprocess"]["profile"] == "fixed-center-224-from-512":
+            ctrans = importlib.import_module("utils.custom_transforms")
+            transform = torch.nn.Sequential(
+                ctrans.CenterCrop_DCT(28),
+                ctrans.ToRange(
+                    val_min=-1,
+                    val_max=1,
+                    orig_min=-1024,
+                    orig_max=1016,
+                    dtype=torch.float32,
+                ),
+            )
+        else:
+            transform = datasets.get_transform(dataset="imagenet_dct", type="test", dtype=torch.float32)
         transformed = datasets.SubsetWithTransform(base, dataset="imagenet_dct", transform=transform)
         self.loader = torch.utils.data.DataLoader(
             IndexedDataset(transformed),
@@ -267,21 +360,22 @@ class DaliAdapter(Adapter):
                 name="Reader",
             )
             images = fn.decoders.image(encoded, device="mixed", output_type=types.RGB)
-            images = fn.resize(
-                images,
-                device="gpu",
-                resize_shorter=int(preprocess["resize_shorter"]),
-                interp_type=types.INTERP_LINEAR,
-                antialias=True,
-            )
+            if preprocess["resize_shorter"] is not None:
+                images = fn.resize(
+                    images,
+                    device="gpu",
+                    resize_shorter=int(preprocess["resize_shorter"]),
+                    interp_type=types.INTERP_LINEAR,
+                    antialias=True,
+                )
             images = fn.crop_mirror_normalize(
                 images,
                 device="gpu",
                 dtype=types.FLOAT,
                 output_layout="CHW",
                 crop=tuple(preprocess["crop_size"]),
-                crop_pos_x=0.499999,
-                crop_pos_y=0.499999,
+                crop_pos_x=(0.5 if preprocess.get("crop_origin") == [144, 144] else 0.499999),
+                crop_pos_y=(0.5 if preprocess.get("crop_origin") == [144, 144] else 0.499999),
                 mean=[127.5, 127.5, 127.5],
                 std=[127.5, 127.5, 127.5],
             )
@@ -376,11 +470,17 @@ def _native_args(config: dict[str, Any], preprocess: str) -> SimpleNamespace:
         no_scale=False,
         enable_planless_execution=bool(config.get("enable_planless_execution", True)),
         crop_execution_mode=str(config.get("crop_execution_mode", "auto")),
+        bounded_read_amplification_cap=float(config.get("bounded_read_amplification_cap", 1.0)),
+        bounded_read_local_amplification_cap=float(
+            config.get("bounded_read_local_amplification_cap", 0.0)
+        ),
+        bounded_read_max_run_bytes=int(config.get("bounded_read_max_run_bytes", 0)),
         scheduling_policy=str(config.get("scheduling_policy", "limited-overlap")),
         transform_blocks_per_launch=int(config.get("transform_blocks_per_launch", 0)),
         transform_ctas_per_launch=int(config.get("transform_ctas_per_launch", 0)),
         use_low_priority_streams=bool(config.get("use_low_priority_streams", True)),
         block_major_double_buffer=str(config.get("block_major_double_buffer", "auto")),
+        output_prefetch_policy=str(config.get("output_prefetch_policy", "overlapped")),
     )
 
 
@@ -498,6 +598,46 @@ def _rebuild_grayscale_full_grid(
     )
 
 
+def _manifest_shard_segments(
+    samples: Sequence[dict[str, Any]], manifest: dict[str, Any]
+) -> list[list[dict[str, Any]]]:
+    """Partition a sequential prefix into complete physical manifest shards."""
+
+    if not samples:
+        return []
+    image_ids = [int(sample["galp_image_id"]) for sample in samples]
+    if image_ids != list(range(len(samples))):
+        raise ValueError("manifest-shard mode requires the canonical sequential image prefix")
+    selected_end = len(samples)
+    segments: list[list[dict[str, Any]]] = []
+    consumed = 0
+    for shard in manifest["shards"]:
+        first = int(shard["first_global_image_index"])
+        count = int(shard["image_count"])
+        end = first + count
+        if first >= selected_end:
+            break
+        if first != consumed:
+            raise ValueError(
+                f"manifest shard ranges are not contiguous at image {consumed}: next starts at {first}"
+            )
+        if end > selected_end:
+            raise ValueError(
+                "manifest-shard sample_count truncates a physical shard: "
+                f"selected [0,{selected_end}), shard {int(shard['shard_id'])} is [{first},{end})"
+            )
+        segment = list(samples[first:end])
+        if len(segment) != count:
+            raise ValueError(f"manifest shard {int(shard['shard_id'])} is not fully represented")
+        segments.append(segment)
+        consumed = end
+    if consumed != selected_end:
+        raise ValueError(
+            f"manifest-shard partition covered {consumed} of {selected_end} selected images"
+        )
+    return segments
+
+
 class GalpAdapter(Adapter):
     domain = "dct"
     worker_semantics = "galp_native_segment_prefetch"
@@ -508,6 +648,23 @@ class GalpAdapter(Adapter):
             raise ValueError("GALP Direct-DCT requires CUDA")
         self.config = contract["pipelines"][name]
         self.preprocess = str(self.config["preprocess"])
+        self.segment_mode = str(self.config.get("segment_mode", "fixed"))
+        if self.segment_mode not in {"fixed", "manifest-shard"}:
+            raise ValueError(f"unsupported GALP segment mode: {self.segment_mode}")
+        self.output_prefetch_policy = str(
+            self.config.get("output_prefetch_policy", "overlapped")
+        )
+        if self.output_prefetch_policy not in {"overlapped", "deferred-allocation"}:
+            raise ValueError(
+                f"unsupported GALP output prefetch policy: {self.output_prefetch_policy}"
+            )
+        if (
+            self.output_prefetch_policy == "deferred-allocation"
+            and self.segment_mode != "manifest-shard"
+        ):
+            raise ValueError(
+                "deferred-allocation output prefetch requires manifest-shard mode"
+            )
         block_major_access_dir = self.config.get("block_major_access_dir")
         if block_major_access_dir is not None:
             access_dir = Path(block_major_access_dir).resolve()
@@ -521,6 +678,10 @@ class GalpAdapter(Adapter):
             Path(self.config["torch_binding_dir"]),
             load_postdecode_diagnostics=self.preprocess == "rgbnomore-val",
         )
+        crop_reference = contract["preprocess"]["dct"].get("crop_reference_size_blocks")
+        if crop_reference is not None:
+            self.grid_transform["crop_reference_width_blocks"] = int(crop_reference[1])
+            self.grid_transform["crop_reference_height_blocks"] = int(crop_reference[0])
         reader_started_ns = time.perf_counter_ns()
         self.reader = binding.DirectDctReader(str(Path(self.config["manifest"]).resolve()))
         reader_ready_ns = time.perf_counter_ns()
@@ -531,24 +692,71 @@ class GalpAdapter(Adapter):
         if int(self.reader.image_count) < len(samples):
             raise ValueError(f"GALP manifest has {self.reader.image_count} images for {len(samples)} samples")
         self.args = _native_args(self.config, self.preprocess)
-        self.rgbnomore_transform = (
-            self.direct_dct.build_rgbnomore_dct_val_transform(Path(contract["models"]["rgbnomore_root"]))
-            if self.preprocess == "rgbnomore-val"
-            else None
+        self._uses_native_segment_stream = (
+            self.preprocess == "rgbnomore-val-pushdown"
+            or self.segment_mode == "manifest-shard"
         )
-        segment_size = int(self.config.get("segment_size", contract["execution"]["batch_size"]))
-        self.segment_size = max(1, segment_size)
+        if not self._uses_native_segment_stream:
+            if contract["preprocess"]["profile"] == "fixed-center-224-from-512":
+                root = str(Path(contract["models"]["rgbnomore_root"]))
+                if root not in sys.path:
+                    sys.path.insert(0, root)
+                ctrans = importlib.import_module("utils.custom_transforms")
+                self.rgbnomore_transform = torch.nn.Sequential(
+                    ctrans.CenterCrop_DCT(28),
+                    ctrans.ToRange(
+                        val_min=-1,
+                        val_max=1,
+                        orig_min=-1024,
+                        orig_max=1016,
+                        dtype=torch.float32,
+                    ),
+                )
+            else:
+                self.rgbnomore_transform = self.direct_dct.build_rgbnomore_dct_val_transform(
+                    Path(contract["models"]["rgbnomore_root"])
+                )
+        else:
+            self.rgbnomore_transform = None
         warmup_images = int(contract["execution"]["batch_size"]) * int(
             contract["execution"]["warmup_batches"]
         )
-        self._warmup_segments = list(chunked(self.samples[:warmup_images], self.segment_size))
-        self._measurement_segments = list(chunked(self.samples[warmup_images:], self.segment_size))
+        parsed_manifest = parse_manifest(Path(self.config["manifest"]))
+        self._shard_by_image_id: dict[int, int] = {}
+        for shard in parsed_manifest["shards"]:
+            first = int(shard["first_global_image_index"])
+            end = first + int(shard["image_count"])
+            for image_id in range(first, min(end, len(self.samples))):
+                self._shard_by_image_id[image_id] = int(shard["shard_id"])
+        if self.segment_mode == "manifest-shard":
+            if warmup_images != 0:
+                raise ValueError(
+                    "manifest-shard mode requires zero warmup images to preserve one activation per shard"
+                )
+            self.segment_size = None
+            self._warmup_segments = []
+            self._measurement_segments = _manifest_shard_segments(self.samples, parsed_manifest)
+        else:
+            segment_size = int(
+                self.config.get("segment_size") or contract["execution"]["batch_size"]
+            )
+            self.segment_size = max(1, segment_size)
+            self._warmup_segments = list(chunked(self.samples[:warmup_images], self.segment_size))
+            self._measurement_segments = list(chunked(self.samples[warmup_images:], self.segment_size))
         self.segments: list[list[dict[str, Any]]] = []
         self._next_segment = 0
         self._pending: Any | None = None
         self._current: dict[str, Any] | None = None
+        self._pending_segment: list[dict[str, Any]] | None = None
+        self._pending_submit_ns: int | None = None
+        self._seen_segment_shards: set[int] = set()
+        self._last_segment_shard: int | None = None
+        self._process_scope_started_ns: int | None = None
         self._cold_measurement_primed = False
         self._reuse_cold_measurement = False
+
+    def set_process_scope_start(self, started_ns: int) -> None:
+        self._process_scope_started_ns = int(started_ns)
 
     def startup_diagnostics(self) -> dict[str, Any]:
         result = dict(self.startup_timings)
@@ -563,6 +771,18 @@ class GalpAdapter(Adapter):
         self._next_segment = 0
         self._pending = None
         self._current = None
+        self._pending_segment = None
+        self._pending_submit_ns = None
+        self._seen_segment_shards = set()
+        self._last_segment_shard = None
+
+    def _segment_shard_ids(self, segment: Sequence[dict[str, Any]]) -> set[int]:
+        mapping = getattr(self, "_shard_by_image_id", {})
+        return {
+            int(mapping[int(sample["galp_image_id"])])
+            for sample in segment
+            if int(sample["galp_image_id"]) in mapping
+        }
 
     def _prefetch(self, segment: Sequence[dict[str, Any]]) -> Any:
         image_ids = [int(sample["galp_image_id"]) for sample in segment]
@@ -583,7 +803,13 @@ class GalpAdapter(Adapter):
             transform_ctas_per_launch=self.args.transform_ctas_per_launch,
             use_low_priority_streams=self.args.use_low_priority_streams,
             block_major_double_buffer=getattr(self.args, "block_major_double_buffer", "auto"),
+            async_planless_completion=(
+                self.output_prefetch_policy == "deferred-allocation"
+            ),
             crop_execution_mode=self.args.crop_execution_mode,
+            bounded_read_amplification_cap=self.args.bounded_read_amplification_cap,
+            bounded_read_local_amplification_cap=self.args.bounded_read_local_amplification_cap,
+            bounded_read_max_run_bytes=self.args.bounded_read_max_run_bytes,
             layout="transformed_dct_grid",
             grid_transform=self.grid_transform,
         )
@@ -591,15 +817,24 @@ class GalpAdapter(Adapter):
     def _start_next_prefetch(self) -> None:
         if self._next_segment >= len(self.segments):
             self._pending = None
+            self._pending_segment = None
+            self._pending_submit_ns = None
             return
-        self._pending = self._prefetch(self.segments[self._next_segment])
+        segment = self.segments[self._next_segment]
+        self._pending_segment = segment
+        self._pending_submit_ns = time.perf_counter_ns()
+        self._pending = self._prefetch(segment)
         self._next_segment += 1
 
     def _load_next_segment(self) -> None:
         if self._pending is None:
             raise StopIteration("GALP segment stream is exhausted")
         pending = self._pending
+        segment = list(self._pending_segment or [])
+        submit_ns = self._pending_submit_ns
+        wait_started_ns = time.perf_counter_ns()
         batch = pending.read()
+        ready_ns = time.perf_counter_ns()
         image_ids = [int(item) for item in batch.global_image_ids]
         y = batch.y
         cbcr = batch.cbcr
@@ -609,6 +844,13 @@ class GalpAdapter(Adapter):
             )
         if tuple(y.shape[1:]) != (1, 28, 28, 8, 8) or tuple(cbcr.shape[1:]) != (2, 14, 14, 8, 8):
             raise RuntimeError(f"unexpected transformed grid shapes: y={tuple(y.shape)} cbcr={tuple(cbcr.shape)}")
+        shard_ids = self._segment_shard_ids(segment)
+        cross_shard = int(len(shard_ids) != 1)
+        shard_id = next(iter(shard_ids)) if len(shard_ids) == 1 else None
+        reactivation = int(shard_id is not None and shard_id in self._seen_segment_shards)
+        if shard_id is not None:
+            self._seen_segment_shards.add(shard_id)
+            self._last_segment_shard = shard_id
         self._current = {
             "image_ids": image_ids,
             "y": y,
@@ -621,9 +863,65 @@ class GalpAdapter(Adapter):
                 "planning_ms": float(pending.planning_ms),
                 "io_staging_ms": float(pending.io_staging_ms),
                 "ordered_submission_ms": float(pending.ordered_submission_ms),
+                "submit_to_ready_ms": (
+                    (ready_ns - submit_ns) / 1.0e6 if submit_ns is not None else 0.0
+                ),
+                # This is the directly observed main-thread input-ready stall:
+                # time spent inside consumption of an asynchronously produced
+                # segment.  It is distinct from producer service time and can
+                # be divided by measured repeat time for the P2 <=2% gate.
+                "consumer_wait_ms": (ready_ns - wait_started_ns) / 1.0e6,
+                "process_scope_ready_ms": (
+                    (ready_ns - self._process_scope_started_ns) / 1.0e6
+                    if self._process_scope_started_ns is not None
+                    else 0.0
+                ),
+            },
+            "scheduler_stats": {
+                "segment_mode": self.segment_mode,
+                "output_prefetch_policy": self.output_prefetch_policy,
+                "segment_shard_id": shard_id if shard_id is not None else -1,
+                "segment_cross_shard_count": cross_shard,
+                "shard_reactivation_count": reactivation,
             },
         }
         self._start_next_prefetch()
+
+    def _release_consumed_current(self) -> None:
+        current = self._current
+        if current is None:
+            return
+        if int(current["offset"]) < len(current["image_ids"]):
+            raise RuntimeError("cannot release a GALP segment before it is consumed")
+        self._current = None
+        del current
+        reclaim = getattr(self.reader, "manual_reclaim", None)
+        if callable(reclaim):
+            reclaim()
+
+    def _stitch_consumed_parts_before_deferred_allocation(
+        self,
+        y_parts: list[torch.Tensor],
+        cbcr_parts: list[torch.Tensor],
+        keepalive: list[Any],
+    ) -> None:
+        if not y_parts:
+            return
+        if len(y_parts) != len(cbcr_parts):
+            raise RuntimeError("GALP Y/CbCr segment part count mismatch")
+        # A model batch can straddle a physical shard boundary (1024 is not a
+        # multiple of batch 50).  Copy only that small tail before releasing
+        # the old full-shard output; otherwise the views would keep both whole
+        # shard allocations resident while the next output is produced.
+        stitched_y = y_parts[0].clone() if len(y_parts) == 1 else torch.cat(y_parts, dim=0)
+        stitched_cbcr = (
+            cbcr_parts[0].clone() if len(cbcr_parts) == 1 else torch.cat(cbcr_parts, dim=0)
+        )
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
+        y_parts[:] = [stitched_y]
+        cbcr_parts[:] = [stitched_cbcr]
+        keepalive.clear()
 
     def begin_repeat(self) -> None:
         if getattr(self, "_cold_measurement_primed", False):
@@ -654,6 +952,16 @@ class GalpAdapter(Adapter):
         keepalive: list[Any] = []
         while remaining:
             if self._current is None or int(self._current["offset"]) >= len(self._current["image_ids"]):
+                if (
+                    self._current is not None
+                    and self.output_prefetch_policy == "deferred-allocation"
+                ):
+                    self._stitch_consumed_parts_before_deferred_allocation(
+                        y_parts,
+                        cbcr_parts,
+                        keepalive,
+                    )
+                    self._release_consumed_current()
                 if self._pending is None:
                     self._start_next_prefetch()
                 self._load_next_segment()
@@ -673,6 +981,7 @@ class GalpAdapter(Adapter):
                 stats["segment_first_image_id"] = self._current["image_ids"][0]
                 stats["segment_last_image_id"] = self._current["image_ids"][-1]
                 stats.update({f"prefetch_{key}": value for key, value in self._current["prefetch_telemetry"].items()})
+                stats.update(self._current["scheduler_stats"])
                 native_stats.append(stats)
                 self._current["stats_pending"] = False
             self._current["offset"] = offset + take
@@ -772,7 +1081,7 @@ class GalpAdapter(Adapter):
         )
 
     def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
-        if self.preprocess == "rgbnomore-val-pushdown":
+        if self._uses_native_segment_stream:
             return self._load_pushdown(expected)
         if self.preprocess == "rgbnomore-val":
             return self._load_postdecode(expected)
@@ -781,6 +1090,8 @@ class GalpAdapter(Adapter):
     def end_repeat(self) -> None:
         self._pending = None
         self._current = None
+        self._pending_segment = None
+        self._pending_submit_ns = None
 
 
 def _is_galp_pipeline(name: str) -> bool:
@@ -879,6 +1190,40 @@ _NATIVE_ALLOCATOR_LAST_VALUE_FIELDS = frozenset(
     }
 )
 
+_NATIVE_INVARIANT_FIELDS = frozenset(
+    {
+        "bounded_read_amplification_ppm",
+        "bounded_read_local_amplification_ppm",
+        "bounded_read_max_run_bytes",
+        "bounded_io_backend",
+        "bounded_io_uring_queue_depth",
+        "active_output_schedule_mmap_capacity_bytes",
+        "active_output_schedule_mmap_window_count",
+        "cuda_greatest_stream_priority",
+        "cuda_least_stream_priority",
+        "cuda_warp_size",
+        "direct_dct_decode_stream_priority",
+        "direct_dct_h2d_stream_priority",
+        "direct_dct_low_priority_streams",
+        "direct_dct_round_stream_priority",
+        "direct_dct_stream_priority",
+        "direct_dct_transform_stream_priority",
+        "fixed_grid_output_add",
+        "fixed_grid_output_affine_applied",
+        "fixed_grid_output_float32",
+        "fixed_grid_output_scale",
+    }
+)
+
+_NATIVE_DERIVED_RATIO_FIELDS = frozenset(
+    {
+        "coordinate_group_index_density",
+        "physical_page_coverage_ratio",
+        "read_amplification",
+        "selected_coefficient_ratio",
+    }
+)
+
 
 def _merge_allocator_snapshot(totals: dict[str, Any], key: str, value: int | float) -> None:
     """Merge a process-global allocator snapshot without inventing segment work."""
@@ -897,12 +1242,31 @@ def _merge_allocator_snapshot(totals: dict[str, Any], key: str, value: int | flo
 def _accumulate_native(totals: dict[str, Any], stats: dict[str, Any]) -> None:
     totals["segment_count"] = int(totals.get("segment_count", 0)) + 1
     for key, value in stats.items():
+        if key in _NATIVE_INVARIANT_FIELDS:
+            previous = totals.get(key)
+            if previous is not None and previous != value:
+                raise RuntimeError(f"native invariant changed across segments: {key}")
+            totals[key] = value
+            continue
         if isinstance(value, bool):
-            totals[key] = int(totals.get(key, 0)) + int(value)
+            if key == "actual_transient_memory_gate_passed":
+                totals[key] = bool(totals.get(key, True)) and value
+            else:
+                totals[key] = int(totals.get(key, 0)) + int(value)
         elif isinstance(value, int):
             if key.startswith(_NATIVE_ALLOCATOR_SNAPSHOT_PREFIXES):
                 _merge_allocator_snapshot(totals, key, value)
-            elif any(token in key for token in ("peak", "max_", "capacity", "registers_per_thread", "threads_per_cta")):
+            elif any(
+                token in key
+                for token in (
+                    "peak",
+                    "high_water",
+                    "max_",
+                    "capacity",
+                    "registers_per_thread",
+                    "threads_per_cta",
+                )
+            ):
                 totals[key] = max(int(totals.get(key, 0)), value)
             elif key in {
                 "decoded_rowgroup_cache_capacity_bytes",
@@ -919,7 +1283,7 @@ def _accumulate_native(totals: dict[str, Any], stats: dict[str, Any]) -> None:
         elif isinstance(value, float) and math.isfinite(value):
             if key.startswith(_NATIVE_ALLOCATOR_SNAPSHOT_PREFIXES):
                 _merge_allocator_snapshot(totals, key, value)
-            elif key != "coordinate_group_index_density":
+            elif key not in _NATIVE_DERIVED_RATIO_FIELDS:
                 totals[key] = float(totals.get(key, 0.0)) + value
         elif isinstance(value, str) and value:
             previous = str(totals.get(key, ""))
@@ -931,6 +1295,25 @@ def _accumulate_native(totals: dict[str, Any], stats: dict[str, Any]) -> None:
     if coordinate_entries > 0:
         totals["coordinate_group_index_density"] = (
             int(totals.get("coordinate_group_index_populated", 0)) / coordinate_entries
+        )
+    ratio_sources = {
+        "read_amplification": (
+            "compressed_payload_bytes_read",
+            "selected_compressed_payload_bytes",
+        ),
+        "selected_coefficient_ratio": (
+            "selected_coefficient_count",
+            "full_coefficient_count",
+        ),
+        "physical_page_coverage_ratio": (
+            "physical_page_bytes_covered",
+            "full_physical_page_bytes",
+        ),
+    }
+    for ratio_key, (numerator_key, denominator_key) in ratio_sources.items():
+        denominator = int(totals.get(denominator_key, 0))
+        totals[ratio_key] = (
+            int(totals.get(numerator_key, 0)) / denominator if denominator > 0 else 0.0
         )
 
 
@@ -987,15 +1370,19 @@ def _verify_runtime_inputs(name: str, contract: dict[str, Any]) -> None:
             access = contract["dataset"].get("block_major_access")
             if not isinstance(access, dict):
                 raise RuntimeError(f"{name} has a descriptor directory without a descriptor contract")
-            fingerprints = [access.get("companion_index"), *access.get("shards", [])]
+            fingerprints = [
+                access.get("companion_index"),
+                *access.get("shards", []),
+                *access.get("active_output_schedules", []),
+            ]
             for fingerprint in fingerprints:
                 if not isinstance(fingerprint, dict):
-                    raise RuntimeError(f"{name} block-major descriptor fingerprint is missing")
+                    raise RuntimeError(f"{name} block-major sidecar fingerprint is missing")
                 path = Path(fingerprint["path"])
                 if not path.is_file() or file_identity(path) != fingerprint["file_identity"]:
-                    raise RuntimeError(f"{name} block-major descriptor identity changed: {path}")
+                    raise RuntimeError(f"{name} block-major sidecar identity changed: {path}")
                 if sha256_file(path) != fingerprint["sha256"]:
-                    raise RuntimeError(f"{name} block-major descriptor SHA-256 changed: {path}")
+                    raise RuntimeError(f"{name} block-major sidecar SHA-256 changed: {path}")
 
 
 def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str, Any]:
@@ -1031,8 +1418,11 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
     adapter_started_ns = time.perf_counter_ns()
     adapter = make_adapter(name, contract, adapter_samples, device)
     adapter_ready_ns = time.perf_counter_ns()
+    if isinstance(adapter, GalpAdapter):
+        adapter.set_process_scope_start(pipeline_started_ns)
     cold_prime_started_ns = time.perf_counter_ns()
-    adapter.prime_cold_start()
+    if contract["execution"].get("cold_protocol", "application-overlapped") == "application-overlapped":
+        adapter.prime_cold_start()
     cold_prime_submitted_ns = time.perf_counter_ns()
     model_key = "rgb" if adapter.domain == "rgb" else "dct"
     model_config = contract["models"][model_key]
@@ -1084,11 +1474,14 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             if device.type == "cuda":
                 torch.cuda.current_stream(device).synchronize()
             _record_keepalive(batch)
+            del batch
 
         adapter.begin_measurement()
         if device.type == "cuda":
             torch.cuda.current_stream(device).synchronize()
             torch.cuda.reset_peak_memory_stats(device)
+        gpu_utilization = _GpuUtilizationSampler(device)
+        gpu_utilization.start()
         latency_ms: list[float] = []
         load_ms: list[float] = []
         h2d_ms: list[float] = []
@@ -1104,6 +1497,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
         predictions_top5: list[np.ndarray] = []
         process_started = time.process_time()
         host_before = _process_memory_snapshot()
+        process_io_before = _process_io_snapshot()
         feature_sink: np.memmap | None = None
         feature_sink_offset = 0
         repeat_to_first_batch_ms: float | None = None
@@ -1183,9 +1577,18 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                             "segment_image_count",
                             "segment_first_image_id",
                             "segment_last_image_id",
+                            "segment_mode",
+                            "segment_shard_id",
+                            "segment_cross_shard_count",
+                            "shard_reactivation_count",
+                            "duplicate_physical_read_count",
+                            "rowgroup_revisit_count",
+                            "vector_run_revisit_count",
+                            "physical_read_order_inversions",
                             "planned_vector_count",
                             "actual_vector_count",
                             "full_vector_count",
+                            "selected_compressed_payload_bytes",
                             "compressed_payload_bytes_read",
                             "full_compressed_payload_bytes",
                             "pread_count",
@@ -1193,6 +1596,9 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                             "planning_ms",
                             "prefetch_producer_active_ms",
                             "prefetch_ordered_submission_ms",
+                            "prefetch_submit_to_ready_ms",
+                            "prefetch_consumer_wait_ms",
+                            "prefetch_process_scope_ready_ms",
                             "sync_rowgroup_read_ms",
                             "workset_count",
                             "workset_build_ms",
@@ -1210,6 +1616,17 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                             "planless_transform_source_contribution_visit_count",
                             "planless_transform_output_workset_ownership_count",
                             "planless_transform_active_output_schedule_build_count",
+                            "active_output_schedule_sidecar_hit_count",
+                            "active_output_schedule_sidecar_miss_count",
+                            "active_output_schedule_sidecar_reject_count",
+                            "active_output_schedule_sidecar_persist_count",
+                            "active_output_schedule_sidecar_bytes",
+                            "active_output_schedule_interval_count",
+                            "active_output_schedule_mapped_bytes_peak",
+                            "active_output_schedule_load_ms",
+                            "active_output_schedule_validation_ms",
+                            "active_output_schedule_materialize_ms",
+                            "active_output_schedule_persist_ms",
                             "coordinate_group_lookup_count",
                             "coordinate_group_index_entries",
                             "coordinate_group_index_populated",
@@ -1224,9 +1641,15 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             load_ms.append((load_finished - load_started) / 1.0e6)
             h2d_ms.append((h2d_finished - h2d_started) / 1.0e6)
             model_ms.append((model_finished - model_started) / 1.0e6)
+            # Release per-model-batch views before the next adapter.load().
+            # Deferred output allocation can then reclaim an exhausted full
+            # shard before releasing the next native submission gate.
+            del batch
 
         if feature_sink is not None:
             feature_sink.flush()
+        gpu_utilization.stop()
+        process_io = _process_io_delta(process_io_before, _process_io_snapshot())
         host_after = _process_memory_snapshot()
         seconds = sum(latency_ms) / 1000.0
         images = sum(len(batch) for batch in measured_batches)
@@ -1239,8 +1662,26 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             "seconds": seconds,
             "throughput_images_per_s": images / seconds,
             "time_to_first_batch_ms": latency_ms[0],
+            "first_shard_ready_ms": (
+                float(native_segments[0]["prefetch_submit_to_ready_ms"])
+                if native_segments
+                and "prefetch_submit_to_ready_ms" in native_segments[0]
+                and str(native_segments[0].get("segment_mode")) == "manifest-shard"
+                else None
+            ),
+            "process_scope_first_shard_ready_ms": (
+                float(native_segments[0]["prefetch_process_scope_ready_ms"])
+                if repeat == 0
+                and native_segments
+                and "prefetch_process_scope_ready_ms" in native_segments[0]
+                and str(native_segments[0].get("segment_mode")) == "manifest-shard"
+                else None
+            ),
             "repeat_scope_time_to_first_batch_ms": repeat_to_first_batch_ms,
             "repeat_scope_seconds": (time.perf_counter_ns() - repeat_started_ns) / 1.0e9,
+            "repeat_scope_throughput_images_per_s": (
+                images / ((time.perf_counter_ns() - repeat_started_ns) / 1.0e9)
+            ),
             "process_scope_time_to_first_batch_ms": process_scope_to_first_batch_ms,
             "process_scope_throughput_images_per_s": (
                 images / ((time.perf_counter_ns() - pipeline_started_ns) / 1.0e9)
@@ -1262,8 +1703,14 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             "host_rss_before_bytes": host_before["rss_bytes"],
             "host_rss_after_bytes": host_after["rss_bytes"],
             "host_peak_rss_bytes": host_after["peak_rss_bytes"],
+            "process_io": process_io,
             "peak_torch_gpu_allocated_bytes": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
             "peak_torch_gpu_reserved_bytes": int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else 0,
+            "gpu_utilization_percent": (
+                distribution(gpu_utilization.values)
+                if gpu_utilization.values
+                else {"count": 0, "error": gpu_utilization.error}
+            ),
             "native_totals": native_totals,
             "native_segments": native_segments,
             "sample_trace": measured_trace,

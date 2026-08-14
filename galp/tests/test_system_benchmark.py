@@ -37,6 +37,7 @@ from shared.common import (  # noqa: E402
 )
 from diagnostics.audit_planless_storage_io import _counter_values  # noqa: E402
 from diagnostics.direct_dct import (  # noqa: E402
+    _latency_distribution_ms,
     _make_benchmark_image_ids,
     _scale_to_rgbnomore_dct_range,
     adapt_galp_batch_to_rgbnomore,
@@ -66,6 +67,7 @@ from diagnostics.scheduler_matrix import (  # noqa: E402
     _pareto_frontier,
     _policy_specs,
     _residency_bounds,
+    _serial_model_reference,
 )
 from inference.validate import (  # noqa: E402
     _aggregate_pipeline,
@@ -78,6 +80,19 @@ from inference.crop_io_ab import validate_crop_io_ab_results  # noqa: E402
 
 
 class SystemBenchmarkTest(unittest.TestCase):
+    def test_scheduler_rejects_slower_serial_model_as_model_only_ceiling(self) -> None:
+        reference = _serial_model_reference(50, 9.8, 11.0)
+        self.assertFalse(reference["consistent_with_model_only_upper_bound"])
+        self.assertIsNone(reference["model_only_ceiling_images_per_s_from_serial_p50"])
+        self.assertAlmostEqual(reference["serial_model_period_ceiling_images_per_s"], 50_000 / 11.0)
+
+    def test_direct_dct_latency_distribution_uses_interpolated_percentiles(self) -> None:
+        summary = _latency_distribution_ms([4.0, 1.0, 3.0, 2.0])
+        self.assertEqual(summary["count"], 4)
+        self.assertEqual(summary["mean"], 2.5)
+        self.assertEqual(summary["p50"], 2.5)
+        self.assertAlmostEqual(summary["p95"], 3.85)
+
     def test_crop_io_ab_accepts_same_outputs_and_real_physical_byte_reduction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -676,7 +691,7 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(PRESETS["e2e"]["repeats"], 5)
         self.assertEqual(
             E2E_PIPELINES,
-            ("galp_planless", "galp_fixed_items", "rgbnomore", "dali"),
+            ("galp_planless", "pytorch", "rgbnomore", "dali"),
         )
         self.assertGreater(PRESETS["e2e"]["measurement_batches"], PRESETS["smoke"]["measurement_batches"])
         self.assertEqual(GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, 1.10)

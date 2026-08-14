@@ -317,6 +317,38 @@ TEST(CompactDescriptorV3, AcceptsZeroPayloadConstantVectorRowgroup) {
 	EXPECT_TRUE(read.rowgroups.front().bytes.empty());
 }
 
+TEST(CompactDescriptorV3, MappingTelemetryTracksRetainedLifetime) {
+	TemporaryDirectory temp;
+	const auto         standard = temp.path() / "mapping-standard.fls";
+	const auto         compact  = temp.path() / "mapping-compact.fls";
+	write_standard_vector_rowgroups(standard);
+
+	galp::format::CompactV3BuildOptions options;
+	options.vector_size   = 1024U;
+	options.spatial_order = 3U;
+	(void)galp::format::compact_standard_fls_to_v3(standard, compact, options);
+
+	const auto before = galp::format::compact_descriptor_v3_mapping_stats();
+	size_t     descriptor_bytes = 0U;
+	{
+		auto descriptor = galp::format::CompactDescriptorV3::Open(compact);
+		descriptor_bytes = descriptor.descriptor_bytes();
+		ASSERT_GT(descriptor_bytes, 0U);
+		const auto live = galp::format::compact_descriptor_v3_mapping_stats();
+		EXPECT_EQ(live.current_mapping_count, before.current_mapping_count + 1U);
+		EXPECT_EQ(live.map_count, before.map_count + 1U);
+		EXPECT_GT(live.current_mapped_bytes, before.current_mapped_bytes);
+		EXPECT_GE(live.peak_mapping_count, live.current_mapping_count);
+		EXPECT_GE(live.peak_mapped_bytes, live.current_mapped_bytes);
+		descriptor.release_resident_pages();
+		EXPECT_EQ(descriptor.rowgroup_count(), 2U);
+	}
+	const auto after = galp::format::compact_descriptor_v3_mapping_stats();
+	EXPECT_EQ(after.current_mapping_count, before.current_mapping_count);
+	EXPECT_EQ(after.current_mapped_bytes, before.current_mapped_bytes);
+	EXPECT_EQ(after.unmap_count, before.unmap_count + 1U);
+}
+
 TEST(CompactDescriptorV3, RejectsZeroPayloadWithPayloadDependentOperator) {
 	TemporaryDirectory temp;
 	const auto         standard = temp.path() / "malformed-standard.fls";

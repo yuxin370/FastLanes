@@ -37,6 +37,7 @@ enum class JpegDctRuntimePolicyReason {
 
 enum class JpegDctReadStrategy {
 	kRunIntervalExact,
+	kRunIntervalBounded,
 	kBitmapExact,
 	kFullRowgroup,
 };
@@ -204,6 +205,9 @@ struct JpegDctDeviceBlockMajorPlanlessPlan {
 	std::vector<uint32_t>                                coordinate_group_indices;
 	std::vector<JpegDctDeviceBlockMajorRankCell>        rank_cells;
 	std::vector<uint8_t>                                rank_payload;
+	std::filesystem::path                               active_output_schedule_directory;
+	uint64_t                                            canonical_plan_digest = 0U;
+	bool                                                active_output_schedule_sidecar_enabled = false;
 };
 
 // One rowgroup belongs to exactly one bounded execution workset.  These
@@ -222,11 +226,26 @@ struct JpegDctDeviceBlockMajorRowgroupWorkset {
 struct JpegDctDeviceBlockMajorActiveOutputSchedule {
 	std::vector<uint64_t> offsets;
 	std::vector<uint32_t> active_output_blocks;
+	// A loaded compressed sidecar keeps its mmap alive through the current
+	// execution window. The process cache retains at most the current/next two
+	// mappings under a byte cap; the expanded uint32 upload vector remains the
+	// only device-facing representation.
+	std::shared_ptr<const void> sidecar_mapping;
 	uint64_t              logical_output_block_count = 0U;
 	uint64_t              source_contribution_count  = 0U;
 	uint64_t              source_contribution_visit_count = 0U;
 	uint64_t              output_workset_ownership_count = 0U;
 	uint64_t              temporary_bytes_peak       = 0U;
+	uint64_t              sidecar_bytes               = 0U;
+	uint64_t              sidecar_mapped_bytes        = 0U;
+	uint64_t              sidecar_interval_count      = 0U;
+	bool                  sidecar_hit                 = false;
+	bool                  sidecar_rejected            = false;
+	bool                  sidecar_persisted           = false;
+	double                sidecar_load_ms             = 0.0;
+	double                sidecar_validation_ms       = 0.0;
+	double                sidecar_materialize_ms      = 0.0;
+	double                sidecar_persist_ms          = 0.0;
 	double                group_workset_build_ms      = 0.0;
 	double                active_output_count_ms      = 0.0;
 	double                active_output_prefix_ms     = 0.0;
@@ -251,6 +270,7 @@ void build_block_major_coordinate_group_lookup(JpegDctDeviceBlockMajorPlanlessPl
 struct JpegDctDeviceRowgroupPlan {
 	uint32_t                                          rowgroup_index  = 0;
 	uint32_t                                          source_shard_id = std::numeric_limits<uint32_t>::max();
+	uint64_t                                          source_payload_crc64 = 0U;
 	const std::filesystem::path*                      source_fls_path = nullptr;
 	std::vector<JpegDctDeviceGatherItem>              items;
 	std::vector<JpegDctDeviceProjectionItem>          projection_items;
@@ -298,6 +318,7 @@ struct JpegDctDeviceBatchPlan {
 	JpegDctDeviceLayout                                  layout = JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
 	std::shared_ptr<std::vector<JpegDctDeviceShardPlan>> shards =
 	    std::make_shared<std::vector<JpegDctDeviceShardPlan>>();
+	std::shared_ptr<const std::vector<std::filesystem::path>> static_metadata_prewarm_paths;
 	std::shared_ptr<std::vector<uint32_t>>  fixed_transform_item_order    = std::make_shared<std::vector<uint32_t>>();
 	std::shared_ptr<std::vector<uint32_t>>  fixed_transform_group_offsets = std::make_shared<std::vector<uint32_t>>();
 	std::vector<JpegDctDeviceImageLayout>   image_layouts;
@@ -322,8 +343,20 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     host_global_transform_sort_items       = 0;
 	size_t                                     planless_axis_program_count            = 0;
 	size_t                                     planless_axis_phase_matrix_count       = 0;
+	size_t                                     planless_axis_program_capacity_contract_count = 0;
+	bool                                       planless_axis_program_capacity_contract_complete = false;
 	size_t                                     compact_plan_bytes                     = 0;
 	size_t                                     compact_plan_peak_bytes                = 0;
+	size_t                                     canonical_template_hit_count           = 0;
+	size_t                                     canonical_template_miss_count          = 0;
+	size_t                                     canonical_template_sidecar_bytes       = 0;
+	uint64_t                                   canonical_template_audit_digest        = 0U;
+	double                                     canonical_template_load_ms             = 0.0;
+	double                                     canonical_template_validation_ms       = 0.0;
+	size_t                                     duplicate_physical_read_count          = 0;
+	size_t                                     rowgroup_revisit_count                 = 0;
+	size_t                                     vector_run_revisit_count               = 0;
+	size_t                                     physical_read_order_inversions         = 0;
 	size_t                                     coordinate_group_lookup_count          = 0;
 	size_t                                     coordinate_group_index_entries         = 0;
 	size_t                                     coordinate_group_index_populated       = 0;
@@ -342,6 +375,75 @@ struct JpegDctDeviceBatchPlan {
 	double                                     planned_selected_vector_ratio      = 0.0;
 	double                                     estimated_selected_vector_ratio    = 0.0;
 	double                                     planning_ms                        = 0.0;
+	// Phase-separated planning telemetry.  Counts are per prepared batch;
+	// current/peak values are snapshots of the reader-owned caches.
+	double                                     plan_device_batch_ms               = 0.0;
+	double                                     compile_io_plan_ms                 = 0.0;
+	double                                     reader_lookup_ms                   = 0.0;
+	double                                     descriptor_open_ms                 = 0.0;
+	double                                     schema_plan_build_ms               = 0.0;
+	double                                     static_metadata_wait_ms            = 0.0;
+	size_t                                     reader_cache_hit_count             = 0U;
+	size_t                                     reader_cache_miss_count            = 0U;
+	size_t                                     reader_cache_eviction_count        = 0U;
+	size_t                                     static_metadata_cache_hit_count    = 0U;
+	size_t                                     static_metadata_cache_miss_count   = 0U;
+	size_t                                     descriptor_map_count               = 0U;
+	size_t                                     static_metadata_wait_count         = 0U;
+	double                                     parallel_reader_resolve_ms         = 0.0;
+	size_t                                     parallel_reader_resolve_workers    = 0U;
+	double                                     dynamic_image_planning_ms          = 0.0;
+	double                                     crop_geometry_planning_ms          = 0.0;
+	double                                     crop_interval_planning_ms          = 0.0;
+	double                                     axis_program_planning_ms           = 0.0;
+	double                                     rowgroup_binding_planning_ms       = 0.0;
+	double                                     plan_finalize_ms                   = 0.0;
+	size_t                                     active_reader_count                = 0U;
+	size_t                                     active_reader_peak_count           = 0U;
+	size_t                                     static_metadata_count              = 0U;
+	size_t                                     static_metadata_peak_count         = 0U;
+	size_t                                     static_metadata_bytes              = 0U;
+	size_t                                     static_metadata_peak_bytes         = 0U;
+	size_t                                     planning_unique_shard_count        = 0U;
+	size_t                                     planning_rowgroup_binding_count    = 0U;
+	bool                                       static_metadata_prewarm_performed  = false;
+	double                                     static_metadata_prewarm_ms         = 0.0;
+	size_t                                     static_metadata_prewarm_shards     = 0U;
+	size_t                                     static_metadata_prewarm_workers    = 0U;
+	size_t                                     sparse_recipe_reader_hit_count     = 0U;
+	size_t                                     sparse_recipe_reader_miss_count    = 0U;
+	size_t                                     sparse_recipe_rowgroup_hit_count   = 0U;
+	size_t                                     sparse_recipe_rowgroup_miss_count  = 0U;
+	size_t                                     sparse_recipe_sidecar_bytes        = 0U;
+	size_t                                     sparse_recipe_record_count         = 0U;
+	size_t                                     sparse_recipe_source_metadata_bytes = 0U;
+	size_t                                     sparse_recipe_source_metadata_pread_count = 0U;
+	double                                     sparse_descriptor_open_ms          = 0.0;
+	double                                     sparse_source_validation_ms        = 0.0;
+	double                                     sparse_access_index_build_ms       = 0.0;
+	double                                     sparse_recipe_load_ms              = 0.0;
+	double                                     sparse_recipe_validation_ms        = 0.0;
+	double                                     sparse_recipe_lookup_ms            = 0.0;
+	double                                     sparse_recipe_rehydrate_ms         = 0.0;
+	double                                     sparse_recipe_rehydrate_service_ms = 0.0;
+	size_t                                     sparse_recipe_rehydrate_workers    = 0U;
+	double                                     sparse_endpoint_resolution_ms      = 0.0;
+	double                                     sparse_range_gather_ms             = 0.0;
+	double                                     sparse_range_sort_exact_coalesce_ms = 0.0;
+	double                                     sparse_bounded_coalesce_ms          = 0.0;
+	uint32_t                                   bounded_read_amplification_ppm      = 1'000'000U;
+	uint32_t                                   bounded_read_local_amplification_ppm = 0U;
+	size_t                                     bounded_read_max_run_bytes          = 0U;
+	bool                                       bounded_io_uring_enabled             = false;
+	uint32_t                                   bounded_io_uring_queue_depth         = 0U;
+	size_t                                     bounded_exact_storage_bytes         = 0U;
+	size_t                                     bounded_physical_storage_bytes      = 0U;
+	size_t                                     bounded_merged_gap_bytes            = 0U;
+	size_t                                     bounded_exact_extent_count          = 0U;
+	size_t                                     bounded_physical_run_count          = 0U;
+	size_t                                     bounded_selected_gap_count          = 0U;
+	size_t                                     bounded_max_run_rejected_gap_count  = 0U;
+	size_t                                     bounded_budget_rejected_gap_count   = 0U;
 	size_t                                     plan_cache_hits                    = 0;
 	size_t                                     plan_cache_misses                  = 0;
 	size_t                                     plan_cache_evictions               = 0;
@@ -361,6 +463,8 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     transform_blocks_per_launch = 0;
 	size_t                                     transform_ctas_per_launch   = 0;
 	bool                                       use_low_priority_streams    = false;
+	bool                                       async_planless_completion   = false;
+	std::shared_ptr<JpegDctDeviceTransformSubmissionGate> transform_submission_gate;
 	JpegDctBlockMajorDoubleBufferPolicy        block_major_double_buffer_policy =
 	    JpegDctBlockMajorDoubleBufferPolicy::kAutomatic;
 	size_t automatic_sparse_storage_candidate_rowgroup_count = 0U;
@@ -380,10 +484,12 @@ struct JpegDctDeviceBatchPlan {
 	size_t adaptive_selected_memory_fit_rowgroup_count        = 0U;
 	size_t adaptive_full_memory_fit_rowgroup_count            = 0U;
 	size_t run_interval_exact_rowgroup_count                  = 0U;
+	size_t run_interval_bounded_rowgroup_count                = 0U;
 	size_t bitmap_exact_rowgroup_count                        = 0U;
 	size_t full_rowgroup_strategy_count                       = 0U;
 	bool                                       host_io_staged             = false;
 	double                                     host_io_staging_ms         = 0.0;
+	double                                     compact_read_group_planning_ms = 0.0;
 	size_t                                     host_io_staged_rowgroups   = 0U;
 	// Compact-v3 host staging runs before ordered CUDA submission. Preserve
 	// its batch-read and pinned-arena evidence on the prepared plan so Execute
@@ -397,6 +503,15 @@ struct JpegDctDeviceBatchPlan {
 	size_t compact_batch_buffer_pageable_fallback_count = 0U;
 	size_t compact_batch_read_group_count               = 0U;
 	size_t compact_batch_read_worker_count              = 0U;
+	bool   compact_batch_pool_prewarm_performed          = false;
+	size_t compact_batch_pool_prewarmed_slots            = 0U;
+	size_t compact_batch_pool_prewarmed_bytes            = 0U;
+	size_t compact_batch_pool_largest_size_class_bytes   = 0U;
+	bool   compact_batch_pool_capacity_contract_complete = false;
+	size_t compact_batch_pool_capacity_contract_images   = 0U;
+	size_t compact_batch_pool_capacity_contract_groups   = 0U;
+	size_t compact_batch_pool_capacity_contract_batches  = 0U;
+	size_t compact_batch_pool_capacity_contract_bytes    = 0U;
 };
 
 } // namespace galp::jpeg::detail
