@@ -16,11 +16,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from galp.profiles.rgbnomore import VALIDATION
 from galp.benchmarks.system_rgbnomore.shared.common import GALP_RUNTIME_PROFILE
-from galp.torch import DirectDctReader
-from galp.torch.diagnostics import (
+from galp.torch import DirectDctMetrics, DirectDctReader
+from galp.diagnostics.direct_dct import (
     execution_stats as public_execution_stats,
     execution_stats_snapshot as public_execution_stats_snapshot,
-    prefetch_stats,
+    pipeline_stats,
 )
 
 
@@ -93,37 +93,15 @@ class DirectDctTrainingBatch:
     def transform_descriptors(self) -> list[dict[str, Any]]:
         return [dict(value) for value in self.native_batch.transform_descriptors]
 
+    @property
+    def metrics(self) -> Any:
+        return self.native_batch.metrics
+
     def native_execution_stats(self) -> dict[str, Any]:
         return optional_native_execution_stats(self.native_batch)
 
     def native_execution_stats_snapshot(self) -> dict[str, Any]:
         return optional_native_execution_stats_snapshot(self.native_batch)
-
-
-class DirectDctTrainingHandle:
-    """Small training-facing future; native scheduling details stay private."""
-
-    def __init__(self, native_handle: Any) -> None:
-        self._native_handle = native_handle
-
-    @property
-    def ready(self) -> bool:
-        return bool(getattr(self._native_handle, "ready", False))
-
-    @property
-    def started(self) -> bool:
-        return bool(getattr(self._native_handle, "started", False))
-
-    @property
-    def telemetry(self) -> dict[str, float]:
-        return prefetch_stats(self._native_handle)
-
-    def read(self) -> DirectDctTrainingBatch:
-        return DirectDctTrainingBatch(self._native_handle.read())
-
-    def cancel(self) -> bool:
-        cancel = getattr(self._native_handle, "cancel", None)
-        return bool(cancel()) if callable(cancel) else False
 
 
 class DirectDctTrainingReader:
@@ -148,27 +126,40 @@ class DirectDctTrainingReader:
                 "GALP native profile does not match the training contract: "
                 f"expected {GALP_RUNTIME_PROFILE!r}, got {runtime_policy_id!r}"
             )
+        self._pipeline = self._reader.pipeline(VALIDATION)
 
     @property
     def image_count(self) -> int:
         return int(self._reader.image_count)
 
-    def prefetch_batch(
+    def start(
         self,
-        image_ids: Sequence[int],
+        image_id_batches: Sequence[Sequence[int]],
         *,
-        transforms: Sequence[dict[str, Any]],
-    ) -> DirectDctTrainingHandle:
-        native_handle = self._reader.prefetch(
-            image_ids,
-            VALIDATION,
-            transforms=[dict(value) for value in transforms],
+        transforms_by_batch: Sequence[Sequence[dict[str, Any]]],
+    ) -> None:
+        self._pipeline.start(
+            [
+                [int(value) for value in image_ids]
+                for image_ids in image_id_batches
+            ],
+            transforms_by_batch=[
+                [dict(value) for value in transforms]
+                for transforms in transforms_by_batch
+            ],
         )
-        # Training has no preceding model whose completion must gate this
-        # submission.  Release the profile's event-owned handoff inside the
-        # facade so callers never manipulate the native submission gate.
-        native_handle._release_submission()
-        return DirectDctTrainingHandle(native_handle)
+
+    def next_batch(self) -> DirectDctTrainingBatch:
+        return DirectDctTrainingBatch(next(self._pipeline))
+
+    def close(self) -> None:
+        self._pipeline.close()
+
+    def metrics(self) -> DirectDctMetrics:
+        return self._pipeline.metrics
+
+    def prefetched_batch_count(self) -> int:
+        return int(pipeline_stats(self._pipeline)["prefetched_batch_count"])
 
 
 class NativeExecutionStatsAccumulator:

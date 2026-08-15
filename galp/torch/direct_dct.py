@@ -6,6 +6,7 @@ import importlib
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -14,6 +15,7 @@ from galp.profiles import DirectDctProfile
 
 
 PROFILE_SCHEMA = "galp-direct-dct-profile-v1"
+METRICS_SCHEMA = "galp-direct-dct-metrics-v2"
 
 
 def _load_native_module(module_path: Path | None) -> ModuleType:
@@ -30,6 +32,46 @@ def _profile_id(profile: DirectDctProfile | str) -> str:
     if isinstance(profile, str) and profile:
         return profile
     raise TypeError("profile must be a DirectDctProfile or non-empty profile id")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectDctMetrics:
+    """Versioned, implementation-independent Direct-DCT observations.
+
+    ``complete`` is false while native GPU timing events are still pending.
+    Reading metrics is always non-blocking; use a natural application
+    synchronization boundary before requiring final timing values.
+    """
+
+    complete: bool
+    consumer_wait_ms: float
+    submit_to_ready_ms: float
+    producer_ms: float
+    planning_ms: float
+    io_ms: float
+    decode_ms: float
+    transform_ms: float
+    logical_bytes: int
+    physical_bytes: int
+    peak_transient_bytes: int
+
+    @classmethod
+    def _from_native(cls, values: Mapping[str, Any]) -> "DirectDctMetrics":
+        if values.get("schema") != METRICS_SCHEMA:
+            raise RuntimeError("native Direct-DCT metrics schema is incompatible")
+        return cls(
+            complete=bool(values["complete"]),
+            consumer_wait_ms=float(values["consumer_wait_ms"]),
+            submit_to_ready_ms=float(values["submit_to_ready_ms"]),
+            producer_ms=float(values["producer_ms"]),
+            planning_ms=float(values["planning_ms"]),
+            io_ms=float(values["io_ms"]),
+            decode_ms=float(values["decode_ms"]),
+            transform_ms=float(values["transform_ms"]),
+            logical_bytes=int(values["logical_bytes"]),
+            physical_bytes=int(values["physical_bytes"]),
+            peak_transient_bytes=int(values["peak_transient_bytes"]),
+        )
 
 
 class DirectDctBatch:
@@ -69,47 +111,73 @@ class DirectDctBatch:
     def layout(self) -> str:
         return str(self._native.layout)
 
-    def record_stream(self) -> None:
-        """Keep this batch alive for work already queued on the current stream."""
+    @property
+    def metrics(self) -> DirectDctMetrics:
+        """Return a non-blocking snapshot of this batch's stable metrics.
 
-        self._native.record_stream()
+        Event-derived GPU timings are valid when ``complete`` is true. Reading
+        this property never adds a synchronization point to the model hot path.
+        """
+
+        return DirectDctMetrics._from_native(dict(self._native.metrics))
 
 
-class DirectDctFuture:
-    """Single-consumer future returned by :meth:`DirectDctReader.prefetch`."""
+class DirectDctPipeline:
+    """Native-owned bounded iterator for one semantic Direct-DCT profile."""
 
     __slots__ = ("_native", "profile_id")
 
-    def __init__(self, native_future: Any, profile_id: str) -> None:
-        self._native = native_future
+    def __init__(self, native_pipeline: Any, profile_id: str) -> None:
+        self._native = native_pipeline
         self.profile_id = profile_id
 
-    @property
-    def ready(self) -> bool:
-        return bool(self._native.ready)
+    def start(
+        self,
+        image_id_batches: Sequence[Sequence[int]],
+        *,
+        transforms_by_batch: Sequence[Sequence[Mapping[str, Any]] | None] | None = None,
+    ) -> "DirectDctPipeline":
+        batches = [[int(value) for value in batch] for batch in image_id_batches]
+        if any(not batch for batch in batches):
+            raise ValueError("Direct-DCT batches must not be empty")
+        native_transforms: list[list[dict[str, Any]] | None] | None = None
+        if transforms_by_batch is not None:
+            if len(transforms_by_batch) != len(batches):
+                raise ValueError(
+                    "transforms_by_batch must contain exactly one entry per batch"
+                )
+            native_transforms = [
+                None if transforms is None else [dict(value) for value in transforms]
+                for transforms in transforms_by_batch
+            ]
+        self._native.reset(batches, transforms_by_batch=native_transforms)
+        return self
+
+    def __iter__(self) -> "DirectDctPipeline":
+        return self
+
+    def __next__(self) -> DirectDctBatch:
+        return DirectDctBatch(next(self._native), self.profile_id)
+
+    def close(self) -> None:
+        self._native.close()
 
     @property
-    def started(self) -> bool:
-        return bool(self._native.started)
+    def metrics(self) -> DirectDctMetrics:
+        """Return non-blocking cumulative metrics for consumed batches.
 
-    @property
-    def active(self) -> bool:
-        return bool(self._native.active)
+        The native pipeline retains only the batches whose timing events are
+        pending and finalizes them opportunistically. After the application's
+        normal CUDA synchronization boundary, ``complete`` must be true.
+        """
 
-    @property
-    def finished(self) -> bool:
-        return bool(self._native.finished)
+        return DirectDctMetrics._from_native(dict(self._native.metrics))
 
-    def read(self) -> DirectDctBatch:
-        return DirectDctBatch(self._native.read(), self.profile_id)
+    def __enter__(self) -> "DirectDctPipeline":
+        return self
 
-    def cancel(self) -> bool:
-        return bool(self._native.cancel())
-
-    def _release_submission(self) -> bool:
-        """Private compatibility hook for the benchmark overlap coordinator."""
-
-        return bool(self._native.release_submission())
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
 
 class DirectDctReader:
@@ -132,9 +200,12 @@ class DirectDctReader:
             Path(module_path) if module_path is not None else None
         )
         self._binding_import_ms = (time.perf_counter() - binding_started) * 1000.0
-        if getattr(module, "DIRECT_DCT_PROFILE_SCHEMA", None) != PROFILE_SCHEMA:
+        if (
+            getattr(module, "DIRECT_DCT_PROFILE_SCHEMA", None) != PROFILE_SCHEMA
+            or getattr(module, "DIRECT_DCT_METRICS_SCHEMA", None) != METRICS_SCHEMA
+        ):
             raise RuntimeError(
-                "GALP native binding does not implement the public Direct-DCT profile API; "
+                "GALP native binding does not implement the public Direct-DCT pipeline API; "
                 "rebuild the binding"
             )
         self._module = module
@@ -144,14 +215,6 @@ class DirectDctReader:
     @property
     def image_count(self) -> int:
         return int(self._native.image_count)
-
-    @property
-    def binding_import_ms(self) -> float:
-        return self._binding_import_ms
-
-    @property
-    def initialization_stats(self) -> dict[str, Any]:
-        return dict(self._native.initialization_stats)
 
     def profile_info(self, profile: DirectDctProfile | str) -> dict[str, Any]:
         profile_id = _profile_id(profile)
@@ -164,42 +227,13 @@ class DirectDctReader:
             self._validated_profiles[profile_id] = info
         return dict(self._validated_profiles[profile_id])
 
-    def plan(
-        self,
-        image_ids: Sequence[int],
-        profile: DirectDctProfile | str,
-        *,
-        transforms: Sequence[Mapping[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        profile_id = self.profile_info(profile)["id"]
-        native_transforms = (
-            None if transforms is None else [dict(value) for value in transforms]
-        )
-        return dict(
-            self._native.plan(
-                [int(value) for value in image_ids],
-                profile_id,
-                transforms=native_transforms,
-            )
-        )
+    def pipeline(
+        self, profile: DirectDctProfile | str
+    ) -> DirectDctPipeline:
+        """Create a reusable native pipeline for a semantic profile."""
 
-    def prefetch(
-        self,
-        image_ids: Sequence[int],
-        profile: DirectDctProfile | str,
-        *,
-        transforms: Sequence[Mapping[str, Any]] | None = None,
-    ) -> DirectDctFuture:
         profile_id = self.profile_info(profile)["id"]
-        native_transforms = (
-            None if transforms is None else [dict(value) for value in transforms]
-        )
-        native_future = self._native.prefetch(
-            [int(value) for value in image_ids],
-            profile_id,
-            transforms=native_transforms,
-        )
-        return DirectDctFuture(native_future, profile_id)
+        return DirectDctPipeline(self._native.pipeline(profile_id), profile_id)
 
     def read(
         self,
@@ -219,17 +253,11 @@ class DirectDctReader:
         )
         return DirectDctBatch(native_batch, profile_id)
 
-    def image_metadata(self, global_image_index: int) -> dict[str, Any]:
-        return dict(self._native.image_metadata(int(global_image_index)))
-
-    def rowgroup_storage_bytes(
-        self, shard_id: int, rowgroup_indices: Sequence[int]
-    ) -> int:
-        return int(
-            self._native.rowgroup_storage_bytes(
-                int(shard_id), [int(value) for value in rowgroup_indices]
-            )
-        )
-
-
-__all__ = ["DirectDctBatch", "DirectDctFuture", "DirectDctReader", "PROFILE_SCHEMA"]
+__all__ = [
+    "DirectDctBatch",
+    "DirectDctMetrics",
+    "DirectDctPipeline",
+    "DirectDctReader",
+    "METRICS_SCHEMA",
+    "PROFILE_SCHEMA",
+]

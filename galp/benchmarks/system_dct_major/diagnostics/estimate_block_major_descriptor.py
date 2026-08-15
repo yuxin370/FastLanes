@@ -28,6 +28,7 @@ for path in (BENCHMARK_ROOT, REPO_ROOT):
 
 from common import parse_manifest, write_json  # noqa: E402
 from galp.torch import DirectDctReader  # noqa: E402
+from galp.diagnostics.direct_dct import image_metadata  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +75,7 @@ def main() -> None:
             shards[shard_cursor]["image_count"]
         ):
             shard_cursor += 1
-        metadata = reader.image_metadata(image_index)
+        metadata = image_metadata(reader, image_index)
         components = _image_components(metadata)
         images.append(components)
         present_component_count += len(components)

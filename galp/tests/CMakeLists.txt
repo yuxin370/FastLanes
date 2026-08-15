@@ -4,6 +4,7 @@ add_executable(galp_tests
         galp_test.cu
 		delta_test.cu
         reader_test.cu
+        device_arena_test.cu
         workset_selected_vectors_test.cu
 )
 
@@ -186,7 +187,7 @@ if (GALP_ENABLE_INSTALL)
 endif ()
 
 gtest_discover_tests(galp_tests
-        TEST_FILTER "WorksetSelectedVectors.*"
+        TEST_FILTER "DeviceArenaBackingRegions.*:WorksetSelectedVectors.*"
         DISCOVERY_TIMEOUT 60
         PROPERTIES LABELS "galp-workset-cpu"
 )

@@ -70,6 +70,7 @@ from training.optimizer import (
     resolved_scheduler_config,
 )
 from training.pipeline import (
+    CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
     TrainingBatch,
     TrainingPipelineAdapter,
     TrainingSample,
@@ -186,7 +187,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--prefetch-depth", type=int, default=2)
     parser.add_argument("--distributed-rank", type=int, default=0)
     parser.add_argument("--distributed-world-size", type=int, default=1)
     parser.add_argument(
@@ -281,8 +281,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--output-dir is required unless --resume-run is used")
     if args.resume_run is None and (args.train_manifest is None or args.val_manifest is None):
         raise ValueError("--train-manifest and --val-manifest are required")
-    if args.batch_size <= 0 or args.workers < 0 or args.prefetch_depth < 0:
-        raise ValueError("batch-size must be positive; workers/prefetch-depth must be non-negative")
+    if args.batch_size <= 0 or args.workers < 0:
+        raise ValueError("batch-size must be positive and workers must be non-negative")
     if args.distributed_world_size <= 0:
         raise ValueError("--distributed-world-size must be positive")
     if args.distributed_rank < 0 or args.distributed_rank >= args.distributed_world_size:
@@ -470,7 +470,7 @@ def _runtime_files(rgbnomore_root: Path) -> tuple[list[Path], list[Path]]:
             FASTLANES_ROOT / "galp/benchmarks/system_rgbnomore/shared/manifest_contract.py",
             FASTLANES_ROOT / "galp/torch/direct_dct_torch.cpp",
             FASTLANES_ROOT / "galp/torch/direct_dct.py",
-            FASTLANES_ROOT / "galp/torch/diagnostics.py",
+            FASTLANES_ROOT / "galp/diagnostics/direct_dct.py",
             FASTLANES_ROOT / "galp/profiles/_base.py",
             FASTLANES_ROOT / "galp/profiles/rgbnomore.py",
             FASTLANES_ROOT / "galp/include/galp/direct_dct.hpp",
@@ -704,7 +704,7 @@ def _build_contract(
             "identity": ["epoch", "position", "logical_sample_id"],
             "seed": args.seed,
             "drop_last": args.drop_last,
-            "prefetch_depth_batches": args.prefetch_depth,
+            "lookahead_evidence_batches": CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
             "validation_basis": "optimizer_consumed_ids",
             "repeat_cursor_reset": True,
             "distributed_rank": args.distributed_rank,
@@ -723,7 +723,7 @@ def _build_contract(
                 "selected": args.execution_mode,
             },
             "worker_semantics": {
-                "galp": "native rowgroup-prefetch workers within one ordered asynchronous batch producer",
+                "galp": "native-owned DirectDctPipeline; Python workers do not configure its execution policy",
                 "rgbnomore": "PyTorch DataLoader processes",
                 "dali": "DALI pipeline threads",
                 "pytorch": "PyTorch DataLoader processes",
@@ -1108,7 +1108,6 @@ def _adapter_pipeline_config(
         raise ValueError(f"unknown adapter dataset split {split!r}")
     config = {
         **contract["pipelines"],
-        "prefetch_depth": args.prefetch_depth,
         "execution_mode": args.execution_mode,
     }
     if split == "validation":
@@ -1497,7 +1496,7 @@ def _first_step_probe(
         args,
         train_samples,
         seed=args.seed,
-        batch_count=1 + args.prefetch_depth,
+        batch_count=1 + CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
         start_cursor=initial["sample_order_cursor"],
     )
     decisions = _training_augmentation_batches(
@@ -1657,7 +1656,7 @@ def _run_repeat(
         args,
         train_samples,
         seed=args.seed,
-        batch_count=total_consumed_batches + args.prefetch_depth,
+        batch_count=total_consumed_batches + CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
         start_cursor=initial["sample_order_cursor"],
     )
     decisions = _training_augmentation_batches(
@@ -1742,8 +1741,8 @@ def _run_repeat(
             warmup_records.append(record)
             del batch
 
-        loader_before_measurement = adapter.loader_metrics()
         _sync(device, measurement_syncs, "measured_region_start")
+        loader_before_measurement = adapter.loader_metrics()
         measured_begin = time.perf_counter()
         for measured in range(measured_steps):
             index = warmup_steps + measured
@@ -1873,9 +1872,9 @@ def _run_repeat(
         measured_native_stats,
     )
 
-    ledger.record_prefetched(adapter.prefetched_read_identities())
     adapter.end()
     loader_metrics = adapter.loader_metrics()
+    ledger.record_prefetched(adapter.prefetched_read_identities())
     loader_measured_metrics: dict[str, Any] = {}
     for name in (
         "submitted_batches",
@@ -1887,13 +1886,28 @@ def _run_repeat(
         "producer_planning_seconds",
         "producer_io_staging_seconds",
         "producer_ordered_submission_seconds",
+        "producer_decode_seconds",
+        "producer_transform_seconds",
         "consumer_wait_seconds",
+        "logical_bytes",
+        "physical_bytes",
     ):
         if name in loader_after_measurement:
             loader_measured_metrics[name] = (
                 float(loader_after_measurement[name])
                 - float(loader_before_measurement.get(name, 0))
             )
+    loader_measured_metrics["native_pipeline_owned"] = bool(
+        loader_after_measurement.get("native_pipeline_owned", False)
+    )
+    if "peak_transient_bytes" in loader_after_measurement:
+        loader_measured_metrics["peak_transient_bytes"] = int(
+            loader_after_measurement["peak_transient_bytes"]
+        )
+    if pipeline == "galp" and loader_after_measurement.get("native_metrics_complete") is not True:
+        failures.append(
+            "GALP native pipeline metrics were not finalized at the synchronized measurement boundary"
+        )
     expected_consumed = _flatten(all_batches[:total_consumed_batches])
     order_validation = ledger.validate(expected_consumed)
     failures.extend(order_validation["failures"])
@@ -1939,7 +1953,7 @@ def _run_repeat(
     compute_upper_bound = processed / compute_seconds if compute_seconds else None
     measured_wait = float(loader_measured_metrics.get("consumer_wait_seconds", 0.0))
     measured_queue_consumed = int(loader_measured_metrics.get("consumed_batches", 0))
-    measured_queue_hits = int(loader_measured_metrics.get("queue_hit_batches", 0))
+    measured_queue_hits = loader_measured_metrics.get("queue_hit_batches")
     native_sync_reasons = {
         name: int(native_counter_totals.get(name, 0))
         for name in (
@@ -1995,8 +2009,8 @@ def _run_repeat(
         "loader_measured_metrics": {
             **loader_measured_metrics,
             "queue_hit_rate": (
-                measured_queue_hits / measured_queue_consumed
-                if measured_queue_consumed
+                float(measured_queue_hits) / measured_queue_consumed
+                if measured_queue_consumed and measured_queue_hits is not None
                 else None
             ),
             "consumer_wait_fraction_of_measured_wall": (
@@ -2252,7 +2266,7 @@ def _run_convergence_seed(
         args,
         train_samples,
         seed=seed,
-        batch_count=args.train_steps + args.prefetch_depth,
+        batch_count=args.train_steps + CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
         start_cursor=initial["sample_order_cursor"],
     )
     decisions = _training_augmentation_batches(
@@ -2361,9 +2375,9 @@ def _run_convergence_seed(
                     scheduler_total_steps=scheduler_total_steps,
                     augmentation_state=_augmentation_state(contract),
                 )
-    ledger.record_prefetched(adapter.prefetched_read_identities())
-    loader_metrics = adapter.loader_metrics()
     adapter.close()
+    loader_metrics = adapter.loader_metrics()
+    ledger.record_prefetched(adapter.prefetched_read_identities())
     expected = _flatten(batches[: args.train_steps])
     order_validation = ledger.validate(expected)
     failures.extend(order_validation["failures"])
@@ -2415,13 +2429,21 @@ def _run_convergence_seed(
     fully_emitted_pools = int(
         pool_metrics.get("fully_emitted_release_eligible_pool_count", 0)
     )
+    released_pools = int(pool_metrics.get("released_pool_count", 0))
+    max_active_pools = int(
+        pool_metrics.get("max_simultaneously_active_pool_count", 0)
+    )
+    single_active_pool_contract = bool(
+        materialized_pools > 0
+        and fully_emitted_pools == materialized_pools
+        and released_pools == materialized_pools
+        and max_active_pools <= 1
+        and int(pool_metrics.get("active_pool_count", 0)) == 0
+    )
     gpu_pool_evidence = {
         "configured": bool(args.pls_gpu_pool),
-        "observed": bool(
-            args.pls_gpu_pool
-            and materialized_pools > 0
-            and fully_emitted_pools == materialized_pools
-        ),
+        "observed": bool(args.pls_gpu_pool and single_active_pool_contract),
+        "single_active_pool_contract_satisfied": single_active_pool_contract,
         "native_request_granularity": "one complete closed pool",
         "metrics": pool_metrics,
     }
@@ -3011,7 +3033,6 @@ def _hydrate_resume_args(args: argparse.Namespace, contract: dict[str, Any]) -> 
     args.workers = int(contract["execution"]["workers"])
     args.execution_mode = str(contract["execution"].get("mode", "audit"))
     args.drop_last = bool(contract["sample_order"]["drop_last"])
-    args.prefetch_depth = int(contract["sample_order"]["prefetch_depth_batches"])
     args.distributed_rank = int(contract["sample_order"].get("distributed_rank", 0))
     args.distributed_world_size = int(
         contract["sample_order"].get("distributed_world_size", 1)

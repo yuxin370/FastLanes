@@ -101,9 +101,9 @@ PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 
 `--workers N` 是训练 workload 的外层数据 worker 参数，不再转发为 native
 rowgroup-prefetch worker 数；native I/O 并行度由 production profile 固定。
-`N=0` 会失败。`--prefetch-depth D` 对应最多 `D+1` 个 in-flight batch（当前
-batch 加 D 个 ahead batch），队列保持 FIFO、施加硬 backpressure，并在 close 时
-cancel 或 drain 全部未消费任务。
+`N=0` 表示不创建外层 DataLoader worker。batch lookahead 使用冻结的 production
+配置；训练入口不再接受 `--prefetch-depth`。GALP 将整个逻辑 schedule 交给
+native-owned 有界 Pipeline，Python 不维护 FIFO、future、backpressure 或 cancel/drain。
 
 模型固定为 RGB-no-more ViT-Ti，augmentation 固定为 published recipe，precision
 固定为 FP32。因为三者都只有一个生产值，`--model-architecture`、
@@ -129,7 +129,7 @@ CUDA_VISIBLE_DEVICES=0 "$PY" galp/benchmarks/system_rgbnomore/training/run.py \
   --expected-physical-layout image-major-vector-rowgroups \
   --expected-spatial-order tiled-z32 \
   --expected-image-count 1281167 --expected-validation-image-count 50000 \
-  --device cuda:0 --batch-size 64 --workers 4 --prefetch-depth 2 \
+  --device cuda:0 --batch-size 64 --workers 4 \
   --warmup-steps 3 --measured-steps 10 --repeats 3 \
   --output-dir /tmp/galp-training-runtime-smoke
 ```
@@ -154,7 +154,6 @@ CUDA_VISIBLE_DEVICES=0 "$PY" \
   --device cuda:0 \
   --batch-size 64 \
   --workers 4 \
-  --prefetch-depth 2 \
   --warmup-steps 10 \
   --measured-steps 100 \
   --output-dir /tmp/galp-training-smoke
@@ -203,9 +202,9 @@ CUDA_VISIBLE_DEVICES=0 "$PY" \
   --output-dir /tmp/pytorch-short-convergence
 ```
 
-正式性能运行前先完成上面的 10-step stability smoke。不要直接从 `--phase all` 开始。runtime artifact 会记录 queue hit/miss、producer busy、consumer wait、native read/decode/projection、同步原因、event-derived compute-only upper bound、cold repeat 0、hot repeat 1--4 与 CV。compute-only 数值只是诊断上界，不是第五条 pipeline，也不能替代 end-to-end images/s。
+正式性能运行前先完成上面的 10-step stability smoke。不要直接从 `--phase all` 开始。runtime artifact 会记录 native pipeline ownership、producer busy、consumer wait、完成后的 native read/decode/transform、同步原因、event-derived compute-only upper bound、cold repeat 0、hot repeat 1--4 与 CV。compute-only 数值只是诊断上界，不是第五条 pipeline，也不能替代 end-to-end images/s。
 
-建议依次用 `--prefetch-depth 0`、`2`、`4` 做三个独立短目录；不要在同一目录跨 depth 或跨 mode resume。
+历史 K=2/4/8 sweep 已删除：这些值不能改变冻结的 native runtime policy，继续比较只会把噪声误标为配置收益。
 
 ## 6. 初始化和精确恢复
 

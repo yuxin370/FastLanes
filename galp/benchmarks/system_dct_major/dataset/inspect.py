@@ -19,6 +19,7 @@ for path in (BENCHMARK_ROOT, REPO_ROOT):
 from common import parse_manifest  # noqa: E402
 from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512  # noqa: E402
 from galp.torch import DirectDctReader  # noqa: E402
+from galp.diagnostics.direct_dct import plan_preview  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +48,8 @@ def main() -> None:
             args.manifest,
             module_path=args.torch_binding_dir,
         )
-        preview = reader.plan(
+        preview = plan_preview(
+            reader,
             list(range(image_count)),
             VALIDATION_CENTER_CROP_512,
         )

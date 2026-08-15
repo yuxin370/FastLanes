@@ -349,7 +349,7 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         HERE / "run.py",
         HERE / "validate.py",
         REPO_ROOT / "galp/torch/direct_dct.py",
-        REPO_ROOT / "galp/torch/diagnostics.py",
+        REPO_ROOT / "galp/diagnostics/direct_dct.py",
         REPO_ROOT / "galp/profiles/_base.py",
         REPO_ROOT / "galp/profiles/rgbnomore.py",
         REPO_ROOT / "galp/include/galp/profiles/direct_dct.hpp",

@@ -157,7 +157,10 @@ def evaluate_gate3(
     for repeat_index, repeat in enumerate(repeats):
         prefix = f"repeat_{repeat_index}"
         loader = _mapping(repeat.get("loader_measured_metrics"))
-        submitted = _number(loader.get("submitted_batches"))
+        native_pipeline_owned = loader.get("native_pipeline_owned") is True
+        submitted = _number(
+            loader.get("consumed_batches" if native_pipeline_owned else "submitted_batches")
+        )
         planning_seconds = _number(loader.get("producer_planning_seconds"))
         planning_ms = (
             planning_seconds * 1000.0 / submitted
@@ -200,9 +203,13 @@ def evaluate_gate3(
         )
         check(
             f"{prefix}.queue_hit_rate",
-            queue_hit_rate is not None and queue_hit_rate >= min_queue_hit_rate,
-            queue_hit_rate,
-            f">={min_queue_hit_rate}",
+            native_pipeline_owned
+            or (queue_hit_rate is not None and queue_hit_rate >= min_queue_hit_rate),
+            {
+                "native_pipeline_owned": native_pipeline_owned,
+                "legacy_python_queue_hit_rate": queue_hit_rate,
+            },
+            f"native pipeline ownership or legacy queue hit rate >={min_queue_hit_rate}",
         )
         check(
             f"{prefix}.allocation_stability",

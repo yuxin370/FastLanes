@@ -176,11 +176,11 @@ image_counts_tensor: int64 CUDA tensor [image_count]
 block_to_image_tensor: int64 CUDA tensor [total_blocks]
 ```
 
-Use these tensors for per-image pooling or token packing on CUDA. The legacy
-The private native batch's `image_layouts`, `block_metadata`, `rowgroups`, and
+Use these tensors for per-image pooling or token packing on CUDA. The private
+native batch's `image_layouts`, `block_metadata`, `rowgroups`, and
 `execution_stats` properties materialize Python list/dict objects and are
 intended for debugging and compatibility. The stable `galp.torch.DirectDctBatch`
-does not expose them; benchmark tools opt into `galp.torch.diagnostics`.
+does not expose them; benchmark tools opt into `galp.diagnostics.direct_dct`.
 
 Applications should use the stable Python facade rather than importing the
 private `_galp_direct_dct` extension.  The caller chooses a semantic output
@@ -195,12 +195,19 @@ reader = DirectDctReader(
     "/path/to/manifest.bin",
     module_path="build/galp/torch",
 )
-preview = reader.plan([0, 1, 2, 3], VALIDATION)
-pending = reader.prefetch([0, 1, 2, 3], VALIDATION)
-batch = pending.read()
-output = model(batch.y, batch.cbcr)
-batch.record_stream()
+pipeline = reader.pipeline(VALIDATION).start(
+    [[0, 1, 2, 3], [4, 5, 6, 7]],
+)
+for batch in pipeline:
+    output = model(batch.y, batch.cbcr)
 ```
+
+The public API has no future/submission gate, planner preview, manual reclaim,
+rowgroup metadata, or buffer-keepalive method. The native pipeline owns bounded
+prefetch, ordered CUDA submission, completion, and deferred reclamation. Tensor
+ownership automatically keeps native storage alive on the consuming PyTorch
+stream. Dataset and implementation diagnostics are available only from the
+explicitly unstable `galp.diagnostics.direct_dct` module.
 
 `galp.profiles.rgbnomore` owns RGB-no-more geometry, normalization, and crop
 reference semantics.  Generic native runtime policies are defined separately
@@ -234,38 +241,33 @@ cmake -S . -B build-galp-torch -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"
 cmake --build build-galp-torch --target _galp_direct_dct -j
 PYTHONPATH=build-galp-torch/galp/torch \
-  python3 galp/examples/direct_dct_torch_end_to_end_demo.py /path/to/manifest.bin \
+  python3 galp/examples/direct_dct_pipeline_demo.py /path/to/manifest.bin \
     --batch-size 32 \
-    --crop 0 0 64 64 \
-    --dct-coeffs first:8 \
-    --cache-capacity-mib 1024 \
-    --model tiny-dct-vit \
     --steps 3 \
     --train-smoke
 ```
 
-The end-to-end script keeps the GALP coefficient tensor on CUDA, constructs
-per-image DCT-token features from tensorized metadata, runs either a small MLP
-or a tiny ViT-like classifier, and reports logits/loss/timing plus GALP
-execution counters and `cache_capacity_mib`. It enables Python-side async
-prefetch by default; pass `--no-async-prefetch` to force synchronous reads. It
-can also request the YCbCr DCT grid layout:
+The example keeps the model-ready Y/CbCr tensors on CUDA and runs a small
+classifier through the public native-owned pipeline. It reports only the
+versioned aggregate metrics. Prefetch depth, cache capacity, crop execution,
+I/O scheduling, CUDA stream selection, and kernel launch geometry are not
+command-line options.
+
+The fixed 512 center-crop semantic profile can be selected for a compatible
+DCT-major manifest without exposing its block-major runtime policy:
 
 ```bash
 PYTHONPATH=build-galp-torch/galp/torch \
-  python3 galp/examples/direct_dct_torch_end_to_end_demo.py /path/to/manifest.bin \
+  python3 galp/examples/direct_dct_pipeline_demo.py /path/to/manifest.bin \
     --batch-size 32 \
-    --crop 0 0 64 64 \
-    --dct-coeffs first:8 \
-    --output-layout ycbcr_dct_grid \
-    --phase loader
+    --profile validation-center-crop-512
 ```
 
-Both paths keep tensor operations on CUDA and avoid copying coefficient data
-back to host. The CMake module also tries to discover this Torch prefix
-automatically from the selected Python interpreter when `Torch_DIR` is not
-already set. The demo uses crop pushdown only; DCT-domain flip and rotation
-augmentation are not implemented.
+The older `direct_dct_torch_end_to_end_demo.py` is a private-extension
+diagnostic/compatibility harness used by pushdown validation. It is not a
+model-facing API example. The CMake module also tries to discover the Torch
+prefix automatically from the selected Python interpreter when `Torch_DIR` is
+not already set.
 
 Public headers must not include private implementation prefixes such as
 `core/`, `format/`, `engine/`, `cuda/`, `codecs/`, benchmark,

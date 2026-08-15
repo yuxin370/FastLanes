@@ -108,6 +108,44 @@ plots, a CSV containing the plotted points, and a JSON source summary. Use
 future run has a different directory layout, override any source with repeated
 `--run CONDITION=/absolute/run/directory` arguments.
 
+Audit the registered formal matrix and an optional live comparison without
+trusting stale `run_status.json` values as proof of an active process:
+
+```bash
+python -m training_pls.audit_goal \
+  --experiment-root /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811 \
+  --layout-plan /mnt/nvme2/home/tangyuxin/pls-experiments/pls-layout-20260811/physical_layout_plan.json \
+  --formal-report-dir /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/formal_report \
+  --output-dir /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/audits/current \
+  --comparison-id premixed-layout-M4-seed-11997733 \
+  --comparison-seed 11997733 \
+  --comparison-run A0=/absolute/A0/run \
+  --comparison-run A1=/absolute/A1/run \
+  --comparison-run B2=/absolute/B2/run \
+  --comparison-run B6=/absolute/B6/run
+```
+
+The audit writes `goal_completion_audit.json` and
+`goal_completion_audit.md` atomically. It requires an actual epoch-300
+`final_result.json` for formal completion, reports exact checkpoint and
+validation coverage at every milestone, and labels a single-seed Premixed
+comparison as exploratory rather than as the pre-registered four-seed result.
+
+Generate a strict common-epoch Premixed single-seed report (the command
+rejects missing validation points or permanent checkpoints):
+
+```bash
+python -m training_pls.report_premixed_milestone \
+  --experiment-root /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811 \
+  --seed 11997733 \
+  --epoch 50 \
+  --output-dir /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/premixed_milestones/epoch_050
+```
+
+This report provides exact fixed-budget metrics, single-seed 2×2 contrasts,
+and partial normalized AUC through the requested epoch. It deliberately does
+not calculate a confidence interval from one seed.
+
 ## Implementation map
 
 - `layout.py`, `plan_layout.py`, `parquet_helper.py`: immutable layout sidecars.
@@ -118,6 +156,8 @@ future run has a different directory layout, override any source with repeated
 - `run_matrix.py`: plan-first balanced matrix orchestration.
 - `sanity_check.py`: one-update GALP/reference semantic comparison.
 - `report.py`: curves, final metrics, paired/factorial effects, Student-t CIs.
+- `audit_goal.py`: read-only formal-matrix, live-process, and evidence-boundary audit.
+- `report_premixed_milestone.py`: strict common-epoch single-seed Premixed report.
 
 The report includes every condition and seed. Throughput, memory, loader timing,
 and class composition are explanatory only and never select a condition.

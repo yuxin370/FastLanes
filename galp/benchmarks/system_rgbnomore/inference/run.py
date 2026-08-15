@@ -487,7 +487,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/tests/test_system_benchmark.py",
                     "galp/torch/direct_dct_torch.cpp",
                     "galp/torch/direct_dct.py",
-                    "galp/torch/diagnostics.py",
+                    "galp/diagnostics/direct_dct.py",
                     "galp/profiles/_base.py",
                     "galp/profiles/rgbnomore.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/rgbnomore_dct_profile.py",

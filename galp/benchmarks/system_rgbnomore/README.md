@@ -113,7 +113,8 @@ python3 galp/benchmarks/system_rgbnomore/inference/run.py \
 precision 固定为 FP32，因此原来的三个单值选项已经删除。
 
 `--workers` 是外层数据 worker/workload 参数，不再转发为 native rowgroup
-prefetch worker 数；`--prefetch-depth` 是有序 batch producer 的队列深度。
+prefetch worker 数。所有 pipeline 使用已冻结的 production lookahead；训练入口不再
+提供 `--prefetch-depth`，GALP 的有界预取完全由 native runtime policy 拥有。
 详见 [training guide](docs/TRAINING_BENCHMARK_RUN_GUIDE.md)。
 
 ## 输出与诊断边界

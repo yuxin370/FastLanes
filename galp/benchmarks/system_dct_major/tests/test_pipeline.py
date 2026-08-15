@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from galp.torch import DirectDctFuture
+from galp.torch import DirectDctBatch
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
@@ -204,33 +204,51 @@ class PipelineControlTest(unittest.TestCase):
             )
 
     def test_galp_measurement_does_not_reuse_warmup_segment(self) -> None:
+        class Pipeline:
+            def start(self, batches):
+                self.batches = batches
+                return self
+
         adapter = object.__new__(GalpAdapter)
-        adapter._warmup_segments = [[{"ordinal": 0}]]
-        adapter._measurement_segments = [[{"ordinal": 1}, {"ordinal": 2}]]
+        adapter.pipeline = Pipeline()
+        adapter._warmup_segments = [[{"ordinal": 0, "galp_image_id": 0}]]
+        adapter._measurement_segments = [[
+            {"ordinal": 1, "galp_image_id": 1},
+            {"ordinal": 2, "galp_image_id": 2},
+        ]]
         adapter.begin_repeat()
         self.assertEqual(adapter.segments, adapter._warmup_segments)
         adapter.begin_measurement()
         self.assertEqual(adapter.segments, adapter._measurement_segments)
         self.assertEqual(adapter._next_segment, 0)
-        self.assertIsNone(adapter._pending)
         self.assertIsNone(adapter._current)
 
     def test_galp_cold_prime_is_reused_by_first_measurement(self) -> None:
+        class Pipeline:
+            def __init__(self):
+                self.starts = []
+
+            def start(self, batches):
+                self.starts.append(batches)
+                return self
+
         adapter = object.__new__(GalpAdapter)
+        adapter.pipeline = Pipeline()
         adapter._warmup_segments = []
-        adapter._measurement_segments = [[{"ordinal": 1}, {"ordinal": 2}]]
+        adapter._measurement_segments = [[
+            {"ordinal": 1, "galp_image_id": 1},
+            {"ordinal": 2, "galp_image_id": 2},
+        ]]
         adapter._cold_measurement_primed = False
         adapter._reuse_cold_measurement = False
-        adapter._prefetch = lambda segment: ("prefetch", tuple(item["ordinal"] for item in segment))
 
         adapter.prime_cold_start()
-        pending = adapter._pending
-        self.assertEqual(pending, ("prefetch", (1, 2)))
+        self.assertEqual(adapter.pipeline.starts, [[[1, 2]]])
 
         adapter.begin_repeat()
         adapter.begin_measurement()
-        self.assertIs(adapter._pending, pending)
-        self.assertEqual(adapter._next_segment, 1)
+        self.assertEqual(adapter.pipeline.starts, [[[1, 2]]])
+        self.assertEqual(adapter._next_segment, 0)
 
     def test_manifest_shard_prefetch_overlaps_and_model_batches_cross_boundary(self) -> None:
         class FakePending:
@@ -248,6 +266,20 @@ class PipelineControlTest(unittest.TestCase):
                     layout="transformed_dct_grid",
                     execution_stats={"actual_vector_count": len(image_ids)},
                     cache_stats={},
+                    metrics={
+                        "schema": "galp-direct-dct-metrics-v2",
+                        "complete": True,
+                        "consumer_wait_ms": 0.0,
+                        "submit_to_ready_ms": 1.0,
+                        "producer_ms": 1.0,
+                        "planning_ms": 2.0,
+                        "io_ms": 3.0,
+                        "decode_ms": 0.0,
+                        "transform_ms": 0.0,
+                        "logical_bytes": 0,
+                        "physical_bytes": 0,
+                        "peak_transient_bytes": 0,
+                    },
                 )
 
             def read(self):
@@ -262,22 +294,23 @@ class PipelineControlTest(unittest.TestCase):
             FakePending([0, 1, 2], 1.0),
             FakePending([3, 4, 5], 2.0),
         ]
-        pending = [
-            DirectDctFuture(item, "test-profile") for item in native_pending
-        ]
+        class FakePipeline:
+            def start(self, batches):
+                self.offset = 0
+                return self
 
-        class FakeReader:
-            pass
+            def __next__(self):
+                pending = native_pending[self.offset]
+                self.offset += 1
+                return DirectDctBatch(pending.read(), "test-profile")
 
         adapter = object.__new__(GalpAdapter)
         adapter.segment_mode = "manifest-shard"
         adapter.device = torch.device("cpu")
-        adapter.reader = FakeReader()
+        adapter.pipeline = FakePipeline()
         adapter._shard_by_image_id = {image_id: image_id // 3 for image_id in range(6)}
         adapter._process_scope_started_ns = None
-        adapter._prefetch = lambda segment: pending[int(segment[0]["galp_image_id"]) // 3]
         adapter._activate_segments(segments)
-        adapter._start_next_prefetch()
 
         first = adapter._load_pushdown(
             [
@@ -287,7 +320,6 @@ class PipelineControlTest(unittest.TestCase):
         )
         self.assertEqual(native_pending[0].read_calls, 1)
         self.assertEqual(native_pending[1].read_calls, 0)
-        self.assertIs(adapter._pending, pending[1])
         self.assertEqual(first.native_stats[0]["segment_mode"], "manifest-shard")
         self.assertEqual(first.native_stats[0]["segment_shard_id"], 0)
         self.assertEqual(first.native_stats[0]["segment_cross_shard_count"], 0)

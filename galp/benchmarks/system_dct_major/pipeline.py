@@ -41,7 +41,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
 from galp.torch import DirectDctReader
-from galp.torch.diagnostics import cache_stats, execution_stats, prefetch_stats
+from galp.diagnostics.direct_dct import (
+    binding_import_ms,
+    cache_stats,
+    execution_stats,
+    initialization_stats,
+)
 from feature_model import build_workload_model, expected_output_width
 
 
@@ -526,14 +531,17 @@ class GalpAdapter(Adapter):
         profile_info = self.reader.profile_info(VALIDATION_CENTER_CROP_512)
         if profile_info["runtime_policy_id"] != BLOCK_MAJOR_RUNTIME_PROFILE:
             raise RuntimeError("GALP native profile does not match the benchmark contract")
+        self.pipeline = self.reader.pipeline(VALIDATION_CENTER_CROP_512)
         reader_ready_ns = time.perf_counter_ns()
         self.startup_timings = {
-            "binding_extension_import_ms": self.reader.binding_import_ms,
+            "binding_extension_import_ms": binding_import_ms(self.reader),
         }
         self.startup_timings["direct_dct_reader_python_constructor_ms"] = (
             reader_ready_ns - reader_started_ns
         ) / 1.0e6
-        self.startup_timings["native_reader_initialization"] = dict(self.reader.initialization_stats)
+        self.startup_timings["native_reader_initialization"] = initialization_stats(
+            self.reader
+        )
         if int(self.reader.image_count) < len(samples):
             raise ValueError(f"GALP manifest has {self.reader.image_count} images for {len(samples)} samples")
         warmup_images = int(contract["execution"]["batch_size"]) * int(
@@ -554,10 +562,7 @@ class GalpAdapter(Adapter):
         self._measurement_segments = _manifest_shard_segments(self.samples, parsed_manifest)
         self.segments: list[list[dict[str, Any]]] = []
         self._next_segment = 0
-        self._pending: Any | None = None
         self._current: dict[str, Any] | None = None
-        self._pending_segment: list[dict[str, Any]] | None = None
-        self._pending_submit_ns: int | None = None
         self._seen_segment_shards: set[int] = set()
         self._last_segment_shard: int | None = None
         self._process_scope_started_ns: int | None = None
@@ -572,18 +577,21 @@ class GalpAdapter(Adapter):
         # Descriptor mmap/ValidateSource is lazy and normally occurs in the
         # real first-segment prefetch, so refresh the native snapshot at report
         # time rather than freezing a construction-only zero.
-        result["native_reader_initialization"] = dict(self.reader.initialization_stats)
+        result["native_reader_initialization"] = initialization_stats(self.reader)
         return result
 
     def _activate_segments(self, segments: Sequence[Sequence[dict[str, Any]]]) -> None:
         self.segments = [list(segment) for segment in segments]
         self._next_segment = 0
-        self._pending = None
         self._current = None
-        self._pending_segment = None
-        self._pending_submit_ns = None
         self._seen_segment_shards = set()
         self._last_segment_shard = None
+        self.pipeline.start(
+            [
+                [int(sample["galp_image_id"]) for sample in segment]
+                for segment in self.segments
+            ]
+        )
 
     def _segment_shard_ids(self, segment: Sequence[dict[str, Any]]) -> set[int]:
         mapping = getattr(self, "_shard_by_image_id", {})
@@ -593,30 +601,12 @@ class GalpAdapter(Adapter):
             if int(sample["galp_image_id"]) in mapping
         }
 
-    def _prefetch(self, segment: Sequence[dict[str, Any]]) -> Any:
-        image_ids = [int(sample["galp_image_id"]) for sample in segment]
-        return self.reader.prefetch(image_ids, VALIDATION_CENTER_CROP_512)
-
-    def _start_next_prefetch(self) -> None:
-        if self._next_segment >= len(self.segments):
-            self._pending = None
-            self._pending_segment = None
-            self._pending_submit_ns = None
-            return
-        segment = self.segments[self._next_segment]
-        self._pending_segment = segment
-        self._pending_submit_ns = time.perf_counter_ns()
-        self._pending = self._prefetch(segment)
-        self._next_segment += 1
-
     def _load_next_segment(self) -> None:
-        if self._pending is None:
+        if self._next_segment >= len(self.segments):
             raise StopIteration("GALP segment stream is exhausted")
-        pending = self._pending
-        segment = list(self._pending_segment or [])
-        submit_ns = self._pending_submit_ns
-        wait_started_ns = time.perf_counter_ns()
-        batch = pending.read()
+        segment = self.segments[self._next_segment]
+        batch = next(self.pipeline)
+        self._next_segment += 1
         ready_ns = time.perf_counter_ns()
         image_ids = [int(item) for item in batch.global_image_ids]
         y = batch.y
@@ -634,7 +624,7 @@ class GalpAdapter(Adapter):
         if shard_id is not None:
             self._seen_segment_shards.add(shard_id)
             self._last_segment_shard = shard_id
-        native_prefetch_stats = prefetch_stats(pending)
+        metrics = batch.metrics
         self._current = {
             "image_ids": image_ids,
             "y": y,
@@ -643,15 +633,15 @@ class GalpAdapter(Adapter):
             "batch": batch,
             "stats_pending": True,
             "prefetch_telemetry": {
-                **native_prefetch_stats,
-                "submit_to_ready_ms": (
-                    (ready_ns - submit_ns) / 1.0e6 if submit_ns is not None else 0.0
-                ),
+                "producer_active_ms": metrics.producer_ms,
+                "planning_ms": metrics.planning_ms,
+                "io_staging_ms": metrics.io_ms,
+                "submit_to_ready_ms": metrics.submit_to_ready_ms,
                 # This is the directly observed main-thread input-ready stall:
                 # time spent inside consumption of an asynchronously produced
                 # segment.  It is distinct from producer service time and can
                 # be divided by measured repeat time for the P2 <=2% gate.
-                "consumer_wait_ms": (ready_ns - wait_started_ns) / 1.0e6,
+                "consumer_wait_ms": metrics.consumer_wait_ms,
                 "process_scope_ready_ms": (
                     (ready_ns - self._process_scope_started_ns) / 1.0e6
                     if self._process_scope_started_ns is not None
@@ -668,7 +658,6 @@ class GalpAdapter(Adapter):
                 "shard_reactivation_count": reactivation,
             },
         }
-        self._start_next_prefetch()
 
     def _release_consumed_current(self) -> None:
         current = self._current
@@ -721,7 +710,6 @@ class GalpAdapter(Adapter):
         if self._warmup_segments or not self._measurement_segments or self._cold_measurement_primed:
             return
         self._activate_segments(self._measurement_segments)
-        self._start_next_prefetch()
         self._cold_measurement_primed = True
 
     def _load_pushdown(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
@@ -739,8 +727,6 @@ class GalpAdapter(Adapter):
                         keepalive,
                     )
                     self._release_consumed_current()
-                if self._pending is None:
-                    self._start_next_prefetch()
                 self._load_next_segment()
             assert self._current is not None
             offset = int(self._current["offset"])
@@ -753,10 +739,14 @@ class GalpAdapter(Adapter):
             cbcr_parts.append(self._current["cbcr"][offset : offset + take])
             keepalive.append(self._current["batch"])
             if self._current["stats_pending"]:
-                stats = _batch_native_stats(self._current["batch"])
-                stats["segment_image_count"] = len(self._current["image_ids"])
-                stats["segment_first_image_id"] = self._current["image_ids"][0]
-                stats["segment_last_image_id"] = self._current["image_ids"][-1]
+                # Keep implementation counters out of the timed input path.
+                # They are finalized after the model stream completes.
+                stats = {
+                    "_native_batch": self._current["batch"],
+                    "segment_image_count": len(self._current["image_ids"]),
+                    "segment_first_image_id": self._current["image_ids"][0],
+                    "segment_last_image_id": self._current["image_ids"][-1],
+                }
                 stats.update({f"prefetch_{key}": value for key, value in self._current["prefetch_telemetry"].items()})
                 stats.update(self._current["scheduler_stats"])
                 native_stats.append(stats)
@@ -781,10 +771,8 @@ class GalpAdapter(Adapter):
         return self._load_pushdown(expected)
 
     def end_repeat(self) -> None:
-        self._pending = None
         self._current = None
-        self._pending_segment = None
-        self._pending_submit_ns = None
+        self.pipeline.close()
 
 
 def _is_galp_pipeline(name: str) -> bool:
@@ -857,16 +845,23 @@ def _prime_model_for_cold_start(
         torch.cuda.current_stream(device).synchronize()
 
 
-def _record_keepalive(batch: LoadedBatch) -> None:
-    seen: set[int] = set()
-    for item in batch.keepalive:
-        identity = id(item)
-        if identity in seen:
+def _release_native_context(batch: LoadedBatch) -> None:
+    """Drop audit references; tensor owners defer native release automatically."""
+
+    batch.keepalive.clear()
+
+
+def _finalize_native_stats(batch: LoadedBatch) -> None:
+    """Resolve audit-only implementation counters after model completion."""
+
+    for stats in batch.native_stats:
+        source = stats.pop("_native_batch", None)
+        if source is None:
             continue
-        seen.add(identity)
-        record = getattr(item, "record_stream", None)
-        if callable(record):
-            record()
+        stable_fields = dict(stats)
+        stats.clear()
+        stats.update(_batch_native_stats(source))
+        stats.update(stable_fields)
 
 
 _NATIVE_ALLOCATOR_SNAPSHOT_PREFIXES = (
@@ -1163,7 +1158,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             _forward(model, batch.inputs, expected_width)
             if device.type == "cuda":
                 torch.cuda.current_stream(device).synchronize()
-            _record_keepalive(batch)
+            _release_native_context(batch)
             del batch
 
         adapter.begin_measurement()
@@ -1243,7 +1238,8 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                         ),
                         flush=True,
                     )
-            _record_keepalive(batch)
+            _finalize_native_stats(batch)
+            _release_native_context(batch)
             if repeat == 0 and semantic_captured < semantic_limit:
                 semantic_captured += _capture_semantic(
                     semantic_store,
@@ -1332,8 +1328,8 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             h2d_ms.append((h2d_finished - h2d_started) / 1.0e6)
             model_ms.append((model_finished - model_started) / 1.0e6)
             # Release per-model-batch views before the next adapter.load().
-            # Deferred output allocation can then reclaim an exhausted full
-            # shard before releasing the next native submission gate.
+            # Tensor ownership and the native pipeline then determine when an
+            # exhausted segment can be reclaimed.
             del batch
 
         if feature_sink is not None:

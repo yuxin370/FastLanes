@@ -10,7 +10,6 @@ import json
 import platform
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -27,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from galp.profiles.rgbnomore import VALIDATION
 from galp.torch import DirectDctReader
-from galp.torch.diagnostics import execution_stats, execution_stats_snapshot, prefetch_stats
+from galp.diagnostics.direct_dct import execution_stats, execution_stats_snapshot
 
 from shared.common import (
     RESULT_SCHEMA,
@@ -137,7 +136,7 @@ class LoadedBatch:
     native_stage_seconds: dict[str, float] = field(default_factory=dict)
     native_counters: dict[str, int] = field(default_factory=dict)
     native_properties: dict[str, Any] = field(default_factory=dict)
-    keepalive: list[Any] = field(default_factory=list)
+    audit_sources: list[Any] = field(default_factory=list)
 
 
 def _resolve_model_stream_priority(
@@ -447,27 +446,32 @@ class DaliAdapter(PipelineAdapter):
         self.iterator = None
 
 
-def _validate_transform_capability(
-    preview: dict[str, Any],
+def _validate_profile_contract(
+    profile_info: dict[str, Any],
     *,
     context: str,
 ) -> dict[str, Any]:
-    uses_planless = bool(preview.get("uses_planless_fixed_transform", False))
-    if not uses_planless:
+    expected = {
+        "layout": "transformed_dct_grid",
+        "output_dtype": "float32",
+        "y_output_blocks": (28, 28),
+        "cbcr_output_blocks": (14, 14),
+    }
+    mismatches: dict[str, Any] = {}
+    for key, expected_value in expected.items():
+        observed = profile_info.get(key)
+        normalized = tuple(observed) if key.endswith("_blocks") and observed is not None else observed
+        if normalized != expected_value:
+            mismatches[key] = observed
+    if mismatches:
         raise RuntimeError(
-            f"GALP transform capability preflight failed for {context}: "
-            "the production runtime profile requires planless execution"
+            f"GALP semantic profile contract failed for {context}: {mismatches}"
         )
     return {
         "status": "passed",
         "runtime_profile": GALP_RUNTIME_PROFILE,
-        "observed_transform_execution": "planless",
-        "uses_planless_fixed_transform": uses_planless,
-        "layout": preview.get("layout"),
-        "image_count": int(preview.get("image_count", 0)),
-        "rowgroup_count": int(preview.get("rowgroup_count", 0)),
-        "fixed_transform_component_count": int(preview.get("fixed_transform_component_count", 0)),
-        "compact_image_descriptor_count": int(preview.get("compact_image_descriptor_count", 0)),
+        "profile_id": profile_info.get("id"),
+        **expected,
     }
 
 
@@ -521,51 +525,29 @@ class GalpAdapter(PipelineAdapter):
             raise ValueError("GALP production pipeline supports only native RGB-no-more preprocessing")
         self.batch_size = int(contract["execution"]["batch_size"])
         self.total_batches = len(self.samples) // self.batch_size
-        self.pending_batches: deque[tuple[list[int], Any]] = deque()
-        self.next_prefetch_batch_index = 0
+        self.pipeline = self.reader.pipeline(VALIDATION)
         self.last_batch_prefetch_metrics: dict[str, float | int] = {}
-        preflight_samples = self.samples[: self.batch_size]
-        if len(preflight_samples) != self.batch_size:
-            raise RuntimeError("GALP transform capability preflight requires one complete batch")
-        preview = dict(
-            self.reader.plan(
-                [int(sample["galp_image_id"]) for sample in preflight_samples],
-                VALIDATION,
-            )
-        )
         context = (
             f"pipeline={self.config_name}, manifest_version={config.get('manifest_version', 'unknown')}, "
             f"runtime_profile={GALP_RUNTIME_PROFILE}"
         )
-        self.setup_metrics["transform_capability_preflight"] = _validate_transform_capability(
-            preview,
+        self.setup_metrics["semantic_profile_contract"] = _validate_profile_contract(
+            profile_info,
             context=context,
         )
 
-    def _enqueue_next_pushdown_batch(self) -> None:
-        if self.next_prefetch_batch_index >= self.total_batches:
-            return
-        begin = self.next_prefetch_batch_index * self.batch_size
-        expected = self.samples[begin : begin + self.batch_size]
-        if len(expected) != self.batch_size:
-            raise RuntimeError("GALP prefetch encountered an incomplete batch")
-        image_ids = [int(sample["galp_image_id"]) for sample in expected]
-        pending = self.reader.prefetch(image_ids, VALIDATION)
-        self.pending_batches.append((image_ids, pending))
-        self.next_prefetch_batch_index += 1
-
     def begin_repeat(self) -> None:
-        self.pending_batches.clear()
-        self.next_prefetch_batch_index = 0
         self.last_batch_prefetch_metrics = {}
-        for _ in range(min(2, self.total_batches)):
-            self._enqueue_next_pushdown_batch()
-        if self.pending_batches:
-            self.pending_batches[0][1]._release_submission()
-
-    def after_model_complete(self) -> None:
-        if self.pending_batches:
-            self.pending_batches[0][1]._release_submission()
+        image_id_batches = [
+            [
+                int(sample["galp_image_id"])
+                for sample in self.samples[
+                    begin : begin + self.batch_size
+                ]
+            ]
+            for begin in range(0, self.total_batches * self.batch_size, self.batch_size)
+        ]
+        self.pipeline.start(image_id_batches)
 
     def load(
         self,
@@ -573,17 +555,7 @@ class GalpAdapter(PipelineAdapter):
         next_expected: Sequence[dict[str, Any]] | None = None,
     ) -> LoadedBatch:
         image_ids = [int(sample["galp_image_id"]) for sample in expected]
-        if not self.pending_batches:
-            raise RuntimeError("GALP pushdown prefetch queue is empty")
-        queued_image_ids, pending = self.pending_batches.popleft()
-        if queued_image_ids != image_ids:
-            raise RuntimeError(
-                f"GALP pending batch mismatch: expected {image_ids}, queued {queued_image_ids}"
-            )
-        ready_before_read = bool(getattr(pending, "ready", False))
-        prefetch_read_started = time.perf_counter()
-        native_batch = pending.read()
-        prefetch_read_seconds = time.perf_counter() - prefetch_read_started
+        native_batch = next(self.pipeline)
         observed_image_ids = [int(value) for value in native_batch.global_image_ids]
         if observed_image_ids != image_ids:
             raise RuntimeError(
@@ -600,29 +572,19 @@ class GalpAdapter(PipelineAdapter):
         ):
             raise RuntimeError("GALP production profile returned an invalid model-ready DCT batch")
         source_batches = [native_batch]
-        prefetch_telemetry = prefetch_stats(pending)
+        metrics = native_batch.metrics
         self.last_batch_prefetch_metrics = {
-            "batch_prefetch_read_wait_seconds": prefetch_read_seconds,
-            "batch_prefetch_producer_active_seconds": prefetch_telemetry[
-                "producer_active_ms"
-            ] / 1000.0,
-            "batch_prefetch_planning_seconds": prefetch_telemetry["planning_ms"]
-            / 1000.0,
-            "batch_prefetch_io_staging_seconds": prefetch_telemetry["io_staging_ms"]
-            / 1000.0,
-            "batch_prefetch_ordered_submission_seconds": prefetch_telemetry[
-                "ordered_submission_ms"
-            ] / 1000.0,
-            "batch_prefetch_ready_before_read": int(ready_before_read),
+            "batch_prefetch_read_wait_seconds": metrics.consumer_wait_ms / 1000.0,
+            "batch_prefetch_producer_active_seconds": metrics.producer_ms / 1000.0,
+            "batch_prefetch_planning_seconds": metrics.planning_ms / 1000.0,
+            "batch_prefetch_io_staging_seconds": metrics.io_ms / 1000.0,
         }
-        self._enqueue_next_pushdown_batch()
         if not self.audit_enabled:
             return LoadedBatch(
                 inputs=(input_y, input_cbcr),
                 labels=None,
                 ordinals=[],
                 on_device=True,
-                keepalive=source_batches,
             )
         labels = torch.tensor([sample["label"] for sample in expected], dtype=torch.long, device=self.device)
         native_stage_seconds = {
@@ -636,19 +598,18 @@ class GalpAdapter(PipelineAdapter):
             ordinals=[int(sample["ordinal"]) for sample in expected],
             on_device=True,
             native_stage_seconds=native_stage_seconds,
-            native_counters={
-                "batch_prefetch_ready_before_read": int(
-                    self.last_batch_prefetch_metrics.get("batch_prefetch_ready_before_read", 0)
-                )
-            },
-            keepalive=source_batches,
+            native_counters={},
+            audit_sources=source_batches,
         )
 
+    def close(self) -> None:
+        self.pipeline.close()
+
     def finalize_batch_metrics(self, batch: LoadedBatch) -> None:
-        if not self.audit_enabled or not batch.keepalive:
+        if not self.audit_enabled or not batch.audit_sources:
             return
         source_execution_stats: list[dict[str, Any]] = []
-        for source_batch in batch.keepalive:
+        for source_batch in batch.audit_sources:
             try:
                 stats = execution_stats(source_batch)
             except (AttributeError, TypeError, ValueError, RuntimeError):
@@ -695,8 +656,7 @@ class GalpAdapter(PipelineAdapter):
         )
 
     def end_repeat(self) -> None:
-        self.pending_batches.clear()
-        self.next_prefetch_batch_index = 0
+        self.pipeline.close()
 
 
 def _make_adapter(
@@ -731,7 +691,7 @@ def _to_device(batch: LoadedBatch, device: torch.device) -> LoadedBatch:
         native_stage_seconds=batch.native_stage_seconds,
         native_counters=batch.native_counters,
         native_properties=batch.native_properties,
-        keepalive=batch.keepalive,
+        audit_sources=batch.audit_sources,
     )
 
 

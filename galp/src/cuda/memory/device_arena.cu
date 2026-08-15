@@ -129,7 +129,10 @@ void DeviceArena::coalesce_backing_regions() {
 			const auto rhs_begin = reinterpret_cast<std::uintptr_t>(regions_[rhs].base);
 			const auto rhs_end =
 			    checked_ptr_end(rhs_begin, regions_[rhs].bytes, "DeviceArena backing range overflow");
-			if (lhs_begin <= rhs_end && rhs_begin <= lhs_end) {
+			// Backing ranges are half-open. Merely touching ranges can come from
+			// distinct cudaHostAlloc registrations, and combining them would make
+			// one cudaMemcpyAsync span two independent pinned allocations.
+			if (lhs_begin < rhs_end && rhs_begin < lhs_end) {
 				has_mergeable_regions = true;
 				break;
 			}
@@ -156,7 +159,9 @@ void DeviceArena::coalesce_backing_regions() {
 		const auto cur_end      = checked_ptr_end(cur_begin, cur.bytes, "DeviceArena coalesced range overflow");
 		const auto region_begin = reinterpret_cast<std::uintptr_t>(region.base);
 		const auto region_end   = checked_ptr_end(region_begin, region.bytes, "DeviceArena backing range overflow");
-		if (region_begin <= cur_end && region.upload == cur.upload) {
+		// Coalesce true overlap only. Adjacent virtual addresses do not prove
+		// that two pinned regions share the same CUDA allocation identity.
+		if (region_begin < cur_end && region.upload == cur.upload) {
 			if (region_end > cur_end) {
 				cur.bytes = static_cast<size_t>(region_end - cur_begin);
 			}

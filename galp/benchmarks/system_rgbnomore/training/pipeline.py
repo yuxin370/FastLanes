@@ -15,10 +15,9 @@ import json
 import multiprocessing
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import torch
@@ -36,6 +35,9 @@ from training.direct_dct_reader import (
 )
 from training.sample_order import SampleIdentity
 from training.schema import DOMAINS, PIPELINES
+
+
+CANONICAL_PIPELINE_LOOKAHEAD_BATCHES = 2
 
 
 @dataclass(frozen=True)
@@ -73,146 +75,6 @@ class TrainingBatch:
     native_stats_finalized: bool = False
     keepalive: list[Any] = field(default_factory=list)
     native_stats_source: Any | None = None
-
-
-@dataclass
-class _AsyncQueueEntry:
-    sequence: int
-    metadata: Any
-    handle: Any
-
-
-class OrderedAsyncPrefetchQueue:
-    """Bounded FIFO ownership for asynchronous producer handles."""
-
-    def __init__(self, capacity: int) -> None:
-        if capacity <= 0:
-            raise ValueError("prefetch queue capacity must be positive")
-        self.capacity = int(capacity)
-        self._entries: deque[_AsyncQueueEntry] = deque()
-        self._closed = False
-        self._next_sequence = 0
-        self._metrics: dict[str, int | float | bool] = {
-            "capacity_batches": self.capacity,
-            "submitted_batches": 0,
-            "consumed_batches": 0,
-            "max_queue_depth_batches": 0,
-            "queue_hit_batches": 0,
-            "queue_miss_batches": 0,
-            "backpressure_events": 0,
-            "producer_submit_seconds": 0.0,
-            "producer_active_seconds": 0.0,
-            "producer_planning_seconds": 0.0,
-            "producer_io_staging_seconds": 0.0,
-            "producer_ordered_submission_seconds": 0.0,
-            "consumer_wait_seconds": 0.0,
-            "async_worker_started_batches": 0,
-            "cancelled_batches": 0,
-            "drained_batches": 0,
-            "close_errors": 0,
-            "closed": False,
-        }
-
-    @staticmethod
-    def _boolean_property(handle: Any, name: str, default: bool = False) -> bool:
-        value = getattr(handle, name, default)
-        return bool(value() if callable(value) else value)
-
-    @staticmethod
-    def _numeric_property(handle: Any, name: str, default: float = 0.0) -> float:
-        value = getattr(handle, name, default)
-        return float(value() if callable(value) else value)
-
-    def _accumulate_completed_handle_metrics(self, handle: Any) -> None:
-        telemetry = getattr(handle, "telemetry", {})
-        self._metrics["producer_active_seconds"] += (
-            float(telemetry.get("producer_active_ms", 0.0)) / 1000.0
-        )
-        self._metrics["producer_planning_seconds"] += (
-            float(telemetry.get("planning_ms", 0.0)) / 1000.0
-        )
-        self._metrics["producer_io_staging_seconds"] += (
-            float(telemetry.get("io_staging_ms", 0.0)) / 1000.0
-        )
-        self._metrics["producer_ordered_submission_seconds"] += (
-            float(telemetry.get("ordered_submission_ms", 0.0)) / 1000.0
-        )
-
-    def submit(self, metadata: Any, factory: Callable[[], Any]) -> None:
-        if self._closed:
-            raise RuntimeError("prefetch queue is closed")
-        if len(self._entries) >= self.capacity:
-            self._metrics["backpressure_events"] += 1
-            raise RuntimeError(
-                f"prefetch queue capacity {self.capacity} reached; consumer must make progress"
-            )
-        begin = time.perf_counter()
-        handle = factory()
-        self._metrics["producer_submit_seconds"] += time.perf_counter() - begin
-        self._entries.append(_AsyncQueueEntry(self._next_sequence, metadata, handle))
-        self._next_sequence += 1
-        self._metrics["submitted_batches"] += 1
-        self._metrics["max_queue_depth_batches"] = max(
-            int(self._metrics["max_queue_depth_batches"]), len(self._entries)
-        )
-
-    def pop(self) -> tuple[Any, Any]:
-        if not self._entries:
-            raise StopIteration
-        entry = self._entries.popleft()
-        ready = self._boolean_property(entry.handle, "ready")
-        self._metrics["queue_hit_batches" if ready else "queue_miss_batches"] += 1
-        begin = time.perf_counter()
-        try:
-            value = entry.handle.read()
-        finally:
-            self._metrics["consumer_wait_seconds"] += time.perf_counter() - begin
-            if self._boolean_property(entry.handle, "started"):
-                self._metrics["async_worker_started_batches"] += 1
-            self._accumulate_completed_handle_metrics(entry.handle)
-        self._metrics["consumed_batches"] += 1
-        return entry.metadata, value
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        entries = list(self._entries)
-        self._entries.clear()
-        cancellation: list[bool] = []
-        # Request cancellation for every queued successor before joining the
-        # active head; otherwise the ordered native chain could start each
-        # successor while close was blocked draining its predecessor.
-        for entry in entries:
-            cancelled = False
-            cancel = getattr(entry.handle, "cancel", None)
-            if callable(cancel):
-                try:
-                    cancelled = bool(cancel())
-                    self._metrics["cancelled_batches"] += int(cancelled)
-                except Exception:
-                    self._metrics["close_errors"] += 1
-            cancellation.append(cancelled)
-        for entry, cancelled in zip(entries, cancellation):
-            try:
-                entry.handle.read()
-                self._metrics["drained_batches"] += 1
-            except Exception:
-                if not cancelled:
-                    self._metrics["close_errors"] += 1
-            if self._boolean_property(entry.handle, "started"):
-                self._metrics["async_worker_started_batches"] += 1
-            self._accumulate_completed_handle_metrics(entry.handle)
-        self._metrics["closed"] = True
-
-    def metrics(self) -> dict[str, Any]:
-        result = dict(self._metrics)
-        result["current_queue_depth_batches"] = len(self._entries)
-        consumed = int(result["consumed_batches"])
-        result["queue_hit_rate"] = (
-            float(result["queue_hit_batches"]) / consumed if consumed else None
-        )
-        return result
 
 
 def _manifest_samples(payload: dict[str, Any], manifest_path: Path, root: Path | None) -> list[TrainingSample]:
@@ -508,7 +370,7 @@ class PyTorchTrainingAdapter(TrainingPipelineAdapter):
             num_workers=self.workers,
             pin_memory=self.device.type == "cuda",
             persistent_workers=self.workers > 0,
-            prefetch_factor=int(self.config.get("prefetch_depth", 2)) if self.workers > 0 else None,
+            prefetch_factor=CANONICAL_PIPELINE_LOOKAHEAD_BATCHES if self.workers > 0 else None,
         )
         self._iterator = iter(loader)
 
@@ -662,7 +524,7 @@ class RgbNoMoreTrainingAdapter(TrainingPipelineAdapter):
             num_workers=self.workers,
             pin_memory=self.device.type == "cuda",
             persistent_workers=self.workers > 0,
-            prefetch_factor=int(self.config.get("prefetch_depth", 2)) if self.workers > 0 else None,
+            prefetch_factor=CANONICAL_PIPELINE_LOOKAHEAD_BATCHES if self.workers > 0 else None,
         )
         self._iterator = iter(loader)
 
@@ -694,6 +556,17 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
     domain = "dct"
     gpu_only = True
 
+    _NATIVE_SUM_METRICS = {
+        "producer_active_seconds": "producer_ms",
+        "producer_planning_seconds": "planning_ms",
+        "producer_io_staging_seconds": "io_ms",
+        "producer_decode_seconds": "decode_ms",
+        "producer_transform_seconds": "transform_ms",
+        "consumer_wait_seconds": "consumer_wait_ms",
+        "logical_bytes": "logical_bytes",
+        "physical_bytes": "physical_bytes",
+    }
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         injected_reader = self.config.get("_direct_dct_training_reader")
@@ -708,8 +581,16 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self.execution_mode = str(self.config.get("execution_mode", "audit"))
         if self.execution_mode not in ("audit", "runtime"):
             raise ValueError(f"invalid GALP execution mode {self.execution_mode!r}")
-        self._queue: OrderedAsyncPrefetchQueue | None = None
-        self._reported_consumer_wait = 0.0
+        self._repeat_active = False
+        self._pipeline_active = False
+        self._native_schedule: list[
+            tuple[list[int], list[int], list[dict[str, Any]]]
+        ] = []
+        self._next_native_batch = 0
+        self._prefetched_batch_count = 0
+        self._prefetched_indices: list[int] = []
+        self._committed_native_metrics: dict[str, Any] = {}
+        self._loader_metrics: dict[str, Any] = {}
         pls_pool_config = self.config.get("pls_gpu_pool") or {}
         self._pls_gpu_pool = bool(pls_pool_config.get("enabled", False))
         self._pls_closed_pool_specs = list(
@@ -718,7 +599,12 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self._pls_pool_ranges: list[list[int]] = []
         self._active_pls_pool: dict[str, Any] | None = None
         self._next_emit_batch = 0
-        self._pls_pool_metrics: dict[str, int | bool | str] = {
+        self._next_pls_pool = 0
+        self._pls_pool_release_pending = False
+        self._pls_pool_metrics = self._new_pls_pool_metrics()
+
+    def _new_pls_pool_metrics(self) -> dict[str, int | bool | str]:
+        return {
             "enabled": self._pls_gpu_pool,
             "pool_lifetime": (
                 "load-complete-pool; consume-completely; release; load-next"
@@ -729,33 +615,85 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             "materialized_pool_count": 0,
             "materialized_sample_count": 0,
             "fully_emitted_release_eligible_pool_count": 0,
+            "released_pool_count": 0,
+            "active_pool_count": 0,
             "max_materialized_pool_samples": 0,
+            "max_simultaneously_active_pool_count": 0,
             "simultaneously_active_pool_limit": 1 if self._pls_gpu_pool else 0,
         }
 
-    def _enqueue_next(self) -> None:
-        ranges = self._pls_pool_ranges if self._pls_gpu_pool else self._batch_ranges
-        if self._next_enqueue >= len(ranges):
-            return
-        indices = ranges[self._next_enqueue]
-        plan = [self._planned[index] for index in indices]
-        image_ids: list[int] = []
-        transforms: list[dict[str, Any]] = []
-        for sample, _identity, decision in plan:
-            if sample.galp_image_id is None:
-                raise ValueError(f"GALP sample {sample.logical_sample_id!r} lacks galp_image_id")
-            image_ids.append(sample.galp_image_id)
-            transforms.append(decision.native_dct_descriptor())
-        if self._queue is None:
-            raise RuntimeError("GALP prefetch queue is not initialized")
-        self._queue.submit(
-            (indices, image_ids, transforms),
-            lambda: self.reader.prefetch_batch(
-                image_ids, transforms=transforms
-            ),
+    def _reset_native_repeat(self, scheduled_batches: int) -> None:
+        self._native_schedule = []
+        self._next_native_batch = 0
+        self._prefetched_batch_count = 0
+        self._prefetched_indices = []
+        self._committed_native_metrics = {}
+        self._loader_metrics = {
+            "native_pipeline_owned": True,
+            "scheduled_batches": scheduled_batches,
+            "consumed_batches": 0,
+            "max_queue_depth_batches": 0,
+            "closed": False,
+        }
+
+    def _start_native_pipeline(self, ranges: Sequence[Sequence[int]]) -> None:
+        self._native_schedule = []
+        image_id_batches: list[list[int]] = []
+        transforms_by_batch: list[list[dict[str, Any]]] = []
+        for raw_indices in ranges:
+            indices = [int(index) for index in raw_indices]
+            plan = [self._planned[index] for index in indices]
+            image_ids: list[int] = []
+            transforms: list[dict[str, Any]] = []
+            for sample, _identity, decision in plan:
+                if sample.galp_image_id is None:
+                    raise ValueError(
+                        f"GALP sample {sample.logical_sample_id!r} lacks galp_image_id"
+                    )
+                image_ids.append(int(sample.galp_image_id))
+                transforms.append(decision.native_dct_descriptor())
+            self._native_schedule.append((indices, image_ids, transforms))
+            image_id_batches.append(image_ids)
+            transforms_by_batch.append(transforms)
+        self._next_native_batch = 0
+        self._prefetched_batch_count = 0
+        self.reader.start(
+            image_id_batches,
+            transforms_by_batch=transforms_by_batch,
         )
-        self._read_indices.extend(indices)
-        self._next_enqueue += 1
+        self._pipeline_active = True
+
+    def _consume_native_batch(
+        self,
+    ) -> tuple[list[int], list[int], list[dict[str, Any]], Any, float]:
+        if not self._pipeline_active:
+            raise RuntimeError("native GALP pipeline has not been started")
+        if self._next_native_batch >= len(self._native_schedule):
+            raise StopIteration
+        indices, image_ids, transforms = self._native_schedule[self._next_native_batch]
+        begin = time.perf_counter()
+        try:
+            batch = self.reader.next_batch()
+        except Exception:
+            self.reader.close()
+            self._pipeline_active = False
+            raise
+        observed_wait = time.perf_counter() - begin
+        self._next_native_batch += 1
+        try:
+            self._validate_native_provenance(batch, image_ids, transforms)
+        except Exception:
+            self.reader.close()
+            self._pipeline_active = False
+            raise
+        metrics = getattr(batch, "metrics", None)
+        wait = (
+            float(metrics.consumer_wait_ms) / 1000.0
+            if metrics is not None
+            else observed_wait
+        )
+        self._loader_metrics["consumed_batches"] += 1
+        return indices, image_ids, transforms, batch, wait
 
     def begin(
         self,
@@ -763,14 +701,16 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         decisions: Sequence[AugmentationDecision],
         batch_lengths: Sequence[int] | None = None,
     ) -> None:
+        if self._repeat_active:
+            self.end()
         super().begin(identities, decisions, batch_lengths)
-        self._next_enqueue = 0
         self._read_indices = []
-        self._reported_consumer_wait = 0.0
-        self._prefetch_depth = int(self.config.get("prefetch_depth", 2))
         self._active_pls_pool = None
         self._next_emit_batch = 0
+        self._next_pls_pool = 0
+        self._pls_pool_release_pending = False
         self._pls_pool_ranges = []
+        self._pls_pool_metrics = self._new_pls_pool_metrics()
         if self._pls_gpu_pool:
             batch_cursor = 0
             for spec in self._pls_closed_pool_specs:
@@ -789,14 +729,15 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
                 batch_cursor += optimizer_batches
             if batch_cursor != len(self._batch_ranges):
                 raise ValueError("PLS pool specifications do not cover every planned batch")
-        capacity = 1 if self._pls_gpu_pool else self._prefetch_depth + 1
-        self._queue = OrderedAsyncPrefetchQueue(capacity)
-        initial_depth = min(
-            len(self._pls_pool_ranges if self._pls_gpu_pool else self._batch_ranges),
-            capacity,
+        scheduled_batches = (
+            len(self._pls_pool_ranges) if self._pls_gpu_pool else len(self._batch_ranges)
         )
-        for _ in range(initial_depth):
-            self._enqueue_next()
+        self._reset_native_repeat(scheduled_batches)
+        self._repeat_active = True
+        if self._pls_gpu_pool:
+            self._start_next_pls_pipeline()
+        else:
+            self._start_native_pipeline(self._batch_ranges)
 
     @staticmethod
     def _validate_native_provenance(
@@ -819,20 +760,120 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
                 if actual[field] != expected[field]:
                     raise RuntimeError(f"GALP native transform provenance mismatch for {field}")
 
-    def _load_active_pls_pool(self) -> None:
-        if self._queue is None:
-            raise RuntimeError("GALP prefetch queue is not initialized")
-        if int(self._queue.metrics()["current_queue_depth_batches"]) == 0:
-            self._enqueue_next()
+    @classmethod
+    def _native_loader_metrics(cls, native: Any) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            "native_metrics_complete": bool(native.complete),
+            "peak_transient_bytes": int(native.peak_transient_bytes),
+        }
+        for loader_name, native_name in cls._NATIVE_SUM_METRICS.items():
+            value = getattr(native, native_name)
+            values[loader_name] = (
+                float(value) / 1000.0
+                if native_name.endswith("_ms")
+                else int(value)
+            )
+        return values
+
+    @classmethod
+    def _merge_native_loader_metrics(
+        cls, committed: dict[str, Any], current: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not committed:
+            return dict(current)
+        merged = dict(committed)
+        merged["native_metrics_complete"] = bool(
+            committed.get("native_metrics_complete", True)
+        ) and bool(current["native_metrics_complete"])
+        merged["peak_transient_bytes"] = max(
+            int(committed.get("peak_transient_bytes", 0)),
+            int(current["peak_transient_bytes"]),
+        )
+        for loader_name in cls._NATIVE_SUM_METRICS:
+            merged[loader_name] = committed.get(loader_name, 0) + current[loader_name]
+        return merged
+
+    def _current_native_metrics(self) -> dict[str, Any]:
+        return self._native_loader_metrics(self.reader.metrics())
+
+    def _combined_native_metrics(self) -> dict[str, Any]:
+        if not self._pipeline_active:
+            return dict(self._committed_native_metrics)
+        return self._merge_native_loader_metrics(
+            self._committed_native_metrics,
+            self._current_native_metrics(),
+        )
+
+    def _freeze_active_prefetch_evidence(self) -> None:
+        if not self._pipeline_active:
+            return
+        self._prefetched_batch_count = min(
+            self.reader.prefetched_batch_count(), len(self._native_schedule)
+        )
+        for indices, _image_ids, _transforms in self._native_schedule[
+            : self._prefetched_batch_count
+        ]:
+            self._prefetched_indices.extend(indices)
+
+    def _close_native_pipeline(
+        self,
+        *,
+        synchronize_consumer: bool,
+        require_complete_metrics: bool,
+        released_pls_pool: bool,
+    ) -> None:
+        if not self._pipeline_active:
+            return
         try:
-            (indices, image_ids, transforms), native_batch = self._queue.pop()
-            self._validate_native_provenance(native_batch, image_ids, transforms)
-        except Exception:
-            self._queue.close()
-            raise
-        queue_wait = float(self._queue.metrics()["consumer_wait_seconds"])
-        wait = queue_wait - self._reported_consumer_wait
-        self._reported_consumer_wait = queue_wait
+            if synchronize_consumer and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            current = self._current_native_metrics()
+            if require_complete_metrics and not current["native_metrics_complete"]:
+                raise RuntimeError(
+                    "GALP native metrics remained incomplete at a PLS pool boundary"
+                )
+            self._committed_native_metrics = self._merge_native_loader_metrics(
+                self._committed_native_metrics, current
+            )
+            self._loader_metrics.update(self._committed_native_metrics)
+            self._freeze_active_prefetch_evidence()
+        finally:
+            self.reader.close()
+            self._pipeline_active = False
+            self._native_schedule = []
+            self._next_native_batch = 0
+            self._prefetched_batch_count = 0
+            if released_pls_pool:
+                self._pls_pool_metrics["released_pool_count"] = int(
+                    self._pls_pool_metrics["released_pool_count"]
+                ) + 1
+                self._pls_pool_metrics["active_pool_count"] = 0
+
+    def _start_next_pls_pipeline(self) -> None:
+        if self._next_pls_pool >= len(self._pls_pool_ranges):
+            raise StopIteration
+        self._start_native_pipeline([self._pls_pool_ranges[self._next_pls_pool]])
+        self._next_pls_pool += 1
+        self._pls_pool_metrics["active_pool_count"] = 1
+        self._pls_pool_metrics["max_simultaneously_active_pool_count"] = max(
+            int(self._pls_pool_metrics["max_simultaneously_active_pool_count"]),
+            int(self._pls_pool_metrics["active_pool_count"]),
+        )
+
+    def _load_active_pls_pool(self) -> None:
+        if self._pls_pool_release_pending:
+            self._close_native_pipeline(
+                synchronize_consumer=True,
+                require_complete_metrics=True,
+                released_pls_pool=True,
+            )
+            self._pls_pool_release_pending = False
+            self._start_next_pls_pipeline()
+        elif not self._pipeline_active:
+            self._start_next_pls_pipeline()
+        indices, _image_ids, _transforms, native_batch, wait = (
+            self._consume_native_batch()
+        )
         self._active_pls_pool = {
             "indices": indices,
             "batch": native_batch,
@@ -885,7 +926,6 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
                     else 0.0
                 ),
             },
-            keepalive=[native_batch],
             native_stats_source=native_batch if stats_pending else None,
         )
         self._active_pls_pool["native_stats_pending"] = False
@@ -893,6 +933,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self._next_emit_batch += 1
         if int(self._active_pls_pool["offset"]) == len(indices):
             self._active_pls_pool = None
+            self._pls_pool_release_pending = True
             self._pls_pool_metrics["fully_emitted_release_eligible_pool_count"] = int(
                 self._pls_pool_metrics["fully_emitted_release_eligible_pool_count"]
             ) + 1
@@ -901,35 +942,16 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         return training_batch
 
     def next_batch(self) -> TrainingBatch:
-        if self._queue is None:
+        if not self._repeat_active:
             raise RuntimeError("pipeline repeat has not begun")
         if self._pls_gpu_pool:
-            return self._next_pls_pool_batch()
-        if int(self._queue.metrics()["current_queue_depth_batches"]) == 0:
-            if self._next_enqueue >= len(self._batch_ranges):
+            if self._next_emit_batch >= len(self._batch_ranges):
                 raise StopIteration
-            self._enqueue_next()
-        try:
-            (indices, image_ids, transforms), batch = self._queue.pop()
-        except Exception:
-            # Join/cancel successors before propagating the producer failure.
-            self._queue.close()
-            raise
+            return self._next_pls_pool_batch()
+        if not self._pipeline_active:
+            raise RuntimeError("pipeline repeat has not begun")
+        indices, image_ids, transforms, batch, wait = self._consume_native_batch()
         plan = [self._planned[index] for index in indices]
-        queue_wait = float(self._queue.metrics()["consumer_wait_seconds"])
-        wait = queue_wait - self._reported_consumer_wait
-        self._reported_consumer_wait = queue_wait
-        while (
-            int(self._queue.metrics()["current_queue_depth_batches"])
-            < self._prefetch_depth
-            and self._next_enqueue < len(self._batch_ranges)
-        ):
-            self._enqueue_next()
-        try:
-            self._validate_native_provenance(batch, image_ids, transforms)
-        except Exception:
-            self._queue.close()
-            raise
         inputs = tuple(batch.tensors)
         training_batch = TrainingBatch(
             inputs=inputs,
@@ -940,7 +962,6 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             stage_seconds={
                 "loader_data_wait": wait,
             },
-            keepalive=[batch],
             native_stats_source=batch,
         )
         if self.execution_mode == "audit":
@@ -1083,24 +1104,51 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         )
         self._apply_batch_metrics(batch, execution_stats)
 
+    def _capture_native_metrics(self) -> None:
+        self._loader_metrics.update(self._combined_native_metrics())
+
     def loader_metrics(self) -> dict[str, Any]:
-        metrics = self._queue.metrics() if self._queue is not None else {}
+        if self._pipeline_active:
+            self._capture_native_metrics()
+        metrics = dict(self._loader_metrics)
         metrics.update(
             {
                 "worker_semantics": (
                     "native runtime profile; --workers is not forwarded to GALP"
                 ),
                 "configured_workers": self.workers,
-                "actual_batch_producer_workers": 1,
                 "execution_mode": self.execution_mode,
                 "physical_load_segment_gpu_pool": dict(self._pls_pool_metrics),
             }
         )
         return metrics
 
+    def prefetched_read_identities(self) -> list[SampleIdentity]:
+        active_indices: list[int] = []
+        if self._pipeline_active:
+            self._prefetched_batch_count = min(
+                self.reader.prefetched_batch_count(), len(self._native_schedule)
+            )
+            active_indices = [
+                index
+                for batch_indices, _image_ids, _transforms in self._native_schedule[
+                    : self._prefetched_batch_count
+                ]
+                for index in batch_indices
+            ]
+        indices = [*self._prefetched_indices, *active_indices]
+        return [self._planned[index][1] for index in indices]
+
     def end(self) -> None:
-        if self._queue is not None:
-            self._queue.close()
+        if self._pipeline_active:
+            self._close_native_pipeline(
+                synchronize_consumer=self._pls_gpu_pool,
+                require_complete_metrics=self._pls_gpu_pool,
+                released_pls_pool=self._pls_gpu_pool,
+            )
+            self._pls_pool_release_pending = False
+        self._repeat_active = False
+        self._loader_metrics["closed"] = True
         super().end()
 
 
@@ -1154,7 +1202,7 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
             batch_size=self.batch_size,
             num_threads=max(1, self.workers),
             device_id=self.device.index or 0,
-            prefetch_queue_depth=int(self.config.get("prefetch_depth", 2)),
+            prefetch_queue_depth=CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
             exec_pipelined=True,
             exec_async=True,
         )

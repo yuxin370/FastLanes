@@ -11,14 +11,12 @@ import struct
 import sys
 import tempfile
 import unittest
-from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import torch
-from galp.torch import DirectDctFuture
 
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "benchmarks/system_rgbnomore"
@@ -49,7 +47,7 @@ from inference.pipeline import (  # noqa: E402
     _accumulate_native_counter,
     _process_memory_snapshot,
     _resolve_model_stream_priority,
-    _validate_transform_capability,
+    _validate_profile_contract,
 )
 from dataset.prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
 from inference.run import (  # noqa: E402
@@ -237,17 +235,20 @@ class SystemBenchmarkTest(unittest.TestCase):
         self.assertEqual(args.pipelines[0], "galp")
         self.assertEqual(args.dct_source_image_size, 512)
 
-    def test_transform_capability_preflight_requires_production_planless_path(self) -> None:
-        fixed_preview = {
-            "uses_planless_fixed_transform": False,
+    def test_semantic_profile_contract_rejects_wrong_output(self) -> None:
+        valid_profile = {
+            "id": "rgbnomore-validation-v1",
             "layout": "transformed_dct_grid",
-            "image_count": 2,
+            "output_dtype": "float32",
+            "y_output_blocks": (28, 28),
+            "cbcr_output_blocks": (14, 14),
         }
-        planless_preview = {**fixed_preview, "uses_planless_fixed_transform": True}
-        accepted = _validate_transform_capability(planless_preview, context="test")
-        self.assertEqual(accepted["observed_transform_execution"], "planless")
-        with self.assertRaisesRegex(RuntimeError, "requires planless"):
-            _validate_transform_capability(fixed_preview, context="test")
+        accepted = _validate_profile_contract(valid_profile, context="test")
+        self.assertEqual(accepted["profile_id"], "rgbnomore-validation-v1")
+        with self.assertRaisesRegex(RuntimeError, "semantic profile contract"):
+            _validate_profile_contract(
+                {**valid_profile, "output_dtype": "int16"}, context="test"
+            )
 
     def test_production_cli_rejects_historical_galp_pipeline_names(self) -> None:
         with mock.patch.object(
@@ -829,33 +830,20 @@ class SystemBenchmarkTest(unittest.TestCase):
             self.assertTrue(result["full_prediction"]["within_tolerance"])
             self.assertTrue(any("logits exceed tolerance" in failure for failure in failures))
 
-    def test_galp_adapter_prefetches_two_batches_ahead_in_order(self) -> None:
-        prefetch_calls: list[list[int]] = []
+    def test_galp_adapter_uses_native_pipeline_in_logical_order(self) -> None:
+        scheduled_batches: list[list[int]] = []
 
-        class Pending:
-            ready = True
-            started = True
-            active = False
-            finished = True
-            producer_active_ms = 0.0
-            planning_ms = 0.0
-            io_staging_ms = 0.0
-            ordered_submission_ms = 0.0
+        class Pipeline:
+            def start(self, image_id_batches):
+                scheduled_batches.extend([list(batch) for batch in image_id_batches])
+                self.batches = iter([SourceBatch(list(batch)) for batch in image_id_batches])
+                return self
 
-            def __init__(self, image_ids: list[int]) -> None:
-                self.image_ids = image_ids
+            def __next__(self):
+                return next(self.batches)
 
-            def release_submission(self) -> bool:
-                return True
-
-            def read(self):
-                return SourceBatch(self.image_ids)
-
-        class Reader:
-            @staticmethod
-            def prefetch(image_ids, profile):
-                prefetch_calls.append(list(image_ids))
-                return DirectDctFuture(Pending(list(image_ids)), profile.id)
+            def close(self):
+                pass
 
         class SourceBatch:
             execution_stats = {
@@ -879,13 +867,17 @@ class SystemBenchmarkTest(unittest.TestCase):
                 self.layout = "transformed_dct_grid"
                 self.y = torch.zeros((count, 1, 28, 28, 8, 8), dtype=torch.float32)
                 self.cbcr = torch.zeros((count, 2, 14, 14, 8, 8), dtype=torch.float32)
+                self.metrics = SimpleNamespace(
+                    consumer_wait_ms=0.0,
+                    producer_ms=0.0,
+                    planning_ms=0.0,
+                    io_ms=0.0,
+                )
 
         adapter = object.__new__(GalpAdapter)
-        adapter.reader = Reader()
+        adapter.pipeline = Pipeline()
         adapter.device = torch.device("cpu")
         adapter.batch_size = 2
-        adapter.pending_batches = deque()
-        adapter.next_prefetch_batch_index = 0
 
         first = [
             {"galp_image_id": 10, "label": 3, "ordinal": 0},
@@ -906,11 +898,10 @@ class SystemBenchmarkTest(unittest.TestCase):
         second_batch = adapter.load(second, third)
         third_batch = adapter.load(third, None)
 
-        self.assertEqual(prefetch_calls, [[10, 11], [12, 13], [14, 15]])
+        self.assertEqual(scheduled_batches, [[10, 11], [12, 13], [14, 15]])
         self.assertEqual(first_batch.ordinals, [0, 1])
         self.assertEqual(second_batch.ordinals, [2, 3])
         self.assertEqual(third_batch.ordinals, [4, 5])
-        self.assertEqual(list(adapter.pending_batches), [])
 
 if __name__ == "__main__":
     unittest.main()

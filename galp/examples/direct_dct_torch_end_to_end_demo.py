@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end stay-on-GPU GALP Direct-DCT PyTorch demo.
+"""Legacy low-level Direct-DCT diagnostic and compatibility harness.
 
-The demo intentionally stays in the DCT domain: it reads compact DCT
+This script intentionally exercises the private native extension and exposes
+implementation counters. Applications should use ``direct_dct_pipeline_demo.py``;
+this file remains only because RGB-no-more pushdown diagnostics import its raw
+reference helpers.
+
+The harness stays in the DCT domain: it reads compact DCT
 coefficient tensors from GALP, converts them to float on CUDA only, aggregates
 block tokens into per-image logits, and optionally runs a short optimizer smoke.
 It can also request the YCbCr DCT grid layout and feed the

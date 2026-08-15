@@ -1,6 +1,7 @@
 #include "galp/direct_dct.hpp"
 #include "galp/profiles/registry.hpp"
 #include <ATen/cuda/CUDAEvent.h>
+#include <algorithm>
 #include <atomic>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -1124,16 +1125,8 @@ public:
 			return;
 		}
 		try {
-			const auto          stream = c10::cuda::getCurrentCUDAStream(device_index);
-			at::cuda::CUDAEvent ready(cudaEventDisableTiming);
-			ready.record(stream);
-			{
-				std::lock_guard<std::mutex> lock(mutex_);
-				pending_.emplace_back();
-				pending_.back().ready = std::move(ready);
-				pending_.back().owner = std::move(owner);
-			}
-			reclaim_finished();
+			const auto stream = c10::cuda::getCurrentCUDAStream(device_index);
+			defer_on_stream(std::move(owner), stream);
 		} catch (const std::exception& e) {
 			std::fprintf(stderr,
 			             "GALP direct-DCT PyTorch tensor deleter: failed to defer CUDA release; "
@@ -1146,6 +1139,37 @@ public:
 			             "GALP direct-DCT PyTorch tensor deleter: failed to defer CUDA release; "
 			             "waiting for the current stream before releasing the batch.\n");
 			synchronize_current_stream(device_index);
+			owner.reset();
+		}
+	}
+
+	void defer_on_stream(std::shared_ptr<galp::jpeg::DirectDctBatch> owner,
+	                     const c10::cuda::CUDAStream                  stream) noexcept {
+		if (!owner) {
+			return;
+		}
+		try {
+			at::cuda::CUDAEvent ready(cudaEventDisableTiming);
+			ready.record(stream);
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				pending_.emplace_back();
+				pending_.back().ready = std::move(ready);
+				pending_.back().owner = std::move(owner);
+			}
+			reclaim_finished();
+		} catch (const std::exception& e) {
+			std::fprintf(stderr,
+			             "GALP direct-DCT PyTorch tensor deleter: failed to defer registered-stream release; "
+			             "waiting for that stream before releasing the batch: %s\n",
+			             e.what());
+			synchronize_stream(stream);
+			owner.reset();
+		} catch (...) {
+			std::fprintf(stderr,
+			             "GALP direct-DCT PyTorch tensor deleter: failed to defer registered-stream release; "
+			             "waiting for that stream before releasing the batch.\n");
+			synchronize_stream(stream);
 			owner.reset();
 		}
 	}
@@ -1206,21 +1230,79 @@ private:
 		} catch (...) { std::fprintf(stderr, "GALP direct-DCT PyTorch tensor deleter: current stream wait failed.\n"); }
 	}
 
+	static void synchronize_stream(const c10::cuda::CUDAStream stream) noexcept {
+		try {
+			stream.synchronize();
+		} catch (const std::exception& e) {
+			std::fprintf(stderr, "GALP direct-DCT PyTorch tensor deleter: registered stream wait failed: %s\n", e.what());
+		} catch (...) { std::fprintf(stderr, "GALP direct-DCT PyTorch tensor deleter: registered stream wait failed.\n"); }
+	}
+
 	std::mutex                 mutex_;
 	std::deque<PendingRelease> pending_;
 };
 
+class TorchDirectDctConsumerStreams {
+public:
+	void register_current(const c10::DeviceIndex device_index) {
+		const auto stream = c10::cuda::getCurrentCUDAStream(device_index);
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (const auto& registered : streams_) {
+			if (registered.device_index() == stream.device_index() && registered.stream() == stream.stream()) {
+				return;
+			}
+		}
+		streams_.push_back(stream);
+	}
+
+	void defer(std::shared_ptr<galp::jpeg::DirectDctBatch> owner,
+	           const c10::DeviceIndex                      device_index) const noexcept {
+		std::vector<c10::cuda::CUDAStream> streams;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			streams = streams_;
+		}
+		auto& queue = DeferredDirectDctBatchReleaseQueue::instance();
+		if (streams.empty()) {
+			queue.defer(std::move(owner), device_index);
+			return;
+		}
+		for (const auto& stream : streams) {
+			queue.defer_on_stream(owner, stream);
+		}
+		owner.reset();
+	}
+
+private:
+	mutable std::mutex                 mutex_;
+	std::vector<c10::cuda::CUDAStream> streams_;
+};
+
+struct TorchDirectDctPrefetchTelemetry {
+	std::atomic<bool>    started {false};
+	// 0=queued, 1=active, 2=finished, 3=cancelled-before-active.
+	std::atomic<int>     state {0};
+	std::chrono::steady_clock::time_point submitted_at = std::chrono::steady_clock::now();
+	std::atomic<int64_t> producer_active_nanoseconds {0};
+	std::atomic<int64_t> planning_nanoseconds {0};
+	std::atomic<int64_t> io_staging_nanoseconds {0};
+	std::atomic<int64_t> ordered_submission_nanoseconds {0};
+	std::atomic<int64_t> submit_to_ready_nanoseconds {0};
+};
+
 struct TorchDirectDctBatch {
 	explicit TorchDirectDctBatch(galp::jpeg::DirectDctBatch batch_in)
-	    : batch(std::make_shared<galp::jpeg::DirectDctBatch>(std::move(batch_in))) {
+	    : batch(std::make_shared<galp::jpeg::DirectDctBatch>(std::move(batch_in))),
+	      consumer_streams(std::make_shared<TorchDirectDctConsumerStreams>()) {
 	}
 
 	torch::Tensor coefficients() {
 		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
+		wait_for_batch_completion();
+		register_current_consumer_stream();
 		if (tensor.defined()) {
 			return tensor;
 		}
-		wait_for_batch_completion();
 		const auto desc         = batch->tensor_async();
 		const auto device_index = static_cast<c10::DeviceIndex>(desc.cuda_device < 0 ? 0 : desc.cuda_device);
 		auto options = torch::TensorOptions().dtype(torch::kInt16).device(torch::Device(torch::kCUDA, device_index));
@@ -1229,24 +1311,27 @@ struct TorchDirectDctBatch {
 			return tensor;
 		}
 		auto owner = batch;
+		auto streams = consumer_streams;
 		tensor     = torch::from_blob(
             const_cast<int16_t*>(desc.data),
             {static_cast<int64_t>(desc.rows()), static_cast<int64_t>(desc.columns())},
             {static_cast<int64_t>(desc.strides[0]), static_cast<int64_t>(desc.strides[1])},
-            [owner = std::move(owner), device_index](void*) mutable {
-                DeferredDirectDctBatchReleaseQueue::instance().defer(std::move(owner), device_index);
-            },
+			[owner = std::move(owner), streams = std::move(streams), device_index](void*) mutable {
+				streams->defer(std::move(owner), device_index);
+			},
             options);
 		return tensor;
 	}
 
 	torch::Tensor y() {
 		wait_for_batch_completion();
+		register_current_consumer_stream();
 		return grid_tensor(batch->y_tensor_async(), y_tensor);
 	}
 
 	torch::Tensor cbcr() {
 		wait_for_batch_completion();
+		register_current_consumer_stream();
 		return grid_tensor(batch->cbcr_tensor_async(), cbcr_tensor);
 	}
 
@@ -1287,10 +1372,6 @@ struct TorchDirectDctBatch {
 		return block_to_image_tensor_cache;
 	}
 
-	void record_stream() {
-		DeferredDirectDctBatchReleaseQueue::instance().defer(batch, tensor_device_index());
-	}
-
 	[[nodiscard]] py::list image_layouts() const {
 		return image_layouts_to_list(batch->image_layouts());
 	}
@@ -1318,6 +1399,52 @@ struct TorchDirectDctBatch {
 		// explicitly non-blocking snapshot; execution_stats() finalizes them after
 		// the consumer has already waited for batch completion.
 		return execution_stats_to_dict(batch->execution_stats_ref());
+	}
+
+	[[nodiscard]] py::dict metrics() const {
+		// Keep the hot input path non-blocking. Completion-derived durations are
+		// finalized only when the native CUDA event is already ready; callers can
+		// read the same stable schema again after model completion.
+		auto       stats    = batch->execution_stats_ref();
+		auto*      event    = batch->cuda_completion_event();
+		bool       complete = event == nullptr;
+		if (event != nullptr) {
+			const auto status = cudaEventQuery(static_cast<cudaEvent_t>(event));
+			if (status == cudaSuccess) {
+				complete = true;
+			} else if (status != cudaErrorNotReady) {
+				C10_CUDA_CHECK(status);
+			}
+		}
+		if (complete) {
+			stats = batch->execution_stats();
+		}
+		py::dict   out;
+		out["schema"]               = "galp-direct-dct-metrics-v2";
+		out["complete"]             = complete;
+		out["consumer_wait_ms"]     = consumer_wait_ms;
+		out["submit_to_ready_ms"]   = submit_to_ready_ms;
+		out["producer_ms"]          = prefetch_telemetry
+		                                    ? static_cast<double>(prefetch_telemetry->producer_active_nanoseconds.load(
+		                                          std::memory_order_acquire)) /
+		                                          1.0e6
+		                                    : 0.0;
+		out["planning_ms"]          = prefetch_telemetry
+		                                    ? static_cast<double>(prefetch_telemetry->planning_nanoseconds.load(
+		                                          std::memory_order_acquire)) /
+		                                          1.0e6
+		                                    : stats.planning_ms;
+		out["io_ms"]                = prefetch_telemetry
+		                                    ? static_cast<double>(prefetch_telemetry->io_staging_nanoseconds.load(
+		                                          std::memory_order_acquire)) /
+		                                          1.0e6
+		                                    : stats.host_io_staging_ms;
+		out["decode_ms"]            = stats.decode_ms;
+		out["transform_ms"]         = stats.fixed_transform_ms + stats.fixed_grid_round_ms;
+		out["logical_bytes"]        = stats.selected_compressed_payload_bytes;
+		out["physical_bytes"]       = stats.compressed_payload_bytes_read;
+		out["peak_transient_bytes"] = stats.actual_transient_total_allocated_high_water_bytes;
+		return out;
 	}
 
 	[[nodiscard]] size_t cache_hits() const noexcept {
@@ -1433,12 +1560,16 @@ struct TorchDirectDctBatch {
 	}
 
 	std::shared_ptr<galp::jpeg::DirectDctBatch> batch;
+	std::shared_ptr<TorchDirectDctConsumerStreams> consumer_streams;
 	torch::Tensor                               tensor;
 	torch::Tensor                               y_tensor;
 	torch::Tensor                               cbcr_tensor;
 	torch::Tensor                               image_offsets_tensor_cache;
 	torch::Tensor                               image_counts_tensor_cache;
 	torch::Tensor                               block_to_image_tensor_cache;
+	std::shared_ptr<TorchDirectDctPrefetchTelemetry> prefetch_telemetry;
+	double                                      consumer_wait_ms = 0.0;
+	double                                      submit_to_ready_ms = 0.0;
 
 private:
 	[[nodiscard]] c10::DeviceIndex tensor_device_index() const noexcept {
@@ -1470,14 +1601,19 @@ private:
 			return cached;
 		}
 		auto owner = batch;
+		auto streams = consumer_streams;
 		cached     = torch::from_blob(const_cast<void*>(desc.raw_data()),
                                   shape,
                                   strides,
-                                  [owner = std::move(owner), device_index](void*) mutable {
-                                      DeferredDirectDctBatchReleaseQueue::instance().defer(std::move(owner), device_index);
-                                  },
+		                          [owner = std::move(owner), streams = std::move(streams), device_index](void*) mutable {
+		                              streams->defer(std::move(owner), device_index);
+		                          },
                                   options);
 		return cached;
+	}
+
+	void register_current_consumer_stream() const {
+		consumer_streams->register_current(tensor_device_index());
 	}
 
 	void wait_for_batch_completion() const {
@@ -1518,16 +1654,6 @@ TorchDirectDctBatch read_batch_from_state(const std::shared_ptr<TorchDirectDctRe
 	release_queue.reclaim_finished();
 	return TorchDirectDctBatch(std::move(raw_batch));
 }
-
-struct TorchDirectDctPrefetchTelemetry {
-	std::atomic<bool>    started {false};
-	// 0=queued, 1=active, 2=finished, 3=cancelled-before-active.
-	std::atomic<int>     state {0};
-	std::atomic<int64_t> producer_active_nanoseconds {0};
-	std::atomic<int64_t> planning_nanoseconds {0};
-	std::atomic<int64_t> io_staging_nanoseconds {0};
-	std::atomic<int64_t> ordered_submission_nanoseconds {0};
-};
 
 class TorchDirectDctPrefetch {
 public:
@@ -1607,7 +1733,15 @@ public:
 		// before opening the next transform submission gate.
 		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
 		release_submission();
-		auto batch = future_.get();
+		const auto wait_started = std::chrono::steady_clock::now();
+		auto       batch        = future_.get();
+		const auto ready_at     = std::chrono::steady_clock::now();
+		batch.prefetch_telemetry = telemetry_;
+		batch.consumer_wait_ms =
+		    std::chrono::duration<double, std::milli>(ready_at - wait_started).count();
+		batch.submit_to_ready_ms = static_cast<double>(
+		                               telemetry_->submit_to_ready_nanoseconds.load(std::memory_order_acquire)) /
+		                           1.0e6;
 		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
 		return batch;
 	}
@@ -1618,6 +1752,104 @@ private:
 	std::shared_ptr<galp::jpeg::JpegDctDeviceTransformSubmissionGate> submission_gate_;
 	std::atomic<bool>                                submission_released_ {true};
 };
+
+std::shared_ptr<TorchDirectDctPrefetch> prefetch_batch_from_state(
+    const std::shared_ptr<TorchDirectDctReaderState>&          state,
+    std::vector<galp::jpeg::JpegDctImageCropRequest>           requests,
+    galp::jpeg::JpegDctDeviceBatchOptions                      options) {
+	const auto               device_index = c10::cuda::current_device();
+	auto                     state_copy   = state;
+	auto                     completion   = std::make_shared<std::promise<void>>();
+	auto                     telemetry    = std::make_shared<TorchDirectDctPrefetchTelemetry>();
+	auto submission_gate = options.async_planless_completion
+	                           ? std::make_shared<galp::jpeg::JpegDctDeviceTransformSubmissionGate>()
+	                           : nullptr;
+	options.transform_submission_gate = submission_gate;
+	std::shared_future<void> predecessor;
+	{
+		std::lock_guard<std::mutex> lock(state->prefetch_mutex);
+		predecessor          = state->prefetch_tail;
+		state->prefetch_tail = completion->get_future().share();
+	}
+	std::future<TorchDirectDctBatch> future;
+	try {
+		future = std::async(std::launch::async,
+		                    [state     = std::move(state_copy),
+		                     requests = std::move(requests),
+		                     options,
+		                     device_index,
+		                     predecessor = std::move(predecessor),
+		                     completion,
+		                     telemetry]() mutable {
+			                    telemetry->started.store(true, std::memory_order_release);
+			                    try {
+				                    int queued = 0;
+				                    if (!telemetry->state.compare_exchange_strong(
+				                            queued, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+					                    throw std::runtime_error("DirectDctPrefetch was cancelled before execution");
+				                    }
+				                    const auto active_begin   = std::chrono::steady_clock::now();
+				                    const auto planning_begin = active_begin;
+				                    auto prepared = state->runtime.PrepareBatch(requests, options);
+				                    const auto planning_end = std::chrono::steady_clock::now();
+				                    telemetry->planning_nanoseconds.store(
+				                        std::chrono::duration_cast<std::chrono::nanoseconds>(planning_end - planning_begin)
+				                            .count(),
+				                        std::memory_order_release);
+				                    const auto io_begin = std::chrono::steady_clock::now();
+				                    state->runtime.StageBatchIo(prepared);
+				                    const auto io_end = std::chrono::steady_clock::now();
+				                    telemetry->io_staging_nanoseconds.store(
+				                        std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_begin).count(),
+				                        std::memory_order_release);
+				                    if (predecessor.valid()) {
+					                    predecessor.wait();
+				                    }
+				                    const auto submission_begin = std::chrono::steady_clock::now();
+				                    c10::cuda::CUDAGuard guard(device_index);
+				                    auto& release_queue = DeferredDirectDctBatchReleaseQueue::instance();
+				                    release_queue.reclaim_finished();
+				                    galp::jpeg::DirectDctBatch raw_batch;
+				                    {
+					                    std::lock_guard<std::mutex> lock(state->runtime_mutex);
+					                    raw_batch = state->runtime.ReadPreparedBatch(std::move(prepared));
+				                    }
+				                    release_queue.reclaim_finished();
+				                    auto batch = TorchDirectDctBatch(std::move(raw_batch));
+				                    const auto submission_end = std::chrono::steady_clock::now();
+				                    telemetry->ordered_submission_nanoseconds.store(
+				                        std::chrono::duration_cast<std::chrono::nanoseconds>(submission_end - submission_begin)
+				                            .count(),
+				                        std::memory_order_release);
+				                    const auto active_end = std::chrono::steady_clock::now();
+				                    telemetry->producer_active_nanoseconds.store(
+				                        std::chrono::duration_cast<std::chrono::nanoseconds>(active_end - active_begin)
+				                            .count(),
+				                        std::memory_order_release);
+				                    telemetry->submit_to_ready_nanoseconds.store(
+				                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                            active_end - telemetry->submitted_at).count(),
+				                        std::memory_order_release);
+				                    telemetry->state.store(2, std::memory_order_release);
+				                    completion->set_value();
+				                    return batch;
+			                    } catch (...) {
+				                    if (telemetry->state.load(std::memory_order_acquire) != 3) {
+					                    telemetry->state.store(2, std::memory_order_release);
+				                    }
+				                    try {
+					                    completion->set_value();
+				                    } catch (const std::future_error&) {}
+				                    throw;
+			                    }
+		                    });
+	} catch (...) {
+		completion->set_value();
+		throw;
+	}
+	return std::make_shared<TorchDirectDctPrefetch>(
+	    std::move(future), std::move(telemetry), std::move(submission_gate));
+}
 
 class TorchDirectDctReader {
 public:
@@ -1659,94 +1891,7 @@ public:
 	std::shared_ptr<TorchDirectDctPrefetch> prefetch_batch(
 	                                                       std::vector<galp::jpeg::JpegDctImageCropRequest> requests,
 	                                                       galp::jpeg::JpegDctDeviceBatchOptions options) {
-		const auto               device_index = c10::cuda::current_device();
-		auto                     state_copy   = state;
-		auto                     completion   = std::make_shared<std::promise<void>>();
-		auto                     telemetry    = std::make_shared<TorchDirectDctPrefetchTelemetry>();
-		auto submission_gate = options.async_planless_completion
-		                           ? std::make_shared<galp::jpeg::JpegDctDeviceTransformSubmissionGate>()
-		                           : nullptr;
-		options.transform_submission_gate = submission_gate;
-		std::shared_future<void> predecessor;
-		{
-			std::lock_guard<std::mutex> lock(state->prefetch_mutex);
-			predecessor          = state->prefetch_tail;
-			state->prefetch_tail = completion->get_future().share();
-		}
-		std::future<TorchDirectDctBatch> future;
-		try {
-			future = std::async(std::launch::async,
-			                    [state     = std::move(state_copy),
-			                     requests = std::move(requests),
-			                     options,
-			                     device_index,
-			                     predecessor = std::move(predecessor),
-			                     completion,
-			                     telemetry]() mutable {
-				                    telemetry->started.store(true, std::memory_order_release);
-				                    try {
-					                    int queued = 0;
-					                    if (!telemetry->state.compare_exchange_strong(
-					                            queued, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-						                    throw std::runtime_error("DirectDctPrefetch was cancelled before execution");
-					                    }
-				                    const auto active_begin = std::chrono::steady_clock::now();
-				                    const auto planning_begin = active_begin;
-				                    auto prepared = state->runtime.PrepareBatch(requests, options);
-				                    const auto planning_end = std::chrono::steady_clock::now();
-				                    telemetry->planning_nanoseconds.store(
-				                        std::chrono::duration_cast<std::chrono::nanoseconds>(planning_end - planning_begin)
-				                            .count(),
-				                        std::memory_order_release);
-				                    const auto io_begin = std::chrono::steady_clock::now();
-				                    state->runtime.StageBatchIo(prepared);
-				                    const auto io_end = std::chrono::steady_clock::now();
-				                    telemetry->io_staging_nanoseconds.store(
-				                        std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_begin).count(),
-				                        std::memory_order_release);
-				                    if (predecessor.valid()) {
-					                    predecessor.wait();
-				                    }
-				                    const auto submission_begin = std::chrono::steady_clock::now();
-				                    c10::cuda::CUDAGuard guard(device_index);
-				                    auto& release_queue = DeferredDirectDctBatchReleaseQueue::instance();
-				                    release_queue.reclaim_finished();
-				                    galp::jpeg::DirectDctBatch raw_batch;
-				                    {
-					                    std::lock_guard<std::mutex> lock(state->runtime_mutex);
-					                    raw_batch = state->runtime.ReadPreparedBatch(std::move(prepared));
-				                    }
-				                    release_queue.reclaim_finished();
-				                    auto batch = TorchDirectDctBatch(std::move(raw_batch));
-				                    const auto submission_end = std::chrono::steady_clock::now();
-				                    telemetry->ordered_submission_nanoseconds.store(
-				                        std::chrono::duration_cast<std::chrono::nanoseconds>(submission_end - submission_begin)
-				                            .count(),
-				                        std::memory_order_release);
-					                    const auto active_end = std::chrono::steady_clock::now();
-					                    telemetry->producer_active_nanoseconds.store(
-					                        std::chrono::duration_cast<std::chrono::nanoseconds>(active_end - active_begin)
-					                            .count(),
-					                        std::memory_order_release);
-					                    telemetry->state.store(2, std::memory_order_release);
-					                    completion->set_value();
-					                    return batch;
-				                    } catch (...) {
-					                    if (telemetry->state.load(std::memory_order_acquire) != 3) {
-						                    telemetry->state.store(2, std::memory_order_release);
-					                    }
-					                    try {
-						                    completion->set_value();
-					                    } catch (const std::future_error&) {}
-					                    throw;
-				                    }
-			                    });
-		} catch (...) {
-			completion->set_value();
-			throw;
-		}
-		return std::make_shared<TorchDirectDctPrefetch>(
-		    std::move(future), std::move(telemetry), std::move(submission_gate));
+		return prefetch_batch_from_state(state, std::move(requests), options);
 	}
 
 	TorchDirectDctBatch read_prefetched(const std::shared_ptr<TorchDirectDctPrefetch>& prefetch) {
@@ -1775,15 +1920,249 @@ public:
 		return state->runtime.RowgroupStorageBytes(shard_id, rowgroup_indices);
 	}
 
+	[[nodiscard]] std::shared_ptr<TorchDirectDctReaderState> shared_state() const noexcept {
+		return state;
+	}
+
 private:
 	std::shared_ptr<TorchDirectDctReaderState> state;
 	double construction_ms_ = 0.0;
 };
 
+class TorchDirectDctPipelineMetrics {
+public:
+	void reset() {
+		pending_.clear();
+		consumed_batches_ = 0;
+		completed_batches_ = 0;
+		consumer_wait_ms_ = 0.0;
+		submit_to_ready_ms_ = 0.0;
+		producer_ms_ = 0.0;
+		planning_ms_ = 0.0;
+		io_ms_ = 0.0;
+		decode_ms_ = 0.0;
+		transform_ms_ = 0.0;
+		logical_bytes_ = 0;
+		physical_bytes_ = 0;
+		peak_transient_bytes_ = 0;
+	}
+
+	void observe(const TorchDirectDctBatch& batch) {
+		++consumed_batches_;
+		consumer_wait_ms_ += batch.consumer_wait_ms;
+		submit_to_ready_ms_ += batch.submit_to_ready_ms;
+		if (batch.prefetch_telemetry) {
+			producer_ms_ += static_cast<double>(
+			                    batch.prefetch_telemetry->producer_active_nanoseconds.load(std::memory_order_acquire)) /
+			                1.0e6;
+			planning_ms_ += static_cast<double>(
+			                    batch.prefetch_telemetry->planning_nanoseconds.load(std::memory_order_acquire)) /
+			                1.0e6;
+			io_ms_ += static_cast<double>(
+			              batch.prefetch_telemetry->io_staging_nanoseconds.load(std::memory_order_acquire)) /
+			          1.0e6;
+		}
+		const auto& stats = batch.batch->execution_stats_ref();
+		logical_bytes_ += stats.selected_compressed_payload_bytes;
+		physical_bytes_ += stats.compressed_payload_bytes_read;
+		peak_transient_bytes_ = std::max(
+		    peak_transient_bytes_, stats.actual_transient_total_allocated_high_water_bytes);
+		pending_.push_back(batch.batch);
+		collect_ready();
+	}
+
+	[[nodiscard]] py::dict snapshot() {
+		collect_ready();
+		py::dict out;
+		out["schema"]               = "galp-direct-dct-metrics-v2";
+		out["complete"]             = pending_.empty();
+		out["consumer_wait_ms"]     = consumer_wait_ms_;
+		out["submit_to_ready_ms"]   = submit_to_ready_ms_;
+		out["producer_ms"]          = producer_ms_;
+		out["planning_ms"]          = planning_ms_;
+		out["io_ms"]                = io_ms_;
+		out["decode_ms"]            = decode_ms_;
+		out["transform_ms"]         = transform_ms_;
+		out["logical_bytes"]        = logical_bytes_;
+		out["physical_bytes"]       = physical_bytes_;
+		out["peak_transient_bytes"] = peak_transient_bytes_;
+		out["consumed_batches"]     = consumed_batches_;
+		out["completed_batches"]    = completed_batches_;
+		return out;
+	}
+
+private:
+	void collect_ready() {
+		for (auto it = pending_.begin(); it != pending_.end();) {
+			auto* event = (*it)->cuda_completion_event();
+			bool  ready = event == nullptr;
+			if (event != nullptr) {
+				const auto status = cudaEventQuery(static_cast<cudaEvent_t>(event));
+				if (status == cudaSuccess) {
+					ready = true;
+				} else if (status != cudaErrorNotReady) {
+					C10_CUDA_CHECK(status);
+				}
+			}
+			if (!ready) {
+				++it;
+				continue;
+			}
+			const auto stats = (*it)->execution_stats();
+			decode_ms_ += stats.decode_ms;
+			transform_ms_ += stats.fixed_transform_ms + stats.fixed_grid_round_ms;
+			peak_transient_bytes_ = std::max(
+			    peak_transient_bytes_, stats.actual_transient_total_allocated_high_water_bytes);
+			++completed_batches_;
+			it = pending_.erase(it);
+		}
+	}
+
+	std::deque<std::shared_ptr<galp::jpeg::DirectDctBatch>> pending_;
+	size_t consumed_batches_ = 0;
+	size_t completed_batches_ = 0;
+	double consumer_wait_ms_ = 0.0;
+	double submit_to_ready_ms_ = 0.0;
+	double producer_ms_ = 0.0;
+	double planning_ms_ = 0.0;
+	double io_ms_ = 0.0;
+	double decode_ms_ = 0.0;
+	double transform_ms_ = 0.0;
+	size_t logical_bytes_ = 0;
+	size_t physical_bytes_ = 0;
+	size_t peak_transient_bytes_ = 0;
+};
+
+class TorchDirectDctPipeline {
+public:
+	TorchDirectDctPipeline(std::shared_ptr<TorchDirectDctReaderState> state,
+	                       galp::jpeg::JpegDctDeviceBatchOptions     options)
+	    : state_(std::move(state)), options_(std::move(options)) {
+	}
+
+	~TorchDirectDctPipeline() {
+		close();
+	}
+
+	void reset(const std::vector<std::vector<uint32_t>>& image_id_batches,
+	           const py::object&                         transforms_by_batch) {
+		const bool has_transforms = !transforms_by_batch.is_none();
+		py::list   transform_batches;
+		if (has_transforms) {
+			transform_batches = transforms_by_batch.cast<py::list>();
+			if (static_cast<size_t>(transform_batches.size()) != image_id_batches.size()) {
+				throw std::invalid_argument(
+				    "transforms_by_batch must contain exactly one entry per image-id batch");
+			}
+		}
+		std::vector<std::vector<galp::jpeg::JpegDctImageCropRequest>> parsed_requests;
+		parsed_requests.reserve(image_id_batches.size());
+		for (size_t index = 0; index < image_id_batches.size(); ++index) {
+			if (image_id_batches[index].empty()) {
+				throw std::invalid_argument("DirectDctPipeline batches must not be empty");
+			}
+			const py::object transforms = has_transforms
+			                                  ? py::reinterpret_borrow<py::object>(transform_batches[index])
+			                                  : py::none();
+			parsed_requests.push_back(parse_transform_requests(
+			    image_id_batches[index], transforms, galp::jpeg::JpegDctCropBox {}));
+		}
+		close();
+		metrics_.reset();
+		closed_   = false;
+		requests_ = std::move(parsed_requests);
+		fill_pending();
+		if (!pending_.empty()) {
+			pending_.front()->release_submission();
+		}
+	}
+
+	TorchDirectDctBatch next() {
+		if (closed_ || pending_.empty()) {
+			throw py::stop_iteration();
+		}
+		auto current = pending_.front();
+		current->release_submission();
+		try {
+			auto batch = current->read();
+			last_prefetch_ = std::move(current);
+			pending_.pop_front();
+			fill_pending();
+			metrics_.observe(batch);
+			return batch;
+		} catch (...) {
+			close();
+			throw;
+		}
+	}
+
+	[[nodiscard]] bool ready() const {
+		return !pending_.empty() && pending_.front()->ready();
+	}
+
+	[[nodiscard]] bool started() const noexcept {
+		return !pending_.empty() && pending_.front()->started();
+	}
+
+	[[nodiscard]] py::dict prefetch_metrics() const {
+		std::shared_ptr<TorchDirectDctPrefetch> source = last_prefetch_;
+		if (!source && !pending_.empty()) {
+			source = pending_.front();
+		}
+		py::dict out;
+		out["producer_ms"]           = source ? source->producer_active_ms() : 0.0;
+		out["planning_ms"]           = source ? source->planning_ms() : 0.0;
+		out["io_ms"]                 = source ? source->io_staging_ms() : 0.0;
+		out["ordered_submission_ms"] = source ? source->ordered_submission_ms() : 0.0;
+		return out;
+	}
+
+	[[nodiscard]] size_t prefetched_batch_count() const noexcept {
+		return next_request_;
+	}
+
+	[[nodiscard]] py::dict metrics() {
+		return metrics_.snapshot();
+	}
+
+	size_t close() noexcept {
+		size_t cancelled = 0;
+		for (auto& pending : pending_) {
+			cancelled += pending && pending->cancel() ? 1U : 0U;
+		}
+		pending_.clear();
+		requests_.clear();
+		last_prefetch_.reset();
+		next_request_ = 0;
+		closed_       = true;
+		return cancelled;
+	}
+
+private:
+	static constexpr size_t kNativePrefetchDepth = 2U;
+
+	void fill_pending() {
+		while (pending_.size() < kNativePrefetchDepth && next_request_ < requests_.size()) {
+			pending_.push_back(prefetch_batch_from_state(
+			    state_, std::move(requests_[next_request_]), options_));
+			++next_request_;
+		}
+	}
+
+	std::shared_ptr<TorchDirectDctReaderState> state_;
+	galp::jpeg::JpegDctDeviceBatchOptions options_;
+	std::vector<std::vector<galp::jpeg::JpegDctImageCropRequest>> requests_;
+	std::deque<std::shared_ptr<TorchDirectDctPrefetch>> pending_;
+	std::shared_ptr<TorchDirectDctPrefetch> last_prefetch_;
+	TorchDirectDctPipelineMetrics metrics_;
+	size_t next_request_ = 0;
+	bool   closed_       = true;
+};
+
 } // namespace
 
 PYBIND11_MODULE(_galp_direct_dct, m) {
-	m.doc() = "Stay-on-GPU GALP JPEG DCT runtime for PyTorch direct-DCT workloads";
+	m.doc() = "Private GALP Direct-DCT backend; applications must import galp.torch";
 
 	py::class_<TorchDirectDctBatch>(m, "DirectDctBatch")
 	    .def_property_readonly("coefficients", &TorchDirectDctBatch::coefficients)
@@ -1798,6 +2177,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("cache_stats", &TorchDirectDctBatch::cache_stats)
 	    .def_property_readonly("execution_stats", &TorchDirectDctBatch::execution_stats)
 	    .def_property_readonly("execution_stats_snapshot", &TorchDirectDctBatch::execution_stats_snapshot)
+	    .def_property_readonly("metrics", &TorchDirectDctBatch::metrics)
 	    .def_property_readonly("cache_hits", &TorchDirectDctBatch::cache_hits)
 	    .def_property_readonly("cache_misses", &TorchDirectDctBatch::cache_misses)
 	    .def_property_readonly("cache_inserts", &TorchDirectDctBatch::cache_inserts)
@@ -1821,9 +2201,6 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("projection_ms", &TorchDirectDctBatch::projection_ms)
 	    .def_property_readonly("prefetch_wait_ms", &TorchDirectDctBatch::prefetch_wait_ms)
 	    .def_property_readonly("sync_rowgroup_read_ms", &TorchDirectDctBatch::sync_rowgroup_read_ms)
-	    .def("record_stream",
-	         &TorchDirectDctBatch::record_stream,
-	         "Keep the underlying DirectDctBatch alive until work on the current CUDA stream reaches this point.")
 	    .def_property_readonly("layout", &TorchDirectDctBatch::layout)
 	    .def_property_readonly("device_data_ptr", &TorchDirectDctBatch::device_data_ptr)
 	    .def_property_readonly("y_device_data_ptr", &TorchDirectDctBatch::y_device_data_ptr)
@@ -1866,6 +2243,23 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	         &TorchDirectDctPrefetch::read,
 	         "Consume the prefetch handle and return the batch; dropping an unread handle waits for the read to finish.",
 	         py::call_guard<py::gil_scoped_release>());
+
+	py::class_<TorchDirectDctPipeline, std::shared_ptr<TorchDirectDctPipeline>>(m, "DirectDctPipeline")
+	    .def("reset",
+	         &TorchDirectDctPipeline::reset,
+	         py::arg("image_id_batches"),
+	         py::arg("transforms_by_batch") = py::none(),
+	         "Replace the logical batch schedule and start native-owned bounded prefetching.")
+	    .def("__iter__", [](const std::shared_ptr<TorchDirectDctPipeline>& pipeline) { return pipeline; })
+	    .def("__next__",
+	         &TorchDirectDctPipeline::next,
+	         py::call_guard<py::gil_scoped_release>())
+	    .def_property_readonly("ready", &TorchDirectDctPipeline::ready)
+	    .def_property_readonly("started", &TorchDirectDctPipeline::started)
+	    .def_property_readonly("prefetched_batch_count", &TorchDirectDctPipeline::prefetched_batch_count)
+	    .def_property_readonly("metrics", &TorchDirectDctPipeline::metrics)
+	    .def_property_readonly("prefetch_metrics", &TorchDirectDctPipeline::prefetch_metrics)
+	    .def("close", &TorchDirectDctPipeline::close);
 
 	py::class_<TorchDirectDctReader>(m, "DirectDctReader")
 	    .def(py::init<const std::string&>(), py::arg("manifest_path"))
@@ -1919,6 +2313,15 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("profile_id"),
 	        py::arg("transforms") = py::none(),
 	        "Read a registered semantic Direct-DCT profile synchronously.")
+	    .def(
+	        "pipeline",
+	        [](TorchDirectDctReader& reader, const std::string& profile_id) {
+		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
+		        return std::make_shared<TorchDirectDctPipeline>(
+		            reader.shared_state(), galp::profiles::materialize_direct_dct_options(profile));
+	        },
+	        py::arg("profile_id"),
+	        "Create a native-owned bounded pipeline for one semantic profile.")
 	    .def("image_metadata",
 	         &TorchDirectDctReader::image_metadata,
 	         py::arg("global_image_index"),
@@ -2301,6 +2704,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	m.attr("DEFAULT_CACHE_CAPACITY_MIB")  = kDefaultDirectDctCacheCapacityMiB;
 	m.attr("DEFAULT_PLAN_CACHE_CAPACITY") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity;
 	m.attr("DIRECT_DCT_PROFILE_SCHEMA") = "galp-direct-dct-profile-v1";
+	m.attr("DIRECT_DCT_METRICS_SCHEMA") = "galp-direct-dct-metrics-v2";
 	m.def("available_direct_dct_profiles", &galp::profiles::available_direct_dct_profile_ids);
 	m.def("direct_dct_profile_info", [](const std::string& profile_id) {
 		return direct_dct_profile_info(galp::profiles::resolve_direct_dct_profile(profile_id));

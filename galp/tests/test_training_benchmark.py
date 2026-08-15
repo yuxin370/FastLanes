@@ -54,7 +54,6 @@ from training.gate3_acceptance import (  # noqa: E402
     evaluate_gate3,
 )
 from training.strict1k_acceptance import evaluate_strict1k  # noqa: E402
-from training.select_gate3_prefetch import select_gate3_prefetch  # noqa: E402
 from training.manifest_preflight import (  # noqa: E402
     ManifestPreflightError,
     preflight_manifest,
@@ -76,7 +75,6 @@ from training.pipeline import (  # noqa: E402
     DaliTrainingAdapter,
     GalpTrainingAdapter,
     PyTorchTrainingAdapter,
-    OrderedAsyncPrefetchQueue,
     RgbNoMoreTrainingAdapter,
     _RgbNoMoreDctDataset,
     TrainingBatch,
@@ -231,39 +229,6 @@ class _OneBatchAdapter:
         return self.batch
 
 
-class _FakeAsyncHandle:
-    def __init__(self, value: object = None, *, ready: bool = True, error: Exception | None = None) -> None:
-        self.value = value
-        self.ready = ready
-        self.started = True
-        self.producer_active_ms = 2.0
-        self.error = error
-        self.read_count = 0
-        self.cancel_count = 0
-
-    @property
-    def telemetry(self):
-        return {
-            "producer_active_ms": self.producer_active_ms,
-            "planning_ms": 0.0,
-            "io_staging_ms": 0.0,
-            "ordered_submission_ms": 0.0,
-        }
-
-    def read(self):
-        self.read_count += 1
-        if self.error is not None:
-            raise self.error
-        return self.value
-
-    def cancel(self) -> bool:
-        self.cancel_count += 1
-        return False
-
-    def release_submission(self) -> bool:
-        return True
-
-
 class _FakeNativeTrainingBatch:
     def __init__(
         self,
@@ -296,6 +261,20 @@ class _FakeNativeTrainingBatch:
     def tensors(self):
         return self.y, self.cbcr
 
+    @property
+    def metrics(self):
+        return SimpleNamespace(
+            consumer_wait_ms=0.25,
+            producer_ms=2.0,
+            planning_ms=0.5,
+            io_ms=0.75,
+            decode_ms=1.0,
+            transform_ms=0.25,
+            logical_bytes=1024,
+            physical_bytes=512,
+            peak_transient_bytes=4096,
+        )
+
     def native_execution_stats(self):
         return {} if self._execution_stats is None else dict(self._execution_stats)
 
@@ -305,14 +284,55 @@ class _FakeDirectDctTrainingReader:
         self.execution_stats = execution_stats
         self.requests: list[tuple[list[int], list[dict[str, object]], dict[str, object]]] = []
         self.batches: list[_FakeNativeTrainingBatch] = []
+        self.start_requests: list[list[list[int]]] = []
+        self.lifecycle: list[str] = []
 
-    def prefetch_batch(self, image_ids, *, transforms, **options):
-        ids = [int(value) for value in image_ids]
-        descriptors = [dict(value) for value in transforms]
-        self.requests.append((ids, descriptors, dict(options)))
-        batch = _FakeNativeTrainingBatch(ids, descriptors, self.execution_stats)
-        self.batches.append(batch)
-        return _FakeAsyncHandle(batch)
+        self._next_batch = 0
+
+    def start(self, image_id_batches, *, transforms_by_batch):
+        self.requests = []
+        self.batches = []
+        self._next_batch = 0
+        for image_ids, transforms in zip(image_id_batches, transforms_by_batch):
+            ids = [int(value) for value in image_ids]
+            descriptors = [dict(value) for value in transforms]
+            self.requests.append((ids, descriptors, {}))
+            self.batches.append(
+                _FakeNativeTrainingBatch(ids, descriptors, self.execution_stats)
+            )
+        self.start_requests.append(
+            [list(request[0]) for request in self.requests]
+        )
+        self.lifecycle.append("start")
+
+    def next_batch(self):
+        if self._next_batch >= len(self.batches):
+            raise StopIteration
+        batch = self.batches[self._next_batch]
+        self._next_batch += 1
+        return batch
+
+    def close(self):
+        self.lifecycle.append("close")
+        return None
+
+    def metrics(self):
+        consumed = self._next_batch
+        return SimpleNamespace(
+            complete=True,
+            consumer_wait_ms=0.25 * consumed,
+            producer_ms=2.0 * consumed,
+            planning_ms=0.5 * consumed,
+            io_ms=0.75 * consumed,
+            decode_ms=1.0 * consumed,
+            transform_ms=0.25 * consumed,
+            logical_bytes=1024 * consumed,
+            physical_bytes=512 * consumed,
+            peak_transient_bytes=4096 if consumed else 0,
+        )
+
+    def prefetched_batch_count(self):
+        return min(len(self.batches), self._next_batch + 2)
 
 
 class _FakeDaliTensorList:
@@ -686,17 +706,43 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 constructed.append(path)
                 self.image_count = 9
 
-            def prefetch(self, image_ids, profile_id, *, transforms):
-                self.assert_profile_id = profile_id
-                return _FakeAsyncHandle(
-                    _FakeNativeTrainingBatch(
-                        list(image_ids), list(transforms), {"future_counter": 11}
-                    )
-                )
+            def pipeline(self, profile_id):
+                reader = self
+
+                class NativePipeline:
+                    ready = True
+                    started = True
+                    prefetch_metrics = {
+                        "producer_ms": 0.0,
+                        "planning_ms": 0.0,
+                        "io_ms": 0.0,
+                        "ordered_submission_ms": 0.0,
+                    }
+
+                    def reset(self, batches, *, transforms_by_batch):
+                        reader.assert_profile_id = profile_id
+                        self.batch = _FakeNativeTrainingBatch(
+                            list(batches[0]),
+                            list(transforms_by_batch[0]),
+                            {"future_counter": 11},
+                        )
+                        self.consumed = False
+
+                    def __next__(self):
+                        if self.consumed:
+                            raise StopIteration
+                        self.consumed = True
+                        return self.batch
+
+                    def close(self):
+                        return 0
+
+                return NativePipeline()
 
         native_module = SimpleNamespace(
             DirectDctReader=NativeReader,
             DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
+            DIRECT_DCT_METRICS_SCHEMA="galp-direct-dct-metrics-v2",
             direct_dct_profile_info=lambda profile_id: {
                 "schema": "galp-direct-dct-profile-v1",
                 "id": profile_id,
@@ -706,10 +752,10 @@ class TrainingBenchmarkTest(unittest.TestCase):
         for name in ("v2.bin", "v3.bin"):
             reader = DirectDctTrainingReader(Path(name), native_module=native_module)
             self.assertEqual(reader.image_count, 9)
-            handle = reader.prefetch_batch(
-                [3], transforms=[{"global_image_id": 3}]
+            reader.start(
+                [[3]], transforms_by_batch=[[{"global_image_id": 3}]]
             )
-            batch = handle.read()
+            batch = reader.next_batch()
             self.assertEqual(batch.global_image_ids, [3])
             self.assertEqual(batch.native_execution_stats()["future_counter"], 11)
             self.assertEqual(
@@ -727,6 +773,7 @@ class TrainingBenchmarkTest(unittest.TestCase):
         native_module = SimpleNamespace(
             DirectDctReader=NativeReader,
             DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
+            DIRECT_DCT_METRICS_SCHEMA="galp-direct-dct-metrics-v2",
             direct_dct_profile_info=lambda profile_id: {
                 "schema": "galp-direct-dct-profile-v1",
                 "id": profile_id,
@@ -808,7 +855,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
                     device=torch.device("cpu"),
                     config={
                         "_direct_dct_training_reader": reader,
-                        "prefetch_depth": 1,
                         "execution_mode": "audit",
                     },
                 )
@@ -853,7 +899,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
                     device=torch.device("cpu"),
                     config={
                         "_direct_dct_training_reader": reader,
-                        "prefetch_depth": 2,
                         "execution_mode": "audit",
                     },
                 )
@@ -900,7 +945,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 device=torch.device("cpu"),
                 config={
                     "_direct_dct_training_reader": reader,
-                    "prefetch_depth": 1,
                     "execution_mode": "runtime",
                 },
             )
@@ -915,7 +959,124 @@ class TrainingBenchmarkTest(unittest.TestCase):
             self.assertEqual(reader.batches[0].snapshot_stats_reads, 1)
             adapter.close()
 
-    def test_galp_workers_and_prefetch_depth_do_not_change_semantics(self) -> None:
+    def test_galp_prefetch_evidence_tracks_only_native_accepted_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            samples = _samples(Path(temporary), 8)
+            identities = [
+                SampleIdentity(0, index, sample.logical_sample_id)
+                for index, sample in enumerate(samples)
+            ]
+            decisions = [
+                derive_augmentation(
+                    seed=23,
+                    epoch=0,
+                    logical_sample_id=sample.logical_sample_id,
+                    source_width=sample.width,
+                    source_height=sample.height,
+                    domain="dct",
+                )
+                for sample in samples
+            ]
+            adapter = GalpTrainingAdapter(
+                samples,
+                batch_size=2,
+                workers=0,
+                device=torch.device("cpu"),
+                config={
+                    "_direct_dct_training_reader": _FakeDirectDctTrainingReader(),
+                    "execution_mode": "runtime",
+                },
+            )
+            adapter.begin(identities, decisions, [2, 2, 2, 2])
+            adapter.next_batch()
+            self.assertEqual(adapter.prefetched_read_identities(), identities[:6])
+            self.assertNotEqual(adapter.prefetched_read_identities(), identities)
+            adapter.close()
+            self.assertEqual(adapter.prefetched_read_identities(), identities[:6])
+            self.assertTrue(adapter.loader_metrics()["native_metrics_complete"])
+            self.assertTrue(adapter.loader_metrics()["closed"])
+
+    def test_galp_pls_gpu_pool_uses_one_native_pipeline_scope_per_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            samples = _samples(Path(temporary), 8)
+            identities = [
+                SampleIdentity(0, index, sample.logical_sample_id)
+                for index, sample in enumerate(samples)
+            ]
+            decisions = [
+                derive_augmentation(
+                    seed=29,
+                    epoch=0,
+                    logical_sample_id=sample.logical_sample_id,
+                    source_width=sample.width,
+                    source_height=sample.height,
+                    domain="dct",
+                )
+                for sample in samples
+            ]
+            reader = _FakeDirectDctTrainingReader()
+            adapter = GalpTrainingAdapter(
+                samples,
+                batch_size=2,
+                workers=0,
+                device=torch.device("cpu"),
+                config={
+                    "_direct_dct_training_reader": reader,
+                    "execution_mode": "runtime",
+                    "pls_gpu_pool": {
+                        "enabled": True,
+                        "closed_pool_batches": [
+                            {"optimizer_batches": 2, "sample_count": 4},
+                            {"optimizer_batches": 2, "sample_count": 4},
+                        ],
+                    },
+                },
+            )
+            adapter.begin(identities, decisions, [2, 2, 2, 2])
+            self.assertEqual(reader.start_requests, [[[0, 1, 2, 3]]])
+            self.assertEqual(reader.lifecycle, ["start"])
+
+            first = adapter.next_batch()
+            second = adapter.next_batch()
+            self.assertEqual(reader.start_requests, [[[0, 1, 2, 3]]])
+            self.assertEqual(adapter.prefetched_read_identities(), identities[:4])
+            self.assertEqual(
+                reader.lifecycle,
+                ["start"],
+                "the next PLS pool must not start before the first is released",
+            )
+
+            third = adapter.next_batch()
+            fourth = adapter.next_batch()
+            self.assertEqual(
+                reader.start_requests,
+                [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+            )
+            self.assertEqual(reader.lifecycle, ["start", "close", "start"])
+            self.assertEqual(adapter.prefetched_read_identities(), identities)
+            self.assertEqual(
+                [
+                    identity
+                    for batch in (first, second, third, fourth)
+                    for identity in batch.identities
+                ],
+                identities,
+            )
+
+            adapter.end()
+            metrics = adapter.loader_metrics()
+            pool = metrics["physical_load_segment_gpu_pool"]
+            self.assertEqual(reader.lifecycle, ["start", "close", "start", "close"])
+            self.assertEqual(metrics["scheduled_batches"], 2)
+            self.assertEqual(metrics["consumed_batches"], 2)
+            self.assertEqual(metrics["logical_bytes"], 2048)
+            self.assertEqual(pool["materialized_pool_count"], 2)
+            self.assertEqual(pool["released_pool_count"], 2)
+            self.assertEqual(pool["max_simultaneously_active_pool_count"], 1)
+            self.assertEqual(pool["active_pool_count"], 0)
+            self.assertTrue(metrics["closed"])
+
+    def test_galp_workers_do_not_change_native_pipeline_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             samples = _samples(Path(temporary), 6)
             identities = canonical_epoch_order(
@@ -934,9 +1095,9 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 for identity in identities
             ]
             observed = []
-            for workers, depth in ((1, 0), (1, 3), (4, 0), (4, 3)):
+            for workers in (1, 4):
                 reader = _FakeDirectDctTrainingReader(
-                    {"future_counter": workers * 10 + depth}
+                    {"future_counter": workers}
                 )
                 adapter = GalpTrainingAdapter(
                     samples,
@@ -945,7 +1106,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
                     device=torch.device("cpu"),
                     config={
                         "_direct_dct_training_reader": reader,
-                        "prefetch_depth": depth,
                         "execution_mode": "audit",
                     },
                 )
@@ -965,8 +1125,9 @@ class TrainingBenchmarkTest(unittest.TestCase):
                         ],
                     )
                 )
-                self.assertLessEqual(
-                    adapter.loader_metrics()["max_queue_depth_batches"], depth + 1
+                self.assertTrue(adapter.loader_metrics()["native_pipeline_owned"])
+                self.assertEqual(
+                    adapter.loader_metrics()["max_queue_depth_batches"], 0
                 )
                 adapter.close()
             self.assertTrue(all(value == observed[0] for value in observed[1:]))
@@ -1339,31 +1500,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 ]["ok"]
             )
 
-    def test_gate3_prefetch_selector_requires_gates_and_two_percent_gain(self) -> None:
-        def report(median: float, *, ok: bool = True) -> dict[str, object]:
-            return {
-                "complete": True,
-                "ok": ok,
-                "failures": [] if ok else ["resource growth"],
-                "metrics": {"hot_repeat_throughput": {"median": median}},
-            }
-
-        below_margin = select_gate3_prefetch(
-            {2: report(1000.0), 4: report(1019.0), 8: report(1100.0, ok=False)}
-        )
-        self.assertTrue(below_margin["ok"])
-        self.assertEqual(below_margin["selection"]["prefetch_depth_batches"], 2)
-
-        above_margin = select_gate3_prefetch(
-            {2: report(1000.0), 4: report(1021.0), 8: report(1010.0)}
-        )
-        self.assertTrue(above_margin["ok"])
-        self.assertEqual(above_margin["selection"]["prefetch_depth_batches"], 4)
-
-        missing = select_gate3_prefetch({2: report(1000.0), 4: report(1100.0)})
-        self.assertFalse(missing["complete"])
-        self.assertFalse(missing["ok"])
-
     def test_v3_acceptance_report_combines_planner_reader_and_training_gates(self) -> None:
         def write(path: Path, value: dict[str, object]) -> None:
             path.write_text(json.dumps(value), encoding="utf-8")
@@ -1615,6 +1751,9 @@ class TrainingBenchmarkTest(unittest.TestCase):
         self.assertLess(default.dct_semantic_atol, 2.0 / 1020.0)
         self.assertEqual(runtime.execution_mode, "runtime")
         self.assertTrue(runtime.execution_mode_explicit)
+        self.assertFalse(hasattr(default, "prefetch_depth"))
+        with self.assertRaises(SystemExit):
+            _parse_args(["--prefetch-depth", "4"])
         self.assertEqual(_first_step_probe_policy("audit"), "audit")
         self.assertEqual(_first_step_probe_policy("runtime"), "audit")
 
@@ -1681,34 +1820,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "immutable contract mode"):
                 _load_resume(args)
-
-    def test_ordered_async_queue_order_backpressure_exception_and_close(self) -> None:
-        queue = OrderedAsyncPrefetchQueue(2)
-        first = _FakeAsyncHandle("first", ready=True)
-        second = _FakeAsyncHandle("second", ready=False)
-        queue.submit("meta-1", lambda: first)
-        queue.submit("meta-2", lambda: second)
-        with self.assertRaisesRegex(RuntimeError, "capacity"):
-            queue.submit("overflow", lambda: _FakeAsyncHandle())
-        self.assertEqual(queue.pop(), ("meta-1", "first"))
-        self.assertEqual(queue.pop(), ("meta-2", "second"))
-        metrics = queue.metrics()
-        self.assertEqual(metrics["queue_hit_batches"], 1)
-        self.assertEqual(metrics["queue_miss_batches"], 1)
-        self.assertEqual(metrics["backpressure_events"], 1)
-
-        failing = OrderedAsyncPrefetchQueue(2)
-        error_handle = _FakeAsyncHandle(error=RuntimeError("producer failed"))
-        drain_handle = _FakeAsyncHandle("drain")
-        failing.submit("bad", lambda: error_handle)
-        failing.submit("pending", lambda: drain_handle)
-        with self.assertRaisesRegex(RuntimeError, "producer failed"):
-            failing.pop()
-        failing.close()
-        self.assertEqual(drain_handle.read_count, 1)
-        self.assertEqual(drain_handle.cancel_count, 1)
-        self.assertTrue(failing.metrics()["closed"])
-        self.assertEqual(failing.metrics()["current_queue_depth_batches"], 0)
 
     def test_runtime_step_avoids_audit_scans_syncs_and_scalar_materialization(self) -> None:
         model = torch.nn.Sequential(
@@ -2121,7 +2232,7 @@ class TrainingBenchmarkTest(unittest.TestCase):
                     batch_size=2,
                     workers=0,
                     device=torch.device("cpu"),
-                    config={"rgbnomore_root": str(RGBNOMORE_ROOT), "prefetch_depth": 0},
+                    config={"rgbnomore_root": str(RGBNOMORE_ROOT)},
                 )
                 adapter.begin(identities, decisions, [2])
                 batch = adapter.next_batch()
@@ -2314,7 +2425,7 @@ class TrainingBenchmarkTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot produce a batch"):
                 _collect_batches(samples[:1], seed=1, batch_size=2, batch_count=1, drop_last=True)
 
-    def test_rank_partition_and_prefetch_depth_preserve_logical_order(self) -> None:
+    def test_rank_partition_and_extra_lookahead_preserve_logical_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             samples = [
                 TrainingSample(
@@ -2602,8 +2713,6 @@ class TrainingBenchmarkTest(unittest.TestCase):
                     "--batch-size",
                     "2",
                     "--workers",
-                    "0",
-                    "--prefetch-depth",
                     "0",
                     "--execution-mode",
                     "runtime",
