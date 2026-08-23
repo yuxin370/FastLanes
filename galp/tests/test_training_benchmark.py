@@ -741,6 +741,7 @@ class TrainingBenchmarkTest(unittest.TestCase):
 
         native_module = SimpleNamespace(
             DirectDctReader=NativeReader,
+            DIRECT_DCT_BINDING_SCHEMA="galp-direct-dct-binding-v2",
             DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
             DIRECT_DCT_METRICS_SCHEMA="galp-direct-dct-metrics-v2",
             direct_dct_profile_info=lambda profile_id: {
@@ -772,6 +773,7 @@ class TrainingBenchmarkTest(unittest.TestCase):
 
         native_module = SimpleNamespace(
             DirectDctReader=NativeReader,
+            DIRECT_DCT_BINDING_SCHEMA="galp-direct-dct-binding-v2",
             DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
             DIRECT_DCT_METRICS_SCHEMA="galp-direct-dct-metrics-v2",
             direct_dct_profile_info=lambda profile_id: {

@@ -126,6 +126,7 @@ def _profile_info(profile_id: str) -> dict[str, object]:
 
 def _native_module():
     return SimpleNamespace(
+        DIRECT_DCT_BINDING_SCHEMA="galp-direct-dct-binding-v2",
         DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
         DIRECT_DCT_METRICS_SCHEMA="galp-direct-dct-metrics-v2",
         DirectDctReader=_NativeReader,
@@ -193,6 +194,16 @@ class PublicDirectDctApiTest(unittest.TestCase):
 
     def test_old_binding_schema_is_rejected(self) -> None:
         module = SimpleNamespace(DirectDctReader=_NativeReader)
+        with self.assertRaisesRegex(RuntimeError, "rebuild the binding"):
+            DirectDctReader("manifest.bin", native_module=module)
+
+    def test_stale_binding_with_data_schemas_is_rejected(self) -> None:
+        module = SimpleNamespace(
+            DirectDctReader=_NativeReader,
+            DIRECT_DCT_PROFILE_SCHEMA="galp-direct-dct-profile-v1",
+            DIRECT_DCT_METRICS_SCHEMA="galp-direct-dct-metrics-v2",
+            direct_dct_profile_info=_profile_info,
+        )
         with self.assertRaisesRegex(RuntimeError, "rebuild the binding"):
             DirectDctReader("manifest.bin", native_module=module)
 

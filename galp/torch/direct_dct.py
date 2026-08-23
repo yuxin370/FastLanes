@@ -16,6 +16,7 @@ from galp.profiles import DirectDctProfile
 
 PROFILE_SCHEMA = "galp-direct-dct-profile-v1"
 METRICS_SCHEMA = "galp-direct-dct-metrics-v2"
+BINDING_SCHEMA = "galp-direct-dct-binding-v2"
 
 
 def _load_native_module(module_path: Path | None) -> ModuleType:
@@ -201,7 +202,8 @@ class DirectDctReader:
         )
         self._binding_import_ms = (time.perf_counter() - binding_started) * 1000.0
         if (
-            getattr(module, "DIRECT_DCT_PROFILE_SCHEMA", None) != PROFILE_SCHEMA
+            getattr(module, "DIRECT_DCT_BINDING_SCHEMA", None) != BINDING_SCHEMA
+            or getattr(module, "DIRECT_DCT_PROFILE_SCHEMA", None) != PROFILE_SCHEMA
             or getattr(module, "DIRECT_DCT_METRICS_SCHEMA", None) != METRICS_SCHEMA
         ):
             raise RuntimeError(

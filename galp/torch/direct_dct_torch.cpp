@@ -2703,6 +2703,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 
 	m.attr("DEFAULT_CACHE_CAPACITY_MIB")  = kDefaultDirectDctCacheCapacityMiB;
 	m.attr("DEFAULT_PLAN_CACHE_CAPACITY") = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity;
+	m.attr("DIRECT_DCT_BINDING_SCHEMA") = "galp-direct-dct-binding-v2";
 	m.attr("DIRECT_DCT_PROFILE_SCHEMA") = "galp-direct-dct-profile-v1";
 	m.attr("DIRECT_DCT_METRICS_SCHEMA") = "galp-direct-dct-metrics-v2";
 	m.def("available_direct_dct_profiles", &galp::profiles::available_direct_dct_profile_ids);
