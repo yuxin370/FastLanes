@@ -1826,7 +1826,14 @@ TEST(JpegDct, DeviceBatchPlanPreviewSupportsConfiguredTransformedGrid) {
 
 	galp::jpeg::JpegDctDeviceBatchOptions sparse_options = options;
 	sparse_options.coefficient_selection.coefficients    = {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U};
-	EXPECT_THROW((void)reader.PlanDeviceDctBatch(requests, sparse_options), std::runtime_error);
+	const auto sparse_preview = reader.PlanDeviceDctBatch(requests, sparse_options);
+	EXPECT_EQ(sparse_preview.layout, galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid);
+	EXPECT_EQ(sparse_preview.coefficients_per_block, sparse_options.coefficient_selection.coefficients.size());
+	EXPECT_EQ(sparse_preview.selected_coefficients, sparse_options.coefficient_selection.coefficients);
+	EXPECT_EQ(sparse_preview.ycbcr_dct_grid_shape.y, preview.ycbcr_dct_grid_shape.y);
+	EXPECT_EQ(sparse_preview.ycbcr_dct_grid_shape.cbcr, preview.ycbcr_dct_grid_shape.cbcr);
+	EXPECT_GT(sparse_preview.block_metadata.size(), 0U);
+	EXPECT_GT(sparse_preview.rowgroups.size(), 0U);
 
 	auto int16_affine_transform         = *options.grid_transform;
 	int16_affine_transform.output_add   = 4.0F;

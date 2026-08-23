@@ -27,7 +27,11 @@ inline jpeg::JpegDctGridTransformSpec rgbnomore_val_dct_grid_transform() {
 	spec.clamp_min                      = -1024;
 	spec.clamp_max                      = 1016;
 	spec.dequantize                     = true;
-	spec.require_all_coefficients       = true;
+	// Missing raw source coefficients are defined as zero before
+	// dequantization and frequency mixing.  The model-facing transformed grid
+	// remains dense, so callers may select any valid JPEG coefficient subset
+	// without changing the RGB-no-more tensor contract.
+	spec.require_all_coefficients       = false;
 	spec.allow_grayscale                = true;
 	spec.preferred_small_crop_width_blocks  = {2, 4, 14, 28};
 	spec.preferred_small_crop_height_blocks = {2, 4, 14, 28};
