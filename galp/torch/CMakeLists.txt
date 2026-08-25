@@ -45,10 +45,16 @@ find_library(GALP_TORCH_PYTHON_LIBRARY
 
 Python3_add_library(_galp_direct_dct MODULE WITH_SOABI
         direct_dct_torch.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_batch_lifetime.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/profile_registry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/resolved_execution_policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_pipeline_state.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_logical_batch_pipeline.cpp
 )
 
 target_include_directories(_galp_direct_dct PRIVATE
         ${TORCH_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
 )
 
 target_link_libraries(_galp_direct_dct PRIVATE
@@ -72,6 +78,49 @@ set_target_properties(_galp_direct_dct PROPERTIES
 )
 
 if (BUILD_TESTING)
+	# Private Phase-4 deterministic outstanding-consumer harness. The module
+	# submits its gate, sentinel-read consumer, and completion marker in one
+	# native call and is never linked into or installed with _galp_direct_dct.
+	Python3_add_library(_galp_phase4_outstanding_test MODULE WITH_SOABI
+		phase4_native_outstanding_harness.cu)
+	target_include_directories(_galp_phase4_outstanding_test PRIVATE ${TORCH_INCLUDE_DIRS})
+	target_link_libraries(_galp_phase4_outstanding_test PRIVATE CUDA::cudart)
+	if (GALP_TORCH_PYTHON_LIBRARY)
+		target_link_libraries(_galp_phase4_outstanding_test PRIVATE ${GALP_TORCH_PYTHON_LIBRARY})
+	endif ()
+	target_compile_features(_galp_phase4_outstanding_test PRIVATE cxx_std_20 cuda_std_20)
+	set_target_properties(_galp_phase4_outstanding_test PROPERTIES
+		LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/galp/torch
+		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/galp/torch)
+
+	# Private Phase-2 A/B probe. It links the shadow executor into a separate
+	# module and cannot become an authority for the production Torch binding.
+	Python3_add_library(_galp_phase2_native_ab MODULE WITH_SOABI
+		phase2_native_ab.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/profile_registry.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/resolved_execution_policy.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_pipeline_state.cpp
+	)
+	target_include_directories(_galp_phase2_native_ab PRIVATE
+		${TORCH_INCLUDE_DIRS}
+		${CMAKE_CURRENT_SOURCE_DIR}/../src
+	)
+	target_link_libraries(_galp_phase2_native_ab PRIVATE
+		Galp::jpeg_dct_device
+		${TORCH_LIBRARIES}
+	)
+	if (GALP_TORCH_PYTHON_LIBRARY)
+		target_link_libraries(_galp_phase2_native_ab PRIVATE ${GALP_TORCH_PYTHON_LIBRARY})
+	endif ()
+	target_compile_features(_galp_phase2_native_ab PRIVATE cxx_std_20)
+	if (TORCH_CXX_FLAGS)
+		target_compile_options(_galp_phase2_native_ab PRIVATE ${GALP_TORCH_CXX_FLAGS})
+	endif ()
+	set_target_properties(_galp_phase2_native_ab PROPERTIES
+		LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/galp/torch
+		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/galp/torch
+	)
+
         add_test(
                 NAME GalpDirectDctTorchImport
                 COMMAND ${CMAKE_COMMAND} -E env

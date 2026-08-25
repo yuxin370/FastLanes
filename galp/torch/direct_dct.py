@@ -76,7 +76,13 @@ class DirectDctMetrics:
 
 
 class DirectDctBatch:
-    """Model-ready tensors plus stable request metadata."""
+    """Model-ready tensors plus stable request metadata.
+
+    When tensors are consumed on a CUDA stream other than the stream where
+    their properties were accessed, call :meth:`record_stream` before
+    submitting that consumer work. This explicitly forwards the true consumer
+    dependency to GALP's native-backed storage lifetime mechanism.
+    """
 
     __slots__ = ("_native", "profile_id")
 
@@ -99,6 +105,28 @@ class DirectDctBatch:
     @property
     def tensors(self) -> tuple[Any, Any]:
         return self.y, self.cbcr
+
+    def record_stream(self, stream: Any | None = None) -> None:
+        """Register the actual CUDA consumer stream before submitting work.
+
+        With no argument, the current PyTorch CUDA stream is registered. An
+        explicit ``torch.cuda.Stream`` can be supplied from any host context.
+        This method is required when tensors were obtained on one stream and
+        will be consumed on another; it never synchronizes the host. Work
+        submitted to the registered stream before the final related
+        Tensor/Storage reference is released is protected. Work submitted
+        after that release is outside the lifetime contract.
+        """
+
+        if stream is None:
+            self._native.record_stream()
+            return
+        try:
+            stream_identity = int(stream.cuda_stream)
+            cuda_device = int(stream.device_index)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise TypeError("stream must be a torch.cuda.Stream") from error
+        self._native.record_stream(stream_identity, cuda_device)
 
     @property
     def global_image_ids(self) -> list[int]:

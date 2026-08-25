@@ -43,6 +43,12 @@ class _NativeBatch:
         "peak_transient_bytes": 4096,
     }
 
+    def __init__(self) -> None:
+        self.record_stream_calls: list[tuple[int, ...]] = []
+
+    def record_stream(self, *values: int) -> None:
+        self.record_stream_calls.append(values)
+
 class _NativePipeline:
     ready = True
     started = True
@@ -178,7 +184,10 @@ class PublicDirectDctApiTest(unittest.TestCase):
         self.assertFalse(hasattr(reader, "prefetch"))
         self.assertFalse(hasattr(reader, "image_metadata"))
         self.assertFalse(hasattr(reader, "initialization_stats"))
-        self.assertFalse(hasattr(batch, "record_stream"))
+        batch.record_stream()
+        stream = SimpleNamespace(cuda_stream=1234, device_index=0)
+        batch.record_stream(stream)
+        self.assertEqual(batch._native.record_stream_calls, [(), (1234, 0)])
         self.assertFalse(hasattr(reader, "prefetch_rgbnomore_val_batch"))
         self.assertFalse(hasattr(reader, "prefetch_batch"))
 

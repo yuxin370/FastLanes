@@ -31,6 +31,39 @@ if (Python3_Interpreter_FOUND)
         set_tests_properties(GalpPrepareImagenet512ParallelismPython PROPERTIES LABELS "galp;jpeg-dct;pipeline;cpu")
 endif ()
 if (GALP_WITH_JPEG_DCT)
+	add_library(galp_direct_dct_shadow_contract STATIC
+			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_batch_lifetime.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/profile_registry.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/resolved_execution_policy.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_pipeline_state.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_logical_batch_pipeline.cpp)
+	target_link_libraries(galp_direct_dct_shadow_contract PUBLIC
+			galp_jpeg_dct_device)
+	target_include_directories(galp_direct_dct_shadow_contract PUBLIC
+			${CMAKE_CURRENT_SOURCE_DIR}/../src)
+	apply_warnings(galp_direct_dct_shadow_contract)
+
+	add_executable(galp_direct_dct_contract_tests
+			direct_dct_contract_test.cpp)
+	target_link_libraries(galp_direct_dct_contract_tests PRIVATE
+			galp_direct_dct_shadow_contract
+			GTest::gtest_main)
+	apply_warnings(galp_direct_dct_contract_tests)
+	gtest_discover_tests(galp_direct_dct_contract_tests
+			DISCOVERY_TIMEOUT 60
+			PROPERTIES LABELS "galp;direct-dct;contract;cpu;shadow")
+
+	add_executable(galp_native_logical_batch_pipeline_tests
+			native_batch_lifetime_test.cpp
+			native_logical_batch_pipeline_test.cpp)
+	target_link_libraries(galp_native_logical_batch_pipeline_tests PRIVATE
+			galp_direct_dct_shadow_contract
+			GTest::gtest_main)
+	apply_warnings(galp_native_logical_batch_pipeline_tests)
+	gtest_discover_tests(galp_native_logical_batch_pipeline_tests
+			DISCOVERY_TIMEOUT 60
+			PROPERTIES LABELS "galp;direct-dct;pipeline;cpu;shadow")
+
         add_executable(galp_jpeg_dct_decode_memory_tests
                 jpeg_dct_decode_memory_test.cpp)
         target_link_libraries(galp_jpeg_dct_decode_memory_tests PRIVATE

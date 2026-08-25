@@ -1,5 +1,8 @@
 #include "galp/direct_dct.hpp"
 #include "galp/profiles/registry.hpp"
+#include "direct_dct/native_batch_lifetime.hpp"
+#include "direct_dct/native_logical_batch_pipeline.hpp"
+#include "cuda/memory/device_pool.cuh"
 #include <ATen/cuda/CUDAEvent.h>
 #include <algorithm>
 #include <atomic>
@@ -10,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <deque>
 #include <future>
@@ -1113,6 +1117,122 @@ py::list rowgroups_to_list(const std::vector<galp::jpeg::JpegDctDeviceRowgroupMe
 	return out;
 }
 
+const char* lifetime_differential_name(
+    const galp::direct_dct::NativeEligibilityDifferential differential) noexcept {
+	switch (differential) {
+	case galp::direct_dct::NativeEligibilityDifferential::kBothBlocked: return "both_blocked";
+	case galp::direct_dct::NativeEligibilityDifferential::kEquivalentEligible: return "equivalent_eligible";
+	case galp::direct_dct::NativeEligibilityDifferential::kNativeSafer: return "native_safer";
+	case galp::direct_dct::NativeEligibilityDifferential::kNativeEarlierUnsafe: return "native_earlier_unsafe";
+	}
+	return "unknown";
+}
+
+py::dict lifetime_shadow_snapshot_to_dict(
+    const galp::direct_dct::NativeBatchLeaseSnapshot& snapshot) {
+	py::dict out;
+	out["batch_identity"] = snapshot.completion.batch_identity;
+	out["producer_completion_event_identity"] = snapshot.completion.producer_completion_event_identity;
+	out["producer_complete"] = snapshot.completion.producer_complete;
+	out["release_requested"] = snapshot.completion.release_requested;
+	out["consumer_dependency_count"] = snapshot.completion.consumer_dependency_count;
+	out["explicit_consumer_dependency_count"] = snapshot.completion.explicit_consumer_dependency_count;
+	out["pending_consumer_dependency_count"] = snapshot.completion.pending_consumer_dependency_count;
+	out["consumer_completion_event_count"] = snapshot.completion.consumer_completion_event_count;
+	out["consumer_completion_events_recorded"] =
+	    snapshot.completion.consumer_completion_events_recorded;
+	out["storage_reference_count"] = snapshot.storage_reference_count;
+	out["released_storage_reference_count"] = snapshot.released_storage_reference_count;
+	out["all_storage_references_released"] = snapshot.all_storage_references_released;
+	out["legacy_reclaim_eligible"] = snapshot.legacy_reclaim_eligible;
+	out["native_reclaim_eligible"] = snapshot.completion.reclaim_eligible;
+	out["owner_reference_count"] = snapshot.owner_reference_count;
+	out["released_owner_reference_count"] = snapshot.released_owner_reference_count;
+	out["authoritative"] = snapshot.authoritative;
+	out["backing_storage_present"] = snapshot.backing_storage_present;
+	out["reclaim_executed"] = snapshot.reclaim_executed;
+	out["differential"] = lifetime_differential_name(snapshot.differential);
+	return out;
+}
+
+class TorchDirectDctLifetimeShadowHandle final {
+public:
+	explicit TorchDirectDctLifetimeShadowHandle(
+	    std::shared_ptr<galp::direct_dct::NativeBatchLease> lease)
+	    : lease_(std::move(lease)) {
+		if (!lease_) {
+			throw std::invalid_argument("lifetime shadow handle requires a lease");
+		}
+	}
+
+	[[nodiscard]] py::dict snapshot() const {
+		return lifetime_shadow_snapshot_to_dict(lease_->snapshot());
+	}
+
+private:
+	std::shared_ptr<galp::direct_dct::NativeBatchLease> lease_;
+};
+
+enum class TorchDirectDctLifetimeBackend : uint8_t { kLegacy, kNative };
+
+TorchDirectDctLifetimeBackend requested_phase4_lifetime_backend() noexcept {
+	// Temporary one-release-cycle rollback seam. Remove after the explicit
+	// record_stream contract and native reclaim telemetry have remained clean
+	// in production; the choice is made once when the pipeline is constructed.
+	const auto* override = std::getenv("GALP_PHASE4_NATIVE_LIFETIME");
+	return override == nullptr || std::string_view(override) != "0"
+	           ? TorchDirectDctLifetimeBackend::kNative
+	           : TorchDirectDctLifetimeBackend::kLegacy;
+}
+
+uint64_t next_direct_dct_lifetime_batch_identity() noexcept {
+	static std::atomic<uint64_t> next_batch_identity {1U};
+	return next_batch_identity.fetch_add(1U, std::memory_order_relaxed);
+}
+
+class TorchDirectDctNativeOwnerReference final {
+public:
+	TorchDirectDctNativeOwnerReference() noexcept = default;
+
+	explicit TorchDirectDctNativeOwnerReference(
+	    std::shared_ptr<galp::direct_dct::NativeBatchLease> lease)
+	    : lease_(std::move(lease)) {
+		if (!lease_ || !lease_->authoritative()) {
+			throw std::invalid_argument("native owner reference requires an authoritative lease");
+		}
+		lease_->retain_owner_reference();
+	}
+
+	~TorchDirectDctNativeOwnerReference() {
+		if (lease_) {
+			static_cast<void>(lease_->release_owner_reference());
+		}
+	}
+
+	TorchDirectDctNativeOwnerReference(const TorchDirectDctNativeOwnerReference&) = delete;
+	TorchDirectDctNativeOwnerReference& operator=(const TorchDirectDctNativeOwnerReference&) = delete;
+	TorchDirectDctNativeOwnerReference(TorchDirectDctNativeOwnerReference&& other) noexcept
+	    : lease_(std::move(other.lease_)) {
+	}
+	TorchDirectDctNativeOwnerReference& operator=(TorchDirectDctNativeOwnerReference&& other) noexcept {
+		if (this != &other) {
+			release();
+			lease_ = std::move(other.lease_);
+		}
+		return *this;
+	}
+
+private:
+	void release() noexcept {
+		if (lease_) {
+			static_cast<void>(lease_->release_owner_reference());
+			lease_.reset();
+		}
+	}
+
+	std::shared_ptr<galp::direct_dct::NativeBatchLease> lease_;
+};
+
 class DeferredDirectDctBatchReleaseQueue {
 public:
 	static DeferredDirectDctBatchReleaseQueue& instance() {
@@ -1120,13 +1240,16 @@ public:
 		return queue;
 	}
 
-	void defer(std::shared_ptr<galp::jpeg::DirectDctBatch> owner, const c10::DeviceIndex device_index) noexcept {
+	void defer(
+	    std::shared_ptr<galp::jpeg::DirectDctBatch> owner,
+	    const c10::DeviceIndex device_index,
+	    std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow = {}) noexcept {
 		if (!owner) {
 			return;
 		}
 		try {
 			const auto stream = c10::cuda::getCurrentCUDAStream(device_index);
-			defer_on_stream(std::move(owner), stream);
+			defer_on_stream(std::move(owner), stream, std::move(lifetime_shadow));
 		} catch (const std::exception& e) {
 			std::fprintf(stderr,
 			             "GALP direct-DCT PyTorch tensor deleter: failed to defer CUDA release; "
@@ -1143,8 +1266,10 @@ public:
 		}
 	}
 
-	void defer_on_stream(std::shared_ptr<galp::jpeg::DirectDctBatch> owner,
-	                     const c10::cuda::CUDAStream                  stream) noexcept {
+	void defer_on_stream(
+	    std::shared_ptr<galp::jpeg::DirectDctBatch> owner,
+	    const c10::cuda::CUDAStream stream,
+	    std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow = {}) noexcept {
 		if (!owner) {
 			return;
 		}
@@ -1156,6 +1281,12 @@ public:
 				pending_.emplace_back();
 				pending_.back().ready = std::move(ready);
 				pending_.back().owner = std::move(owner);
+				pending_.back().lifetime_shadow = std::move(lifetime_shadow);
+				pending_.back().cuda_device = stream.device_index();
+				pending_.back().stream_identity = reinterpret_cast<uintptr_t>(stream.stream());
+				++consumer_event_count_;
+				++enqueued_batch_count_;
+				pending_peak_ = std::max(pending_peak_, pending_.size());
 			}
 			reclaim_finished();
 		} catch (const std::exception& e) {
@@ -1180,8 +1311,23 @@ public:
 			std::lock_guard<std::mutex> lock(mutex_);
 			for (auto it = pending_.begin(); it != pending_.end();) {
 				if (it->ready.query()) {
+					if (it->lifetime_shadow) {
+						try {
+							it->lifetime_shadow->mark_producer_complete();
+							it->lifetime_shadow->mark_consumer_complete(
+							    it->cuda_device, it->stream_identity);
+							if (it->lifetime_shadow->snapshot().completion.pending_consumer_dependency_count == 0U) {
+								it->lifetime_shadow->observe_legacy_reclaim_eligibility(true);
+							}
+						} catch (...) {
+							// Shadow observation is never allowed to delay or veto
+							// the authoritative legacy release path.
+							it->lifetime_shadow.reset();
+						}
+					}
 					ready.push_back(std::move(it->owner));
 					it = pending_.erase(it);
+					++reclaimed_batch_count_;
 				} else {
 					++it;
 				}
@@ -1193,6 +1339,20 @@ public:
 			std::fprintf(stderr, "GALP direct-DCT PyTorch tensor deleter: deferred release query failed.\n");
 		}
 		return ready.size();
+	}
+
+	[[nodiscard]] py::dict stats() const {
+		std::lock_guard<std::mutex> lock(mutex_);
+		py::dict out;
+		out["pending_reclaim_count"] = pending_.size();
+		out["pending_reclaim_peak"] = pending_peak_;
+		out["live_batch_count"] = pending_.size();
+		out["live_batch_peak"] = pending_peak_;
+		out["enqueued_batch_count"] = enqueued_batch_count_;
+		out["reclaimed_batch_count"] = reclaimed_batch_count_;
+		out["consumer_event_count"] = consumer_event_count_;
+		out["producer_event_count"] = 0U;
+		return out;
 	}
 
 	~DeferredDirectDctBatchReleaseQueue() {
@@ -1220,6 +1380,9 @@ private:
 	struct PendingRelease {
 		at::cuda::CUDAEvent                         ready;
 		std::shared_ptr<galp::jpeg::DirectDctBatch> owner;
+		std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow;
+		int                                         cuda_device = -1;
+		uintptr_t                                   stream_identity = 0U;
 	};
 
 	static void synchronize_current_stream(const c10::DeviceIndex device_index) noexcept {
@@ -1238,37 +1401,182 @@ private:
 		} catch (...) { std::fprintf(stderr, "GALP direct-DCT PyTorch tensor deleter: registered stream wait failed.\n"); }
 	}
 
-	std::mutex                 mutex_;
+	mutable std::mutex         mutex_;
 	std::deque<PendingRelease> pending_;
+	size_t                     pending_peak_ = 0U;
+	size_t                     enqueued_batch_count_ = 0U;
+	size_t                     reclaimed_batch_count_ = 0U;
+	size_t                     consumer_event_count_ = 0U;
 };
+
+size_t reclaim_finished_direct_dct_batches() noexcept {
+	return DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished() +
+	       galp::direct_dct::NativeBatchLease::reclaim_finished();
+}
+
+py::dict direct_dct_lifetime_reclaim_stats() {
+	const auto native = galp::direct_dct::NativeBatchLease::reclaim_queue_stats();
+	py::dict native_out;
+	native_out["pending_reclaim_count"] = native.pending_reclaim_count;
+	native_out["pending_reclaim_peak"] = native.pending_reclaim_peak;
+	native_out["live_batch_count"] = native.live_batch_count;
+	native_out["live_batch_peak"] = native.live_batch_peak;
+	native_out["enqueued_batch_count"] = native.enqueued_batch_count;
+	native_out["reclaimed_batch_count"] = native.reclaimed_batch_count;
+	native_out["consumer_event_count"] = native.consumer_event_count;
+	native_out["producer_event_count"] = 0U;
+	py::dict out;
+	out["legacy"] = DeferredDirectDctBatchReleaseQueue::instance().stats();
+	out["native"] = std::move(native_out);
+	const auto device = galp::memory::DevicePool::instance().stats();
+	py::dict device_out;
+	device_out["in_use_bytes"] = device.in_use_bytes;
+	device_out["peak_in_use_bytes"] = device.peak_in_use_bytes;
+	device_out["cached_bytes"] = device.cached_bytes;
+	device_out["allocation_requests"] = device.allocation_requests;
+	device_out["cuda_allocation_count"] = device.cuda_allocation_count;
+	device_out["cuda_allocation_bytes"] = device.cuda_allocation_bytes;
+	out["device_pool"] = std::move(device_out);
+	const auto pinned = galp::memory::DevicePool::instance().pinned_stats();
+	py::dict pinned_out;
+	pinned_out["in_use_bytes"] = pinned.in_use_bytes;
+	pinned_out["peak_in_use_bytes"] = pinned.peak_in_use_bytes;
+	pinned_out["cached_bytes"] = pinned.cached_bytes;
+	pinned_out["allocation_requests"] = pinned.allocation_requests;
+	pinned_out["cuda_allocation_count"] = pinned.cuda_allocation_count;
+	pinned_out["cuda_allocation_bytes"] = pinned.cuda_allocation_bytes;
+	out["pinned_pool"] = std::move(pinned_out);
+	return out;
+}
 
 class TorchDirectDctConsumerStreams {
 public:
-	void register_current(const c10::DeviceIndex device_index) {
-		const auto stream = c10::cuda::getCurrentCUDAStream(device_index);
-		std::lock_guard<std::mutex> lock(mutex_);
-		for (const auto& registered : streams_) {
-			if (registered.device_index() == stream.device_index() && registered.stream() == stream.stream()) {
-				return;
-			}
+	TorchDirectDctConsumerStreams() = default;
+
+	explicit TorchDirectDctConsumerStreams(
+	    std::shared_ptr<galp::direct_dct::NativeBatchLease> native_lifetime)
+	    : lifetime_shadow_(std::move(native_lifetime))
+	    , native_authority_(true) {
+		if (!lifetime_shadow_ || !lifetime_shadow_->authoritative()) {
+			throw std::invalid_argument("native lifetime adapter requires an authoritative lease");
 		}
-		streams_.push_back(stream);
+		lifetime_shadow_enabled_.store(true, std::memory_order_release);
+	}
+
+	void register_current(
+	    const c10::DeviceIndex device_index,
+	    const galp::direct_dct::ConsumerDependency::Source source =
+	        galp::direct_dct::ConsumerDependency::Source::kGetterCompatibility) {
+		register_stream(c10::cuda::getCurrentCUDAStream(device_index), source);
+	}
+
+	void register_stream(
+	    const c10::cuda::CUDAStream stream,
+	    const galp::direct_dct::ConsumerDependency::Source source =
+	        galp::direct_dct::ConsumerDependency::Source::kGetterCompatibility) {
+		std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (!native_authority_) {
+				const auto registered = std::find_if(streams_.begin(), streams_.end(), [&](const auto& value) {
+					return value.device_index() == stream.device_index() && value.stream() == stream.stream();
+				});
+				if (registered == streams_.end()) {
+					streams_.push_back(stream);
+				}
+			}
+			lifetime_shadow = lifetime_shadow_;
+		}
+		if (lifetime_shadow) {
+			galp::direct_dct::ConsumerDependency dependency;
+			dependency.cuda_device = stream.device_index();
+			dependency.stream_identity = reinterpret_cast<uintptr_t>(stream.stream());
+			dependency.source = source;
+			lifetime_shadow->register_consumer(dependency);
+		}
+	}
+
+	std::shared_ptr<galp::direct_dct::NativeBatchLease> enable_lifetime_shadow(
+	    const uint64_t batch_identity,
+	    const uintptr_t producer_completion_event_identity,
+	    const int producer_cuda_device) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (!lifetime_shadow_) {
+			auto completion = std::make_shared<galp::direct_dct::NativeBatchCompletion>(
+			    batch_identity, producer_completion_event_identity, producer_cuda_device);
+			lifetime_shadow_ = std::make_shared<galp::direct_dct::NativeBatchLease>(std::move(completion));
+			lifetime_shadow_enabled_.store(true, std::memory_order_release);
+		}
+		return lifetime_shadow_;
+	}
+
+	void retain_storage_reference() {
+		if (!lifetime_shadow_enabled_.load(std::memory_order_acquire)) {
+			return;
+		}
+		std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			lifetime_shadow = lifetime_shadow_;
+		}
+		if (lifetime_shadow) {
+			lifetime_shadow->retain_storage_reference();
+		}
+	}
+
+	void mark_producer_complete_for_test() {
+		std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			lifetime_shadow = lifetime_shadow_;
+		}
+		if (!lifetime_shadow) {
+			throw std::logic_error("lifetime shadow must be enabled before marking producer completion");
+		}
+		lifetime_shadow->mark_producer_complete();
 	}
 
 	void defer(std::shared_ptr<galp::jpeg::DirectDctBatch> owner,
 	           const c10::DeviceIndex                      device_index) const noexcept {
 		std::vector<c10::cuda::CUDAStream> streams;
+		std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow;
+		bool native_authority = false;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			streams = streams_;
+			lifetime_shadow = lifetime_shadow_;
+			native_authority = native_authority_;
+		}
+		if (native_authority) {
+			if (lifetime_shadow) {
+				static_cast<void>(lifetime_shadow->release_storage_reference());
+			}
+			return;
 		}
 		auto& queue = DeferredDirectDctBatchReleaseQueue::instance();
 		if (streams.empty()) {
-			queue.defer(std::move(owner), device_index);
-			return;
+			try {
+				const auto stream = c10::cuda::getCurrentCUDAStream(device_index);
+				streams.push_back(stream);
+				if (lifetime_shadow) {
+					galp::direct_dct::ConsumerDependency dependency;
+					dependency.cuda_device = stream.device_index();
+					dependency.stream_identity = reinterpret_cast<uintptr_t>(stream.stream());
+					dependency.source = galp::direct_dct::ConsumerDependency::Source::kGetterCompatibility;
+					lifetime_shadow->register_consumer(dependency);
+				}
+			} catch (...) {
+				// Preserve the pre-shadow exception-safe fallback.
+				queue.defer(std::move(owner), device_index);
+				return;
+			}
+		}
+		std::shared_ptr<galp::direct_dct::NativeBatchLease> final_release_shadow;
+		if (lifetime_shadow && lifetime_shadow->release_storage_reference()) {
+			final_release_shadow = lifetime_shadow;
 		}
 		for (const auto& stream : streams) {
-			queue.defer_on_stream(owner, stream);
+			queue.defer_on_stream(owner, stream, final_release_shadow);
 		}
 		owner.reset();
 	}
@@ -1276,6 +1584,9 @@ public:
 private:
 	mutable std::mutex                 mutex_;
 	std::vector<c10::cuda::CUDAStream> streams_;
+	std::shared_ptr<galp::direct_dct::NativeBatchLease> lifetime_shadow_;
+	std::atomic<bool>                  lifetime_shadow_enabled_ {false};
+	bool                               native_authority_ = false;
 };
 
 struct TorchDirectDctPrefetchTelemetry {
@@ -1291,13 +1602,28 @@ struct TorchDirectDctPrefetchTelemetry {
 };
 
 struct TorchDirectDctBatch {
-	explicit TorchDirectDctBatch(galp::jpeg::DirectDctBatch batch_in)
-	    : batch(std::make_shared<galp::jpeg::DirectDctBatch>(std::move(batch_in))),
-	      consumer_streams(std::make_shared<TorchDirectDctConsumerStreams>()) {
+	explicit TorchDirectDctBatch(
+	    galp::jpeg::DirectDctBatch batch_in,
+	    const TorchDirectDctLifetimeBackend lifetime_backend = TorchDirectDctLifetimeBackend::kLegacy) {
+		auto owner = std::make_shared<galp::jpeg::DirectDctBatch>(std::move(batch_in));
+		batch = owner.get();
+		if (lifetime_backend == TorchDirectDctLifetimeBackend::kNative) {
+			auto completion = std::make_shared<galp::direct_dct::NativeBatchCompletion>(
+			    next_direct_dct_lifetime_batch_identity(),
+			    reinterpret_cast<uintptr_t>(owner->cuda_completion_event()),
+			    owner->cuda_device());
+			native_lifetime = std::make_shared<galp::direct_dct::NativeBatchLease>(
+			    std::move(completion), std::move(owner));
+			consumer_streams = std::make_shared<TorchDirectDctConsumerStreams>(native_lifetime);
+			adapter_reference = TorchDirectDctNativeOwnerReference(native_lifetime);
+		} else {
+			legacy_batch_owner = std::move(owner);
+			consumer_streams = std::make_shared<TorchDirectDctConsumerStreams>();
+		}
 	}
 
 	torch::Tensor coefficients() {
-		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
+		reclaim_finished_direct_dct_batches();
 		wait_for_batch_completion();
 		register_current_consumer_stream();
 		if (tensor.defined()) {
@@ -1310,8 +1636,9 @@ struct TorchDirectDctBatch {
 			tensor = torch::empty({static_cast<int64_t>(desc.rows()), static_cast<int64_t>(desc.columns())}, options);
 			return tensor;
 		}
-		auto owner = batch;
+		auto owner = legacy_batch_owner;
 		auto streams = consumer_streams;
+		consumer_streams->retain_storage_reference();
 		tensor     = torch::from_blob(
             const_cast<int16_t*>(desc.data),
             {static_cast<int64_t>(desc.rows()), static_cast<int64_t>(desc.columns())},
@@ -1333,6 +1660,49 @@ struct TorchDirectDctBatch {
 		wait_for_batch_completion();
 		register_current_consumer_stream();
 		return grid_tensor(batch->cbcr_tensor_async(), cbcr_tensor);
+	}
+
+	void record_current_consumer_stream() {
+		wait_for_batch_completion();
+		consumer_streams->register_current(
+		    tensor_device_index(),
+		    galp::direct_dct::ConsumerDependency::Source::kExplicitConsumer);
+	}
+
+	void record_consumer_stream(const uintptr_t stream_identity, const int cuda_device) {
+		const auto device_index = tensor_device_index();
+		if (cuda_device != static_cast<int>(device_index)) {
+			throw std::invalid_argument("Direct-DCT consumer stream device does not match the batch device");
+		}
+		c10::cuda::CUDAGuard guard(device_index);
+		const auto stream = stream_identity == 0U
+		                        ? c10::cuda::getDefaultCUDAStream(device_index)
+		                        : c10::cuda::getStreamFromExternal(
+		                              reinterpret_cast<cudaStream_t>(stream_identity), device_index);
+		wait_for_batch_completion(stream);
+		consumer_streams->register_stream(
+		    stream, galp::direct_dct::ConsumerDependency::Source::kExplicitConsumer);
+	}
+
+	std::shared_ptr<TorchDirectDctLifetimeShadowHandle> enable_lifetime_shadow_for_test() {
+		if (tensor.defined() || y_tensor.defined() || cbcr_tensor.defined()) {
+			throw std::logic_error("lifetime shadow must be enabled before creating native-backed tensors");
+		}
+		const auto batch_identity = next_direct_dct_lifetime_batch_identity();
+		const auto producer_event_identity = reinterpret_cast<uintptr_t>(batch->cuda_completion_event());
+		auto lease = consumer_streams->enable_lifetime_shadow(
+		    batch_identity, producer_event_identity, static_cast<int>(tensor_device_index()));
+		return std::make_shared<TorchDirectDctLifetimeShadowHandle>(std::move(lease));
+	}
+
+	void wait_for_producer_completion_for_test() {
+		auto* event = batch->cuda_completion_event();
+		if (event != nullptr) {
+			const auto device_index = tensor_device_index();
+			c10::cuda::CUDAGuard guard(device_index);
+			C10_CUDA_CHECK(cudaEventSynchronize(static_cast<cudaEvent_t>(event)));
+		}
+		consumer_streams->mark_producer_complete_for_test();
 	}
 
 	torch::Tensor image_offsets_tensor() {
@@ -1559,8 +1929,11 @@ struct TorchDirectDctBatch {
 		return layout_to_string(batch->device_batch().layout());
 	}
 
-	std::shared_ptr<galp::jpeg::DirectDctBatch> batch;
+	std::shared_ptr<galp::jpeg::DirectDctBatch> legacy_batch_owner;
+	galp::jpeg::DirectDctBatch*                 batch = nullptr;
 	std::shared_ptr<TorchDirectDctConsumerStreams> consumer_streams;
+	std::shared_ptr<galp::direct_dct::NativeBatchLease> native_lifetime;
+	TorchDirectDctNativeOwnerReference                  adapter_reference;
 	torch::Tensor                               tensor;
 	torch::Tensor                               y_tensor;
 	torch::Tensor                               cbcr_tensor;
@@ -1578,7 +1951,7 @@ private:
 	}
 
 	torch::Tensor grid_tensor(const galp::jpeg::DirectDctGridTensorDescriptor& desc, torch::Tensor& cached) {
-		DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
+		reclaim_finished_direct_dct_batches();
 		if (cached.defined()) {
 			return cached;
 		}
@@ -1600,8 +1973,9 @@ private:
 			cached = torch::empty(shape, options);
 			return cached;
 		}
-		auto owner = batch;
+		auto owner = legacy_batch_owner;
 		auto streams = consumer_streams;
+		consumer_streams->retain_storage_reference();
 		cached     = torch::from_blob(const_cast<void*>(desc.raw_data()),
                                   shape,
                                   strides,
@@ -1617,13 +1991,16 @@ private:
 	}
 
 	void wait_for_batch_completion() const {
+		const auto device_index = tensor_device_index();
+		c10::cuda::CUDAGuard guard(device_index);
+		wait_for_batch_completion(c10::cuda::getCurrentCUDAStream(device_index));
+	}
+
+	void wait_for_batch_completion(const c10::cuda::CUDAStream stream) const {
 		auto* event = batch->cuda_completion_event();
 		if (event == nullptr) {
 			return;
 		}
-		const auto device_index = tensor_device_index();
-		c10::cuda::CUDAGuard guard(device_index);
-		auto stream = c10::cuda::getCurrentCUDAStream(device_index);
 		C10_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), static_cast<cudaEvent_t>(event), 0));
 	}
 };
@@ -1902,7 +2279,7 @@ public:
 	}
 
 	size_t manual_reclaim() {
-		return DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished();
+		return reclaim_finished_direct_dct_batches();
 	}
 
 	[[nodiscard]] uint64_t image_count() const noexcept {
@@ -1967,7 +2344,14 @@ public:
 		physical_bytes_ += stats.compressed_payload_bytes_read;
 		peak_transient_bytes_ = std::max(
 		    peak_transient_bytes_, stats.actual_transient_total_allocated_high_water_bytes);
-		pending_.push_back(batch.batch);
+		PendingBatch pending;
+		if (batch.native_lifetime) {
+			pending.native_lifetime = batch.native_lifetime;
+			pending.native_reference = TorchDirectDctNativeOwnerReference(batch.native_lifetime);
+		} else {
+			pending.legacy_owner = batch.legacy_batch_owner;
+		}
+		pending_.push_back(std::move(pending));
 		collect_ready();
 	}
 
@@ -1992,9 +2376,24 @@ public:
 	}
 
 private:
+	struct PendingBatch final {
+		[[nodiscard]] galp::jpeg::DirectDctBatch* get() const noexcept {
+			return native_lifetime ? native_lifetime->backing_batch() : legacy_owner.get();
+		}
+
+		std::shared_ptr<galp::jpeg::DirectDctBatch> legacy_owner;
+		std::shared_ptr<galp::direct_dct::NativeBatchLease> native_lifetime;
+		TorchDirectDctNativeOwnerReference native_reference;
+	};
+
 	void collect_ready() {
 		for (auto it = pending_.begin(); it != pending_.end();) {
-			auto* event = (*it)->cuda_completion_event();
+			auto* owner = it->get();
+			if (owner == nullptr) {
+				it = pending_.erase(it);
+				continue;
+			}
+			auto* event = owner->cuda_completion_event();
 			bool  ready = event == nullptr;
 			if (event != nullptr) {
 				const auto status = cudaEventQuery(static_cast<cudaEvent_t>(event));
@@ -2008,7 +2407,7 @@ private:
 				++it;
 				continue;
 			}
-			const auto stats = (*it)->execution_stats();
+			const auto stats = owner->execution_stats();
 			decode_ms_ += stats.decode_ms;
 			transform_ms_ += stats.fixed_transform_ms + stats.fixed_grid_round_ms;
 			peak_transient_bytes_ = std::max(
@@ -2018,7 +2417,7 @@ private:
 		}
 	}
 
-	std::deque<std::shared_ptr<galp::jpeg::DirectDctBatch>> pending_;
+	std::deque<PendingBatch> pending_;
 	size_t consumed_batches_ = 0;
 	size_t completed_batches_ = 0;
 	double consumer_wait_ms_ = 0.0;
@@ -2035,9 +2434,22 @@ private:
 
 class TorchDirectDctPipeline {
 public:
+	enum class Backend : uint8_t { kLegacy, kNative };
+
 	TorchDirectDctPipeline(std::shared_ptr<TorchDirectDctReaderState> state,
-	                       galp::jpeg::JpegDctDeviceBatchOptions     options)
-	    : state_(std::move(state)), options_(std::move(options)) {
+	                       galp::jpeg::JpegDctDeviceBatchOptions     options,
+	                       std::string                               semantic_profile_id,
+	                       Backend                                    backend = Backend::kLegacy)
+	    : state_(std::move(state)),
+	      options_(std::move(options)),
+	      semantic_profile_id_(std::move(semantic_profile_id)) {
+		if (backend == Backend::kNative) {
+			auto runtime = std::shared_ptr<galp::jpeg::DirectDctRuntime>(
+			    &state_->runtime, [](galp::jpeg::DirectDctRuntime*) {});
+			native_delegate_ = std::make_unique<galp::direct_dct::NativeLogicalBatchPipeline>(
+			    std::move(runtime), semantic_profile_id_, options_);
+			lifetime_backend_ = requested_phase4_lifetime_backend();
+		}
 	}
 
 	~TorchDirectDctPipeline() {
@@ -2069,7 +2481,21 @@ public:
 		}
 		close();
 		metrics_.reset();
-		closed_   = false;
+		closed_ = false;
+		if (native_delegate_) {
+			std::vector<galp::direct_dct::LogicalBatchRequest> logical_requests;
+			logical_requests.reserve(parsed_requests.size());
+			for (size_t index = 0U; index < parsed_requests.size(); ++index) {
+				logical_requests.push_back(galp::direct_dct::shadow_convert_legacy_requests(
+				    parsed_requests[index],
+				    parsed_requests[index].size(),
+				    semantic_profile_id_,
+				    index + 1U,
+				    index));
+			}
+			native_delegate_->reset(std::move(logical_requests));
+			return;
+		}
 		requests_ = std::move(parsed_requests);
 		fill_pending();
 		if (!pending_.empty()) {
@@ -2078,7 +2504,45 @@ public:
 	}
 
 	TorchDirectDctBatch next() {
-		if (closed_ || pending_.empty()) {
+		if (closed_) {
+			throw py::stop_iteration();
+		}
+		if (native_delegate_) {
+			const auto state = native_delegate_->state();
+			if (state.lifecycle == galp::direct_dct::NativePipelineState::Lifecycle::kDrained || state.closed) {
+				throw py::stop_iteration();
+			}
+			try {
+				reclaim_finished_direct_dct_batches();
+				const auto wait_started = std::chrono::steady_clock::now();
+				auto batch = TorchDirectDctBatch(native_delegate_->next(), lifetime_backend_);
+				const auto ready_at = std::chrono::steady_clock::now();
+				const auto native_metrics = native_delegate_->prefetch_metrics();
+				auto telemetry = std::make_shared<TorchDirectDctPrefetchTelemetry>();
+				telemetry->producer_active_nanoseconds.store(
+				    native_metrics.producer_active_nanoseconds, std::memory_order_release);
+				telemetry->planning_nanoseconds.store(
+				    native_metrics.planning_nanoseconds, std::memory_order_release);
+				telemetry->io_staging_nanoseconds.store(
+				    native_metrics.io_staging_nanoseconds, std::memory_order_release);
+				telemetry->ordered_submission_nanoseconds.store(
+				    native_metrics.ordered_submission_nanoseconds, std::memory_order_release);
+				telemetry->submit_to_ready_nanoseconds.store(
+				    native_metrics.submit_to_ready_nanoseconds, std::memory_order_release);
+				batch.prefetch_telemetry = std::move(telemetry);
+				batch.consumer_wait_ms =
+				    std::chrono::duration<double, std::milli>(ready_at - wait_started).count();
+				batch.submit_to_ready_ms =
+				    static_cast<double>(native_metrics.submit_to_ready_nanoseconds) / 1.0e6;
+				reclaim_finished_direct_dct_batches();
+				metrics_.observe(batch);
+				return batch;
+			} catch (...) {
+				close();
+				throw;
+			}
+		}
+		if (pending_.empty()) {
 			throw py::stop_iteration();
 		}
 		auto current = pending_.front();
@@ -2097,14 +2561,29 @@ public:
 	}
 
 	[[nodiscard]] bool ready() const {
+		if (native_delegate_) {
+			return native_delegate_->ready();
+		}
 		return !pending_.empty() && pending_.front()->ready();
 	}
 
 	[[nodiscard]] bool started() const noexcept {
+		if (native_delegate_) {
+			return native_delegate_->started();
+		}
 		return !pending_.empty() && pending_.front()->started();
 	}
 
 	[[nodiscard]] py::dict prefetch_metrics() const {
+		if (native_delegate_) {
+			const auto metrics = native_delegate_->prefetch_metrics();
+			py::dict out;
+			out["producer_ms"] = static_cast<double>(metrics.producer_active_nanoseconds) / 1.0e6;
+			out["planning_ms"] = static_cast<double>(metrics.planning_nanoseconds) / 1.0e6;
+			out["io_ms"] = static_cast<double>(metrics.io_staging_nanoseconds) / 1.0e6;
+			out["ordered_submission_ms"] = static_cast<double>(metrics.ordered_submission_nanoseconds) / 1.0e6;
+			return out;
+		}
 		std::shared_ptr<TorchDirectDctPrefetch> source = last_prefetch_;
 		if (!source && !pending_.empty()) {
 			source = pending_.front();
@@ -2118,6 +2597,9 @@ public:
 	}
 
 	[[nodiscard]] size_t prefetched_batch_count() const noexcept {
+		if (native_delegate_) {
+			return native_delegate_->prefetched_batch_count();
+		}
 		return next_request_;
 	}
 
@@ -2125,7 +2607,18 @@ public:
 		return metrics_.snapshot();
 	}
 
+	[[nodiscard]] const char* lifetime_backend_for_test() const noexcept {
+		return lifetime_backend_ == TorchDirectDctLifetimeBackend::kNative ? "native" : "legacy";
+	}
+
 	size_t close() noexcept {
+		if (native_delegate_) {
+			const auto cancelled = native_delegate_->close();
+			requests_.clear();
+			next_request_ = 0;
+			closed_ = true;
+			return cancelled;
+		}
 		size_t cancelled = 0;
 		for (auto& pending : pending_) {
 			cancelled += pending && pending->cancel() ? 1U : 0U;
@@ -2151,6 +2644,9 @@ private:
 
 	std::shared_ptr<TorchDirectDctReaderState> state_;
 	galp::jpeg::JpegDctDeviceBatchOptions options_;
+	std::string semantic_profile_id_;
+	std::unique_ptr<galp::direct_dct::NativeLogicalBatchPipeline> native_delegate_;
+	TorchDirectDctLifetimeBackend lifetime_backend_ = TorchDirectDctLifetimeBackend::kLegacy;
 	std::vector<std::vector<galp::jpeg::JpegDctImageCropRequest>> requests_;
 	std::deque<std::shared_ptr<TorchDirectDctPrefetch>> pending_;
 	std::shared_ptr<TorchDirectDctPrefetch> last_prefetch_;
@@ -2163,11 +2659,24 @@ private:
 
 PYBIND11_MODULE(_galp_direct_dct, m) {
 	m.doc() = "Private GALP Direct-DCT backend; applications must import galp.torch";
+	py::class_<TorchDirectDctLifetimeShadowHandle,
+	           std::shared_ptr<TorchDirectDctLifetimeShadowHandle>>(
+	    m, "_DirectDctLifetimeShadowHandle")
+	    .def_property_readonly("snapshot", &TorchDirectDctLifetimeShadowHandle::snapshot);
 
 	py::class_<TorchDirectDctBatch>(m, "DirectDctBatch")
 	    .def_property_readonly("coefficients", &TorchDirectDctBatch::coefficients)
 	    .def_property_readonly("y", &TorchDirectDctBatch::y)
 	    .def_property_readonly("cbcr", &TorchDirectDctBatch::cbcr)
+	    .def("record_stream", &TorchDirectDctBatch::record_current_consumer_stream,
+	         "Register the current CUDA stream as an actual consumer before submitting work.")
+	    .def("record_stream", &TorchDirectDctBatch::record_consumer_stream,
+	         py::arg("stream_identity"), py::arg("cuda_device"),
+	         "Register an explicit CUDA stream as an actual consumer before submitting work.")
+	    .def("_enable_lifetime_shadow_for_test", &TorchDirectDctBatch::enable_lifetime_shadow_for_test,
+	         "Enable the non-authoritative Phase-4 lifetime observer before tensor creation.")
+	    .def("_wait_for_producer_completion_for_test", &TorchDirectDctBatch::wait_for_producer_completion_for_test,
+	         "Wait for the existing producer event and update the Phase-4 test observer.")
 	    .def_property_readonly("image_offsets_tensor", &TorchDirectDctBatch::image_offsets_tensor)
 	    .def_property_readonly("image_counts_tensor", &TorchDirectDctBatch::image_counts_tensor)
 	    .def_property_readonly("block_to_image_tensor", &TorchDirectDctBatch::block_to_image_tensor)
@@ -2259,6 +2768,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("prefetched_batch_count", &TorchDirectDctPipeline::prefetched_batch_count)
 	    .def_property_readonly("metrics", &TorchDirectDctPipeline::metrics)
 	    .def_property_readonly("prefetch_metrics", &TorchDirectDctPipeline::prefetch_metrics)
+	    .def_property_readonly("_lifetime_backend_for_test", &TorchDirectDctPipeline::lifetime_backend_for_test)
 	    .def("close", &TorchDirectDctPipeline::close);
 
 	py::class_<TorchDirectDctReader>(m, "DirectDctReader")
@@ -2317,8 +2827,14 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        "pipeline",
 	        [](TorchDirectDctReader& reader, const std::string& profile_id) {
 		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
+		        const auto* backend_override = std::getenv("GALP_PHASE3_NATIVE_DELEGATE");
+		        const auto native_delegate = backend_override == nullptr || std::string_view(backend_override) != "0";
 		        return std::make_shared<TorchDirectDctPipeline>(
-		            reader.shared_state(), galp::profiles::materialize_direct_dct_options(profile));
+		            reader.shared_state(),
+		            galp::profiles::materialize_direct_dct_options(profile),
+		            profile_id,
+		            native_delegate ? TorchDirectDctPipeline::Backend::kNative
+		                            : TorchDirectDctPipeline::Backend::kLegacy);
 	        },
 	        py::arg("profile_id"),
 	        "Create a native-owned bounded pipeline for one semantic profile.")
@@ -2710,5 +3226,18 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	m.def("direct_dct_profile_info", [](const std::string& profile_id) {
 		return direct_dct_profile_info(galp::profiles::resolve_direct_dct_profile(profile_id));
 	}, py::arg("profile_id"));
-	m.def("manual_reclaim", []() { return DeferredDirectDctBatchReleaseQueue::instance().reclaim_finished(); });
+	m.def("manual_reclaim", []() { return reclaim_finished_direct_dct_batches(); });
+	m.def("_lifetime_reclaim_stats_for_test", &direct_dct_lifetime_reclaim_stats);
+	m.def("_device_pool_reuse_probe_for_test", [](const size_t bytes, const size_t attempts) {
+		if (bytes == 0U || attempts == 0U || attempts > 16U) {
+			throw std::invalid_argument("device-pool reuse probe requires non-zero bytes and 1..16 attempts");
+		}
+		py::list pointers;
+		for (size_t index = 0U; index < attempts; ++index) {
+			void* pointer = galp::memory::DevicePool::instance().alloc(bytes);
+			pointers.append(reinterpret_cast<uintptr_t>(pointer));
+			galp::memory::DevicePool::instance().free(pointer);
+		}
+		return pointers;
+	}, py::arg("bytes"), py::arg("attempts"));
 }
