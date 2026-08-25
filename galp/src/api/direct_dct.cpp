@@ -289,6 +289,10 @@ JpegDctDeviceExecutionStats DirectDctBatch::execution_stats() const {
 	return batch_.execution_stats();
 }
 
+bool DirectDctBatch::try_finalize_execution_stats() const {
+	return batch_.try_finalize_execution_stats();
+}
+
 const JpegDctDeviceCacheStats& DirectDctBatch::cache_stats_ref() const noexcept {
 	return batch_.cache_stats_ref();
 }

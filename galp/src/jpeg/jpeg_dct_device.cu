@@ -108,6 +108,27 @@ struct JpegDctDeviceBatch::Impl {
 		fixed_grid_round_timing_finalized = true;
 	}
 
+	bool try_finalize_completion() {
+		if (completion_error) {
+			completion_error_observed = true;
+			std::rethrow_exception(completion_error);
+		}
+		if (completion_event && !completion_synchronized) {
+			const auto status = cudaEventQuery(completion_event.get());
+			if (status == cudaErrorNotReady) {
+				return false;
+			}
+			CUDA_SAFE_CALL(status);
+			// The name is retained for ABI-local compatibility: readiness was
+			// observed without issuing cudaEventSynchronize.
+			completion_synchronized = true;
+		}
+		finalize_decode_timing();
+		finalize_planless_transform_timing();
+		finalize_fixed_grid_round_timing();
+		return true;
+	}
+
 	void synchronize_completion() {
 		if (completion_error) {
 			completion_error_observed = true;
@@ -310,6 +331,10 @@ JpegDctDeviceExecutionStats JpegDctDeviceBatch::execution_stats() const {
 		impl_->synchronize_completion();
 	}
 	return execution_stats_ref();
+}
+
+bool JpegDctDeviceBatch::try_finalize_execution_stats() const {
+	return !impl_ || impl_->try_finalize_completion();
 }
 
 const JpegDctDeviceCacheStats& JpegDctDeviceBatch::cache_stats_ref() const noexcept {

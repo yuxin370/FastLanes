@@ -1,5 +1,6 @@
 #include "galp/direct_dct.hpp"
 #include "galp/profiles/registry.hpp"
+#include "direct_dct/direct_dct_metrics.hpp"
 #include "direct_dct/native_batch_lifetime.hpp"
 #include "direct_dct/native_logical_batch_pipeline.hpp"
 #include "cuda/memory/device_pool.cuh"
@@ -1117,6 +1118,131 @@ py::list rowgroups_to_list(const std::vector<galp::jpeg::JpegDctDeviceRowgroupMe
 	return out;
 }
 
+py::dict direct_dct_metrics_to_dict(
+    const galp::direct_dct::DirectDctMetricsSnapshot& snapshot,
+    const bool include_batch_counts) {
+	py::dict out;
+	out["schema"]               = std::string(galp::direct_dct::kDirectDctMetricsSchema);
+	out["complete"]             = snapshot.gpu_timings_finalized;
+	out["consumer_wait_ms"]     = snapshot.consumer_wait_ms;
+	out["submit_to_ready_ms"]   = snapshot.submit_to_ready_ms;
+	out["producer_ms"]          = snapshot.producer_ms;
+	out["planning_ms"]          = snapshot.planning_ms;
+	out["io_ms"]                = snapshot.io_ms;
+	out["decode_ms"]            = snapshot.decode_ms;
+	out["transform_ms"]         = snapshot.transform_ms;
+	out["logical_bytes"]        = snapshot.logical_bytes;
+	out["physical_bytes"]       = snapshot.physical_bytes;
+	out["peak_transient_bytes"] = snapshot.peak_transient_bytes;
+	if (include_batch_counts) {
+		out["consumed_batches"]  = snapshot.consumed_batches;
+		out["completed_batches"] = snapshot.completed_batches;
+	}
+	return out;
+}
+
+py::dict direct_dct_metrics_completion_to_dict(
+    const galp::direct_dct::DirectDctMetricsSnapshot& snapshot) {
+	py::dict out;
+	out["host_snapshot_taken"]   = snapshot.host_snapshot_taken;
+	out["gpu_timings_finalized"] = snapshot.gpu_timings_finalized;
+	return out;
+}
+
+const char* metric_value_type_name(const galp::direct_dct::MetricValueType value) noexcept {
+	switch (value) {
+	case galp::direct_dct::MetricValueType::kBoolean: return "boolean";
+	case galp::direct_dct::MetricValueType::kUnsignedInteger: return "unsigned_integer";
+	case galp::direct_dct::MetricValueType::kFloatingPoint: return "floating_point";
+	case galp::direct_dct::MetricValueType::kString: return "string";
+	}
+	return "unknown";
+}
+
+const char* metric_scope_name(const galp::direct_dct::MetricScope value) noexcept {
+	return value == galp::direct_dct::MetricScope::kBatch ? "batch" : "pipeline";
+}
+
+const char* metric_unit_name(const galp::direct_dct::MetricUnit value) noexcept {
+	switch (value) {
+	case galp::direct_dct::MetricUnit::kBoolean: return "boolean";
+	case galp::direct_dct::MetricUnit::kCount: return "count";
+	case galp::direct_dct::MetricUnit::kMilliseconds: return "milliseconds";
+	case galp::direct_dct::MetricUnit::kBytes: return "bytes";
+	case galp::direct_dct::MetricUnit::kIdentifier: return "identifier";
+	}
+	return "unknown";
+}
+
+const char* metric_reducer_name(const galp::direct_dct::MetricReducer value) noexcept {
+	switch (value) {
+	case galp::direct_dct::MetricReducer::kSum: return "sum";
+	case galp::direct_dct::MetricReducer::kMaximum: return "max";
+	case galp::direct_dct::MetricReducer::kInvariant: return "invariant";
+	}
+	return "unknown";
+}
+
+const char* metric_completion_name(
+    const galp::direct_dct::MetricCompletionRequirement value) noexcept {
+	return value == galp::direct_dct::MetricCompletionRequirement::kHostSnapshot
+	           ? "host_snapshot"
+	           : "gpu_completion";
+}
+
+py::list direct_dct_metric_descriptors_to_list() {
+	py::list out;
+	for (const auto& descriptor : galp::direct_dct::direct_dct_metric_descriptors()) {
+		py::dict item;
+		item["name"] = std::string(descriptor.name);
+		item["value_type"] = metric_value_type_name(descriptor.value_type);
+		item["scope"] = metric_scope_name(descriptor.scope);
+		item["unit"] = metric_unit_name(descriptor.unit);
+		item["reducer"] = metric_reducer_name(descriptor.reducer);
+		item["completion_requirement"] = metric_completion_name(descriptor.completion_requirement);
+		item["schema_version"] = descriptor.schema_version;
+		out.append(std::move(item));
+	}
+	return out;
+}
+
+galp::direct_dct::DirectDctMetricsObservation direct_dct_metrics_from_mapping(
+    const py::dict& values) {
+	const auto required_schema = std::string(galp::direct_dct::kDirectDctMetricsSchema);
+	if (!values.contains("schema") || py::cast<std::string>(values["schema"]) != required_schema) {
+		throw std::invalid_argument("Direct-DCT metrics snapshot schema mismatch");
+	}
+	galp::direct_dct::DirectDctMetricsObservation observation;
+	observation.gpu_timings_finalized = py::cast<bool>(values["complete"]);
+	observation.consumer_wait_ms = py::cast<double>(values["consumer_wait_ms"]);
+	observation.submit_to_ready_ms = py::cast<double>(values["submit_to_ready_ms"]);
+	observation.producer_ms = py::cast<double>(values["producer_ms"]);
+	observation.planning_ms = py::cast<double>(values["planning_ms"]);
+	observation.io_ms = py::cast<double>(values["io_ms"]);
+	observation.decode_ms = py::cast<double>(values["decode_ms"]);
+	observation.transform_ms = py::cast<double>(values["transform_ms"]);
+	observation.logical_bytes = py::cast<uint64_t>(values["logical_bytes"]);
+	observation.physical_bytes = py::cast<uint64_t>(values["physical_bytes"]);
+	observation.peak_transient_bytes = py::cast<uint64_t>(values["peak_transient_bytes"]);
+	observation.consumed_batches = values.contains("consumed_batches")
+	                                   ? py::cast<uint64_t>(values["consumed_batches"])
+	                                   : 1U;
+	observation.completed_batches = values.contains("completed_batches")
+	                                    ? py::cast<uint64_t>(values["completed_batches"])
+	                                    : (observation.gpu_timings_finalized
+	                                           ? observation.consumed_batches
+	                                           : 0U);
+	return observation;
+}
+
+py::dict aggregate_direct_dct_metrics(const py::iterable& snapshots) {
+	galp::direct_dct::DirectDctMetricsAggregator aggregator;
+	for (const auto& value : snapshots) {
+		aggregator.observe(direct_dct_metrics_from_mapping(py::cast<py::dict>(value)));
+	}
+	return direct_dct_metrics_to_dict(aggregator.snapshot(), true);
+}
+
 const char* lifetime_differential_name(
     const galp::direct_dct::NativeEligibilityDifferential differential) noexcept {
 	switch (differential) {
@@ -1763,58 +1889,58 @@ struct TorchDirectDctBatch {
 	}
 
 	[[nodiscard]] py::dict execution_stats_snapshot() const {
-		// Runtime benchmarks need the host-populated counters without turning
-		// every training step into a cudaEventSynchronize. Completion-event-derived
-		// decode, fixed-transform, and rounding durations remain optional in this
-		// explicitly non-blocking snapshot; execution_stats() finalizes them after
-		// the consumer has already waited for batch completion.
+		// This is intentionally a host-only snapshot. Completion state is exposed
+		// separately so callers cannot mistake a captured host dictionary for
+		// finalized GPU event timing.
 		return execution_stats_to_dict(batch->execution_stats_ref());
 	}
 
-	[[nodiscard]] py::dict metrics() const {
-		// Keep the hot input path non-blocking. Completion-derived durations are
-		// finalized only when the native CUDA event is already ready; callers can
-		// read the same stable schema again after model completion.
-		auto       stats    = batch->execution_stats_ref();
-		auto*      event    = batch->cuda_completion_event();
-		bool       complete = event == nullptr;
-		if (event != nullptr) {
-			const auto status = cudaEventQuery(static_cast<cudaEvent_t>(event));
-			if (status == cudaSuccess) {
-				complete = true;
-			} else if (status != cudaErrorNotReady) {
-				C10_CUDA_CHECK(status);
-			}
-		}
-		if (complete) {
-			stats = batch->execution_stats();
-		}
-		py::dict   out;
-		out["schema"]               = "galp-direct-dct-metrics-v2";
-		out["complete"]             = complete;
-		out["consumer_wait_ms"]     = consumer_wait_ms;
-		out["submit_to_ready_ms"]   = submit_to_ready_ms;
-		out["producer_ms"]          = prefetch_telemetry
-		                                    ? static_cast<double>(prefetch_telemetry->producer_active_nanoseconds.load(
-		                                          std::memory_order_acquire)) /
-		                                          1.0e6
-		                                    : 0.0;
-		out["planning_ms"]          = prefetch_telemetry
-		                                    ? static_cast<double>(prefetch_telemetry->planning_nanoseconds.load(
-		                                          std::memory_order_acquire)) /
-		                                          1.0e6
-		                                    : stats.planning_ms;
-		out["io_ms"]                = prefetch_telemetry
-		                                    ? static_cast<double>(prefetch_telemetry->io_staging_nanoseconds.load(
-		                                          std::memory_order_acquire)) /
-		                                          1.0e6
-		                                    : stats.host_io_staging_ms;
-		out["decode_ms"]            = stats.decode_ms;
-		out["transform_ms"]         = stats.fixed_transform_ms + stats.fixed_grid_round_ms;
-		out["logical_bytes"]        = stats.selected_compressed_payload_bytes;
-		out["physical_bytes"]       = stats.compressed_payload_bytes_read;
-		out["peak_transient_bytes"] = stats.actual_transient_total_allocated_high_water_bytes;
+	[[nodiscard]] py::dict execution_stats_observation() const {
+		const bool gpu_timings_finalized = batch->try_finalize_execution_stats();
+		py::dict out;
+		out["host_snapshot_taken"] = true;
+		out["gpu_timings_finalized"] = gpu_timings_finalized;
+		out["stats"] = execution_stats_to_dict(batch->execution_stats_ref());
 		return out;
+	}
+
+	[[nodiscard]] py::dict metrics() const {
+		const bool gpu_timings_finalized = batch->try_finalize_execution_stats();
+		const auto& stats = batch->execution_stats_ref();
+		galp::direct_dct::DirectDctMetricsObservation observation;
+		observation.gpu_timings_finalized = gpu_timings_finalized;
+		observation.consumer_wait_ms = consumer_wait_ms;
+		observation.submit_to_ready_ms = submit_to_ready_ms;
+		observation.producer_ms = prefetch_telemetry
+		                              ? static_cast<double>(prefetch_telemetry->producer_active_nanoseconds.load(
+		                                    std::memory_order_acquire)) /
+		                                    1.0e6
+		                              : 0.0;
+		observation.planning_ms = prefetch_telemetry
+		                              ? static_cast<double>(prefetch_telemetry->planning_nanoseconds.load(
+		                                    std::memory_order_acquire)) /
+		                                    1.0e6
+		                              : stats.planning_ms;
+		observation.io_ms = prefetch_telemetry
+		                        ? static_cast<double>(prefetch_telemetry->io_staging_nanoseconds.load(
+		                              std::memory_order_acquire)) /
+		                              1.0e6
+		                        : stats.host_io_staging_ms;
+		observation.decode_ms = stats.decode_ms;
+		observation.transform_ms = stats.fixed_transform_ms + stats.fixed_grid_round_ms;
+		observation.logical_bytes = stats.selected_compressed_payload_bytes;
+		observation.physical_bytes = stats.compressed_payload_bytes_read;
+		observation.peak_transient_bytes = stats.actual_transient_total_allocated_high_water_bytes;
+		observation.completed_batches = gpu_timings_finalized ? 1U : 0U;
+		galp::direct_dct::DirectDctMetricsAggregator aggregator;
+		aggregator.observe(observation);
+		return direct_dct_metrics_to_dict(aggregator.snapshot(), false);
+	}
+
+	[[nodiscard]] py::dict metrics_completion() const {
+		galp::direct_dct::DirectDctMetricsSnapshot snapshot;
+		snapshot.gpu_timings_finalized = batch->try_finalize_execution_stats();
+		return direct_dct_metrics_completion_to_dict(snapshot);
 	}
 
 	[[nodiscard]] size_t cache_hits() const noexcept {
@@ -2310,40 +2436,32 @@ class TorchDirectDctPipelineMetrics {
 public:
 	void reset() {
 		pending_.clear();
-		consumed_batches_ = 0;
-		completed_batches_ = 0;
-		consumer_wait_ms_ = 0.0;
-		submit_to_ready_ms_ = 0.0;
-		producer_ms_ = 0.0;
-		planning_ms_ = 0.0;
-		io_ms_ = 0.0;
-		decode_ms_ = 0.0;
-		transform_ms_ = 0.0;
-		logical_bytes_ = 0;
-		physical_bytes_ = 0;
-		peak_transient_bytes_ = 0;
+		aggregator_.reset();
 	}
 
 	void observe(const TorchDirectDctBatch& batch) {
-		++consumed_batches_;
-		consumer_wait_ms_ += batch.consumer_wait_ms;
-		submit_to_ready_ms_ += batch.submit_to_ready_ms;
+		galp::direct_dct::DirectDctMetricsObservation observation;
+		observation.consumer_wait_ms = batch.consumer_wait_ms;
+		observation.submit_to_ready_ms = batch.submit_to_ready_ms;
 		if (batch.prefetch_telemetry) {
-			producer_ms_ += static_cast<double>(
-			                    batch.prefetch_telemetry->producer_active_nanoseconds.load(std::memory_order_acquire)) /
-			                1.0e6;
-			planning_ms_ += static_cast<double>(
-			                    batch.prefetch_telemetry->planning_nanoseconds.load(std::memory_order_acquire)) /
-			                1.0e6;
-			io_ms_ += static_cast<double>(
-			              batch.prefetch_telemetry->io_staging_nanoseconds.load(std::memory_order_acquire)) /
-			          1.0e6;
+			observation.producer_ms = static_cast<double>(
+			                              batch.prefetch_telemetry->producer_active_nanoseconds.load(
+			                                  std::memory_order_acquire)) /
+			                          1.0e6;
+			observation.planning_ms = static_cast<double>(
+			                              batch.prefetch_telemetry->planning_nanoseconds.load(
+			                                  std::memory_order_acquire)) /
+			                          1.0e6;
+			observation.io_ms = static_cast<double>(
+			                        batch.prefetch_telemetry->io_staging_nanoseconds.load(
+			                            std::memory_order_acquire)) /
+			                    1.0e6;
 		}
 		const auto& stats = batch.batch->execution_stats_ref();
-		logical_bytes_ += stats.selected_compressed_payload_bytes;
-		physical_bytes_ += stats.compressed_payload_bytes_read;
-		peak_transient_bytes_ = std::max(
-		    peak_transient_bytes_, stats.actual_transient_total_allocated_high_water_bytes);
+		observation.logical_bytes = stats.selected_compressed_payload_bytes;
+		observation.physical_bytes = stats.compressed_payload_bytes_read;
+		observation.peak_transient_bytes = stats.actual_transient_total_allocated_high_water_bytes;
+		aggregator_.observe_host(observation);
 		PendingBatch pending;
 		if (batch.native_lifetime) {
 			pending.native_lifetime = batch.native_lifetime;
@@ -2357,22 +2475,12 @@ public:
 
 	[[nodiscard]] py::dict snapshot() {
 		collect_ready();
-		py::dict out;
-		out["schema"]               = "galp-direct-dct-metrics-v2";
-		out["complete"]             = pending_.empty();
-		out["consumer_wait_ms"]     = consumer_wait_ms_;
-		out["submit_to_ready_ms"]   = submit_to_ready_ms_;
-		out["producer_ms"]          = producer_ms_;
-		out["planning_ms"]          = planning_ms_;
-		out["io_ms"]                = io_ms_;
-		out["decode_ms"]            = decode_ms_;
-		out["transform_ms"]         = transform_ms_;
-		out["logical_bytes"]        = logical_bytes_;
-		out["physical_bytes"]       = physical_bytes_;
-		out["peak_transient_bytes"] = peak_transient_bytes_;
-		out["consumed_batches"]     = consumed_batches_;
-		out["completed_batches"]    = completed_batches_;
-		return out;
+		return direct_dct_metrics_to_dict(aggregator_.snapshot(), true);
+	}
+
+	[[nodiscard]] py::dict completion_snapshot() {
+		collect_ready();
+		return direct_dct_metrics_completion_to_dict(aggregator_.snapshot());
 	}
 
 private:
@@ -2393,43 +2501,21 @@ private:
 				it = pending_.erase(it);
 				continue;
 			}
-			auto* event = owner->cuda_completion_event();
-			bool  ready = event == nullptr;
-			if (event != nullptr) {
-				const auto status = cudaEventQuery(static_cast<cudaEvent_t>(event));
-				if (status == cudaSuccess) {
-					ready = true;
-				} else if (status != cudaErrorNotReady) {
-					C10_CUDA_CHECK(status);
-				}
-			}
-			if (!ready) {
+			if (!owner->try_finalize_execution_stats()) {
 				++it;
 				continue;
 			}
-			const auto stats = owner->execution_stats();
-			decode_ms_ += stats.decode_ms;
-			transform_ms_ += stats.fixed_transform_ms + stats.fixed_grid_round_ms;
-			peak_transient_bytes_ = std::max(
-			    peak_transient_bytes_, stats.actual_transient_total_allocated_high_water_bytes);
-			++completed_batches_;
+			const auto& stats = owner->execution_stats_ref();
+			aggregator_.observe_gpu_completion(
+			    stats.decode_ms,
+			    stats.fixed_transform_ms + stats.fixed_grid_round_ms,
+			    stats.actual_transient_total_allocated_high_water_bytes);
 			it = pending_.erase(it);
 		}
 	}
 
 	std::deque<PendingBatch> pending_;
-	size_t consumed_batches_ = 0;
-	size_t completed_batches_ = 0;
-	double consumer_wait_ms_ = 0.0;
-	double submit_to_ready_ms_ = 0.0;
-	double producer_ms_ = 0.0;
-	double planning_ms_ = 0.0;
-	double io_ms_ = 0.0;
-	double decode_ms_ = 0.0;
-	double transform_ms_ = 0.0;
-	size_t logical_bytes_ = 0;
-	size_t physical_bytes_ = 0;
-	size_t peak_transient_bytes_ = 0;
+	galp::direct_dct::DirectDctMetricsAggregator aggregator_;
 };
 
 class TorchDirectDctPipeline {
@@ -2607,6 +2693,10 @@ public:
 		return metrics_.snapshot();
 	}
 
+	[[nodiscard]] py::dict metrics_completion() {
+		return metrics_.completion_snapshot();
+	}
+
 	[[nodiscard]] const char* lifetime_backend_for_test() const noexcept {
 		return lifetime_backend_ == TorchDirectDctLifetimeBackend::kNative ? "native" : "legacy";
 	}
@@ -2686,7 +2776,9 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("cache_stats", &TorchDirectDctBatch::cache_stats)
 	    .def_property_readonly("execution_stats", &TorchDirectDctBatch::execution_stats)
 	    .def_property_readonly("execution_stats_snapshot", &TorchDirectDctBatch::execution_stats_snapshot)
+	    .def_property_readonly("_execution_stats_observation", &TorchDirectDctBatch::execution_stats_observation)
 	    .def_property_readonly("metrics", &TorchDirectDctBatch::metrics)
+	    .def_property_readonly("_metrics_completion", &TorchDirectDctBatch::metrics_completion)
 	    .def_property_readonly("cache_hits", &TorchDirectDctBatch::cache_hits)
 	    .def_property_readonly("cache_misses", &TorchDirectDctBatch::cache_misses)
 	    .def_property_readonly("cache_inserts", &TorchDirectDctBatch::cache_inserts)
@@ -2767,6 +2859,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("started", &TorchDirectDctPipeline::started)
 	    .def_property_readonly("prefetched_batch_count", &TorchDirectDctPipeline::prefetched_batch_count)
 	    .def_property_readonly("metrics", &TorchDirectDctPipeline::metrics)
+	    .def_property_readonly("_metrics_completion", &TorchDirectDctPipeline::metrics_completion)
 	    .def_property_readonly("prefetch_metrics", &TorchDirectDctPipeline::prefetch_metrics)
 	    .def_property_readonly("_lifetime_backend_for_test", &TorchDirectDctPipeline::lifetime_backend_for_test)
 	    .def("close", &TorchDirectDctPipeline::close);
@@ -3226,6 +3319,10 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	m.def("direct_dct_profile_info", [](const std::string& profile_id) {
 		return direct_dct_profile_info(galp::profiles::resolve_direct_dct_profile(profile_id));
 	}, py::arg("profile_id"));
+	m.def("_direct_dct_metric_descriptors", &direct_dct_metric_descriptors_to_list);
+	m.def("_aggregate_direct_dct_metrics", &aggregate_direct_dct_metrics,
+	      py::arg("snapshots"),
+	      "Aggregate stable Direct-DCT snapshots using the native metric descriptors.");
 	m.def("manual_reclaim", []() { return reclaim_finished_direct_dct_batches(); });
 	m.def("_lifetime_reclaim_stats_for_test", &direct_dct_lifetime_reclaim_stats);
 	m.def("_device_pool_reuse_probe_for_test", [](const size_t bytes, const size_t attempts) {

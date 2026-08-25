@@ -18,6 +18,7 @@ from galp.profiles.rgbnomore import VALIDATION
 from galp.benchmarks.system_rgbnomore.shared.common import GALP_RUNTIME_PROFILE
 from galp.torch import DirectDctMetrics, DirectDctReader
 from galp.diagnostics.direct_dct import (
+    execution_stats_observation as public_execution_stats_observation,
     execution_stats as public_execution_stats,
     execution_stats_snapshot as public_execution_stats_snapshot,
     pipeline_stats,
@@ -75,6 +76,18 @@ def optional_native_execution_stats_snapshot(source: Any) -> dict[str, Any]:
     )
 
 
+def optional_native_execution_stats_observation(source: Any) -> dict[str, Any]:
+    """Return non-blocking stats plus independent host/GPU completion state."""
+
+    try:
+        return _json_compatible(public_execution_stats_observation(source))
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        pass
+    return _optional_native_execution_stats_attribute(
+        source, "_execution_stats_observation"
+    )
+
+
 @dataclass
 class DirectDctTrainingBatch:
     """Layout-independent semantic result returned to the training adapter."""
@@ -102,6 +115,9 @@ class DirectDctTrainingBatch:
 
     def native_execution_stats_snapshot(self) -> dict[str, Any]:
         return optional_native_execution_stats_snapshot(self.native_batch)
+
+    def native_execution_stats_observation(self) -> dict[str, Any]:
+        return optional_native_execution_stats_observation(self.native_batch)
 
 
 class DirectDctTrainingReader:
@@ -157,6 +173,22 @@ class DirectDctTrainingReader:
 
     def metrics(self) -> DirectDctMetrics:
         return self._pipeline.metrics
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Return the native stable-schema snapshot without Python reduction."""
+
+        return dict(self._pipeline._native.metrics)
+
+    def aggregate_metrics_snapshots(
+        self, snapshots: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        """Combine pipeline scopes using the native descriptor-driven reducer."""
+
+        return dict(
+            self._reader._module._aggregate_direct_dct_metrics(
+                [dict(snapshot) for snapshot in snapshots]
+            )
+        )
 
     def prefetched_batch_count(self) -> int:
         return int(pipeline_stats(self._pipeline)["prefetched_batch_count"])

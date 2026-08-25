@@ -381,6 +381,10 @@ public:
 	[[nodiscard]] int                                               cuda_device() const noexcept;
 	[[nodiscard]] JpegDctDeviceCacheStats                           cache_stats() const noexcept;
 	[[nodiscard]] JpegDctDeviceExecutionStats                       execution_stats() const;
+	// Non-blocking completion probe used by native metrics aggregation. It
+	// finalizes existing event-derived timings only when the existing producer
+	// completion event is already ready; it never synchronizes a stream/device.
+	[[nodiscard]] bool                                              try_finalize_execution_stats() const;
 	[[nodiscard]] const JpegDctDeviceCacheStats&                    cache_stats_ref() const noexcept;
 	[[nodiscard]] const JpegDctDeviceExecutionStats&                execution_stats_ref() const noexcept;
 	[[nodiscard]] JpegDctDeviceLayout                               layout() const noexcept;

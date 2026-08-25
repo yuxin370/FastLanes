@@ -117,6 +117,7 @@ public:
 	[[nodiscard]] const std::vector<uint8_t>&                       selected_coefficients() const noexcept;
 	[[nodiscard]] JpegDctDeviceCacheStats                           cache_stats() const noexcept;
 	[[nodiscard]] JpegDctDeviceExecutionStats                       execution_stats() const;
+	[[nodiscard]] bool                                              try_finalize_execution_stats() const;
 	[[nodiscard]] const JpegDctDeviceCacheStats&                    cache_stats_ref() const noexcept;
 	[[nodiscard]] const JpegDctDeviceExecutionStats&                execution_stats_ref() const noexcept;
 	[[nodiscard]] const JpegDctDeviceBatch&                         device_batch() const noexcept;

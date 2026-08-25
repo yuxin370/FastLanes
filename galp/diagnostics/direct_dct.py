@@ -37,6 +37,34 @@ def execution_stats_snapshot(batch: DirectDctBatch) -> dict[str, Any]:
     return dict(_native_batch(batch).execution_stats_snapshot)
 
 
+def execution_stats_observation(batch: DirectDctBatch) -> dict[str, Any]:
+    """Return a non-blocking snapshot with separate host/GPU completion state."""
+
+    return dict(_native_batch(batch)._execution_stats_observation)
+
+
+def metric_descriptors(reader: DirectDctReader) -> list[dict[str, Any]]:
+    """Return the native descriptor inventory for the stable metrics schema."""
+
+    if not isinstance(reader, DirectDctReader):
+        raise TypeError("expected galp.torch.DirectDctReader")
+    return [dict(value) for value in reader._module._direct_dct_metric_descriptors()]
+
+
+def aggregate_metric_snapshots(
+    reader: DirectDctReader, snapshots: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Combine stable snapshots with the native canonical reducers."""
+
+    if not isinstance(reader, DirectDctReader):
+        raise TypeError("expected galp.torch.DirectDctReader")
+    return dict(
+        reader._module._aggregate_direct_dct_metrics(
+            [dict(snapshot) for snapshot in snapshots]
+        )
+    )
+
+
 def cache_stats(batch: DirectDctBatch) -> dict[str, Any]:
     """Return decoded-rowgroup cache implementation counters."""
 
@@ -120,10 +148,13 @@ def rowgroup_storage_bytes(
 __all__ = [
     "binding_import_ms",
     "cache_stats",
+    "aggregate_metric_snapshots",
     "execution_stats",
+    "execution_stats_observation",
     "execution_stats_snapshot",
     "image_metadata",
     "initialization_stats",
+    "metric_descriptors",
     "pipeline_stats",
     "plan_preview",
     "rowgroup_storage_bytes",

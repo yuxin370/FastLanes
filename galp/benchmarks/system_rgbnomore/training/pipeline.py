@@ -15,6 +15,7 @@ import json
 import multiprocessing
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -31,6 +32,7 @@ from training.augmentation import (
 from training.direct_dct_reader import (
     DirectDctTrainingReader,
     optional_native_execution_stats,
+    optional_native_execution_stats_observation,
     optional_native_execution_stats_snapshot,
 )
 from training.sample_order import SampleIdentity
@@ -72,6 +74,10 @@ class TrainingBatch:
     stage_seconds: dict[str, float] = field(default_factory=dict)
     native_counters: dict[str, int | float] = field(default_factory=dict)
     native_execution_stats: dict[str, Any] = field(default_factory=dict)
+    native_host_snapshot_taken: bool = False
+    native_gpu_timings_finalized: bool = False
+    # Compatibility alias for historical report readers. It now means GPU
+    # timing finalization, not merely that a host snapshot was taken.
     native_stats_finalized: bool = False
     keepalive: list[Any] = field(default_factory=list)
     native_stats_source: Any | None = None
@@ -589,6 +595,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self._next_native_batch = 0
         self._prefetched_batch_count = 0
         self._prefetched_indices: list[int] = []
+        self._committed_native_metric_snapshots: list[dict[str, Any]] = []
         self._committed_native_metrics: dict[str, Any] = {}
         self._loader_metrics: dict[str, Any] = {}
         pls_pool_config = self.config.get("pls_gpu_pool") or {}
@@ -627,6 +634,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self._next_native_batch = 0
         self._prefetched_batch_count = 0
         self._prefetched_indices = []
+        self._committed_native_metric_snapshots = []
         self._committed_native_metrics = {}
         self._loader_metrics = {
             "native_pipeline_owned": True,
@@ -762,16 +770,21 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
 
     @classmethod
     def _native_loader_metrics(cls, native: Any) -> dict[str, Any]:
+        def value(name: str) -> Any:
+            if isinstance(native, Mapping):
+                return native[name]
+            return getattr(native, name)
+
         values: dict[str, Any] = {
-            "native_metrics_complete": bool(native.complete),
-            "peak_transient_bytes": int(native.peak_transient_bytes),
+            "native_metrics_complete": bool(value("complete")),
+            "peak_transient_bytes": int(value("peak_transient_bytes")),
         }
         for loader_name, native_name in cls._NATIVE_SUM_METRICS.items():
-            value = getattr(native, native_name)
+            metric_value = value(native_name)
             values[loader_name] = (
-                float(value) / 1000.0
+                float(metric_value) / 1000.0
                 if native_name.endswith("_ms")
-                else int(value)
+                else int(metric_value)
             )
         return values
 
@@ -794,14 +807,42 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         return merged
 
     def _current_native_metrics(self) -> dict[str, Any]:
-        return self._native_loader_metrics(self.reader.metrics())
+        snapshot = self._current_native_metric_snapshot()
+        return self._native_loader_metrics(
+            snapshot if snapshot is not None else self.reader.metrics()
+        )
+
+    def _current_native_metric_snapshot(self) -> dict[str, Any] | None:
+        snapshot = getattr(self.reader, "metrics_snapshot", None)
+        if not callable(snapshot):
+            return None
+        return dict(snapshot())
+
+    def _aggregate_native_metric_snapshots(
+        self, snapshots: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any] | None:
+        aggregate = getattr(self.reader, "aggregate_metrics_snapshots", None)
+        if not callable(aggregate):
+            return None
+        return dict(aggregate(snapshots))
 
     def _combined_native_metrics(self) -> dict[str, Any]:
         if not self._pipeline_active:
             return dict(self._committed_native_metrics)
+        current_snapshot = self._current_native_metric_snapshot()
+        if current_snapshot is not None:
+            aggregated = self._aggregate_native_metric_snapshots(
+                [*self._committed_native_metric_snapshots, current_snapshot]
+            )
+            if aggregated is not None:
+                return self._native_loader_metrics(aggregated)
         return self._merge_native_loader_metrics(
             self._committed_native_metrics,
-            self._current_native_metrics(),
+            self._native_loader_metrics(
+                current_snapshot
+                if current_snapshot is not None
+                else self.reader.metrics()
+            ),
         )
 
     def _freeze_active_prefetch_evidence(self) -> None:
@@ -827,14 +868,33 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         try:
             if synchronize_consumer and self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
-            current = self._current_native_metrics()
+            current_snapshot = self._current_native_metric_snapshot()
+            current = self._native_loader_metrics(
+                current_snapshot
+                if current_snapshot is not None
+                else self.reader.metrics()
+            )
             if require_complete_metrics and not current["native_metrics_complete"]:
                 raise RuntimeError(
                     "GALP native metrics remained incomplete at a PLS pool boundary"
                 )
-            self._committed_native_metrics = self._merge_native_loader_metrics(
-                self._committed_native_metrics, current
-            )
+            if current_snapshot is not None:
+                self._committed_native_metric_snapshots.append(current_snapshot)
+                aggregated = self._aggregate_native_metric_snapshots(
+                    self._committed_native_metric_snapshots
+                )
+                if aggregated is None:
+                    raise RuntimeError(
+                        "native metrics snapshots require the native canonical aggregator"
+                    )
+                self._committed_native_metrics = self._native_loader_metrics(aggregated)
+            else:
+                # Test-injected/legacy readers may not expose the private native
+                # snapshot API. This compatibility path is not production
+                # metrics authority.
+                self._committed_native_metrics = self._merge_native_loader_metrics(
+                    self._committed_native_metrics, current
+                )
             self._loader_metrics.update(self._committed_native_metrics)
             self._freeze_active_prefetch_evidence()
         finally:
@@ -970,10 +1030,16 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
 
     @staticmethod
     def _apply_batch_metrics(
-        batch: TrainingBatch, execution_stats: dict[str, Any]
+        batch: TrainingBatch,
+        execution_stats: dict[str, Any],
+        *,
+        host_snapshot_taken: bool,
+        gpu_timings_finalized: bool,
     ) -> None:
         batch.native_execution_stats = execution_stats
-        batch.native_stats_finalized = True
+        batch.native_host_snapshot_taken = host_snapshot_taken
+        batch.native_gpu_timings_finalized = gpu_timings_finalized
+        batch.native_stats_finalized = gpu_timings_finalized
         projection = float(execution_stats.get("projection_ms", 0.0)) / 1000.0
         batch.stage_seconds.update(
             {
@@ -1082,7 +1148,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
 
     def finalize_batch_metrics(self, batch: TrainingBatch) -> None:
         source = batch.native_stats_source
-        if source is None or batch.native_stats_finalized:
+        if source is None or batch.native_gpu_timings_finalized:
             return
         stats_method = getattr(source, "native_execution_stats", None)
         execution_stats = (
@@ -1090,19 +1156,50 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             if callable(stats_method)
             else optional_native_execution_stats(source)
         )
-        self._apply_batch_metrics(batch, execution_stats)
+        self._apply_batch_metrics(
+            batch,
+            execution_stats,
+            host_snapshot_taken=True,
+            gpu_timings_finalized=True,
+        )
 
     def snapshot_batch_metrics(self, batch: TrainingBatch) -> None:
         source = batch.native_stats_source
-        if source is None or batch.native_stats_finalized:
+        if source is None or batch.native_gpu_timings_finalized:
             return
-        stats_method = getattr(source, "native_execution_stats_snapshot", None)
-        execution_stats = (
-            dict(stats_method())
-            if callable(stats_method)
-            else optional_native_execution_stats_snapshot(source)
+        observation_method = getattr(
+            source, "native_execution_stats_observation", None
         )
-        self._apply_batch_metrics(batch, execution_stats)
+        observation = (
+            dict(observation_method())
+            if callable(observation_method)
+            else optional_native_execution_stats_observation(source)
+        )
+        if observation and isinstance(observation.get("stats"), Mapping):
+            execution_stats = dict(observation["stats"])
+            host_snapshot_taken = bool(
+                observation.get("host_snapshot_taken", True)
+            )
+            gpu_timings_finalized = bool(
+                observation.get("gpu_timings_finalized", False)
+            )
+        else:
+            # Compatibility path for injected/legacy readers. A host snapshot
+            # alone never claims that CUDA event timings are finalized.
+            stats_method = getattr(source, "native_execution_stats_snapshot", None)
+            execution_stats = (
+                dict(stats_method())
+                if callable(stats_method)
+                else optional_native_execution_stats_snapshot(source)
+            )
+            host_snapshot_taken = True
+            gpu_timings_finalized = False
+        self._apply_batch_metrics(
+            batch,
+            execution_stats,
+            host_snapshot_taken=host_snapshot_taken,
+            gpu_timings_finalized=gpu_timings_finalized,
+        )
 
     def _capture_native_metrics(self) -> None:
         self._loader_metrics.update(self._combined_native_metrics())

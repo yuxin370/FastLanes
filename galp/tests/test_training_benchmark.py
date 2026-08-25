@@ -276,6 +276,7 @@ class _FakeNativeTrainingBatch:
         )
 
     def native_execution_stats(self):
+        self.complete_stats_reads += 1
         return {} if self._execution_stats is None else dict(self._execution_stats)
 
 
@@ -954,11 +955,17 @@ class TrainingBenchmarkTest(unittest.TestCase):
             batch = adapter.next_batch()
             self.assertFalse(batch.native_stats_finalized)
             adapter.snapshot_batch_metrics(batch)
-            self.assertTrue(batch.native_stats_finalized)
+            self.assertTrue(batch.native_host_snapshot_taken)
+            self.assertFalse(batch.native_gpu_timings_finalized)
+            self.assertFalse(batch.native_stats_finalized)
             self.assertEqual(batch.native_execution_stats["planning_ms"], 3.5)
             self.assertEqual(batch.stage_seconds["preprocess"], 0.00125)
             self.assertEqual(reader.batches[0].complete_stats_reads, 0)
             self.assertEqual(reader.batches[0].snapshot_stats_reads, 1)
+            adapter.finalize_batch_metrics(batch)
+            self.assertTrue(batch.native_gpu_timings_finalized)
+            self.assertTrue(batch.native_stats_finalized)
+            self.assertEqual(reader.batches[0].complete_stats_reads, 1)
             adapter.close()
 
     def test_galp_prefetch_evidence_tracks_only_native_accepted_batches(self) -> None:
