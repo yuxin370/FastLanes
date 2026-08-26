@@ -1,31 +1,17 @@
 #include <filesystem>
-#include <galp/galp.hpp>
+#include <galp/stable.hpp>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 
 int main() {
+	static_assert(GALP_STABLE_API == 1);
 	static_assert(!std::is_copy_constructible_v<galp::Reader>);
 	static_assert(!std::is_copy_assignable_v<galp::Reader>);
 	static_assert(std::is_move_constructible_v<galp::Reader>);
 	static_assert(!std::is_copy_constructible_v<galp::Table>);
 	static_assert(!std::is_copy_assignable_v<galp::Table>);
 	static_assert(std::is_move_constructible_v<galp::Table>);
-
-#if GALP_WITH_JPEG_DCT
-	static_assert(!std::is_copy_constructible_v<galp::jpeg::DirectDctBatch>);
-	static_assert(!std::is_copy_assignable_v<galp::jpeg::DirectDctBatch>);
-	static_assert(std::is_move_constructible_v<galp::jpeg::DirectDctBatch>);
-
-	galp::jpeg::DirectDctBatch direct_dct_batch;
-	const auto                 direct_dct_tensor = direct_dct_batch.tensor();
-	if (direct_dct_tensor.data != nullptr || direct_dct_tensor.rows() != 0 || direct_dct_tensor.columns() != 64 ||
-	    direct_dct_tensor.strides[0] != 64 || direct_dct_tensor.strides[1] != 1 ||
-	    direct_dct_tensor.dtype != galp::jpeg::DirectDctTensorDataType::kInt16 ||
-	    direct_dct_tensor.device != galp::jpeg::DirectDctTensorDevice::kCuda) {
-		return 8;
-	}
-#endif
 
 	galp::DecompressOptions options {};
 	options.scope                   = galp::TableDecompressionScope::PerRowgroup;

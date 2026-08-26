@@ -117,6 +117,10 @@ add_executable(galp_public_api_smoke
 )
 if (GALP_WITH_JPEG_DCT)
         target_sources(galp_public_api_smoke PRIVATE
+		direct_dct_advanced_header_smoke.cpp
+		direct_dct_diagnostics_boundary_smoke.cpp
+		direct_dct_legacy_header_smoke.cpp
+		legacy_umbrella_header_smoke.cpp
                 jpeg_dct_format_header_smoke.cpp
                 jpeg_dct_storage_header_smoke.cpp
                 jpeg_dct_device_header_smoke.cpp
