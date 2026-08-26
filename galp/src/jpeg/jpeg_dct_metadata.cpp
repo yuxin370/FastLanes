@@ -761,4 +761,9 @@ JpegDctDatasetMetadata read_jpeg_dct_metadata_file(const std::filesystem::path& 
 }
 
 } // namespace detail
+
+JpegDctShardManifest read_jpeg_dct_shard_manifest(const std::filesystem::path& path) {
+	return detail::read_jpeg_dct_shard_manifest_file(path);
+}
+
 } // namespace galp::jpeg

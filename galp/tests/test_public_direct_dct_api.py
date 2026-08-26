@@ -60,9 +60,10 @@ class _NativePipeline:
     }
     prefetched_batch_count = 0
 
-    def __init__(self, reader, profile_id: str) -> None:
+    def __init__(self, reader, profile_id: str, dct_coeffs: str) -> None:
         self.reader = reader
         self.profile_id = profile_id
+        self.dct_coeffs = dct_coeffs
         self.batches: list[list[int]] = []
         self.transforms = None
         self.offset = 0
@@ -72,7 +73,9 @@ class _NativePipeline:
         self.transforms = transforms_by_batch
         self.offset = 0
         self.prefetched_batch_count = min(2, len(self.batches))
-        self.reader.calls.append(("pipeline", self.batches, self.profile_id, transforms_by_batch))
+        self.reader.calls.append(
+            ("pipeline", self.batches, self.profile_id, self.dct_coeffs, transforms_by_batch)
+        )
 
     def __iter__(self):
         return self
@@ -103,11 +106,11 @@ class _NativeReader:
         self.calls.append(("plan", image_ids, profile_id, transforms))
         return {"layout": "transformed_dct_grid", "image_count": len(image_ids)}
 
-    def pipeline(self, profile_id):
-        return _NativePipeline(self, profile_id)
+    def pipeline(self, profile_id, *, dct_coeffs="all"):
+        return _NativePipeline(self, profile_id, dct_coeffs)
 
-    def read(self, image_ids, profile_id, *, transforms):
-        self.calls.append(("read", image_ids, profile_id, transforms))
+    def read(self, image_ids, profile_id, *, dct_coeffs="all", transforms):
+        self.calls.append(("read", image_ids, profile_id, dct_coeffs, transforms))
         return _NativeBatch()
 
     def image_metadata(self, image_id):
@@ -200,6 +203,19 @@ class PublicDirectDctApiTest(unittest.TestCase):
         self.assertFalse(hasattr(VALIDATION, "runtime_policy_id"))
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             DirectDctProfile("")
+
+    def test_coefficient_selection_defaults_to_all_and_is_forwarded(self) -> None:
+        reader = DirectDctReader("manifest.bin", native_module=_native_module())
+
+        reader.pipeline(VALIDATION).start([[4, 7]])
+        reader.pipeline(VALIDATION, dct_coeffs="first:16").start([[4, 7]])
+        reader.read([4, 7], VALIDATION)
+        reader.read([4, 7], VALIDATION, dct_coeffs="list:5,0,2")
+
+        self.assertEqual(reader._native.calls[0][3], "all")
+        self.assertEqual(reader._native.calls[1][3], "first:16")
+        self.assertEqual(reader._native.calls[2][3], "all")
+        self.assertEqual(reader._native.calls[3][3], "list:5,0,2")
 
     def test_old_binding_schema_is_rejected(self) -> None:
         module = SimpleNamespace(DirectDctReader=_NativeReader)
