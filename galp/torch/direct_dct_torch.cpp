@@ -314,6 +314,14 @@ galp::jpeg::JpegDctCoefficientSelection parse_coefficients(const std::string& sp
 	return selection;
 }
 
+galp::jpeg::JpegDctDeviceBatchOptions materialize_profile_options(
+    const galp::profiles::RegisteredDirectDctProfile& profile,
+    const std::string&                                dct_coeffs) {
+	auto options                  = galp::profiles::materialize_direct_dct_options(profile);
+	options.coefficient_selection = parse_coefficients(dct_coeffs);
+	return options;
+}
+
 galp::jpeg::JpegDctDeviceLayout parse_layout(const std::string& layout) {
 	if (layout == "compact" || layout == "image-major-component-block-coeff" ||
 	    layout == "image_major_component_block_coeff") {
@@ -2133,9 +2141,10 @@ private:
 
 struct TorchDirectDctReaderState {
 	explicit TorchDirectDctReaderState(const std::string& manifest_path)
-	    : runtime(manifest_path) {
+	    : manifest_path(manifest_path), runtime(manifest_path) {
 	}
 
+	std::string                  manifest_path;
 	std::mutex                   runtime_mutex;
 	std::mutex                   prefetch_mutex;
 	std::shared_future<void>     prefetch_tail;
@@ -2533,7 +2542,7 @@ public:
 			auto runtime = std::shared_ptr<galp::jpeg::DirectDctRuntime>(
 			    &state_->runtime, [](galp::jpeg::DirectDctRuntime*) {});
 			native_delegate_ = std::make_unique<galp::direct_dct::NativeLogicalBatchPipeline>(
-			    std::move(runtime), semantic_profile_id_, options_);
+			    std::move(runtime), state_->manifest_path, semantic_profile_id_, options_);
 			lifetime_backend_ = requested_phase4_lifetime_backend();
 		}
 	}
@@ -2569,12 +2578,16 @@ public:
 		metrics_.reset();
 		closed_ = false;
 		if (native_delegate_) {
+			size_t logical_batch_size = 0U;
+			for (const auto& request : parsed_requests) {
+				logical_batch_size = std::max(logical_batch_size, request.size());
+			}
 			std::vector<galp::direct_dct::LogicalBatchRequest> logical_requests;
 			logical_requests.reserve(parsed_requests.size());
 			for (size_t index = 0U; index < parsed_requests.size(); ++index) {
 				logical_requests.push_back(galp::direct_dct::shadow_convert_legacy_requests(
 				    parsed_requests[index],
-				    parsed_requests[index].size(),
+				    logical_batch_size,
 				    semantic_profile_id_,
 				    index + 1U,
 				    index));
@@ -2699,6 +2712,32 @@ public:
 
 	[[nodiscard]] const char* lifetime_backend_for_test() const noexcept {
 		return lifetime_backend_ == TorchDirectDctLifetimeBackend::kNative ? "native" : "legacy";
+	}
+
+	[[nodiscard]] py::list segment_plans_for_test() const {
+		py::list batches;
+		if (!native_delegate_) {
+			return batches;
+		}
+		for (const auto& plan : native_delegate_->physical_plans()) {
+			py::dict batch;
+			batch["request_identity"] = plan.request_identity;
+			batch["batch_ordinal"] = plan.batch_ordinal;
+			batch["logical_image_count"] = plan.logical_image_count;
+			py::list segments;
+			for (const auto& segment : plan.segments) {
+				py::dict item;
+				item["shard_id"] = segment.shard_id;
+				item["logical_output_offset"] = segment.logical_output_offset;
+				item["image_count"] = segment.image_count;
+				item["first_global_image_id"] = segment.first_global_image_id;
+				item["last_global_image_id"] = segment.last_global_image_id;
+				segments.append(std::move(item));
+			}
+			batch["segments"] = std::move(segments);
+			batches.append(std::move(batch));
+		}
+		return batches;
 	}
 
 	size_t close() noexcept {
@@ -2862,6 +2901,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("_metrics_completion", &TorchDirectDctPipeline::metrics_completion)
 	    .def_property_readonly("prefetch_metrics", &TorchDirectDctPipeline::prefetch_metrics)
 	    .def_property_readonly("_lifetime_backend_for_test", &TorchDirectDctPipeline::lifetime_backend_for_test)
+	    .def_property_readonly("_segment_plans", &TorchDirectDctPipeline::segment_plans_for_test)
 	    .def("close", &TorchDirectDctPipeline::close);
 
 	py::class_<TorchDirectDctReader>(m, "DirectDctReader")
@@ -2873,63 +2913,69 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        [](TorchDirectDctReader&        reader,
 	           const std::vector<uint32_t>& image_ids,
 	           const std::string&           profile_id,
-	           const py::object&            transforms) {
+	           const py::object&            transforms,
+	           const std::string&           dct_coeffs) {
 		        const auto requests = parse_transform_requests(
 		            image_ids, transforms, galp::jpeg::JpegDctCropBox {});
 		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
-		        return reader.plan_batch(requests, galp::profiles::materialize_direct_dct_options(profile));
+		        return reader.plan_batch(requests, materialize_profile_options(profile, dct_coeffs));
 	        },
 	        py::arg("image_ids"),
 	        py::arg("profile_id"),
 	        py::arg("transforms") = py::none(),
+	        py::arg("dct_coeffs") = "all",
 	        "Plan a registered semantic Direct-DCT profile using its native-owned runtime policy.")
 	    .def(
 	        "prefetch",
 	        [](TorchDirectDctReader& reader,
 	           std::vector<uint32_t> image_ids,
 	           const std::string&    profile_id,
-	           const py::object&     transforms) {
+	           const py::object&     transforms,
+	           const std::string&    dct_coeffs) {
 		        auto requests = parse_transform_requests(
 		            image_ids, transforms, galp::jpeg::JpegDctCropBox {});
 		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
-		        return reader.prefetch_batch(
-		            std::move(requests), galp::profiles::materialize_direct_dct_options(profile));
+		        return reader.prefetch_batch(std::move(requests), materialize_profile_options(profile, dct_coeffs));
 	        },
 	        py::arg("image_ids"),
 	        py::arg("profile_id"),
 	        py::arg("transforms") = py::none(),
+	        py::arg("dct_coeffs") = "all",
 	        "Prefetch a registered semantic Direct-DCT profile using its native-owned runtime policy.")
 	    .def(
 	        "read",
 	        [](TorchDirectDctReader& reader,
 	           std::vector<uint32_t> image_ids,
 	           const std::string&    profile_id,
-	           const py::object&     transforms) {
+	           const py::object&     transforms,
+	           const std::string&    dct_coeffs) {
 		        auto requests = parse_transform_requests(
 		            image_ids, transforms, galp::jpeg::JpegDctCropBox {});
 		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
-		        const auto options = galp::profiles::materialize_direct_dct_options(profile);
+		        const auto options = materialize_profile_options(profile, dct_coeffs);
 		        py::gil_scoped_release release;
 		        return reader.read_batch(std::move(requests), options);
 	        },
 	        py::arg("image_ids"),
 	        py::arg("profile_id"),
 	        py::arg("transforms") = py::none(),
+	        py::arg("dct_coeffs") = "all",
 	        "Read a registered semantic Direct-DCT profile synchronously.")
 	    .def(
 	        "pipeline",
-	        [](TorchDirectDctReader& reader, const std::string& profile_id) {
+	        [](TorchDirectDctReader& reader, const std::string& profile_id, const std::string& dct_coeffs) {
 		        const auto profile = galp::profiles::resolve_direct_dct_profile(profile_id);
 		        const auto* backend_override = std::getenv("GALP_PHASE3_NATIVE_DELEGATE");
 		        const auto native_delegate = backend_override == nullptr || std::string_view(backend_override) != "0";
 		        return std::make_shared<TorchDirectDctPipeline>(
 		            reader.shared_state(),
-		            galp::profiles::materialize_direct_dct_options(profile),
+		            materialize_profile_options(profile, dct_coeffs),
 		            profile_id,
 		            native_delegate ? TorchDirectDctPipeline::Backend::kNative
 		                            : TorchDirectDctPipeline::Backend::kLegacy);
 	        },
 	        py::arg("profile_id"),
+	        py::arg("dct_coeffs") = "all",
 	        "Create a native-owned bounded pipeline for one semantic profile.")
 	    .def("image_metadata",
 	         &TorchDirectDctReader::image_metadata,

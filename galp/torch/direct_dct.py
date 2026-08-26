@@ -258,18 +258,29 @@ class DirectDctReader:
         return dict(self._validated_profiles[profile_id])
 
     def pipeline(
-        self, profile: DirectDctProfile | str
+        self,
+        profile: DirectDctProfile | str,
+        *,
+        dct_coeffs: str = "all",
     ) -> DirectDctPipeline:
-        """Create a reusable native pipeline for a semantic profile."""
+        """Create a reusable native pipeline for a semantic profile.
+
+        ``dct_coeffs`` selects raw JPEG zigzag columns before dequantization
+        and frequency mixing.  It does not expose or alter the profile's
+        native runtime policy.
+        """
 
         profile_id = self.profile_info(profile)["id"]
-        return DirectDctPipeline(self._native.pipeline(profile_id), profile_id)
+        return DirectDctPipeline(
+            self._native.pipeline(profile_id, dct_coeffs=dct_coeffs), profile_id
+        )
 
     def read(
         self,
         image_ids: Sequence[int],
         profile: DirectDctProfile | str,
         *,
+        dct_coeffs: str = "all",
         transforms: Sequence[Mapping[str, Any]] | None = None,
     ) -> DirectDctBatch:
         profile_id = self.profile_info(profile)["id"]
@@ -279,6 +290,7 @@ class DirectDctReader:
         native_batch = self._native.read(
             [int(value) for value in image_ids],
             profile_id,
+            dct_coeffs=dct_coeffs,
             transforms=native_transforms,
         )
         return DirectDctBatch(native_batch, profile_id)

@@ -3,14 +3,19 @@
 #include "direct_dct/profile_registry.hpp"
 #include "direct_dct/resolved_execution_policy.hpp"
 #include <array>
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -323,13 +328,41 @@ jpeg::JpegDctDeviceBatchOptions resolved_shadow_options(const std::string_view p
 	return materialize_shadow_options(semantic, policy);
 }
 
+bool native_physical_orchestration_enabled() noexcept {
+	const auto* value = std::getenv("GALP_PHASE6_NATIVE_PHYSICAL");
+	return value != nullptr && std::string_view(value) != "0";
+}
+
+jpeg::JpegDctImageCropRequest lower_sample_copy(const LogicalBatchRequest::Sample& sample) {
+	jpeg::JpegDctImageCropRequest request;
+	request.global_image_index = sample.image_id;
+	if (sample.transform.source_crop.has_value()) {
+		request.source_crop = *sample.transform.source_crop;
+	}
+	request.horizontal_flip   = sample.transform.horizontal_flip;
+	request.logical_sample_id = sample.transform.logical_sample_id;
+	request.augmentation_key  = sample.transform.augmentation_key;
+	return request;
+}
+
+void add_prefetch_metrics(NativePipelinePrefetchMetrics& destination,
+	                       const NativePipelinePrefetchMetrics& source) noexcept {
+	destination.producer_active_nanoseconds += source.producer_active_nanoseconds;
+	destination.planning_nanoseconds += source.planning_nanoseconds;
+	destination.io_staging_nanoseconds += source.io_staging_nanoseconds;
+	destination.ordered_submission_nanoseconds += source.ordered_submission_nanoseconds;
+	destination.submit_to_ready_nanoseconds += source.submit_to_ready_nanoseconds;
+}
+
 } // namespace
 
 struct NativeLogicalBatchPipeline::Impl final {
 	Impl(const std::filesystem::path& manifest_path,
 	     const std::string_view       semantic_profile_id,
 	     NativePipelineTraceBuffer*   trace)
-	    : core(DirectDctRuntimeAdapter(manifest_path),
+	    : planner(manifest_path),
+	      optimized_physical(native_physical_orchestration_enabled()),
+	      core(DirectDctRuntimeAdapter(manifest_path),
 	           std::string(semantic_profile_id),
 	           resolved_shadow_options(semantic_profile_id),
 	           trace) {
@@ -345,6 +378,111 @@ struct NativeLogicalBatchPipeline::Impl final {
 	           trace) {
 	}
 
+	Impl(std::shared_ptr<jpeg::DirectDctRuntime> runtime,
+	     const std::filesystem::path&             manifest_path,
+	     const std::string_view                   semantic_profile_id,
+	     jpeg::JpegDctDeviceBatchOptions          options,
+	     NativePipelineTraceBuffer*               trace)
+	    : planner(manifest_path),
+	      optimized_physical(native_physical_orchestration_enabled()),
+	      core(DirectDctRuntimeAdapter(std::move(runtime)),
+	           std::string(semantic_profile_id),
+	           std::move(options),
+	           trace) {
+	}
+
+	[[nodiscard]] const jpeg::JpegDctShardManifestEntry& shard(const uint32_t shard_id) const {
+		if (!planner) {
+			throw std::logic_error("native physical orchestration has no manifest planner");
+		}
+		const auto& shards = planner->manifest().shards;
+		const auto found = std::find_if(shards.begin(), shards.end(), [shard_id](const auto& value) {
+			return value.shard_id == shard_id;
+		});
+		if (found == shards.end()) {
+			throw std::out_of_range("native physical plan references an unknown shard");
+		}
+		return *found;
+	}
+
+	[[nodiscard]] std::vector<LogicalBatchRequest>
+	canonical_shard_requests(const std::vector<LogicalBatchRequest>& requests) {
+		std::unordered_map<uint32_t, LogicalBatchRequest::Sample> samples;
+		for (const auto& request : requests) {
+			for (const auto& sample : request.samples) {
+				if (!samples.emplace(sample.image_id, sample).second) {
+					throw std::invalid_argument("native physical orchestration requires unique image IDs");
+				}
+			}
+		}
+		std::vector<uint32_t> touched_shards;
+		for (size_t logical_index = 0U; logical_index < physical_plans.size(); ++logical_index) {
+			const auto& plan = physical_plans[logical_index];
+			for (const auto& segment : plan.segments) {
+				if (std::find(touched_shards.begin(), touched_shards.end(), segment.shard_id) ==
+				    touched_shards.end()) {
+					touched_shards.push_back(segment.shard_id);
+				}
+				last_logical_use[segment.shard_id] = logical_index;
+			}
+		}
+		std::vector<LogicalBatchRequest> canonical;
+		canonical.reserve(touched_shards.size());
+		physical_shard_ids.clear();
+		for (size_t ordinal = 0U; ordinal < touched_shards.size(); ++ordinal) {
+			const auto shard_id = touched_shards[ordinal];
+			const auto& entry = shard(shard_id);
+			LogicalBatchRequest request;
+			request.request_identity = static_cast<uint64_t>(shard_id) + 1U;
+			request.batch_ordinal = ordinal;
+			request.semantic_profile_id = requests.front().semantic_profile_id;
+			request.logical_batch_size = entry.image_count;
+			request.partial_tail = false;
+			request.samples.reserve(entry.image_count);
+			for (uint64_t offset = 0U; offset < entry.image_count; ++offset) {
+				const auto image_id = static_cast<uint32_t>(entry.first_global_image_index + offset);
+				const auto found = samples.find(image_id);
+				if (found == samples.end()) {
+					throw std::invalid_argument(
+					    "optimized native physical orchestration requires complete physical-shard coverage");
+				}
+				request.samples.push_back(found->second);
+			}
+			validate_logical_batch_request(request);
+			physical_shard_ids.push_back(shard_id);
+			canonical.push_back(std::move(request));
+		}
+		return canonical;
+	}
+
+	std::shared_ptr<jpeg::DirectDctBatch> load_shard(const uint32_t shard_id) {
+		if (const auto found = active_shards.find(shard_id); found != active_shards.end()) {
+			return found->second;
+		}
+		while (next_physical_batch < physical_shard_ids.size()) {
+			const auto loaded_id = physical_shard_ids[next_physical_batch++];
+			auto loaded = std::make_shared<jpeg::DirectDctBatch>(core.next());
+			add_prefetch_metrics(last_logical_prefetch_metrics, core.prefetch_metrics());
+			active_shards.emplace(loaded_id, loaded);
+			if (loaded_id == shard_id) {
+				return loaded;
+			}
+		}
+		throw std::logic_error("native physical shard execution order did not satisfy SegmentPlan");
+	}
+
+	std::optional<PhysicalLayoutPlanner> planner;
+	bool optimized_physical = false;
+	std::vector<LogicalBatchPhysicalPlan> physical_plans;
+	std::vector<LogicalBatchRequest> logical_requests;
+	std::vector<uint32_t> physical_shard_ids;
+	std::unordered_map<uint32_t, size_t> last_logical_use;
+	std::unordered_map<uint32_t, std::shared_ptr<jpeg::DirectDctBatch>> active_shards;
+	std::unordered_set<uint32_t> reported_shards;
+	size_t next_physical_batch = 0U;
+	size_t next_logical_batch = 0U;
+	NativePipelineState logical_state;
+	NativePipelinePrefetchMetrics last_logical_prefetch_metrics;
 	detail::NativeLogicalBatchPipelineCore<DirectDctRuntimeAdapter> core;
 };
 
@@ -362,18 +500,99 @@ NativeLogicalBatchPipeline::NativeLogicalBatchPipeline(std::shared_ptr<jpeg::Dir
           std::move(runtime), semantic_profile_id, std::move(options), trace)) {
 }
 
+NativeLogicalBatchPipeline::NativeLogicalBatchPipeline(std::shared_ptr<jpeg::DirectDctRuntime> runtime,
+                                                       const std::filesystem::path& manifest_path,
+                                                       const std::string_view semantic_profile_id,
+                                                       jpeg::JpegDctDeviceBatchOptions options,
+                                                       NativePipelineTraceBuffer* trace)
+    : impl_(std::make_unique<Impl>(
+          std::move(runtime), manifest_path, semantic_profile_id, std::move(options), trace)) {
+}
+
 NativeLogicalBatchPipeline::~NativeLogicalBatchPipeline() = default;
 
 void NativeLogicalBatchPipeline::reset(std::vector<LogicalBatchRequest> requests) {
-	impl_->core.reset(std::move(requests));
+	impl_->physical_plans = impl_->planner.has_value()
+	                            ? impl_->planner->plan(requests)
+	                            : std::vector<LogicalBatchPhysicalPlan> {};
+	if (!impl_->optimized_physical) {
+		impl_->core.reset(std::move(requests));
+		return;
+	}
+	if (!impl_->planner || requests.empty()) {
+		throw std::invalid_argument("optimized native physical orchestration requires a manifest and requests");
+	}
+	impl_->logical_requests = requests;
+	impl_->last_logical_use.clear();
+	impl_->active_shards.clear();
+	impl_->reported_shards.clear();
+	impl_->next_physical_batch = 0U;
+	impl_->next_logical_batch = 0U;
+	impl_->last_logical_prefetch_metrics = {};
+	auto canonical = impl_->canonical_shard_requests(requests);
+	impl_->logical_state = {};
+	impl_->logical_state.lifecycle = NativePipelineState::Lifecycle::kRunning;
+	impl_->logical_state.request_count = requests.size();
+	impl_->logical_state.next_request = requests.size();
+	impl_->logical_state.pending_count = std::min<size_t>(2U, requests.size());
+	impl_->logical_state.max_pending_count = impl_->logical_state.pending_count;
+	impl_->logical_state.closed = false;
+	impl_->core.reset(std::move(canonical));
 }
 
 jpeg::DirectDctBatch NativeLogicalBatchPipeline::next() {
-	return impl_->core.next();
+	if (!impl_->optimized_physical) {
+		return impl_->core.next();
+	}
+	if (impl_->logical_state.closed || impl_->next_logical_batch >= impl_->logical_requests.size()) {
+		throw std::out_of_range("NativeLogicalBatchPipeline is closed or exhausted");
+	}
+	impl_->last_logical_prefetch_metrics = {};
+	const auto logical_index = impl_->next_logical_batch;
+	const auto& request = impl_->logical_requests[logical_index];
+	const auto& plan = impl_->physical_plans[logical_index];
+	std::vector<jpeg::DirectDctBatch::LogicalSegmentInput> segments;
+	segments.reserve(plan.segments.size());
+	std::shared_ptr<jpeg::DirectDctBatch> stats_source;
+	for (const auto& segment : plan.segments) {
+		auto source = impl_->load_shard(segment.shard_id);
+		const auto& shard = impl_->shard(segment.shard_id);
+		const auto source_offset = static_cast<size_t>(
+		    static_cast<uint64_t>(segment.first_global_image_id) - shard.first_global_image_index);
+		segments.push_back(jpeg::DirectDctBatch::LogicalSegmentInput {
+		    source, source_offset, segment.image_count, segment.logical_output_offset});
+		if (!stats_source && impl_->reported_shards.insert(segment.shard_id).second) {
+			stats_source = source;
+		}
+	}
+	std::vector<uint32_t> image_ids;
+	std::vector<jpeg::JpegDctImageCropRequest> transforms;
+	image_ids.reserve(request.samples.size());
+	transforms.reserve(request.samples.size());
+	for (const auto& sample : request.samples) {
+		image_ids.push_back(sample.image_id);
+		transforms.push_back(lower_sample_copy(sample));
+	}
+	auto result = jpeg::DirectDctBatch::MakeLogicalGridBatch(
+	    std::move(segments), std::move(image_ids), std::move(transforms), std::move(stats_source));
+	for (const auto& segment : plan.segments) {
+		const auto found = impl_->last_logical_use.find(segment.shard_id);
+		if (found != impl_->last_logical_use.end() && found->second == logical_index) {
+			impl_->active_shards.erase(segment.shard_id);
+		}
+	}
+	++impl_->next_logical_batch;
+	++impl_->logical_state.completed_request_count;
+	impl_->logical_state.pending_count = std::min<size_t>(
+	    2U, impl_->logical_requests.size() - impl_->next_logical_batch);
+	if (impl_->next_logical_batch == impl_->logical_requests.size()) {
+		impl_->logical_state.lifecycle = NativePipelineState::Lifecycle::kDrained;
+	}
+	return result;
 }
 
 bool NativeLogicalBatchPipeline::ready() const {
-	return impl_->core.ready();
+	return impl_->optimized_physical && impl_->active_shards.size() != 0U ? true : impl_->core.ready();
 }
 
 bool NativeLogicalBatchPipeline::started() const noexcept {
@@ -381,19 +600,35 @@ bool NativeLogicalBatchPipeline::started() const noexcept {
 }
 
 size_t NativeLogicalBatchPipeline::prefetched_batch_count() const noexcept {
-	return impl_->core.prefetched_batch_count();
+	return impl_->optimized_physical ? impl_->logical_state.next_request : impl_->core.prefetched_batch_count();
 }
 
 NativePipelineState NativeLogicalBatchPipeline::state() const noexcept {
-	return impl_->core.state();
+	return impl_->optimized_physical ? impl_->logical_state : impl_->core.state();
 }
 
 NativePipelinePrefetchMetrics NativeLogicalBatchPipeline::prefetch_metrics() const noexcept {
-	return impl_->core.prefetch_metrics();
+	return impl_->optimized_physical ? impl_->last_logical_prefetch_metrics : impl_->core.prefetch_metrics();
+}
+
+const std::vector<LogicalBatchPhysicalPlan>& NativeLogicalBatchPipeline::physical_plans() const noexcept {
+	return impl_->physical_plans;
 }
 
 size_t NativeLogicalBatchPipeline::close() noexcept {
-	return impl_->core.close();
+	const auto cancelled = impl_->core.close();
+	if (impl_->optimized_physical) {
+		impl_->active_shards.clear();
+		impl_->logical_requests.clear();
+		impl_->physical_shard_ids.clear();
+		impl_->logical_state.request_count = 0U;
+		impl_->logical_state.next_request = 0U;
+		impl_->logical_state.pending_count = 0U;
+		impl_->logical_state.cancelled_request_count = cancelled;
+		impl_->logical_state.closed = true;
+		impl_->logical_state.lifecycle = NativePipelineState::Lifecycle::kClosed;
+	}
+	return cancelled;
 }
 
 } // namespace galp::direct_dct

@@ -523,6 +523,15 @@ class GalpAdapter(Adapter):
                     f"configured block-major access companion index is missing: {companion_index}"
                 )
             os.environ["GALP_BLOCK_MAJOR_ACCESS_DIR"] = str(access_dir)
+        # Construction-time only rollback seam. Publish the selection before
+        # constructing the native pipeline so C++ and Python have one physical
+        # orchestration owner and no per-batch dispatch.
+        self._native_physical_orchestration = os.environ.get(
+            "GALP_PHASE6_NATIVE_PHYSICAL", "1"
+        ) != "0"
+        os.environ["GALP_PHASE6_NATIVE_PHYSICAL"] = (
+            "1" if self._native_physical_orchestration else "0"
+        )
         reader_started_ns = time.perf_counter_ns()
         self.reader = DirectDctReader(
             self.config["manifest"],
@@ -531,7 +540,10 @@ class GalpAdapter(Adapter):
         profile_info = self.reader.profile_info(VALIDATION_CENTER_CROP_512)
         if profile_info["runtime_policy_id"] != BLOCK_MAJOR_RUNTIME_PROFILE:
             raise RuntimeError("GALP native profile does not match the benchmark contract")
-        self.pipeline = self.reader.pipeline(VALIDATION_CENTER_CROP_512)
+        self.pipeline = self.reader.pipeline(
+            VALIDATION_CENTER_CROP_512,
+            dct_coeffs=str(self.config["native_coefficient_spec"]),
+        )
         reader_ready_ns = time.perf_counter_ns()
         self.startup_timings = {
             "binding_extension_import_ms": binding_import_ms(self.reader),
@@ -547,19 +559,31 @@ class GalpAdapter(Adapter):
         warmup_images = int(contract["execution"]["batch_size"]) * int(
             contract["execution"]["warmup_batches"]
         )
-        parsed_manifest = parse_manifest(Path(self.config["manifest"]))
-        self._shard_by_image_id: dict[int, int] = {}
-        for shard in parsed_manifest["shards"]:
-            first = int(shard["first_global_image_index"])
-            end = first + int(shard["image_count"])
-            for image_id in range(first, min(end, len(self.samples))):
-                self._shard_by_image_id[image_id] = int(shard["shard_id"])
         if warmup_images != 0:
             raise ValueError(
                 "block-major production profile requires zero warmup images to preserve one activation per shard"
             )
-        self._warmup_segments = []
-        self._measurement_segments = _manifest_shard_segments(self.samples, parsed_manifest)
+        batch_size = int(contract["execution"]["batch_size"])
+        self._logical_batches = [
+            list(self.samples[offset : offset + batch_size])
+            for offset in range(0, len(self.samples), batch_size)
+        ]
+        self._warmup_segments: list[list[dict[str, Any]]] = []
+        self._measurement_segments: list[list[dict[str, Any]]] = []
+        self._shard_by_image_id: dict[int, int] = {}
+        if getattr(self, "_native_physical_orchestration", False):
+            # Bind the hot-path method once at construction. Python owns only
+            # semantic logical batches; native code owns all shard planning
+            # and returns one already assembled logical result per request.
+            self.load = self._load_native_logical  # type: ignore[method-assign]
+        else:
+            parsed_manifest = parse_manifest(Path(self.config["manifest"]))
+            for shard in parsed_manifest["shards"]:
+                first = int(shard["first_global_image_index"])
+                end = first + int(shard["image_count"])
+                for image_id in range(first, min(end, len(self.samples))):
+                    self._shard_by_image_id[image_id] = int(shard["shard_id"])
+            self._measurement_segments = _manifest_shard_segments(self.samples, parsed_manifest)
         self.segments: list[list[dict[str, Any]]] = []
         self._next_segment = 0
         self._current: dict[str, Any] | None = None
@@ -590,6 +614,16 @@ class GalpAdapter(Adapter):
             [
                 [int(sample["galp_image_id"]) for sample in segment]
                 for segment in self.segments
+            ]
+        )
+
+    def _activate_logical_batches(self) -> None:
+        self._next_segment = 0
+        self._current = None
+        self.pipeline.start(
+            [
+                [int(sample["galp_image_id"]) for sample in batch]
+                for batch in self._logical_batches
             ]
         )
 
@@ -697,20 +731,78 @@ class GalpAdapter(Adapter):
             self._cold_measurement_primed = False
             self._reuse_cold_measurement = True
             return
-        initial = self._warmup_segments if self._warmup_segments else self._measurement_segments
-        self._activate_segments(initial)
+        if getattr(self, "_native_physical_orchestration", False):
+            self._activate_logical_batches()
+        else:
+            initial = self._warmup_segments if self._warmup_segments else self._measurement_segments
+            self._activate_segments(initial)
 
     def begin_measurement(self) -> None:
         if getattr(self, "_reuse_cold_measurement", False):
             self._reuse_cold_measurement = False
             return
-        self._activate_segments(self._measurement_segments)
+        if getattr(self, "_native_physical_orchestration", False):
+            self._activate_logical_batches()
+        else:
+            self._activate_segments(self._measurement_segments)
 
     def prime_cold_start(self) -> None:
-        if self._warmup_segments or not self._measurement_segments or self._cold_measurement_primed:
+        native_physical = getattr(self, "_native_physical_orchestration", False)
+        scheduled = self._logical_batches if native_physical else self._measurement_segments
+        if self._warmup_segments or not scheduled or self._cold_measurement_primed:
             return
-        self._activate_segments(self._measurement_segments)
+        if native_physical:
+            self._activate_logical_batches()
+        else:
+            self._activate_segments(self._measurement_segments)
         self._cold_measurement_primed = True
+
+    def _load_native_logical(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        batch = next(self.pipeline)
+        ready_ns = time.perf_counter_ns()
+        expected_ids = [int(sample["galp_image_id"]) for sample in expected]
+        image_ids = [int(item) for item in batch.global_image_ids]
+        if image_ids != expected_ids:
+            raise RuntimeError(
+                f"GALP native logical order mismatch: expected {expected_ids}, got {image_ids}"
+            )
+        y = batch.y
+        cbcr = batch.cbcr
+        if batch.layout != "transformed_dct_grid" or y.dtype != torch.float32 or cbcr.dtype != torch.float32:
+            raise RuntimeError(
+                f"expected native FP32 transformed grid, got layout={batch.layout} y={y.dtype} cbcr={cbcr.dtype}"
+            )
+        if tuple(y.shape[1:]) != (1, 28, 28, 8, 8) or tuple(cbcr.shape[1:]) != (2, 14, 14, 8, 8):
+            raise RuntimeError(f"unexpected transformed grid shapes: y={tuple(y.shape)} cbcr={tuple(cbcr.shape)}")
+        metrics = batch.metrics
+        stats = {
+            "_native_batch": batch,
+            "segment_mode": "native-logical-batch",
+            "segment_image_count": len(image_ids),
+            "segment_first_image_id": image_ids[0],
+            "segment_last_image_id": image_ids[-1],
+            "prefetch_producer_active_ms": metrics.producer_ms,
+            "prefetch_planning_ms": metrics.planning_ms,
+            "prefetch_io_staging_ms": metrics.io_ms,
+            "prefetch_submit_to_ready_ms": metrics.submit_to_ready_ms,
+            "prefetch_consumer_wait_ms": metrics.consumer_wait_ms,
+            "prefetch_process_scope_ready_ms": (
+                (ready_ns - self._process_scope_started_ns) / 1.0e6
+                if self._process_scope_started_ns is not None
+                else 0.0
+            ),
+        }
+        label_values = [int(sample["label"]) for sample in expected]
+        labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
+        return LoadedBatch(
+            inputs=(y, cbcr),
+            labels=labels,
+            ordinals=[int(sample["ordinal"]) for sample in expected],
+            label_values=label_values,
+            on_device=True,
+            native_stats=[stats],
+            keepalive=[batch],
+        )
 
     def _load_pushdown(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
         remaining = [int(sample["galp_image_id"]) for sample in expected]

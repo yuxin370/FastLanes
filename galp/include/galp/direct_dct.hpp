@@ -11,7 +11,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <vector>
+
+namespace galp::direct_dct {
+class NativeLogicalBatchPipeline;
+}
 
 namespace galp::jpeg {
 
@@ -124,6 +129,21 @@ public:
 
 private:
 	friend class DirectDctRuntime;
+	friend class galp::direct_dct::NativeLogicalBatchPipeline;
+
+	struct LogicalSegmentInput final {
+		std::shared_ptr<DirectDctBatch> source;
+		size_t                          source_image_offset  = 0U;
+		size_t                          image_count          = 0U;
+		size_t                          logical_image_offset = 0U;
+	};
+	struct LogicalImpl;
+
+	static DirectDctBatch MakeLogicalGridBatch(
+	    std::vector<LogicalSegmentInput> segments,
+	    std::vector<uint32_t> global_image_ids,
+	    std::vector<JpegDctImageCropRequest> transform_requests,
+	    std::shared_ptr<DirectDctBatch> stats_source);
 
 	DirectDctBatch(JpegDctDeviceBatch batch,
 	               std::vector<uint32_t> global_image_ids,
@@ -134,6 +154,7 @@ private:
 	std::vector<uint32_t> global_image_ids_;
 	std::vector<JpegDctImageCropRequest> transform_requests_;
 	int                   cuda_device_ = -1;
+	std::unique_ptr<LogicalImpl> logical_;
 };
 
 // CPU-only result of compiling request geometry into storage and GPU transform

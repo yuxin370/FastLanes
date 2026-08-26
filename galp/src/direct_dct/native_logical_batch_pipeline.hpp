@@ -3,6 +3,7 @@
 
 #include "direct_dct/logical_types.hpp"
 #include "direct_dct/native_pipeline_state.hpp"
+#include "direct_dct/physical_layout_planner.hpp"
 #include "galp/direct_dct.hpp"
 #include <cstddef>
 #include <filesystem>
@@ -24,6 +25,11 @@ public:
 	                           std::string_view                        semantic_profile_id,
 	                           jpeg::JpegDctDeviceBatchOptions         options,
 	                           NativePipelineTraceBuffer*              trace = nullptr);
+	NativeLogicalBatchPipeline(std::shared_ptr<jpeg::DirectDctRuntime> runtime,
+	                           const std::filesystem::path&            manifest_path,
+	                           std::string_view                        semantic_profile_id,
+	                           jpeg::JpegDctDeviceBatchOptions         options,
+	                           NativePipelineTraceBuffer*              trace = nullptr);
 	~NativeLogicalBatchPipeline();
 
 	NativeLogicalBatchPipeline(const NativeLogicalBatchPipeline&)            = delete;
@@ -38,6 +44,7 @@ public:
 	[[nodiscard]] size_t               prefetched_batch_count() const noexcept;
 	[[nodiscard]] NativePipelineState  state() const noexcept;
 	[[nodiscard]] NativePipelinePrefetchMetrics prefetch_metrics() const noexcept;
+	[[nodiscard]] const std::vector<LogicalBatchPhysicalPlan>& physical_plans() const noexcept;
 	size_t                             close() noexcept;
 
 private:

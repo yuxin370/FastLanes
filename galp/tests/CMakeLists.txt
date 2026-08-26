@@ -34,6 +34,7 @@ if (GALP_WITH_JPEG_DCT)
 	add_library(galp_direct_dct_shadow_contract STATIC
 			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/direct_dct_metrics.cpp
 			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_batch_lifetime.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/physical_layout_planner.cpp
 			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/profile_registry.cpp
 			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/resolved_execution_policy.cpp
 			${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_pipeline_state.cpp
@@ -57,7 +58,8 @@ if (GALP_WITH_JPEG_DCT)
 	add_executable(galp_native_logical_batch_pipeline_tests
 			direct_dct_metrics_test.cpp
 			native_batch_lifetime_test.cpp
-			native_logical_batch_pipeline_test.cpp)
+			native_logical_batch_pipeline_test.cpp
+			physical_layout_planner_test.cpp)
 	target_link_libraries(galp_native_logical_batch_pipeline_tests PRIVATE
 			galp_direct_dct_shadow_contract
 			GTest::gtest_main)

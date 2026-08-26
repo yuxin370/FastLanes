@@ -47,6 +47,7 @@ Python3_add_library(_galp_direct_dct MODULE WITH_SOABI
         direct_dct_torch.cpp
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/direct_dct_metrics.cpp
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_batch_lifetime.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/physical_layout_planner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/profile_registry.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/resolved_execution_policy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_pipeline_state.cpp
