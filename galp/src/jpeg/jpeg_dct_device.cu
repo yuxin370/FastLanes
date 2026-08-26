@@ -17,6 +17,7 @@
 #include "jpeg/jpeg_dct_active_output_schedule.hpp"
 #include "jpeg/jpeg_dct_cuda_internal.cuh"
 #include "jpeg/jpeg_dct_kernel_launch.cuh"
+#include "jpeg/jpeg_dct_order.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1240,6 +1241,7 @@ struct JpegDctDeviceScratch {
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_vector_remap;
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_image_vector_bindings;
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_active_output_blocks;
+	JpegDctDeviceScratchBuffer<JpegDctDeviceSparseTransformPlan>            planless_sparse_transform_plans;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceBlockMajorGroupBinding>        block_major_groups;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceBlockMajorRankCell>            block_major_rank_cells;
 	JpegDctDeviceScratchBuffer<uint8_t>                                    block_major_rank_payload;
@@ -1263,6 +1265,8 @@ struct JpegDctDeviceScratch {
 	std::shared_ptr<const void>                                            host_planless_active_output_schedule_mapping;
 	size_t                                                                 host_planless_active_output_workset = 0U;
 	bool                                                                   planless_active_output_schedule_uploaded = false;
+	uint64_t                                                               uploaded_sparse_transform_plan_mask = 0U;
+	bool                                                                   sparse_transform_plan_uploaded = false;
 	std::vector<JpegDctDeviceBlockMajorGroupBinding>                       host_block_major_groups;
 	const JpegDctDeviceBlockMajorPlanlessPlan*                              uploaded_block_major_plan = nullptr;
 	std::vector<uint32_t>                                                  host_workset_fixed_transform_item_order;
@@ -1384,6 +1388,7 @@ struct JpegDctDeviceScratch {
 			planless_vector_remap.release();
 			planless_image_vector_bindings.release();
 			planless_active_output_blocks.release();
+			planless_sparse_transform_plans.release();
 			block_major_groups.release();
 			block_major_rank_cells.release();
 			block_major_rank_payload.release();
@@ -1900,6 +1905,73 @@ void append_dense_column_bindings(const BoundCoeffColumns&                      
 	}
 }
 
+uint64_t coefficient_selection_mask(const std::vector<uint8_t>& coefficients) {
+	if (coefficients.empty() || coefficients.size() > kJpegDctCoefficientCount) {
+		throw std::invalid_argument("JPEG DCT planless transform coefficient selection is empty or oversized");
+	}
+	uint64_t mask = 0U;
+	for (const auto coefficient : coefficients) {
+		if (coefficient >= kJpegDctCoefficientCount) {
+			throw std::out_of_range("JPEG DCT planless transform coefficient is outside [0, 64)");
+		}
+		const uint64_t bit = uint64_t {1} << coefficient;
+		if ((mask & bit) != 0U) {
+			throw std::invalid_argument("JPEG DCT planless transform coefficient selection contains a duplicate");
+		}
+		mask |= bit;
+	}
+	return mask;
+}
+
+std::vector<uint8_t> coefficients_in_physical_mask_order(const uint64_t mask) {
+	std::vector<uint8_t> coefficients;
+	coefficients.reserve(kJpegDctCoefficientCount);
+	for (uint8_t physical = 0U; physical < kJpegDctCoefficientCount; ++physical) {
+		if ((mask & (uint64_t {1} << physical)) != 0U) {
+			coefficients.push_back(physical);
+		}
+	}
+	return coefficients;
+}
+
+JpegDctDeviceSparseTransformPlan build_sparse_transform_plan(const uint64_t physical_mask,
+	                                                          const bool     zigzag_columns) {
+	JpegDctDeviceSparseTransformPlan plan;
+	plan.natural_to_compact_binding.fill(JpegDctDeviceSparseTransformPlan::kMissingBinding);
+	uint8_t compact_binding = 0U;
+	for (uint8_t physical = 0U; physical < kJpegDctCoefficientCount; ++physical) {
+		if ((physical_mask & (uint64_t {1} << physical)) == 0U) {
+			continue;
+		}
+		const auto natural = zigzag_columns ? kZigzagColumnToNaturalIndex[physical] : physical;
+		plan.natural_to_compact_binding[natural] = compact_binding++;
+	}
+	plan.selected_coefficient_count = compact_binding;
+	for (uint8_t x = 0U; x < 8U; ++x) {
+		for (uint8_t y = 0U; y < 8U; ++y) {
+			const auto natural = static_cast<uint8_t>(y * 8U + x);
+			if (plan.natural_to_compact_binding[natural] != JpegDctDeviceSparseTransformPlan::kMissingBinding) {
+				plan.selected_y_by_x[x * 8U + plan.selected_y_count_by_x[x]++] = y;
+			}
+		}
+		if (plan.selected_y_count_by_x[x] != 0U) {
+			plan.active_x[plan.active_x_count++] = x;
+		}
+	}
+	for (uint8_t y = 0U; y < 8U; ++y) {
+		for (uint8_t x = 0U; x < 8U; ++x) {
+			const auto natural = static_cast<uint8_t>(y * 8U + x);
+			if (plan.natural_to_compact_binding[natural] != JpegDctDeviceSparseTransformPlan::kMissingBinding) {
+				plan.selected_x_by_y[y * 8U + plan.selected_x_count_by_y[y]++] = x;
+			}
+		}
+		if (plan.selected_x_count_by_y[y] != 0U) {
+			plan.active_y[plan.active_y_count++] = y;
+		}
+	}
+	return plan;
+}
+
 void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffColumns>&   sources,
                                                  const std::vector<DecodedRowgroupWork>& works,
 	                                             const JpegDctDeviceImageMajorPlanlessPlan* image_major_plan,
@@ -1924,12 +1996,20 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	auto& vector_remap    = scratch.host_planless_vector_remap;
 	auto& image_vector_bindings = scratch.host_planless_image_vector_bindings;
 	auto& block_groups    = scratch.host_block_major_groups;
+	const auto selected_physical_mask = coefficient_selection_mask(works.front().active_physical_coefficients);
+	for (const auto& work : works) {
+		if (coefficient_selection_mask(work.active_physical_coefficients) != selected_physical_mask) {
+			throw std::runtime_error("JPEG DCT planless workset mixed coefficient selections");
+		}
+	}
+	const auto selected_physical_coefficients = coefficients_in_physical_mask_order(selected_physical_mask);
+	const bool sparse_transform = selected_physical_coefficients.size() < kJpegDctCoefficientCount;
 	column_bindings.clear();
 	images.clear();
 	vector_remap.clear();
 	image_vector_bindings.clear();
 	block_groups.clear();
-	column_bindings.reserve(works.size() * kJpegDctCoefficientCount);
+	column_bindings.reserve(works.size() * selected_physical_coefficients.size());
 	std::shared_ptr<const JpegDctDeviceBlockMajorPlanlessPlan> block_major_plan;
 	size_t image_count = 0;
 	for (const auto& work : works) {
@@ -1963,7 +2043,14 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	for (size_t source_idx = 0; source_idx < works.size(); ++source_idx) {
 		const auto                                     binding_base = static_cast<uint32_t>(column_bindings.size());
 		std::array<uint32_t, kJpegDctCoefficientCount> binding_index_by_physical {};
-		append_dense_column_bindings(sources[source_idx], column_bindings, binding_index_by_physical);
+		if (sparse_transform) {
+			append_compact_column_bindings(sources[source_idx],
+			                               selected_physical_coefficients,
+			                               column_bindings,
+			                               binding_index_by_physical);
+		} else {
+			append_dense_column_bindings(sources[source_idx], column_bindings, binding_index_by_physical);
+		}
 		uint32_t remap_base = std::numeric_limits<uint32_t>::max();
 		if (!works[source_idx].decodes_full_rowgroup) {
 			if (works[source_idx].selected_vectors == nullptr || works[source_idx].selected_vectors->empty()) {
@@ -2029,6 +2116,12 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	}
 	if (images.empty()) {
 		return;
+	}
+	stats.planless_transform_selected_coefficient_count =
+	    std::max(stats.planless_transform_selected_coefficient_count, selected_physical_coefficients.size());
+	stats.planless_transform_dense_binding_equivalent_count += works.size() * kJpegDctCoefficientCount;
+	if (sparse_transform) {
+		stats.planless_transform_compact_binding_count += column_bindings.size();
 	}
 	record_planless_transform_resources(scratch, stats);
 	const uint64_t blocks_per_image =
@@ -2122,6 +2215,18 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	if (output_blocks == 0U) {
 		return;
 	}
+	if (sparse_transform &&
+	    (!scratch.sparse_transform_plan_uploaded ||
+	     scratch.uploaded_sparse_transform_plan_mask != selected_physical_mask ||
+	     scratch.planless_sparse_transform_plans.needs_reallocation(2U))) {
+		const std::array<JpegDctDeviceSparseTransformPlan, 2> plans {
+		    build_sparse_transform_plan(selected_physical_mask, false),
+		    build_sparse_transform_plan(selected_physical_mask, true),
+		};
+		scratch.planless_sparse_transform_plans.upload(plans.data(), plans.size(), stream, stats);
+		scratch.uploaded_sparse_transform_plan_mask = selected_physical_mask;
+		scratch.sparse_transform_plan_uploaded       = true;
+	}
 	if (scratch.transform_submission_gate) {
 		auto gate = std::move(scratch.transform_submission_gate);
 		gate->wait();
@@ -2154,6 +2259,8 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 		        ? scratch.block_major_rank_payload.data
 		        : nullptr,
 		    block_major_plan ? block_major_plan->rank_payload.size() : 0U,
+		    selected_physical_mask,
+		    sparse_transform ? scratch.planless_sparse_transform_plans.data : nullptr,
 		    images.size(),
 		    offset,
 		    launch_output_blocks,
@@ -2170,6 +2277,11 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 		CUDA_SAFE_CALL(cudaGetLastError());
 		++stats.materialize_kernel_launch_count;
 		++stats.planless_transform_kernel_launch_count;
+		if (sparse_transform) {
+			++stats.planless_transform_sparse_kernel_launch_count;
+		} else {
+			++stats.planless_transform_dense_kernel_launch_count;
+		}
 		stats.planless_transform_max_blocks_per_launch =
 		    std::max(stats.planless_transform_max_blocks_per_launch, static_cast<size_t>(launch_ctas));
 		stats.planless_transform_max_output_blocks_per_launch =
@@ -2188,6 +2300,11 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 		stats.planless_image_descriptor_count += images.size();
 	}
 	stats.planless_transform_output_block_count += output_blocks;
+	if (sparse_transform) {
+		stats.planless_transform_sparse_output_block_count += output_blocks;
+	} else {
+		stats.planless_transform_dense_output_block_count += output_blocks;
+	}
 	stats.device_mapping_fused = true;
 }
 
@@ -3352,8 +3469,14 @@ void compile_jpeg_dct_device_batch_io_impl(JpegDctDeviceBatchPlan& plan, JpegDct
 				std::shared_ptr<const galp::format::SparseVectorReadPlan> candidate;
 				if (block_major_planless) {
 					candidate = std::make_shared<const galp::format::SparseVectorReadPlan>(
-					    rowgroup.prepared_reader->compile_sparse_vector_read_plan(
-					        rowgroup.rowgroup_index, physical_vectors, packed_device_scatter));
+					    selects_all_coefficients(plan.selected_coefficients)
+					        ? rowgroup.prepared_reader->compile_sparse_vector_read_plan(
+					              rowgroup.rowgroup_index, physical_vectors, packed_device_scatter)
+					        : rowgroup.prepared_reader->compile_sparse_vector_read_plan(
+					              rowgroup.rowgroup_index,
+					              physical_vectors,
+					              plan.selected_coefficients,
+					              packed_device_scatter));
 				} else {
 					candidate = context.sparse_plan(*source_path,
 					                                rowgroup.prepared_reader,
@@ -3919,7 +4042,11 @@ void stage_jpeg_dct_device_batch_io_impl(JpegDctDeviceBatchPlan& plan, JpegDctHo
 }
 
 void record_decoded_rowgroup_read(const galp::format::ZeroCopyReadTiming& io_timing,
-                                  JpegDctDeviceExecutionStats&             execution_stats) {
+	                              JpegDctDeviceExecutionStats&             execution_stats,
+	                              const size_t selected_coefficient_count) {
+	if (selected_coefficient_count == 0U || selected_coefficient_count > kJpegDctCoefficientCount) {
+		throw std::logic_error("JPEG DCT read telemetry received an invalid coefficient selection");
+	}
 	execution_stats.rowgroup_storage_bytes_read += io_timing.storage_bytes;
 	execution_stats.compressed_payload_bytes_read += io_timing.storage_bytes;
 	execution_stats.selected_compressed_payload_bytes +=
@@ -3951,8 +4078,8 @@ void record_decoded_rowgroup_read(const galp::format::ZeroCopyReadTiming& io_tim
 	execution_stats.physical_page_bytes_covered += io_timing.physical_page_bytes;
 	execution_stats.full_physical_page_bytes += io_timing.full_physical_page_bytes;
 	execution_stats.coalesced_read_run_count += io_timing.coalesced_read_run_count;
-	execution_stats.selected_coefficient_count += io_timing.selected_coefficient_count;
-	execution_stats.full_coefficient_count += io_timing.full_coefficient_count;
+	execution_stats.selected_coefficient_count += selected_coefficient_count;
+	execution_stats.full_coefficient_count += kJpegDctCoefficientCount;
 	if (io_timing.used_pinned_backing) {
 		++execution_stats.pinned_rowgroup_read_count;
 		execution_stats.pinned_rowgroup_read_bytes += io_timing.storage_bytes;
@@ -3983,7 +4110,7 @@ DecodedRowgroupWork prepare_decoded_rowgroup_work(galp::format::FlsReader&      
 	    take_staged_or_read_decoded_rowgroup(rdr, rowgroup_plan, selected_coefficients, decode_unpack_n_vectors);
 	const auto                       sync_read_end = Clock::now();
 	execution_stats.sync_rowgroup_read_ms += elapsed_ms(sync_read_start, sync_read_end);
-	record_decoded_rowgroup_read(read_result.io_timing, execution_stats);
+	record_decoded_rowgroup_read(read_result.io_timing, execution_stats, selected_coefficients.size());
 
 	return prepare_decoded_rowgroup_work_from_materialized(std::move(read_result.rowgroup),
 	                                                       shard_id,
@@ -5193,7 +5320,8 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 			}
 			for (size_t local = 0U; local < results.size(); ++local) {
 				const auto miss_index = bounded_read_chunks[chunk_index].begin + local;
-				record_decoded_rowgroup_read(results[local].io_timing, execution_stats);
+				record_decoded_rowgroup_read(
+				    results[local].io_timing, execution_stats, selected_coefficients.size());
 				auto work = prepare_decoded_rowgroup_work_from_materialized(std::move(results[local].rowgroup),
 				                                                            misses[miss_index].shard_id,
 				                                                            *misses[miss_index].rowgroup,
@@ -5394,7 +5522,8 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 			});
 			for (size_t miss_index = 0U; miss_index < misses.size(); ++miss_index) {
 				const auto miss = misses[miss_index];
-				record_decoded_rowgroup_read(read_results[miss_index].io_timing, execution_stats);
+				record_decoded_rowgroup_read(
+				    read_results[miss_index].io_timing, execution_stats, selected_coefficients.size());
 				merge_decoded_rowgroup_preparation_stats(execution_stats, preparation_stats[miss_index]);
 				append_pending(std::move(*prepared[miss_index]), miss.rowgroup->estimated_workset_resident_bytes);
 			}
@@ -5402,7 +5531,8 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 			for (size_t miss_index = 0U; miss_index < misses.size(); ++miss_index) {
 				auto&      read_result = read_results[miss_index];
 				const auto miss        = misses[miss_index];
-				record_decoded_rowgroup_read(read_result.io_timing, execution_stats);
+				record_decoded_rowgroup_read(
+				    read_result.io_timing, execution_stats, selected_coefficients.size());
 				auto work = prepare_decoded_rowgroup_work_from_materialized(std::move(read_result.rowgroup),
 				                                                            miss.shard_id,
 				                                                            *miss.rowgroup,
@@ -5499,7 +5629,8 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 		for (size_t miss_index = 0U; miss_index < misses.size(); ++miss_index) {
 			auto& read_result = read_results[miss_index];
 			const auto miss = misses[miss_index];
-			record_decoded_rowgroup_read(read_result.io_timing, execution_stats);
+			record_decoded_rowgroup_read(
+			    read_result.io_timing, execution_stats, selected_coefficients.size());
 			auto work = prepare_decoded_rowgroup_work_from_materialized(std::move(read_result.rowgroup),
 			                                                               miss.shard_id,
 			                                                               *miss.rowgroup,

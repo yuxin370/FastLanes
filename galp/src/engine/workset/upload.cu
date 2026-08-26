@@ -141,12 +141,21 @@ void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 		constexpr auto type  = galp::execution::type_tag_for<T>();
 		const auto&    batch = workset.buffers.host_batches.template get<T>();
 		if (batch.work_items_explicit) {
+			std::vector<bool> has_explicit_items(batch.device_exprs.size(), false);
 			for (const auto& work : batch.work_items) {
+				if (work.expr_index >= batch.device_exprs.size()) {
+					throw std::out_of_range("mixed work item expression index out of range");
+				}
+				has_explicit_items[work.expr_index] = true;
 				const auto semantic_lanes =
 				    galp::execution::semantic_lane_count(type, batch.device_exprs[work.expr_index].plan);
 				append_to_slots(workset.slots.mixed, pending_half, has_pending_half, work, semantic_lanes);
 			}
 			for (const auto& work : batch.scalar_tail_work_items) {
+				if (work.expr_index >= batch.device_exprs.size()) {
+					throw std::out_of_range("mixed scalar-tail work item expression index out of range");
+				}
+				has_explicit_items[work.expr_index] = true;
 				const auto semantic_lanes =
 				    galp::execution::semantic_lane_count(type, batch.device_exprs[work.expr_index].plan);
 				append_to_slots(workset.slots.scalar_tail_mixed,
@@ -154,6 +163,32 @@ void build_mixed_slots(ExecutionWorkset& workset, const ExecutionConfig& cfg) {
 				                has_pending_scalar_tail_half,
 				                work,
 				                semantic_lanes);
+			}
+			for (uint32_t expr_idx = 0; expr_idx < batch.device_exprs.size(); ++expr_idx) {
+				if (has_explicit_items[expr_idx]) {
+					continue;
+				}
+				const auto& expr           = batch.device_exprs[expr_idx];
+				const auto  semantic_lanes = galp::execution::semantic_lane_count(type, expr.plan);
+				const auto  n_vecs         = galp::codec::utils::get_n_vecs_from_size(expr.n_values);
+				const uint32_t full_n_vecs =
+				    decode_vector_width <= 1U
+				        ? static_cast<uint32_t>(n_vecs)
+				        : static_cast<uint32_t>((n_vecs / decode_vector_width) * decode_vector_width);
+				for (uint32_t vec = 0; vec < full_n_vecs; vec += decode_vector_width) {
+					append_to_slots(workset.slots.mixed,
+					                pending_half,
+					                has_pending_half,
+					                galp::execution::WorkItemAny {expr_idx, vec, type, vec},
+					                semantic_lanes);
+				}
+				for (uint32_t vec = full_n_vecs; vec < n_vecs; ++vec) {
+					append_to_slots(workset.slots.scalar_tail_mixed,
+					                pending_scalar_tail_half,
+					                has_pending_scalar_tail_half,
+					                galp::execution::WorkItemAny {expr_idx, vec, type, vec},
+					                semantic_lanes);
+				}
 			}
 			return;
 		}

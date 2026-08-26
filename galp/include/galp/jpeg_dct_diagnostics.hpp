@@ -230,6 +230,13 @@ struct JpegDctDeviceExecutionStats {
 	bool   device_mapping_fused                     = false;
 	// Scheduling/stream diagnostics (appended for aggregate compatibility).
 	size_t      planless_transform_kernel_launch_count          = 0;
+	size_t      planless_transform_dense_kernel_launch_count    = 0;
+	size_t      planless_transform_sparse_kernel_launch_count   = 0;
+	size_t      planless_transform_dense_output_block_count     = 0;
+	size_t      planless_transform_sparse_output_block_count    = 0;
+	size_t      planless_transform_selected_coefficient_count   = 0;
+	size_t      planless_transform_compact_binding_count        = 0;
+	size_t      planless_transform_dense_binding_equivalent_count = 0;
 	size_t      planless_transform_max_blocks_per_launch        = 0;
 	size_t      planless_transform_max_output_blocks_per_launch = 0;
 	size_t      planless_transform_registers_per_thread         = 0;

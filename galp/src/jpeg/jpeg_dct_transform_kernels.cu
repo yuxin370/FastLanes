@@ -23,6 +23,8 @@ __device__ __forceinline__ uint8_t natural_to_physical_coeff_device(const uint8_
 	return natural_to_zigzag[natural];
 }
 
+inline constexpr uint64_t kAllPhysicalCoefficientMask = ~uint64_t {0};
+
 __device__ __forceinline__ float
 finalize_dct_grid_float(const float value, const float output_add, const float output_scale) {
 	float rounded = nearbyintf(value);
@@ -44,6 +46,82 @@ __device__ __forceinline__ float normalize_reference_down2_value(const float val
 	return factor_product == 4U   ? __fmul_rn(value, 0.5F)
 	       : factor_product == 2U ? __fdiv_rn(value, 0x1.6a09e60000000p+0F)
 	                              : value;
+}
+
+template <uint32_t PrefixCount>
+__device__ __forceinline__ uint32_t zigzag_prefix_selected_y_count(const uint32_t source_frequency_x) {
+	static_assert(PrefixCount == 16U || PrefixCount == 32U);
+	if constexpr (PrefixCount == 16U) {
+		switch (source_frequency_x) {
+		case 0U: return 5U;
+		case 1U: return 4U;
+		case 2U: return 3U;
+		case 3U: return 2U;
+		case 4U:
+		case 5U: return 1U;
+		default: return 0U;
+		}
+	} else {
+		switch (source_frequency_x) {
+		case 0U: return 7U;
+		case 1U: return 6U;
+		case 2U: return 5U;
+		case 3U:
+		case 4U: return 4U;
+		case 5U: return 3U;
+		case 6U: return 2U;
+		default: return 1U;
+		}
+	}
+}
+
+template <uint32_t PrefixCount>
+__device__ __forceinline__ float zigzag_prefix_vertical_sum(const uint32_t out_y,
+	                                                          const uint32_t source_x,
+	                                                          const uint32_t source_width,
+	                                                          const uint32_t y_down,
+	                                                          const float*   composed) {
+	const auto selected_y_count = zigzag_prefix_selected_y_count<PrefixCount>(source_x % 8U);
+	float      sum              = 0.0F;
+#pragma unroll
+	for (uint32_t subblock_y = 0U; subblock_y < 2U; ++subblock_y) {
+		if (subblock_y < y_down) {
+#pragma unroll
+			for (uint32_t source_frequency_y = 0U; source_frequency_y < 8U; ++source_frequency_y) {
+				if (source_frequency_y < selected_y_count) {
+					const auto source_y = subblock_y * 8U + source_frequency_y;
+					sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
+					                       composed[source_y * source_width + source_x],
+					                       sum);
+				}
+			}
+		}
+	}
+	return sum;
+}
+
+template <uint32_t PrefixCount>
+__device__ __forceinline__ float zigzag_prefix_horizontal_sum(const uint32_t out_y,
+	                                                            const uint32_t out_x,
+	                                                            const uint32_t source_width,
+	                                                            const uint32_t x_down,
+	                                                            const float*   vertical) {
+	static_assert(PrefixCount == 16U || PrefixCount == 32U);
+	constexpr uint32_t active_x_count = PrefixCount == 16U ? 6U : 8U;
+	float              sum            = 0.0F;
+#pragma unroll
+	for (uint32_t subblock_x = 0U; subblock_x < 2U; ++subblock_x) {
+		if (subblock_x < x_down) {
+#pragma unroll
+			for (uint32_t source_frequency_x = 0U; source_frequency_x < active_x_count; ++source_frequency_x) {
+				const auto source_x = subblock_x * 8U + source_frequency_x;
+				sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
+				                       kReferenceDown2Conversion[out_x * 16U + source_x],
+				                       sum);
+			}
+		}
+	}
+	return sum;
 }
 
 __device__ __forceinline__ uint64_t remap_planless_row_base(
@@ -446,13 +524,15 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 	                                                     const size_t block_major_rank_cell_count,
 	                                                     const uint8_t* __restrict block_major_rank_payload,
 	                                                     const size_t block_major_rank_payload_size,
-                                                     const size_t   image_count,
-                                                     const uint64_t output_block_offset,
-                                                     const uint64_t output_block_count,
-                                                     const uint16_t* __restrict quant_tables,
-                                                     const float* __restrict phase_matrices,
-                                                     const uint32_t y_output_width,
-                                                     const uint32_t y_output_height,
+	                                                     const uint64_t selected_physical_coefficient_mask,
+	                                                     const JpegDctDeviceSparseTransformPlan* __restrict sparse_transform_plans,
+	                                                     const size_t   image_count,
+	                                                     const uint64_t output_block_offset,
+	                                                     const uint64_t output_block_count,
+	                                                     const uint16_t* __restrict quant_tables,
+	                                                     const float* __restrict phase_matrices,
+	                                                     const uint32_t y_output_width,
+	                                                     const uint32_t y_output_height,
                                                      const uint32_t cbcr_output_width,
                                                      const uint32_t cbcr_output_height,
                                                      const int32_t  clamp_min,
@@ -496,6 +576,17 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 		const auto descriptor = image.components[component];
 		if (descriptor.present == 0U || descriptor.x_up_factor == 0U || descriptor.y_up_factor == 0U ||
 		    descriptor.x_down_factor == 0U || descriptor.y_down_factor == 0U) {
+			continue;
+		}
+		const bool sparse_transform = selected_physical_coefficient_mask != kAllPhysicalCoefficientMask;
+		const bool zigzag_prefix16 = image.zigzag_columns != 0U &&
+		                             selected_physical_coefficient_mask == uint64_t {0x000000000000ffffULL};
+		const bool zigzag_prefix32 = image.zigzag_columns != 0U &&
+		                             selected_physical_coefficient_mask == uint64_t {0x00000000ffffffffULL};
+		const auto* sparse_plan = sparse_transform && sparse_transform_plans != nullptr
+		                              ? &sparse_transform_plans[image.zigzag_columns != 0U ? 1U : 0U]
+		                              : nullptr;
+		if (sparse_transform && sparse_plan == nullptr) {
 			continue;
 		}
 		const auto x_down                   = static_cast<uint32_t>(descriptor.x_down_factor);
@@ -542,15 +633,23 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 			__syncthreads();
 			const auto coeff    = static_cast<uint8_t>(lane);
 			const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
+			const auto compact_binding =
+			    zigzag_prefix16 || zigzag_prefix32
+			        ? (physical < (zigzag_prefix16 ? 16U : 32U)
+			               ? physical
+			               : JpegDctDeviceSparseTransformPlan::kMissingBinding)
+			        : sparse_transform ? sparse_plan->natural_to_compact_binding[coeff]
+			                           : static_cast<uint8_t>(physical);
+			const bool selected = compact_binding != JpegDctDeviceSparseTransformPlan::kMissingBinding;
 			const auto quant =
 			    static_cast<int32_t>(quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
 			for (uint32_t source_block_slot = 0U; source_block_slot < source_block_count; ++source_block_slot) {
 				const auto subblock_x = source_block_slot % x_down;
 				const auto subblock_y = source_block_slot / x_down;
 				int16_t    value    = 0;
-				if (located_rows[source_block_slot] != std::numeric_limits<uint64_t>::max() &&
+				if (selected && located_rows[source_block_slot] != std::numeric_limits<uint64_t>::max() &&
 				    located_binding_bases[source_block_slot] != std::numeric_limits<uint32_t>::max()) {
-					const auto binding = column_bindings[located_binding_bases[source_block_slot] + physical];
+					const auto binding = column_bindings[located_binding_bases[source_block_slot] + compact_binding];
 					if (binding.source == DeviceCoeffSource::kI16) {
 						value = binding.column_i16[located_rows[source_block_slot]];
 					} else if (binding.source == DeviceCoeffSource::kI8) {
@@ -569,6 +668,22 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 				float      sum      = 0.0F;
 				if (y_down == 1U) {
 					sum = composed[out_y * source_width + source_x];
+				} else if (zigzag_prefix16) {
+					sum = zigzag_prefix_vertical_sum<16U>(out_y, source_x, source_width, y_down, composed);
+				} else if (zigzag_prefix32) {
+					sum = zigzag_prefix_vertical_sum<32U>(out_y, source_x, source_width, y_down, composed);
+				} else if (sparse_transform) {
+					const auto source_frequency_x = source_x % 8U;
+					const auto selected_y_count = sparse_plan->selected_y_count_by_x[source_frequency_x];
+					for (uint32_t subblock_y = 0U; subblock_y < y_down; ++subblock_y) {
+						for (uint32_t selected_y = 0U; selected_y < selected_y_count; ++selected_y) {
+							const auto source_y = subblock_y * 8U +
+							    sparse_plan->selected_y_by_x[source_frequency_x * 8U + selected_y];
+							sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
+							                       composed[source_y * source_width + source_x],
+							                       sum);
+						}
+					}
 				} else {
 #pragma unroll
 					for (uint32_t source_y = 0; source_y < 16U; ++source_y) {
@@ -586,6 +701,19 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 				float      sum   = 0.0F;
 				if (x_down == 1U) {
 					sum = vertical[out_y * source_width + out_x];
+				} else if (zigzag_prefix16) {
+					sum = zigzag_prefix_horizontal_sum<16U>(out_y, out_x, source_width, x_down, vertical);
+				} else if (zigzag_prefix32) {
+					sum = zigzag_prefix_horizontal_sum<32U>(out_y, out_x, source_width, x_down, vertical);
+				} else if (sparse_transform) {
+					for (uint32_t subblock_x = 0U; subblock_x < x_down; ++subblock_x) {
+						for (uint32_t selected_x = 0U; selected_x < sparse_plan->active_x_count; ++selected_x) {
+							const auto source_x = subblock_x * 8U + sparse_plan->active_x[selected_x];
+							sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
+							                       kReferenceDown2Conversion[out_x * 16U + source_x],
+							                       sum);
+						}
+					}
 				} else {
 #pragma unroll
 					for (uint32_t source_x = 0; source_x < 16U; ++source_x) {
@@ -658,9 +786,13 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 					const auto coeff = static_cast<uint8_t>(lane);
 					const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
 					int16_t    value    = 0;
-					if (located_rows[0] != std::numeric_limits<uint64_t>::max() &&
+					const auto compact_binding =
+					    sparse_transform ? sparse_plan->natural_to_compact_binding[coeff]
+					                     : static_cast<uint8_t>(physical);
+					const bool selected = compact_binding != JpegDctDeviceSparseTransformPlan::kMissingBinding;
+					if (selected && located_rows[0] != std::numeric_limits<uint64_t>::max() &&
 					    located_binding_bases[0] != std::numeric_limits<uint32_t>::max()) {
-						const auto binding = column_bindings[located_binding_bases[0] + physical];
+						const auto binding = column_bindings[located_binding_bases[0] + compact_binding];
 						if (binding.source == DeviceCoeffSource::kI16) {
 							value = binding.column_i16[located_rows[0]];
 						} else if (binding.source == DeviceCoeffSource::kI8) {
@@ -677,7 +809,12 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 					const auto source_y_coeff = lane / 8U;
 					const auto out_x_coeff    = lane % 8U;
 					float      x_sum          = 0.0F;
-					for (uint32_t in_x_coeff = 0U; in_x_coeff < 8U; ++in_x_coeff) {
+					const auto selected_x_count =
+					    sparse_transform ? sparse_plan->selected_x_count_by_y[source_y_coeff] : uint8_t {8U};
+					for (uint32_t selected_x = 0U; selected_x < selected_x_count; ++selected_x) {
+						const auto in_x_coeff = sparse_transform
+						                          ? sparse_plan->selected_x_by_y[source_y_coeff * 8U + selected_x]
+						                          : static_cast<uint8_t>(selected_x);
 						const auto wx = planless_axis_phase_weight(phase_matrices,
 						                                           descriptor.x_phase_matrix_base,
 						                                           descriptor.x_up_factor,
@@ -695,7 +832,10 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 					const auto out_x_coeff = lane % 8U;
 					const auto out_y_coeff = lane / 8U;
 					float      weighted    = 0.0F;
-					for (uint32_t in_y_coeff = 0U; in_y_coeff < 8U; ++in_y_coeff) {
+					const auto active_y_count = sparse_transform ? sparse_plan->active_y_count : uint8_t {8U};
+					for (uint32_t active_y = 0U; active_y < active_y_count; ++active_y) {
+						const auto in_y_coeff = sparse_transform ? sparse_plan->active_y[active_y]
+						                                            : static_cast<uint8_t>(active_y);
 						const auto wy = planless_axis_phase_weight(phase_matrices,
 						                                           descriptor.y_phase_matrix_base,
 						                                           descriptor.y_up_factor,

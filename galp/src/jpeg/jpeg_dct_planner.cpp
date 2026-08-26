@@ -1199,9 +1199,6 @@ struct JpegDctShardDatasetReader::Impl {
 		if (!spec.dequantize) {
 			throw std::runtime_error("transformed DCT grid executor currently requires dequantize=true");
 		}
-		if (!spec.require_all_coefficients) {
-			throw std::runtime_error("transformed DCT grid executor currently requires all 64 DCT coefficients");
-		}
 		for (const auto& ratio : spec.allowed_chroma_sampling_ratios) {
 			if (ratio.horizontal_numerator == 0 || ratio.horizontal_denominator == 0 || ratio.vertical_numerator == 0 ||
 			    ratio.vertical_denominator == 0) {

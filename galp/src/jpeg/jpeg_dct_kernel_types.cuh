@@ -2,8 +2,10 @@
 #define GALP_JPEG_DCT_KERNEL_TYPES_CUH
 
 #include "jpeg/jpeg_dct_plan_types.hpp"
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace galp::jpeg::detail {
 
@@ -17,6 +19,24 @@ struct DeviceCoeffBinding {
 	const int8_t*     column_i8  = nullptr;
 	const int16_t*    column_i16 = nullptr;
 	DeviceCoeffSource source     = DeviceCoeffSource::kMissing;
+};
+
+// Request-scoped sparse frequency plan. The transform output remains a dense
+// 8x8 grid; these compact lists remove zero raw coefficients from the two
+// separable mixing passes without materializing per-rowgroup remap tables.
+struct JpegDctDeviceSparseTransformPlan {
+	static constexpr uint8_t kMissingBinding = std::numeric_limits<uint8_t>::max();
+
+	uint8_t selected_coefficient_count = 0U;
+	std::array<uint8_t, 64> natural_to_compact_binding {};
+	std::array<uint8_t, 8>  selected_y_count_by_x {};
+	std::array<uint8_t, 64> selected_y_by_x {};
+	std::array<uint8_t, 8>  selected_x_count_by_y {};
+	std::array<uint8_t, 64> selected_x_by_y {};
+	uint8_t                 active_x_count = 0U;
+	std::array<uint8_t, 8>  active_x {};
+	uint8_t                 active_y_count = 0U;
+	std::array<uint8_t, 8>  active_y {};
 };
 
 struct JpegDctDeviceProjectionBatchItem {

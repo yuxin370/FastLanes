@@ -177,6 +177,10 @@ public:
 	SparseVectorReadPlan compile_sparse_vector_read_plan(size_t                       rowgroup_idx,
 	                                                     const std::vector<uint32_t>& selected_vectors,
 	                                                     bool packed_device_scatter = false) const;
+	SparseVectorReadPlan compile_sparse_vector_read_plan(size_t                       rowgroup_idx,
+	                                                     const std::vector<uint32_t>& selected_vectors,
+	                                                     const std::vector<uint8_t>&  selected_columns,
+	                                                     bool packed_device_scatter = false) const;
 
 	void read_rowgroup_bytes_into(size_t              rowgroup_idx,
 	                              std::byte*          backing_data,

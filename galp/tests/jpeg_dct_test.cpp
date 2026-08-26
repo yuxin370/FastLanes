@@ -520,6 +520,10 @@ TEST(JpegDct, DctCoefficientSelectionParserAndNormalization) {
 	galp::jpeg::JpegDctCoefficientSelection out_of_range_selection;
 	out_of_range_selection.coefficients = {64U};
 	EXPECT_THROW((void)galp::jpeg::detail::normalize_coefficient_selection(out_of_range_selection), std::out_of_range);
+	galp::jpeg::JpegDctCoefficientSelection oversized_selection;
+	oversized_selection.coefficients.resize(65U, 0U);
+	EXPECT_THROW((void)galp::jpeg::detail::normalize_coefficient_selection(oversized_selection),
+	             std::invalid_argument);
 }
 
 TEST(JpegDct, ClassifiesNormalizedDctCoefficientSelectionShapes) {
@@ -1150,6 +1154,87 @@ TEST(JpegDct, DeviceBatchReadsTransformedGridWithRgbNoMoreProfile) {
 	EXPECT_EQ(empty_batch.cbcr_coefficients(), nullptr);
 	EXPECT_EQ(empty_batch.ycbcr_dct_grid_shape().y, (std::array<size_t, 6> {0U, 1U, 28U, 28U, 8U, 8U}));
 	EXPECT_EQ(empty_batch.ycbcr_dct_grid_shape().cbcr, (std::array<size_t, 6> {0U, 2U, 14U, 14U, 8U, 8U}));
+
+	std::filesystem::remove_all(dir);
+}
+
+TEST(JpegDct, TransformedGridSupportsArbitraryCoefficientSelections) {
+	int device_count = 0;
+	if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
+	}
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir = std::filesystem::temp_directory_path() /
+	                 ("galp_jpeg_dct_generic_coefficient_selection_" + std::to_string(suffix));
+	const auto path0 = dir / "input0.jpg";
+	const auto path1 = dir / "input1.jpg";
+	std::filesystem::create_directories(dir);
+	write_test_jpeg(path0, 32, 32);
+	write_test_jpeg(path1, 64, 40);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images        = 2U;
+	shard_options.rowgroup_vectors    = 1U;
+	shard_options.rowgroups_per_shard = 256U;
+	const auto output_dir = dir / "out";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    {path0, path1}, output_dir, reader_options, shard_options);
+
+	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
+	const std::vector<galp::jpeg::JpegDctImageCropRequest> requests {
+	    {0U, {}},
+	    {1U, {}},
+	};
+	const auto copy_grid = [](const galp::jpeg::JpegDctDeviceBatch& batch) {
+		std::pair<std::vector<int16_t>, std::vector<int16_t>> host {
+		    std::vector<int16_t>(batch.y_coefficient_count()),
+		    std::vector<int16_t>(batch.cbcr_coefficient_count()),
+		};
+		EXPECT_EQ(cudaMemcpy(host.first.data(),
+		                     batch.y_coefficients(),
+		                     host.first.size() * sizeof(int16_t),
+		                     cudaMemcpyDeviceToHost),
+		          cudaSuccess);
+		EXPECT_EQ(cudaMemcpy(host.second.data(),
+		                     batch.cbcr_coefficients(),
+		                     host.second.size() * sizeof(int16_t),
+		                     cudaMemcpyDeviceToHost),
+		          cudaSuccess);
+		return host;
+	};
+
+	std::vector<uint8_t> all(64U);
+	std::iota(all.begin(), all.end(), uint8_t {0U});
+	const std::array<std::vector<uint8_t>, 3> selections {{
+	    {5U},
+	    {5U, 0U, 2U},
+	    all,
+	}};
+	for (const auto& selection : selections) {
+		galp::jpeg::JpegDctDeviceBatchOptions planless_options;
+		planless_options.layout = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+		planless_options.grid_transform = galp::profiles::rgbnomore_val_dct_grid_transform();
+		planless_options.enable_planless_execution = true;
+		planless_options.cache_capacity_bytes = 0U;
+		planless_options.plan_cache_capacity = 0U;
+		planless_options.coefficient_selection.coefficients = selection;
+		auto reference_options = planless_options;
+		reference_options.enable_planless_execution = false;
+
+		auto actual = reader.ReadDeviceDctBatch(requests, planless_options);
+		auto reference = reader.ReadDeviceDctBatch(requests, reference_options);
+		EXPECT_EQ(copy_grid(actual), copy_grid(reference)) << "selection size " << selection.size();
+		EXPECT_EQ(actual.selected_coefficients(), selection);
+		EXPECT_EQ(actual.coefficients_per_block(), selection.size());
+		EXPECT_EQ(actual.grid_output_data_type(), galp::jpeg::JpegDctGridOutputDataType::kInt16);
+		EXPECT_EQ(actual.ycbcr_dct_grid_shape().y,
+		          (std::array<size_t, 6> {2U, 1U, 28U, 28U, 8U, 8U}));
+		EXPECT_EQ(actual.ycbcr_dct_grid_shape().cbcr,
+		          (std::array<size_t, 6> {2U, 2U, 14U, 14U, 8U, 8U}));
+	}
 
 	std::filesystem::remove_all(dir);
 }

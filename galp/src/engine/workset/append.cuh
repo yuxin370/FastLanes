@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <unordered_set>
 #include <variant>
+#include <vector>
 
 namespace galp::runtime {
 
@@ -129,6 +130,22 @@ inline size_t count_expr_work_items(const ExecutionWorkset& workset) {
 		const auto& batch = workset.buffers.host_batches.template get<T>();
 		if (batch.work_items_explicit) {
 			total += batch.work_items.size() + batch.scalar_tail_work_items.size();
+			std::vector<bool> has_explicit_items(batch.device_exprs.size(), false);
+			for (const auto& work : batch.work_items) {
+				if (work.expr_index < has_explicit_items.size()) {
+					has_explicit_items[work.expr_index] = true;
+				}
+			}
+			for (const auto& work : batch.scalar_tail_work_items) {
+				if (work.expr_index < has_explicit_items.size()) {
+					has_explicit_items[work.expr_index] = true;
+				}
+			}
+			for (size_t expr_idx = 0; expr_idx < batch.device_exprs.size(); ++expr_idx) {
+				if (!has_explicit_items[expr_idx]) {
+					total += galp::codec::utils::get_n_vecs_from_size(batch.device_exprs[expr_idx].n_values);
+				}
+			}
 			return;
 		}
 		for (const auto& expr : batch.device_exprs) {

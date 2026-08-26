@@ -64,18 +64,49 @@ def _resource_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
 
 
 def _legacy(
-    reader: Any, torch: Any, first: int, count: int, boundary: int
+    reader: Any,
+    torch: Any,
+    first: int,
+    count: int,
+    left_shard: dict[str, Any],
+    right_shard: dict[str, Any],
 ) -> tuple[Any, Any, list[int]]:
+    boundary = int(right_shard["first_global_image_index"])
     if not first < boundary < first + count:
         raise ValueError("the targeted legacy arm requires exactly one physical shard boundary")
-    batches = [list(range(first, boundary)), list(range(boundary, first + count))]
+    # Scheduled active-output execution is canonically keyed by a complete
+    # physical shard.  Match the production Legacy path: activate both full
+    # shards once, then assemble the requested tail/head slices in Python.
+    batches = [
+        list(
+            range(
+                int(shard["first_global_image_index"]),
+                int(shard["first_global_image_index"]) + int(shard["image_count"]),
+            )
+        )
+        for shard in (left_shard, right_shard)
+    ]
     pipeline = _pipeline(reader, native_physical=False)
     pipeline.start(batches)
     left = next(pipeline)
     right = next(pipeline)
-    y = torch.cat((left.y, right.y), dim=0)
-    cbcr = torch.cat((left.cbcr, right.cbcr), dim=0)
-    ids = left.global_image_ids + right.global_image_ids
+    left_offset = first - int(left_shard["first_global_image_index"])
+    left_count = boundary - first
+    right_count = count - left_count
+    y = torch.cat(
+        (left.y[left_offset : left_offset + left_count], right.y[:right_count]), dim=0
+    )
+    cbcr = torch.cat(
+        (
+            left.cbcr[left_offset : left_offset + left_count],
+            right.cbcr[:right_count],
+        ),
+        dim=0,
+    )
+    ids = (
+        left.global_image_ids[left_offset : left_offset + left_count]
+        + right.global_image_ids[:right_count]
+    )
     torch.cuda.synchronize()
     pipeline.close()
     return y, cbcr, ids
@@ -277,7 +308,12 @@ def main() -> int:
     right_count = args.image_count - left_count
     reader = reader_type(args.manifest, module_path=args.module_path)
     legacy_y, legacy_cbcr, legacy_ids = _legacy(
-        reader, torch, first_image, args.image_count, boundary
+        reader,
+        torch,
+        first_image,
+        args.image_count,
+        left_shard,
+        right_shard,
     )
     performance_shards = [left_shard, right_shard]
     performance_first = int(left_shard["first_global_image_index"])

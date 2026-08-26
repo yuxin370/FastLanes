@@ -201,6 +201,9 @@ std::vector<uint8_t> normalize_coefficient_selection(const JpegDctCoefficientSel
 		}
 		return coefficients;
 	}
+	if (selection.coefficients.size() > kJpegDctCoefficientCount) {
+		throw std::invalid_argument("JPEG DCT coefficient selection contains more than 64 coefficients");
+	}
 	coefficients = selection.coefficients;
 	std::array<bool, kJpegDctCoefficientCount> seen {};
 	for (const auto coeff : coefficients) {

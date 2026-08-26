@@ -60,6 +60,10 @@ struct SparseRowgroupAccessIndex {
 	std::vector<SparseByteRange>              index_ranges;
 	std::vector<SparseByteRange>              shared_ranges;
 	std::vector<std::vector<SparseByteRange>> vector_ranges;
+	// For every logical column, identify its non-shared segment positions in
+	// vector_ranges.  This lets a single sparse plan intersect spatial vectors
+	// with coefficient columns without rebuilding descriptor geometry.
+	std::vector<std::vector<size_t>>           column_vector_range_indices;
 	std::vector<size_t>                       vector_storage_bytes;
 	std::vector<std::byte>                    static_prefix;
 };
@@ -639,18 +643,38 @@ build_sparse_rowgroup_access_index(fastlanes::File& file, const fastlanes::Rowgr
 	entry->static_prefix.insert(entry->static_prefix.end(), shared_prefix.begin(), shared_prefix.end());
 	entry->vector_ranges.resize(rowgroup.m_n_vec());
 	entry->vector_storage_bytes.assign(rowgroup.m_n_vec(), 0U);
-	for (const auto* segment : segments) {
-		if (segment_entrypoint_count(*segment) == 1U) {
-			continue;
+	const auto* columns = rowgroup.m_column_descriptors();
+	if (columns == nullptr) {
+		throw std::runtime_error("sparse rowgroup column descriptors are missing");
+	}
+	entry->column_vector_range_indices.resize(columns->size());
+	size_t vector_range_index = 0U;
+	for (flatbuffers::uoffset_t column_index = 0U; column_index < columns->size(); ++column_index) {
+		const auto* column = columns->Get(column_index);
+		if (column == nullptr) {
+			throw std::runtime_error("sparse rowgroup column descriptor is missing");
 		}
-		for (uint32_t vector = 0U; vector < rowgroup.m_n_vec(); ++vector) {
-			const auto range = segment_vector_range(*segment, index_backing.data(), vector);
-			entry->vector_ranges[vector].push_back(range);
-			if (range.size > std::numeric_limits<size_t>::max() - entry->vector_storage_bytes[vector]) {
-				throw std::runtime_error("sparse rowgroup vector byte count overflow");
+		std::vector<const fastlanes::SegmentDescriptor*> column_segments;
+		collect_segment_descriptors(*column, column_segments);
+		for (const auto* segment : column_segments) {
+			if (segment_entrypoint_count(*segment) == 1U) {
+				continue;
 			}
-			entry->vector_storage_bytes[vector] += range.size;
+			entry->column_vector_range_indices[column_index].push_back(vector_range_index++);
+			for (uint32_t vector = 0U; vector < rowgroup.m_n_vec(); ++vector) {
+				const auto range = segment_vector_range(*segment, index_backing.data(), vector);
+				entry->vector_ranges[vector].push_back(range);
+				if (range.size > std::numeric_limits<size_t>::max() - entry->vector_storage_bytes[vector]) {
+					throw std::runtime_error("sparse rowgroup vector byte count overflow");
+				}
+				entry->vector_storage_bytes[vector] += range.size;
+			}
 		}
+	}
+	if (std::any_of(entry->vector_ranges.begin(), entry->vector_ranges.end(), [&](const auto& ranges) {
+		    return ranges.size() != vector_range_index;
+	    })) {
+		throw std::logic_error("sparse rowgroup column/vector range index is inconsistent");
 	}
 	entry->supported = true;
 	entry->fallback_reason.clear();
@@ -1756,6 +1780,7 @@ struct SparseVectorReadPlan::Impl {
 	size_t                         selected_vector_count = 0U;
 	size_t                         storage_bytes        = 0U;
 	size_t                         selected_storage_bytes = 0U;
+	std::vector<uint8_t>           materialized_columns;
 	Strategy                       strategy             = Strategy::kFullRowgroup;
 	std::string                    fallback_reason;
 	std::vector<detail::SparseByteRange> exact_source_ranges;
@@ -2570,7 +2595,20 @@ bool FlsReader::sparse_vector_read_supported(const size_t rowgroup_idx, std::str
 
 SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	const size_t rowgroup_idx, const std::vector<uint32_t>& selected_vectors, const bool packed_device_scatter) const {
+	return compile_sparse_vector_read_plan(
+	    rowgroup_idx, selected_vectors, std::vector<uint8_t> {}, packed_device_scatter);
+}
+
+SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
+	const size_t                    rowgroup_idx,
+	const std::vector<uint32_t>&    selected_vectors,
+	const std::vector<uint8_t>&     selected_columns,
+	const bool                      packed_device_scatter) const {
 	if (m_compact_descriptor != nullptr) {
+		if (!selected_columns.empty()) {
+			throw std::invalid_argument(
+			    "combined selected-vector/selected-column plans require manifest-v1 FLS storage");
+		}
 		if (rowgroup_idx >= m_compact_descriptor->rowgroup_count()) {
 			throw std::out_of_range("rowgroup_idx out of range");
 		}
@@ -2610,6 +2648,52 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	if (rowgroup == nullptr) {
 		throw std::runtime_error("rowgroup descriptor is missing");
 	}
+	std::vector<uint8_t> materialized_columns(selected_columns);
+	std::sort(materialized_columns.begin(), materialized_columns.end());
+	materialized_columns.erase(
+	    std::unique(materialized_columns.begin(), materialized_columns.end()), materialized_columns.end());
+	const auto* column_descriptors = rowgroup->m_column_descriptors();
+	if (column_descriptors == nullptr) {
+		throw std::runtime_error("rowgroup column descriptors are missing");
+	}
+	if (!materialized_columns.empty() && materialized_columns.back() >= column_descriptors->size()) {
+		throw std::out_of_range("selected column exceeds rowgroup column count");
+	}
+	std::vector<uint8_t> physical_columns;
+	if (!materialized_columns.empty()) {
+		const auto column_plan = detail::build_zero_copy_column_plan(*rowgroup, /*load_column_names=*/false);
+		std::vector<uint8_t> state(column_plan.size(), 0U);
+		std::vector<bool>    active(column_plan.size(), false);
+		const auto resolve = [&](const auto& self, const size_t column_index) -> void {
+			if (column_index >= column_plan.size()) {
+				throw std::out_of_range("selected column alias target exceeds rowgroup column count");
+			}
+			if (state[column_index] == 2U) {
+				return;
+			}
+			if (state[column_index] == 1U) {
+				throw std::runtime_error("cycle detected in selected column aliases");
+			}
+			state[column_index] = 1U;
+			if (column_plan[column_index].alias_of.has_value()) {
+				self(self, *column_plan[column_index].alias_of);
+			} else {
+				active[column_index] = true;
+			}
+			state[column_index] = 2U;
+		};
+		for (const auto column : materialized_columns) {
+			resolve(resolve, column);
+		}
+		for (size_t column = 0U; column < active.size(); ++column) {
+			if (active[column]) {
+				physical_columns.push_back(static_cast<uint8_t>(column));
+			}
+		}
+		if (physical_columns.empty()) {
+			throw std::runtime_error("selected columns resolve to no physical payload columns");
+		}
+	}
 	const size_t rowgroup_bytes = static_cast<size_t>(rowgroup->m_size());
 	const size_t vector_count   = static_cast<size_t>(rowgroup->m_n_vec());
 	std::vector<uint32_t> vectors(selected_vectors);
@@ -2627,10 +2711,11 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	plan->rowgroup_bytes        = rowgroup_bytes;
 	plan->full_vector_count     = vector_count;
 	plan->selected_vector_count = vectors.size();
+	plan->materialized_columns  = materialized_columns;
 	const auto recipe_lookup_begin = std::chrono::steady_clock::now();
 	const auto selection_words = detail::sparse_selection_words(vector_count, vectors);
 	const detail::SparseReadRecipeRecord* recipe_record = nullptr;
-	if (m_sparse_read_recipe) {
+	if (m_sparse_read_recipe && materialized_columns.empty()) {
 		recipe_record = detail::find_sparse_read_recipe_record(*m_sparse_read_recipe, rowgroup_idx, selection_words);
 	}
 	plan->recipe_lookup_ms = std::chrono::duration<double, std::milli>(
@@ -2664,20 +2749,34 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	plan->endpoint_resolution_ms = std::chrono::duration<double, std::milli>(
 	    std::chrono::steady_clock::now() - endpoint_begin).count();
 	plan->access = access;
-	if (!access->supported || vectors.size() >= vector_count) {
+	if (!access->supported || (vectors.size() >= vector_count && materialized_columns.empty())) {
 		plan->fallback_reason = access->supported ? "selected-vectors-cover-full-rowgroup" : access->fallback_reason;
 		plan->storage_bytes   = rowgroup_bytes;
 		plan->selected_storage_bytes = rowgroup_bytes;
 		return SparseVectorReadPlan(std::move(plan));
 	}
 
-	if (!m_sparse_vector_bundle) {
+	if (!m_sparse_vector_bundle || !materialized_columns.empty()) {
 		plan->strategy = SparseVectorReadPlan::Impl::Strategy::kSourceRanges;
 		std::vector<detail::SparseByteRange> ranges;
 		const auto gather_begin = std::chrono::steady_clock::now();
 		for (const auto vector : vectors) {
 			const auto& vector_ranges = access->vector_ranges.at(vector);
-			ranges.insert(ranges.end(), vector_ranges.begin(), vector_ranges.end());
+			if (materialized_columns.empty()) {
+				ranges.insert(ranges.end(), vector_ranges.begin(), vector_ranges.end());
+				continue;
+			}
+			for (const auto physical_column : physical_columns) {
+				if (physical_column >= access->column_vector_range_indices.size()) {
+					throw std::logic_error("selected physical column is absent from sparse access geometry");
+				}
+				for (const auto range_index : access->column_vector_range_indices[physical_column]) {
+					if (range_index >= vector_ranges.size()) {
+						throw std::logic_error("selected column/vector sparse range index is out of bounds");
+					}
+					ranges.push_back(vector_ranges[range_index]);
+				}
+			}
 		}
 		plan->range_gather_ms = std::chrono::duration<double, std::milli>(
 		    std::chrono::steady_clock::now() - gather_begin).count();
@@ -4027,7 +4126,9 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 			timing->sparse_fallback_reason = plan.fallback_reason;
 			timing->sparse_read_supported = plan.fallback_reason == "selected-vectors-cover-full-rowgroup";
 		}
-		return read_rowgroup_zero_copy(plan.rowgroup_index, timing);
+		auto zero_copy = read_rowgroup_zero_copy(plan.rowgroup_index, timing);
+		zero_copy.materialized_column_indices = plan.materialized_columns;
+		return zero_copy;
 	}
 	if (!plan.access) {
 		throw std::runtime_error("compiled sparse rowgroup access index is unavailable");
@@ -4228,6 +4329,12 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 		    plan.strategy != SparseVectorReadPlan::Impl::Strategy::kBoundedSourceRanges;
 		timing->used_vector_bundle_envelope_read =
 		    plan.strategy == SparseVectorReadPlan::Impl::Strategy::kBundleEnvelope;
+		if (!plan.materialized_columns.empty()) {
+			timing->logical_storage_bytes       = plan.selected_storage_bytes;
+			timing->selected_coefficient_count  = plan.materialized_columns.size();
+			timing->full_coefficient_count      = rowgroup->m_column_descriptors()->size();
+			timing->used_coefficient_range_read = true;
+		}
 	}
 	auto zero_copy = make_zero_copy_rowgroup_from_backing(plan.rowgroup_index,
 	                                                      std::static_pointer_cast<void>(logical),
@@ -4235,6 +4342,7 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 	                                                      logical->Capacity(),
 	                                                      /*backing_is_pinned=*/false,
 	                                                      timing);
+	zero_copy.materialized_column_indices = plan.materialized_columns;
 	zero_copy.packed_device_payload = std::move(device_payload);
 	return zero_copy;
 }
