@@ -3,6 +3,7 @@
 #include "direct_dct/direct_dct_metrics.hpp"
 #include "direct_dct/native_batch_lifetime.hpp"
 #include "direct_dct/native_logical_batch_pipeline.hpp"
+#include "direct_dct_pls_torch.hpp"
 #include "cuda/memory/device_pool.cuh"
 #include <ATen/cuda/CUDAEvent.h>
 #include <algorithm>
@@ -3383,4 +3384,5 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 		}
 		return pointers;
 	}, py::arg("bytes"), py::arg("attempts"));
+	bind_direct_dct_pls_torch(m);
 }

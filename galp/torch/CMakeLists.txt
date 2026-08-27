@@ -45,6 +45,7 @@ find_library(GALP_TORCH_PYTHON_LIBRARY
 
 Python3_add_library(_galp_direct_dct MODULE WITH_SOABI
         direct_dct_torch.cpp
+		direct_dct_pls_torch.cpp
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/direct_dct_metrics.cpp
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_batch_lifetime.cpp
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/physical_layout_planner.cpp
@@ -128,7 +129,7 @@ if (BUILD_TESTING)
                 COMMAND ${CMAKE_COMMAND} -E env
                         "PYTHONPATH=$<TARGET_FILE_DIR:_galp_direct_dct>"
                         ${Python3_EXECUTABLE}
-                        -c "import torch; import _galp_direct_dct as m; print(torch.__version__); print(torch.cuda.is_available()); assert m.DirectDctReader; assert m.DirectDctPipeline; assert m.DirectDctBatch; assert m.DIRECT_DCT_PROFILE_SCHEMA == 'galp-direct-dct-profile-v1'; assert m.DIRECT_DCT_METRICS_SCHEMA == 'galp-direct-dct-metrics-v2'; assert m.available_direct_dct_profiles()"
+                        -c "import torch; import _galp_direct_dct as m; print(torch.__version__); print(torch.cuda.is_available()); assert m.DirectDctReader; assert m.DirectDctPipeline; assert m.DirectDctBatch; assert m.DirectDctPlsPipeline; assert m.DirectDctPlsPool; assert m.DirectDctPlsMicrobatch; assert m.DIRECT_DCT_PROFILE_SCHEMA == 'galp-direct-dct-profile-v1'; assert m.DIRECT_DCT_METRICS_SCHEMA == 'galp-direct-dct-metrics-v2'; assert 'rgbnomore-training-pls-v1' in m.available_direct_dct_profiles()"
         )
         set_tests_properties(GalpDirectDctTorchImport PROPERTIES
                 LABELS "galp;jpeg-dct;direct-dct;torch;smoke"
@@ -142,6 +143,17 @@ if (BUILD_TESTING)
         )
         set_tests_properties(GalpDirectDctTorchRuntimeSmoke PROPERTIES
                 LABELS "galp;jpeg-dct;direct-dct;torch;gpu;smoke"
+                SKIP_RETURN_CODE 77
+        )
+        add_test(
+                NAME GalpDirectDctPlsTorchRuntimeSmoke
+                COMMAND ${CMAKE_COMMAND} -E env
+                        "PYTHONPATH=${PROJECT_SOURCE_DIR}:$<TARGET_FILE_DIR:_galp_direct_dct>"
+                        ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/direct_dct_pls_torch_runtime_smoke.py
+        )
+        set_tests_properties(GalpDirectDctPlsTorchRuntimeSmoke PROPERTIES
+                LABELS "galp;jpeg-dct;direct-dct;pls;torch;gpu;smoke"
                 SKIP_RETURN_CODE 77
         )
 endif ()
