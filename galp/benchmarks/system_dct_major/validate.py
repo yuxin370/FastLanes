@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import math
 from pathlib import Path
@@ -14,6 +15,7 @@ import numpy as np
 
 from common import (
     BLOCK_MAJOR_RUNTIME_PROFILE,
+    GALP_PIPELINES,
     PIPELINE_RESULT_SCHEMA,
     SUMMARY_SCHEMA,
     distribution,
@@ -125,7 +127,21 @@ def _aggregate(contract: dict[str, Any], result: dict[str, Any]) -> dict[str, An
 
     return {
         "pipeline": result["pipeline"],
+        "display_name": result.get("display_name", result["pipeline"]),
         "domain": result["domain"],
+        "coefficient_selection": {
+            key: result.get("pipeline_config", {}).get(key)
+            for key in (
+                "coefficient_spec",
+                "coefficient_selection_kind",
+                "coefficient_count",
+                "resolved_zigzag_column_indices",
+                "resolved_natural_indices",
+                "coefficient_seed",
+                "coefficient_mask_stage",
+            )
+            if key in result.get("pipeline_config", {})
+        },
         "cold_start": {
             "repeat": int(cold["repeat"]),
             "scope": "controlled-repeat-scope" if controlled_io else "process-scope",
@@ -189,6 +205,21 @@ def _aggregate(contract: dict[str, Any], result: dict[str, Any]) -> dict[str, An
         ),
         "h2d_mean_ms": distribution([float(item["top_level_h2d_ms"]["mean"]) for item in hot]),
         "model_mean_ms": distribution([float(item["model_ms"]["mean"]) for item in hot]),
+        "accuracy_top1": distribution(
+            [float(item["accuracy_top1"]) for item in hot if "accuracy_top1" in item]
+        )
+        if any("accuracy_top1" in item for item in hot)
+        else None,
+        "accuracy_top5": distribution(
+            [float(item["accuracy_top5"]) for item in hot if "accuracy_top5" in item]
+        )
+        if any("accuracy_top5" in item for item in hot)
+        else None,
+        "cross_entropy_loss": distribution(
+            [float(item["cross_entropy_loss"]) for item in hot if "cross_entropy_loss" in item]
+        )
+        if any("cross_entropy_loss" in item for item in hot)
+        else None,
         "host_peak_rss_bytes": distribution([float(item["host_peak_rss_bytes"]) for item in hot]),
         "peak_torch_gpu_allocated_bytes": distribution(
             [float(item["peak_torch_gpu_allocated_bytes"]) for item in hot]
@@ -331,6 +362,182 @@ def _semantic_compare(
     return result
 
 
+def _compare_raw_mask_oracle(
+    native_result: dict[str, Any],
+    contract: dict[str, Any],
+    failures: list[str],
+) -> dict[str, Any] | None:
+    """Compare full native predictions with the audited raw-JPEG mask run."""
+
+    if contract["workload"]["kind"] != "evaluation":
+        return None
+    selection = native_result.get("pipeline_config", {})
+    oracle = contract.get("semantic_validation", {}).get("raw_mask_oracle")
+    if oracle is None:
+        if (
+            selection.get("coefficient_selection_kind") == "prefix"
+            and int(selection.get("coefficient_count", 0)) == 32
+        ):
+            failures.append("GALP first:32 evaluation is missing the raw-mask oracle contract")
+        return None
+
+    condition_id = str(oracle["condition_id"])
+    predictions_column = f"{condition_id}__top1_class"
+    predictions_fingerprint = oracle["per_sample_top1"]
+    curve_fingerprint = oracle["prefix_accuracy_curve"]
+    metadata_fingerprint = oracle["run_metadata"]
+    predictions_path = Path(predictions_fingerprint["path"])
+    curve_path = Path(curve_fingerprint["path"])
+    metadata_path = Path(metadata_fingerprint["path"])
+    for path, fingerprint in (
+        (predictions_path, predictions_fingerprint),
+        (curve_path, curve_fingerprint),
+        (metadata_path, metadata_fingerprint),
+    ):
+        _require(
+            path.is_file() and sha256_file(path) == fingerprint.get("sha256"),
+            failures,
+            f"raw-mask oracle artifact changed: {path}",
+        )
+    if not predictions_path.is_file() or not curve_path.is_file() or not metadata_path.is_file():
+        return None
+
+    metadata = read_json(metadata_path)
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    signature = metadata_dict.get("run_signature", {})
+    signature = signature if isinstance(signature, dict) else {}
+    oracle_conditions = {
+        str(item.get("condition_id")): item
+        for item in signature.get("conditions", [])
+        if isinstance(item, dict)
+    }
+    oracle_condition = oracle_conditions.get(condition_id)
+    expected_checkpoint_sha256 = contract["models"]["dct"]["checkpoint_sha256"]
+    expected_stage = str(selection["coefficient_mask_stage"])
+    expected_natural_indices = list(selection["resolved_natural_indices"])
+    _require(metadata_dict.get("status") == "complete", failures, "raw-mask oracle run is incomplete")
+    _require(
+        signature.get("checkpoint_sha256") == expected_checkpoint_sha256,
+        failures,
+        "raw-mask oracle checkpoint differs from the GALP DCT checkpoint",
+    )
+    _require(
+        signature.get("mask_application_stage") == expected_stage,
+        failures,
+        "raw-mask oracle coefficient mask stage differs from the GALP contract",
+    )
+    _require(
+        isinstance(oracle_condition, dict)
+        and oracle_condition.get("natural_indices") == expected_natural_indices,
+        failures,
+        f"raw-mask oracle condition {condition_id} differs from the resolved coefficient selection",
+    )
+    _require(
+        int(signature.get("sample_count", -1)) >= int(contract["dataset"]["sample_count"]),
+        failures,
+        "raw-mask oracle does not cover the GALP evaluation sample count",
+    )
+
+    artifact = _artifact(native_result["semantic_artifact"])
+    native_predictions = np.asarray(artifact.get("top1_predictions", []), dtype=np.int64)
+    samples = load_sample_manifest(
+        Path(contract["dataset"]["sample_manifest"]),
+        contract["dataset"]["sample_manifest_sha256"],
+    )
+    oracle_predictions: list[int] = []
+    identity_match = True
+    with gzip.open(predictions_path, "rt", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if predictions_column not in (reader.fieldnames or []):
+            failures.append(f"raw-mask oracle has no column {predictions_column}")
+            return None
+        for sample, row in zip(samples, reader, strict=False):
+            logical_id = sample.get("sample_id") or sample.get("logical_sample_id")
+            identity_match = identity_match and str(row.get("logical_sample_id")) == str(logical_id)
+            identity_match = identity_match and int(row.get("label", -1)) == int(sample["label"])
+            oracle_predictions.append(int(row[predictions_column]))
+    oracle_array = np.asarray(oracle_predictions, dtype=np.int64)
+    identity_match = identity_match and len(oracle_array) == len(samples)
+    _require(identity_match, failures, "raw-mask oracle sample identity/order differs from the GALP contract")
+    _require(
+        native_predictions.shape == oracle_array.shape,
+        failures,
+        "raw-mask oracle/native full prediction shapes differ",
+    )
+    agreement = (
+        float(np.mean(native_predictions == oracle_array))
+        if native_predictions.shape == oracle_array.shape and native_predictions.size
+        else 0.0
+    )
+    minimum_agreement = float(
+        contract["semantic_validation"].get("full_prediction_top1_agreement_min", 0.999)
+    )
+    _require(
+        agreement >= minimum_agreement,
+        failures,
+        f"native/raw-mask full Top-1 agreement {agreement:.6f} is below {minimum_agreement:.6f}",
+    )
+
+    oracle_row: dict[str, str] | None = None
+    with curve_path.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            if row.get("condition_id") == condition_id:
+                oracle_row = row
+                break
+    _require(oracle_row is not None, failures, f"raw-mask accuracy curve has no row {condition_id}")
+    curve_accuracy = float(oracle_row["accuracy_top1"]) if oracle_row is not None else math.nan
+    oracle_labels = np.asarray([int(sample["label"]) for sample in samples], dtype=np.int64)
+    oracle_accuracy = (
+        float(np.mean(oracle_array == oracle_labels))
+        if oracle_array.shape == oracle_labels.shape and oracle_array.size
+        else math.nan
+    )
+    if len(samples) == int(signature.get("sample_count", -1)):
+        _require(
+            math.isclose(oracle_accuracy, curve_accuracy, rel_tol=0.0, abs_tol=1.0e-12),
+            failures,
+            "raw-mask per-sample predictions disagree with the published full accuracy curve",
+        )
+    native_accuracy = float(native_result["repeats"][0]["accuracy_top1"])
+    accuracy_delta = native_accuracy - oracle_accuracy
+    configured_maximum_delta = float(
+        contract["semantic_validation"].get("native_oracle_accuracy_delta_max", 0.0005)
+    )
+    # A smoke prefix cannot represent an accuracy delta smaller than one
+    # sample.  Keep the published full-run threshold for formal 50K, while
+    # allowing at most one-sample resolution on shorter exact-order prefixes.
+    maximum_delta = max(
+        configured_maximum_delta,
+        1.0 / len(oracle_array) if len(oracle_array) else math.inf,
+    )
+    _require(
+        abs(accuracy_delta) <= maximum_delta,
+        failures,
+        f"native/raw-mask Top-1 delta {100.0 * accuracy_delta:.6f} pp exceeds {100.0 * maximum_delta:.6f} pp",
+    )
+    return {
+        "condition_id": condition_id,
+        "checkpoint_sha256": expected_checkpoint_sha256,
+        "coefficient_mask_stage": expected_stage,
+        "sample_count": len(oracle_array),
+        "sample_identity_match": identity_match,
+        "full_top1_prediction_agreement": agreement,
+        "full_top1_prediction_agreement_min": minimum_agreement,
+        "native_accuracy_top1": native_accuracy,
+        "oracle_accuracy_top1": oracle_accuracy,
+        "oracle_full_curve_accuracy_top1": curve_accuracy,
+        "accuracy_delta_percentage_points": 100.0 * accuracy_delta,
+        "accuracy_delta_max_percentage_points": 100.0 * maximum_delta,
+        "configured_accuracy_delta_max_percentage_points": 100.0 * configured_maximum_delta,
+        "ok": bool(
+            identity_match
+            and native_predictions.shape == oracle_array.shape
+            and agreement >= minimum_agreement
+            and abs(accuracy_delta) <= maximum_delta
+        ),
+    }
+
+
 def _validate_result(
     name: str,
     result: dict[str, Any],
@@ -361,11 +568,11 @@ def _validate_result(
                 f"{name}: missing steady-state throughput",
             )
         pipeline_config = contract["pipelines"].get(name, {})
-        if name == "dct_major_pushdown":
+        if name in GALP_PIPELINES:
             _require(
                 pipeline_config.get("runtime_profile") == BLOCK_MAJOR_RUNTIME_PROFILE,
                 failures,
-                "dct_major_pushdown: missing current native runtime profile",
+                f"{name}: missing current native runtime profile",
             )
             native = repeat.get("native_totals", {})
             native_segments = repeat.get("native_segments", [])
@@ -406,8 +613,30 @@ def _validate_result(
                 failures,
                 f"{name}: missing first-shard ready time",
             )
-        if name == "dct_major_pushdown":
+        if name in GALP_PIPELINES:
             native = repeat.get("native_totals", {})
+            coefficient_count = pipeline_config.get("coefficient_count")
+            if isinstance(coefficient_count, int):
+                selected_coefficient_count = int(native.get("selected_coefficient_count", -1))
+                full_coefficient_count = int(native.get("full_coefficient_count", -1))
+                _require(
+                    selected_coefficient_count > 0
+                    and full_coefficient_count > 0
+                    and math.isclose(
+                        selected_coefficient_count / full_coefficient_count,
+                        coefficient_count / 64.0,
+                        rel_tol=1.0e-12,
+                        abs_tol=1.0e-12,
+                    )
+                    and math.isclose(
+                        float(native.get("selected_coefficient_ratio", math.nan)),
+                        coefficient_count / 64.0,
+                        rel_tol=1.0e-12,
+                        abs_tol=1.0e-12,
+                    ),
+                    failures,
+                    f"{name}: native selected/full coefficient metrics disagree with K={coefficient_count}",
+                )
             _require(
                 isinstance(contract["dataset"].get("block_major_access"), dict),
                 failures,
@@ -629,19 +858,22 @@ def _validate_result(
             actual_read_bytes = int(native.get("compressed_payload_bytes_read", -1))
             _require(
                 exact_bytes > 0
-                and exact_bytes == selected_bytes
-                and physical_bytes == actual_read_bytes
                 and gap_bytes == physical_bytes - exact_bytes,
                 failures,
-                "dct_major_pushdown: bounded exact/physical/gap byte accounting is inconsistent",
+                "dct_major_pushdown: bounded-subset exact/physical/gap byte accounting is inconsistent",
             )
             _require(
-                physical_bytes <= (exact_bytes * cap_ppm) // 1_000_000
-                and physical_bytes <= full_bytes,
+                selected_bytes > 0
+                and actual_read_bytes == selected_bytes + gap_bytes
+                and actual_read_bytes <= (selected_bytes * cap_ppm) // 1_000_000
+                and actual_read_bytes <= full_bytes
+                and physical_bytes <= (exact_bytes * cap_ppm) // 1_000_000,
                 failures,
-                "dct_major_pushdown: bounded physical bytes exceed the whole-run cap or full payload",
+                "dct_major_pushdown: selected/physical bytes exceed the whole-run cap or full payload",
             )
-            expected_read_amplification = physical_bytes / exact_bytes if exact_bytes > 0 else 0.0
+            expected_read_amplification = (
+                actual_read_bytes / selected_bytes if selected_bytes > 0 else 0.0
+            )
             _require(
                 math.isclose(
                     float(native.get("read_amplification", math.nan)),
@@ -672,7 +904,8 @@ def _validate_result(
             _require(
                 native.get("bounded_io_backend") == "io-uring"
                 and int(native.get("bounded_io_uring_queue_depth", -1)) == 256
-                and int(native.get("pread_count", -1)) == 0
+                and int(native.get("pread_count", -1))
+                == int(native.get("full_rowgroup_strategy_count", -2))
                 and io_requests == io_completions
                 and io_requests >= physical_runs
                 and 0 < io_submits < io_requests
@@ -690,9 +923,9 @@ def _validate_result(
             )
             _require(
                 segment_count > 0
-                and sidecar_hits == segment_count
+                and sidecar_hits == 1
                 and sidecar_misses == 0
-                and schedule_builds == 0
+                and schedule_builds == segment_count - 1
                 and int(native.get("active_output_schedule_sidecar_reject_count", -1)) == 0
                 and int(native.get("active_output_schedule_sidecar_persist_count", -1)) == 0
                 and int(native.get("active_output_schedule_sidecar_bytes", 0)) > 0
@@ -702,15 +935,27 @@ def _validate_result(
                 and int(native.get("active_output_schedule_mmap_window_count", 0)) == 2
                 and int(native.get("active_output_schedule_mapped_bytes_peak", 0)) > 0,
                 failures,
-                "dct_major_pushdown: frozen schedule sidecar evidence is inconsistent",
+                "dct_major_pushdown: frozen shard-0 schedule sidecar evidence is inconsistent",
+            )
+            coefficient_count = int(pipeline_config.get("coefficient_count", 64))
+            expected_storage_read_granularity = (
+                "selected-coefficient-range"
+                if coefficient_count < 64
+                else "bounded-selected-vector-range"
             )
             _require(
-                int(native.get("run_interval_bounded_rowgroup_count", 0))
+                int(native.get("run_interval_bounded_rowgroup_count", 0)) > 0
+                and int(native.get("run_interval_bounded_rowgroup_count", 0))
+                + int(native.get("full_rowgroup_strategy_count", 0))
                 == int(native.get("rowgroup_count", -1))
-                and native.get("storage_read_granularity") == "bounded-selected-vector-range"
+                and int(native.get("run_interval_exact_rowgroup_count", -1)) == 0
+                and int(native.get("bitmap_exact_rowgroup_count", -1)) == 0
+                and native.get("storage_read_granularity")
+                == expected_storage_read_granularity
                 and native.get("decode_granularity") == "selected-vector",
                 failures,
-                "dct_major_pushdown: native profile did not remain bounded-read + selected-decode",
+                f"{name}: native profile left the bounded/full-rowgroup + "
+                f"{expected_storage_read_granularity} + selected-decode policy",
             )
             capacity = int(native.get("decode_workset_capacity_bytes", 0))
             expected_capacity = 512 * 1024 * 1024
@@ -830,6 +1075,8 @@ def _write_csv(
     columns = (
         "pipeline",
         "domain",
+        "coefficient_spec",
+        "coefficient_count",
         "repeat",
         "images",
         "seconds",
@@ -846,6 +1093,7 @@ def _write_csv(
         "gpu_utilization_mean_percent",
         "accuracy_top1",
         "accuracy_top5",
+        "cross_entropy_loss",
         "planning_ms",
         "planning_item_count",
         "sort_item_count",
@@ -854,6 +1102,9 @@ def _write_csv(
         "selected_compressed_payload_bytes",
         "compressed_payload_bytes_read",
         "full_compressed_payload_bytes",
+        "selected_coefficient_count",
+        "full_coefficient_count",
+        "selected_coefficient_ratio",
         "physical_io_saving",
         "read_amplification",
         "process_io_logical_read_bytes",
@@ -871,6 +1122,8 @@ def _write_csv(
         "vector_run_revisit_count",
         "physical_read_order_inversions",
         "decoded_coefficient_bytes",
+        "decode_ms",
+        "transform_ms",
         "requested_source_block_count",
         "host_peak_rss_bytes",
         "native_pinned_peak_bytes",
@@ -958,6 +1211,12 @@ def _write_csv(
                     {
                         "pipeline": result["pipeline"],
                         "domain": result["domain"],
+                        "coefficient_spec": result.get("pipeline_config", {}).get(
+                            "coefficient_spec"
+                        ),
+                        "coefficient_count": result.get("pipeline_config", {}).get(
+                            "coefficient_count"
+                        ),
                         "repeat": repeat["repeat"],
                         "images": repeat["images"],
                         "seconds": repeat["seconds"],
@@ -983,6 +1242,7 @@ def _write_csv(
                         ),
                         "accuracy_top1": repeat.get("accuracy_top1"),
                         "accuracy_top5": repeat.get("accuracy_top5"),
+                        "cross_entropy_loss": repeat.get("cross_entropy_loss"),
                         "planning_ms": native(native_totals, "planning_ms", "prefetch_planning_ms"),
                         "planning_item_count": native(
                             native_totals, "host_expanded_transform_items_created"
@@ -993,6 +1253,15 @@ def _write_csv(
                         "selected_compressed_payload_bytes": selected_compressed,
                         "compressed_payload_bytes_read": compressed,
                         "full_compressed_payload_bytes": full_compressed,
+                        "selected_coefficient_count": native(
+                            native_totals, "selected_coefficient_count"
+                        ),
+                        "full_coefficient_count": native(
+                            native_totals, "full_coefficient_count"
+                        ),
+                        "selected_coefficient_ratio": native(
+                            native_totals, "selected_coefficient_ratio"
+                        ),
                         "physical_io_saving": (
                             1.0 - compressed / full_compressed if full_compressed else 0.0
                         ),
@@ -1028,6 +1297,12 @@ def _write_csv(
                             native_totals, "physical_read_order_inversions"
                         ),
                         "decoded_coefficient_bytes": native(native_totals, "decoded_coefficient_bytes"),
+                        "decode_ms": native(native_totals, "decode_ms"),
+                        "transform_ms": native(
+                            native_totals,
+                            "fixed_transform_ms",
+                            "planless_transform_gpu_kernel_ms",
+                        ),
                         "requested_source_block_count": native(
                             native_totals, "requested_source_block_count"
                         ),
@@ -1191,19 +1466,44 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         f"Workload: `{summary['workload']}`; sample order: `galp_image_id_ascending`; shuffle: `false`.",
         f"Preprocess: `{summary.get('preprocess_profile', 'unspecified')}`.",
         "",
-        "| Pipeline | Domain | Cold E2E (img/s) | Cold first batch (ms) | Hot E2E p50 (img/s) | Steady p50 (img/s) | Hot first batch p50 (ms) |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Pipeline | Domain | Coeff spec | K | Top-1 | Top-5 | CE | Physical read | Decode ms | Transform ms | Model ms | Cold img/s | Hot img/s |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for aggregate in summary["aggregates"]:
-        steady = aggregate["steady_throughput_images_per_s"]
-        steady_text = f"{steady['p50']:.3f}" if steady is not None else "n/a"
+        selection = aggregate.get("coefficient_selection", {})
+        native = aggregate.get("native_hot_mean", {})
+        top1 = aggregate.get("accuracy_top1")
+        top5 = aggregate.get("accuracy_top5")
+        ce = aggregate.get("cross_entropy_loss")
+        transform_ms = native.get(
+            "fixed_transform_ms", native.get("planless_transform_gpu_kernel_ms")
+        )
+        top1_text = f"{100.0 * float(top1['p50']):.3f}%" if top1 is not None else "n/a"
         lines.append(
-            f"| {aggregate['pipeline']} | {aggregate['domain']} | "
+            f"| {aggregate.get('display_name', aggregate['pipeline'])} | {aggregate['domain']} | "
+            f"{selection.get('coefficient_spec', 'n/a')} | "
+            f"{selection.get('coefficient_count', 'n/a')} | "
+            f"{top1_text} | "
+        )
+        lines[-1] += (
+            f"{100.0 * float(top5['p50']):.3f}% | " if top5 is not None else "n/a | "
+        )
+        lines[-1] += f"{float(ce['p50']):.6f} | " if ce is not None else "n/a | "
+        lines[-1] += (
+            f"{int(native['bounded_physical_storage_bytes'])} | "
+            if "bounded_physical_storage_bytes" in native
+            else "n/a | "
+        )
+        lines[-1] += (
+            f"{float(native['decode_ms']):.3f} | " if "decode_ms" in native else "n/a | "
+        )
+        lines[-1] += (
+            f"{float(transform_ms):.3f} | " if transform_ms is not None else "n/a | "
+        )
+        lines[-1] += (
+            f"{aggregate['model_mean_ms']['p50']:.3f} | "
             f"{aggregate['cold_start']['throughput_images_per_s']:.3f} | "
-            f"{aggregate['cold_start']['time_to_first_batch_ms']:.3f} | "
-            f"{aggregate['throughput_images_per_s']['p50']:.3f} | "
-            f"{steady_text} | "
-            f"{aggregate['time_to_first_batch_ms']['p50']:.3f} |"
+            f"{aggregate['throughput_images_per_s']['p50']:.3f} |"
         )
     lines.extend(
         [
@@ -1258,6 +1558,26 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
     lines.extend(["", "## Hot-repeat speedups (diagnostic)", ""])
     for name, value in summary["speedups"].items():
         lines.append(f"- `{name}`: `{value:.6f}x`.")
+    comparison = summary.get("coefficient_comparison")
+    if comparison is not None:
+        lines.extend(
+            [
+                "",
+                "## GALP K64 versus selected coefficients",
+                "",
+                "| Metric | GALP K64 | GALP selected | Selected/K64 |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+        )
+        for metric in comparison["metric_rows"]:
+            ratio = metric.get("ratio")
+            ratio_text = f"{float(ratio):.6f}" if ratio is not None else "n/a"
+            if metric["name"] == "Top-1" and "delta_percentage_points" in metric:
+                ratio_text = f"{float(metric['delta_percentage_points']):+.6f} pp"
+            lines.append(
+                f"| {metric['name']} | {metric['galp_k64']} | "
+                f"{metric['galp_selected']} | {ratio_text} |"
+            )
     lines.extend(["", "## Stability", ""])
     for aggregate in summary["aggregates"]:
         lines.append(
@@ -1277,6 +1597,24 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
             f"- `{comparison['pipelines'][0]}` vs `{comparison['pipelines'][1]}`: "
             f"{comparison_status} ({comparison['enforcement']}); "
             f"output max_abs=`{comparison['output'].get('max_abs', float('nan')):.6g}`."
+        )
+    oracle = summary.get("raw_mask_oracle_comparison")
+    if oracle is not None:
+        lines.extend(
+            [
+                "",
+                "## Raw-mask oracle",
+                "",
+                f"- Condition: `{oracle['condition_id']}`; samples: `{oracle['sample_count']}`.",
+                f"- Full per-sample Top-1 agreement: "
+                f"`{100.0 * oracle['full_top1_prediction_agreement']:.6f}%` "
+                f"(minimum `{100.0 * oracle['full_top1_prediction_agreement_min']:.6f}%`).",
+                f"- Native/oracle Top-1: `{100.0 * oracle['native_accuracy_top1']:.6f}%` / "
+                f"`{100.0 * oracle['oracle_accuracy_top1']:.6f}%`; delta "
+                f"`{oracle['accuracy_delta_percentage_points']:+.6f} pp`.",
+                f"- Checkpoint SHA-256: `{oracle['checkpoint_sha256']}`; mask stage: "
+                f"`{oracle['coefficient_mask_stage']}`.",
+            ]
         )
     lines.extend(["", "## Block-major sidecar storage", ""])
     storage = summary["block_major_access_storage"]
@@ -1336,6 +1674,7 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
     failures: list[str] = []
     if contract["preprocess"].get("profile") == "fixed-center-224-from-512":
         geometry = contract["dataset"].get("source_geometry_validation") or {}
+        manifest_geometry = contract["dataset"].get("manifest_geometry_validation") or {}
         _require(
             int(geometry.get("validated_image_count", -1)) == len(samples)
             and [geometry.get("source_width"), geometry.get("source_height")] == [512, 512]
@@ -1345,10 +1684,26 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
             "fixed 512 source / center crop (144,144,224,224) geometry was not fully validated",
         )
         _require(
-            contract["preprocess"]["rgb"].get("resize_shorter") is None
-            and contract["preprocess"]["dct"].get("crop_reference_size_blocks") == [64, 64],
+            int(manifest_geometry.get("validated_image_count", -1))
+            == int(contract["dataset"]["dct_major_storage"]["header"]["image_count"])
+            and [
+                manifest_geometry.get("source_width"),
+                manifest_geometry.get("source_height"),
+            ]
+            == [512, 512]
+            and manifest_geometry.get("jpeg_sampling") == "4:2:0"
+            and manifest_geometry.get("y_blocks") == [64, 64]
+            and manifest_geometry.get("cbcr_blocks") == [32, 32],
             failures,
-            "fixed crop profile unexpectedly contains RGB resize or non-64-block DCT reference",
+            "native DCT-major manifest was not fully validated as the same fixed-512 4:2:0 view",
+        )
+        _require(
+            contract["preprocess"]["rgb"].get("resize_shorter") is None
+            and contract["preprocess"]["dct"].get("source_grid_size_blocks") == [64, 64]
+            and contract["preprocess"]["dct"].get("crop_reference_size_blocks") == [32, 32]
+            and contract["preprocess"]["dct"].get("center_crop_size_blocks") == [56, 56],
+            failures,
+            "fixed crop profile does not encode RGB-no-more 64 -> crop 56 -> resize 28 semantics",
         )
     results: dict[str, dict[str, Any]] = {}
     for name in contract["pipelines"]["enabled"]:
@@ -1392,6 +1747,13 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         for left, right, strict in semantic_pairs
         if left in results and right in results
     ]
+    raw_mask_oracle_comparison = (
+        _compare_raw_mask_oracle(
+            results["dct_major_coefficient_pushdown"], contract, failures
+        )
+        if "dct_major_coefficient_pushdown" in results
+        else None
+    )
     aggregate_list = [_aggregate(contract, results[name]) for name in contract["pipelines"]["enabled"] if name in results]
     aggregates = {item["pipeline"]: item for item in aggregate_list}
     maximum_cv = float(contract["stability_gates"]["maximum_hot_cv"])
@@ -1418,6 +1780,11 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
 
     ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
     ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
+    ratio(
+        "coefficient_pushdown_over_galp",
+        "dct_major_coefficient_pushdown",
+        "dct_major_pushdown",
+    )
     ratio("dali_over_pytorch", "dali", "pytorch")
 
     cold_speedups: dict[str, float] = {}
@@ -1428,7 +1795,158 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
 
     cold_ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
     cold_ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
+    cold_ratio(
+        "coefficient_pushdown_over_galp",
+        "dct_major_coefficient_pushdown",
+        "dct_major_pushdown",
+    )
     cold_ratio("dali_over_pytorch", "dali", "pytorch")
+
+    coefficient_comparison: dict[str, Any] | None = None
+    baseline_name = "dct_major_pushdown"
+    pushdown_name = "dct_major_coefficient_pushdown"
+    if baseline_name in aggregates and pushdown_name in aggregates:
+        baseline = aggregates[baseline_name]
+        pushdown = aggregates[pushdown_name]
+        baseline_native = baseline["native_hot_mean"]
+        pushdown_native = pushdown["native_hot_mean"]
+
+        def native_ratio(key: str) -> float | None:
+            denominator = float(baseline_native.get(key, 0.0))
+            return float(pushdown_native.get(key, 0.0)) / denominator if denominator > 0.0 else None
+
+        accuracy_delta_pp: float | None = None
+        if baseline.get("accuracy_top1") and pushdown.get("accuracy_top1"):
+            accuracy_delta_pp = 100.0 * (
+                float(pushdown["accuracy_top1"]["p50"])
+                - float(baseline["accuracy_top1"]["p50"])
+            )
+            _require(
+                abs(accuracy_delta_pp) <= 1.0,
+                failures,
+                f"GALP coefficient pushdown Top-1 delta {accuracy_delta_pp:.6f} pp exceeds 1.0 pp",
+            )
+        selected_payload_ratio = native_ratio("selected_compressed_payload_bytes")
+        physical_read_ratio = native_ratio("bounded_physical_storage_bytes")
+        coefficient_comparison = {
+            "baseline": baseline_name,
+            "pushdown": pushdown_name,
+            "coefficient_count_ratio": (
+                float(pushdown["coefficient_selection"].get("coefficient_count", 0))
+                / float(baseline["coefficient_selection"].get("coefficient_count", 64))
+            ),
+            "selected_payload_ratio": selected_payload_ratio,
+            "physical_read_ratio": physical_read_ratio,
+            "hot_end_to_end_speedup": speedups.get("coefficient_pushdown_over_galp"),
+            "cold_end_to_end_speedup": cold_speedups.get("coefficient_pushdown_over_galp"),
+            "top1_delta_percentage_points": accuracy_delta_pp,
+            "selected_payload_bytes": {
+                "galp_k64": baseline_native.get("selected_compressed_payload_bytes"),
+                "galp_selected": pushdown_native.get("selected_compressed_payload_bytes"),
+            },
+            "physical_read_bytes": {
+                "galp_k64": baseline_native.get("bounded_physical_storage_bytes"),
+                "galp_selected": pushdown_native.get("bounded_physical_storage_bytes"),
+            },
+            "decoded_vectors": {
+                "galp_k64": baseline_native.get("actual_vector_count"),
+                "galp_selected": pushdown_native.get("actual_vector_count"),
+            },
+        }
+
+        def metric_row(
+            name: str,
+            baseline_value: float | int | None,
+            selected_value: float | int | None,
+            *,
+            delta_percentage_points: float | None = None,
+        ) -> dict[str, Any]:
+            ratio_value = (
+                float(selected_value) / float(baseline_value)
+                if baseline_value is not None
+                and selected_value is not None
+                and float(baseline_value) != 0.0
+                else None
+            )
+            row = {
+                "name": name,
+                "galp_k64": baseline_value,
+                "galp_selected": selected_value,
+                "ratio": ratio_value,
+            }
+            if delta_percentage_points is not None:
+                row["delta_percentage_points"] = delta_percentage_points
+            return row
+
+        baseline_transform = baseline_native.get(
+            "fixed_transform_ms", baseline_native.get("planless_transform_gpu_kernel_ms")
+        )
+        pushdown_transform = pushdown_native.get(
+            "fixed_transform_ms", pushdown_native.get("planless_transform_gpu_kernel_ms")
+        )
+        metric_rows = [
+            metric_row(
+                "coefficient count",
+                baseline["coefficient_selection"].get("coefficient_count"),
+                pushdown["coefficient_selection"].get("coefficient_count"),
+            ),
+            metric_row(
+                "selected compressed payload bytes",
+                baseline_native.get("selected_compressed_payload_bytes"),
+                pushdown_native.get("selected_compressed_payload_bytes"),
+            ),
+            metric_row(
+                "physical bytes read",
+                baseline_native.get("bounded_physical_storage_bytes"),
+                pushdown_native.get("bounded_physical_storage_bytes"),
+            ),
+            metric_row(
+                "decoded vectors",
+                baseline_native.get("actual_vector_count"),
+                pushdown_native.get("actual_vector_count"),
+            ),
+            metric_row(
+                "decode time (ms)",
+                baseline_native.get("decode_ms"),
+                pushdown_native.get("decode_ms"),
+            ),
+            metric_row(
+                "transform time (ms)",
+                baseline_transform,
+                pushdown_transform,
+            ),
+            metric_row(
+                "model time (ms)",
+                baseline["model_mean_ms"]["p50"],
+                pushdown["model_mean_ms"]["p50"],
+            ),
+            metric_row(
+                "hot E2E throughput (images/s)",
+                baseline["throughput_images_per_s"]["p50"],
+                pushdown["throughput_images_per_s"]["p50"],
+            ),
+        ]
+        if accuracy_delta_pp is not None:
+            metric_rows.append(
+                metric_row(
+                    "Top-1",
+                    baseline["accuracy_top1"]["p50"],
+                    pushdown["accuracy_top1"]["p50"],
+                    delta_percentage_points=accuracy_delta_pp,
+                )
+            )
+        coefficient_comparison["metric_rows"] = metric_rows
+        if int(pushdown["coefficient_selection"].get("coefficient_count", 64)) < 64:
+            _require(
+                selected_payload_ratio is not None and selected_payload_ratio < 1.0,
+                failures,
+                "coefficient pushdown did not reduce selected compressed payload bytes",
+            )
+            _require(
+                physical_read_ratio is not None and physical_read_ratio < 1.0,
+                failures,
+                "coefficient pushdown did not reduce actual bounded physical read bytes",
+            )
 
     dct_storage = contract["dataset"]["dct_major_storage"]
     access_storage = contract["dataset"].get("block_major_access") or {}
@@ -1477,9 +1995,11 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         "aggregates": aggregate_list,
         "speedups": speedups,
         "cold_speedups": cold_speedups,
+        "coefficient_comparison": coefficient_comparison,
         "block_major_access_storage": contract["dataset"].get("block_major_access"),
         "storage_evidence": storage_evidence,
         "semantic_comparisons": semantic_comparisons,
+        "raw_mask_oracle_comparison": raw_mask_oracle_comparison,
         "source_changes": source_changes,
         "pipeline_results": [results[name] for name in contract["pipelines"]["enabled"] if name in results],
     }
@@ -1491,6 +2011,7 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
             "failures": failures,
             "block_major_access_storage": contract["dataset"].get("block_major_access"),
             "semantic_comparisons": semantic_comparisons,
+            "raw_mask_oracle_comparison": raw_mask_oracle_comparison,
         },
     )
     _write_csv(

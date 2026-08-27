@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import gzip
+import json
 import sys
 import tempfile
 import unittest
@@ -13,8 +15,16 @@ BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from common import BLOCK_MAJOR_RUNTIME_PROFILE, PIPELINE_RESULT_SCHEMA, sha256_json  # noqa: E402
+from common import (  # noqa: E402
+    BLOCK_MAJOR_RUNTIME_PROFILE,
+    PIPELINE_RESULT_SCHEMA,
+    fingerprint_file,
+    resolve_coefficient_selection,
+    sha256_json,
+    write_sample_manifest,
+)
 from validate import (  # noqa: E402
+    _compare_raw_mask_oracle,
     _compact_plan_memory_is_consistent,
     _semantic_compare,
     _validate_result,
@@ -181,6 +191,51 @@ class PlanlessResultGateTest(unittest.TestCase):
             failures,
         )
         self.assertEqual(failures, [])
+
+    def test_accepts_selected_coefficient_storage_for_k_below_64(self) -> None:
+        contract = self._contract()
+        pipeline = contract["pipelines"].pop("dct_major_pushdown")
+        pipeline["coefficient_count"] = 32
+        contract["pipelines"]["dct_major_coefficient_pushdown"] = pipeline
+        result = self._result(contract)
+        result["pipeline"] = "dct_major_coefficient_pushdown"
+        result["contract_sha256"] = sha256_json(contract)
+        native = result["repeats"][0]["native_totals"]
+        native["selected_coefficient_count"] = 32
+        native["full_coefficient_count"] = 64
+        native["selected_coefficient_ratio"] = 0.5
+        native["storage_read_granularity"] = "selected-coefficient-range"
+        failures: list[str] = []
+        _validate_result(
+            "dct_major_coefficient_pushdown",
+            result,
+            contract,
+            [{"ordinal": 0, "label": 7}],
+            failures,
+        )
+        self.assertEqual(failures, [])
+
+    def test_rejects_k32_without_coefficient_range_storage(self) -> None:
+        contract = self._contract()
+        pipeline = contract["pipelines"].pop("dct_major_pushdown")
+        pipeline["coefficient_count"] = 32
+        contract["pipelines"]["dct_major_coefficient_pushdown"] = pipeline
+        result = self._result(contract)
+        result["pipeline"] = "dct_major_coefficient_pushdown"
+        result["contract_sha256"] = sha256_json(contract)
+        native = result["repeats"][0]["native_totals"]
+        native["selected_coefficient_count"] = 32
+        native["full_coefficient_count"] = 64
+        native["selected_coefficient_ratio"] = 0.5
+        failures: list[str] = []
+        _validate_result(
+            "dct_major_coefficient_pushdown",
+            result,
+            contract,
+            [{"ordinal": 0, "label": 7}],
+            failures,
+        )
+        self.assertTrue(any("selected-coefficient-range" in item for item in failures))
 
     def test_accepts_cumulative_compact_bytes_across_segments(self) -> None:
         native = {
@@ -444,6 +499,108 @@ class SemanticToleranceTest(unittest.TestCase):
             self.assertEqual(failures, [])
             self.assertTrue(result["ok"])
             self.assertEqual(result["full_top1_prediction_agreement"], 0.999)
+
+
+class RawMaskOracleTest(unittest.TestCase):
+    def test_freezes_checkpoint_stage_selection_and_full_predictions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sample_path = root / "samples.json"
+            samples = [
+                {
+                    "ordinal": 0,
+                    "galp_image_id": 0,
+                    "sample_id": "val/n00000000/image.JPEG",
+                    "label": 1,
+                }
+            ]
+            sample_sha256 = write_sample_manifest(
+                sample_path,
+                samples,
+                {"sample_order": "galp_image_id_ascending", "shuffle": False},
+            )
+            predictions_path = root / "per_sample_top1.csv.gz"
+            with gzip.open(predictions_path, "wt", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=(
+                        "logical_sample_id",
+                        "label",
+                        "prefix_k32__top1_class",
+                    ),
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "logical_sample_id": samples[0]["sample_id"],
+                        "label": 1,
+                        "prefix_k32__top1_class": 1,
+                    }
+                )
+            curve_path = root / "prefix_accuracy_curve.csv"
+            with curve_path.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=("condition_id", "accuracy_top1"))
+                writer.writeheader()
+                # The frozen curve summarizes the full oracle run, while this
+                # contract intentionally validates only its first sample.
+                writer.writerow({"condition_id": "prefix_k32", "accuracy_top1": 0.5})
+            selection = resolve_coefficient_selection("first:32")
+            checkpoint_sha256 = "dct-checkpoint-sha256"
+            metadata_path = root / "run_metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "run_signature": {
+                            "checkpoint_sha256": checkpoint_sha256,
+                            "mask_application_stage": selection["coefficient_mask_stage"],
+                            "sample_count": 2,
+                            "conditions": [
+                                {
+                                    "condition_id": "prefix_k32",
+                                    "natural_indices": selection["resolved_natural_indices"],
+                                }
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            artifact_path = root / "native.npz"
+            np.savez(artifact_path, top1_predictions=np.asarray([1], dtype=np.int64))
+            contract = {
+                "workload": {"kind": "evaluation"},
+                "dataset": {
+                    "sample_manifest": str(sample_path),
+                    "sample_manifest_sha256": sample_sha256,
+                    "sample_count": 1,
+                },
+                "models": {"dct": {"checkpoint_sha256": checkpoint_sha256}},
+                "semantic_validation": {
+                    "full_prediction_top1_agreement_min": 0.999,
+                    "native_oracle_accuracy_delta_max": 0.0005,
+                    "raw_mask_oracle": {
+                        "condition_id": "prefix_k32",
+                        "per_sample_top1": fingerprint_file(predictions_path),
+                        "prefix_accuracy_curve": fingerprint_file(curve_path),
+                        "run_metadata": fingerprint_file(metadata_path),
+                    },
+                },
+            }
+            native_result = {
+                "pipeline_config": selection,
+                "semantic_artifact": str(artifact_path),
+                "repeats": [{"accuracy_top1": 1.0}],
+            }
+            failures: list[str] = []
+            comparison = _compare_raw_mask_oracle(native_result, contract, failures)
+            self.assertEqual(failures, [])
+            self.assertIsNotNone(comparison)
+            assert comparison is not None
+            self.assertTrue(comparison["ok"])
+            self.assertEqual(comparison["full_top1_prediction_agreement"], 1.0)
+            self.assertEqual(comparison["oracle_accuracy_top1"], 1.0)
+            self.assertEqual(comparison["oracle_full_curve_accuracy_top1"], 0.5)
 
 
 if __name__ == "__main__":
