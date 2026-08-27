@@ -1,3 +1,16 @@
 __pycache__/
 *.py[cod]
 /runs/
+
+# Local study notes and host-specific launchers (not package sources)
+/FEASIBILITY_REPORT_20260819.md
+/NEXT_STAGE.md
+/run_delayed_diagnostics.sh
+/run_delayed_stage_a_block4.sh
+/run_delayed_stage_b_block4.sh
+/run_remaining_study.sh
+/run_superpatch_diagnostics.sh
+/run_superpatch_kd.sh
+/run_superpatch_stage_a.sh
+/run_superpatch_stage_a_pro6000.sh
+/run_superpatch_stage_b.sh

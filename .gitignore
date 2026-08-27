@@ -159,3 +159,9 @@ build_win/
 
 # Content fingerprints cached beside large GALP shard manifests.
 *.payload_fingerprints.json
+
+# GALP local benchmark outputs (results, checkpoints, profiler exports)
+/benchmark_results/
+
+# Generated GALP documentation evidence; source reports remain visible
+/galp/benchmarks/system_rgbnomore/docs/artifacts/
