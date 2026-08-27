@@ -49,6 +49,7 @@ struct Options {
 	std::filesystem::path                 compact_v3_output;
 	std::filesystem::path                 expand_v3_source;
 	std::filesystem::path                 expand_v3_output;
+	std::filesystem::path                 input_list;
 	std::vector<std::filesystem::path>    inputs;
 	galp::jpeg::JpegMetadataProfile       metadata_profile = galp::jpeg::JpegMetadataProfile::kDctDatasetOnly;
 	galp::jpeg::JpegDctShardPreset        shard_preset     = galp::jpeg::JpegDctShardPreset::kBalanced;
@@ -104,7 +105,7 @@ void print_usage(const char* prog) {
 		       "[--spatial-order raster|tiled-raster-32|z-order|tiled-z-32] "
 	       "[--shard-images N] [--rowgroup-vectors N] [--rowgroups-per-shard N] [--threads N] "
 	       "[--layout-threads N] [--shard-decode-threads N] [--shard-workers N] "
-	       "[--encoding-workers-per-shard N] input_dir\n"
+	       "[--encoding-workers-per-shard N] (input_dir | --input-list ordered_paths.txt)\n"
 	    << "  " << prog
 		    << " --verify-manifest manifest.bin [--image-index N] source.jpg\n"
 	    << "  " << prog << " --verify-manifest manifest.bin [--verify-workers N] source_dir\n"
@@ -118,7 +119,8 @@ void print_usage(const char* prog) {
 	    << "  --threads defaults to all available cores when not set.\n"
 	    << "  --metadata-profile writes the sectioned metadata format; use reconstruct to persist image dimensions "
 	       "and quantization tables.\n"
-	    << "  --shard writes manifest.bin plus shard_*.fls and shard_*.meta.bin; default preset is balanced.\n";
+	    << "  --shard writes manifest.bin plus shard_*.fls and shard_*.meta.bin; default preset is balanced.\n"
+	    << "  --input-list reads one JPEG path per line and preserves that exact order.\n";
 }
 
 int verify_manifest_image(const std::filesystem::path& manifest_path,
@@ -269,6 +271,36 @@ std::vector<std::filesystem::path> expand_inputs(const std::vector<std::filesyst
 		throw std::runtime_error("no JPEG files found in input path(s)");
 	}
 	return expanded;
+}
+
+std::vector<std::filesystem::path> read_ordered_input_list(const std::filesystem::path& input_list) {
+	std::ifstream stream(input_list);
+	if (!stream) {
+		throw std::runtime_error("failed to open --input-list: " + input_list.string());
+	}
+
+	std::vector<std::filesystem::path> ordered;
+	std::string                        line;
+	size_t                             line_number = 0;
+	while (std::getline(stream, line)) {
+		++line_number;
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		if (line.empty()) {
+			continue;
+		}
+		const std::filesystem::path path(line);
+		if (!std::filesystem::is_regular_file(path) || !is_jpeg_path(path)) {
+			throw std::runtime_error("--input-list line " + std::to_string(line_number) +
+			                         " is not a readable JPEG file: " + line);
+		}
+		ordered.push_back(path);
+	}
+	if (ordered.empty()) {
+		throw std::runtime_error("--input-list contains no JPEG files: " + input_list.string());
+	}
+	return ordered;
 }
 
 uint32_t parse_u32_arg(const std::string_view name, const char* value) {
@@ -573,6 +605,10 @@ bool parse_args(const int argc, char** argv, Options& options) {
 			options.expand_v3_output = argv[++i];
 			continue;
 		}
+		if (arg == "--input-list" && i + 1 < argc) {
+			options.input_list = argv[++i];
+			continue;
+		}
 		if (arg == "--repeats" && i + 1 < argc) {
 			options.benchmark_repeats = parse_size_arg(arg, argv[++i]);
 			continue;
@@ -737,6 +773,9 @@ bool parse_args(const int argc, char** argv, Options& options) {
 	}
 
 	apply_shard_preset(options);
+	if (!options.input_list.empty() && !options.inputs.empty()) {
+		throw std::runtime_error("--input-list cannot be combined with positional input paths");
+	}
 	const unsigned hw              = std::thread::hardware_concurrency();
 	const size_t   default_threads = hw == 0U ? 1U : static_cast<size_t>(hw);
 	if (options.threads_specified) {
@@ -757,10 +796,10 @@ bool parse_args(const int argc, char** argv, Options& options) {
 		}
 	}
 	if (options.shard_mode) {
-		return !options.output_dir.empty() && !options.inputs.empty();
+		return !options.output_dir.empty() && (!options.inputs.empty() || !options.input_list.empty());
 	}
 	if (options.verify_mode) {
-		return !options.verify_manifest.empty() && !options.inputs.empty();
+		return !options.verify_manifest.empty() && (!options.inputs.empty() || !options.input_list.empty());
 	}
 	if (options.sparse_bundle_mode) {
 		return !options.sparse_bundle_source.empty() && !options.sparse_bundle_output.empty();
@@ -839,7 +878,8 @@ int main(const int argc, char** argv) {
 			    "image-major-vector-rowgroups requires --spatial-order tiled-z-32");
 		}
 
-		options.inputs = expand_inputs(options.inputs);
+		options.inputs = options.input_list.empty() ? expand_inputs(options.inputs)
+		                                           : read_ordered_input_list(options.input_list);
 		if (options.verify_mode) {
 			if (options.verify_image_index_specified && options.verify_workers != 1U) {
 				throw std::runtime_error("--verify-workers cannot be combined with --image-index");
