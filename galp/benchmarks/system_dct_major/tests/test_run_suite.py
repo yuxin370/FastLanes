@@ -15,8 +15,10 @@ if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
 
 from run_suite import (  # noqa: E402
+    _contract_phase,
     _formal_phases,
     _initial_phases,
+    _semantic_phase,
     _volume,
     parse_args,
     run,
@@ -44,7 +46,7 @@ class CompleteSuiteTest(unittest.TestCase):
 
         self.assertEqual(len(initial), 2)
         self.assertEqual(len(formal), 6)
-        self.assertEqual(_volume(args)["total_model_invocations"], 2_060_032)
+        self.assertEqual(_volume(args)["total_model_invocations"], 2_570_496)
         feature = next(phase for phase in formal if phase.name == "06_formal_feature_extraction")
         for removed in (
             "--dct-major-segment-size",
@@ -55,6 +57,18 @@ class CompleteSuiteTest(unittest.TestCase):
             self.assertNotIn(removed, feature.command)
         self.assertNotIn("dct_major_full", feature.command)
         self.assertNotIn("dct_major_legacy_pushdown", feature.command)
+        self.assertIn("dct_major_coefficient_pushdown", feature.command)
+        self.assertEqual(
+            feature.command[feature.command.index("--dct-coeffs") + 1],
+            "first:32",
+        )
+        semantic = _semantic_phase(args, output)
+        contract = _contract_phase(args, output)
+        self.assertFalse(contract.gpu)
+        self.assertEqual(contract.command[-1], "--dry-run")
+        self.assertIn("00_semantic_contract/contract.json", semantic.command[3])
+        self.assertIn("verify_coefficient_semantics.py", semantic.command[1])
+        self.assertEqual(semantic.command[-1], "32")
 
     def test_removed_single_choice_options_are_rejected(self) -> None:
         for option in (
@@ -91,12 +105,15 @@ class CompleteSuiteTest(unittest.TestCase):
                 self.assertEqual(run(args), 0)
             plan = json.loads((output / "suite_plan.json").read_text(encoding="utf-8"))
             self.assertEqual(plan["runtime_policy"], "native block-major production profile")
-            self.assertEqual(len(plan["phases"]), 8)
+            self.assertEqual(plan["dct_coeffs"], "first:32")
+            self.assertEqual(len(plan["phases"]), 10)
+            self.assertEqual(plan["phases"][0]["name"], "00_semantic_contract")
+            self.assertEqual(plan["phases"][1]["name"], "01_coefficient_semantics")
             commands = [item for phase in plan["phases"] for item in phase["command"]]
             self.assertNotIn("--compare-legacy", commands)
             self.assertNotIn("--segment-sizes", commands)
 
-    def test_execution_runs_the_eight_production_phases(self) -> None:
+    def test_execution_runs_the_ten_production_phases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             access_dir = root / "access"
@@ -116,7 +133,7 @@ class CompleteSuiteTest(unittest.TestCase):
             with mock.patch("run_suite._execute_phase") as execute_phase:
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(run(args), 0)
-            self.assertEqual(execute_phase.call_count, 8)
+            self.assertEqual(execute_phase.call_count, 10)
             result = json.loads((output / "suite_results.json").read_text(encoding="utf-8"))
             self.assertTrue(result["ok"])
             self.assertNotIn("selected_segment_size", result)

@@ -13,6 +13,7 @@ if str(BENCHMARK_ROOT) not in sys.path:
 
 from run import (  # noqa: E402
     _block_major_access_contract,
+    _validate_fixed_manifest_geometry,
     _prepare_output_dir,
     _resolve_torch_binding_artifact,
     _run_streamed,
@@ -22,6 +23,51 @@ from run import (  # noqa: E402
 
 
 class RunContractTest(unittest.TestCase):
+    def test_fixed_manifest_geometry_rejects_same_order_different_jpeg_view(self) -> None:
+        class Reader:
+            image_count = 1
+
+            @staticmethod
+            def image_metadata(_: int) -> dict:
+                return {
+                    "image_width": 500,
+                    "image_height": 375,
+                    "components": [],
+                }
+
+        with self.assertRaisesRegex(ValueError, "same 512x512 JPEG view"):
+            _validate_fixed_manifest_geometry(Reader(), 1)
+
+    def test_fixed_manifest_geometry_accepts_complete_420_view(self) -> None:
+        class Reader:
+            image_count = 2
+
+            @staticmethod
+            def image_metadata(_: int) -> dict:
+                return {
+                    "image_width": 512,
+                    "image_height": 512,
+                    "components": [
+                        {
+                            "present": True,
+                            "semantic_slot_id": slot,
+                            "width_in_blocks": width,
+                            "height_in_blocks": height,
+                            "h_samp_factor": sampling,
+                            "v_samp_factor": sampling,
+                        }
+                        for slot, width, height, sampling in (
+                            (0, 64, 64, 2),
+                            (1, 32, 32, 1),
+                            (2, 32, 32, 1),
+                        )
+                    ],
+                }
+
+        result = _validate_fixed_manifest_geometry(Reader(), 2)
+        self.assertEqual(result["validated_image_count"], 2)
+        self.assertEqual(result["jpeg_sampling"], "4:2:0")
+
     def test_descriptor_contract_freezes_every_shard_and_storage_ratio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -86,6 +132,8 @@ class RunContractTest(unittest.TestCase):
             ["--output-dir", "/tmp/unused-dct-major-test-output"]
         )
         self.assertIn("dct_major_pushdown", args.pipelines)
+        self.assertIn("dct_major_coefficient_pushdown", args.pipelines)
+        self.assertEqual(args.dct_coeffs, "first:32")
         self.assertNotIn("dct_major_legacy_pushdown", args.pipelines)
         self.assertNotIn("dct_major_full", args.pipelines)
         for field in (

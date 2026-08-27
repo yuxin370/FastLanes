@@ -12,7 +12,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from PIL import Image
 
@@ -20,6 +20,7 @@ from common import (
     BLOCK_MAJOR_RUNTIME_PROFILE,
     CONTRACT_SCHEMA,
     DEFAULT_PIPELINES,
+    GALP_PIPELINES,
     HERE,
     PIPELINES,
     REPO_ROOT,
@@ -29,6 +30,7 @@ from common import (
     load_sample_manifest,
     manifest_snapshot,
     parse_manifest,
+    resolve_coefficient_selection,
     sha256_file,
     source_fingerprints,
     write_canonical_index,
@@ -36,13 +38,23 @@ from common import (
     write_sample_manifest,
 )
 
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
 DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
-DEFAULT_DCT_MAJOR_MANIFEST = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/manifest.bin"
-DEFAULT_DCT_MAJOR_LABELS = DEFAULT_DCT_MAJOR_MANIFEST.with_name("labels.json")
+DEFAULT_DCT_MAJOR_MANIFEST = Path("/tmp/galp-blockmajor-512-s1024-rg128/manifest.bin")
+DEFAULT_DCT_MAJOR_LABELS = (
+    REPO_ROOT
+    / "galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json"
+)
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
+DEFAULT_RAW_MASK_ORACLE_DIR = (
+    REPO_ROOT
+    / "galp/experiments/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100"
+)
 
 PRESETS = {
     "smoke": {"batch_size": 2, "warmup_batches": 0, "measurement_batches": 2, "repeats": 1, "workers": 2},
@@ -149,6 +161,80 @@ def _validate_fixed_source_geometry(samples: Sequence[dict[str, Any]]) -> dict[s
     }
 
 
+def _validate_fixed_manifest_geometry(
+    reader: Any,
+    expected_images: int,
+    *,
+    metadata_getter: Callable[[int], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Prove that the native store implements the fixed-512 DCT profile.
+
+    The JPEG paths and the compressed manifest are independent inputs.  A
+    matching image count/order is insufficient: two ImageNet views can have
+    the same filenames while containing different JPEG encodings.  Validate
+    the geometry and sampling recorded in native reconstruct metadata before
+    admitting a manifest into the benchmark contract.
+    """
+
+    observed_images = int(reader.image_count)
+    if observed_images != expected_images:
+        raise ValueError(
+            f"DCT-major manifest has {observed_images} images, expected {expected_images}"
+        )
+
+    read_metadata = metadata_getter or reader.image_metadata
+    expected_components = {
+        0: (64, 64, 2, 2),
+        1: (32, 32, 1, 1),
+        2: (32, 32, 1, 1),
+    }
+    for image_id in range(expected_images):
+        metadata = read_metadata(image_id)
+        width = int(metadata.get("image_width", -1))
+        height = int(metadata.get("image_height", -1))
+        if (width, height) != (512, 512):
+            raise ValueError(
+                "fixed-center-224-from-512 requires the DCT-major manifest to "
+                f"contain the same 512x512 JPEG view; image {image_id} metadata "
+                f"is {width}x{height}"
+            )
+
+        components = {
+            int(component.get("semantic_slot_id", -1)): component
+            for component in metadata.get("components", [])
+            if bool(component.get("present", False))
+        }
+        if set(components) != set(expected_components):
+            raise ValueError(
+                "fixed-center-224-from-512 requires exactly Y/Cb/Cr components; "
+                f"manifest image {image_id} has semantic slots {sorted(components)}"
+            )
+        for slot, expected in expected_components.items():
+            component = components[slot]
+            observed = (
+                int(component.get("width_in_blocks", -1)),
+                int(component.get("height_in_blocks", -1)),
+                int(component.get("h_samp_factor", -1)),
+                int(component.get("v_samp_factor", -1)),
+            )
+            if observed != expected:
+                raise ValueError(
+                    "fixed-center-224-from-512 requires 4:2:0 native DCT geometry; "
+                    f"manifest image {image_id} component slot {slot} has "
+                    f"blocks/sampling={observed}, expected {expected}"
+                )
+
+    return {
+        "validated_image_count": expected_images,
+        "source_width": 512,
+        "source_height": 512,
+        "jpeg_sampling": "4:2:0",
+        "y_blocks": [64, 64],
+        "cbcr_blocks": [32, 32],
+        "semantic_slots": [0, 1, 2],
+    }
+
+
 def _block_major_access_contract(
     directory: Path,
     dct_major_storage: dict[str, Any],
@@ -248,8 +334,8 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "block-major production profile requires warmup_batches=0 so a boundary "
             "cannot split and reactivate a physical shard"
         )
-    if "dct_major_pushdown" in args.pipelines and args.block_major_access_dir is None:
-        raise ValueError("dct_major_pushdown requires --block-major-access-dir")
+    if any(name in args.pipelines for name in GALP_PIPELINES) and args.block_major_access_dir is None:
+        raise ValueError("GALP DCT-major pipelines require --block-major-access-dir")
 
     dct_major = _manifest_contract(
         args.dct_major_manifest,
@@ -262,9 +348,10 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
     if block_major_access_dir is not None:
         parsed_dct_major = parse_manifest(args.dct_major_manifest)
         required_schedule_shard_ids: list[int] = []
-        if "dct_major_pushdown" in args.pipelines:
+        if any(name in args.pipelines for name in GALP_PIPELINES):
             selected_end = sample_count
             consumed = 0
+            selected_shard_ids: list[int] = []
             for shard in parsed_dct_major["shards"]:
                 first = int(shard["first_global_image_index"])
                 count = int(shard["image_count"])
@@ -276,12 +363,18 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
                         "scheduled manifest-shard sample_count must cover a contiguous "
                         "prefix of complete physical shards"
                     )
-                required_schedule_shard_ids.append(int(shard["shard_id"]))
+                selected_shard_ids.append(int(shard["shard_id"]))
                 consumed = end
             if consumed != selected_end:
                 raise ValueError(
                     "scheduled manifest-shard sample_count is not covered by complete physical shards"
                 )
+            if selected_shard_ids:
+                if selected_shard_ids[0] != 0:
+                    raise ValueError("scheduled active-output sidecar requires canonical shard 0")
+                # The native P4 policy persists only the critical first-shard
+                # schedule; later shard schedules are built under overlap.
+                required_schedule_shard_ids = [0]
         block_major_access = _block_major_access_contract(
             block_major_access_dir,
             dct_major,
@@ -298,6 +391,22 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         hash_samples=args.hash_samples,
     )
     fixed_geometry = _validate_fixed_source_geometry(samples)
+    try:
+        from galp.diagnostics.direct_dct import image_metadata
+        from galp.torch import DirectDctReader
+    except ImportError as error:
+        raise RuntimeError(
+            "native Torch binding is required to validate DCT-major manifest geometry"
+        ) from error
+    manifest_reader = DirectDctReader(
+        args.dct_major_manifest,
+        module_path=args.torch_binding_dir,
+    )
+    manifest_geometry = _validate_fixed_manifest_geometry(
+        manifest_reader,
+        image_count,
+        metadata_getter=lambda image_id: image_metadata(manifest_reader, image_id),
+    )
     sample_manifest_path = output_dir / "sample_manifest.json"
     sample_manifest_sha256 = write_sample_manifest(sample_manifest_path, samples, sample_provenance)
     canonical_index = output_dir / "canonical_index.csv"
@@ -308,23 +417,39 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
     for path in (rgb_checkpoint, dct_checkpoint, args.torch_binding_dir, args.rgbnomore_root):
         if not path.exists():
             raise FileNotFoundError(path)
+    rgb_checkpoint_sha256 = sha256_file(rgb_checkpoint)
+    dct_checkpoint_sha256 = sha256_file(dct_checkpoint)
     torch_binding_artifact_path = _resolve_torch_binding_artifact(args.torch_binding_dir)
     torch_binding_artifact = fingerprint_file(torch_binding_artifact_path)
 
+    galp_config: dict[str, Any] = {
+        "torch_binding_dir": str(args.torch_binding_dir.resolve()),
+        "torch_binding_artifact": torch_binding_artifact,
+        "runtime_profile": BLOCK_MAJOR_RUNTIME_PROFILE,
+        "manifest": str(args.dct_major_manifest.resolve()),
+        "manifest_version": 1,
+        "physical_layout": "dct-major/spatial-major-image-minor",
+        "preprocess": "rgbnomore-val-pushdown",
+        "model_key": "dct",
+        "checkpoint_sha256": dct_checkpoint_sha256,
+        "block_major_access_dir": (
+            str(block_major_access_dir) if block_major_access_dir is not None else None
+        ),
+        "role": "native scheduled bounded-I/O RGB-no-more profile per manifest shard",
+    }
+    coefficient_selection = resolve_coefficient_selection(args.dct_coeffs)
     pipeline_configs: dict[str, Any] = {
         "enabled": list(args.pipelines),
         "dct_major_pushdown": {
-            "torch_binding_dir": str(args.torch_binding_dir.resolve()),
-            "torch_binding_artifact": torch_binding_artifact,
-            "runtime_profile": BLOCK_MAJOR_RUNTIME_PROFILE,
-            "manifest": str(args.dct_major_manifest.resolve()),
-            "manifest_version": 1,
-            "physical_layout": "dct-major/spatial-major-image-minor",
-            "preprocess": "rgbnomore-val-pushdown",
-            "block_major_access_dir": (
-                str(block_major_access_dir) if block_major_access_dir is not None else None
-            ),
-            "role": "native scheduled bounded-I/O RGB-no-more profile per manifest shard",
+            **galp_config,
+            **resolve_coefficient_selection("all"),
+            "display_name": "GALP",
+        },
+        "dct_major_coefficient_pushdown": {
+            **galp_config,
+            **coefficient_selection,
+            "display_name": "GALP-DCT-pushdown",
+            "role": "native crop and configurable raw-coefficient pushdown per manifest shard",
         },
         "rgbnomore": {
             "root": str(args.rgbnomore_root.resolve()),
@@ -348,6 +473,7 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         HERE / "pipeline.py",
         HERE / "run.py",
         HERE / "validate.py",
+        HERE / "verify_coefficient_semantics.py",
         REPO_ROOT / "galp/torch/direct_dct.py",
         REPO_ROOT / "galp/diagnostics/direct_dct.py",
         REPO_ROOT / "galp/profiles/_base.py",
@@ -361,6 +487,29 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         args.rgbnomore_root / "models/plainvit.py",
         args.rgbnomore_root / "datasets.py",
     ]
+    raw_mask_oracle: dict[str, Any] | None = None
+    if args.raw_mask_oracle_dir is not None and coefficient_selection["coefficient_selection_kind"] == "prefix":
+        oracle_dir = args.raw_mask_oracle_dir.resolve(strict=True)
+        oracle_predictions = oracle_dir / "per_sample_top1.csv.gz"
+        oracle_curve = oracle_dir / "prefix_accuracy_curve.csv"
+        oracle_metadata = oracle_dir / "run_metadata.json"
+        if not all(
+            path.is_file()
+            for path in (oracle_predictions, oracle_curve, oracle_metadata)
+        ):
+            raise FileNotFoundError(
+                "raw-mask oracle directory must contain per_sample_top1.csv.gz, "
+                "prefix_accuracy_curve.csv, and run_metadata.json"
+            )
+        raw_mask_oracle = {
+            "schema": "coefficient-mask-evaluator-result-v1",
+            "condition_id": f"prefix_k{coefficient_selection['coefficient_count']:02d}",
+            "coefficient_spec": coefficient_selection["coefficient_spec"],
+            "per_sample_top1": fingerprint_file(oracle_predictions),
+            "prefix_accuracy_curve": fingerprint_file(oracle_curve),
+            "run_metadata": fingerprint_file(oracle_metadata),
+        }
+
     contract = {
         "schema_version": CONTRACT_SCHEMA,
         "benchmark_id": args.benchmark_id or f"dct-major-{args.workload}-{args.preset}",
@@ -376,6 +525,7 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "full_image_count": image_count,
             "source_image_shape_hwc": [512, 512, 3],
             "source_geometry_validation": fixed_geometry,
+            "manifest_geometry_validation": manifest_geometry,
             "jpeg_selected_bytes": sum(int(sample["size_bytes"]) for sample in samples),
             "jpeg_full_dataset_bytes": (
                 sum(int(sample["size_bytes"]) for sample in samples)
@@ -422,10 +572,14 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             },
             "dct": {
                 "profile": "RGB-no-more CenterCrop_DCT(28) from fixed 64x64 Y-block source",
-                "crop_reference_size_blocks": [64, 64],
+                "source_grid_size_blocks": [64, 64],
+                "crop_reference_size_blocks": [32, 32],
+                "center_crop_size_blocks": [56, 56],
                 "y_shape": [1, 28, 28, 8, 8],
                 "cbcr_shape": [2, 14, 14, 8, 8],
-                "coefficients": "all-64",
+                "stored_coefficients": "all-64",
+                "model_ready_frequency_grid": "dense-64",
+                "selection_stage": "raw quantized coefficients before dequantization and frequency mixing",
                 "range": [-1.0, 1.0],
             },
         },
@@ -434,13 +588,13 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "rgb": {
                 "architecture": "RGB-no-more ViT-Ti RGB",
                 "checkpoint": str(rgb_checkpoint.resolve()),
-                "checkpoint_sha256": sha256_file(rgb_checkpoint),
+                "checkpoint_sha256": rgb_checkpoint_sha256,
                 "input_domain": "RGB",
             },
             "dct": {
                 "architecture": "RGB-no-more JPEG-Ti ViT-Ti DCT",
                 "checkpoint": str(dct_checkpoint.resolve()),
-                "checkpoint_sha256": sha256_file(dct_checkpoint),
+                "checkpoint_sha256": dct_checkpoint_sha256,
                 "input_domain": "JPEG_DCT",
             },
         },
@@ -455,6 +609,8 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "logit_cosine_min": 0.999,
             "semantic_top1_agreement_min": 1.0,
             "full_prediction_top1_agreement_min": 0.999,
+            "native_oracle_accuracy_delta_max": 0.0005,
+            "raw_mask_oracle": raw_mask_oracle,
         },
         "stability_gates": {
             "maximum_hot_cv": 0.05,
@@ -509,7 +665,7 @@ def _pipeline_cache_paths(contract: dict[str, Any], pipeline: str) -> list[Path]
     }
     model_key = "rgb" if pipeline in {"dali", "pytorch"} else "dct"
     paths.add(Path(contract["models"][model_key]["checkpoint"]))
-    if pipeline == "dct_major_pushdown":
+    if pipeline in GALP_PIPELINES:
         snapshot = contract["dataset"]["dct_major_storage"]
         paths.add(Path(snapshot["manifest"]["path"]))
         paths.update(Path(payload["path"]) for payload in snapshot["payloads"])
@@ -659,6 +815,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-count", type=int)
     parser.add_argument("--semantic-samples", type=int, default=32)
     parser.add_argument(
+        "--dct-coeffs",
+        default="first:32",
+        help="coefficient selection for dct_major_coefficient_pushdown: all, first:N, list:..., or random:K:SEED",
+    )
+    parser.add_argument(
+        "--raw-mask-oracle-dir",
+        type=Path,
+        default=(DEFAULT_RAW_MASK_ORACLE_DIR if DEFAULT_RAW_MASK_ORACLE_DIR.is_dir() else None),
+        help="completed coefficient-mask evaluator run used for full per-sample prefix validation",
+    )
+    parser.add_argument(
         "--cold-protocol",
         choices=("application-overlapped", "controlled-io"),
         default="application-overlapped",
@@ -675,7 +842,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hash-samples", action="store_true")
     parser.add_argument("--hash-payloads", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    resolve_coefficient_selection(args.dct_coeffs)
+    return args
 
 
 def main() -> None:

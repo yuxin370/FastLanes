@@ -13,19 +13,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from common import parse_manifest, resolve_coefficient_selection
+
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 DIAGNOSTICS = HERE / "diagnostics"
 DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
 DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
-DEFAULT_DCT_MAJOR_MANIFEST = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/manifest.bin"
-DEFAULT_DCT_MAJOR_LABELS = DEFAULT_DCT_MAJOR_MANIFEST.with_name("labels.json")
+DEFAULT_DCT_MAJOR_MANIFEST = Path("/tmp/galp-blockmajor-512-s1024-rg128/manifest.bin")
+DEFAULT_DCT_MAJOR_LABELS = (
+    REPO_ROOT
+    / "galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json"
+)
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
+DEFAULT_RAW_MASK_ORACLE_DIR = (
+    REPO_ROOT
+    / "galp/experiments/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100"
+)
 
 ALL_PIPELINES = (
     "dct_major_pushdown",
+    "dct_major_coefficient_pushdown",
     "rgbnomore",
     "dali",
     "pytorch",
@@ -67,11 +77,15 @@ def _common_run_args(args: argparse.Namespace) -> list[str]:
         args.device,
         "--workers",
         str(args.workers),
+        "--dct-coeffs",
+        args.dct_coeffs,
     ]
     if args.rgb_checkpoint is not None:
         result.extend(("--rgb-checkpoint", str(args.rgb_checkpoint.resolve())))
     if args.dct_checkpoint is not None:
         result.extend(("--dct-checkpoint", str(args.dct_checkpoint.resolve())))
+    if args.raw_mask_oracle_dir is not None:
+        result.extend(("--raw-mask-oracle-dir", str(args.raw_mask_oracle_dir.resolve())))
     block_major_access_dir = getattr(args, "block_major_access_dir", None)
     if block_major_access_dir is not None:
         result.extend(("--block-major-access-dir", str(block_major_access_dir.resolve())))
@@ -123,22 +137,65 @@ def _run_phase(
 
 
 def _initial_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
+    first_shard_samples = int(parse_manifest(args.dct_major_manifest)["shards"][0]["image_count"])
     return [
         _run_phase(
             args,
-            "01_feature_smoke",
+            "02_feature_smoke",
             output_dir,
             workload="feature-extraction",
             pipelines=ALL_PIPELINES,
+            sample_count=first_shard_samples,
+            repeats=1,
         ),
         _run_phase(
             args,
-            "02_evaluation_smoke",
+            "03_evaluation_smoke",
             output_dir,
             workload="evaluation",
             pipelines=ALL_PIPELINES,
+            sample_count=first_shard_samples,
+            repeats=1,
         ),
     ]
+
+
+def _contract_phase(args: argparse.Namespace, output_dir: Path) -> Phase:
+    first_shard_samples = int(parse_manifest(args.dct_major_manifest)["shards"][0]["image_count"])
+    phase = _run_phase(
+        args,
+        "00_semantic_contract",
+        output_dir,
+        workload="evaluation",
+        pipelines=ALL_PIPELINES,
+        sample_count=first_shard_samples,
+        repeats=1,
+    )
+    return Phase(
+        name=phase.name,
+        command=(*phase.command, "--dry-run"),
+        target=phase.target,
+        gpu=False,
+    )
+
+
+def _semantic_phase(args: argparse.Namespace, output_dir: Path) -> Phase:
+    target = output_dir / "01_coefficient_semantics.json"
+    return Phase(
+        name="01_coefficient_semantics",
+        command=(
+            str(args.python.resolve()),
+            str(HERE / "verify_coefficient_semantics.py"),
+            "--contract",
+            str((output_dir / "00_semantic_contract/contract.json").resolve()),
+            "--output",
+            str(target.resolve()),
+            "--sample-count",
+            str(args.semantic_samples),
+        ),
+        target=target,
+        gpu=True,
+    )
 
 
 def _formal_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
@@ -214,6 +271,7 @@ def _execute_phase(
     resume: bool,
 ) -> None:
     marker = _phase_marker(output_dir, phase)
+    failed_marker = marker.with_name(f"{phase.name}.failed.json")
     if marker.is_file():
         recorded = json.loads(marker.read_text(encoding="utf-8"))
         if recorded.get("exit_code") != 0:
@@ -250,7 +308,7 @@ def _execute_phase(
             stream.write(line)
             stream.flush()
         exit_code = int(process.wait())
-    status_path = marker if exit_code == 0 else marker.with_name(f"{phase.name}.failed.json")
+    status_path = marker if exit_code == 0 else failed_marker
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(
         json.dumps(
@@ -263,17 +321,21 @@ def _execute_phase(
     )
     if exit_code != 0:
         raise RuntimeError(f"phase failed with exit code {exit_code}: {phase.name}")
+    failed_marker.unlink(missing_ok=True)
 
 
 def _volume(args: argparse.Namespace) -> dict[str, int]:
-    smoke = 2 * len(ALL_PIPELINES) * 4
+    first_shard_samples = int(parse_manifest(args.dct_major_manifest)["shards"][0]["image_count"])
+    smoke = 2 * len(ALL_PIPELINES) * first_shard_samples
+    semantic = 8 * args.semantic_samples
     formal = 2 * len(ALL_PIPELINES) * args.formal_samples * args.formal_repeats
     model_ceiling = 4 * args.batch_size * args.ceiling_steps
     return {
         "smoke_pipeline_images": smoke,
+        "semantic_model_invocations": semantic,
         "formal_pipeline_images": formal,
         "synthetic_model_ceiling_images": model_ceiling,
-        "total_model_invocations": smoke + formal + model_ceiling,
+        "total_model_invocations": smoke + semantic + formal + model_ceiling,
     }
 
 
@@ -299,12 +361,18 @@ def run(args: argparse.Namespace) -> int:
     if not args.block_major_access_dir.is_dir():
         raise NotADirectoryError(args.block_major_access_dir)
 
-    phases = [*_initial_phases(args, output_dir), *_formal_phases(args, output_dir)]
+    phases = [
+        _contract_phase(args, output_dir),
+        _semantic_phase(args, output_dir),
+        *_initial_phases(args, output_dir),
+        *_formal_phases(args, output_dir),
+    ]
     volume = _volume(args)
     plan = {
         "schema_version": SUITE_SCHEMA,
         "dry_run": bool(args.dry_run),
         "runtime_policy": "native block-major production profile",
+        "dct_coeffs": args.dct_coeffs,
         "volume": volume,
         "phases": [phase.as_json() for phase in phases],
     }
@@ -337,6 +405,7 @@ def run(args: argparse.Namespace) -> int:
         "volume": volume,
         "feature_results": str((output_dir / "06_formal_feature_extraction/results.json").resolve()),
         "evaluation_results": str((output_dir / "07_formal_evaluation/results.json").resolve()),
+        "coefficient_semantics": str((output_dir / "01_coefficient_semantics.json").resolve()),
     }
     _write_json(output_dir / "suite_results.json", result)
     print("RESULT_JSON " + json.dumps(result, sort_keys=True))
@@ -354,12 +423,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT)
     parser.add_argument("--rgb-checkpoint", type=Path)
     parser.add_argument("--dct-checkpoint", type=Path)
+    parser.add_argument(
+        "--raw-mask-oracle-dir",
+        type=Path,
+        default=(DEFAULT_RAW_MASK_ORACLE_DIR if DEFAULT_RAW_MASK_ORACLE_DIR.is_dir() else None),
+    )
     parser.add_argument("--torch-binding-dir", type=Path, default=DEFAULT_BINDING_DIR)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=50)
+    parser.add_argument("--dct-coeffs", default="first:32")
     parser.add_argument("--formal-samples", type=int, default=50000)
     parser.add_argument("--formal-repeats", type=int, default=5)
+    parser.add_argument("--semantic-samples", type=int, default=32)
     parser.add_argument("--ceiling-warmup", type=int, default=20)
     parser.add_argument("--ceiling-steps", type=int, default=300)
     parser.add_argument("--hash-samples", action="store_true")
@@ -372,12 +448,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "batch_size",
         "formal_samples",
         "formal_repeats",
+        "semantic_samples",
         "ceiling_steps",
     ):
         if int(getattr(args, name)) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.ceiling_warmup < 0:
         parser.error("--ceiling-warmup must be non-negative")
+    resolve_coefficient_selection(args.dct_coeffs)
     return args
 
 
