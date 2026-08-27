@@ -8,7 +8,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
 
-from training.schema import TRAINING_SAMPLE_ORDER_SCHEMA
+from galp.benchmarks.system_rgbnomore.training.schema import TRAINING_SAMPLE_ORDER_SCHEMA
 
 
 @dataclass(frozen=True, order=True)

@@ -9,7 +9,7 @@ import random
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from training.schema import TRAINING_AUGMENTATION_SCHEMA
+from galp.benchmarks.system_rgbnomore.training.schema import TRAINING_AUGMENTATION_SCHEMA
 
 
 @dataclass(frozen=True)

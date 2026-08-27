@@ -4,15 +4,10 @@
 from __future__ import annotations
 
 import math
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-REPO_ROOT = Path(__file__).resolve().parents[4]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from galp.profiles.rgbnomore import VALIDATION
 from galp.benchmarks.system_rgbnomore.shared.common import GALP_RUNTIME_PROFILE

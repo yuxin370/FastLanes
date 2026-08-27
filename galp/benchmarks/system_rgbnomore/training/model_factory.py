@@ -16,7 +16,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from training.artifacts import sha256_file, tensor_state_sha256
+from galp.benchmarks.system_rgbnomore.training.artifacts import (
+    sha256_file,
+    tensor_state_sha256,
+)
 
 
 MODEL_ARCHITECTURE = "rgbnomore-vitti-v1"

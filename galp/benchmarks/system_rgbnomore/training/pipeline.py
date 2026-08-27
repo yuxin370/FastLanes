@@ -23,20 +23,20 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 import torch
 
-from training.artifacts import sha256_file, sha256_json
-from training.augmentation import (
+from galp.benchmarks.system_rgbnomore.training.artifacts import sha256_file, sha256_json
+from galp.benchmarks.system_rgbnomore.training.augmentation import (
     AugmentationDecision,
     apply_rgb_augmentation_staged,
     horizontal_flip_dct,
 )
-from training.direct_dct_reader import (
+from galp.benchmarks.system_rgbnomore.training.direct_dct_reader import (
     DirectDctTrainingReader,
     optional_native_execution_stats,
     optional_native_execution_stats_observation,
     optional_native_execution_stats_snapshot,
 )
-from training.sample_order import SampleIdentity
-from training.schema import DOMAINS, PIPELINES
+from galp.benchmarks.system_rgbnomore.training.sample_order import SampleIdentity
+from galp.benchmarks.system_rgbnomore.training.schema import DOMAINS, PIPELINES
 
 
 CANONICAL_PIPELINE_LOOKAHEAD_BATCHES = 2
