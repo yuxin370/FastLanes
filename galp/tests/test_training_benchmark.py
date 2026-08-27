@@ -707,7 +707,8 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 constructed.append(path)
                 self.image_count = 9
 
-            def pipeline(self, profile_id):
+            def pipeline(self, profile_id, *, dct_coeffs="all"):
+                self.assert_dct_coeffs = dct_coeffs
                 reader = self
 
                 class NativePipeline:

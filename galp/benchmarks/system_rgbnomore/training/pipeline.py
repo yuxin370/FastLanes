@@ -1302,6 +1302,10 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
             prefetch_queue_depth=CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
             exec_pipelined=True,
             exec_async=True,
+            # DALI's PyTorch plugin can safely expose dynamic-executor outputs
+            # through DLPack.  Keeping the executor mode explicit makes the
+            # zero-copy handoff below part of this adapter's contract.
+            exec_dynamic=True,
         )
         with pipeline:
             encoded, anchors, shapes, mirrors, indices = fn.external_source(
@@ -1311,8 +1315,19 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
                 dtype=[types.UINT8, types.FLOAT, types.FLOAT, types.INT32, types.INT64],
                 ndim=[1, 1, 1, 0, 0],
             )
-            images = fn.decoders.image(encoded, device="mixed", output_type=types.RGB)
-            images = fn.slice(images, anchors, shapes, axes=[0, 1], normalized_anchor=True, normalized_shape=True)
+            # Decode the requested crop directly.  For supported JPEGs DALI can
+            # push this ROI into nvJPEG instead of materializing every 512x512
+            # RGB image before the crop.
+            images = fn.decoders.image_slice(
+                encoded,
+                anchors,
+                shapes,
+                device="mixed",
+                output_type=types.RGB,
+                axes=[0, 1],
+                normalized_anchor=True,
+                normalized_shape=True,
+            )
             images = fn.resize(images, device="gpu", resize_x=224, resize_y=224, interp_type=types.INTERP_LINEAR)
             images = fn.crop_mirror_normalize(
                 images,
@@ -1328,19 +1343,20 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
         self._dali_pipeline = pipeline
 
     def next_batch(self) -> TrainingBatch:
-        from nvidia.dali.plugin.pytorch import feed_ndarray, to_torch_type
+        from nvidia.dali.plugin.pytorch.torch_utils import to_torch_tensor
 
         begin = time.perf_counter()
         outputs = self._dali_pipeline.run()
         wait = time.perf_counter() - begin
         image_output, index_output = outputs
-        image_tensor, image_shape = _uniform_dali_tensor(image_output)
-        images = torch.empty(
-            image_shape,
-            device=self.device,
-            dtype=to_torch_type[image_tensor.dtype],
+        image_tensor, _image_shape = _uniform_dali_tensor(image_output)
+        # Match DALI's official PyTorch iterator: dynamic-executor outputs have
+        # independent storage and can be handed to PyTorch through DLPack;
+        # static-executor outputs require a defensive device-to-device copy.
+        images = to_torch_tensor(
+            image_tensor,
+            copy=not bool(self._dali_pipeline.exec_dynamic),
         )
-        feed_ndarray(image_tensor, images)
         indices_cpu = index_output.as_cpu().as_array().reshape(-1).tolist()
         indices = [int(value) for value in indices_cpu]
         read_seconds = self._dali_read_seconds.pop(tuple(indices), 0.0)

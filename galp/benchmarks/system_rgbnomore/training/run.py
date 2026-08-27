@@ -1872,9 +1872,10 @@ def _run_repeat(
         measured_native_stats,
     )
 
+    prefetched_read_identities = adapter.prefetched_read_identities()
     adapter.end()
     loader_metrics = adapter.loader_metrics()
-    ledger.record_prefetched(adapter.prefetched_read_identities())
+    ledger.record_prefetched(prefetched_read_identities)
     loader_measured_metrics: dict[str, Any] = {}
     for name in (
         "submitted_batches",
@@ -2375,9 +2376,10 @@ def _run_convergence_seed(
                     scheduler_total_steps=scheduler_total_steps,
                     augmentation_state=_augmentation_state(contract),
                 )
+    prefetched_read_identities = adapter.prefetched_read_identities()
     adapter.close()
     loader_metrics = adapter.loader_metrics()
-    ledger.record_prefetched(adapter.prefetched_read_identities())
+    ledger.record_prefetched(prefetched_read_identities)
     expected = _flatten(batches[: args.train_steps])
     order_validation = ledger.validate(expected)
     failures.extend(order_validation["failures"])
