@@ -1,0 +1,24 @@
+{
+  "schema": "dct-retokenization-evaluation-config-v1",
+  "configurations": [
+    {"id": "k64_n196", "k": 64, "n": 196, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k64_n98_height", "k": 64, "n": 98, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k64_n98_width", "k": 64, "n": 98, "merge_axis": "width", "merge_type": "fixed"},
+    {"id": "k64_n49", "k": 64, "n": 49, "merge_axis": "height", "merge_type": "fixed"},
+
+    {"id": "k32_n196", "k": 32, "n": 196, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k32_n98_height", "k": 32, "n": 98, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k32_n98_width", "k": 32, "n": 98, "merge_axis": "width", "merge_type": "fixed"},
+    {"id": "k32_n49", "k": 32, "n": 49, "merge_axis": "height", "merge_type": "fixed"},
+
+    {"id": "k24_n196", "k": 24, "n": 196, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k24_n98_height", "k": 24, "n": 98, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k24_n98_width", "k": 24, "n": 98, "merge_axis": "width", "merge_type": "fixed"},
+    {"id": "k24_n49", "k": 24, "n": 49, "merge_axis": "height", "merge_type": "fixed"},
+
+    {"id": "k16_n196", "k": 16, "n": 196, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k16_n98_height", "k": 16, "n": 98, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k16_n98_width", "k": 16, "n": 98, "merge_axis": "width", "merge_type": "fixed"},
+    {"id": "k16_n49", "k": 16, "n": 49, "merge_axis": "height", "merge_type": "fixed"}
+  ]
+}

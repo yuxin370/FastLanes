@@ -1,0 +1,34 @@
+{
+  "schema": "dct-delayed-retokenization-training-config-v1",
+  "stage": "delayed_stage_b",
+  "method": "Delayed Frequency-Spatial Retokenization",
+  "k": 32,
+  "token_count": 98,
+  "merge_after_block": 4,
+  "merge_axis": "width",
+  "initialization": "keep_second",
+  "epochs": 5,
+  "physical_batch_size": 64,
+  "gradient_accumulation": 16,
+  "effective_batch_size": 1024,
+  "learning_rates": {
+    "tokenizer": 0.0001,
+    "head": 0.00003,
+    "post_merge_blocks": 0.00001
+  },
+  "weight_decay": {
+    "tokenizer": 0.0001,
+    "head": 0.00001,
+    "post_merge_blocks": 0.00001
+  },
+  "warmup_updates": 100,
+  "betas": [0.9, 0.999],
+  "epsilon": 1e-8,
+  "gradient_clip_norm": 1.0,
+  "scheduler": "differential_warmup_then_cosine",
+  "crop": "published deterministic per-sample RandomResizedCrop_DCT",
+  "horizontal_flip_probability": 0.5,
+  "randaugment": false,
+  "mixup_alpha": 0.0,
+  "seed": 11997733
+}

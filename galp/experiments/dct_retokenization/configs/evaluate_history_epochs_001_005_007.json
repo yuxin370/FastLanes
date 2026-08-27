@@ -1,0 +1,115 @@
+{
+  "schema": "dct-retokenization-evaluation-config-v1",
+  "configurations": [
+    {
+      "id": "k64_n196",
+      "k": 64,
+      "n": 196,
+      "merge_axis": "height",
+      "merge_type": "fixed"
+    },
+    {
+      "id": "k32_n196",
+      "k": 32,
+      "n": 196,
+      "merge_axis": "height",
+      "merge_type": "fixed"
+    },
+    {
+      "id": "adapter_epoch001_k64_n98_width",
+      "k": 64,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/adapter_only_k64_n98_width_seed11997733_20ep/checkpoint_epoch_001.pt"
+    },
+    {
+      "id": "adapter_epoch001_k32_n98_width",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/adapter_only_k32_n98_width_seed11997733_20ep/checkpoint_epoch_001.pt"
+    },
+    {
+      "id": "adapter_epoch005_k64_n98_width",
+      "k": 64,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/adapter_only_k64_n98_width_seed11997733_20ep/checkpoint_epoch_005.pt"
+    },
+    {
+      "id": "adapter_epoch005_k32_n98_width",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/adapter_only_k32_n98_width_seed11997733_20ep/checkpoint_epoch_005.pt"
+    },
+    {
+      "id": "adapter_epoch007_k64_n98_width",
+      "k": 64,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/adapter_only_k64_n98_width_seed11997733_20ep/checkpoint_epoch_007.pt"
+    },
+    {
+      "id": "adapter_epoch007_k32_n98_width",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/adapter_only_k32_n98_width_seed11997733_20ep/checkpoint_epoch_007.pt"
+    },
+    {
+      "id": "short_ft_epoch001_k64_n98_width",
+      "k": 64,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/short_ft_k64_n98_width_seed11997733_20ep/checkpoint_epoch_001.pt"
+    },
+    {
+      "id": "short_ft_epoch001_k32_n98_width",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/short_ft_k32_n98_width_seed11997733_20ep/checkpoint_epoch_001.pt"
+    },
+    {
+      "id": "short_ft_epoch005_k64_n98_width",
+      "k": 64,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/short_ft_k64_n98_width_seed11997733_20ep/checkpoint_epoch_005.pt"
+    },
+    {
+      "id": "short_ft_epoch005_k32_n98_width",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/short_ft_k32_n98_width_seed11997733_20ep/checkpoint_epoch_005.pt"
+    },
+    {
+      "id": "short_ft_epoch007_k64_n98_width",
+      "k": 64,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/short_ft_k64_n98_width_seed11997733_20ep/checkpoint_epoch_007.pt"
+    },
+    {
+      "id": "short_ft_epoch007_k32_n98_width",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "experiment_checkpoint": "galp/experiments/dct_retokenization/runs/short_ft_k32_n98_width_seed11997733_20ep/checkpoint_epoch_007.pt"
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "study": "K32/N98 delayed retokenization frozen initialization diagnostics",
+  "method_note": "average is a control; all N98 projections are learned layers evaluated only at initialization",
+  "configurations": [
+    {
+      "id": "k64_n196_baseline",
+      "k": 64,
+      "n": 196,
+      "merge_axis": "width",
+      "merge_type": "fixed",
+      "architecture": "post_projection",
+      "initialization": "average",
+      "position_mode": "pooled_existing"
+    },
+    {
+      "id": "k32_n196_baseline",
+      "k": 32,
+      "n": 196,
+      "merge_axis": "width",
+      "merge_type": "fixed",
+      "architecture": "post_projection",
+      "initialization": "average",
+      "position_mode": "pooled_existing"
+    },
+    {
+      "id": "k32_n98_after_b2_average",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "architecture": "delayed_retokenization",
+      "merge_after_block": 2,
+      "initialization": "average"
+    },
+    {
+      "id": "k32_n98_after_b2_keep_first",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "architecture": "delayed_retokenization",
+      "merge_after_block": 2,
+      "initialization": "keep_first"
+    },
+    {
+      "id": "k32_n98_after_b2_keep_second",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "architecture": "delayed_retokenization",
+      "merge_after_block": 2,
+      "initialization": "keep_second"
+    },
+    {
+      "id": "k32_n98_after_b4_average",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "architecture": "delayed_retokenization",
+      "merge_after_block": 4,
+      "initialization": "average"
+    },
+    {
+      "id": "k32_n98_after_b4_keep_first",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "architecture": "delayed_retokenization",
+      "merge_after_block": 4,
+      "initialization": "keep_first"
+    },
+    {
+      "id": "k32_n98_after_b4_keep_second",
+      "k": 32,
+      "n": 98,
+      "merge_axis": "width",
+      "merge_type": "learned",
+      "architecture": "delayed_retokenization",
+      "merge_after_block": 4,
+      "initialization": "keep_second"
+    }
+  ]
+}

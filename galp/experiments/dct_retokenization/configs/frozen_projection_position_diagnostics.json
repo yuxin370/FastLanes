@@ -1,0 +1,20 @@
+{
+  "schema": "dct-retokenization-evaluation-config-v2",
+  "description": "Low-cost post-projection controls and two-way position ablation; average is a negative/control baseline.",
+  "configurations": [
+    {"id": "k64_n196", "k": 64, "n": 196, "merge_axis": "height", "merge_type": "fixed"},
+    {"id": "k32_n196", "k": 32, "n": 196, "merge_axis": "height", "merge_type": "fixed"},
+
+    {"id": "k64_avg_pooled", "k": 64, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "average", "position_mode": "pooled_existing"},
+    {"id": "k64_keep_first_pooled", "k": 64, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "keep_first", "position_mode": "pooled_existing"},
+    {"id": "k64_keep_second_pooled", "k": 64, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "keep_second", "position_mode": "pooled_existing"},
+
+    {"id": "k32_avg_pooled", "k": 32, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "average", "position_mode": "pooled_existing"},
+    {"id": "k32_keep_first_pooled", "k": 32, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "keep_first", "position_mode": "pooled_existing"},
+    {"id": "k32_keep_second_pooled", "k": 32, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "keep_second", "position_mode": "pooled_existing"},
+
+    {"id": "k32_avg_center", "k": 32, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "average", "position_mode": "superpatch_center"},
+    {"id": "k32_keep_first_center", "k": 32, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "keep_first", "position_mode": "superpatch_center"},
+    {"id": "k32_keep_second_center", "k": 32, "n": 98, "merge_axis": "width", "merge_type": "fixed", "initialization": "keep_second", "position_mode": "superpatch_center"}
+  ]
+}
