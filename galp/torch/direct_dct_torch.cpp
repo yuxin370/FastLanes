@@ -900,6 +900,15 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["project_decoded_ycbcr_grid_launch_count"]       = stats.project_decoded_ycbcr_grid_launch_count;
 	out["jpeg_dct_projection_items_materialized"]        = stats.jpeg_dct_projection_items_materialized;
 	out["planless_transform_kernel_launch_count"]        = stats.planless_transform_kernel_launch_count;
+	out["planless_transform_dense_kernel_launch_count"]  = stats.planless_transform_dense_kernel_launch_count;
+	out["planless_transform_sparse_kernel_launch_count"] = stats.planless_transform_sparse_kernel_launch_count;
+	out["planless_transform_dense_output_block_count"]   = stats.planless_transform_dense_output_block_count;
+	out["planless_transform_sparse_output_block_count"]  = stats.planless_transform_sparse_output_block_count;
+	out["planless_transform_selected_coefficient_count"] =
+	    stats.planless_transform_selected_coefficient_count;
+	out["planless_transform_compact_binding_count"] = stats.planless_transform_compact_binding_count;
+	out["planless_transform_dense_binding_equivalent_count"] =
+	    stats.planless_transform_dense_binding_equivalent_count;
 	out["planless_transform_max_blocks_per_launch"]      = stats.planless_transform_max_blocks_per_launch;
 	out["planless_transform_max_output_blocks_per_launch"] =
 	    stats.planless_transform_max_output_blocks_per_launch;
