@@ -106,6 +106,18 @@ if (GALP_WITH_JPEG_DCT)
                 DISCOVERY_TIMEOUT 60
                 PROPERTIES LABELS "galp;jpeg-dct;block-major-access;cpu")
 
+		add_executable(galp_direct_dct_pls_tests
+		        direct_dct_pls_test.cpp)
+		target_link_libraries(galp_direct_dct_pls_tests PRIVATE
+		        galp_jpeg_dct_device
+		        GTest::gtest_main)
+		target_include_directories(galp_direct_dct_pls_tests PRIVATE
+		        ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+		apply_warnings(galp_direct_dct_pls_tests)
+		gtest_discover_tests(galp_direct_dct_pls_tests
+		        DISCOVERY_TIMEOUT 60
+		        PROPERTIES LABELS "galp;jpeg-dct;pls;cpu")
+
         target_sources(galp_tests PRIVATE
                 jpeg_dct_order_test.cpp
                 jpeg_dct_test.cpp

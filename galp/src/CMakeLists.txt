@@ -87,6 +87,8 @@ if (GALP_WITH_JPEG_DCT)
 
         add_library(galp_jpeg_dct_device STATIC
                 api/direct_dct.cpp
+                api/direct_dct_pls.cpp
+                api/direct_dct_pls_postprocess.cu
                 engine/materialization/selected_vector_compactor.cpp
                 jpeg/jpeg_dct_device_bridge.cpp
 				jpeg/jpeg_dct_active_output_schedule.cpp

@@ -119,6 +119,21 @@ inline DirectDctRuntimePolicy block_major_scheduled_bounded_runtime_policy() {
 	return policy;
 }
 
+// Dynamic training crops cannot use the active-output schedule sidecar: that
+// artifact is deliberately keyed to a canonical whole-shard/no-transform
+// plan. Keep the same physical-order planless executor and bounded io_uring
+// selected-decode policy, but compile output activity from each keyed crop in
+// memory. The request output_slot still carries the closed-pool shuffle order.
+inline constexpr std::string_view kBlockMajorDynamicCropBoundedRuntimePolicyId =
+    "block-major-dynamic-crop-p4-bounded-110-v1";
+
+inline DirectDctRuntimePolicy block_major_dynamic_crop_bounded_runtime_policy() {
+	auto policy = block_major_scheduled_bounded_runtime_policy();
+	policy.id = kBlockMajorDynamicCropBoundedRuntimePolicyId;
+	policy.crop_execution_mode = jpeg::JpegDctCropExecutionMode::kBoundedIoUringRangeReadSelectedDecode;
+	return policy;
+}
+
 } // namespace galp::profiles
 
 #endif // GALP_PROFILES_DIRECT_DCT_HPP

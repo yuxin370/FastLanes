@@ -10,6 +10,7 @@ namespace galp::profiles {
 inline constexpr std::string_view kRgbNoMoreValidationProfileId = "rgbnomore-validation-v1";
 inline constexpr std::string_view kRgbNoMoreValidationCenterCrop512ProfileId =
     "rgbnomore-validation-center-crop-512-v1";
+inline constexpr std::string_view kRgbNoMoreTrainingPlsProfileId = "rgbnomore-training-pls-v1";
 
 // Optional application profile. No RGB-no-more name or geometry is required by
 // the generic JPEG-DCT API or executor when this header is not included.
@@ -72,17 +73,36 @@ inline RegisteredDirectDctProfile rgbnomore_validation_profile() {
 	};
 }
 
-// The 64-block reference encodes the 512x512 centre-crop input contract.  It
-// is an RGB-no-more semantic variant, not a property of block-major storage.
+// The fixed-512 variant changes the runtime policy, not RGB-no-more's model
+// transform.  ResizedCenterCrop_DCT(32, 28) uses a 32-block pseudo-resize
+// reference: a 64-block luma source is centre-cropped to 56 blocks and then
+// downsampled to 28.  Replacing the reference with the 64-block source extent
+// would incorrectly turn this into an identity resize of a 28-block crop.
 inline RegisteredDirectDctProfile rgbnomore_validation_center_crop_512_profile() {
 	auto output = rgbnomore_validation_output_profile();
 	output.id   = kRgbNoMoreValidationCenterCrop512ProfileId;
-	output.grid_transform->crop_reference_width_blocks  = 64U;
-	output.grid_transform->crop_reference_height_blocks = 64U;
 	return RegisteredDirectDctProfile {
 	    kRgbNoMoreValidationCenterCrop512ProfileId,
 	    std::move(output),
 	    block_major_scheduled_bounded_runtime_policy(),
+	};
+}
+
+// Physical-PLS training uses arbitrary keyed source crops, but the same 28/14
+// model grid. The block-major scheduled runtime performs physical-order reads
+// and writes transformed images directly into the native scheduler's shuffled
+// output slots. M/G are epoch-scheduler fields, not output-profile fields.
+inline RegisteredDirectDctProfile rgbnomore_training_pls_profile() {
+	DirectDctOutputProfile output;
+	output.id             = kRgbNoMoreTrainingPlsProfileId;
+	output.layout         = jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+	// RandAugment operates in the published dequantized int16 domain; the
+	// native PLS CUDA postprocessor performs normalization and Mixup afterward.
+	output.grid_transform = rgbnomore_val_dct_grid_transform();
+	return RegisteredDirectDctProfile {
+	    kRgbNoMoreTrainingPlsProfileId,
+	    std::move(output),
+	    block_major_dynamic_crop_bounded_runtime_policy(),
 	};
 }
 
