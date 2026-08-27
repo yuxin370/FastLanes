@@ -230,6 +230,9 @@ struct JpegDctDeviceExecutionStats {
 	bool   device_mapping_fused                     = false;
 	// Scheduling/stream diagnostics (appended for aggregate compatibility).
 	size_t      planless_transform_kernel_launch_count          = 0;
+	// Coefficient-aware planless transform diagnostics. A sparse launch keeps
+	// the model-facing 64-coefficient output dense, but binds and mixes only the
+	// selected raw physical coefficient columns.
 	size_t      planless_transform_dense_kernel_launch_count    = 0;
 	size_t      planless_transform_sparse_kernel_launch_count   = 0;
 	size_t      planless_transform_dense_output_block_count     = 0;
@@ -378,8 +381,9 @@ struct JpegDctDeviceExecutionStats {
 	size_t galp_native_pinned_allocation_requests   = 0;
 	size_t galp_native_pinned_cuda_allocation_count = 0;
 	size_t galp_native_pinned_cuda_allocation_bytes = 0;
-	// Compact-v3 coefficient pushdown accounting. Logical bytes exclude
-	// same-page gaps; range bytes are the actual bytes requested with pread.
+	// JPEG coefficient-selection accounting across storage formats. Logical
+	// selection counts describe the request; byte/page/run counters describe the
+	// actual physical work and expose storage backends that cannot push it down.
 	size_t coefficient_range_rowgroup_count       = 0;
 	size_t coefficient_logical_bytes_requested    = 0;
 	size_t coefficient_range_bytes_read           = 0;

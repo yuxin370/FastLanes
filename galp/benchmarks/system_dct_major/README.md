@@ -12,7 +12,8 @@ storage API 名称为 `kSpatialMajorImageMinor`，benchmark 中简称 DCT-major�
 
 | Pipeline | 输入域 | 用途 |
 | --- | --- | --- |
-| `dct_major_pushdown` | DCT | GALP block-major 原生 crop pushdown |
+| `dct_major_pushdown` | DCT | GALP block-major 原生 crop pushdown，固定 `all`/K64 |
+| `dct_major_coefficient_pushdown` | DCT | 同一 GALP adapter/profile/runtime，加可配置 raw coefficient pushdown |
 | `rgbnomore` | DCT | RGB-no-more 严格语义参考 |
 | `dali` | RGB | nvJPEG/GPU transform 部署参考 |
 | `pytorch` | RGB | PIL/torchvision 部署参考 |
@@ -31,7 +32,8 @@ checkpoint；RGB 路径共享 RGB checkpoint。
 - 所有 sampler/reader 都是 `shuffle=false`；
 - `drop_last=false`，支持 partial tail；
 - sample ordinal 等于物理 `galp_image_id`；
-- DCT 请求全部 64 个系数并使用 FP32 模型；
+- 完整 DCT-major storage 始终保存 64 个系数；GALP baseline 读取 `all`，coefficient-pushdown pipeline 默认读取 `first:32`；
+- coefficient selection 在 dequantization/frequency mixing 前应用，模型仍接收 dense-64 FP32 grid 和 N=196 tokens；
 - 生产运行要求完整 manifest shard 和预先物化的 `BLOCK_MAJOR_ACCESS_V1` sidecar；
 - transformed DCT 允许最多一个归一化整数级误差（`1/1020`）；
 - physical bytes、vectors、source blocks、rowgroups 和 preads 必须写入结果；
@@ -39,9 +41,10 @@ checkpoint；RGB 路径共享 RGB checkpoint。
 
 ## 语义 profile 与原生运行策略
 
-`dct_major_pushdown` 使用语义 profile
-`rgbnomore-validation-center-crop-512-v1`，由它定义 64×64 block crop reference、
-28×28/14×14 输出网格和 FP32 归一化。其原生 runtime policy 固定为
+两条 GALP pipeline 使用同一个语义 profile
+`rgbnomore-validation-center-crop-512-v1`：输入是固定 64×64 luma block 网格，
+保持 RGB-no-more `ResizedCenterCrop_DCT(32, 28)` 语义（中心裁 56×56 后缩小到
+28×28，chroma 对应 28×28→14×14）和 FP32 归一化。其原生 runtime policy 固定为
 `block-major-p4-scheduled-bounded-110-v1`：
 
 - planless execution，decoded-rowgroup cache/plan cache 为 0；
@@ -54,23 +57,13 @@ checkpoint；RGB 路径共享 RGB checkpoint。
 - double buffer 由 runtime policy 自动选择。
 
 Python contract 只记录 runtime policy 身份，不记录上述 planner、allocator、I/O 或 kernel
-细节。
+细节。selection 是独立的 request 参数，支持 `all`、`first:N`、`list:i,j,...`；
+benchmark 还把 `random:K:SEED` 一次性解析成确定性的 native `list`。contract 同时记录
+原始 spec、zigzag column indices、natural 8×8 indices、K 和 seed。
 
 ## Quick start
 
-只生成 contract：
-
-```bash
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/run.py \
-  --preset smoke \
-  --workload feature-extraction \
-  --block-major-access-dir /tmp/galp-block-major-access-v1-real \
-  --output-dir /tmp/galp-dct-major-dry-run \
-  --dry-run
-```
-
-四管线 feature smoke：
+只生成 contract（manifest 与 labels 必须来自同一个 fixed-512 数据视图）：
 
 ```bash
 PYTHONPATH=build/galp/torch \
@@ -78,7 +71,26 @@ PYTHONPATH=build/galp/torch \
   galp/benchmarks/system_dct_major/run.py \
   --preset smoke \
   --workload feature-extraction \
-  --block-major-access-dir /tmp/galp-block-major-access-v1-real \
+  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
+  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
+  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
+  --dct-coeffs first:32 \
+  --output-dir /tmp/galp-dct-major-dry-run \
+  --dry-run
+```
+
+五管线 feature smoke（正式 coefficient spec 必须显式给出）：
+
+```bash
+PYTHONPATH=build/galp/torch \
+/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  galp/benchmarks/system_dct_major/run.py \
+  --preset smoke \
+  --workload feature-extraction \
+  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
+  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
+  --dct-coeffs first:32 \
+  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
   --output-dir /tmp/galp-dct-major-feature-smoke
 ```
 
@@ -90,7 +102,10 @@ PYTHONPATH=build/galp/torch \
   galp/benchmarks/system_dct_major/run.py \
   --preset e2e \
   --workload evaluation \
-  --block-major-access-dir /tmp/galp-block-major-access-v1-real \
+  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
+  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
+  --dct-coeffs first:32 \
+  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
   --output-dir /tmp/galp-dct-major-eval-50k
 ```
 
@@ -99,16 +114,20 @@ PYTHONPATH=build/galp/torch \
 
 ## 完整 suite
 
-`run_suite.py` 固定执行：feature smoke、evaluation smoke、两次四管线 formal 和
-四个 DCT/RGB model-only ceiling。它不再做 segment sweep、自动选优、legacy
+`run_suite.py` 固定执行：只读 contract preflight、K64 regression 与 K32/K16/list
+raw-mask semantic gate、约 1K 的五管线 feature/evaluation smoke、两次五管线 formal 和四个 DCT/RGB model-only
+ceiling。它不再做 segment sweep、自动选优、legacy
 ABBA、crop A/B 或 plan-audit compare。
 
 ```bash
 PYTHONPATH=build/galp/torch:galp/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   galp/benchmarks/system_dct_major/run_suite.py \
-  --block-major-access-dir /tmp/galp-block-major-access-v1-real \
-  --output-dir /tmp/galp-dct-major-complete \
+  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
+  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
+  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
+  --dct-coeffs first:32 \
+  --output-dir /tmp/galp-dct-pushdown-k32-fixed \
   --dry-run
 ```
 
@@ -118,7 +137,8 @@ phase。
 ## 测试
 
 ```bash
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+PYTHONPATH=galp/benchmarks/system_dct_major \
+  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
   -m unittest discover -s galp/benchmarks/system_dct_major/tests -v
 ```
 

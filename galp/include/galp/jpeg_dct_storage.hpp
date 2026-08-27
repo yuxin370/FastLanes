@@ -224,8 +224,8 @@ void compress_jpeg_dct_dataset_to_fls(const std::vector<std::filesystem::path>& 
                                       const JpegDctMetadataWriterOptions&       metadata_options);
 
 void write_jpeg_dct_shard_manifest(const JpegDctShardManifest& manifest, const std::filesystem::path& output_path);
-// Public, read-only manifest entry point. Native physical schedulers need the
-// shard boundaries without depending on src/jpeg private headers.
+// Public, read-only manifest entry point. Production schedulers need the
+// physical shard boundaries without depending on src/jpeg private headers.
 JpegDctShardManifest read_jpeg_dct_shard_manifest(const std::filesystem::path& path);
 JpegDctShardManifest
 compress_jpeg_dct_dataset_to_sharded_fls(const std::vector<std::filesystem::path>& jpeg_paths,

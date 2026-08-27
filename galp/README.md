@@ -137,6 +137,10 @@ context.
 When `GALP_WITH_JPEG_DCT=ON`, `galp/direct_dct.hpp` exposes a small
 stay-on-GPU runtime facade for direct-DCT ML workloads:
 
+The advanced premixed physical-PLS training path, including its native
+crop/pool-shuffle/CUDA augmentation boundary and deployment prerequisites, is
+documented in the [experimental PLS training guide](benchmarks/system_dct_major/training_pls/README.md).
+
 ```cpp
 #include <galp/direct_dct.hpp>
 
@@ -200,6 +204,12 @@ pipeline = reader.pipeline(VALIDATION).start(
 )
 for batch in pipeline:
     output = model(batch.y, batch.cbcr)
+
+# Optional raw JPEG zigzag-column selection.  The registered profile still
+# owns crop/layout/runtime policy, and the model-ready tensor shape is unchanged.
+selected = reader.pipeline(VALIDATION, dct_coeffs="first:32").start(
+    [[0, 1, 2, 3]],
+)
 ```
 
 The public API has no future/submission gate, planner preview, manual reclaim,

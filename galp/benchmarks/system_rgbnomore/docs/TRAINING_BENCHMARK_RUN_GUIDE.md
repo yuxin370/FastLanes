@@ -283,3 +283,67 @@ python3 galp/benchmarks/system_rgbnomore/training/v3_acceptance.py \
 ```
 
 返回码 `0` 表示所有 blocking gates 通过，`1` 表示已有证据违反 blocking gate，`2` 表示仍缺 required evidence。`--allow-incomplete` 只允许 incomplete 报告返回 `0`，不会掩盖已失败的门。报告不会相加可能重叠的 planner/read/decode/transform stage 时间，也明确禁止把 GALP 与 DALI 的不同模型路径解释为纯 codec 差异。
+
+## 10. H100 equal-image 两 epoch 性能比较
+
+短 step benchmark 不能与完整 Native PLS epoch 直接相除。以下入口固定完整
+ImageNet、microbatch 64、accumulation 16、不丢尾部、每 epoch 20,019 个
+microbatch 和 1,252 个 optimizer update。Epoch 1 是 cold observation，Epoch 2
+是主要 warm observation。DALI/PyTorch 共享同一 RGB 模型初始状态、sample order、
+augmentation key、optimizer 和 300-epoch scheduler horizon。
+两条 RGB pipeline 在同一进程中按注册顺序运行，因此 Epoch 1 还包含编译缓存的
+顺序效应，只作为诊断记录，不用于 pipeline 排名；正式直接性能比较只使用 Epoch 2。
+
+先生成不可变 contract，不启动训练：
+
+```bash
+cd /home/tangyuxin/gfastlanes/FastLanes
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=1
+
+PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+PYTHONPATH="$PWD/galp/benchmarks/system_rgbnomore:$PWD/build/galp/torch"
+E2E="$PWD/galp/data/system_rgbnomore/e2e_v3"
+OUT=/mnt/nvme2/home/tangyuxin/pls-experiments/backend-comparison-20260819/equal-image-rgb-h100-e2
+
+PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
+  --train-manifest "$E2E/training_manifests_official_v3/train.json" \
+  --val-manifest "$E2E/training_manifests_official_v3/val.json" \
+  --output-dir "$OUT" \
+  --pipelines dali,pytorch \
+  --device cuda:0
+```
+
+检查 `contract.json` 和 `execution_plan.json` 后执行：
+
+```bash
+PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
+  --train-manifest "$E2E/training_manifests_official_v3/train.json" \
+  --val-manifest "$E2E/training_manifests_official_v3/val.json" \
+  --output-dir "$OUT" \
+  --pipelines dali,pytorch \
+  --device cuda:0 \
+  --execute
+```
+
+runner 在 checkpoint epoch boundary 自动恢复；已存在且 contract 相同的完整
+pipeline 不会重跑。默认要求所选 GPU 名称包含 `H100`，避免 PCI bus 映射错误。
+
+Native B6 H100 完成 E2 后生成三路统一表：
+
+```bash
+PLS_PYTHONPATH="$PWD/galp/benchmarks/system_dct_major:$PWD/build/galp/torch"
+NATIVE=/mnt/nvme2/home/tangyuxin/pls-experiments/native-pls-b6-h100-seed11997733-e2/runs/B6/seed_11997733
+REPORT=/mnt/nvme2/home/tangyuxin/pls-experiments/backend-comparison-20260819/equal-image-h100-report
+
+PYTHONPATH="$PLS_PYTHONPATH" "$PY" \
+  -m training_pls.report_equal_image_performance \
+  --standard-root "$OUT" \
+  --native-run "$NATIVE" \
+  --output-dir "$REPORT"
+```
+
+报告会拒绝 GPU UUID、hostname、PyTorch/CUDA 版本或每 epoch
+images/microbatches/updates 不一致的输入。DALI 与 PyTorch 是直接 RGB pipeline
+比较；RGB 与 Native DCT B6 是 equal-image 完整应用路径比较，不声明纯 loader 或
+纯 codec 隔离。
