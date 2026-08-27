@@ -1,4 +1,5 @@
 #include "core/operator_capabilities.hpp"
+#include "cuda/memory/cuda_raii.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/file/file_footer.hpp"
@@ -8,6 +9,7 @@
 #include "fls/table/memory_table.hpp"
 #include "galp/direct_dct.hpp"
 #include "galp/jpeg_dct.hpp"
+#include "galp/jpeg_dct_block_major_access.hpp"
 #include "galp/profiles/rgbnomore.hpp"
 #include "galp_tools/benchmark_support/pipeline.cuh"
 #include "jpeg/jpeg_dct_cuda_internal.cuh"
@@ -16,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -28,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -43,6 +47,34 @@ struct FileCloser {
 			std::fclose(file);
 		}
 	}
+};
+
+class ScopedEnvironmentVariable {
+public:
+	ScopedEnvironmentVariable(std::string name, const std::string& value)
+	    : name_(std::move(name)) {
+		if (const auto* previous = std::getenv(name_.c_str()); previous != nullptr) {
+			previous_ = previous;
+		}
+		if (setenv(name_.c_str(), value.c_str(), 1) != 0) {
+			throw std::runtime_error("failed to set test environment variable " + name_);
+		}
+	}
+
+	ScopedEnvironmentVariable(const ScopedEnvironmentVariable&)            = delete;
+	ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) = delete;
+
+	~ScopedEnvironmentVariable() {
+		if (previous_.has_value()) {
+			(void)setenv(name_.c_str(), previous_->c_str(), 1);
+		} else {
+			(void)unsetenv(name_.c_str());
+		}
+	}
+
+private:
+	std::string                name_;
+	std::optional<std::string> previous_;
 };
 
 using FilePtr = std::unique_ptr<FILE, FileCloser>;
@@ -2694,6 +2726,169 @@ TEST(JpegDct, CropExecutionModesMatchAndVectorRangeReadsFewerPhysicalBytes) {
 	std::filesystem::remove_all(dir);
 }
 
+TEST(JpegDct, BlockMajorProductionProfileOutputInitializationIsSelectorStable) {
+	const auto* run_gpu_tests = std::getenv("GALP_RUN_GPU_TESTS");
+	if (run_gpu_tests == nullptr || std::string(run_gpu_tests) != "1") {
+		GTEST_SKIP() << "set GALP_RUN_GPU_TESTS=1 on the target-GPU host";
+	}
+	int device_count = 0;
+	if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+		GTEST_SKIP() << "CUDA device is not available";
+	}
+
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto dir = std::filesystem::temp_directory_path() /
+	                 ("galp_jpeg_dct_block_major_output_initialization_" + std::to_string(suffix));
+	std::filesystem::create_directories(dir);
+	const auto input_path = dir / "input.jpg";
+	write_test_jpeg(input_path, 512, 512);
+	constexpr size_t image_count = 64U;
+	const std::vector<std::filesystem::path> input_paths(image_count, input_path);
+
+	galp::jpeg::JpegDctReaderOptions reader_options;
+	reader_options.validation_mode = galp::jpeg::JpegDatasetValidationMode::kRaggedBlockMajor;
+	galp::jpeg::JpegDctShardOptions shard_options;
+	shard_options.shard_images                  = image_count;
+	shard_options.shard_images_specified        = true;
+	shard_options.rowgroup_vectors              = 1U;
+	shard_options.rowgroup_vectors_specified    = true;
+	// 512x512 4:2:0 contributes 6144 spatial component groups.  With
+	// 64 image rows per group and 1024 rows per rowgroup, the fixture needs
+	// 384 rowgroups to remain one physical shard and exercise the scheduled
+	// block-major sidecar path.
+	shard_options.rowgroups_per_shard           = 512U;
+	shard_options.rowgroups_per_shard_specified = true;
+	shard_options.physical_layout               = galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor;
+	shard_options.physical_layout_specified     = true;
+	const auto output_dir                       = dir / "dataset";
+	const auto manifest = galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    input_paths, output_dir, reader_options, shard_options);
+	ASSERT_EQ(manifest.shards.size(), 1U);
+	const auto sidecar_dir = dir / "block-major-access";
+	const auto access_report = galp::jpeg::build_jpeg_dct_block_major_access_dataset(
+	    output_dir / "manifest.bin", sidecar_dir);
+	ASSERT_EQ(access_report.shards.size(), 1U);
+
+	ScopedEnvironmentVariable block_major_access_directory("GALP_BLOCK_MAJOR_ACCESS_DIR", sidecar_dir.string());
+	galp::jpeg::JpegDctShardDatasetReader reader(output_dir / "manifest.bin");
+	std::vector<galp::jpeg::JpegDctImageCropRequest> requests;
+	requests.reserve(image_count);
+	for (size_t image = 0U; image < image_count; ++image) {
+		requests.push_back({static_cast<uint32_t>(image), {}});
+	}
+
+	auto omitted_options = galp::profiles::materialize_direct_dct_options(
+	    galp::profiles::rgbnomore_validation_center_crop_512_profile());
+	ASSERT_TRUE(omitted_options.grid_transform.has_value());
+	EXPECT_EQ(omitted_options.grid_transform->crop_reference_width_blocks, 32U);
+	EXPECT_EQ(omitted_options.grid_transform->crop_reference_height_blocks, 32U);
+	auto explicit_all_options = omitted_options;
+	explicit_all_options.coefficient_selection.coefficients = all_dct_coefficients();
+	auto prefix_options = omitted_options;
+	prefix_options.coefficient_selection.coefficients.resize(32U);
+	std::iota(prefix_options.coefficient_selection.coefficients.begin(),
+	          prefix_options.coefficient_selection.coefficients.end(),
+	          uint8_t {0U});
+
+	const auto preview = reader.PlanDeviceDctBatch(requests, omitted_options);
+	EXPECT_TRUE(preview.uses_planless_fixed_transform);
+	EXPECT_EQ(preview.compact_image_descriptor_count, image_count);
+	EXPECT_TRUE(preview.block_metadata.empty());
+
+	const auto copy_grid = [](const galp::jpeg::JpegDctDeviceBatch& batch) {
+		std::pair<std::vector<float>, std::vector<float>> host {
+		    std::vector<float>(batch.y_coefficient_count()),
+		    std::vector<float>(batch.cbcr_coefficient_count())};
+		if (!host.first.empty()) {
+			EXPECT_EQ(cudaMemcpy(host.first.data(),
+			                     batch.y_float_coefficients(),
+			                     host.first.size() * sizeof(float),
+			                     cudaMemcpyDeviceToHost),
+			          cudaSuccess);
+		}
+		if (!host.second.empty()) {
+			EXPECT_EQ(cudaMemcpy(host.second.data(),
+			                     batch.cbcr_float_coefficients(),
+			                     host.second.size() * sizeof(float),
+			                     cudaMemcpyDeviceToHost),
+			          cudaSuccess);
+		}
+		return host;
+	};
+
+	// Submit the next batch before synchronously reading the previous output.
+	// This exercises the reader-owned asynchronous reuse fence as well as the
+	// initialization handoff between non-blocking CUDA streams.
+	auto omitted_first_batch = reader.ReadDeviceDctBatch(requests, omitted_options);
+	auto explicit_all_batch  = reader.ReadDeviceDctBatch(requests, explicit_all_options);
+	const auto omitted_first = copy_grid(omitted_first_batch);
+	const auto explicit_all  = copy_grid(explicit_all_batch);
+	EXPECT_EQ(omitted_first, explicit_all);
+	const auto all_stats = explicit_all_batch.execution_stats();
+	EXPECT_TRUE(all_stats.fixed_grid_output_float32);
+	EXPECT_TRUE(all_stats.direct_dct_low_priority_streams);
+	EXPECT_EQ(all_stats.scheduling_policy, "limited-overlap");
+	EXPECT_EQ(all_stats.bounded_io_backend, "io-uring");
+	EXPECT_GT(all_stats.full_coefficient_count, 0U);
+	EXPECT_EQ(all_stats.selected_coefficient_count, all_stats.full_coefficient_count);
+	EXPECT_DOUBLE_EQ(all_stats.selected_coefficient_ratio, 1.0);
+	EXPECT_GT(all_stats.planless_transform_dense_kernel_launch_count, 0U);
+	EXPECT_EQ(all_stats.planless_transform_sparse_kernel_launch_count, 0U);
+	EXPECT_EQ(all_stats.planless_transform_dense_output_block_count,
+	          all_stats.planless_transform_output_block_count);
+	EXPECT_EQ(all_stats.planless_transform_sparse_output_block_count, 0U);
+	EXPECT_EQ(all_stats.planless_transform_selected_coefficient_count, 64U);
+	EXPECT_EQ(all_stats.planless_transform_compact_binding_count, 0U);
+	omitted_first_batch = {};
+	explicit_all_batch  = {};
+
+	auto prefix_first_batch  = reader.ReadDeviceDctBatch(requests, prefix_options);
+	auto prefix_second_batch = reader.ReadDeviceDctBatch(requests, prefix_options);
+	const auto prefix_first  = copy_grid(prefix_first_batch);
+	const auto prefix_second = copy_grid(prefix_second_batch);
+	EXPECT_EQ(prefix_first, prefix_second);
+	const auto prefix_stats = prefix_second_batch.execution_stats();
+	EXPECT_GT(prefix_stats.full_coefficient_count, 0U);
+	EXPECT_EQ(prefix_stats.selected_coefficient_count * 2U, prefix_stats.full_coefficient_count);
+	EXPECT_DOUBLE_EQ(prefix_stats.selected_coefficient_ratio, 0.5);
+	EXPECT_EQ(prefix_stats.planless_transform_dense_kernel_launch_count, 0U);
+	EXPECT_GT(prefix_stats.planless_transform_sparse_kernel_launch_count, 0U);
+	EXPECT_EQ(prefix_stats.planless_transform_dense_output_block_count, 0U);
+	EXPECT_EQ(prefix_stats.planless_transform_sparse_output_block_count,
+	          prefix_stats.planless_transform_output_block_count);
+	EXPECT_EQ(prefix_stats.planless_transform_selected_coefficient_count, 32U);
+	EXPECT_GT(prefix_stats.planless_transform_compact_binding_count, 0U);
+	EXPECT_EQ(prefix_stats.planless_transform_compact_binding_count * 2U,
+	          prefix_stats.planless_transform_dense_binding_equivalent_count);
+	EXPECT_TRUE(std::all_of(prefix_first.first.begin(), prefix_first.first.end(), [](const float value) {
+		return std::isfinite(value);
+	}));
+	prefix_first_batch  = {};
+	prefix_second_batch = {};
+
+	// Make the former race deterministic.  Planning and host I/O complete first,
+	// then the legacy default stream is held while the production non-blocking
+	// transform streams execute.  Output initialization must be part of the
+	// transform dependency graph instead of relying on implicit default-stream
+	// ordering.
+	auto gated_prepared = reader.PrepareDeviceDctBatch(requests, omitted_options);
+	reader.StagePreparedDeviceDctBatchIo(gated_prepared);
+	galp::memory::CudaEvent  default_stream_gate(cudaEventDisableTiming);
+	galp::memory::CudaStream gate_release_stream(cudaStreamNonBlocking);
+	ASSERT_EQ(cudaLaunchHostFunc(
+	              gate_release_stream.get(),
+	              [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); },
+	              nullptr),
+	          cudaSuccess);
+	default_stream_gate.record(gate_release_stream.get());
+	ASSERT_EQ(cudaStreamWaitEvent(nullptr, default_stream_gate.get(), 0), cudaSuccess);
+	auto omitted_after_prefix_batch = reader.ReadPreparedDeviceDctBatch(std::move(gated_prepared));
+	const auto omitted_after_prefix = copy_grid(omitted_after_prefix_batch);
+	EXPECT_EQ(omitted_after_prefix, omitted_first);
+
+	std::filesystem::remove_all(dir);
+}
+
 TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 	const auto* run_gpu_tests = std::getenv("GALP_RUN_GPU_TESTS");
 	if (run_gpu_tests == nullptr || std::string(run_gpu_tests) != "1") {
@@ -2851,6 +3046,52 @@ TEST(JpegDct, PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix) {
 			EXPECT_EQ(planless_host, legacy_host) << test_case.name << " transform=" << transform_index;
 			EXPECT_EQ(planless_host, repeat_host) << test_case.name << " transform=" << transform_index;
 			EXPECT_EQ(planless_host, chunked_host) << test_case.name << " transform=" << transform_index;
+
+			std::vector<std::vector<uint8_t>> selections(4);
+			selections[0].resize(64U);
+			selections[1].resize(32U);
+			selections[2].resize(16U);
+			std::iota(selections[0].begin(), selections[0].end(), uint8_t {0U});
+			std::iota(selections[1].begin(), selections[1].end(), uint8_t {0U});
+			std::iota(selections[2].begin(), selections[2].end(), uint8_t {0U});
+			selections[3] = {0U, 3U, 7U};
+			for (const auto& coefficients : selections) {
+				auto selected_planless_options = planless_options;
+				selected_planless_options.coefficient_selection.coefficients = coefficients;
+				auto selected_legacy_options = selected_planless_options;
+				selected_legacy_options.enable_planless_execution = false;
+				auto selected_planless = reader.ReadDeviceDctBatch(requests, selected_planless_options);
+				auto selected_legacy = reader.ReadDeviceDctBatch(requests, selected_legacy_options);
+				const auto selected_planless_host = copy_grid(selected_planless);
+				EXPECT_EQ(selected_planless_host, copy_grid(selected_legacy))
+				    << test_case.name << " transform=" << transform_index
+				    << " K=" << coefficients.size();
+				EXPECT_EQ(selected_planless.selected_coefficients(), coefficients);
+				EXPECT_EQ(selected_planless.coefficients_per_block(), coefficients.size());
+				const auto selected_stats = selected_planless.execution_stats();
+				EXPECT_EQ(selected_stats.selected_coefficient_count,
+				          coefficients.size() * selected_stats.rowgroup_count);
+				EXPECT_EQ(selected_stats.full_coefficient_count,
+				          64U * selected_stats.rowgroup_count);
+				EXPECT_DOUBLE_EQ(selected_stats.selected_coefficient_ratio,
+				                 static_cast<double>(coefficients.size()) / 64.0);
+				if (coefficients.size() == 64U) {
+					EXPECT_EQ(selected_planless_host, planless_host)
+					    << test_case.name << " transform=" << transform_index;
+					EXPECT_GT(selected_stats.planless_transform_dense_kernel_launch_count, 0U);
+					EXPECT_EQ(selected_stats.planless_transform_sparse_kernel_launch_count, 0U);
+					EXPECT_EQ(selected_stats.planless_transform_compact_binding_count, 0U);
+				} else {
+					EXPECT_EQ(selected_stats.planless_transform_dense_kernel_launch_count, 0U);
+					EXPECT_GT(selected_stats.planless_transform_sparse_kernel_launch_count, 0U);
+					EXPECT_EQ(selected_stats.planless_transform_selected_coefficient_count,
+					          coefficients.size());
+					EXPECT_GT(selected_stats.planless_transform_compact_binding_count, 0U);
+					EXPECT_EQ(selected_stats.planless_transform_compact_binding_count * 64U,
+					          selected_stats.planless_transform_dense_binding_equivalent_count *
+					              coefficients.size());
+				}
+			}
 
 			auto float_transform                  = transforms[transform_index];
 			float_transform.output_data_type      = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
