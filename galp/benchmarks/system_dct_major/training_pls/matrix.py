@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Frozen 2x2 PLS crop/shuffle model-effect matrix."""
+"""Frozen 2x2 PLS matrix plus explicitly supplemental controls."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from typing import Any
 
 
 MATRIX_SCHEMA = "galp-pls-core-matrix-v2"
+SUPPLEMENTAL_MATRIX_SCHEMA = "galp-pls-matrix-with-supplemental-controls-v1"
 CORE_CONDITION_IDS = ("A0", "A1", "B2", "B6")
+SUPPLEMENTAL_CONDITION_IDS = ("N6", "N2")
+REGISTERED_CONDITION_IDS = CORE_CONDITION_IDS + SUPPLEMENTAL_CONDITION_IDS
 PAIRED_SEEDS = (11997733, 11997734, 11997735, 11997736)
 BALANCED_EXECUTION_ORDER = {
     11997733: ("A0", "A1", "B2", "B6"),
@@ -33,11 +36,40 @@ def _condition(
         "order_policy": order_policy,
         "organization": "frozen-physical-layout-plan",
         "segment_images": 1024,
-        "segments_per_pool": 4 if order_policy == "closed-pool" else None,
+        "segments_per_pool": (
+            4 if order_policy in {"closed-pool", "physical-order"} else None
+        ),
         "execution_mode": "semantic_emulation",
         "question": question,
         "selection_role": "pre-registered scientific contrast; never performance-selected",
     }
+
+
+def supplemental_conditions() -> list[dict[str, Any]]:
+    """Return controls that must not alter the registered 2x2 estimands."""
+
+    return [
+        _condition(
+            "N2",
+            crop_policy="per-sample",
+            crop_key_scope="logical_sample_id",
+            order_policy="physical-order",
+            question=(
+                "per-sample-crop no-epoch-shuffle control: consume the frozen "
+                "premixed physical order in consecutive M=4 pools"
+            ),
+        ),
+        _condition(
+            "N6",
+            crop_policy="per-pls",
+            crop_key_scope="virtual_pls_id",
+            order_policy="physical-order",
+            question=(
+                "no-epoch-shuffle control: consume the frozen premixed physical "
+                "order in consecutive M=4 pools"
+            ),
+        )
+    ]
 
 
 def core_matrix() -> dict[str, Any]:
@@ -141,16 +173,70 @@ def core_matrix() -> dict[str, Any]:
     }
 
 
+def experiment_matrix(condition_ids: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Describe a plan without rewriting the original four-condition design."""
+
+    selected = {str(value).upper() for value in condition_ids}
+    supplemental = [
+        condition
+        for condition in supplemental_conditions()
+        if condition["condition_id"] in selected
+    ]
+    matrix = core_matrix()
+    if not supplemental:
+        return matrix
+    matrix["schema_version"] = SUPPLEMENTAL_MATRIX_SCHEMA
+    matrix["design"] = "registered 2x2 paired-seed factorial plus supplemental controls"
+    matrix["conditions"].extend(supplemental)
+    matrix["supplemental_estimands"] = [
+        {
+            "effect_id": "closed_pool_shuffle_vs_none_per_pls_crop",
+            "formula": "B6 - N6",
+            "kind": "supplemental paired simple effect",
+        },
+        {
+            "effect_id": "global_shuffle_vs_none_per_pls_crop",
+            "formula": "A1 - N6",
+            "kind": "supplemental paired simple effect",
+        },
+        {
+            "effect_id": "closed_pool_shuffle_vs_none_per_sample_crop",
+            "formula": "B2 - N2",
+            "kind": "supplemental paired simple effect",
+        },
+        {
+            "effect_id": "global_shuffle_vs_none_per_sample_crop",
+            "formula": "A0 - N2",
+            "kind": "supplemental paired simple effect",
+        },
+        {
+            "effect_id": "crop_effect_without_epoch_shuffle",
+            "formula": "N6 - N2",
+            "kind": "supplemental paired simple effect",
+        },
+        {
+            "effect_id": "crop_x_closed_shuffle_vs_none",
+            "formula": "B6 - B2 - N6 + N2",
+            "kind": "supplemental paired interaction",
+        },
+    ]
+    matrix["supplemental_interpretation"] = (
+        "N2 and N6 are supplemental no-shuffle controls and are never folded "
+        "into the original registered 2x2 main-effect or interaction formulas."
+    )
+    return matrix
+
+
 def resolve_condition(condition_id: str) -> dict[str, Any]:
     condition_id = str(condition_id).upper()
     matches = [
         condition
-        for condition in core_matrix()["conditions"]
+        for condition in core_matrix()["conditions"] + supplemental_conditions()
         if condition["condition_id"] == condition_id
     ]
     if len(matches) != 1:
         raise ValueError(
-            f"unknown core PLS condition {condition_id!r}; expected {CORE_CONDITION_IDS}"
+            f"unknown PLS condition {condition_id!r}; expected {REGISTERED_CONDITION_IDS}"
         )
     return deepcopy(matches[0])
 
@@ -164,4 +250,6 @@ def execution_order(seeds: list[int] | tuple[int, ...]) -> list[tuple[int, int, 
             )
         for position, condition_id in enumerate(BALANCED_EXECUTION_ORDER[seed], start=1):
             result.append((seed, position, condition_id))
+        for offset, condition_id in enumerate(SUPPLEMENTAL_CONDITION_IDS, start=1):
+            result.append((seed, len(CORE_CONDITION_IDS) + offset, condition_id))
     return result

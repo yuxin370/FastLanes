@@ -20,7 +20,12 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 
-from .contracts import code_version
+from .contracts import (
+    blocking_code_identity,
+    code_provenance_differences,
+    code_version,
+    condition_identity_hash,
+)
 from .core_schedule import epoch_position_pools, stable_digest
 from .layout import (
     LayoutMapping,
@@ -59,11 +64,14 @@ from training.pipeline import (  # noqa: E402
     build_training_adapter,
 )
 from training.sample_order import SampleIdentity  # noqa: E402
+from galp.torch.experimental import DirectDctPlsPipeline  # noqa: E402
 
 
 RUN_SCHEMA = "galp-pls-core-training-run-v2"
 CHECKPOINT_SCHEMA = "galp-pls-core-epoch-checkpoint-v4"
 DESCRIPTOR_CHUNK_MICROBATCHES = 256
+NATIVE_PHYSICAL_BACKEND = "native-physical-pls"
+SEMANTIC_BACKEND = "semantic-emulation"
 
 
 def build_paired_model(
@@ -218,30 +226,101 @@ def _validate_contract(
     seed: int,
     recipe_hash: str,
     layout_hash: str,
-) -> dict[str, Any]:
+    execution_backend: str,
+    physical_galp_manifest: Path | None,
+    premixed_mapping_csv: Path | None,
+    expected_mapping_sha256: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    expected_hash = sha256_json(
-        {key: value for key, value in payload.items() if key != "condition_hash"}
-    )
-    if payload.get("condition_hash") != expected_hash:
-        raise ValueError("condition contract hash mismatch")
+    if "run_manifest_hash" in payload:
+        expected_manifest_hash = sha256_json(
+            {
+                key: value
+                for key, value in payload.items()
+                if key != "run_manifest_hash"
+            }
+        )
+        if payload.get("run_manifest_hash") != expected_manifest_hash:
+            raise ValueError("run manifest integrity hash mismatch")
+        if payload.get("condition_hash") != condition_identity_hash(payload):
+            raise ValueError("run manifest training identity hash mismatch")
+    else:
+        # Compatibility with v2 condition contracts produced before the
+        # resolved run-manifest format introduced a separate integrity hash.
+        expected_hash = sha256_json(
+            {key: value for key, value in payload.items() if key != "condition_hash"}
+        )
+        if payload.get("condition_hash") != expected_hash:
+            raise ValueError("condition contract hash mismatch")
+    native_physical = execution_backend == NATIVE_PHYSICAL_BACKEND
     expected = {
         "condition_id": condition_id,
         "training_seed": seed,
         "recipe_hash": recipe_hash,
         "layout_hash": layout_hash,
-        "execution_mode": "semantic_emulation",
-        "semantic_emulation": True,
-        "physical_fls_observed": False,
-        "physical_gpu_pool": False,
-        "code_version": code_version(REPO_ROOT),
+        "execution_mode": (
+            "native_physical_pls" if native_physical else "semantic_emulation"
+        ),
+        "semantic_emulation": not native_physical,
+        "physical_fls_observed": native_physical,
+        "physical_gpu_pool": native_physical,
+        "backend_implementation": (
+            "galp-native-direct-dct-pls-block-major-v1"
+            if native_physical
+            else "shared-galp-direct-dct-semantic-backend-v2"
+        ),
     }
     observed = {key: payload.get(key) for key in expected}
     if observed != expected:
         raise ValueError(
             f"condition contract does not match run arguments: expected {expected}, got {observed}"
         )
-    return payload
+    planned_code = payload.get("code_version")
+    if not isinstance(planned_code, dict):
+        raise ValueError("run manifest lacks code_version")
+    current_code = code_version(REPO_ROOT)
+    planned_identity = blocking_code_identity(planned_code)
+    current_identity = blocking_code_identity(current_code)
+    if planned_identity != current_identity:
+        raise ValueError(
+            "training runtime sources changed after the run manifest was generated: "
+            f"planned={planned_identity}, current={current_identity}"
+        )
+    if native_physical:
+        if (
+            physical_galp_manifest is None
+            or premixed_mapping_csv is None
+            or expected_mapping_sha256 is None
+        ):
+            raise ValueError("native physical execution arguments are incomplete")
+        physical = payload.get("physical_execution")
+        if not isinstance(physical, dict):
+            raise ValueError("native condition contract lacks physical_execution")
+        expected_physical = {
+            "physical_galp_manifest": str(physical_galp_manifest.resolve()),
+            "physical_galp_manifest_sha256": sha256_file(
+                physical_galp_manifest.resolve()
+            ),
+            "premixed_mapping_csv": str(premixed_mapping_csv.resolve()),
+            "premixed_mapping_sha256": expected_mapping_sha256,
+        }
+        observed_physical = {
+            key: physical.get(key) for key in expected_physical
+        }
+        if observed_physical != expected_physical:
+            raise ValueError(
+                "physical execution contract does not match run arguments: "
+                f"expected {expected_physical}, got {observed_physical}"
+            )
+    provenance_differences = code_provenance_differences(planned_code, current_code)
+    validation = {
+        "schema_version": "galp-pls-run-manifest-validation-v1",
+        "blocking_code_identity": current_identity,
+        "blocking_code_identity_matches": True,
+        "non_blocking_code_provenance_differences": provenance_differences,
+        "non_blocking_code_provenance_changed": bool(provenance_differences),
+    }
+    return payload, validation
 
 
 def _device_environment(device: torch.device) -> dict[str, Any]:
@@ -697,18 +776,289 @@ def _final_metrics_from_file(path: Path) -> dict[str, Any]:
     return final_validation
 
 
+def _train_native_physical_epoch(
+    *,
+    pipeline: DirectDctPlsPipeline,
+    execution_model: torch.nn.Module,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    weight_decayer: Any,
+    scheduler: Any,
+    device: torch.device,
+    recipe: Mapping[str, Any],
+    metrics: MetricsWriter,
+    loader_totals: dict[str, float],
+    integration_checks: dict[str, Any],
+    condition_id: str,
+    seed: int,
+    epoch: int,
+    expected_sample_count: int,
+    global_update: int,
+    processed_images: int,
+    loss_since_log: float,
+    samples_since_log: int,
+    last_logged_update: int,
+    integration_check_first_100: bool,
+) -> dict[str, Any]:
+    """Consume one native-owned physical PLS epoch at the model boundary."""
+
+    epoch_started = time.perf_counter()
+    order_policy = str(resolve_condition(condition_id)["order_policy"])
+    sample_shuffle_enabled = order_policy != "physical-order"
+    epoch_loss_sum = 0.0
+    epoch_samples = 0
+    epoch_microbatches = 0
+    epoch_updates = 0
+    pool_count = 0
+    pool_load_seconds = 0.0
+    pool_boundary_wait_seconds = 0.0
+    native_execution_stats: dict[str, Any] = {}
+    coverage = np.zeros(expected_sample_count, dtype=np.bool_)
+    order_hash = hashlib.sha256()
+    pool_membership_hash = hashlib.sha256()
+    microbatch_images = int(recipe["training"]["physical_microbatch"])
+    accumulation = int(recipe["training"]["gradient_accumulation"])
+    pipeline.start_epoch(epoch)
+
+    while pipeline.has_next_pool:
+        load_started = time.perf_counter()
+        pool = pipeline.next_pool()
+        pool_load_seconds += time.perf_counter() - load_started
+        if pool.epoch != epoch or pool.pool_index != pool_count:
+            raise RuntimeError(
+                "native PLS pool epoch/index differs from the streaming cursor"
+            )
+        for pls_id in pool.virtual_pls_ids:
+            pool_membership_hash.update(int(pls_id).to_bytes(8, "little"))
+        pool_membership_hash.update((2**63 - 1).to_bytes(8, "little"))
+
+        pool_microbatches = int(pool.microbatch_count)
+        pool_images = int(pool.image_count)
+        pool_seen_images = 0
+        for window_begin in range(0, pool_microbatches, accumulation):
+            window_microbatches = min(
+                accumulation, pool_microbatches - window_begin
+            )
+            window_sample_count = min(
+                window_microbatches * microbatch_images,
+                pool_images - window_begin * microbatch_images,
+            )
+            if window_sample_count <= 0:
+                raise RuntimeError("native PLS accumulation window is empty")
+            optimizer.zero_grad(set_to_none=True)
+            learning_rate = scheduler.prepare_next_update()
+            update_loss_sum = 0.0
+            for _local_index in range(window_microbatches):
+                native_batch = next(pool)
+                y, cbcr, targets = native_batch.tensors
+                image_ids = native_batch.global_image_ids
+                labels = native_batch.labels
+                batch_size = len(image_ids)
+                if (
+                    batch_size <= 0
+                    or batch_size != int(y.shape[0])
+                    or batch_size != int(cbcr.shape[0])
+                    or batch_size != int(targets.shape[0])
+                    or batch_size != len(labels)
+                ):
+                    raise RuntimeError("native PLS tensor/identity cardinalities differ")
+                for image_id in image_ids:
+                    if image_id < 0 or image_id >= expected_sample_count:
+                        raise RuntimeError(
+                            f"native PLS emitted out-of-range physical image ID {image_id}"
+                        )
+                    if coverage[image_id]:
+                        raise RuntimeError(
+                            f"native PLS emitted duplicate physical image ID {image_id}"
+                        )
+                    coverage[image_id] = True
+                    order_hash.update(int(image_id).to_bytes(8, "little"))
+                logits = execution_model(y, cbcr)
+                loss = torch.nn.functional.cross_entropy(logits, targets)
+                if not bool(torch.isfinite(loss).item()) or not bool(
+                    torch.isfinite(logits).all().item()
+                ):
+                    raise FloatingPointError(
+                        f"non-finite native PLS loss/logits at epoch {epoch} "
+                        f"pool {pool_count} microbatch {epoch_microbatches}"
+                    )
+                (loss * (batch_size / window_sample_count)).backward()
+                update_loss_sum += float(loss.detach().item()) * batch_size
+                pool_seen_images += batch_size
+                epoch_microbatches += 1
+                del native_batch, y, cbcr, targets, logits, loss
+
+            if not _all_finite(
+                parameter.grad
+                for parameter in model.parameters()
+                if parameter.grad is not None
+            ):
+                raise FloatingPointError(
+                    f"non-finite gradients at optimizer update {global_update + 1}"
+                )
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
+            )
+            optimizer.step()
+            weight_decayer.step(learning_rate)
+            scheduler.complete_update()
+            global_update += 1
+            epoch_updates += 1
+            processed_images += window_sample_count
+            epoch_samples += window_sample_count
+            epoch_loss_sum += update_loss_sum
+            loss_since_log += update_loss_sum
+            samples_since_log += window_sample_count
+            if integration_check_first_100 and global_update <= 100:
+                integration_checks["checked_updates"] += 1
+                if not _all_finite(model.parameters()):
+                    integration_checks["parameters_finite"] = False
+                    raise FloatingPointError(
+                        f"non-finite model parameters at integration update {global_update}"
+                    )
+            if global_update % int(
+                recipe["logging"]["train_loss_every_optimizer_updates"]
+            ) == 0:
+                metrics.append(
+                    {
+                        "record_type": "train",
+                        "scope": "optimizer-window",
+                        "condition": condition_id,
+                        "seed": seed,
+                        "epoch": epoch + 1,
+                        "optimizer_update": global_update,
+                        "processed_images": processed_images,
+                        "train_loss": loss_since_log / samples_since_log,
+                        "learning_rate": learning_rate,
+                        "window_optimizer_updates": global_update
+                        - last_logged_update,
+                        "window_samples": samples_since_log,
+                        "execution_backend": NATIVE_PHYSICAL_BACKEND,
+                    }
+                )
+                loss_since_log = 0.0
+                samples_since_log = 0
+                last_logged_update = global_update
+
+        if pool_seen_images != pool_images:
+            raise RuntimeError(
+                f"native PLS pool consumed {pool_seen_images}/{pool_images} images"
+            )
+        wait_started = time.perf_counter()
+        torch.cuda.synchronize(device)
+        pool_stats = pool.execution_stats
+        for key, value in pool_stats.items():
+            if isinstance(value, bool):
+                native_execution_stats[key] = bool(
+                    native_execution_stats.get(key, True) and value
+                )
+            elif isinstance(value, (int, float)):
+                native_execution_stats[key] = (
+                    native_execution_stats.get(key, 0) + value
+                )
+            elif value:
+                previous = native_execution_stats.get(key)
+                if previous is None:
+                    native_execution_stats[key] = value
+                elif previous != value:
+                    native_execution_stats[key] = "mixed"
+        del pool
+        pipeline.reclaim_finished_pools()
+        pool_boundary_wait_seconds += time.perf_counter() - wait_started
+        pool_count += 1
+
+    if epoch_samples != expected_sample_count or not bool(coverage.all()):
+        integration_checks["coverage_counters_valid"] = False
+        raise RuntimeError(
+            f"native PLS epoch {epoch} consumed {epoch_samples}/"
+            f"{expected_sample_count} unique images"
+        )
+    epoch_seconds = time.perf_counter() - epoch_started
+    loader_totals["native_pool_load_seconds"] = (
+        loader_totals.get("native_pool_load_seconds", 0.0) + pool_load_seconds
+    )
+    loader_totals["native_pool_boundary_wait_seconds"] = (
+        loader_totals.get("native_pool_boundary_wait_seconds", 0.0)
+        + pool_boundary_wait_seconds
+    )
+    loader_totals["native_pool_count"] = (
+        loader_totals.get("native_pool_count", 0.0) + pool_count
+    )
+    for key, value in native_execution_stats.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            loader_key = f"native_execution.{key}"
+            loader_totals[loader_key] = loader_totals.get(loader_key, 0.0) + float(
+                value
+            )
+    return {
+        "global_update": global_update,
+        "processed_images": processed_images,
+        "loss_since_log": loss_since_log,
+        "samples_since_log": samples_since_log,
+        "last_logged_update": last_logged_update,
+        "epoch_record": {
+            "record_type": "train",
+            "scope": "epoch",
+            "condition": condition_id,
+            "seed": seed,
+            "epoch": epoch + 1,
+            "optimizer_update": global_update,
+            "processed_images": processed_images,
+            "train_loss": epoch_loss_sum / epoch_samples,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "epoch_samples": epoch_samples,
+            "epoch_microbatches": epoch_microbatches,
+            "epoch_optimizer_updates": epoch_updates,
+            "epoch_seconds": epoch_seconds,
+            "images_per_second": epoch_samples / epoch_seconds,
+            "data_preparation_seconds": 0.0,
+            "native_pool_load_seconds": pool_load_seconds,
+            "native_pool_boundary_wait_seconds": pool_boundary_wait_seconds,
+            "native_pool_count": pool_count,
+            "native_execution_stats": native_execution_stats,
+            "sample_order_digest": order_hash.hexdigest(),
+            "pool_membership_digest": pool_membership_hash.hexdigest(),
+            "crop_key_digest": "native-owned-by-rgbnomore-training-pls-v1",
+            "flip_key_digest": "native-owned-by-rgbnomore-training-pls-v1",
+            "randaugment_digest": "native-owned-by-rgbnomore-training-pls-v1",
+            "mixup_digest": "native-owned-by-rgbnomore-training-pls-v1",
+            "execution_backend": NATIVE_PHYSICAL_BACKEND,
+            "native_crop_pushdown": True,
+            "native_physical_order": True,
+            "gpu_resident_closed_pool": True,
+            "sample_order_policy": order_policy,
+            "sample_shuffle_enabled": sample_shuffle_enabled,
+            "cuda_transform": True,
+            "cuda_ordered_output_placement": True,
+            "cuda_mixup": True,
+            "cuda_transform_shuffle_mixup": sample_shuffle_enabled,
+        },
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     recipe = assert_recipe_overrides(recipe=RECIPE_NAME, epochs=args.epochs)
     condition = resolve_condition(args.condition)
+    native_physical = args.execution_backend == NATIVE_PHYSICAL_BACKEND
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     layout = load_layout_mapping(args.layout_plan)
-    contract = _validate_contract(
-        args.condition_contract,
+    manifest_path = getattr(args, "run_manifest", None) or getattr(
+        args, "condition_contract", None
+    )
+    if manifest_path is None:
+        raise ValueError("a run manifest is required")
+    contract, manifest_validation = _validate_contract(
+        manifest_path,
         condition_id=args.condition,
         seed=args.seed,
         recipe_hash=recipe["recipe_hash"],
         layout_hash=layout.layout_hash,
+        execution_backend=args.execution_backend,
+        physical_galp_manifest=args.physical_galp_manifest,
+        premixed_mapping_csv=args.premixed_mapping_csv,
+        expected_mapping_sha256=args.expected_mapping_sha256,
     )
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -725,18 +1075,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         sample.logical_sample_id for sample in val_samples
     }:
         raise ValueError("training and validation logical sample IDs overlap")
-    train_galp_manifest = Path(train_meta["galp_manifest"])
+    train_galp_manifest = (
+        args.physical_galp_manifest.resolve()
+        if native_physical
+        else Path(train_meta["galp_manifest"])
+    )
     val_galp_manifest = Path(val_meta["galp_manifest"])
     for path in (train_galp_manifest, val_galp_manifest):
         if not path.is_file():
             raise FileNotFoundError(path)
-    train_reader = DirectDctTrainingReader(
-        train_galp_manifest, module_path=args.galp_torch_module_path
+    train_reader = (
+        None
+        if native_physical
+        else DirectDctTrainingReader(
+            train_galp_manifest, module_path=args.galp_torch_module_path
+        )
     )
     val_reader = DirectDctTrainingReader(
         val_galp_manifest, module_path=args.galp_torch_module_path
     )
-    if train_reader.image_count != len(train_samples):
+    if train_reader is not None and train_reader.image_count != len(train_samples):
         raise ValueError("training GALP image count differs from training manifest")
     if val_reader.image_count != len(val_samples):
         raise ValueError("validation GALP image count differs from validation manifest")
@@ -787,6 +1145,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     elif any(output_dir.iterdir()):
         allowed = {
             "condition_contract.json",
+            "run_manifest.json",
             "run_status.json",
             "environment.json",
             "failure.json",
@@ -803,22 +1162,52 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     execution_model = compile_published_model(model, recipe)
 
+    native_pipeline: DirectDctPlsPipeline | None = None
+    if native_physical:
+        native_pipeline = DirectDctPlsPipeline(
+            train_galp_manifest,
+            args.premixed_mapping_csv,
+            training_seed=args.seed,
+            expected_mapping_sha256=args.expected_mapping_sha256,
+            crop_policy=str(condition["crop_policy"]),
+            order_policy=str(condition["order_policy"]),
+            segments_per_pool=int(condition.get("segments_per_pool") or 4),
+            microbatch_images=int(recipe["training"]["physical_microbatch"]),
+            segment_images=int(layout.plan["target_pls_size"]),
+            model_classes=int(recipe["model"]["classes"]),
+            module_path=args.galp_torch_module_path,
+        )
+        if native_pipeline.sample_count != layout.sample_count:
+            raise ValueError(
+                "native physical PLS mapping and frozen layout have different populations"
+            )
+
     environment = _device_environment(device)
     environment.update(
-        execution_mode="semantic_emulation",
-        semantic_emulation=True,
-        physical_fls_observed=False,
-        physical_gpu_pool=False,
+        execution_mode=(
+            "native_physical_pls" if native_physical else "semantic_emulation"
+        ),
+        semantic_emulation=not native_physical,
+        physical_fls_observed=native_physical,
+        physical_gpu_pool=native_physical,
         layout_hash=layout.layout_hash,
         recipe_hash=recipe["recipe_hash"],
         condition_hash=contract["condition_hash"],
         initial_model_hash=initial_model_hash,
         model_execution=recipe["execution"],
-        backend_implementation="shared-galp-direct-dct-semantic-backend-v2",
+        backend_implementation=(
+            "galp-native-direct-dct-pls-block-major-v1"
+            if native_physical
+            else "shared-galp-direct-dct-semantic-backend-v2"
+        ),
         train_manifest=train_meta,
         validation_manifest=val_meta,
         galp_torch_module_path=str(args.galp_torch_module_path.resolve()),
+        run_manifest=str(manifest_path.resolve()),
+        run_manifest_validation=manifest_validation,
     )
+    if native_physical:
+        environment["physical_execution"] = dict(contract["physical_execution"])
     _atomic_json(output_dir / "environment.json", environment)
     run_status = {
         "schema_version": RUN_SCHEMA,
@@ -909,11 +1298,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             pending_validation_epoch=None,
         )
 
-    adapter_config = _adapter_config(
-        reader=train_reader,
-        galp_manifest=train_galp_manifest,
-        module_path=args.galp_torch_module_path,
-        prefetch_depth=args.prefetch_depth,
+    adapter_config = (
+        None
+        if native_physical
+        else _adapter_config(
+            reader=train_reader,
+            galp_manifest=train_galp_manifest,
+            module_path=args.galp_torch_module_path,
+            prefetch_depth=args.prefetch_depth,
+        )
     )
     pending_validation_epoch = resume_bookkeeping.get("pending_validation_epoch")
     if pending_validation_epoch is not None:
@@ -965,6 +1358,153 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             pending_validation_epoch=None,
         )
     for epoch in range(completed_epoch, int(recipe["training"]["epochs"])):
+        if native_physical:
+            if native_pipeline is None:
+                raise RuntimeError("native physical backend was not initialized")
+            native_epoch = _train_native_physical_epoch(
+                pipeline=native_pipeline,
+                execution_model=execution_model,
+                model=model,
+                optimizer=optimizer,
+                weight_decayer=weight_decayer,
+                scheduler=scheduler,
+                device=device,
+                recipe=recipe,
+                metrics=metrics,
+                loader_totals=loader_totals,
+                integration_checks=integration_checks,
+                condition_id=args.condition,
+                seed=args.seed,
+                epoch=epoch,
+                expected_sample_count=layout.sample_count,
+                global_update=global_update,
+                processed_images=processed_images,
+                loss_since_log=loss_since_log,
+                samples_since_log=samples_since_log,
+                last_logged_update=last_logged_update,
+                integration_check_first_100=args.integration_check_first_100,
+            )
+            global_update = int(native_epoch["global_update"])
+            processed_images = int(native_epoch["processed_images"])
+            loss_since_log = float(native_epoch["loss_since_log"])
+            samples_since_log = int(native_epoch["samples_since_log"])
+            last_logged_update = int(native_epoch["last_logged_update"])
+            metrics.append(native_epoch["epoch_record"])
+            completed_epoch = epoch + 1
+            if completed_epoch in validation_grid:
+                _save_boundary_checkpoint(
+                    output_dir=output_dir,
+                    permanent_epoch=None,
+                    model=model,
+                    optimizer=optimizer,
+                    weight_decayer=weight_decayer,
+                    scheduler=scheduler,
+                    completed_epoch=completed_epoch,
+                    global_optimizer_update=global_update,
+                    processed_images=processed_images,
+                    recipe_hash=recipe["recipe_hash"],
+                    layout_hash=layout.layout_hash,
+                    condition_hash=contract["condition_hash"],
+                    initial_model_hash=initial_model_hash,
+                    metrics=metrics,
+                    logging_state={
+                        "loss_since_log": loss_since_log,
+                        "samples_since_log": samples_since_log,
+                        "last_logged_update": last_logged_update,
+                    },
+                    integration_checks=integration_checks,
+                    loader_totals=loader_totals,
+                    elapsed_runtime_seconds=(
+                        elapsed_runtime_seconds
+                        + time.perf_counter()
+                        - runtime_started
+                    ),
+                    pending_validation_epoch=completed_epoch,
+                )
+                validation, validation_loader = _run_validation(
+                    model=execution_model,
+                    samples=val_samples,
+                    reader=val_reader,
+                    galp_manifest=val_galp_manifest,
+                    module_path=args.galp_torch_module_path,
+                    prefetch_depth=args.prefetch_depth,
+                    workers=args.workers,
+                    device=device,
+                    condition_id=args.condition,
+                    seed=args.seed,
+                    epoch=completed_epoch,
+                    optimizer_update=global_update,
+                    processed_images=processed_images,
+                )
+                metrics.append(validation)
+                _merge_numeric(loader_totals, validation_loader, "validation")
+            _save_boundary_checkpoint(
+                output_dir=output_dir,
+                permanent_epoch=(
+                    completed_epoch if completed_epoch in validation_grid else None
+                ),
+                model=model,
+                optimizer=optimizer,
+                weight_decayer=weight_decayer,
+                scheduler=scheduler,
+                completed_epoch=completed_epoch,
+                global_optimizer_update=global_update,
+                processed_images=processed_images,
+                recipe_hash=recipe["recipe_hash"],
+                layout_hash=layout.layout_hash,
+                condition_hash=contract["condition_hash"],
+                initial_model_hash=initial_model_hash,
+                metrics=metrics,
+                logging_state={
+                    "loss_since_log": loss_since_log,
+                    "samples_since_log": samples_since_log,
+                    "last_logged_update": last_logged_update,
+                },
+                integration_checks=integration_checks,
+                loader_totals=loader_totals,
+                elapsed_runtime_seconds=(
+                    elapsed_runtime_seconds + time.perf_counter() - runtime_started
+                ),
+                pending_validation_epoch=None,
+            )
+            run_status.update(
+                completed_epoch=completed_epoch,
+                optimizer_update=global_update,
+                processed_images=processed_images,
+            )
+            _atomic_json(output_dir / "run_status.json", run_status)
+            if (
+                args.stop_after_epoch is not None
+                and completed_epoch >= args.stop_after_epoch
+                and completed_epoch < int(recipe["training"]["epochs"])
+            ):
+                native_pipeline.close()
+                paused = {
+                    "schema_version": RUN_SCHEMA,
+                    "state": "paused-at-epoch-boundary",
+                    "condition": args.condition,
+                    "seed": args.seed,
+                    "completed_epoch": completed_epoch,
+                    "optimizer_update": global_update,
+                    "processed_images": processed_images,
+                    "integration_checks": integration_checks,
+                    "latest_checkpoint": str((output_dir / "latest.pt").resolve()),
+                    "resume_semantics": (
+                        "rerun the same command with --resume and without "
+                        "--stop-after-epoch"
+                    ),
+                    "scientific_result": False,
+                    "execution_backend": NATIVE_PHYSICAL_BACKEND,
+                }
+                _atomic_json(output_dir / "pause_result.json", paused)
+                run_status.update(
+                    state="paused-at-epoch-boundary",
+                    ended_at_unix=time.time(),
+                    pause_result="pause_result.json",
+                )
+                _atomic_json(output_dir / "run_status.json", run_status)
+                return paused
+            continue
         epoch_started = time.perf_counter()
         epoch_loss_sum = 0.0
         epoch_samples = 0
@@ -1311,6 +1851,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("final processed image count is inconsistent with full epochs")
     if args.integration_check_first_100 and integration_checks["checked_updates"] < 100:
         raise RuntimeError("first-seed integration check did not observe 100 optimizer updates")
+    if native_pipeline is not None:
+        torch.cuda.synchronize(device)
+        native_pipeline.reclaim_finished_pools()
+        native_pipeline.close()
     final_validation = _final_metrics_from_file(metrics.path)
     runtime = elapsed_runtime_seconds + time.perf_counter() - runtime_started
     memory = {
@@ -1324,16 +1868,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "state": "completed",
         "condition": args.condition,
         "seed": args.seed,
-        "execution_mode": "semantic_emulation",
-        "semantic_emulation": True,
-        "physical_fls_observed": False,
-        "physical_gpu_pool": False,
+        "execution_mode": (
+            "native_physical_pls" if native_physical else "semantic_emulation"
+        ),
+        "semantic_emulation": not native_physical,
+        "physical_fls_observed": native_physical,
+        "physical_gpu_pool": native_physical,
         "layout_hash": layout.layout_hash,
         "recipe_hash": recipe["recipe_hash"],
         "condition_hash": contract["condition_hash"],
         "initial_model_hash": initial_model_hash,
         "model_execution": recipe["execution"],
-        "backend_implementation": "shared-galp-direct-dct-semantic-backend-v2",
+        "backend_implementation": (
+            "galp-native-direct-dct-pls-block-major-v1"
+            if native_physical
+            else "shared-galp-direct-dct-semantic-backend-v2"
+        ),
         "final_top1": final_validation["validation_top1"],
         "final_top5": final_validation["validation_top5"],
         "final_validation_loss": final_validation["validation_loss"],
@@ -1350,10 +1900,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "final_epoch": completed_epoch,
         },
         "claim_boundary": (
-            "model effect observed with a frozen virtual PLS mapping and the shared "
-            "Direct-DCT semantic backend; no full physical FLS or byte-reduction claim"
+            (
+                "model training used the registered premixed block-major manifest, "
+                "native crop pushdown/physical ordering, one GPU-resident M=4 pool, "
+                "and CUDA transform/ordered placement/augmentation; sample shuffle "
+                f"policy was {condition['order_policy']}; physical byte reduction "
+                "requires the recorded native counters"
+            )
+            if native_physical
+            else (
+                "model effect observed with a frozen virtual PLS mapping and the shared "
+                "Direct-DCT semantic backend; no full physical FLS or byte-reduction claim"
+            )
         ),
     }
+    if native_physical:
+        result["physical_execution"] = dict(contract["physical_execution"])
     _atomic_json(output_dir / "final_result.json", result)
     run_status.update(
         state="completed",
@@ -1369,10 +1931,33 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--layout-plan", type=Path, required=True)
-    parser.add_argument("--condition-contract", type=Path, required=True)
-    parser.add_argument("--condition", required=True, choices=("A0", "A1", "B2", "B6"))
+    manifest_group = parser.add_mutually_exclusive_group(required=True)
+    manifest_group.add_argument(
+        "--run-manifest",
+        type=Path,
+        help="resolved run manifest generated by training_pls.run_matrix",
+    )
+    manifest_group.add_argument(
+        "--condition-contract",
+        type=Path,
+        help="deprecated alias for --run-manifest",
+    )
+    parser.add_argument(
+        "--condition",
+        required=True,
+        choices=("A0", "A1", "B2", "B6", "N6", "N2"),
+    )
     parser.add_argument("--seed", required=True, type=int)
+    parser.add_argument("--recipe", choices=(RECIPE_NAME,), default=RECIPE_NAME)
     parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument(
+        "--execution-backend",
+        choices=(SEMANTIC_BACKEND, NATIVE_PHYSICAL_BACKEND),
+        default=SEMANTIC_BACKEND,
+    )
+    parser.add_argument("--physical-galp-manifest", type=Path)
+    parser.add_argument("--premixed-mapping-csv", type=Path)
+    parser.add_argument("--expected-mapping-sha256")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
@@ -1400,6 +1985,36 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("prefetch depth must be non-negative")
     if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch < 300:
         raise ValueError("--stop-after-epoch must be in [1, 299]")
+    physical_values = (
+        args.physical_galp_manifest,
+        args.premixed_mapping_csv,
+        args.expected_mapping_sha256,
+    )
+    if args.execution_backend == NATIVE_PHYSICAL_BACKEND:
+        if any(value is None for value in physical_values):
+            raise ValueError(
+                "native-physical-pls requires --physical-galp-manifest, "
+                "--premixed-mapping-csv, and --expected-mapping-sha256"
+            )
+        for path in (args.physical_galp_manifest, args.premixed_mapping_csv):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        if len(args.expected_mapping_sha256) != 64:
+            raise ValueError("--expected-mapping-sha256 must contain 64 hex characters")
+        try:
+            int(args.expected_mapping_sha256, 16)
+        except ValueError as error:
+            raise ValueError(
+                "--expected-mapping-sha256 must contain 64 hex characters"
+            ) from error
+        if sha256_file(args.premixed_mapping_csv) != args.expected_mapping_sha256:
+            raise ValueError(
+                "--expected-mapping-sha256 differs from --premixed-mapping-csv"
+            )
+    elif any(value is not None for value in physical_values):
+        raise ValueError(
+            "physical PLS paths require --execution-backend native-physical-pls"
+        )
     return args
 
 

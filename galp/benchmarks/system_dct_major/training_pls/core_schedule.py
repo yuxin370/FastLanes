@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Epoch-local streaming schedules for the four core PLS conditions."""
+"""Epoch-local streaming schedules for core and supplemental PLS conditions."""
 
 from __future__ import annotations
 
@@ -152,8 +152,13 @@ def epoch_position_pools(
         return
 
     pls_order = list(range(len(layout.positions_by_pls)))
-    random.Random(stable_seed("closed-pool-pls-order", seed, epoch)).shuffle(pls_order)
     segments_per_pool = int(condition["segments_per_pool"])
+    if condition["order_policy"] == "closed-pool":
+        random.Random(stable_seed("closed-pool-pls-order", seed, epoch)).shuffle(
+            pls_order
+        )
+    elif condition["order_policy"] != "physical-order":
+        raise ValueError(f"unknown order policy: {condition['order_policy']}")
     for pool_index, begin in enumerate(range(0, len(pls_order), segments_per_pool)):
         pool_pls = tuple(pls_order[begin : begin + segments_per_pool])
         positions = [
@@ -161,9 +166,10 @@ def epoch_position_pools(
             for pls_id in pool_pls
             for position in layout.positions_by_pls[pls_id]
         ]
-        random.Random(
-            stable_seed("closed-pool-sample-order", seed, epoch, pool_index)
-        ).shuffle(positions)
+        if condition["order_policy"] == "closed-pool":
+            random.Random(
+                stable_seed("closed-pool-sample-order", seed, epoch, pool_index)
+            ).shuffle(positions)
         yield pool_index, pool_pls, positions
 
 

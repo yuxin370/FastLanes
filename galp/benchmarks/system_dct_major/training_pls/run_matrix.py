@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan, then optionally execute, the frozen 4-condition x 4-seed matrix."""
+"""Resolve run manifests, then optionally execute the registered PLS matrix."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from .matrix import (
     CORE_CONDITION_IDS,
     PAIRED_SEEDS,
     core_matrix,
+    experiment_matrix,
     execution_order,
     resolve_condition,
 )
@@ -241,6 +242,33 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("core matrix requires a frozen G=1024 layout")
     if sha256_file(args.train_manifest.resolve()) != layout_plan["dataset_manifest_hash"]:
         raise ValueError("--train-manifest differs from the frozen physical layout plan")
+    physical_execution: dict[str, Any] | None = None
+    if args.execution_backend == "native-physical-pls":
+        actual_mapping_hash = sha256_file(args.premixed_mapping_csv.resolve())
+        if actual_mapping_hash != args.expected_mapping_sha256:
+            raise ValueError(
+                "--expected-mapping-sha256 differs from --premixed-mapping-csv"
+            )
+        physical_execution = {
+            "schema_version": "galp-native-physical-pls-execution-v1",
+            "semantic_profile": "rgbnomore-training-pls-v1",
+            "physical_galp_manifest": str(args.physical_galp_manifest.resolve()),
+            "physical_galp_manifest_sha256": sha256_file(
+                args.physical_galp_manifest.resolve()
+            ),
+            "premixed_mapping_csv": str(args.premixed_mapping_csv.resolve()),
+            "premixed_mapping_sha256": actual_mapping_hash,
+            "segment_images": 1024,
+            "segments_per_closed_pool": 4,
+            "microbatch_images": 64,
+            "native_crop_pushdown": True,
+            "native_physical_order": True,
+            "gpu_resident_closed_pool": True,
+            "cuda_transform": True,
+            "cuda_ordered_output_placement": True,
+            "cuda_mixup": True,
+            "sample_order_policy_from_condition_contract": True,
+        }
     code = code_version(REPO_ROOT)
     initial_hashes = _initial_model_hashes(seeds, args.rgbnomore_root)
     updates_by_condition = {
@@ -255,6 +283,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     contracts_by_seed: dict[int, list[dict[str, Any]]] = {}
     contract_paths: dict[tuple[int, str], Path] = {}
+    legacy_contract_paths: dict[tuple[int, str], Path] = {}
     for seed in seeds:
         contracts: list[dict[str, Any]] = []
         for condition_id in conditions:
@@ -269,19 +298,26 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 initial_model_hash=initial_hashes[seed],
                 code=code,
                 device=seed_devices[seed],
+                execution_backend=args.execution_backend,
+                physical_execution=physical_execution,
             )
             contracts.append(contract)
-            contract_path = (
+            legacy_contract_path = (
                 output_dir
                 / "contracts"
                 / f"seed_{seed}"
                 / f"{condition_id}.json"
             )
-            _atomic_json(contract_path, contract)
-            contract_paths[(seed, condition_id)] = contract_path
             run_dir = output_dir / "runs" / condition_id / f"seed_{seed}"
             run_dir.mkdir(parents=True, exist_ok=True)
+            run_manifest_path = run_dir / "run_manifest.json"
+            _atomic_json(run_manifest_path, contract)
+            contract_paths[(seed, condition_id)] = run_manifest_path
+            # Compatibility artifacts for existing reports and operational tools.
+            # New commands consume run_manifest.json directly.
+            _atomic_json(legacy_contract_path, contract)
             _atomic_json(run_dir / "condition_contract.json", contract)
+            legacy_contract_paths[(seed, condition_id)] = legacy_contract_path
         contracts_by_seed[seed] = contracts
 
     diff_blocks = []
@@ -320,14 +356,21 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     _atomic_json(
         output_dir / "condition_execution_order.json",
         {
-            "balanced": True,
+            "balanced": not any(
+                int(row["condition_position"]) > len(CORE_CONDITION_IDS)
+                for row in execution_rows
+            ),
             "rows": execution_rows,
-            "policy": "fixed Latin-rotation order within each paired seed block",
+            "policy": (
+                "fixed Latin rotation for core conditions; supplemental controls "
+                "follow the registered core order"
+            ),
         },
     )
+    registered_matrix = experiment_matrix(conditions)
     analysis_contract = {
         "schema_version": "galp-pls-analysis-contract-v2",
-        "matrix_hash": sha256_json(core_matrix()),
+        "matrix_hash": sha256_json(registered_matrix),
         "primary_endpoint": "final-checkpoint validation top-1",
         "secondary_endpoints": [
             "final top-5",
@@ -345,6 +388,13 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "system_metric_strategy_gate": False,
         "estimands": core_matrix()["estimands"],
     }
+    if "supplemental_estimands" in registered_matrix:
+        analysis_contract["supplemental_estimands"] = registered_matrix[
+            "supplemental_estimands"
+        ]
+        analysis_contract["supplemental_interpretation"] = registered_matrix[
+            "supplemental_interpretation"
+        ]
     _atomic_json(output_dir / "analysis_contract.json", analysis_contract)
     environment = _environment(args.device)
     environment["requested_seed_devices"] = {
@@ -369,7 +419,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             str(args.val_manifest.resolve()),
             "--layout-plan",
             str(args.layout_plan.resolve()),
-            "--condition-contract",
+            "--run-manifest",
             str(contract_paths[(seed, condition_id)].resolve()),
             "--condition",
             condition_id,
@@ -391,13 +441,31 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             str(args.rgbnomore_root.resolve()),
             "--resume",
         ]
+        if args.execution_backend == "native-physical-pls":
+            argv.extend(
+                [
+                    "--execution-backend",
+                    "native-physical-pls",
+                    "--physical-galp-manifest",
+                    str(args.physical_galp_manifest.resolve()),
+                    "--premixed-mapping-csv",
+                    str(args.premixed_mapping_csv.resolve()),
+                    "--expected-mapping-sha256",
+                    args.expected_mapping_sha256,
+                ]
+            )
         if seed == first_seed:
             argv.append("--integration-check-first-100")
+        if args.stop_after_epoch is not None:
+            argv.extend(["--stop-after-epoch", str(args.stop_after_epoch)])
         commands.append(
             {
                 **row,
                 "output_dir": str(run_dir),
-                "condition_contract": str(contract_paths[(seed, condition_id)]),
+                "run_manifest": str(contract_paths[(seed, condition_id)]),
+                "condition_contract": str(
+                    legacy_contract_paths[(seed, condition_id)]
+                ),
                 "argv": argv,
                 "shell": shlex.join(argv),
             }
@@ -419,14 +487,17 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     plan = {
         "schema_version": "galp-pls-core-execution-plan-v2",
         "execute_requested": bool(args.execute),
-        "matrix": core_matrix(),
+        "matrix": registered_matrix,
         "conditions": conditions,
         "seeds": seeds,
         "seed_devices": {str(seed): seed_devices[seed] for seed in seeds},
         "epochs": args.epochs,
+        "stop_after_epoch": args.stop_after_epoch,
         "total_runs": len(commands),
         "layout_hash": layout_plan["layout_hash"],
         "recipe_hash": recipe["recipe_hash"],
+        "execution_backend": args.execution_backend,
+        "physical_execution": physical_execution,
         "total_optimizer_updates_per_run": next(iter(updates_by_condition.values())),
         "commands": commands,
         "result_policy": (
@@ -458,11 +529,43 @@ def execute_plan(
             status.update(state="completed", returncode=0)
             _write_status_csv(output_dir / "run_status.csv", statuses)
             continue
+        requested_stop = plan.get("stop_after_epoch")
+        existing_status_path = Path(command["output_dir"]) / "run_status.json"
+        if requested_stop is not None and existing_status_path.is_file():
+            try:
+                existing_status = json.loads(
+                    existing_status_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                existing_status = {}
+            if (
+                existing_status.get("state") == "paused-at-epoch-boundary"
+                and int(existing_status.get("completed_epoch", -1))
+                >= int(requested_stop)
+            ):
+                status.update(
+                    state="paused-at-epoch-boundary",
+                    returncode=0,
+                    retry_reason="requested epoch boundary already completed",
+                )
+                _write_status_csv(output_dir / "run_status.csv", statuses)
+                continue
         status.update(state="running", started_at_unix=time.time())
         _write_status_csv(output_dir / "run_status.csv", statuses)
         completed = subprocess.run(command["argv"], check=False)
+        run_state = "completed" if completed.returncode == 0 else "failed"
+        run_status_path = Path(command["output_dir"]) / "run_status.json"
+        if completed.returncode == 0 and run_status_path.is_file():
+            try:
+                recorded_state = json.loads(
+                    run_status_path.read_text(encoding="utf-8")
+                ).get("state")
+            except (OSError, json.JSONDecodeError):
+                recorded_state = None
+            if recorded_state == "paused-at-epoch-boundary":
+                run_state = recorded_state
         status.update(
-            state="completed" if completed.returncode == 0 else "failed",
+            state=run_state,
             returncode=completed.returncode,
             ended_at_unix=time.time(),
         )
@@ -496,7 +599,23 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--seeds", default=",".join(str(seed) for seed in PAIRED_SEEDS)
     )
     parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument(
+        "--stop-after-epoch",
+        type=int,
+        help=(
+            "operational epoch-boundary pause forwarded to every selected run; "
+            "the scientific recipe remains fixed at 300 epochs"
+        ),
+    )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--execution-backend",
+        choices=("semantic-emulation", "native-physical-pls"),
+        default="semantic-emulation",
+    )
+    parser.add_argument("--physical-galp-manifest", type=Path)
+    parser.add_argument("--premixed-mapping-csv", type=Path)
+    parser.add_argument("--expected-mapping-sha256")
     parser.add_argument(
         "--seed-devices",
         help=(
@@ -519,9 +638,38 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("workers must be positive")
     if args.prefetch_depth < 0:
         raise ValueError("prefetch depth must be non-negative")
+    if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch < 300:
+        raise ValueError("--stop-after-epoch must be in [1, 299]")
     for path in (args.train_manifest, args.val_manifest, args.layout_plan):
         if not path.is_file():
             raise FileNotFoundError(path)
+    physical_values = (
+        args.physical_galp_manifest,
+        args.premixed_mapping_csv,
+        args.expected_mapping_sha256,
+    )
+    if args.execution_backend == "native-physical-pls":
+        if any(value is None for value in physical_values):
+            raise ValueError(
+                "native-physical-pls requires --physical-galp-manifest, "
+                "--premixed-mapping-csv, and --expected-mapping-sha256"
+            )
+        for path in (args.physical_galp_manifest, args.premixed_mapping_csv):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        if len(args.expected_mapping_sha256) != 64:
+            raise ValueError("--expected-mapping-sha256 must contain 64 hex characters")
+        try:
+            int(args.expected_mapping_sha256, 16)
+        except ValueError as error:
+            raise ValueError(
+                "--expected-mapping-sha256 must contain 64 hex characters"
+            ) from error
+    elif any(value is not None for value in physical_values):
+        raise ValueError(
+            "physical PLS paths are accepted only with "
+            "--execution-backend native-physical-pls"
+        )
     return args
 
 

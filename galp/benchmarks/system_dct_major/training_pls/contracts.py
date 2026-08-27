@@ -18,6 +18,47 @@ from .recipe import sha256_json
 
 CONTRACT_SCHEMA = "galp-pls-condition-contract-v2"
 CONTRACT_DIFF_SCHEMA = "galp-pls-condition-contract-diff-v2"
+RUN_MANIFEST_SCHEMA = "galp-pls-run-manifest-v1"
+TRAINING_SOURCE_SCOPE = "galp-pls-training-runtime-v1"
+
+_TRAINING_PLS_RUNTIME_MODULES = frozenset(
+    {
+        "__init__.py",
+        "artifacts.py",
+        "contracts.py",
+        "core_schedule.py",
+        "layout.py",
+        "matrix.py",
+        "parquet_helper.py",
+        "published_augmentation.py",
+        "published_optimizer.py",
+        "recipe.py",
+        "run_matrix.py",
+        "schedule.py",
+        "train.py",
+    }
+)
+
+_TRAINING_RUNTIME_EXTERNAL_PATHS = frozenset(
+    {
+        "galp/benchmarks/system_rgbnomore/training/artifacts.py",
+        "galp/benchmarks/system_rgbnomore/training/augmentation.py",
+        "galp/benchmarks/system_rgbnomore/training/direct_dct_reader.py",
+        "galp/benchmarks/system_rgbnomore/training/model_factory.py",
+        "galp/benchmarks/system_rgbnomore/training/pipeline.py",
+        "galp/benchmarks/system_rgbnomore/training/pls_experiment.py",
+        "galp/benchmarks/system_rgbnomore/training/sample_order.py",
+        "galp/include/galp/direct_dct_pls.hpp",
+        "galp/include/galp/profiles/rgbnomore.hpp",
+        "galp/src/api/direct_dct_pls.cpp",
+        "galp/src/api/direct_dct_pls_postprocess.cu",
+        "galp/src/api/direct_dct_pls_postprocess.hpp",
+        "galp/torch/__init__.py",
+        "galp/torch/direct_dct.py",
+        "galp/torch/direct_dct_pls_torch.cpp",
+        "galp/torch/direct_dct_pls_torch.hpp",
+    }
+)
 
 ALLOWED_CONDITION_DIFFERENCES = frozenset(
     {
@@ -70,7 +111,11 @@ def code_version(repo_root: Path) -> dict[str, Any]:
     )
     for extra in (
         repo_root / "galp/benchmarks/system_dct_major/tests/test_training_pls.py",
-        repo_root / "galp/benchmarks/system_rgbnomore/training/pls_experiment.py",
+        *(
+            repo_root / relative
+            for relative in sorted(_TRAINING_RUNTIME_EXTERNAL_PATHS)
+        ),
+        repo_root / "docs/PHYSICAL_PLS_TRAINING_PIPELINE.md",
     ):
         if extra.is_file():
             core_paths.append(extra)
@@ -81,6 +126,11 @@ def code_version(repo_root: Path) -> dict[str, Any]:
         }
         for path in sorted(set(core_paths))
     ]
+    runtime_source_files = [
+        row
+        for row in source_files
+        if _is_training_runtime_source(str(row["path"]))
+    ]
     return {
         "commit": commit,
         "working_tree_clean": not bool(status),
@@ -88,7 +138,72 @@ def code_version(repo_root: Path) -> dict[str, Any]:
         "tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
         "experiment_source_files": source_files,
         "experiment_source_tree_sha256": sha256_json(source_files),
+        "training_source_scope": TRAINING_SOURCE_SCOPE,
+        "training_runtime_source_files": runtime_source_files,
+        "training_runtime_source_tree_sha256": sha256_json(runtime_source_files),
     }
+
+
+def _is_training_runtime_source(relative_path: str) -> bool:
+    prefix = "galp/benchmarks/system_dct_major/training_pls/"
+    if relative_path.startswith(prefix):
+        return Path(relative_path).name in _TRAINING_PLS_RUNTIME_MODULES
+    return relative_path in _TRAINING_RUNTIME_EXTERNAL_PATHS
+
+
+def blocking_code_identity(version: Mapping[str, Any]) -> dict[str, str]:
+    """Return the code identity that is allowed to block execution/resume.
+
+    Whole-repository Git status and diff hashes remain useful provenance, but
+    unrelated edits must not invalidate a prepared training run.  Only the
+    explicitly scoped runtime source tree participates in the blocking identity.
+    """
+
+    scope = version.get("training_source_scope")
+    source_hash = version.get("training_runtime_source_tree_sha256")
+    if scope != TRAINING_SOURCE_SCOPE or not isinstance(source_hash, str):
+        raise ValueError(
+            "run manifest lacks the scoped training runtime source identity; "
+            "regenerate it with training_pls.run_matrix"
+        )
+    return {
+        "training_source_scope": str(scope),
+        "training_runtime_source_tree_sha256": source_hash,
+    }
+
+
+def code_provenance_differences(
+    planned: Mapping[str, Any], current: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Report non-blocking repository provenance changes for audit output."""
+
+    fields = (
+        "commit",
+        "working_tree_clean",
+        "working_tree_status_sha256",
+        "tracked_diff_sha256",
+        "experiment_source_tree_sha256",
+    )
+    return {
+        field: {"planned": planned.get(field), "current": current.get(field)}
+        for field in fields
+        if planned.get(field) != current.get(field)
+    }
+
+
+def condition_identity_hash(contract: Mapping[str, Any]) -> str:
+    """Hash only fields that define training and checkpoint compatibility."""
+
+    payload = {
+        key: value
+        for key, value in contract.items()
+        if key not in {"condition_hash", "run_manifest_hash"}
+    }
+    code = payload.get("code_version")
+    if not isinstance(code, Mapping):
+        raise ValueError("run manifest lacks code_version")
+    payload["code_version"] = blocking_code_identity(code)
+    return sha256_json(payload)
 
 
 def build_condition_contract(
@@ -103,11 +218,22 @@ def build_condition_contract(
     initial_model_hash: str,
     code: Mapping[str, Any],
     device: str,
+    execution_backend: str = "semantic-emulation",
+    physical_execution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     condition = resolve_condition(condition_id)
     layout_hash = str(layout_plan["layout_hash"])
+    if execution_backend not in {"semantic-emulation", "native-physical-pls"}:
+        raise ValueError(f"unsupported execution backend: {execution_backend!r}")
+    native_physical = execution_backend == "native-physical-pls"
+    if native_physical and physical_execution is None:
+        raise ValueError("native-physical-pls requires a physical execution contract")
+    if not native_physical and physical_execution is not None:
+        raise ValueError("semantic-emulation cannot carry a physical execution contract")
     contract: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA,
+        "run_manifest_schema": RUN_MANIFEST_SCHEMA,
+        "artifact_role": "resolved-run-manifest",
         "condition_id": condition_id,
         "training_seed": int(seed),
         "crop_policy": condition["crop_policy"],
@@ -156,25 +282,38 @@ def build_condition_contract(
             "permanent": "every formal validation epoch",
             "resume_granularity": "completed epoch",
         },
-        "backend_implementation": "shared-galp-direct-dct-semantic-backend-v2",
+        "backend_implementation": (
+            "galp-native-direct-dct-pls-block-major-v1"
+            if native_physical
+            else "shared-galp-direct-dct-semantic-backend-v2"
+        ),
         "recipe_hash": recipe["recipe_hash"],
         "code_version": dict(code),
         "execution_device": str(device),
-        "execution_mode": "semantic_emulation",
-        "semantic_emulation": True,
-        "physical_fls_observed": False,
-        "physical_gpu_pool": False,
+        "execution_mode": (
+            "native_physical_pls" if native_physical else "semantic_emulation"
+        ),
+        "semantic_emulation": not native_physical,
+        "physical_fls_observed": native_physical,
+        "physical_gpu_pool": native_physical,
         "layout_hash": layout_hash,
         "reference_topology": "8gpu_ddp",
         "execution_topology": "single_gpu_accum16",
         "distributed_bitwise_equivalence_claim": False,
     }
-    contract["condition_hash"] = sha256_json(contract)
+    if native_physical:
+        contract["physical_execution"] = dict(physical_execution or {})
+    contract["condition_hash"] = condition_identity_hash(contract)
+    contract["run_manifest_hash"] = sha256_json(contract)
     return contract
 
 
 def _without_hash(contract: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in contract.items() if key != "condition_hash"}
+    return {
+        key: value
+        for key, value in contract.items()
+        if key not in {"condition_hash", "run_manifest_hash"}
+    }
 
 
 def condition_differences(

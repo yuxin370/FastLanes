@@ -9,11 +9,18 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
 
-from training_pls.contracts import validate_seed_block_contracts
+from training_pls.contracts import (
+    TRAINING_SOURCE_SCOPE,
+    blocking_code_identity,
+    code_provenance_differences,
+    condition_identity_hash,
+    validate_seed_block_contracts,
+)
 from training_pls.core_schedule import (
     crop_key,
     epoch_position_pools,
@@ -22,12 +29,15 @@ from training_pls.core_schedule import (
     summarize_epoch,
     update_windows,
 )
-from training_pls.layout import create_layout_plan, load_layout_mapping
+from training_pls.layout import create_layout_plan, load_layout_mapping, sha256_file
 from training_pls.matrix import (
     BALANCED_EXECUTION_ORDER,
     CORE_CONDITION_IDS,
     PAIRED_SEEDS,
+    SUPPLEMENTAL_CONDITION_IDS,
     core_matrix,
+    experiment_matrix,
+    execution_order,
     resolve_condition,
 )
 from training_pls.published_augmentation import (
@@ -37,11 +47,24 @@ from training_pls.published_augmentation import (
     published_training_augmentation,
     published_validation_augmentation,
 )
-from training_pls.recipe import RECIPE_NAME, recipe_contract, validation_epochs
+from training_pls.recipe import (
+    RECIPE_NAME,
+    recipe_contract,
+    sha256_json,
+    validation_epochs,
+)
 from training_pls.report import aggregate, mean_ci, normalized_auc
 from training_pls.published_optimizer import build_published_optimizer
-from training_pls.run_matrix import _seed_devices
-from training_pls.train import MetricsWriter, _checkpoint_payload, _restore_checkpoint
+from training_pls.run_matrix import _parse_args as _parse_matrix_args
+from training_pls.run_matrix import _seed_devices, build_plan
+from training_pls.train import (
+    MetricsWriter,
+    _checkpoint_payload,
+    _parse_args as _parse_train_args,
+    _restore_checkpoint,
+    _train_native_physical_epoch,
+    _validate_contract,
+)
 
 
 @dataclass
@@ -80,6 +103,62 @@ class CoreScheduleTests(unittest.TestCase):
         self.assertEqual(resolve_condition("B2")["order_policy"], "closed-pool")
         self.assertEqual(resolve_condition("B6")["segments_per_pool"], 4)
         self.assertEqual(tuple(BALANCED_EXECUTION_ORDER), PAIRED_SEEDS)
+
+    def test_no_shuffle_is_supplemental_not_a_factorial_cell(self) -> None:
+        self.assertEqual(SUPPLEMENTAL_CONDITION_IDS, ("N6", "N2"))
+        condition = resolve_condition("N6")
+        self.assertEqual(condition["crop_policy"], "per-pls")
+        self.assertEqual(condition["order_policy"], "physical-order")
+        self.assertEqual(condition["segments_per_pool"], 4)
+        self.assertEqual(
+            tuple(value["condition_id"] for value in core_matrix()["conditions"]),
+            CORE_CONDITION_IDS,
+        )
+        extended = experiment_matrix(("N6",))
+        self.assertEqual(extended["conditions"][-1]["condition_id"], "N6")
+        self.assertEqual(len(extended["estimands"]), len(core_matrix()["estimands"]))
+        self.assertEqual(
+            extended["supplemental_estimands"][0]["formula"], "B6 - N6"
+        )
+        no_shared_crop = resolve_condition("N2")
+        self.assertEqual(no_shared_crop["crop_policy"], "per-sample")
+        self.assertEqual(no_shared_crop["crop_key_scope"], "logical_sample_id")
+        self.assertEqual(no_shared_crop["order_policy"], "physical-order")
+        self.assertEqual(no_shared_crop["segments_per_pool"], 4)
+        supplemental_rows = [
+            row for row in execution_order([11997733]) if row[2] == "N6"
+        ]
+        self.assertEqual(supplemental_rows, [(11997733, 5, "N6")])
+
+    def test_n2_and_n6_share_order_but_not_crop_scope(self) -> None:
+        layout = fixture_layout(4097)
+        n2 = list(
+            epoch_position_pools(
+                layout, condition_id="N2", seed=11997733, epoch=4
+            )
+        )
+        n6 = list(
+            epoch_position_pools(
+                layout, condition_id="N6", seed=11997733, epoch=4
+            )
+        )
+        self.assertEqual(n2, n6)
+        self.assertNotEqual(
+            crop_key(
+                training_seed=11997733,
+                epoch=4,
+                logical_sample_id="a",
+                virtual_pls_id=0,
+                crop_policy="per-sample",
+            ),
+            crop_key(
+                training_seed=11997733,
+                epoch=4,
+                logical_sample_id="a",
+                virtual_pls_id=0,
+                crop_policy="per-pls",
+            ),
+        )
 
     def test_required_sizes_have_exact_coverage_and_no_drop(self) -> None:
         for count in (359, 1024, 1025, 4096, 4097):
@@ -126,6 +205,26 @@ class CoreScheduleTests(unittest.TestCase):
         self.assertEqual(order("B2"), order("B6"))
         self.assertNotEqual(order("A0"), order("B2"))
         self.assertEqual(order("B2"), order("B2"))
+
+    def test_no_shuffle_uses_fixed_physical_order_at_every_epoch(self) -> None:
+        layout = fixture_layout(4097)
+
+        def pools(epoch: int) -> list[tuple[tuple[int, ...], list[int]]]:
+            return [
+                (pls_ids, positions)
+                for _pool, pls_ids, positions in epoch_position_pools(
+                    layout,
+                    condition_id="N6",
+                    seed=11997733,
+                    epoch=epoch,
+                )
+            ]
+
+        epoch_zero = pools(0)
+        self.assertEqual(epoch_zero, pools(7))
+        self.assertEqual(epoch_zero[0][0], (0, 1, 2, 3))
+        self.assertEqual(epoch_zero[0][1], list(range(4096)))
+        self.assertEqual(epoch_zero[1], ((4,), [4096]))
 
     def test_closed_pool_microbatches_and_updates_do_not_cross_pool(self) -> None:
         layout = fixture_layout(4097)
@@ -251,6 +350,132 @@ class CoreScheduleTests(unittest.TestCase):
 
 
 class RecipeAndContractTests(unittest.TestCase):
+    def test_native_physical_epoch_consumes_native_order_and_updates_model(self) -> None:
+        class Batch:
+            def __init__(self, image_ids: list[int]) -> None:
+                self.global_image_ids = image_ids
+                self.labels = [value % 2 for value in image_ids]
+                y = torch.tensor([[float(value)] for value in image_ids])
+                cbcr = torch.zeros_like(y)
+                targets = torch.nn.functional.one_hot(
+                    torch.tensor(self.labels), num_classes=2
+                ).float()
+                self.tensors = (y, cbcr, targets)
+
+        class Pool:
+            epoch = 0
+            pool_index = 0
+            virtual_pls_ids = [0]
+            image_count = 4
+            microbatch_count = 2
+            execution_stats = {
+                "selected_vector_count": 4,
+                "full_vector_count": 8,
+                "compressed_payload_bytes_read": 16,
+                "uses_planless_fixed_transform": True,
+            }
+
+            def __init__(self) -> None:
+                self._batches = iter((Batch([2, 0]), Batch([3, 1])))
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._batches)
+
+        class Pipeline:
+            def __init__(self) -> None:
+                self.pending = False
+                self.reclaims = 0
+
+            def start_epoch(self, epoch: int) -> None:
+                self.pending = True
+
+            @property
+            def has_next_pool(self) -> bool:
+                return self.pending
+
+            def next_pool(self) -> Pool:
+                self.pending = False
+                return Pool()
+
+            def reclaim_finished_pools(self) -> int:
+                self.reclaims += 1
+                return 1
+
+        class Model(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2)
+
+            def forward(self, y: torch.Tensor, cbcr: torch.Tensor) -> torch.Tensor:
+                return self.linear(torch.cat((y, cbcr), dim=1))
+
+        class Scheduler:
+            def __init__(self) -> None:
+                self.updates = 0
+
+            def prepare_next_update(self) -> float:
+                return 0.1
+
+            def complete_update(self) -> None:
+                self.updates += 1
+
+        class WeightDecay:
+            def step(self, learning_rate: float) -> None:
+                self.learning_rate = learning_rate
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pipeline = Pipeline()
+            model = Model()
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            scheduler = Scheduler()
+            metrics = MetricsWriter(Path(temporary) / "metrics.jsonl")
+            with mock.patch("torch.cuda.synchronize"):
+                result = _train_native_physical_epoch(
+                    pipeline=pipeline,
+                    execution_model=model,
+                    model=model,
+                    optimizer=optimizer,
+                    weight_decayer=WeightDecay(),
+                    scheduler=scheduler,
+                    device=torch.device("cpu"),
+                    recipe={
+                        "training": {
+                            "physical_microbatch": 64,
+                            "gradient_accumulation": 16,
+                        },
+                        "optimizer": {"gradient_clipping_norm": 1.0},
+                        "logging": {"train_loss_every_optimizer_updates": 100},
+                    },
+                    metrics=metrics,
+                    loader_totals={},
+                    integration_checks={"coverage_counters_valid": True},
+                    condition_id="B6",
+                    seed=11997733,
+                    epoch=0,
+                    expected_sample_count=4,
+                    global_update=0,
+                    processed_images=0,
+                    loss_since_log=0.0,
+                    samples_since_log=0,
+                    last_logged_update=0,
+                    integration_check_first_100=False,
+                )
+            self.assertEqual(result["global_update"], 1)
+            self.assertEqual(result["processed_images"], 4)
+            self.assertEqual(result["epoch_record"]["epoch_microbatches"], 2)
+            self.assertEqual(result["epoch_record"]["native_pool_count"], 1)
+            self.assertEqual(
+                result["epoch_record"]["native_execution_stats"][
+                    "selected_vector_count"
+                ],
+                4,
+            )
+            self.assertEqual(scheduler.updates, 1)
+            self.assertEqual(pipeline.reclaims, 1)
+
     def test_seed_device_mapping_is_exact_and_defaults_cleanly(self) -> None:
         seeds = (11997733, 11997734)
         self.assertEqual(
@@ -410,6 +635,267 @@ class RecipeAndContractTests(unittest.TestCase):
         contracts[-1]["recipe_hash"] = "changed"
         with self.assertRaises(ValueError):
             validate_seed_block_contracts(contracts)
+
+    def test_scoped_code_identity_ignores_unrelated_repository_changes(self) -> None:
+        planned = {
+            "commit": "old",
+            "working_tree_clean": True,
+            "working_tree_status_sha256": "status-old",
+            "tracked_diff_sha256": "diff-old",
+            "experiment_source_tree_sha256": "broad-old",
+            "training_source_scope": TRAINING_SOURCE_SCOPE,
+            "training_runtime_source_tree_sha256": "runtime-stable",
+        }
+        current = {
+            **planned,
+            "commit": "new",
+            "working_tree_clean": False,
+            "working_tree_status_sha256": "status-new",
+            "tracked_diff_sha256": "diff-new",
+            "experiment_source_tree_sha256": "broad-new",
+        }
+        self.assertEqual(
+            blocking_code_identity(planned), blocking_code_identity(current)
+        )
+        self.assertEqual(
+            condition_identity_hash({"code_version": planned, "condition_id": "B6"}),
+            condition_identity_hash({"code_version": current, "condition_id": "B6"}),
+        )
+        self.assertEqual(
+            set(code_provenance_differences(planned, current)),
+            {
+                "commit",
+                "working_tree_clean",
+                "working_tree_status_sha256",
+                "tracked_diff_sha256",
+                "experiment_source_tree_sha256",
+            },
+        )
+        current["training_runtime_source_tree_sha256"] = "runtime-changed"
+        self.assertNotEqual(
+            blocking_code_identity(planned), blocking_code_identity(current)
+        )
+
+    def test_contract_validation_treats_repository_provenance_as_non_blocking(
+        self,
+    ) -> None:
+        planned_code = {
+            "commit": "planned",
+            "working_tree_clean": True,
+            "working_tree_status_sha256": "planned-status",
+            "tracked_diff_sha256": "planned-diff",
+            "experiment_source_tree_sha256": "planned-broad",
+            "training_source_scope": TRAINING_SOURCE_SCOPE,
+            "training_runtime_source_tree_sha256": "runtime-stable",
+        }
+        current_code = {
+            **planned_code,
+            "commit": "current",
+            "working_tree_clean": False,
+            "working_tree_status_sha256": "current-status",
+            "tracked_diff_sha256": "current-diff",
+            "experiment_source_tree_sha256": "current-broad",
+        }
+        payload = {
+            "condition_id": "B6",
+            "training_seed": 11997733,
+            "recipe_hash": "recipe",
+            "layout_hash": "layout",
+            "execution_mode": "semantic_emulation",
+            "semantic_emulation": True,
+            "physical_fls_observed": False,
+            "physical_gpu_pool": False,
+            "backend_implementation": "shared-galp-direct-dct-semantic-backend-v2",
+            "code_version": planned_code,
+        }
+        payload["condition_hash"] = condition_identity_hash(payload)
+        payload["run_manifest_hash"] = sha256_json(payload)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "run_manifest.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with mock.patch(
+                "training_pls.train.code_version", return_value=current_code
+            ):
+                observed, validation = _validate_contract(
+                    path,
+                    condition_id="B6",
+                    seed=11997733,
+                    recipe_hash="recipe",
+                    layout_hash="layout",
+                    execution_backend="semantic-emulation",
+                    physical_galp_manifest=None,
+                    premixed_mapping_csv=None,
+                    expected_mapping_sha256=None,
+                )
+            self.assertEqual(observed["condition_hash"], payload["condition_hash"])
+            self.assertTrue(validation["blocking_code_identity_matches"])
+            self.assertTrue(validation["non_blocking_code_provenance_changed"])
+
+            changed_runtime = {
+                **current_code,
+                "training_runtime_source_tree_sha256": "runtime-changed",
+            }
+            with mock.patch(
+                "training_pls.train.code_version", return_value=changed_runtime
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "training runtime sources changed"
+                ):
+                    _validate_contract(
+                        path,
+                        condition_id="B6",
+                        seed=11997733,
+                        recipe_hash="recipe",
+                        layout_hash="layout",
+                        execution_backend="semantic-emulation",
+                        physical_galp_manifest=None,
+                        premixed_mapping_csv=None,
+                        expected_mapping_sha256=None,
+                    )
+
+    def test_manifest_cli_and_matrix_epoch_boundary_pause(self) -> None:
+        train_args = _parse_train_args(
+            [
+                "--train-manifest",
+                "train.json",
+                "--val-manifest",
+                "val.json",
+                "--layout-plan",
+                "layout.json",
+                "--run-manifest",
+                "run_manifest.json",
+                "--condition",
+                "B6",
+                "--seed",
+                "11997733",
+                "--output-dir",
+                "output",
+                "--stop-after-epoch",
+                "2",
+            ]
+        )
+        self.assertEqual(train_args.run_manifest, Path("run_manifest.json"))
+        self.assertIsNone(train_args.condition_contract)
+        self.assertEqual(train_args.stop_after_epoch, 2)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [root / name for name in ("train.json", "val.json", "layout.json")]
+            for path in paths:
+                path.touch()
+            matrix_args = _parse_matrix_args(
+                [
+                    "--output-dir",
+                    str(root / "output"),
+                    "--train-manifest",
+                    str(paths[0]),
+                    "--val-manifest",
+                    str(paths[1]),
+                    "--layout-plan",
+                    str(paths[2]),
+                    "--stop-after-epoch",
+                    "2",
+                ]
+            )
+        self.assertEqual(matrix_args.stop_after_epoch, 2)
+
+    def test_matrix_plan_writes_canonical_run_manifest_and_forwards_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train_manifest = root / "train.json"
+            val_manifest = root / "val.json"
+            layout_path = root / "layout.json"
+            for path in (train_manifest, val_manifest, layout_path):
+                path.write_text("{}", encoding="utf-8")
+            output = root / "output"
+            args = _parse_matrix_args(
+                [
+                    "--output-dir",
+                    str(output),
+                    "--train-manifest",
+                    str(train_manifest),
+                    "--val-manifest",
+                    str(val_manifest),
+                    "--layout-plan",
+                    str(layout_path),
+                    "--conditions",
+                    "B6",
+                    "--seeds",
+                    "11997733",
+                    "--stop-after-epoch",
+                    "2",
+                ]
+            )
+            positions = tuple(
+                np.arange(index * 1024, (index + 1) * 1024, dtype=np.int64)
+                for index in range(4)
+            )
+            mapping = mock.Mock(
+                sample_count=4096,
+                positions_by_pls=positions,
+                plan={"target_pls_size": 1024},
+                layout_hash="layout-hash",
+            )
+            layout_plan = {
+                "target_pls_size": 1024,
+                "dataset_manifest_hash": sha256_file(train_manifest),
+                "layout_hash": "layout-hash",
+            }
+            version = {
+                "commit": "commit",
+                "working_tree_clean": True,
+                "working_tree_status_sha256": "status",
+                "tracked_diff_sha256": "diff",
+                "experiment_source_files": [],
+                "experiment_source_tree_sha256": "broad",
+                "training_source_scope": TRAINING_SOURCE_SCOPE,
+                "training_runtime_source_files": [],
+                "training_runtime_source_tree_sha256": "runtime",
+            }
+            with (
+                mock.patch(
+                    "training_pls.run_matrix.load_layout_plan",
+                    return_value=layout_plan,
+                ),
+                mock.patch(
+                    "training_pls.run_matrix.load_layout_mapping",
+                    return_value=mapping,
+                ),
+                mock.patch(
+                    "training_pls.run_matrix._initial_model_hashes",
+                    return_value={11997733: "initial-model"},
+                ),
+                mock.patch(
+                    "training_pls.run_matrix.code_version", return_value=version
+                ),
+                mock.patch(
+                    "training_pls.run_matrix._environment", return_value={}
+                ),
+            ):
+                built = build_plan(args)
+
+            command = built["plan"]["commands"][0]
+            run_manifest = (
+                output / "runs" / "B6" / "seed_11997733" / "run_manifest.json"
+            )
+            self.assertEqual(Path(command["run_manifest"]), run_manifest)
+            self.assertTrue(run_manifest.is_file())
+            self.assertIn("--run-manifest", command["argv"])
+            self.assertNotIn("--condition-contract", command["argv"])
+            stop_index = command["argv"].index("--stop-after-epoch")
+            self.assertEqual(command["argv"][stop_index + 1], "2")
+            self.assertTrue(
+                (output / "contracts" / "seed_11997733" / "B6.json").is_file()
+            )
+            self.assertTrue(
+                (
+                    output
+                    / "runs"
+                    / "B6"
+                    / "seed_11997733"
+                    / "condition_contract.json"
+                ).is_file()
+            )
 
 
 class ReportTests(unittest.TestCase):
