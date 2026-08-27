@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Plot live validation progress for the four premixed PLS conditions.
+"""Plot validation progress for registered premixed PLS conditions.
 
-The script reads the current ``metrics.jsonl`` files on every invocation.  It
-does not require ``final_result.json`` and therefore works for paused, failed,
-and still-running jobs.  A partially written JSONL tail is ignored so the
-script can safely run while training is appending metrics.
+By default the script reads the current ``metrics.jsonl`` files on every
+invocation.  It can instead read a fresh-process revalidation table with
+``--canonical-csv``.  The two modes are deliberately explicit so superseded
+inline validation values cannot silently replace canonical results.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import tempfile
@@ -20,11 +21,11 @@ from typing import Any, Mapping, Sequence
 
 from PIL import Image
 
-from .matrix import CORE_CONDITION_IDS
+from .matrix import CORE_CONDITION_IDS, REGISTERED_CONDITION_IDS
 from .report import COLORS, _line_chart
 
 
-SCHEMA_VERSION = "galp-pls-premixed-progress-plot-v1"
+SCHEMA_VERSION = "galp-pls-premixed-progress-plot-v2"
 DEFAULT_EXPERIMENT_ROOT = Path(
     os.environ.get(
         "PLS_EXPERIMENT_ROOT",
@@ -36,6 +37,8 @@ CONDITION_LABELS = {
     "A1": "A1: PLS/global",
     "B2": "B2: sample/closed-M4",
     "B6": "B6: PLS/closed-M4",
+    "N6": "N6: PLS/physical-order (no epoch shuffle)",
+    "N2": "N2: sample/physical-order (no epoch shuffle)",
 }
 CSV_FIELDS = (
     "condition",
@@ -49,6 +52,24 @@ CSV_FIELDS = (
     "validation_latency_seconds",
     "validation_samples",
     "source_metrics",
+    "source_validation",
+    "checkpoint_sha256",
+    "validation_gpu",
+    "canonical_fresh_process",
+    "inline_superseded",
+)
+CANONICAL_REQUIRED_FIELDS = (
+    "condition",
+    "seed",
+    "epoch",
+    "optimizer_update",
+    "processed_images",
+    "validation_top1",
+    "validation_top5",
+    "validation_loss",
+    "checkpoint_sha256",
+    "validation_gpu",
+    "canonical_fresh_process",
 )
 
 
@@ -75,9 +96,10 @@ def parse_run_overrides(values: Sequence[str]) -> dict[str, Path]:
             raise ValueError(f"invalid --run {value!r}; expected CONDITION=PATH")
         condition, raw_path = value.split("=", 1)
         condition = condition.strip().upper()
-        if condition not in CORE_CONDITION_IDS:
+        if condition not in REGISTERED_CONDITION_IDS:
             raise ValueError(
-                f"invalid --run condition {condition!r}; expected {CORE_CONDITION_IDS}"
+                f"invalid --run condition {condition!r}; expected "
+                f"{REGISTERED_CONDITION_IDS}"
             )
         if condition in result:
             raise ValueError(f"duplicate --run override for {condition}")
@@ -187,6 +209,117 @@ def read_validation_metrics(
     return records, metadata
 
 
+def _is_true(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read_canonical_validation_csv(
+    path: Path,
+    *,
+    seed: int,
+    condition_ids: Sequence[str] = CORE_CONDITION_IDS,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Read a trusted fresh-process validation table for one seed.
+
+    Rows for other seeds and non-core conditions are ignored.  Selected rows
+    must be unique by condition/epoch and explicitly marked as fresh-process
+    canonical validation.
+    """
+
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"canonical validation CSV does not exist: {path}")
+
+    records_by_condition: dict[str, list[dict[str, Any]]] = {
+        condition: [] for condition in condition_ids
+    }
+    seen: set[tuple[str, int]] = set()
+    with path.open("r", encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        fields = set(reader.fieldnames or ())
+        missing_fields = sorted(set(CANONICAL_REQUIRED_FIELDS) - fields)
+        if missing_fields:
+            raise ValueError(
+                f"canonical validation CSV lacks required fields {missing_fields}: {path}"
+            )
+        for line_number, value in enumerate(reader, 2):
+            try:
+                observed_seed = int(value["seed"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"invalid seed at {path}:{line_number}") from error
+            condition = str(value["condition"]).strip().upper()
+            if observed_seed != seed or condition not in condition_ids:
+                continue
+            if not _is_true(value["canonical_fresh_process"]):
+                raise ValueError(
+                    f"non-canonical row selected at {path}:{line_number}: "
+                    "canonical_fresh_process must be true"
+                )
+            try:
+                epoch = int(value["epoch"])
+                record = {
+                    "condition": condition,
+                    "seed": observed_seed,
+                    "epoch": epoch,
+                    "optimizer_update": int(value["optimizer_update"]),
+                    "processed_images": int(value["processed_images"]),
+                    "validation_top1": float(value["validation_top1"]),
+                    "validation_top5": float(value["validation_top5"]),
+                    "validation_loss": float(value["validation_loss"]),
+                    "validation_latency_seconds": float(
+                        value.get("validation_latency_seconds") or 0.0
+                    ),
+                    "validation_samples": int(value.get("validation_samples") or 0),
+                    "source_metrics": "",
+                    "source_validation": str(path),
+                    "checkpoint_sha256": str(value["checkpoint_sha256"]),
+                    "validation_gpu": str(value["validation_gpu"]),
+                    "canonical_fresh_process": True,
+                    "inline_superseded": _is_true(value.get("inline_superseded", "")),
+                }
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"invalid canonical validation row at {path}:{line_number}: {error}"
+                ) from error
+            identity = (condition, epoch)
+            if identity in seen:
+                raise ValueError(
+                    f"duplicate canonical condition/epoch {identity} at "
+                    f"{path}:{line_number}"
+                )
+            seen.add(identity)
+            records_by_condition[condition].append(record)
+
+    file_hash = _sha256(path)
+    sources: dict[str, dict[str, Any]] = {}
+    for condition in condition_ids:
+        rows = sorted(records_by_condition[condition], key=lambda row: int(row["epoch"]))
+        records_by_condition[condition] = rows
+        sources[condition] = {
+            "condition": condition,
+            "seed": seed,
+            "source_kind": "fresh-process-canonical-csv",
+            "canonical_csv": str(path),
+            "canonical_csv_sha256": file_hash,
+            "canonical_csv_size_bytes": path.stat().st_size,
+            "validation_point_count": len(rows),
+            "latest_epoch": rows[-1]["epoch"] if rows else None,
+            "latest_validation": rows[-1] if rows else None,
+            "all_rows_canonical_fresh_process": all(
+                bool(row["canonical_fresh_process"]) for row in rows
+            ),
+        }
+    return records_by_condition, sources
+
+
 def _atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
@@ -280,31 +413,50 @@ def generate_plots(
     seed: int,
     x_axis: str = "epoch",
     allow_missing: bool = False,
+    canonical_csv: Path | None = None,
+    condition_ids: Sequence[str] = CORE_CONDITION_IDS,
 ) -> dict[str, Any]:
-    """Read current records, write audit tables, and atomically refresh plots."""
+    """Read selected records, write audit tables, and atomically refresh plots."""
 
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    records_by_condition: dict[str, list[dict[str, Any]]] = {}
-    sources: dict[str, dict[str, Any]] = {}
-    for condition in CORE_CONDITION_IDS:
-        records, metadata = read_validation_metrics(
-            run_paths[condition], condition=condition, seed=seed
+    if canonical_csv is not None:
+        records_by_condition, sources = read_canonical_validation_csv(
+            canonical_csv, seed=seed, condition_ids=condition_ids
         )
-        records_by_condition[condition] = records
-        sources[condition] = metadata
+        data_mode = "fresh-process-canonical"
+        title_suffix = "fresh-process canonical validation"
+        claim_boundary = (
+            "Fresh-process canonical single-seed milestone curves; differing last "
+            "epochs are retained. These are not final 300-epoch or multi-seed results."
+        )
+    else:
+        records_by_condition = {}
+        sources = {}
+        for condition in condition_ids:
+            records, metadata = read_validation_metrics(
+                run_paths[condition], condition=condition, seed=seed
+            )
+            records_by_condition[condition] = records
+            sources[condition] = metadata
+        data_mode = "live-metrics-jsonl"
+        title_suffix = "live milestone data"
+        claim_boundary = (
+            "Live single-seed milestone curves; differing last epochs are retained. "
+            "These are not final 300-epoch or multi-seed results."
+        )
 
     missing = [condition for condition, rows in records_by_condition.items() if not rows]
     if missing and not allow_missing:
         raise ValueError(
             f"no validation points for {missing}; pass --allow-missing to plot partial coverage"
         )
-    if len(missing) == len(CORE_CONDITION_IDS):
-        raise ValueError("none of the four premixed runs has a validation point")
+    if len(missing) == len(condition_ids):
+        raise ValueError("none of the selected premixed runs has a validation point")
 
     all_rows = [
         row
-        for condition in CORE_CONDITION_IDS
+        for condition in condition_ids
         for row in records_by_condition[condition]
     ]
     _atomic_csv(output_dir / "premixed_validation_progress.csv", all_rows)
@@ -333,7 +485,7 @@ def generate_plots(
     for endpoint, filename, title, ylabel in chart_specs:
         path = output_dir / filename
         series = []
-        for condition in CORE_CONDITION_IDS:
+        for condition in condition_ids:
             rows = records_by_condition[condition]
             if not rows:
                 continue
@@ -350,7 +502,7 @@ def generate_plots(
             )
         _atomic_line_chart(
             path,
-            title=f"{title} (seed {seed}; live milestone data)",
+            title=f"{title} (seed {seed}; {title_suffix})",
             xlabel=_x_label(x_axis),
             ylabel=ylabel,
             series=series,
@@ -364,7 +516,11 @@ def generate_plots(
         "generated_at_unix": time.time(),
         "seed": seed,
         "x_axis": x_axis,
-        "conditions": list(CORE_CONDITION_IDS),
+        "data_mode": data_mode,
+        "canonical_csv": (
+            str(canonical_csv.expanduser().resolve()) if canonical_csv else None
+        ),
+        "conditions": list(condition_ids),
         "missing_conditions": missing,
         "sources": sources,
         "outputs": {
@@ -374,10 +530,7 @@ def generate_plots(
             "validation_loss_plot": str(chart_paths[2]),
             "validation_csv": str(output_dir / "premixed_validation_progress.csv"),
         },
-        "claim_boundary": (
-            "Live single-seed milestone curves; differing last epochs are retained. "
-            "These are not final 300-epoch or multi-seed results."
-        ),
+        "claim_boundary": claim_boundary,
     }
     _atomic_json(output_dir / "premixed_progress_summary.json", result)
     return result
@@ -392,6 +545,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="PLS experiment root (default: PLS_EXPERIMENT_ROOT or current NVMe root)",
     )
     parser.add_argument("--seed", type=int, default=11997733)
+    parser.add_argument(
+        "--conditions",
+        default=",".join(CORE_CONDITION_IDS),
+        help=(
+            "comma-separated plotted conditions; include N6 for the no-shuffle "
+            "control"
+        ),
+    )
     parser.add_argument(
         "--run",
         action="append",
@@ -414,11 +575,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="plot available conditions when one or more metrics files are absent",
     )
+    parser.add_argument(
+        "--canonical-csv",
+        type=Path,
+        help=(
+            "read fresh-process canonical validation rows from this CSV instead of "
+            "the runs' live metrics.jsonl files"
+        ),
+    )
     args = parser.parse_args(argv)
 
+    if args.canonical_csv is not None and args.run:
+        parser.error("--canonical-csv and --run cannot be used together")
+
     experiment_root = args.experiment_root.expanduser().resolve()
+    condition_ids = tuple(
+        value.strip().upper() for value in args.conditions.split(",") if value.strip()
+    )
+    if not condition_ids or len(set(condition_ids)) != len(condition_ids):
+        parser.error("--conditions must contain unique registered condition IDs")
+    invalid_conditions = sorted(set(condition_ids) - set(REGISTERED_CONDITION_IDS))
+    if invalid_conditions:
+        parser.error(
+            f"unknown --conditions {invalid_conditions}; expected "
+            f"{REGISTERED_CONDITION_IDS}"
+        )
     run_paths = default_run_paths(experiment_root, args.seed)
     run_paths.update(parse_run_overrides(args.run))
+    missing_run_paths = [
+        condition for condition in condition_ids if condition not in run_paths
+    ]
+    if missing_run_paths and args.canonical_csv is None:
+        parser.error(
+            f"selected conditions {missing_run_paths} require --run CONDITION=PATH"
+        )
     output_dir = args.output_dir or (
         experiment_root / "plots" / "premixed_progress" / f"seed_{args.seed}"
     )
@@ -428,6 +618,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         x_axis=args.x_axis,
         allow_missing=args.allow_missing,
+        canonical_csv=args.canonical_csv,
+        condition_ids=condition_ids,
     )
     print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
     return 0
