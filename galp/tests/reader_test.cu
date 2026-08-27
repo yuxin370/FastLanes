@@ -1454,6 +1454,48 @@ TEST(Reader, CompiledSparseVectorBundlePlansMatchLogicalPackedAndEnvelopeReads) 
 	expect_selected_segments_equal(compiled_envelope, reference_envelope);
 }
 
+TEST(Reader, SparsePlanIntersectsSelectedVectorsAndColumns) {
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	galp::format::FlsReader reader(fls_path);
+	const std::vector<uint32_t> selected_vectors {1U, 3U, 6U};
+	const std::vector<uint8_t> selected_columns {0U, 1U};
+
+	const auto all_column_plan = reader.compile_sparse_vector_read_plan(0U, selected_vectors);
+	galp::format::ZeroCopyReadTiming all_column_timing {};
+	auto all_column = reader.read_rowgroup_zero_copy_compiled(all_column_plan, &all_column_timing);
+
+	const auto intersected_plan =
+	    reader.compile_sparse_vector_read_plan(0U, selected_vectors, selected_columns);
+	galp::format::ZeroCopyReadTiming intersected_timing {};
+	auto intersected = reader.read_rowgroup_zero_copy_compiled(intersected_plan, &intersected_timing);
+	EXPECT_EQ(intersected.materialized_column_indices, selected_columns);
+	EXPECT_TRUE(intersected_timing.used_coefficient_range_read);
+	EXPECT_EQ(intersected_timing.selected_coefficient_count, selected_columns.size());
+	EXPECT_LT(intersected_timing.storage_bytes, all_column_timing.storage_bytes);
+
+	const auto* columns = intersected.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(columns, nullptr);
+	for (const auto column_index : selected_columns) {
+		const auto* column = columns->Get(column_index);
+		ASSERT_NE(column, nullptr);
+		const auto* segments = column->segment_descriptors();
+		ASSERT_NE(segments, nullptr);
+		for (flatbuffers::uoffset_t segment_index = 0U; segment_index < segments->size(); ++segment_index) {
+			const auto* descriptor = segments->Get(segment_index);
+			auto actual = fastlanes::make_segment_view(intersected.backing_span, *descriptor);
+			auto expected = fastlanes::make_segment_view(all_column.backing_span, *descriptor);
+			for (const auto vector : selected_vectors) {
+				actual.PointTo(vector);
+				expected.PointTo(vector);
+				ASSERT_EQ(actual.Size(), expected.Size());
+				EXPECT_EQ(std::memcmp(actual.data, expected.data, actual.Size()), 0)
+				    << "column=" << static_cast<size_t>(column_index)
+				    << " segment=" << segment_index << " vector=" << vector;
+			}
+		}
+	}
+}
+
 TEST(Reader, SparseVectorBundlePackedDeviceRangesRebuildSelectedSegments) {
 	const auto fls_path = make_sparse_vector_bundle_fixture();
 	const auto bundle_path = galp::format::sparse_vector_bundle_path(fls_path);
@@ -1527,6 +1569,62 @@ TEST(Reader, SparseVectorBundlePackedDeviceRangesDecodeSelectedVectorsOnGpu) {
 				    static_cast<int>((source_row * 17U + column * 29U + source_row / 1024U) % 101U) - 50);
 				ASSERT_EQ(output[selected_index * galp::codec::consts::VALUES_PER_VECTOR + offset], expected)
 				    << "column=" << column << " selected_index=" << selected_index << " offset=" << offset;
+			}
+		}
+	}
+	galp::execution::free_rowgroup(rowgroup);
+}
+
+TEST(Reader, MixedDispatchCoversImplicitFullAndExplicitSelectedExpressions) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	galp::format::FlsReader reader(fls_path);
+	auto rowgroup   = reader.read_rowgroup(0);
+	auto expressions = galp::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 8U);
+
+	galp::runtime::ExecutionWorkset      workset {};
+	galp::runtime::ExecutionWorksetGuard guard(workset);
+	galp::execution::ExecutionConfig     config {};
+	config.unpack_n_vectors = 1U;
+	config.launch_strategy  = galp::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	galp::runtime::reserve_batch_expr_storage(workset, expressions.size() * 2U);
+	galp::runtime::append_rowgroup_columns(
+	    workset, rowgroup, config, /*expr_index_base=*/0U, /*use_global_expr_index=*/true);
+	const std::vector<uint32_t> selected_vectors {1U, 3U, 6U};
+	galp::runtime::append_rowgroup_columns_selected_vectors(
+	    workset, rowgroup, config, selected_vectors, expressions.size(), /*use_global_expr_index=*/true);
+
+	std::vector<galp::expression::Expression> combined_expressions = expressions;
+	combined_expressions.insert(combined_expressions.end(), expressions.begin(), expressions.end());
+	galp::runtime::upload_workset(workset, config);
+	galp::runtime::run_workset(workset, 1U, config);
+	const auto result = galp::runtime::materialize_workset(workset, combined_expressions, config);
+	ASSERT_EQ(result.columns.size(), combined_expressions.size());
+	for (size_t column = 0; column < expressions.size(); ++column) {
+		ASSERT_TRUE(result.columns[column].has_value());
+		ASSERT_TRUE(result.columns[expressions.size() + column].has_value());
+		const auto& full = std::get<std::shared_ptr<int8_t[]>>(result.columns[column]->values);
+		const auto& selected =
+		    std::get<std::shared_ptr<int8_t[]>>(result.columns[expressions.size() + column]->values);
+		for (size_t row = 0; row < rowgroup.n_tuples; ++row) {
+			const auto expected = static_cast<int8_t>(
+			    static_cast<int>((row * 17U + column * 29U + row / 1024U) % 101U) - 50);
+			ASSERT_EQ(full[row], expected) << "full column=" << column << " row=" << row;
+		}
+		for (size_t selected_index = 0; selected_index < selected_vectors.size(); ++selected_index) {
+			for (size_t offset = 0; offset < galp::codec::consts::VALUES_PER_VECTOR; ++offset) {
+				const size_t source_row = static_cast<size_t>(selected_vectors[selected_index]) *
+				                              galp::codec::consts::VALUES_PER_VECTOR +
+				                          offset;
+				const auto expected = static_cast<int8_t>(
+				    static_cast<int>((source_row * 17U + column * 29U + source_row / 1024U) % 101U) - 50);
+				ASSERT_EQ(selected[selected_index * galp::codec::consts::VALUES_PER_VECTOR + offset], expected)
+				    << "selected column=" << column << " selected_index=" << selected_index
+				    << " offset=" << offset;
 			}
 		}
 	}

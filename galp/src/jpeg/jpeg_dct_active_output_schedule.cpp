@@ -425,13 +425,6 @@ uint64_t jpeg_dct_active_output_decision_digest(
 		hash = hash_scalar(hash, record.shard_id);
 		hash = hash_scalar(hash, record.rowgroup_index);
 		hash = hash_scalar(hash, record.workset_index);
-		hash = hash_scalar(hash, record.runtime_decision);
-		hash = hash_scalar(hash, record.read_strategy);
-		hash = hash_scalar(hash, record.submission_backend);
-		hash = hash_scalar(hash, record.selected_vector_count);
-		hash = hash_scalar(hash, record.full_vector_count);
-		hash = hash_scalar(hash, record.physical_bytes);
-		hash = hash_scalar(hash, record.physical_run_count);
 	}
 	return hash;
 }

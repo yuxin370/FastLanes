@@ -118,6 +118,8 @@ public:
 	explicit NativeBatchLease(std::shared_ptr<NativeBatchCompletion> completion);
 	NativeBatchLease(std::shared_ptr<NativeBatchCompletion> completion,
 	                 std::shared_ptr<jpeg::DirectDctBatch> backing_batch);
+	NativeBatchLease(std::shared_ptr<NativeBatchCompletion> completion,
+	                 std::shared_ptr<void>                 backing_owner);
 
 	bool register_consumer(ConsumerDependency dependency);
 	void mark_producer_complete() noexcept;
@@ -149,7 +151,8 @@ private:
 
 	std::shared_ptr<NativeBatchCompletion> completion_;
 	mutable std::mutex                    mutex_;
-	std::shared_ptr<jpeg::DirectDctBatch> backing_batch_;
+	std::shared_ptr<void>                  backing_owner_;
+	jpeg::DirectDctBatch*                  backing_batch_ = nullptr;
 	size_t                                storage_reference_count_ = 0U;
 	size_t                                released_storage_reference_count_ = 0U;
 	size_t                                owner_reference_count_ = 0U;

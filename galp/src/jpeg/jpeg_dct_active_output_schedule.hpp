@@ -15,10 +15,10 @@ inline constexpr uint32_t kJpegDctActiveOutputSchedulePlannerAbi = 1U;
 inline constexpr size_t   kJpegDctActiveOutputScheduleMmapCapacityBytes = 16U << 20U;
 inline constexpr size_t   kJpegDctActiveOutputScheduleMmapWindowCount = 2U;
 
-// Everything that can change output-to-workset ownership participates in the
-// immutable sidecar key. The physical byte plan itself is represented by one
-// deterministic record per rowgroup; no pointer or process-local identity is
-// serialized.
+// Only fields that can change output-to-workset ownership participate in the
+// immutable sidecar digest.  The remaining fields retain the physical I/O
+// decision for diagnostics, but coefficient-dependent byte/range choices do
+// not invalidate a schedule when rowgroup ownership is unchanged.
 struct JpegDctActiveOutputDecisionRecord {
 	uint32_t shard_id              = 0U;
 	uint32_t rowgroup_index        = 0U;

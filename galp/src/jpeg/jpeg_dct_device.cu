@@ -1225,6 +1225,10 @@ struct JpegDctDeviceScratch {
 	galp::memory::CudaStream                                               fixed_grid_round_stream;
 	galp::memory::CudaStream                                               transform_stream;
 	galp::memory::CudaEvent                                                decode_to_transform_event;
+	// Batch-scoped dependency from output initialization to every stream that
+	// may write or finalize the grid.  The streams are non-blocking, so the
+	// legacy default-stream ordering rules cannot provide this dependency.
+	galp::memory::CudaEvent                                                output_initialized_event;
 	galp::memory::CudaEvent                                                fixed_constants_ready_event;
 	galp::memory::CudaEvent                                                async_decode_start_event;
 	galp::memory::CudaEvent                                                async_decode_done_event;
@@ -1268,7 +1272,10 @@ struct JpegDctDeviceScratch {
 	uint64_t                                                               uploaded_sparse_transform_plan_mask = 0U;
 	bool                                                                   sparse_transform_plan_uploaded = false;
 	std::vector<JpegDctDeviceBlockMajorGroupBinding>                       host_block_major_groups;
-	const JpegDctDeviceBlockMajorPlanlessPlan*                              uploaded_block_major_plan = nullptr;
+	// Identity is meaningful only while the shared plan is alive.  A weak
+	// reference prevents both dangling-address reuse and persistent retention of
+	// a batch-sized host plan after a zero-capacity plan-cache execution.
+	std::weak_ptr<const JpegDctDeviceBlockMajorPlanlessPlan>                uploaded_block_major_plan;
 	std::vector<uint32_t>                                                  host_workset_fixed_transform_item_order;
 	std::vector<uint32_t>                                                  host_workset_fixed_transform_group_offsets;
 	std::vector<uint32_t>                                                  host_workset_fixed_transform_item_groups;
@@ -1292,6 +1299,7 @@ struct JpegDctDeviceScratch {
 	int                                                                    cuda_least_stream_priority          = 0;
 	int                                                                    cuda_greatest_stream_priority       = 0;
 	bool                                                                   direct_dct_low_priority_streams     = false;
+	bool                                                                   output_initialization_pending       = false;
 	bool                                                                   decoded_batch_cleanup_pending       = false;
 	std::function<void()>                                                  decoded_batch_transient_cleanup;
 	std::shared_ptr<JpegDctDeviceTransformSubmissionGate>                  transform_submission_gate;
@@ -1433,6 +1441,33 @@ struct JpegDctDeviceScratch {
 			transform_stream.create_with_priority(cudaStreamNonBlocking, direct_dct_stream_priority);
 		}
 		return transform_stream.get();
+	}
+
+	void reset_output_initialization() noexcept {
+		output_initialization_pending = false;
+	}
+
+	void begin_batch() noexcept {
+		reset_output_initialization();
+		// Block-major image/rank descriptors are execution inputs, not a
+		// reader-lifetime cache.  A new plan may share a long-lived host plan
+		// object while changing the device buffers used by intervening work.
+		// Invalidate the upload identity at the batch boundary so the first
+		// workset always establishes this batch's immutable device state; later
+		// worksets in the same batch may still reuse that upload.
+		uploaded_block_major_plan.reset();
+	}
+
+	void record_output_initialization(const cudaStream_t stream) {
+		output_initialized_event.create_with_flags(cudaEventDisableTiming);
+		output_initialized_event.record(stream);
+		output_initialization_pending = true;
+	}
+
+	void make_stream_wait_for_output_initialization(const cudaStream_t stream) const {
+		if (output_initialization_pending) {
+			CUDA_SAFE_CALL(cudaStreamWaitEvent(stream, output_initialized_event.get(), 0));
+		}
 	}
 
 	void configure_scheduling(const bool   use_low_priority,
@@ -2177,7 +2212,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	}
 	const bool upload_block_major_immutable =
 	    block_major_plan &&
-	    (scratch.uploaded_block_major_plan != block_major_plan.get() ||
+	    (scratch.uploaded_block_major_plan.lock().get() != block_major_plan.get() ||
 	     scratch.planless_image_descriptors.needs_reallocation(images.size()) ||
 	     scratch.block_major_rank_cells.needs_reallocation(block_major_plan->rank_cells.size()) ||
 	     scratch.block_major_rank_payload.needs_reallocation(block_major_plan->rank_payload.size()));
@@ -2196,7 +2231,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 				scratch.block_major_rank_payload.upload(
 				    block_major_plan->rank_payload.data(), block_major_plan->rank_payload.size(), stream, stats);
 			}
-			scratch.uploaded_block_major_plan = block_major_plan.get();
+			scratch.uploaded_block_major_plan = block_major_plan;
 		}
 		if (!scratch.planless_active_output_schedule_uploaded &&
 		    !scratch.host_planless_active_output_blocks.empty()) {
@@ -2210,7 +2245,7 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 			active_output_blocks = scratch.planless_active_output_blocks.data + active_output_begin;
 		}
 	} else {
-		scratch.uploaded_block_major_plan = nullptr;
+		scratch.uploaded_block_major_plan.reset();
 	}
 	if (output_blocks == 0U) {
 		return;
@@ -2748,6 +2783,7 @@ void round_fixed_ycbcr_grid_outputs(float*                          y_accum,
 	const size_t       active_cbcr_count = launch_cbcr ? cbcr_count : 0U;
 	const size_t       total_count       = active_y_count + active_cbcr_count;
 	const cudaStream_t stream            = scratch.stream_for_fixed_grid_rounding();
+	scratch.make_stream_wait_for_output_initialization(stream);
 	if (scratch.decoded_batch_cleanup_pending) {
 		CUDA_SAFE_CALL(cudaStreamWaitEvent(stream, scratch.decoded_batch_gather_done.get(), 0));
 	}
@@ -4070,14 +4106,17 @@ void record_decoded_rowgroup_read(const galp::format::ZeroCopyReadTiming& io_tim
 		++execution_stats.coefficient_range_rowgroup_count;
 		execution_stats.coefficient_range_bytes_read += io_timing.storage_bytes;
 	}
-	// Compact-v3 records these values for both full-rowgroup reads and
-	// coefficient-range reads. Keep Full-All observable instead of reporting
-	// zero page/coefficient coverage merely because it did not use the sparse
-	// coefficient path.
+	// Compact-v3 records these physical coverage values for both full-rowgroup
+	// and coefficient-range reads. Keep Full-All observable when it does not use
+	// the sparse coefficient path.
 	execution_stats.coefficient_logical_bytes_requested += io_timing.logical_storage_bytes;
 	execution_stats.physical_page_bytes_covered += io_timing.physical_page_bytes;
 	execution_stats.full_physical_page_bytes += io_timing.full_physical_page_bytes;
 	execution_stats.coalesced_read_run_count += io_timing.coalesced_read_run_count;
+	// Coefficient selection is a JPEG request semantic, independent of whether
+	// the physical reader can issue compact-v3 column ranges.  The byte/page/run
+	// counters above continue to describe the actual storage work, including a
+	// manifest-v1 full-rowgroup fallback for a smaller logical selection.
 	execution_stats.selected_coefficient_count += selected_coefficient_count;
 	execution_stats.full_coefficient_count += kJpegDctCoefficientCount;
 	if (io_timing.used_pinned_backing) {
@@ -4507,6 +4546,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		CUDA_SAFE_CALL(cudaStreamWaitEvent(materialize_stream, scratch.decode_to_transform_event.get(), 0));
 		++execution_stats.decode_to_transform_event_handoff_count;
 	}
+	scratch.make_stream_wait_for_output_initialization(materialize_stream);
 	make_stream_wait_for_cached_gather(materialize_stream, scratch, execution_stats);
 	const bool use_dense_bindings        = materializes_dense_cache || uses_decoded_gather || batch_has_fixed_transform;
 	bind_coeff_columns_batch(works,
@@ -4694,6 +4734,7 @@ void execute_cached_fixed_transform_hits(const std::vector<JpegDctDeviceCachedFi
 	}
 	auto& upload_items = scratch.host_cached_fixed_transform_uploads.emplace_back(items.begin(), items.end());
 	const auto stream = scratch.stream_for_cache_hit();
+	scratch.make_stream_wait_for_output_initialization(stream);
 	if (scratch.fixed_constants_ready_event) {
 		CUDA_SAFE_CALL(cudaStreamWaitEvent(stream, scratch.fixed_constants_ready_event.get(), 0));
 	}
@@ -5058,32 +5099,25 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 		                                  rowgroup_worksets.front().shard_id == 0U;
 		if (use_schedule_sidecar) {
 			const auto schedule_shard_id = rowgroup_worksets.front().shard_id;
-			std::vector<JpegDctActiveOutputDecisionRecord> decisions;
-			decisions.reserve(misses.size());
+			std::vector<JpegDctActiveOutputDecisionRecord> ownership_decisions;
+			ownership_decisions.reserve(misses.size());
 			for (size_t miss_index = 0U; miss_index < misses.size(); ++miss_index) {
 				const auto& rowgroup = *misses[miss_index].rowgroup;
-				if (misses[miss_index].shard_id != schedule_shard_id ||
-				    !rowgroup.compiled_sparse_read_plan || rowgroup.compiled_sparse_read_plan->empty()) {
-					throw std::runtime_error(
-					    "scheduled active-output execution requires one shard and a compiled sparse read plan");
+				if (misses[miss_index].shard_id != schedule_shard_id) {
+					throw std::runtime_error("scheduled active-output execution requires one shard");
 				}
-				const auto& read_plan = *rowgroup.compiled_sparse_read_plan;
-				decisions.push_back({misses[miss_index].shard_id,
-				                     rowgroup.rowgroup_index,
-				                     miss_worksets[miss_index],
-				                     static_cast<uint32_t>(rowgroup.runtime_policy.decision),
-				                     static_cast<uint32_t>(rowgroup.read_strategy),
-				                     static_cast<uint32_t>(read_plan.submission_backend()),
-				                     rowgroup.selected_vector_count,
-				                     rowgroup.full_vector_count,
-				                     read_plan.storage_bytes(),
-				                     read_plan.estimated_pread_count()});
+				// The persisted active-output schedule is a pure mapping from output
+				// blocks to rowgroup worksets.  A legal full/bitmap read has no
+				// compiled sparse plan, and its physical I/O choice cannot affect
+				// that mapping.
+				ownership_decisions.push_back(
+				    {misses[miss_index].shard_id, rowgroup.rowgroup_index, miss_worksets[miss_index]});
 			}
 			const JpegDctActiveOutputScheduleKey sidecar_key {
 			    schedule_plan->active_output_schedule_directory,
 			    schedule_shard_id,
 			    schedule_plan->canonical_plan_digest,
-			    jpeg_dct_active_output_decision_digest(decisions),
+			    jpeg_dct_active_output_decision_digest(ownership_decisions),
 			    jpeg_dct_active_output_transform_digest(grid_transform),
 			    decode_workset_capacity_bytes,
 			    static_cast<uint32_t>(effective_decode_batch_rowgroups),
@@ -6416,6 +6450,17 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan    
 		plan.transform_submission_gate->wait();
 		plan.transform_submission_gate.reset();
 	}
+	JpegDctDeviceScratch local_scratch;
+	auto&                scratch = plan.scratch != nullptr ? *plan.scratch : local_scratch;
+	scratch.configure_scheduling(plan.use_low_priority_streams,
+	                             plan.transform_blocks_per_launch,
+	                             plan.transform_ctas_per_launch);
+	scratch.transform_submission_gate = std::move(plan.transform_submission_gate);
+	scratch.begin_batch();
+	// Keep initialization asynchronous and inside the same execution graph as
+	// decode/transform/finalize.  All alternate writer streams wait on the event
+	// recorded below; no device-wide or host-side synchronization is required.
+	cudaStream_t output_initialization_stream = nullptr;
 	if (output_ycbcr_dct_grid) {
 		impl->coefficient_count      = 0;
 		impl->y_coefficient_count    = impl->ycbcr_dct_grid_shape.y_count();
@@ -6423,25 +6468,41 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan    
 		if (impl->y_coefficient_count != 0) {
 			if (impl->grid_output_data_type == JpegDctGridOutputDataType::kInt16) {
 				impl->y_coefficients.emplace(impl->y_coefficient_count);
-					CUDA_SAFE_CALL(
-					    cudaMemset(impl->y_coefficients->get(), 0, impl->y_coefficient_count * sizeof(int16_t)));
+				output_initialization_stream = scratch.stream_for_transform();
+				CUDA_SAFE_CALL(cudaMemsetAsync(impl->y_coefficients->get(),
+				                               0,
+				                               impl->y_coefficient_count * sizeof(int16_t),
+				                               output_initialization_stream));
 			}
 			if (output_weighted_grid) {
 				impl->y_accum.emplace(impl->y_coefficient_count);
-				CUDA_SAFE_CALL(cudaMemset(impl->y_accum->get(), 0, impl->y_coefficient_count * sizeof(float)));
+				output_initialization_stream = scratch.stream_for_transform();
+				CUDA_SAFE_CALL(cudaMemsetAsync(impl->y_accum->get(),
+				                               0,
+				                               impl->y_coefficient_count * sizeof(float),
+				                               output_initialization_stream));
 			}
 		}
 		if (impl->cbcr_coefficient_count != 0) {
 			if (impl->grid_output_data_type == JpegDctGridOutputDataType::kInt16) {
 				impl->cbcr_coefficients.emplace(impl->cbcr_coefficient_count);
-				CUDA_SAFE_CALL(
-				    cudaMemset(impl->cbcr_coefficients->get(), 0, impl->cbcr_coefficient_count * sizeof(int16_t)));
+				output_initialization_stream = scratch.stream_for_transform();
+				CUDA_SAFE_CALL(cudaMemsetAsync(impl->cbcr_coefficients->get(),
+				                               0,
+				                               impl->cbcr_coefficient_count * sizeof(int16_t),
+				                               output_initialization_stream));
 			}
 			if (output_weighted_grid) {
 				impl->cbcr_accum.emplace(impl->cbcr_coefficient_count);
-					CUDA_SAFE_CALL(
-					    cudaMemset(impl->cbcr_accum->get(), 0, impl->cbcr_coefficient_count * sizeof(float)));
+				output_initialization_stream = scratch.stream_for_transform();
+				CUDA_SAFE_CALL(cudaMemsetAsync(impl->cbcr_accum->get(),
+				                               0,
+				                               impl->cbcr_coefficient_count * sizeof(float),
+				                               output_initialization_stream));
 			}
+		}
+		if (output_initialization_stream != nullptr) {
+			scratch.record_output_initialization(output_initialization_stream);
 		}
 	} else {
 		impl->coefficient_count = impl->block_metadata.size() * impl->coefficients_per_block;
@@ -6464,8 +6525,6 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan    
 			throw std::runtime_error("JPEG DCT fixed transform plan has invalid resize weight matrices");
 		}
 	}
-	JpegDctDeviceScratch local_scratch;
-	auto&                scratch              = plan.scratch != nullptr ? *plan.scratch : local_scratch;
 	const bool bounded_block_major_arena =
 	    !plan.compact_v3_storage && plan.rowgroup_prefetch.enabled &&
 	    plan.block_major_double_buffer_policy != JpegDctBlockMajorDoubleBufferPolicy::kDisabled &&
@@ -6495,10 +6554,6 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan    
 	    scratch.decode_workset_output_arena_capacity_plan_bytes;
 	impl->execution_stats.decode_workset_chunk_arena_capacity_plan_bytes =
 	    scratch.decode_workset_chunk_arena_capacity_plan_bytes;
-	scratch.configure_scheduling(plan.use_low_priority_streams,
-	                             plan.transform_blocks_per_launch,
-	                             plan.transform_ctas_per_launch);
-	scratch.transform_submission_gate = std::move(plan.transform_submission_gate);
 	const uint16_t* fixed_quant_tables          = nullptr;
 	const float*    fixed_resize_weight_matrices = nullptr;
 	if (has_weighted_grid_output) {

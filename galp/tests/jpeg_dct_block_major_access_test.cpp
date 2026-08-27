@@ -979,6 +979,25 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputIntervalSidecarRoundTripsAndBindsEveryDe
 	    {7U, 0U, 0U, 1U, 3U, 1U, 32U, 64U, 4096U, 3U},
 	    {7U, 1U, 1U, 1U, 3U, 1U, 30U, 64U, 3900U, 2U},
 	};
+	auto coefficient_variant = decisions;
+	coefficient_variant[0].runtime_decision      = 9U;
+	coefficient_variant[0].read_strategy         = 8U;
+	coefficient_variant[0].submission_backend    = 7U;
+	coefficient_variant[0].selected_vector_count = 16U;
+	coefficient_variant[0].physical_bytes        = 2048U;
+	coefficient_variant[0].physical_run_count    = 12U;
+	EXPECT_EQ(jpeg_dct_active_output_decision_digest(decisions),
+	          jpeg_dct_active_output_decision_digest(coefficient_variant));
+	const std::vector<JpegDctActiveOutputDecisionRecord> ownership_only {
+	    {7U, 0U, 0U},
+	    {7U, 1U, 1U},
+	};
+	EXPECT_EQ(jpeg_dct_active_output_decision_digest(decisions),
+	          jpeg_dct_active_output_decision_digest(ownership_only));
+	auto ownership_variant = decisions;
+	ownership_variant[0].workset_index = 1U;
+	EXPECT_NE(jpeg_dct_active_output_decision_digest(decisions),
+	          jpeg_dct_active_output_decision_digest(ownership_variant));
 	JpegDctActiveOutputScheduleKey key {
 	    temporary.path(),
 	    7U,
@@ -1398,6 +1417,21 @@ TEST(JpegDctBlockMajorPlan, ProductionPreviewSelectsCompactPlanlessPath) {
 	EXPECT_GT(preview.estimated_max_decode_workset_bytes, preview.decode_workset_capacity_bytes);
 	EXPECT_EQ(preview.estimated_oversized_decode_rowgroups, preview.rowgroups.size());
 	EXPECT_EQ(preview_vectors(preview), actual_vectors(compact));
+	EXPECT_FALSE(options.grid_transform->require_all_coefficients);
+	for (const auto& coefficients : std::vector<std::vector<uint8_t>> {
+	         {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U},
+	         {0U, 3U, 7U}}) {
+		auto selected_options = options;
+		selected_options.coefficient_selection.coefficients = coefficients;
+		const auto selected_preview = reader.PlanDeviceDctBatch(requests, selected_options);
+		EXPECT_TRUE(selected_preview.uses_planless_fixed_transform);
+		EXPECT_EQ(selected_preview.selected_coefficients, coefficients);
+		EXPECT_EQ(selected_preview.coefficients_per_block, coefficients.size());
+	}
+	auto guarded_options = options;
+	guarded_options.grid_transform->require_all_coefficients = true;
+	guarded_options.coefficient_selection.coefficients       = {0U, 1U, 2U};
+	EXPECT_THROW((void)reader.PlanDeviceDctBatch(requests, guarded_options), std::runtime_error);
 	auto legacy_options = options;
 	legacy_options.enable_planless_execution = false;
 	const auto legacy_preview = reader.PlanDeviceDctBatch(requests, legacy_options);

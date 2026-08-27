@@ -151,4 +151,23 @@ TEST(NativeBatchCompletionShadow, AuthoritativeLeaseReclaimsBackingAfterFinalRef
 	EXPECT_TRUE(backing_observer.expired());
 }
 
+TEST(NativeBatchCompletionShadow, AuthoritativeLeaseSupportsOpaqueNativeBacking) {
+	auto completion = std::make_shared<NativeBatchCompletion>(25U);
+	auto backing = std::make_shared<int>(7);
+	std::weak_ptr<int> backing_observer = backing;
+	auto lease = std::make_shared<NativeBatchLease>(
+	    completion, std::static_pointer_cast<void>(std::move(backing)));
+	lease->retain_owner_reference();
+
+	EXPECT_TRUE(lease->authoritative());
+	EXPECT_EQ(lease->backing_batch(), nullptr);
+	EXPECT_TRUE(lease->release_owner_reference());
+	static_cast<void>(NativeBatchLease::reclaim_finished());
+
+	const auto snapshot = lease->snapshot();
+	EXPECT_TRUE(snapshot.reclaim_executed);
+	EXPECT_FALSE(snapshot.backing_storage_present);
+	EXPECT_TRUE(backing_observer.expired());
+}
+
 } // namespace

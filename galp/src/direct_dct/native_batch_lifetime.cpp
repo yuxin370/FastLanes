@@ -337,9 +337,20 @@ NativeBatchLease::NativeBatchLease(
     std::shared_ptr<NativeBatchCompletion> completion,
     std::shared_ptr<jpeg::DirectDctBatch> backing_batch)
     : completion_(std::move(completion))
-    , backing_batch_(std::move(backing_batch)) {
-	if (!completion_ || !backing_batch_) {
+	, backing_owner_(backing_batch)
+	, backing_batch_(backing_batch.get()) {
+	if (!completion_ || !backing_owner_) {
 		throw std::invalid_argument("authoritative NativeBatchLease requires completion and backing batch");
+	}
+}
+
+NativeBatchLease::NativeBatchLease(
+    std::shared_ptr<NativeBatchCompletion> completion,
+    std::shared_ptr<void> backing_owner)
+    : completion_(std::move(completion))
+	, backing_owner_(std::move(backing_owner)) {
+	if (!completion_ || !backing_owner_) {
+		throw std::invalid_argument("authoritative NativeBatchLease requires completion and backing owner");
 	}
 }
 
@@ -425,7 +436,7 @@ void NativeBatchLease::request_release() noexcept {
 	{
 		std::lock_guard lock(mutex_);
 		release_requested_ = true;
-		if (backing_batch_ && !reclaim_enqueued_) {
+		if (backing_owner_ && !reclaim_enqueued_) {
 			reclaim_enqueued_ = true;
 			enqueue = true;
 		}
@@ -469,8 +480,8 @@ NativeBatchLeaseSnapshot NativeBatchLease::snapshot() const {
 		out.legacy_reclaim_eligible = legacy_reclaim_eligible_;
 		out.owner_reference_count = owner_reference_count_;
 		out.released_owner_reference_count = released_owner_reference_count_;
-		out.authoritative = static_cast<bool>(backing_batch_) || reclaim_enqueued_ || reclaim_executed_;
-		out.backing_storage_present = static_cast<bool>(backing_batch_);
+		out.authoritative = static_cast<bool>(backing_owner_) || reclaim_enqueued_ || reclaim_executed_;
+		out.backing_storage_present = static_cast<bool>(backing_owner_);
 		out.reclaim_executed = reclaim_executed_;
 	}
 	if (out.legacy_reclaim_eligible && out.completion.reclaim_eligible) {
@@ -487,12 +498,12 @@ NativeBatchLeaseSnapshot NativeBatchLease::snapshot() const {
 
 jpeg::DirectDctBatch* NativeBatchLease::backing_batch() const noexcept {
 	std::lock_guard lock(mutex_);
-	return backing_batch_.get();
+	return backing_owner_ ? backing_batch_ : nullptr;
 }
 
 bool NativeBatchLease::authoritative() const noexcept {
 	std::lock_guard lock(mutex_);
-	return static_cast<bool>(backing_batch_) || reclaim_enqueued_ || reclaim_executed_;
+	return static_cast<bool>(backing_owner_) || reclaim_enqueued_ || reclaim_executed_;
 }
 
 bool NativeBatchLease::try_reclaim() {
@@ -500,13 +511,14 @@ bool NativeBatchLease::try_reclaim() {
 	if (!completion_->snapshot().reclaim_eligible) {
 		return false;
 	}
-	std::shared_ptr<jpeg::DirectDctBatch> release;
+	std::shared_ptr<void> release;
 	{
 		std::lock_guard lock(mutex_);
-		if (!backing_batch_) {
+		if (!backing_owner_) {
 			return reclaim_executed_;
 		}
-		release = std::move(backing_batch_);
+		release = std::move(backing_owner_);
+		backing_batch_ = nullptr;
 		reclaim_executed_ = true;
 	}
 	release.reset();
