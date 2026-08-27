@@ -22,6 +22,7 @@ import torch
 
 from common import (
     BLOCK_MAJOR_RUNTIME_PROFILE,
+    GALP_PIPELINES,
     PIPELINES,
     PIPELINE_RESULT_SCHEMA,
     REPO_ROOT,
@@ -221,6 +222,28 @@ class Adapter:
         pass
 
 
+def _rgbnomore_fixed_validation_transform(ctrans: Any) -> torch.nn.Sequential:
+    """Materialize the published fixed-512 DCT validation transform.
+
+    A 512-pixel luma grid has 64 blocks.  RGB-no-more's validation transform
+    uses a 32-block resize reference followed by a 28-block crop, which is
+    equivalent to cropping 56 source blocks and resizing them to 28.  A plain
+    ``CenterCrop_DCT(28)`` would instead select only the central 28 source
+    blocks and is a different model input.
+    """
+
+    return torch.nn.Sequential(
+        ctrans.ResizedCenterCrop_DCT(32, 28),
+        ctrans.ToRange(
+            val_min=-1,
+            val_max=1,
+            orig_min=-1024,
+            orig_max=1016,
+            dtype=torch.float32,
+        ),
+    )
+
+
 class PyTorchAdapter(Adapter):
     domain = "rgb"
     worker_semantics = "torch_dataloader_processes"
@@ -292,16 +315,7 @@ class RgbNoMoreAdapter(Adapter):
         )
         if contract["preprocess"]["profile"] == "fixed-center-224-from-512":
             ctrans = importlib.import_module("utils.custom_transforms")
-            transform = torch.nn.Sequential(
-                ctrans.CenterCrop_DCT(28),
-                ctrans.ToRange(
-                    val_min=-1,
-                    val_max=1,
-                    orig_min=-1024,
-                    orig_max=1016,
-                    dtype=torch.float32,
-                ),
-            )
+            transform = _rgbnomore_fixed_validation_transform(ctrans)
         else:
             transform = datasets.get_transform(dataset="imagenet_dct", type="test", dtype=torch.float32)
         transformed = datasets.SubsetWithTransform(base, dataset="imagenet_dct", transform=transform)
@@ -868,7 +882,7 @@ class GalpAdapter(Adapter):
 
 
 def _is_galp_pipeline(name: str) -> bool:
-    return name == "dct_major_pushdown"
+    return name in GALP_PIPELINES
 
 
 def make_adapter(name: str, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device) -> Adapter:
@@ -1268,6 +1282,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
         native_segments: list[dict[str, Any]] = []
         correct1 = 0
         correct5 = 0
+        cross_entropy_sum = 0.0
         feature_sum = torch.zeros(expected_width, dtype=torch.float64, device=device)
         feature_square_sum = torch.zeros(expected_width, dtype=torch.float64, device=device)
         predictions_top1: list[np.ndarray] = []
@@ -1302,6 +1317,11 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             model_started = time.perf_counter_ns()
             output = _forward(model, batch.inputs, expected_width)
             if contract["workload"]["kind"] == "evaluation":
+                cross_entropy_sum += float(
+                    torch.nn.functional.cross_entropy(
+                        output, batch.labels, reduction="sum"
+                    ).item()
+                )
                 top5 = output.topk(5, dim=1).indices
                 matches = top5.eq(batch.labels.reshape(-1, 1))
                 correct1 += int(matches[:, :1].sum().item())
@@ -1500,6 +1520,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                     "correct_top5": correct5,
                     "accuracy_top1": correct1 / images,
                     "accuracy_top5": correct5 / images,
+                    "cross_entropy_loss": cross_entropy_sum / images,
                     "top1_predictions_sha256": hashlib.sha256(np.concatenate(predictions_top1).tobytes()).hexdigest(),
                     "top5_predictions_sha256": hashlib.sha256(np.concatenate(predictions_top5).tobytes()).hexdigest(),
                 }
@@ -1530,6 +1551,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
     result = {
         "schema_version": PIPELINE_RESULT_SCHEMA,
         "pipeline": name,
+        "display_name": contract["pipelines"][name].get("display_name", name),
         "domain": adapter.domain,
         "worker_semantics": adapter.worker_semantics,
         "contract": str(contract_path.resolve()),

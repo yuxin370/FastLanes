@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import inspect
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,11 +21,60 @@ from pipeline import (  # noqa: E402
     _manifest_shard_segments,
     _process_io_delta,
     _process_io_snapshot,
+    _rgbnomore_fixed_validation_transform,
     _validate_identity,
 )
 
 
 class PipelineControlTest(unittest.TestCase):
+    def test_native_logical_hot_path_has_no_python_physical_stitch_or_sync(self) -> None:
+        source = inspect.getsource(GalpAdapter._load_native_logical)
+        for forbidden in ("torch.cat", ".clone(", ".synchronize(", "_load_next_segment"):
+            self.assertNotIn(forbidden, source)
+
+    def test_native_physical_mode_schedules_logical_batches_without_shard_activation(self) -> None:
+        class Pipeline:
+            def start(self, batches):
+                self.batches = batches
+                return self
+
+        adapter = object.__new__(GalpAdapter)
+        adapter.pipeline = Pipeline()
+        adapter._native_physical_orchestration = True
+        adapter._logical_batches = [
+            [{"galp_image_id": 1000}, {"galp_image_id": 1001}],
+            [{"galp_image_id": 1024}],
+        ]
+        adapter._current = {"legacy": "must be cleared"}
+        adapter._next_segment = 9
+        adapter._cold_measurement_primed = False
+        adapter.begin_repeat()
+        self.assertEqual(adapter.pipeline.batches, [[1000, 1001], [1024]])
+        self.assertEqual(adapter._next_segment, 0)
+        self.assertIsNone(adapter._current)
+
+    def test_fixed_rgbnomore_transform_preserves_published_resize_reference(self) -> None:
+        class Transform(torch.nn.Module):
+            def __init__(self, name: str, *args: object, **kwargs: object) -> None:
+                super().__init__()
+                self.name = name
+                self.args = args
+                self.kwargs = kwargs
+
+            def forward(self, value: object) -> object:
+                return value
+
+        ctrans = SimpleNamespace(
+            ResizedCenterCrop_DCT=lambda *args: Transform("resize_crop", *args),
+            ToRange=lambda **kwargs: Transform("range", **kwargs),
+        )
+        transform = _rgbnomore_fixed_validation_transform(ctrans)
+        self.assertEqual(transform[0].name, "resize_crop")
+        self.assertEqual(transform[0].args, (32, 28))
+        self.assertEqual(transform[1].name, "range")
+        self.assertEqual(transform[1].kwargs["orig_min"], -1024)
+        self.assertEqual(transform[1].kwargs["orig_max"], 1016)
+
     def test_manifest_shard_segments_use_exact_manifest_ranges(self) -> None:
         samples = [{"galp_image_id": image_id} for image_id in range(9)]
         manifest = {
