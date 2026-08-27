@@ -19,6 +19,7 @@ from common import (  # noqa: E402
     load_sample_manifest,
     manifest_snapshot,
     parse_manifest,
+    resolve_coefficient_selection,
     sample_trace,
     write_sample_manifest,
 )
@@ -80,6 +81,44 @@ def _compact_v3_manifest_bytes(
 
 
 class CommonTest(unittest.TestCase):
+    def test_coefficient_specs_cover_all_prefix_list_and_deterministic_random(self) -> None:
+        all_coefficients = resolve_coefficient_selection("all")
+        self.assertEqual(all_coefficients["coefficient_count"], 64)
+        self.assertEqual(all_coefficients["resolved_natural_indices"][:8], [0, 1, 8, 16, 9, 2, 3, 10])
+
+        for count in (1, 16, 32, 64):
+            prefix = resolve_coefficient_selection(f"first:{count}")
+            self.assertEqual(prefix["coefficient_selection_kind"], "prefix")
+            self.assertEqual(prefix["resolved_zigzag_column_indices"], list(range(count)))
+
+        listed = resolve_coefficient_selection("list:5,0,2")
+        self.assertEqual(listed["resolved_zigzag_column_indices"], [5, 0, 2])
+        self.assertEqual(listed["resolved_natural_indices"], [2, 0, 8])
+
+        random_a = resolve_coefficient_selection("random:32:11997733")
+        random_b = resolve_coefficient_selection("random:32:11997733")
+        self.assertEqual(random_a, random_b)
+        self.assertEqual(len(random_a["resolved_zigzag_column_indices"]), 32)
+        self.assertTrue(random_a["native_coefficient_spec"].startswith("list:"))
+
+    def test_coefficient_specs_reject_invalid_values(self) -> None:
+        for spec in (
+            "",
+            "first:0",
+            "first:65",
+            "first:x",
+            "list:",
+            "list:1,1",
+            "list:64",
+            "list:1,,2",
+            "random:0:7",
+            "random:65:7",
+            "random:4:-1",
+            "unknown",
+        ):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                resolve_coefficient_selection(spec)
+
     def test_manifest_version_maps_to_physical_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

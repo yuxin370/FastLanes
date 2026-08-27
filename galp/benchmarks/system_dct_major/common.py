@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import statistics
 import struct
 import sys
@@ -20,21 +21,37 @@ SAMPLE_MANIFEST_SCHEMA = "galp_dct_major_samples_v1"
 PIPELINE_RESULT_SCHEMA = "galp_dct_major_pipeline_v1"
 SUMMARY_SCHEMA = "galp_dct_major_summary_v1"
 BLOCK_MAJOR_RUNTIME_PROFILE = "block-major-p4-scheduled-bounded-110-v1"
+COEFFICIENT_MASK_STAGE = (
+    "raw_quantized_coefficients_before_dequantization_and_frequency_mixing"
+)
+ZIGZAG_COLUMN_TO_NATURAL_INDEX = (
+    0, 1, 8, 16, 9, 2, 3, 10,
+    17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63,
+)
 
 PIPELINES = (
     "dct_major_pushdown",
+    "dct_major_coefficient_pushdown",
     "rgbnomore",
     "dali",
     "pytorch",
 )
 DEFAULT_PIPELINES = (
     "dct_major_pushdown",
+    "dct_major_coefficient_pushdown",
     "rgbnomore",
     "dali",
     "pytorch",
 )
 WORKLOADS = ("feature-extraction", "evaluation")
 JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe"}
+GALP_PIPELINES = ("dct_major_pushdown", "dct_major_coefficient_pushdown")
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
@@ -88,6 +105,77 @@ def write_json(path: Path, value: Any) -> None:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def resolve_coefficient_selection(spec: str) -> dict[str, Any]:
+    """Resolve benchmark coefficient grammar to the native JPEG-column grammar.
+
+    Native columns are stored in JPEG zigzag order.  ``random`` is deliberately
+    a benchmark-only reproducibility feature and is lowered to an explicit
+    native ``list`` specification once per contract.
+    """
+
+    require(isinstance(spec, str) and bool(spec), "coefficient spec must be a non-empty string")
+    seed: int | None = None
+    if spec == "all":
+        kind = "all"
+        indices = list(range(64))
+        native_spec = "all"
+    elif spec.startswith("first:"):
+        value = spec.removeprefix("first:")
+        require(value.isdecimal(), "first:N requires a decimal N")
+        count = int(value)
+        require(1 <= count <= 64, "first:N requires N in [1, 64]")
+        kind = "prefix"
+        indices = list(range(count))
+        native_spec = spec
+    elif spec.startswith("list:"):
+        values = spec.removeprefix("list:").split(",")
+        require(bool(values) and all(value.isdecimal() for value in values), "list requires comma-separated integers")
+        indices = [int(value) for value in values]
+        require(bool(indices), "coefficient list must not be empty")
+        require(all(0 <= value < 64 for value in indices), "coefficient list indices must be in [0, 63]")
+        require(len(indices) == len(set(indices)), "coefficient list must not contain duplicates")
+        kind = "list"
+        native_spec = spec
+    elif spec.startswith("random:"):
+        fields = spec.split(":")
+        require(
+            len(fields) == 3 and fields[1].isdecimal() and fields[2].isdecimal(),
+            "random coefficient spec must be random:K:SEED",
+        )
+        count = int(fields[1])
+        seed = int(fields[2])
+        require(1 <= count <= 64, "random:K:SEED requires K in [1, 64]")
+        indices = random.Random(seed).sample(range(64), count)
+        kind = "random"
+        native_spec = "list:" + ",".join(str(value) for value in indices)
+    else:
+        raise ValueError(
+            "invalid coefficient spec; expected all, first:N, list:i,j,..., or random:K:SEED"
+        )
+
+    return {
+        "coefficient_spec": spec,
+        "coefficient_selection_kind": kind,
+        "coefficient_count": len(indices),
+        "resolved_zigzag_column_indices": indices,
+        "resolved_natural_indices": [
+            ZIGZAG_COLUMN_TO_NATURAL_INDEX[index] for index in indices
+        ],
+        "coefficient_seed": seed,
+        "coefficient_mask_stage": COEFFICIENT_MASK_STAGE,
+        "native_coefficient_spec": native_spec,
+    }
+
+
+def validate_coefficient_contract(config: dict[str, Any], *, baseline: bool) -> None:
+    expected = resolve_coefficient_selection(str(config.get("coefficient_spec", "")))
+    for field, value in expected.items():
+        require(config.get(field) == value, f"coefficient contract field {field} is inconsistent")
+    if baseline:
+        require(expected["coefficient_selection_kind"] == "all", "GALP baseline selection must be all")
+        require(expected["coefficient_count"] == 64, "GALP baseline coefficient count must be 64")
 
 
 def file_identity(path: Path) -> dict[str, int]:
@@ -507,12 +595,16 @@ def load_contract(path: Path) -> dict[str, Any]:
     require(isinstance(enabled, list) and enabled, "pipelines.enabled must be a non-empty list")
     require(len(enabled) == len(set(enabled)), "pipelines.enabled contains duplicates")
     require(all(item in PIPELINES for item in enabled), f"unknown pipeline; expected subset of {PIPELINES}")
-    if "dct_major_pushdown" in enabled:
-        galp = contract["pipelines"].get("dct_major_pushdown")
-        require(isinstance(galp, dict), "pipelines.dct_major_pushdown must be an object")
+    galp_configs: dict[str, dict[str, Any]] = {}
+    for pipeline_name in GALP_PIPELINES:
+        if pipeline_name not in enabled:
+            continue
+        galp = contract["pipelines"].get(pipeline_name)
+        require(isinstance(galp, dict), f"pipelines.{pipeline_name} must be an object")
+        galp_configs[pipeline_name] = galp
         require(
             galp.get("runtime_profile") == BLOCK_MAJOR_RUNTIME_PROFILE,
-            "dct_major_pushdown must use the canonical block-major runtime profile",
+            f"{pipeline_name} must use the canonical block-major runtime profile",
         )
         internal_fields = {
             "cache_capacity_mib",
@@ -536,7 +628,33 @@ def load_contract(path: Path) -> dict[str, Any]:
             "output_prefetch_policy",
         }
         leaked = sorted(internal_fields.intersection(galp))
-        require(not leaked, f"dct_major_pushdown exposes native runtime fields: {leaked}")
+        require(not leaked, f"{pipeline_name} exposes native runtime fields: {leaked}")
+        validate_coefficient_contract(
+            galp,
+            baseline=pipeline_name == "dct_major_pushdown",
+        )
+        require(galp.get("model_key") == "dct", f"{pipeline_name} must use the DCT model")
+        require(
+            galp.get("checkpoint_sha256")
+            == contract["models"].get("dct", {}).get("checkpoint_sha256"),
+            f"{pipeline_name} checkpoint identity differs from models.dct",
+        )
+    if all(name in galp_configs for name in GALP_PIPELINES):
+        baseline = galp_configs["dct_major_pushdown"]
+        pushdown = galp_configs["dct_major_coefficient_pushdown"]
+        for field in (
+            "runtime_profile",
+            "manifest",
+            "torch_binding_artifact",
+            "preprocess",
+            "block_major_access_dir",
+            "model_key",
+            "checkpoint_sha256",
+        ):
+            require(
+                baseline.get(field) == pushdown.get(field),
+                f"GALP K64/K-selected pipelines differ in {field}",
+            )
     manifest_path = Path(str(contract["dataset"].get("sample_manifest", "")))
     require(manifest_path.is_file(), f"sample manifest does not exist: {manifest_path}")
     load_sample_manifest(manifest_path, str(contract["dataset"]["sample_manifest_sha256"]))
