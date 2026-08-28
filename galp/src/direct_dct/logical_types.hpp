@@ -118,7 +118,7 @@ struct PipelineTraceEvent final {
 		kPlanReady,
 		kStaged,
 		kAwaitingPredecessor,
-		kGateReleased,
+		kGateReleaseRequested,
 		kReadStarted,
 		kSubmitted,
 		kCompleted,

@@ -304,7 +304,7 @@ TEST(NativeLogicalBatchPipelineTrace, MoreThanDepthPreservesLegacyBackpressureAn
 		          event_index(events, request, PipelineTraceEvent::Stage::kAwaitingPredecessor));
 		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kAwaitingPredecessor),
 		          event_index(events, request, PipelineTraceEvent::Stage::kReadStarted));
-		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kGateReleased),
+		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kGateReleaseRequested),
 		          event_index(events, request, PipelineTraceEvent::Stage::kSubmitted));
 		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kSubmitted),
 		          event_index(events, request, PipelineTraceEvent::Stage::kCompleted));

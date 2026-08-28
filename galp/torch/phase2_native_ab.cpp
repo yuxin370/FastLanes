@@ -254,7 +254,7 @@ const char* stage_name(const PipelineTraceEvent::Stage stage) {
 	case PipelineTraceEvent::Stage::kPlanReady: return "plan_ready";
 	case PipelineTraceEvent::Stage::kStaged: return "staged";
 	case PipelineTraceEvent::Stage::kAwaitingPredecessor: return "awaiting_predecessor";
-	case PipelineTraceEvent::Stage::kGateReleased: return "gate_released";
+	case PipelineTraceEvent::Stage::kGateReleaseRequested: return "gate_release_requested";
 	case PipelineTraceEvent::Stage::kReadStarted: return "read_started";
 	case PipelineTraceEvent::Stage::kSubmitted: return "submitted";
 	case PipelineTraceEvent::Stage::kCompleted: return "completed";

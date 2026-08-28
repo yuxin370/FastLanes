@@ -211,10 +211,13 @@ private:
 			        expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
 				return false;
 			}
+			// Project the causal decision before waking the worker. Recording an
+			// after-the-fact "released" observation raced with kSubmitted even
+			// though the gate itself behaved correctly.
+			emit(PipelineTraceEvent::Stage::kGateReleaseRequested);
 			if (submission_gate_) {
 				submission_gate_->release();
 			}
-			emit(PipelineTraceEvent::Stage::kGateReleased);
 			return true;
 		}
 
