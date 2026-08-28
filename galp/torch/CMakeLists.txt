@@ -80,6 +80,28 @@ set_target_properties(_galp_direct_dct PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/galp/torch
 )
 
+if (GALP_INSTALL_TORCH_PACKAGE)
+	set_target_properties(_galp_direct_dct PROPERTIES
+		INSTALL_RPATH "$ORIGIN/../../torch/lib")
+	install(TARGETS _galp_direct_dct
+		LIBRARY DESTINATION galp/torch
+		RUNTIME DESTINATION galp/torch)
+	install(FILES
+		${CMAKE_CURRENT_SOURCE_DIR}/../__init__.py
+		DESTINATION galp)
+	install(FILES
+		${CMAKE_CURRENT_SOURCE_DIR}/__init__.py
+		${CMAKE_CURRENT_SOURCE_DIR}/direct_dct.py
+		${CMAKE_CURRENT_SOURCE_DIR}/experimental.py
+		DESTINATION galp/torch)
+	install(DIRECTORY
+		${CMAKE_CURRENT_SOURCE_DIR}/../profiles
+		${CMAKE_CURRENT_SOURCE_DIR}/../diagnostics
+		DESTINATION galp
+		FILES_MATCHING PATTERN "*.py"
+		PATTERN "__pycache__" EXCLUDE)
+endif ()
+
 if (BUILD_TESTING)
 	# Private Phase-4 deterministic outstanding-consumer harness. The module
 	# submits its gate, sentinel-read consumer, and completion marker in one

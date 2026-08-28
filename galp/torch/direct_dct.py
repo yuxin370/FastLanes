@@ -24,6 +24,13 @@ def _load_native_module(module_path: Path | None) -> ModuleType:
         resolved = str(module_path.resolve())
         if resolved not in sys.path:
             sys.path.insert(0, resolved)
+        return importlib.import_module("_galp_direct_dct")
+    importlib.import_module("torch")
+    try:
+        return importlib.import_module("galp.torch._galp_direct_dct")
+    except ModuleNotFoundError as error:
+        if error.name != "galp.torch._galp_direct_dct":
+            raise
     return importlib.import_module("_galp_direct_dct")
 
 

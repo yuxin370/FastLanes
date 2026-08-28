@@ -17,7 +17,7 @@ void bind_connection(py::module_& m) {
 	         "Read CSV files from directory",
 	         py::return_value_policy::reference_internal)
 	    .def("to_fls",
-	         &fastlanes::Connection::to_fls,
+	         py::overload_cast<const fastlanes::path&>(&fastlanes::Connection::to_fls),
 	         py::arg("dir_path"),
 	         "Write to fastlanes file format",
 	         py::return_value_policy::reference_internal)

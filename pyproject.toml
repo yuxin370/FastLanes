@@ -25,6 +25,9 @@ requires-python = ">=3.8"
 license = { file = "LICENSE" }
 keywords = ["fastlanes", "file-format"]
 
+[project.optional-dependencies]
+galp = ["torch>=2.11"]
+
 [tool.setuptools_scm]
 write_to = "python/pyfastlanes/_version.py"
 version_scheme = "no-guess-dev"
@@ -55,6 +58,15 @@ sdist.include = [
     "CMakeLists.txt",
     "cmake/**",
     "src/**",
+    "galp/CMakeLists.txt",
+    "galp/__init__.py",
+    "galp/cmake/**",
+    "galp/diagnostics/**",
+    "galp/extensions/**",
+    "galp/include/**",
+    "galp/profiles/**",
+    "galp/src/**",
+    "galp/torch/**",
 ]
 
 [tool.scikit-build.wheel]

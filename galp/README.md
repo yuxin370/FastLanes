@@ -137,6 +137,27 @@ context.
 
 ## Direct-DCT Runtime
 
+### Installable Python wheel
+
+The repository's release wheel can include the stable `galp.torch` facade,
+the opt-in `galp.torch.experimental` adapters, diagnostics, profiles, and the
+native `_galp_direct_dct` extension. Build it from an environment that already
+contains a compatible PyTorch and CUDA development toolkit:
+
+```bash
+python -m pip wheel . --no-build-isolation --wheel-dir dist \
+  --config-settings=cmake.define.FLS_BUILD_GALP=ON \
+  --config-settings=cmake.define.GALP_BUILD_TORCH=ON \
+  --config-settings=cmake.define.GALP_INSTALL_TORCH_PACKAGE=ON \
+  --config-settings=cmake.define.FLS_ENABLE_INSTALL=OFF \
+  --config-settings=cmake.define.GALP_ENABLE_INSTALL=OFF
+```
+
+The resulting wheel does not install benchmarks, tests, run artifacts, or
+historical diagnostic scripts. Development builds may still load the extension
+from an explicit `module_path`; installed code resolves the package-local
+extension without a source-tree or build-tree `PYTHONPATH`.
+
 When `GALP_WITH_JPEG_DCT=ON`, `galp/direct_dct.hpp` exposes a small
 stay-on-GPU runtime facade for direct-DCT ML workloads:
 
