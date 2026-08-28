@@ -2,71 +2,34 @@
 
 import argparse
 import difflib
+import hashlib
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GALP_ROOT = REPO_ROOT / "galp"
 CODEGEN_DIR = GALP_ROOT / "scripts" / "codegen"
 OWNERSHIP_MARKER = ".galp-codegen-owned"
 
-EXPECTED_BINDING_FILES = [
-    "alp-double-decompress_column-bindings.cu",
-    "alp-double-query_column-bindings.cu",
-    "alp-float-decompress_column-bindings.cu",
-    "alp-float-query_column-bindings.cu",
-    "alpextended-double-decompress_column-bindings.cu",
-    "alpextended-double-query_column-bindings.cu",
-    "alpextended-float-decompress_column-bindings.cu",
-    "alpextended-float-query_column-bindings.cu",
-    "bp-uint32_t-decompress_column-bindings.cu",
-    "bp-uint32_t-query_column-bindings.cu",
-    "bp-uint64_t-decompress_column-bindings.cu",
-    "bp-uint64_t-query_column-bindings.cu",
-    "constant-uint32_t-decompress_column-bindings.cu",
-    "constant-uint64_t-decompress_column-bindings.cu",
-    "crossrle-uint32_t-decompress_column-bindings.cu",
-    "crossrle-uint64_t-decompress_column-bindings.cu",
-    "crossrleextended-uint32_t-decompress_column-bindings.cu",
-    "crossrleextended-uint64_t-decompress_column-bindings.cu",
-    "crossrlelanemask-uint32_t-decompress_column-bindings.cu",
-    "crossrlelanemask-uint64_t-decompress_column-bindings.cu",
-    "dict-uint32_t-decompress_column-bindings.cu",
-    "dict-uint64_t-decompress_column-bindings.cu",
-    "dictslpatch-uint32_t-decompress_column-bindings.cu",
-    "dictslpatch-uint64_t-decompress_column-bindings.cu",
-    "ffor-uint32_t-compute_column-bindings.cu",
-    "ffor-uint32_t-decompress_column-bindings.cu",
-    "ffor-uint32_t-query_column-bindings.cu",
-    "ffor-uint64_t-compute_column-bindings.cu",
-    "ffor-uint64_t-decompress_column-bindings.cu",
-    "ffor-uint64_t-query_column-bindings.cu",
-    "freq-int16_t-decompress_column-bindings.cu",
-    "freq-int8_t-decompress_column-bindings.cu",
-    "freq-uint32_t-decompress_column-bindings.cu",
-    "freq-uint64_t-decompress_column-bindings.cu",
-    "freqextended-int16_t-decompress_column-bindings.cu",
-    "freqextended-int8_t-decompress_column-bindings.cu",
-    "freqextended-uint32_t-decompress_column-bindings.cu",
-    "freqextended-uint64_t-decompress_column-bindings.cu",
-    "rle-uint32_t-decompress_column-bindings.cu",
-    "rle-uint64_t-decompress_column-bindings.cu",
-    "slpatch-int16_t-decompress_column-bindings.cu",
-    "slpatch-uint32_t-decompress_column-bindings.cu",
-    "slpatch-uint64_t-decompress_column-bindings.cu",
-]
-
-EXPECTED_HEADER_FILES = [
-    "kernel_bindings.cuh",
-]
+GENERATED_BINDINGS_MANIFEST = json.loads(
+    (CODEGEN_DIR / "generated_bindings_manifest.json").read_text()
+)
+if GENERATED_BINDINGS_MANIFEST.get("schema") != "galp-generated-bindings-v1":
+    raise RuntimeError("unsupported generated binding manifest")
+EXPECTED_BINDING_FILES = GENERATED_BINDINGS_MANIFEST["bindings"]
+EXPECTED_HEADER_FILES = GENERATED_BINDINGS_MANIFEST["headers"]
 
 
 def relative_files(root: Path, suffix: str) -> list[str]:
     return sorted(str(path.relative_to(root)) for path in root.rglob(f"*{suffix}") if path.is_file())
+
+
+def content_hashes(root: Path, paths: list[str]) -> dict[str, str]:
+    return {path: hashlib.sha256((root / path).read_bytes()).hexdigest() for path in paths}
 
 
 def print_list_diff(label: str, expected: list[str], generated: list[str]) -> bool:
@@ -108,14 +71,23 @@ def run_codegen(tmp_dir: Path) -> tuple[Path, Path]:
 
 
 def check(tmp_dir: Path) -> int:
-    generated_bindings_dir, generated_headers_dir = run_codegen(tmp_dir)
+    first_bindings_dir, first_headers_dir = run_codegen(tmp_dir / "first")
+    second_bindings_dir, second_headers_dir = run_codegen(tmp_dir / "second")
 
-    generated_cu = relative_files(generated_bindings_dir, ".cu")
-    generated_cuh = relative_files(generated_headers_dir, ".cuh")
+    generated_cu = relative_files(first_bindings_dir, ".cu")
+    generated_cuh = relative_files(first_headers_dir, ".cuh")
 
     failed = False
     failed |= print_list_diff(".cu", sorted(EXPECTED_BINDING_FILES), generated_cu)
     failed |= print_list_diff(".cuh", sorted(EXPECTED_HEADER_FILES), generated_cuh)
+    failed |= print_list_diff("second .cu", generated_cu, relative_files(second_bindings_dir, ".cu"))
+    failed |= print_list_diff("second .cuh", generated_cuh, relative_files(second_headers_dir, ".cuh"))
+    if content_hashes(first_bindings_dir, generated_cu) != content_hashes(second_bindings_dir, generated_cu):
+        failed = True
+        print("generated .cu contents are not reproducible", file=sys.stderr)
+    if content_hashes(first_headers_dir, generated_cuh) != content_hashes(second_headers_dir, generated_cuh):
+        failed = True
+        print("generated .cuh contents are not reproducible", file=sys.stderr)
 
     dictshfl32 = [name for name in generated_cu if name.startswith("dictshfl32-")]
     if dictshfl32:

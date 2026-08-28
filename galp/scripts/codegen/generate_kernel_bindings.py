@@ -5,8 +5,10 @@
 # ────────────────────────────────────────────────────────
 #!/usr/bin/python3
 
+import json
 import os
 import sys
+from pathlib import Path
 
 import argparse
 import logging
@@ -14,6 +16,23 @@ import logging
 # Resolved from argparse at startup; see __main__ block.
 GENERATED_BINDINGS_DIR: str = ""
 GENERATED_HEADERS_DIR: str | None = None
+WRITTEN_BINDINGS: set[str] = set()
+WRITTEN_HEADERS: set[str] = set()
+
+MANIFEST_PATH = Path(__file__).with_name("generated_bindings_manifest.json")
+
+
+def load_generated_bindings_manifest() -> dict[str, object]:
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    if manifest.get("schema") != "galp-generated-bindings-v1":
+        raise RuntimeError(f"unsupported generated binding manifest: {MANIFEST_PATH}")
+    for field in ("bindings", "headers", "optional_bindings"):
+        if field not in manifest:
+            raise RuntimeError(f"generated binding manifest lacks {field!r}: {MANIFEST_PATH}")
+    return manifest
+
+
+GENERATED_BINDINGS_MANIFEST = load_generated_bindings_manifest()
 
 FILE_HEADER = """
 #include "cuda/launch/dispatch.cuh"
@@ -384,6 +403,9 @@ def write_file(
     file_name: str,
     functions: list[str],
 ):
+    if file_name in WRITTEN_BINDINGS:
+        raise RuntimeError(f"duplicate generated binding output: {file_name}")
+    WRITTEN_BINDINGS.add(file_name)
     logging.info(f"Writing file {file_name}")
     out_path = os.path.join(GENERATED_BINDINGS_DIR, file_name)
     with open(out_path, "w") as f:
@@ -393,8 +415,12 @@ def write_file(
 def write_kernel_bindings_header():
     if GENERATED_HEADERS_DIR is None:
         return
+    file_name = "kernel_bindings.cuh"
+    if file_name in WRITTEN_HEADERS:
+        raise RuntimeError(f"duplicate generated header output: {file_name}")
+    WRITTEN_HEADERS.add(file_name)
     os.makedirs(GENERATED_HEADERS_DIR, exist_ok=True)
-    out_path = os.path.join(GENERATED_HEADERS_DIR, "kernel_bindings.cuh")
+    out_path = os.path.join(GENERATED_HEADERS_DIR, file_name)
     with open(out_path, "w") as f:
         f.write(KERNEL_BINDINGS_HEADER)
 
@@ -457,6 +483,8 @@ def get_if_statement_check_wrapper(
 
 
 def main(args):
+    WRITTEN_BINDINGS.clear()
+    WRITTEN_HEADERS.clear()
     for encoding, patchers_per_encoding in zip(
         ["FREQ", "FREQExtended"], [PATCHERS[1:4], PATCHERS[4:]]
     ):
@@ -863,6 +891,24 @@ def main(args):
                 )
 
     write_kernel_bindings_header()
+
+    expected_bindings = set(GENERATED_BINDINGS_MANIFEST["bindings"])
+    if args.enable_dictshfl32:
+        expected_bindings.update(GENERATED_BINDINGS_MANIFEST["optional_bindings"]["dictshfl32"])
+    if WRITTEN_BINDINGS != expected_bindings:
+        missing = sorted(expected_bindings - WRITTEN_BINDINGS)
+        unexpected = sorted(WRITTEN_BINDINGS - expected_bindings)
+        raise RuntimeError(
+            f"generated binding outputs disagree with {MANIFEST_PATH}: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if GENERATED_HEADERS_DIR is not None:
+        expected_headers = set(GENERATED_BINDINGS_MANIFEST["headers"])
+        if WRITTEN_HEADERS != expected_headers:
+            raise RuntimeError(
+                f"generated header outputs disagree with {MANIFEST_PATH}: "
+                f"expected={sorted(expected_headers)}, actual={sorted(WRITTEN_HEADERS)}"
+            )
 
 
 if __name__ == "__main__":

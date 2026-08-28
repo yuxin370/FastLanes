@@ -11,55 +11,20 @@ set(GALP_GENERATED_INCLUDE_DIR "${GALP_GENERATED_BENCHMARK_DIR}/include")
 set(GALP_GENERATED_HEADER_DIR "${GALP_GENERATED_INCLUDE_DIR}/galp_bench/generated")
 set(GALP_GENERATED_STAMP "${GALP_GENERATED_BENCHMARK_DIR}/generated-bindings.stamp")
 
-set(GALP_GENERATED_BINDING_FILENAMES
-        alp-double-decompress_column-bindings.cu
-        alp-double-query_column-bindings.cu
-        alp-float-decompress_column-bindings.cu
-        alp-float-query_column-bindings.cu
-        alpextended-double-decompress_column-bindings.cu
-        alpextended-double-query_column-bindings.cu
-        alpextended-float-decompress_column-bindings.cu
-        alpextended-float-query_column-bindings.cu
-        bp-uint32_t-decompress_column-bindings.cu
-        bp-uint32_t-query_column-bindings.cu
-        bp-uint64_t-decompress_column-bindings.cu
-        bp-uint64_t-query_column-bindings.cu
-        constant-uint32_t-decompress_column-bindings.cu
-        constant-uint64_t-decompress_column-bindings.cu
-        crossrle-uint32_t-decompress_column-bindings.cu
-        crossrle-uint64_t-decompress_column-bindings.cu
-        crossrleextended-uint32_t-decompress_column-bindings.cu
-        crossrleextended-uint64_t-decompress_column-bindings.cu
-        crossrlelanemask-uint32_t-decompress_column-bindings.cu
-        crossrlelanemask-uint64_t-decompress_column-bindings.cu
-        dict-uint32_t-decompress_column-bindings.cu
-        dict-uint64_t-decompress_column-bindings.cu
-        dictslpatch-uint32_t-decompress_column-bindings.cu
-        dictslpatch-uint64_t-decompress_column-bindings.cu
-		delta-int16_t-decompress_column-bindings.cu
-		delta-int8_t-decompress_column-bindings.cu
-		ffor-int16_t-decompress_column-bindings.cu
-		ffor-int8_t-decompress_column-bindings.cu
-        ffor-uint32_t-compute_column-bindings.cu
-        ffor-uint32_t-decompress_column-bindings.cu
-        ffor-uint32_t-query_column-bindings.cu
-        ffor-uint64_t-compute_column-bindings.cu
-        ffor-uint64_t-decompress_column-bindings.cu
-        ffor-uint64_t-query_column-bindings.cu
-        freq-int16_t-decompress_column-bindings.cu
-        freq-int8_t-decompress_column-bindings.cu
-        freq-uint32_t-decompress_column-bindings.cu
-        freq-uint64_t-decompress_column-bindings.cu
-        freqextended-int16_t-decompress_column-bindings.cu
-        freqextended-int8_t-decompress_column-bindings.cu
-        freqextended-uint32_t-decompress_column-bindings.cu
-        freqextended-uint64_t-decompress_column-bindings.cu
-        rle-uint32_t-decompress_column-bindings.cu
-        rle-uint64_t-decompress_column-bindings.cu
-        slpatch-int16_t-decompress_column-bindings.cu
-        slpatch-uint32_t-decompress_column-bindings.cu
-        slpatch-uint64_t-decompress_column-bindings.cu
-)
+set(GALP_GENERATED_BINDINGS_MANIFEST
+        "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/codegen/generated_bindings_manifest.json")
+file(READ "${GALP_GENERATED_BINDINGS_MANIFEST}" GALP_GENERATED_BINDINGS_MANIFEST_CONTENT)
+string(JSON GALP_GENERATED_BINDING_COUNT LENGTH "${GALP_GENERATED_BINDINGS_MANIFEST_CONTENT}" bindings)
+if (GALP_GENERATED_BINDING_COUNT LESS 1)
+        message(FATAL_ERROR "GALP generated binding manifest is empty")
+endif ()
+math(EXPR GALP_GENERATED_BINDING_LAST "${GALP_GENERATED_BINDING_COUNT} - 1")
+set(GALP_GENERATED_BINDING_FILENAMES)
+foreach (generated_index RANGE 0 ${GALP_GENERATED_BINDING_LAST})
+        string(JSON generated_file GET
+                "${GALP_GENERATED_BINDINGS_MANIFEST_CONTENT}" bindings ${generated_index})
+        list(APPEND GALP_GENERATED_BINDING_FILENAMES "${generated_file}")
+endforeach ()
 
 set(GALP_GENERATED_BINDING_COMPILED_FILENAMES ${GALP_GENERATED_BINDING_FILENAMES})
 
@@ -73,8 +38,17 @@ foreach (generated_file IN LISTS GALP_GENERATED_BINDING_COMPILED_FILENAMES)
         list(APPEND GALP_GENERATED_BINDINGS_SOURCES "${GALP_GENERATED_BINDINGS_DIR}/${generated_file}")
 endforeach ()
 
-set(GALP_GENERATED_HEADERS
-        "${GALP_GENERATED_HEADER_DIR}/kernel_bindings.cuh")
+string(JSON GALP_GENERATED_HEADER_COUNT LENGTH "${GALP_GENERATED_BINDINGS_MANIFEST_CONTENT}" headers)
+if (GALP_GENERATED_HEADER_COUNT LESS 1)
+        message(FATAL_ERROR "GALP generated header manifest is empty")
+endif ()
+math(EXPR GALP_GENERATED_HEADER_LAST "${GALP_GENERATED_HEADER_COUNT} - 1")
+set(GALP_GENERATED_HEADERS)
+foreach (generated_index RANGE 0 ${GALP_GENERATED_HEADER_LAST})
+        string(JSON generated_file GET
+                "${GALP_GENERATED_BINDINGS_MANIFEST_CONTENT}" headers ${generated_index})
+        list(APPEND GALP_GENERATED_HEADERS "${GALP_GENERATED_HEADER_DIR}/${generated_file}")
+endforeach ()
 
 set(GALP_GENERATE_KERNEL_BINDINGS_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/codegen/generate_kernel_bindings.py")
 
@@ -91,6 +65,7 @@ add_custom_command(
         COMMAND ${CMAKE_COMMAND} -E touch "${GALP_GENERATED_STAMP}"
         DEPENDS
                 "${GALP_GENERATE_KERNEL_BINDINGS_SCRIPT}"
+                "${GALP_GENERATED_BINDINGS_MANIFEST}"
         COMMENT "Generating GALP benchmark bindings"
         VERBATIM)
 
