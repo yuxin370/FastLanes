@@ -140,10 +140,10 @@ struct PipelineTraceEvent final {
 	uint64_t completion_ordinal = 0U;
 };
 
-// Future lifetime boundary (contract only): the Torch adapter observes and
-// forwards the ATen consumer stream and wraps Tensor/Storage. Native code will
-// own consumer dependencies, completion interpretation, and reclamation.
-// Phase 1 intentionally implements neither side of that migration.
+// Lifetime boundary: the Torch adapter wraps Tensor/Storage and forwards the
+// declared ATen consumer stream. NativeBatchCompletion/NativeBatchLease own
+// dependency completion and backing-storage reclamation. CUDA work submitted
+// after the final related Tensor/Storage release is outside this contract.
 
 } // namespace galp::direct_dct
 
