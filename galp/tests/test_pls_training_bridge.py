@@ -126,10 +126,40 @@ class PlsTrainingBridgeTest(unittest.TestCase):
         class Reader:
             def __init__(self):
                 self.calls = []
+                self.pending = []
+                self.prefetched = 0
 
-            def prefetch_batch(self, image_ids, *, transforms, **_kwargs):
-                self.calls.append(list(image_ids))
-                return Handle(NativeBatch(image_ids, transforms))
+            def start(self, image_id_batches, *, transforms_by_batch):
+                self.pending = []
+                self.prefetched = len(image_id_batches)
+                for image_ids, transforms in zip(image_id_batches, transforms_by_batch):
+                    self.calls.append(list(image_ids))
+                    self.pending.append(Handle(NativeBatch(image_ids, transforms)))
+
+            def next_batch(self):
+                if not self.pending:
+                    raise StopIteration
+                return self.pending.pop(0).read()
+
+            def prefetched_batch_count(self):
+                return self.prefetched
+
+            def metrics(self):
+                return {
+                    "complete": True,
+                    "peak_transient_bytes": 0,
+                    "producer_ms": 0.0,
+                    "planning_ms": 0.0,
+                    "io_ms": 0.0,
+                    "decode_ms": 0.0,
+                    "transform_ms": 0.0,
+                    "consumer_wait_ms": 0.0,
+                    "logical_bytes": 0,
+                    "physical_bytes": 0,
+                }
+
+            def close(self):
+                self.pending = []
 
         train_samples = self._samples()
         plan = build_execution_plan(

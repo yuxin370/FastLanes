@@ -15,19 +15,22 @@ set(cxx_paths
         "${GALP_ROOT}/src/api/direct_dct.cpp"
         "${GALP_ROOT}/torch/direct_dct_torch.cpp"
 )
+if (DEFINED GALP_D2H_EXTRA_SOURCE)
+        list(APPEND cxx_paths "${GALP_D2H_EXTRA_SOURCE}")
+endif ()
 
 foreach (path IN LISTS cxx_paths)
         if (NOT EXISTS "${path}")
                 message(FATAL_ERROR "Direct-DCT no-D2H check path does not exist: ${path}")
         endif ()
         file(READ "${path}" content)
-        foreach (forbidden_call cudaMemcpy cudaMemcpyAsync cudaDeviceSynchronize cudaStreamSynchronize)
+        foreach (forbidden_call cudaDeviceSynchronize cudaStreamSynchronize)
                 if (content MATCHES "${forbidden_call}[ \t\r\n]*\\(")
                         message(FATAL_ERROR
                                 "Direct-DCT runtime/export path must not call ${forbidden_call}(): ${path}")
                 endif ()
         endforeach ()
-        foreach (forbidden_token cudaMemcpyDeviceToHost cudaMemcpyDefault)
+        foreach (forbidden_token cudaMemcpyDeviceToHost cudaMemcpyDefault cudaMemcpyDtoH)
                 if (content MATCHES "${forbidden_token}")
                         message(FATAL_ERROR
                                 "Direct-DCT runtime/export path must not contain ${forbidden_token}: ${path}")

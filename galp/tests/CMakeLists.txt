@@ -199,6 +199,16 @@ if (GALP_WITH_JPEG_DCT)
 	                -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/GalpDirectDctRuntimeNoD2H.cmake
         )
         set_tests_properties(GalpDirectDctRuntimeNoD2H PROPERTIES LABELS "galp;jpeg-dct;direct-dct;static")
+        add_test(
+                NAME GalpDirectDctRuntimeRejectsD2H
+                COMMAND ${CMAKE_COMMAND}
+	                -DGALP_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
+	                -DGALP_D2H_NEGATIVE_FIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/direct_dct_d2h_fixture.cu
+	                -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/GalpDirectDctRuntimeD2HNegativeTest.cmake
+        )
+        set_tests_properties(
+                GalpDirectDctRuntimeRejectsD2H
+                PROPERTIES LABELS "galp;jpeg-dct;direct-dct;static")
 endif ()
 
 if (GALP_ENABLE_INSTALL)
