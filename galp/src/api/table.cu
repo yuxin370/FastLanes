@@ -39,16 +39,8 @@ DataType to_public_data_type(const galp::format::DataType type) {
 		return DataType::I8;
 	case galp::format::DataType::I16:
 		return DataType::I16;
-	case galp::format::DataType::U32:
-		return DataType::U32;
-	case galp::format::DataType::U64:
-		return DataType::U64;
-	case galp::format::DataType::F32:
-		return DataType::F32;
-	case galp::format::DataType::F64:
-		return DataType::F64;
 	default:
-		throw std::runtime_error("unknown GALP materialized column type");
+		throw std::runtime_error("galp::Table materialization supports only i8 and i16 columns");
 	}
 }
 

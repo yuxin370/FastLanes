@@ -8,10 +8,6 @@ namespace galp {
 enum class DataType {
 	I8,
 	I16,
-	U32,
-	U64,
-	F32,
-	F64,
 };
 
 enum class TableDecompressionScope {

@@ -117,6 +117,9 @@ if (rowgroups != 0 && first_rowgroup_columns != 0) {
 - `size()`
 - `values<T>() -> std::span<const T>`
 
+The stable materialized value contract accepts `int8_t` and `int16_t` only;
+other schema types are rejected before a public `ColumnView` is created.
+
 Output storage is owned by `galp::Table`. `RowgroupView` and `ColumnView` are
 lightweight read-only views and must not outlive their source table.
 

@@ -1,8 +1,14 @@
 #include <filesystem>
 #include <galp/stable.hpp>
+#include <concepts>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+template <typename T>
+concept GalpColumnValue = requires(const galp::ColumnView& column) {
+	{ column.template values<T>() } -> std::same_as<std::span<const T>>;
+};
 
 int main() {
 	static_assert(GALP_STABLE_API == 1);
@@ -12,6 +18,12 @@ int main() {
 	static_assert(!std::is_copy_constructible_v<galp::Table>);
 	static_assert(!std::is_copy_assignable_v<galp::Table>);
 	static_assert(std::is_move_constructible_v<galp::Table>);
+	static_assert(GalpColumnValue<int8_t>);
+	static_assert(GalpColumnValue<int16_t>);
+	static_assert(!GalpColumnValue<uint32_t>);
+	static_assert(!GalpColumnValue<uint64_t>);
+	static_assert(!GalpColumnValue<float>);
+	static_assert(!GalpColumnValue<double>);
 
 	galp::DecompressOptions options {};
 	options.scope                   = galp::TableDecompressionScope::PerRowgroup;

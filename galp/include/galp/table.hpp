@@ -24,6 +24,7 @@ public:
 	[[nodiscard]] bool               empty() const;
 
 	template <typename T>
+	requires(std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>)
 	[[nodiscard]] std::span<const T> values() const {
 		const auto untyped = values_untyped(data_type_for<T>(), sizeof(T));
 		return {static_cast<const T*>(untyped.data), untyped.size};
@@ -41,22 +42,9 @@ private:
 	static constexpr DataType data_type_for() {
 		if constexpr (std::is_same_v<T, int8_t>) {
 			return DataType::I8;
-		} else if constexpr (std::is_same_v<T, int16_t>) {
-			return DataType::I16;
-		} else if constexpr (std::is_same_v<T, uint32_t>) {
-			return DataType::U32;
-		} else if constexpr (std::is_same_v<T, uint64_t>) {
-			return DataType::U64;
-		} else if constexpr (std::is_same_v<T, float>) {
-			return DataType::F32;
-		} else if constexpr (std::is_same_v<T, double>) {
-			return DataType::F64;
 		} else {
-			static_assert(
-			    std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> || std::is_same_v<T, uint32_t> ||
-			        std::is_same_v<T, uint64_t> || std::is_same_v<T, float> || std::is_same_v<T, double>,
-			    "galp::ColumnView::values<T>() supports int8_t, int16_t, uint32_t, uint64_t, float, and double");
-			return DataType::I8;
+			static_assert(std::is_same_v<T, int16_t>);
+			return DataType::I16;
 		}
 	}
 
