@@ -12,6 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GALP_ROOT = REPO_ROOT / "galp"
 CODEGEN_DIR = GALP_ROOT / "scripts" / "codegen"
+OWNERSHIP_MARKER = ".galp-codegen-owned"
 
 EXPECTED_BINDING_FILES = [
     "alp-double-decompress_column-bindings.cu",
@@ -131,18 +132,43 @@ def check(tmp_dir: Path) -> int:
     return 0
 
 
-def main() -> int:
+def create_owned_tmp_dir(path: Path) -> Path:
+    tmp_dir = path.resolve()
+    if tmp_dir.exists():
+        raise ValueError(f"--tmp-dir must not already exist: {tmp_dir}")
+    tmp_dir.mkdir()
+    (tmp_dir / OWNERSHIP_MARKER).write_text("owned by check_generated_reproducible.py\n")
+    return tmp_dir
+
+
+def remove_owned_tmp_dir(tmp_dir: Path) -> None:
+    marker = tmp_dir / OWNERSHIP_MARKER
+    if not marker.is_file():
+        raise RuntimeError(f"refusing to remove unowned temporary directory: {tmp_dir}")
+    shutil.rmtree(tmp_dir)
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tmp-dir", help="Use this temporary directory instead of creating one.")
+    parser.add_argument(
+        "--tmp-dir",
+        help="Create and use this new temporary directory; an existing path is always rejected.",
+    )
     parser.add_argument("--keep-tmp", action="store_true", help="Keep the generated temporary output.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.tmp_dir:
-        tmp_dir = Path(args.tmp_dir).resolve()
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        tmp_dir.mkdir(parents=True)
-        return check(tmp_dir)
+        try:
+            tmp_dir = create_owned_tmp_dir(Path(args.tmp_dir))
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        try:
+            return check(tmp_dir)
+        finally:
+            if args.keep_tmp:
+                print(f"kept temporary output: {tmp_dir}")
+            else:
+                remove_owned_tmp_dir(tmp_dir)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="galp_codegen_check_"))
     try:
