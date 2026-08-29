@@ -2,6 +2,7 @@
 #define GALP_DIRECT_DCT_NATIVE_LOGICAL_BATCH_PIPELINE_DETAIL_HPP
 
 #include "direct_dct/logical_types.hpp"
+#include "direct_dct/native_batch_lifetime.hpp"
 #include "direct_dct/native_pipeline_state.hpp"
 #include "galp/jpeg_dct_device.hpp"
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <deque>
 #include <future>
 #include <memory>
@@ -26,6 +28,133 @@ struct NativePlanTraceIdentity final {
 	uint64_t io_identity_hash   = 0U;
 };
 
+// A narrow admission controller for full materialized outputs. A permit is
+// attached to the produced DirectDctBatch and therefore remains live through
+// the existing NativeBatchLease lifetime. This bounds producer admission
+// without introducing a second allocator or completion system.
+class MaterializedOutputSlotPool final
+    : public std::enable_shared_from_this<MaterializedOutputSlotPool> {
+public:
+	struct Snapshot final {
+		size_t capacity                  = 0U;
+		size_t live_slots                = 0U;
+		size_t peak_live_slots           = 0U;
+		size_t waiters                   = 0U;
+		size_t live_bytes                = 0U;
+		size_t peak_bytes                = 0U;
+		size_t maximum_slot_bytes        = 0U;
+	};
+
+	class Permit final {
+	public:
+		~Permit() {
+			if (pool_) {
+				pool_->release(bytes_);
+			}
+		}
+
+		Permit(const Permit&)            = delete;
+		Permit& operator=(const Permit&) = delete;
+
+		void set_materialized_bytes(const size_t bytes) {
+			if (bytes_ != 0U) {
+				throw std::logic_error("materialized output slot bytes were already recorded");
+			}
+			bytes_ = bytes;
+			pool_->add_bytes(bytes);
+		}
+
+	private:
+		friend class MaterializedOutputSlotPool;
+		explicit Permit(std::shared_ptr<MaterializedOutputSlotPool> pool)
+		    : pool_(std::move(pool)) {
+		}
+
+		std::shared_ptr<MaterializedOutputSlotPool> pool_;
+		size_t                                      bytes_ = 0U;
+	};
+
+	explicit MaterializedOutputSlotPool(const size_t capacity)
+	    : capacity_(capacity) {
+		if (capacity_ == 0U || capacity_ > 2U) {
+			throw std::invalid_argument("materialized output slot capacity must be 1 or 2");
+		}
+	}
+
+	[[nodiscard]] std::shared_ptr<Permit> acquire(const std::atomic<bool>& cancelled) {
+		std::unique_lock lock(mutex_);
+		++waiters_;
+		while (live_slots_ >= capacity_ && !cancelled.load(std::memory_order_acquire)) {
+			// Consumer completion is queried by the existing native lifetime
+			// authority.  Progress it only when output admission is actually
+			// blocked; otherwise an event that becomes ready just after the
+			// final Tensor deleter ran would have no caller left to return the
+			// permit.  The pool mutex must not be held while reclaim destroys a
+			// permit and calls release().
+			lock.unlock();
+			static_cast<void>(NativeBatchLease::reclaim_finished());
+			lock.lock();
+			condition_.wait_for(lock, std::chrono::microseconds {250}, [&] {
+				return live_slots_ < capacity_ || cancelled.load(std::memory_order_acquire);
+			});
+		}
+		--waiters_;
+		if (cancelled.load(std::memory_order_acquire)) {
+			return {};
+		}
+		++live_slots_;
+		peak_live_slots_ = std::max(peak_live_slots_, live_slots_);
+		return std::shared_ptr<Permit>(new Permit(shared_from_this()));
+	}
+
+	void notify_waiters() noexcept {
+		condition_.notify_all();
+	}
+
+	[[nodiscard]] Snapshot snapshot() const noexcept {
+		std::lock_guard lock(mutex_);
+		return {
+		    capacity_,
+		    live_slots_,
+		    peak_live_slots_,
+		    waiters_,
+		    live_bytes_,
+		    peak_bytes_,
+		    maximum_slot_bytes_,
+		};
+	}
+
+private:
+	void add_bytes(const size_t bytes) {
+		std::lock_guard lock(mutex_);
+		live_bytes_ += bytes;
+		peak_bytes_ = std::max(peak_bytes_, live_bytes_);
+		maximum_slot_bytes_ = std::max(maximum_slot_bytes_, bytes);
+	}
+
+	void release(const size_t bytes) noexcept {
+		{
+			std::lock_guard lock(mutex_);
+			if (live_slots_ == 0U || bytes > live_bytes_) {
+				std::terminate();
+			}
+			--live_slots_;
+			live_bytes_ -= bytes;
+		}
+		condition_.notify_one();
+	}
+
+	const size_t            capacity_ = 0U;
+	mutable std::mutex      mutex_;
+	std::condition_variable condition_;
+	size_t                  live_slots_         = 0U;
+	size_t                  peak_live_slots_    = 0U;
+	size_t                  waiters_            = 0U;
+	size_t                  live_bytes_         = 0U;
+	size_t                  peak_bytes_         = 0U;
+	size_t                  maximum_slot_bytes_ = 0U;
+};
+
 template <typename Runtime>
 class NativeLogicalBatchPipelineCore final {
 public:
@@ -34,8 +163,10 @@ public:
 	NativeLogicalBatchPipelineCore(Runtime                         runtime,
 	                               std::string                     semantic_profile_id,
 	                               jpeg::JpegDctDeviceBatchOptions options,
-	                               NativePipelineTraceBuffer*      trace = nullptr)
-	    : shared_state_(std::make_shared<SharedState>(std::move(runtime)))
+	                               NativePipelineTraceBuffer*      trace = nullptr,
+	                               size_t materialized_output_slot_capacity = 2U)
+	    : shared_state_(std::make_shared<SharedState>(
+	          std::move(runtime), materialized_output_slot_capacity))
 	    , semantic_profile_id_(std::move(semantic_profile_id))
 	    , options_(std::move(options))
 	    , trace_(trace) {
@@ -77,9 +208,6 @@ public:
 			emit_trace(request, PipelineTraceEvent::Stage::kRequestAccepted);
 		}
 		fill_pending();
-		if (!pending_.empty()) {
-			pending_.front()->release_submission();
-		}
 	}
 
 	Batch next() {
@@ -87,9 +215,9 @@ public:
 			throw std::out_of_range("NativeLogicalBatchPipeline is closed or exhausted");
 		}
 		auto current = pending_.front();
-		current->release_submission();
 		try {
 			auto batch              = current->read();
+			last_output_slot_owner_ = current->take_output_slot_owner();
 			last_prefetch_metrics_ = current->metrics();
 			last_prefetch_ = std::move(current);
 			pending_.pop_front();
@@ -119,7 +247,22 @@ public:
 	}
 
 	[[nodiscard]] NativePipelineState state() const noexcept {
-		return pipeline_state_;
+		auto state = pipeline_state_;
+		const auto slots = shared_state_->output_slots->snapshot();
+		state.output_slot_capacity      = slots.capacity;
+		state.live_output_slots         = slots.live_slots;
+		state.peak_live_output_slots    = slots.peak_live_slots;
+		state.output_slot_waiters       = slots.waiters;
+		state.live_output_bytes         = slots.live_bytes;
+		state.peak_output_bytes         = slots.peak_bytes;
+		state.maximum_output_slot_bytes = slots.maximum_slot_bytes;
+		return state;
+	}
+
+	// Transfers the just-delivered permit to the actual DirectDctBatch. The
+	// batch then carries it through NativeBatchLease until backing reclaim.
+	[[nodiscard]] std::shared_ptr<void> take_delivered_output_slot_owner() noexcept {
+		return std::move(last_output_slot_owner_);
 	}
 
 	[[nodiscard]] NativePipelinePrefetchMetrics prefetch_metrics() const noexcept {
@@ -140,11 +283,13 @@ private:
 	static constexpr size_t kNativePrefetchDepth = 2U;
 
 	struct SharedState final {
-		explicit SharedState(Runtime runtime_in)
-		    : runtime(std::move(runtime_in)) {
+		explicit SharedState(Runtime runtime_in, const size_t output_slot_capacity)
+		    : runtime(std::move(runtime_in))
+		    , output_slots(std::make_shared<MaterializedOutputSlotPool>(output_slot_capacity)) {
 		}
 
 		Runtime                  runtime;
+		std::shared_ptr<MaterializedOutputSlotPool> output_slots;
 		std::mutex               runtime_mutex;
 		std::mutex               prefetch_mutex;
 		std::shared_future<void> prefetch_tail;
@@ -160,6 +305,7 @@ private:
 	struct PendingTelemetry final {
 		NativePipelineRequestState execution_state;
 		std::chrono::steady_clock::time_point submitted_at = std::chrono::steady_clock::now();
+		std::atomic<bool>    cancel_requested {false};
 		std::atomic<int64_t> producer_active_nanoseconds {0};
 		std::atomic<int64_t> planning_nanoseconds {0};
 		std::atomic<int64_t> io_staging_nanoseconds {0};
@@ -174,17 +320,14 @@ private:
 	public:
 		Pending(std::future<Batch>                                          future,
 		        std::shared_ptr<PendingTelemetry>                           telemetry,
-		        std::shared_ptr<jpeg::JpegDctDeviceTransformSubmissionGate> submission_gate,
+		        std::shared_ptr<MaterializedOutputSlotPool>                  output_slots,
+		        std::shared_ptr<std::shared_ptr<MaterializedOutputSlotPool::Permit>> output_slot_owner,
 		        NativePipelineTraceBuffer*                                  trace)
 		    : future_(std::move(future))
 		    , telemetry_(std::move(telemetry))
-		    , submission_gate_(std::move(submission_gate))
-		    , submission_released_(submission_gate_ == nullptr)
+		    , output_slots_(std::move(output_slots))
+		    , output_slot_owner_(std::move(output_slot_owner))
 		    , trace_(trace) {
-		}
-
-		~Pending() {
-			release_submission();
 		}
 
 		[[nodiscard]] bool ready() const {
@@ -205,24 +348,9 @@ private:
 			};
 		}
 
-		bool release_submission() noexcept {
-			bool expected = false;
-			if (!submission_released_.compare_exchange_strong(
-			        expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
-				return false;
-			}
-			// Project the causal decision before waking the worker. Recording an
-			// after-the-fact "released" observation raced with kSubmitted even
-			// though the gate itself behaved correctly.
-			emit(PipelineTraceEvent::Stage::kGateReleaseRequested);
-			if (submission_gate_) {
-				submission_gate_->release();
-			}
-			return true;
-		}
-
 		bool cancel() noexcept {
-			release_submission();
+			telemetry_->cancel_requested.store(true, std::memory_order_release);
+			output_slots_->notify_waiters();
 			const bool cancelled = telemetry_->execution_state.try_cancel();
 			if (cancelled) {
 				emit(PipelineTraceEvent::Stage::kCancelled);
@@ -234,8 +362,11 @@ private:
 			if (!future_.valid()) {
 				throw std::runtime_error("NativeLogicalBatchPipeline batch has already been consumed");
 			}
-			release_submission();
 			return future_.get();
+		}
+
+		[[nodiscard]] std::shared_ptr<void> take_output_slot_owner() noexcept {
+			return std::move(*output_slot_owner_);
 		}
 
 	private:
@@ -257,8 +388,8 @@ private:
 
 		std::future<Batch>                                          future_;
 		std::shared_ptr<PendingTelemetry>                           telemetry_;
-		std::shared_ptr<jpeg::JpegDctDeviceTransformSubmissionGate> submission_gate_;
-		std::atomic<bool>                                           submission_released_ {true};
+		std::shared_ptr<MaterializedOutputSlotPool>                  output_slots_;
+		std::shared_ptr<std::shared_ptr<MaterializedOutputSlotPool::Permit>> output_slot_owner_;
 		NativePipelineTraceBuffer*                                  trace_ = nullptr;
 	};
 
@@ -304,10 +435,12 @@ private:
 		telemetry->request_ordinal        = request.request_ordinal;
 		telemetry->batch_ordinal          = request.batch_ordinal;
 		auto options                      = options_;
-		auto submission_gate              = options.async_planless_completion
-		                                        ? std::make_shared<jpeg::JpegDctDeviceTransformSubmissionGate>()
-		                                        : nullptr;
-		options.transform_submission_gate = submission_gate;
+		// Native admission is output-slot driven. The legacy/manual prefetch API
+		// may still use transform_submission_gate, but the production native
+		// pipeline must not bind submission to the next consumer iteration.
+		options.transform_submission_gate.reset();
+		auto output_slot_owner = std::make_shared<
+		    std::shared_ptr<MaterializedOutputSlotPool::Permit>>();
 		const int device_index            = state_copy->runtime.capture_device();
 
 		std::shared_future<void> predecessor;
@@ -328,6 +461,7 @@ private:
 			     predecessor = std::move(predecessor),
 			     completion,
 			     telemetry,
+			     output_slot_owner,
 			     trace = trace_]() mutable -> Batch {
 				    try {
 					    if (!telemetry->execution_state.try_start()) {
@@ -365,6 +499,19 @@ private:
 						    predecessor.wait();
 					    }
 
+					    telemetry->execution_state.set_stage(PipelineTraceEvent::Stage::kAwaitingOutputSlot);
+					    emit_trace(trace, *telemetry, PipelineTraceEvent::Stage::kAwaitingOutputSlot, identity);
+					    auto permit = state_copy->output_slots->acquire(telemetry->cancel_requested);
+					    if (!permit) {
+						    telemetry->execution_state.set_stage(PipelineTraceEvent::Stage::kCancelled);
+						    emit_trace(trace, *telemetry, PipelineTraceEvent::Stage::kCancelled, identity);
+						    throw std::runtime_error(
+						        "NativeLogicalBatchPipeline request was cancelled while awaiting an output slot");
+					    }
+					    *output_slot_owner = permit;
+					    telemetry->execution_state.set_stage(PipelineTraceEvent::Stage::kOutputSlotAcquired);
+					    emit_trace(trace, *telemetry, PipelineTraceEvent::Stage::kOutputSlotAcquired, identity);
+
 					    const auto submission_begin = std::chrono::steady_clock::now();
 					    state_copy->runtime.activate_device(device_index);
 					    Batch batch;
@@ -373,6 +520,8 @@ private:
 						    telemetry->execution_state.set_stage(PipelineTraceEvent::Stage::kReadStarted);
 						    emit_trace(trace, *telemetry, PipelineTraceEvent::Stage::kReadStarted, identity);
 						    batch = state_copy->runtime.read(std::move(prepared));
+						    permit->set_materialized_bytes(
+						        state_copy->runtime.materialized_output_bytes(batch));
 						    telemetry->execution_state.set_stage(PipelineTraceEvent::Stage::kSubmitted);
 						    emit_trace(trace, *telemetry, PipelineTraceEvent::Stage::kSubmitted, identity);
 					    }
@@ -407,7 +556,12 @@ private:
 			throw;
 		}
 
-		return std::make_shared<Pending>(std::move(future), std::move(telemetry), std::move(submission_gate), trace_);
+		return std::make_shared<Pending>(
+		    std::move(future),
+		    std::move(telemetry),
+		    state_copy->output_slots,
+		    std::move(output_slot_owner),
+		    trace_);
 	}
 
 	static void emit_trace(NativePipelineTraceBuffer*      trace,
@@ -456,6 +610,7 @@ private:
 		pending_.clear();
 		requests_.clear();
 		last_prefetch_.reset();
+		last_output_slot_owner_.reset();
 		pipeline_state_.request_count           = 0U;
 		pipeline_state_.next_request            = 0U;
 		pipeline_state_.pending_count           = 0U;
@@ -479,6 +634,7 @@ private:
 	std::vector<QueuedRequest>           requests_;
 	std::deque<std::shared_ptr<Pending>> pending_;
 	std::shared_ptr<Pending>             last_prefetch_;
+	std::shared_ptr<void>                last_output_slot_owner_;
 	NativePipelinePrefetchMetrics        last_prefetch_metrics_;
 	NativePipelineState                  pipeline_state_;
 };

@@ -6,7 +6,7 @@ namespace galp::direct_dct {
 void NativePipelineTraceBuffer::reset(const size_t request_count) {
 	std::lock_guard lock(mutex_);
 	events_.clear();
-	events_.reserve(std::max(events_.capacity(), request_count * 9U + 1U));
+	events_.reserve(std::max(events_.capacity(), request_count * 10U + 1U));
 	next_prepare_ordinal_    = 1U;
 	next_stage_ordinal_      = 1U;
 	next_read_ordinal_       = 1U;

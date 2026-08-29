@@ -66,14 +66,14 @@ FP32 RGB-no-more 数值合同。其 native runtime policy
 - decode rowgroup batch 64，decode workset 512 MiB；
 - rowgroup prefetch depth/workers/min-batches 为 `16/8/1`；
 - decoded-rowgroup cache 与 plan cache 关闭；
-- limited-overlap、低优先级 stream、异步 completion；
+- 单 batch limited-overlap、跨 batch bounded two-slot overlap、低优先级 stream、异步 completion；
 - transform launch 上限为 512 blocks / 512 CTAs；
 - double buffer 由 runtime policy 自动管理。
 
 FP32 grid 的反量化 `(coefficient + 4) / 1020` 属于语义 profile，不属于运行策略。
 
-Python 只提交 `image_ids` 和高层 transform 描述并读取结果；submission gate、
-future 生命周期、buffer keepalive 和 reclaim 由 adapter/native 层封装。
+Python 只提交 `image_ids` 和高层 transform 描述并读取结果；output-slot admission、
+future 生命周期、buffer keepalive 和 reclaim 由 native 层封装。
 
 ## 常用命令
 

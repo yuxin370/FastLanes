@@ -152,6 +152,9 @@ private:
 	               std::vector<JpegDctImageCropRequest> transform_requests,
 	               int cuda_device) noexcept;
 
+	// Declared before the backing objects so reverse member destruction returns
+	// the admission permit only after device storage has actually been released.
+	std::shared_ptr<void>   materialized_output_slot_owner_;
 	JpegDctDeviceBatch    batch_;
 	std::vector<uint32_t> global_image_ids_;
 	std::vector<JpegDctImageCropRequest> transform_requests_;

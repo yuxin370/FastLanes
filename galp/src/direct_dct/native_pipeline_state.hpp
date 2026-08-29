@@ -63,6 +63,13 @@ struct NativePipelineState final {
 	size_t    max_pending_count       = 0U;
 	size_t    completed_request_count = 0U;
 	size_t    cancelled_request_count = 0U;
+	size_t    output_slot_capacity    = 0U;
+	size_t    live_output_slots       = 0U;
+	size_t    peak_live_output_slots  = 0U;
+	size_t    output_slot_waiters     = 0U;
+	size_t    live_output_bytes       = 0U;
+	size_t    peak_output_bytes       = 0U;
+	size_t    maximum_output_slot_bytes = 0U;
 	bool      closed                  = true;
 };
 

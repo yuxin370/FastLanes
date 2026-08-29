@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -154,6 +155,10 @@ public:
 		return batch;
 	}
 
+	[[nodiscard]] size_t materialized_output_bytes(const Batch& batch) const noexcept {
+		return batch.image_ids.size() * sizeof(uint32_t);
+	}
+
 private:
 	static uint32_t first_image(const std::vector<galp::jpeg::JpegDctImageCropRequest>& requests) {
 		if (requests.empty()) {
@@ -211,6 +216,18 @@ size_t event_index(const std::vector<PipelineTraceEvent>& events,
 		}
 	}
 	throw std::runtime_error("expected trace event was not emitted");
+}
+
+template <typename Predicate>
+bool wait_until(Predicate&& predicate) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {5};
+	while (!predicate()) {
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
 }
 
 TEST(NativePipelineRequestStateContract, QueuedCancellationAndStartedTransitionMatchLegacyAtomicState) {
@@ -303,9 +320,11 @@ TEST(NativeLogicalBatchPipelineTrace, MoreThanDepthPreservesLegacyBackpressureAn
 		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kStaged),
 		          event_index(events, request, PipelineTraceEvent::Stage::kAwaitingPredecessor));
 		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kAwaitingPredecessor),
+		          event_index(events, request, PipelineTraceEvent::Stage::kAwaitingOutputSlot));
+		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kAwaitingOutputSlot),
+		          event_index(events, request, PipelineTraceEvent::Stage::kOutputSlotAcquired));
+		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kOutputSlotAcquired),
 		          event_index(events, request, PipelineTraceEvent::Stage::kReadStarted));
-		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kGateReleaseRequested),
-		          event_index(events, request, PipelineTraceEvent::Stage::kSubmitted));
 		EXPECT_LT(event_index(events, request, PipelineTraceEvent::Stage::kSubmitted),
 		          event_index(events, request, PipelineTraceEvent::Stage::kCompleted));
 	}
@@ -323,6 +342,42 @@ TEST(NativeLogicalBatchPipelineTrace, MoreThanDepthPreservesLegacyBackpressureAn
 		EXPECT_EQ(submitted[index].io_identity_hash, 0x200000000ULL + 100U + index);
 		EXPECT_EQ(control->count("stage", static_cast<uint32_t>(100U + index)), 2U);
 	}
+}
+
+TEST(NativeLogicalBatchPipelineOutputSlots, TwoSlotsOverlapAndThirdWaitsForSafeReuse) {
+	auto                      control = std::make_shared<FakeRuntimeControl>();
+	NativePipelineTraceBuffer trace;
+	FakePipeline pipeline(
+	    FakeRuntime(control), std::string(kProfileId), shadow_options(), &trace, 2U);
+	pipeline.reset({make_request(100U, 0U), make_request(101U, 1U), make_request(102U, 2U)});
+
+	const auto first = pipeline.next();
+	auto first_slot = pipeline.take_delivered_output_slot_owner();
+	ASSERT_TRUE(first_slot);
+	// Holding first_slot models an incomplete Batch-N consumer. Batch N+1 must
+	// nevertheless submit using the independent second slot.
+	ASSERT_TRUE(wait_until([&] { return control->count("read", 101U) == 1U; }));
+	EXPECT_EQ(first.first_image_id, 100U);
+	EXPECT_EQ(pipeline.state().live_output_slots, 2U);
+	EXPECT_EQ(pipeline.state().peak_live_output_slots, 2U);
+
+	const auto second = pipeline.next();
+	auto second_slot = pipeline.take_delivered_output_slot_owner();
+	ASSERT_TRUE(second_slot);
+	ASSERT_TRUE(wait_until([&] { return pipeline.state().output_slot_waiters == 1U; }));
+	EXPECT_EQ(second.first_image_id, 101U);
+	EXPECT_EQ(control->count("read", 102U), 0U);
+	EXPECT_EQ(pipeline.state().live_output_slots, 2U);
+
+	first_slot.reset();
+	ASSERT_TRUE(wait_until([&] { return control->count("read", 102U) == 1U; }));
+	const auto third = pipeline.next();
+	auto third_slot = pipeline.take_delivered_output_slot_owner();
+	ASSERT_TRUE(third_slot);
+	EXPECT_EQ(third.first_image_id, 102U);
+	EXPECT_LE(pipeline.state().peak_live_output_slots, 2U);
+	EXPECT_EQ(pipeline.state().maximum_output_slot_bytes, sizeof(uint32_t));
+	EXPECT_EQ(pipeline.state().peak_output_bytes, 2U * sizeof(uint32_t));
 }
 
 TEST(NativeLogicalBatchPipelineState, PartialTailAndSemanticTransformsLowerWithoutReinterpretation) {

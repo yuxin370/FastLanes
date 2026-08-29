@@ -274,7 +274,7 @@ class PipelineAdapter:
         raise NotImplementedError
 
     def after_model_complete(self) -> None:
-        """Release GPU work intentionally serialized after the current model."""
+        """Compatibility hook for post-model adapter bookkeeping."""
 
     def finalize_batch_metrics(self, batch: LoadedBatch) -> None:
         """Collect audit-only metrics outside the timed loader/model interval."""
@@ -904,6 +904,9 @@ def run_pipeline(
             )
             _synchronize_model_stream(device)
             adapter.after_model_complete()
+            # Do not retain a completed warmup output while requesting the next
+            # bounded native output slot.
+            del batch
 
         if device.type == "cuda":
             _synchronize_model_stream(device)
@@ -1033,6 +1036,13 @@ def run_pipeline(
                             native_properties[key] = max(float(current), float(value))
                         elif current != value:
                             native_properties[key] = "mixed"
+
+                # The measured work and all audit reads for this batch are
+                # complete.  Release its Python/Torch references before the
+                # next iterator request so capacity=1 remains a valid bounded
+                # control without giving this benchmark ownership of native
+                # submission scheduling.
+                del logits, batch
 
         h2d_gpu_ms.extend(_event_ms(start, end) for start, end in h2d_event_pairs)
         forward_gpu_ms.extend(_event_ms(start, end) for start, end in forward_event_pairs)

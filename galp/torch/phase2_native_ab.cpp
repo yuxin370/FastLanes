@@ -254,7 +254,8 @@ const char* stage_name(const PipelineTraceEvent::Stage stage) {
 	case PipelineTraceEvent::Stage::kPlanReady: return "plan_ready";
 	case PipelineTraceEvent::Stage::kStaged: return "staged";
 	case PipelineTraceEvent::Stage::kAwaitingPredecessor: return "awaiting_predecessor";
-	case PipelineTraceEvent::Stage::kGateReleaseRequested: return "gate_release_requested";
+	case PipelineTraceEvent::Stage::kAwaitingOutputSlot: return "awaiting_output_slot";
+	case PipelineTraceEvent::Stage::kOutputSlotAcquired: return "output_slot_acquired";
 	case PipelineTraceEvent::Stage::kReadStarted: return "read_started";
 	case PipelineTraceEvent::Stage::kSubmitted: return "submitted";
 	case PipelineTraceEvent::Stage::kCompleted: return "completed";
@@ -285,6 +286,13 @@ py::dict state_to_dict(const NativePipelineState& state) {
 	out["max_pending_count"]       = state.max_pending_count;
 	out["completed_request_count"] = state.completed_request_count;
 	out["cancelled_request_count"] = state.cancelled_request_count;
+	out["output_slot_capacity"]    = state.output_slot_capacity;
+	out["live_output_slots"]       = state.live_output_slots;
+	out["peak_live_output_slots"]  = state.peak_live_output_slots;
+	out["output_slot_waiters"]     = state.output_slot_waiters;
+	out["live_output_bytes"]       = state.live_output_bytes;
+	out["peak_output_bytes"]       = state.peak_output_bytes;
+	out["maximum_output_slot_bytes"] = state.maximum_output_slot_bytes;
 	out["closed"]                  = state.closed;
 	return out;
 }

@@ -318,6 +318,20 @@ public:
 		return runtime_->ReadPreparedBatch(std::move(prepared));
 	}
 
+	[[nodiscard]] size_t materialized_output_bytes(const Batch& batch) const {
+		const auto layout = batch.device_batch().layout();
+		if (layout != jpeg::JpegDctDeviceLayout::kYcbcrDctGrid &&
+		    layout != jpeg::JpegDctDeviceLayout::kTransformedDctGrid) {
+			return batch.coefficient_bytes();
+		}
+		const auto y = batch.y_tensor_async();
+		const auto cbcr = batch.cbcr_tensor_async();
+		const auto element_bytes = y.dtype == jpeg::DirectDctTensorDataType::kFloat32
+		                               ? sizeof(float)
+		                               : sizeof(int16_t);
+		return (y.element_count() + cbcr.element_count()) * element_bytes;
+	}
+
 private:
 	std::shared_ptr<jpeg::DirectDctRuntime> runtime_;
 };
@@ -331,6 +345,20 @@ jpeg::JpegDctDeviceBatchOptions resolved_shadow_options(const std::string_view p
 bool native_physical_orchestration_enabled() noexcept {
 	const auto* value = std::getenv("GALP_PHASE6_NATIVE_PHYSICAL");
 	return value != nullptr && std::string_view(value) != "0";
+}
+
+size_t materialized_output_slot_capacity() {
+	// Internal construction-time A/B and low-memory rollback. Production uses
+	// two slots so input N+1 can overlap model N; this is intentionally absent
+	// from the Stable Python API.
+	const auto* value = std::getenv("GALP_DIRECT_DCT_OUTPUT_SLOT_CAPACITY");
+	if (value == nullptr || std::string_view(value) == "2") {
+		return 2U;
+	}
+	if (std::string_view(value) == "1") {
+		return 1U;
+	}
+	throw std::invalid_argument("GALP_DIRECT_DCT_OUTPUT_SLOT_CAPACITY must be 1 or 2");
 }
 
 jpeg::JpegDctImageCropRequest lower_sample_copy(const LogicalBatchRequest::Sample& sample) {
@@ -365,7 +393,8 @@ struct NativeLogicalBatchPipeline::Impl final {
 	      core(DirectDctRuntimeAdapter(manifest_path),
 	           std::string(semantic_profile_id),
 	           resolved_shadow_options(semantic_profile_id),
-	           trace) {
+	           trace,
+	           materialized_output_slot_capacity()) {
 	}
 
 	Impl(std::shared_ptr<jpeg::DirectDctRuntime> runtime,
@@ -375,7 +404,8 @@ struct NativeLogicalBatchPipeline::Impl final {
 	    : core(DirectDctRuntimeAdapter(std::move(runtime)),
 	           std::string(semantic_profile_id),
 	           std::move(options),
-	           trace) {
+	           trace,
+	           materialized_output_slot_capacity()) {
 	}
 
 	Impl(std::shared_ptr<jpeg::DirectDctRuntime> runtime,
@@ -388,7 +418,8 @@ struct NativeLogicalBatchPipeline::Impl final {
 	      core(DirectDctRuntimeAdapter(std::move(runtime)),
 	           std::string(semantic_profile_id),
 	           std::move(options),
-	           trace) {
+	           trace,
+	           materialized_output_slot_capacity()) {
 	}
 
 	[[nodiscard]] const jpeg::JpegDctShardManifestEntry& shard(const uint32_t shard_id) const {
@@ -461,7 +492,10 @@ struct NativeLogicalBatchPipeline::Impl final {
 		}
 		while (next_physical_batch < physical_shard_ids.size()) {
 			const auto loaded_id = physical_shard_ids[next_physical_batch++];
-			auto loaded = std::make_shared<jpeg::DirectDctBatch>(core.next());
+			auto loaded_batch = core.next();
+			NativeLogicalBatchPipeline::attach_materialized_output_slot(
+			    loaded_batch, core.take_delivered_output_slot_owner());
+			auto loaded = std::make_shared<jpeg::DirectDctBatch>(std::move(loaded_batch));
 			add_prefetch_metrics(last_logical_prefetch_metrics, core.prefetch_metrics());
 			active_shards.emplace(loaded_id, loaded);
 			if (loaded_id == shard_id) {
@@ -542,7 +576,9 @@ void NativeLogicalBatchPipeline::reset(std::vector<LogicalBatchRequest> requests
 
 jpeg::DirectDctBatch NativeLogicalBatchPipeline::next() {
 	if (!impl_->optimized_physical) {
-		return impl_->core.next();
+		auto batch = impl_->core.next();
+		attach_materialized_output_slot(batch, impl_->core.take_delivered_output_slot_owner());
+		return batch;
 	}
 	if (impl_->logical_state.closed || impl_->next_logical_batch >= impl_->logical_requests.size()) {
 		throw std::out_of_range("NativeLogicalBatchPipeline is closed or exhausted");
@@ -591,6 +627,11 @@ jpeg::DirectDctBatch NativeLogicalBatchPipeline::next() {
 	return result;
 }
 
+void NativeLogicalBatchPipeline::attach_materialized_output_slot(
+    jpeg::DirectDctBatch& batch, std::shared_ptr<void> output_slot_owner) noexcept {
+	batch.materialized_output_slot_owner_ = std::move(output_slot_owner);
+}
+
 bool NativeLogicalBatchPipeline::ready() const {
 	return impl_->optimized_physical && impl_->active_shards.size() != 0U ? true : impl_->core.ready();
 }
@@ -604,7 +645,19 @@ size_t NativeLogicalBatchPipeline::prefetched_batch_count() const noexcept {
 }
 
 NativePipelineState NativeLogicalBatchPipeline::state() const noexcept {
-	return impl_->optimized_physical ? impl_->logical_state : impl_->core.state();
+	if (!impl_->optimized_physical) {
+		return impl_->core.state();
+	}
+	auto state = impl_->logical_state;
+	const auto physical = impl_->core.state();
+	state.output_slot_capacity      = physical.output_slot_capacity;
+	state.live_output_slots         = physical.live_output_slots;
+	state.peak_live_output_slots    = physical.peak_live_output_slots;
+	state.output_slot_waiters       = physical.output_slot_waiters;
+	state.live_output_bytes         = physical.live_output_bytes;
+	state.peak_output_bytes         = physical.peak_output_bytes;
+	state.maximum_output_slot_bytes = physical.maximum_output_slot_bytes;
+	return state;
 }
 
 NativePipelinePrefetchMetrics NativeLogicalBatchPipeline::prefetch_metrics() const noexcept {

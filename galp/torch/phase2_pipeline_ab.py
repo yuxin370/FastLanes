@@ -282,6 +282,8 @@ def _assert_plan_and_trace(native: dict[str, Any], batch_count: int) -> None:
         "plan_ready",
         "staged",
         "awaiting_predecessor",
+        "awaiting_output_slot",
+        "output_slot_acquired",
         "read_started",
         "submitted",
         "completed",
@@ -297,10 +299,10 @@ def _assert_plan_and_trace(native: dict[str, Any], batch_count: int) -> None:
         ordered = [positions[stage] for stage in expected_chain]
         if ordered != sorted(ordered):
             raise AssertionError(f"request {ordinal} trace order is invalid: {positions}")
-        gate = positions.get("gate_release_requested")
-        if gate is None or gate >= positions["submitted"]:
+        slot = positions.get("output_slot_acquired")
+        if slot is None or slot >= positions["submitted"]:
             raise AssertionError(
-                f"request {ordinal} gate release was not requested before submission"
+                f"request {ordinal} output slot was not acquired before submission"
             )
         plan_event = trace[positions["plan_ready"]]
         _assert_equal(

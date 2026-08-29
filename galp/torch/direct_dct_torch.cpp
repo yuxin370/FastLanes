@@ -2502,6 +2502,10 @@ public:
 		return direct_dct_metrics_completion_to_dict(aggregator_.snapshot());
 	}
 
+	void progress() {
+		collect_ready();
+	}
+
 private:
 	struct PendingBatch final {
 		[[nodiscard]] galp::jpeg::DirectDctBatch* get() const noexcept {
@@ -2622,6 +2626,10 @@ public:
 				throw py::stop_iteration();
 			}
 			try {
+				// Metrics keeps a native owner reference only until the producer
+				// timing event can be finalized. Release completed observations
+				// before bounded output admission waits for that lease.
+				metrics_.progress();
 				reclaim_finished_direct_dct_batches();
 				const auto wait_started = std::chrono::steady_clock::now();
 				auto batch = TorchDirectDctBatch(native_delegate_->next(), lifetime_backend_);
@@ -2702,6 +2710,22 @@ public:
 		out["planning_ms"]           = source ? source->planning_ms() : 0.0;
 		out["io_ms"]                 = source ? source->io_staging_ms() : 0.0;
 		out["ordered_submission_ms"] = source ? source->ordered_submission_ms() : 0.0;
+		return out;
+	}
+
+	[[nodiscard]] py::dict native_state_for_test() const {
+		if (!native_delegate_) {
+			throw std::logic_error("native pipeline state is unavailable for the legacy delegate");
+		}
+		const auto state = native_delegate_->state();
+		py::dict out;
+		out["output_slot_capacity"]      = state.output_slot_capacity;
+		out["live_output_slots"]         = state.live_output_slots;
+		out["peak_live_output_slots"]    = state.peak_live_output_slots;
+		out["output_slot_waiters"]       = state.output_slot_waiters;
+		out["live_output_bytes"]         = state.live_output_bytes;
+		out["peak_output_bytes"]         = state.peak_output_bytes;
+		out["maximum_output_slot_bytes"] = state.maximum_output_slot_bytes;
 		return out;
 	}
 
@@ -2910,6 +2934,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	    .def_property_readonly("metrics", &TorchDirectDctPipeline::metrics)
 	    .def_property_readonly("_metrics_completion", &TorchDirectDctPipeline::metrics_completion)
 	    .def_property_readonly("prefetch_metrics", &TorchDirectDctPipeline::prefetch_metrics)
+	    .def_property_readonly("_native_state_for_test", &TorchDirectDctPipeline::native_state_for_test)
 	    .def_property_readonly("_lifetime_backend_for_test", &TorchDirectDctPipeline::lifetime_backend_for_test)
 	    .def_property_readonly("_segment_plans", &TorchDirectDctPipeline::segment_plans_for_test)
 	    .def("close", &TorchDirectDctPipeline::close);

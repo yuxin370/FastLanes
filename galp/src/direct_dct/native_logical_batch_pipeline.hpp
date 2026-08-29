@@ -48,6 +48,9 @@ public:
 	size_t                             close() noexcept;
 
 private:
+	static void attach_materialized_output_slot(
+	    jpeg::DirectDctBatch& batch, std::shared_ptr<void> output_slot_owner) noexcept;
+
 	struct Impl;
 	std::unique_ptr<Impl> impl_;
 };
