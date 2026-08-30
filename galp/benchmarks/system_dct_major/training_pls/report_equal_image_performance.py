@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Combine equal-image H100 RGB results with native physical B6 metrics."""
+"""Combine equal-image D2/D3/PyTorch results with native physical B6 metrics."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ EXPECTED_EPOCHS = (1, 2)
 EXPECTED_SAMPLES = 1_281_167
 EXPECTED_MICROBATCHES = 20_019
 EXPECTED_UPDATES = 1_252
-STANDARD_PIPELINES = ("dali", "pytorch")
+STANDARD_PIPELINES = ("d2", "d3", "pytorch")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -108,8 +108,12 @@ def build_report(
     standard_root = standard_root.resolve()
     native_run = native_run.resolve()
     contract = _read_json(standard_root / "contract.json")
-    if contract.get("benchmark") != "equal-image-epoch-aware-rgb-training-v1":
+    if contract.get("benchmark") != "equal-image-epoch-aware-rgb-training-v2":
         raise ValueError("standard root is not an equal-image RGB benchmark")
+    if bool(contract.get("profiling", {}).get("enabled", False)):
+        raise ValueError(
+            "profiling-only RGB runs cannot be used as formal performance evidence"
+        )
     schedule = contract.get("prefix_schedule", {})
     expected_schedule = {
         "processed_images": 2 * EXPECTED_SAMPLES,
@@ -160,7 +164,12 @@ def build_report(
 
     rows: list[dict[str, Any]] = []
     native_warm_ips = float(epoch_maps["native_b6"][2]["images_per_second"])
-    domains = {"native_b6": "dct", "dali": "rgb", "pytorch": "rgb"}
+    domains = {
+        "native_b6": "dct",
+        "d2": "rgb",
+        "d3": "rgb",
+        "pytorch": "rgb",
+    }
     for pipeline in ("native_b6", *standard_pipelines):
         for epoch in EXPECTED_EPOCHS:
             source = epoch_maps[pipeline][epoch]
@@ -195,7 +204,7 @@ def build_report(
             )
 
     report = {
-        "schema_version": "galp-equal-image-performance-report-v1",
+        "schema_version": "galp-equal-image-performance-report-v2",
         "hardware": standard_gpu,
         "workload": {
             "epochs": [1, 2],
@@ -211,10 +220,16 @@ def build_report(
         "rows": rows,
         "included_pipelines": ["native_b6", *standard_pipelines],
         "claims": {
-            "dali_vs_pytorch": (
-                "direct RGB pipeline comparison"
-                if set(STANDARD_PIPELINES).issubset(standard_pipelines)
-                else "pending; both RGB pipelines are not included in this report"
+            "d2_vs_pytorch": (
+                "direct RGB comparison with canonical order and planned crop/flip"
+                if {"d2", "pytorch"}.issubset(standard_pipelines)
+                else "pending; D2 and PyTorch are not both included"
+            ),
+            "d3_performance_ceiling": (
+                "DALI-native shuffle/crop/flip performance ceiling; order and "
+                "augmentation decisions differ from D2/PyTorch"
+                if "d3" in standard_pipelines
+                else "pending; D3 is not included"
             ),
             "rgb_vs_native_b6": (
                 "equal-image full-application comparison, not loader-only and not "

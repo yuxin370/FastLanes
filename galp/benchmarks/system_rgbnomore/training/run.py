@@ -76,6 +76,7 @@ from training.pipeline import (
     TrainingSample,
     build_training_adapter,
     load_training_manifest,
+    resolve_dali_variant,
     validate_dataset_separation,
 )
 from training.pls_experiment import (
@@ -199,7 +200,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--pls-condition-id",
-        help="pre-registered condition ID (A0-A3, B0-B7, C0-C2, or D0-D3)",
+        help="pre-registered PLS condition ID (A0, A1, B2, B6, N6, or N2)",
     )
     parser.add_argument(
         "--pls-organization",
@@ -736,6 +737,12 @@ def _build_contract(
         },
         "pipelines": {
             "rgbnomore_root": str(rgbnomore_root),
+            # The generic semantic/correctness runner keeps its historical
+            # pipeline name ("dali"), but that name now resolves exclusively
+            # to the fair native-reader D2 condition.  D3 intentionally lives
+            # in the equal-image performance runner because it changes sample
+            # order and augmentation semantics.
+            "dali": resolve_dali_variant("d2"),
             "galp_manifest": None if args.galp_manifest is None else str(args.galp_manifest.resolve()),
             "galp_manifest_sha256": galp_manifest_sha256,
             "galp_manifest_preflight": galp_manifest_preflight,
@@ -1109,6 +1116,7 @@ def _adapter_pipeline_config(
     config = {
         **contract["pipelines"],
         "execution_mode": args.execution_mode,
+        "phase": split,
     }
     if split == "validation":
         config["galp_manifest"] = contract["pipelines"].get(

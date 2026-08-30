@@ -8,11 +8,13 @@ optimizer, reset, timing window, and artifact generation remain controlled by
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import importlib
 import io
 import json
 import multiprocessing
+import os
 import sys
 import time
 from collections.abc import Mapping
@@ -40,6 +42,46 @@ from galp.benchmarks.system_rgbnomore.training.schema import DOMAINS, PIPELINES
 
 
 CANONICAL_PIPELINE_LOOKAHEAD_BATCHES = 2
+DALI_VARIANTS = ("d2", "d3")
+DALI_VARIANT_CONFIGS = {
+    "d2": {
+        "source_mode": "reader",
+        "decoder_mode": "roi",
+        "augmentation_mode": "planned",
+        "preserves_canonical_order": True,
+        "role": "fair-native-dali-baseline",
+    },
+    "d3": {
+        "source_mode": "reader",
+        "decoder_mode": "roi",
+        "augmentation_mode": "native",
+        "preserves_canonical_order": False,
+        "role": "native-dali-performance-ceiling",
+    },
+}
+
+
+def resolve_dali_variant(variant: str) -> dict[str, Any]:
+    name = str(variant).strip().lower()
+    if name not in DALI_VARIANT_CONFIGS:
+        raise ValueError(f"unknown DALI variant {variant!r}; expected {DALI_VARIANTS}")
+    return {"variant": name, **DALI_VARIANT_CONFIGS[name]}
+
+
+_FINE_NSYS_RANGES = os.environ.get("GALP_NSYS_FINE", "0") == "1"
+
+
+@contextlib.contextmanager
+def _fine_nsys_range(name: str):
+    """Emit profiling-only NVTX without creating CUDA in loader workers."""
+
+    if not _FINE_NSYS_RANGES:
+        yield
+        return
+    import nvtx
+
+    with nvtx.annotate(name, domain="galp-training"):
+        yield
 
 
 @dataclass(frozen=True)
@@ -273,6 +315,11 @@ class TrainingPipelineAdapter:
         batch_lengths: Sequence[int] | None = None,
     ) -> None:
         self._planned = _resolve_plan(self.samples, identities, decisions)
+        self._set_batch_ranges(batch_lengths)
+
+    def _set_batch_ranges(
+        self, batch_lengths: Sequence[int] | None = None
+    ) -> None:
         self._batch_lengths = list(batch_lengths or [])
         if not self._batch_lengths:
             self._batch_lengths = [
@@ -307,6 +354,9 @@ class TrainingPipelineAdapter:
             "prefetch": "framework-managed",
         }
 
+    def preserves_canonical_order(self) -> bool:
+        return True
+
     def prefetched_read_identities(self) -> list[SampleIdentity]:
         return [self._planned[int(index)][1] for index in list(self._read_indices)]
 
@@ -332,16 +382,20 @@ class _PlannedRgbDataset(torch.utils.data.Dataset):
         from PIL import Image
 
         sample, _identity, decision = self.plan[index]
-        start = time.perf_counter()
-        encoded = sample.path.read_bytes()
-        read_seconds = time.perf_counter() - start
-        start = time.perf_counter()
-        with Image.open(io.BytesIO(encoded)) as image:
-            rgb = image.convert("RGB")
-            rgb.load()
-        decode_seconds = time.perf_counter() - start
-        tensor, stages = apply_rgb_augmentation_staged(rgb, decision)
-        self.read_indices.append(index)
+        with _fine_nsys_range("pytorch.worker.read"):
+            start = time.perf_counter()
+            encoded = sample.path.read_bytes()
+            read_seconds = time.perf_counter() - start
+        with _fine_nsys_range("pytorch.worker.jpeg_decode"):
+            start = time.perf_counter()
+            with Image.open(io.BytesIO(encoded)) as image:
+                rgb = image.convert("RGB")
+                rgb.load()
+            decode_seconds = time.perf_counter() - start
+        with _fine_nsys_range("pytorch.worker.augment_preprocess"):
+            tensor, stages = apply_rgb_augmentation_staged(rgb, decision)
+        with _fine_nsys_range("pytorch.worker.result_enqueue"):
+            self.read_indices.append(index)
         return (
             tensor,
             sample.label,
@@ -383,11 +437,15 @@ class PyTorchTrainingAdapter(TrainingPipelineAdapter):
     def next_batch(self) -> TrainingBatch:
         if self._iterator is None:
             raise RuntimeError("pipeline repeat has not begun")
-        begin = time.perf_counter()
-        images, labels, indices, read, decode, augmentation, preprocess = next(self._iterator)
-        wait = time.perf_counter() - begin
-        indices_list = [int(index) for index in indices.tolist()]
-        plan = [self._planned[index] for index in indices_list]
+        with _fine_nsys_range("pytorch.main.dataloader_wait"):
+            begin = time.perf_counter()
+            images, labels, indices, read, decode, augmentation, preprocess = next(
+                self._iterator
+            )
+            wait = time.perf_counter() - begin
+        with _fine_nsys_range("pytorch.main.batch_metadata"):
+            indices_list = [int(index) for index in indices.tolist()]
+            plan = [self._planned[index] for index in indices_list]
         return TrainingBatch(
             inputs=(images,),
             labels=labels.long(),
@@ -1249,6 +1307,33 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         super().end()
 
 
+class _DaliMetadataBatchSource:
+    """Metadata stream aligned with a deterministic ``readers.file`` stream."""
+
+    def __init__(
+        self,
+        anchors: np.ndarray,
+        shapes: np.ndarray,
+        mirrors: np.ndarray,
+        batch_ranges: Sequence[Sequence[int]],
+        batch_size: int,
+    ) -> None:
+        self.anchors = anchors
+        self.shapes = shapes
+        self.mirrors = mirrors
+        self.batch_ranges = [list(values) for values in batch_ranges]
+        self.batch_size = int(batch_size)
+
+    def __call__(self, iteration: int):
+        if iteration >= len(self.batch_ranges):
+            raise StopIteration
+        indices = list(self.batch_ranges[iteration])
+        if len(indices) < self.batch_size:
+            indices.extend([indices[-1]] * (self.batch_size - len(indices)))
+        values = np.asarray(indices, dtype=np.int64)
+        return self.anchors[values], self.shapes[values], self.mirrors[values]
+
+
 class DaliTrainingAdapter(TrainingPipelineAdapter):
     pipeline = "dali"
     domain = "rgb"
@@ -1260,7 +1345,25 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
         decisions: Sequence[AugmentationDecision],
         batch_lengths: Sequence[int] | None = None,
     ) -> None:
-        super().begin(identities, decisions, batch_lengths)
+        dali_config = dict(self.config.get("dali", {}))
+        variant = resolve_dali_variant(str(dali_config.get("variant", "d2")))
+        requested_augmentation = str(variant["augmentation_mode"])
+        dali_phase = str(self.config.get("phase", "train"))
+        effective_augmentation = (
+            requested_augmentation if dali_phase == "train" else "planned"
+        )
+        if effective_augmentation == "native" and not decisions:
+            self._planned = []
+            for identity in identities:
+                sample = self.samples.get(identity.logical_sample_id)
+                if sample is None:
+                    raise KeyError(
+                        f"sample order references unknown ID {identity.logical_sample_id!r}"
+                    )
+                self._planned.append((sample, identity, None))
+            self._set_batch_ranges(batch_lengths)
+        else:
+            super().begin(identities, decisions, batch_lengths)
         if self.device.type != "cuda":
             raise RuntimeError("DALI training adapter requires a CUDA device")
         from nvidia.dali import fn, types
@@ -1268,38 +1371,65 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
 
         self._cursor = 0
         self._read_indices = []
-        batches: list[tuple[list[Path], np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-        for indices in self._batch_ranges:
-            plan = [self._planned[index] for index in indices]
-            paths = [item[0].path for item in plan]
+        self._dali_variant = str(variant["variant"])
+        self._dali_source_mode = "reader"
+        self._dali_decoder_mode = "roi"
+        self._dali_phase = dali_phase
+        self._dali_augmentation_mode = effective_augmentation
+
+        paths = [str(item[0].path) for item in self._planned]
+        if self._dali_augmentation_mode == "planned":
             anchors = np.asarray(
-                [[item[2].crop_y / item[2].source_height, item[2].crop_x / item[2].source_width] for item in plan],
+                [
+                    [
+                        item[2].crop_y / item[2].source_height,
+                        item[2].crop_x / item[2].source_width,
+                    ]
+                    for item in self._planned
+                ],
                 dtype=np.float32,
             )
             shapes = np.asarray(
-                [[item[2].crop_height / item[2].source_height, item[2].crop_width / item[2].source_width] for item in plan],
+                [
+                    [
+                        item[2].crop_height / item[2].source_height,
+                        item[2].crop_width / item[2].source_width,
+                    ]
+                    for item in self._planned
+                ],
                 dtype=np.float32,
             )
-            mirrors = np.asarray([int(item[2].horizontal_flip) for item in plan], dtype=np.int32)
-            indices = np.asarray(indices, dtype=np.int64)
-            batches.append((paths, anchors, shapes, mirrors, indices))
-        source_iterator = iter(batches)
-        self._dali_read_seconds: dict[tuple[int, ...], float] = {}
+            mirrors_host = np.asarray(
+                [int(item[2].horizontal_flip) for item in self._planned],
+                dtype=np.int32,
+            )
+        else:
+            anchors = np.empty((0, 2), dtype=np.float32)
+            shapes = np.empty((0, 2), dtype=np.float32)
+            mirrors_host = np.empty((0,), dtype=np.int32)
+        self._dali_encoded_bytes = 0
+        self._dali_source_samples = 0
+        self._dali_consumed_samples = 0
+        self._dali_handoff_seconds = 0.0
+        self._dali_run_wait_seconds = 0.0
 
-        def source():
-            value = next(source_iterator)
-            read_begin = time.perf_counter()
-            encoded = [np.fromfile(path, dtype=np.uint8) for path in value[0]]
-            read_seconds = time.perf_counter() - read_begin
-            self._read_indices.extend(int(index) for index in value[4].tolist())
-            self._dali_read_seconds[tuple(int(index) for index in value[4].tolist())] = read_seconds
-            return encoded, value[1], value[2], value[3], value[4]
+        num_threads = int(dali_config.get("num_threads", max(1, self.workers)))
+        prefetch_depth = int(
+            dali_config.get(
+                "prefetch_queue_depth", CANONICAL_PIPELINE_LOOKAHEAD_BATCHES
+            )
+        )
+        if num_threads <= 0 or prefetch_depth <= 0:
+            raise ValueError("DALI thread/prefetch values must be positive")
+        epoch = int(identities[0].epoch) if identities else 0
+        dali_seed = int(dali_config.get("seed", 11997733)) + epoch
 
         pipeline = Pipeline(
             batch_size=self.batch_size,
-            num_threads=max(1, self.workers),
+            num_threads=num_threads,
             device_id=self.device.index or 0,
-            prefetch_queue_depth=CANONICAL_PIPELINE_LOOKAHEAD_BATCHES,
+            seed=dali_seed,
+            prefetch_queue_depth=prefetch_depth,
             exec_pipelined=True,
             exec_async=True,
             # DALI's PyTorch plugin can safely expose dynamic-executor outputs
@@ -1308,27 +1438,72 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
             exec_dynamic=True,
         )
         with pipeline:
-            encoded, anchors, shapes, mirrors, indices = fn.external_source(
-                source=source,
-                num_outputs=5,
-                batch=True,
-                dtype=[types.UINT8, types.FLOAT, types.FLOAT, types.INT32, types.INT64],
-                ndim=[1, 1, 1, 0, 0],
+            encoded, indices = fn.readers.file(
+                files=paths,
+                labels=list(range(len(paths))),
+                random_shuffle=self._dali_augmentation_mode == "native",
+                initial_fill=int(dali_config.get("reader_initial_fill", 1024)),
+                pad_last_batch=True,
+                dont_use_mmap=bool(dali_config.get("reader_dont_use_mmap", False)),
+                read_ahead=bool(dali_config.get("reader_read_ahead", False)),
+                seed=dali_seed,
+                name="dali_training_reader",
             )
-            # Decode the requested crop directly.  For supported JPEGs DALI can
-            # push this ROI into nvJPEG instead of materializing every 512x512
-            # RGB image before the crop.
-            images = fn.decoders.image_slice(
-                encoded,
-                anchors,
-                shapes,
-                device="mixed",
-                output_type=types.RGB,
-                axes=[0, 1],
-                normalized_anchor=True,
-                normalized_shape=True,
+            encoded_bytes = encoded.shape(dtype=types.INT64)
+            if self._dali_augmentation_mode == "planned":
+                metadata_source = _DaliMetadataBatchSource(
+                    anchors,
+                    shapes,
+                    mirrors_host,
+                    self._batch_ranges,
+                    self.batch_size,
+                )
+                anchors_node, shapes_node, mirrors = fn.external_source(
+                    source=metadata_source,
+                    num_outputs=3,
+                    batch=True,
+                    dtype=[types.FLOAT, types.FLOAT, types.INT32],
+                    ndim=[1, 1, 0],
+                )
+            else:
+                anchors_node = None
+                shapes_node = None
+                mirrors = fn.random.coin_flip(probability=0.5, seed=dali_seed + 2)
+
+            decoder_kwargs = {
+                "device": "mixed",
+                "output_type": types.RGB,
+                "hybrid_huffman_threshold": int(
+                    dali_config.get("hybrid_huffman_threshold", 1_000_000)
+                ),
+                "hw_decoder_load": float(dali_config.get("hw_decoder_load", 0.65)),
+            }
+            if self._dali_augmentation_mode == "native":
+                images = fn.decoders.image_random_crop(
+                    encoded,
+                    random_area=[0.05, 1.0],
+                    random_aspect_ratio=[0.75, 4.0 / 3.0],
+                    num_attempts=10,
+                    seed=dali_seed + 1,
+                    **decoder_kwargs,
+                )
+            else:
+                images = fn.decoders.image_slice(
+                    encoded,
+                    anchors_node,
+                    shapes_node,
+                    axes=[0, 1],
+                    normalized_anchor=True,
+                    normalized_shape=True,
+                    **decoder_kwargs,
+                )
+            images = fn.resize(
+                images,
+                device="gpu",
+                resize_x=224,
+                resize_y=224,
+                interp_type=types.INTERP_LINEAR,
             )
-            images = fn.resize(images, device="gpu", resize_x=224, resize_y=224, interp_type=types.INTERP_LINEAR)
             images = fn.crop_mirror_normalize(
                 images,
                 device="gpu",
@@ -1338,42 +1513,112 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
                 std=[127.5, 127.5, 127.5],
                 mirror=mirrors,
             )
-            pipeline.set_outputs(images, indices)
+            pipeline.set_outputs(images, indices, encoded_bytes)
         pipeline.build()
         self._dali_pipeline = pipeline
+
+    def preserves_canonical_order(self) -> bool:
+        return self._dali_augmentation_mode != "native"
 
     def next_batch(self) -> TrainingBatch:
         from nvidia.dali.plugin.pytorch.torch_utils import to_torch_tensor
 
-        begin = time.perf_counter()
-        outputs = self._dali_pipeline.run()
-        wait = time.perf_counter() - begin
-        image_output, index_output = outputs
-        image_tensor, _image_shape = _uniform_dali_tensor(image_output)
-        # Match DALI's official PyTorch iterator: dynamic-executor outputs have
-        # independent storage and can be handed to PyTorch through DLPack;
-        # static-executor outputs require a defensive device-to-device copy.
-        images = to_torch_tensor(
-            image_tensor,
-            copy=not bool(self._dali_pipeline.exec_dynamic),
-        )
-        indices_cpu = index_output.as_cpu().as_array().reshape(-1).tolist()
-        indices = [int(value) for value in indices_cpu]
-        read_seconds = self._dali_read_seconds.pop(tuple(indices), 0.0)
-        plan = [self._planned[index] for index in indices]
-        return TrainingBatch(
-            inputs=(images,),
-            labels=torch.tensor([item[0].label for item in plan], dtype=torch.long, device=self.device),
-            identities=[item[1] for item in plan],
-            augmentations=[item[2].as_dict() for item in plan],
-            on_device=True,
-            stage_seconds={
-                "loader_data_wait": wait,
-                "read": read_seconds,
-                "read_decode_augmentation_preprocess": wait,
-            },
-            keepalive=list(outputs),
-        )
+        with _fine_nsys_range("dali.adapter.pipeline_run"):
+            begin = time.perf_counter()
+            outputs = self._dali_pipeline.run()
+            wait = time.perf_counter() - begin
+        handoff_started = time.perf_counter()
+        image_output, index_output = outputs[:2]
+        with _fine_nsys_range("dali.adapter.dlpack_handoff"):
+            image_tensor, _image_shape = _uniform_dali_tensor(image_output)
+            # Match DALI's official PyTorch iterator: dynamic-executor outputs have
+            # independent storage and can be handed to PyTorch through DLPack;
+            # static-executor outputs require a defensive device-to-device copy.
+            images = to_torch_tensor(
+                image_tensor,
+                copy=not bool(self._dali_pipeline.exec_dynamic),
+            )
+        with _fine_nsys_range("dali.adapter.index_and_byte_metadata"):
+            all_indices = [
+                int(value)
+                for value in index_output.as_cpu().as_array().reshape(-1).tolist()
+            ]
+            expected_length = self._batch_lengths[len(self._read_indices)]
+            indices = all_indices[:expected_length]
+            if int(images.shape[0]) != expected_length:
+                images = images[:expected_length]
+            if len(outputs) != 3:
+                raise RuntimeError(f"unexpected DALI output count: {len(outputs)}")
+            encoded_bytes = outputs[2].as_cpu().as_array().reshape(-1)
+            read_seconds = 0.0
+            source_bytes = int(encoded_bytes.sum())
+            source_samples = int(encoded_bytes.size)
+            plan = [self._planned[index] for index in indices]
+        self._read_indices.append(indices)
+        self._dali_run_wait_seconds += wait
+        self._dali_encoded_bytes += source_bytes
+        self._dali_source_samples += source_samples
+        self._dali_consumed_samples += len(indices)
+        handoff = time.perf_counter() - handoff_started
+        self._dali_handoff_seconds += handoff
+        with _fine_nsys_range("dali.adapter.training_batch_construct"):
+            return TrainingBatch(
+                inputs=(images,),
+                labels=torch.tensor(
+                    [item[0].label for item in plan],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                identities=[item[1] for item in plan],
+                augmentations=(
+                    [item[2].as_dict() for item in plan]
+                    if self._dali_augmentation_mode == "planned"
+                    else [
+                        {
+                            "source": "dali-native-random-resized-crop",
+                            "epoch": item[1].epoch,
+                            "logical_sample_id": item[1].logical_sample_id,
+                        }
+                        for item in plan
+                    ]
+                ),
+                on_device=True,
+                stage_seconds={
+                    "loader_data_wait": wait,
+                    "read": read_seconds,
+                    "dali_handoff": handoff,
+                    "read_decode_augmentation_preprocess": wait,
+                },
+                keepalive=list(outputs),
+            )
+
+    def loader_metrics(self) -> dict[str, Any]:
+        return {
+            "worker_semantics": "DALI native file reader and operator threads",
+            "configured_workers": self.workers,
+            "variant": self._dali_variant,
+            "source_mode": self._dali_source_mode,
+            "decoder_mode": self._dali_decoder_mode,
+            "augmentation_mode": self._dali_augmentation_mode,
+            "preserves_canonical_order": self.preserves_canonical_order(),
+            "encoded_source_bytes": self._dali_encoded_bytes,
+            "source_samples_read": self._dali_source_samples,
+            "consumed_samples": self._dali_consumed_samples,
+            "reader_overread_samples": max(
+                0, self._dali_source_samples - self._dali_consumed_samples
+            ),
+            "read_work_seconds": 0.0,
+            "read_work_timing_semantics": "unavailable for native reader",
+            "pipeline_run_wait_seconds": self._dali_run_wait_seconds,
+            "torch_handoff_host_seconds": self._dali_handoff_seconds,
+            "config": dict(self.config.get("dali", {})),
+        }
+
+    def prefetched_read_identities(self) -> list[SampleIdentity]:
+        # The native reader is owned by DALI, so a complete main-process prefetch
+        # ledger is not available.  Full-epoch coverage is validated by the runner.
+        indices = [index for batch in self._read_indices for index in batch]
+        return [self._planned[int(index)][1] for index in indices]
 
     def end(self) -> None:
         if hasattr(self, "_dali_pipeline"):

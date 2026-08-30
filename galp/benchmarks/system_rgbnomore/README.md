@@ -108,7 +108,9 @@ python3 galp/benchmarks/system_rgbnomore/inference/run.py \
 
 ## 训练入口
 
-训练使用 `training/run.py`，管线仍为 `galp`、`rgbnomore`、`dali`、`pytorch`。
+训练使用 `training/run.py`，管线仍为 `galp`、`rgbnomore`、`dali`、`pytorch`；
+其中通用 semantic/correctness runner 的历史名称 `dali` 固定映射为 D2，并写入
+contract。D3 改变顺序和增强语义，只进入下面的 equal-image 性能上限测试。
 模型固定为 RGB-no-more ViT-Ti，augmentation recipe 固定为 published v1，
 precision 固定为 FP32，因此原来的三个单值选项已经删除。
 
@@ -116,6 +118,12 @@ precision 固定为 FP32，因此原来的三个单值选项已经删除。
 prefetch worker 数。所有 pipeline 使用已冻结的 production lookahead；训练入口不再
 提供 `--prefetch-depth`，GALP 的有界预取完全由 native runtime policy 拥有。
 详见 [training guide](docs/TRAINING_BENCHMARK_RUN_GUIDE.md)。
+
+完整 equal-image RGB 性能基线使用 `training/equal_image_epoch_benchmark.py`，
+只注册 `d2`、`d3` 和 `pytorch`：D2 是 canonical order/planned augmentation 的
+原生 DALI 公平基线，D3 是 DALI-native shuffle/augmentation 性能上限。两者都固定
+`fn.readers.file`、ROI decode 和 DLPack zero-copy；历史 Python JPEG
+`external_source` reader 已删除。
 
 ## 输出与诊断边界
 

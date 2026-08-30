@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run equal-image, epoch-aware DALI/PyTorch RGB training on one GPU.
+"""Run equal-image, epoch-aware D2/D3/PyTorch RGB training on one GPU.
 
 This is the RGB-side companion to the native physical PLS runner.  It fixes
 the workload to full ImageNet epochs, microbatch 64, accumulation 16, no
@@ -10,7 +10,9 @@ is the cold observation and epoch 2 is the primary warm observation.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import hashlib
 import json
 import math
 import os
@@ -45,10 +47,12 @@ from galp.benchmarks.system_rgbnomore.training.model_factory import (
     seed_everything,
 )
 from galp.benchmarks.system_rgbnomore.training.pipeline import (
+    DALI_VARIANTS,
     TrainingBatch,
     TrainingSample,
     build_training_adapter,
     load_training_manifest,
+    resolve_dali_variant,
     validate_dataset_separation,
 )
 from galp.benchmarks.system_rgbnomore.training.sample_order import (
@@ -68,10 +72,10 @@ from galp.benchmarks.system_dct_major.training_pls.train import (
 )
 
 
-CONTRACT_SCHEMA = "galp-equal-image-rgb-epoch-contract-v1"
-CHECKPOINT_SCHEMA = "galp-equal-image-rgb-epoch-checkpoint-v1"
-RESULT_SCHEMA = "galp-equal-image-rgb-epoch-result-v1"
-PIPELINES = ("dali", "pytorch")
+CONTRACT_SCHEMA = "galp-equal-image-rgb-epoch-contract-v2"
+CHECKPOINT_SCHEMA = "galp-equal-image-rgb-epoch-checkpoint-v2"
+RESULT_SCHEMA = "galp-equal-image-rgb-epoch-result-v2"
+PIPELINES = (*DALI_VARIANTS, "pytorch")
 MICROBATCH_IMAGES = 64
 GRADIENT_ACCUMULATION = 16
 REFERENCE_EPOCHS = 300
@@ -228,6 +232,47 @@ def _parse_pipelines(value: str) -> list[str]:
     return values
 
 
+def _dali_variant_contract(args: argparse.Namespace, variant: str) -> dict[str, Any]:
+    resolved = resolve_dali_variant(variant)
+    return {
+        **resolved,
+        "num_threads": int(args.dali_num_threads),
+        "prefetch_queue_depth": int(args.dali_prefetch_depth),
+        "hybrid_huffman_threshold": int(args.dali_hybrid_huffman_threshold),
+        "hw_decoder_load": float(args.dali_hw_decoder_load),
+        "reader_initial_fill": int(args.dali_reader_initial_fill),
+        "reader_dont_use_mmap": bool(args.dali_reader_dont_use_mmap),
+        "reader_read_ahead": bool(args.dali_reader_read_ahead),
+        "seed": int(args.seed),
+        "strict_order": bool(resolved["preserves_canonical_order"]),
+        "tail_policy": (
+            "native reader pads its final physical batch and the adapter consumes "
+            "only the registered logical tail; over-read is counted"
+        ),
+        "torch_handoff": "DLPack zero-copy with the DALI dynamic executor",
+    }
+
+
+def _comparison_scope() -> dict[str, Any]:
+    return {
+        "d2_vs_pytorch": (
+            "direct RGB comparison with canonical order and planned crop/flip"
+        ),
+        "d3_performance_ceiling": (
+            "DALI-native shuffle/crop/flip performance ceiling; order and "
+            "augmentation decisions differ from D2/PyTorch"
+        ),
+        "vs_native_dct_b6": (
+            "equal-image full-application comparison; not loader-only because "
+            "the model input domains differ"
+        ),
+        "primary_performance_observation": "epoch 2 warm throughput",
+        "pipeline_process_isolation": False,
+        "epoch_1_cold_compile_order_bias": True,
+        "epoch_1_comparison_role": "diagnostic only",
+    }
+
+
 def _runtime_files() -> list[Path]:
     return [
         Path(__file__).resolve(),
@@ -263,7 +308,7 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
     published = recipe_contract(RECIPE_NAME)
     payload: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA,
-        "benchmark": "equal-image-epoch-aware-rgb-training-v1",
+        "benchmark": "equal-image-epoch-aware-rgb-training-v2",
         "pipelines": list(args.resolved_pipelines),
         "seed": int(args.seed),
         "device": str(args.device),
@@ -301,31 +346,48 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
         },
         "augmentation": {
             "policy": "standard RGB/JPEG path",
-            "decision_source": "training.augmentation.derive_augmentation",
+            "decision_source": {
+                "d2": "training.augmentation.derive_augmentation",
+                "d3": "DALI native shuffle, image_random_crop, and coin_flip",
+                "pytorch": "training.augmentation.derive_augmentation",
+            },
             "crop": "per-sample RandomResizedCrop RGB",
-            "horizontal_flip": "per-sample keyed",
-            "dali_decode": "JPEG ROI decode via image_slice then resize/normalize",
+            "horizontal_flip": "D2/PyTorch keyed; D3 DALI-native",
+            "dali_decode": "JPEG ROI decode before resize/normalize",
             "dali_torch_handoff": "DLPack zero-copy with the DALI dynamic executor",
             "pytorch_decode": "PIL full JPEG decode then crop/resize/normalize",
             "mixup": False,
             "randaugment": False,
         },
+        "dali_variants": {
+            variant: _dali_variant_contract(args, variant)
+            for variant in DALI_VARIANTS
+            if variant in args.resolved_pipelines
+        },
+        "profiling": {
+            "enabled": args.profile_epoch is not None,
+            "epoch": args.profile_epoch,
+            "warmup_microbatches": int(args.profile_warmup_microbatches),
+            "capture_microbatches": int(args.profile_microbatches),
+            "capture_control": "cudaProfilerApi",
+            "nvtx_stage_ranges": True,
+            "skip_profiled_epoch_validation": bool(
+                args.profile_skip_validation
+            ),
+        },
         "validation": {
-            "epochs": [0, 1, 2],
+            "epochs": [
+                epoch
+                for epoch in (0, 1, 2)
+                if not (
+                    args.profile_skip_validation
+                    and args.profile_epoch == epoch
+                )
+            ],
             "transform": "standard RGB centered square crop resized to 224",
             "timing_excluded_from_training_throughput": True,
         },
-        "comparison_scope": {
-            "dali_vs_pytorch": "direct pipeline comparison",
-            "vs_native_dct_b6": (
-                "equal-image full-application comparison; not loader-only because "
-                "the model input domains differ"
-            ),
-            "primary_performance_observation": "epoch 2 warm throughput",
-            "pipeline_process_isolation": False,
-            "epoch_1_cold_compile_order_bias": True,
-            "epoch_1_comparison_role": "diagnostic only",
-        },
+        "comparison_scope": _comparison_scope(),
         "runtime_files": [file_record(path) for path in _runtime_files()],
     }
     payload["contract_hash"] = sha256_json(payload)
@@ -438,21 +500,45 @@ def _all_finite(values: Sequence[torch.Tensor]) -> bool:
     return all(bool(torch.isfinite(value).all().item()) for value in values)
 
 
+@contextlib.contextmanager
+def _nvtx_range(enabled: bool, name: str):
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.cuda.nvtx.range_pop()
+
+
 def _validate_emitted(
-    batch: TrainingBatch, expected: Sequence[SampleIdentity]
+    batch: TrainingBatch,
+    expected: Sequence[SampleIdentity],
+    *,
+    require_order: bool = True,
 ) -> None:
-    if batch.identities != list(expected):
+    if require_order and batch.identities != list(expected):
         raise RuntimeError("adapter emitted sample order different from canonical order")
     if int(batch.labels.shape[0]) != len(expected):
         raise RuntimeError("adapter batch cardinality differs from schedule")
 
 
-def _adapter_config(contract: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+def _adapter_pipeline(pipeline: str) -> str:
+    return "dali" if pipeline in DALI_VARIANTS else pipeline
+
+
+def _adapter_config(
+    contract: Mapping[str, Any], *, pipeline: str, phase: str
+) -> dict[str, Any]:
+    config = {
         "execution_mode": "runtime",
         "benchmark": contract["benchmark"],
         "equal_image_contract_hash": contract["contract_hash"],
+        "phase": phase,
     }
+    if pipeline in DALI_VARIANTS:
+        config["dali"] = dict(contract["dali_variants"][pipeline])
+    return config
 
 
 def _evaluate(
@@ -478,12 +564,12 @@ def _evaluate(
     decisions = [_center_validation_decision(sample) for sample in samples]
     lengths = batch_lengths(len(samples))
     adapter = build_training_adapter(
-        pipeline,
+        _adapter_pipeline(pipeline),
         samples,
         batch_size=MICROBATCH_IMAGES,
         workers=workers,
         device=device,
-        config=_adapter_config(contract),
+        config=_adapter_config(contract, pipeline=pipeline, phase="validation"),
     )
     adapter.begin(identities, decisions, lengths)
     execution_model.eval()
@@ -561,34 +647,53 @@ def _train_epoch(
         [sample.logical_sample_id for sample in samples], seed, epoch
     )
     by_id = {sample.logical_sample_id: sample for sample in samples}
-    decisions = [
-        derive_augmentation(
-            seed=seed,
-            epoch=epoch,
-            logical_sample_id=identity.logical_sample_id,
-            source_width=by_id[identity.logical_sample_id].width,
-            source_height=by_id[identity.logical_sample_id].height,
-            domain="rgb",
-        )
-        for identity in identities
-    ]
+    dali_native_augmentation = pipeline in DALI_VARIANTS and str(
+        contract["dali_variants"][pipeline]["augmentation_mode"]
+    ) == "native"
+    decisions = (
+        []
+        if dali_native_augmentation
+        else [
+            derive_augmentation(
+                seed=seed,
+                epoch=epoch,
+                logical_sample_id=identity.logical_sample_id,
+                source_width=by_id[identity.logical_sample_id].width,
+                source_height=by_id[identity.logical_sample_id].height,
+                domain="rgb",
+            )
+            for identity in identities
+        ]
+    )
     lengths = batch_lengths(len(samples))
     adapter = build_training_adapter(
-        pipeline,
+        _adapter_pipeline(pipeline),
         samples,
         batch_size=MICROBATCH_IMAGES,
         workers=workers,
         device=device,
-        config=_adapter_config(contract),
+        config=_adapter_config(contract, pipeline=pipeline, phase="train"),
     )
     adapter.begin(identities, decisions, lengths)
     preparation_seconds = time.perf_counter() - planning_started
+    steady_started = time.perf_counter()
+    preserves_canonical_order = adapter.preserves_canonical_order()
+    coverage = bytearray(len(identities))
+    emitted_order_digest = hashlib.sha256()
     epoch_loss_sum = 0.0
     epoch_samples = 0
     epoch_updates = 0
     loader_wait = 0.0
     loader_stage_totals: dict[str, float] = {}
+    capture_loader_stage_totals: dict[str, float] = {}
     cursor = 0
+    profile = dict(contract.get("profiling", {}))
+    profile_this_epoch = bool(profile.get("enabled")) and int(
+        profile.get("epoch")
+    ) == epoch + 1
+    profile_begin = int(profile.get("warmup_microbatches", 0))
+    profile_end = profile_begin + int(profile.get("capture_microbatches", 0))
+    profiling_active = False
     try:
         for window_begin in range(0, len(lengths), GRADIENT_ACCUMULATION):
             window_lengths = lengths[
@@ -597,20 +702,55 @@ def _train_epoch(
             window_samples = sum(window_lengths)
             optimizer.zero_grad(set_to_none=True)
             learning_rate = scheduler.prepare_next_update()
+            if profile_this_epoch and window_begin == profile_begin:
+                torch.cuda.synchronize(device)
+                torch.cuda.profiler.start()
+                torch.cuda.nvtx.range_push(
+                    f"profile-rgb-{pipeline}-microbatches_"
+                    f"{profile_begin}_{profile_end - 1}"
+                )
+                profiling_active = True
             for length in window_lengths:
-                batch = adapter.next_batch()
+                stage_nvtx = profile_this_epoch and profiling_active
+                with _nvtx_range(stage_nvtx, "training.loader.next_batch"):
+                    batch = adapter.next_batch()
                 expected = identities[cursor : cursor + length]
-                _validate_emitted(batch, expected)
-                inputs, labels = _move_batch(batch, device)
-                logits = execution_model(*inputs)
-                loss = torch.nn.functional.cross_entropy(logits, labels)
+                _validate_emitted(
+                    batch,
+                    expected,
+                    require_order=preserves_canonical_order,
+                )
+                for identity in batch.identities:
+                    if identity.epoch != epoch:
+                        raise RuntimeError("adapter emitted an identity from another epoch")
+                    if not 0 <= identity.position < len(identities):
+                        raise RuntimeError("adapter emitted an out-of-range sample position")
+                    if identities[identity.position] != identity:
+                        raise RuntimeError(
+                            "adapter identity position does not match the canonical epoch set"
+                        )
+                    if coverage[identity.position]:
+                        raise RuntimeError("adapter emitted a duplicate sample position")
+                    coverage[identity.position] = 1
+                    emitted_order_digest.update(
+                        f"{identity.epoch}:{identity.position}:{identity.logical_sample_id}\n".encode(
+                            "utf-8"
+                        )
+                    )
+                with _nvtx_range(stage_nvtx, "training.input_handoff"):
+                    inputs, labels = _move_batch(batch, device)
+                with _nvtx_range(stage_nvtx, "training.model.forward"):
+                    logits = execution_model(*inputs)
+                with _nvtx_range(stage_nvtx, "training.loss"):
+                    loss = torch.nn.functional.cross_entropy(logits, labels)
                 if not bool(torch.isfinite(loss).item()) or not bool(
                     torch.isfinite(logits).all().item()
                 ):
                     raise FloatingPointError(
                         f"non-finite loss/logits in {pipeline} epoch {epoch + 1}"
                     )
-                (loss * (length / window_samples)).backward()
+                with _nvtx_range(stage_nvtx, "training.model.backward"):
+                    (loss * (length / window_samples)).backward()
                 loss_value = float(loss.detach().item())
                 epoch_loss_sum += loss_value * length
                 epoch_samples += length
@@ -619,34 +759,85 @@ def _train_epoch(
                     loader_stage_totals[name] = (
                         loader_stage_totals.get(name, 0.0) + float(value)
                     )
+                    if stage_nvtx:
+                        capture_loader_stage_totals[name] = (
+                            capture_loader_stage_totals.get(name, 0.0)
+                            + float(value)
+                        )
                 loader_wait += float(batch.stage_seconds.get("loader_data_wait", 0.0))
                 del batch, inputs, labels, logits, loss
-            gradients = [
-                parameter.grad
-                for parameter in model.parameters()
-                if parameter.grad is not None
-            ]
-            if not gradients or not _all_finite(gradients):
-                raise FloatingPointError(
-                    f"non-finite/empty gradients in {pipeline} update {global_update + 1}"
+            stage_nvtx = profile_this_epoch and profiling_active
+            with _nvtx_range(stage_nvtx, "training.optimizer"):
+                gradients = [
+                    parameter.grad
+                    for parameter in model.parameters()
+                    if parameter.grad is not None
+                ]
+                if not gradients or not _all_finite(gradients):
+                    raise FloatingPointError(
+                        f"non-finite/empty gradients in {pipeline} update {global_update + 1}"
+                    )
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=float(
+                        contract["optimizer"]["gradient_clipping_norm"]
+                    ),
                 )
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=float(
-                    contract["optimizer"]["gradient_clipping_norm"]
-                ),
-            )
-            optimizer.step()
-            weight_decayer.step(learning_rate)
-            scheduler.complete_update()
+                optimizer.step()
+                weight_decayer.step(learning_rate)
+                scheduler.complete_update()
             global_update += 1
             epoch_updates += 1
             processed_images += window_samples
+            if (
+                profile_this_epoch
+                and profiling_active
+                and window_begin + len(window_lengths) == profile_end
+            ):
+                torch.cuda.synchronize(device)
+                torch.cuda.nvtx.range_pop()
+                capture_metrics_path = os.environ.get(
+                    "GALP_NSYS_CAPTURE_METRICS"
+                )
+                if capture_metrics_path:
+                    capture_metrics = {
+                        "schema_version": "galp-training-nsys-capture-metrics-v1",
+                        "pipeline": pipeline,
+                        "begin_microbatch": profile_begin,
+                        "end_microbatch_exclusive": profile_end,
+                        "captured_microbatches": profile_end - profile_begin,
+                        "captured_images": sum(lengths[profile_begin:profile_end]),
+                        "loader_stage_seconds": capture_loader_stage_totals,
+                        "loader_stage_semantics": {
+                            "loader_data_wait": (
+                                "main-thread exposed wall time; comparable to the "
+                                "training.loader.next_batch NVTX union"
+                            ),
+                            "read_decode_augmentation_preprocess": (
+                                "summed per-sample worker work; stages overlap across "
+                                "DataLoader workers and must not be added to wall time"
+                            ),
+                        },
+                    }
+                    capture_metrics_file = Path(capture_metrics_path)
+                    capture_metrics_file.parent.mkdir(parents=True, exist_ok=True)
+                    capture_metrics_file.write_text(
+                        json.dumps(capture_metrics, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                torch.cuda.profiler.stop()
+                profiling_active = False
     finally:
+        if profiling_active:
+            torch.cuda.synchronize(device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.profiler.stop()
+            profiling_active = False
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         adapter_metrics = adapter.loader_metrics()
         adapter.close()
+    steady_seconds = time.perf_counter() - steady_started
     seconds = time.perf_counter() - epoch_started
     expected_schedule = schedule_summary(len(samples), epochs=1)
     if cursor != len(samples) or epoch_samples != len(samples):
@@ -657,6 +848,10 @@ def _train_epoch(
         raise RuntimeError(
             f"{pipeline} epoch performed {epoch_updates} updates; expected "
             f"{expected_schedule['optimizer_updates_per_epoch']}"
+        )
+    if coverage.count(1) != len(identities):
+        raise RuntimeError(
+            f"{pipeline} epoch covered {coverage.count(1)}/{len(identities)} unique positions"
         )
     tail_window_microbatches = (
         len(lengths) % GRADIENT_ACCUMULATION or GRADIENT_ACCUMULATION
@@ -678,6 +873,7 @@ def _train_epoch(
             "train_loss": epoch_loss_sum / epoch_samples,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "data_preparation_seconds": preparation_seconds,
+            "steady_training_seconds": steady_seconds,
             "loader_wait_seconds": loader_wait,
             "loader_stage_seconds": loader_stage_totals,
             "adapter_metrics": adapter_metrics,
@@ -685,6 +881,20 @@ def _train_epoch(
             "gradient_accumulation": GRADIENT_ACCUMULATION,
             "tail_microbatch_images": lengths[-1],
             "tail_update_samples": sum(lengths[-tail_window_microbatches:]),
+            "sample_order": {
+                "preserves_canonical_order": preserves_canonical_order,
+                "unique_positions": coverage.count(1),
+                "emitted_order_sha256": emitted_order_digest.hexdigest(),
+            },
+            "profile_capture": (
+                {
+                    "begin_microbatch": profile_begin,
+                    "end_microbatch_exclusive": profile_end,
+                    "captured_microbatches": profile_end - profile_begin,
+                }
+                if profile_this_epoch
+                else None
+            ),
             "training_timing_includes": (
                 "epoch schedule/augmentation construction, adapter setup, JPEG read/decode/"
                 "transform, H2D, forward, backward, optimizer, synchronization, adapter close"
@@ -784,6 +994,40 @@ def _restore_checkpoint(
         int(payload["processed_image_count"]),
         payload.get("pending_validation_epoch"),
     )
+
+
+def _profiling_skips_validation(
+    contract: Mapping[str, Any], epoch: int
+) -> bool:
+    profiling = dict(contract.get("profiling", {}))
+    return (
+        bool(profiling.get("enabled"))
+        and bool(profiling.get("skip_profiled_epoch_validation", False))
+        and int(profiling.get("epoch", -1)) == int(epoch)
+    )
+
+
+def _validation_skipped_record(
+    *,
+    pipeline: str,
+    seed: int,
+    epoch: int,
+    optimizer_update: int,
+    processed_images: int,
+) -> dict[str, Any]:
+    return {
+        "record_type": "validation_skipped",
+        "pipeline": pipeline,
+        "seed": seed,
+        "epoch": epoch,
+        "optimizer_update": optimizer_update,
+        "processed_images": processed_images,
+        "reason": (
+            "profiling-only replay: avoid post-capture inference graph compilation; "
+            "the source formal run already contains authoritative validation"
+        ),
+        "scientific_result": False,
+    }
 
 
 def _run_pipeline(
@@ -903,20 +1147,31 @@ def _run_pipeline(
     if pending_validation_epoch is not None:
         if int(pending_validation_epoch) != completed_epoch:
             raise ValueError("pending validation epoch differs from checkpoint epoch")
-        metrics.append(
-            _evaluate(
-                pipeline=pipeline,
-                execution_model=execution_model,
-                samples=val_samples,
-                workers=workers,
-                device=device,
-                contract=contract,
-                seed=seed,
-                epoch=completed_epoch,
-                optimizer_update=global_update,
-                processed_images=processed_images,
+        if _profiling_skips_validation(contract, completed_epoch):
+            metrics.append(
+                _validation_skipped_record(
+                    pipeline=pipeline,
+                    seed=seed,
+                    epoch=completed_epoch,
+                    optimizer_update=global_update,
+                    processed_images=processed_images,
+                )
             )
-        )
+        else:
+            metrics.append(
+                _evaluate(
+                    pipeline=pipeline,
+                    execution_model=execution_model,
+                    samples=val_samples,
+                    workers=workers,
+                    device=device,
+                    contract=contract,
+                    seed=seed,
+                    epoch=completed_epoch,
+                    optimizer_update=global_update,
+                    processed_images=processed_images,
+                )
+            )
         save(completed_epoch, None)
 
     for epoch in range(completed_epoch, int(contract["prefix_schedule"]["epochs"])):
@@ -939,20 +1194,31 @@ def _run_pipeline(
         metrics.append(epoch_record)
         completed_epoch = epoch + 1
         save(None, completed_epoch)
-        metrics.append(
-            _evaluate(
-                pipeline=pipeline,
-                execution_model=execution_model,
-                samples=val_samples,
-                workers=workers,
-                device=device,
-                contract=contract,
-                seed=seed,
-                epoch=completed_epoch,
-                optimizer_update=global_update,
-                processed_images=processed_images,
+        if _profiling_skips_validation(contract, completed_epoch):
+            metrics.append(
+                _validation_skipped_record(
+                    pipeline=pipeline,
+                    seed=seed,
+                    epoch=completed_epoch,
+                    optimizer_update=global_update,
+                    processed_images=processed_images,
+                )
             )
-        )
+        else:
+            metrics.append(
+                _evaluate(
+                    pipeline=pipeline,
+                    execution_model=execution_model,
+                    samples=val_samples,
+                    workers=workers,
+                    device=device,
+                    contract=contract,
+                    seed=seed,
+                    epoch=completed_epoch,
+                    optimizer_update=global_update,
+                    processed_images=processed_images,
+                )
+            )
         save(completed_epoch, None)
         run_status.update(
             completed_epoch=completed_epoch,
@@ -983,6 +1249,9 @@ def _run_pipeline(
         if row.get("record_type") == "train" and row.get("scope") == "epoch"
     ]
     validations = [row for row in records if row.get("record_type") == "validation"]
+    skipped_validations = [
+        row for row in records if row.get("record_type") == "validation_skipped"
+    ]
     total_seconds = sum(float(row["epoch_seconds"]) for row in epochs)
     total_samples = sum(int(row["epoch_samples"]) for row in epochs)
     result = {
@@ -999,6 +1268,7 @@ def _run_pipeline(
         "images_per_second": total_samples / total_seconds,
         "epoch_records": epochs,
         "validation_records": validations,
+        "validation_skipped_records": skipped_validations,
         "primary_warm_epoch": next(
             row for row in epochs if int(row["epoch"]) == DEFAULT_PREFIX_EPOCHS
         ),
@@ -1020,7 +1290,7 @@ def _run_pipeline(
 def _write_summary(output_dir: Path, results: Sequence[Mapping[str, Any]]) -> None:
     completed = [row for row in results if row.get("state") == "completed"]
     summary = {
-        "schema_version": "galp-equal-image-rgb-summary-v1",
+        "schema_version": "galp-equal-image-rgb-summary-v2",
         "results": list(results),
         "all_completed": len(completed) == len(results),
         "primary_metric": "epoch 2 images_per_second",
@@ -1052,9 +1322,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--pipelines", default="dali,pytorch")
+    parser.add_argument("--pipelines", default="d2,d3,pytorch")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--dali-num-threads", type=int, default=4)
+    parser.add_argument("--dali-prefetch-depth", type=int, default=2)
+    parser.add_argument(
+        "--dali-hybrid-huffman-threshold", type=int, default=1_000_000
+    )
+    parser.add_argument("--dali-hw-decoder-load", type=float, default=0.65)
+    parser.add_argument("--dali-reader-initial-fill", type=int, default=1024)
+    parser.add_argument(
+        "--dali-reader-dont-use-mmap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--dali-reader-read-ahead",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--seed", type=int, default=11997733)
     parser.add_argument("--epochs", type=int, default=DEFAULT_PREFIX_EPOCHS)
     parser.add_argument(
@@ -1074,17 +1361,56 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more")
     )
     parser.add_argument("--stop-after-epoch", type=int)
+    parser.add_argument("--profile-epoch", type=int, choices=(1, 2))
+    parser.add_argument("--profile-warmup-microbatches", type=int, default=512)
+    parser.add_argument("--profile-microbatches", type=int, default=1024)
+    parser.add_argument(
+        "--profile-skip-validation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "skip validation after the profiled epoch; profiling-only replays can "
+            "use the authoritative validation records copied from the source run"
+        ),
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     args.resolved_pipelines = _parse_pipelines(args.pipelines)
     if args.workers < 0:
         raise ValueError("--workers must be non-negative")
+    for name in (
+        "dali_num_threads",
+        "dali_prefetch_depth",
+        "dali_reader_initial_fill",
+    ):
+        if int(getattr(args, name)) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.dali_hybrid_huffman_threshold < 0:
+        raise ValueError("--dali-hybrid-huffman-threshold must be non-negative")
+    if not 0.0 <= args.dali_hw_decoder_load <= 1.0:
+        raise ValueError("--dali-hw-decoder-load must be in [0, 1]")
     if args.epochs != DEFAULT_PREFIX_EPOCHS:
         raise ValueError(
             f"the registered equal-image benchmark fixes --epochs={DEFAULT_PREFIX_EPOCHS}"
         )
     if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch <= args.epochs:
         raise ValueError("--stop-after-epoch must be in [1, epochs]")
+    if args.profile_warmup_microbatches < 0 or args.profile_microbatches <= 0:
+        raise ValueError("profiling warmup must be non-negative and capture must be positive")
+    if (
+        args.profile_warmup_microbatches % GRADIENT_ACCUMULATION
+        or args.profile_microbatches % GRADIENT_ACCUMULATION
+    ):
+        raise ValueError("profiling bounds must align to gradient accumulation")
+    if (
+        args.profile_warmup_microbatches + args.profile_microbatches
+        > schedule_summary(args.expected_train_images, epochs=1)[
+            "microbatches_per_epoch"
+        ]
+    ):
+        raise ValueError("profiling range exceeds one epoch")
+    if args.profile_skip_validation and args.profile_epoch is None:
+        raise ValueError("--profile-skip-validation requires --profile-epoch")
     return args
 
 
@@ -1097,7 +1423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _atomic_json(
         output_dir / "execution_plan.json",
         {
-            "schema_version": "galp-equal-image-rgb-execution-plan-v1",
+            "schema_version": "galp-equal-image-rgb-execution-plan-v2",
             "execute_requested": bool(args.execute),
             "pipeline_order": list(args.resolved_pipelines),
             "device": args.device,

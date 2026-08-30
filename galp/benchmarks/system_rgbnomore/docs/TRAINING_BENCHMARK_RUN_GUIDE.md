@@ -289,9 +289,13 @@ python3 galp/benchmarks/system_rgbnomore/training/v3_acceptance.py \
 短 step benchmark 不能与完整 Native PLS epoch 直接相除。以下入口固定完整
 ImageNet、microbatch 64、accumulation 16、不丢尾部、每 epoch 20,019 个
 microbatch 和 1,252 个 optimizer update。Epoch 1 是 cold observation，Epoch 2
-是主要 warm observation。DALI/PyTorch 共享同一 RGB 模型初始状态、sample order、
-augmentation key、optimizer 和 300-epoch scheduler horizon。
-两条 RGB pipeline 在同一进程中按注册顺序运行，因此 Epoch 1 还包含编译缓存的
+是主要 warm observation。正式 DALI 条件只有 D2 和 D3：D2 使用原生
+`readers.file`、canonical order 与 planned crop/flip；D3 使用同一个原生 reader
+和 ROI decoder，但使用 DALI-native shuffle/crop/flip，定位为性能上限。旧的 Python
+batch/parallel `external_source` JPEG reader 不再属于正式实现。D2/PyTorch 共享同一
+RGB 模型初始状态、sample order、augmentation key、optimizer 和 300-epoch scheduler
+horizon；D3 只共享模型与优化器 recipe，不声明顺序或逐样本增强等价。
+三条 RGB pipeline 在同一进程中按注册顺序运行，因此 Epoch 1 还包含编译缓存的
 顺序效应，只作为诊断记录，不用于 pipeline 排名；正式直接性能比较只使用 Epoch 2。
 
 先生成不可变 contract，不启动训练：
@@ -310,7 +314,7 @@ PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
   --train-manifest "$E2E/training_manifests_official_v3/train.json" \
   --val-manifest "$E2E/training_manifests_official_v3/val.json" \
   --output-dir "$OUT" \
-  --pipelines dali,pytorch \
+  --pipelines d2,d3,pytorch \
   --device cuda:0
 ```
 
@@ -321,7 +325,7 @@ PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
   --train-manifest "$E2E/training_manifests_official_v3/train.json" \
   --val-manifest "$E2E/training_manifests_official_v3/val.json" \
   --output-dir "$OUT" \
-  --pipelines dali,pytorch \
+  --pipelines d2,d3,pytorch \
   --device cuda:0 \
   --execute
 ```
@@ -329,7 +333,7 @@ PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
 runner 在 checkpoint epoch boundary 自动恢复；已存在且 contract 相同的完整
 pipeline 不会重跑。默认要求所选 GPU 名称包含 `H100`，避免 PCI bus 映射错误。
 
-Native B6 H100 完成 E2 后生成三路统一表：
+Native B6 H100 完成 E2 后生成四路统一表：
 
 ```bash
 PLS_PYTHONPATH="$PWD/galp/benchmarks/system_dct_major:$PWD/build/galp/torch"

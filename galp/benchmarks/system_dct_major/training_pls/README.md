@@ -271,11 +271,13 @@ not calculate a confidence interval from one seed.
 - `report.py`: curves, final metrics, paired/factorial effects, Student-t CIs.
 - `audit_goal.py`: read-only formal-matrix, live-process, and evidence-boundary audit.
 - `report_premixed_milestone.py`: strict common-epoch single-seed Premixed report.
-- `galp/benchmarks/system_rgbnomore/training/equal_image_epoch_benchmark.py`: H100 DALI/PyTorch
-  full-ImageNet E1/E2 runner with microbatch 64, accumulation 16, exact tail,
-  shared RGB initialization, and epoch-boundary resume.
+- `galp/benchmarks/system_rgbnomore/training/equal_image_epoch_benchmark.py`: H100
+  D2/D3/PyTorch full-ImageNet E1/E2 runner with microbatch 64, accumulation 16,
+  exact tail, shared RGB initialization, and epoch-boundary resume. D2 is the
+  canonical-order planned-augmentation native DALI baseline; D3 is the
+  DALI-native shuffle/augmentation performance ceiling.
 - `report_equal_image_performance.py`: fail-closed H100 equal-image table combining
-  Native physical B6 with the DALI/PyTorch E1/E2 artifacts.
+  Native physical B6 with the D2/D3/PyTorch E1/E2 artifacts.
 
 The report includes every condition and seed. Throughput, memory, loader timing,
 and class composition are explanatory only and never select a condition.
