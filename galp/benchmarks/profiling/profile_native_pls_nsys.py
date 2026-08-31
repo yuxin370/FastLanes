@@ -142,10 +142,12 @@ def _make_profiled_epoch(
         captured_images = 0
         captured_microbatches = 0
         captured_updates = 0
+        capture_prefetch_start: dict[str, Any] | None = None
 
         while pipeline.has_next_pool:
             if pool_count == warmup_pools:
                 torch.cuda.synchronize(device)
+                capture_prefetch_start = pipeline.prefetch_stats
                 torch.cuda.profiler.start()
                 torch.cuda.nvtx.range_push(
                     f"profile-galp-native-b6-pools_{warmup_pools}_{capture_end_pool - 1}"
@@ -336,13 +338,13 @@ def _make_profiled_epoch(
                         f"native PLS pool consumed {pool_seen_images}/{pool_images} images"
                     )
                 boundary_context = (
-                    _range("galp.pool.sync_stats_reclaim")
+                    _range("galp.pool.retire_stats_reclaim")
                     if profiling_active
                     else contextlib.nullcontext()
                 )
                 with boundary_context:
-                    torch.cuda.synchronize(device)
                     _pool_stats = pool.execution_stats
+                    pool.retire()
                     del pool
                     pipeline.reclaim_finished_pools()
 
@@ -350,6 +352,24 @@ def _make_profiled_epoch(
             if profiling_active and pool_count == capture_end_pool:
                 torch.cuda.synchronize(device)
                 capture_seconds = time.perf_counter() - float(capture_started_wall)
+                capture_prefetch_end = pipeline.prefetch_stats
+                capture_prefetch = {
+                    key: (
+                        float(value)
+                        - float((capture_prefetch_start or {}).get(key, 0.0))
+                        if isinstance(value, (int, float))
+                        and key
+                        not in {
+                            "context_capacity",
+                            "live_context_count",
+                            "peak_live_context_count",
+                            "context_waiter_count",
+                            "peak_context_waiter_count",
+                        }
+                        else value
+                    )
+                    for key, value in capture_prefetch_end.items()
+                }
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.profiler.stop()
                 pipeline.close()
@@ -364,6 +384,9 @@ def _make_profiled_epoch(
                     "captured_optimizer_updates": captured_updates,
                     "captured_images": captured_images,
                     "capture_wall_seconds_with_instrumentation": capture_seconds,
+                    "native_pool_prefetch_start": capture_prefetch_start,
+                    "native_pool_prefetch_end": capture_prefetch_end,
+                    "native_pool_prefetch": capture_prefetch,
                     "outer_nvtx": (
                         f"profile-galp-native-b6-pools_{warmup_pools}_"
                         f"{capture_end_pool - 1}"

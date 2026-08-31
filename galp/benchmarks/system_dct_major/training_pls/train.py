@@ -946,7 +946,6 @@ def _train_native_physical_epoch(
                 f"native PLS pool consumed {pool_seen_images}/{pool_images} images"
             )
         wait_started = time.perf_counter()
-        torch.cuda.synchronize(device)
         pool_stats = pool.execution_stats
         for key, value in pool_stats.items():
             if isinstance(value, bool):
@@ -963,6 +962,10 @@ def _train_native_physical_epoch(
                     native_execution_stats[key] = value
                 elif previous != value:
                     native_execution_stats[key] = "mixed"
+        # Retiring the scheduling context admits exactly one next-pool prepare.
+        # Tensor backing remains owned by NativeBatchLease until the current
+        # stream and every explicitly registered consumer are complete.
+        pool.retire()
         del pool
         pipeline.reclaim_finished_pools()
         pool_boundary_wait_seconds += time.perf_counter() - wait_started
@@ -975,6 +978,20 @@ def _train_native_physical_epoch(
             f"{expected_sample_count} unique images"
         )
     epoch_seconds = time.perf_counter() - epoch_started
+    pool_prefetch_stats = pipeline.prefetch_stats
+    total_prepare_ms = float(pool_prefetch_stats["prepare_plan_ms"]) + float(
+        pool_prefetch_stats["prepare_io_ms"]
+    )
+    exposed_prepare_ms = min(
+        total_prepare_ms, float(pool_prefetch_stats["activation_wait_ms"])
+    )
+    # This ratio covers only the prepare work owned by the lookahead worker.
+    # Activation/materialization remains visible in native_pool_load_seconds.
+    pool_prefetch_stats["pool_prepare_hidden_ratio"] = (
+        0.0
+        if total_prepare_ms <= 0.0
+        else max(0.0, 1.0 - exposed_prepare_ms / total_prepare_ms)
+    )
     loader_totals["native_pool_load_seconds"] = (
         loader_totals.get("native_pool_load_seconds", 0.0) + pool_load_seconds
     )
@@ -985,6 +1002,12 @@ def _train_native_physical_epoch(
     loader_totals["native_pool_count"] = (
         loader_totals.get("native_pool_count", 0.0) + pool_count
     )
+    for key, value in pool_prefetch_stats.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            loader_key = f"native_pool_prefetch.{key}"
+            loader_totals[loader_key] = loader_totals.get(loader_key, 0.0) + float(
+                value
+            )
     for key, value in native_execution_stats.items():
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             loader_key = f"native_execution.{key}"
@@ -1016,6 +1039,7 @@ def _train_native_physical_epoch(
             "native_pool_load_seconds": pool_load_seconds,
             "native_pool_boundary_wait_seconds": pool_boundary_wait_seconds,
             "native_pool_count": pool_count,
+            "native_pool_prefetch": pool_prefetch_stats,
             "native_execution_stats": native_execution_stats,
             "sample_order_digest": order_hash.hexdigest(),
             "pool_membership_digest": pool_membership_hash.hexdigest(),

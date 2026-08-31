@@ -37,6 +37,7 @@ class _NativePool:
 
     def __init__(self) -> None:
         self._done = False
+        self.retired = False
 
     def __iter__(self):
         return self
@@ -50,12 +51,20 @@ class _NativePool:
     def microbatch(self, _index: int):
         return _NativeMicrobatch()
 
+    def retire(self) -> None:
+        self.retired = True
+
 
 class _NativePipeline:
     sample_count = 1281167
     pls_count = 1252
     segment_images = 1024
     has_next_pool = True
+    prefetch_stats = {
+        "context_capacity": 2,
+        "live_context_count": 1,
+        "peak_live_context_count": 2,
+    }
 
     def __init__(self, manifest, mapping, seed, mapping_sha256, **options) -> None:
         self.arguments = (manifest, mapping, seed, mapping_sha256, options)
@@ -101,6 +110,7 @@ class ExperimentalDirectDctPlsApiTest(unittest.TestCase):
         pool = pipeline.next_pool()
         self.assertEqual(pool.virtual_pls_ids, [11, 5, 8, 2])
         self.assertEqual(pool.execution_stats["selected_vector_count"], 7)
+        self.assertEqual(pipeline.prefetch_stats["context_capacity"], 2)
         microbatch = next(pool)
         self.assertEqual(microbatch.tensors, ("pls-y", "pls-cbcr", "pls-targets"))
         self.assertEqual(microbatch.global_image_ids, [9, 3])
@@ -108,6 +118,8 @@ class ExperimentalDirectDctPlsApiTest(unittest.TestCase):
         stream = SimpleNamespace(cuda_stream=4321, device_index=0)
         microbatch.record_stream(stream)
         self.assertEqual(microbatch._native.record_stream_calls, [(), (4321, 0)])
+        pool.retire()
+        self.assertTrue(pool._native.retired)
 
 
 if __name__ == "__main__":

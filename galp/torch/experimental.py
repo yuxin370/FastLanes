@@ -105,6 +105,15 @@ class DirectDctPlsPool:
     def microbatch(self, index: int) -> DirectDctPlsMicrobatch:
         return DirectDctPlsMicrobatch(self._native.microbatch(int(index)))
 
+    def retire(self) -> None:
+        """Retire this scheduling context after submitting its model work.
+
+        Tensor backing remains protected independently by the native
+        producer/consumer completion contract.
+        """
+
+        self._native.retire()
+
     @property
     def epoch(self) -> int:
         return int(self._native.epoch)
@@ -222,6 +231,10 @@ class DirectDctPlsPipeline:
     @property
     def segment_images(self) -> int:
         return int(self._native.segment_images)
+
+    @property
+    def prefetch_stats(self) -> dict[str, Any]:
+        return dict(self._native.prefetch_stats)
 
 
 __all__ = [

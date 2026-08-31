@@ -112,6 +112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elapsed = time.perf_counter() - started
     if images != pool.image_count or updates != math.ceil(pool.microbatch_count / 16):
         raise RuntimeError("native physical training smoke did not consume one full pool")
+    pool.retire()
     del pool
     pipeline.reclaim_finished_pools()
     pipeline.close()

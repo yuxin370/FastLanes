@@ -8,18 +8,23 @@
 #include <bit>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <numbers>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -919,7 +924,128 @@ DirectDctPlsAugmentationDecision derive_direct_dct_pls_augmentation(const Direct
 	return result;
 }
 
+namespace {
+
+using PlsPoolClock = std::chrono::steady_clock;
+
+double elapsed_ms(const PlsPoolClock::time_point begin, const PlsPoolClock::time_point end) {
+	return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+// Bounds scheduling contexts, not device-storage lifetime. Retiring a context
+// admits the next CPU/I/O prepare; NativeBatchLease/NativeBatchCompletion still
+// retain the pool's actual backing until producer and consumers are complete.
+class DirectDctPlsPoolContextSlots : public std::enable_shared_from_this<DirectDctPlsPoolContextSlots> {
+public:
+	static constexpr size_t kCapacity = 2U;
+
+	class Permit {
+	public:
+		explicit Permit(std::shared_ptr<DirectDctPlsPoolContextSlots> owner)
+		    : owner_(std::move(owner)) {
+		}
+		~Permit() {
+			if (owner_) {
+				owner_->release();
+			}
+		}
+		Permit(const Permit&)            = delete;
+		Permit& operator=(const Permit&) = delete;
+
+	private:
+		std::shared_ptr<DirectDctPlsPoolContextSlots> owner_;
+	};
+
+	std::shared_ptr<void> acquire() {
+		std::unique_lock lock(mutex_);
+		++stats_.context_waiter_count;
+		stats_.peak_context_waiter_count =
+		    std::max(stats_.peak_context_waiter_count, stats_.context_waiter_count);
+		cv_.wait(lock, [this] { return stopping_ || stats_.live_context_count < kCapacity; });
+		--stats_.context_waiter_count;
+		if (stopping_) {
+			return {};
+		}
+		++stats_.live_context_count;
+		stats_.peak_live_context_count =
+		    std::max(stats_.peak_live_context_count, stats_.live_context_count);
+		return std::make_shared<Permit>(shared_from_this());
+	}
+
+	void stop() noexcept {
+		{
+			std::lock_guard lock(mutex_);
+			stopping_ = true;
+		}
+		cv_.notify_all();
+	}
+	void reset_epoch_stats() noexcept {
+		std::lock_guard lock(mutex_);
+		const auto live                = stats_.live_context_count;
+		stats_                         = DirectDctPlsPoolPrefetchStats {};
+		stats_.live_context_count      = live;
+		stats_.peak_live_context_count = live;
+	}
+
+	void prepare_started() noexcept {
+		std::lock_guard lock(mutex_);
+		++stats_.prepare_started_count;
+	}
+	void prepare_completed(const double plan_ms, const double io_ms) noexcept {
+		std::lock_guard lock(mutex_);
+		++stats_.prepare_completed_count;
+		stats_.prepare_plan_ms += plan_ms;
+		stats_.prepare_io_ms += io_ms;
+	}
+	void activated(const double wait_ms, const double activation_ms) noexcept {
+		std::lock_guard lock(mutex_);
+		++stats_.activation_count;
+		stats_.activation_wait_ms += wait_ms;
+		stats_.activation_ms += activation_ms;
+	}
+	[[nodiscard]] DirectDctPlsPoolPrefetchStats snapshot() const noexcept {
+		std::lock_guard lock(mutex_);
+		return stats_;
+	}
+
+private:
+	void release() noexcept {
+		{
+			std::lock_guard lock(mutex_);
+			if (stats_.live_context_count != 0U) {
+				--stats_.live_context_count;
+			}
+			++stats_.retired_count;
+		}
+		cv_.notify_one();
+	}
+
+	mutable std::mutex            mutex_;
+	std::condition_variable       cv_;
+	bool                          stopping_ = false;
+	DirectDctPlsPoolPrefetchStats stats_;
+};
+
+struct PendingDirectDctPlsPool {
+	DirectDctPlsPoolPlan        plan;
+	DirectDctPlsScheduleOptions schedule;
+};
+
+struct PreparedDirectDctPlsPool {
+	std::shared_ptr<void>                                 context_owner;
+	DirectDctPlsPoolPlan                                 plan;
+	std::vector<int64_t>                                 labels;
+	std::vector<detail::DirectDctPlsRandAugmentDecision> randaugment;
+	std::vector<detail::DirectDctPlsMixupDecision>       mixup;
+	DirectDctPreparedBatch                               prepared;
+};
+
+} // namespace
+
 struct DirectDctPlsPoolBatch::Impl {
+	// Declared first so implicit destruction releases the scheduling permit
+	// only after postprocess and Direct-DCT backing owners are destroyed.
+	std::shared_ptr<void>                                  pool_context_owner;
 	DirectDctPlsPoolPlan                                 plan;
 	DirectDctBatch                                       batch;
 	std::vector<int64_t>                                 labels;
@@ -935,14 +1061,22 @@ DirectDctPlsPoolBatch& DirectDctPlsPoolBatch::operator=(DirectDctPlsPoolBatch&&)
 DirectDctPlsPoolBatch::DirectDctPlsPoolBatch(DirectDctPlsPoolPlan plan,
                                              DirectDctBatch       batch,
                                              std::vector<int64_t> labels,
-                                             const uint32_t       microbatch_images)
+                                             const uint32_t       microbatch_images,
+                                             std::shared_ptr<void> pool_context_owner)
     : impl_(std::make_unique<Impl>(Impl {
+	      std::move(pool_context_owner),
           std::move(plan),
           std::move(batch),
           std::move(labels),
           microbatch_images,
           nullptr,
       })) {
+}
+
+void DirectDctPlsPoolBatch::retire_context() noexcept {
+	if (impl_) {
+		impl_->pool_context_owner.reset();
+	}
 }
 
 uint32_t DirectDctPlsPoolBatch::epoch() const noexcept {
@@ -1003,6 +1137,16 @@ struct DirectDctPlsPipeline::Impl {
 	DirectDctRuntime                         runtime;
 	DirectDctPlsLayout                       layout;
 	std::optional<DirectDctPlsEpochSchedule> epoch;
+	std::shared_ptr<DirectDctPlsPoolContextSlots>  context_slots =
+	    std::make_shared<DirectDctPlsPoolContextSlots>();
+	mutable std::mutex                            work_mutex;
+	std::condition_variable                       work_cv;
+	std::optional<PendingDirectDctPlsPool>         pending;
+	std::optional<PreparedDirectDctPlsPool>        ready;
+	std::exception_ptr                            worker_failure;
+	bool                                          worker_busy = false;
+	bool                                          stopping    = false;
+	std::thread                                   worker;
 
 	Impl(const std::filesystem::path& manifest_path,
 	     const std::filesystem::path& mapping_csv,
@@ -1029,6 +1173,103 @@ struct DirectDctPlsPipeline::Impl {
 				                         "transformed-grid planless execution");
 			}
 		}
+		worker = std::thread([this] { worker_loop(); });
+	}
+
+	~Impl() {
+		{
+			std::lock_guard lock(work_mutex);
+			stopping = true;
+		}
+		context_slots->stop();
+		work_cv.notify_all();
+		if (worker.joinable()) {
+			worker.join();
+		}
+	}
+
+	void enqueue_next_locked() {
+		if (!epoch.has_value() || !epoch->has_next() || pending.has_value() || worker_busy || ready.has_value()) {
+			return;
+		}
+		pending.emplace(PendingDirectDctPlsPool {epoch->next_pool(), options.schedule});
+	}
+
+	PreparedDirectDctPlsPool prepare_pool(PendingDirectDctPlsPool source) {
+		auto context_owner = context_slots->acquire();
+		if (!context_owner) {
+			return {};
+		}
+		context_slots->prepare_started();
+		const auto plan_started = PlsPoolClock::now();
+		std::vector<JpegDctImageCropRequest>                    requests;
+		std::vector<int64_t>                                    labels;
+		std::vector<detail::DirectDctPlsRandAugmentDecision>    randaugment;
+		requests.reserve(source.plan.ordered_positions.size());
+		labels.reserve(source.plan.ordered_positions.size());
+		randaugment.reserve(source.plan.ordered_positions.size());
+		for (const auto physical_position : source.plan.ordered_positions) {
+			const auto& sample       = layout.sample(physical_position);
+			const auto  metadata     = runtime.ImageMetadata(sample.global_image_index);
+			auto        augmentation = derive_direct_dct_pls_augmentation(
+			    sample, metadata.image_width, metadata.image_height, source.schedule);
+			requests.push_back(std::move(augmentation.request));
+			labels.push_back(sample.label);
+			randaugment.push_back(detail::derive_published_randaugment_decision(sample, source.schedule));
+		}
+		std::vector<detail::DirectDctPlsMixupDecision> mixup;
+		const auto microbatch_count =
+		    (labels.size() + source.schedule.microbatch_images - 1U) / source.schedule.microbatch_images;
+		mixup.reserve(microbatch_count);
+		for (size_t index = 0U; index < microbatch_count; ++index) {
+			mixup.push_back(detail::derive_published_mixup_decision(
+			    source.schedule.training_seed,
+			    source.schedule.epoch,
+			    source.plan.first_microbatch_index + index));
+		}
+		auto prepared          = runtime.PrepareBatch(requests, options.device);
+		const auto plan_done   = PlsPoolClock::now();
+		runtime.StageBatchIo(prepared);
+		const auto io_done = PlsPoolClock::now();
+		context_slots->prepare_completed(elapsed_ms(plan_started, plan_done), elapsed_ms(plan_done, io_done));
+		return PreparedDirectDctPlsPool {
+		    std::move(context_owner),
+		    std::move(source.plan),
+		    std::move(labels),
+		    std::move(randaugment),
+		    std::move(mixup),
+		    std::move(prepared),
+		};
+	}
+
+	void worker_loop() noexcept {
+		for (;;) {
+			std::optional<PendingDirectDctPlsPool> source;
+			{
+				std::unique_lock lock(work_mutex);
+				work_cv.wait(lock, [this] { return stopping || pending.has_value(); });
+				if (stopping) {
+					return;
+				}
+				source.emplace(std::move(*pending));
+				pending.reset();
+				worker_busy = true;
+			}
+			try {
+				auto prepared = prepare_pool(std::move(*source));
+				std::lock_guard lock(work_mutex);
+				worker_busy = false;
+				if (stopping) {
+					return;
+				}
+				ready.emplace(std::move(prepared));
+			} catch (...) {
+				std::lock_guard lock(work_mutex);
+				worker_busy    = false;
+				worker_failure = std::current_exception();
+			}
+			work_cv.notify_all();
+		}
 	}
 };
 
@@ -1043,56 +1284,67 @@ DirectDctPlsPipeline::DirectDctPlsPipeline(DirectDctPlsPipeline&&) noexcept     
 DirectDctPlsPipeline& DirectDctPlsPipeline::operator=(DirectDctPlsPipeline&&) noexcept = default;
 
 void DirectDctPlsPipeline::start_epoch(const uint32_t epoch) {
-	auto schedule                 = impl_->options.schedule;
-	schedule.epoch                = epoch;
-	impl_->options.schedule.epoch = epoch;
+	std::lock_guard lock(impl_->work_mutex);
+	if (impl_->pending.has_value() || impl_->ready.has_value() || impl_->worker_busy ||
+	    (impl_->epoch.has_value() && impl_->epoch->has_next())) {
+		throw std::logic_error("Direct-DCT PLS previous epoch still has pending pool work");
+	}
+	auto schedule                  = impl_->options.schedule;
+	schedule.epoch                 = epoch;
+	impl_->options.schedule.epoch  = epoch;
+	impl_->worker_failure          = nullptr;
 	impl_->epoch.emplace(impl_->layout, schedule);
+	impl_->context_slots->reset_epoch_stats();
+	impl_->enqueue_next_locked();
+	impl_->work_cv.notify_one();
 }
 
 bool DirectDctPlsPipeline::has_next_pool() const noexcept {
-	return impl_ && impl_->epoch.has_value() && impl_->epoch->has_next();
+	if (!impl_) {
+		return false;
+	}
+	std::lock_guard lock(impl_->work_mutex);
+	return impl_->worker_failure != nullptr || impl_->pending.has_value() || impl_->worker_busy ||
+	       impl_->ready.has_value() || (impl_->epoch.has_value() && impl_->epoch->has_next());
 }
 
 DirectDctPlsPoolBatch DirectDctPlsPipeline::next_pool() {
-	if (!has_next_pool()) {
-		throw std::out_of_range("Direct-DCT PLS pipeline has no pending pool; start an epoch first");
+	const auto wait_started = PlsPoolClock::now();
+	std::optional<PreparedDirectDctPlsPool> prepared;
+	{
+		std::unique_lock lock(impl_->work_mutex);
+		if (!impl_->worker_failure && !impl_->pending && !impl_->worker_busy && !impl_->ready &&
+		    (!impl_->epoch.has_value() || !impl_->epoch->has_next())) {
+			throw std::out_of_range("Direct-DCT PLS pipeline has no pending pool; start an epoch first");
+		}
+		impl_->work_cv.wait(lock, [this] { return impl_->worker_failure != nullptr || impl_->ready.has_value(); });
+		if (impl_->worker_failure) {
+			std::rethrow_exception(impl_->worker_failure);
+		}
+		prepared.emplace(std::move(*impl_->ready));
+		impl_->ready.reset();
+		impl_->enqueue_next_locked();
 	}
-	auto                                                 plan = impl_->epoch->next_pool();
-	std::vector<JpegDctImageCropRequest>                 requests;
-	std::vector<int64_t>                                 labels;
-	std::vector<detail::DirectDctPlsRandAugmentDecision> randaugment;
-	requests.reserve(plan.ordered_positions.size());
-	labels.reserve(plan.ordered_positions.size());
-	randaugment.reserve(plan.ordered_positions.size());
-	for (const auto physical_position : plan.ordered_positions) {
-		const auto& sample       = impl_->layout.sample(physical_position);
-		const auto  metadata     = impl_->runtime.ImageMetadata(sample.global_image_index);
-		auto        augmentation = derive_direct_dct_pls_augmentation(
-            sample, metadata.image_width, metadata.image_height, impl_->options.schedule);
-		requests.push_back(std::move(augmentation.request));
-		labels.push_back(sample.label);
-		randaugment.push_back(detail::derive_published_randaugment_decision(sample, impl_->options.schedule));
-	}
-	std::vector<detail::DirectDctPlsMixupDecision> mixup;
-	const auto                                     microbatch_count =
-	    (labels.size() + impl_->options.schedule.microbatch_images - 1U) / impl_->options.schedule.microbatch_images;
-	mixup.reserve(microbatch_count);
-	for (size_t index = 0U; index < microbatch_count; ++index) {
-		mixup.push_back(detail::derive_published_mixup_decision(
-		    impl_->options.schedule.training_seed, impl_->options.schedule.epoch, plan.first_microbatch_index + index));
-	}
-	auto batch  = impl_->runtime.ReadBatch(requests, impl_->options.device);
-	auto result = DirectDctPlsPoolBatch(
-	    std::move(plan), std::move(batch), std::move(labels), impl_->options.schedule.microbatch_images);
+	impl_->work_cv.notify_one();
+	const auto activation_started = PlsPoolClock::now();
+	auto       batch              = impl_->runtime.ReadPreparedBatch(std::move(prepared->prepared));
+	auto result = DirectDctPlsPoolBatch(std::move(prepared->plan),
+	                                        std::move(batch),
+	                                        std::move(prepared->labels),
+	                                        impl_->options.schedule.microbatch_images,
+	                                        std::move(prepared->context_owner));
 	result.impl_->postprocess =
 	    std::make_unique<detail::DirectDctPlsCudaPostprocess>(result.impl_->batch,
 	                                                          result.impl_->labels,
-	                                                          randaugment,
-	                                                          mixup,
+	                                                          prepared->randaugment,
+	                                                          prepared->mixup,
 	                                                          impl_->options.schedule.microbatch_images,
 	                                                          impl_->options.model_classes,
 	                                                          impl_->options.enable_published_randaugment,
 	                                                          impl_->options.enable_published_mixup);
+	const auto activation_done = PlsPoolClock::now();
+	impl_->context_slots->activated(elapsed_ms(wait_started, activation_started),
+	                                elapsed_ms(activation_started, activation_done));
 	return result;
 }
 
@@ -1101,6 +1353,9 @@ const DirectDctPlsLayout& DirectDctPlsPipeline::layout() const noexcept {
 }
 const DirectDctPlsPipelineOptions& DirectDctPlsPipeline::options() const noexcept {
 	return impl_->options;
+}
+DirectDctPlsPoolPrefetchStats DirectDctPlsPipeline::prefetch_stats() const noexcept {
+	return impl_ ? impl_->context_slots->snapshot() : DirectDctPlsPoolPrefetchStats {};
 }
 
 } // namespace galp::jpeg

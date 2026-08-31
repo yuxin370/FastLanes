@@ -260,6 +260,15 @@ public:
 	    , storage_lifetime_(std::make_shared<PlsExternalTensorLifetime>(
 	          owner_, static_cast<c10::DeviceIndex>(owner_->batch().cuda_device()))) {
 	}
+	~TorchDirectDctPlsPool() {
+		retire();
+	}
+
+	void retire() noexcept {
+		if (owner_) {
+			owner_->retire_context();
+		}
+	}
 
 	std::shared_ptr<TorchDirectDctPlsMicrobatch> microbatch(const size_t index) const {
 		return std::make_shared<TorchDirectDctPlsMicrobatch>(owner_, storage_lifetime_, index);
@@ -400,6 +409,25 @@ public:
 		ensure_open();
 		return pipeline_->layout().segment_images();
 	}
+	[[nodiscard]] py::dict prefetch_stats() const {
+		ensure_open();
+		const auto stats = pipeline_->prefetch_stats();
+		py::dict out;
+		out["context_capacity"]        = stats.context_capacity;
+		out["live_context_count"]      = stats.live_context_count;
+		out["peak_live_context_count"] = stats.peak_live_context_count;
+		out["context_waiter_count"]    = stats.context_waiter_count;
+		out["peak_context_waiter_count"] = stats.peak_context_waiter_count;
+		out["prepare_started_count"]   = stats.prepare_started_count;
+		out["prepare_completed_count"] = stats.prepare_completed_count;
+		out["activation_count"]        = stats.activation_count;
+		out["retired_count"]           = stats.retired_count;
+		out["prepare_plan_ms"]          = stats.prepare_plan_ms;
+		out["prepare_io_ms"]            = stats.prepare_io_ms;
+		out["activation_wait_ms"]       = stats.activation_wait_ms;
+		out["activation_ms"]            = stats.activation_ms;
+		return out;
+	}
 
 private:
 	void ensure_open() const {
@@ -437,6 +465,8 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	    .def("__iter__", [](const std::shared_ptr<TorchDirectDctPlsPool>& pool) { return pool; })
 	    .def("__next__", &TorchDirectDctPlsPool::next)
 	    .def("microbatch", &TorchDirectDctPlsPool::microbatch, py::arg("index"))
+	    .def("retire", &TorchDirectDctPlsPool::retire,
+	         "Retire the consumed scheduling context; tensor backing remains native-lifetime protected.")
 	    .def_property_readonly("epoch", &TorchDirectDctPlsPool::epoch)
 	    .def_property_readonly("pool_index", &TorchDirectDctPlsPool::pool_index)
 	    .def_property_readonly("image_count", &TorchDirectDctPlsPool::image_count)
@@ -475,7 +505,8 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	    .def_property_readonly("has_next_pool", &TorchDirectDctPlsPipeline::has_next_pool)
 	    .def_property_readonly("sample_count", &TorchDirectDctPlsPipeline::sample_count)
 	    .def_property_readonly("pls_count", &TorchDirectDctPlsPipeline::pls_count)
-	    .def_property_readonly("segment_images", &TorchDirectDctPlsPipeline::segment_images);
+	    .def_property_readonly("segment_images", &TorchDirectDctPlsPipeline::segment_images)
+	    .def_property_readonly("prefetch_stats", &TorchDirectDctPlsPipeline::prefetch_stats);
 
 	module.def("reclaim_direct_dct_pls_pools", []() {
 		return galp::direct_dct::NativeBatchLease::reclaim_finished();

@@ -155,6 +155,26 @@ struct DirectDctPlsMicrobatchView {
 	size_t                             image_count = 0U;
 };
 
+// Experimental diagnostics for the bounded one-pool lookahead. A context is
+// either the pool currently exposed to the consumer or the single pool being
+// prepared/held ready by the native pipeline. Retired device backing remains
+// governed by NativeBatchLease/NativeBatchCompletion and is not a context.
+struct DirectDctPlsPoolPrefetchStats {
+	size_t   context_capacity          = 2U;
+	size_t   live_context_count        = 0U;
+	size_t   peak_live_context_count   = 0U;
+	size_t   context_waiter_count      = 0U;
+	size_t   peak_context_waiter_count = 0U;
+	uint64_t prepare_started_count     = 0U;
+	uint64_t prepare_completed_count   = 0U;
+	uint64_t activation_count          = 0U;
+	uint64_t retired_count             = 0U;
+	double   prepare_plan_ms            = 0.0;
+	double   prepare_io_ms              = 0.0;
+	double   activation_wait_ms         = 0.0;
+	double   activation_ms              = 0.0;
+};
+
 // Owns one model-ready M-PLS device pool. Tensor views are zero-copy slices;
 // shuffle has already been encoded in CUDA transform output placement.
 class DirectDctPlsPoolBatch {
@@ -174,13 +194,18 @@ public:
 	[[nodiscard]] const DirectDctBatch&        batch() const noexcept;
 	[[nodiscard]] void*                        cuda_completion_event() const noexcept;
 	[[nodiscard]] DirectDctPlsMicrobatchView   microbatch(size_t index) const;
+	// Marks the scheduling context retired after its model work has been
+	// submitted. Device backing may outlive this call and remains protected by
+	// the existing producer/consumer completion authority. Idempotent.
+	void retire_context() noexcept;
 
 private:
 	friend class DirectDctPlsPipeline;
 	DirectDctPlsPoolBatch(DirectDctPlsPoolPlan plan,
 	                      DirectDctBatch       batch,
 	                      std::vector<int64_t> labels,
-	                      uint32_t             microbatch_images);
+	                      uint32_t             microbatch_images,
+	                      std::shared_ptr<void> pool_context_owner);
 	struct Impl;
 	std::unique_ptr<Impl> impl_;
 };
@@ -205,6 +230,7 @@ public:
 
 	[[nodiscard]] const DirectDctPlsLayout&          layout() const noexcept;
 	[[nodiscard]] const DirectDctPlsPipelineOptions& options() const noexcept;
+	[[nodiscard]] DirectDctPlsPoolPrefetchStats      prefetch_stats() const noexcept;
 
 private:
 	struct Impl;

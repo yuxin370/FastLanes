@@ -430,6 +430,8 @@ def _write_timeline(
     else:
         backend_predicate = lambda name: name in (
             "galp.pool.load",
+            "galp.pool.retire_stats_reclaim",
+            # Accepted for historical captures produced before pool lookahead.
             "galp.pool.sync_stats_reclaim",
         )
     backend = [
@@ -796,11 +798,20 @@ def analyze(
                 raise ValueError(
                     "capture metrics microbatch count differs from Nsys window"
                 )
-            summary["loader_worker_work"] = {
-                "semantics": capture_metrics["loader_stage_semantics"],
-                "stage_seconds": capture_metrics["loader_stage_seconds"],
-                "source": str(capture_metrics_path.resolve()),
-            }
+            if {
+                "loader_stage_semantics",
+                "loader_stage_seconds",
+            }.issubset(capture_metrics):
+                summary["loader_worker_work"] = {
+                    "semantics": capture_metrics["loader_stage_semantics"],
+                    "stage_seconds": capture_metrics["loader_stage_seconds"],
+                    "source": str(capture_metrics_path.resolve()),
+                }
+            if "native_pool_prefetch" in capture_metrics:
+                summary["native_pool_prefetch"] = {
+                    **capture_metrics["native_pool_prefetch"],
+                    "source": str(capture_metrics_path.resolve()),
+                }
         rep_start, rep_end = _representative_window(
             nvtx, profile_tid, window_start, window_end
         )

@@ -378,6 +378,9 @@ class RecipeAndContractTests(unittest.TestCase):
             def __init__(self) -> None:
                 self._batches = iter((Batch([2, 0]), Batch([3, 1])))
 
+            def retire(self) -> None:
+                self.retired = True
+
             def __iter__(self):
                 return self
 
@@ -388,6 +391,23 @@ class RecipeAndContractTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.pending = False
                 self.reclaims = 0
+                self.pool: Pool | None = None
+
+            @property
+            def prefetch_stats(self) -> dict[str, int | float]:
+                return {
+                    "context_capacity": 2,
+                    "live_context_count": 0,
+                    "peak_live_context_count": 2,
+                    "prepare_started_count": 1,
+                    "prepare_completed_count": 1,
+                    "activation_count": 1,
+                    "retired_count": 1,
+                    "prepare_plan_ms": 1.0,
+                    "prepare_io_ms": 3.0,
+                    "activation_wait_ms": 1.0,
+                    "activation_ms": 0.5,
+                }
 
             def start_epoch(self, epoch: int) -> None:
                 self.pending = True
@@ -398,7 +418,8 @@ class RecipeAndContractTests(unittest.TestCase):
 
             def next_pool(self) -> Pool:
                 self.pending = False
-                return Pool()
+                self.pool = Pool()
+                return self.pool
 
             def reclaim_finished_pools(self) -> int:
                 self.reclaims += 1
@@ -432,7 +453,7 @@ class RecipeAndContractTests(unittest.TestCase):
             optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
             scheduler = Scheduler()
             metrics = MetricsWriter(Path(temporary) / "metrics.jsonl")
-            with mock.patch("torch.cuda.synchronize"):
+            with mock.patch("torch.cuda.synchronize") as synchronize:
                 result = _train_native_physical_epoch(
                     pipeline=pipeline,
                     execution_model=model,
@@ -463,6 +484,7 @@ class RecipeAndContractTests(unittest.TestCase):
                     last_logged_update=0,
                     integration_check_first_100=False,
                 )
+            synchronize.assert_not_called()
             self.assertEqual(result["global_update"], 1)
             self.assertEqual(result["processed_images"], 4)
             self.assertEqual(result["epoch_record"]["epoch_microbatches"], 2)
@@ -475,6 +497,8 @@ class RecipeAndContractTests(unittest.TestCase):
             )
             self.assertEqual(scheduler.updates, 1)
             self.assertEqual(pipeline.reclaims, 1)
+            self.assertIsNotNone(pipeline.pool)
+            self.assertTrue(pipeline.pool.retired)
 
     def test_seed_device_mapping_is_exact_and_defaults_cleanly(self) -> None:
         seeds = (11997733, 11997734)
