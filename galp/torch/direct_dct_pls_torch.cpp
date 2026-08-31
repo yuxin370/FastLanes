@@ -424,6 +424,7 @@ public:
 		out["retired_count"]           = stats.retired_count;
 		out["prepare_plan_ms"]          = stats.prepare_plan_ms;
 		out["prepare_io_ms"]            = stats.prepare_io_ms;
+		out["prepare_materialize_ms"]   = stats.prepare_materialize_ms;
 		out["activation_wait_ms"]       = stats.activation_wait_ms;
 		out["activation_ms"]            = stats.activation_ms;
 		return out;

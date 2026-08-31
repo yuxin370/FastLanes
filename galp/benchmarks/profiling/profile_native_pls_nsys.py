@@ -149,11 +149,15 @@ def _make_profiled_epoch(
         captured_microbatches = 0
         captured_updates = 0
         capture_prefetch_start: dict[str, Any] | None = None
+        capture_audit_start: dict[str, int] | None = None
+        capture_execution_totals: dict[str, int | float] = {}
 
         while pipeline.has_next_pool:
             if pool_count == warmup_pools:
                 torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
                 capture_prefetch_start = pipeline.prefetch_stats
+                capture_audit_start = audit.counters.as_dict()
                 torch.cuda.profiler.start()
                 torch.cuda.nvtx.range_push(
                     f"profile-galp-native-b6-pools_{warmup_pools}_{capture_end_pool - 1}"
@@ -354,16 +358,48 @@ def _make_profiled_epoch(
                     else contextlib.nullcontext()
                 )
                 with boundary_context:
-                    _pool_stats = pool.execution_stats
-                    pool.retire()
-                    del pool
-                    pipeline.reclaim_finished_pools()
+                    stats_context = (
+                        _range("galp.pool.stats")
+                        if profiling_active
+                        else contextlib.nullcontext()
+                    )
+                    with stats_context:
+                        _pool_stats = pool.execution_stats
+                        if profiling_active:
+                            for key, value in _pool_stats.items():
+                                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                    capture_execution_totals[key] = (
+                                        capture_execution_totals.get(key, 0) + value
+                                    )
+                    retire_context = (
+                        _range("galp.pool.retire")
+                        if profiling_active
+                        else contextlib.nullcontext()
+                    )
+                    with retire_context:
+                        pool.retire()
+                        del pool
+                    reclaim_context = (
+                        _range("galp.pool.reclaim")
+                        if profiling_active
+                        else contextlib.nullcontext()
+                    )
+                    with reclaim_context:
+                        pipeline.reclaim_finished_pools()
 
             pool_count += 1
             if profiling_active and pool_count == capture_end_pool:
                 torch.cuda.synchronize(device)
                 capture_seconds = time.perf_counter() - float(capture_started_wall)
                 capture_prefetch_end = pipeline.prefetch_stats
+                resource_probe = getattr(
+                    getattr(pipeline, "_module", None),
+                    "_lifetime_reclaim_stats_for_test",
+                    None,
+                )
+                native_resources = (
+                    dict(resource_probe()) if resource_probe is not None else None
+                )
                 capture_prefetch = {
                     key: (
                         float(value)
@@ -398,9 +434,19 @@ def _make_profiled_epoch(
                     "native_pool_prefetch_start": capture_prefetch_start,
                     "native_pool_prefetch_end": capture_prefetch_end,
                     "native_pool_prefetch": capture_prefetch,
+                    "native_execution_totals": capture_execution_totals,
+                    "torch_peak_memory": {
+                        "allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                        "reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                    },
+                    "native_resource_stats": native_resources,
                     "training_audit": {
                         "policy": audit.policy.as_contract(),
-                        "counters": audit.counters.as_dict(),
+                        "counters": {
+                            key: int(value)
+                            - int((capture_audit_start or {}).get(key, 0))
+                            for key, value in audit.counters.as_dict().items()
+                        },
                     },
                     "outer_nvtx": (
                         f"profile-galp-native-b6-pools_{warmup_pools}_"

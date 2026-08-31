@@ -77,7 +77,11 @@ def main() -> int:
         if int(bounded["peak_live_context_count"]) > 2:
             raise AssertionError(f"pool context bound exceeded: {bounded!r}")
 
+        ids_a = pool_a.microbatch(0).global_image_ids
+        ids_b = pool_b.microbatch(0).global_image_ids
         pool_a.retire()
+        pool_a = None
+        pipeline.reclaim_finished_pools()
         after_retire = _wait_stats(
             pipeline,
             lambda value: int(value["prepare_started_count"]) >= 3,
@@ -87,15 +91,13 @@ def main() -> int:
         if int(after_retire["peak_live_context_count"]) > 2:
             raise AssertionError(f"pool context bound exceeded after retirement: {after_retire!r}")
 
-        ids_a = pool_a.microbatch(0).global_image_ids
-        ids_b = pool_b.microbatch(0).global_image_ids
         if not ids_a or not ids_b or set(ids_a).intersection(ids_b):
             raise AssertionError("adjacent PLS pools emitted empty or overlapping first microbatches")
 
         result = {
             "schema": "galp-pls-pool-lookahead-v1",
             "result": "PASS",
-            "pool_indices": [pool_a.pool_index, pool_b.pool_index],
+            "pool_indices": [0, pool_b.pool_index],
             "pool_a_first_microbatch_ids": ids_a,
             "pool_b_first_microbatch_ids": ids_b,
             "after_pool_a_activation": after_a,

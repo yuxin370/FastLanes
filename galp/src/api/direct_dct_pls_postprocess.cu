@@ -270,9 +270,31 @@ size_t launch_blocks(const size_t count) {
 
 } // namespace
 
+struct DirectDctPlsCudaPostprocess::Stream::Impl {
+	int                      device = -1;
+	galp::memory::CudaStream stream;
+
+	explicit Impl(const int cuda_device)
+	    : device(cuda_device) {
+		check_cuda(cudaSetDevice(device), "select postprocess stream device");
+		stream.create(cudaStreamNonBlocking);
+	}
+
+	~Impl() {
+		if (device >= 0) {
+			(void)cudaSetDevice(device);
+		}
+	}
+};
+
+DirectDctPlsCudaPostprocess::Stream::Stream(const int cuda_device)
+	: impl_(std::make_unique<Impl>(cuda_device)) {
+}
+DirectDctPlsCudaPostprocess::Stream::~Stream() = default;
+
 struct DirectDctPlsCudaPostprocess::Impl {
 	int                                      device = -1;
-	galp::memory::CudaStream                 stream;
+	std::shared_ptr<Stream>                  stream;
 	galp::memory::CudaEvent                  completion;
 	std::optional<GPUArray<int16_t>>         y_a;
 	std::optional<GPUArray<int16_t>>         y_b;
@@ -307,9 +329,13 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
     const uint32_t                                         microbatch_images,
     const uint32_t                                         model_classes,
     const bool                                             enable_randaugment,
-    const bool                                             enable_mixup)
+    const bool                                             enable_mixup,
+    std::shared_ptr<Stream>                                stream)
     : impl_(std::make_unique<Impl>()) {
 	try {
+		if (!stream || !stream->impl_) {
+			throw std::invalid_argument("Direct-DCT PLS CUDA postprocess requires a shared stream");
+		}
 		if (labels.empty() || randaugment.size() != labels.size() || microbatch_images == 0U || model_classes == 0U) {
 			throw std::invalid_argument("invalid Direct-DCT PLS CUDA postprocess cardinality");
 		}
@@ -332,9 +358,12 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 		impl_->images  = labels.size();
 		impl_->classes = model_classes;
 		check_cuda(cudaSetDevice(impl_->device), "select device");
-		impl_->stream.create(cudaStreamNonBlocking);
+		if (stream->impl_->device != impl_->device) {
+			throw std::invalid_argument("Direct-DCT PLS postprocess stream device differs from the source batch");
+		}
+		impl_->stream = std::move(stream);
 		impl_->completion.create_with_flags(cudaEventDisableTiming);
-		const auto stream = impl_->stream.get();
+		const auto stream = impl_->stream->impl_->stream.get();
 		if (source.cuda_completion_event() != nullptr) {
 			check_cuda(cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(source.cuda_completion_event()), 0U),
 			           "wait for Direct-DCT transform");

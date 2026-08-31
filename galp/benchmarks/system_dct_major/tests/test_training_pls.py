@@ -410,6 +410,7 @@ class RecipeAndContractTests(unittest.TestCase):
                     "retired_count": 1,
                     "prepare_plan_ms": 1.0,
                     "prepare_io_ms": 3.0,
+                    "prepare_materialize_ms": 5.0,
                     "activation_wait_ms": 1.0,
                     "activation_ms": 0.5,
                 }

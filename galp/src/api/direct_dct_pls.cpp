@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cuda_runtime_api.h>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -932,9 +933,16 @@ double elapsed_ms(const PlsPoolClock::time_point begin, const PlsPoolClock::time
 	return std::chrono::duration<double, std::milli>(end - begin).count();
 }
 
-// Bounds scheduling contexts, not device-storage lifetime. Retiring a context
-// admits the next CPU/I/O prepare; NativeBatchLease/NativeBatchCompletion still
-// retain the pool's actual backing until producer and consumers are complete.
+void check_pls_cuda(const cudaError_t status, const char* operation) {
+	if (status != cudaSuccess) {
+		throw std::runtime_error(std::string("Direct-DCT PLS ") + operation +
+		                         " failed: " + cudaGetErrorString(status));
+	}
+}
+
+// Bounds materialized pool contexts. The permit is part of the pool backing, so
+// NativeBatchLease/NativeBatchCompletion release it only after producer,
+// consumers, and external storage owners are complete.
 class DirectDctPlsPoolContextSlots : public std::enable_shared_from_this<DirectDctPlsPoolContextSlots> {
 public:
 	static constexpr size_t kCapacity = 2U;
@@ -991,11 +999,12 @@ public:
 		std::lock_guard lock(mutex_);
 		++stats_.prepare_started_count;
 	}
-	void prepare_completed(const double plan_ms, const double io_ms) noexcept {
+	void prepare_completed(const double plan_ms, const double io_ms, const double materialize_ms) noexcept {
 		std::lock_guard lock(mutex_);
 		++stats_.prepare_completed_count;
 		stats_.prepare_plan_ms += plan_ms;
 		stats_.prepare_io_ms += io_ms;
+		stats_.prepare_materialize_ms += materialize_ms;
 	}
 	void activated(const double wait_ms, const double activation_ms) noexcept {
 		std::lock_guard lock(mutex_);
@@ -1032,12 +1041,7 @@ struct PendingDirectDctPlsPool {
 };
 
 struct PreparedDirectDctPlsPool {
-	std::shared_ptr<void>                                 context_owner;
-	DirectDctPlsPoolPlan                                 plan;
-	std::vector<int64_t>                                 labels;
-	std::vector<detail::DirectDctPlsRandAugmentDecision> randaugment;
-	std::vector<detail::DirectDctPlsMixupDecision>       mixup;
-	DirectDctPreparedBatch                               prepared;
+	DirectDctPlsPoolBatch batch;
 };
 
 } // namespace
@@ -1074,9 +1078,8 @@ DirectDctPlsPoolBatch::DirectDctPlsPoolBatch(DirectDctPlsPoolPlan plan,
 }
 
 void DirectDctPlsPoolBatch::retire_context() noexcept {
-	if (impl_) {
-		impl_->pool_context_owner.reset();
-	}
+	// Compatibility marker only. The bounded permit follows native backing
+	// lifetime and cannot be released early by a scheduling-context call.
 }
 
 uint32_t DirectDctPlsPoolBatch::epoch() const noexcept {
@@ -1146,6 +1149,8 @@ struct DirectDctPlsPipeline::Impl {
 	std::exception_ptr                            worker_failure;
 	bool                                          worker_busy = false;
 	bool                                          stopping    = false;
+	int                                           cuda_device = 0;
+	std::shared_ptr<detail::DirectDctPlsCudaPostprocess::Stream> postprocess_stream;
 	std::thread                                   worker;
 
 	Impl(const std::filesystem::path& manifest_path,
@@ -1164,6 +1169,9 @@ struct DirectDctPlsPipeline::Impl {
 		if (runtime.image_count() != layout.sample_count()) {
 			throw std::runtime_error("Direct-DCT runtime and premixed PLS layout cardinalities differ");
 		}
+		check_pls_cuda(cudaGetDevice(&cuda_device), "capture CUDA device");
+		postprocess_stream =
+		    std::make_shared<detail::DirectDctPlsCudaPostprocess::Stream>(cuda_device);
 		if (options.require_block_major_planless) {
 			const auto stats = runtime.InitializationStats();
 			if (!stats.block_major_metadata_lazy || !options.device.enable_planless_execution ||
@@ -1196,6 +1204,7 @@ struct DirectDctPlsPipeline::Impl {
 	}
 
 	PreparedDirectDctPlsPool prepare_pool(PendingDirectDctPlsPool source) {
+		check_pls_cuda(cudaSetDevice(cuda_device), "activate worker CUDA device");
 		auto context_owner = context_slots->acquire();
 		if (!context_owner) {
 			return {};
@@ -1231,15 +1240,27 @@ struct DirectDctPlsPipeline::Impl {
 		const auto plan_done   = PlsPoolClock::now();
 		runtime.StageBatchIo(prepared);
 		const auto io_done = PlsPoolClock::now();
-		context_slots->prepare_completed(elapsed_ms(plan_started, plan_done), elapsed_ms(plan_done, io_done));
-		return PreparedDirectDctPlsPool {
-		    std::move(context_owner),
-		    std::move(source.plan),
-		    std::move(labels),
-		    std::move(randaugment),
-		    std::move(mixup),
-		    std::move(prepared),
-		};
+		auto       batch   = runtime.ReadPreparedBatch(std::move(prepared));
+		auto result = DirectDctPlsPoolBatch(std::move(source.plan),
+		                                    std::move(batch),
+		                                    std::move(labels),
+		                                    options.schedule.microbatch_images,
+		                                    std::move(context_owner));
+		result.impl_->postprocess =
+		    std::make_unique<detail::DirectDctPlsCudaPostprocess>(result.impl_->batch,
+		                                                          result.impl_->labels,
+		                                                          randaugment,
+		                                                          mixup,
+		                                                          options.schedule.microbatch_images,
+		                                                          options.model_classes,
+		                                                          options.enable_published_randaugment,
+		                                                          options.enable_published_mixup,
+		                                                          postprocess_stream);
+		const auto materialize_done = PlsPoolClock::now();
+		context_slots->prepare_completed(elapsed_ms(plan_started, plan_done),
+		                                  elapsed_ms(plan_done, io_done),
+		                                  elapsed_ms(io_done, materialize_done));
+		return PreparedDirectDctPlsPool {std::move(result)};
 	}
 
 	void worker_loop() noexcept {
@@ -1327,21 +1348,7 @@ DirectDctPlsPoolBatch DirectDctPlsPipeline::next_pool() {
 	}
 	impl_->work_cv.notify_one();
 	const auto activation_started = PlsPoolClock::now();
-	auto       batch              = impl_->runtime.ReadPreparedBatch(std::move(prepared->prepared));
-	auto result = DirectDctPlsPoolBatch(std::move(prepared->plan),
-	                                        std::move(batch),
-	                                        std::move(prepared->labels),
-	                                        impl_->options.schedule.microbatch_images,
-	                                        std::move(prepared->context_owner));
-	result.impl_->postprocess =
-	    std::make_unique<detail::DirectDctPlsCudaPostprocess>(result.impl_->batch,
-	                                                          result.impl_->labels,
-	                                                          prepared->randaugment,
-	                                                          prepared->mixup,
-	                                                          impl_->options.schedule.microbatch_images,
-	                                                          impl_->options.model_classes,
-	                                                          impl_->options.enable_published_randaugment,
-	                                                          impl_->options.enable_published_mixup);
+	auto       result             = std::move(prepared->batch);
 	const auto activation_done = PlsPoolClock::now();
 	impl_->context_slots->activated(elapsed_ms(wait_started, activation_started),
 	                                elapsed_ms(activation_started, activation_done));

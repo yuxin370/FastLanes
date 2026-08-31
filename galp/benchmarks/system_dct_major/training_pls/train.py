@@ -995,14 +995,17 @@ def _train_native_physical_epoch(
         )
     epoch_seconds = time.perf_counter() - epoch_started
     pool_prefetch_stats = pipeline.prefetch_stats
-    total_prepare_ms = float(pool_prefetch_stats["prepare_plan_ms"]) + float(
-        pool_prefetch_stats["prepare_io_ms"]
+    total_prepare_ms = (
+        float(pool_prefetch_stats["prepare_plan_ms"])
+        + float(pool_prefetch_stats["prepare_io_ms"])
+        + float(pool_prefetch_stats.get("prepare_materialize_ms", 0.0))
     )
     exposed_prepare_ms = min(
         total_prepare_ms, float(pool_prefetch_stats["activation_wait_ms"])
     )
-    # This ratio covers only the prepare work owned by the lookahead worker.
-    # Activation/materialization remains visible in native_pool_load_seconds.
+    # This ratio covers all work owned by the lookahead worker, including
+    # bounded next-pool device submission/materialization. Activation only
+    # publishes an already-ready pool.
     pool_prefetch_stats["pool_prepare_hidden_ratio"] = (
         0.0
         if total_prepare_ms <= 0.0

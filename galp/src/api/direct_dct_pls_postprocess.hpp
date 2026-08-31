@@ -50,6 +50,21 @@ derive_published_mixup_decision(uint64_t training_seed, uint32_t epoch, uint64_t
 
 class DirectDctPlsCudaPostprocess {
 public:
+	class Stream {
+	public:
+		explicit Stream(int cuda_device);
+		~Stream();
+		Stream(const Stream&)            = delete;
+		Stream& operator=(const Stream&) = delete;
+		Stream(Stream&&)                 = delete;
+		Stream& operator=(Stream&&)      = delete;
+
+	private:
+		friend class DirectDctPlsCudaPostprocess;
+		struct Impl;
+		std::unique_ptr<Impl> impl_;
+	};
+
 	DirectDctPlsCudaPostprocess(const DirectDctBatch&                            source,
 	                            std::span<const int64_t>                         labels,
 	                            std::span<const DirectDctPlsRandAugmentDecision> randaugment,
@@ -57,7 +72,8 @@ public:
 	                            uint32_t                                         microbatch_images,
 	                            uint32_t                                         model_classes,
 	                            bool                                             enable_randaugment,
-	                            bool                                             enable_mixup);
+	                            bool                                             enable_mixup,
+	                            std::shared_ptr<Stream>                          stream);
 	~DirectDctPlsCudaPostprocess();
 	DirectDctPlsCudaPostprocess(const DirectDctPlsCudaPostprocess&)            = delete;
 	DirectDctPlsCudaPostprocess& operator=(const DirectDctPlsCudaPostprocess&) = delete;

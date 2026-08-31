@@ -171,6 +171,7 @@ struct DirectDctPlsPoolPrefetchStats {
 	uint64_t retired_count             = 0U;
 	double   prepare_plan_ms            = 0.0;
 	double   prepare_io_ms              = 0.0;
+	double   prepare_materialize_ms     = 0.0;
 	double   activation_wait_ms         = 0.0;
 	double   activation_ms              = 0.0;
 };
@@ -194,9 +195,9 @@ public:
 	[[nodiscard]] const DirectDctBatch&        batch() const noexcept;
 	[[nodiscard]] void*                        cuda_completion_event() const noexcept;
 	[[nodiscard]] DirectDctPlsMicrobatchView   microbatch(size_t index) const;
-	// Marks the scheduling context retired after its model work has been
-	// submitted. Device backing may outlive this call and remains protected by
-	// the existing producer/consumer completion authority. Idempotent.
+	// Compatibility marker for callers that explicitly retire a pool. The
+	// bounded context permit now follows the pool backing and is released only
+	// when NativeBatchLease/NativeBatchCompletion can destroy that backing.
 	void retire_context() noexcept;
 
 private:
