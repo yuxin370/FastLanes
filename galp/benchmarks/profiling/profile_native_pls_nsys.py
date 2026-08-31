@@ -15,11 +15,15 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
 
+from galp.benchmarks.training_audit_policy import (
+    TrainingAuditPolicy,
+    TrainingAuditState,
+)
 from galp.benchmarks.system_dct_major.training_pls import train
 class ProfileCaptureComplete(RuntimeError):
     def __init__(self, payload: Mapping[str, Any]) -> None:
@@ -34,10 +38,6 @@ def _range(name: str):
         yield
     finally:
         torch.cuda.nvtx.range_pop()
-
-
-def _all_finite(values: Iterable[torch.Tensor]) -> bool:
-    return all(bool(torch.isfinite(value).all().item()) for value in values)
 
 
 def _profiling_contract_validation(
@@ -125,6 +125,7 @@ def _make_profiled_epoch(
         samples_since_log: int,
         last_logged_update: int,
         integration_check_first_100: bool,
+        audit_policy: TrainingAuditPolicy,
     ) -> dict[str, Any]:
         del loader_totals, integration_checks, integration_check_first_100
         epoch_loss_sum = 0.0
@@ -136,6 +137,11 @@ def _make_profiled_epoch(
         order_hash = hashlib.sha256()
         microbatch_images = int(recipe["training"]["physical_microbatch"])
         accumulation = int(recipe["training"]["gradient_accumulation"])
+        audit = TrainingAuditState(
+            audit_policy,
+            completed_updates=global_update,
+            device=device,
+        )
         pipeline.start_epoch(epoch)
         profiling_active = False
         capture_started_wall: float | None = None
@@ -243,12 +249,14 @@ def _make_profiled_epoch(
                         )
                         with loss_context:
                             loss = torch.nn.functional.cross_entropy(logits, targets)
-                            if not bool(torch.isfinite(loss).item()) or not bool(
-                                torch.isfinite(logits).all().item()
-                            ):
+                            try:
+                                audited_loss_sum = audit.observe(
+                                    loss, logits, batch_size
+                                )
+                            except FloatingPointError as error:
                                 raise FloatingPointError(
                                     "non-finite native PLS loss/logits"
-                                )
+                                ) from error
                         backward_context = (
                             _range("training.model.backward")
                             if profiling_active
@@ -256,7 +264,7 @@ def _make_profiled_epoch(
                         )
                         with backward_context:
                             (loss * (batch_size / window_sample_count)).backward()
-                        update_loss_sum += float(loss.detach().item()) * batch_size
+                        update_loss_sum += audited_loss_sum
                         pool_seen_images += batch_size
                         epoch_microbatches += 1
                         if profiling_active:
@@ -270,23 +278,22 @@ def _make_profiled_epoch(
                         else contextlib.nullcontext()
                     )
                     with optimizer_context:
-                        if not _all_finite(
-                            parameter.grad
-                            for parameter in model.parameters()
-                            if parameter.grad is not None
-                        ):
-                            raise FloatingPointError("non-finite gradients")
                         with (
                             _range("training.optimizer.clip_grad")
                             if profiling_active
                             else contextlib.nullcontext()
                         ):
-                            torch.nn.utils.clip_grad_norm_(
-                                model.parameters(),
-                                max_norm=float(
-                                    recipe["optimizer"]["gradient_clipping_norm"]
-                                ),
-                            )
+                            try:
+                                audit.check_gradients_and_clip(
+                                    model.parameters(),
+                                    max_norm=float(
+                                        recipe["optimizer"]["gradient_clipping_norm"]
+                                    ),
+                                )
+                            except FloatingPointError as error:
+                                raise FloatingPointError(
+                                    "non-finite gradients"
+                                ) from error
                         with (
                             _range("training.optimizer.adamw")
                             if profiling_active
@@ -301,6 +308,7 @@ def _make_profiled_epoch(
                             weight_decayer.step(learning_rate)
                         scheduler.complete_update()
                     global_update += 1
+                    audit.complete_update()
                     epoch_updates += 1
                     processed_images += window_sample_count
                     epoch_samples += window_sample_count
@@ -312,6 +320,9 @@ def _make_profiled_epoch(
                     if global_update % int(
                         recipe["logging"]["train_loss_every_optimizer_updates"]
                     ) == 0:
+                        deferred_loss, _deferred_samples = audit.read_deferred_loss()
+                        epoch_loss_sum += deferred_loss
+                        loss_since_log += deferred_loss
                         metrics.append(
                             {
                                 "record_type": "train",
@@ -387,6 +398,10 @@ def _make_profiled_epoch(
                     "native_pool_prefetch_start": capture_prefetch_start,
                     "native_pool_prefetch_end": capture_prefetch_end,
                     "native_pool_prefetch": capture_prefetch,
+                    "training_audit": {
+                        "policy": audit.policy.as_contract(),
+                        "counters": audit.counters.as_dict(),
+                    },
                     "outer_nvtx": (
                         f"profile-galp-native-b6-pools_{warmup_pools}_"
                         f"{capture_end_pool - 1}"

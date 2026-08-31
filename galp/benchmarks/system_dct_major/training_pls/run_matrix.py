@@ -19,6 +19,13 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from galp.benchmarks.training_audit_policy import (
+    AUDIT_MODES,
+    DEFAULT_AUDIT_MODE,
+    DEFAULT_STRICT_UPDATES,
+    TrainingAuditPolicy,
+)
+
 from .contracts import (
     build_condition_contract,
     code_version,
@@ -300,6 +307,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 device=seed_devices[seed],
                 execution_backend=args.execution_backend,
                 physical_execution=physical_execution,
+                training_audit_policy=TrainingAuditPolicy(
+                    mode=args.audit_mode,
+                    strict_updates=args.audit_strict_updates,
+                ).as_contract(),
             )
             contracts.append(contract)
             legacy_contract_path = (
@@ -626,6 +637,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--prefetch-depth", type=int, default=2)
     parser.add_argument(
+        "--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE
+    )
+    parser.add_argument(
+        "--audit-strict-updates", type=int, default=DEFAULT_STRICT_UPDATES
+    )
+    parser.add_argument(
         "--galp-torch-module-path", type=Path, default=REPO_ROOT / "build/galp/torch"
     )
     parser.add_argument(
@@ -638,6 +655,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("workers must be positive")
     if args.prefetch_depth < 0:
         raise ValueError("prefetch depth must be non-negative")
+    if args.audit_strict_updates < 0:
+        raise ValueError("--audit-strict-updates must be non-negative")
     if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch < 300:
         raise ValueError("--stop-after-epoch must be in [1, 299]")
     for path in (args.train_manifest, args.val_manifest, args.layout_plan):

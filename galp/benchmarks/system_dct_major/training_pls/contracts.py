@@ -10,6 +10,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from galp.benchmarks.training_audit_policy import TrainingAuditPolicy
+
 from .core_schedule import policy_digest
 from .layout import sha256_file
 from .matrix import resolve_condition
@@ -41,6 +43,7 @@ _TRAINING_PLS_RUNTIME_MODULES = frozenset(
 
 _TRAINING_RUNTIME_EXTERNAL_PATHS = frozenset(
     {
+        "galp/benchmarks/training_audit_policy.py",
         "galp/benchmarks/system_rgbnomore/training/artifacts.py",
         "galp/benchmarks/system_rgbnomore/training/augmentation.py",
         "galp/benchmarks/system_rgbnomore/training/direct_dct_reader.py",
@@ -220,6 +223,7 @@ def build_condition_contract(
     device: str,
     execution_backend: str = "semantic-emulation",
     physical_execution: Mapping[str, Any] | None = None,
+    training_audit_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     condition = resolve_condition(condition_id)
     layout_hash = str(layout_plan["layout_hash"])
@@ -230,6 +234,7 @@ def build_condition_contract(
         raise ValueError("native-physical-pls requires a physical execution contract")
     if not native_physical and physical_execution is not None:
         raise ValueError("semantic-emulation cannot carry a physical execution contract")
+    audit_policy = TrainingAuditPolicy.from_contract(training_audit_policy)
     contract: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA,
         "run_manifest_schema": RUN_MANIFEST_SCHEMA,
@@ -271,6 +276,7 @@ def build_condition_contract(
         "total_optimizer_updates": int(total_optimizer_updates),
         "microbatch_size": recipe["training"]["physical_microbatch"],
         "gradient_accumulation": recipe["training"]["gradient_accumulation"],
+        "training_audit_policy": audit_policy.as_contract(),
         "effective_update_batch": recipe["training"]["effective_update_batch"],
         "mixup": recipe["augmentation"]["mixup"],
         "randaugment": recipe["augmentation"]["randaugment"],

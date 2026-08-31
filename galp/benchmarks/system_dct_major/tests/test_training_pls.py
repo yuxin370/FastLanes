@@ -14,6 +14,11 @@ from unittest import mock
 import numpy as np
 import torch
 
+from galp.benchmarks.training_audit_policy import (
+    TrainingAuditPolicy,
+    TrainingAuditState,
+)
+
 from training_pls.contracts import (
     TRAINING_SOURCE_SCOPE,
     blocking_code_identity,
@@ -483,6 +488,7 @@ class RecipeAndContractTests(unittest.TestCase):
                     samples_since_log=0,
                     last_logged_update=0,
                     integration_check_first_100=False,
+                    audit_policy=TrainingAuditPolicy(),
                 )
             synchronize.assert_not_called()
             self.assertEqual(result["global_update"], 1)
@@ -499,6 +505,85 @@ class RecipeAndContractTests(unittest.TestCase):
             self.assertEqual(pipeline.reclaims, 1)
             self.assertIsNotNone(pipeline.pool)
             self.assertTrue(pipeline.pool.retired)
+
+
+    @staticmethod
+    def _one_update(
+        state: TrainingAuditState,
+        model: torch.nn.Module,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> float:
+        model.zero_grad(set_to_none=True)
+        logits = model(inputs)
+        loss = torch.nn.functional.cross_entropy(logits, targets)
+        immediate = state.observe(loss, logits, int(inputs.shape[0]))
+        loss.backward()
+        state.check_gradients_and_clip(model.parameters(), max_norm=1.0)
+        state.complete_update()
+        return immediate
+
+    def test_benchmark_prefix_matches_strict_then_reduces_host_reads(self) -> None:
+        model = torch.nn.Linear(3, 2)
+        inputs = torch.tensor([[0.5, -1.0, 2.0], [1.5, 0.0, -0.5]])
+        targets = torch.tensor([0, 1])
+        strict = TrainingAuditState(
+            TrainingAuditPolicy(mode="strict", strict_updates=100),
+            completed_updates=100,
+            device=torch.device("cpu"),
+        )
+        benchmark_prefix = TrainingAuditState(
+            TrainingAuditPolicy(mode="benchmark", strict_updates=100),
+            completed_updates=99,
+            device=torch.device("cpu"),
+        )
+        benchmark_steady = TrainingAuditState(
+            TrainingAuditPolicy(mode="benchmark", strict_updates=100),
+            completed_updates=100,
+            device=torch.device("cpu"),
+        )
+
+        strict_loss = self._one_update(strict, model, inputs, targets)
+        prefix_loss = self._one_update(benchmark_prefix, model, inputs, targets)
+        steady_loss = self._one_update(benchmark_steady, model, inputs, targets)
+        deferred_loss, deferred_samples = benchmark_steady.read_deferred_loss()
+
+        self.assertGreater(strict_loss, 0.0)
+        self.assertGreater(prefix_loss, 0.0)
+        self.assertEqual(steady_loss, 0.0)
+        self.assertGreater(deferred_loss, 0.0)
+        self.assertEqual(deferred_samples, 2)
+        self.assertEqual(strict.counters.strict_microbatches, 1)
+        self.assertEqual(benchmark_prefix.counters.strict_microbatches, 1)
+        self.assertEqual(benchmark_steady.counters.strict_microbatches, 0)
+        self.assertEqual(strict.counters.finite_host_reads, 3)
+        self.assertEqual(benchmark_prefix.counters.finite_host_reads, 3)
+        self.assertEqual(benchmark_steady.counters.finite_host_reads, 1)
+        self.assertEqual(benchmark_steady.counters.gradient_gate_reads, 1)
+
+    def test_nonfinite_is_sticky_and_blocks_optimizer_step(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        state = TrainingAuditState(
+            TrainingAuditPolicy(mode="benchmark", strict_updates=100),
+            completed_updates=100,
+            device=torch.device("cpu"),
+        )
+        loss = parameter * 0.0 + 1.0
+        state.observe(loss, torch.tensor([float("nan")]), 1)
+        loss.backward()
+        with self.assertRaises(FloatingPointError):
+            state.check_gradients_and_clip([parameter], max_norm=1.0)
+
+    def test_contract_is_canonical_and_global_update_drives_mode(self) -> None:
+        policy = TrainingAuditPolicy(mode="benchmark", strict_updates=100)
+        restored = TrainingAuditPolicy.from_contract(policy.as_contract())
+        self.assertEqual(restored, policy)
+        self.assertTrue(restored.is_strict_update(99))
+        self.assertFalse(restored.is_strict_update(100))
+        with self.assertRaises(ValueError):
+            TrainingAuditPolicy.from_contract(
+                {**policy.as_contract(), "extra_backend_override": True}
+            )
 
     def test_seed_device_mapping_is_exact_and_defaults_cleanly(self) -> None:
         seeds = (11997733, 11997734)

@@ -26,6 +26,14 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from galp.benchmarks.training_audit_policy import (
+    AUDIT_MODES,
+    DEFAULT_AUDIT_MODE,
+    DEFAULT_STRICT_UPDATES,
+    TrainingAuditPolicy,
+    TrainingAuditState,
+)
+
 
 HERE = Path(__file__).resolve().parent
 FASTLANES_ROOT = HERE.parents[3]
@@ -276,6 +284,7 @@ def _comparison_scope() -> dict[str, Any]:
 def _runtime_files() -> list[Path]:
     return [
         Path(__file__).resolve(),
+        FASTLANES_ROOT / "galp/benchmarks/training_audit_policy.py",
         HERE / "pipeline.py",
         HERE / "augmentation.py",
         HERE / "sample_order.py",
@@ -335,6 +344,10 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
             "float32_matmul_precision": published["execution"][
                 "float32_matmul_precision"
             ],
+            "audit_policy": TrainingAuditPolicy(
+                mode=args.audit_mode,
+                strict_updates=args.audit_strict_updates,
+            ).as_contract(),
         },
         "optimizer": published["optimizer"],
         "scheduler": {
@@ -494,10 +507,6 @@ def _move_batch(
         tuple(value.to(device, non_blocking=True) for value in batch.inputs),
         batch.labels.to(device, non_blocking=True),
     )
-
-
-def _all_finite(values: Sequence[torch.Tensor]) -> bool:
-    return all(bool(torch.isfinite(value).all().item()) for value in values)
 
 
 @contextlib.contextmanager
@@ -680,6 +689,11 @@ def _train_epoch(
     preserves_canonical_order = adapter.preserves_canonical_order()
     coverage = bytearray(len(identities))
     emitted_order_digest = hashlib.sha256()
+    audit = TrainingAuditState(
+        TrainingAuditPolicy.from_contract(contract["training"]["audit_policy"]),
+        completed_updates=global_update,
+        device=device,
+    )
     epoch_loss_sum = 0.0
     epoch_samples = 0
     epoch_updates = 0
@@ -743,16 +757,15 @@ def _train_epoch(
                     logits = execution_model(*inputs)
                 with _nvtx_range(stage_nvtx, "training.loss"):
                     loss = torch.nn.functional.cross_entropy(logits, labels)
-                if not bool(torch.isfinite(loss).item()) or not bool(
-                    torch.isfinite(logits).all().item()
-                ):
+                try:
+                    audited_loss_sum = audit.observe(loss, logits, length)
+                except FloatingPointError as error:
                     raise FloatingPointError(
                         f"non-finite loss/logits in {pipeline} epoch {epoch + 1}"
-                    )
+                    ) from error
                 with _nvtx_range(stage_nvtx, "training.model.backward"):
                     (loss * (length / window_samples)).backward()
-                loss_value = float(loss.detach().item())
-                epoch_loss_sum += loss_value * length
+                epoch_loss_sum += audited_loss_sum
                 epoch_samples += length
                 cursor += length
                 for name, value in batch.stage_seconds.items():
@@ -768,25 +781,22 @@ def _train_epoch(
                 del batch, inputs, labels, logits, loss
             stage_nvtx = profile_this_epoch and profiling_active
             with _nvtx_range(stage_nvtx, "training.optimizer"):
-                gradients = [
-                    parameter.grad
-                    for parameter in model.parameters()
-                    if parameter.grad is not None
-                ]
-                if not gradients or not _all_finite(gradients):
+                try:
+                    audit.check_gradients_and_clip(
+                        model.parameters(),
+                        max_norm=float(
+                            contract["optimizer"]["gradient_clipping_norm"]
+                        ),
+                    )
+                except FloatingPointError as error:
                     raise FloatingPointError(
                         f"non-finite/empty gradients in {pipeline} update {global_update + 1}"
-                    )
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    max_norm=float(
-                        contract["optimizer"]["gradient_clipping_norm"]
-                    ),
-                )
+                    ) from error
                 optimizer.step()
                 weight_decayer.step(learning_rate)
                 scheduler.complete_update()
             global_update += 1
+            audit.complete_update()
             epoch_updates += 1
             processed_images += window_samples
             if (
@@ -839,6 +849,12 @@ def _train_epoch(
         adapter.close()
     steady_seconds = time.perf_counter() - steady_started
     seconds = time.perf_counter() - epoch_started
+    deferred_loss_sum, deferred_samples = audit.read_deferred_loss()
+    epoch_loss_sum += deferred_loss_sum
+    if deferred_samples > epoch_samples:
+        raise RuntimeError("deferred audit loss exceeds epoch sample count")
+    if audit.completed_updates != global_update:
+        raise RuntimeError("training audit global update cursor diverged")
     expected_schedule = schedule_summary(len(samples), epochs=1)
     if cursor != len(samples) or epoch_samples != len(samples):
         raise RuntimeError(
@@ -877,6 +893,10 @@ def _train_epoch(
             "loader_wait_seconds": loader_wait,
             "loader_stage_seconds": loader_stage_totals,
             "adapter_metrics": adapter_metrics,
+            "training_audit": {
+                "policy": audit.policy.as_contract(),
+                "counters": audit.counters.as_dict(),
+            },
             "microbatch_images": MICROBATCH_IMAGES,
             "gradient_accumulation": GRADIENT_ACCUMULATION,
             "tail_microbatch_images": lengths[-1],
@@ -1345,6 +1365,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=11997733)
     parser.add_argument("--epochs", type=int, default=DEFAULT_PREFIX_EPOCHS)
     parser.add_argument(
+        "--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE
+    )
+    parser.add_argument(
+        "--audit-strict-updates", type=int, default=DEFAULT_STRICT_UPDATES
+    )
+    parser.add_argument(
         "--expected-train-images", type=int, default=EXPECTED_TRAIN_IMAGES
     )
     parser.add_argument(
@@ -1378,6 +1404,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.resolved_pipelines = _parse_pipelines(args.pipelines)
     if args.workers < 0:
         raise ValueError("--workers must be non-negative")
+    if args.audit_strict_updates < 0:
+        raise ValueError("--audit-strict-updates must be non-negative")
     for name in (
         "dali_num_threads",
         "dali_prefetch_depth",

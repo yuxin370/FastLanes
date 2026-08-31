@@ -15,10 +15,15 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
+
+from galp.benchmarks.training_audit_policy import (
+    TrainingAuditPolicy,
+    TrainingAuditState,
+)
 
 from .contracts import (
     blocking_code_identity,
@@ -371,10 +376,6 @@ def _move_batch(
         tuple(value.to(device, non_blocking=True) for value in batch.inputs),
         batch.labels.to(device, non_blocking=True),
     )
-
-
-def _all_finite(values: Iterable[torch.Tensor]) -> bool:
-    return all(bool(torch.isfinite(value).all().item()) for value in values)
 
 
 def _merge_numeric(target: dict[str, float], source: Mapping[str, Any], prefix: str = "") -> None:
@@ -799,6 +800,7 @@ def _train_native_physical_epoch(
     samples_since_log: int,
     last_logged_update: int,
     integration_check_first_100: bool,
+    audit_policy: TrainingAuditPolicy,
 ) -> dict[str, Any]:
     """Consume one native-owned physical PLS epoch at the model boundary."""
 
@@ -818,6 +820,11 @@ def _train_native_physical_epoch(
     pool_membership_hash = hashlib.sha256()
     microbatch_images = int(recipe["training"]["physical_microbatch"])
     accumulation = int(recipe["training"]["gradient_accumulation"])
+    audit = TrainingAuditState(
+        audit_policy,
+        completed_updates=global_update,
+        device=device,
+    )
     pipeline.start_epoch(epoch)
 
     while pipeline.has_next_pool:
@@ -875,35 +882,33 @@ def _train_native_physical_epoch(
                     order_hash.update(int(image_id).to_bytes(8, "little"))
                 logits = execution_model(y, cbcr)
                 loss = torch.nn.functional.cross_entropy(logits, targets)
-                if not bool(torch.isfinite(loss).item()) or not bool(
-                    torch.isfinite(logits).all().item()
-                ):
+                try:
+                    audited_loss_sum = audit.observe(loss, logits, batch_size)
+                except FloatingPointError as error:
                     raise FloatingPointError(
                         f"non-finite native PLS loss/logits at epoch {epoch} "
                         f"pool {pool_count} microbatch {epoch_microbatches}"
-                    )
+                    ) from error
                 (loss * (batch_size / window_sample_count)).backward()
-                update_loss_sum += float(loss.detach().item()) * batch_size
+                update_loss_sum += audited_loss_sum
                 pool_seen_images += batch_size
                 epoch_microbatches += 1
                 del native_batch, y, cbcr, targets, logits, loss
 
-            if not _all_finite(
-                parameter.grad
-                for parameter in model.parameters()
-                if parameter.grad is not None
-            ):
+            try:
+                audit.check_gradients_and_clip(
+                    model.parameters(),
+                    max_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
+                )
+            except FloatingPointError as error:
                 raise FloatingPointError(
                     f"non-finite gradients at optimizer update {global_update + 1}"
-                )
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
-            )
+                ) from error
             optimizer.step()
             weight_decayer.step(learning_rate)
             scheduler.complete_update()
             global_update += 1
+            audit.complete_update()
             epoch_updates += 1
             processed_images += window_sample_count
             epoch_samples += window_sample_count
@@ -912,14 +917,19 @@ def _train_native_physical_epoch(
             samples_since_log += window_sample_count
             if integration_check_first_100 and global_update <= 100:
                 integration_checks["checked_updates"] += 1
-                if not _all_finite(model.parameters()):
+                try:
+                    audit.check_parameters(model.parameters())
+                except FloatingPointError as error:
                     integration_checks["parameters_finite"] = False
                     raise FloatingPointError(
                         f"non-finite model parameters at integration update {global_update}"
-                    )
+                    ) from error
             if global_update % int(
                 recipe["logging"]["train_loss_every_optimizer_updates"]
             ) == 0:
+                deferred_loss, _deferred_samples = audit.read_deferred_loss()
+                epoch_loss_sum += deferred_loss
+                loss_since_log += deferred_loss
                 metrics.append(
                     {
                         "record_type": "train",
@@ -970,6 +980,12 @@ def _train_native_physical_epoch(
         pipeline.reclaim_finished_pools()
         pool_boundary_wait_seconds += time.perf_counter() - wait_started
         pool_count += 1
+
+    deferred_loss, _deferred_samples = audit.read_deferred_loss()
+    epoch_loss_sum += deferred_loss
+    loss_since_log += deferred_loss
+    if audit.completed_updates != global_update:
+        raise RuntimeError("training audit global update cursor diverged")
 
     if epoch_samples != expected_sample_count or not bool(coverage.all()):
         integration_checks["coverage_counters_valid"] = False
@@ -1041,6 +1057,10 @@ def _train_native_physical_epoch(
             "native_pool_count": pool_count,
             "native_pool_prefetch": pool_prefetch_stats,
             "native_execution_stats": native_execution_stats,
+            "training_audit": {
+                "policy": audit.policy.as_contract(),
+                "counters": audit.counters.as_dict(),
+            },
             "sample_order_digest": order_hash.hexdigest(),
             "pool_membership_digest": pool_membership_hash.hexdigest(),
             "crop_key_digest": "native-owned-by-rgbnomore-training-pls-v1",
@@ -1083,6 +1103,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         physical_galp_manifest=args.physical_galp_manifest,
         premixed_mapping_csv=args.premixed_mapping_csv,
         expected_mapping_sha256=args.expected_mapping_sha256,
+    )
+    audit_policy = TrainingAuditPolicy.from_contract(
+        contract.get("training_audit_policy")
     )
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -1407,6 +1430,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 samples_since_log=samples_since_log,
                 last_logged_update=last_logged_update,
                 integration_check_first_100=args.integration_check_first_100,
+                audit_policy=audit_policy,
             )
             global_update = int(native_epoch["global_update"])
             processed_images = int(native_epoch["processed_images"])
@@ -1544,6 +1568,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         mixup_hash = hashlib.sha256()
         pool_membership_hash = hashlib.sha256()
         data_preparation_seconds = 0.0
+        audit = TrainingAuditState(
+            audit_policy,
+            completed_updates=global_update,
+            device=device,
+        )
         for pool_index, pool_pls_ids, positions in epoch_position_pools(
             layout,
             condition_id=args.condition,
@@ -1631,15 +1660,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             )
                             logits = execution_model(*inputs)
                             loss = torch.nn.functional.cross_entropy(logits, mixed_labels)
-                            if not bool(torch.isfinite(loss).item()) or not bool(
-                                torch.isfinite(logits).all().item()
-                            ):
+                            try:
+                                audited_loss_sum = audit.observe(
+                                    loss, logits, len(expected)
+                                )
+                            except FloatingPointError as error:
                                 raise FloatingPointError(
                                     f"non-finite loss/logits at epoch {epoch} microbatch {microbatch_index}"
-                                )
+                                ) from error
                             batch_size = len(expected)
                             (loss * (batch_size / window_sample_count)).backward()
-                            update_loss_sum += float(loss.detach().item()) * batch_size
+                            update_loss_sum += audited_loss_sum
                             for planned_position, augmentation in zip(
                                 microbatch_positions[local_index], augmentations[local_index]
                             ):
@@ -1670,22 +1701,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             adapter.snapshot_batch_metrics(batch)
                             epoch_microbatches += 1
                             del batch, inputs, labels, mixed_labels, logits, loss
-                        if not _all_finite(
-                            parameter.grad
-                            for parameter in model.parameters()
-                            if parameter.grad is not None
-                        ):
+                        try:
+                            audit.check_gradients_and_clip(
+                                model.parameters(),
+                                max_norm=float(
+                                    recipe["optimizer"]["gradient_clipping_norm"]
+                                ),
+                            )
+                        except FloatingPointError as error:
                             raise FloatingPointError(
                                 f"non-finite gradients at optimizer update {global_update + 1}"
-                            )
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(),
-                            max_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
-                        )
+                            ) from error
                         optimizer.step()
                         weight_decayer.step(learning_rate)
                         scheduler.complete_update()
                         global_update += 1
+                        audit.complete_update()
                         epoch_updates += 1
                         processed_images += window_sample_count
                         epoch_samples += window_sample_count
@@ -1694,14 +1725,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         samples_since_log += window_sample_count
                         if args.integration_check_first_100 and global_update <= 100:
                             integration_checks["checked_updates"] += 1
-                            if not _all_finite(model.parameters()):
+                            try:
+                                audit.check_parameters(model.parameters())
+                            except FloatingPointError as error:
                                 integration_checks["parameters_finite"] = False
                                 raise FloatingPointError(
                                     f"non-finite model parameters at integration update {global_update}"
-                                )
+                                ) from error
                         if global_update % int(
                             recipe["logging"]["train_loss_every_optimizer_updates"]
                         ) == 0:
+                            deferred_loss, _deferred_samples = audit.read_deferred_loss()
+                            epoch_loss_sum += deferred_loss
+                            loss_since_log += deferred_loss
                             metrics.append(
                                 {
                                     "record_type": "train",
@@ -1735,6 +1771,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if not bool(coverage.all()):
             integration_checks["coverage_counters_valid"] = False
             raise RuntimeError(f"epoch {epoch} has missing planned positions")
+        deferred_loss, _deferred_samples = audit.read_deferred_loss()
+        epoch_loss_sum += deferred_loss
+        loss_since_log += deferred_loss
+        if audit.completed_updates != global_update:
+            raise RuntimeError("training audit global update cursor diverged")
         epoch_seconds = time.perf_counter() - epoch_started
         epoch_record = {
             "record_type": "train",
@@ -1752,6 +1793,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "epoch_seconds": epoch_seconds,
             "images_per_second": epoch_samples / epoch_seconds,
             "data_preparation_seconds": data_preparation_seconds,
+            "training_audit": {
+                "policy": audit.policy.as_contract(),
+                "counters": audit.counters.as_dict(),
+            },
             "sample_order_digest": order_hash.hexdigest(),
             "pool_membership_digest": pool_membership_hash.hexdigest(),
             "crop_key_digest": crop_hash.hexdigest(),
