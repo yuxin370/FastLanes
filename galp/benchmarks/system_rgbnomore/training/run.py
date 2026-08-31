@@ -17,6 +17,11 @@ from typing import Any, Iterable, Sequence
 
 import torch
 
+from galp.benchmarks.training_audit_policy import (
+    TrainingAuditPolicy,
+    TrainingAuditState,
+)
+
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 if str(BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCHMARK_ROOT))
@@ -1374,6 +1379,7 @@ def _train_one_step_runtime(
     device: torch.device,
     label_smoothing: float,
     gradient_clipping: float | None,
+    audit: TrainingAuditState,
 ) -> tuple[dict[str, Any], TrainingBatch]:
     """Submit one real train step without measured-path host materialization."""
 
@@ -1421,6 +1427,8 @@ def _train_one_step_runtime(
     loss = torch.nn.functional.cross_entropy(
         logits, labels, label_smoothing=label_smoothing
     )
+    audit_before = audit.counters.as_dict()
+    audit.observe(loss, logits, len(expected))
     event_end("loss", begin, stage)
 
     begin = event_begin("backward")
@@ -1428,16 +1436,21 @@ def _train_one_step_runtime(
     event_end("backward", begin, stage)
 
     begin = event_begin("gradient_processing")
-    if gradient_clipping is not None:
-        # Deliberately retain the device scalar; converting it with .item()
-        # would synchronize every measured step.
-        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+    audit.check_gradients_and_clip(
+        model.parameters(),
+        max_norm=(float("inf") if gradient_clipping is None else gradient_clipping),
+    )
     event_end("gradient_processing", begin, stage)
 
     begin = event_begin("optimizer")
     optimizer.step()
+    audit.complete_update()
     event_end("optimizer", begin, stage)
     scheduler.step()
+    audit_delta = {
+        key: int(value) - int(audit_before.get(key, 0))
+        for key, value in audit.counters.as_dict().items()
+    }
     return (
         {
             "loss_tensor": loss.detach(),
@@ -1447,7 +1460,10 @@ def _train_one_step_runtime(
             "batch_failures": batch_failures,
             "optimizer_step_executed": True,
             "deep_parameter_scans": 0,
-            "host_scalar_materializations_in_step": 0,
+            "host_scalar_materializations_in_step": (
+                audit_delta["finite_host_reads"] + audit_delta["loss_host_reads"]
+            ),
+            "training_audit": audit_delta,
         },
         batch,
     )
@@ -1641,6 +1657,11 @@ def _run_repeat(
     scheduler = build_scheduler(
         optimizer, contract["scheduler"], total_steps=scheduler_total_steps
     )
+    runtime_audit = TrainingAuditState(
+        TrainingAuditPolicy(),
+        completed_updates=0,
+        device=device,
+    )
     reset_training_state(model=model, optimizer=optimizer, scheduler=scheduler, scaler=None, initial=initial)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -1741,6 +1762,7 @@ def _run_repeat(
                 device=device,
                 label_smoothing=contract["optimizer"]["label_smoothing"],
                 gradient_clipping=contract["optimizer"]["gradient_clipping_norm"],
+                audit=runtime_audit,
             )
             failures.extend(
                 f"warmup step {step}: {value}" for value in record["batch_failures"]
@@ -1764,6 +1786,7 @@ def _run_repeat(
                 device=device,
                 label_smoothing=contract["optimizer"]["label_smoothing"],
                 gradient_clipping=contract["optimizer"]["gradient_clipping_norm"],
+                audit=runtime_audit,
             )
             failures.extend(
                 f"measured step {measured}: {value}"
@@ -2040,12 +2063,24 @@ def _run_repeat(
                 0 if args.execution_mode == "runtime" else min(1, measured_steps)
             ),
             "host_scalar_materializations_in_runtime_step": (
-                0 if args.execution_mode == "runtime" else None
+                (
+                    runtime_audit.counters.finite_host_reads
+                    + runtime_audit.counters.loss_host_reads
+                )
+                if args.execution_mode == "runtime"
+                else None
+            ),
+            "host_scalar_materializations_scope": (
+                "warmup_and_measured_updates"
+                if args.execution_mode == "runtime"
+                else None
             ),
             "deferred_loss_materialization_batches": (
                 measured_steps if args.execution_mode == "runtime" else 0
             ),
             "first_step_probe_in_timing": False,
+            "training_audit_policy": runtime_audit.policy.as_contract(),
+            "training_audit_counters": runtime_audit.counters.as_dict(),
         },
         "host_memory": memory,
         "host_memory_scope": (

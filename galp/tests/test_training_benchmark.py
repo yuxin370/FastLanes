@@ -23,6 +23,11 @@ import numpy as np
 import torch
 from PIL import Image
 
+from galp.benchmarks.training_audit_policy import (
+    TrainingAuditPolicy,
+    TrainingAuditState,
+)
+
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "benchmarks/system_rgbnomore"
 if str(BENCHMARK_DIR) not in sys.path:
@@ -1831,7 +1836,7 @@ class TrainingBenchmarkTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "immutable contract mode"):
                 _load_resume(args)
 
-    def test_runtime_step_avoids_audit_scans_syncs_and_scalar_materialization(self) -> None:
+    def test_runtime_step_uses_shared_finite_gate_without_deep_scans(self) -> None:
         model = torch.nn.Sequential(
             torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten(), torch.nn.Linear(3, 1000)
         )
@@ -1861,13 +1866,19 @@ class TrainingBenchmarkTest(unittest.TestCase):
                 device=torch.device("cpu"),
                 label_smoothing=0.0,
                 gradient_clipping=None,
+                audit=TrainingAuditState(
+                    TrainingAuditPolicy(mode="benchmark", strict_updates=100),
+                    completed_updates=100,
+                    device=torch.device("cpu"),
+                ),
             )
         gradient_scan.assert_not_called()
         parameter_scan.assert_not_called()
         explicit_sync.assert_not_called()
         self.assertIs(emitted, batch)
         self.assertEqual(record["deep_parameter_scans"], 0)
-        self.assertEqual(record["host_scalar_materializations_in_step"], 0)
+        self.assertEqual(record["host_scalar_materializations_in_step"], 1)
+        self.assertEqual(record["training_audit"]["gradient_gate_reads"], 1)
         self.assertIn("loss_tensor", record)
         _resolve_runtime_record(record)
         self.assertFalse(torch.equal(before, model[-1].weight.detach()))
