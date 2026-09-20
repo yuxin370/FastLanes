@@ -137,6 +137,11 @@ context.
 
 ## Direct-DCT Runtime
 
+See the [DCT-domain augmentation guide (中文)](DCT_DOMAIN_AUGMENTATIONS_ZH.md)
+for all currently integrated geometric transforms, the 14 PLS RandAugment
+operations, Mixup, and coefficient masks, with implementation details,
+pixel-domain correspondences, and concrete examples.
+
 ### Installable Python wheel
 
 The repository's release wheel can include the stable `galp.torch` facade,
@@ -211,30 +216,45 @@ intended for debugging and compatibility. The stable `galp.torch.DirectDctBatch`
 does not expose them; benchmark tools opt into `galp.diagnostics.direct_dct`.
 
 Applications should use the stable Python facade rather than importing the
-private `_galp_direct_dct` extension.  The caller chooses a semantic output
-profile; cache, planning, prefetch, stream, I/O, and launch policies remain
+private `_galp_direct_dct` extension. A profile defines stable processing
+semantics and the output contract; explicit input selections complete each
+request. Cache, planning, prefetch, stream, I/O, and launch policies remain
 native-owned:
 
 ```python
 from galp.profiles.rgbnomore import VALIDATION
 from galp.torch import DirectDctReader
 
-reader = DirectDctReader(
-    "/path/to/manifest.bin",
-    module_path="build/galp/torch",
-)
-pipeline = reader.pipeline(VALIDATION).start(
-    [[0, 1, 2, 3], [4, 5, 6, 7]],
-)
-for batch in pipeline:
-    output = model(batch.y, batch.cbcr)
+reader = DirectDctReader("/path/to/manifest.bin")
 
-# Optional raw JPEG zigzag-column selection.  The registered profile still
-# owns crop/layout/runtime policy, and the model-ready tensor shape is unchanged.
-selected = reader.pipeline(VALIDATION, dct_coeffs="first:32").start(
-    [[0, 1, 2, 3]],
+batch = reader.read(
+    [0, 1, 2, 3],
+    profile=VALIDATION,
+    coefficients=range(32),
 )
+output = model(batch.y, batch.cbcr)
+
+logical_batches = [[0, 1, 2, 3], [4, 5, 6, 7]]
+with reader.iter_batches(
+    logical_batches,
+    profile=VALIDATION,
+    coefficients=range(32),
+) as batches:
+    for batch in batches:
+        output = model(batch.y, batch.cbcr)
+        assert batch.sample_ids == batch.global_image_ids
 ```
+
+`coefficients=None` selects all 64 coefficients. Explicit iterables preserve
+their order, so `coefficients=[5, 0, 2]` remains `[5, 0, 2]`. The legacy
+`dct_coeffs="all"`, `"first:N"`, and `"list:..."` spellings remain supported
+for compatibility but are not the recommended application-facing form.
+
+`iter_batches()` is a thin convenience wrapper around the same native-owned
+`pipeline()` + `start()` path. Applications that need explicit reuse, early
+reset, or cumulative `pipeline.metrics` may continue to manage
+`DirectDctPipeline` directly. In source-tree development only, `module_path`
+can point at the built extension; installed applications normally omit it.
 
 The public API has no future/submission gate, planner preview, manual reclaim,
 rowgroup metadata, or buffer-keepalive method. The native pipeline owns bounded
@@ -258,12 +278,11 @@ planning, compressed rowgroup upload, GPU FastLanes decode, gather/projection,
 cache reuse, and event handoff to the existing `JpegDctShardDatasetReader`
 device-batch path. The direct-DCT facade and PyTorch export path do not issue
 device-to-host copies, `cudaDeviceSynchronize()`, or `cudaStreamSynchronize()`.
-The optional PyTorch wrapper records a CUDA event on the current PyTorch stream
-when external tensor storage is released and delays `DirectDctBatch` destruction
-until that event completes, preventing GALP's device pool from reusing a buffer
-while already queued PyTorch kernels on that stream are still consuming it.
-Custom-stream callers should use normal CUDA/PyTorch stream synchronization
-around the returned tensor before launching dependent work on another stream.
+Same-stream consumption needs no extra application action. Before submitting
+work to a different CUDA stream, call `batch.record_stream(actual_stream)`.
+The native lifetime owner then delays reclaim until the producer, every
+registered consumer, and Tensor/Storage ownership have completed; this does not
+add a host or device-wide synchronization.
 
 An optional PyTorch extension is available behind `GALP_BUILD_TORCH=ON`. This
 is deliberately not part of `Galp::core`'s default dependency set:
@@ -278,14 +297,17 @@ PYTHONPATH=build-galp-torch/galp/torch \
   python3 galp/examples/direct_dct_pipeline_demo.py /path/to/manifest.bin \
     --batch-size 32 \
     --steps 3 \
+    --coefficients 5 0 2 \
     --train-smoke
 ```
 
 The example keeps the model-ready Y/CbCr tensors on CUDA and runs a small
-classifier through the public native-owned pipeline. It reports only the
-versioned aggregate metrics. Prefetch depth, cache capacity, crop execution,
-I/O scheduling, CUDA stream selection, and kernel launch geometry are not
-command-line options.
+classifier through the public native-owned pipeline. It uses the explicit
+Pipeline form because it reports cumulative versioned metrics; ordinary loops
+can use `iter_batches()` as shown above. Omitting `--coefficients` selects all
+64 coefficients, while supplied indices preserve their order. Prefetch depth,
+cache capacity, crop execution, I/O scheduling, CUDA stream selection, and
+kernel launch geometry are not command-line options.
 
 The fixed 512 center-crop semantic profile can be selected for a compatible
 DCT-major manifest without exposing its block-major runtime policy:
@@ -397,8 +419,7 @@ crop reads from a sharded DCT/FLS manifest:
   --crop 64 64 512 512 --window-images 256 --dct-coeffs first:8 --mode dct-compare
 ```
 
-The current implementation, benchmark, and historical-document status is indexed in
-[`galp/docs/README.md`](docs/README.md). The executable inference contract is documented in
+The executable inference contract is documented in
 [`galp/benchmarks/system_rgbnomore/docs/E2E_COMPARISON_RUN_GUIDE.md`](benchmarks/system_rgbnomore/docs/E2E_COMPARISON_RUN_GUIDE.md).
 For GPU evidence collection, save raw `pipeline_benchmark` output and summarize
 it with:

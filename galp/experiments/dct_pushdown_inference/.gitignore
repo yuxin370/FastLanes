@@ -1,0 +1,6 @@
+DCTNet/
+FUN/
+dctnet_storage
+*.o
+run_training_optimization.py
+__pycache__/

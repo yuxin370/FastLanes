@@ -4,7 +4,15 @@ The model-facing stable API is the `galp.torch` facade:
 
 - `DirectDctReader`, `DirectDctPipeline`, and `DirectDctBatch`;
 - registered semantic profiles and the small `DirectDctMetrics` schema;
+- Pythonic `coefficients=` request selection and the thin
+  `DirectDctReader.iter_batches()` convenience iterator;
 - `batch.record_stream(actual_consumer_stream)` for cross-stream consumers.
+
+`coefficients=None`, `range(...)`, and an explicitly ordered index iterable
+normalize to the existing native coefficient-selection request. Legacy
+`dct_coeffs` strings remain source-compatible. `iter_batches()` owns no Python
+producer, queue, or scheduling policy: it delegates to the same
+`DirectDctPipeline.start()` and native iterator used by explicit pipeline code.
 
 The canonical `galp/stable.hpp` C++ umbrella intentionally does not expose raw
 CUDA events, device descriptors, physical rowgroups, allocator state, or

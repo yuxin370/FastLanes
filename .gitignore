@@ -165,3 +165,19 @@ build_win/
 
 # Generated GALP documentation evidence; source reports remain visible
 /galp/benchmarks/system_rgbnomore/docs/artifacts/
+
+# Local GALP benchmark outputs at the repository root
+/canonical_rgbnomore_index.csv
+/commands.json
+/contract.json
+/pipeline_*.json
+/report.md
+/results.*
+/run_metadata.json
+/sample_manifest.json
+/semantic_*.npz
+/validation.json
+
+# Local duplicate workspace files
+/CALUDE.md
+/galp/benchmarks/system_dct_major/docs/* copy.md

@@ -1,8 +1,8 @@
 # GALP Python 公共 API 重构：实施状态与后续计划
 
-- 状态：公共 Reader/Profile、native-owned Pipeline/Iterator 与稳定 metrics schema 已实现；
-  DCT-major native stitching 尚待后续阶段
-- 更新日期：2026-08-14
+- 状态：公共 Reader/Profile、native-owned Pipeline/Iterator、Native physical stitching 与稳定
+  metrics schema 已实现；Stable Python facade 已提供 `coefficients=` 和 `iter_batches()`
+- 更新日期：2026-09-02
 - 范围：Direct-DCT 配置所有权、C++ profile、PyTorch API、canonical benchmark adapter
 - 设计参考：DALI 的“公共 pipeline 接口 + 私有执行引擎”边界，不照搬其 DSL
 
@@ -34,7 +34,7 @@ buffer keepalive 机制。
 
 - `DirectDctRuntimePolicy`：只包含 cache、prefetch、workset、planless、调度、launch、stream、
   double-buffer 和 bounded-read 策略；
-- `DirectDctOutputProfile`：只包含模型输出 layout、grid transform 和 coefficient selection；
+- `DirectDctOutputProfile`：只包含模型输出 layout、grid transform 和 coefficient 合同；
 - `RegisteredDirectDctProfile`：在 native registry 中把语义输出与 runtime policy 组合；
 - `materialize_direct_dct_options()`：组合点集中在 C++，Python 不再构造
   `JpegDctDeviceBatchOptions`。
@@ -93,17 +93,21 @@ reader/future 的宽入口只属于下划线开头的私有 extension 和 diagno
 from galp.profiles.rgbnomore import VALIDATION
 from galp.torch import DirectDctReader
 
-reader = DirectDctReader(
-    "/data/imagenet/manifest.bin",
-    module_path="build/galp/torch",
-)
+reader = DirectDctReader("/data/imagenet/manifest.bin")
 
-pipeline = reader.pipeline(VALIDATION).start(
+with reader.iter_batches(
     [[0, 1, 2, 3], [4, 5, 6, 7]],
-)
-for batch in pipeline:
-    logits = model(batch.y, batch.cbcr)
+    profile=VALIDATION,
+    coefficients=range(32),
+) as batches:
+    for batch in batches:
+        logits = model(batch.y, batch.cbcr)
 ```
+
+`iter_batches()` 只组合现有 `pipeline()`、`start()` 和 native iteration；需要显式 reset、
+close 或累计 `pipeline.metrics` 的调用方仍可直接使用 `DirectDctPipeline`。旧
+`dct_coeffs="all"`、`"first:N"`、`"list:..."` 保持兼容，但普通应用推荐
+`coefficients=None`、`range(...)` 或显式有序 index iterable。
 
 公共类型为：
 
@@ -135,11 +139,12 @@ provenance 校验，但语义 profile 对象本身不持有该字段。
 | 参数/属性 | 类型 | 公共 | 含义 |
 | --- | --- | --- | --- |
 | `manifest_path` | `str | Path` | 是 | 数据集 manifest |
-| `module_path` | `str | Path | None` | 是 | 可选 native binding 搜索目录，部署辅助参数 |
+| `module_path` | `str | Path | None` | 兼容 | build-tree 开发/测试搜索目录；安装环境通常不传 |
 | `image_count` | `int` | 是 | manifest 中可读取图片数 |
 | `profile_info(profile)` | `dict` | 是，观测 | profile schema、输出 layout、runtime policy identity |
-| `pipeline(profile)` | `DirectDctPipeline` | 是 | 创建固定语义 profile 的 native iterator |
-| `read(image_ids, profile, transforms=None)` | `DirectDctBatch` | 是 | 无预取需求时的同步便捷入口 |
+| `pipeline(profile, coefficients=None)` | `DirectDctPipeline` | 是，高级 | 创建固定语义 profile 的 native iterator |
+| `read(image_ids, profile, coefficients=None, transforms=None)` | `DirectDctBatch` | 是 | 无预取需求时的同步便捷入口 |
+| `iter_batches(logical_batches, profile=..., coefficients=None)` | iterator/context manager | 是，推荐 | 使用同一 Native pipeline 连续读取 logical batches |
 
 `initialization_stats`、binding import latency、planner preview、JPEG metadata 与 rowgroup
 storage 查询已移至 `galp.diagnostics.direct_dct`，不属于模型调用 API。
@@ -162,15 +167,16 @@ reclaim 或 buffer keepalive 参数。
 | `y`, `cbcr`, `coefficients` | GPU-resident 输出；profile 决定哪些字段有效 |
 | `tensors` | `(y, cbcr)` 便捷视图 |
 | `global_image_ids` | 实际输出样本身份 |
+| `sample_ids` | `global_image_ids` 的只读别名 |
 | `transform_descriptors` | native 接受的逐样本变换描述 |
 | `layout`, `profile_id` | 输出合同身份 |
 | `metrics` | `DirectDctMetrics` 稳定聚合观测 |
+| `record_stream(stream=None)` | 显式登记实际 CUDA consumer stream，不同步 host |
 
-底层 batch 生命周期由 PyTorch tensor 的 owner/deleter 自动管理，公共 API 不提供
-`record_stream()` 或 keepalive。binding 在输出 tensor 被取得时自动登记当前 CUDA consumer
-stream，并在 tensor storage 最终释放时把 native owner 延迟到所有已登记 stream 的 event
-完成之后；默认流和非默认流使用同一套生命周期规则。完整 native counters 不属于
-`DirectDctBatch`；benchmark
+底层 batch 生命周期由 PyTorch tensor 的 owner/deleter 和 Native lifetime 共同管理。同流
+消费不需要额外动作；跨 stream 消费必须在提交 work 前调用 `record_stream(actual_stream)`。
+Native owner 只会在 producer、所有已登记 consumer 和 Storage ownership 条件满足后回收。
+公共 API 不提供 manual keepalive 或 reclaim。完整 native counters 不属于 `DirectDctBatch`；benchmark
 审计/调试工具必须显式从
 `galp.diagnostics.direct_dct` 调用 `execution_stats()`、`execution_stats_snapshot()` 或
 `cache_stats()`。该模块不承诺字段级稳定性。
@@ -192,7 +198,7 @@ priority counter。
 | --- | --- | --- |
 | RGB-no-more inference | `DirectDctPipeline` + `rgbnomore.VALIDATION` | 已迁移；无 Python FIFO/gate |
 | RGB-no-more training facade | 一个 epoch schedule 对应一个 `DirectDctPipeline` | 已迁移；无 Python Future/FIFO/K sweep |
-| DCT-major production | `DirectDctPipeline` + `VALIDATION_CENTER_CROP_512` | 预取/gate 已迁移；stitching 待下沉 |
+| DCT-major production | `DirectDctPipeline` + `VALIDATION_CENTER_CROP_512` | 已迁移；Native physical orchestration/assembly |
 | DCT-major inspect/metadata tool | public reader + diagnostics opt-in | 已迁移 |
 | model-facing Direct-DCT example | `DirectDctPipeline` + stable metrics | 已迁移；无 raw runtime 参数 |
 | A/B diagnostics 与历史复现实验 | 私有 low-level binding | 有意保留为 experimental |
@@ -211,9 +217,8 @@ sample-order 证据从 native 已实际接收的 batch 数生成，不再把尚�
 
 ## 6. 尚未完全封装的机制
 
-公共“配置面”和普通 batch pipeline 已收敛，但仍有以下后续工作：
+公共“配置面”和普通 batch pipeline 已收敛。仍保留的非 Stable 机制包括：
 
-- DCT-major adapter 仍感知 physical shard segment，并在 Python 中进行跨 segment tensor 拼接；
 - benchmark audit 模式仍读取完整 native counter 字典形成历史验收证据；
 - 私有 binding 为 diagnostics 保留宽参数的 `plan_batch/read_batch/prefetch_batch`。
 
@@ -226,7 +231,7 @@ sample-order 证据从 native 已实际接收的 batch 数生成，不再把尚�
 1. ~~实现 `galp.torch.DirectDctPipeline` 与有界 iterator；~~ 已完成；
 2. ~~native 统一拥有 plan → I/O → CUDA submission → completion → reclaim 状态机；~~ 已完成；
 3. ~~将 FIFO、cancel/reset/close、异常传播和 CUDA event handoff 移出 adapter；~~ 已完成；
-4. 在 native 中完成 DCT-major segment stitching，Python 只接收普通 model batch。
+4. ~~在 native 中完成 DCT-major segment stitching，Python 只接收普通 model batch。~~ 已完成；
 
 完成标准：canonical Python 不出现 submission gate、physical segment、manual keepalive 或
 reclaim 编排。

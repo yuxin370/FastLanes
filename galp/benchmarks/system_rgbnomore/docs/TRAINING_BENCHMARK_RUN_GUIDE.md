@@ -284,7 +284,7 @@ python3 galp/benchmarks/system_rgbnomore/training/v3_acceptance.py \
 
 返回码 `0` 表示所有 blocking gates 通过，`1` 表示已有证据违反 blocking gate，`2` 表示仍缺 required evidence。`--allow-incomplete` 只允许 incomplete 报告返回 `0`，不会掩盖已失败的门。报告不会相加可能重叠的 planner/read/decode/transform stage 时间，也明确禁止把 GALP 与 DALI 的不同模型路径解释为纯 codec 差异。
 
-## 10. H100 equal-image 两 epoch 性能比较
+## 10. Equal-image 两 epoch 训练性能比较
 
 短 step benchmark 不能与完整 Native PLS epoch 直接相除。以下入口固定完整
 ImageNet、microbatch 64、accumulation 16、不丢尾部、每 epoch 20,019 个
@@ -295,8 +295,9 @@ microbatch 和 1,252 个 optimizer update。Epoch 1 是 cold observation，Epoch
 batch/parallel `external_source` JPEG reader 不再属于正式实现。D2/PyTorch 共享同一
 RGB 模型初始状态、sample order、augmentation key、optimizer 和 300-epoch scheduler
 horizon；D3 只共享模型与优化器 recipe，不声明顺序或逐样本增强等价。
-三条 RGB pipeline 在同一进程中按注册顺序运行，因此 Epoch 1 还包含编译缓存的
-顺序效应，只作为诊断记录，不用于 pipeline 排名；正式直接性能比较只使用 Epoch 2。
+可在同一进程按注册顺序运行，也可分别指定单条 pipeline 并使用独立输出目录/进程。
+两种方式都把 Epoch 1 作为 cold/order diagnostic，只把 Epoch 2 作为 warm primary。
+正式发布建议使用独立进程，并由统一报告核对 GPU UUID、软件和 source identity。
 
 先生成不可变 contract，不启动训练：
 
@@ -308,14 +309,16 @@ export CUDA_VISIBLE_DEVICES=1
 PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 PYTHONPATH="$PWD/galp/benchmarks/system_rgbnomore:$PWD/build/galp/torch"
 E2E="$PWD/galp/data/system_rgbnomore/e2e_v3"
-OUT=/mnt/nvme2/home/tangyuxin/pls-experiments/backend-comparison-20260819/equal-image-rgb-h100-e2
+OUT=/path/to/new/equal-image-rgb-e2
 
 PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
   --train-manifest "$E2E/training_manifests_official_v3/train.json" \
   --val-manifest "$E2E/training_manifests_official_v3/val.json" \
   --output-dir "$OUT" \
   --pipelines d2,d3,pytorch \
-  --device cuda:0
+  --device cuda:0 \
+  --audit-mode runtime-first-100 \
+  --required-gpu-name-substring "RTX 4090"
 ```
 
 检查 `contract.json` 和 `execution_plan.json` 后执行：
@@ -327,27 +330,32 @@ PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
   --output-dir "$OUT" \
   --pipelines d2,d3,pytorch \
   --device cuda:0 \
+  --audit-mode runtime-first-100 \
+  --required-gpu-name-substring "RTX 4090" \
   --execute
 ```
 
 runner 在 checkpoint epoch boundary 自动恢复；已存在且 contract 相同的完整
-pipeline 不会重跑。默认要求所选 GPU 名称包含 `H100`，避免 PCI bus 映射错误。
+pipeline 不会重跑。GPU 名称不再硬编码；正式运行应显式设置
+`--required-gpu-name-substring`，并由报告严格核对实际 GPU UUID。
 
-Native B6 H100 完成 E2 后生成四路统一表：
+Native B6 完成 E2 后生成四路统一表：
 
 ```bash
 PLS_PYTHONPATH="$PWD/galp/benchmarks/system_dct_major:$PWD/build/galp/torch"
-NATIVE=/mnt/nvme2/home/tangyuxin/pls-experiments/native-pls-b6-h100-seed11997733-e2/runs/B6/seed_11997733
-REPORT=/mnt/nvme2/home/tangyuxin/pls-experiments/backend-comparison-20260819/equal-image-h100-report
+NATIVE=/path/to/native-pls-b6-e2/runs/B6/seed_11997733
+REPORT=/path/to/new/equal-image-report
 
 PYTHONPATH="$PLS_PYTHONPATH" "$PY" \
   -m training_pls.report_equal_image_performance \
   --standard-root "$OUT" \
   --native-run "$NATIVE" \
-  --output-dir "$REPORT"
+  --output-dir "$REPORT" \
+  --requested-claim system-level
 ```
 
-报告会拒绝 GPU UUID、hostname、PyTorch/CUDA 版本或每 epoch
-images/microbatches/updates 不一致的输入。DALI 与 PyTorch 是直接 RGB pipeline
-比较；RGB 与 Native DCT B6 是 equal-image 完整应用路径比较，不声明纯 loader 或
-纯 codec 隔离。
+报告会拒绝 GPU UUID、hostname、PyTorch/CUDA、audit policy、source identity 或每
+epoch images/microbatches/updates 不一致的输入。D2 与 PyTorch 是直接 RGB pipeline
+比较；D3 只是 DALI-native performance ceiling；RGB 与 Native DCT B6 是
+equal-image 完整应用路径比较，不声明纯 loader/data-pipeline 隔离。报告同时展示
+固定 GPU-resident 输入的 RGB/DCT model-only 校准；禁止把它从 E2E 时间中简单相减。

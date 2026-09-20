@@ -27,8 +27,9 @@ does not represent class-sorted raw ImageNet order. Crop, flip, RandAugment and
 Mixup RNG remain epoch-aware. Fixed microbatch membership (and therefore
 repeated Mixup partners) is an intentional consequence of disabling shuffle.
 
-All four conditions use the same GALP Direct-DCT backend and the immutable
-`rgbnomore-vitti-dct-published-v1` recipe: ViT-Ti DCT, 300 epochs, FP32,
+All four conditions use the same GALP Direct-DCT backend. The default formal
+matrix uses the immutable `rgbnomore-vitti-dct-published-v1` recipe: ViT-Ti
+DCT, 300 epochs, FP32,
 microbatch 64, accumulation 16, effective batch 1024, LR 3e-3, 10,000-update
 warmup plus epoch-aware cosine, independent RGB-no-more WeightDecay semantics,
 gradient clipping 1, DCT Mixup 0.2, and the published two-op/magnitude-three DCT
@@ -39,6 +40,31 @@ RandAugment operation/magnitude and compiles the fixed-shape ViT with
 to the sanity check; grouping changes kernel dispatch only, not decisions or
 tensor values.
 
+The runner also has a model-independent DCT-native interface. A registered
+model receives exactly two model-facing tensors from either backend:
+`Y[N,1,28,28,8,8]` and `CbCr[N,2,14,14,8,8]`. Storage, Block-major B6
+scheduling, crop pushdown, augmentation, validation, checkpointing and audit
+logic do not import architecture-specific code. `model_registry.py` currently
+registers:
+
+| model id | DCT-native stem | execution precision | status |
+|---|---|---|---|
+| `rgbnomore-vitti-dct-224-v1` | RGB-no-more grouped DCT patch embedding | FP32 | default published ViT-Ti matrix |
+| `rgbnomore-swinv2-t-dct-224-v1` | grouped/sub-block YCbCr DCT stem | BF16 autocast | active B6-only convergence and runtime baselines |
+
+The SwinV2-T entry adapts the RGB-no-more DCT architecture to the existing
+224-crop B6 contract (`window_size=7`). It is intentionally not compatible
+with the project's 256-crop/window-8 checkpoint and therefore makes no
+official pretrained-accuracy claim. It is suitable for measured throughput,
+memory and from-scratch convergence comparisons under the same B6 data path.
+The active SwinV2 B6 convergence suite, equal-image baselines, resume commands,
+and breakdown reports are defined in
+[`SWINV2_FULL_BASELINE_RUNBOOK.md`](SWINV2_FULL_BASELINE_RUNBOOK.md).
+
+SwinV2 is intentionally registered for `B6` only. `A0`, `A1`, and `B2`
+remain readable/executable only for the historical ViT-Ti factorial experiment;
+they are not part of the active SwinV2 route.
+
 The pre-registered model-effect matrix defaults to semantic emulation over a
 frozen virtual physical mapping. A separate, fail-closed
 `native-physical-pls` execution backend consumes the materialized premixed
@@ -46,6 +72,16 @@ block-major dataset through the advanced native C++/CUDA
 `DirectDctPlsPipeline`; its Torch adapter remains explicitly experimental.
 Physical and semantic checkpoints/contracts are intentionally incompatible;
 one cannot be silently resumed as the other.
+
+The third backend, `standard-rgbnomore-dct`, is the convergence reference. It
+reads source JPEG coefficients with RGB-no-more `dct_manip`, while reusing the
+registered model and the exact premixed B6 position-to-source-sample mapping,
+plus the published DCT augmentation, optimizer, validation and checkpoint
+lifecycle. The premixed mapping path and SHA-256 are mandatory, while a physical
+GALP manifest is forbidden. It accepts any compatible registered DCT-native
+model and carries no physical-FLS or storage-reduction claim. Use a 300-epoch
+recipe with `--stop-after-epoch 50` for the current SwinV2 prefix comparison;
+see the SwinV2 runbook for the exact command and paired report.
 
 ## Commands
 
@@ -108,6 +144,29 @@ For a physical premixed B6 run, add:
   --premixed-mapping-csv /path/to/premixed/ordered_mapping.csv \
   --expected-mapping-sha256 REGISTERED_64_HEX_SHA256
 ```
+
+To run the same physical B6 path with the registered DCT-native SwinV2-T,
+add only the model selector; its immutable recipe is inferred:
+
+```bash
+  --conditions B6 \
+  --model rgbnomore-swinv2-t-dct-224-v1 \
+  --execution-backend native-physical-pls \
+  --physical-galp-manifest /path/to/premixed/dct/manifest.bin \
+  --premixed-mapping-csv /path/to/premixed/ordered_mapping.csv \
+  --expected-mapping-sha256 REGISTERED_64_HEX_SHA256
+```
+
+The resolved run manifest freezes the selected model id, complete input and
+architecture configuration, parameter count, recipe hash, and SHA-256 hashes
+of the external RGB-no-more model sources. A model/recipe mismatch or a model
+source edit fails before training or resume.
+
+For another DCT-native architecture (for example EfficientNet or MobileNetV3),
+the extension boundary is one `DctModelSpec` plus its recipe. Its builder must
+return `forward(y, cbcr) -> logits`, declare the input contract and expected
+parameter count, and list every external source file. No B6/GALP pipeline or
+training-loop branch is required.
 
 For the native no-epoch-shuffle control, use the same command and physical
 artifacts with `--conditions N6`. Planning remains the default; add `--execute`
@@ -262,6 +321,8 @@ not calculate a confidence interval from one seed.
 
 - `layout.py`, `plan_layout.py`, `parquet_helper.py`: immutable layout sidecars.
 - `recipe.py`, `published_augmentation.py`, `published_optimizer.py`: locked recipe.
+- `model_registry.py`: architecture-independent DCT input contract, model
+  builders, parameter guards, recipe binding and external-source provenance.
 - `core_schedule.py`: epoch-local global, closed-pool, and frozen-physical-order
   streams plus stable keys.
 - `contracts.py`: per-seed condition whitelist and hashes.
@@ -269,14 +330,16 @@ not calculate a confidence interval from one seed.
 - `run_matrix.py`: plan-first balanced matrix orchestration.
 - `sanity_check.py`: one-update GALP/reference semantic comparison.
 - `report.py`: curves, final metrics, paired/factorial effects, Student-t CIs.
+- `report_convergence_reference.py`: threshold-free paired Native-B6 versus
+  standard-DCT prefix curves, endpoint deltas, and normalized Top-1 AUC.
 - `audit_goal.py`: read-only formal-matrix, live-process, and evidence-boundary audit.
 - `report_premixed_milestone.py`: strict common-epoch single-seed Premixed report.
-- `galp/benchmarks/system_rgbnomore/training/equal_image_epoch_benchmark.py`: H100
+- `galp/benchmarks/system_rgbnomore/training/equal_image_epoch_benchmark.py`: GPU-identity-checked
   D2/D3/PyTorch full-ImageNet E1/E2 runner with microbatch 64, accumulation 16,
   exact tail, shared RGB initialization, and epoch-boundary resume. D2 is the
   canonical-order planned-augmentation native DALI baseline; D3 is the
   DALI-native shuffle/augmentation performance ceiling.
-- `report_equal_image_performance.py`: fail-closed H100 equal-image table combining
+- `report_equal_image_performance.py`: fail-closed equal-image table combining
   Native physical B6 with the D2/D3/PyTorch E1/E2 artifacts.
 
 The report includes every condition and seed. Throughput, memory, loader timing,

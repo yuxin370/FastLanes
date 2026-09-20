@@ -23,6 +23,15 @@ PYTHONPATH=build/galp/torch \
 
 ## 数据与模型
 
+模型不是散落在四条 pipeline 中分别配置的。`inference/model_factory.py`
+中的注册项同时声明模型构造、RGB/DCT checkpoint 对、RGB/DCT 变换、输入形状和
+GALP semantic profile；`--model` 只选择一个完整契约。当前注册项为：
+
+```text
+rgbnomore-vitti-224-v1
+rgbnomore-swinv2-t-256-window8-v1
+```
+
 正式 DCT checkpoint 的输入是预处理后的 `512×512` JPEG。推荐路径：
 
 ```text
@@ -33,6 +42,25 @@ Labels:     galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/
 RGB model:  galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth
 DCT model:  galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth
 ```
+
+官方 SwinV2-T 使用 256 输入、window=8 和独立的 RGB/DCT 300-epoch
+checkpoint。将以下两个官方文件放到同一 checkpoints 目录：
+
+```text
+imgnetSwinRGB_ep300_79.0.pth
+imgnetSwinDCT_ep300_79.4.pth
+```
+
+上游发布链接：
+
+```text
+http://www-personal.umich.edu/~jespark/rgbnomore-2023/imgnetSwinRGB_ep300_79.0.pth
+http://www-personal.umich.edu/~jespark/rgbnomore-2023/imgnetSwinDCT_ep300_79.4.pth
+```
+
+Swin 注册项会统一选择 RGB `imagenet_swin`、DCT `imagenet_dct_swin`、
+`Resize_DCT(32)` 和 GALP `rgbnomore-swinv2-validation-v1`，不会把官方
+256/window=8 权重误装进训练实验使用的 224/window=7 变体。
 
 默认 `--dct-source-image-size 512` 会扫描 JPEG SOF 并拒绝数据语义不一致。
 只有自定义 checkpoint/recipe 才应传 `0`。
@@ -63,6 +91,18 @@ PYTHONPATH=build/galp/torch \
 ```
 
 Smoke 使用 batch 2、1 个 warmup batch、2 个 measured batch、1 个 repeat。
+
+SwinV2-T smoke：
+
+```bash
+PYTHONPATH=build/galp/torch \
+/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  galp/benchmarks/system_rgbnomore/inference/run.py \
+  --preset smoke \
+  --model rgbnomore-swinv2-t-256-window8-v1 \
+  --pipelines galp rgbnomore dali pytorch \
+  --output-dir /tmp/galp-rgbnomore-swinv2-smoke
+```
 
 ## 正式 E2E
 
