@@ -1246,6 +1246,10 @@ struct DirectDctPlsPipeline::Impl {
 		                                    std::move(labels),
 		                                    options.schedule.microbatch_images,
 		                                    std::move(context_owner));
+		const auto input_channels =
+		    options.device.grid_transform
+		        ? std::span<const JpegDctOutputChannel>(options.device.grid_transform->output_channels)
+		        : std::span<const JpegDctOutputChannel> {};
 		result.impl_->postprocess =
 		    std::make_unique<detail::DirectDctPlsCudaPostprocess>(result.impl_->batch,
 		                                                          result.impl_->labels,
@@ -1255,7 +1259,9 @@ struct DirectDctPlsPipeline::Impl {
 		                                                          options.model_classes,
 		                                                          options.enable_published_randaugment,
 		                                                          options.enable_published_mixup,
-		                                                          postprocess_stream);
+		                                                          postprocess_stream,
+		                                                          input_channels,
+		                                                          options.output_channels);
 		const auto materialize_done = PlsPoolClock::now();
 		context_slots->prepare_completed(elapsed_ms(plan_started, plan_done),
 		                                  elapsed_ms(plan_done, io_done),
