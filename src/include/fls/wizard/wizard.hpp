@@ -29,7 +29,7 @@ public:
 	Wizard() = delete;
 
 public:
-	static up<TableDescriptorT> Spell(const Connection& fls);
+	static up<TableDescriptorT> Spell(const Connection& fls, n_t worker_count = 1);
 };
 } // namespace fastlanes
 

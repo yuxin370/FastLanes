@@ -27,6 +27,7 @@
 #include <algorithm> // std::min_element
 #include <cstdint>   // int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t
 #include <cstring>
+#include <future>
 #include <limits>        // std::numeric_limits
 #include <memory>        // for unique_ptr, make_unique
 #include <type_traits>   // std::conditional_t
@@ -1367,16 +1368,36 @@ void rowgroup_check(const rowgroup_pt& rowgroup, RowgroupDescriptorT& footer, co
 	expression_check(rowgroup, footer, fls); // all left over columns are expression encoded.
 }
 
-up<TableDescriptorT> Wizard::Spell(const Connection& fls) {
+up<TableDescriptorT> Wizard::Spell(const Connection& fls, const n_t worker_count) {
 	// init
 	const auto& table = fls.get_table();
 
 	auto table_descriptor = make_table_descriptor(table);
 
-	for (n_t rowgroup_idx {0}; rowgroup_idx < table.get_n_rowgroups(); ++rowgroup_idx) {
+	const auto check_rowgroup = [&](const n_t rowgroup_idx) {
 		rowgroup_check(table.m_rowgroups[rowgroup_idx]->internal_rowgroup,
 		               *table_descriptor->m_rowgroup_descriptors[rowgroup_idx],
 		               fls);
+	};
+	const auto rowgroup_count = table.get_n_rowgroups();
+	const auto workers        = std::min(worker_count, rowgroup_count);
+	if (workers <= 1) {
+		for (n_t rowgroup_idx = 0; rowgroup_idx < rowgroup_count; ++rowgroup_idx) {
+			check_rowgroup(rowgroup_idx);
+		}
+	} else {
+		vector<std::future<void>> futures;
+		futures.reserve(workers);
+		for (n_t worker = 0; worker < workers; ++worker) {
+			futures.push_back(std::async(std::launch::async, [&, worker] {
+				for (n_t rowgroup_idx = worker; rowgroup_idx < rowgroup_count; rowgroup_idx += workers) {
+					check_rowgroup(rowgroup_idx);
+				}
+			}));
+		}
+		for (auto& future : futures) {
+			future.get();
+		}
 	}
 
 	return table_descriptor;

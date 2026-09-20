@@ -136,7 +136,7 @@ public:
 	[[nodiscard]] const EncodingStats& get_last_encoding_stats() const;
 
 private:
-	void prepare_table() const;
+	void prepare_table(n_t worker_count) const;
 	void write_footer(const path& dir_path) const;
 	void clear_forced_schema_state();
 

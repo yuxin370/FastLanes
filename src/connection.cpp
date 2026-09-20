@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdint> // for uint64_t
 #include <filesystem>
+#include <future>
 #include <memory>    // for std::make_unique, unique_ptr
 #include <stdexcept> // for std::runtime_error
 #include <system_error>
@@ -196,9 +197,27 @@ void prepare_rowgroup(Rowgroup& rowgroup, const Config& config) {
 	rowgroup.PopulateBiMap();
 }
 
-void Connection::prepare_table() const {
-	for (auto& rowgroup : m_table->m_rowgroups) {
-		prepare_rowgroup(*rowgroup, *m_config);
+void Connection::prepare_table(const n_t worker_count) const {
+	const auto rowgroup_count = m_table->get_n_rowgroups();
+	const auto workers        = std::min(worker_count, rowgroup_count);
+	if (workers <= 1) {
+		for (auto& rowgroup : m_table->m_rowgroups) {
+			prepare_rowgroup(*rowgroup, *m_config);
+		}
+		return;
+	}
+
+	vector<std::future<void>> futures;
+	futures.reserve(workers);
+	for (n_t worker = 0; worker < workers; ++worker) {
+		futures.push_back(std::async(std::launch::async, [&, worker] {
+			for (n_t rowgroup_idx = worker; rowgroup_idx < rowgroup_count; rowgroup_idx += workers) {
+				prepare_rowgroup(*m_table->m_rowgroups[rowgroup_idx], *m_config);
+			}
+		}));
+	}
+	for (auto& future : futures) {
+		future.get();
 	}
 }
 
@@ -242,11 +261,11 @@ Connection& Connection::to_fls(const path& file_path, const EncodingOptions& opt
 		throw std::runtime_error("data is not loaded.");
 	}
 
-	prepare_table();
+	prepare_table(options.worker_count);
 
 	//  make a rowgroup-get_descriptor if there is no rowgroup-get_descriptor .
 	if (m_table_descriptor == nullptr) {
-		spell();
+		m_table_descriptor = Wizard::Spell(*this, options.worker_count);
 	}
 	const auto preparation_finished = std::chrono::steady_clock::now();
 
