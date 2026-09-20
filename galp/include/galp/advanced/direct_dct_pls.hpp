@@ -126,12 +126,14 @@ DirectDctPlsAugmentationDecision derive_direct_dct_pls_augmentation(const Direct
 struct DirectDctPlsPipelineOptions {
 	DirectDctPlsScheduleOptions schedule;
 	JpegDctDeviceBatchOptions   device;
-	uint32_t                    segment_images = 1024U;
-	uint32_t                    model_classes  = 1000U;
-	std::string                 expected_mapping_sha256;
-	bool                        enable_published_randaugment = true;
-	bool                        enable_published_mixup       = true;
-	bool                        require_block_major_planless = true;
+	// Optional projected training output; includes normalization after augmentation.
+	std::vector<JpegDctOutputChannel> output_channels;
+	uint32_t                          segment_images = 1024U;
+	uint32_t                          model_classes  = 1000U;
+	std::string                       expected_mapping_sha256;
+	bool                              enable_published_randaugment = true;
+	bool                              enable_published_mixup       = true;
+	bool                              require_block_major_planless = true;
 };
 
 struct DirectDctPlsTargetTensorDescriptor {
@@ -148,6 +150,7 @@ struct DirectDctPlsTargetTensorDescriptor {
 struct DirectDctPlsMicrobatchView {
 	DirectDctGridTensorDescriptor      y;
 	DirectDctGridTensorDescriptor      cbcr;
+	DirectDctGridTensorDescriptor      projected;
 	DirectDctPlsTargetTensorDescriptor targets;
 	std::span<const uint32_t>          global_image_ids;
 	std::span<const int64_t>           labels;
@@ -192,9 +195,10 @@ public:
 	[[nodiscard]] size_t                       image_count() const noexcept;
 	[[nodiscard]] size_t                       microbatch_count() const noexcept;
 	[[nodiscard]] const std::vector<uint32_t>& virtual_pls_ids() const noexcept;
-	[[nodiscard]] const DirectDctBatch&        batch() const noexcept;
-	[[nodiscard]] void*                        cuda_completion_event() const noexcept;
-	[[nodiscard]] DirectDctPlsMicrobatchView   microbatch(size_t index) const;
+	// Backing ownership and reader diagnostics; use microbatch() for model tensor geometry.
+	[[nodiscard]] const DirectDctBatch&      batch() const noexcept;
+	[[nodiscard]] void*                      cuda_completion_event() const noexcept;
+	[[nodiscard]] DirectDctPlsMicrobatchView microbatch(size_t index) const;
 	// Compatibility marker for callers that explicitly retire a pool. The
 	// bounded context permit now follows the pool backing and is released only
 	// when NativeBatchLease/NativeBatchCompletion can destroy that backing.

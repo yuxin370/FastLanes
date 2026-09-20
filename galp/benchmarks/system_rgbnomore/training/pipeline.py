@@ -1345,6 +1345,7 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
         decisions: Sequence[AugmentationDecision],
         batch_lengths: Sequence[int] | None = None,
     ) -> None:
+        setup_started = time.perf_counter()
         dali_config = dict(self.config.get("dali", {}))
         variant = resolve_dali_variant(str(dali_config.get("variant", "d2")))
         requested_augmentation = str(variant["augmentation_mode"])
@@ -1515,6 +1516,7 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
             )
             pipeline.set_outputs(images, indices, encoded_bytes)
         pipeline.build()
+        self._dali_build_setup_seconds = time.perf_counter() - setup_started
         self._dali_pipeline = pipeline
 
     def preserves_canonical_order(self) -> bool:
@@ -1611,6 +1613,13 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
             "read_work_timing_semantics": "unavailable for native reader",
             "pipeline_run_wait_seconds": self._dali_run_wait_seconds,
             "torch_handoff_host_seconds": self._dali_handoff_seconds,
+            "pipeline_build_setup_seconds": self._dali_build_setup_seconds,
+            "pipeline_internal_work_seconds": None,
+            "decode_augmentation_internal_seconds": None,
+            "pipeline_internal_work_timing_semantics": (
+                "unavailable from asynchronous DALI operators; pipeline.run is "
+                "main-thread exposed wait and can overlap native reader/decode work"
+            ),
             "config": dict(self.config.get("dali", {})),
         }
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -410,6 +411,140 @@ def load_layout_mapping(path: Path) -> LayoutMapping:
         widths=np.asarray(archive["width"], dtype=np.int32),
         heights=np.asarray(archive["height"], dtype=np.int32),
         positions_by_pls=tuple(positions_by_pls),
+    )
+
+
+def load_premixed_layout_mapping(
+    path: Path,
+    *,
+    expected_sha256: str,
+    base_mapping: LayoutMapping,
+    samples: Sequence[Any],
+) -> LayoutMapping:
+    """Load the physical-writer CSV as the logical schedule for a JPEG reference.
+
+    A standard JPEG-DCT reference must read the *source* sample associated with
+    each premixed physical position.  Reusing the pre-premix layout mapping here
+    silently changes B6 pool membership (ImageNet manifests are class clustered),
+    so the CSV identity is validated exhaustively before any training begins.
+    """
+
+    path = path.resolve()
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "premixed mapping SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    count = base_mapping.sample_count
+    if len(samples) != count:
+        raise ValueError("training sample count differs from the premixed mapping")
+    required = {
+        "planned_physical_position",
+        "virtual_pls_id",
+        "position_in_pls",
+        "manifest_index",
+        "galp_image_id",
+        "logical_sample_id",
+        "label",
+        "source_path",
+    }
+    logical_ids: list[str] = []
+    labels = np.empty(count, dtype=np.int32)
+    galp_image_ids = np.empty(count, dtype=np.int64)
+    manifest_indices = np.empty(count, dtype=np.int64)
+    pls_ids = np.empty(count, dtype=np.int32)
+    positions_in_pls = np.empty(count, dtype=np.int32)
+    widths = np.empty(count, dtype=np.int32)
+    heights = np.empty(count, dtype=np.int32)
+    seen_manifest_indices = np.zeros(count, dtype=np.bool_)
+    segment_images = base_mapping.segment_images
+
+    with path.open("r", encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        missing = sorted(required - set(reader.fieldnames or ()))
+        if missing:
+            raise ValueError(f"premixed mapping is missing columns: {missing}")
+        for planned_position, row in enumerate(reader):
+            if planned_position >= count:
+                raise ValueError("premixed mapping has more rows than the layout plan")
+            observed_position = int(row["planned_physical_position"])
+            if observed_position != planned_position:
+                raise ValueError(
+                    "premixed planned_physical_position must be contiguous and "
+                    f"file-ordered; row {planned_position} contains {observed_position}"
+                )
+            manifest_index = int(row["manifest_index"])
+            if not 0 <= manifest_index < count:
+                raise ValueError(
+                    f"premixed manifest_index is out of range at row {planned_position}"
+                )
+            if seen_manifest_indices[manifest_index]:
+                raise ValueError(
+                    f"premixed mapping repeats manifest_index {manifest_index}"
+                )
+            seen_manifest_indices[manifest_index] = True
+            sample = samples[manifest_index]
+            expected_pls_id = planned_position // segment_images
+            expected_position_in_pls = planned_position % segment_images
+            if int(row["virtual_pls_id"]) != expected_pls_id:
+                raise ValueError(
+                    f"premixed virtual_pls_id is invalid at row {planned_position}"
+                )
+            if int(row["position_in_pls"]) != expected_position_in_pls:
+                raise ValueError(
+                    f"premixed position_in_pls is invalid at row {planned_position}"
+                )
+            logical_id = str(row["logical_sample_id"])
+            if logical_id != str(sample.logical_sample_id):
+                raise ValueError(
+                    f"premixed logical identity mismatch at row {planned_position}"
+                )
+            galp_image_id = int(row["galp_image_id"])
+            if galp_image_id != int(sample.galp_image_id):
+                raise ValueError(
+                    f"premixed GALP image identity mismatch at row {planned_position}"
+                )
+            label = int(row["label"])
+            if label != int(sample.label):
+                raise ValueError(f"premixed label mismatch at row {planned_position}")
+            if str(row["source_path"]) != str(sample.path):
+                raise ValueError(
+                    f"premixed source path mismatch at row {planned_position}"
+                )
+            logical_ids.append(logical_id)
+            labels[planned_position] = label
+            galp_image_ids[planned_position] = galp_image_id
+            manifest_indices[planned_position] = manifest_index
+            pls_ids[planned_position] = expected_pls_id
+            positions_in_pls[planned_position] = expected_position_in_pls
+            widths[planned_position] = int(getattr(sample, "width", 0))
+            heights[planned_position] = int(getattr(sample, "height", 0))
+
+    if len(logical_ids) != count:
+        raise ValueError(
+            f"premixed mapping has {len(logical_ids)} rows; expected {count}"
+        )
+    if not bool(seen_manifest_indices.all()):
+        raise ValueError("premixed manifest_index is not a complete permutation")
+    positions_by_pls = tuple(
+        np.arange(begin, min(begin + segment_images, count), dtype=np.int64)
+        for begin in range(0, count, segment_images)
+    )
+    if len(positions_by_pls) != int(base_mapping.plan["virtual_pls_count"]):
+        raise ValueError("premixed virtual PLS count differs from the layout plan")
+    return LayoutMapping(
+        plan_path=base_mapping.plan_path,
+        plan=base_mapping.plan,
+        logical_sample_ids=tuple(logical_ids),
+        labels=labels,
+        galp_image_ids=galp_image_ids,
+        manifest_indices=manifest_indices,
+        virtual_pls_ids=pls_ids,
+        positions_in_pls=positions_in_pls,
+        widths=widths,
+        heights=heights,
+        positions_by_pls=positions_by_pls,
     )
 
 

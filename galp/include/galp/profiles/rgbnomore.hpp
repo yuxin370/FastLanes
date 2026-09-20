@@ -10,6 +10,8 @@ namespace galp::profiles {
 inline constexpr std::string_view kRgbNoMoreValidationProfileId = "rgbnomore-validation-v1";
 inline constexpr std::string_view kRgbNoMoreValidationCenterCrop512ProfileId =
     "rgbnomore-validation-center-crop-512-v1";
+inline constexpr std::string_view kRgbNoMoreSwinV2ValidationProfileId =
+    "rgbnomore-swinv2-validation-v1";
 inline constexpr std::string_view kRgbNoMoreTrainingPlsProfileId = "rgbnomore-training-pls-v1";
 
 // Optional application profile. No RGB-no-more name or geometry is required by
@@ -69,6 +71,26 @@ inline RegisteredDirectDctProfile rgbnomore_validation_profile() {
 	return RegisteredDirectDctProfile {
 	    kRgbNoMoreValidationProfileId,
 	    rgbnomore_validation_output_profile(),
+	    compact_v3_runtime_policy(),
+	};
+}
+
+// Published RGB-no-more SwinV2-T evaluates a 512x512 JPEG with
+// Resize_DCT(32): the full 64-block luma grid is resized to 32 blocks, with a
+// 16-block chroma result for 4:2:0 inputs. Numeric semantics match the ViT
+// validation profile.
+inline RegisteredDirectDctProfile rgbnomore_swinv2_validation_profile() {
+	auto output = rgbnomore_validation_output_profile();
+	output.id = kRgbNoMoreSwinV2ValidationProfileId;
+	output.grid_transform->y_output_width_blocks     = 32;
+	output.grid_transform->y_output_height_blocks    = 32;
+	output.grid_transform->cbcr_output_width_blocks  = 16;
+	output.grid_transform->cbcr_output_height_blocks = 16;
+	output.grid_transform->preferred_small_crop_width_blocks  = {2, 4, 16, 32};
+	output.grid_transform->preferred_small_crop_height_blocks = {2, 4, 16, 32};
+	return RegisteredDirectDctProfile {
+	    kRgbNoMoreSwinV2ValidationProfileId,
+	    std::move(output),
 	    compact_v3_runtime_policy(),
 	};
 }

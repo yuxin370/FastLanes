@@ -1246,26 +1246,99 @@ TEST(JpegDct, TransformedGridSupportsArbitraryCoefficientSelections) {
 	    all,
 	}};
 	for (const auto& selection : selections) {
-		galp::jpeg::JpegDctDeviceBatchOptions planless_options;
-		planless_options.layout = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
-		planless_options.grid_transform = galp::profiles::rgbnomore_val_dct_grid_transform();
-		planless_options.enable_planless_execution = true;
-		planless_options.cache_capacity_bytes = 0U;
-		planless_options.plan_cache_capacity = 0U;
-		planless_options.coefficient_selection.coefficients = selection;
-		auto reference_options = planless_options;
-		reference_options.enable_planless_execution = false;
+		for (const bool identity : {false, true}) {
+			galp::jpeg::JpegDctDeviceBatchOptions planless_options;
+			planless_options.layout                             = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+			planless_options.grid_transform                     = galp::profiles::rgbnomore_val_dct_grid_transform();
+			planless_options.enable_planless_execution          = true;
+			planless_options.cache_capacity_bytes               = 0U;
+			planless_options.plan_cache_capacity                = 0U;
+			planless_options.coefficient_selection.coefficients = selection;
+			auto selected_requests                              = requests;
+			if (identity) {
+				auto& transform                 = *planless_options.grid_transform;
+				transform.y_output_width_blocks = transform.y_output_height_blocks = 4U;
+				transform.cbcr_output_width_blocks = transform.cbcr_output_height_blocks = 2U;
+				transform.crop_reference_width_blocks = transform.crop_reference_height_blocks = 4U;
+				for (auto& request : selected_requests) {
+					request.source_crop = galp::jpeg::JpegDctCropBox {0U, 0U, 32U, 32U};
+				}
+			}
+			auto reference_options                      = planless_options;
+			reference_options.enable_planless_execution = false;
 
-		auto actual = reader.ReadDeviceDctBatch(requests, planless_options);
-		auto reference = reader.ReadDeviceDctBatch(requests, reference_options);
-		EXPECT_EQ(copy_grid(actual), copy_grid(reference)) << "selection size " << selection.size();
-		EXPECT_EQ(actual.selected_coefficients(), selection);
-		EXPECT_EQ(actual.coefficients_per_block(), selection.size());
-		EXPECT_EQ(actual.grid_output_data_type(), galp::jpeg::JpegDctGridOutputDataType::kInt16);
-		EXPECT_EQ(actual.ycbcr_dct_grid_shape().y,
-		          (std::array<size_t, 6> {2U, 1U, 28U, 28U, 8U, 8U}));
-		EXPECT_EQ(actual.ycbcr_dct_grid_shape().cbcr,
-		          (std::array<size_t, 6> {2U, 2U, 14U, 14U, 8U, 8U}));
+			auto actual    = reader.ReadDeviceDctBatch(selected_requests, planless_options);
+			auto reference = reader.ReadDeviceDctBatch(selected_requests, reference_options);
+			EXPECT_EQ(copy_grid(actual), copy_grid(reference)) << "selection size " << selection.size();
+			EXPECT_EQ(actual.selected_coefficients(), selection);
+			EXPECT_EQ(actual.coefficients_per_block(), selection.size());
+			EXPECT_EQ(actual.grid_output_data_type(), galp::jpeg::JpegDctGridOutputDataType::kInt16);
+			EXPECT_EQ(actual.ycbcr_dct_grid_shape().y,
+			          (std::array<size_t, 6> {2U, 1U, identity ? 4U : 28U, identity ? 4U : 28U, 8U, 8U}));
+			EXPECT_EQ(actual.ycbcr_dct_grid_shape().cbcr,
+			          (std::array<size_t, 6> {2U, 2U, identity ? 2U : 14U, identity ? 2U : 14U, 8U, 8U}));
+		}
+	}
+
+	// Arbitrary component/channel order, normalization, flip, and frequency-mixing chroma resize.
+	auto projected_shards                      = shard_options;
+	projected_shards.physical_layout           = galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
+	projected_shards.physical_layout_specified = true;
+	const auto projected_dir                   = dir / "projected";
+	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+	    {path0, path1}, projected_dir, reader_options, projected_shards);
+	galp::jpeg::JpegDctShardDatasetReader projected_reader(projected_dir / "manifest.bin");
+	for (const uint32_t size : {4U, 2U, 7U}) {
+		galp::jpeg::JpegDctDeviceBatchOptions options;
+		options.layout                 = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+		options.grid_transform         = galp::profiles::rgbnomore_val_dct_grid_transform();
+		options.cache_capacity_bytes   = 0;
+		options.plan_cache_capacity    = 0;
+		options.decode_batch_rowgroups = 1;
+		auto& spec                     = *options.grid_transform;
+		spec.y_output_width_blocks = spec.y_output_height_blocks = size;
+		spec.cbcr_output_width_blocks = spec.cbcr_output_height_blocks = size;
+		spec.crop_reference_width_blocks = spec.crop_reference_height_blocks = 4;
+		spec.output_data_type = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+		spec.output_add       = 0.25F;
+		spec.output_scale     = 0.75F;
+		auto cropped          = requests;
+		for (auto& request : cropped)
+			request.source_crop = {0, 0, 32, 32};
+		cropped[1].horizontal_flip = true;
+		auto               full    = projected_reader.ReadDeviceDctBatch(cropped, options);
+		std::vector<float> y(full.y_coefficient_count()), c(full.cbcr_coefficient_count());
+		ASSERT_EQ(cudaMemcpy(y.data(), full.y_float_coefficients(), y.size() * sizeof(float), cudaMemcpyDeviceToHost),
+		          cudaSuccess);
+		ASSERT_EQ(
+		    cudaMemcpy(c.data(), full.cbcr_float_coefficients(), c.size() * sizeof(float), cudaMemcpyDeviceToHost),
+		    cudaSuccess);
+		spec.output_channels   = {{2, 7, 0.125F, 1.7F}, {0, 0, -2.0F, 3.0F}, {1, 4, 0.5F, 0.7F}};
+		auto         projected = projected_reader.ReadDeviceDctBatch(cropped, options);
+		const size_t spatial   = size * size;
+		ASSERT_EQ(projected.projected_shape(), (std::array<size_t, 6> {2, 3, size, size, 1, 1}));
+		ASSERT_EQ(projected.cbcr_coefficient_count(), 0U);
+		ASSERT_EQ(projected.y_coefficient_count(), 2U * 3U * spatial);
+		std::vector<float> actual(projected.y_coefficient_count());
+		ASSERT_EQ(
+		    cudaMemcpy(
+		        actual.data(), projected.y_float_coefficients(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
+		    cudaSuccess);
+		for (size_t image = 0; image < 2; ++image) {
+			for (size_t channel = 0; channel < spec.output_channels.size(); ++channel) {
+				const auto& entry = spec.output_channels[channel];
+				for (size_t xy = 0; xy < spatial; ++xy) {
+					const float value =
+					    entry.component == 0
+					        ? y[(image * spatial + xy) * 64 + entry.frequency]
+					        : c[((image * 2 + entry.component - 1) * spatial + xy) * 64 + entry.frequency];
+					EXPECT_FLOAT_EQ(actual[(image * 3 + channel) * spatial + xy],
+					                (value - entry.subtract) / entry.divide);
+				}
+			}
+		}
+		spec.output_channels.push_back(spec.output_channels[0]);
+		EXPECT_THROW(projected_reader.ReadDeviceDctBatch(cropped, options), std::runtime_error);
 	}
 
 	std::filesystem::remove_all(dir);
@@ -2885,6 +2958,26 @@ TEST(JpegDct, BlockMajorProductionProfileOutputInitializationIsSelectorStable) {
 	auto omitted_after_prefix_batch = reader.ReadPreparedDeviceDctBatch(std::move(gated_prepared));
 	const auto omitted_after_prefix = copy_grid(omitted_after_prefix_batch);
 	EXPECT_EQ(omitted_after_prefix, omitted_first);
+	omitted_after_prefix_batch = {};
+
+	// Reuse the bounded reader across chunks and batches, preserving output,
+	// physical read order, and the existing double-buffer memory limit.
+	auto bounded_options                             = omitted_options;
+	bounded_options.async_planless_completion        = false;
+	bounded_options.decode_batch_rowgroups           = 4U;
+	bounded_options.decode_workset_capacity_bytes    = 8U * 1024U * 1024U;
+	bounded_options.rowgroup_prefetch_workers        = 4U;
+	bounded_options.block_major_double_buffer_policy = galp::jpeg::JpegDctBlockMajorDoubleBufferPolicy::kEnabled;
+	for (size_t batch_index = 0U; batch_index < 2U; ++batch_index) {
+		auto batch = reader.ReadDeviceDctBatch(requests, bounded_options);
+		EXPECT_EQ(copy_grid(batch), omitted_first);
+		const auto stats = batch.execution_stats();
+		EXPECT_TRUE(stats.bounded_double_buffer_enabled);
+		EXPECT_GT(stats.bounded_double_buffer_workset_count, 1U);
+		EXPECT_EQ(stats.duplicate_physical_read_count, 0U);
+		EXPECT_EQ(stats.physical_read_order_inversions, 0U);
+		EXPECT_LE(stats.bounded_double_buffer_peak_estimated_bytes, bounded_options.decode_workset_capacity_bytes);
+	}
 
 	std::filesystem::remove_all(dir);
 }

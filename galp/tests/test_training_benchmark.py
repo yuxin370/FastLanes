@@ -66,6 +66,8 @@ from training.manifest_preflight import (  # noqa: E402
 from training.generate_imagenet_manifests import main as generate_training_manifests  # noqa: E402
 from training.model_factory import (  # noqa: E402
     EXPECTED_PARAMETER_COUNTS,
+    MODEL_IDS,
+    SWINV2_T_MODEL_ID,
     build_model,
     capture_rng_state,
     capture_training_state,
@@ -1985,6 +1987,18 @@ class TrainingBenchmarkTest(unittest.TestCase):
             self.assertFalse(torch.equal(before, next(model.parameters()).detach()))
             del model, optimizer, logits, loss
             gc.collect()
+
+    def test_training_model_registry_exposes_swinv2_rgb_and_dct_pair(self) -> None:
+        self.assertIn(SWINV2_T_MODEL_ID, MODEL_IDS)
+        rgb = model_configuration("rgb", SWINV2_T_MODEL_ID)
+        dct = model_configuration("dct", SWINV2_T_MODEL_ID)
+        self.assertEqual(rgb["architecture"], dct["architecture"])
+        self.assertEqual(rgb["window_size"], 7)
+        self.assertEqual(rgb["image_size"], 224)
+        self.assertEqual(rgb["expected_trainable_parameters"], 28_347_154)
+        self.assertEqual(dct["expected_trainable_parameters"], 28_344_850)
+        self.assertIsNone(rgb["dct_stem"])
+        self.assertEqual(dct["dct_stem"], "grouped-subblock-ycbcr-v1")
 
     def test_tiny_training_step_checks_loss_gradient_and_update(self) -> None:
         model = torch.nn.Sequential(

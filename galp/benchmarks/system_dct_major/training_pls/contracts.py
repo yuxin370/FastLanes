@@ -10,18 +10,25 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from galp.benchmarks.training_audit_policy import TrainingAuditPolicy
-
 from .core_schedule import policy_digest
 from .layout import sha256_file
 from .matrix import resolve_condition
 from .recipe import sha256_json
+from galp.benchmarks.training_audit_policy import validate_audit_policy
 
 
-CONTRACT_SCHEMA = "galp-pls-condition-contract-v2"
-CONTRACT_DIFF_SCHEMA = "galp-pls-condition-contract-diff-v2"
-RUN_MANIFEST_SCHEMA = "galp-pls-run-manifest-v1"
-TRAINING_SOURCE_SCOPE = "galp-pls-training-runtime-v1"
+CONTRACT_SCHEMA = "galp-pls-condition-contract-v3"
+CONTRACT_DIFF_SCHEMA = "galp-pls-condition-contract-diff-v3"
+RUN_MANIFEST_SCHEMA = "galp-pls-run-manifest-v2"
+TRAINING_SOURCE_SCOPE = "galp-training-runtime-v2"
+STANDARD_DCT_BACKEND = "standard-rgbnomore-dct"
+SEMANTIC_BACKEND = "semantic-emulation"
+NATIVE_PHYSICAL_BACKEND = "native-physical-pls"
+EXECUTION_BACKENDS = (
+    SEMANTIC_BACKEND,
+    NATIVE_PHYSICAL_BACKEND,
+    STANDARD_DCT_BACKEND,
+)
 
 _TRAINING_PLS_RUNTIME_MODULES = frozenset(
     {
@@ -31,10 +38,13 @@ _TRAINING_PLS_RUNTIME_MODULES = frozenset(
         "core_schedule.py",
         "layout.py",
         "matrix.py",
+        "model_registry.py",
         "parquet_helper.py",
         "published_augmentation.py",
         "published_optimizer.py",
         "recipe.py",
+        "report_convergence_reference.py",
+        "report_equal_image_performance.py",
         "run_matrix.py",
         "schedule.py",
         "train.py",
@@ -43,7 +53,6 @@ _TRAINING_PLS_RUNTIME_MODULES = frozenset(
 
 _TRAINING_RUNTIME_EXTERNAL_PATHS = frozenset(
     {
-        "galp/benchmarks/training_audit_policy.py",
         "galp/benchmarks/system_rgbnomore/training/artifacts.py",
         "galp/benchmarks/system_rgbnomore/training/augmentation.py",
         "galp/benchmarks/system_rgbnomore/training/direct_dct_reader.py",
@@ -51,6 +60,10 @@ _TRAINING_RUNTIME_EXTERNAL_PATHS = frozenset(
         "galp/benchmarks/system_rgbnomore/training/pipeline.py",
         "galp/benchmarks/system_rgbnomore/training/pls_experiment.py",
         "galp/benchmarks/system_rgbnomore/training/sample_order.py",
+        "galp/benchmarks/system_rgbnomore/training/equal_image_epoch_benchmark.py",
+        "galp/benchmarks/system_dct_major/training_pls/report_equal_image_performance.py",
+        "galp/benchmarks/training_audit_policy.py",
+        "galp/benchmarks/model_only_training_calibration.py",
         "galp/include/galp/direct_dct_pls.hpp",
         "galp/include/galp/profiles/rgbnomore.hpp",
         "galp/src/api/direct_dct_pls.cpp",
@@ -221,20 +234,56 @@ def build_condition_contract(
     initial_model_hash: str,
     code: Mapping[str, Any],
     device: str,
-    execution_backend: str = "semantic-emulation",
+    model_source_provenance: Sequence[Mapping[str, str]],
+    audit_policy: Mapping[str, Any],
+    required_gpu_name_substring: str,
+    execution_backend: str = SEMANTIC_BACKEND,
     physical_execution: Mapping[str, Any] | None = None,
-    training_audit_policy: Mapping[str, Any] | None = None,
+    standard_dct_reference: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     condition = resolve_condition(condition_id)
     layout_hash = str(layout_plan["layout_hash"])
-    if execution_backend not in {"semantic-emulation", "native-physical-pls"}:
+    if execution_backend not in EXECUTION_BACKENDS:
         raise ValueError(f"unsupported execution backend: {execution_backend!r}")
-    native_physical = execution_backend == "native-physical-pls"
+    native_physical = execution_backend == NATIVE_PHYSICAL_BACKEND
+    standard_dct = execution_backend == STANDARD_DCT_BACKEND
+    resolved_audit_policy = validate_audit_policy(audit_policy)
     if native_physical and physical_execution is None:
         raise ValueError("native-physical-pls requires a physical execution contract")
     if not native_physical and physical_execution is not None:
-        raise ValueError("semantic-emulation cannot carry a physical execution contract")
-    audit_policy = TrainingAuditPolicy.from_contract(training_audit_policy)
+        raise ValueError(
+            f"{execution_backend} cannot carry a physical execution contract"
+        )
+    if standard_dct and standard_dct_reference is None:
+        raise ValueError(
+            "standard-rgbnomore-dct requires a premixed reference contract"
+        )
+    if not standard_dct and standard_dct_reference is not None:
+        raise ValueError(
+            f"{execution_backend} cannot carry a standard DCT reference contract"
+        )
+    resolved_standard_reference = dict(standard_dct_reference or {})
+    if standard_dct:
+        mapping_path = str(
+            resolved_standard_reference.get("premixed_mapping_csv", "")
+        )
+        mapping_hash = str(
+            resolved_standard_reference.get("premixed_mapping_sha256", "")
+        )
+        if not mapping_path:
+            raise ValueError("standard DCT reference lacks premixed_mapping_csv")
+        if len(mapping_hash) != 64:
+            raise ValueError(
+                "standard DCT reference premixed_mapping_sha256 must contain "
+                "64 hex characters"
+            )
+        try:
+            int(mapping_hash, 16)
+        except ValueError as error:
+            raise ValueError(
+                "standard DCT reference premixed_mapping_sha256 must contain "
+                "64 hex characters"
+            ) from error
     contract: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA,
         "run_manifest_schema": RUN_MANIFEST_SCHEMA,
@@ -267,6 +316,9 @@ def build_condition_contract(
         "train_manifest_hash": _cached_file_hash(str(train_manifest.resolve())),
         "validation_manifest_hash": _cached_file_hash(str(val_manifest.resolve())),
         "model_configuration": recipe["model"],
+        "model_id": recipe["model"]["model_id"],
+        "model_input_contract": recipe["model"]["input_contract"],
+        "model_source_provenance": [dict(row) for row in model_source_provenance],
         "model_execution": recipe["execution"],
         "initial_model_hash": initial_model_hash,
         "optimizer_configuration": recipe["optimizer"],
@@ -276,13 +328,24 @@ def build_condition_contract(
         "total_optimizer_updates": int(total_optimizer_updates),
         "microbatch_size": recipe["training"]["physical_microbatch"],
         "gradient_accumulation": recipe["training"]["gradient_accumulation"],
-        "training_audit_policy": audit_policy.as_contract(),
         "effective_update_batch": recipe["training"]["effective_update_batch"],
         "mixup": recipe["augmentation"]["mixup"],
         "randaugment": recipe["augmentation"]["randaugment"],
         "flip": recipe["augmentation"]["horizontal_flip"],
         "validation_preprocessing": recipe["validation"],
         "precision": recipe["training"]["precision"],
+        "audit_policy": resolved_audit_policy,
+        "model_only_calibration": {
+            "enabled": True,
+            "domain": "dct",
+            "microbatch_images": recipe["training"]["physical_microbatch"],
+            "gradient_accumulation": recipe["training"]["gradient_accumulation"],
+            "precision": recipe["training"]["precision"],
+            "fixed_pre_resident_gpu_inputs": True,
+            "warmup_optimizer_updates": 5,
+            "measured_optimizer_updates": 120,
+            "subtraction_from_e2e_forbidden": True,
+        },
         "checkpoint_schedule": {
             "rolling": "every completed epoch",
             "permanent": "every formal validation epoch",
@@ -291,15 +354,24 @@ def build_condition_contract(
         "backend_implementation": (
             "galp-native-direct-dct-pls-block-major-v1"
             if native_physical
-            else "shared-galp-direct-dct-semantic-backend-v2"
+            else (
+                "rgbnomore-jpeg-dct-premixed-reference-v2"
+                if standard_dct
+                else "shared-galp-direct-dct-semantic-backend-v2"
+            )
         ),
         "recipe_hash": recipe["recipe_hash"],
         "code_version": dict(code),
         "execution_device": str(device),
+        "required_gpu_name_substring": str(required_gpu_name_substring),
         "execution_mode": (
-            "native_physical_pls" if native_physical else "semantic_emulation"
+            "native_physical_pls"
+            if native_physical
+            else (
+                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
+            )
         ),
-        "semantic_emulation": not native_physical,
+        "semantic_emulation": execution_backend == SEMANTIC_BACKEND,
         "physical_fls_observed": native_physical,
         "physical_gpu_pool": native_physical,
         "layout_hash": layout_hash,
@@ -309,6 +381,22 @@ def build_condition_contract(
     }
     if native_physical:
         contract["physical_execution"] = dict(physical_execution or {})
+    if standard_dct:
+        contract["standard_dct_reference"] = {
+            **resolved_standard_reference,
+            "schema_version": "galp-standard-rgbnomore-dct-reference-v2",
+            "training_input": "source JPEG decoded by RGB-no-more dct_manip",
+            "logical_schedule": (
+                "physical-writer premixed mapping followed by identical condition "
+                "schedule and augmentation keys"
+            ),
+            "validation_input": "shared GALP Direct-DCT validation reader",
+            "comparison_scope": (
+                "recipe-matched DCT reference for convergence or validated "
+                "equal-image E1/E2 system performance; no physical FLS or "
+                "storage-reduction claim"
+            ),
+        }
     contract["condition_hash"] = condition_identity_hash(contract)
     contract["run_manifest_hash"] = sha256_json(contract)
     return contract

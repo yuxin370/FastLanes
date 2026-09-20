@@ -181,6 +181,16 @@ std::optional<galp::jpeg::JpegDctGridTransformSpec> parse_grid_transform(const p
 	spec.dequantize               = optional_bool("dequantize", true);
 	spec.require_all_coefficients = optional_bool("require_all_coefficients", true);
 	spec.allow_grayscale          = optional_bool("allow_grayscale", false);
+	if (dict.contains("output_channels")) {
+		for (const auto item : dict["output_channels"].cast<py::sequence>()) {
+			const auto c = py::reinterpret_borrow<py::sequence>(item);
+			if (c.size() != 4)
+				throw std::invalid_argument("output_channels entries require component, frequency, subtract, divide");
+			spec.output_channels.push_back(
+			    {c[0].cast<uint8_t>(), c[1].cast<uint8_t>(), c[2].cast<float>(), c[3].cast<float>()});
+		}
+	}
+
 	if (dict.contains("preferred_small_crop_width_blocks")) {
 		spec.preferred_small_crop_width_blocks =
 		    dict["preferred_small_crop_width_blocks"].cast<std::vector<uint32_t>>();
@@ -210,6 +220,9 @@ size_t cache_capacity_bytes_from_mib(const size_t cache_capacity_mib) {
 }
 
 galp::jpeg::JpegDctCropExecutionMode parse_crop_execution_mode(const std::string& mode) {
+	if (mode == "full-source-decode") {
+		return galp::jpeg::JpegDctCropExecutionMode::kFullSourceDecode;
+	}
 	if (mode == "auto") {
 		return galp::jpeg::JpegDctCropExecutionMode::kAutomatic;
 	}
@@ -234,7 +247,7 @@ galp::jpeg::JpegDctCropExecutionMode parse_crop_execution_mode(const std::string
 		return galp::jpeg::JpegDctCropExecutionMode::kBoundedIoUringScheduledRangeReadSelectedDecode;
 	}
 	throw std::invalid_argument(
-	    "invalid crop_execution_mode; expected auto, full-rowgroup-decode, "
+	    "invalid crop_execution_mode; expected auto, full-source-decode, full-rowgroup-decode, "
 	    "rowgroup-read-selected-decode, vector-range-read-selected-decode, or "
 	    "bounded-range-read-selected-decode, bounded-io-uring-range-read-selected-decode, or "
 	    "bounded-io-uring-scheduled-range-read-selected-decode");
@@ -1794,6 +1807,13 @@ struct TorchDirectDctBatch {
 		return tensor;
 	}
 
+	torch::Tensor projected() {
+		wait_for_batch_completion();
+		register_current_consumer_stream();
+		auto value = grid_tensor(batch->projected_tensor_async(), projected_tensor);
+		return value.squeeze(-1).squeeze(-1);
+	}
+
 	torch::Tensor y() {
 		wait_for_batch_completion();
 		register_current_consumer_stream();
@@ -1829,7 +1849,7 @@ struct TorchDirectDctBatch {
 	}
 
 	std::shared_ptr<TorchDirectDctLifetimeShadowHandle> enable_lifetime_shadow_for_test() {
-		if (tensor.defined() || y_tensor.defined() || cbcr_tensor.defined()) {
+		if (tensor.defined() || y_tensor.defined() || cbcr_tensor.defined() || projected_tensor.defined()) {
 			throw std::logic_error("lifetime shadow must be enabled before creating native-backed tensors");
 		}
 		const auto batch_identity = next_direct_dct_lifetime_batch_identity();
@@ -2080,6 +2100,7 @@ struct TorchDirectDctBatch {
 	TorchDirectDctNativeOwnerReference                  adapter_reference;
 	torch::Tensor                               tensor;
 	torch::Tensor                               y_tensor;
+	torch::Tensor                                       projected_tensor;
 	torch::Tensor                               cbcr_tensor;
 	torch::Tensor                               image_offsets_tensor_cache;
 	torch::Tensor                               image_counts_tensor_cache;
@@ -2829,16 +2850,22 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 
 	py::class_<TorchDirectDctBatch>(m, "DirectDctBatch")
 	    .def_property_readonly("coefficients", &TorchDirectDctBatch::coefficients)
+	    .def_property_readonly("projected", &TorchDirectDctBatch::projected)
 	    .def_property_readonly("y", &TorchDirectDctBatch::y)
 	    .def_property_readonly("cbcr", &TorchDirectDctBatch::cbcr)
-	    .def("record_stream", &TorchDirectDctBatch::record_current_consumer_stream,
+	    .def("record_stream",
+	         &TorchDirectDctBatch::record_current_consumer_stream,
 	         "Register the current CUDA stream as an actual consumer before submitting work.")
-	    .def("record_stream", &TorchDirectDctBatch::record_consumer_stream,
-	         py::arg("stream_identity"), py::arg("cuda_device"),
+	    .def("record_stream",
+	         &TorchDirectDctBatch::record_consumer_stream,
+	         py::arg("stream_identity"),
+	         py::arg("cuda_device"),
 	         "Register an explicit CUDA stream as an actual consumer before submitting work.")
-	    .def("_enable_lifetime_shadow_for_test", &TorchDirectDctBatch::enable_lifetime_shadow_for_test,
+	    .def("_enable_lifetime_shadow_for_test",
+	         &TorchDirectDctBatch::enable_lifetime_shadow_for_test,
 	         "Enable the non-authoritative Phase-4 lifetime observer before tensor creation.")
-	    .def("_wait_for_producer_completion_for_test", &TorchDirectDctBatch::wait_for_producer_completion_for_test,
+	    .def("_wait_for_producer_completion_for_test",
+	         &TorchDirectDctBatch::wait_for_producer_completion_for_test,
 	         "Wait for the existing producer event and update the Phase-4 test observer.")
 	    .def_property_readonly("image_offsets_tensor", &TorchDirectDctBatch::image_offsets_tensor)
 	    .def_property_readonly("image_counts_tensor", &TorchDirectDctBatch::image_counts_tensor)

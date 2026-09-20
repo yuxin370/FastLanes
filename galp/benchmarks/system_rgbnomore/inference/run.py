@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
+BENCHMARK_ROOT_TEXT = str(BENCHMARK_ROOT)
+if BENCHMARK_ROOT_TEXT in sys.path:
+    sys.path.remove(BENCHMARK_ROOT_TEXT)
+sys.path.insert(0, BENCHMARK_ROOT_TEXT)
 
 from shared.common import (
     CONTRACT_SCHEMA,
@@ -35,6 +37,7 @@ from shared.common import (
     write_json,
 )
 from dataset.manifest import build_manifest
+from inference.model_factory import DEFAULT_MODEL_ID, MODEL_IDS, resolve_model
 
 
 HERE = Path(__file__).resolve().parent
@@ -44,8 +47,7 @@ DEFAULT_E2E_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2"
 DEFAULT_E2E_V3_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v3"
 DEFAULT_DATA_ROOT = DEFAULT_E2E_V3_ROOT / "imagenet_512"
 DEFAULT_INDEX_CSV = DEFAULT_E2E_DATA_ROOT / "indexbase_val.csv"
-DEFAULT_RGB_CHECKPOINT = DEFAULT_E2E_DATA_ROOT / "checkpoints/imgnetRGBViTTi_ep300_74.1.pth"
-DEFAULT_DCT_CHECKPOINT = DEFAULT_E2E_DATA_ROOT / "checkpoints/imgnetDCTViTTi_ep300_75.1.pth"
+DEFAULT_CHECKPOINT_DIR = DEFAULT_E2E_DATA_ROOT / "checkpoints"
 DEFAULT_GALP_MANIFEST = DEFAULT_E2E_V3_ROOT / "compact_v3_tiled_z32_rgbnomore512/manifest.bin"
 DEFAULT_GALP_LABEL_MAP = DEFAULT_E2E_V3_ROOT / "compact_v3_tiled_z32_rgbnomore512/labels.json"
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
@@ -56,9 +58,34 @@ PRESETS = {
     "smoke": {"batch_size": 2, "warmup_batches": 1, "measurement_batches": 2, "repeats": 1, "workers": 1, "semantic_samples": 2},
     "e2e": {"batch_size": 50, "warmup_batches": 0, "measurement_batches": 1000, "repeats": 5, "workers": 8, "semantic_samples": 8},
 }
-GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO = 1.10
-E2E_MAX_HOT_THROUGHPUT_CV = 0.05
 E2E_PIPELINES = ("galp", "pytorch", "rgbnomore", "dali")
+
+
+def _model_performance_gate_contract(model_spec: Any, preset: str) -> dict[str, Any]:
+    target_defaults: dict[str, float | bool | None] = {
+        "minimum_median_throughput_images_per_s": None,
+        "minimum_hot_median_to_dali_hot_median_ratio": None,
+        "require_hot_min_above_dali_hot_median": False,
+        "maximum_hot_throughput_cv": None,
+        "planning_median_ms_max": None,
+        "planning_p95_ms_max": None,
+        "device_mapping_median_ms_max": None,
+        "device_mapping_plus_fixed_transform_median_ms_max": None,
+    }
+    registered_targets = dict(model_spec.e2e_performance_targets) if preset == "e2e" else {}
+    target_defaults.update(registered_targets)
+    return {
+        "policy": {
+            "scope": "registered-model-specific",
+            "profile_id": model_spec.performance_gate_profile_id,
+            "mode": "enforced" if registered_targets else "report-only",
+            "rationale": (
+                "Only targets registered for this exact model are enforced; "
+                "targets from another architecture are never inherited."
+            ),
+        },
+        "targets": target_defaults,
+    }
 
 
 def _value(args: argparse.Namespace, key: str) -> int:
@@ -193,11 +220,17 @@ def _source_revision_policy(source_revisions: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str, Any], Path]:
+    model_spec = resolve_model(args.model)
+    model_gate_contract = _model_performance_gate_contract(model_spec, args.preset)
     rgbnomore_root = args.rgbnomore_root.resolve()
     data_root = args.data_root.resolve()
     index_csv = (args.index_csv or DEFAULT_INDEX_CSV).resolve()
-    rgb_checkpoint = (args.rgb_checkpoint or DEFAULT_RGB_CHECKPOINT).resolve()
-    dct_checkpoint = (args.dct_checkpoint or DEFAULT_DCT_CHECKPOINT).resolve()
+    rgb_checkpoint = (
+        args.rgb_checkpoint or DEFAULT_CHECKPOINT_DIR / model_spec.rgb_checkpoint_name
+    ).resolve()
+    dct_checkpoint = (
+        args.dct_checkpoint or DEFAULT_CHECKPOINT_DIR / model_spec.dct_checkpoint_name
+    ).resolve()
     galp_manifest = args.galp_manifest.resolve()
     galp_label_map = args.galp_label_map_json.resolve()
 
@@ -301,38 +334,42 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
         },
         "preprocess": {
             "rgb": {
-                "name": "rgbnomore_imagenet_eval_rgb_v1",
+                "name": f"rgbnomore_{model_spec.rgb_dataset}_eval_rgb_v1",
+                "rgbnomore_dataset": model_spec.rgb_dataset,
                 "decode": "JPEG_to_RGB",
                 "resize_shorter": 256,
                 "resize_interpolation": "bilinear_antialias",
                 "crop": "center",
-                "crop_size": [224, 224],
+                "crop_size": [model_spec.rgb_size, model_spec.rgb_size],
                 "range": [-1.0, 1.0],
                 "layout": "NCHW",
             },
             "dct": {
-                "name": "rgbnomore_imagenet_eval_dct_v1",
+                "name": f"rgbnomore_{model_spec.dct_dataset}_eval_dct_v1",
+                "rgbnomore_dataset": model_spec.dct_dataset,
                 "decode": "JPEG_quantized_DCT",
                 "dequantize": True,
-                "transform": "ResizedCenterCrop_DCT(32,28)",
+                "transform": model_spec.dct_transform,
                 "range": [-1.0, 1.0],
-                "y_shape": [1, 28, 28, 8, 8],
-                "cbcr_shape": [2, 14, 14, 8, 8],
+                "y_shape": list(model_spec.y_shape),
+                "cbcr_shape": list(model_spec.cbcr_shape),
             },
         },
         "models": {
             "rgb": {
-                "architecture": "RGB-no-more ViT-Ti RGB",
+                "model_id": model_spec.model_id,
+                "architecture": model_spec.rgb_architecture,
                 "input_domain": "RGB",
-                "recipe_id": "rgbnomore_imagenet_vitti_300ep_recipe_family",
+                "recipe_id": model_spec.recipe_id,
                 "checkpoint": rgb_meta["path"],
                 "checkpoint_sha256": rgb_meta["sha256"],
                 "checkpoint_size_bytes": rgb_meta["size_bytes"],
             },
             "dct": {
-                "architecture": "RGB-no-more JPEG-Ti ViT-Ti DCT",
+                "model_id": model_spec.model_id,
+                "architecture": model_spec.dct_architecture,
                 "input_domain": "JPEG_DCT",
-                "recipe_id": "rgbnomore_imagenet_vitti_300ep_recipe_family",
+                "recipe_id": model_spec.recipe_id,
                 "checkpoint": dct_meta["path"],
                 "checkpoint_sha256": dct_meta["sha256"],
                 "checkpoint_size_bytes": dct_meta["size_bytes"],
@@ -360,6 +397,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                 "label_map_sha256": sha256_file(galp_label_map),
                 "torch_binding_dir": str(args.torch_binding_dir.resolve()),
                 "preprocess": "rgbnomore-val-pushdown",
+                "semantic_profile_id": model_spec.dct_profile_id,
                 "runtime_profile": GALP_RUNTIME_PROFILE,
             },
             "rgbnomore": {"root": str(rgbnomore_root), "adapter_policy": "reuse_external_model_dataset_and_transform_code"},
@@ -383,17 +421,9 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             "os_page_cache_policy": "uncontrolled; e2e aggregate excludes repeat 0 and reports every repeat",
         },
         "performance_gates": {
+            "policy": model_gate_contract["policy"],
             "galp": {
-                "minimum_median_throughput_images_per_s": None,
-                "minimum_hot_median_to_dali_hot_median_ratio": (
-                    GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO if args.preset == "e2e" else None
-                ),
-                "require_hot_min_above_dali_hot_median": args.preset == "e2e",
-                "maximum_hot_throughput_cv": E2E_MAX_HOT_THROUGHPUT_CV if args.preset == "e2e" else None,
-                "planning_median_ms_max": 2.0 if args.preset == "e2e" else None,
-                "planning_p95_ms_max": 3.0 if args.preset == "e2e" else None,
-                "device_mapping_median_ms_max": 1.0 if args.preset == "e2e" else None,
-                "device_mapping_plus_fixed_transform_median_ms_max": 6.5 if args.preset == "e2e" else None,
+                **model_gate_contract["targets"],
                 "image_major_manifest_minimum_version": 2,
                 "manifest_v2_rowgroups_per_image": 1,
                 "worksets_per_batch": 1,
@@ -495,7 +525,12 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
             ),
             "rgbnomore": source_tree_metadata(
                 rgbnomore_root,
-                ["datasets.py", "models/plainvit.py", "utils/custom_transforms.py"],
+                [
+                    "datasets.py",
+                    "models/plainvit.py",
+                    "models/swinv2.py",
+                    "utils/custom_transforms.py",
+                ],
             ),
         },
     }
@@ -604,6 +639,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--preset", choices=tuple(PRESETS), default="smoke")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--benchmark-id")
+    parser.add_argument(
+        "--model",
+        choices=MODEL_IDS,
+        default=DEFAULT_MODEL_ID,
+        help="Registered paired RGB/DCT model and preprocessing contract.",
+    )
     parser.add_argument("--python", type=Path, default=DEFAULT_BENCHMARK_PYTHON if DEFAULT_BENCHMARK_PYTHON.exists() else Path(sys.executable))
     parser.add_argument(
         "--pipelines",

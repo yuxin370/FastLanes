@@ -1,12 +1,15 @@
 #include "direct_dct_pls_torch.hpp"
+#include "api/direct_dct_pls_postprocess.hpp"
+#include "cuda/memory/cuda_raii.cuh"
 #include "direct_dct/native_batch_lifetime.hpp"
 #include "galp/advanced/direct_dct_pls.hpp"
 #include "galp/jpeg_dct_diagnostics.hpp"
 #include "galp/profiles/registry.hpp"
+#include <atomic>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <atomic>
+#include <cmath>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <pybind11/stl.h>
@@ -124,6 +127,10 @@ public:
 	}
 	torch::Tensor cbcr() {
 		return grid_tensor(view().cbcr, cbcr_);
+	}
+
+	torch::Tensor projected() {
+		return grid_tensor(view().projected, projected_).squeeze(-1).squeeze(-1);
 	}
 
 	torch::Tensor targets() {
@@ -251,6 +258,7 @@ private:
 	torch::Tensor                              y_;
 	torch::Tensor                              cbcr_;
 	torch::Tensor                              targets_;
+	torch::Tensor                              projected_;
 };
 
 class TorchDirectDctPlsPool : public std::enable_shared_from_this<TorchDirectDctPlsPool> {
@@ -297,7 +305,7 @@ public:
 	}
 
 	[[nodiscard]] py::dict execution_stats() const {
-		const auto& stats = owner_->batch().execution_stats_ref();
+		const auto stats = owner_->batch().execution_stats();
 		py::dict    out;
 		out["planned_selected_vector_count"]      = stats.planned_selected_vector_count;
 		out["selected_vector_count"]              = stats.selected_vector_count;
@@ -317,9 +325,26 @@ public:
 		out["bounded_physical_run_count"]         = stats.bounded_physical_run_count;
 		out["io_uring_read_request_count"]        = stats.io_uring_read_request_count;
 		out["io_uring_fallback_count"]            = stats.io_uring_fallback_count;
+		out["planless_transform_kernel_launch_count"] = stats.planless_transform_kernel_launch_count;
+		out["planless_transform_source_contribution_visit_count"] = stats.planless_transform_source_contribution_visit_count;
+		out["planless_transform_active_output_count_ms"] = stats.planless_transform_active_output_count_ms;
+		out["planless_transform_active_output_fill_ms"] = stats.planless_transform_active_output_fill_ms;
+		out["active_output_planning_ms"] = stats.planless_transform_active_output_planning_ms;
+		out["planning_ms"] = stats.planning_ms;
+		out["host_io_staging_ms"] = stats.host_io_staging_ms;
+		out["workset_build_ms"] = stats.workset_build_ms;
+		out["workset_upload_ms"] = stats.workset_upload_ms;
+		out["workset_upload_dma_bytes"] = stats.workset_upload_dma_bytes;
+		out["decode_ms"] = stats.decode_ms;
+		out["fixed_transform_ms"] = stats.fixed_transform_ms;
+		out["fixed_grid_round_ms"] = stats.fixed_grid_round_ms;
+		out["resize_weight_build_ms"] = stats.resize_weight_build_ms;
+		out["prefetch_wait_ms"] = stats.prefetch_wait_ms;
+		out["prefetch_rowgroup_read_ms"] = stats.prefetch_rowgroup_read_ms;
+		out["sync_rowgroup_read_ms"] = stats.sync_rowgroup_read_ms;
 		out["uses_planless_fixed_transform"]      = stats.uses_planless_fixed_transform;
 		out["runtime_policy_decision"]            = stats.runtime_policy_decision;
-		out["runtime_policy_reason"]              = stats.runtime_policy_reason;
+		out["runtime_policy_reason"]                     = stats.runtime_policy_reason;
 		return out;
 	}
 
@@ -330,19 +355,139 @@ private:
 	size_t                                     next_microbatch_ = 0U;
 };
 
+struct ProjectedTrainingChannels {
+	std::vector<galp::jpeg::JpegDctOutputChannel> input;
+	std::vector<galp::jpeg::JpegDctOutputChannel> output;
+};
+
+ProjectedTrainingChannels make_projected_training_channels(const std::vector<std::array<float, 4>>& output_channels) {
+	if (output_channels.empty())
+		throw std::invalid_argument("projected training needs output channels");
+	ProjectedTrainingChannels result;
+	// Rotation transposes frequencies; photometric statistics require all three DC planes.
+	bool included[3][64] {};
+	auto include = [&](uint8_t component, uint8_t frequency) {
+		if (!included[component][frequency]) {
+			result.input.push_back({component, frequency, 0.0F, 1.0F});
+			included[component][frequency] = true;
+		}
+	};
+	for (const auto& channel : output_channels) {
+		if (!std::isfinite(channel[0]) || !std::isfinite(channel[1]) || channel[0] < 0 || channel[0] > 2 ||
+		    channel[1] < 0 || channel[1] > 63 || channel[0] != std::floor(channel[0]) ||
+		    channel[1] != std::floor(channel[1]) || !std::isfinite(channel[2]) || !std::isfinite(channel[3]) ||
+		    channel[3] <= 0)
+			throw std::invalid_argument("invalid projected PLS component, frequency, or normalization");
+		const auto c = static_cast<uint8_t>(channel[0]);
+		const auto f = static_cast<uint8_t>(channel[1]);
+		result.output.push_back({c, f, channel[2], channel[3]});
+		include(c, f);
+		include(c, static_cast<uint8_t>((f % 8) * 8 + f / 8));
+	}
+	for (uint8_t c = 0; c < 3; ++c)
+		include(c, 0);
+	return result;
+}
+
+// The JPEG/PyTorch reference uses this same augmentation implementation after
+// its independently constructed DCT grid. It does not enter the GALP reader.
+class TorchProjectedDctTrainingAugment {
+public:
+	explicit TorchProjectedDctTrainingAugment(const std::vector<std::array<float, 4>>& output_channels,
+	                                          uint32_t                                 classes)
+	    : channels_(make_projected_training_channels(output_channels))
+	    , classes_(classes) {
+		C10_CUDA_CHECK(cudaGetDevice(&device_));
+		stream_ = std::make_shared<galp::jpeg::detail::DirectDctPlsCudaPostprocess::Stream>(device_);
+	}
+
+	std::vector<std::array<int, 2>> input_channels() const {
+		std::vector<std::array<int, 2>> result;
+		for (const auto c : channels_.input)
+			result.push_back({c.component, c.frequency});
+		return result;
+	}
+
+	std::pair<torch::Tensor, torch::Tensor> apply(torch::Tensor                   input,
+	                                              const std::vector<std::string>& logical_ids,
+	                                              const std::vector<int64_t>&     labels,
+	                                              uint64_t                        seed,
+	                                              uint32_t                        epoch,
+	                                              uint64_t                        microbatch_index) {
+		if (!input.is_cuda() || input.get_device() != device_ || input.scalar_type() != torch::kFloat32 ||
+		    input.dim() != 4 || !input.is_contiguous() || input.requires_grad() ||
+		    input.size(0) != static_cast<int64_t>(labels.size()) || labels.size() != logical_ids.size() ||
+		    input.size(1) != static_cast<int64_t>(channels_.input.size()))
+			throw std::invalid_argument(
+			    "projected augmentation requires a contiguous CUDA float32 NCHW input and matching labels/IDs");
+		c10::cuda::CUDAGuard                    guard(input.device());
+		galp::jpeg::DirectDctPlsScheduleOptions schedule;
+		schedule.training_seed = seed;
+		schedule.epoch         = epoch;
+		std::vector<galp::jpeg::detail::DirectDctPlsRandAugmentDecision> decisions;
+		for (const auto& id : logical_ids) {
+			galp::jpeg::DirectDctPlsSample sample;
+			sample.logical_sample_id = id;
+			decisions.push_back(galp::jpeg::detail::derive_published_randaugment_decision(sample, schedule));
+		}
+		const std::array mixup {galp::jpeg::detail::derive_published_mixup_decision(seed, epoch, microbatch_index)};
+		const auto       n = static_cast<size_t>(input.size(0)), h = static_cast<size_t>(input.size(2)),
+		           w = static_cast<size_t>(input.size(3));
+		galp::jpeg::DirectDctGridTensorDescriptor descriptor {nullptr,
+		                                                      input.data_ptr<float>(),
+		                                                      {n, channels_.input.size(), h, w, 1U, 1U},
+		                                                      {channels_.input.size() * h * w, h * w, w, 1U, 1U, 1U},
+		                                                      galp::jpeg::DirectDctTensorDataType::kFloat32,
+		                                                      galp::jpeg::DirectDctTensorDevice::kCuda,
+		                                                      device_};
+		galp::memory::CudaEvent                   ready;
+		ready.create_with_flags(cudaEventDisableTiming);
+		ready.record(c10::cuda::getCurrentCUDAStream(static_cast<c10::DeviceIndex>(device_)).stream());
+		// Both returned tensors use PyTorch-owned storage, so autograd and stream lifetimes
+		// never depend on the postprocessor's allocator or temporary scratch buffers.
+		auto targets = torch::empty({static_cast<int64_t>(n), static_cast<int64_t>(classes_)}, input.options());
+		galp::jpeg::detail::DirectDctPlsCudaPostprocess postprocess(descriptor,
+		                                                            ready.get(),
+		                                                            targets.data_ptr<float>(),
+		                                                            labels,
+		                                                            decisions,
+		                                                            mixup,
+		                                                            static_cast<uint32_t>(n),
+		                                                            classes_,
+		                                                            stream_,
+		                                                            channels_.input,
+		                                                            channels_.output);
+		const auto                                      output_channels = static_cast<int64_t>(channels_.output.size());
+		auto                                            output          = input.as_strided(
+            {input.size(0), output_channels, input.size(2), input.size(3)},
+            {output_channels * input.size(2) * input.size(3), input.size(2) * input.size(3), input.size(3), 1});
+		return {std::move(output), std::move(targets)};
+	}
+
+private:
+	ProjectedTrainingChannels                                                channels_;
+	uint32_t                                                                 classes_;
+	int                                                                      device_ = -1;
+	std::shared_ptr<galp::jpeg::detail::DirectDctPlsCudaPostprocess::Stream> stream_;
+};
+
 class TorchDirectDctPlsPipeline : public std::enable_shared_from_this<TorchDirectDctPlsPipeline> {
 public:
-	TorchDirectDctPlsPipeline(const std::string& manifest_path,
-	                          const std::string& premixed_mapping_csv,
-	                          const uint64_t     training_seed,
-	                          const std::string& expected_mapping_sha256,
-	                          const std::string& crop_policy,
-	                          const std::string& order_policy,
-	                          const uint32_t     segments_per_pool,
-	                          const uint32_t     microbatch_images,
-	                          const uint32_t     segment_images,
-	                          const uint32_t     model_classes,
-	                          const std::string& profile_id) {
+	TorchDirectDctPlsPipeline(const std::string&                       manifest_path,
+	                          const std::string&                       premixed_mapping_csv,
+	                          const uint64_t                           training_seed,
+	                          const std::string&                       expected_mapping_sha256,
+	                          const std::string&                       crop_policy,
+	                          const std::string&                       order_policy,
+	                          const uint32_t                           segments_per_pool,
+	                          const uint32_t                           microbatch_images,
+	                          const uint32_t                           segment_images,
+	                          const uint32_t                           model_classes,
+	                          const std::string&                       profile_id,
+	                          const uint32_t                           output_grid_size,
+	                          const std::vector<std::array<float, 4>>& output_channels,
+	                          const size_t                             transform_blocks_per_launch,
+	                          const size_t                             transform_ctas_per_launch) {
 		if (profile_id != galp::profiles::kRgbNoMoreTrainingPlsProfileId) {
 			throw std::invalid_argument("DirectDctPlsPipeline requires registered profile 'rgbnomore-training-pls-v1'");
 		}
@@ -357,6 +502,28 @@ public:
 		options.schedule.order_policy      = parse_order_policy(order_policy);
 		options.device =
 		    galp::profiles::materialize_direct_dct_options(galp::profiles::resolve_direct_dct_profile(profile_id));
+
+		if (output_grid_size != 0U || !output_channels.empty()) {
+			if (output_grid_size == 0U || output_channels.empty())
+				throw std::invalid_argument("projected PLS requires a grid size and output channels");
+			auto& grid                 = *options.device.grid_transform;
+			grid.y_output_width_blocks = grid.y_output_height_blocks = output_grid_size;
+			grid.cbcr_output_width_blocks = grid.cbcr_output_height_blocks = output_grid_size;
+			grid.crop_reference_width_blocks = grid.crop_reference_height_blocks = 64U;
+			grid.require_all_coefficients                                        = true;
+			grid.output_add                                                      = 0.0F;
+			grid.output_scale                                                    = 1.0F;
+			grid.clamp_min                                                       = -32768;
+			grid.clamp_max                                                       = 32767;
+			grid.output_data_type = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+			auto channels = make_projected_training_channels(output_channels);
+			grid.output_channels    = std::move(channels.input);
+			options.output_channels = std::move(channels.output);
+		}
+		if (transform_blocks_per_launch != 0U)
+			options.device.transform_blocks_per_launch = transform_blocks_per_launch;
+		if (transform_ctas_per_launch != 0U)
+			options.device.transform_ctas_per_launch = transform_ctas_per_launch;
 		options.segment_images          = segment_images;
 		options.model_classes           = model_classes;
 		options.expected_mapping_sha256 = expected_mapping_sha256;
@@ -447,6 +614,7 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	                                                                                      "DirectDctPlsMicrobatch")
 	    .def_property_readonly("y", &TorchDirectDctPlsMicrobatch::y)
 	    .def_property_readonly("cbcr", &TorchDirectDctPlsMicrobatch::cbcr)
+	    .def_property_readonly("projected", &TorchDirectDctPlsMicrobatch::projected)
 	    .def_property_readonly("targets", &TorchDirectDctPlsMicrobatch::targets)
 	    .def("record_stream", &TorchDirectDctPlsMicrobatch::record_current_consumer_stream,
 	         "Register the current CUDA stream as an actual PLS tensor consumer.")
@@ -475,6 +643,20 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	    .def_property_readonly("virtual_pls_ids", &TorchDirectDctPlsPool::virtual_pls_ids)
 	    .def_property_readonly("execution_stats", &TorchDirectDctPlsPool::execution_stats);
 
+	py::class_<TorchProjectedDctTrainingAugment>(module, "ProjectedDctTrainingAugment")
+	    .def(py::init<const std::vector<std::array<float, 4>>&, uint32_t>(),
+	         py::arg("output_channels"),
+	         py::arg("model_classes") = 1000U)
+	    .def_property_readonly("input_channels", &TorchProjectedDctTrainingAugment::input_channels)
+	    .def("apply",
+	         &TorchProjectedDctTrainingAugment::apply,
+	         py::arg("input"),
+	         py::arg("logical_ids"),
+	         py::arg("labels"),
+	         py::arg("training_seed"),
+	         py::arg("epoch"),
+	         py::arg("microbatch_index"));
+
 	py::class_<TorchDirectDctPlsPipeline, std::shared_ptr<TorchDirectDctPlsPipeline>>(module, "DirectDctPlsPipeline")
 	    .def(py::init<const std::string&,
 	                  const std::string&,
@@ -486,18 +668,26 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	                  uint32_t,
 	                  uint32_t,
 	                  uint32_t,
-	                  const std::string&>(),
+	                  const std::string&,
+	                  uint32_t,
+	                  const std::vector<std::array<float, 4>>&,
+	                  size_t,
+	                  size_t>(),
 	         py::arg("manifest_path"),
 	         py::arg("premixed_mapping_csv"),
 	         py::arg("training_seed"),
 	         py::arg("expected_mapping_sha256"),
-	         py::arg("crop_policy")       = "per-pls",
-	         py::arg("order_policy")      = "closed-pool",
-	         py::arg("segments_per_pool") = 4U,
-	         py::arg("microbatch_images") = 64U,
-	         py::arg("segment_images")    = 1024U,
-	         py::arg("model_classes")     = 1000U,
-	         py::arg("profile_id")        = std::string(galp::profiles::kRgbNoMoreTrainingPlsProfileId))
+	         py::arg("crop_policy")                 = "per-pls",
+	         py::arg("order_policy")                = "closed-pool",
+	         py::arg("segments_per_pool")           = 4U,
+	         py::arg("microbatch_images")           = 64U,
+	         py::arg("segment_images")              = 1024U,
+	         py::arg("model_classes")               = 1000U,
+	         py::arg("profile_id")                  = std::string(galp::profiles::kRgbNoMoreTrainingPlsProfileId),
+	         py::arg("output_grid_size")            = 0U,
+	         py::arg("output_channels")             = std::vector<std::array<float, 4>> {},
+	         py::arg("transform_blocks_per_launch") = 0U,
+	         py::arg("transform_ctas_per_launch")   = 0U)
 	    .def("start_epoch", &TorchDirectDctPlsPipeline::start_epoch, py::arg("epoch"))
 	    .def("next_pool", &TorchDirectDctPlsPipeline::next_pool)
 	    .def("close", &TorchDirectDctPlsPipeline::close)

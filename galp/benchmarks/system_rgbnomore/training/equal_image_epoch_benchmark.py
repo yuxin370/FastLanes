@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -29,9 +30,15 @@ import torch
 from galp.benchmarks.training_audit_policy import (
     AUDIT_MODES,
     DEFAULT_AUDIT_MODE,
-    DEFAULT_STRICT_UPDATES,
-    TrainingAuditPolicy,
-    TrainingAuditState,
+    audit_cursor,
+    build_audit_policy,
+    decision_for_next_update,
+    epoch_audit_summary,
+    validate_audit_cursor,
+    validate_audit_policy,
+)
+from galp.benchmarks.model_only_training_calibration import (
+    run_model_only_calibration,
 )
 
 
@@ -39,6 +46,7 @@ HERE = Path(__file__).resolve().parent
 FASTLANES_ROOT = HERE.parents[3]
 
 from galp.benchmarks.system_rgbnomore.training.artifacts import (
+    canonical_json_bytes,
     file_record,
     sha256_file,
     sha256_json,
@@ -49,8 +57,11 @@ from galp.benchmarks.system_rgbnomore.training.augmentation import (
     derive_augmentation,
 )
 from galp.benchmarks.system_rgbnomore.training.model_factory import (
+    DEFAULT_MODEL_ID,
+    MODEL_IDS,
     build_model,
     capture_rng_state,
+    model_configuration,
     restore_rng_state,
     seed_everything,
 )
@@ -72,17 +83,21 @@ from galp.benchmarks.system_dct_major.training_pls.published_optimizer import (
     build_published_optimizer,
 )
 from galp.benchmarks.system_dct_major.training_pls.recipe import (
-    RECIPE_NAME,
     recipe_contract,
+)
+from galp.benchmarks.system_dct_major.training_pls.model_registry import (
+    recipe_for_model,
+    source_provenance,
 )
 from galp.benchmarks.system_dct_major.training_pls.train import (
     compile_published_model,
 )
+from galp.benchmarks.system_dct_major.training_pls.contracts import code_version
 
 
-CONTRACT_SCHEMA = "galp-equal-image-rgb-epoch-contract-v2"
-CHECKPOINT_SCHEMA = "galp-equal-image-rgb-epoch-checkpoint-v2"
-RESULT_SCHEMA = "galp-equal-image-rgb-epoch-result-v2"
+CONTRACT_SCHEMA = "galp-equal-image-rgb-epoch-contract-v3"
+CHECKPOINT_SCHEMA = "galp-equal-image-rgb-epoch-checkpoint-v3"
+RESULT_SCHEMA = "galp-equal-image-rgb-epoch-result-v3"
 PIPELINES = (*DALI_VARIANTS, "pytorch")
 MICROBATCH_IMAGES = 64
 GRADIENT_ACCUMULATION = 16
@@ -90,6 +105,90 @@ REFERENCE_EPOCHS = 300
 DEFAULT_PREFIX_EPOCHS = 2
 EXPECTED_TRAIN_IMAGES = 1_281_167
 EXPECTED_VALIDATION_IMAGES = 50_000
+DALI_NATIVE_DECISION_DIGEST = "dali-native-not-observable"
+
+
+@dataclass(frozen=True)
+class TrainingAugmentationPlan:
+    """Epoch-local augmentation inputs and their audit identity."""
+
+    mode: str
+    decisions: Sequence[AugmentationDecision]
+    decision_digest: str
+
+
+def _build_training_augmentation_plan(
+    *,
+    pipeline: str,
+    contract: Mapping[str, Any],
+    identities: Sequence[SampleIdentity],
+    samples_by_id: Mapping[str, TrainingSample],
+    seed: int,
+    epoch: int,
+) -> TrainingAugmentationPlan:
+    """Build exactly the augmentation plan consumed by one training epoch.
+
+    D2 and PyTorch share the deterministic per-sample plan. D3 delegates the
+    decisions to DALI and therefore cannot publish a per-sample digest. Planned
+    decisions are hashed while they are created so a full ImageNet epoch does
+    not allocate a second list of 1.28M serialized dictionaries just for audit.
+    """
+
+    if pipeline == "pytorch":
+        augmentation_mode = "planned"
+    elif pipeline in DALI_VARIANTS:
+        dali_contracts = contract.get("dali_variants")
+        if not isinstance(dali_contracts, Mapping):
+            raise ValueError("contract is missing the DALI variant mapping")
+        variant_contract = dali_contracts.get(pipeline)
+        if not isinstance(variant_contract, Mapping):
+            raise ValueError(f"contract is missing DALI variant {pipeline!r}")
+        augmentation_mode = str(variant_contract.get("augmentation_mode", ""))
+        expected_mode = str(resolve_dali_variant(pipeline)["augmentation_mode"])
+        if augmentation_mode != expected_mode:
+            raise ValueError(
+                f"contract DALI variant {pipeline!r} has augmentation_mode "
+                f"{augmentation_mode!r}; expected {expected_mode!r}"
+            )
+    else:
+        raise ValueError(f"unknown equal-image training pipeline {pipeline!r}")
+
+    if augmentation_mode == "native":
+        return TrainingAugmentationPlan(
+            mode="dali-native",
+            decisions=(),
+            decision_digest=DALI_NATIVE_DECISION_DIGEST,
+        )
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    decisions: list[AugmentationDecision] = []
+    for index, identity in enumerate(identities):
+        try:
+            sample = samples_by_id[identity.logical_sample_id]
+        except KeyError as error:
+            raise ValueError(
+                "augmentation plan references unknown logical sample ID "
+                f"{identity.logical_sample_id!r}"
+            ) from error
+        decision = derive_augmentation(
+            seed=seed,
+            epoch=epoch,
+            logical_sample_id=identity.logical_sample_id,
+            source_width=sample.width,
+            source_height=sample.height,
+            domain="rgb",
+        )
+        decisions.append(decision)
+        if index:
+            digest.update(b",")
+        digest.update(canonical_json_bytes(decision.as_dict()))
+    digest.update(b"]")
+    return TrainingAugmentationPlan(
+        mode="planned",
+        decisions=decisions,
+        decision_digest=digest.hexdigest(),
+    )
 
 
 def schedule_summary(
@@ -129,6 +228,14 @@ def batch_lengths(sample_count: int) -> list[int]:
         min(MICROBATCH_IMAGES, sample_count - begin)
         for begin in range(0, sample_count, MICROBATCH_IMAGES)
     ]
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as source:
+        value = json.load(source)
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON artifact is not an object: {path}")
+    return value
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -284,7 +391,6 @@ def _comparison_scope() -> dict[str, Any]:
 def _runtime_files() -> list[Path]:
     return [
         Path(__file__).resolve(),
-        FASTLANES_ROOT / "galp/benchmarks/training_audit_policy.py",
         HERE / "pipeline.py",
         HERE / "augmentation.py",
         HERE / "sample_order.py",
@@ -314,14 +420,24 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
     published_reference_schedule = schedule_summary(
         EXPECTED_TRAIN_IMAGES, epochs=REFERENCE_EPOCHS
     )
-    published = recipe_contract(RECIPE_NAME)
+    published = recipe_contract(recipe_for_model(args.model))
+    audit_policy = build_audit_policy(args.audit_mode)
     payload: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA,
-        "benchmark": "equal-image-epoch-aware-rgb-training-v2",
+        "benchmark": "equal-image-epoch-aware-rgb-training-v3",
         "pipelines": list(args.resolved_pipelines),
         "seed": int(args.seed),
         "device": str(args.device),
         "required_gpu_name_substring": str(args.required_gpu_name_substring),
+        "model": {
+            "model_id": str(args.model),
+            "configuration": model_configuration("rgb", args.model),
+            "recipe": published["recipe"],
+            "recipe_hash": published["recipe_hash"],
+            "source_provenance": source_provenance(
+                args.rgbnomore_root, args.model
+            ),
+        },
         "datasets": {"train": train, "validation": validation},
         "prefix_schedule": prefix,
         "reference_schedule": full_schedule,
@@ -338,18 +454,15 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
                 "actual samples in the accumulation window"
             ),
             "accumulation_crosses_epoch": False,
-            "precision": "fp32",
+            "precision": published["training"]["precision"],
             "model_domain": "rgb",
             "model_compile": published["execution"]["model_compile"],
             "float32_matmul_precision": published["execution"][
                 "float32_matmul_precision"
             ],
-            "audit_policy": TrainingAuditPolicy(
-                mode=args.audit_mode,
-                strict_updates=args.audit_strict_updates,
-            ).as_contract(),
         },
         "optimizer": published["optimizer"],
+        "audit_policy": audit_policy,
         "scheduler": {
             **published["scheduler"],
             "total_optimizer_updates": published_reference_schedule[
@@ -402,6 +515,29 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
         },
         "comparison_scope": _comparison_scope(),
         "runtime_files": [file_record(path) for path in _runtime_files()],
+        "source_identity": code_version(FASTLANES_ROOT),
+        "resource_execution": {
+            "pipeline_order": list(args.resolved_pipelines),
+            "process_isolation": (
+                "independent invocation when one pipeline is selected; otherwise "
+                "fixed-order same-process execution"
+            ),
+            "cache_state": (
+                "not forcibly dropped; epoch 1 is cold/order diagnostic and epoch 2 "
+                "is warm-primary"
+            ),
+        },
+        "model_only_calibration": {
+            "enabled": True,
+            "domain": "rgb",
+            "microbatch_images": MICROBATCH_IMAGES,
+            "gradient_accumulation": GRADIENT_ACCUMULATION,
+            "precision": published["training"]["precision"],
+            "fixed_pre_resident_gpu_inputs": True,
+            "warmup_optimizer_updates": int(args.model_only_warmup_updates),
+            "measured_optimizer_updates": int(args.model_only_updates),
+            "subtraction_from_e2e_forbidden": True,
+        },
     }
     payload["contract_hash"] = sha256_json(payload)
     return payload
@@ -444,20 +580,26 @@ def _environment(device: torch.device) -> dict[str, Any]:
 
 
 def _canonical_initial_state(
-    output_dir: Path, *, rgbnomore_root: Path, seed: int
+    output_dir: Path, *, rgbnomore_root: Path, seed: int, model_id: str
 ) -> tuple[dict[str, torch.Tensor], str]:
     path = output_dir / "initial_rgb_state.pt"
     if path.exists():
         payload = torch.load(path, map_location="cpu", weights_only=False)
         state = payload["model_state"]
         initial_hash = tensor_state_sha256(state)
-        if payload.get("format") != "galp-equal-image-rgb-initial-state-v1":
+        if payload.get("format") != "galp-equal-image-rgb-initial-state-v2":
             raise ValueError("initial RGB state format differs")
-        if int(payload["seed"]) != seed or payload["initial_model_hash"] != initial_hash:
+        if (
+            int(payload["seed"]) != seed
+            or payload.get("model_id") != model_id
+            or payload["initial_model_hash"] != initial_hash
+        ):
             raise ValueError("initial RGB state contract/hash differs")
         return state, initial_hash
     seed_everything(seed)
-    canonical = build_model(rgbnomore_root, "rgb", torch.device("cpu"))
+    canonical = build_model(
+        rgbnomore_root, "rgb", torch.device("cpu"), model_id=model_id
+    )
     state = {
         name: value.detach().cpu().clone()
         for name, value in canonical.state_dict().items()
@@ -466,8 +608,9 @@ def _canonical_initial_state(
     _atomic_checkpoint(
         path,
         {
-            "format": "galp-equal-image-rgb-initial-state-v1",
+            "format": "galp-equal-image-rgb-initial-state-v2",
             "seed": seed,
+            "model_id": model_id,
             "initial_model_hash": initial_hash,
             "model_state": state,
         },
@@ -498,6 +641,80 @@ def _center_validation_decision(sample: TrainingSample) -> AugmentationDecision:
     )
 
 
+def _run_rgb_model_only_calibration(
+    *,
+    output_dir: Path,
+    contract: Mapping[str, Any],
+    initial_state: Mapping[str, torch.Tensor],
+    initial_model_hash: str,
+    rgbnomore_root: Path,
+    device: torch.device,
+) -> dict[str, Any]:
+    path = output_dir / "model_only_rgb.json"
+    if path.exists():
+        observed = json.loads(path.read_text(encoding="utf-8"))
+        expected = {
+            "contract_hash": contract["contract_hash"],
+            "initial_model_hash": initial_model_hash,
+            "audit_policy_hash": contract["audit_policy"]["audit_policy_hash"],
+        }
+        if {key: observed.get(key) for key in expected} != expected:
+            raise ValueError("existing RGB model-only calibration contract differs")
+        return observed
+    seed_everything(int(contract["seed"]))
+    model_id = str(contract["model"]["model_id"])
+    model = build_model(rgbnomore_root, "rgb", device, model_id=model_id)
+    model.load_state_dict(initial_state, strict=True)
+    published = recipe_contract(str(contract["model"]["recipe"]))
+    optimizer, weight_decayer, scheduler = build_published_optimizer(
+        model,
+        learning_rate=float(published["optimizer"]["learning_rate"]),
+        weight_decay=float(published["optimizer"]["weight_decay"]["coefficient"]),
+        warmup_updates=int(published["scheduler"]["warmup_optimizer_updates"]),
+        total_updates=int(contract["scheduler"]["total_optimizer_updates"]),
+    )
+    execution_model = compile_published_model(model, published)
+    images = torch.zeros(
+        (MICROBATCH_IMAGES, 3, 224, 224), dtype=torch.float32, device=device
+    )
+    labels = torch.arange(MICROBATCH_IMAGES, device=device, dtype=torch.long) % int(
+        published["model"]["classes"]
+    )
+    calibration = run_model_only_calibration(
+        domain="rgb",
+        execution_model=execution_model,
+        model=model,
+        optimizer=optimizer,
+        weight_decayer=weight_decayer,
+        scheduler=scheduler,
+        inputs=(images,),
+        labels=labels,
+        device=device,
+        audit_policy=contract["audit_policy"],
+        microbatch_images=MICROBATCH_IMAGES,
+        gradient_accumulation=GRADIENT_ACCUMULATION,
+        gradient_clipping_norm=float(
+            published["optimizer"]["gradient_clipping_norm"]
+        ),
+        warmup_updates=int(
+            contract["model_only_calibration"]["warmup_optimizer_updates"]
+        ),
+        measured_updates=int(
+            contract["model_only_calibration"]["measured_optimizer_updates"]
+        ),
+        precision=str(contract["training"]["precision"]),
+    )
+    calibration.update(
+        contract_hash=contract["contract_hash"],
+        initial_model_hash=initial_model_hash,
+        model_parameter_count=sum(parameter.numel() for parameter in model.parameters()),
+    )
+    _atomic_json(path, calibration)
+    del execution_model, model, optimizer, scheduler, images, labels
+    torch.cuda.empty_cache()
+    return calibration
+
+
 def _move_batch(
     batch: TrainingBatch, device: torch.device
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
@@ -507,6 +724,21 @@ def _move_batch(
         tuple(value.to(device, non_blocking=True) for value in batch.inputs),
         batch.labels.to(device, non_blocking=True),
     )
+
+
+def _all_finite(values: Sequence[torch.Tensor]) -> bool:
+    return all(bool(torch.isfinite(value).all().item()) for value in values)
+
+
+def _autocast_context(contract: Mapping[str, Any], device: torch.device) -> Any:
+    # Small unit fixtures and legacy v3 contracts predate the explicit
+    # precision field; their historical execution is FP32.
+    precision = str(contract.get("training", {}).get("precision", "fp32"))
+    if precision == "fp32":
+        return contextlib.nullcontext()
+    if precision == "bf16-autocast":
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    raise ValueError(f"unsupported equal-image precision {precision!r}")
 
 
 @contextlib.contextmanager
@@ -543,6 +775,7 @@ def _adapter_config(
         "execution_mode": "runtime",
         "benchmark": contract["benchmark"],
         "equal_image_contract_hash": contract["contract_hash"],
+        "audit_policy_hash": contract["audit_policy"]["audit_policy_hash"],
         "phase": phase,
     }
     if pipeline in DALI_VARIANTS:
@@ -595,8 +828,9 @@ def _evaluate(
                 expected = identities[cursor : cursor + length]
                 _validate_emitted(batch, expected)
                 inputs, labels = _move_batch(batch, device)
-                logits = execution_model(*inputs)
-                loss = torch.nn.functional.cross_entropy(logits, labels)
+                with _autocast_context(contract, device):
+                    logits = execution_model(*inputs)
+                    loss = torch.nn.functional.cross_entropy(logits, labels)
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("validation loss is non-finite")
                 predictions = logits.topk(5, dim=1).indices
@@ -648,31 +882,26 @@ def _train_epoch(
     global_update: int,
     processed_images: int,
 ) -> tuple[dict[str, Any], int, int]:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+    audit_policy = validate_audit_policy(contract.get("audit_policy", {}))
+    epoch_start_update = int(global_update)
     epoch_started = time.perf_counter()
+    boundary_sync_seconds = 0.0
+    if device.type == "cuda":
+        initial_sync_started = time.perf_counter()
+        torch.cuda.synchronize(device)
+        boundary_sync_seconds += time.perf_counter() - initial_sync_started
     planning_started = time.perf_counter()
     identities = canonical_epoch_order(
         [sample.logical_sample_id for sample in samples], seed, epoch
     )
     by_id = {sample.logical_sample_id: sample for sample in samples}
-    dali_native_augmentation = pipeline in DALI_VARIANTS and str(
-        contract["dali_variants"][pipeline]["augmentation_mode"]
-    ) == "native"
-    decisions = (
-        []
-        if dali_native_augmentation
-        else [
-            derive_augmentation(
-                seed=seed,
-                epoch=epoch,
-                logical_sample_id=identity.logical_sample_id,
-                source_width=by_id[identity.logical_sample_id].width,
-                source_height=by_id[identity.logical_sample_id].height,
-                domain="rgb",
-            )
-            for identity in identities
-        ]
+    augmentation_plan = _build_training_augmentation_plan(
+        pipeline=pipeline,
+        contract=contract,
+        identities=identities,
+        samples_by_id=by_id,
+        seed=seed,
+        epoch=epoch,
     )
     lengths = batch_lengths(len(samples))
     adapter = build_training_adapter(
@@ -683,21 +912,21 @@ def _train_epoch(
         device=device,
         config=_adapter_config(contract, pipeline=pipeline, phase="train"),
     )
-    adapter.begin(identities, decisions, lengths)
+    adapter.begin(identities, augmentation_plan.decisions, lengths)
     preparation_seconds = time.perf_counter() - planning_started
     steady_started = time.perf_counter()
     preserves_canonical_order = adapter.preserves_canonical_order()
     coverage = bytearray(len(identities))
     emitted_order_digest = hashlib.sha256()
-    audit = TrainingAuditState(
-        TrainingAuditPolicy.from_contract(contract["training"]["audit_policy"]),
-        completed_updates=global_update,
-        device=device,
-    )
     epoch_loss_sum = 0.0
+    epoch_loss_device = torch.zeros((), dtype=torch.float64, device=device)
+    deferred_finite = torch.ones((), dtype=torch.bool, device=device)
     epoch_samples = 0
     epoch_updates = 0
     loader_wait = 0.0
+    h2d_enqueue_seconds = 0.0
+    audit_seconds = 0.0
+    adapter_close_seconds = 0.0
     loader_stage_totals: dict[str, float] = {}
     capture_loader_stage_totals: dict[str, float] = {}
     cursor = 0
@@ -716,6 +945,7 @@ def _train_epoch(
             window_samples = sum(window_lengths)
             optimizer.zero_grad(set_to_none=True)
             learning_rate = scheduler.prepare_next_update()
+            audit_decision = decision_for_next_update(audit_policy, global_update)
             if profile_this_epoch and window_begin == profile_begin:
                 torch.cuda.synchronize(device)
                 torch.cuda.profiler.start()
@@ -752,20 +982,40 @@ def _train_epoch(
                         )
                     )
                 with _nvtx_range(stage_nvtx, "training.input_handoff"):
+                    handoff_started = time.perf_counter()
                     inputs, labels = _move_batch(batch, device)
-                with _nvtx_range(stage_nvtx, "training.model.forward"):
-                    logits = execution_model(*inputs)
-                with _nvtx_range(stage_nvtx, "training.loss"):
-                    loss = torch.nn.functional.cross_entropy(logits, labels)
-                try:
-                    audited_loss_sum = audit.observe(loss, logits, length)
-                except FloatingPointError as error:
-                    raise FloatingPointError(
-                        f"non-finite loss/logits in {pipeline} epoch {epoch + 1}"
-                    ) from error
+                    h2d_enqueue_seconds += time.perf_counter() - handoff_started
+                with _autocast_context(contract, device):
+                    with _nvtx_range(stage_nvtx, "training.model.forward"):
+                        logits = execution_model(*inputs)
+                    with _nvtx_range(stage_nvtx, "training.loss"):
+                        loss = torch.nn.functional.cross_entropy(logits, labels)
+                audit_started = time.perf_counter()
+                if audit_decision.synchronous_loss_logits:
+                    if not bool(torch.isfinite(loss).item()) or not bool(
+                        torch.isfinite(logits).all().item()
+                    ):
+                        raise FloatingPointError(
+                            f"non-finite loss/logits in {pipeline} epoch {epoch + 1}"
+                        )
+                else:
+                    deferred_finite = (
+                        deferred_finite
+                        & torch.isfinite(loss)
+                        & torch.isfinite(logits).all()
+                    )
+                audit_seconds += time.perf_counter() - audit_started
                 with _nvtx_range(stage_nvtx, "training.model.backward"):
                     (loss * (length / window_samples)).backward()
-                epoch_loss_sum += audited_loss_sum
+                if audit_decision.per_microbatch_loss_readback:
+                    readback_started = time.perf_counter()
+                    loss_value = float(loss.detach().item())
+                    epoch_loss_sum += loss_value * length
+                    audit_seconds += time.perf_counter() - readback_started
+                else:
+                    epoch_loss_device = (
+                        epoch_loss_device + loss.detach().to(torch.float64) * length
+                    )
                 epoch_samples += length
                 cursor += length
                 for name, value in batch.stage_seconds.items():
@@ -781,22 +1031,44 @@ def _train_epoch(
                 del batch, inputs, labels, logits, loss
             stage_nvtx = profile_this_epoch and profiling_active
             with _nvtx_range(stage_nvtx, "training.optimizer"):
-                try:
-                    audit.check_gradients_and_clip(
-                        model.parameters(),
-                        max_norm=float(
-                            contract["optimizer"]["gradient_clipping_norm"]
-                        ),
-                    )
-                except FloatingPointError as error:
+                gradients = [
+                    parameter.grad
+                    for parameter in model.parameters()
+                    if parameter.grad is not None
+                ]
+                audit_started = time.perf_counter()
+                if not gradients:
                     raise FloatingPointError(
-                        f"non-finite/empty gradients in {pipeline} update {global_update + 1}"
-                    ) from error
+                        f"empty gradients in {pipeline} update {global_update + 1}"
+                    )
+                if audit_decision.synchronous_gradients:
+                    if not _all_finite(gradients):
+                        raise FloatingPointError(
+                            f"non-finite gradients in {pipeline} update {global_update + 1}"
+                        )
+                else:
+                    for gradient in gradients:
+                        deferred_finite = (
+                            deferred_finite & torch.isfinite(gradient).all()
+                        )
+                audit_seconds += time.perf_counter() - audit_started
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=float(
+                        contract["optimizer"]["gradient_clipping_norm"]
+                    ),
+                )
                 optimizer.step()
                 weight_decayer.step(learning_rate)
                 scheduler.complete_update()
             global_update += 1
-            audit.complete_update()
+            if audit_decision.synchronous_parameters:
+                audit_started = time.perf_counter()
+                if not _all_finite(list(model.parameters())):
+                    raise FloatingPointError(
+                        f"non-finite parameters in {pipeline} update {global_update}"
+                    )
+                audit_seconds += time.perf_counter() - audit_started
             epoch_updates += 1
             processed_images += window_samples
             if (
@@ -844,17 +1116,13 @@ def _train_epoch(
             torch.cuda.profiler.stop()
             profiling_active = False
         if device.type == "cuda":
+            sync_started = time.perf_counter()
             torch.cuda.synchronize(device)
+            boundary_sync_seconds += time.perf_counter() - sync_started
         adapter_metrics = adapter.loader_metrics()
+        close_started = time.perf_counter()
         adapter.close()
-    steady_seconds = time.perf_counter() - steady_started
-    seconds = time.perf_counter() - epoch_started
-    deferred_loss_sum, deferred_samples = audit.read_deferred_loss()
-    epoch_loss_sum += deferred_loss_sum
-    if deferred_samples > epoch_samples:
-        raise RuntimeError("deferred audit loss exceeds epoch sample count")
-    if audit.completed_updates != global_update:
-        raise RuntimeError("training audit global update cursor diverged")
+        adapter_close_seconds += time.perf_counter() - close_started
     expected_schedule = schedule_summary(len(samples), epochs=1)
     if cursor != len(samples) or epoch_samples != len(samples):
         raise RuntimeError(
@@ -869,6 +1137,22 @@ def _train_epoch(
         raise RuntimeError(
             f"{pipeline} epoch covered {coverage.count(1)}/{len(identities)} unique positions"
         )
+    if (
+        audit_policy["audit_mode"] == "runtime-first-100"
+        and global_update
+        > max(epoch_start_update, int(audit_policy["strict_update_count"]))
+    ):
+        audit_started = time.perf_counter()
+        for parameter in model.parameters():
+            deferred_finite = deferred_finite & torch.isfinite(parameter).all()
+        if not bool(deferred_finite.item()):
+            raise FloatingPointError(
+                f"deferred non-finite audit failed in {pipeline} epoch {epoch + 1}"
+            )
+        epoch_loss_sum += float(epoch_loss_device.item())
+        audit_seconds += time.perf_counter() - audit_started
+    steady_seconds = time.perf_counter() - steady_started
+    seconds = time.perf_counter() - epoch_started
     tail_window_microbatches = (
         len(lengths) % GRADIENT_ACCUMULATION or GRADIENT_ACCUMULATION
     )
@@ -891,12 +1175,22 @@ def _train_epoch(
             "data_preparation_seconds": preparation_seconds,
             "steady_training_seconds": steady_seconds,
             "loader_wait_seconds": loader_wait,
+            "exposed_input_wait_seconds": loader_wait,
+            "model_forward_backward_optimizer_seconds": None,
+            "audit_seconds": audit_seconds,
+            "boundary_sync_seconds": boundary_sync_seconds,
+            "pipeline_internal_work_seconds": (
+                sum(
+                    float(loader_stage_totals.get(name, 0.0))
+                    for name in ("read", "decode", "augmentation", "preprocess")
+                )
+                if pipeline == "pytorch"
+                else None
+            ),
+            "h2d_enqueue_seconds": h2d_enqueue_seconds,
+            "adapter_close_seconds": adapter_close_seconds,
             "loader_stage_seconds": loader_stage_totals,
             "adapter_metrics": adapter_metrics,
-            "training_audit": {
-                "policy": audit.policy.as_contract(),
-                "counters": audit.counters.as_dict(),
-            },
             "microbatch_images": MICROBATCH_IMAGES,
             "gradient_accumulation": GRADIENT_ACCUMULATION,
             "tail_microbatch_images": lengths[-1],
@@ -906,6 +1200,8 @@ def _train_epoch(
                 "unique_positions": coverage.count(1),
                 "emitted_order_sha256": emitted_order_digest.hexdigest(),
             },
+            "augmentation_decision_sha256": augmentation_plan.decision_digest,
+            "augmentation_decision_mode": augmentation_plan.mode,
             "profile_capture": (
                 {
                     "begin_microbatch": profile_begin,
@@ -919,6 +1215,50 @@ def _train_epoch(
                 "epoch schedule/augmentation construction, adapter setup, JPEG read/decode/"
                 "transform, H2D, forward, backward, optimizer, synchronization, adapter close"
             ),
+            "audit": epoch_audit_summary(
+                audit_policy,
+                start_update=epoch_start_update,
+                end_update=global_update,
+            ),
+            "timing_semantics": {
+                "epoch_seconds_includes": [
+                    "epoch-order-and-augmentation-planning",
+                    "adapter-and-pipeline-setup",
+                    "read-decode-crop-flip-preprocess",
+                    "H2D-or-DLPack-handoff",
+                    "forward-loss-backward",
+                    "gradient-clipping-optimizer-scheduler",
+                    "audit-required-synchronization",
+                    "boundary-synchronize",
+                    "adapter-and-pipeline-close",
+                ],
+                "validation_included": False,
+                "critical_path_rule": (
+                    "only epoch_seconds is the critical path; worker, DALI, and "
+                    "CUDA work counters can overlap and must not be added"
+                ),
+                "pipeline_internal_work_semantics": (
+                    "summed worker task work, overlap-capable"
+                    if pipeline == "pytorch"
+                    else "unavailable from asynchronous DALI operators"
+                ),
+                "model_component_available": False,
+                "component_fields": {
+                    "data_preparation_seconds": "host wall, non-overlapping prefix",
+                    "exposed_input_wait_seconds": "main-thread exposed host wall",
+                    "audit_seconds": (
+                        "host-observed audit/readback wall; deferred CUDA audit work "
+                        "can be realized by boundary_sync_seconds"
+                    ),
+                    "boundary_sync_seconds": (
+                        "host wall blocked on all prior CUDA work; not additive with "
+                        "CUDA model/pipeline work"
+                    ),
+                    "pipeline_internal_work_seconds": (
+                        "overlap-capable summed worker work or unavailable"
+                    ),
+                },
+            },
         },
         global_update,
         processed_images,
@@ -939,7 +1279,11 @@ def _checkpoint_payload(
     processed_images: int,
     metrics: MetricsWriter,
     pending_validation_epoch: int | None,
+    audit_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    resolved_audit_policy = validate_audit_policy(
+        audit_policy or build_audit_policy()
+    )
     return {
         "format": CHECKPOINT_SCHEMA,
         "pipeline": pipeline,
@@ -960,6 +1304,8 @@ def _checkpoint_payload(
             "boundary": "completed-epoch",
         },
         "pending_validation_epoch": pending_validation_epoch,
+        "audit_policy_hash": resolved_audit_policy["audit_policy_hash"],
+        "audit_cursor": audit_cursor(resolved_audit_policy, global_update),
     }
 
 
@@ -988,13 +1334,18 @@ def _restore_checkpoint(
     weight_decayer: Any,
     scheduler: Any,
     metrics: MetricsWriter,
+    audit_policy: Mapping[str, Any] | None = None,
 ) -> tuple[int, int, int, int | None]:
+    resolved_audit_policy = validate_audit_policy(
+        audit_policy or build_audit_policy()
+    )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     expected = {
         "format": CHECKPOINT_SCHEMA,
         "pipeline": pipeline,
         "contract_hash": contract_hash,
         "initial_model_hash": initial_model_hash,
+        "audit_policy_hash": resolved_audit_policy["audit_policy_hash"],
     }
     observed = {key: payload.get(key) for key in expected}
     if observed != expected:
@@ -1002,6 +1353,11 @@ def _restore_checkpoint(
     accumulation = payload.get("gradient_accumulation_state", {})
     if accumulation.get("microbatches") != 0 or accumulation.get("samples") != 0:
         raise ValueError("resume checkpoint is not at an epoch boundary")
+    validate_audit_cursor(
+        payload.get("audit_cursor", {}),
+        resolved_audit_policy,
+        completed_updates=int(payload["global_optimizer_update"]),
+    )
     model.load_state_dict(payload["model_state"], strict=True)
     optimizer.load_state_dict(payload["optimizer_state"])
     weight_decayer.load_state_dict(payload["weight_decay_state"])
@@ -1075,11 +1431,12 @@ def _run_pipeline(
 
     seed = int(contract["seed"])
     seed_everything(seed)
-    model = build_model(rgbnomore_root, "rgb", device)
+    model_id = str(contract["model"]["model_id"])
+    model = build_model(rgbnomore_root, "rgb", device, model_id=model_id)
     model.load_state_dict(initial_state, strict=True)
     if tensor_state_sha256(model.state_dict()) != initial_model_hash:
         raise RuntimeError(f"{pipeline} device model differs from canonical state")
-    published = recipe_contract(RECIPE_NAME)
+    published = recipe_contract(str(contract["model"]["recipe"]))
     total_updates = int(contract["scheduler"]["total_optimizer_updates"])
     optimizer, weight_decayer, scheduler = build_published_optimizer(
         model,
@@ -1113,6 +1470,7 @@ def _run_pipeline(
             weight_decayer=weight_decayer,
             scheduler=scheduler,
             metrics=metrics,
+            audit_policy=contract["audit_policy"],
         )
     elif metrics.lines:
         metrics.truncate({"lines": 0, "bytes": 0})
@@ -1145,6 +1503,7 @@ def _run_pipeline(
             processed_images=processed_images,
             metrics=metrics,
             pending_validation_epoch=pending,
+            audit_policy=contract["audit_policy"],
         )
 
     if not latest.exists() and metrics.lines == 0:
@@ -1281,6 +1640,13 @@ def _run_pipeline(
         "seed": seed,
         "contract_hash": contract["contract_hash"],
         "initial_model_hash": initial_model_hash,
+        "model_id": model_id,
+        "model_domain": "rgb",
+        "precision": str(contract["training"]["precision"]),
+        "model_parameter_count": sum(
+            parameter.numel() for parameter in model.parameters()
+        ),
+        "audit_policy_hash": contract["audit_policy"]["audit_policy_hash"],
         "completed_epoch": completed_epoch,
         "optimizer_update": global_update,
         "processed_images": processed_images,
@@ -1310,7 +1676,7 @@ def _run_pipeline(
 def _write_summary(output_dir: Path, results: Sequence[Mapping[str, Any]]) -> None:
     completed = [row for row in results if row.get("state") == "completed"]
     summary = {
-        "schema_version": "galp-equal-image-rgb-summary-v2",
+        "schema_version": "galp-equal-image-rgb-summary-v3",
         "results": list(results),
         "all_completed": len(completed) == len(results),
         "primary_metric": "epoch 2 images_per_second",
@@ -1325,6 +1691,11 @@ def _write_summary(output_dir: Path, results: Sequence[Mapping[str, Any]]) -> No
         "epoch_seconds",
         "images_per_second",
         "data_preparation_seconds",
+        "exposed_input_wait_seconds",
+        "model_forward_backward_optimizer_seconds",
+        "audit_seconds",
+        "boundary_sync_seconds",
+        "pipeline_internal_work_seconds",
         "loader_wait_seconds",
     ]
     temporary = output_dir / ".epoch_performance.csv.tmp"
@@ -1337,13 +1708,53 @@ def _write_summary(output_dir: Path, results: Sequence[Mapping[str, Any]]) -> No
     os.replace(temporary, output_dir / "epoch_performance.csv")
 
 
+def _record_pipeline_failure(
+    *,
+    output_dir: Path,
+    pipeline: str,
+    seed: int,
+    error: Exception,
+) -> dict[str, Any]:
+    timestamp = time.time()
+    failure = {
+        "timestamp_unix": timestamp,
+        "pipeline": pipeline,
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "scientific_failure": False,
+    }
+    run_status_path = output_dir / "runs" / pipeline / "run_status.json"
+    try:
+        run_status = _read_json(run_status_path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        run_status = {
+            "schema_version": RESULT_SCHEMA,
+            "pipeline": pipeline,
+            "seed": seed,
+            "completed_epoch": 0,
+            "optimizer_update": 0,
+            "processed_images": 0,
+        }
+    run_status.update(
+        state="failed",
+        ended_at_unix=timestamp,
+        error_type=failure["error_type"],
+        error=failure["error"],
+        scientific_result=False,
+    )
+    _atomic_json(run_status_path, run_status)
+    return failure
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pipelines", default="d2,d3,pytorch")
+    parser.add_argument("--model", choices=MODEL_IDS, default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--dali-num-threads", type=int, default=4)
     parser.add_argument("--dali-prefetch-depth", type=int, default=2)
@@ -1365,12 +1776,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=11997733)
     parser.add_argument("--epochs", type=int, default=DEFAULT_PREFIX_EPOCHS)
     parser.add_argument(
-        "--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE
-    )
-    parser.add_argument(
-        "--audit-strict-updates", type=int, default=DEFAULT_STRICT_UPDATES
-    )
-    parser.add_argument(
         "--expected-train-images", type=int, default=EXPECTED_TRAIN_IMAGES
     )
     parser.add_argument(
@@ -1380,13 +1785,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--required-gpu-name-substring",
-        default="H100",
+        default="",
         help="fail closed when the selected logical CUDA device is not the intended GPU",
     )
     parser.add_argument(
         "--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more")
     )
     parser.add_argument("--stop-after-epoch", type=int)
+    parser.add_argument("--model-only-warmup-updates", type=int, default=5)
+    parser.add_argument("--model-only-updates", type=int, default=120)
     parser.add_argument("--profile-epoch", type=int, choices=(1, 2))
     parser.add_argument("--profile-warmup-microbatches", type=int, default=512)
     parser.add_argument("--profile-microbatches", type=int, default=1024)
@@ -1404,8 +1811,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.resolved_pipelines = _parse_pipelines(args.pipelines)
     if args.workers < 0:
         raise ValueError("--workers must be non-negative")
-    if args.audit_strict_updates < 0:
-        raise ValueError("--audit-strict-updates must be non-negative")
     for name in (
         "dali_num_threads",
         "dali_prefetch_depth",
@@ -1439,6 +1844,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("profiling range exceeds one epoch")
     if args.profile_skip_validation and args.profile_epoch is None:
         raise ValueError("--profile-skip-validation requires --profile-epoch")
+    if args.model_only_warmup_updates < 0 or args.model_only_updates <= 0:
+        raise ValueError("model-only warmup must be non-negative and updates positive")
     return args
 
 
@@ -1451,7 +1858,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _atomic_json(
         output_dir / "execution_plan.json",
         {
-            "schema_version": "galp-equal-image-rgb-execution-plan-v2",
+            "schema_version": "galp-equal-image-rgb-execution-plan-v3",
             "execute_requested": bool(args.execute),
             "pipeline_order": list(args.resolved_pipelines),
             "device": args.device,
@@ -1505,8 +1912,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     )
     initial_state, initial_model_hash = _canonical_initial_state(
-        output_dir, rgbnomore_root=args.rgbnomore_root, seed=args.seed
+        output_dir,
+        rgbnomore_root=args.rgbnomore_root,
+        seed=args.seed,
+        model_id=args.model,
     )
+    environment.update(
+        model_domain="rgb",
+        model_id=args.model,
+        precision=contract["training"]["precision"],
+        model_parameter_count=sum(value.numel() for value in initial_state.values()),
+        audit_policy=contract["audit_policy"],
+        source_identity=contract["source_identity"],
+        pipeline_order=list(args.resolved_pipelines),
+        process_isolation=len(args.resolved_pipelines) == 1,
+        cache_state=(
+            "not forcibly dropped; epoch 1 is cold/order diagnostic and epoch 2 "
+            "is warm-primary"
+        ),
+    )
+    _atomic_json(output_dir / "environment.json", environment)
     failures_path = output_dir / "failures.jsonl"
     failures_path.touch(exist_ok=True)
     results: list[dict[str, Any]] = []
@@ -1528,19 +1953,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             results.append(result)
         except Exception as error:  # retain the other standard-path result
-            failure = {
-                "timestamp_unix": time.time(),
-                "pipeline": pipeline,
-                "error_type": type(error).__name__,
-                "error": str(error),
-                "scientific_failure": False,
-            }
+            failure = _record_pipeline_failure(
+                output_dir=output_dir,
+                pipeline=pipeline,
+                seed=int(contract["seed"]),
+                error=error,
+            )
             with failures_path.open("a", encoding="utf-8") as output:
                 output.write(json.dumps(failure, sort_keys=True) + "\n")
                 output.flush()
                 os.fsync(output.fileno())
             results.append({"state": "failed", **failure})
             exit_code = 1
+    # This calibration compiles and executes an independent model.  Keeping
+    # it after every formal pipeline run makes the cold/cache diagnostic
+    # independent of whether model_only_rgb.json already exists.
+    _run_rgb_model_only_calibration(
+        output_dir=output_dir,
+        contract=contract,
+        initial_state=initial_state,
+        initial_model_hash=initial_model_hash,
+        rgbnomore_root=args.rgbnomore_root,
+        device=device,
+    )
     _write_summary(output_dir, results)
     return exit_code
 

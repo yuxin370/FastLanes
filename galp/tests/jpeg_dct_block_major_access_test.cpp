@@ -889,12 +889,13 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorkse
 		y.present               = 1U;
 		return image;
 	};
-	// The first two descriptors are duplicate requests for the same source
-	// image.  Their down2 outputs are owned by disjoint worksets.  The partial
+	// The first two descriptors share crop geometry across distinct image ranks
+	// and flip decisions. Their down2 outputs are owned by disjoint worksets.  The partial
 	// tail descriptor uses a 2/3 rational phase: output 0 spans worksets 0 and
 	// 2, while output 1 is wholly owned by workset 2.
 	plan.images.push_back(grayscale_image(0U, 0U, 5U, 4U, 1U, 2U));
-	plan.images.push_back(grayscale_image(1U, 0U, 5U, 4U, 1U, 2U));
+	plan.images.push_back(grayscale_image(1U, 0U, 6U, 4U, 1U, 2U));
+	plan.images.back().horizontal_flip = 1U;
 	plan.images.push_back(grayscale_image(2U, 1U, 0U, 3U, 2U, 3U));
 	const auto add_group = [&](const uint32_t shard,
 	                           const uint32_t x,
@@ -934,7 +935,9 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorkse
 	const auto reference = reference_active_output_schedule(plan, worksets, transform);
 	EXPECT_EQ(schedule0.logical_output_block_count, 12U);
 	EXPECT_EQ(schedule0.source_contribution_count, 12U);
-	EXPECT_EQ(schedule0.source_contribution_visit_count, 24U);
+	const auto expanded = build_block_major_active_output_schedule(plan, worksets, transform, false);
+	EXPECT_EQ(schedule0.active_output_blocks, expanded.active_output_blocks);
+	EXPECT_LT(schedule0.source_contribution_visit_count, expanded.source_contribution_visit_count);
 	EXPECT_EQ(schedule0.offsets, (std::vector<uint64_t> {0U, 3U, 5U, 7U, 7U}));
 	EXPECT_EQ(schedule0.output_workset_ownership_count, 7U);
 	EXPECT_EQ(schedule0.active_output_blocks,
@@ -956,6 +959,121 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorkse
 		EXPECT_TRUE(std::is_sorted(begin, end));
 		EXPECT_EQ(std::adjacent_find(begin, end), end);
 	}
+}
+
+TEST(JpegDctBlockMajorPlan, SharedIdentityScheduleRepeatsSpatialOwnershipInRequestOrder) {
+	using namespace galp::jpeg;
+	using namespace galp::jpeg::detail;
+	JpegDctDeviceBlockMajorPlanlessPlan plan;
+	JpegDctGridTransformSpec            transform;
+	transform.y_output_width_blocks     = 3U;
+	transform.y_output_height_blocks    = 2U;
+	transform.cbcr_output_width_blocks  = 2U;
+	transform.cbcr_output_height_blocks = 1U;
+	// Unequal component grids and shuffled/duplicate requests must preserve the
+	// same workset-local sequence as the independent expanded reference.
+	for (const uint32_t local : {7U, 2U, 7U}) {
+		JpegDctDevicePlanlessImageDescriptor image;
+		image.request_index     = static_cast<uint32_t>(plan.images.size());
+		image.local_image_index = local;
+		for (uint32_t c = 0U; c < 3U; ++c) {
+			auto& component            = image.components[c];
+			component.present          = 1U;
+			component.semantic_slot_id = c;
+			component.width_in_blocks  = c == 0U ? 3U : 2U;
+			component.height_in_blocks = c == 0U ? 2U : 1U;
+			component.crop_width       = component.width_in_blocks;
+			component.crop_height      = component.height_in_blocks;
+		}
+		plan.images.push_back(image);
+	}
+	for (uint32_t c = 0U; c < 3U; ++c) {
+		const auto& component = plan.images.front().components[c];
+		for (uint32_t y = 0U; y < component.height_in_blocks; ++y) {
+			for (uint32_t x = 0U; x < component.width_in_blocks; ++x) {
+				JpegDctDeviceBlockMajorGroupBinding group;
+				group.semantic_slot_id = c;
+				group.block_x          = x;
+				group.block_y          = y;
+				group.rowgroup_index   = (x + y + c) % 2U;
+				plan.groups.push_back(group);
+			}
+		}
+	}
+	build_block_major_coordinate_group_lookup(plan);
+	for (auto& image : plan.images) {
+		for (auto& component : image.components) {
+			component.block_major_coordinate_lookup_index =
+			    find_block_major_coordinate_group_lookup(plan, image.shard_id, component.semantic_slot_id);
+		}
+	}
+	const std::vector<JpegDctDeviceBlockMajorRowgroupWorkset> worksets {{0U, 0U, 0U}, {0U, 1U, 1U}, {0U, 99U, 2U}};
+	const auto schedule  = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto reference = reference_active_output_schedule(plan, worksets, transform);
+	ASSERT_EQ(schedule.repeated_image_count, 3U);
+	EXPECT_EQ(schedule.active_output_blocks.size(), 10U);
+	EXPECT_EQ(schedule.source_contribution_count, reference.source_contribution_count);
+	EXPECT_EQ(schedule.source_contribution_visit_count, 20U);
+	EXPECT_EQ(schedule.output_workset_ownership_count, reference.output_workset_ownership_count);
+	std::vector<uint32_t> expanded;
+	for (size_t workset = 0U; workset + 1U < schedule.offsets.size(); ++workset) {
+		EXPECT_EQ(expanded.size(), reference.offsets[workset]);
+		for (uint32_t image = 0U; image < schedule.repeated_image_count; ++image) {
+			for (auto i = schedule.offsets[workset]; i < schedule.offsets[workset + 1U]; ++i) {
+				expanded.push_back(image * 10U + schedule.active_output_blocks[i]);
+			}
+		}
+	}
+	EXPECT_EQ(expanded, reference.active_output_blocks);
+	const auto sidecar_schedule = build_block_major_active_output_schedule(plan, worksets, transform, false);
+	EXPECT_EQ(sidecar_schedule.repeated_image_count, 1U);
+	EXPECT_EQ(sidecar_schedule.offsets, reference.offsets);
+	EXPECT_EQ(sidecar_schedule.active_output_blocks, reference.active_output_blocks);
+	// A different crop invalidates shared ownership and retains the general path.
+	plan.images.back().components[0].crop_x = -1;
+	const auto cropped                      = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto cropped_reference            = reference_active_output_schedule(plan, worksets, transform);
+	EXPECT_EQ(cropped.repeated_image_count, 1U);
+	EXPECT_EQ(cropped.offsets, cropped_reference.offsets);
+	EXPECT_EQ(cropped.active_output_blocks, cropped_reference.active_output_blocks);
+	// Repeated upsampling crops have multiple local outputs per workset, with
+	// alternating ownership and a different, partially padded final image.
+	transform.y_output_width_blocks *= 2U;
+	transform.y_output_height_blocks *= 2U;
+	transform.cbcr_output_width_blocks *= 2U;
+	transform.cbcr_output_height_blocks *= 2U;
+	for (auto& image : plan.images) {
+		for (auto& component : image.components) {
+			component.x_up_factor = 2U;
+			component.y_up_factor = 2U;
+		}
+	}
+	const auto upsampled           = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto upsampled_reference = reference_active_output_schedule(plan, worksets, transform);
+	EXPECT_EQ(upsampled.repeated_image_count, 1U);
+	EXPECT_EQ(upsampled.offsets, upsampled_reference.offsets);
+	EXPECT_EQ(upsampled.active_output_blocks, upsampled_reference.active_output_blocks);
+	EXPECT_EQ(upsampled.source_contribution_count, upsampled_reference.source_contribution_count);
+	// Equal online crops can share the same upsampled ownership template too.
+	// Keep the negative crop: padded output blocks must still match the reference.
+	for (auto& image : plan.images) {
+		image.components[0].crop_x = -1;
+	}
+	const auto shared_crop      = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto shared_reference = reference_active_output_schedule(plan, worksets, transform);
+	ASSERT_EQ(shared_crop.repeated_image_count, 3U);
+	expanded.clear();
+	for (size_t workset = 0U; workset + 1U < shared_crop.offsets.size(); ++workset) {
+		EXPECT_EQ(expanded.size(), shared_reference.offsets[workset]);
+		for (uint32_t image = 0U; image < shared_crop.repeated_image_count; ++image) {
+			for (auto i = shared_crop.offsets[workset]; i < shared_crop.offsets[workset + 1U]; ++i) {
+				expanded.push_back(image * 40U + shared_crop.active_output_blocks[i]);
+			}
+		}
+	}
+	EXPECT_EQ(expanded, shared_reference.active_output_blocks);
+	EXPECT_EQ(shared_crop.source_contribution_count, shared_reference.source_contribution_count);
+	EXPECT_EQ(shared_crop.output_workset_ownership_count, shared_reference.output_workset_ownership_count);
 }
 
 TEST(JpegDctBlockMajorPlan, ActiveOutputIntervalSidecarRoundTripsAndBindsEveryDecisionKey) {
@@ -1417,10 +1535,26 @@ TEST(JpegDctBlockMajorPlan, ProductionPreviewSelectsCompactPlanlessPath) {
 	EXPECT_GT(preview.estimated_max_decode_workset_bytes, preview.decode_workset_capacity_bytes);
 	EXPECT_EQ(preview.estimated_oversized_decode_rowgroups, preview.rowgroups.size());
 	EXPECT_EQ(preview_vectors(preview), actual_vectors(compact));
+	// Full-source mode must retain outside-crop storage groups while leaving
+	// the output shape and transform support unchanged.
+	auto crop_requests = requests;
+	for (auto& request : crop_requests) {
+		request.source_crop = {0U, 0U, 8U, 8U};
+	}
+	const auto crop_preview          = reader.PlanDeviceDctBatch(crop_requests, options);
+	auto       full_options          = options;
+	full_options.crop_execution_mode = galp::jpeg::JpegDctCropExecutionMode::kFullSourceDecode;
+	const auto full_preview          = reader.PlanDeviceDctBatch(crop_requests, full_options);
+	const auto full_compact          = compact_planner.Plan(requests, std::nullopt);
+	EXPECT_TRUE(full_preview.uses_planless_fixed_transform);
+	EXPECT_EQ(preview_vectors(full_preview), actual_vectors(full_compact));
+	EXPECT_EQ(full_preview.fixed_transform_source_block_count, crop_preview.fixed_transform_source_block_count);
+	EXPECT_EQ(full_preview.fixed_transform_output_block_count, crop_preview.fixed_transform_output_block_count);
+	EXPECT_GT(full_preview.coordinate_group_index_populated, crop_preview.coordinate_group_index_populated);
+	EXPECT_EQ(full_preview.estimated_selected_vector_count, full_preview.full_vector_count);
 	EXPECT_FALSE(options.grid_transform->require_all_coefficients);
 	for (const auto& coefficients : std::vector<std::vector<uint8_t>> {
-	         {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U},
-	         {0U, 3U, 7U}}) {
+	         {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U}, {0U, 3U, 7U}}) {
 		auto selected_options = options;
 		selected_options.coefficient_selection.coefficients = coefficients;
 		const auto selected_preview = reader.PlanDeviceDctBatch(requests, selected_options);

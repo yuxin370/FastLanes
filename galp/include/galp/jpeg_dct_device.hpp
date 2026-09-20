@@ -52,7 +52,17 @@ struct JpegDctSamplingRatio {
 // Generic parameters for a fused JPEG-DCT grid transform. Application
 // profiles provide concrete geometry and numeric policy; the JPEG executor
 // only lowers this specification to its batched transform kernels.
+struct JpegDctOutputChannel {
+	uint8_t component = 0;
+	uint8_t frequency = 0; // Natural 8x8 frequency index, independent of storage order.
+	float   subtract  = 0.0F;
+	float   divide    = 1.0F;
+};
+
 struct JpegDctGridTransformSpec {
+	// Empty retains the component grids. Otherwise emit these channels in contiguous NCHW.
+	std::vector<JpegDctOutputChannel> output_channels;
+
 	uint32_t                          y_output_width_blocks        = 0;
 	uint32_t                          y_output_height_blocks       = 0;
 	uint32_t                          cbcr_output_width_blocks     = 0;
@@ -149,6 +159,9 @@ enum class JpegDctCropExecutionMode {
 	kBoundedRangeReadSelectedDecode,
 	kBoundedIoUringRangeReadSelectedDecode,
 	kBoundedIoUringScheduledRangeReadSelectedDecode,
+	// Block-major planless ablation: decode the complete requested source images,
+	// while retaining the requested online crop/resize transform.
+	kFullSourceDecode,
 };
 
 class JpegDctDeviceTransformSubmissionGate {
@@ -394,6 +407,7 @@ public:
 	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;
 	[[nodiscard]] const std::vector<uint8_t>&                       selected_coefficients() const noexcept;
 	[[nodiscard]] JpegDctYcbcrDctGridShape                          ycbcr_dct_grid_shape() const noexcept;
+	[[nodiscard]] std::array<size_t, 6>                             projected_shape() const noexcept;
 
 private:
 	std::unique_ptr<Impl> impl_;

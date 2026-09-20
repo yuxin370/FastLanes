@@ -46,6 +46,9 @@ def _profiling_contract_validation(
     condition_id: str,
     seed: int,
     recipe_hash: str,
+    model_id: str,
+    model_configuration: Mapping[str, Any],
+    model_source_provenance: Sequence[Mapping[str, Any]],
     layout_hash: str,
     execution_backend: str,
     physical_galp_manifest: Path | None,
@@ -59,6 +62,9 @@ def _profiling_contract_validation(
         "condition_id": condition_id,
         "training_seed": seed,
         "recipe_hash": recipe_hash,
+        "model_id": model_id,
+        "model_configuration": dict(model_configuration),
+        "model_source_provenance": list(model_source_provenance),
         "layout_hash": layout_hash,
         "execution_mode": "native_physical_pls",
     }
@@ -126,8 +132,13 @@ def _make_profiled_epoch(
         last_logged_update: int,
         integration_check_first_100: bool,
         audit_policy: TrainingAuditPolicy,
+        pipeline_setup_seconds: float,
+        close_pipeline_at_epoch_end: bool,
     ) -> dict[str, Any]:
         del loader_totals, integration_checks, integration_check_first_100
+        # The bounded capture starts after epoch setup and exits via
+        # ProfileCaptureComplete, before normal end-of-epoch closure.
+        del pipeline_setup_seconds, close_pipeline_at_epoch_end
         epoch_loss_sum = 0.0
         epoch_samples = 0
         epoch_microbatches = 0

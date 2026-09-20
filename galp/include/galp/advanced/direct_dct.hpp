@@ -105,6 +105,7 @@ public:
 	[[nodiscard]] DirectDctGridTensorDescriptor cbcr_tensor() const;
 	[[nodiscard]] DirectDctTensorDescriptor tensor_async() const;
 	[[nodiscard]] DirectDctGridTensorDescriptor y_tensor_async() const;
+	[[nodiscard]] DirectDctGridTensorDescriptor projected_tensor_async() const;
 	[[nodiscard]] DirectDctGridTensorDescriptor cbcr_tensor_async() const;
 	[[nodiscard]] size_t                    block_count() const noexcept;
 	[[nodiscard]] size_t                    coefficients_per_block() const noexcept;

@@ -32,6 +32,7 @@ from .report import COLORS
 
 SCHEMA_VERSION = "galp-pls-premixed-fixed-budget-report-v1"
 CONTRACT_EQUAL_FIELDS = (
+    "model_id",
     "recipe_hash",
     "layout_hash",
     "initial_model_hash",

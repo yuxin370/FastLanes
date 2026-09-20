@@ -15,8 +15,10 @@ from typing import Any, Sequence
 import numpy as np
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
+BENCHMARK_ROOT_TEXT = str(BENCHMARK_ROOT)
+if BENCHMARK_ROOT_TEXT in sys.path:
+    sys.path.remove(BENCHMARK_ROOT_TEXT)
+sys.path.insert(0, BENCHMARK_ROOT_TEXT)
 
 from shared.common import (
     GALP_PIPELINES,
@@ -158,7 +160,10 @@ def _validate_pipeline_result(
     contract: dict[str, Any],
     expected_trace: dict[str, Any],
     failures: list[str],
+    performance_failures: list[str] | None = None,
 ) -> None:
+    if performance_failures is None:
+        performance_failures = failures
     label = f"pipeline {pipeline}"
     _require(payload.get("schema_version") == RESULT_SCHEMA, failures, f"{label}: bad result schema")
     _require(payload.get("pipeline") == pipeline, failures, f"{label}: pipeline name mismatch")
@@ -173,7 +178,14 @@ def _validate_pipeline_result(
     _require(payload.get("execution") == contract["execution"], failures, f"{label}: execution contract mismatch")
     model = payload.get("model", {})
     expected_model = contract["models"][expected_domain]
-    for key in ("architecture", "input_domain", "recipe_id", "checkpoint", "checkpoint_sha256"):
+    for key in (
+        "model_id",
+        "architecture",
+        "input_domain",
+        "recipe_id",
+        "checkpoint",
+        "checkpoint_sha256",
+    ):
         _require(model.get(key) == expected_model.get(key), failures, f"{label}: model.{key} mismatch")
     semantic = Path(str(payload.get("semantic_artifact", "")))
     _require(semantic.is_file(), failures, f"{label}: missing semantic artifact {semantic}")
@@ -328,12 +340,12 @@ def _validate_pipeline_result(
                 actual = summary.get(statistic) if isinstance(summary, dict) else None
                 _require(
                     finite_number(actual) and float(actual) <= float(maximum),
-                    failures,
+                    performance_failures,
                     f"{record_label}: {stage}.{statistic}={actual} ms exceeds {maximum} ms",
                 )
                 _require(
                     summary.get("count") == contract["execution"]["measurement_batches"],
-                    failures,
+                    performance_failures,
                     f"{record_label}: {stage} per-batch distribution is incomplete",
                 )
 
@@ -678,7 +690,9 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
     lines = [
         "# Canonical end-to-end benchmark report",
         "",
-        f"Validation: **{'PASS' if summary['ok'] else 'FAIL'}**",
+        f"Correctness/comparability validation: **{'PASS' if summary.get('validation_ok', summary['ok']) else 'FAIL'}**",
+        "",
+        f"Registered performance targets: **{'PASS' if summary.get('performance_gates_ok', summary['ok']) else 'FAIL'}**",
         "",
         "| Pipeline | Domain | Throughput median (img/s) | Mean latency median (ms/batch) | Peak host RSS (MiB) | Top-1 median | Top-5 median |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
@@ -700,7 +714,11 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
                 f"{gate.get('comparison', '>=')} {gate['target']:.3f}."
             )
     else:
-        lines.append("- No throughput gate applies to this preset.")
+        policy = summary.get("contract_snapshot", {}).get("performance_gates", {}).get("policy", {})
+        lines.append(
+            "- No model-specific performance target is enforced "
+            f"(`{policy.get('profile_id', 'unregistered')}`, mode `{policy.get('mode', 'report-only')}`)."
+        )
     lines.extend(["", "## Comparability", ""])
     for comparison in summary["comparability"]:
         lines.append(f"- **{comparison['pair']}**: `{comparison['classification']}` — {comparison['reason']}")
@@ -721,9 +739,12 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
     lines.extend(["", "## Caveats", ""])
     for caveat in summary["caveats"]:
         lines.append(f"- {caveat}")
-    if summary["failures"]:
-        lines.extend(["", "## Validation failures", ""])
-        lines.extend(f"- {failure}" for failure in summary["failures"])
+    if summary.get("validation_failures"):
+        lines.extend(["", "## Correctness/contract failures", ""])
+        lines.extend(f"- {failure}" for failure in summary["validation_failures"])
+    if summary.get("performance_gate_failures"):
+        lines.extend(["", "## Performance-target failures", ""])
+        lines.extend(f"- {failure}" for failure in summary["performance_gate_failures"])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -737,7 +758,9 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
         int(contract["execution"]["measurement_batches"]),
     )
     expected_trace = sample_trace(measured)
-    failures: list[str] = []
+    validation_failures: list[str] = []
+    performance_failures: list[str] = []
+    failures = validation_failures
     source_revision_warnings: list[str] = []
     observed_source_revisions: dict[str, Any] = {}
     for source_name, expected_revision in contract.get("source_revisions", {}).items():
@@ -773,7 +796,14 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
             continue
         payload = _load_result(path)
         results[pipeline] = payload
-        _validate_pipeline_result(pipeline, payload, contract, expected_trace, failures)
+        _validate_pipeline_result(
+            pipeline,
+            payload,
+            contract,
+            expected_trace,
+            validation_failures,
+            performance_failures,
+        )
 
     semantic_comparisons: list[dict[str, Any]] = []
     groups = contract["semantic_validation"]["comparison_groups"]
@@ -796,7 +826,9 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
     semantic_by_pair = {tuple(item["pipelines"]): item for item in semantic_comparisons}
     ordered_results = [results[name] for name in contract["pipelines"]["enabled"] if name in results]
     aggregates = [_aggregate_pipeline(payload) for payload in ordered_results]
-    performance_gates = _evaluate_performance_gates(contract, aggregates, failures)
+    performance_gates = _evaluate_performance_gates(
+        contract, aggregates, performance_failures
+    )
 
     def classification(left: str, right: str) -> str:
         if left not in results or right not in results:
@@ -806,7 +838,7 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
             return "not_yet_validated"
         if comparison.get("enforcement") == "diagnostic":
             return "system_level_reference_only"
-        if not comparison["ok"] or failures:
+        if not comparison["ok"] or validation_failures:
             return "not_yet_validated"
         return "strict_system_comparison"
 
@@ -824,13 +856,18 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
         {
             "pair": "DCT-domain pair vs RGB-domain pair",
             "classification": "system_level_reference_only",
-            "reason": "DCT and RGB models require different input-domain checkpoints; both checkpoints declare the same RGB-no-more ImageNet ViT-Ti recipe family, but tensors and weights are not interchangeable.",
+            "reason": "DCT and RGB models require different input-domain checkpoints; both checkpoints declare the same registered RGB-no-more model recipe family, but tensors and weights are not interchangeable.",
         },
     ]
+    all_failures = [*validation_failures, *performance_failures]
     summary = {
         "schema_version": "galp_system_benchmark_summary_v2",
-        "ok": not failures,
-        "failures": failures,
+        "ok": not all_failures,
+        "validation_ok": not validation_failures,
+        "performance_gates_ok": not performance_failures,
+        "failures": all_failures,
+        "validation_failures": validation_failures,
+        "performance_gate_failures": performance_failures,
         "contract": str(contract_path.resolve()),
         "contract_snapshot": contract,
         "source_revisions_observed_at_validation": observed_source_revisions,
@@ -863,7 +900,17 @@ def validate_and_summarize(contract_path: Path, output_dir: Path) -> dict[str, A
     write_json(output_dir / "results.json", summary)
     _write_csv(output_dir / "results.csv", ordered_results)
     _write_report(output_dir / "report.md", summary)
-    write_json(output_dir / "validation.json", {"ok": not failures, "failures": failures, "semantic_validation": summary["semantic_validation"]})
+    write_json(
+        output_dir / "validation.json",
+        {
+            "ok": summary["validation_ok"],
+            "validation_ok": summary["validation_ok"],
+            "performance_gates_ok": summary["performance_gates_ok"],
+            "failures": summary["validation_failures"],
+            "performance_gate_failures": summary["performance_gate_failures"],
+            "semantic_validation": summary["semantic_validation"],
+        },
+    )
     return summary
 
 

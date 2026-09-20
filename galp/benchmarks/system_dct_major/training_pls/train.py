@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run one full core PLS condition/seed with the shared Direct-DCT backend."""
+"""Run one registered DCT-native condition/seed training backend."""
 
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import math
@@ -15,17 +16,30 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
 
 from galp.benchmarks.training_audit_policy import (
-    TrainingAuditPolicy,
-    TrainingAuditState,
+    AUDIT_MODES,
+    DEFAULT_AUDIT_MODE,
+    audit_cursor,
+    build_audit_policy,
+    decision_for_next_update,
+    epoch_audit_summary,
+    validate_audit_cursor,
+    validate_audit_policy,
+)
+from galp.benchmarks.model_only_training_calibration import (
+    run_model_only_calibration,
 )
 
 from .contracts import (
+    EXECUTION_BACKENDS,
+    NATIVE_PHYSICAL_BACKEND,
+    SEMANTIC_BACKEND,
+    STANDARD_DCT_BACKEND,
     blocking_code_identity,
     code_provenance_differences,
     code_version,
@@ -35,10 +49,19 @@ from .core_schedule import epoch_position_pools, stable_digest
 from .layout import (
     LayoutMapping,
     load_layout_mapping,
+    load_premixed_layout_mapping,
     sha256_file,
     validate_manifest_against_layout,
 )
 from .matrix import resolve_condition
+from .model_registry import (
+    DEFAULT_MODEL_ID,
+    MODEL_IDS,
+    build_model,
+    example_inputs,
+    resolve_model,
+    source_provenance,
+)
 from .published_augmentation import (
     PublishedAugmentation,
     apply_published_mixup,
@@ -47,7 +70,7 @@ from .published_augmentation import (
     published_validation_augmentation,
 )
 from .published_optimizer import build_published_optimizer
-from .recipe import RECIPE_NAME, assert_recipe_overrides, sha256_json, validation_epochs
+from .recipe import RECIPE_NAMES, assert_recipe_overrides, sha256_json, validation_epochs
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -58,9 +81,7 @@ if str(RGB_BENCHMARK_ROOT) not in sys.path:
 from training.artifacts import nested_state_sha256, tensor_state_sha256  # noqa: E402
 from training.direct_dct_reader import DirectDctTrainingReader  # noqa: E402
 from training.model_factory import (  # noqa: E402
-    build_model,
     capture_rng_state,
-    model_configuration,
     restore_rng_state,
     seed_everything,
 )
@@ -72,24 +93,26 @@ from training.sample_order import SampleIdentity  # noqa: E402
 from galp.torch.experimental import DirectDctPlsPipeline  # noqa: E402
 
 
-RUN_SCHEMA = "galp-pls-core-training-run-v2"
-CHECKPOINT_SCHEMA = "galp-pls-core-epoch-checkpoint-v4"
+RUN_SCHEMA = "galp-pls-core-training-run-v3"
+CHECKPOINT_SCHEMA = "galp-pls-core-epoch-checkpoint-v5"
 DESCRIPTOR_CHUNK_MICROBATCHES = 256
-NATIVE_PHYSICAL_BACKEND = "native-physical-pls"
-SEMANTIC_BACKEND = "semantic-emulation"
 
 
 def build_paired_model(
-    rgbnomore_root: Path, *, seed: int, device: torch.device
+    rgbnomore_root: Path,
+    *,
+    model_id: str = DEFAULT_MODEL_ID,
+    seed: int,
+    device: torch.device,
 ) -> tuple[torch.nn.Module, str]:
     """Build a device-native model with a device-independent paired state."""
 
     seed_everything(seed)
-    canonical = build_model(rgbnomore_root, "dct", torch.device("cpu"))
+    canonical = build_model(rgbnomore_root, model_id, torch.device("cpu"))
     initial_hash = tensor_state_sha256(canonical.state_dict())
     if device.type == "cpu":
         return canonical, initial_hash
-    execution_model = build_model(rgbnomore_root, "dct", device)
+    execution_model = build_model(rgbnomore_root, model_id, device)
     incompatible = execution_model.load_state_dict(canonical.state_dict(), strict=True)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise RuntimeError("strict paired model initialization unexpectedly differed")
@@ -97,6 +120,26 @@ def build_paired_model(
     if tensor_state_sha256(execution_model.state_dict()) != initial_hash:
         raise RuntimeError("device-native model differs after loading canonical paired state")
     return execution_model, initial_hash
+
+
+def _autocast_context(
+    recipe: Mapping[str, Any], device: torch.device
+) -> Any:
+    configuration = recipe.get("execution", {}).get(
+        "autocast", {"enabled": False}
+    )
+    if not bool(configuration.get("enabled", False)):
+        return nullcontext()
+    requested_device = str(configuration.get("device_type", device.type))
+    if requested_device != device.type:
+        raise ValueError(
+            f"recipe autocast device {requested_device!r} does not match {device.type!r}"
+        )
+    dtype_name = str(configuration.get("dtype", ""))
+    dtypes = {"bfloat16": torch.bfloat16}
+    if dtype_name not in dtypes:
+        raise ValueError(f"unsupported recipe autocast dtype: {dtype_name!r}")
+    return torch.autocast(device_type=device.type, dtype=dtypes[dtype_name])
 
 
 def compile_published_model(
@@ -116,6 +159,82 @@ def compile_published_model(
         fullgraph=bool(configuration["fullgraph"]),
         dynamic=bool(configuration["dynamic"]),
     )
+
+
+def _run_dct_model_only_calibration(
+    *,
+    output_dir: Path,
+    contract: Mapping[str, Any],
+    recipe: Mapping[str, Any],
+    rgbnomore_root: Path,
+    model_id: str,
+    seed: int,
+    device: torch.device,
+    initial_model_hash: str,
+) -> dict[str, Any]:
+    path = output_dir / "model_only_dct.json"
+    if path.exists():
+        observed = json.loads(path.read_text(encoding="utf-8"))
+        expected = {
+            "condition_hash": contract["condition_hash"],
+            "initial_model_hash": initial_model_hash,
+            "audit_policy_hash": contract["audit_policy"]["audit_policy_hash"],
+        }
+        if {key: observed.get(key) for key in expected} != expected:
+            raise ValueError("existing DCT model-only calibration contract differs")
+        return observed
+    calibration_model, calibration_hash = build_paired_model(
+        rgbnomore_root, model_id=model_id, seed=seed, device=device
+    )
+    if calibration_hash != initial_model_hash:
+        raise RuntimeError("DCT model-only calibration initial state differs")
+    optimizer, weight_decayer, scheduler = build_published_optimizer(
+        calibration_model,
+        learning_rate=float(recipe["optimizer"]["learning_rate"]),
+        weight_decay=float(recipe["optimizer"]["weight_decay"]["coefficient"]),
+        warmup_updates=int(recipe["scheduler"]["warmup_optimizer_updates"]),
+        total_updates=int(contract["total_optimizer_updates"]),
+    )
+    execution_model = compile_published_model(calibration_model, recipe)
+    microbatch = int(recipe["training"]["physical_microbatch"])
+    y, cbcr = example_inputs(model_id, microbatch, device)
+    labels = torch.arange(microbatch, device=device, dtype=torch.long) % int(
+        recipe["model"]["classes"]
+    )
+    calibration = run_model_only_calibration(
+        domain="dct",
+        execution_model=execution_model,
+        model=calibration_model,
+        optimizer=optimizer,
+        weight_decayer=weight_decayer,
+        scheduler=scheduler,
+        inputs=(y, cbcr),
+        labels=labels,
+        device=device,
+        audit_policy=contract["audit_policy"],
+        microbatch_images=microbatch,
+        gradient_accumulation=int(recipe["training"]["gradient_accumulation"]),
+        gradient_clipping_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
+        warmup_updates=int(
+            contract["model_only_calibration"]["warmup_optimizer_updates"]
+        ),
+        measured_updates=int(
+            contract["model_only_calibration"]["measured_optimizer_updates"]
+        ),
+        precision=str(recipe["training"]["precision"]),
+    )
+    calibration.update(
+        condition_hash=contract["condition_hash"],
+        initial_model_hash=initial_model_hash,
+        model_id=model_id,
+        model_parameter_count=sum(
+            parameter.numel() for parameter in calibration_model.parameters()
+        ),
+    )
+    _atomic_json(path, calibration)
+    del execution_model, calibration_model, optimizer, scheduler, y, cbcr, labels
+    torch.cuda.empty_cache()
+    return calibration
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -235,46 +354,73 @@ def _validate_contract(
     physical_galp_manifest: Path | None,
     premixed_mapping_csv: Path | None,
     expected_mapping_sha256: str | None,
+    model_id: str | None = None,
+    model_configuration: Mapping[str, Any] | None = None,
+    model_source_provenance: Sequence[Mapping[str, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if "run_manifest_hash" in payload:
-        expected_manifest_hash = sha256_json(
-            {
-                key: value
-                for key, value in payload.items()
-                if key != "run_manifest_hash"
-            }
+    if payload.get("schema_version") != "galp-pls-condition-contract-v3":
+        raise ValueError(
+            "legacy/unsupported PLS contract schema; generate a new run manifest "
+            "and use a new output directory"
         )
-        if payload.get("run_manifest_hash") != expected_manifest_hash:
-            raise ValueError("run manifest integrity hash mismatch")
-        if payload.get("condition_hash") != condition_identity_hash(payload):
-            raise ValueError("run manifest training identity hash mismatch")
-    else:
-        # Compatibility with v2 condition contracts produced before the
-        # resolved run-manifest format introduced a separate integrity hash.
-        expected_hash = sha256_json(
-            {key: value for key, value in payload.items() if key != "condition_hash"}
-        )
-        if payload.get("condition_hash") != expected_hash:
-            raise ValueError("condition contract hash mismatch")
+    if payload.get("run_manifest_schema") != "galp-pls-run-manifest-v2":
+        raise ValueError("legacy/unsupported resolved run-manifest schema")
+    if "run_manifest_hash" not in payload:
+        raise ValueError("resolved run manifest lacks its integrity hash")
+    expected_manifest_hash = sha256_json(
+        {
+            key: value
+            for key, value in payload.items()
+            if key != "run_manifest_hash"
+        }
+    )
+    if payload.get("run_manifest_hash") != expected_manifest_hash:
+        raise ValueError("run manifest integrity hash mismatch")
+    if payload.get("condition_hash") != condition_identity_hash(payload):
+        raise ValueError("run manifest training identity hash mismatch")
+    validate_audit_policy(payload.get("audit_policy", {}))
+    if execution_backend not in EXECUTION_BACKENDS:
+        raise ValueError(f"unsupported execution backend: {execution_backend!r}")
     native_physical = execution_backend == NATIVE_PHYSICAL_BACKEND
+    standard_dct = execution_backend == STANDARD_DCT_BACKEND
     expected = {
         "condition_id": condition_id,
         "training_seed": seed,
         "recipe_hash": recipe_hash,
         "layout_hash": layout_hash,
         "execution_mode": (
-            "native_physical_pls" if native_physical else "semantic_emulation"
+            "native_physical_pls"
+            if native_physical
+            else (
+                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
+            )
         ),
-        "semantic_emulation": not native_physical,
+        "semantic_emulation": execution_backend == SEMANTIC_BACKEND,
         "physical_fls_observed": native_physical,
         "physical_gpu_pool": native_physical,
         "backend_implementation": (
             "galp-native-direct-dct-pls-block-major-v1"
             if native_physical
-            else "shared-galp-direct-dct-semantic-backend-v2"
+            else (
+                "rgbnomore-jpeg-dct-premixed-reference-v2"
+                if standard_dct
+                else "shared-galp-direct-dct-semantic-backend-v2"
+            )
         ),
     }
+    if model_id is not None:
+        if model_configuration is None or model_source_provenance is None:
+            raise ValueError(
+                "model identity validation requires configuration and source provenance"
+            )
+        expected.update(
+            model_id=model_id,
+            model_configuration=dict(model_configuration),
+            model_source_provenance=[
+                dict(row) for row in model_source_provenance
+            ],
+        )
     observed = {key: payload.get(key) for key in expected}
     if observed != expected:
         raise ValueError(
@@ -316,6 +462,25 @@ def _validate_contract(
             raise ValueError(
                 "physical execution contract does not match run arguments: "
                 f"expected {expected_physical}, got {observed_physical}"
+            )
+    if standard_dct:
+        if premixed_mapping_csv is None or expected_mapping_sha256 is None:
+            raise ValueError("standard DCT reference mapping arguments are incomplete")
+        reference = payload.get("standard_dct_reference")
+        if not isinstance(reference, dict):
+            raise ValueError("standard condition contract lacks standard_dct_reference")
+        expected_reference = {
+            "schema_version": "galp-standard-rgbnomore-dct-reference-v2",
+            "premixed_mapping_csv": str(premixed_mapping_csv.resolve()),
+            "premixed_mapping_sha256": expected_mapping_sha256,
+        }
+        observed_reference = {
+            key: reference.get(key) for key in expected_reference
+        }
+        if observed_reference != expected_reference:
+            raise ValueError(
+                "standard DCT reference contract does not match run arguments: "
+                f"expected {expected_reference}, got {observed_reference}"
             )
     provenance_differences = code_provenance_differences(planned_code, current_code)
     validation = {
@@ -376,6 +541,21 @@ def _move_batch(
         tuple(value.to(device, non_blocking=True) for value in batch.inputs),
         batch.labels.to(device, non_blocking=True),
     )
+
+
+def _all_finite(values: Iterable[torch.Tensor]) -> bool:
+    return all(bool(torch.isfinite(value).all().item()) for value in values)
+
+
+def _optimizer_gradients(
+    parameters: Iterable[torch.nn.Parameter], *, update: int
+) -> list[torch.Tensor]:
+    gradients = [
+        parameter.grad for parameter in parameters if parameter.grad is not None
+    ]
+    if not gradients:
+        raise FloatingPointError(f"empty gradients at optimizer update {update}")
+    return gradients
 
 
 def _merge_numeric(target: dict[str, float], source: Mapping[str, Any], prefix: str = "") -> None:
@@ -442,6 +622,7 @@ def _schedule_chunk(
 
 def _make_adapter(
     *,
+    pipeline: str = "galp",
     samples: Sequence[TrainingSample],
     identities: Sequence[Sequence[SampleIdentity]],
     augmentations: Sequence[Sequence[PublishedAugmentation]],
@@ -454,7 +635,7 @@ def _make_adapter(
     by_id = {sample.logical_sample_id: sample for sample in samples}
     selected_samples = [by_id[identity.logical_sample_id] for identity in flat_identities]
     adapter = build_training_adapter(
-        "galp",
+        pipeline,
         selected_samples,
         batch_size=64,
         workers=workers,
@@ -484,6 +665,7 @@ def _run_validation(
     epoch: int,
     optimizer_update: int,
     processed_images: int,
+    recipe: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, float]]:
     model.eval()
     total = 0
@@ -547,8 +729,9 @@ def _run_validation(
                         value.logical_sample_id for value in expected
                     ]:
                         raise RuntimeError("validation adapter changed logical sample order")
-                    logits = model(*inputs)
-                    loss = torch.nn.functional.cross_entropy(logits, labels)
+                    with _autocast_context(recipe, device):
+                        logits = model(*inputs)
+                        loss = torch.nn.functional.cross_entropy(logits, labels)
                     if not bool(torch.isfinite(loss).item()) or not bool(
                         torch.isfinite(logits).all().item()
                     ):
@@ -635,7 +818,11 @@ def _checkpoint_payload(
     loader_totals: Mapping[str, float],
     elapsed_runtime_seconds: float,
     pending_validation_epoch: int | None,
+    audit_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    resolved_audit_policy = validate_audit_policy(
+        audit_policy or build_audit_policy()
+    )
     rng = capture_rng_state()
     return {
         "format": CHECKPOINT_SCHEMA,
@@ -666,6 +853,10 @@ def _checkpoint_payload(
         "loader_totals": dict(loader_totals),
         "elapsed_runtime_seconds": float(elapsed_runtime_seconds),
         "pending_validation_epoch": pending_validation_epoch,
+        "audit_policy_hash": resolved_audit_policy["audit_policy_hash"],
+        "audit_cursor": audit_cursor(
+            resolved_audit_policy, int(global_optimizer_update)
+        ),
     }
 
 
@@ -681,7 +872,11 @@ def _restore_checkpoint(
     condition_hash: str,
     initial_model_hash: str,
     metrics: MetricsWriter,
+    audit_policy: Mapping[str, Any] | None = None,
 ) -> tuple[int, int, int, dict[str, Any]]:
+    resolved_audit_policy = validate_audit_policy(
+        audit_policy or build_audit_policy()
+    )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     expected = {
         "format": CHECKPOINT_SCHEMA,
@@ -689,6 +884,7 @@ def _restore_checkpoint(
         "layout_hash": layout_hash,
         "condition_contract_hash": condition_hash,
         "initial_model_hash": initial_model_hash,
+        "audit_policy_hash": resolved_audit_policy["audit_policy_hash"],
     }
     observed = {key: payload.get(key) for key in expected}
     if observed != expected:
@@ -696,6 +892,11 @@ def _restore_checkpoint(
     accumulation = payload.get("gradient_accumulation_state", {})
     if accumulation.get("microbatches") != 0 or accumulation.get("samples") != 0:
         raise ValueError("resume checkpoint is not at an epoch/accumulation boundary")
+    validate_audit_cursor(
+        payload.get("audit_cursor", {}),
+        resolved_audit_policy,
+        completed_updates=int(payload["global_optimizer_update"]),
+    )
     model.load_state_dict(payload["model_state"], strict=True)
     optimizer.load_state_dict(payload["optimizer_state"])
     weight_decayer.load_state_dict(payload["weight_decay_state"])
@@ -739,6 +940,7 @@ def _save_boundary_checkpoint(
     loader_totals: Mapping[str, float],
     elapsed_runtime_seconds: float,
     pending_validation_epoch: int | None,
+    audit_policy: Mapping[str, Any] | None = None,
 ) -> None:
     latest = output_dir / "latest.pt"
     payload = _checkpoint_payload(
@@ -759,6 +961,7 @@ def _save_boundary_checkpoint(
         loader_totals=loader_totals,
         elapsed_runtime_seconds=elapsed_runtime_seconds,
         pending_validation_epoch=pending_validation_epoch,
+        audit_policy=audit_policy,
     )
     _atomic_checkpoint(latest, payload)
     if permanent_epoch is not None:
@@ -800,37 +1003,52 @@ def _train_native_physical_epoch(
     samples_since_log: int,
     last_logged_update: int,
     integration_check_first_100: bool,
-    audit_policy: TrainingAuditPolicy,
+    audit_policy: Mapping[str, Any] | None = None,
+    pipeline_setup_seconds: float = 0.0,
+    close_pipeline_at_epoch_end: bool = False,
 ) -> dict[str, Any]:
     """Consume one native-owned physical PLS epoch at the model boundary."""
 
+    resolved_audit_policy = validate_audit_policy(
+        audit_policy or build_audit_policy()
+    )
+    epoch_start_update = int(global_update)
     epoch_started = time.perf_counter()
     order_policy = str(resolve_condition(condition_id)["order_policy"])
     sample_shuffle_enabled = order_policy != "physical-order"
     epoch_loss_sum = 0.0
+    epoch_loss_device = torch.zeros((), dtype=torch.float64, device=device)
+    loss_since_log_device = torch.zeros((), dtype=torch.float64, device=device)
+    deferred_finite = torch.ones((), dtype=torch.bool, device=device)
     epoch_samples = 0
     epoch_microbatches = 0
     epoch_updates = 0
     pool_count = 0
     pool_load_seconds = 0.0
+    start_epoch_seconds = 0.0
+    next_pool_wait_seconds = 0.0
+    next_microbatch_wait_seconds = 0.0
     pool_boundary_wait_seconds = 0.0
+    reclaim_seconds = 0.0
+    pipeline_close_seconds = 0.0
+    audit_seconds = 0.0
+    boundary_sync_seconds = 0.0
     native_execution_stats: dict[str, Any] = {}
     coverage = np.zeros(expected_sample_count, dtype=np.bool_)
     order_hash = hashlib.sha256()
     pool_membership_hash = hashlib.sha256()
     microbatch_images = int(recipe["training"]["physical_microbatch"])
     accumulation = int(recipe["training"]["gradient_accumulation"])
-    audit = TrainingAuditState(
-        audit_policy,
-        completed_updates=global_update,
-        device=device,
-    )
+    start_epoch_started = time.perf_counter()
     pipeline.start_epoch(epoch)
+    start_epoch_seconds = time.perf_counter() - start_epoch_started
 
     while pipeline.has_next_pool:
         load_started = time.perf_counter()
         pool = pipeline.next_pool()
-        pool_load_seconds += time.perf_counter() - load_started
+        exposed_pool_wait = time.perf_counter() - load_started
+        pool_load_seconds += exposed_pool_wait
+        next_pool_wait_seconds += exposed_pool_wait
         if pool.epoch != epoch or pool.pool_index != pool_count:
             raise RuntimeError(
                 "native PLS pool epoch/index differs from the streaming cursor"
@@ -854,9 +1072,17 @@ def _train_native_physical_epoch(
                 raise RuntimeError("native PLS accumulation window is empty")
             optimizer.zero_grad(set_to_none=True)
             learning_rate = scheduler.prepare_next_update()
+            audit_decision = decision_for_next_update(
+                resolved_audit_policy, global_update
+            )
             update_loss_sum = 0.0
+            update_loss_device = torch.zeros((), dtype=torch.float64, device=device)
             for _local_index in range(window_microbatches):
+                next_batch_started = time.perf_counter()
                 native_batch = next(pool)
+                next_microbatch_wait_seconds += (
+                    time.perf_counter() - next_batch_started
+                )
                 y, cbcr, targets = native_batch.tensors
                 image_ids = native_batch.global_image_ids
                 labels = native_batch.labels
@@ -880,56 +1106,85 @@ def _train_native_physical_epoch(
                         )
                     coverage[image_id] = True
                     order_hash.update(int(image_id).to_bytes(8, "little"))
-                logits = execution_model(y, cbcr)
-                loss = torch.nn.functional.cross_entropy(logits, targets)
-                try:
-                    audited_loss_sum = audit.observe(loss, logits, batch_size)
-                except FloatingPointError as error:
-                    raise FloatingPointError(
-                        f"non-finite native PLS loss/logits at epoch {epoch} "
-                        f"pool {pool_count} microbatch {epoch_microbatches}"
-                    ) from error
+                with _autocast_context(recipe, device):
+                    logits = execution_model(y, cbcr)
+                    loss = torch.nn.functional.cross_entropy(logits, targets)
+                audit_started = time.perf_counter()
+                if audit_decision.synchronous_loss_logits:
+                    if not bool(torch.isfinite(loss).item()) or not bool(
+                        torch.isfinite(logits).all().item()
+                    ):
+                        raise FloatingPointError(
+                            f"non-finite native PLS loss/logits at epoch {epoch} "
+                            f"pool {pool_count} microbatch {epoch_microbatches}"
+                        )
+                else:
+                    deferred_finite = (
+                        deferred_finite
+                        & torch.isfinite(loss)
+                        & torch.isfinite(logits).all()
+                    )
+                audit_seconds += time.perf_counter() - audit_started
                 (loss * (batch_size / window_sample_count)).backward()
-                update_loss_sum += audited_loss_sum
+                if audit_decision.per_microbatch_loss_readback:
+                    readback_started = time.perf_counter()
+                    update_loss_sum += float(loss.detach().item()) * batch_size
+                    audit_seconds += time.perf_counter() - readback_started
+                else:
+                    weighted_loss = loss.detach().to(torch.float64) * batch_size
+                    update_loss_device = update_loss_device + weighted_loss
+                    epoch_loss_device = epoch_loss_device + weighted_loss
                 pool_seen_images += batch_size
                 epoch_microbatches += 1
                 del native_batch, y, cbcr, targets, logits, loss
 
-            try:
-                audit.check_gradients_and_clip(
-                    model.parameters(),
-                    max_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
-                )
-            except FloatingPointError as error:
-                raise FloatingPointError(
-                    f"non-finite gradients at optimizer update {global_update + 1}"
-                ) from error
+            gradients = _optimizer_gradients(
+                model.parameters(), update=global_update + 1
+            )
+            audit_started = time.perf_counter()
+            if audit_decision.synchronous_gradients:
+                if not _all_finite(gradients):
+                    raise FloatingPointError(
+                        f"non-finite gradients at optimizer update {global_update + 1}"
+                    )
+            else:
+                for gradient in gradients:
+                    deferred_finite = deferred_finite & torch.isfinite(gradient).all()
+            audit_seconds += time.perf_counter() - audit_started
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
+            )
             optimizer.step()
             weight_decayer.step(learning_rate)
             scheduler.complete_update()
             global_update += 1
-            audit.complete_update()
             epoch_updates += 1
             processed_images += window_sample_count
             epoch_samples += window_sample_count
             epoch_loss_sum += update_loss_sum
             loss_since_log += update_loss_sum
+            loss_since_log_device = loss_since_log_device + update_loss_device
             samples_since_log += window_sample_count
-            if integration_check_first_100 and global_update <= 100:
-                integration_checks["checked_updates"] += 1
-                try:
-                    audit.check_parameters(model.parameters())
-                except FloatingPointError as error:
+            if audit_decision.synchronous_parameters:
+                audit_started = time.perf_counter()
+                integration_checks["checked_updates"] = int(
+                    integration_checks.get("checked_updates", 0)
+                ) + 1
+                if not _all_finite(model.parameters()):
                     integration_checks["parameters_finite"] = False
                     raise FloatingPointError(
                         f"non-finite model parameters at integration update {global_update}"
-                    ) from error
+                    )
+                audit_seconds += time.perf_counter() - audit_started
             if global_update % int(
                 recipe["logging"]["train_loss_every_optimizer_updates"]
             ) == 0:
-                deferred_loss, _deferred_samples = audit.read_deferred_loss()
-                epoch_loss_sum += deferred_loss
-                loss_since_log += deferred_loss
+                if not audit_decision.per_microbatch_loss_readback:
+                    readback_started = time.perf_counter()
+                    loss_since_log += float(loss_since_log_device.item())
+                    loss_since_log_device.zero_()
+                    audit_seconds += time.perf_counter() - readback_started
                 metrics.append(
                     {
                         "record_type": "train",
@@ -972,20 +1227,16 @@ def _train_native_physical_epoch(
                     native_execution_stats[key] = value
                 elif previous != value:
                     native_execution_stats[key] = "mixed"
-        # Retiring the scheduling context admits exactly one next-pool prepare.
-        # Tensor backing remains owned by NativeBatchLease until the current
-        # stream and every explicitly registered consumer are complete.
+        # Admit exactly one next-pool prepare while the current pool's tensor
+        # backing remains owned by its NativeBatchLease until all registered
+        # stream consumers complete.
         pool.retire()
         del pool
+        reclaim_started = time.perf_counter()
         pipeline.reclaim_finished_pools()
+        reclaim_seconds += time.perf_counter() - reclaim_started
         pool_boundary_wait_seconds += time.perf_counter() - wait_started
         pool_count += 1
-
-    deferred_loss, _deferred_samples = audit.read_deferred_loss()
-    epoch_loss_sum += deferred_loss
-    loss_since_log += deferred_loss
-    if audit.completed_updates != global_update:
-        raise RuntimeError("training audit global update cursor diverged")
 
     if epoch_samples != expected_sample_count or not bool(coverage.all()):
         integration_checks["coverage_counters_valid"] = False
@@ -993,8 +1244,46 @@ def _train_native_physical_epoch(
             f"native PLS epoch {epoch} consumed {epoch_samples}/"
             f"{expected_sample_count} unique images"
         )
-    epoch_seconds = time.perf_counter() - epoch_started
+    if (
+        resolved_audit_policy["audit_mode"] == "runtime-first-100"
+        and global_update
+        > max(epoch_start_update, int(resolved_audit_policy["strict_update_count"]))
+    ):
+        audit_started = time.perf_counter()
+        for parameter in model.parameters():
+            deferred_finite = deferred_finite & torch.isfinite(parameter).all()
+        if not bool(deferred_finite.item()):
+            integration_checks["parameters_finite"] = False
+            raise FloatingPointError(
+                f"deferred non-finite audit failed at native epoch {epoch + 1} boundary"
+            )
+        audit_seconds += time.perf_counter() - audit_started
+    if (
+        resolved_audit_policy["audit_mode"] == "runtime-first-100"
+        and global_update > int(resolved_audit_policy["strict_update_count"])
+    ):
+        readback_started = time.perf_counter()
+        pending_loss = float(loss_since_log_device.item())
+        loss_since_log += pending_loss
+        loss_since_log_device.zero_()
+        audit_seconds += time.perf_counter() - readback_started
+    if (
+        resolved_audit_policy["audit_mode"] == "runtime-first-100"
+        and global_update > int(resolved_audit_policy["strict_update_count"])
+    ):
+        readback_started = time.perf_counter()
+        epoch_loss_sum += float(epoch_loss_device.item())
+        audit_seconds += time.perf_counter() - readback_started
+    # The native pipeline invalidates its stats accessor as part of close().
+    # Snapshot the completed epoch counters while the pipeline is still live.
     pool_prefetch_stats = pipeline.prefetch_stats
+    if close_pipeline_at_epoch_end:
+        close_started = time.perf_counter()
+        pipeline.close()
+        pipeline_close_seconds = time.perf_counter() - close_started
+    epoch_seconds = (
+        float(pipeline_setup_seconds) + time.perf_counter() - epoch_started
+    )
     total_prepare_ms = (
         float(pool_prefetch_stats["prepare_plan_ms"])
         + float(pool_prefetch_stats["prepare_io_ms"])
@@ -1003,9 +1292,6 @@ def _train_native_physical_epoch(
     exposed_prepare_ms = min(
         total_prepare_ms, float(pool_prefetch_stats["activation_wait_ms"])
     )
-    # This ratio covers all work owned by the lookahead worker, including
-    # bounded next-pool device submission/materialization. Activation only
-    # publishes an already-ready pool.
     pool_prefetch_stats["pool_prepare_hidden_ratio"] = (
         0.0
         if total_prepare_ms <= 0.0
@@ -1054,15 +1340,33 @@ def _train_native_physical_epoch(
             "epoch_optimizer_updates": epoch_updates,
             "epoch_seconds": epoch_seconds,
             "images_per_second": epoch_samples / epoch_seconds,
-            "data_preparation_seconds": 0.0,
+            "data_preparation_seconds": (
+                float(pipeline_setup_seconds) + start_epoch_seconds
+            ),
+            "exposed_input_wait_seconds": (
+                next_pool_wait_seconds + next_microbatch_wait_seconds
+            ),
+            "model_forward_backward_optimizer_seconds": None,
+            "audit_seconds": audit_seconds,
+            "boundary_sync_seconds": boundary_sync_seconds,
+            "pipeline_internal_work_seconds": None,
             "native_pool_load_seconds": pool_load_seconds,
             "native_pool_boundary_wait_seconds": pool_boundary_wait_seconds,
+            "native_start_epoch_seconds": start_epoch_seconds,
+            "native_next_pool_exposed_wait_seconds": next_pool_wait_seconds,
+            "native_next_microbatch_exposed_wait_seconds": next_microbatch_wait_seconds,
+            "native_reclaim_seconds": reclaim_seconds,
+            "native_pipeline_setup_seconds": float(pipeline_setup_seconds),
+            "native_pipeline_close_seconds": pipeline_close_seconds,
             "native_pool_count": pool_count,
             "native_pool_prefetch": pool_prefetch_stats,
             "native_execution_stats": native_execution_stats,
-            "training_audit": {
-                "policy": audit.policy.as_contract(),
-                "counters": audit.counters.as_dict(),
+            "native_planning_read_decode_transform_work": {
+                "counters_and_overlap_capable_timings": native_execution_stats,
+                "semantics": (
+                    "native internal work may overlap next_pool/model CUDA work and "
+                    "must not be added to epoch_seconds"
+                ),
             },
             "sample_order_digest": order_hash.hexdigest(),
             "pool_membership_digest": pool_membership_hash.hexdigest(),
@@ -1080,14 +1384,65 @@ def _train_native_physical_epoch(
             "cuda_ordered_output_placement": True,
             "cuda_mixup": True,
             "cuda_transform_shuffle_mixup": sample_shuffle_enabled,
+            "audit": epoch_audit_summary(
+                resolved_audit_policy,
+                start_update=epoch_start_update,
+                end_update=global_update,
+            ),
+            "timing_semantics": {
+                "epoch_seconds_includes": [
+                    "pipeline.start_epoch",
+                    "pipeline.next_pool",
+                    "next(pool)",
+                    "native-read-decode-transform",
+                    "forward-loss-backward",
+                    "gradient-clipping-optimizer-scheduler",
+                    "audit-required-synchronization",
+                    "pool-boundary-synchronize",
+                    "reclaim",
+                    "pipeline-close",
+                ],
+                "validation_included": False,
+                "critical_path_rule": (
+                    "only epoch_seconds is the critical path; native worker/CUDA "
+                    "work may overlap and must not be added to exposed waits"
+                ),
+                "model_component_available": False,
+                "component_fields": {
+                    "data_preparation_seconds": "pipeline construction plus start_epoch host wall",
+                    "exposed_input_wait_seconds": "next_pool plus next(pool) exposed host wall",
+                    "audit_seconds": (
+                        "host-observed audit/readback wall; deferred device work can "
+                        "be realized at a pool/epoch synchronization boundary"
+                    ),
+                    "boundary_sync_seconds": (
+                        "host wall blocked at pool boundaries; not additive with "
+                        "native CUDA/model work"
+                    ),
+                    "pipeline_internal_work_seconds": (
+                        "unavailable as a non-overlapping scalar; use native counters"
+                    ),
+                },
+            },
         },
     }
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    recipe = assert_recipe_overrides(recipe=RECIPE_NAME, epochs=args.epochs)
+    recipe = assert_recipe_overrides(
+        recipe=args.recipe,
+        epochs=args.epochs,
+        model_id=args.model,
+    )
+    model_spec = resolve_model(args.model)
     condition = resolve_condition(args.condition)
+    if args.condition not in model_spec.supported_conditions:
+        raise ValueError(
+            f"model {args.model!r} supports only conditions "
+            f"{model_spec.supported_conditions}; got {args.condition!r}"
+        )
     native_physical = args.execution_backend == NATIVE_PHYSICAL_BACKEND
+    standard_dct = args.execution_backend == STANDARD_DCT_BACKEND
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     layout = load_layout_mapping(args.layout_plan)
@@ -1101,19 +1456,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         condition_id=args.condition,
         seed=args.seed,
         recipe_hash=recipe["recipe_hash"],
+        model_id=args.model,
+        model_configuration=recipe["model"],
+        model_source_provenance=source_provenance(
+            args.rgbnomore_root, args.model
+        ),
         layout_hash=layout.layout_hash,
         execution_backend=args.execution_backend,
         physical_galp_manifest=args.physical_galp_manifest,
         premixed_mapping_csv=args.premixed_mapping_csv,
         expected_mapping_sha256=args.expected_mapping_sha256,
     )
-    audit_policy = TrainingAuditPolicy.from_contract(
-        contract.get("training_audit_policy")
-    )
+    requested_audit_policy = build_audit_policy(args.audit_mode)
+    if contract["audit_policy"] != requested_audit_policy:
+        raise ValueError("--audit-mode differs from the immutable run manifest")
+    if str(contract.get("required_gpu_name_substring", "")) != str(
+        args.required_gpu_name_substring
+    ):
+        raise ValueError(
+            "--required-gpu-name-substring differs from the immutable run manifest"
+        )
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("the formal PLS core run requires an available CUDA device")
     torch.cuda.set_device(device)
+    selected_gpu_name = torch.cuda.get_device_properties(device).name
+    required_gpu = str(contract["required_gpu_name_substring"])
+    if required_gpu and required_gpu.lower() not in selected_gpu_name.lower():
+        raise RuntimeError(
+            f"selected device is {selected_gpu_name!r}; required substring is "
+            f"{required_gpu!r}"
+        )
     train_samples, train_meta = _load_manifest_fast(
         args.train_manifest, expected_split="train"
     )
@@ -1121,6 +1494,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     validate_manifest_against_layout(
         layout, manifest_path=args.train_manifest, samples=train_samples
     )
+    if standard_dct:
+        layout = load_premixed_layout_mapping(
+            args.premixed_mapping_csv,
+            expected_sha256=args.expected_mapping_sha256,
+            base_mapping=layout,
+            samples=train_samples,
+        )
     if {sample.logical_sample_id for sample in train_samples} & {
         sample.logical_sample_id for sample in val_samples
     }:
@@ -1136,7 +1516,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise FileNotFoundError(path)
     train_reader = (
         None
-        if native_physical
+        if native_physical or standard_dct
         else DirectDctTrainingReader(
             train_galp_manifest, module_path=args.galp_torch_module_path
         )
@@ -1150,7 +1530,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("validation GALP image count differs from validation manifest")
 
     model, initial_model_hash = build_paired_model(
-        args.rgbnomore_root, seed=args.seed, device=device
+        args.rgbnomore_root,
+        model_id=args.model,
+        seed=args.seed,
+        device=device,
     )
     if contract["initial_model_hash"] != initial_model_hash:
         raise ValueError(
@@ -1191,6 +1574,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             condition_hash=contract["condition_hash"],
             initial_model_hash=initial_model_hash,
             metrics=metrics,
+            audit_policy=contract["audit_policy"],
         )
     elif any(output_dir.iterdir()):
         allowed = {
@@ -1200,6 +1584,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "environment.json",
             "failure.json",
             "failures.jsonl",
+            "model_only_dct.json",
             "attempts",
         }
         unexpected = [
@@ -1213,8 +1598,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     execution_model = compile_published_model(model, recipe)
 
     native_pipeline: DirectDctPlsPipeline | None = None
-    if native_physical:
-        native_pipeline = DirectDctPlsPipeline(
+
+    def make_native_pipeline() -> DirectDctPlsPipeline:
+        created = DirectDctPlsPipeline(
             train_galp_manifest,
             args.premixed_mapping_csv,
             training_seed=args.seed,
@@ -1225,30 +1611,51 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             microbatch_images=int(recipe["training"]["physical_microbatch"]),
             segment_images=int(layout.plan["target_pls_size"]),
             model_classes=int(recipe["model"]["classes"]),
+            profile=model_spec.input_contract.profile_id,
             module_path=args.galp_torch_module_path,
         )
-        if native_pipeline.sample_count != layout.sample_count:
+        if created.sample_count != layout.sample_count:
+            created.close()
             raise ValueError(
                 "native physical PLS mapping and frozen layout have different populations"
             )
+        return created
 
     environment = _device_environment(device)
     environment.update(
         execution_mode=(
-            "native_physical_pls" if native_physical else "semantic_emulation"
+            "native_physical_pls"
+            if native_physical
+            else (
+                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
+            )
         ),
-        semantic_emulation=not native_physical,
+        semantic_emulation=args.execution_backend == SEMANTIC_BACKEND,
         physical_fls_observed=native_physical,
         physical_gpu_pool=native_physical,
         layout_hash=layout.layout_hash,
         recipe_hash=recipe["recipe_hash"],
         condition_hash=contract["condition_hash"],
         initial_model_hash=initial_model_hash,
+        model_id=args.model,
+        model_configuration=dict(recipe["model"]),
+        model_domain="dct",
+        model_parameter_count=sum(parameter.numel() for parameter in model.parameters()),
         model_execution=recipe["execution"],
+        audit_policy=contract["audit_policy"],
+        process_isolation="one-condition-seed-per-process",
+        cache_state=(
+            "not forcibly dropped; epoch 1 is cold/order diagnostic and epoch 2 "
+            "is warm-primary"
+        ),
         backend_implementation=(
             "galp-native-direct-dct-pls-block-major-v1"
             if native_physical
-            else "shared-galp-direct-dct-semantic-backend-v2"
+            else (
+                "rgbnomore-jpeg-dct-premixed-reference-v2"
+                if standard_dct
+                else "shared-galp-direct-dct-semantic-backend-v2"
+            )
         ),
         train_manifest=train_meta,
         validation_manifest=val_meta,
@@ -1258,12 +1665,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if native_physical:
         environment["physical_execution"] = dict(contract["physical_execution"])
+    if standard_dct:
+        environment["standard_dct_reference"] = dict(
+            contract["standard_dct_reference"]
+        )
     _atomic_json(output_dir / "environment.json", environment)
     run_status = {
         "schema_version": RUN_SCHEMA,
         "state": "running",
         "condition": args.condition,
         "seed": args.seed,
+        "model_id": args.model,
+        "recipe": recipe["recipe"],
+        "precision": recipe["training"]["precision"],
         "started_at_unix": time.time(),
         "completed_epoch": completed_epoch,
         "optimizer_update": global_update,
@@ -1271,7 +1685,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     _atomic_json(output_dir / "run_status.json", run_status)
 
-    validation_grid = set(validation_epochs())
+    validation_grid = set(validation_epochs(str(recipe["recipe"])))
     loader_totals: dict[str, float] = {
         str(key): float(value)
         for key, value in resume_bookkeeping.get("loader_totals", {}).items()
@@ -1287,11 +1701,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     loss_since_log = float(logging_state.get("loss_since_log", 0.0))
     samples_since_log = int(logging_state.get("samples_since_log", 0))
     last_logged_update = int(logging_state.get("last_logged_update", global_update))
+    audit_checkpoint_cursor = audit_cursor(contract["audit_policy"], global_update)
     default_integration_checks = {
-        "required_updates": 100 if args.integration_check_first_100 else 0,
-        "checked_updates": min(global_update, 100)
-        if args.integration_check_first_100
-        else 0,
+        "required_updates": contract["audit_policy"]["checked_updates"],
+        "checked_updates": audit_checkpoint_cursor["checked_updates"],
         "loss_finite": True,
         "gradients_finite": True,
         "parameters_finite": True,
@@ -1317,6 +1730,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             epoch=0,
             optimizer_update=0,
             processed_images=0,
+            recipe=recipe,
         )
         metrics.append(event)
         _merge_numeric(loader_totals, validation_loader, "validation")
@@ -1346,16 +1760,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 elapsed_runtime_seconds + time.perf_counter() - runtime_started
             ),
             pending_validation_epoch=None,
+            audit_policy=contract["audit_policy"],
         )
 
     adapter_config = (
         None
         if native_physical
-        else _adapter_config(
-            reader=train_reader,
-            galp_manifest=train_galp_manifest,
-            module_path=args.galp_torch_module_path,
-            prefetch_depth=args.prefetch_depth,
+        else (
+            {
+                "rgbnomore_root": str(args.rgbnomore_root.resolve()),
+                "execution_mode": "runtime",
+                "benchmark": "standard-rgbnomore-dct-reference-v2",
+            }
+            if standard_dct
+            else _adapter_config(
+                reader=train_reader,
+                galp_manifest=train_galp_manifest,
+                module_path=args.galp_torch_module_path,
+                prefetch_depth=args.prefetch_depth,
+            )
         )
     )
     pending_validation_epoch = resume_bookkeeping.get("pending_validation_epoch")
@@ -1377,6 +1800,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             epoch=completed_epoch,
             optimizer_update=global_update,
             processed_images=processed_images,
+            recipe=recipe,
         )
         metrics.append(validation)
         _merge_numeric(loader_totals, validation_loader, "validation")
@@ -1406,11 +1830,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 elapsed_runtime_seconds + time.perf_counter() - runtime_started
             ),
             pending_validation_epoch=None,
+            audit_policy=contract["audit_policy"],
         )
+    resolved_audit_policy = validate_audit_policy(contract["audit_policy"])
     for epoch in range(completed_epoch, int(recipe["training"]["epochs"])):
         if native_physical:
-            if native_pipeline is None:
-                raise RuntimeError("native physical backend was not initialized")
+            setup_started = time.perf_counter()
+            native_pipeline = make_native_pipeline()
+            pipeline_setup_seconds = time.perf_counter() - setup_started
             native_epoch = _train_native_physical_epoch(
                 pipeline=native_pipeline,
                 execution_model=execution_model,
@@ -1433,8 +1860,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 samples_since_log=samples_since_log,
                 last_logged_update=last_logged_update,
                 integration_check_first_100=args.integration_check_first_100,
-                audit_policy=audit_policy,
+                audit_policy=contract["audit_policy"],
+                pipeline_setup_seconds=pipeline_setup_seconds,
+                close_pipeline_at_epoch_end=True,
             )
+            native_pipeline = None
             global_update = int(native_epoch["global_update"])
             processed_images = int(native_epoch["processed_images"])
             loss_since_log = float(native_epoch["loss_since_log"])
@@ -1471,6 +1901,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         - runtime_started
                     ),
                     pending_validation_epoch=completed_epoch,
+                    audit_policy=contract["audit_policy"],
                 )
                 validation, validation_loader = _run_validation(
                     model=execution_model,
@@ -1486,6 +1917,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     epoch=completed_epoch,
                     optimizer_update=global_update,
                     processed_images=processed_images,
+                    recipe=recipe,
                 )
                 metrics.append(validation)
                 _merge_numeric(loader_totals, validation_loader, "validation")
@@ -1517,6 +1949,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     elapsed_runtime_seconds + time.perf_counter() - runtime_started
                 ),
                 pending_validation_epoch=None,
+                audit_policy=contract["audit_policy"],
             )
             run_status.update(
                 completed_epoch=completed_epoch,
@@ -1529,17 +1962,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 and completed_epoch >= args.stop_after_epoch
                 and completed_epoch < int(recipe["training"]["epochs"])
             ):
-                native_pipeline.close()
+                # The equal-image report consumes a matched model-only DCT
+                # calibration.  Run it only after the measured epoch has been
+                # checkpointed so it cannot contaminate cold/warm epoch timing.
+                _run_dct_model_only_calibration(
+                    output_dir=output_dir,
+                    contract=contract,
+                    recipe=recipe,
+                    rgbnomore_root=args.rgbnomore_root,
+                    model_id=args.model,
+                    seed=args.seed,
+                    device=device,
+                    initial_model_hash=initial_model_hash,
+                )
                 paused = {
                     "schema_version": RUN_SCHEMA,
                     "state": "paused-at-epoch-boundary",
                     "condition": args.condition,
                     "seed": args.seed,
+                    "model_id": args.model,
+                    "recipe": recipe["recipe"],
+                    "precision": recipe["training"]["precision"],
                     "completed_epoch": completed_epoch,
                     "optimizer_update": global_update,
                     "processed_images": processed_images,
                     "integration_checks": integration_checks,
                     "latest_checkpoint": str((output_dir / "latest.pt").resolve()),
+                    "model_only_calibration": str(
+                        (output_dir / "model_only_dct.json").resolve()
+                    ),
                     "resume_semantics": (
                         "rerun the same command with --resume and without "
                         "--stop-after-epoch"
@@ -1557,7 +2008,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 return paused
             continue
         epoch_started = time.perf_counter()
+        epoch_start_update = int(global_update)
         epoch_loss_sum = 0.0
+        epoch_loss_device = torch.zeros((), dtype=torch.float64, device=device)
+        loss_since_log_device = torch.zeros(
+            (), dtype=torch.float64, device=device
+        )
+        deferred_finite = torch.ones((), dtype=torch.bool, device=device)
         epoch_samples = 0
         epoch_microbatches = 0
         epoch_updates = 0
@@ -1571,11 +2028,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         mixup_hash = hashlib.sha256()
         pool_membership_hash = hashlib.sha256()
         data_preparation_seconds = 0.0
-        audit = TrainingAuditState(
-            audit_policy,
-            completed_updates=global_update,
-            device=device,
-        )
+        exposed_input_wait_seconds = 0.0
+        audit_seconds = 0.0
+        boundary_sync_seconds = 0.0
+        adapter_close_seconds = 0.0
+        epoch_loader_stage_seconds: dict[str, float] = {}
         for pool_index, pool_pls_ids, positions in epoch_position_pools(
             layout,
             condition_id=args.condition,
@@ -1618,6 +2075,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     for position in batch
                 ]
                 adapter = _make_adapter(
+                    pipeline=("rgbnomore" if standard_dct else "galp"),
                     samples=chunk_samples,
                     identities=identities,
                     augmentations=augmentations,
@@ -1634,9 +2092,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         )
                         optimizer.zero_grad(set_to_none=True)
                         learning_rate = scheduler.prepare_next_update()
+                        audit_decision = decision_for_next_update(
+                            resolved_audit_policy, global_update
+                        )
                         update_loss_sum = 0.0
+                        update_loss_device = torch.zeros(
+                            (), dtype=torch.float64, device=device
+                        )
                         for local_index in range(window_begin, window_end):
+                            input_wait_started = time.perf_counter()
                             batch = adapter.next_batch()
+                            exposed_input_wait_seconds += (
+                                time.perf_counter() - input_wait_started
+                            )
                             expected = identities[local_index]
                             if [value.logical_sample_id for value in batch.identities] != [
                                 value.logical_sample_id for value in expected
@@ -1661,19 +2129,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                 alpha=float(recipe["augmentation"]["mixup"]["alpha"]),
                                 classes=int(recipe["model"]["classes"]),
                             )
-                            logits = execution_model(*inputs)
-                            loss = torch.nn.functional.cross_entropy(logits, mixed_labels)
-                            try:
-                                audited_loss_sum = audit.observe(
-                                    loss, logits, len(expected)
+                            with _autocast_context(recipe, device):
+                                logits = execution_model(*inputs)
+                                loss = torch.nn.functional.cross_entropy(
+                                    logits, mixed_labels
                                 )
-                            except FloatingPointError as error:
-                                raise FloatingPointError(
-                                    f"non-finite loss/logits at epoch {epoch} microbatch {microbatch_index}"
-                                ) from error
+                            if audit_decision.synchronous_loss_logits:
+                                audit_started = time.perf_counter()
+                                if not bool(torch.isfinite(loss).item()) or not bool(
+                                    torch.isfinite(logits).all().item()
+                                ):
+                                    raise FloatingPointError(
+                                        "non-finite loss/logits at epoch "
+                                        f"{epoch} microbatch {microbatch_index}"
+                                    )
+                                audit_seconds += time.perf_counter() - audit_started
+                            else:
+                                deferred_finite = (
+                                    deferred_finite
+                                    & torch.isfinite(loss)
+                                    & torch.isfinite(logits).all()
+                                )
                             batch_size = len(expected)
                             (loss * (batch_size / window_sample_count)).backward()
-                            update_loss_sum += audited_loss_sum
+                            if audit_decision.per_microbatch_loss_readback:
+                                update_loss_sum += (
+                                    float(loss.detach().item()) * batch_size
+                                )
+                            else:
+                                weighted_loss = (
+                                    loss.detach().to(torch.float64) * batch_size
+                                )
+                                update_loss_device = (
+                                    update_loss_device + weighted_loss
+                                )
+                                epoch_loss_device = epoch_loss_device + weighted_loss
                             for planned_position, augmentation in zip(
                                 microbatch_positions[local_index], augmentations[local_index]
                             ):
@@ -1701,46 +2191,66 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             )
                             for name, value in batch.stage_seconds.items():
                                 loader_totals[name] = loader_totals.get(name, 0.0) + float(value)
+                                epoch_loader_stage_seconds[name] = (
+                                    epoch_loader_stage_seconds.get(name, 0.0)
+                                    + float(value)
+                                )
                             adapter.snapshot_batch_metrics(batch)
                             epoch_microbatches += 1
                             del batch, inputs, labels, mixed_labels, logits, loss
-                        try:
-                            audit.check_gradients_and_clip(
-                                model.parameters(),
-                                max_norm=float(
-                                    recipe["optimizer"]["gradient_clipping_norm"]
-                                ),
-                            )
-                        except FloatingPointError as error:
-                            raise FloatingPointError(
-                                f"non-finite gradients at optimizer update {global_update + 1}"
-                            ) from error
+                        gradients = _optimizer_gradients(
+                            model.parameters(), update=global_update + 1
+                        )
+                        if audit_decision.synchronous_gradients:
+                            audit_started = time.perf_counter()
+                            if not _all_finite(gradients):
+                                raise FloatingPointError(
+                                    "non-finite gradients at optimizer update "
+                                    f"{global_update + 1}"
+                                )
+                            audit_seconds += time.perf_counter() - audit_started
+                        else:
+                            for gradient in gradients:
+                                deferred_finite = (
+                                    deferred_finite
+                                    & torch.isfinite(gradient).all()
+                                )
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(),
+                            max_norm=float(recipe["optimizer"]["gradient_clipping_norm"]),
+                        )
                         optimizer.step()
                         weight_decayer.step(learning_rate)
                         scheduler.complete_update()
                         global_update += 1
-                        audit.complete_update()
                         epoch_updates += 1
                         processed_images += window_sample_count
                         epoch_samples += window_sample_count
                         epoch_loss_sum += update_loss_sum
                         loss_since_log += update_loss_sum
+                        loss_since_log_device = (
+                            loss_since_log_device + update_loss_device
+                        )
                         samples_since_log += window_sample_count
-                        if args.integration_check_first_100 and global_update <= 100:
+                        if audit_decision.synchronous_parameters:
+                            audit_started = time.perf_counter()
                             integration_checks["checked_updates"] += 1
-                            try:
-                                audit.check_parameters(model.parameters())
-                            except FloatingPointError as error:
+                            if not _all_finite(model.parameters()):
                                 integration_checks["parameters_finite"] = False
                                 raise FloatingPointError(
                                     f"non-finite model parameters at integration update {global_update}"
-                                ) from error
+                                )
+                            audit_seconds += time.perf_counter() - audit_started
                         if global_update % int(
                             recipe["logging"]["train_loss_every_optimizer_updates"]
                         ) == 0:
-                            deferred_loss, _deferred_samples = audit.read_deferred_loss()
-                            epoch_loss_sum += deferred_loss
-                            loss_since_log += deferred_loss
+                            if not audit_decision.per_microbatch_loss_readback:
+                                audit_started = time.perf_counter()
+                                loss_since_log += float(
+                                    loss_since_log_device.item()
+                                )
+                                loss_since_log_device.zero_()
+                                audit_seconds += time.perf_counter() - audit_started
                             metrics.append(
                                 {
                                     "record_type": "train",
@@ -1762,7 +2272,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             last_logged_update = global_update
                     _merge_numeric(loader_totals, adapter.loader_metrics(), "train_adapter")
                 finally:
+                    close_started = time.perf_counter()
                     adapter.close()
+                    adapter_close_seconds += time.perf_counter() - close_started
                 epoch_position = next_epoch_position
                 global_microbatch_index += len(identities)
         if epoch_position != layout.sample_count or epoch_samples != layout.sample_count:
@@ -1774,17 +2286,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if not bool(coverage.all()):
             integration_checks["coverage_counters_valid"] = False
             raise RuntimeError(f"epoch {epoch} has missing planned positions")
-        deferred_loss, _deferred_samples = audit.read_deferred_loss()
-        epoch_loss_sum += deferred_loss
-        loss_since_log += deferred_loss
-        if audit.completed_updates != global_update:
-            raise RuntimeError("training audit global update cursor diverged")
+        if (
+            resolved_audit_policy["audit_mode"] == "runtime-first-100"
+            and global_update
+            > max(
+                epoch_start_update,
+                int(resolved_audit_policy["strict_update_count"]),
+            )
+        ):
+            audit_started = time.perf_counter()
+            for parameter in model.parameters():
+                deferred_finite = (
+                    deferred_finite & torch.isfinite(parameter).all()
+                )
+            if not bool(deferred_finite.item()):
+                integration_checks["parameters_finite"] = False
+                raise FloatingPointError(
+                    "deferred non-finite audit failed at semantic epoch "
+                    f"{epoch + 1} boundary"
+                )
+            audit_seconds += time.perf_counter() - audit_started
+        if (
+            resolved_audit_policy["audit_mode"] == "runtime-first-100"
+            and global_update
+            > int(resolved_audit_policy["strict_update_count"])
+        ):
+            audit_started = time.perf_counter()
+            loss_since_log += float(loss_since_log_device.item())
+            loss_since_log_device.zero_()
+            epoch_loss_sum += float(epoch_loss_device.item())
+            audit_seconds += time.perf_counter() - audit_started
         epoch_seconds = time.perf_counter() - epoch_started
+        pipeline_internal_work_seconds = sum(
+            float(epoch_loader_stage_seconds.get(name, 0.0))
+            for name in ("read", "decode", "augmentation", "preprocess")
+        )
         epoch_record = {
             "record_type": "train",
             "scope": "epoch",
             "condition": args.condition,
             "seed": args.seed,
+            "execution_backend": args.execution_backend,
             "epoch": epoch + 1,
             "optimizer_update": global_update,
             "processed_images": processed_images,
@@ -1796,16 +2338,56 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "epoch_seconds": epoch_seconds,
             "images_per_second": epoch_samples / epoch_seconds,
             "data_preparation_seconds": data_preparation_seconds,
-            "training_audit": {
-                "policy": audit.policy.as_contract(),
-                "counters": audit.counters.as_dict(),
-            },
+            "exposed_input_wait_seconds": exposed_input_wait_seconds,
+            "model_forward_backward_optimizer_seconds": None,
+            "audit_seconds": audit_seconds,
+            "boundary_sync_seconds": boundary_sync_seconds,
+            "pipeline_internal_work_seconds": pipeline_internal_work_seconds,
+            "adapter_close_seconds": adapter_close_seconds,
+            "loader_stage_seconds": epoch_loader_stage_seconds,
             "sample_order_digest": order_hash.hexdigest(),
             "pool_membership_digest": pool_membership_hash.hexdigest(),
             "crop_key_digest": crop_hash.hexdigest(),
             "flip_key_digest": flip_hash.hexdigest(),
             "randaugment_digest": randaugment_hash.hexdigest(),
             "mixup_digest": mixup_hash.hexdigest(),
+            "audit": epoch_audit_summary(
+                resolved_audit_policy,
+                start_update=epoch_start_update,
+                end_update=global_update,
+            ),
+            "timing_semantics": {
+                "epoch_seconds_includes": [
+                    "schedule-and-adapter-construction",
+                    "adapter.next_batch",
+                    "jpeg-coefficient-read-and-dct-preprocessing",
+                    "forward-loss-backward",
+                    "gradient-clipping-optimizer-scheduler",
+                    "audit-required-synchronization",
+                    "adapter-close",
+                ],
+                "validation_included": False,
+                "critical_path_rule": (
+                    "only epoch_seconds is the critical path; loader stage times "
+                    "may overlap and must not be added to exposed waits"
+                ),
+                "model_component_available": False,
+                "component_fields": {
+                    "data_preparation_seconds": (
+                        "schedule construction plus adapter construction host wall"
+                    ),
+                    "exposed_input_wait_seconds": "adapter.next_batch host wall",
+                    "audit_seconds": "host-observed audit and loss-readback wall",
+                    "boundary_sync_seconds": (
+                        "explicit runner boundary synchronization; none in this path"
+                    ),
+                    "pipeline_internal_work_seconds": (
+                        "sum of adapter-reported read/decode/augmentation/preprocess "
+                        "work; diagnostic and potentially overlapping"
+                    ),
+                    "adapter_close_seconds": "adapter close host wall",
+                },
+            },
         }
         metrics.append(epoch_record)
         completed_epoch = epoch + 1
@@ -1836,6 +2418,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     elapsed_runtime_seconds + time.perf_counter() - runtime_started
                 ),
                 pending_validation_epoch=completed_epoch,
+                audit_policy=contract["audit_policy"],
             )
         if completed_epoch in validation_grid:
             validation, validation_loader = _run_validation(
@@ -1852,6 +2435,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 epoch=completed_epoch,
                 optimizer_update=global_update,
                 processed_images=processed_images,
+                recipe=recipe,
             )
             metrics.append(validation)
             _merge_numeric(loader_totals, validation_loader, "validation")
@@ -1881,6 +2465,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 elapsed_runtime_seconds + time.perf_counter() - runtime_started
             ),
             pending_validation_epoch=None,
+            audit_policy=contract["audit_policy"],
         )
         run_status.update(
             completed_epoch=completed_epoch,
@@ -1893,18 +2478,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             and completed_epoch >= args.stop_after_epoch
             and completed_epoch < int(recipe["training"]["epochs"])
         ):
+            # Keep an operational prefix self-contained for downstream reports;
+            # this happens after the measured epoch and its checkpoint.
+            _run_dct_model_only_calibration(
+                output_dir=output_dir,
+                contract=contract,
+                recipe=recipe,
+                rgbnomore_root=args.rgbnomore_root,
+                model_id=args.model,
+                seed=args.seed,
+                device=device,
+                initial_model_hash=initial_model_hash,
+            )
             paused = {
                 "schema_version": RUN_SCHEMA,
                 "state": "paused-at-epoch-boundary",
                 "condition": args.condition,
                 "seed": args.seed,
+                "model_id": args.model,
+                "recipe": recipe["recipe"],
+                "precision": recipe["training"]["precision"],
                 "completed_epoch": completed_epoch,
                 "optimizer_update": global_update,
                 "processed_images": processed_images,
                 "integration_checks": integration_checks,
                 "latest_checkpoint": str((output_dir / "latest.pt").resolve()),
+                "model_only_calibration": str(
+                    (output_dir / "model_only_dct.json").resolve()
+                ),
                 "resume_semantics": "rerun the same command with --resume and without --stop-after-epoch",
                 "scientific_result": False,
+                "execution_backend": args.execution_backend,
             }
             _atomic_json(output_dir / "pause_result.json", paused)
             run_status.update(
@@ -1941,20 +2545,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "condition": args.condition,
         "seed": args.seed,
         "execution_mode": (
-            "native_physical_pls" if native_physical else "semantic_emulation"
+            "native_physical_pls"
+            if native_physical
+            else (
+                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
+            )
         ),
-        "semantic_emulation": not native_physical,
+        "semantic_emulation": args.execution_backend == SEMANTIC_BACKEND,
         "physical_fls_observed": native_physical,
         "physical_gpu_pool": native_physical,
         "layout_hash": layout.layout_hash,
         "recipe_hash": recipe["recipe_hash"],
+        "recipe": recipe["recipe"],
+        "precision": recipe["training"]["precision"],
         "condition_hash": contract["condition_hash"],
         "initial_model_hash": initial_model_hash,
+        "audit_policy_hash": contract["audit_policy"]["audit_policy_hash"],
+        "audit_cursor": audit_cursor(contract["audit_policy"], global_update),
+        "model_domain": "dct",
+        "model_id": args.model,
+        "model_configuration": dict(recipe["model"]),
+        "model_parameter_count": sum(
+            parameter.numel() for parameter in model.parameters()
+        ),
+        "model_only_calibration": str(
+            (output_dir / "model_only_dct.json").resolve()
+        ),
         "model_execution": recipe["execution"],
         "backend_implementation": (
             "galp-native-direct-dct-pls-block-major-v1"
             if native_physical
-            else "shared-galp-direct-dct-semantic-backend-v2"
+            else (
+                "rgbnomore-jpeg-dct-premixed-reference-v2"
+                if standard_dct
+                else "shared-galp-direct-dct-semantic-backend-v2"
+            )
         ),
         "final_top1": final_validation["validation_top1"],
         "final_top5": final_validation["validation_top5"],
@@ -1981,13 +2606,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             if native_physical
             else (
-                "model effect observed with a frozen virtual PLS mapping and the shared "
-                "Direct-DCT semantic backend; no full physical FLS or byte-reduction claim"
+                "model training used the standard RGB-no-more JPEG coefficient "
+                "reader with the identical frozen B6 logical schedule, crop/flip "
+                "keys, DCT RandAugment, Mixup, initialization, optimizer, and "
+                "300-epoch scheduler horizon; this is a convergence reference, "
+                "not a physical FLS or byte-reduction result"
+                if standard_dct
+                else (
+                    "model effect observed with a frozen virtual PLS mapping and the "
+                    "shared Direct-DCT semantic backend; no full physical FLS or "
+                    "byte-reduction claim"
+                )
             )
         ),
     }
     if native_physical:
         result["physical_execution"] = dict(contract["physical_execution"])
+    if standard_dct:
+        result["standard_dct_reference"] = dict(
+            contract["standard_dct_reference"]
+        )
+    # Calibration compiles and executes a separate model.  Run it only after
+    # the formal epochs and their runtime/memory observations are complete so
+    # the cold epoch cannot depend on whether a calibration artifact existed.
+    _run_dct_model_only_calibration(
+        output_dir=output_dir,
+        contract=contract,
+        recipe=recipe,
+        rgbnomore_root=args.rgbnomore_root,
+        model_id=args.model,
+        seed=args.seed,
+        device=device,
+        initial_model_hash=initial_model_hash,
+    )
     _atomic_json(output_dir / "final_result.json", result)
     run_status.update(
         state="completed",
@@ -2020,17 +2671,28 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("A0", "A1", "B2", "B6", "N6", "N2"),
     )
     parser.add_argument("--seed", required=True, type=int)
-    parser.add_argument("--recipe", choices=(RECIPE_NAME,), default=RECIPE_NAME)
+    parser.add_argument("--model", choices=MODEL_IDS, default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--recipe",
+        choices=RECIPE_NAMES,
+        help="defaults to the immutable recipe registered for --model",
+    )
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument(
         "--execution-backend",
-        choices=(SEMANTIC_BACKEND, NATIVE_PHYSICAL_BACKEND),
+        choices=EXECUTION_BACKENDS,
         default=SEMANTIC_BACKEND,
     )
     parser.add_argument("--physical-galp-manifest", type=Path)
     parser.add_argument("--premixed-mapping-csv", type=Path)
     parser.add_argument("--expected-mapping-sha256")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE)
+    parser.add_argument(
+        "--required-gpu-name-substring",
+        default="",
+        help="must match the immutable run manifest and selected GPU name",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--prefetch-depth", type=int, default=2)
@@ -2071,6 +2733,31 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         for path in (args.physical_galp_manifest, args.premixed_mapping_csv):
             if not path.is_file():
                 raise FileNotFoundError(path)
+        if len(args.expected_mapping_sha256) != 64:
+            raise ValueError("--expected-mapping-sha256 must contain 64 hex characters")
+        try:
+            int(args.expected_mapping_sha256, 16)
+        except ValueError as error:
+            raise ValueError(
+                "--expected-mapping-sha256 must contain 64 hex characters"
+            ) from error
+        if sha256_file(args.premixed_mapping_csv) != args.expected_mapping_sha256:
+            raise ValueError(
+                "--expected-mapping-sha256 differs from --premixed-mapping-csv"
+            )
+    elif args.execution_backend == STANDARD_DCT_BACKEND:
+        if args.physical_galp_manifest is not None:
+            raise ValueError(
+                "standard-rgbnomore-dct reads source JPEGs and cannot accept "
+                "--physical-galp-manifest"
+            )
+        if args.premixed_mapping_csv is None or args.expected_mapping_sha256 is None:
+            raise ValueError(
+                "standard-rgbnomore-dct requires --premixed-mapping-csv and "
+                "--expected-mapping-sha256"
+            )
+        if not args.premixed_mapping_csv.is_file():
+            raise FileNotFoundError(args.premixed_mapping_csv)
         if len(args.expected_mapping_sha256) != 64:
             raise ValueError("--expected-mapping-sha256 must contain 64 hex characters")
         try:

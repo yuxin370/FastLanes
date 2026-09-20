@@ -321,6 +321,8 @@ DirectDctTensorDescriptor DirectDctBatch::tensor() const {
 }
 
 DirectDctGridTensorDescriptor DirectDctBatch::y_tensor() const {
+	if (batch_.projected_shape()[1] != 0)
+		throw std::logic_error("use projected_tensor_async for projected output");
 	if (logical_) {
 		logical_->synchronize();
 		return logical_->y_descriptor;
@@ -349,6 +351,8 @@ DirectDctGridTensorDescriptor DirectDctBatch::y_tensor() const {
 }
 
 DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor() const {
+	if (batch_.projected_shape()[1] != 0)
+		throw std::logic_error("use projected_tensor_async for projected output");
 	if (logical_) {
 		logical_->synchronize();
 		return logical_->cbcr_descriptor;
@@ -396,7 +400,22 @@ DirectDctTensorDescriptor DirectDctBatch::tensor_async() const {
 	};
 }
 
+DirectDctGridTensorDescriptor DirectDctBatch::projected_tensor_async() const {
+	const auto shape = batch_.projected_shape();
+	if (logical_ || shape[1] == 0)
+		throw std::logic_error("batch does not have projected NCHW output");
+	return DirectDctGridTensorDescriptor {nullptr,
+	                                      batch_.y_float_coefficients_async(),
+	                                      shape,
+	                                      {shape[1] * shape[2] * shape[3], shape[2] * shape[3], shape[3], 1, 1, 1},
+	                                      DirectDctTensorDataType::kFloat32,
+	                                      DirectDctTensorDevice::kCuda,
+	                                      cuda_device_};
+}
+
 DirectDctGridTensorDescriptor DirectDctBatch::y_tensor_async() const {
+	if (batch_.projected_shape()[1] != 0)
+		throw std::logic_error("use projected_tensor_async for projected output");
 	if (logical_) {
 		return logical_->y_descriptor;
 	}
@@ -424,6 +443,8 @@ DirectDctGridTensorDescriptor DirectDctBatch::y_tensor_async() const {
 }
 
 DirectDctGridTensorDescriptor DirectDctBatch::cbcr_tensor_async() const {
+	if (batch_.projected_shape()[1] != 0)
+		throw std::logic_error("use projected_tensor_async for projected output");
 	if (logical_) {
 		return logical_->cbcr_descriptor;
 	}

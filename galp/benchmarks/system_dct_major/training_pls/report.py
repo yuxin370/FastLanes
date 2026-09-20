@@ -153,7 +153,13 @@ def _curve_rows(runs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     )
     for run in runs:
         for event in run["metrics"]:
-            row = {"condition": run["condition"], "seed": run["seed"]}
+            result = run.get("result") or {}
+            row = {
+                "condition": run["condition"],
+                "seed": run["seed"],
+                "model_id": result.get("model_id", "legacy-unspecified"),
+                "precision": result.get("precision", "legacy-unspecified"),
+            }
             row.update({field: event.get(field) for field in fields})
             rows.append(row)
     rows.sort(
@@ -178,6 +184,8 @@ def _final_rows(runs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             {
                 "condition": run["condition"],
                 "seed": run["seed"],
+                "model_id": result.get("model_id", "legacy-unspecified"),
+                "precision": result.get("precision", "legacy-unspecified"),
                 "final_top1": float(result["final_top1"]),
                 "final_top5": float(result["final_top5"]),
                 "final_validation_loss": float(result["final_validation_loss"]),
@@ -641,11 +649,19 @@ def aggregate(
         raise ValueError(f"core matrix is incomplete: {missing}")
     curve_rows = _curve_rows(runs)
     final_rows = _final_rows(runs)
+    model_ids = {str(row["model_id"]) for row in final_rows}
+    if len(model_ids) > 1:
+        raise ValueError(
+            "one factorial report cannot mix model identities; use one output root "
+            f"per model, got {sorted(model_ids)}"
+        )
     effects = _effect_rows(final_rows)
     pointwise = _pointwise_rows(runs)
     curve_fields = (
         "condition",
         "seed",
+        "model_id",
+        "precision",
         "record_type",
         "scope",
         "epoch",
@@ -663,6 +679,8 @@ def aggregate(
     final_fields = (
         "condition",
         "seed",
+        "model_id",
+        "precision",
         "final_top1",
         "final_top5",
         "final_validation_loss",
@@ -737,6 +755,20 @@ def aggregate(
                 "normalized_top1_auc",
             )
         }
+    execution_modes = {str(row["execution_mode"]) for row in final_rows}
+    if execution_modes == {"native_physical_pls"}:
+        claim_boundary = (
+            "Model effects use the native physical-FLS PLS/GPU-pool backend. "
+            "Throughput, memory, and loader counters are explanatory and never select a condition."
+        )
+    elif execution_modes:
+        claim_boundary = (
+            "Model effects use the recorded execution modes "
+            f"{sorted(execution_modes)}; do not interpret them as physical-FLS evidence "
+            "unless every completed run records native_physical_pls."
+        )
+    else:
+        claim_boundary = "No completed run is available; no scientific claim is made."
     result = {
         "schema_version": REPORT_SCHEMA,
         "conditions": list(conditions),
@@ -750,10 +782,9 @@ def aggregate(
         "effects": effects,
         "pointwise_confidence_band_semantics": "pointwise, not simultaneous",
         "strategy_selection_performed": False,
-        "claim_boundary": (
-            "Results, when present, are semantic-emulation model effects under the "
-            "frozen virtual PLS mapping. They are not full physical-FLS byte-reduction evidence."
-        ),
+        "model_ids": sorted(model_ids),
+        "execution_modes": sorted(execution_modes),
+        "claim_boundary": claim_boundary,
     }
     _write_json(output_dir / "model_results.json", result)
 

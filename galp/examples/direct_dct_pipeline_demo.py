@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Model-facing Direct-DCT example using only the stable GALP PyTorch API."""
+"""Model-facing Direct-DCT example using only the stable GALP PyTorch API.
+
+Ordinary applications can use ``reader.iter_batches(...)`` directly. This
+example keeps an explicit ``DirectDctPipeline`` only because it reports the
+cumulative ``pipeline.metrics`` snapshot after the normal synchronization
+boundary; both forms use the same native execution path.
+"""
 
 from __future__ import annotations
 
@@ -77,8 +83,18 @@ def _parse_args() -> argparse.Namespace:
         description="Run a tiny CUDA model through GALP's stable Direct-DCT pipeline API"
     )
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--module-path", type=Path, default=Path("build/galp/torch"))
+    parser.add_argument(
+        "--module-path",
+        type=Path,
+        help="development/testing extension directory; installed packages do not need it",
+    )
     parser.add_argument("--profile", choices=tuple(PROFILES), default="validation")
+    parser.add_argument(
+        "--coefficients",
+        type=int,
+        nargs="+",
+        help="ordered DCT coefficient indices; omit to select all 64",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
@@ -105,13 +121,13 @@ def main() -> None:
     schedule = _batch_schedule(
         reader.image_count, args.batch_size, args.warmup + args.steps
     )
-    pipeline = reader.pipeline(profile)
+    pipeline = reader.pipeline(profile, coefficients=args.coefficients)
     model = TinyDctClassifier(args.hidden_dim, args.num_classes).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3) if args.train_smoke else None
     model.train(args.train_smoke)
 
     def run_model_step(batch: Any) -> torch.Tensor:
-        labels = torch.arange(len(batch.global_image_ids), device="cuda") % args.num_classes
+        labels = torch.arange(len(batch.sample_ids), device="cuda") % args.num_classes
         if optimizer is None:
             with torch.no_grad():
                 logits = model(batch.y, batch.cbcr)
@@ -137,7 +153,7 @@ def main() -> None:
     started = time.perf_counter()
     for batch in pipeline:
         loss = run_model_step(batch)
-        measured_images += len(batch.global_image_ids)
+        measured_images += len(batch.sample_ids)
         final_loss_tensor = loss.detach()
 
     torch.cuda.synchronize()
@@ -153,6 +169,9 @@ def main() -> None:
         "api": "galp.torch",
         "profile_id": profile.id,
         "runtime_policy_id": reader.profile_info(profile)["runtime_policy_id"],
+        "coefficient_selection": (
+            "all" if args.coefficients is None else list(args.coefficients)
+        ),
         "train_smoke": bool(args.train_smoke),
         "images": measured_images,
         "steps": args.steps,

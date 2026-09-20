@@ -28,36 +28,61 @@ __global__ void materialize_dense_dct_rowgroup_batch_kernel(const DeviceCoeffBin
 __global__ void
 gather_cached_dct_blocks_batch_kernel(const JpegDctDeviceCachedGatherBatchItem* items, size_t item_count, int16_t* out);
 
+// One compact output buffer; map is indexed by component * 64 + natural frequency.
+struct JpegDctOutputProjection {
+	int16_t  channel[192];
+	uint32_t count;
+	uint8_t  frequency_count[3];
+	uint8_t  frequencies[3][64];
+	uint8_t  horizontal_count[3];
+	uint8_t  horizontal_frequencies[3][64];
+	bool     direct_identity;
+	float    add;
+	float    scale;
+	float    subtract[192];
+	float    divide[192];
+};
+__global__ void finalize_projected_dct_kernel(float*                         output,
+                                              size_t                         count,
+                                              size_t                         spatial,
+                                              const JpegDctOutputProjection* projection,
+                                              float                          add,
+                                              float                          scale,
+                                              bool                           initialize);
+
 __global__ void round_dct_grid_accum_pair_kernel(
     const float* y_in, size_t y_count, const float* cbcr_in, size_t cbcr_count, int16_t* y_out, int16_t* cbcr_out);
 __global__ void round_affine_dct_grid_accum_pair_kernel(
     float* y_in_out, size_t y_count, float* cbcr_in_out, size_t cbcr_count, float output_add, float output_scale);
 __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding*                   column_bindings,
                                                      const JpegDctDevicePlanlessImageDescriptor* images,
-	                                                     const uint32_t*                            logical_to_compact_vectors,
-	                                                     const uint32_t*                            image_vector_bindings,
-	                                                     const uint32_t*                            active_output_blocks,
-	                                                     const JpegDctDeviceBlockMajorGroupBinding* block_major_groups,
-	                                                     size_t                                      block_major_group_count,
-	                                                     const JpegDctDeviceBlockMajorRankCell*     block_major_rank_cells,
-	                                                     size_t                                      block_major_rank_cell_count,
-	                                                     const uint8_t*                             block_major_rank_payload,
-	                                                     size_t                                      block_major_rank_payload_size,
-	                                                     uint64_t                                    selected_physical_coefficient_mask,
-	                                                     const JpegDctDeviceSparseTransformPlan*      sparse_transform_plans,
-	                                                     size_t                                      image_count,
-	                                                     uint64_t                                    output_block_offset,
-	                                                     uint64_t                                    output_block_count,
-	                                                     const uint16_t*                             quant_tables,
-	                                                     const float*                                phase_matrices,
-	                                                     uint32_t                                    y_output_width,
-	                                                     uint32_t                                    y_output_height,
-	                                                     uint32_t                                    cbcr_output_width,
-                                                     uint32_t                                    cbcr_output_height,
-                                                     int32_t                                     clamp_min,
-                                                     int32_t                                     clamp_max,
-                                                     float*                                      y_accum,
-                                                     float*                                      cbcr_accum);
+                                                     const uint32_t* logical_to_compact_vectors,
+                                                     const uint32_t* image_vector_bindings,
+                                                     const uint32_t* active_output_blocks,
+                                                     uint64_t active_output_blocks_per_image,
+                                                     const JpegDctDeviceBlockMajorGroupBinding* block_major_groups,
+                                                     size_t                                     block_major_group_count,
+                                                     const JpegDctDeviceBlockMajorRankCell*     block_major_rank_cells,
+                                                     size_t         block_major_rank_cell_count,
+                                                     const uint8_t* block_major_rank_payload,
+                                                     size_t         block_major_rank_payload_size,
+                                                     uint64_t       selected_physical_coefficient_mask,
+                                                     const JpegDctDeviceSparseTransformPlan* sparse_transform_plans,
+                                                     size_t                                  image_count,
+                                                     uint64_t                                output_block_offset,
+                                                     uint64_t                                output_block_count,
+                                                     const uint16_t*                         quant_tables,
+                                                     const float*                            phase_matrices,
+                                                     uint32_t                                y_output_width,
+                                                     uint32_t                                y_output_height,
+                                                     uint32_t                                cbcr_output_width,
+                                                     uint32_t                                cbcr_output_height,
+                                                     int32_t                                 clamp_min,
+                                                     int32_t                                 clamp_max,
+                                                     float*                                  y_accum,
+                                                     float*                                  cbcr_accum,
+                                                     const JpegDctOutputProjection*          projection,
+                                                     bool                                    identity_projection);
 __global__ void transformed_dct_grid_sources_kernel(const DeviceCoeffBinding*                   column_bindings,
                                                     const JpegDctDeviceFixedTransformBatchItem* items,
                                                     size_t                                      item_count,

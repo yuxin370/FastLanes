@@ -664,6 +664,8 @@ JpegDctCropBox published_crop(const uint64_t seed, const uint32_t source_width, 
 
 DirectDctGridTensorDescriptor
 slice_grid(DirectDctGridTensorDescriptor source, const size_t offset, const size_t count) {
+	if (source.empty())
+		return source;
 	if (offset > source.shape[0] || count > source.shape[0] - offset) {
 		throw std::out_of_range("Direct-DCT PLS tensor slice exceeds pool bounds");
 	}
@@ -1127,6 +1129,7 @@ DirectDctPlsMicrobatchView DirectDctPlsPoolBatch::microbatch(const size_t index)
 	return DirectDctPlsMicrobatchView {
 	    slice_grid(y, offset, count),
 	    slice_grid(c, offset, count),
+	    slice_grid(impl_->postprocess->projected_tensor(), offset, count),
 	    targets,
 	    std::span<const uint32_t>(ids).subspan(offset, count),
 	    std::span<const int64_t>(impl_->labels).subspan(offset, count),

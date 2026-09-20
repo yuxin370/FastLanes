@@ -74,6 +74,21 @@ class ProfileReplayContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not registered"):
             _validate_replay_contracts(source, target, pipeline="d2")
 
+    def test_repository_edits_preserve_replay_but_runtime_changes_do_not(self) -> None:
+        source = _contract(contract_hash="source", profiling_enabled=False)
+        target = _contract(contract_hash="target", profiling_enabled=True)
+        for contract, label in ((source, "source"), (target, "target")):
+            contract["source_identity"] = {
+                "tracked_diff_sha256": label + "-diff",
+                "working_tree_status_sha256": label + "-status",
+                "training_runtime_source_tree_sha256": "same-runtime",
+            }
+        _validate_replay_contracts(source, target, pipeline="d2")
+
+        target["source_identity"]["training_runtime_source_tree_sha256"] = "changed-runtime"
+        with self.assertRaisesRegex(ValueError, "workload contracts differ"):
+            _validate_replay_contracts(source, target, pipeline="d2")
+
 
 class NativeProfileIdentityTest(unittest.TestCase):
     def test_physical_manifest_content_is_part_of_identity(self) -> None:

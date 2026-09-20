@@ -49,12 +49,16 @@ from inference.pipeline import (  # noqa: E402
     _resolve_model_stream_priority,
     _validate_profile_contract,
 )
+from inference.model_factory import (  # noqa: E402
+    MODEL_IDS as INFERENCE_MODEL_IDS,
+    SWINV2_T_MODEL_ID as INFERENCE_SWINV2_T_MODEL_ID,
+    resolve_model as resolve_inference_model,
+)
 from dataset.prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
 from inference.run import (  # noqa: E402
-    E2E_MAX_HOT_THROUGHPUT_CV,
     E2E_PIPELINES,
-    GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO,
     PRESETS,
+    _model_performance_gate_contract,
     _parse_args as _parse_run_args,
     _source_revision_policy,
 )
@@ -249,6 +253,30 @@ class SystemBenchmarkTest(unittest.TestCase):
             _validate_profile_contract(
                 {**valid_profile, "output_dtype": "int16"}, context="test"
             )
+
+    def test_swinv2_inference_spec_binds_model_and_preprocessing(self) -> None:
+        self.assertEqual(len(INFERENCE_MODEL_IDS), 2)
+        spec = resolve_inference_model(INFERENCE_SWINV2_T_MODEL_ID)
+        self.assertEqual(spec.rgb_size, 256)
+        self.assertEqual(spec.rgb_dataset, "imagenet_swin")
+        self.assertEqual(spec.dct_dataset, "imagenet_dct_swin")
+        self.assertEqual(spec.dct_transform, "Resize_DCT(32)")
+        self.assertEqual(spec.y_shape, (1, 32, 32, 8, 8))
+        self.assertEqual(spec.cbcr_shape, (2, 16, 16, 8, 8))
+        self.assertEqual(spec.dct_profile_id, "rgbnomore-swinv2-validation-v1")
+        accepted = _validate_profile_contract(
+            {
+                "id": spec.dct_profile_id,
+                "layout": "transformed_dct_grid",
+                "output_dtype": "float32",
+                "y_output_blocks": (32, 32),
+                "cbcr_output_blocks": (16, 16),
+            },
+            context="swinv2-test",
+            expected_y_blocks=(32, 32),
+            expected_cbcr_blocks=(16, 16),
+        )
+        self.assertEqual(accepted["profile_id"], spec.dct_profile_id)
 
     def test_production_cli_rejects_historical_galp_pipeline_names(self) -> None:
         with mock.patch.object(
@@ -496,8 +524,24 @@ class SystemBenchmarkTest(unittest.TestCase):
             ("galp", "pytorch", "rgbnomore", "dali"),
         )
         self.assertGreater(PRESETS["e2e"]["measurement_batches"], PRESETS["smoke"]["measurement_batches"])
-        self.assertEqual(GALP_E2E_MIN_DALI_HOT_MEDIAN_RATIO, 1.10)
-        self.assertEqual(E2E_MAX_HOT_THROUGHPUT_CV, 0.05)
+        vitti = resolve_inference_model()
+        vitti_gates = _model_performance_gate_contract(vitti, "e2e")
+        self.assertEqual(vitti_gates["policy"]["mode"], "enforced")
+        self.assertEqual(
+            vitti_gates["targets"]["minimum_hot_median_to_dali_hot_median_ratio"],
+            1.10,
+        )
+
+    def test_swinv2_does_not_inherit_vitti_performance_thresholds(self) -> None:
+        swin = resolve_inference_model(INFERENCE_SWINV2_T_MODEL_ID)
+        gates = _model_performance_gate_contract(swin, "e2e")
+        self.assertEqual(gates["policy"]["mode"], "report-only")
+        self.assertIn("swinv2", gates["policy"]["profile_id"])
+        self.assertIsNone(
+            gates["targets"]["minimum_hot_median_to_dali_hot_median_ratio"]
+        )
+        self.assertIsNone(gates["targets"]["planning_median_ms_max"])
+        self.assertFalse(gates["targets"]["require_hot_min_above_dali_hot_median"])
 
     def test_galp_e2e_throughput_gate_is_hard(self) -> None:
         contract = {

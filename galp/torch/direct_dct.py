@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import importlib
+import operator
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 from galp.profiles import DirectDctProfile
 
@@ -17,6 +19,76 @@ from galp.profiles import DirectDctProfile
 PROFILE_SCHEMA = "galp-direct-dct-profile-v1"
 METRICS_SCHEMA = "galp-direct-dct-metrics-v2"
 BINDING_SCHEMA = "galp-direct-dct-binding-v2"
+
+
+class _NotProvided:
+    """Sentinel that lets the facade distinguish omitted compatibility args."""
+
+    __slots__ = ("_public_default",)
+
+    def __init__(self, public_default: str) -> None:
+        self._public_default = public_default
+
+    def __repr__(self) -> str:
+        return self._public_default
+
+
+_COEFFICIENTS_NOT_PROVIDED = _NotProvided("None")
+_DCT_COEFFS_NOT_PROVIDED = _NotProvided("'all'")
+_CoefficientInput = Iterable[int] | None
+_INVALID_COEFFICIENTS = (
+    "invalid DCT coefficient selection; expected 1 to 64 unique indices in [0, 64)"
+)
+
+
+def _normalize_coefficients(
+    *,
+    coefficients: _CoefficientInput | _NotProvided = _COEFFICIENTS_NOT_PROVIDED,
+    dct_coeffs: str | _NotProvided = _DCT_COEFFS_NOT_PROVIDED,
+) -> str:
+    """Normalize both Python APIs to the binding's existing string contract."""
+
+    if (
+        coefficients is not _COEFFICIENTS_NOT_PROVIDED
+        and dct_coeffs is not _DCT_COEFFS_NOT_PROVIDED
+    ):
+        raise TypeError("coefficients and dct_coeffs are mutually exclusive")
+    if dct_coeffs is not _DCT_COEFFS_NOT_PROVIDED:
+        # Preserve the legacy path exactly: validation remains in the existing
+        # binding/native coefficient parser.
+        return dct_coeffs  # type: ignore[return-value]
+    if coefficients is _COEFFICIENTS_NOT_PROVIDED or coefficients is None:
+        return "all"
+    if isinstance(coefficients, (str, bytes, bytearray)):
+        raise TypeError("coefficients must be None or an iterable of integer indices")
+    try:
+        raw_values = list(islice(iter(coefficients), 65))
+    except TypeError as error:
+        raise TypeError(
+            "coefficients must be None or an iterable of integer indices"
+        ) from error
+    if not 1 <= len(raw_values) <= 64:
+        raise ValueError(_INVALID_COEFFICIENTS)
+
+    values: list[int] = []
+    seen: set[int] = set()
+    for raw_value in raw_values:
+        if isinstance(raw_value, bool):
+            raise TypeError("coefficient indices must be integers")
+        try:
+            value = operator.index(raw_value)
+        except TypeError as error:
+            raise TypeError("coefficient indices must be integers") from error
+        if not 0 <= value < 64 or value in seen:
+            raise ValueError(_INVALID_COEFFICIENTS)
+        seen.add(value)
+        values.append(value)
+
+    if values == list(range(64)):
+        return "all"
+    if values == list(range(len(values))):
+        return f"first:{len(values)}"
+    return "list:" + ",".join(str(value) for value in values)
 
 
 def _load_native_module(module_path: Path | None) -> ModuleType:
@@ -140,6 +212,16 @@ class DirectDctBatch:
         return [int(value) for value in self._native.global_image_ids]
 
     @property
+    def sample_ids(self) -> list[int]:
+        """Pythonic alias for :attr:`global_image_ids`.
+
+        This does not touch Tensor or native backing storage; it has the same
+        metadata materialization behavior as the compatibility property.
+        """
+
+        return self.global_image_ids
+
+    @property
     def transform_descriptors(self) -> list[dict[str, Any]]:
         return [dict(value) for value in self._native.transform_descriptors]
 
@@ -216,11 +298,61 @@ class DirectDctPipeline:
         self.close()
 
 
+class _DirectDctBatchIterator(Iterator[DirectDctBatch]):
+    """Context-manageable iterator owning one existing native pipeline."""
+
+    __slots__ = ("_closed", "_pipeline")
+
+    def __init__(self, pipeline: DirectDctPipeline) -> None:
+        self._pipeline = pipeline
+        self._closed = False
+
+    def __iter__(self) -> "_DirectDctBatchIterator":
+        return self
+
+    def __next__(self) -> DirectDctBatch:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._pipeline)
+        except StopIteration:
+            self.close()
+            raise
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._pipeline.close()
+
+    def __enter__(self) -> "_DirectDctBatchIterator":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            # Destructors cannot safely report close errors. Explicit ``with``
+            # or ``close`` remains the deterministic early-exit contract.
+            pass
+
+
 class DirectDctReader:
     """Read model-ready Direct-DCT batches from a GALP manifest.
 
-    The caller chooses only a semantic profile.  Native scheduling, allocator,
-    I/O, cache, and launch settings are intentionally absent from this API.
+    A profile defines stable processing semantics and the output contract;
+    explicit input selections such as ``coefficients`` complete the request.
+    Native scheduling, allocator, I/O, cache, and launch settings are
+    intentionally absent from this API.
+
+    ``module_path`` and ``native_module`` are development/testing compatibility
+    parameters. Installed applications should normally pass only the manifest.
     """
 
     def __init__(
@@ -268,18 +400,27 @@ class DirectDctReader:
         self,
         profile: DirectDctProfile | str,
         *,
-        dct_coeffs: str = "all",
+        coefficients: Iterable[int] | None = cast(
+            Any, _COEFFICIENTS_NOT_PROVIDED
+        ),
+        dct_coeffs: str = cast(Any, _DCT_COEFFS_NOT_PROVIDED),
     ) -> DirectDctPipeline:
         """Create a reusable native pipeline for a semantic profile.
 
-        ``dct_coeffs`` selects raw JPEG zigzag columns before dequantization
-        and frequency mixing.  It does not expose or alter the profile's
-        native runtime policy.
+        ``coefficients`` is the recommended Python API. ``None`` selects all
+        coefficients; an iterable preserves its explicit order. ``dct_coeffs``
+        remains supported as the legacy string API. Supplying both is an error.
         """
 
+        canonical_coefficients = _normalize_coefficients(
+            coefficients=coefficients, dct_coeffs=dct_coeffs
+        )
         profile_id = self.profile_info(profile)["id"]
         return DirectDctPipeline(
-            self._native.pipeline(profile_id, dct_coeffs=dct_coeffs), profile_id
+            self._native.pipeline(
+                profile_id, dct_coeffs=canonical_coefficients
+            ),
+            profile_id,
         )
 
     def read(
@@ -287,9 +428,22 @@ class DirectDctReader:
         image_ids: Sequence[int],
         profile: DirectDctProfile | str,
         *,
-        dct_coeffs: str = "all",
+        coefficients: Iterable[int] | None = cast(
+            Any, _COEFFICIENTS_NOT_PROVIDED
+        ),
+        dct_coeffs: str = cast(Any, _DCT_COEFFS_NOT_PROVIDED),
         transforms: Sequence[Mapping[str, Any]] | None = None,
     ) -> DirectDctBatch:
+        """Read one logical batch through the existing native read path.
+
+        ``coefficients`` is normalized to the binding's established
+        ``all``/``first:N``/``list:...`` representation. ``dct_coeffs`` remains
+        a compatibility parameter and cannot be combined with it.
+        """
+
+        canonical_coefficients = _normalize_coefficients(
+            coefficients=coefficients, dct_coeffs=dct_coeffs
+        )
         profile_id = self.profile_info(profile)["id"]
         native_transforms = (
             None if transforms is None else [dict(value) for value in transforms]
@@ -297,10 +451,43 @@ class DirectDctReader:
         native_batch = self._native.read(
             [int(value) for value in image_ids],
             profile_id,
-            dct_coeffs=dct_coeffs,
+            dct_coeffs=canonical_coefficients,
             transforms=native_transforms,
         )
         return DirectDctBatch(native_batch, profile_id)
+
+    def iter_batches(
+        self,
+        logical_batches: Iterable[Sequence[int]],
+        *,
+        profile: DirectDctProfile | str,
+        coefficients: Iterable[int] | None = cast(
+            Any, _COEFFICIENTS_NOT_PROVIDED
+        ),
+        dct_coeffs: str = cast(Any, _DCT_COEFFS_NOT_PROVIDED),
+        transforms_by_batch: Sequence[Sequence[Mapping[str, Any]] | None]
+        | None = None,
+    ) -> Iterator[DirectDctBatch]:
+        """Iterate batches using exactly ``pipeline()`` + ``start()``.
+
+        The returned iterator also supports ``with`` and ``close`` for
+        deterministic early-exit cleanup. It introduces no producer, queue,
+        submission protocol, or execution path of its own.
+        """
+
+        pipeline = self.pipeline(
+            profile,
+            coefficients=coefficients,
+            dct_coeffs=dct_coeffs,
+        )
+        try:
+            pipeline.start(
+                logical_batches, transforms_by_batch=transforms_by_batch
+            )
+        except BaseException:
+            pipeline.close()
+            raise
+        return _DirectDctBatchIterator(pipeline)
 
 __all__ = [
     "DirectDctBatch",

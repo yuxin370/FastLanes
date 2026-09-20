@@ -18,8 +18,17 @@ VALIDATION_CENTER_CROP_512 = DirectDctProfile(
     id="rgbnomore-validation-center-crop-512-v1",
 )
 
+SWINV2_VALIDATION = DirectDctProfile(
+    id="rgbnomore-swinv2-validation-v1",
+)
+
 TRAINING_PLS = DirectDctProfile(
     id="rgbnomore-training-pls-v1",
 )
 
-__all__ = ["TRAINING_PLS", "VALIDATION", "VALIDATION_CENTER_CROP_512"]
+__all__ = [
+    "SWINV2_VALIDATION",
+    "TRAINING_PLS",
+    "VALIDATION",
+    "VALIDATION_CENTER_CROP_512",
+]

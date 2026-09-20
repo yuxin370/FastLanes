@@ -70,6 +70,11 @@ def _normalized_workload_contract(contract: Mapping[str, Any]) -> dict[str, Any]
 
     normalized = copy.deepcopy(dict(contract))
     normalized.pop("contract_hash", None)
+    source_identity = normalized.get("source_identity")
+    if source_identity is not None:
+        # Repository-wide edits are provenance; scoped runtime sources still match.
+        source_identity.pop("tracked_diff_sha256", None)
+        source_identity.pop("working_tree_status_sha256", None)
     profiling = normalized.pop("profiling", {})
     validation = normalized.get("validation")
     if isinstance(validation, dict):

@@ -7,10 +7,11 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class DirectDctProfile:
-    """A stable semantic Direct-DCT output contract.
+    """Stable Direct-DCT processing semantics and output contract.
 
-    The native runtime owns all scheduling, cache, I/O, and kernel launch
-    details. They are intentionally absent from this application-facing type.
+    A final request combines this profile with explicit input selections made
+    by the caller. The native runtime owns all scheduling, cache, I/O, and
+    kernel launch details; they are intentionally absent from this type.
     """
 
     id: str

@@ -12,6 +12,7 @@
 #include "fls/file/file_footer.hpp"
 #include "fls/file/file_header.hpp"
 #include "fls/io/file.hpp"
+#include <map>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -90,6 +91,7 @@ void configure_crop_execution_mode(detail::JpegDctDeviceRowgroupPlan& rowgroup,
 		                             : detail::JpegDctReadStrategy::kFullRowgroup;
 		break;
 	case JpegDctCropExecutionMode::kFullRowgroupDecode:
+	case JpegDctCropExecutionMode::kFullSourceDecode:
 		rowgroup.runtime_policy = {detail::JpegDctRuntimePolicyDecision::kFullRowgroup,
 		                           detail::JpegDctRuntimePolicyReason::kForcedFullRowgroup};
 		rowgroup.read_strategy = detail::JpegDctReadStrategy::kFullRowgroup;
@@ -241,9 +243,10 @@ uint32_t detail::find_block_major_coordinate_group_lookup(
 detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_active_output_schedule(
     const JpegDctDeviceBlockMajorPlanlessPlan&                 plan,
     const std::vector<JpegDctDeviceBlockMajorRowgroupWorkset>& rowgroup_worksets,
-    const JpegDctGridTransformSpec&                            transform) {
-	using Clock = std::chrono::steady_clock;
-	const auto total_start = Clock::now();
+    const JpegDctGridTransformSpec&                            transform,
+    const bool                                                 allow_repeated_images) {
+	using Clock                                             = std::chrono::steady_clock;
+	const auto                                  total_start = Clock::now();
 	JpegDctDeviceBlockMajorActiveOutputSchedule schedule;
 	if (plan.images.empty()) {
 		schedule.offsets.push_back(0U);
@@ -254,25 +257,52 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 		throw std::runtime_error("block-major active-output schedule has images but no worksets");
 	}
 
-	const auto y_blocks = static_cast<uint64_t>(transform.y_output_width_blocks) *
-	                      transform.y_output_height_blocks;
-	const auto cbcr_channel_blocks = static_cast<uint64_t>(transform.cbcr_output_width_blocks) *
-	                                 transform.cbcr_output_height_blocks;
+	const auto y_blocks = static_cast<uint64_t>(transform.y_output_width_blocks) * transform.y_output_height_blocks;
+	const auto cbcr_channel_blocks =
+	    static_cast<uint64_t>(transform.cbcr_output_width_blocks) * transform.cbcr_output_height_blocks;
 	const auto blocks_per_image = y_blocks + 2U * cbcr_channel_blocks;
 	if (blocks_per_image == 0U || plan.images.size() > std::numeric_limits<uint32_t>::max() / blocks_per_image) {
 		throw std::runtime_error("block-major active-output logical grid exceeds uint32 range");
 	}
 	schedule.logical_output_block_count = blocks_per_image * plan.images.size();
+	// Block-major ownership depends on the shared spatial topology, not the
+	// image's rank or quantization table. Retain image descriptors for CUDA's
+	// source lookup; only factor identical output ownership across requests.
+	const auto& first_image = plan.images.front();
+	const bool  shared_geometry =
+	    allow_repeated_images && std::all_of(plan.images.begin(), plan.images.end(), [&](const auto& image) {
+		    if (image.shard_id != first_image.shard_id) {
+			    return false;
+		    }
+		    for (size_t c = 0U; c < image.components.size(); ++c) {
+			    const auto& component = image.components[c];
+			    const auto& first     = first_image.components[c];
+			    if (component.present == 0U || component.crop_x != first.crop_x || component.crop_y != first.crop_y ||
+			        component.width_in_blocks != first.width_in_blocks ||
+			        component.height_in_blocks != first.height_in_blocks ||
+			        component.x_up_factor != first.x_up_factor || component.y_up_factor != first.y_up_factor ||
+			        component.x_down_factor != first.x_down_factor || component.y_down_factor != first.y_down_factor ||
+			        component.semantic_slot_id != first.semantic_slot_id ||
+			        component.block_major_coordinate_lookup_index != first.block_major_coordinate_lookup_index) {
+				    return false;
+			    }
+		    }
+		    return true;
+	    });
+	if (shared_geometry) {
+		schedule.repeated_image_count = static_cast<uint32_t>(plan.images.size());
+	}
+	const size_t scheduled_images = shared_geometry ? 1U : plan.images.size();
 
 	const auto group_workset_start = Clock::now();
-	uint32_t workset_count = 0U;
+	uint32_t   workset_count       = 0U;
 	for (const auto& binding : rowgroup_worksets) {
 		if (binding.workset_index == std::numeric_limits<uint32_t>::max()) {
 			throw std::runtime_error("block-major active-output workset index exceeds runtime range");
 		}
 		workset_count = std::max(workset_count, binding.workset_index + 1U);
 	}
-	std::vector<uint8_t> workset_seen(workset_count, 0U);
+	std::vector<uint8_t>                   workset_seen(workset_count, 0U);
 	std::unordered_map<uint64_t, uint32_t> rowgroup_to_workset;
 	rowgroup_to_workset.reserve(rowgroup_worksets.size());
 	for (const auto& binding : rowgroup_worksets) {
@@ -287,9 +317,9 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	}
 	std::vector<uint32_t> group_workset(plan.groups.size(), std::numeric_limits<uint32_t>::max());
 	for (size_t group_index = 0U; group_index < plan.groups.size(); ++group_index) {
-		const auto& group = plan.groups[group_index];
-		const auto rowgroup_key = (static_cast<uint64_t>(group.shard_id) << 32U) | group.rowgroup_index;
-		const auto owner = rowgroup_to_workset.find(rowgroup_key);
+		const auto& group        = plan.groups[group_index];
+		const auto  rowgroup_key = (static_cast<uint64_t>(group.shard_id) << 32U) | group.rowgroup_index;
+		const auto  owner        = rowgroup_to_workset.find(rowgroup_key);
 		if (owner == rowgroup_to_workset.end()) {
 			throw std::runtime_error("block-major active-output group has no resident workset");
 		}
@@ -298,15 +328,52 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	schedule.group_workset_build_ms =
 	    std::chrono::duration<double, std::milli>(Clock::now() - group_workset_start).count();
 
+	// Grouped training crops repeat ownership geometry within each physical PLS.
+	// Reuse the coordinate/workset calculation, while retaining the original
+	// per-image output order and existing on-disk schedule representation.
+	using OwnershipKey = std::array<int64_t, 14>;
+	struct OwnershipTemplate {
+		size_t                                     occurrences   = 0U;
+		bool                                       ready         = false;
+		uint64_t                                   contributions = 0U;
+		std::vector<std::pair<uint32_t, uint32_t>> outputs;
+	};
+	const auto ownership_key = [&](const auto& image, const auto& component, const size_t index) {
+		return OwnershipKey {image.shard_id,
+		                     component.semantic_slot_id,
+		                     static_cast<int64_t>(index),
+		                     component.block_major_coordinate_lookup_index,
+		                     component.crop_x,
+		                     component.crop_y,
+		                     component.width_in_blocks,
+		                     component.height_in_blocks,
+		                     component.x_up_factor,
+		                     component.y_up_factor,
+		                     component.x_down_factor,
+		                     component.y_down_factor,
+		                     index == 0U ? transform.y_output_width_blocks : transform.cbcr_output_width_blocks,
+		                     index == 0U ? transform.y_output_height_blocks : transform.cbcr_output_height_blocks};
+	};
+	std::map<OwnershipKey, OwnershipTemplate> ownership_templates;
+	if (allow_repeated_images) {
+		for (size_t i = 0U; i < scheduled_images; ++i) {
+			const auto& image = plan.images[i];
+			for (size_t c = 0U; c < image.components.size(); ++c) {
+				if (image.components[c].present != 0U)
+					++ownership_templates[ownership_key(image, image.components[c], c)].occurrences;
+			}
+		}
+	}
+	uint64_t              actual_contribution_visits = 0U;
 	std::vector<uint32_t> owner_generations(workset_count, 0U);
 	std::vector<uint32_t> owners;
 	owners.reserve(std::min<size_t>(workset_count, 16U));
-	const auto enumerate = [&](auto&& emit) -> uint64_t {
+	const auto enumerate = [&](auto&& emit, auto&& emit_repeated) -> uint64_t {
 		std::fill(owner_generations.begin(), owner_generations.end(), 0U);
 		owners.clear();
-		uint32_t generation = 0U;
+		uint32_t generation         = 0U;
 		uint64_t contribution_count = 0U;
-		for (size_t image_index = 0U; image_index < plan.images.size(); ++image_index) {
+		for (size_t image_index = 0U; image_index < scheduled_images; ++image_index) {
 			const auto& image = plan.images[image_index];
 			for (uint32_t component_index = 0U; component_index < image.components.size(); ++component_index) {
 				const auto& component = image.components[component_index];
@@ -316,15 +383,14 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 					}
 					continue;
 				}
-				if (component.x_up_factor == 0U || component.y_up_factor == 0U ||
-				    component.x_down_factor == 0U || component.y_down_factor == 0U) {
+				if (component.x_up_factor == 0U || component.y_up_factor == 0U || component.x_down_factor == 0U ||
+				    component.y_down_factor == 0U) {
 					throw std::runtime_error("block-major active-output component has an invalid axis relation");
 				}
 				if (component.block_major_coordinate_lookup_index >= plan.coordinate_group_lookups.size()) {
 					throw std::runtime_error("block-major active-output component has no coordinate lookup");
 				}
-				const auto& lookup =
-				    plan.coordinate_group_lookups[component.block_major_coordinate_lookup_index];
+				const auto& lookup = plan.coordinate_group_lookups[component.block_major_coordinate_lookup_index];
 				if (lookup.shard_id != image.shard_id || lookup.semantic_slot_id != component.semantic_slot_id ||
 				    lookup.width == 0U || lookup.height == 0U || lookup.stride < lookup.width) {
 					throw std::runtime_error("block-major active-output component coordinate lookup is inconsistent");
@@ -334,22 +400,44 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 				    lookup_area > plan.coordinate_group_indices.size() - lookup.group_index_base) {
 					throw std::runtime_error("block-major active-output coordinate lookup range is invalid");
 				}
+				OwnershipTemplate* reusable = nullptr;
+				if (allow_repeated_images) {
+					auto& candidate = ownership_templates.at(ownership_key(image, component, component_index));
+					// Unique crops keep the streaming traversal rather than caching a second full schedule.
+					if (candidate.occurrences > 1U)
+						reusable = &candidate;
+				}
+				const auto image_base = static_cast<uint32_t>(image_index * blocks_per_image);
+				if (reusable != nullptr && reusable->ready) {
+					contribution_count += reusable->contributions;
+					for (auto begin = reusable->outputs.cbegin(); begin != reusable->outputs.cend();) {
+						const auto end = std::upper_bound(
+						    begin,
+						    reusable->outputs.cend(),
+						    begin->first,
+						    [](const uint32_t workset, const auto& output) { return workset < output.first; });
+						emit_repeated(begin->first, begin, end, image_base);
+						begin = end;
+					}
+					continue;
+				}
+				const auto  contribution_begin = contribution_count;
 				const auto* coordinate_groups =
 				    plan.coordinate_group_indices.data() + static_cast<size_t>(lookup.group_index_base);
-				const auto output_width = component_index == 0U ? transform.y_output_width_blocks
-				                                                   : transform.cbcr_output_width_blocks;
-				const auto output_height = component_index == 0U ? transform.y_output_height_blocks
-				                                                    : transform.cbcr_output_height_blocks;
-				const uint64_t component_offset = component_index == 0U
-				                                              ? 0U
-				                                              : y_blocks + static_cast<uint64_t>(component_index - 1U) *
-				                                                               cbcr_channel_blocks;
+				const auto output_width =
+				    component_index == 0U ? transform.y_output_width_blocks : transform.cbcr_output_width_blocks;
+				const auto output_height =
+				    component_index == 0U ? transform.y_output_height_blocks : transform.cbcr_output_height_blocks;
+				const uint64_t component_offset =
+				    component_index == 0U
+				        ? 0U
+				        : y_blocks + static_cast<uint64_t>(component_index - 1U) * cbcr_channel_blocks;
 				for (uint32_t output_y = 0U; output_y < output_height; ++output_y) {
 					const auto source_y_begin = static_cast<uint32_t>(
 					    (static_cast<uint64_t>(output_y) * component.y_down_factor) / component.y_up_factor);
-					const auto source_y_end = static_cast<uint32_t>(
-					    ((static_cast<uint64_t>(output_y + 1U) * component.y_down_factor) - 1U) /
-					    component.y_up_factor);
+					const auto source_y_end =
+					    static_cast<uint32_t>(((static_cast<uint64_t>(output_y + 1U) * component.y_down_factor) - 1U) /
+					                          component.y_up_factor);
 					for (uint32_t output_x = 0U; output_x < output_width; ++output_x) {
 						if (++generation == 0U) {
 							std::fill(owner_generations.begin(), owner_generations.end(), 0U);
@@ -370,16 +458,19 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 									continue;
 								}
 								++contribution_count;
+								++actual_contribution_visits;
 								if (absolute_x < lookup.origin_x || absolute_y < lookup.origin_y ||
 								    static_cast<uint64_t>(absolute_x) - lookup.origin_x >= lookup.width ||
 								    static_cast<uint64_t>(absolute_y) - lookup.origin_y >= lookup.height) {
 									throw std::runtime_error(
 									    "block-major active-output source coordinate is outside its lookup");
 								}
-								const auto local = (static_cast<uint64_t>(absolute_y) - lookup.origin_y) * lookup.stride +
-								                   (static_cast<uint64_t>(absolute_x) - lookup.origin_x);
+								const auto local =
+								    (static_cast<uint64_t>(absolute_y) - lookup.origin_y) * lookup.stride +
+								    (static_cast<uint64_t>(absolute_x) - lookup.origin_x);
 								const auto group_index = coordinate_groups[local];
-								if (group_index == kInvalidJpegDctBlockMajorGroupIndex || group_index >= plan.groups.size()) {
+								if (group_index == kInvalidJpegDctBlockMajorGroupIndex ||
+								    group_index >= plan.groups.size()) {
 									throw std::runtime_error(
 									    "block-major active-output source coordinate is a topology hole");
 								}
@@ -399,8 +490,17 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 						    static_cast<uint64_t>(output_y) * output_width + output_x);
 						for (const auto workset : owners) {
 							emit(workset, linear);
+							if (reusable != nullptr)
+								reusable->outputs.emplace_back(workset, linear - image_base);
 						}
 					}
+				}
+				if (reusable != nullptr) {
+					// Keep each workset's local indices contiguous and ordered. Repeated
+					// crops can then count a slice once and fill it without per-block dispatch.
+					std::sort(reusable->outputs.begin(), reusable->outputs.end());
+					reusable->contributions = contribution_count - contribution_begin;
+					reusable->ready         = true;
 				}
 			}
 		}
@@ -408,20 +508,23 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	};
 
 	schedule.offsets.assign(static_cast<size_t>(workset_count) + 1U, 0U);
-	const auto count_start = Clock::now();
-	schedule.source_contribution_count = enumerate([&](const uint32_t workset, const uint32_t) {
-		if (schedule.offsets[workset + 1U] == std::numeric_limits<uint64_t>::max()) {
+	const auto count_start   = Clock::now();
+	const auto count_outputs = [&](const uint32_t workset, const uint64_t count) {
+		if (count > std::numeric_limits<uint64_t>::max() - schedule.offsets[workset + 1U]) {
 			throw std::runtime_error("block-major active-output ownership count overflow");
 		}
-		++schedule.offsets[workset + 1U];
-	});
-	schedule.active_output_count_ms =
-	    std::chrono::duration<double, std::milli>(Clock::now() - count_start).count();
+		schedule.offsets[workset + 1U] += count;
+	};
+	schedule.source_contribution_count =
+	    enumerate([&](const uint32_t workset, const uint32_t) { count_outputs(workset, 1U); },
+	              [&](const uint32_t workset, const auto begin, const auto end, const uint32_t) {
+		              count_outputs(workset, static_cast<uint64_t>(end - begin));
+	              });
+	schedule.active_output_count_ms = std::chrono::duration<double, std::milli>(Clock::now() - count_start).count();
 
 	const auto prefix_start = Clock::now();
 	for (uint32_t workset = 0U; workset < workset_count; ++workset) {
-		if (schedule.offsets[workset + 1U] >
-		    std::numeric_limits<uint64_t>::max() - schedule.offsets[workset]) {
+		if (schedule.offsets[workset + 1U] > std::numeric_limits<uint64_t>::max() - schedule.offsets[workset]) {
 			throw std::runtime_error("block-major active-output prefix sum overflow");
 		}
 		schedule.offsets[workset + 1U] += schedule.offsets[workset];
@@ -436,44 +539,60 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	}
 	schedule.active_output_blocks.resize(static_cast<size_t>(schedule.offsets.back()));
 	std::vector<uint64_t> cursors(schedule.offsets.begin(), schedule.offsets.end() - 1U);
-	schedule.active_output_prefix_ms =
-	    std::chrono::duration<double, std::milli>(Clock::now() - prefix_start).count();
+	schedule.active_output_prefix_ms = std::chrono::duration<double, std::milli>(Clock::now() - prefix_start).count();
 
-	const auto fill_start = Clock::now();
-	const auto fill_contribution_count = enumerate([&](const uint32_t workset, const uint32_t linear) {
-		if (cursors[workset] >= schedule.offsets[workset + 1U]) {
-			throw std::runtime_error("block-major active-output fill exceeded its workset slice");
-		}
-		schedule.active_output_blocks[static_cast<size_t>(cursors[workset]++)] = linear;
-	});
+	const auto fill_start              = Clock::now();
+	const auto fill_contribution_count = enumerate(
+	    [&](const uint32_t workset, const uint32_t linear) {
+		    if (cursors[workset] >= schedule.offsets[workset + 1U]) {
+			    throw std::runtime_error("block-major active-output fill exceeded its workset slice");
+		    }
+		    schedule.active_output_blocks[static_cast<size_t>(cursors[workset]++)] = linear;
+	    },
+	    [&](const uint32_t workset, const auto begin, const auto end, const uint32_t image_base) {
+		    const auto count = static_cast<uint64_t>(end - begin);
+		    if (count > schedule.offsets[workset + 1U] - cursors[workset]) {
+			    throw std::runtime_error("block-major active-output fill exceeded its workset slice");
+		    }
+		    auto* destination = schedule.active_output_blocks.data() + cursors[workset];
+		    std::transform(
+		        begin, end, destination, [image_base](const auto& output) { return image_base + output.second; });
+		    cursors[workset] += count;
+	    });
 	if (fill_contribution_count != schedule.source_contribution_count ||
 	    schedule.source_contribution_count > std::numeric_limits<uint64_t>::max() - fill_contribution_count) {
 		throw std::runtime_error("block-major active-output count/fill contribution mismatch");
 	}
-	schedule.source_contribution_visit_count = schedule.source_contribution_count + fill_contribution_count;
+	schedule.source_contribution_visit_count = actual_contribution_visits;
 	for (uint32_t workset = 0U; workset < workset_count; ++workset) {
 		if (cursors[workset] != schedule.offsets[workset + 1U]) {
 			throw std::runtime_error("block-major active-output fill did not complete its workset slice");
 		}
 		const auto begin = schedule.active_output_blocks.begin() + static_cast<ptrdiff_t>(schedule.offsets[workset]);
 		const auto end = schedule.active_output_blocks.begin() + static_cast<ptrdiff_t>(schedule.offsets[workset + 1U]);
-		if (!std::is_sorted(begin, end) || std::adjacent_find(begin, end) != end ||
-		    std::any_of(begin, end, [&](const uint32_t output) {
-			    return output >= schedule.logical_output_block_count;
-		    })) {
+		// Strict ordering proves uniqueness; its last element is also the maximum.
+		// Check the same invariants in one traversal of the expanded schedule.
+		if (begin != end &&
+		    (*(end - 1) >= schedule.logical_output_block_count ||
+		     std::adjacent_find(begin, end, [](const uint32_t a, const uint32_t b) { return a >= b; }) != end)) {
 			throw std::runtime_error("block-major active-output workset slice is not sorted, unique, and bounded");
 		}
 	}
-	schedule.active_output_fill_ms =
-	    std::chrono::duration<double, std::milli>(Clock::now() - fill_start).count();
+	schedule.active_output_fill_ms = std::chrono::duration<double, std::milli>(Clock::now() - fill_start).count();
+	// Logical work is unchanged; visit_count records only actual CPU visits.
+	schedule.source_contribution_count *= schedule.repeated_image_count;
+	schedule.output_workset_ownership_count *= schedule.repeated_image_count;
 
 	// The coordinate index belongs to the plan and is reported as persistent
 	// compact-plan storage. The schedule peak contains only per-build ownership
 	// state; there are no node-based coordinate maps or nested output vectors.
+	uint64_t ownership_template_bytes =
+	    ownership_templates.size() * (sizeof(OwnershipKey) + sizeof(OwnershipTemplate) + 4U * sizeof(void*));
+	for (const auto& [key, value] : ownership_templates)
+		ownership_template_bytes += value.outputs.capacity() * sizeof(std::pair<uint32_t, uint32_t>);
 	schedule.temporary_bytes_peak =
-	    static_cast<uint64_t>(group_workset.capacity()) * sizeof(uint32_t) +
-	    static_cast<uint64_t>(rowgroup_worksets.size()) *
-	        (sizeof(uint64_t) + sizeof(uint32_t) + 4U * sizeof(void*)) +
+	    ownership_template_bytes + static_cast<uint64_t>(group_workset.capacity()) * sizeof(uint32_t) +
+	    static_cast<uint64_t>(rowgroup_worksets.size()) * (sizeof(uint64_t) + sizeof(uint32_t) + 4U * sizeof(void*)) +
 	    static_cast<uint64_t>(workset_seen.capacity()) * sizeof(uint8_t) +
 	    static_cast<uint64_t>(owner_generations.capacity()) * sizeof(uint32_t) +
 	    static_cast<uint64_t>(owners.capacity()) * sizeof(uint32_t) +
@@ -1177,6 +1296,24 @@ struct JpegDctShardDatasetReader::Impl {
 	}
 
 	static void validate_grid_transform_spec(const JpegDctGridTransformSpec& spec) {
+		if (!spec.output_channels.empty()) {
+			if (spec.output_data_type != JpegDctGridOutputDataType::kFloat32 ||
+			    spec.y_output_width_blocks != spec.cbcr_output_width_blocks ||
+			    spec.y_output_height_blocks != spec.cbcr_output_height_blocks) {
+				throw std::runtime_error("projected NCHW requires FP32 and equal component output grids");
+			}
+			std::array<bool, 192> seen {};
+			for (const auto& c : spec.output_channels) {
+				if (c.component >= 3 || c.frequency >= 64 || !std::isfinite(c.subtract) || !std::isfinite(c.divide) ||
+				    c.divide == 0.0F) {
+					throw std::runtime_error("invalid projected output channel or normalization");
+				}
+				if (seen[c.component * 64U + c.frequency])
+					throw std::runtime_error("duplicate projected output channel");
+				seen[c.component * 64U + c.frequency] = true;
+			}
+		}
+
 		if (spec.y_output_width_blocks == 0 || spec.y_output_height_blocks == 0 || spec.cbcr_output_width_blocks == 0 ||
 		    spec.cbcr_output_height_blocks == 0 || spec.crop_reference_width_blocks == 0 ||
 		    spec.crop_reference_height_blocks == 0) {
@@ -2043,7 +2180,19 @@ struct JpegDctShardDatasetReader::Impl {
 			return std::nullopt;
 		}
 		const auto& transform = *options.grid_transform;
-		auto compact = block_major_compact_planner->Plan(requests, transform);
+		auto        compact   = block_major_compact_planner->Plan(requests, transform);
+		if (options.crop_execution_mode == JpegDctCropExecutionMode::kFullSourceDecode) {
+			auto full_requests = requests;
+			for (auto& request : full_requests) {
+				request.source_crop = {};
+			}
+			auto full = block_major_compact_planner->Plan(full_requests, std::nullopt);
+			// Storage bindings cover the entire source. Only the transform's support
+			// rectangles and quantization-table indices retain the requested crop.
+			full.requests     = std::move(compact.requests);
+			full.quant_tables = std::move(compact.quant_tables);
+			compact           = std::move(full);
+		}
 		detail::JpegDctDeviceBatchPlan plan;
 		plan.compact_plan_bytes                     = compact.stats.compact_plan_bytes;
 		plan.compact_plan_peak_bytes                = compact.stats.compact_plan_peak_bytes;
@@ -3031,6 +3180,9 @@ struct JpegDctShardDatasetReader::Impl {
 		if (auto planless = try_block_major_planless_device_batch(requests, options); planless.has_value()) {
 			return std::move(*planless);
 		}
+		if (options.crop_execution_mode == JpegDctCropExecutionMode::kFullSourceDecode) {
+			throw std::runtime_error("full-source-decode requires the block-major planless transformed DCT path");
+		}
 		if (auto planless = try_planless_device_batch(requests, options); planless.has_value()) {
 			return std::move(*planless);
 		}
@@ -3887,6 +4039,11 @@ struct JpegDctShardDatasetReader::Impl {
 			    << static_cast<int>(spec.output_data_type) << ',' << std::hexfloat << spec.output_add << ','
 			    << spec.output_scale << std::defaultfloat << ',' << spec.dequantize << ','
 			    << spec.require_all_coefficients << ',' << spec.allow_grayscale << ':';
+			for (const auto& c : spec.output_channels) {
+				key << static_cast<unsigned>(c.component) << ',' << static_cast<unsigned>(c.frequency) << ','
+				    << std::hexfloat << c.subtract << ',' << c.divide << std::defaultfloat << ';';
+			}
+			key << ':';
 			for (const auto value : spec.preferred_small_crop_width_blocks) {
 				key << value << ',';
 			}

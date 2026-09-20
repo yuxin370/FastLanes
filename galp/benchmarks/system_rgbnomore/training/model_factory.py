@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Formal RGB-no-more ViT-Ti model construction and reset state handling."""
+"""Registered RGB-no-more model construction and reset state handling."""
 
 from __future__ import annotations
 
@@ -22,8 +22,16 @@ from galp.benchmarks.system_rgbnomore.training.artifacts import (
 )
 
 
+VITTI_MODEL_ID = "rgbnomore-vitti-dct-224-v1"
+SWINV2_T_MODEL_ID = "rgbnomore-swinv2-t-dct-224-v1"
+DEFAULT_MODEL_ID = VITTI_MODEL_ID
+MODEL_IDS = (VITTI_MODEL_ID, SWINV2_T_MODEL_ID)
+
+# Compatibility aliases for the formal four-pipeline ViT benchmark. New
+# model-aware callers use model_configuration(..., model_id=...).
 MODEL_ARCHITECTURE = "rgbnomore-vitti-v1"
 EXPECTED_PARAMETER_COUNTS = {"rgb": 5_716_456, "dct": 5_642_728}
+_SWINV2_PARAMETER_COUNTS = {"rgb": 28_347_154, "dct": 28_344_850}
 
 
 def seed_everything(seed: int) -> None:
@@ -94,28 +102,55 @@ def rng_state_from_artifact(payload: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def _plainvit(rgbnomore_root: Path):
+def _rgbnomore_module(rgbnomore_root: Path, qualified_name: str):
     root = rgbnomore_root.resolve()
     root_text = str(root)
     if root_text not in sys.path:
         sys.path.insert(0, root_text)
-    existing = sys.modules.get("models.plainvit")
+    existing = sys.modules.get(qualified_name)
     if existing is not None:
         imported = Path(existing.__file__).resolve()
         if root not in imported.parents:
-            raise RuntimeError(f"models.plainvit already imported from {imported}, expected below {root}")
+            raise RuntimeError(f"{qualified_name} already imported from {imported}, expected below {root}")
         return existing
-    module = importlib.import_module("models.plainvit")
+    module = importlib.import_module(qualified_name)
     imported = Path(module.__file__).resolve()
     if root not in imported.parents:
-        raise RuntimeError(f"imported models.plainvit from {imported}, expected below {root}")
+        raise RuntimeError(f"imported {qualified_name} from {imported}, expected below {root}")
     return module
 
 
-def model_configuration(domain: str) -> dict[str, Any]:
+def model_configuration(
+    domain: str, model_id: str = DEFAULT_MODEL_ID
+) -> dict[str, Any]:
     if domain not in ("rgb", "dct"):
         raise ValueError(f"invalid model domain: {domain}")
+    if model_id not in MODEL_IDS:
+        raise ValueError(f"unknown training model {model_id!r}; expected one of {MODEL_IDS}")
+    if model_id == SWINV2_T_MODEL_ID:
+        return {
+            "model_id": model_id,
+            "architecture": "rgbnomore-swinv2-t-v1",
+            "domain": domain,
+            "pixel_space": domain.upper(),
+            "image_size": 224,
+            "patch_size": 4,
+            "embedding_dimension": 96,
+            "depths": [2, 2, 6, 2],
+            "attention_heads": [3, 6, 12, 24],
+            "window_size": 7,
+            "mlp_ratio": 4.0,
+            "classes": 1000,
+            "dropout": 0.0,
+            "attention_dropout": 0.0,
+            "drop_path": 0.2,
+            "patch_normalization": True,
+            "precision": "bf16-autocast",
+            "dct_stem": "grouped-subblock-ycbcr-v1" if domain == "dct" else None,
+            "expected_trainable_parameters": _SWINV2_PARAMETER_COUNTS[domain],
+        }
     return {
+        "model_id": model_id,
         "architecture": MODEL_ARCHITECTURE,
         "domain": domain,
         "pixel_space": domain.upper(),
@@ -133,8 +168,50 @@ def model_configuration(domain: str) -> dict[str, Any]:
     }
 
 
-def build_model(rgbnomore_root: Path, domain: str, device: torch.device) -> torch.nn.Module:
-    config = model_configuration(domain)
+def build_model(
+    rgbnomore_root: Path,
+    domain: str,
+    device: torch.device,
+    model_id: str = DEFAULT_MODEL_ID,
+) -> torch.nn.Module:
+    config = model_configuration(domain, model_id)
+    if model_id == SWINV2_T_MODEL_ID:
+        model = _rgbnomore_module(
+            rgbnomore_root, "models.swinv2"
+        ).SwinTransformerV2(
+            img_size=224,
+            patch_size=4,
+            in_chans=3,
+            num_classes=1000,
+            embed_dim=96,
+            depths=[2, 2, 6, 2],
+            num_heads=[3, 6, 12, 24],
+            window_size=7,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.2,
+            norm_layer=torch.nn.LayerNorm,
+            ape=False,
+            patch_norm=True,
+            use_checkpoint=False,
+            pretrained_window_sizes=[0, 0, 0, 0],
+            device=device,
+            pixel_space=domain,
+        ).to(device)
+        model.train()
+        actual = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        expected = _SWINV2_PARAMETER_COUNTS[domain]
+        if actual != expected:
+            raise RuntimeError(
+                f"{domain} trainable parameter regression: expected {expected}, got {actual}"
+            )
+        return model
     arguments: dict[str, Any] = {
         "in_channels": 3,
         "patch_size": config["patch_size"],
@@ -150,7 +227,7 @@ def build_model(rgbnomore_root: Path, domain: str, device: torch.device) -> torc
     }
     if domain == "dct":
         arguments.update(ver=1, use_subblock=True)
-    model = _plainvit(rgbnomore_root).ViT(**arguments)
+    model = _rgbnomore_module(rgbnomore_root, "models.plainvit").ViT(**arguments)
     model.train()
     actual = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     expected = EXPECTED_PARAMETER_COUNTS[domain]
@@ -183,7 +260,10 @@ def initialize_model(
     init_mode: str,
     checkpoint: Path | None,
     domain: str,
+    model_id: str = DEFAULT_MODEL_ID,
 ) -> dict[str, Any]:
+    expected_configuration = model_configuration(domain, model_id)
+    expected_architecture = str(expected_configuration["architecture"])
     mode = init_mode.lower()
     provenance: dict[str, Any] = {"mode": mode, "domain": domain, "checkpoint": None}
     if mode == "random":
@@ -198,9 +278,9 @@ def initialize_model(
         if isinstance(payload, dict):
             checkpoint_architecture = payload.get("model_architecture")
             checkpoint_domain = payload.get("model_domain")
-            if checkpoint_architecture is not None and checkpoint_architecture != MODEL_ARCHITECTURE:
+            if checkpoint_architecture is not None and checkpoint_architecture != expected_architecture:
                 raise ValueError(
-                    f"checkpoint architecture is {checkpoint_architecture!r}, expected {MODEL_ARCHITECTURE!r}"
+                    f"checkpoint architecture is {checkpoint_architecture!r}, expected {expected_architecture!r}"
                 )
             if checkpoint_domain is not None and checkpoint_domain != domain:
                 raise ValueError(
@@ -226,11 +306,11 @@ def initialize_model(
             missing = sorted(required - set(payload)) if isinstance(payload, dict) else sorted(required)
             if missing:
                 raise ValueError(f"full checkpoint is missing required fields: {missing}")
-            if payload["model_architecture"] != MODEL_ARCHITECTURE:
+            if payload["model_architecture"] != expected_architecture:
                 raise ValueError("full checkpoint architecture does not match the formal model")
             if payload["model_domain"] != domain:
                 raise ValueError("full checkpoint domain does not match the requested model domain")
-            if payload["model_configuration"] != model_configuration(domain):
+            if payload["model_configuration"] != expected_configuration:
                 raise ValueError("full checkpoint model configuration does not match exactly")
         state = _model_state_from_checkpoint(payload)
         incompatible = model.load_state_dict(state, strict=True)
@@ -242,7 +322,7 @@ def initialize_model(
         provenance["checkpoint"] = {
             "path": str(checkpoint),
             "sha256": sha256_file(checkpoint),
-            "model_architecture": MODEL_ARCHITECTURE,
+            "model_architecture": expected_architecture,
             "architecture_verification": "strict_parameter_name_shape_dtype_signature",
             "strict_load": True,
             "missing_keys": [],

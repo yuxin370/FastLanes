@@ -65,7 +65,8 @@ public:
 		std::unique_ptr<Impl> impl_;
 	};
 
-	DirectDctPlsCudaPostprocess(const DirectDctBatch&                            source,
+	// Projected mode compacts the unpublished source allocation in place.
+	DirectDctPlsCudaPostprocess(DirectDctBatch&                                  source,
 	                            std::span<const int64_t>                         labels,
 	                            std::span<const DirectDctPlsRandAugmentDecision> randaugment,
 	                            std::span<const DirectDctPlsMixupDecision>       mixup,
@@ -73,7 +74,21 @@ public:
 	                            uint32_t                                         model_classes,
 	                            bool                                             enable_randaugment,
 	                            bool                                             enable_mixup,
-	                            std::shared_ptr<Stream>                          stream);
+	                            std::shared_ptr<Stream>                          stream,
+	                            std::span<const JpegDctOutputChannel>            input_channels  = {},
+	                            std::span<const JpegDctOutputChannel>            output_channels = {});
+	// Reuse the same augmentation contract for a framework-owned projected batch.
+	DirectDctPlsCudaPostprocess(DirectDctGridTensorDescriptor                    source,
+	                            void*                                            source_completion_event,
+	                            float*                                           targets,
+	                            std::span<const int64_t>                         labels,
+	                            std::span<const DirectDctPlsRandAugmentDecision> randaugment,
+	                            std::span<const DirectDctPlsMixupDecision>       mixup,
+	                            uint32_t                                         microbatch_images,
+	                            uint32_t                                         model_classes,
+	                            std::shared_ptr<Stream>                          stream,
+	                            std::span<const JpegDctOutputChannel>            input_channels,
+	                            std::span<const JpegDctOutputChannel>            output_channels);
 	~DirectDctPlsCudaPostprocess();
 	DirectDctPlsCudaPostprocess(const DirectDctPlsCudaPostprocess&)            = delete;
 	DirectDctPlsCudaPostprocess& operator=(const DirectDctPlsCudaPostprocess&) = delete;
@@ -82,6 +97,7 @@ public:
 
 	[[nodiscard]] DirectDctGridTensorDescriptor      y_tensor() const noexcept;
 	[[nodiscard]] DirectDctGridTensorDescriptor      cbcr_tensor() const noexcept;
+	[[nodiscard]] DirectDctGridTensorDescriptor      projected_tensor() const noexcept;
 	[[nodiscard]] DirectDctPlsTargetTensorDescriptor targets() const noexcept;
 	[[nodiscard]] void*                              completion_event() const noexcept;
 

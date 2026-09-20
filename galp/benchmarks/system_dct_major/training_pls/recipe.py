@@ -8,8 +8,18 @@ import json
 from copy import deepcopy
 from typing import Any
 
+from .model_registry import (
+    DEFAULT_MODEL_ID,
+    SWINV2_T_MODEL_ID,
+    VITTI_MODEL_ID,
+    model_configuration,
+    recipe_for_model,
+)
+
 
 RECIPE_NAME = "rgbnomore-vitti-dct-published-v1"
+SWINV2_RECIPE_NAME = "rgbnomore-swinv2-t-dct-224-v1"
+RECIPE_NAMES = (RECIPE_NAME, SWINV2_RECIPE_NAME)
 RECIPE_SCHEMA = "galp-pls-recipe-contract-v2"
 
 # This order is copied from RGB-no-more ``generate_config(modelarch='vitti',
@@ -43,11 +53,16 @@ def sha256_json(value: Any) -> str:
 
 
 def recipe_contract(name: str = RECIPE_NAME) -> dict[str, Any]:
-    if name != RECIPE_NAME:
-        raise ValueError(f"unknown recipe {name!r}; expected {RECIPE_NAME!r}")
+    recipe_models = {
+        RECIPE_NAME: VITTI_MODEL_ID,
+        SWINV2_RECIPE_NAME: SWINV2_T_MODEL_ID,
+    }
+    if name not in recipe_models:
+        raise ValueError(f"unknown recipe {name!r}; expected one of {RECIPE_NAMES}")
+    model_id = recipe_models[name]
     payload: dict[str, Any] = {
         "schema_version": RECIPE_SCHEMA,
-        "recipe": RECIPE_NAME,
+        "recipe": name,
         "reference": {
             "project": "RGB-no-more",
             "local_commit": "dce075711991a5d2e7668e5137f37fb74e1dc4f2",
@@ -56,17 +71,7 @@ def recipe_contract(name: str = RECIPE_NAME) -> dict[str, Any]:
             "distributed_bitwise_equivalence_claim": False,
         },
         "model": {
-            "architecture": "rgbnomore-vitti-v1",
-            "domain": "dct",
-            "version": 1,
-            "use_subblock": True,
-            "patch_size": 16,
-            "embedding_dimension": 192,
-            "layers": 12,
-            "attention_heads": 3,
-            "head_size": 64,
-            "classes": 1000,
-            "dropout": 0.0,
+            **model_configuration(model_id),
             "initialization_device": "canonical-cpu-state-loaded-into-device-native-model",
         },
         "execution": {
@@ -79,6 +84,11 @@ def recipe_contract(name: str = RECIPE_NAME) -> dict[str, Any]:
             },
             "float32_matmul_precision": "highest",
             "randaugment_dispatch": "exact-keyed-operation-grouped-v1",
+            "autocast": {
+                "enabled": False,
+                "device_type": "cuda",
+                "dtype": None,
+            },
         },
         "training": {
             "epochs": 300,
@@ -170,11 +180,47 @@ def recipe_contract(name: str = RECIPE_NAME) -> dict[str, Any]:
             "practical_top1_equivalence_margin_percentage_points": 0.3,
         },
     }
+    if model_id == SWINV2_T_MODEL_ID:
+        payload["reference"].update(
+            {
+                "configuration_source": "RGB-no-more SwinV2-T DCT adapted to 224 input",
+                "official_256_checkpoint_compatible": False,
+                "training_recipe_policy": (
+                    "B6-only model-comparison recipe; ViT schedule retained and "
+                    "BF16 autocast enabled for the larger architecture"
+                ),
+            }
+        )
+        payload["execution"]["autocast"] = {
+            "enabled": True,
+            "device_type": "cuda",
+            "dtype": "bfloat16",
+        }
+        payload["training"]["precision"] = "bf16-autocast"
+        payload["scientific_policy"].update(
+            {
+                "primary_endpoint": "B6 convergence and equal-image runtime",
+                "official_rgbnomore_accuracy_claim": False,
+                "model_sweep_recipe": True,
+            }
+        )
     payload["recipe_hash"] = sha256_json(payload)
     return deepcopy(payload)
 
 
-def assert_recipe_overrides(*, recipe: str, epochs: int | None = None) -> dict[str, Any]:
+def assert_recipe_overrides(
+    *,
+    recipe: str | None,
+    epochs: int | None = None,
+    model_id: str = DEFAULT_MODEL_ID,
+) -> dict[str, Any]:
+    expected_recipe = recipe_for_model(model_id)
+    if recipe is None:
+        recipe = expected_recipe
+    if recipe != expected_recipe:
+        raise ValueError(
+            f"model {model_id!r} requires recipe {expected_recipe!r}; got {recipe!r}"
+        )
     contract = recipe_contract(recipe)
     fixed_epochs = int(contract["training"]["epochs"])
     if epochs is not None and int(epochs) != fixed_epochs:
@@ -184,5 +230,8 @@ def assert_recipe_overrides(*, recipe: str, epochs: int | None = None) -> dict[s
     return contract
 
 
-def validation_epochs() -> tuple[int, ...]:
-    return tuple(int(value) for value in recipe_contract()["logging"]["validation_epochs"])
+def validation_epochs(recipe: str = RECIPE_NAME) -> tuple[int, ...]:
+    return tuple(
+        int(value)
+        for value in recipe_contract(recipe)["logging"]["validation_epochs"]
+    )

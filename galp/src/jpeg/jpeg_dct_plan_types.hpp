@@ -226,6 +226,9 @@ struct JpegDctDeviceBlockMajorRowgroupWorkset {
 struct JpegDctDeviceBlockMajorActiveOutputSchedule {
 	std::vector<uint64_t> offsets;
 	std::vector<uint32_t> active_output_blocks;
+	// Shared crop/resize geometry stores one image's spatial indices per workset.
+	// CUDA repeats each slice in request order with the logical image stride.
+	uint32_t repeated_image_count = 1U;
 	// A loaded compressed sidecar keeps its mmap alive through the current
 	// execution window. The process cache retains at most the current/next two
 	// mappings under a byte cap; the expanded uint32 upload vector remains the
@@ -262,10 +265,11 @@ void build_block_major_coordinate_group_lookup(JpegDctDeviceBlockMajorPlanlessPl
     uint32_t                                   shard_id,
     uint32_t                                   semantic_slot_id);
 
-[[nodiscard]] JpegDctDeviceBlockMajorActiveOutputSchedule build_block_major_active_output_schedule(
-    const JpegDctDeviceBlockMajorPlanlessPlan&                 plan,
-    const std::vector<JpegDctDeviceBlockMajorRowgroupWorkset>& rowgroup_worksets,
-    const JpegDctGridTransformSpec&                            transform);
+[[nodiscard]] JpegDctDeviceBlockMajorActiveOutputSchedule
+build_block_major_active_output_schedule(const JpegDctDeviceBlockMajorPlanlessPlan&                 plan,
+                                         const std::vector<JpegDctDeviceBlockMajorRowgroupWorkset>& rowgroup_worksets,
+                                         const JpegDctGridTransformSpec&                            transform,
+                                         bool allow_repeated_images = true);
 
 struct JpegDctDeviceRowgroupPlan {
 	uint32_t                                          rowgroup_index  = 0;

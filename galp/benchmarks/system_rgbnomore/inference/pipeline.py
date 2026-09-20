@@ -18,13 +18,14 @@ import numpy as np
 import torch
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 REPO_ROOT = Path(__file__).resolve().parents[4]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+for root in (REPO_ROOT, BENCHMARK_ROOT):
+    root_text = str(root)
+    if root_text in sys.path:
+        sys.path.remove(root_text)
+    sys.path.insert(0, root_text)
 
-from galp.profiles.rgbnomore import VALIDATION
+from galp.profiles import DirectDctProfile
 from galp.torch import DirectDctReader
 from galp.diagnostics.direct_dct import execution_stats, execution_stats_snapshot
 
@@ -164,6 +165,7 @@ def _build_rgb_model(contract: dict[str, Any], device: torch.device) -> torch.nn
         Path(config["root"]),
         Path(contract["models"]["rgb"]["checkpoint"]),
         device,
+        model_id=contract["models"]["rgb"]["model_id"],
     )
     model.eval()
     return model
@@ -175,6 +177,7 @@ def _build_dct_model(contract: dict[str, Any], device: torch.device) -> torch.nn
         Path(config["root"]),
         Path(contract["models"]["dct"]["checkpoint"]),
         device,
+        model_id=contract["models"]["dct"]["model_id"],
     )
     model.eval()
     return model
@@ -297,7 +300,11 @@ class PyTorchAdapter(PipelineAdapter):
         if root_text not in sys.path:
             sys.path.insert(0, root_text)
         datasets = importlib.import_module("datasets")
-        transform = datasets.get_transform(dataset="imagenet", type="test", dtype=torch.float32)
+        transform = datasets.get_transform(
+            dataset=contract["preprocess"]["rgb"]["rgbnomore_dataset"],
+            type="test",
+            dtype=torch.float32,
+        )
         self.loader = torch.utils.data.DataLoader(CanonicalRgbDataset(samples, transform), **_loader_kwargs(contract))
 
     def begin_repeat(self) -> None:
@@ -333,8 +340,9 @@ class RgbNoMoreAdapter(PipelineAdapter):
             load_mode="DCT",
             dtype=torch.float32,
         )
-        transform = datasets.get_transform(dataset="imagenet_dct", type="test", dtype=torch.float32)
-        transformed = datasets.SubsetWithTransform(base, dataset="imagenet_dct", transform=transform)
+        dataset_name = contract["preprocess"]["dct"]["rgbnomore_dataset"]
+        transform = datasets.get_transform(dataset=dataset_name, type="test", dtype=torch.float32)
+        transformed = datasets.SubsetWithTransform(base, dataset=dataset_name, transform=transform)
         self.loader = torch.utils.data.DataLoader(IndexedDataset(transformed), **_loader_kwargs(contract))
 
     def begin_repeat(self) -> None:
@@ -450,12 +458,14 @@ def _validate_profile_contract(
     profile_info: dict[str, Any],
     *,
     context: str,
+    expected_y_blocks: tuple[int, int] = (28, 28),
+    expected_cbcr_blocks: tuple[int, int] = (14, 14),
 ) -> dict[str, Any]:
     expected = {
         "layout": "transformed_dct_grid",
         "output_dtype": "float32",
-        "y_output_blocks": (28, 28),
-        "cbcr_output_blocks": (14, 14),
+        "y_output_blocks": expected_y_blocks,
+        "cbcr_output_blocks": expected_cbcr_blocks,
     }
     mismatches: dict[str, Any] = {}
     for key, expected_value in expected.items():
@@ -518,14 +528,17 @@ class GalpAdapter(PipelineAdapter):
                 f"GALP production pipeline requires runtime_profile={GALP_RUNTIME_PROFILE!r}"
             )
         self.reader = DirectDctReader(config["manifest"])
-        profile_info = self.reader.profile_info(VALIDATION)
+        self.profile = DirectDctProfile(config["semantic_profile_id"])
+        profile_info = self.reader.profile_info(self.profile)
         if profile_info["runtime_policy_id"] != GALP_RUNTIME_PROFILE:
             raise RuntimeError("GALP native profile does not match the benchmark contract")
         if config.get("preprocess") != "rgbnomore-val-pushdown":
             raise ValueError("GALP production pipeline supports only native RGB-no-more preprocessing")
         self.batch_size = int(contract["execution"]["batch_size"])
         self.total_batches = len(self.samples) // self.batch_size
-        self.pipeline = self.reader.pipeline(VALIDATION)
+        self.expected_y_shape = tuple(contract["preprocess"]["dct"]["y_shape"])
+        self.expected_cbcr_shape = tuple(contract["preprocess"]["dct"]["cbcr_shape"])
+        self.pipeline = self.reader.pipeline(self.profile)
         self.last_batch_prefetch_metrics: dict[str, float | int] = {}
         context = (
             f"pipeline={self.config_name}, manifest_version={config.get('manifest_version', 'unknown')}, "
@@ -534,6 +547,8 @@ class GalpAdapter(PipelineAdapter):
         self.setup_metrics["semantic_profile_contract"] = _validate_profile_contract(
             profile_info,
             context=context,
+            expected_y_blocks=tuple(contract["preprocess"]["dct"]["y_shape"][1:3]),
+            expected_cbcr_blocks=tuple(contract["preprocess"]["dct"]["cbcr_shape"][1:3]),
         )
 
     def begin_repeat(self) -> None:
@@ -567,8 +582,10 @@ class GalpAdapter(PipelineAdapter):
             native_batch.layout != "transformed_dct_grid"
             or input_y.dtype != torch.float32
             or input_cbcr.dtype != torch.float32
-            or tuple(input_y.shape[1:]) != (1, 28, 28, 8, 8)
-            or tuple(input_cbcr.shape[1:]) != (2, 14, 14, 8, 8)
+            or tuple(input_y.shape[1:])
+            != getattr(self, "expected_y_shape", (1, 28, 28, 8, 8))
+            or tuple(input_cbcr.shape[1:])
+            != getattr(self, "expected_cbcr_shape", (2, 14, 14, 8, 8))
         ):
             raise RuntimeError("GALP production profile returned an invalid model-ready DCT batch")
         source_batches = [native_batch]
@@ -766,6 +783,7 @@ def _write_semantic(path: Path, store: dict[str, list[np.ndarray]], metadata: di
 def _model_metadata(contract: dict[str, Any], domain: str) -> dict[str, Any]:
     model = contract["models"][domain]
     return {
+        "model_id": model["model_id"],
         "architecture": model["architecture"],
         "input_domain": model["input_domain"],
         "recipe_id": model["recipe_id"],

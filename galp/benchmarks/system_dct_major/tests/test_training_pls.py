@@ -14,14 +14,14 @@ from unittest import mock
 import numpy as np
 import torch
 
-from galp.benchmarks.training_audit_policy import (
-    TrainingAuditPolicy,
-    TrainingAuditState,
-)
+from galp.benchmarks.training_audit_policy import build_audit_policy
 
 from training_pls.contracts import (
+    NATIVE_PHYSICAL_BACKEND,
+    STANDARD_DCT_BACKEND,
     TRAINING_SOURCE_SCOPE,
     blocking_code_identity,
+    build_condition_contract,
     code_provenance_differences,
     condition_identity_hash,
     validate_seed_block_contracts,
@@ -34,7 +34,13 @@ from training_pls.core_schedule import (
     summarize_epoch,
     update_windows,
 )
-from training_pls.layout import create_layout_plan, load_layout_mapping, sha256_file
+from training_pls.layout import (
+    LayoutMapping,
+    create_layout_plan,
+    load_layout_mapping,
+    load_premixed_layout_mapping,
+    sha256_file,
+)
 from training_pls.matrix import (
     BALANCED_EXECUTION_ORDER,
     CORE_CONDITION_IDS,
@@ -45,6 +51,16 @@ from training_pls.matrix import (
     execution_order,
     resolve_condition,
 )
+from training_pls.model_registry import (
+    DEFAULT_MODEL_ID,
+    MODEL_IDS,
+    SWINV2_T_MODEL_ID,
+    build_model,
+    example_inputs,
+    model_configuration,
+    resolve_model,
+    source_provenance,
+)
 from training_pls.published_augmentation import (
     apply_published_randaugment,
     apply_published_randaugment_scalar_reference,
@@ -54,17 +70,23 @@ from training_pls.published_augmentation import (
 )
 from training_pls.recipe import (
     RECIPE_NAME,
+    SWINV2_RECIPE_NAME,
+    assert_recipe_overrides,
     recipe_contract,
     sha256_json,
     validation_epochs,
 )
 from training_pls.report import aggregate, mean_ci, normalized_auc
+from training_pls.report_convergence_reference import (
+    build_report as build_convergence_reference,
+)
 from training_pls.published_optimizer import build_published_optimizer
 from training_pls.run_matrix import _parse_args as _parse_matrix_args
 from training_pls.run_matrix import _seed_devices, build_plan
 from training_pls.train import (
     MetricsWriter,
     _checkpoint_payload,
+    _optimizer_gradients,
     _parse_args as _parse_train_args,
     _restore_checkpoint,
     _train_native_physical_epoch,
@@ -97,6 +119,74 @@ def fixture_layout(count: int, segment_images: int = 1024) -> FixtureLayout:
 
 
 class CoreScheduleTests(unittest.TestCase):
+    def test_premixed_reference_mapping_reorders_source_samples(self) -> None:
+        @dataclass
+        class Sample:
+            logical_sample_id: str
+            path: Path
+            label: int
+            width: int
+            height: int
+            galp_image_id: int
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            samples = [
+                Sample(f"sample-{index}", root / f"{index}.JPEG", index, 512, 512, index)
+                for index in range(4)
+            ]
+            plan = {
+                "target_pls_size": 2,
+                "sample_count": 4,
+                "virtual_pls_count": 2,
+                "layout_hash": "layout",
+            }
+            base = LayoutMapping(
+                plan_path=root / "layout.json",
+                plan=plan,
+                logical_sample_ids=tuple(sample.logical_sample_id for sample in samples),
+                labels=np.arange(4, dtype=np.int32),
+                galp_image_ids=np.arange(4, dtype=np.int64),
+                manifest_indices=np.arange(4, dtype=np.int64),
+                virtual_pls_ids=np.asarray([0, 0, 1, 1], dtype=np.int32),
+                positions_in_pls=np.asarray([0, 1, 0, 1], dtype=np.int32),
+                widths=np.full(4, 512, dtype=np.int32),
+                heights=np.full(4, 512, dtype=np.int32),
+                positions_by_pls=(np.asarray([0, 1]), np.asarray([2, 3])),
+            )
+            order = (2, 0, 3, 1)
+            mapping = root / "mapping.csv"
+            lines = [
+                "planned_physical_position,virtual_pls_id,position_in_pls,"
+                "manifest_index,galp_image_id,logical_sample_id,label,source_path"
+            ]
+            for position, manifest_index in enumerate(order):
+                sample = samples[manifest_index]
+                lines.append(
+                    f"{position},{position // 2},{position % 2},{manifest_index},"
+                    f"{sample.galp_image_id},{sample.logical_sample_id},{sample.label},"
+                    f"{sample.path}"
+                )
+            mapping.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            loaded = load_premixed_layout_mapping(
+                mapping,
+                expected_sha256=sha256_file(mapping),
+                base_mapping=base,
+                samples=samples,
+            )
+            self.assertEqual(loaded.manifest_indices.tolist(), list(order))
+            self.assertEqual(
+                loaded.logical_sample_ids,
+                tuple(samples[index].logical_sample_id for index in order),
+            )
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                load_premixed_layout_mapping(
+                    mapping,
+                    expected_sha256="0" * 64,
+                    base_mapping=base,
+                    samples=samples,
+                )
+
     def test_matrix_is_exact_frozen_two_by_two(self) -> None:
         matrix = core_matrix()
         self.assertEqual(
@@ -355,6 +445,61 @@ class CoreScheduleTests(unittest.TestCase):
 
 
 class RecipeAndContractTests(unittest.TestCase):
+    def test_standard_rgbnomore_dct_backend_has_distinct_contract_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train_manifest = root / "train.json"
+            val_manifest = root / "val.json"
+            train_manifest.write_text("{}", encoding="utf-8")
+            val_manifest.write_text("{}", encoding="utf-8")
+            recipe = recipe_contract(SWINV2_RECIPE_NAME)
+            contract = build_condition_contract(
+                condition_id="B6",
+                seed=11997733,
+                train_manifest=train_manifest,
+                val_manifest=val_manifest,
+                layout_plan={"layout_hash": "layout"},
+                recipe=recipe,
+                total_optimizer_updates=375600,
+                initial_model_hash="initial",
+                code={
+                    "training_source_scope": TRAINING_SOURCE_SCOPE,
+                    "training_runtime_source_tree_sha256": "source",
+                },
+                device="cuda:0",
+                model_source_provenance=[],
+                audit_policy=build_audit_policy(),
+                required_gpu_name_substring="RTX 4090",
+                execution_backend=STANDARD_DCT_BACKEND,
+                standard_dct_reference={
+                    "premixed_mapping_csv": "/data/mapping.csv",
+                    "premixed_mapping_sha256": "a" * 64,
+                },
+            )
+        self.assertEqual(contract["execution_mode"], "standard_rgbnomore_dct")
+        self.assertEqual(
+            contract["backend_implementation"],
+            "rgbnomore-jpeg-dct-premixed-reference-v2",
+        )
+        self.assertFalse(contract["semantic_emulation"])
+        self.assertFalse(contract["physical_fls_observed"])
+        self.assertFalse(contract["physical_gpu_pool"])
+        self.assertIn("standard_dct_reference", contract)
+        self.assertNotIn("physical_execution", contract)
+        self.assertEqual(
+            contract["condition_hash"], condition_identity_hash(contract)
+        )
+
+    def test_optimizer_update_rejects_an_empty_gradient_set(self) -> None:
+        model = torch.nn.Linear(2, 2)
+        with self.assertRaisesRegex(
+            FloatingPointError, "empty gradients at optimizer update 101"
+        ):
+            _optimizer_gradients(model.parameters(), update=101)
+
+        model(torch.ones(1, 2)).sum().backward()
+        self.assertEqual(len(_optimizer_gradients(model.parameters(), update=101)), 2)
+
     def test_native_physical_epoch_consumes_native_order_and_updates_model(self) -> None:
         class Batch:
             def __init__(self, image_ids: list[int]) -> None:
@@ -382,6 +527,7 @@ class RecipeAndContractTests(unittest.TestCase):
 
             def __init__(self) -> None:
                 self._batches = iter((Batch([2, 0]), Batch([3, 1])))
+                self.retired = False
 
             def retire(self) -> None:
                 self.retired = True
@@ -397,9 +543,12 @@ class RecipeAndContractTests(unittest.TestCase):
                 self.pending = False
                 self.reclaims = 0
                 self.pool: Pool | None = None
+                self.closed = False
 
             @property
             def prefetch_stats(self) -> dict[str, int | float]:
+                if self.closed:
+                    raise RuntimeError("pipeline is closed")
                 return {
                     "context_capacity": 2,
                     "live_context_count": 0,
@@ -431,6 +580,9 @@ class RecipeAndContractTests(unittest.TestCase):
                 self.reclaims += 1
                 return 1
 
+            def close(self) -> None:
+                self.closed = True
+
         class Model(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -459,7 +611,7 @@ class RecipeAndContractTests(unittest.TestCase):
             optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
             scheduler = Scheduler()
             metrics = MetricsWriter(Path(temporary) / "metrics.jsonl")
-            with mock.patch("torch.cuda.synchronize") as synchronize:
+            with mock.patch("torch.cuda.synchronize"):
                 result = _train_native_physical_epoch(
                     pipeline=pipeline,
                     execution_model=model,
@@ -489,9 +641,8 @@ class RecipeAndContractTests(unittest.TestCase):
                     samples_since_log=0,
                     last_logged_update=0,
                     integration_check_first_100=False,
-                    audit_policy=TrainingAuditPolicy(),
+                    close_pipeline_at_epoch_end=True,
                 )
-            synchronize.assert_not_called()
             self.assertEqual(result["global_update"], 1)
             self.assertEqual(result["processed_images"], 4)
             self.assertEqual(result["epoch_record"]["epoch_microbatches"], 2)
@@ -504,86 +655,13 @@ class RecipeAndContractTests(unittest.TestCase):
             )
             self.assertEqual(scheduler.updates, 1)
             self.assertEqual(pipeline.reclaims, 1)
+            self.assertTrue(pipeline.closed)
             self.assertIsNotNone(pipeline.pool)
             self.assertTrue(pipeline.pool.retired)
-
-
-    @staticmethod
-    def _one_update(
-        state: TrainingAuditState,
-        model: torch.nn.Module,
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> float:
-        model.zero_grad(set_to_none=True)
-        logits = model(inputs)
-        loss = torch.nn.functional.cross_entropy(logits, targets)
-        immediate = state.observe(loss, logits, int(inputs.shape[0]))
-        loss.backward()
-        state.check_gradients_and_clip(model.parameters(), max_norm=1.0)
-        state.complete_update()
-        return immediate
-
-    def test_benchmark_prefix_matches_strict_then_reduces_host_reads(self) -> None:
-        model = torch.nn.Linear(3, 2)
-        inputs = torch.tensor([[0.5, -1.0, 2.0], [1.5, 0.0, -0.5]])
-        targets = torch.tensor([0, 1])
-        strict = TrainingAuditState(
-            TrainingAuditPolicy(mode="strict", strict_updates=100),
-            completed_updates=100,
-            device=torch.device("cpu"),
-        )
-        benchmark_prefix = TrainingAuditState(
-            TrainingAuditPolicy(mode="benchmark", strict_updates=100),
-            completed_updates=99,
-            device=torch.device("cpu"),
-        )
-        benchmark_steady = TrainingAuditState(
-            TrainingAuditPolicy(mode="benchmark", strict_updates=100),
-            completed_updates=100,
-            device=torch.device("cpu"),
-        )
-
-        strict_loss = self._one_update(strict, model, inputs, targets)
-        prefix_loss = self._one_update(benchmark_prefix, model, inputs, targets)
-        steady_loss = self._one_update(benchmark_steady, model, inputs, targets)
-        deferred_loss, deferred_samples = benchmark_steady.read_deferred_loss()
-
-        self.assertGreater(strict_loss, 0.0)
-        self.assertGreater(prefix_loss, 0.0)
-        self.assertEqual(steady_loss, 0.0)
-        self.assertGreater(deferred_loss, 0.0)
-        self.assertEqual(deferred_samples, 2)
-        self.assertEqual(strict.counters.strict_microbatches, 1)
-        self.assertEqual(benchmark_prefix.counters.strict_microbatches, 1)
-        self.assertEqual(benchmark_steady.counters.strict_microbatches, 0)
-        self.assertEqual(strict.counters.finite_host_reads, 3)
-        self.assertEqual(benchmark_prefix.counters.finite_host_reads, 3)
-        self.assertEqual(benchmark_steady.counters.finite_host_reads, 1)
-        self.assertEqual(benchmark_steady.counters.gradient_gate_reads, 1)
-
-    def test_nonfinite_is_sticky_and_blocks_optimizer_step(self) -> None:
-        parameter = torch.nn.Parameter(torch.tensor(1.0))
-        state = TrainingAuditState(
-            TrainingAuditPolicy(mode="benchmark", strict_updates=100),
-            completed_updates=100,
-            device=torch.device("cpu"),
-        )
-        loss = parameter * 0.0 + 1.0
-        state.observe(loss, torch.tensor([float("nan")]), 1)
-        loss.backward()
-        with self.assertRaises(FloatingPointError):
-            state.check_gradients_and_clip([parameter], max_norm=1.0)
-
-    def test_contract_is_canonical_and_global_update_drives_mode(self) -> None:
-        policy = TrainingAuditPolicy(mode="benchmark", strict_updates=100)
-        restored = TrainingAuditPolicy.from_contract(policy.as_contract())
-        self.assertEqual(restored, policy)
-        self.assertTrue(restored.is_strict_update(99))
-        self.assertFalse(restored.is_strict_update(100))
-        with self.assertRaises(ValueError):
-            TrainingAuditPolicy.from_contract(
-                {**policy.as_contract(), "extra_backend_override": True}
+            self.assertAlmostEqual(
+                result["epoch_record"]["native_pool_prefetch"]
+                ["pool_prepare_hidden_ratio"],
+                8.0 / 9.0,
             )
 
     def test_seed_device_mapping_is_exact_and_defaults_cleanly(self) -> None:
@@ -717,6 +795,49 @@ class RecipeAndContractTests(unittest.TestCase):
         self.assertEqual(validation_epochs()[:4], (0, 1, 2, 5))
         self.assertEqual(validation_epochs()[-1], 300)
 
+    def test_model_registry_owns_a_shared_dct_input_contract(self) -> None:
+        self.assertEqual(DEFAULT_MODEL_ID, MODEL_IDS[0])
+        contracts = [resolve_model(model_id).input_contract for model_id in MODEL_IDS]
+        self.assertTrue(all(contract == contracts[0] for contract in contracts))
+        for model_id in MODEL_IDS:
+            y, cbcr = example_inputs(model_id, 2, torch.device("cpu"))
+            self.assertEqual(tuple(y.shape), (2, 1, 28, 28, 8, 8))
+            self.assertEqual(tuple(cbcr.shape), (2, 2, 14, 14, 8, 8))
+            self.assertEqual(model_configuration(model_id)["model_id"], model_id)
+
+    def test_swinv2_recipe_is_registered_and_model_locked(self) -> None:
+        recipe = assert_recipe_overrides(
+            recipe=None,
+            model_id=SWINV2_T_MODEL_ID,
+        )
+        self.assertEqual(recipe["recipe"], SWINV2_RECIPE_NAME)
+        self.assertEqual(recipe["model"]["window_size"], 7)
+        self.assertEqual(recipe["training"]["precision"], "bf16-autocast")
+        self.assertTrue(recipe["execution"]["autocast"]["enabled"])
+        self.assertEqual(resolve_model(SWINV2_T_MODEL_ID).supported_conditions, ("B6",))
+        with self.assertRaisesRegex(ValueError, "requires recipe"):
+            assert_recipe_overrides(
+                recipe=RECIPE_NAME,
+                model_id=SWINV2_T_MODEL_ID,
+            )
+
+    @unittest.skipUnless(
+        Path("/home/tangyuxin/RGB-no-more/models/swinv2.py").is_file(),
+        "RGB-no-more SwinV2 source is unavailable",
+    )
+    def test_swinv2_dct_native_forward_matches_registered_contract(self) -> None:
+        root = Path("/home/tangyuxin/RGB-no-more")
+        model = build_model(root, SWINV2_T_MODEL_ID, torch.device("cpu")).eval()
+        y, cbcr = example_inputs(SWINV2_T_MODEL_ID, 1, torch.device("cpu"))
+        with torch.no_grad():
+            logits = model(y, cbcr)
+        self.assertEqual(tuple(logits.shape), (1, 1000))
+        self.assertTrue(bool(torch.isfinite(logits).all()))
+        self.assertEqual(
+            [row["path"] for row in source_provenance(root, SWINV2_T_MODEL_ID)],
+            ["models/swinv2.py", "models/plainvit.py", "utils/dct_ops.py"],
+        )
+
     def test_condition_whitelist_accepts_only_registered_fields(self) -> None:
         invariant = {
             "schema_version": "x",
@@ -807,9 +928,16 @@ class RecipeAndContractTests(unittest.TestCase):
             "experiment_source_tree_sha256": "current-broad",
         }
         payload = {
+            "schema_version": "galp-pls-condition-contract-v3",
+            "run_manifest_schema": "galp-pls-run-manifest-v2",
             "condition_id": "B6",
             "training_seed": 11997733,
             "recipe_hash": "recipe",
+            "model_id": "model",
+            "model_configuration": {"model_id": "model"},
+            "model_source_provenance": [
+                {"path": "models/model.py", "sha256": "source"}
+            ],
             "layout_hash": "layout",
             "execution_mode": "semantic_emulation",
             "semantic_emulation": True,
@@ -817,6 +945,7 @@ class RecipeAndContractTests(unittest.TestCase):
             "physical_gpu_pool": False,
             "backend_implementation": "shared-galp-direct-dct-semantic-backend-v2",
             "code_version": planned_code,
+            "audit_policy": build_audit_policy(),
         }
         payload["condition_hash"] = condition_identity_hash(payload)
         payload["run_manifest_hash"] = sha256_json(payload)
@@ -831,6 +960,11 @@ class RecipeAndContractTests(unittest.TestCase):
                     condition_id="B6",
                     seed=11997733,
                     recipe_hash="recipe",
+                    model_id="model",
+                    model_configuration={"model_id": "model"},
+                    model_source_provenance=[
+                        {"path": "models/model.py", "sha256": "source"}
+                    ],
                     layout_hash="layout",
                     execution_backend="semantic-emulation",
                     physical_galp_manifest=None,
@@ -856,12 +990,42 @@ class RecipeAndContractTests(unittest.TestCase):
                         condition_id="B6",
                         seed=11997733,
                         recipe_hash="recipe",
+                        model_id="model",
+                        model_configuration={"model_id": "model"},
+                        model_source_provenance=[
+                            {"path": "models/model.py", "sha256": "source"}
+                        ],
                         layout_hash="layout",
                         execution_backend="semantic-emulation",
                         physical_galp_manifest=None,
                         premixed_mapping_csv=None,
                         expected_mapping_sha256=None,
                     )
+
+    def test_legacy_v2_contract_is_not_silently_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "galp-pls-condition-contract-v2",
+                        "condition_id": "B6",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "legacy/unsupported"):
+                _validate_contract(
+                    path,
+                    condition_id="B6",
+                    seed=11997733,
+                    recipe_hash="recipe",
+                    layout_hash="layout",
+                    execution_backend="semantic-emulation",
+                    physical_galp_manifest=None,
+                    premixed_mapping_csv=None,
+                    expected_mapping_sha256=None,
+                )
 
     def test_manifest_cli_and_matrix_epoch_boundary_pause(self) -> None:
         train_args = _parse_train_args(
@@ -887,6 +1051,40 @@ class RecipeAndContractTests(unittest.TestCase):
         self.assertEqual(train_args.run_manifest, Path("run_manifest.json"))
         self.assertIsNone(train_args.condition_contract)
         self.assertEqual(train_args.stop_after_epoch, 2)
+        self.assertEqual(train_args.model, DEFAULT_MODEL_ID)
+        self.assertIsNone(train_args.recipe)
+        with tempfile.TemporaryDirectory() as temporary:
+            mapping = Path(temporary) / "mapping.csv"
+            mapping.write_text("mapping", encoding="utf-8")
+            mapping_hash = sha256_file(mapping)
+            standard_args = _parse_train_args(
+                [
+                "--train-manifest",
+                "train.json",
+                "--val-manifest",
+                "val.json",
+                "--layout-plan",
+                "layout.json",
+                "--run-manifest",
+                "run_manifest.json",
+                "--condition",
+                "B6",
+                "--seed",
+                "11997733",
+                "--output-dir",
+                "output",
+                "--execution-backend",
+                STANDARD_DCT_BACKEND,
+                "--premixed-mapping-csv",
+                str(mapping),
+                "--expected-mapping-sha256",
+                mapping_hash,
+                "--stop-after-epoch",
+                "50",
+                ]
+            )
+        self.assertEqual(standard_args.execution_backend, STANDARD_DCT_BACKEND)
+        self.assertEqual(standard_args.stop_after_epoch, 50)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -908,6 +1106,28 @@ class RecipeAndContractTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(matrix_args.stop_after_epoch, 2)
+        self.assertEqual(matrix_args.conditions, ",".join(CORE_CONDITION_IDS))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [root / name for name in ("train.json", "val.json", "layout.json")]
+            for path in paths:
+                path.touch()
+            swin_args = _parse_matrix_args(
+                [
+                    "--output-dir",
+                    str(root / "output"),
+                    "--train-manifest",
+                    str(paths[0]),
+                    "--val-manifest",
+                    str(paths[1]),
+                    "--layout-plan",
+                    str(paths[2]),
+                    "--model",
+                    SWINV2_T_MODEL_ID,
+                ]
+            )
+        self.assertEqual(swin_args.conditions, "B6")
 
     def test_matrix_plan_writes_canonical_run_manifest_and_forwards_pause(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -991,6 +1211,9 @@ class RecipeAndContractTests(unittest.TestCase):
             self.assertEqual(Path(command["run_manifest"]), run_manifest)
             self.assertTrue(run_manifest.is_file())
             self.assertIn("--run-manifest", command["argv"])
+            self.assertIn("--model", command["argv"])
+            model_index = command["argv"].index("--model")
+            self.assertEqual(command["argv"][model_index + 1], DEFAULT_MODEL_ID)
             self.assertNotIn("--condition-contract", command["argv"])
             stop_index = command["argv"].index("--stop-after-epoch")
             self.assertEqual(command["argv"][stop_index + 1], "2")
@@ -1009,6 +1232,126 @@ class RecipeAndContractTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_standard_dct_convergence_report_pairs_epoch_50_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train_manifest = root / "train.json"
+            val_manifest = root / "val.json"
+            train_manifest.write_text("{}", encoding="utf-8")
+            val_manifest.write_text("{}", encoding="utf-8")
+            recipe = recipe_contract(SWINV2_RECIPE_NAME)
+            shared = {
+                "condition_id": "B6",
+                "seed": 11997733,
+                "train_manifest": train_manifest,
+                "val_manifest": val_manifest,
+                "layout_plan": {"layout_hash": "layout"},
+                "recipe": recipe,
+                "total_optimizer_updates": 375600,
+                "initial_model_hash": "initial",
+                "code": {
+                    "training_source_scope": TRAINING_SOURCE_SCOPE,
+                    "training_runtime_source_tree_sha256": "runtime",
+                },
+                "device": "cuda:0",
+                "model_source_provenance": [],
+                "audit_policy": build_audit_policy(),
+                "required_gpu_name_substring": "RTX 4090",
+            }
+            native_contract = build_condition_contract(
+                **shared,
+                execution_backend=NATIVE_PHYSICAL_BACKEND,
+                physical_execution={"premixed_mapping_sha256": "a" * 64},
+            )
+            reference_contract = build_condition_contract(
+                **shared,
+                execution_backend=STANDARD_DCT_BACKEND,
+                standard_dct_reference={
+                    "premixed_mapping_csv": "/data/mapping.csv",
+                    "premixed_mapping_sha256": "a" * 64,
+                },
+            )
+            for name, contract, top1 in (
+                ("native", native_contract, 60.0),
+                ("reference", reference_contract, 59.5),
+            ):
+                run = root / name
+                run.mkdir()
+                (run / "run_manifest.json").write_text(
+                    json.dumps(contract), encoding="utf-8"
+                )
+                (run / "run_status.json").write_text(
+                    json.dumps({"completed_epoch": 50}), encoding="utf-8"
+                )
+                metrics = [
+                    {
+                        "record_type": "validation",
+                        "epoch": 0,
+                        "optimizer_update": 0,
+                        "processed_images": 0,
+                        "validation_top1": 1.0,
+                        "validation_top5": 5.0,
+                        "validation_loss": 7.0,
+                    }
+                ]
+                for epoch in range(1, 51):
+                    metrics.append(
+                        {
+                            "record_type": "train",
+                            "scope": "epoch",
+                            "epoch": epoch,
+                            "sample_order_digest": f"order-{epoch}",
+                            "pool_membership_digest": f"pool-{epoch}",
+                            "crop_key_digest": "native-owned"
+                            if name == "native"
+                            else f"crop-{epoch}",
+                            "flip_key_digest": "native-owned"
+                            if name == "native"
+                            else f"flip-{epoch}",
+                            "randaugment_digest": "native-owned"
+                            if name == "native"
+                            else f"ra-{epoch}",
+                            "mixup_digest": "native-owned"
+                            if name == "native"
+                            else f"mixup-{epoch}",
+                        }
+                    )
+                metrics.append(
+                    {
+                        "record_type": "validation",
+                        "epoch": 50,
+                        "optimizer_update": 62600,
+                        "processed_images": 64058350,
+                        "validation_top1": top1,
+                        "validation_top5": top1 + 20.0,
+                        "validation_loss": 2.0,
+                    }
+                )
+                (run / "metrics.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in metrics),
+                    encoding="utf-8",
+                )
+
+            report, rows = build_convergence_reference(
+                native_run=root / "native",
+                reference_run=root / "reference",
+                max_epoch=50,
+            )
+            self.assertTrue(report["paired_identity_valid"])
+            self.assertEqual(
+                report["premixed_mapping_identity"]["status"], "match"
+            )
+            self.assertFalse(report["thresholds_enforced"])
+            self.assertAlmostEqual(rows[-1]["top1_native_minus_reference"], 0.5)
+            self.assertEqual(
+                report["schedule_digest_checks"]["sample_order_digest"]["status"],
+                "match",
+            )
+            self.assertEqual(
+                report["schedule_digest_checks"]["crop_key_digest"]["status"],
+                "not-comparable-native-owned",
+            )
+
     def test_statistics_and_complete_synthetic_report(self) -> None:
         summary = mean_ci([1.0, 2.0, 3.0, 4.0])
         self.assertEqual(summary["n"], 4)

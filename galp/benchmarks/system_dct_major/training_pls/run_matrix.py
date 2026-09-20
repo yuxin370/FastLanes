@@ -22,11 +22,13 @@ import torch
 from galp.benchmarks.training_audit_policy import (
     AUDIT_MODES,
     DEFAULT_AUDIT_MODE,
-    DEFAULT_STRICT_UPDATES,
-    TrainingAuditPolicy,
+    build_audit_policy,
 )
 
 from .contracts import (
+    EXECUTION_BACKENDS,
+    NATIVE_PHYSICAL_BACKEND,
+    STANDARD_DCT_BACKEND,
     build_condition_contract,
     code_version,
     validate_seed_block_contracts,
@@ -40,7 +42,14 @@ from .matrix import (
     execution_order,
     resolve_condition,
 )
-from .recipe import RECIPE_NAME, assert_recipe_overrides, sha256_json
+from .model_registry import (
+    DEFAULT_MODEL_ID,
+    MODEL_IDS,
+    build_model,
+    resolve_model,
+    source_provenance,
+)
+from .recipe import RECIPE_NAMES, assert_recipe_overrides, sha256_json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -49,7 +58,7 @@ if str(RGB_BENCHMARK_ROOT) not in sys.path:
     sys.path.insert(0, str(RGB_BENCHMARK_ROOT))
 
 from training.artifacts import tensor_state_sha256  # noqa: E402
-from training.model_factory import build_model, seed_everything  # noqa: E402
+from training.model_factory import seed_everything  # noqa: E402
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -67,6 +76,19 @@ def _atomic_json(path: Path, payload: Any) -> None:
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def _write_or_validate_contract(path: Path, payload: Mapping[str, Any]) -> None:
+    """Never overwrite an existing run identity, including a legacy schema."""
+
+    if path.exists():
+        observed = json.loads(path.read_text(encoding="utf-8"))
+        if observed != dict(payload):
+            raise ValueError(
+                f"existing run contract differs at {path}; use a new output directory"
+            )
+        return
+    _atomic_json(path, payload)
 
 
 def _parse_csv(raw: str, *, cast: Any = str) -> list[Any]:
@@ -122,21 +144,29 @@ def _seed_devices(
     return assignments
 
 
-def _initial_model_hashes(seeds: Sequence[int], rgbnomore_root: Path) -> dict[int, str]:
+def _initial_model_hashes(
+    seeds: Sequence[int],
+    rgbnomore_root: Path,
+    model_id: str = DEFAULT_MODEL_ID,
+) -> dict[int, str]:
     result: dict[int, str] = {}
     device = torch.device("cpu")
     for seed in seeds:
         seed_everything(seed)
-        model = build_model(rgbnomore_root, "dct", device)
+        model = build_model(rgbnomore_root, model_id, device)
         result[seed] = tensor_state_sha256(model.state_dict())
         del model
     return result
 
 
-def _updates_per_epoch(mapping: Any, condition_id: str) -> int:
+def _updates_per_epoch(
+    mapping: Any,
+    condition_id: str,
+    *,
+    microbatch: int = 64,
+    accumulation: int = 16,
+) -> int:
     condition = resolve_condition(condition_id)
-    microbatch = 64
-    accumulation = 16
     if condition["order_policy"] == "global":
         return math.ceil(math.ceil(mapping.sample_count / microbatch) / accumulation)
     sizes = [len(positions) for positions in mapping.positions_by_pls]
@@ -237,8 +267,21 @@ def _append_failure(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
-    recipe = assert_recipe_overrides(recipe=RECIPE_NAME, epochs=args.epochs)
+    recipe = assert_recipe_overrides(
+        recipe=args.recipe,
+        epochs=args.epochs,
+        model_id=args.model,
+    )
+    model_spec = resolve_model(args.model)
     conditions = _condition_ids(args.conditions)
+    unsupported_conditions = sorted(
+        set(conditions) - set(model_spec.supported_conditions)
+    )
+    if unsupported_conditions:
+        raise ValueError(
+            f"model {args.model!r} supports only conditions "
+            f"{model_spec.supported_conditions}; got {unsupported_conditions}"
+        )
     seeds = _seeds(args.seeds)
     seed_devices = _seed_devices(
         args.seed_devices, seeds=seeds, default_device=args.device
@@ -250,15 +293,18 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if sha256_file(args.train_manifest.resolve()) != layout_plan["dataset_manifest_hash"]:
         raise ValueError("--train-manifest differs from the frozen physical layout plan")
     physical_execution: dict[str, Any] | None = None
-    if args.execution_backend == "native-physical-pls":
+    standard_dct_reference: dict[str, Any] | None = None
+    audit_policy = build_audit_policy(args.audit_mode)
+    if args.execution_backend in (NATIVE_PHYSICAL_BACKEND, STANDARD_DCT_BACKEND):
         actual_mapping_hash = sha256_file(args.premixed_mapping_csv.resolve())
         if actual_mapping_hash != args.expected_mapping_sha256:
             raise ValueError(
                 "--expected-mapping-sha256 differs from --premixed-mapping-csv"
             )
+    if args.execution_backend == NATIVE_PHYSICAL_BACKEND:
         physical_execution = {
             "schema_version": "galp-native-physical-pls-execution-v1",
-            "semantic_profile": "rgbnomore-training-pls-v1",
+            "semantic_profile": model_spec.input_contract.profile_id,
             "physical_galp_manifest": str(args.physical_galp_manifest.resolve()),
             "physical_galp_manifest_sha256": sha256_file(
                 args.physical_galp_manifest.resolve()
@@ -267,7 +313,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "premixed_mapping_sha256": actual_mapping_hash,
             "segment_images": 1024,
             "segments_per_closed_pool": 4,
-            "microbatch_images": 64,
+            "microbatch_images": int(recipe["training"]["physical_microbatch"]),
             "native_crop_pushdown": True,
             "native_physical_order": True,
             "gpu_resident_closed_pool": True,
@@ -276,10 +322,29 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "cuda_mixup": True,
             "sample_order_policy_from_condition_contract": True,
         }
+    elif args.execution_backend == STANDARD_DCT_BACKEND:
+        standard_dct_reference = {
+            "premixed_mapping_csv": str(args.premixed_mapping_csv.resolve()),
+            "premixed_mapping_sha256": actual_mapping_hash,
+            "mapping_role": (
+                "maps each physical B6 position to the source JPEG decoded by "
+                "RGB-no-more dct_manip"
+            ),
+            "segment_images": 1024,
+        }
     code = code_version(REPO_ROOT)
-    initial_hashes = _initial_model_hashes(seeds, args.rgbnomore_root)
+    model_sources = source_provenance(args.rgbnomore_root, args.model)
+    initial_hashes = _initial_model_hashes(
+        seeds, args.rgbnomore_root, model_id=args.model
+    )
     updates_by_condition = {
-        condition_id: _updates_per_epoch(mapping, condition_id) * args.epochs
+        condition_id: _updates_per_epoch(
+            mapping,
+            condition_id,
+            microbatch=int(recipe["training"]["physical_microbatch"]),
+            accumulation=int(recipe["training"]["gradient_accumulation"]),
+        )
+        * args.epochs
         for condition_id in conditions
     }
     if len(set(updates_by_condition.values())) != 1:
@@ -305,12 +370,12 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 initial_model_hash=initial_hashes[seed],
                 code=code,
                 device=seed_devices[seed],
+                model_source_provenance=model_sources,
+                audit_policy=audit_policy,
+                required_gpu_name_substring=args.required_gpu_name_substring,
                 execution_backend=args.execution_backend,
                 physical_execution=physical_execution,
-                training_audit_policy=TrainingAuditPolicy(
-                    mode=args.audit_mode,
-                    strict_updates=args.audit_strict_updates,
-                ).as_contract(),
+                standard_dct_reference=standard_dct_reference,
             )
             contracts.append(contract)
             legacy_contract_path = (
@@ -322,12 +387,12 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             run_dir = output_dir / "runs" / condition_id / f"seed_{seed}"
             run_dir.mkdir(parents=True, exist_ok=True)
             run_manifest_path = run_dir / "run_manifest.json"
-            _atomic_json(run_manifest_path, contract)
+            _write_or_validate_contract(run_manifest_path, contract)
             contract_paths[(seed, condition_id)] = run_manifest_path
             # Compatibility artifacts for existing reports and operational tools.
             # New commands consume run_manifest.json directly.
-            _atomic_json(legacy_contract_path, contract)
-            _atomic_json(run_dir / "condition_contract.json", contract)
+            _write_or_validate_contract(legacy_contract_path, contract)
+            _write_or_validate_contract(run_dir / "condition_contract.json", contract)
             legacy_contract_paths[(seed, condition_id)] = legacy_contract_path
         contracts_by_seed[seed] = contracts
 
@@ -346,7 +411,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     _atomic_json(
         output_dir / "condition_contract_diff.json",
         {
-            "schema_version": "galp-pls-condition-contract-diff-collection-v2",
+            "schema_version": "galp-pls-condition-contract-diff-collection-v3",
             "all_full_blocks_valid": all(
                 block.get("valid") is not False for block in diff_blocks
             ),
@@ -415,7 +480,6 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
 
     commands: list[dict[str, Any]] = []
     statuses: list[dict[str, Any]] = []
-    first_seed = seeds[0]
     for row in execution_rows:
         seed = int(row["seed"])
         condition_id = str(row["condition"])
@@ -436,6 +500,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             condition_id,
             "--seed",
             str(seed),
+            "--model",
+            args.model,
+            "--recipe",
+            str(recipe["recipe"]),
             "--epochs",
             str(args.epochs),
             "--device",
@@ -451,8 +519,12 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "--rgbnomore-root",
             str(args.rgbnomore_root.resolve()),
             "--resume",
+            "--audit-mode",
+            args.audit_mode,
+            "--required-gpu-name-substring",
+            args.required_gpu_name_substring,
         ]
-        if args.execution_backend == "native-physical-pls":
+        if args.execution_backend == NATIVE_PHYSICAL_BACKEND:
             argv.extend(
                 [
                     "--execution-backend",
@@ -465,8 +537,18 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                     args.expected_mapping_sha256,
                 ]
             )
-        if seed == first_seed:
-            argv.append("--integration-check-first-100")
+        elif args.execution_backend == STANDARD_DCT_BACKEND:
+            argv.extend(
+                [
+                    "--execution-backend",
+                    STANDARD_DCT_BACKEND,
+                    "--premixed-mapping-csv",
+                    str(args.premixed_mapping_csv.resolve()),
+                    "--expected-mapping-sha256",
+                    args.expected_mapping_sha256,
+                ]
+            )
+        argv.append("--integration-check-first-100")
         if args.stop_after_epoch is not None:
             argv.extend(["--stop-after-epoch", str(args.stop_after_epoch)])
         commands.append(
@@ -506,9 +588,23 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "stop_after_epoch": args.stop_after_epoch,
         "total_runs": len(commands),
         "layout_hash": layout_plan["layout_hash"],
+        "model": model_spec.as_dict(),
+        "model_source_provenance": model_sources,
+        "recipe": recipe["recipe"],
         "recipe_hash": recipe["recipe_hash"],
         "execution_backend": args.execution_backend,
         "physical_execution": physical_execution,
+        "standard_dct_reference": standard_dct_reference,
+        "audit_policy": audit_policy,
+        "process_isolation": "one subprocess per condition/seed run",
+        "pipeline_order": [
+            {"seed": row["seed"], "condition": row["condition"]}
+            for row in execution_rows
+        ],
+        "cache_state": (
+            "not forcibly dropped; epoch 1 is the cold/order diagnostic and epoch 2 "
+            "is the warm-primary performance observation"
+        ),
         "total_optimizer_updates_per_run": next(iter(updates_by_condition.values())),
         "commands": commands,
         "result_policy": (
@@ -605,9 +701,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--layout-plan", type=Path, required=True)
-    parser.add_argument("--conditions", default=",".join(CORE_CONDITION_IDS))
+    parser.add_argument(
+        "--conditions",
+        help=(
+            "comma-separated conditions; defaults to B6 for SwinV2 and the "
+            "legacy core factorial matrix for ViT-Ti"
+        ),
+    )
     parser.add_argument(
         "--seeds", default=",".join(str(seed) for seed in PAIRED_SEEDS)
+    )
+    parser.add_argument("--model", choices=MODEL_IDS, default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--recipe",
+        choices=RECIPE_NAMES,
+        help="defaults to the immutable recipe registered for --model",
     )
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument(
@@ -619,9 +727,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE)
+    parser.add_argument(
+        "--required-gpu-name-substring",
+        default="",
+        help="optional fail-closed GPU-name substring (for example 'RTX 4090')",
+    )
     parser.add_argument(
         "--execution-backend",
-        choices=("semantic-emulation", "native-physical-pls"),
+        choices=EXECUTION_BACKENDS,
         default="semantic-emulation",
     )
     parser.add_argument("--physical-galp-manifest", type=Path)
@@ -637,12 +751,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--prefetch-depth", type=int, default=2)
     parser.add_argument(
-        "--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE
-    )
-    parser.add_argument(
-        "--audit-strict-updates", type=int, default=DEFAULT_STRICT_UPDATES
-    )
-    parser.add_argument(
         "--galp-torch-module-path", type=Path, default=REPO_ROOT / "build/galp/torch"
     )
     parser.add_argument(
@@ -651,12 +759,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     args = parser.parse_args(argv)
+    if args.conditions is None:
+        args.conditions = (
+            "B6" if args.model == "rgbnomore-swinv2-t-dct-224-v1"
+            else ",".join(CORE_CONDITION_IDS)
+        )
     if args.workers <= 0:
         raise ValueError("workers must be positive")
     if args.prefetch_depth < 0:
         raise ValueError("prefetch depth must be non-negative")
-    if args.audit_strict_updates < 0:
-        raise ValueError("--audit-strict-updates must be non-negative")
     if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch < 300:
         raise ValueError("--stop-after-epoch must be in [1, 299]")
     for path in (args.train_manifest, args.val_manifest, args.layout_plan):
@@ -667,7 +778,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.premixed_mapping_csv,
         args.expected_mapping_sha256,
     )
-    if args.execution_backend == "native-physical-pls":
+    if args.execution_backend == NATIVE_PHYSICAL_BACKEND:
         if any(value is None for value in physical_values):
             raise ValueError(
                 "native-physical-pls requires --physical-galp-manifest, "
@@ -676,6 +787,27 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         for path in (args.physical_galp_manifest, args.premixed_mapping_csv):
             if not path.is_file():
                 raise FileNotFoundError(path)
+        if len(args.expected_mapping_sha256) != 64:
+            raise ValueError("--expected-mapping-sha256 must contain 64 hex characters")
+        try:
+            int(args.expected_mapping_sha256, 16)
+        except ValueError as error:
+            raise ValueError(
+                "--expected-mapping-sha256 must contain 64 hex characters"
+            ) from error
+    elif args.execution_backend == STANDARD_DCT_BACKEND:
+        if args.physical_galp_manifest is not None:
+            raise ValueError(
+                "standard-rgbnomore-dct reads source JPEGs and cannot accept "
+                "--physical-galp-manifest"
+            )
+        if args.premixed_mapping_csv is None or args.expected_mapping_sha256 is None:
+            raise ValueError(
+                "standard-rgbnomore-dct requires --premixed-mapping-csv and "
+                "--expected-mapping-sha256"
+            )
+        if not args.premixed_mapping_csv.is_file():
+            raise FileNotFoundError(args.premixed_mapping_csv)
         if len(args.expected_mapping_sha256) != 64:
             raise ValueError("--expected-mapping-sha256 must contain 64 hex characters")
         try:

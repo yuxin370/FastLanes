@@ -31,6 +31,10 @@ class DirectDctPlsMicrobatch:
         return self._native.cbcr
 
     @property
+    def projected(self) -> Any:
+        return self._native.projected
+
+    @property
     def targets(self) -> Any:
         return self._native.targets
 
@@ -158,6 +162,10 @@ class DirectDctPlsPipeline:
         segment_images: int = 1024,
         model_classes: int = 1000,
         profile: DirectDctProfile | str = "rgbnomore-training-pls-v1",
+        output_grid_size: int = 0,
+        transform_blocks_per_launch: int = 0,
+        transform_ctas_per_launch: int = 0,
+        output_channels: list[list[float]] | None = None,
         module_path: str | Path | None = None,
         native_module: ModuleType | Any | None = None,
     ) -> None:
@@ -182,6 +190,12 @@ class DirectDctPlsPipeline:
             segment_images=int(segment_images),
             model_classes=int(model_classes),
             profile_id=_profile_id(profile),
+            **(dict(output_grid_size=int(output_grid_size), output_channels=output_channels)
+               if output_grid_size or output_channels else {}),
+            **(dict(transform_blocks_per_launch=int(transform_blocks_per_launch))
+               if transform_blocks_per_launch else {}),
+            **(dict(transform_ctas_per_launch=int(transform_ctas_per_launch))
+               if transform_ctas_per_launch else {}),
         )
 
     def start_epoch(self, epoch: int) -> "DirectDctPlsPipeline":

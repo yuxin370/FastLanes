@@ -1454,6 +1454,35 @@ TEST(Reader, CompiledSparseVectorBundlePlansMatchLogicalPackedAndEnvelopeReads) 
 	expect_selected_segments_equal(compiled_envelope, reference_envelope);
 }
 
+TEST(Reader, StandardColumnReadSkipsOtherColumnsWithoutVectorIndex) {
+	const auto                       fls_path = make_sparse_vector_bundle_fixture();
+	galp::format::FlsReader          reader(fls_path, false, false);
+	auto                             full = reader.read_rowgroup_zero_copy(0U);
+	const std::vector<uint8_t>       selected {0U, 3U};
+	galp::format::ZeroCopyReadTiming timing {};
+	auto                             actual = reader.read_rowgroup_zero_copy_selected_columns(0U, selected, &timing);
+	EXPECT_EQ(actual.materialized_column_indices, selected);
+	EXPECT_TRUE(timing.used_coefficient_range_read);
+	EXPECT_TRUE(timing.used_sparse_read);
+	EXPECT_LT(timing.storage_bytes, timing.full_storage_bytes / 2U);
+	EXPECT_GT(timing.pread_count, 0U);
+	EXPECT_EQ(timing.pread_count, timing.coalesced_read_run_count);
+	for (const auto index : selected) {
+		const auto* segments = full.rowgroup_descriptor->m_column_descriptors()->Get(index)->segment_descriptors();
+		for (const auto* descriptor : *segments) {
+			auto a = fastlanes::make_segment_view(actual.backing_span, *descriptor);
+			auto b = fastlanes::make_segment_view(full.backing_span, *descriptor);
+			for (size_t vector = 0U; vector < full.n_vecs; ++vector) {
+				a.PointTo(vector);
+				b.PointTo(vector);
+				ASSERT_EQ(a.Size(), b.Size());
+				EXPECT_EQ(std::memcmp(a.data, b.data, a.Size()), 0);
+			}
+		}
+	}
+	EXPECT_THROW(reader.read_rowgroup_zero_copy_selected_columns(0U, {8U}), std::out_of_range);
+}
+
 TEST(Reader, SparsePlanIntersectsSelectedVectorsAndColumns) {
 	const auto fls_path = make_sparse_vector_bundle_fixture();
 	galp::format::FlsReader reader(fls_path);

@@ -102,6 +102,16 @@ __device__ size_t component_offset(
 	return (((static_cast<size_t>(channel) * height + h) * width + w) * 8U + u) * 8U + v;
 }
 
+struct ProjectedChannel {
+	int   component;
+	int   frequency;
+	int   source;
+	int   transpose;
+	float subtract;
+	float divide;
+};
+
+template <bool Projected = false>
 __global__ void apply_randaugment_kernel(const int16_t*                         source,
                                          int16_t*                               output,
                                          const DirectDctPlsRandAugmentDecision* decisions,
@@ -111,21 +121,34 @@ __global__ void apply_randaugment_kernel(const int16_t*                         
                                          const int                              channels,
                                          const int                              height,
                                          const int                              width,
-                                         const bool                             luma) {
-	const auto elements_per_image = static_cast<size_t>(channels) * height * width * 64U;
+                                         const bool                             component_is_luma,
+                                         const ProjectedChannel*                channel_info = nullptr) {
+	const auto elements_per_image = static_cast<size_t>(channels) * height * width * (Projected ? 1U : 64U);
 	const auto total              = images * elements_per_image;
 	for (size_t index = blockIdx.x * blockDim.x + threadIdx.x; index < total;
 	     index += static_cast<size_t>(blockDim.x) * gridDim.x) {
 		const auto image = index / elements_per_image;
 		auto       local = index - image * elements_per_image;
-		const auto v     = static_cast<int>(local % 8U);
-		local /= 8U;
-		const auto u = static_cast<int>(local % 8U);
-		local /= 8U;
-		const auto w = static_cast<int>(local % static_cast<size_t>(width));
-		local /= static_cast<size_t>(width);
-		const auto  h         = static_cast<int>(local % static_cast<size_t>(height));
-		const auto  channel   = static_cast<int>(local / static_cast<size_t>(height));
+		int        u, v, w, h, channel;
+		if constexpr (Projected) {
+			w = local % width;
+			local /= width;
+			h       = local % height;
+			channel = local / height;
+			u       = channel_info[channel].frequency / 8;
+			v       = channel_info[channel].frequency % 8;
+		} else {
+			v = local % 8U;
+			local /= 8U;
+			u = local % 8U;
+			local /= 8U;
+			w = local % width;
+			local /= width;
+			h       = local % height;
+			channel = local / height;
+		}
+		const bool  luma      = Projected ? channel_info[channel].component == 0 : component_is_luma;
+		const bool  full_grid = Projected || luma;
 		const auto& decision  = decisions[image];
 		const auto  operation = decision.operations[stage];
 		const auto  magnitude = decision.magnitudes[stage];
@@ -139,7 +162,9 @@ __global__ void apply_randaugment_kernel(const int16_t*                         
 		if (operation == DirectDctPlsRandAugmentOp::kTranslateX ||
 		    operation == DirectDctPlsRandAugmentOp::kTranslateY) {
 			auto blocks = static_cast<int>(floorf(magnitude / 2.0F)) * 2;
-			if (!luma) {
+			if constexpr (Projected)
+				blocks = blocks * width / 28;
+			if (!full_grid) {
 				blocks /= 2;
 			}
 			if (operation == DirectDctPlsRandAugmentOp::kTranslateX) {
@@ -169,7 +194,14 @@ __global__ void apply_randaugment_kernel(const int16_t*                         
 			}
 		}
 
-		const auto source_local = component_offset(channel, source_h, source_w, source_u, source_v, height, width);
+		size_t source_local;
+		if constexpr (Projected) {
+			const auto source_channel =
+			    operation == DirectDctPlsRandAugmentOp::kRotate90 ? channel_info[channel].transpose : channel;
+			source_local = (static_cast<size_t>(source_channel) * height + source_h) * width + source_w;
+		} else {
+			source_local = component_offset(channel, source_h, source_w, source_u, source_v, height, width);
+		}
 		float      value = zero ? 0.0F : static_cast<float>(source[image * elements_per_image + source_local]) * sign;
 		const auto dc    = u == 0 && v == 0;
 		if (operation == DirectDctPlsRandAugmentOp::kAutoContrast && luma && dc) {
@@ -194,9 +226,13 @@ __global__ void apply_randaugment_kernel(const int16_t*                         
 			value *= factor;
 		} else if (operation == DirectDctPlsRandAugmentOp::kCutout) {
 			const auto pad           = static_cast<int>(nearbyintf(magnitude)) & ~1;
-			const auto effective_pad = luma ? pad : pad / 2;
-			const auto center_h      = luma ? decision.cutout_center_h[stage] : decision.cutout_center_h[stage] / 2;
-			const auto center_w      = luma ? decision.cutout_center_w[stage] : decision.cutout_center_w[stage] / 2;
+			const auto effective_pad = Projected ? pad * height / 28 : (luma ? pad : pad / 2);
+			const auto center_h      = Projected
+			                               ? decision.cutout_center_h[stage] * height / 28
+			                               : (luma ? decision.cutout_center_h[stage] : decision.cutout_center_h[stage] / 2);
+			const auto center_w      = Projected
+			                               ? decision.cutout_center_w[stage] * width / 28
+			                               : (luma ? decision.cutout_center_w[stage] : decision.cutout_center_w[stage] / 2);
 			if (cutout_contains(h, w, height, width, center_h, center_w, effective_pad))
 				value = 0.0F;
 		} else if (operation == DirectDctPlsRandAugmentOp::kAutoSaturation && !luma && dc) {
@@ -204,7 +240,7 @@ __global__ void apply_randaugment_kernel(const int16_t*                         
 		} else if (operation == DirectDctPlsRandAugmentOp::kGrayscale && !luma) {
 			value = 0.0F;
 		} else if (operation == DirectDctPlsRandAugmentOp::kChromaDrop && !luma &&
-		           channel == decision.chroma_drop_channel[stage]) {
+		           (Projected ? channel_info[channel].component - 1 : channel) == decision.chroma_drop_channel[stage]) {
 			value = 0.0F;
 		}
 		output[index] = clamp_round(value);
@@ -238,6 +274,60 @@ __global__ void normalize_mixup_kernel(const int16_t*                   source,
 	}
 }
 
+__global__ void projected_to_int16(const float* source, int16_t* target, size_t count) {
+	for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += size_t(blockDim.x) * gridDim.x)
+		target[i] = clamp_round(source[i]);
+}
+
+__global__ void projected_stats(const int16_t* source,
+                                DeviceStats*   stats,
+                                size_t         images,
+                                size_t         pixels,
+                                size_t         channels,
+                                int            y_dc,
+                                int            cb_dc,
+                                int            cr_dc) {
+	for (size_t image = blockIdx.x * blockDim.x + threadIdx.x; image < images;
+	     image += size_t(blockDim.x) * gridDim.x) {
+		DeviceStats value {1.e30F, -1.e30F, 0.F, 1.e30F, -1.e30F};
+		const auto* data = source + image * pixels * channels;
+		for (size_t p = 0; p < pixels; ++p) {
+			float y = data[y_dc * pixels + p], cb = data[cb_dc * pixels + p], cr = data[cr_dc * pixels + p];
+			value.y_min = fminf(value.y_min, y);
+			value.y_max = fmaxf(value.y_max, y);
+			value.y_mean_abs += fabsf(y);
+			value.c_min = fminf(value.c_min, fminf(cb, cr));
+			value.c_max = fmaxf(value.c_max, fmaxf(cb, cr));
+		}
+		value.y_mean_abs /= pixels;
+		stats[image] = value;
+	}
+}
+
+__global__ void projected_normalize_mixup(const int16_t*                   source,
+                                          float*                           target,
+                                          size_t                           images,
+                                          size_t                           pixels,
+                                          size_t                           input_channels,
+                                          size_t                           output_channels,
+                                          const ProjectedChannel*          channels,
+                                          const DirectDctPlsMixupDecision* mixup,
+                                          bool                             enabled) {
+	const auto per_image = pixels * output_channels;
+	for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < images * per_image;
+	     i += size_t(blockDim.x) * gridDim.x) {
+		const auto  image = i / per_image, local = i % per_image, c = local / pixels, p = local % pixels;
+		const auto  channel = channels[c];
+		const float value =
+		    (float(source[(image * input_channels + channel.source) * pixels + p]) - channel.subtract) / channel.divide;
+		const auto  partner = image == 0 ? images - 1 : image - 1;
+		const float rolled =
+		    (float(source[(partner * input_channels + channel.source) * pixels + p]) - channel.subtract) /
+		    channel.divide;
+		target[i] = enabled ? value * mixup->original + rolled * mixup->rolled : value;
+	}
+}
+
 __global__ void mixup_targets_kernel(const int64_t*                   labels,
                                      float*                           targets,
                                      const DirectDctPlsMixupDecision* mixup,
@@ -261,6 +351,25 @@ __global__ void mixup_targets_kernel(const int64_t*                   labels,
 			const auto rolled = labels[partner] == category ? 1.0F : 0.0F;
 			targets[index]    = original * mixup[microbatch].original + rolled * mixup[microbatch].rolled;
 		}
+	}
+}
+
+void validate_metadata(std::span<const int64_t>                         labels,
+                       std::span<const DirectDctPlsRandAugmentDecision> randaugment,
+                       std::span<const DirectDctPlsMixupDecision>       mixup,
+                       uint32_t                                         microbatch_images,
+                       uint32_t                                         model_classes) {
+	if (labels.empty() || randaugment.size() != labels.size() || microbatch_images == 0U || model_classes == 0U) {
+		throw std::invalid_argument("invalid Direct-DCT PLS CUDA postprocess cardinality");
+	}
+	for (const auto label : labels) {
+		if (label < 0 || static_cast<uint64_t>(label) >= model_classes) {
+			throw std::invalid_argument("Direct-DCT PLS label is outside the configured model class range");
+		}
+	}
+	const auto expected_mixup = (labels.size() + microbatch_images - 1U) / microbatch_images;
+	if (mixup.size() != expected_mixup) {
+		throw std::invalid_argument("Direct-DCT PLS mixup decision count does not match microbatches");
 	}
 }
 
@@ -303,14 +412,30 @@ struct DirectDctPlsCudaPostprocess::Impl {
 	std::optional<GPUArray<float>>           y_output;
 	std::optional<GPUArray<float>>           c_output;
 	std::optional<GPUArray<float>>           targets_output;
+	float*                                  external_targets = nullptr;
 	std::optional<GPUArray<int64_t>>         labels_device;
 	std::optional<GPUArray<DirectDctPlsRandAugmentDecision>> decisions_device;
 	std::optional<GPUArray<DirectDctPlsMixupDecision>>       mixup_device;
-	std::optional<GPUArray<DeviceStats>>       stats_device;
-	size_t                             images           = 0U;
-	uint32_t                           classes          = 0U;
-	DirectDctGridTensorDescriptor      y_descriptor;
-	DirectDctGridTensorDescriptor      c_descriptor;
+	std::optional<GPUArray<DeviceStats>>                     stats_device;
+	size_t                                                   images  = 0U;
+	uint32_t                                                 classes = 0U;
+	DirectDctGridTensorDescriptor                            y_descriptor;
+	DirectDctGridTensorDescriptor                            c_descriptor;
+	DirectDctGridTensorDescriptor                            projected_descriptor;
+	std::optional<GPUArray<ProjectedChannel>>                input_channels_device;
+	std::optional<GPUArray<ProjectedChannel>>                output_channels_device;
+
+	void project(DirectDctGridTensorDescriptor                    input,
+	             std::span<const int64_t>                         labels,
+	             std::span<const DirectDctPlsRandAugmentDecision> randaugment,
+	             std::span<const DirectDctPlsMixupDecision>       mixup,
+	             uint32_t                                         microbatch_images,
+	             bool                                             enable_randaugment,
+	             bool                                             enable_mixup,
+	             std::span<const JpegDctOutputChannel>            inputs,
+	             std::span<const JpegDctOutputChannel>            outputs,
+	             cudaStream_t                                     stream);
+
 	DirectDctPlsTargetTensorDescriptor target_descriptor;
 
 	~Impl() {
@@ -318,11 +443,138 @@ struct DirectDctPlsCudaPostprocess::Impl {
 			(void)cudaSetDevice(device);
 		}
 	}
-
 };
 
+void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor                    input,
+                                                std::span<const int64_t>                         labels,
+                                                std::span<const DirectDctPlsRandAugmentDecision> randaugment,
+                                                std::span<const DirectDctPlsMixupDecision>       mixup,
+                                                uint32_t                                         microbatch_images,
+                                                bool                                             enable_randaugment,
+                                                bool                                             enable_mixup,
+                                                std::span<const JpegDctOutputChannel>            inputs,
+                                                std::span<const JpegDctOutputChannel>            outputs,
+                                                cudaStream_t                                     stream) {
+	const auto height = input.shape[2], width = input.shape[3], pixels = height * width;
+	if (input.shape[0] != images || input.shape[1] != inputs.size() || outputs.size() > inputs.size() ||
+	    height != width || height % 28 != 0)
+		throw std::invalid_argument("projected PLS requires equal square grids with size a multiple of 28");
+	int lookup[3][64];
+	for (auto& row : lookup)
+		std::fill(std::begin(row), std::end(row), -1);
+	for (size_t i = 0; i < inputs.size(); ++i)
+		lookup[inputs[i].component][inputs[i].frequency] = i;
+	std::vector<ProjectedChannel> in, out;
+	for (const auto c : inputs) {
+		const int transpose = lookup[c.component][(c.frequency % 8) * 8 + c.frequency / 8];
+		if (transpose < 0)
+			throw std::invalid_argument("projected PLS lacks a rotation frequency dependency");
+		in.push_back({c.component, c.frequency, lookup[c.component][c.frequency], transpose, c.subtract, c.divide});
+	}
+	for (int c = 0; c < 3; ++c)
+		if (lookup[c][0] < 0)
+			throw std::invalid_argument("projected PLS lacks DC statistics dependency");
+	for (const auto c : outputs) {
+		const int index = lookup[c.component][c.frequency];
+		if (index < 0)
+			throw std::invalid_argument("projected PLS lacks an output frequency");
+		out.push_back({c.component, c.frequency, index, 0, c.subtract, c.divide});
+	}
+	const size_t capacity = std::min<size_t>(microbatch_images, images);
+	// The source pool has a single producer and is not published yet. After loading a
+	// whole microbatch into scratch, compact its normalized output in place. Since
+	// output channels <= dependency channels, writes cannot touch the next unread
+	// source microbatch. No second pool-sized float allocation is needed.
+	auto* output = const_cast<float*>(input.float_data);
+	y_a.emplace(capacity * inputs.size() * pixels, stream);
+	y_b.emplace(capacity * inputs.size() * pixels, stream);
+	if (!external_targets)
+		targets_output.emplace(images * classes, stream);
+	auto* targets = external_targets ? external_targets : targets_output->get();
+	labels_device.emplace(images, stream);
+	decisions_device.emplace(images, stream);
+	mixup_device.emplace(mixup.size(), stream);
+	stats_device.emplace(capacity, stream);
+	input_channels_device.emplace(in.size(), stream);
+	output_channels_device.emplace(out.size(), stream);
+	check_cuda(
+	    cudaMemcpyAsync(labels_device->get(), labels.data(), labels.size_bytes(), cudaMemcpyHostToDevice, stream),
+	    "upload labels");
+	check_cuda(
+	    cudaMemcpyAsync(
+	        decisions_device->get(), randaugment.data(), randaugment.size_bytes(), cudaMemcpyHostToDevice, stream),
+	    "upload decisions");
+	check_cuda(cudaMemcpyAsync(mixup_device->get(), mixup.data(), mixup.size_bytes(), cudaMemcpyHostToDevice, stream),
+	           "upload mixup");
+	check_cuda(cudaMemcpyAsync(input_channels_device->get(),
+	                           in.data(),
+	                           in.size() * sizeof(ProjectedChannel),
+	                           cudaMemcpyHostToDevice,
+	                           stream),
+	           "upload dependency channels");
+	check_cuda(cudaMemcpyAsync(output_channels_device->get(),
+	                           out.data(),
+	                           out.size() * sizeof(ProjectedChannel),
+	                           cudaMemcpyHostToDevice,
+	                           stream),
+	           "upload output channels");
+	for (size_t offset = 0; offset < images; offset += capacity) {
+		const auto count = std::min(capacity, images - offset), elements = count * inputs.size() * pixels;
+		projected_to_int16<<<launch_blocks(elements), 256, 0, stream>>>(
+		    input.float_data + offset * inputs.size() * pixels, y_a->get(), elements);
+		auto* current = y_a->get();
+		auto* next    = y_b->get();
+		if (enable_randaugment) {
+			for (int stage = 0; stage < 2; ++stage) {
+				projected_stats<<<launch_blocks(count), 256, 0, stream>>>(current,
+				                                                          stats_device->get(),
+				                                                          count,
+				                                                          pixels,
+				                                                          inputs.size(),
+				                                                          lookup[0][0],
+				                                                          lookup[1][0],
+				                                                          lookup[2][0]);
+				apply_randaugment_kernel<true>
+				    <<<launch_blocks(elements), 256, 0, stream>>>(current,
+				                                                  next,
+				                                                  decisions_device->get() + offset,
+				                                                  stats_device->get(),
+				                                                  count,
+				                                                  stage,
+				                                                  inputs.size(),
+				                                                  height,
+				                                                  width,
+				                                                  true,
+				                                                  input_channels_device->get());
+				std::swap(current, next);
+			}
+		}
+		projected_normalize_mixup<<<launch_blocks(count * outputs.size() * pixels), 256, 0, stream>>>(
+		    current,
+		    output + offset * outputs.size() * pixels,
+		    count,
+		    pixels,
+		    inputs.size(),
+		    outputs.size(),
+		    output_channels_device->get(),
+		    mixup_device->get() + offset / microbatch_images,
+		    enable_mixup);
+	}
+	mixup_targets_kernel<<<launch_blocks(images * classes), 256, 0, stream>>>(
+	    labels_device->get(), targets, mixup_device->get(), images, classes, microbatch_images, enable_mixup);
+	check_cuda(cudaGetLastError(), "launch projected augmentation and normalization");
+	completion.record(stream);
+	projected_descriptor            = input;
+	projected_descriptor.float_data = output;
+	projected_descriptor.shape[1]   = outputs.size();
+	projected_descriptor.strides[0] = outputs.size() * pixels;
+	target_descriptor               = {targets, {images, classes}, {classes, 1U}, device};
+	// Host channel vectors must survive their asynchronous H2D copies only.
+	check_cuda(cudaStreamSynchronize(stream), "finish projected postprocess");
+}
+
 DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
-    const DirectDctBatch&                                  source,
+    DirectDctBatch&                                        source,
     const std::span<const int64_t>                         labels,
     const std::span<const DirectDctPlsRandAugmentDecision> randaugment,
     const std::span<const DirectDctPlsMixupDecision>       mixup,
@@ -330,30 +582,15 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
     const uint32_t                                         model_classes,
     const bool                                             enable_randaugment,
     const bool                                             enable_mixup,
-    std::shared_ptr<Stream>                                stream)
+    std::shared_ptr<Stream>                                stream,
+    std::span<const JpegDctOutputChannel>                  input_channels,
+    std::span<const JpegDctOutputChannel>                  output_channels)
     : impl_(std::make_unique<Impl>()) {
 	try {
 		if (!stream || !stream->impl_) {
 			throw std::invalid_argument("Direct-DCT PLS CUDA postprocess requires a shared stream");
 		}
-		if (labels.empty() || randaugment.size() != labels.size() || microbatch_images == 0U || model_classes == 0U) {
-			throw std::invalid_argument("invalid Direct-DCT PLS CUDA postprocess cardinality");
-		}
-		for (const auto label : labels) {
-			if (label < 0 || static_cast<uint64_t>(label) >= model_classes) {
-				throw std::invalid_argument("Direct-DCT PLS label is outside the configured model class range");
-			}
-		}
-		const auto expected_mixup = (labels.size() + microbatch_images - 1U) / microbatch_images;
-		if (mixup.size() != expected_mixup) {
-			throw std::invalid_argument("Direct-DCT PLS mixup decision count does not match microbatches");
-		}
-		const auto y_source = source.y_tensor_async();
-		const auto c_source = source.cbcr_tensor_async();
-		if (y_source.shape != std::array<size_t, 6> {labels.size(), 1U, 28U, 28U, 8U, 8U} ||
-		    c_source.shape != std::array<size_t, 6> {labels.size(), 2U, 14U, 14U, 8U, 8U}) {
-			throw std::runtime_error("Direct-DCT PLS postprocess requires the registered 28/14 training grid");
-		}
+		validate_metadata(labels, randaugment, mixup, microbatch_images, model_classes);
 		impl_->device  = source.cuda_device();
 		impl_->images  = labels.size();
 		impl_->classes = model_classes;
@@ -367,6 +604,26 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 		if (source.cuda_completion_event() != nullptr) {
 			check_cuda(cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(source.cuda_completion_event()), 0U),
 			           "wait for Direct-DCT transform");
+		}
+
+		if (!output_channels.empty()) {
+			impl_->project(source.projected_tensor_async(),
+			               labels,
+			               randaugment,
+			               mixup,
+			               microbatch_images,
+			               enable_randaugment,
+			               enable_mixup,
+			               input_channels,
+			               output_channels,
+			               stream);
+			return;
+		}
+		const auto y_source = source.y_tensor_async();
+		const auto c_source = source.cbcr_tensor_async();
+		if (y_source.shape != std::array<size_t, 6> {labels.size(), 1U, 28U, 28U, 8U, 8U} ||
+		    c_source.shape != std::array<size_t, 6> {labels.size(), 2U, 14U, 14U, 8U, 8U}) {
+			throw std::runtime_error("Direct-DCT PLS postprocess requires the registered 28/14 training grid");
 		}
 
 		constexpr size_t y_per_image = 1U * 28U * 28U * 8U * 8U;
@@ -424,26 +681,28 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 			for (int stage = 0; stage < 2; ++stage) {
 				compute_stats_kernel<<<launch_blocks(labels.size()), 256, 0, stream>>>(
 				    y_current, c_current, impl_->stats_device->get(), labels.size());
-				apply_randaugment_kernel<<<launch_blocks(y_count), 256, 0, stream>>>(y_current,
-				                                                                            y_next,
-				                                                                            impl_->decisions_device->get(),
-				                                                                            impl_->stats_device->get(),
-				                                                                            labels.size(),
-				                                                                            stage,
-				                                                                            1,
-				                                                                            28,
-				                                                                            28,
-				                                                                            true);
-				apply_randaugment_kernel<<<launch_blocks(c_count), 256, 0, stream>>>(c_current,
-				                                                                            c_next,
-				                                                                            impl_->decisions_device->get(),
-				                                                                            impl_->stats_device->get(),
-				                                                                            labels.size(),
-				                                                                            stage,
-				                                                                            2,
-				                                                                            14,
-				                                                                            14,
-				                                                                            false);
+				apply_randaugment_kernel<false>
+				    <<<launch_blocks(y_count), 256, 0, stream>>>(y_current,
+				                                                 y_next,
+				                                                 impl_->decisions_device->get(),
+				                                                 impl_->stats_device->get(),
+				                                                 labels.size(),
+				                                                 stage,
+				                                                 1,
+				                                                 28,
+				                                                 28,
+				                                                 true);
+				apply_randaugment_kernel<false>
+				    <<<launch_blocks(c_count), 256, 0, stream>>>(c_current,
+				                                                 c_next,
+				                                                 impl_->decisions_device->get(),
+				                                                 impl_->stats_device->get(),
+				                                                 labels.size(),
+				                                                 stage,
+				                                                 2,
+				                                                 14,
+				                                                 14,
+				                                                 false);
 				std::swap(y_current, y_next);
 				std::swap(c_current, c_next);
 			}
@@ -494,6 +753,43 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 	}
 }
 
+DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(DirectDctGridTensorDescriptor source,
+                                                         void*                         source_completion_event,
+                                                         float*                        targets,
+                                                         std::span<const int64_t>      labels,
+                                                         std::span<const DirectDctPlsRandAugmentDecision> randaugment,
+                                                         std::span<const DirectDctPlsMixupDecision>       mixup,
+                                                         uint32_t                              microbatch_images,
+                                                         uint32_t                              model_classes,
+                                                         std::shared_ptr<Stream>               stream,
+                                                         std::span<const JpegDctOutputChannel> input_channels,
+                                                         std::span<const JpegDctOutputChannel> output_channels)
+    : impl_(std::make_unique<Impl>()) {
+	validate_metadata(labels, randaugment, mixup, microbatch_images, model_classes);
+	if (!stream || !stream->impl_ || stream->impl_->device != source.cuda_device)
+		throw std::invalid_argument("projected augmentation stream must match the input device");
+	impl_->device           = source.cuda_device;
+	impl_->images           = labels.size();
+	impl_->classes          = model_classes;
+	impl_->external_targets = targets;
+	impl_->stream           = std::move(stream);
+	check_cuda(cudaSetDevice(impl_->device), "select projected augmentation device");
+	impl_->completion.create_with_flags(cudaEventDisableTiming);
+	const auto execution_stream = impl_->stream->impl_->stream.get();
+	check_cuda(cudaStreamWaitEvent(execution_stream, static_cast<cudaEvent_t>(source_completion_event), 0U),
+	           "wait for projected input upload");
+	impl_->project(source,
+	               labels,
+	               randaugment,
+	               mixup,
+	               microbatch_images,
+	               true,
+	               true,
+	               input_channels,
+	               output_channels,
+	               execution_stream);
+}
+
 DirectDctPlsCudaPostprocess::~DirectDctPlsCudaPostprocess()                                                 = default;
 DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(DirectDctPlsCudaPostprocess&&) noexcept            = default;
 DirectDctPlsCudaPostprocess& DirectDctPlsCudaPostprocess::operator=(DirectDctPlsCudaPostprocess&&) noexcept = default;
@@ -503,6 +799,9 @@ DirectDctGridTensorDescriptor DirectDctPlsCudaPostprocess::y_tensor() const noex
 }
 DirectDctGridTensorDescriptor DirectDctPlsCudaPostprocess::cbcr_tensor() const noexcept {
 	return impl_->c_descriptor;
+}
+DirectDctGridTensorDescriptor DirectDctPlsCudaPostprocess::projected_tensor() const noexcept {
+	return impl_->projected_descriptor;
 }
 DirectDctPlsTargetTensorDescriptor DirectDctPlsCudaPostprocess::targets() const noexcept {
 	return impl_->target_descriptor;

@@ -3219,18 +3219,103 @@ void FlsReader::read_rowgroup_bytes_selected_vectors_into(const size_t          
 }
 
 void FlsReader::read_rowgroup_bytes_selected_columns_into(const size_t                rowgroup_idx,
-	                                                       const std::vector<uint8_t>& selected_columns,
-	                                                       std::byte* const           backing_data,
-	                                                       const size_t               backing_capacity,
-	                                                       ZeroCopyReadTiming*        timing) {
+                                                          const std::vector<uint8_t>& selected_columns,
+                                                          std::byte* const            backing_data,
+                                                          const size_t                backing_capacity,
+                                                          ZeroCopyReadTiming*         timing) {
 	if (selected_columns.empty()) {
 		throw std::invalid_argument("selected-column read requires at least one column");
 	}
 	if (m_compact_descriptor == nullptr) {
-		if (timing != nullptr) {
-			timing->sparse_fallback_reason = "coefficient-range-read-requires-compact-v3";
+		const auto* rowgroups = m_table_descriptor->Get()->m_rowgroup_descriptors();
+		if (rowgroup_idx >= rowgroups->size()) {
+			throw std::out_of_range("selected-column rowgroup index out of range");
 		}
-		read_rowgroup_bytes_into(rowgroup_idx, backing_data, backing_capacity, timing);
+		const auto&  rowgroup = *rowgroups->Get(static_cast<flatbuffers::uoffset_t>(rowgroup_idx));
+		const size_t bytes    = rowgroup.m_size();
+		if ((bytes != 0U && backing_data == nullptr) || backing_capacity < bytes) {
+			throw std::runtime_error("external rowgroup backing is null or too small");
+		}
+		const auto                                       columns = detail::build_zero_copy_column_plan(rowgroup, false);
+		std::vector<uint8_t>                             state(columns.size(), 0U);
+		std::vector<const fastlanes::SegmentDescriptor*> segments;
+		const auto                                       visit = [&](const auto& self, const size_t index) -> void {
+            if (index >= columns.size()) {
+                throw std::out_of_range("selected-column dependency is outside rowgroup schema");
+            }
+            if (state[index] == 2U) {
+                return;
+            }
+            if (state[index] == 1U) {
+                throw std::runtime_error("selected-column dependency cycle");
+            }
+            state[index]       = 1U;
+            const auto& column = columns[index];
+            using fastlanes::OperatorToken;
+            if (column.alias_of.has_value()) {
+                self(self, *column.alias_of);
+            } else if (column.token == OperatorToken::EXP_DICT_I08_U08 ||
+                       column.token == OperatorToken::EXP_DICT_I16_U08 ||
+                       column.token == OperatorToken::EXP_DICT_I16_U16) {
+                if (column.operand_ids.empty()) {
+                    throw std::runtime_error("selected dictionary reference has no source column");
+                }
+                self(self, column.operand_ids.front());
+            }
+            detail::collect_segment_descriptors(
+                *rowgroup.m_column_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(index)), segments);
+            state[index] = 2U;
+		};
+		for (const auto column : selected_columns) {
+			visit(visit, column);
+		}
+		// All vectors are needed. Segment extents in the footer are sufficient:
+		// do not read every column's entrypoints to build a per-vector index.
+		std::vector<detail::SparseByteRange> ranges;
+		for (const auto* segment : segments) {
+			if (segment->entrypoint_offset() > bytes ||
+			    segment->entrypoint_size() > bytes - segment->entrypoint_offset() || segment->data_offset() > bytes ||
+			    segment->data_size() > bytes - segment->data_offset()) {
+				throw std::runtime_error("selected-column segment exceeds rowgroup bounds");
+			}
+			ranges.push_back(
+			    {static_cast<size_t>(segment->entrypoint_offset()), static_cast<size_t>(segment->entrypoint_size())});
+			ranges.push_back({static_cast<size_t>(segment->data_offset()), static_cast<size_t>(segment->data_size())});
+		}
+		ranges          = detail::coalesce_ranges(std::move(ranges));
+		size_t page_end = 0U;
+		for (const auto& range : ranges) {
+			const auto start = std::chrono::steady_clock::now();
+			m_file->ReadRangeUnchecked(backing_data + range.offset, rowgroup.m_offset() + range.offset, range.size);
+			const auto end = std::chrono::steady_clock::now();
+			if (timing != nullptr) {
+				timing->storage_bytes += range.size;
+				++timing->pread_count;
+				timing->pread_ms += std::chrono::duration<double, std::milli>(end - start).count();
+				if (timing->pread_start == std::chrono::steady_clock::time_point {} || start < timing->pread_start) {
+					timing->pread_start = start;
+				}
+				timing->pread_end       = end;
+				const size_t first_page = (rowgroup.m_offset() + range.offset) / 4096U;
+				const size_t last_page  = (rowgroup.m_offset() + range.offset + range.size - 1U) / 4096U + 1U;
+				timing->physical_page_bytes += (last_page - std::max(page_end, first_page)) * 4096U;
+				page_end = last_page;
+			}
+		}
+		if (timing != nullptr) {
+			timing->logical_storage_bytes  = timing->storage_bytes;
+			timing->selected_storage_bytes = timing->storage_bytes;
+			timing->full_storage_bytes     = bytes;
+			timing->full_physical_page_bytes =
+			    bytes == 0U ? 0U
+			                : ((rowgroup.m_offset() + bytes - 1U) / 4096U + 1U - rowgroup.m_offset() / 4096U) * 4096U;
+			timing->coalesced_read_run_count    = ranges.size();
+			timing->selected_coefficient_count  = selected_columns.size();
+			timing->full_coefficient_count      = columns.size();
+			timing->sparse_read_supported       = true;
+			timing->used_sparse_read            = timing->storage_bytes < bytes;
+			timing->used_coefficient_range_read = true;
+		}
 		return;
 	}
 

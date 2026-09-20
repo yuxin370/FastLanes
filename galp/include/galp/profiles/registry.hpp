@@ -14,6 +14,7 @@ inline std::vector<std::string> available_direct_dct_profile_ids() {
 	return {
 	    std::string(kRgbNoMoreValidationProfileId),
 	    std::string(kRgbNoMoreValidationCenterCrop512ProfileId),
+	    std::string(kRgbNoMoreSwinV2ValidationProfileId),
 	    std::string(kRgbNoMoreTrainingPlsProfileId),
 	};
 }
@@ -24,6 +25,9 @@ inline RegisteredDirectDctProfile resolve_direct_dct_profile(const std::string_v
 	}
 	if (profile_id == kRgbNoMoreValidationCenterCrop512ProfileId) {
 		return rgbnomore_validation_center_crop_512_profile();
+	}
+	if (profile_id == kRgbNoMoreSwinV2ValidationProfileId) {
+		return rgbnomore_swinv2_validation_profile();
 	}
 	if (profile_id == kRgbNoMoreTrainingPlsProfileId) {
 		return rgbnomore_training_pls_profile();

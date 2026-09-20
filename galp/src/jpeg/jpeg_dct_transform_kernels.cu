@@ -359,9 +359,10 @@ __device__ __forceinline__ void store_planless_dct_grid_value(const JpegDctDevic
                                                               const uint32_t cbcr_output_height,
                                                               const uint32_t lane,
                                                               const float    value,
-	                                                          const bool     accumulate,
+                                                              const bool     accumulate,
                                                               float* __restrict y_accum,
-                                                              float* __restrict cbcr_accum) {
+                                                              float* __restrict cbcr_accum,
+                                                              const JpegDctOutputProjection* projection) {
 	if (lane >= 64U) {
 		return;
 	}
@@ -369,6 +370,23 @@ __device__ __forceinline__ void store_planless_dct_grid_value(const JpegDctDevic
 	                              ? ((component == 0U ? y_output_width : cbcr_output_width) - 1U - output_x)
 	                              : output_x;
 	const auto stored_value = image.horizontal_flip != 0U && (lane % 8U) % 2U != 0U ? -value : value;
+	if (projection != nullptr) {
+		const int channel = projection->channel[component * 64U + lane];
+		if (channel < 0)
+			return;
+		const uint64_t index =
+		    ((static_cast<uint64_t>(image.request_index) * projection->count + channel) * y_output_height + output_y) *
+		        y_output_width +
+		    stored_x;
+		if (projection->direct_identity) {
+			const float value = finalize_dct_grid_float(stored_value, projection->add, projection->scale);
+			y_accum[index]    = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
+		} else if (accumulate)
+			y_accum[index] += stored_value;
+		else
+			y_accum[index] = stored_value;
+		return;
+	}
 	if (component == 0U && y_accum != nullptr) {
 		const auto output_block_index =
 		    (static_cast<uint64_t>(image.request_index) * y_output_height + output_y) * y_output_width + stored_x;
@@ -388,6 +406,21 @@ __device__ __forceinline__ void store_planless_dct_grid_value(const JpegDctDevic
 			cbcr_accum[output_block_index * 64U + lane] = stored_value;
 		}
 	}
+}
+
+__global__ void finalize_projected_dct_kernel(float*                         output,
+                                              const size_t                   count,
+                                              const size_t                   spatial,
+                                              const JpegDctOutputProjection* projection,
+                                              const float                    add,
+                                              const float                    scale,
+                                              const bool                     initialize) {
+	const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (index >= count)
+		return;
+	const size_t channel = (index / spatial) % projection->count;
+	const float  value   = finalize_dct_grid_float(initialize ? 0.0F : output[index], add, scale);
+	output[index]        = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
 }
 
 __global__ void round_dct_grid_accum_pair_kernel(const float* __restrict y_in,
@@ -513,32 +546,114 @@ __device__ float planless_axis_phase_weight(const float* __restrict phase_matric
 	return 0.0F;
 }
 
-__global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column_bindings,
-                                                     const JpegDctDevicePlanlessImageDescriptor* __restrict images,
-                                                     const uint32_t* __restrict logical_to_compact_vectors,
-	                                                     const uint32_t* __restrict image_vector_bindings,
-	                                                     const uint32_t* __restrict active_output_blocks,
-	                                                     const JpegDctDeviceBlockMajorGroupBinding* __restrict block_major_groups,
-	                                                     const size_t block_major_group_count,
-	                                                     const JpegDctDeviceBlockMajorRankCell* __restrict block_major_rank_cells,
-	                                                     const size_t block_major_rank_cell_count,
-	                                                     const uint8_t* __restrict block_major_rank_payload,
-	                                                     const size_t block_major_rank_payload_size,
-	                                                     const uint64_t selected_physical_coefficient_mask,
-	                                                     const JpegDctDeviceSparseTransformPlan* __restrict sparse_transform_plans,
-	                                                     const size_t   image_count,
-	                                                     const uint64_t output_block_offset,
-	                                                     const uint64_t output_block_count,
-	                                                     const uint16_t* __restrict quant_tables,
-	                                                     const float* __restrict phase_matrices,
-	                                                     const uint32_t y_output_width,
-	                                                     const uint32_t y_output_height,
-                                                     const uint32_t cbcr_output_width,
-                                                     const uint32_t cbcr_output_height,
-                                                     const int32_t  clamp_min,
-                                                     const int32_t  clamp_max,
-                                                     float* __restrict y_accum,
-                                                     float* __restrict cbcr_accum) {
+__global__ void
+transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                     const JpegDctDevicePlanlessImageDescriptor* __restrict images,
+                                     const uint32_t* __restrict logical_to_compact_vectors,
+                                     const uint32_t* __restrict image_vector_bindings,
+                                     const uint32_t* __restrict active_output_blocks,
+                                     const uint64_t active_output_blocks_per_image,
+                                     const JpegDctDeviceBlockMajorGroupBinding* __restrict block_major_groups,
+                                     const size_t block_major_group_count,
+                                     const JpegDctDeviceBlockMajorRankCell* __restrict block_major_rank_cells,
+                                     const size_t block_major_rank_cell_count,
+                                     const uint8_t* __restrict block_major_rank_payload,
+                                     const size_t   block_major_rank_payload_size,
+                                     const uint64_t selected_physical_coefficient_mask,
+                                     const JpegDctDeviceSparseTransformPlan* __restrict sparse_transform_plans,
+                                     const size_t   image_count,
+                                     const uint64_t output_block_offset,
+                                     const uint64_t output_block_count,
+                                     const uint16_t* __restrict quant_tables,
+                                     const float* __restrict phase_matrices,
+                                     const uint32_t y_output_width,
+                                     const uint32_t y_output_height,
+                                     const uint32_t cbcr_output_width,
+                                     const uint32_t cbcr_output_height,
+                                     const int32_t  clamp_min,
+                                     const int32_t  clamp_max,
+                                     float* __restrict y_accum,
+                                     float* __restrict cbcr_accum,
+                                     const JpegDctOutputProjection* projection,
+                                     const bool                     identity_projection) {
+	// Identity projection: neighboring threads own neighboring output blocks,
+	// so each channel is written in spatial order instead of across NCHW planes.
+	// Locate the source once per block and reuse it for every requested channel.
+	if (identity_projection) {
+		const uint64_t spatial          = static_cast<uint64_t>(y_output_width) * y_output_height;
+		const uint64_t blocks_per_image = 3U * spatial;
+		for (uint64_t task = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; task < output_block_count;
+		     task += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+			const uint64_t index     = output_block_offset + task;
+			const uint64_t linear = active_output_blocks_per_image != 0U
+			                            ? (index / active_output_blocks_per_image) * blocks_per_image +
+			                                  active_output_blocks[index % active_output_blocks_per_image]
+			                            : (active_output_blocks ? active_output_blocks[index] : index);
+			const auto     image     = images[linear / blocks_per_image];
+			const uint32_t component = (linear % blocks_per_image) / spatial;
+			const uint32_t xy        = linear % spatial;
+			const uint32_t x = xy % y_output_width, y = xy / y_output_width;
+			const auto     descriptor = image.components[component];
+			const int64_t  sx         = static_cast<int64_t>(descriptor.crop_x) + x;
+			const int64_t  sy         = static_cast<int64_t>(descriptor.crop_y) + y;
+			const auto     located =
+                sx >= 0 && sy >= 0 && sx < descriptor.width_in_blocks && sy < descriptor.height_in_blocks
+			            ? locate_planless_row(image,
+                                          descriptor,
+                                          static_cast<uint32_t>(sx),
+                                          static_cast<uint32_t>(sy),
+                                          logical_to_compact_vectors,
+                                          image_vector_bindings,
+                                          block_major_groups,
+                                          block_major_group_count,
+                                          block_major_rank_cells,
+                                          block_major_rank_cell_count,
+                                          block_major_rank_payload,
+                                          block_major_rank_payload_size)
+			            : PlanlessLocatedRow {};
+			if (projection->direct_identity && (located.row == std::numeric_limits<uint64_t>::max() ||
+			                                    located.binding_base == std::numeric_limits<uint32_t>::max()))
+				continue;
+			const auto* sparse = selected_physical_coefficient_mask != kAllPhysicalCoefficientMask
+			                         ? &sparse_transform_plans[image.zigzag_columns != 0U ? 1U : 0U]
+			                         : nullptr;
+			for (uint32_t frequency = 0; frequency < 64; ++frequency) {
+				const int channel = projection->channel[component * 64U + frequency];
+				if (channel < 0)
+					continue;
+				const uint8_t binding_index = sparse ? sparse->natural_to_compact_binding[frequency]
+				                                     : natural_to_physical_coeff_device(static_cast<uint8_t>(frequency),
+				                                                                        image.zigzag_columns != 0U);
+				int           value         = 0;
+				if (binding_index != JpegDctDeviceSparseTransformPlan::kMissingBinding &&
+				    located.row != std::numeric_limits<uint64_t>::max() &&
+				    located.binding_base != std::numeric_limits<uint32_t>::max()) {
+					const auto binding = column_bindings[located.binding_base + binding_index];
+					if (binding.source == DeviceCoeffSource::kI16)
+						value = binding.column_i16[located.row];
+					else if (binding.source == DeviceCoeffSource::kI8)
+						value = binding.column_i8[located.row];
+				}
+				const int   quant  = quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + frequency];
+				const float result = static_cast<float>(min(clamp_max, max(clamp_min, value * quant)));
+				store_planless_dct_grid_value(image,
+				                              component,
+				                              x,
+				                              y,
+				                              y_output_width,
+				                              y_output_height,
+				                              cbcr_output_width,
+				                              cbcr_output_height,
+				                              frequency,
+				                              result,
+				                              block_major_groups != nullptr,
+				                              y_accum,
+				                              cbcr_accum,
+				                              projection);
+			}
+		}
+		return;
+	}
 	const auto       lane                = static_cast<uint32_t>(threadIdx.x);
 	const uint64_t   y_blocks            = static_cast<uint64_t>(y_output_width) * y_output_height;
 	const uint64_t   cbcr_channel_blocks = static_cast<uint64_t>(cbcr_output_width) * cbcr_output_height;
@@ -552,8 +667,11 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 	__shared__ uint32_t located_binding_bases[4];
 	for (uint64_t launch_block = blockIdx.x; launch_block < output_block_count; launch_block += gridDim.x) {
 		const uint64_t output_index = output_block_offset + launch_block;
-		const uint64_t linear_block =
-		    active_output_blocks == nullptr ? output_index : active_output_blocks[output_index];
+		const uint64_t linear_block = active_output_blocks_per_image != 0U
+		                                  ? (output_index / active_output_blocks_per_image) * blocks_per_image +
+		                                        active_output_blocks[output_index % active_output_blocks_per_image]
+		                                  : (active_output_blocks == nullptr ? output_index
+		                                                                     : active_output_blocks[output_index]);
 		if (blocks_per_image == 0U || linear_block >= image_count * blocks_per_image || quant_tables == nullptr) {
 			continue;
 		}
@@ -656,12 +774,37 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 						value = static_cast<int16_t>(binding.column_i8[located_rows[source_block_slot]]);
 					}
 				}
+				// Identity geometry needs neither separable-transform scratch nor
+				// the intervening barriers. Preserve the same dequantization,
+				// clamp, sparse zero-fill, flip and workset accumulation contract.
+				if (source_block_count == 1U) {
+					const auto dequantized =
+					    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+					store_planless_dct_grid_value(image,
+					                              component,
+					                              output_x,
+					                              output_y,
+					                              y_output_width,
+					                              y_output_height,
+					                              cbcr_output_width,
+					                              cbcr_output_height,
+					                              lane,
+					                              dequantized,
+					                              accumulates_block_major_partials,
+					                              y_accum,
+					                              cbcr_accum,
+					                              projection);
+					continue;
+				}
 				const auto composed_y = subblock_y * 8U + coeff / 8U;
 				const auto composed_x = subblock_x * 8U + coeff % 8U;
 				composed[composed_y * source_width + composed_x] =
 				    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
 			}
 			__syncthreads();
+			if (source_block_count == 1U) {
+				continue;
+			}
 			for (uint32_t vertical_linear = lane; vertical_linear < 8U * source_width; vertical_linear += blockDim.x) {
 				const auto out_y    = vertical_linear / source_width;
 				const auto source_x = vertical_linear % source_width;
@@ -736,7 +879,8 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 				                              value,
 				                              accumulates_block_major_partials,
 				                              y_accum,
-				                              cbcr_accum);
+				                              cbcr_accum,
+				                              projection);
 			}
 			__syncthreads();
 			continue;
@@ -745,6 +889,13 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 		const bool needs_x_program = descriptor.x_phase_matrix_base != std::numeric_limits<uint32_t>::max();
 		const bool needs_y_program = descriptor.y_phase_matrix_base != std::numeric_limits<uint32_t>::max();
 		if ((needs_x_program || needs_y_program) && phase_matrices == nullptr) {
+			continue;
+		}
+		// Source frequencies remain complete. Compact only the requested output
+		// frequencies and the horizontal intermediates needed to produce them.
+		const uint32_t output_frequency_count = projection ? projection->frequency_count[component] : 64U;
+		const uint32_t horizontal_count       = projection ? projection->horizontal_count[component] : 64U;
+		if (output_frequency_count == 0U) {
 			continue;
 		}
 		const auto source_x_begin = static_cast<uint32_t>((static_cast<uint64_t>(output_x) * descriptor.x_down_factor) /
@@ -805,9 +956,10 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 					    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
 				}
 				__syncthreads();
-				if (lane < 64U) {
-					const auto source_y_coeff = lane / 8U;
-					const auto out_x_coeff    = lane % 8U;
+				if (lane < horizontal_count) {
+					const auto frequency      = projection ? projection->horizontal_frequencies[component][lane] : lane;
+					const auto source_y_coeff = frequency / 8U;
+					const auto out_x_coeff    = frequency % 8U;
 					float      x_sum          = 0.0F;
 					const auto selected_x_count =
 					    sparse_transform ? sparse_plan->selected_x_count_by_y[source_y_coeff] : uint8_t {8U};
@@ -825,17 +977,18 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 						                                           in_x_coeff);
 						x_sum = dct_grid_madd_rn(source[source_y_coeff * 8U + in_x_coeff], wx, x_sum);
 					}
-					horizontal[lane] = x_sum;
+					horizontal[source_y_coeff * 8U + out_x_coeff] = x_sum;
 				}
 				__syncthreads();
-				if (lane < 64U) {
-					const auto out_x_coeff = lane % 8U;
-					const auto out_y_coeff = lane / 8U;
-					float      weighted    = 0.0F;
+				if (lane < output_frequency_count) {
+					const auto frequency = projection ? projection->frequencies[component][lane] : lane;
+					const auto out_x_coeff    = frequency % 8U;
+					const auto out_y_coeff    = frequency / 8U;
+					float      weighted       = 0.0F;
 					const auto active_y_count = sparse_transform ? sparse_plan->active_y_count : uint8_t {8U};
 					for (uint32_t active_y = 0U; active_y < active_y_count; ++active_y) {
-						const auto in_y_coeff = sparse_transform ? sparse_plan->active_y[active_y]
-						                                            : static_cast<uint8_t>(active_y);
+						const auto in_y_coeff =
+						    sparse_transform ? sparse_plan->active_y[active_y] : static_cast<uint8_t>(active_y);
 						const auto wy = planless_axis_phase_weight(phase_matrices,
 						                                           descriptor.y_phase_matrix_base,
 						                                           descriptor.y_up_factor,
@@ -851,7 +1004,7 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 				__syncthreads();
 			}
 		}
-		if (lane < 64U) {
+		if (lane < output_frequency_count) {
 			store_planless_dct_grid_value(image,
 			                              component,
 			                              output_x,
@@ -860,11 +1013,12 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* _
 			                              y_output_height,
 			                              cbcr_output_width,
 			                              cbcr_output_height,
-			                              lane,
+			                              projection ? projection->frequencies[component][lane] : lane,
 			                              output_sum,
 			                              accumulates_block_major_partials,
 			                              y_accum,
-			                              cbcr_accum);
+			                              cbcr_accum,
+			                              projection);
 		}
 		__syncthreads();
 	}

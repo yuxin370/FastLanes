@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import galp.torch
@@ -18,12 +19,20 @@ from galp.diagnostics.direct_dct import (
 )
 
 
+@dataclass(frozen=True)
+class _FakeTensor:
+    values: tuple[object, ...]
+    shape: tuple[int, ...]
+    dtype: str = "torch.float32"
+
+    def stride(self) -> tuple[int, ...]:
+        return tuple(
+            1 if index == len(self.shape) - 1 else self.shape[index + 1]
+            for index in range(len(self.shape))
+        )
+
+
 class _NativeBatch:
-    coefficients = None
-    y = "y"
-    cbcr = "cbcr"
-    global_image_ids = [4, 7]
-    transform_descriptors = [{"global_image_id": 4}, {"global_image_id": 7}]
     layout = "transformed_dct_grid"
     execution_stats = {"decode_ms": 1.0}
     execution_stats_snapshot = {"ready": True}
@@ -43,7 +52,31 @@ class _NativeBatch:
         "peak_transient_bytes": 4096,
     }
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        image_ids=None,
+        *,
+        dct_coeffs: str = "all",
+        transforms=None,
+    ) -> None:
+        self.global_image_ids = list(image_ids or [4, 7])
+        self.y = _FakeTensor(
+            ("y", *self.global_image_ids),
+            (len(self.global_image_ids), 1),
+        )
+        self.cbcr = _FakeTensor(
+            ("cbcr", *self.global_image_ids),
+            (len(self.global_image_ids), 2),
+        )
+        self.coefficients = {
+            "canonical_selection": dct_coeffs,
+            "global_image_ids": tuple(self.global_image_ids),
+        }
+        self.transform_descriptors = (
+            [{"global_image_id": value} for value in self.global_image_ids]
+            if transforms is None
+            else [dict(value) for value in transforms]
+        )
         self.record_stream_calls: list[tuple[int, ...]] = []
 
     def record_stream(self, *values: int) -> None:
@@ -67,6 +100,7 @@ class _NativePipeline:
         self.batches: list[list[int]] = []
         self.transforms = None
         self.offset = 0
+        self.close_count = 0
 
     def reset(self, batches, *, transforms_by_batch):
         self.batches = [list(batch) for batch in batches]
@@ -83,15 +117,22 @@ class _NativePipeline:
     def __next__(self):
         if self.offset >= len(self.batches):
             raise StopIteration
+        batch_index = self.offset
         self.offset += 1
         self.prefetched_batch_count = min(len(self.batches), self.offset + 2)
-        return _NativeBatch()
+        transforms = None if self.transforms is None else self.transforms[batch_index]
+        return _NativeBatch(
+            self.batches[batch_index],
+            dct_coeffs=self.dct_coeffs,
+            transforms=transforms,
+        )
 
     @property
     def metrics(self):
         return _NativeBatch.metrics
 
     def close(self) -> int:
+        self.close_count += 1
         return 0
 
 
@@ -101,17 +142,22 @@ class _NativeReader:
         self.image_count = 12
         self.initialization_stats = {"manifest_load_ms": 1.0}
         self.calls: list[tuple[str, list[int], str, object]] = []
+        self.pipelines: list[_NativePipeline] = []
 
     def plan(self, image_ids, profile_id, *, transforms):
         self.calls.append(("plan", image_ids, profile_id, transforms))
         return {"layout": "transformed_dct_grid", "image_count": len(image_ids)}
 
     def pipeline(self, profile_id, *, dct_coeffs="all"):
-        return _NativePipeline(self, profile_id, dct_coeffs)
+        pipeline = _NativePipeline(self, profile_id, dct_coeffs)
+        self.pipelines.append(pipeline)
+        return pipeline
 
     def read(self, image_ids, profile_id, *, dct_coeffs="all", transforms):
         self.calls.append(("read", image_ids, profile_id, dct_coeffs, transforms))
-        return _NativeBatch()
+        return _NativeBatch(
+            image_ids, dct_coeffs=dct_coeffs, transforms=transforms
+        )
 
     def image_metadata(self, image_id):
         return {"image_id": image_id}
@@ -168,8 +214,15 @@ class PublicDirectDctApiTest(unittest.TestCase):
         self.assertEqual(pipeline_stats(pipeline)["planning_ms"], 0.3)
         self.assertEqual(pipeline_stats(pipeline)["prefetched_batch_count"], 1)
         batch = next(pipeline)
-        self.assertEqual(batch.tensors, ("y", "cbcr"))
+        self.assertEqual(
+            batch.tensors,
+            (
+                _FakeTensor(("y", 4, 7), (2, 1)),
+                _FakeTensor(("cbcr", 4, 7), (2, 2)),
+            ),
+        )
         self.assertEqual(batch.global_image_ids, [4, 7])
+        self.assertEqual(batch.sample_ids, batch.global_image_ids)
         self.assertEqual(batch.profile_id, VALIDATION.id)
         self.assertTrue(batch.metrics.complete)
         self.assertEqual(batch.metrics.physical_bytes, 110)
@@ -216,6 +269,129 @@ class PublicDirectDctApiTest(unittest.TestCase):
         self.assertEqual(reader._native.calls[1][3], "first:16")
         self.assertEqual(reader._native.calls[2][3], "all")
         self.assertEqual(reader._native.calls[3][3], "list:5,0,2")
+
+    def test_pythonic_coefficients_normalize_to_legacy_binding_contract(self) -> None:
+        reader = DirectDctReader("manifest.bin", native_module=_native_module())
+
+        legacy_all = reader.read([4, 7], VALIDATION, dct_coeffs="all")
+        pythonic_all = reader.read([4, 7], VALIDATION, coefficients=None)
+        legacy_prefix = reader.read(
+            [4, 7], VALIDATION, dct_coeffs="first:32"
+        )
+        pythonic_prefix = reader.read(
+            [4, 7], VALIDATION, coefficients=range(32)
+        )
+        legacy_ordered = reader.read(
+            [4, 7], VALIDATION, dct_coeffs="list:5,0,2"
+        )
+        pythonic_ordered = reader.read(
+            [4, 7], VALIDATION, coefficients=[5, 0, 2]
+        )
+
+        self.assertEqual(legacy_all.coefficients, pythonic_all.coefficients)
+        self.assertEqual(legacy_prefix.coefficients, pythonic_prefix.coefficients)
+        self.assertEqual(legacy_ordered.coefficients, pythonic_ordered.coefficients)
+        self.assertEqual(
+            reader._native.calls[-1][3],
+            "list:5,0,2",
+            "explicit coefficient order must reach the binding unchanged",
+        )
+
+    def test_pythonic_coefficients_reject_invalid_and_conflicting_inputs(self) -> None:
+        reader = DirectDctReader("manifest.bin", native_module=_native_module())
+
+        for coefficients in ([], [64], [-1], [1, 1], range(65)):
+            with self.subTest(coefficients=coefficients):
+                with self.assertRaises(ValueError):
+                    reader.read(
+                        [4, 7], VALIDATION, coefficients=coefficients
+                    )
+
+        with self.assertRaisesRegex(TypeError, "mutually exclusive"):
+            reader.read(
+                [4, 7],
+                VALIDATION,
+                coefficients=range(32),
+                dct_coeffs="first:32",
+            )
+        with self.assertRaisesRegex(TypeError, "mutually exclusive"):
+            reader.pipeline(
+                VALIDATION,
+                coefficients=range(32),
+                dct_coeffs="first:32",
+            )
+
+    def test_iter_batches_is_thin_pipeline_wrapper_and_closes(self) -> None:
+        logical_batches = [[4, 7], [8, 9]]
+        transforms = [
+            [{"global_image_id": 4}, {"global_image_id": 7}],
+            [{"global_image_id": 8}, {"global_image_id": 9}],
+        ]
+
+        old_reader = DirectDctReader(
+            "manifest.bin", native_module=_native_module()
+        )
+        with old_reader.pipeline(
+            VALIDATION, dct_coeffs="first:32"
+        ) as pipeline:
+            pipeline.start(logical_batches, transforms_by_batch=transforms)
+            old_batches = list(pipeline)
+
+        new_reader = DirectDctReader(
+            "manifest.bin", native_module=_native_module()
+        )
+        new_batches = list(
+            new_reader.iter_batches(
+                logical_batches,
+                profile=VALIDATION,
+                coefficients=range(32),
+                transforms_by_batch=transforms,
+            )
+        )
+
+        self.assertEqual(len(old_batches), len(new_batches))
+        for old_batch, new_batch in zip(old_batches, new_batches, strict=True):
+            self.assertEqual(old_batch.sample_ids, new_batch.sample_ids)
+            self.assertEqual(old_batch.y, new_batch.y)
+            self.assertEqual(old_batch.cbcr, new_batch.cbcr)
+            self.assertEqual(old_batch.y.shape, new_batch.y.shape)
+            self.assertEqual(old_batch.cbcr.shape, new_batch.cbcr.shape)
+            self.assertEqual(old_batch.y.dtype, new_batch.y.dtype)
+            self.assertEqual(old_batch.cbcr.dtype, new_batch.cbcr.dtype)
+            self.assertEqual(old_batch.y.stride(), new_batch.y.stride())
+            self.assertEqual(old_batch.cbcr.stride(), new_batch.cbcr.stride())
+            self.assertEqual(old_batch.coefficients, new_batch.coefficients)
+            self.assertEqual(old_batch.layout, new_batch.layout)
+            self.assertEqual(
+                old_batch.transform_descriptors,
+                new_batch.transform_descriptors,
+            )
+        self.assertEqual(old_reader._native.calls, new_reader._native.calls)
+        self.assertEqual(new_reader._native.pipelines[0].close_count, 1)
+
+        early_reader = DirectDctReader(
+            "manifest.bin", native_module=_native_module()
+        )
+        with early_reader.iter_batches(
+            logical_batches,
+            profile=VALIDATION,
+            coefficients=range(32),
+        ) as batches:
+            next(batches)
+        self.assertEqual(early_reader._native.pipelines[0].close_count, 1)
+
+        error_reader = DirectDctReader(
+            "manifest.bin", native_module=_native_module()
+        )
+        with self.assertRaisesRegex(RuntimeError, "consumer failed"):
+            with error_reader.iter_batches(
+                (batch for batch in logical_batches),
+                profile=VALIDATION,
+                coefficients=range(32),
+            ) as batches:
+                next(batches)
+                raise RuntimeError("consumer failed")
+        self.assertEqual(error_reader._native.pipelines[0].close_count, 1)
 
     def test_old_binding_schema_is_rejected(self) -> None:
         module = SimpleNamespace(DirectDctReader=_NativeReader)
