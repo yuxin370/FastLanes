@@ -19,8 +19,13 @@ target_include_directories(galp_compact_format_tests PRIVATE
 apply_warnings(galp_compact_format_tests)
 gtest_discover_tests(galp_compact_format_tests
         DISCOVERY_TIMEOUT 60
-        PROPERTIES LABELS "galp;compact-v3;cpu")
+	PROPERTIES LABELS "galp-cpu")
 if (Python3_Interpreter_FOUND)
+	add_test(
+		NAME GalpPublicDirectDctApiPython
+		COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_SOURCE_DIR}
+		        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_public_direct_dct_api.py)
+	set_tests_properties(GalpPublicDirectDctApiPython PROPERTIES LABELS "galp;direct-dct;cpu")
         add_test(
                 NAME GalpCompactV3AcceptancePython
                 COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_compact_v3_acceptance.py)
@@ -53,7 +58,7 @@ if (GALP_WITH_JPEG_DCT)
 	apply_warnings(galp_direct_dct_contract_tests)
 	gtest_discover_tests(galp_direct_dct_contract_tests
 			DISCOVERY_TIMEOUT 60
-			PROPERTIES LABELS "galp;direct-dct;contract;cpu;shadow")
+			PROPERTIES LABELS "galp-cpu")
 
 	add_executable(galp_native_logical_batch_pipeline_tests
 			direct_dct_metrics_test.cpp
@@ -66,7 +71,7 @@ if (GALP_WITH_JPEG_DCT)
 	apply_warnings(galp_native_logical_batch_pipeline_tests)
 	gtest_discover_tests(galp_native_logical_batch_pipeline_tests
 			DISCOVERY_TIMEOUT 60
-			PROPERTIES LABELS "galp;direct-dct;pipeline;cpu;shadow")
+			PROPERTIES LABELS "galp-cpu")
 
         add_executable(galp_jpeg_dct_decode_memory_tests
                 jpeg_dct_decode_memory_test.cpp)
@@ -78,7 +83,7 @@ if (GALP_WITH_JPEG_DCT)
         apply_warnings(galp_jpeg_dct_decode_memory_tests)
         gtest_discover_tests(galp_jpeg_dct_decode_memory_tests
                 DISCOVERY_TIMEOUT 60
-                PROPERTIES LABELS "galp;jpeg-dct;memory;cpu")
+                PROPERTIES LABELS "galp-cpu")
 
         add_executable(galp_jpeg_dct_exact_verifier_tests
                 jpeg_dct_exact_verifier_test.cpp)
@@ -91,7 +96,7 @@ if (GALP_WITH_JPEG_DCT)
         apply_warnings(galp_jpeg_dct_exact_verifier_tests)
         gtest_discover_tests(galp_jpeg_dct_exact_verifier_tests
                 DISCOVERY_TIMEOUT 60
-                PROPERTIES LABELS "galp;jpeg-dct;exact-verifier;cpu")
+                PROPERTIES LABELS "galp-cpu")
 
         add_executable(galp_block_major_access_tests
                 jpeg_dct_block_major_access_test.cpp)
@@ -104,7 +109,7 @@ if (GALP_WITH_JPEG_DCT)
         apply_warnings(galp_block_major_access_tests)
         gtest_discover_tests(galp_block_major_access_tests
                 DISCOVERY_TIMEOUT 60
-                PROPERTIES LABELS "galp;jpeg-dct;block-major-access;cpu")
+                PROPERTIES LABELS "galp-cpu")
 
 		add_executable(galp_direct_dct_pls_tests
 		        direct_dct_pls_test.cpp)
@@ -116,7 +121,7 @@ if (GALP_WITH_JPEG_DCT)
 		apply_warnings(galp_direct_dct_pls_tests)
 		gtest_discover_tests(galp_direct_dct_pls_tests
 		        DISCOVERY_TIMEOUT 60
-		        PROPERTIES LABELS "galp;jpeg-dct;pls;cpu")
+		        PROPERTIES LABELS "galp-cpu")
 
         target_sources(galp_tests PRIVATE
                 jpeg_dct_order_test.cpp
@@ -255,7 +260,12 @@ gtest_discover_tests(galp_tests
         PROPERTIES LABELS "galp-workset-cpu"
 )
 gtest_discover_tests(galp_tests
-		TEST_FILTER "ThrustMemcpy.*:ThrustCore.*:DeviceUtils.*:DeltaUnsumer.*:DeltaDecode.*:JpegDct.*:JpegDctMixedExpressions.*:JpegDctOrder.*"
+	TEST_FILTER "CompactSegment.*:GPUArray.*"
+	DISCOVERY_TIMEOUT 60
+	PROPERTIES LABELS "galp-cpu"
+)
+gtest_discover_tests(galp_tests
+		TEST_FILTER "ThrustMemcpy.*:ThrustCore.*:DeviceUtils.*:DevicePool.*:DeltaUnsumer.*:DeltaDecode.*:JpegDct.*:JpegDctMixedExpressions.*:JpegDctOrder.*"
         DISCOVERY_TIMEOUT 60
         PROPERTIES LABELS "galp-gpu-cuda"
 )

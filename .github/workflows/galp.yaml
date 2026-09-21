@@ -54,12 +54,25 @@ jobs:
           cmake --build build --parallel
           --target
           galp_core
+          galp_tests
+          galp_compact_format_tests
+          galp_direct_dct_contract_tests
+          galp_native_logical_batch_pipeline_tests
+          galp_jpeg_dct_decode_memory_tests
+          galp_jpeg_dct_exact_verifier_tests
+          galp_block_major_access_tests
+          galp_direct_dct_pls_tests
           galp_public_api_smoke
           galp_api_boundary_checks
           galp_cli
 
       - name: Public API tests
         run: ctest --test-dir build -L public-api --output-on-failure
+
+      - name: CPU and static tests
+        run: |
+          ctest --test-dir build -N -L 'cpu|static' | grep -Fx 'Total Tests: 95'
+          ctest --test-dir build -L 'cpu|static' --output-on-failure
 
       - name: Package consumer smoke
         run: ctest --test-dir build -R GalpPackageConsumerSmoke --output-on-failure
@@ -130,12 +143,30 @@ jobs:
           --target
           galp_core
           galp_tests
+          galp_compact_format_tests
+          galp_direct_dct_contract_tests
+          galp_native_logical_batch_pipeline_tests
+          galp_jpeg_dct_decode_memory_tests
+          galp_jpeg_dct_exact_verifier_tests
+          galp_block_major_access_tests
+          galp_direct_dct_pls_tests
           galp_public_api_smoke
           galp_api_boundary_checks
           galp_cli
 
       - name: Public API tests
         run: ctest --test-dir build -L public-api --output-on-failure
+
+      - name: CPU and static tests
+        run: |
+          ctest --test-dir build -N -L 'cpu|static' | grep -Fx 'Total Tests: 95'
+          ctest --test-dir build -L 'cpu|static' --output-on-failure
+
+      - name: Verify CUDA tests can run
+        run: |
+          result=$(build/galp/tests/galp_tests --gtest_filter=DevicePool.GPUArrayReleasesFailedCopy)
+          echo "$result"
+          grep -Fq '[  PASSED  ] 1 test.' <<< "$result"
 
       - name: GPU tests
         run: ctest --test-dir build -L gpu --output-on-failure
