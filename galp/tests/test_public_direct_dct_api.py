@@ -321,6 +321,23 @@ class PublicDirectDctApiTest(unittest.TestCase):
                 dct_coeffs="first:32",
             )
 
+    def test_image_ids_reject_implicit_conversion_and_out_of_range(self) -> None:
+        reader = DirectDctReader("manifest.bin", native_module=_native_module())
+
+        for image_id in (True, 1.9, "3"):
+            with self.subTest(image_id=image_id):
+                with self.assertRaisesRegex(TypeError, "image ids must be integers"):
+                    reader.read([image_id], VALIDATION)
+                with self.assertRaisesRegex(TypeError, "image ids must be integers"):
+                    reader.pipeline(VALIDATION).start([[image_id]])
+
+        for image_id in (-1, reader.image_count, 1 << 32):
+            with self.subTest(image_id=image_id):
+                with self.assertRaisesRegex(ValueError, "out of range"):
+                    reader.read([image_id], VALIDATION)
+                with self.assertRaisesRegex(ValueError, "out of range"):
+                    reader.pipeline(VALIDATION).start([[image_id]])
+
     def test_iter_batches_is_thin_pipeline_wrapper_and_closes(self) -> None:
         logical_batches = [[4, 7], [8, 9]]
         transforms = [

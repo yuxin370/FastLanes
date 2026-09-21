@@ -36,7 +36,8 @@ ResolvedExecutionPolicy compact_policy(const std::string_view source_profile_id)
 } // namespace
 
 ResolvedExecutionPolicy resolve_execution_policy(const std::string_view semantic_profile_id) {
-	if (semantic_profile_id == SemanticProfileRegistry::kProfileIds[0]) {
+	if (semantic_profile_id == SemanticProfileRegistry::kProfileIds[0] ||
+	    semantic_profile_id == SemanticProfileRegistry::kProfileIds[2]) {
 		return compact_policy(semantic_profile_id);
 	}
 	if (semantic_profile_id == SemanticProfileRegistry::kProfileIds[1]) {
@@ -67,7 +68,7 @@ ResolvedExecutionPolicy resolve_execution_policy(const std::string_view semantic
 		    0U,
 		};
 	}
-	if (semantic_profile_id == SemanticProfileRegistry::kProfileIds[2]) {
+	if (semantic_profile_id == SemanticProfileRegistry::kProfileIds[3]) {
 		auto compact = compact_policy(semantic_profile_id);
 		return ResolvedExecutionPolicy {
 		    compact.source_profile_id,

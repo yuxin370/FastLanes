@@ -91,6 +91,21 @@ def _normalize_coefficients(
     return "list:" + ",".join(str(value) for value in values)
 
 
+def _normalize_image_ids(image_ids: Iterable[int], image_count: int) -> list[int]:
+    values: list[int] = []
+    for raw_value in image_ids:
+        if isinstance(raw_value, bool):
+            raise TypeError("image ids must be integers")
+        try:
+            value = operator.index(raw_value)
+        except TypeError as error:
+            raise TypeError("image ids must be integers") from error
+        if not 0 <= value < image_count or value >= 1 << 32:
+            raise ValueError(f"image id {value} is out of range")
+        values.append(value)
+    return values
+
+
 def _load_native_module(module_path: Path | None) -> ModuleType:
     if module_path is not None:
         resolved = str(module_path.resolve())
@@ -241,21 +256,27 @@ class DirectDctBatch:
 
 
 class DirectDctPipeline:
-    """Native-owned bounded iterator for one semantic Direct-DCT profile."""
+    """Native-owned bounded iterator for a finite Direct-DCT batch schedule."""
 
-    __slots__ = ("_native", "profile_id")
+    __slots__ = ("_native", "_image_count", "profile_id")
 
-    def __init__(self, native_pipeline: Any, profile_id: str) -> None:
+    def __init__(self, native_pipeline: Any, profile_id: str, image_count: int) -> None:
         self._native = native_pipeline
+        self._image_count = image_count
         self.profile_id = profile_id
 
     def start(
         self,
-        image_id_batches: Sequence[Sequence[int]],
+        image_id_batches: Iterable[Sequence[int]],
         *,
         transforms_by_batch: Sequence[Sequence[Mapping[str, Any]] | None] | None = None,
     ) -> "DirectDctPipeline":
-        batches = [[int(value) for value in batch] for batch in image_id_batches]
+        """Consume the complete finite schedule before the first batch is returned."""
+
+        batches = [
+            _normalize_image_ids(batch, self._image_count)
+            for batch in image_id_batches
+        ]
         if any(not batch for batch in batches):
             raise ValueError("Direct-DCT batches must not be empty")
         native_transforms: list[list[dict[str, Any]] | None] | None = None
@@ -421,6 +442,7 @@ class DirectDctReader:
                 profile_id, dct_coeffs=canonical_coefficients
             ),
             profile_id,
+            self.image_count,
         )
 
     def read(
@@ -449,7 +471,7 @@ class DirectDctReader:
             None if transforms is None else [dict(value) for value in transforms]
         )
         native_batch = self._native.read(
-            [int(value) for value in image_ids],
+            _normalize_image_ids(image_ids, self.image_count),
             profile_id,
             dct_coeffs=canonical_coefficients,
             transforms=native_transforms,
@@ -468,8 +490,9 @@ class DirectDctReader:
         transforms_by_batch: Sequence[Sequence[Mapping[str, Any]] | None]
         | None = None,
     ) -> Iterator[DirectDctBatch]:
-        """Iterate batches using exactly ``pipeline()`` + ``start()``.
+        """Iterate a finite schedule using exactly ``pipeline()`` + ``start()``.
 
+        The input is fully consumed before the first batch is returned.
         The returned iterator also supports ``with`` and ``close`` for
         deterministic early-exit cleanup. It introduces no producer, queue,
         submission protocol, or execution path of its own.

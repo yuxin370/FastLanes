@@ -19,9 +19,10 @@ public:
 		jpeg::JpegDctCoefficientSelection             coefficient_selection;
 	};
 
-	inline static constexpr std::array<std::string_view, 3> kProfileIds = {
+	inline static constexpr std::array<std::string_view, 4> kProfileIds = {
 	    "rgbnomore-validation-v1",
 	    "rgbnomore-validation-center-crop-512-v1",
+	    "rgbnomore-swinv2-validation-v1",
 	    "rgbnomore-training-pls-v1",
 	};
 
