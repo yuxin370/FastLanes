@@ -7,6 +7,7 @@
 #include "cuda/launch/launch.cuh"
 #include "cuda/memory/cuda_raii.cuh"
 #include "cuda/memory/device_pool.cuh"
+#include "cuda/memory/gpu_array.cuh"
 #include "cuda/memory/pinned_host_pool.cuh"
 #include "engine/materialization/metadata.cuh"
 #include "engine/materialization/pinned_d2h.cuh"
@@ -19,14 +20,15 @@
 #include "engine/workset/upload.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
-#include "fls/io/file.hpp"
 #include "fls/expression/rpn.hpp"
+#include "fls/io/file.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/table/memory_table.hpp"
 #include "fls/table/rowgroup.hpp"
 #include "format/compact_descriptor_v3.hpp"
 #include "format/compact_read_plan.hpp"
 #include "format/reader.cuh"
+#include "format/rowgroup_io.cuh"
 #include "galp/galp.hpp"
 #include <algorithm>
 #include <array>
@@ -52,6 +54,67 @@
 namespace {
 
 bool cuda_available_for_reader_tests();
+
+TEST(CompactSegment, RangeIsCheckedBeforeIndexing) {
+	galp::format::CompactV3DirectRowgroup rowgroup;
+	galp::format::CompactV3DirectColumn   direct_column;
+	galp::format::ZeroCopyColumn          column;
+	column.compact_rowgroup = &rowgroup;
+	column.compact_column   = &direct_column;
+
+	direct_column.segment_count = 1;
+	EXPECT_THROW(galp::format::zero_copy_segment(column, 0), std::out_of_range);
+
+	rowgroup.segments.resize(4);
+	direct_column.segment_begin = 4;
+	EXPECT_THROW(galp::format::zero_copy_segment(column, 0), std::out_of_range);
+	direct_column.segment_begin = 5;
+	EXPECT_THROW(galp::format::zero_copy_segment(column, 0), std::out_of_range);
+	direct_column.segment_begin = 3;
+	direct_column.segment_count = 2;
+	EXPECT_THROW(galp::format::zero_copy_segment(column, 0), std::out_of_range);
+	direct_column.segment_count = 1;
+	EXPECT_NO_THROW(galp::format::zero_copy_segment(column, 0));
+	EXPECT_THROW(galp::format::zero_copy_segment(column, 1), std::out_of_range);
+}
+
+TEST(DevicePool, CachedAllocationsStayOnTheirDevice) {
+	int device_count = 0;
+	if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+		GTEST_SKIP() << "Two CUDA devices are required for the cache ownership test.";
+	}
+	int original_device = 0;
+	ASSERT_EQ(cudaGetDevice(&original_device), cudaSuccess);
+	galp::memory::device_release_cached();
+
+	ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+	void* first = galp::memory::device_malloc(1024);
+	galp::memory::device_free(first);
+	EXPECT_GE(galp::memory::device_pool_stats().cached_bytes, 1024U);
+	ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+	void*                 second = galp::memory::device_malloc(1024);
+	cudaPointerAttributes attributes {};
+	EXPECT_EQ(cudaPointerGetAttributes(&attributes, second), cudaSuccess);
+	EXPECT_EQ(attributes.device, 1);
+	ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+	galp::memory::device_free(second);
+	galp::memory::device_release_cached();
+	EXPECT_EQ(cudaSetDevice(original_device), cudaSuccess);
+}
+
+TEST(GPUArray, RejectsOverflow) {
+	EXPECT_THROW((GPUArray<uint64_t>(std::numeric_limits<size_t>::max())), std::overflow_error);
+	EXPECT_THROW((GPUArray<uint64_t>(1, std::numeric_limits<size_t>::max(), nullptr)), std::overflow_error);
+}
+
+TEST(DevicePool, GPUArrayReleasesFailedCopy) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for failed-copy cleanup test.";
+	}
+	const size_t before = galp::memory::device_pool_stats().in_use_bytes;
+	EXPECT_THROW((GPUArray<uint8_t>(1, static_cast<const uint8_t*>(nullptr))), galp::memory::CudaError);
+	EXPECT_EQ(galp::memory::device_pool_stats().in_use_bytes, before);
+}
 
 TEST(PinnedHostPool, ReusesBestFitAndBoundsReleasedMemory) {
 	if (!cuda_available_for_reader_tests()) {

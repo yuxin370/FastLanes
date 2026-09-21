@@ -54,12 +54,13 @@ fastlanes::SegmentView zero_copy_segment(const ZeroCopyColumn& col, const uint32
 	}
 	if (col.compact_rowgroup != nullptr && col.compact_column != nullptr) {
 		const auto& direct_column = *col.compact_column;
-		if (segment_idx >= direct_column.segment_count ||
-		    direct_column.segment_begin > col.compact_rowgroup->segments.size() ||
-		    segment_idx > col.compact_rowgroup->segments.size() - direct_column.segment_begin - 1U) {
+		const size_t total         = col.compact_rowgroup->segments.size();
+		const size_t begin         = direct_column.segment_begin;
+		const size_t count         = direct_column.segment_count;
+		if (begin > total || count > total - begin || segment_idx >= count) {
 			throw std::out_of_range("compact zero-copy segment index out of range");
 		}
-		const auto& segment = col.compact_rowgroup->segments[direct_column.segment_begin + segment_idx];
+		const auto& segment = col.compact_rowgroup->segments[begin + segment_idx];
 		if (segment.entrypoint_offset > col.column_span.size() || segment.entrypoint_size >
 		        col.column_span.size() - static_cast<size_t>(segment.entrypoint_offset) ||
 		    segment.data_offset > col.column_span.size() ||

@@ -7,12 +7,12 @@
 #define GALP_MEMORY_TRANSFER_TRACKER_CUH
 
 #include "cuda/cuda_macros.cuh"
-
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <functional>
+#include <map>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace galp::memory {
@@ -29,11 +29,7 @@ public:
 	// caller has already issued its own cudaMemcpyAsync (e.g. DeviceArena's
 	// aggregate DMA) and just needs `sync_*` to drain it.
 	void register_external(cudaStream_t stream) {
-		cudaEvent_t event {};
-		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-		CUDA_SAFE_CALL(cudaEventRecord(event, stream));
-		std::lock_guard<std::mutex> lock(mutex_);
-		pending_[key(stream)].push_back(PendingEntry {event, nullptr});
+		register_event(stream, nullptr);
 	}
 
 	// Record an event on `stream` and remember `pinned_to_release`. When the
@@ -41,17 +37,13 @@ public:
 	// pointer. `pinned_to_release` may be null — the entry is still tracked so
 	// sync has a synchronisation point.
 	void register_transfer(cudaStream_t stream, void* pinned_to_release) {
-		cudaEvent_t event {};
-		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-		CUDA_SAFE_CALL(cudaEventRecord(event, stream));
-		std::lock_guard<std::mutex> lock(mutex_);
-		pending_[key(stream)].push_back(PendingEntry {event, pinned_to_release});
+		register_event(stream, pinned_to_release);
 	}
 
 	// Block until every tracked stream is idle, then destroy pending events and
 	// invoke the release callback on every pinned pointer we held.
 	void sync_all(const ReleasePinnedFn& release_pinned) {
-		std::unordered_map<StreamKey, std::vector<PendingEntry>> drained;
+		std::map<StreamKey, std::vector<PendingEntry>> drained;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			drained.swap(pending_);
@@ -59,12 +51,12 @@ public:
 
 		for (const auto& [stream_id, entries] : drained) {
 			(void)entries;
+			ScopedDevice device(stream_id.first);
 			CUDA_SAFE_CALL(cudaStreamSynchronize(stream_from_key(stream_id)));
 		}
 
 		for (auto& [stream_id, entries] : drained) {
-			(void)stream_id;
-			drain_entries(entries, release_pinned);
+			drain_entries(stream_id.first, entries, release_pinned);
 		}
 	}
 
@@ -72,46 +64,49 @@ public:
 	// destroys the stream handle so stale keys cannot be reused if CUDA
 	// recycles the handle.
 	void sync_stream(cudaStream_t stream, const ReleasePinnedFn& release_pinned) {
+		const auto stream_id = key(stream);
 		CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
 
 		std::vector<PendingEntry> entries;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
-			auto it = pending_.find(key(stream));
+			auto                        it = pending_.find(stream_id);
 			if (it == pending_.end()) {
 				return;
 			}
 			entries = std::move(it->second);
 			pending_.erase(it);
 		}
-		drain_entries(entries, release_pinned);
+		drain_entries(stream_id.first, entries, release_pinned);
 	}
 
 	// Drop a stream's tracked entries without synchronizing the stream. Callers
 	// must only use this after a later dependency has proven that every tracked
 	// event on this stream has completed.
 	void complete_stream(cudaStream_t stream, const ReleasePinnedFn& release_pinned) {
+		const auto                stream_id = key(stream);
 		std::vector<PendingEntry> entries;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
-			auto it = pending_.find(key(stream));
+			auto                        it = pending_.find(stream_id);
 			if (it == pending_.end()) {
 				return;
 			}
 			entries = std::move(it->second);
 			pending_.erase(it);
 		}
-		drain_entries(entries, release_pinned);
+		drain_entries(stream_id.first, entries, release_pinned);
 	}
 
 	// Non-blocking sweep: for entries whose event has completed, invoke the
 	// release callback and drop them from tracking. Used by the pool's idle
 	// check so a reconfiguration doesn't reject on stale-but-done entries.
 	void reclaim_finished(const ReleasePinnedFn& release_pinned) {
-		std::vector<PendingEntry> finished;
+		std::map<int, std::vector<PendingEntry>> finished;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			for (auto it = pending_.begin(); it != pending_.end();) {
+				ScopedDevice device(it->first.first);
 				auto& entries = it->second;
 				for (auto entry_it = entries.begin(); entry_it != entries.end();) {
 					if (entry_it->event == nullptr) {
@@ -120,7 +115,7 @@ public:
 					}
 					auto status = cudaEventQuery(entry_it->event);
 					if (status == cudaSuccess) {
-						finished.push_back(*entry_it);
+						finished[it->first.first].push_back(*entry_it);
 						entry_it = entries.erase(entry_it);
 					} else if (status == cudaErrorNotReady) {
 						++entry_it;
@@ -135,7 +130,9 @@ public:
 				}
 			}
 		}
-		drain_entries(finished, release_pinned);
+		for (auto& [device, entries] : finished) {
+			drain_entries(device, entries, release_pinned);
+		}
 	}
 
 	bool empty() {
@@ -144,7 +141,30 @@ public:
 	}
 
 private:
-	using StreamKey = uintptr_t;
+	using StreamKey = std::pair<int, uintptr_t>;
+
+	class ScopedDevice {
+	public:
+		explicit ScopedDevice(int device) {
+			CUDA_SAFE_CALL(cudaGetDevice(&previous_));
+			if (previous_ != device) {
+				CUDA_SAFE_CALL(cudaSetDevice(device));
+				restore_ = true;
+			}
+		}
+		~ScopedDevice() {
+			if (restore_) {
+				CUDA_LOG_CALL(cudaSetDevice(previous_));
+			}
+		}
+
+		ScopedDevice(const ScopedDevice&)            = delete;
+		ScopedDevice& operator=(const ScopedDevice&) = delete;
+
+	private:
+		int  previous_ = -1;
+		bool restore_  = false;
+	};
 
 	struct PendingEntry {
 		cudaEvent_t event  = nullptr;
@@ -152,13 +172,31 @@ private:
 	};
 
 	static StreamKey key(cudaStream_t s) {
-		return reinterpret_cast<StreamKey>(s);
+		int device = 0;
+		CUDA_SAFE_CALL(cudaGetDevice(&device));
+		return {device, reinterpret_cast<uintptr_t>(s)};
 	}
 	static cudaStream_t stream_from_key(StreamKey k) {
-		return reinterpret_cast<cudaStream_t>(k);
+		return reinterpret_cast<cudaStream_t>(k.second);
 	}
 
-	static void drain_entries(std::vector<PendingEntry>& entries, const ReleasePinnedFn& release_pinned) {
+	void register_event(cudaStream_t stream, void* pinned) {
+		const auto  stream_id = key(stream);
+		cudaEvent_t event {};
+		CUDA_SAFE_CALL(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+		try {
+			CUDA_SAFE_CALL(cudaEventRecord(event, stream));
+			std::lock_guard<std::mutex> lock(mutex_);
+			pending_[stream_id].push_back(PendingEntry {event, pinned});
+		} catch (...) {
+			CUDA_LOG_CALL(cudaEventDestroy(event));
+			throw;
+		}
+	}
+
+	static void
+	drain_entries(int device_id, std::vector<PendingEntry>& entries, const ReleasePinnedFn& release_pinned) {
+		ScopedDevice device(device_id);
 		for (auto& entry : entries) {
 			if (entry.event != nullptr) {
 				CUDA_SAFE_CALL(cudaEventDestroy(entry.event));
@@ -170,8 +208,8 @@ private:
 		}
 	}
 
-	std::mutex                                               mutex_;
-	std::unordered_map<StreamKey, std::vector<PendingEntry>> pending_;
+	std::mutex                                     mutex_;
+	std::map<StreamKey, std::vector<PendingEntry>> pending_;
 };
 
 } // namespace galp::memory

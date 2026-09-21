@@ -30,6 +30,7 @@ struct DeviceAllocInfo {
 	bool         async_alloc  = false;
 	cudaStream_t alloc_stream = nullptr;
 	bool         sub_alloc    = false; // true for arena sub-pointers (no-op on free)
+	int          device       = -1;
 };
 
 struct DevicePoolStats {
@@ -56,15 +57,17 @@ public:
 		if (bytes == 0) {
 			return nullptr;
 		}
+		int device = 0;
+		CUDA_SAFE_CALL(cudaGetDevice(&device));
 		bool use_async = false;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			use_async = use_async_ && stream != nullptr;
 			if (enabled_ && !use_async) {
 				size_t actual_size = 0;
-				void*  cached_ptr  = take_cached_block_locked(bytes, actual_size);
+				void*  cached_ptr  = take_cached_block_locked(bytes, device, actual_size);
 				if (cached_ptr != nullptr) {
-					in_use_[cached_ptr] = DeviceAllocInfo {actual_size, false, nullptr};
+					in_use_[cached_ptr] = DeviceAllocInfo {actual_size, false, nullptr, false, device};
 					record_in_use_allocation_locked(actual_size, /*cuda_allocation=*/false);
 					return cached_ptr;
 				}
@@ -98,7 +101,7 @@ public:
 		}
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
-			in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? stream : nullptr};
+			in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? stream : nullptr, false, device};
 			record_in_use_allocation_locked(bytes, /*cuda_allocation=*/true);
 		}
 		return ptr;
@@ -131,7 +134,7 @@ public:
 				return;
 			}
 		}
-		in_use_[ptr] = DeviceAllocInfo {0, false, nullptr, true};
+		in_use_[ptr] = DeviceAllocInfo {0, false, nullptr, true, -1};
 	}
 
 	// free() calls cudaFree if ptr is not tracked.
@@ -179,11 +182,18 @@ public:
 		if (use_pinned_staging) {
 			pinned = pinned_pool_.alloc(bytes);
 			std::memcpy(pinned, src, bytes);
-			CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned, bytes, cudaMemcpyHostToDevice, stream));
-		} else {
-			CUDA_SAFE_CALL(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
 		}
-		tracker_.register_transfer(stream, pinned);
+		try {
+			CUDA_SAFE_CALL(
+			    cudaMemcpyAsync(dst, pinned != nullptr ? pinned : src, bytes, cudaMemcpyHostToDevice, stream));
+			tracker_.register_transfer(stream, pinned);
+		} catch (...) {
+			CUDA_LOG_CALL(cudaStreamSynchronize(stream));
+			if (pinned != nullptr) {
+				pinned_pool_.release(pinned);
+			}
+			throw;
+		}
 	}
 
 	// Issue an async upload from storage whose pinned lifetime is owned by the
@@ -217,7 +227,7 @@ public:
 	void release_cached() {
 		sync_h2d();
 
-		std::map<size_t, std::vector<void*>> sync_free;
+		std::map<size_t, std::vector<CachedBlock>> sync_free;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			sync_free.swap(free_sync_by_size_);
@@ -226,8 +236,8 @@ public:
 
 		for (auto& [size, list] : sync_free) {
 			(void)size;
-			for (void* ptr : list) {
-				CUDA_SAFE_CALL(cudaFree(ptr));
+			for (const CachedBlock& block : list) {
+				free_cached_block(block);
 			}
 		}
 		pinned_pool_.release_cached();
@@ -292,14 +302,16 @@ public:
 		for (auto& [ptr, info] : in_use_) {
 			if (info.sub_alloc)
 				continue; // interior arena pointer - no standalone cudaFree
+			static_cast<void>(cudaSetDevice(info.device));
 			cudaFree(ptr);
 		}
 		in_use_.clear();
 
 		for (auto& [size, list] : free_sync_by_size_) {
 			(void)size;
-			for (void* ptr : list) {
-				cudaFree(ptr);
+			for (const CachedBlock& block : list) {
+				static_cast<void>(cudaSetDevice(block.device));
+				cudaFree(block.ptr);
 			}
 		}
 		free_sync_by_size_.clear();
@@ -307,7 +319,31 @@ public:
 
 private:
 	struct CachedBlock {
-		void* ptr = nullptr;
+		void* ptr    = nullptr;
+		int   device = -1;
+	};
+
+	class ScopedDevice {
+	public:
+		explicit ScopedDevice(int device) {
+			CUDA_SAFE_CALL(cudaGetDevice(&previous_));
+			if (previous_ != device) {
+				CUDA_SAFE_CALL(cudaSetDevice(device));
+				restore_ = true;
+			}
+		}
+		~ScopedDevice() {
+			if (restore_) {
+				CUDA_LOG_CALL(cudaSetDevice(previous_));
+			}
+		}
+
+		ScopedDevice(const ScopedDevice&)            = delete;
+		ScopedDevice& operator=(const ScopedDevice&) = delete;
+
+	private:
+		int  previous_ = -1;
+		bool restore_  = false;
 	};
 
 	void record_in_use_allocation_locked(const size_t bytes, const bool cuda_allocation) {
@@ -321,6 +357,7 @@ private:
 	}
 
 	static void free_cached_block(const CachedBlock& block) {
+		ScopedDevice device(block.device);
 		CUDA_SAFE_CALL(cudaFree(block.ptr));
 	}
 
@@ -354,7 +391,7 @@ private:
 			std::vector<CachedBlock> evicted_cached;
 			if (info.size <= free_cache_limit_bytes_) {
 				evict_cached_until_room_locked(info.size, evicted_cached);
-				free_sync_by_size_[info.size].push_back(ptr);
+				free_sync_by_size_[info.size].push_back(CachedBlock {ptr, info.device});
 				free_cached_bytes_ += info.size;
 				lock.unlock();
 				for (const CachedBlock& evicted : evicted_cached) {
@@ -363,10 +400,12 @@ private:
 				return;
 			}
 			lock.unlock();
+			ScopedDevice device(info.device);
 			CUDA_SAFE_CALL(cudaFree(ptr));
 			return;
 		}
 		lock.unlock();
+		ScopedDevice device(info.device);
 		if (info.async_alloc) {
 			CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream));
 			return;
@@ -389,7 +428,7 @@ private:
 
 		auto  bucket_it = std::prev(free_sync_by_size_.end());
 		auto& list      = bucket_it->second;
-		evicted.push_back(CachedBlock {list.back()});
+		evicted.push_back(list.back());
 		list.pop_back();
 		free_cached_bytes_ -= bucket_it->first;
 		if (list.empty()) {
@@ -405,26 +444,26 @@ private:
 		return max_reuse_slack_bytes_ == 0 || cached_bytes - request_bytes <= max_reuse_slack_bytes_;
 	}
 
-	void* take_cached_block_locked(size_t request_bytes, size_t& actual_size) {
-		return take_cached_block_from_map_locked(free_sync_by_size_, request_bytes, actual_size);
-	}
-
-	void* take_cached_block_from_map_locked(std::map<size_t, std::vector<void*>>& buckets,
-	                                        size_t                                request_bytes,
-	                                        size_t&                               actual_size) {
-		auto it = buckets.lower_bound(request_bytes);
-		if (it == buckets.end() || !reusable_size(request_bytes, it->first)) {
-			return nullptr;
+	void* take_cached_block_locked(size_t request_bytes, int device, size_t& actual_size) {
+		auto it = free_sync_by_size_.lower_bound(request_bytes);
+		for (; it != free_sync_by_size_.end() && reusable_size(request_bytes, it->first); ++it) {
+			auto& list  = it->second;
+			auto  block = std::find_if(list.begin(), list.end(), [device](const CachedBlock& candidate) {
+				return candidate.device == device;
+			});
+			if (block == list.end()) {
+				continue;
+			}
+			void* ptr = block->ptr;
+			list.erase(block);
+			actual_size = it->first;
+			free_cached_bytes_ -= actual_size;
+			if (list.empty()) {
+				free_sync_by_size_.erase(it);
+			}
+			return ptr;
 		}
-		auto& list = it->second;
-		void* ptr  = list.back();
-		list.pop_back();
-		actual_size = it->first;
-		free_cached_bytes_ -= actual_size;
-		if (list.empty()) {
-			buckets.erase(it);
-		}
-		return ptr;
+		return nullptr;
 	}
 
 	// Caller must NOT hold mutex_ - the tracker's release callback delegates
@@ -482,7 +521,7 @@ private:
 	size_t     cuda_allocation_count_  = 0;
 	size_t     cuda_allocation_bytes_  = 0;
 
-	std::map<size_t, std::vector<void*>>       free_sync_by_size_;
+	std::map<size_t, std::vector<CachedBlock>> free_sync_by_size_;
 	std::unordered_map<void*, DeviceAllocInfo> in_use_;
 
 	PinnedHostPool  pinned_pool_;

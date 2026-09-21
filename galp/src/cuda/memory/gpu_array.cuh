@@ -8,9 +8,10 @@
 
 #include "cuda/cuda_macros.cuh"
 #include "cuda/memory/device_pool.cuh"
-
 #include <cstddef>
 #include <cuda_runtime.h>
+#include <limits>
+#include <stdexcept>
 
 template <typename T>
 void free_device_pointer(T*& device_ptr) {
@@ -23,9 +24,17 @@ void free_device_pointer(T*& device_ptr) {
 template <typename T>
 class GPUArray {
 private:
-	size_t allocation_size;
-	size_t memory_size;
+	size_t allocation_size = 0;
+	size_t memory_size     = 0;
 	T*     device_ptr = nullptr;
+
+	static size_t checked_bytes(size_t count, size_t buffer = 0) {
+		if (count > std::numeric_limits<size_t>::max() / sizeof(T) ||
+		    buffer > std::numeric_limits<size_t>::max() / sizeof(T) - count) {
+			throw std::overflow_error("GPUArray allocation size overflow");
+		}
+		return (count + buffer) * sizeof(T);
+	}
 
 	void allocate() {
 		device_ptr = reinterpret_cast<T*>(galp::memory::device_malloc(allocation_size));
@@ -34,15 +43,33 @@ private:
 		device_ptr = reinterpret_cast<T*>(galp::memory::device_malloc_on_stream(allocation_size, stream));
 	}
 
+	void copy_from_host(const T* host_p, cudaStream_t stream) {
+		try {
+			if (stream == nullptr) {
+				galp::memory::device_memcpy_h2d(device_ptr, host_p, memory_size);
+			} else {
+				galp::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
+			}
+		} catch (...) {
+			CUDA_LOG_CALL(cudaStreamSynchronize(stream));
+			try {
+				free_device_pointer(device_ptr);
+			} catch (const std::exception& error) {
+				std::fprintf(stderr, "GPUArray constructor cleanup: %s\n", error.what());
+			}
+			throw;
+		}
+	}
+
 public:
 	GPUArray(const size_t count) {
-		memory_size     = count * sizeof(T);
+		memory_size     = checked_bytes(count);
 		allocation_size = memory_size;
 		allocate();
 	}
 
 	GPUArray(const size_t count, cudaStream_t stream) {
-		memory_size     = count * sizeof(T);
+		memory_size     = checked_bytes(count);
 		allocation_size = memory_size;
 		if (stream != nullptr) {
 			allocate(stream);
@@ -52,31 +79,31 @@ public:
 	}
 
 	GPUArray(const size_t count, const T* host_p) {
-		memory_size     = count * sizeof(T);
+		memory_size     = checked_bytes(count);
 		allocation_size = memory_size;
 		allocate();
-		galp::memory::device_memcpy_h2d(device_ptr, host_p, memory_size);
+		copy_from_host(host_p, nullptr);
 	}
 
 	GPUArray(const size_t count, const T* host_p, cudaStream_t stream) {
-		memory_size     = count * sizeof(T);
+		memory_size     = checked_bytes(count);
 		allocation_size = memory_size;
 		allocate(stream);
-		galp::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
+		copy_from_host(host_p, stream);
 	}
 
 	GPUArray(const size_t count, const size_t buffer, const T* host_p) {
-		memory_size     = count * sizeof(T);
-		allocation_size = memory_size + buffer * sizeof(T);
+		memory_size     = checked_bytes(count);
+		allocation_size = checked_bytes(count, buffer);
 		allocate();
-		galp::memory::device_memcpy_h2d(device_ptr, host_p, memory_size);
+		copy_from_host(host_p, nullptr);
 	}
 
 	GPUArray(const size_t count, const size_t buffer, const T* host_p, cudaStream_t stream) {
-		memory_size     = count * sizeof(T);
-		allocation_size = memory_size + buffer * sizeof(T);
+		memory_size     = checked_bytes(count);
+		allocation_size = checked_bytes(count, buffer);
 		allocate(stream);
-		galp::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
+		copy_from_host(host_p, stream);
 	}
 
 	GPUArray(const GPUArray&)            = delete;
@@ -91,7 +118,7 @@ public:
 		other.device_ptr      = nullptr;
 	}
 
-	GPUArray& operator=(GPUArray&& other) noexcept {
+	GPUArray& operator=(GPUArray&& other) {
 		if (this != &other) {
 			free_device_pointer(device_ptr);
 			allocation_size       = other.allocation_size;
