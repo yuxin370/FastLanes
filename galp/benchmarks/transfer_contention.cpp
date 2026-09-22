@@ -22,6 +22,15 @@ void measure(int threads, int devices, bool shared_stream, bool pinned, size_t b
 	pool.set_use_async(false);
 	pool.set_use_pinned(pinned);
 	pool.set_small_copy_threshold(0);
+	// Warm enough staging for all windows even when the old global lock
+	// serialized the per-thread warm-up and therefore reused a smaller set.
+	if (pinned) {
+		std::vector<void*> staging;
+		for (size_t i = 0; i < static_cast<size_t>(threads) * WINDOW; ++i)
+			staging.push_back(pool.alloc_pinned(bytes));
+		for (auto ptr : staging)
+			pool.release_pinned(ptr);
+	}
 	std::vector<cudaStream_t> streams(static_cast<size_t>(shared_stream ? devices : threads));
 	for (size_t i = 0; i < streams.size(); ++i) {
 		CUDA_SAFE_CALL(cudaSetDevice(static_cast<int>(i) % devices));

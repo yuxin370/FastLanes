@@ -788,7 +788,8 @@ Further modularization should keep shrinking `format/reader.cuh` and
 `engine/pipeline/pipeline.cuh`, while hardening the boundaries between reader,
 zero-copy planning, compression column construction, resource preparation,
 prefetch integration, and chunk execution.
-# Transfer ownership and host concurrency
+
+## Transfer ownership and host concurrency
 
 `DevicePool` remains process-wide; allocation/free may cross host threads.
 Different allocations can submit concurrently, including on different CUDA
@@ -836,3 +837,35 @@ for this standalone executable (`GALP_MEMORY_DIAGNOSTICS`); never mix diagnostic
 and ordinary definitions in one linked executable. Normal builds use std::mutex
 directly and have no diagnostic counters/timers. The pipeline command reports
 real read/decode/transform/consumer throughput; discard its first warm-up result.
+Use `--pipelines 2` for two independent readers/pipelines on separate host threads.
+On heterogeneous hosts, select explicit GPU UUIDs and record the device names;
+ordinal ordering alone does not prove that tests use the compiled architecture.
+
+The local 2026-09-22 comparison used identical benchmark code/compiler flags,
+1 MiB transfers, eight-transfer windows, 32 rounds, three repetitions, prewarmed
+staging, and idle H100/RTX PRO 6000 devices (the busy RTX 4090 was excluded).
+For one H100, eight threads and separate streams with staging enabled, median
+host p50/p95 changed from 157/220 to 122/177 us; completed transfers/sec from
+5,978 to 23,264; tracker wait from 497 to 0.23 us/transfer. A 100 ms wait on an
+unrelated stream delayed submit by 89.9 ms before and 8.6 us after. This is a
+host contention result, not faster GPU copy hardware: raw event calibration was
+40.8 vs 48.3 us/transfer. Single-thread staged throughput was essentially flat
+(12,141 vs 11,987 transfers/sec).
+
+Not every path improves: with staging disabled, one H100 and eight threads,
+throughput was 8,016 vs 7,923 transfers/sec and submit p50/p95 increased from
+133/157 to 637/1,881 us. Removing the tracker lock does not remove pageable-copy
+blocking inside CUDA. Do not infer an end-to-end gain from the staged microbench.
+
+The real native two-image cached-fixture control (512 batches, three timed runs
+after warm-up) measured 1,737 vs 1,730 images/sec with one pipeline and 1,959 vs
+2,644 with two independent pipelines. This small control is not representative
+of full model training or uncached large datasets; the single-pipeline result
+does not establish a throughput gain.
+
+Keep the global pool: device/pinned bookkeeping wait remained below 0.6 us per
+transfer in this comparison. Sharding those locks is the smaller possible next
+step if future measurements identify them as a bottleneck. Per-device pools
+would also require coordinating cache budgets and cross-thread/device frees;
+there is no measured justification for that redesign here. A thread-local pool
+would violate the supported cross-thread lifetime contract.

@@ -16,7 +16,7 @@ target_include_directories(galp_cuda_transfer_failure_tests PRIVATE
 target_link_libraries(galp_cuda_transfer_failure_tests PRIVATE GTest::gtest_main)
 apply_warnings(galp_cuda_transfer_failure_tests)
 gtest_discover_tests(galp_cuda_transfer_failure_tests
-        DISCOVERY_TIMEOUT 60 PROPERTIES LABELS "galp;cpu;cuda-fault-injection")
+		DISCOVERY_TIMEOUT 60 PROPERTIES LABELS "galp-cpu")
 
 add_executable(galp_compact_format_tests
         compact_descriptor_v3_test.cpp)
