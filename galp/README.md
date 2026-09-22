@@ -788,3 +788,51 @@ Further modularization should keep shrinking `format/reader.cuh` and
 `engine/pipeline/pipeline.cuh`, while hardening the boundaries between reader,
 zero-copy planning, compression column construction, resource preparation,
 prefetch integration, and chunk execution.
+# Transfer ownership and host concurrency
+
+`DevicePool` remains process-wide; allocation/free may cross host threads.
+Different allocations can submit concurrently, including on different CUDA
+devices. Each submitting thread must select its allocation's device; free
+temporarily selects the recorded device and restores the caller's device.
+
+Overlapping host copy/free operations on the **same live allocation** are not
+supported and throw `std::logic_error`. A per-allocation busy bit stays set while
+an operation drops the pool mutex to wait on a prior stream. Thus another
+operation cannot erase or recycle the record during that wait. `free` and copy
+require a live pool allocation; unknown/already-freed pointers throw
+`std::invalid_argument` instead of falling through to `cudaFree` on cached
+storage. Externally allocated CUDA memory must use its owner's CUDA API.
+The arena's internal `release_arena_ptr` remains an idempotent cleanup operation.
+As with any raw-pointer allocator, callers must not use a stale pointer after
+free/reallocation, or independently free an arena's backing through an alias.
+Pool configuration changes require externally quiescent users.
+
+Transfer reservations remain in the tracker before any DMA can start. Submit
+preparation and CUDA calls run outside its data-structure mutex. A failed record
+keeps an unrecorded entry and pinned ownership; only successful stream sync can
+release it. Concurrent drains claim snapshot entries, wait for their submitters,
+and leave later submissions tracked. Failed drains clear their claim but retain
+ownership for retry. `sync_all` is a snapshot, not a barrier against future work;
+callers must stop submissions before destroying streams or shutting down.
+`complete_h2d` additionally requires an externally established completion proof
+and must not race new submissions on that same stream.
+
+Build `galp_transfer_contention` with `GALP_BUILD_BENCHMARKS=ON`, then run:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID build/galp/benchmarks/galp_transfer_contention 1048576 16
+PYTHONPATH=build/galp/torch:. python galp/benchmarks/transfer_pipeline.py /path/to/manifest.bin
+```
+
+The first command tests 1/2/4/8 host threads, shared/distinct streams, staging
+on/off, and one/two devices when available. CSV includes host p50/p95, completed
+operations/sec, tracker/device/pinned mutex wait, stream sync time, and wall
+transfer GB/s. Lock wait is summed over submit **and drain** then divided by
+transfers, so it is not a submit latency percentile. Raw CUDA-event H2D calibration
+is printed separately; wall GB/s includes host copies and scheduling. Independent
+stream interference uses a 100 ms host callback, not a decode kernel. Each case
+checks copied data and pool idleness. Thread-local diagnostics are enabled only
+for this standalone executable (`GALP_MEMORY_DIAGNOSTICS`); never mix diagnostic
+and ordinary definitions in one linked executable. Normal builds use std::mutex
+directly and have no diagnostic counters/timers. The pipeline command reports
+real read/decode/transform/consumer throughput; discard its first warm-up result.

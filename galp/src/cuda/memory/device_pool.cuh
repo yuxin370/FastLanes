@@ -34,6 +34,7 @@ struct DeviceAllocInfo {
 	int          device       = -1;
 	bool         h2d_pending  = false;
 	cudaStream_t h2d_stream   = nullptr;
+	bool         busy         = false; // exclusive host copy/free operation
 };
 
 struct DevicePoolStats {
@@ -133,23 +134,23 @@ public:
 		if (it != in_use_.end()) {
 			// Preserve the real arena-base allocation record when a zero-sized entry
 			// aliases offset 0. Re-registering an existing sub-allocation is harmless.
-			if (!it->second.sub_alloc) {
-				return;
-			}
+			return;
 		}
 		in_use_[ptr] = DeviceAllocInfo {0, false, nullptr, true, -1};
 	}
 
-	// free() calls cudaFree if ptr is not tracked.
+	// free() accepts live pool allocations only; external cudaMalloc storage
+	// must be released with cudaFree by its owner. Overlapping host copy/free
+	// operations on the same allocation are rejected, not serialized.
 	// release_arena_ptr() silently no-ops instead — used by DeviceArena destructor
 	// so that sub-pointers and device_base_ already cleaned up by free_device_expr()
 	// don't crash via cudaFree on an interior address (cudaErrorInvalidValue) or
 	// double-free device_base_ out of the pool free-list.
 	void free(void* ptr) {
-		do_free(ptr, /*fallback_cudafree=*/true);
+		do_free(ptr, /*require_live=*/true);
 	}
 	void release_arena_ptr(void* ptr) {
-		do_free(ptr, /*fallback_cudafree=*/false);
+		do_free(ptr, /*require_live=*/false);
 	}
 
 	void* alloc_pinned(size_t bytes) {
@@ -164,6 +165,7 @@ public:
 	// External pinned backing remains owned by the caller through sync_h2d().
 	template <typename Submit>
 	void submit_external_h2d(void* dst, cudaStream_t stream, Submit&& issue) {
+		AllocationOperation operation(*this, dst);
 		track_device_transfer(dst, stream);
 		tracker_.submit(stream, [&](void*&) { issue(); });
 	}
@@ -188,6 +190,7 @@ public:
 		if (dst == nullptr || src == nullptr) {
 			CUDA_SAFE_CALL(cudaErrorInvalidValue);
 		}
+		AllocationOperation operation(*this, dst);
 		track_device_transfer(dst, stream);
 		tracker_.submit(stream, [&](void*& pinned) {
 			if (use_pinned_staging) {
@@ -327,6 +330,40 @@ public:
 	}
 
 private:
+	// A busy record cannot be removed or reused while its operation drops mutex_
+	// to wait on CUDA. This avoids needing generations for live operations.
+	class AllocationOperation {
+	public:
+		AllocationOperation(DevicePool& pool, void* ptr, bool allow_missing = false)
+		    : pool_(pool), ptr_(ptr) {
+			std::lock_guard lock(pool_.mutex_);
+			auto it = pool_.in_use_.find(ptr_);
+			if (it == pool_.in_use_.end()) {
+				if (allow_missing) return;
+				throw std::invalid_argument("DevicePool copy/free requires a live pool allocation");
+			}
+			if (it->second.busy) {
+				throw std::logic_error("DevicePool concurrent copy/free on the same allocation is not allowed");
+			}
+			it->second.busy = true;
+			active_ = true;
+		}
+		~AllocationOperation() {
+			if (active_) {
+				std::lock_guard lock(pool_.mutex_);
+				pool_.in_use_.at(ptr_).busy = false;
+			}
+		}
+		void removed() { active_ = false; } // called under mutex_, before reuse
+		bool owns_record() const { return active_; }
+		AllocationOperation(const AllocationOperation&) = delete;
+		AllocationOperation& operator=(const AllocationOperation&) = delete;
+	private:
+		DevicePool& pool_;
+		void* ptr_;
+		bool active_ = false;
+	};
+
 	struct CachedBlock {
 		void* ptr    = nullptr;
 		int   device = -1;
@@ -377,12 +414,17 @@ private:
 	}
 
 	void track_device_transfer(void* ptr, cudaStream_t stream) {
+		int current_device = 0;
+		CUDA_SAFE_CALL(cudaGetDevice(&current_device));
 		std::unique_lock lock(mutex_);
 		auto                         it = in_use_.find(ptr);
-		if (it == in_use_.end() || it->second.sub_alloc) {
-			return; // External allocations retain their caller's lifetime contract.
+		if (it->second.sub_alloc) {
+			return; // Arena owns completion of the backing allocation.
 		}
 		const auto info = it->second;
+		if (info.device != current_device) {
+			throw std::invalid_argument("DevicePool copy requires the allocation's CUDA device");
+		}
 		if (info.h2d_pending && info.h2d_stream != stream) {
 			lock.unlock();
 			ScopedDevice device(info.device);
@@ -394,21 +436,17 @@ private:
 		it->second.h2d_stream  = stream;
 	}
 
-	void do_free(void* ptr, bool fallback_cudafree) {
+	void do_free(void* ptr, bool require_live) {
 		if (ptr == nullptr) {
 			return;
 		}
+		AllocationOperation operation(*this, ptr, !require_live);
+		if (!operation.owns_record()) return;
 		std::unique_lock lock(mutex_);
 		auto                         it = in_use_.find(ptr);
-		if (it == in_use_.end()) {
-			lock.unlock();
-			if (fallback_cudafree) {
-				CUDA_SAFE_CALL(cudaFree(ptr));
-			}
-			return;
-		}
 		if (it->second.sub_alloc) {
 			in_use_.erase(it);
+			operation.removed();
 			return; // arena sub-pointer: no actual GPU free
 		}
 		const auto info = it->second;
@@ -420,6 +458,7 @@ private:
 			it = in_use_.find(ptr);
 		}
 		in_use_.erase(it);
+		operation.removed();
 		in_use_bytes_ = info.size <= in_use_bytes_ ? in_use_bytes_ - info.size : 0;
 		if (enabled_ && !info.async_alloc) {
 			std::vector<CachedBlock> evicted_cached;
