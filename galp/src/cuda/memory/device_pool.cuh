@@ -31,6 +31,8 @@ struct DeviceAllocInfo {
 	cudaStream_t alloc_stream = nullptr;
 	bool         sub_alloc    = false; // true for arena sub-pointers (no-op on free)
 	int          device       = -1;
+	bool         h2d_pending  = false;
+	cudaStream_t h2d_stream   = nullptr;
 };
 
 struct DevicePoolStats {
@@ -157,12 +159,16 @@ public:
 		pinned_pool_.release(ptr);
 	}
 
-	// Register a stream the caller has already issued async H2D work on so
-	// sync_h2d() (no-arg) and sync_h2d(stream) drain it before reset/destroy.
-	// Used by DeviceArena::upload for its aggregate DMA path — pinned
-	// ownership stays with the caller.
-	void register_external_h2d(cudaStream_t stream) {
-		tracker_.register_external(stream);
+	// Device memory remains in in_use_ until tracking proves its DMA complete.
+	// External pinned backing remains owned by the caller through sync_h2d().
+	template <typename Submit>
+	void submit_external_h2d(void* dst, cudaStream_t stream, Submit&& issue) {
+		track_device_transfer(dst, stream);
+		tracker_.submit(stream, [&](void*&) { issue(); });
+	}
+
+	void sync_pending_h2d(cudaStream_t stream) {
+		tracker_.sync_stream(stream, make_release_pinned_fn(), true);
 	}
 
 	void copy_h2d(void* dst, const void* src, size_t bytes) {
@@ -173,27 +179,23 @@ public:
 		if (bytes == 0) {
 			return;
 		}
-		void* pinned = nullptr;
-		bool  use_pinned_staging;
+		bool use_pinned_staging;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			use_pinned_staging = use_pinned_ && bytes > small_copy_threshold_;
 		}
-		if (use_pinned_staging) {
-			pinned = pinned_pool_.alloc(bytes);
-			std::memcpy(pinned, src, bytes);
+		if (dst == nullptr || src == nullptr) {
+			CUDA_SAFE_CALL(cudaErrorInvalidValue);
 		}
-		try {
+		track_device_transfer(dst, stream);
+		tracker_.submit(stream, [&](void*& pinned) {
+			if (use_pinned_staging) {
+				pinned = pinned_pool_.alloc(bytes);
+				std::memcpy(pinned, src, bytes);
+			}
 			CUDA_SAFE_CALL(
 			    cudaMemcpyAsync(dst, pinned != nullptr ? pinned : src, bytes, cudaMemcpyHostToDevice, stream));
-			tracker_.register_transfer(stream, pinned);
-		} catch (...) {
-			CUDA_LOG_CALL(cudaStreamSynchronize(stream));
-			if (pinned != nullptr) {
-				pinned_pool_.release(pinned);
-			}
-			throw;
-		}
+		});
 	}
 
 	// Issue an async upload from storage whose pinned lifetime is owned by the
@@ -208,8 +210,9 @@ public:
 		if (dst == nullptr || pinned_src == nullptr) {
 			throw std::invalid_argument("DevicePool::copy_pinned_h2d_on_stream received a null pointer");
 		}
-		CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned_src, bytes, cudaMemcpyHostToDevice, stream));
-		tracker_.register_external(stream);
+		submit_external_h2d(dst, stream, [&] {
+			CUDA_SAFE_CALL(cudaMemcpyAsync(dst, pinned_src, bytes, cudaMemcpyHostToDevice, stream));
+		});
 	}
 
 	void sync_h2d() {
@@ -284,6 +287,10 @@ public:
 			sync_h2d();
 		} catch (const std::exception& e) {
 			std::fprintf(stderr, "DevicePool destructor: sync_h2d failed: %s\n", e.what());
+			// Completion is unknown. Leave both kinds of allocation to context
+			// teardown rather than freeing memory that DMA may still reference.
+			pinned_pool_.abandon_without_free();
+			return;
 		}
 
 		{
@@ -367,6 +374,24 @@ private:
 		};
 	}
 
+	void track_device_transfer(void* ptr, cudaStream_t stream) {
+		std::unique_lock<std::mutex> lock(mutex_);
+		auto                         it = in_use_.find(ptr);
+		if (it == in_use_.end() || it->second.sub_alloc) {
+			return; // External allocations retain their caller's lifetime contract.
+		}
+		const auto info = it->second;
+		if (info.h2d_pending && info.h2d_stream != stream) {
+			lock.unlock();
+			ScopedDevice device(info.device);
+			sync_pending_h2d(info.h2d_stream);
+			lock.lock();
+			it = in_use_.find(ptr);
+		}
+		it->second.h2d_pending = true;
+		it->second.h2d_stream  = stream;
+	}
+
 	void do_free(void* ptr, bool fallback_cudafree) {
 		if (ptr == nullptr) {
 			return;
@@ -385,6 +410,13 @@ private:
 			return; // arena sub-pointer: no actual GPU free
 		}
 		const auto info = it->second;
+		if (info.h2d_pending) {
+			lock.unlock();
+			ScopedDevice device(info.device);
+			sync_pending_h2d(info.h2d_stream);
+			lock.lock();
+			it = in_use_.find(ptr);
+		}
 		in_use_.erase(it);
 		in_use_bytes_ = info.size <= in_use_bytes_ ? in_use_bytes_ - info.size : 0;
 		if (enabled_ && !info.async_alloc) {

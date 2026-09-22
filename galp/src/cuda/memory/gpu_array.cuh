@@ -51,7 +51,8 @@ private:
 				galp::memory::device_memcpy_h2d_async(device_ptr, host_p, memory_size, stream);
 			}
 		} catch (...) {
-			CUDA_LOG_CALL(cudaStreamSynchronize(stream));
+			// The pool alone owns DMA completion. A failed synchronization keeps
+			// the allocation in-use (and staging memory in the tracker).
 			try {
 				free_device_pointer(device_ptr);
 			} catch (const std::exception& error) {

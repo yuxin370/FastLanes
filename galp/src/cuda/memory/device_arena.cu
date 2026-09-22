@@ -205,6 +205,7 @@ void DeviceArena::defer_free(std::function<void()> fn) {
 }
 
 void DeviceArena::reset(const bool preserve_capacity) {
+	DevicePool::instance().sync_pending_h2d(stream_);
 	if (!preserve_capacity) {
 		release_device_base();
 		release_pinned_base();
@@ -216,13 +217,15 @@ void DeviceArena::reset(const bool preserve_capacity) {
 	staged_entry_indices_.clear();
 	regions_.clear();
 	region_order_.clear();
-	regions_disjoint_ = true;
+	regions_disjoint_  = true;
 	last_region_index_ = static_cast<size_t>(-1);
 	resolvers_.clear();
 	resolver_targets_.clear();
 }
 
 ArenaUploadMetrics DeviceArena::upload(bool resolve_before_pack, bool backing_regions_coalesced) {
+	// Before repacking a retained slab, prove that the preceding upload is done.
+	DevicePool::instance().sync_pending_h2d(stream_);
 	using clock   = std::chrono::steady_clock;
 	const auto ms = [](auto a, auto b) {
 		return std::chrono::duration<double, std::milli>(b - a).count();
@@ -389,22 +392,23 @@ void DeviceArena::pack_staged_area() {
 
 DeviceArena::DmaIssueStats DeviceArena::issue_dma(size_t staged_device_base) {
 	DmaIssueStats stats {};
-	for (const auto& region : regions_) {
-		if (region.bytes == 0 || !region.upload) {
-			continue;
+	DevicePool::instance().submit_external_h2d(device_base_, stream_, [&] {
+		for (const auto& region : regions_) {
+			if (region.bytes == 0 || !region.upload) {
+				continue;
+			}
+			stats.bytes += region.bytes;
+			++stats.count;
+			CUDA_SAFE_CALL(cudaMemcpyAsync(
+			    device_base_ + region.device_offset, region.base, region.bytes, cudaMemcpyHostToDevice, stream_));
 		}
-		stats.bytes += region.bytes;
-		++stats.count;
-		CUDA_SAFE_CALL(cudaMemcpyAsync(
-		    device_base_ + region.device_offset, region.base, region.bytes, cudaMemcpyHostToDevice, stream_));
-	}
-	if (staged_bytes_ > 0) {
-		stats.bytes += staged_bytes_;
-		++stats.count;
-		CUDA_SAFE_CALL(cudaMemcpyAsync(
-		    device_base_ + staged_device_base, pinned_base_, staged_bytes_, cudaMemcpyHostToDevice, stream_));
-	}
-	DevicePool::instance().register_external_h2d(stream_);
+		if (staged_bytes_ > 0) {
+			stats.bytes += staged_bytes_;
+			++stats.count;
+			CUDA_SAFE_CALL(cudaMemcpyAsync(
+			    device_base_ + staged_device_base, pinned_base_, staged_bytes_, cudaMemcpyHostToDevice, stream_));
+		}
+	});
 	return stats;
 }
 
@@ -456,6 +460,7 @@ void DeviceArena::release_pinned_base() {
 		return;
 	}
 	auto& pool = DevicePool::instance();
+	pool.sync_pending_h2d(stream_);
 	pool.release_pinned(pinned_base_);
 	pinned_base_           = nullptr;
 	pinned_capacity_bytes_ = 0;
