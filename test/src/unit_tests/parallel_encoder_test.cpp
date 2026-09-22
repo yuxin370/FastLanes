@@ -2,12 +2,17 @@
 #include "alp/encoder.hpp"
 #include "alp/state.hpp"
 #include "fls/connection.hpp"
+#include "fls/encoder/encoder.hpp"
+#include "fls/encoder/parallel_rowgroups.hpp"
 #include "fls/file/file_footer.hpp"
 #include "fls/file/file_header.hpp"
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/table/memory_table.hpp"
+#include "fls/table/rowgroup.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -164,7 +169,7 @@ TEST(AlpEncoderScratch, ExceptionPlaceholdersComeFromTheCurrentVector) {
 	std::array<float, alp::config::VECTOR_SIZE>    exceptions {};
 	std::array<uint16_t, alp::config::VECTOR_SIZE> exception_positions {};
 	std::array<Encoded, alp::config::VECTOR_SIZE>  encoded {};
-	State                                           state;
+	State                                          state;
 	state.exp = 0;
 	state.fac = 0;
 
@@ -401,6 +406,84 @@ TEST(ParallelEncoder, CompressedFloatingPointIsByteIdenticalAcrossWorkers) {
 	}
 }
 
+TEST(ParallelEncoder, AutomaticWizardMatchesSerialAndOriginalInput) {
+	TemporaryDirectory temp("parallel_wizard");
+	MixedData          data({1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 137});
+	data.options.force_schema = false;
+	data.options.forced_schema.clear();
+	std::fill(data.i8.begin(), data.i8.end(), 7); // constant
+	for (std::size_t row = 0; row < data.i16.size(); ++row) {
+		data.i16[row] = static_cast<int16_t>(row % 5); // low cardinality
+	}
+	std::vector<fastlanes::MemoryColumn> columns(data.columns.begin(), data.columns.end());
+	columns.push_back({"equal_i32", std::span<const int32_t>(data.i32)});
+	const fastlanes::MemoryTable input {columns};
+	std::vector<uint8_t>         serial_bytes;
+	std::vector<uint8_t>         serial_descriptor;
+	for (const fastlanes::n_t workers : std::array<fastlanes::n_t, 4> {1, 2, 4, 8}) {
+		for (int repeat = 0; repeat < 2; ++repeat) {
+			SCOPED_TRACE("workers=" + std::to_string(workers) + " repeat=" + std::to_string(repeat));
+			const auto directory = temp.path / (std::to_string(workers) + "_" + std::to_string(repeat));
+			std::filesystem::create_directory(directory);
+			const auto        output = directory / "data.fls";
+			fastlanes::Config config;
+			config.inline_footer = fastlanes::FLS_FALSE;
+			fastlanes::Connection writer(config);
+			writer.read_memory(input, data.options).to_fls(output, encoding_options(workers));
+			fastlanes::Connection reader;
+			auto                  decoded = reader.read_fls(output)->materialize();
+			std::size_t           offset  = 0;
+			for (const auto& rowgroup : decoded->m_rowgroups) {
+				const auto& cols          = rowgroup->internal_rowgroup;
+				std::size_t string_offset = 0;
+				for (std::size_t row = 0; row < rowgroup->m_descriptor.m_n_tuples; ++row) {
+					// Compare directly to source arrays, never to the prepared writer table.
+					const auto check_number = [&](std::size_t col, auto expected) {
+						std::visit(
+						    [&](const auto& value) {
+							    if constexpr (requires { value->data[row]; }) {
+								    using Value = std::decay_t<decltype(value->data[row])>;
+								    if constexpr (std::is_arithmetic_v<Value>) {
+									    EXPECT_EQ(value->data[row], expected);
+								    } else {
+									    ADD_FAILURE() << "unexpected non-numeric column";
+								    }
+							    } else {
+								    ADD_FAILURE() << "unexpected column type";
+							    }
+						    },
+						    cols[col]);
+					};
+					check_number(0, data.i8[offset + row]);
+					check_number(1, data.i16[offset + row]);
+					check_number(2, data.i32[offset + row]);
+					check_number(3, data.i64[offset + row]);
+					check_number(4, data.f32[offset + row]);
+					check_number(5, data.f64[offset + row]);
+					check_number(7, data.i32[offset + row]);
+					const auto& strings = *std::get<fastlanes::up<fastlanes::FLSStrColumn>>(cols[6]);
+					EXPECT_EQ(std::string(reinterpret_cast<const char*>(strings.byte_arr.data() + string_offset),
+					                      strings.length_arr[row]),
+					          data.strings[offset + row]);
+					string_offset += strings.length_arr[row];
+				}
+				offset += rowgroup->m_descriptor.m_n_tuples;
+			}
+			EXPECT_EQ(offset, data.i8.size());
+			const auto bytes      = read_bytes(output);
+			const auto descriptor = read_bytes(directory / "table_descriptor.fbb");
+			if (serial_bytes.empty()) {
+				serial_bytes      = bytes;
+				serial_descriptor = descriptor;
+			} else {
+				EXPECT_EQ(bytes, serial_bytes);
+				// Includes every selected operator/operand, type and offset.
+				EXPECT_EQ(descriptor, serial_descriptor);
+			}
+		}
+	}
+}
+
 TEST(ParallelEncoder, DefaultApiMatchesExplicitSerialOptions) {
 	TemporaryDirectory   temp("parallel_encoder_default_api");
 	std::vector<int32_t> values(4096U + 137U);
@@ -508,7 +591,7 @@ TEST(ParallelEncoder, EmptyTableIsSafeWithMoreWorkersThanRowgroups) {
 	EXPECT_EQ(stats.effective_worker_count, 0U);
 }
 
-TEST(ParallelEncoder, RejectsUnorderedCommitAndCleansStagedOutput) {
+TEST(ParallelEncoder, InvalidOptionsFailBeforePreparationOrOutput) {
 	TemporaryDirectory                           temp("parallel_encoder_exception");
 	std::vector<int32_t>                         values(fastlanes::CFG::VEC_SZ, 7);
 	const std::array<fastlanes::MemoryColumn, 1> columns {
@@ -520,16 +603,70 @@ TEST(ParallelEncoder, RejectsUnorderedCommitAndCleansStagedOutput) {
 
 	fastlanes::Connection connection;
 	connection.read_memory(fastlanes::MemoryTable {columns}, table_options);
-	fastlanes::EncodingOptions options;
-	options.worker_count                 = 4;
-	options.deterministic_ordered_commit = false;
-	const auto output_path               = temp.path / "data.fls";
-	EXPECT_THROW(connection.to_fls(output_path, options), std::invalid_argument);
-	EXPECT_FALSE(std::filesystem::exists(output_path));
-
-	for (const auto& entry : std::filesystem::directory_iterator(temp.path)) {
-		EXPECT_FALSE(entry.path().filename().string().starts_with(".fastlanes-stage-"));
+	auto& column = *std::get<fastlanes::up<fastlanes::col_i32>>(
+	    connection.get_table().m_rowgroups.front()->internal_rowgroup.front());
+	const auto original_data = column.data;
+	ASSERT_TRUE(column.m_stats.bimap_frequency.empty());
+	for (const bool zero_workers : {true, false}) {
+		auto options                         = encoding_options(zero_workers ? 0 : 4);
+		options.deterministic_ordered_commit = zero_workers;
+		// A missing parent also proves that option validation precedes staging creation.
+		const auto output_path = temp.path / "missing" / "data.fls";
+		EXPECT_THROW(connection.to_fls(output_path, options), std::invalid_argument);
+		EXPECT_TRUE(std::filesystem::is_empty(temp.path));
+		EXPECT_EQ(column.data, original_data);
+		EXPECT_TRUE(column.m_stats.bimap_frequency.empty());
 	}
+}
+
+TEST(ParallelPreparation, CancelsNewRowgroupsAndJoinsEveryWorker) {
+	for (const char* stage : {"prepare_table", "Wizard::Spell"}) {
+		std::barrier     entered(4);
+		std::atomic<int> started {0};
+		std::atomic<int> finished {0};
+		try {
+			fastlanes::detail::parallel_rowgroups(64, 4, stage, [&](fastlanes::n_t) {
+				++started;
+				entered.arrive_and_wait();
+				++finished;
+				throw std::runtime_error("injected rowgroup failure");
+			});
+			FAIL() << "expected failure";
+		} catch (const std::runtime_error& error) {
+			EXPECT_NE(std::string(error.what()).find(stage), std::string::npos);
+			EXPECT_NE(std::string(error.what()).find("rowgroup"), std::string::npos);
+			try {
+				std::rethrow_if_nested(error);
+				FAIL() << "missing original exception";
+			} catch (const std::runtime_error& cause) { EXPECT_STREQ(cause.what(), "injected rowgroup failure"); }
+		}
+		EXPECT_EQ(started.load(), 4);
+		EXPECT_EQ(finished.load(), 4);
+	}
+}
+
+TEST(ParallelPreparation, FailedPreparationRequiresReload) {
+	TemporaryDirectory    temp("prepare_failure");
+	MixedData             data({1024, 1024, 17});
+	fastlanes::Connection connection;
+	connection.read_memory(data.table(), data.options);
+	// Inject an unsupported column into the preparation visitor.
+	connection.get_table().m_rowgroups[0]->internal_rowgroup[0] = std::monostate {};
+	EXPECT_THROW(connection.to_fls(temp.path / "data.fls", encoding_options(2)), std::runtime_error);
+	EXPECT_THROW(static_cast<void>(connection.get_table()), std::runtime_error);
+	EXPECT_THROW(connection.to_fls(temp.path / "data.fls"), std::runtime_error);
+	EXPECT_TRUE(std::filesystem::is_empty(temp.path));
+	EXPECT_NO_THROW(connection.read_memory(data.table(), data.options).to_fls(temp.path / "data.fls"));
+}
+
+TEST(ParallelEncoder, OutputFailureJoinsWorkers) {
+	TemporaryDirectory    temp("encoder_write_failure");
+	MixedData             data({1024, 1024, 1024, 17});
+	fastlanes::Connection connection;
+	connection.read_memory(data.table(), data.options).to_fls(temp.path / "prepared.fls");
+	// Isolate a writer failure after worker launch using already prepared input.
+	EXPECT_THROW(static_cast<void>(fastlanes::Encoder::encode(connection, temp.path, encoding_options(4, 1))),
+	             std::runtime_error);
 }
 
 } // namespace

@@ -36,7 +36,17 @@
 #   Windows    | 🚫 Sanitizers | 🚫 Sanitizers
 #
 
+option(FLS_ENABLE_TSAN "Instrument CPU code and tests with ThreadSanitizer" OFF)
+if (FLS_ENABLE_TSAN)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fsanitize=thread>
+                        $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>)
+    add_link_options(-fsanitize=thread)
+endif ()
+
 function(fls_enable_sanitizers target)
+    if (FLS_ENABLE_TSAN)
+        return() # ASan and TSan cannot be combined; instrumentation is global.
+    endif ()
     # 1) Skip on static macOS
     if (APPLE AND NOT FLS_BUILD_SHARED_LIBS)
         message(STATUS

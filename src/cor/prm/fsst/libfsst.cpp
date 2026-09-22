@@ -136,7 +136,9 @@ SymbolTable* buildSymbolTable(Counters& counters, std::vector<u8*> line, u32 len
 					counters.count1Inc(pos1);
 					// count single symbol (i.e. an option is not extending it)
 					if (st->symbols[pos1].length() != 1) {
-						counters.count1Inc(*cur);
+						// cur already points past pos1, possibly at the end of the
+						// sample. Count this symbol's first byte, not the next byte.
+						counters.count1Inc(st->symbols[pos1].first());
 					}
 					if (cur < end - 7) {
 						u64    word = fsst_unaligned_load(cur);

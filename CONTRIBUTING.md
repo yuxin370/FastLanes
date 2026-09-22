@@ -1,5 +1,19 @@
 # Contributing to FastLanes
 
+For CPU parallel preparation/Wizard race checks on a platform supporting
+ThreadSanitizer, use a separate build (TSan cannot be combined with ASan):
+
+```bash
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Release -DFLS_BUILD_TESTING=ON \
+  -DFLS_ENABLE_TSAN=ON -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=OFF
+cmake --build build-tsan --target unit_test --parallel
+TMPDIR="$HOME/tmp" ctest --test-dir build-tsan --output-on-failure \
+  -R 'ParallelPreparation|ParallelEncoder.AutomaticWizard'
+```
+
+This instruments both the CPU library and tests. A TSan startup/runtime failure
+is an environment limitation, not a passing race check.
+
 We welcome contributions of all kinds:
 
 - bug fixes  
