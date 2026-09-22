@@ -7,6 +7,7 @@
 #define GALP_MEMORY_DEVICE_POOL_CUH
 
 #include "cuda/cuda_macros.cuh"
+#include "cuda/memory/memory_diagnostics.hpp"
 #include "cuda/memory/pinned_host_pool.cuh"
 #include "cuda/memory/transfer_tracker.cuh"
 #include <algorithm>
@@ -63,7 +64,7 @@ public:
 		CUDA_SAFE_CALL(cudaGetDevice(&device));
 		bool use_async = false;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			use_async = use_async_ && stream != nullptr;
 			if (enabled_ && !use_async) {
 				size_t actual_size = 0;
@@ -102,7 +103,7 @@ public:
 			async_alloc = false;
 		}
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			in_use_[ptr] = DeviceAllocInfo {bytes, async_alloc, async_alloc ? stream : nullptr, false, device};
 			record_in_use_allocation_locked(bytes, /*cuda_allocation=*/true);
 		}
@@ -110,7 +111,7 @@ public:
 	}
 
 	DevicePoolStats stats() {
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		return DevicePoolStats {in_use_bytes_,
 		                        peak_in_use_bytes_,
 		                        free_cached_bytes_,
@@ -127,7 +128,7 @@ public:
 		if (ptr == nullptr) {
 			return;
 		}
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		auto                        it = in_use_.find(ptr);
 		if (it != in_use_.end()) {
 			// Preserve the real arena-base allocation record when a zero-sized entry
@@ -181,7 +182,7 @@ public:
 		}
 		bool use_pinned_staging;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			use_pinned_staging = use_pinned_ && bytes > small_copy_threshold_;
 		}
 		if (dst == nullptr || src == nullptr) {
@@ -232,7 +233,7 @@ public:
 
 		std::map<size_t, std::vector<CachedBlock>> sync_free;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			sync_free.swap(free_sync_by_size_);
 			free_cached_bytes_ = 0;
 		}
@@ -248,25 +249,25 @@ public:
 
 	void set_enabled(bool enabled) {
 		assert_idle_for_reconfiguration("set_enabled");
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		enabled_ = enabled;
 	}
 	void set_use_async(bool use_async) {
 		assert_idle_for_reconfiguration("set_use_async");
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		use_async_ = use_async;
 	}
 	void set_use_pinned(bool use_pinned) {
 		assert_idle_for_reconfiguration("set_use_pinned");
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			use_pinned_ = use_pinned;
 		}
 		pinned_pool_.set_use_pinned(use_pinned);
 	}
 	void set_small_copy_threshold(size_t bytes) {
 		assert_idle_for_reconfiguration("set_small_copy_threshold");
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		small_copy_threshold_ = bytes;
 	}
 
@@ -375,7 +376,7 @@ private:
 	}
 
 	void track_device_transfer(void* ptr, cudaStream_t stream) {
-		std::unique_lock<std::mutex> lock(mutex_);
+		std::unique_lock lock(mutex_);
 		auto                         it = in_use_.find(ptr);
 		if (it == in_use_.end() || it->second.sub_alloc) {
 			return; // External allocations retain their caller's lifetime contract.
@@ -396,7 +397,7 @@ private:
 		if (ptr == nullptr) {
 			return;
 		}
-		std::unique_lock<std::mutex> lock(mutex_);
+		std::unique_lock lock(mutex_);
 		auto                         it = in_use_.find(ptr);
 		if (it == in_use_.end()) {
 			lock.unlock();
@@ -504,7 +505,7 @@ private:
 	void assert_idle_for_reconfiguration(const char* api_name) {
 		tracker_.reclaim_finished(make_release_pinned_fn());
 
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		bool                        has_real_allocs = false;
 		for (auto& [ptr, info] : in_use_) {
 			(void)ptr;
@@ -539,7 +540,7 @@ private:
 	                   read_size_env("GALP_PINNED_HOST_POOL_MAX_REUSE_SLACK_BYTES", 64ULL * 1024ULL * 1024ULL)) {
 	}
 
-	std::mutex mutex_;
+	diagnostics::Mutex<diagnostics::Device> mutex_;
 	bool       enabled_                = true;
 	bool       use_async_              = true;
 	bool       use_pinned_             = true;

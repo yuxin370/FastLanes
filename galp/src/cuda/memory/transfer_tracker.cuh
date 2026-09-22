@@ -7,6 +7,7 @@
 #define GALP_MEMORY_TRANSFER_TRACKER_CUH
 
 #include "cuda/cuda_macros.cuh"
+#include "cuda/memory/memory_diagnostics.hpp"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <functional>
@@ -29,8 +30,9 @@ public:
 	// unrecorded entry that can only be reclaimed by synchronizing its stream.
 	template <typename Submit>
 	void submit(cudaStream_t stream, Submit&& issue) {
+		[[maybe_unused]] diagnostics::SubmitTimer timer;
 		const auto                  stream_id = key(stream);
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		auto&                       entries = pending_[stream_id];
 		entries.emplace_back();
 		auto& entry = entries.back();
@@ -43,11 +45,14 @@ public:
 	// Block until every tracked stream is idle, then destroy pending events and
 	// invoke the release callback on every pinned pointer we held.
 	void sync_all(const ReleasePinnedFn& release_pinned) {
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		cudaError_t                 cleanup_error = cudaSuccess;
 		for (auto it = pending_.begin(); it != pending_.end();) {
 			ScopedDevice device(it->first.first);
-			CUDA_SAFE_CALL(cudaStreamSynchronize(stream_from_key(it->first)));
+			{
+				[[maybe_unused]] diagnostics::SyncTimer timer;
+				CUDA_SAFE_CALL(cudaStreamSynchronize(stream_from_key(it->first)));
+			}
 			drain_entries(it->second, release_pinned, cleanup_error);
 			if (it->second.empty()) {
 				it = pending_.erase(it);
@@ -63,12 +68,15 @@ public:
 	// recycles the handle.
 	void sync_stream(cudaStream_t stream, const ReleasePinnedFn& release_pinned, bool only_pending = false) {
 		const auto                  stream_id = key(stream);
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		auto                        it = pending_.find(stream_id);
 		if (only_pending && it == pending_.end()) {
 			return;
 		}
-		CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
+		{
+			[[maybe_unused]] diagnostics::SyncTimer timer;
+			CUDA_SAFE_CALL(cudaStreamSynchronize(stream));
+		}
 		if (it != pending_.end()) {
 			cudaError_t cleanup_error = cudaSuccess;
 			drain_entries(it->second, release_pinned, cleanup_error);
@@ -84,7 +92,7 @@ public:
 	// event on this stream has completed.
 	void complete_stream(cudaStream_t stream, const ReleasePinnedFn& release_pinned) {
 		const auto                  stream_id = key(stream);
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		auto                        it = pending_.find(stream_id);
 		if (it == pending_.end()) {
 			return;
@@ -101,7 +109,7 @@ public:
 	// release callback and drop them from tracking. Used by the pool's idle
 	// check so a reconfiguration doesn't reject on stale-but-done entries.
 	void reclaim_finished(const ReleasePinnedFn& release_pinned) {
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		cudaError_t                 cleanup_error = cudaSuccess;
 		for (auto it = pending_.begin(); it != pending_.end();) {
 			ScopedDevice device(it->first.first);
@@ -132,7 +140,7 @@ public:
 	}
 
 	bool empty() {
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		return pending_.empty();
 	}
 
@@ -206,7 +214,7 @@ private:
 		}
 	}
 
-	std::mutex                                     mutex_;
+	diagnostics::Mutex<diagnostics::Tracker> mutex_;
 	std::map<StreamKey, std::vector<PendingEntry>> pending_;
 };
 

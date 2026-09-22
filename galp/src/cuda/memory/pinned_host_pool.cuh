@@ -7,6 +7,7 @@
 #define GALP_MEMORY_PINNED_HOST_POOL_CUH
 
 #include "cuda/cuda_macros.cuh"
+#include "cuda/memory/memory_diagnostics.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -44,7 +45,7 @@ public:
 			return nullptr;
 		}
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			++allocation_requests_;
 			if (use_pinned_) {
 				// Best-fit: reuse the smallest free buffer >= bytes. Exact-size
@@ -76,7 +77,7 @@ public:
 		}
 		CUDA_SAFE_CALL(status);
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			in_use_[ptr] = bytes;
 			record_in_use_allocation_locked(bytes, true);
 		}
@@ -90,7 +91,7 @@ public:
 		std::vector<void*> evicted;
 		bool               free_released = true;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			auto                        it = in_use_.find(ptr);
 			if (it != in_use_.end()) {
 				const size_t bytes = it->second;
@@ -118,7 +119,7 @@ public:
 	// idleness before flipping this; we don't re-check here.
 	void set_use_pinned(bool use_pinned) {
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			use_pinned_ = use_pinned;
 		}
 		if (!use_pinned) {
@@ -129,7 +130,7 @@ public:
 	void set_cache_limit_bytes(size_t bytes) {
 		std::vector<void*> evicted;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			cache_limit_bytes_ = bytes;
 			evict_until_limit_locked(evicted);
 		}
@@ -141,7 +142,7 @@ public:
 	void release_cached() {
 		std::map<size_t, std::vector<void*>> cached;
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard lock(mutex_);
 			cached.swap(free_by_size_);
 			cached_bytes_ = 0;
 		}
@@ -154,12 +155,12 @@ public:
 	}
 
 	bool has_in_use() {
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		return !in_use_.empty();
 	}
 
 	PinnedHostPoolStats stats() {
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		return PinnedHostPoolStats {in_use_bytes_,
 		                            peak_in_use_bytes_,
 		                            cached_bytes_,
@@ -172,7 +173,7 @@ public:
 	// torn down. The driver will reclaim these allocations with the context;
 	// calling cudaFreeHost at that point is unsafe on some runtime versions.
 	void abandon_without_free() noexcept {
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard lock(mutex_);
 		cleanup_enabled_ = false;
 		in_use_.clear();
 		free_by_size_.clear();
@@ -237,7 +238,7 @@ private:
 		}
 	}
 
-	std::mutex                           mutex_;
+	diagnostics::Mutex<diagnostics::Pinned> mutex_;
 	bool                                 use_pinned_            = true;
 	bool                                 cleanup_enabled_       = true;
 	size_t                               cache_limit_bytes_;

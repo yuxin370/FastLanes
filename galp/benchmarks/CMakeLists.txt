@@ -1,3 +1,8 @@
+add_executable(galp_transfer_contention transfer_contention.cpp)
+target_include_directories(galp_transfer_contention PRIVATE ../src ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_definitions(galp_transfer_contention PRIVATE GALP_MEMORY_DIAGNOSTICS=1)
+target_link_libraries(galp_transfer_contention PRIVATE CUDA::cudart)
+
 ## ────────────────────────────────────────────────
 ## Generated bindings library
 ## ────────────────────────────────────────────────
