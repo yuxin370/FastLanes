@@ -1,5 +1,17 @@
 # G-ALP
 
+CI runs CPU/static checks on internal PRs and GPU checks on pushes. The separate
+push-only Torch smoke job builds `_galp_direct_dct` with `GALP_BUILD_TORCH=ON`,
+creates a small JPEG manifest, and requires native import and CUDA runtime tests
+to execute. CUDA-enabled PyTorch and Pillow must be installed on that runner;
+missing dependencies or CUDA cause failure, not a successful skip.
+
+Single-GPU CI passing does **not** verify multi-GPU ownership. The GPU job reports
+the visible device count; the existing two-device test skips when fewer than two
+devices are available. No dedicated dual-GPU runner is declared by this workflow.
+`CudaTransferFailure.*` tests run on CPU with private CUDA runtime substitutes;
+they validate failure ownership but do not replace real CUDA tests.
+
 G-ALP is the GPU decompression component for FastLanes. This subtree is being
 shaped into a repository-local library component with a small public facade.
 
