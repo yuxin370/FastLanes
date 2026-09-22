@@ -15,23 +15,23 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from galp.profiles.rgbnomore import VALIDATION
+from galp.profiles.rgbnomore import VALIDATION, SWINV2_VALIDATION
 from galp.torch import DirectDctReader
 
 
 SKIP_RETURN_CODE = 77
 
 
-def _validate_batch(batch: object, image_count: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _validate_batch(batch: object, image_count: int, y_grid: int = 28, cbcr_grid: int = 14) -> tuple[torch.Tensor, torch.Tensor]:
     y = batch.y
     cbcr = batch.cbcr
     if not y.is_cuda or not cbcr.is_cuda:
         raise RuntimeError("Direct-DCT profile outputs must remain on CUDA")
     if y.dtype != torch.float32 or cbcr.dtype != torch.float32:
         raise RuntimeError(f"expected FP32 profile output, got y={y.dtype} cbcr={cbcr.dtype}")
-    if tuple(y.shape) != (image_count, 1, 28, 28, 8, 8):
+    if tuple(y.shape) != (image_count, 1, y_grid, y_grid, 8, 8):
         raise RuntimeError(f"unexpected Y shape: {tuple(y.shape)}")
-    if tuple(cbcr.shape) != (image_count, 2, 14, 14, 8, 8):
+    if tuple(cbcr.shape) != (image_count, 2, cbcr_grid, cbcr_grid, 8, 8):
         raise RuntimeError(f"unexpected CbCr shape: {tuple(cbcr.shape)}")
     if batch.layout != "transformed_dct_grid":
         raise RuntimeError(f"unexpected Direct-DCT layout: {batch.layout}")
@@ -41,9 +41,13 @@ def _validate_batch(batch: object, image_count: int) -> tuple[torch.Tensor, torc
 def main() -> int:
     manifest = os.environ.get("GALP_DIRECT_DCT_TEST_MANIFEST")
     if not manifest:
+        if os.environ.get("GALP_REQUIRE_CUDA_SMOKE") == "1":
+            raise RuntimeError("GALP_DIRECT_DCT_TEST_MANIFEST is required by this CI job")
         print("skipping: GALP_DIRECT_DCT_TEST_MANIFEST is not set")
         return SKIP_RETURN_CODE
     if not torch.cuda.is_available():
+        if os.environ.get("GALP_REQUIRE_CUDA_SMOKE") == "1":
+            raise RuntimeError("CUDA-enabled PyTorch and a working GPU are required by this CI job")
         print("skipping: torch.cuda.is_available() is false")
         return SKIP_RETURN_CODE
 
@@ -96,6 +100,13 @@ def main() -> int:
     if metrics.physical_bytes <= 0 or metrics.logical_bytes <= 0:
         raise RuntimeError("Direct-DCT pipeline reported empty storage metrics")
     pipeline.close()
+
+    swinv2_info = reader.profile_info(SWINV2_VALIDATION)
+    if swinv2_info["runtime_policy_id"] != "compact-v3-planless-limited-o512-c512-v1":
+        raise RuntimeError("SwinV2 validation must use the compact runtime policy")
+    with reader.pipeline(SWINV2_VALIDATION).start([image_ids]) as swinv2_pipeline:
+        _validate_batch(next(swinv2_pipeline), len(image_ids), 32, 16)
+    _validate_batch(reader.read(image_ids, SWINV2_VALIDATION), len(image_ids), 32, 16)
 
     print(
         f"profile={VALIDATION.id} runtime_policy={profile_info['runtime_policy_id']} "

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import galp.torch
 from galp.profiles import DirectDctProfile
-from galp.profiles.rgbnomore import VALIDATION, VALIDATION_CENTER_CROP_512
+from galp.profiles.rgbnomore import VALIDATION, VALIDATION_CENTER_CROP_512, SWINV2_VALIDATION
 from galp.torch import DirectDctReader
 from galp.diagnostics.direct_dct import (
     cache_stats,
@@ -169,6 +169,7 @@ class _NativeReader:
 def _profile_info(profile_id: str) -> dict[str, object]:
     runtime = {
         VALIDATION.id: "compact-v3-planless-limited-o512-c512-v1",
+        SWINV2_VALIDATION.id: "compact-v3-planless-limited-o512-c512-v1",
         VALIDATION_CENTER_CROP_512.id: "block-major-p4-scheduled-bounded-110-v1",
     }[profile_id]
     return {
@@ -256,6 +257,18 @@ class PublicDirectDctApiTest(unittest.TestCase):
         self.assertFalse(hasattr(VALIDATION, "runtime_policy_id"))
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             DirectDctProfile("")
+
+    def test_swinv2_profile_is_accepted_by_public_reader_methods(self) -> None:
+        reader = DirectDctReader("manifest.bin", native_module=_native_module())
+        self.assertEqual(SWINV2_VALIDATION.id, "rgbnomore-swinv2-validation-v1")
+        self.assertEqual(
+            reader.profile_info(SWINV2_VALIDATION)["runtime_policy_id"],
+            "compact-v3-planless-limited-o512-c512-v1",
+        )
+        with reader.pipeline(SWINV2_VALIDATION) as pipeline:
+            pipeline.start([[4, 7]])
+            self.assertEqual(next(pipeline).profile_id, SWINV2_VALIDATION.id)
+        self.assertEqual(reader.read([4, 7], SWINV2_VALIDATION).profile_id, SWINV2_VALIDATION.id)
 
     def test_coefficient_selection_defaults_to_all_and_is_forwarded(self) -> None:
         reader = DirectDctReader("manifest.bin", native_module=_native_module())

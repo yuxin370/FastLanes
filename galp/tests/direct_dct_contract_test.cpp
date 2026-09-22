@@ -176,6 +176,21 @@ TEST(DirectDctShadowContract, ProfileIdsMatchLegacy) {
 	}
 }
 
+TEST(DirectDctShadowContract, SwinV2ValidationHasExplicitModelSemantics) {
+	constexpr auto id      = "rgbnomore-swinv2-validation-v1";
+	const auto     profile = galp::profiles::resolve_direct_dct_profile(id);
+	ASSERT_TRUE(profile.output.grid_transform.has_value());
+	const auto& spec = *profile.output.grid_transform;
+	EXPECT_EQ(spec.y_output_width_blocks, 32U);
+	EXPECT_EQ(spec.y_output_height_blocks, 32U);
+	EXPECT_EQ(spec.cbcr_output_width_blocks, 16U);
+	EXPECT_EQ(spec.cbcr_output_height_blocks, 16U);
+	EXPECT_EQ(spec.output_data_type, galp::jpeg::JpegDctGridOutputDataType::kFloat32);
+	EXPECT_FLOAT_EQ(spec.output_add, 4.0F);
+	EXPECT_FLOAT_EQ(spec.output_scale, 1.0F / 1020.0F);
+	EXPECT_EQ(profile.runtime.id, "compact-v3-planless-limited-o512-c512-v1");
+}
+
 TEST(DirectDctShadowContract, SemanticGeometryAndTransformsMatchLegacyFieldByField) {
 	for (const auto profile_id : SemanticProfileRegistry::available_profile_ids()) {
 		SCOPED_TRACE(std::string(profile_id));
