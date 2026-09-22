@@ -5,9 +5,11 @@
 // ────────────────────────────────────────────────────────
 #include "fls/connection.hpp" // for Connection
 #include "fls/cfg/cfg.hpp"
-#include "fls/common/alias.hpp"     // for make_unique<>, n_t, idx_t, fls_bool, FLS_TRUE
-#include "fls/common/status.hpp"    // for Status
-#include "fls/encoder/encoder.hpp"  // for Encoder
+#include "fls/common/alias.hpp"    // for make_unique<>, n_t, idx_t, fls_bool, FLS_TRUE
+#include "fls/common/status.hpp"   // for Status
+#include "fls/encoder/encoder.hpp" // for Encoder
+#include "fls/encoder/parallel_rowgroups.hpp"
+#include "fls/encoder/validate_options.hpp"
 #include "fls/file/file_footer.hpp" // for FileFooter
 #include "fls/file/file_header.hpp" // for FileHeader
 #include "fls/flatbuffers/flatbuffers.hpp"
@@ -29,7 +31,6 @@
 #include <chrono>
 #include <cstdint> // for uint64_t
 #include <filesystem>
-#include <future>
 #include <memory>    // for std::make_unique, unique_ptr
 #include <stdexcept> // for std::runtime_error
 #include <system_error>
@@ -198,27 +199,9 @@ void prepare_rowgroup(Rowgroup& rowgroup, const Config& config) {
 }
 
 void Connection::prepare_table(const n_t worker_count) const {
-	const auto rowgroup_count = m_table->get_n_rowgroups();
-	const auto workers        = std::min(worker_count, rowgroup_count);
-	if (workers <= 1) {
-		for (auto& rowgroup : m_table->m_rowgroups) {
-			prepare_rowgroup(*rowgroup, *m_config);
-		}
-		return;
-	}
-
-	vector<std::future<void>> futures;
-	futures.reserve(workers);
-	for (n_t worker = 0; worker < workers; ++worker) {
-		futures.push_back(std::async(std::launch::async, [&, worker] {
-			for (n_t rowgroup_idx = worker; rowgroup_idx < rowgroup_count; rowgroup_idx += workers) {
-				prepare_rowgroup(*m_table->m_rowgroups[rowgroup_idx], *m_config);
-			}
-		}));
-	}
-	for (auto& future : futures) {
-		future.get();
-	}
+	detail::parallel_rowgroups(m_table->get_n_rowgroups(), worker_count, "prepare_table", [&](n_t index) {
+		prepare_rowgroup(*m_table->m_rowgroups[index], *m_config);
+	});
 }
 
 void Connection::write_footer(const path& file_path) const {
@@ -241,7 +224,12 @@ Connection& Connection::spell() {
 		throw std::runtime_error("Data is not loaded.");
 	}
 
-	m_table_descriptor = Wizard::Spell(*this);
+	try {
+		m_table_descriptor = Wizard::Spell(*this);
+	} catch (...) {
+		reset();
+		throw;
+	}
 
 	return *this;
 }
@@ -251,6 +239,7 @@ Connection& Connection::to_fls(const path& file_path) {
 }
 
 Connection& Connection::to_fls(const path& file_path, const EncodingOptions& options) {
+	detail::validate_encoding_options(options);
 	const auto total_started = std::chrono::steady_clock::now();
 	if (exists(file_path)) {
 		throw std::runtime_error("Fastlanes file already exists at: " + file_path.string());
@@ -261,40 +250,47 @@ Connection& Connection::to_fls(const path& file_path, const EncodingOptions& opt
 		throw std::runtime_error("data is not loaded.");
 	}
 
-	prepare_table(options.worker_count);
+	try {
+		prepare_table(options.worker_count);
+		if (m_table_descriptor == nullptr) {
+			m_table_descriptor = Wizard::Spell(*this, options.worker_count);
+		}
+		const auto preparation_finished = std::chrono::steady_clock::now();
 
-	//  make a rowgroup-get_descriptor if there is no rowgroup-get_descriptor .
-	if (m_table_descriptor == nullptr) {
-		m_table_descriptor = Wizard::Spell(*this, options.worker_count);
+		m_last_encoding_stats = {};
+		StagedOutput staged_output(file_path);
+		FileHeader::Write(*this, staged_output.file_path());
+
+		// encode
+		const auto encoding_started  = std::chrono::steady_clock::now();
+		m_last_encoding_stats        = Encoder::encode(*this, staged_output.file_path(), options);
+		const auto encoding_finished = std::chrono::steady_clock::now();
+
+		if (m_config->enable_verbose) {
+			fs::path json_file = staged_output.file_path();
+			json_file += ".json";
+			JSON::write(*this, json_file, *m_table_descriptor);
+		}
+
+		// write the footer
+		write_footer(staged_output.file_path());
+		staged_output.publish(!static_cast<bool>(m_config->inline_footer), m_config->enable_verbose);
+		const auto total_finished = std::chrono::steady_clock::now();
+		m_last_encoding_stats.preparation_wall_seconds =
+		    std::chrono::duration<double>(preparation_finished - total_started).count();
+		m_last_encoding_stats.encoding_wall_seconds =
+		    std::chrono::duration<double>(encoding_finished - encoding_started).count();
+		m_last_encoding_stats.finalization_wall_seconds =
+		    std::chrono::duration<double>(total_finished - encoding_finished).count();
+		m_last_encoding_stats.total_wall_seconds =
+		    std::chrono::duration<double>(total_finished - total_started).count();
+	} catch (...) {
+		// Preparation mutates columns in place. All workers have exited before
+		// discarding the table; callers must reload input before retrying.
+		reset();
+		m_last_encoding_stats = {};
+		throw;
 	}
-	const auto preparation_finished = std::chrono::steady_clock::now();
-
-	m_last_encoding_stats = {};
-	StagedOutput staged_output(file_path);
-	FileHeader::Write(*this, staged_output.file_path());
-
-	// encode
-	const auto encoding_started  = std::chrono::steady_clock::now();
-	m_last_encoding_stats        = Encoder::encode(*this, staged_output.file_path(), options);
-	const auto encoding_finished = std::chrono::steady_clock::now();
-
-	if (m_config->enable_verbose) {
-		fs::path json_file = staged_output.file_path();
-		json_file += ".json";
-		JSON::write(*this, json_file, *m_table_descriptor);
-	}
-
-	// write the footer
-	write_footer(staged_output.file_path());
-	staged_output.publish(!static_cast<bool>(m_config->inline_footer), m_config->enable_verbose);
-	const auto total_finished = std::chrono::steady_clock::now();
-	m_last_encoding_stats.preparation_wall_seconds =
-	    std::chrono::duration<double>(preparation_finished - total_started).count();
-	m_last_encoding_stats.encoding_wall_seconds =
-	    std::chrono::duration<double>(encoding_finished - encoding_started).count();
-	m_last_encoding_stats.finalization_wall_seconds =
-	    std::chrono::duration<double>(total_finished - encoding_finished).count();
-	m_last_encoding_stats.total_wall_seconds = std::chrono::duration<double>(total_finished - total_started).count();
 
 	return *this;
 }
@@ -401,7 +397,9 @@ n_t Connection::get_sample_size() const {
 }
 
 Table& Connection::get_table() const {
-	//
+	if (!m_table) {
+		throw std::runtime_error("Data is not loaded; reload input before accessing the table.");
+	}
 	return *m_table;
 }
 

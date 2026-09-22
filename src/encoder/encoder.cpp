@@ -4,9 +4,10 @@
 // src/encoder/encoder.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/encoder/encoder.hpp"
-#include "fls/common/alias.hpp"                   // for up, n_t
-#include "fls/connection.hpp"                     // for Connection
-#include "fls/cor/lyt/buf.hpp"                    // for Buf
+#include "fls/common/alias.hpp" // for up, n_t
+#include "fls/connection.hpp"   // for Connection
+#include "fls/cor/lyt/buf.hpp"  // for Buf
+#include "fls/encoder/validate_options.hpp"
 #include "fls/expression/expression_executor.hpp" // for ExprExecutor
 #include "fls/expression/interpreter.hpp"         // for Interpreter
 #include "fls/expression/physical_expression.hpp" // for PhysicalExpr
@@ -147,6 +148,8 @@ EncodingStats encode_parallel(const Table&           table,
 	ParallelEncodingState state(rowgroup_count, window);
 	vector<std::thread>   workers;
 	workers.reserve(static_cast<std::size_t>(worker_count));
+	n_t cur_rowgroup_offset {sizeof(FileHeader)};
+	io  file_io = make_unique<File>(file_path);
 
 	const auto worker = [&]() {
 		try {
@@ -219,7 +222,9 @@ EncodingStats encode_parallel(const Table&           table,
 		} catch (...) { save_first_exception(state, std::current_exception()); }
 	};
 
-	const auto join_workers = [&]() {
+	// Only this coordinator joins these threads, and it cannot be one of them.
+	// With joinable() checked, neither invalid-thread nor self-join is possible.
+	const auto join_workers = [&]() noexcept {
 		for (auto& thread : workers) {
 			if (thread.joinable()) {
 				thread.join();
@@ -231,15 +236,6 @@ EncodingStats encode_parallel(const Table&           table,
 		for (n_t worker_idx = 0; worker_idx < worker_count; ++worker_idx) {
 			workers.emplace_back(worker);
 		}
-	} catch (...) {
-		save_first_exception(state, std::current_exception());
-		join_workers();
-		std::rethrow_exception(state.first_exception);
-	}
-
-	n_t cur_rowgroup_offset {sizeof(FileHeader)};
-	io  file_io = make_unique<File>(file_path);
-	try {
 		for (n_t rowgroup_idx = 0; rowgroup_idx < rowgroup_count; ++rowgroup_idx) {
 			up<EncodedRowgroup> encoded;
 			{
@@ -280,15 +276,6 @@ EncodingStats encode_parallel(const Table&           table,
 	return stats;
 }
 
-void validate_options(const EncodingOptions& options) {
-	if (options.worker_count == 0) {
-		throw std::invalid_argument("EncodingOptions::worker_count must be greater than zero");
-	}
-	if (!options.deterministic_ordered_commit) {
-		throw std::invalid_argument("FastLanes encoding requires deterministic ordered commit");
-	}
-}
-
 } // namespace
 
 void Encoder::encode(const Connection& connection, const path& file_path) {
@@ -296,14 +283,14 @@ void Encoder::encode(const Connection& connection, const path& file_path) {
 }
 
 EncodingStats Encoder::encode(const Connection& connection, const path& file_path, const EncodingOptions& options) {
-	validate_options(options);
+	detail::validate_encoding_options(options);
 	if (options.worker_count == 1) {
 		return encode_serial(*connection.m_table, *connection.m_table_descriptor, file_path, options);
 	}
 
 	// Keep descriptor publication transactional as well as file publication. A
-	// worker failure cannot leave the Connection with a partially encoded set of
-	// rowgroup descriptors, so the caller may safely retry with the same table.
+	// worker failure cannot publish a partially encoded set of descriptors.
+	// This does not make the preceding in-place preparation safe to repeat.
 	auto working_descriptor        = make_unique<TableDescriptorT>(*connection.m_table_descriptor);
 	auto stats                     = encode_parallel(*connection.m_table, *working_descriptor, file_path, options);
 	*connection.m_table_descriptor = std::move(*working_descriptor);

@@ -85,6 +85,7 @@ public:
 	///!
 	Connection& to_fls(const path& dir_path);
 	///! Encode using explicitly configured generic rowgroup parallelism.
+	/// Failure after preparation starts discards the table; reload input before retrying.
 	Connection& to_fls(const path& dir_path, const EncodingOptions& options);
 	//
 	Status verify_fls(const path& file_path);

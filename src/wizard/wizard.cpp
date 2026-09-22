@@ -9,7 +9,8 @@
 #include "fls/common/assert.hpp"
 #include "fls/common/common.hpp" // for FLS_UNREACHABLE
 #include "fls/common/string.hpp"
-#include "fls/connection.hpp"           // for Connector
+#include "fls/connection.hpp" // for Connector
+#include "fls/encoder/parallel_rowgroups.hpp"
 #include "fls/expression/data_type.hpp" // for DataType, get_physical_type
 #include "fls/expression/expression_executor.hpp"
 #include "fls/expression/interpreter.hpp"
@@ -27,7 +28,6 @@
 #include <algorithm> // std::min_element
 #include <cstdint>   // int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t
 #include <cstring>
-#include <future>
 #include <limits>        // std::numeric_limits
 #include <memory>        // for unique_ptr, make_unique
 #include <type_traits>   // std::conditional_t
@@ -953,8 +953,8 @@ bool checkMappingImpl(const up<FLSStrColumn>& left_col, const up<TypedCol<PT>>& 
 		typename ForwardMapType::key_type right_value;
 		typename ReverseMapType::key_type left_value;
 
-		const auto& is_left_val_null  = left_col->null_map_arr[row_idx];
-		const auto& is_right_val_null = right_col->null_map_arr[row_idx];
+		const bool is_left_val_null  = !left_col->null_map_arr.empty() && left_col->null_map_arr[row_idx];
+		const bool is_right_val_null = !right_col->null_map_arr.empty() && right_col->null_map_arr[row_idx];
 
 		if (is_left_val_null != is_right_val_null) {
 			return false;
@@ -1006,8 +1006,8 @@ bool checkMappingImpl(const up<FLSStrColumn>& left_col, const up<FLSStrColumn>& 
 	n_t num_rows = left_col->length_arr.size();
 	for (n_t row_idx = 0; row_idx < num_rows; ++row_idx) {
 
-		const auto& is_left_val_null  = left_col->null_map_arr[row_idx];
-		const auto& is_right_val_null = right_col->null_map_arr[row_idx];
+		const bool is_left_val_null  = !left_col->null_map_arr.empty() && left_col->null_map_arr[row_idx];
+		const bool is_right_val_null = !right_col->null_map_arr.empty() && right_col->null_map_arr[row_idx];
 
 		if (is_left_val_null != is_right_val_null) {
 			return false;
@@ -1379,26 +1379,7 @@ up<TableDescriptorT> Wizard::Spell(const Connection& fls, const n_t worker_count
 		               *table_descriptor->m_rowgroup_descriptors[rowgroup_idx],
 		               fls);
 	};
-	const auto rowgroup_count = table.get_n_rowgroups();
-	const auto workers        = std::min(worker_count, rowgroup_count);
-	if (workers <= 1) {
-		for (n_t rowgroup_idx = 0; rowgroup_idx < rowgroup_count; ++rowgroup_idx) {
-			check_rowgroup(rowgroup_idx);
-		}
-	} else {
-		vector<std::future<void>> futures;
-		futures.reserve(workers);
-		for (n_t worker = 0; worker < workers; ++worker) {
-			futures.push_back(std::async(std::launch::async, [&, worker] {
-				for (n_t rowgroup_idx = worker; rowgroup_idx < rowgroup_count; rowgroup_idx += workers) {
-					check_rowgroup(rowgroup_idx);
-				}
-			}));
-		}
-		for (auto& future : futures) {
-			future.get();
-		}
-	}
+	detail::parallel_rowgroups(table.get_n_rowgroups(), worker_count, "Wizard::Spell", check_rowgroup);
 
 	return table_descriptor;
 }
