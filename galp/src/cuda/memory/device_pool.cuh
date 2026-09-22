@@ -194,9 +194,10 @@ public:
 				pinned = pinned_pool_.alloc(bytes);
 				std::memcpy(pinned, src, bytes);
 			}
+		}, [&](void*& pinned) {
 			CUDA_SAFE_CALL(
 			    cudaMemcpyAsync(dst, pinned != nullptr ? pinned : src, bytes, cudaMemcpyHostToDevice, stream));
-		});
+		}, make_release_pinned_fn());
 	}
 
 	// Issue an async upload from storage whose pinned lifetime is owned by the
