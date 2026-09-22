@@ -8,6 +8,16 @@ add_executable(galp_tests
         workset_selected_vectors_test.cu
 )
 
+# Fault injection uses CUDA declarations but its own runtime symbols, so these
+# ownership tests run on CPU and do not depend on a working GPU/driver.
+add_executable(galp_cuda_transfer_failure_tests cuda_transfer_failure_test.cpp)
+target_include_directories(galp_cuda_transfer_failure_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(galp_cuda_transfer_failure_tests PRIVATE GTest::gtest_main)
+apply_warnings(galp_cuda_transfer_failure_tests)
+gtest_discover_tests(galp_cuda_transfer_failure_tests
+        DISCOVERY_TIMEOUT 60 PROPERTIES LABELS "galp;cpu;cuda-fault-injection")
+
 add_executable(galp_compact_format_tests
         compact_descriptor_v3_test.cpp)
 target_link_libraries(galp_compact_format_tests PRIVATE
