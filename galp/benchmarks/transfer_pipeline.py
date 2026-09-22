@@ -33,3 +33,4 @@ for repeat in range(4):
                 raise RuntimeError("nonfinite pipeline output")
     seconds = time.perf_counter() - start
     print(f"repeat={repeat},images={count},seconds={seconds:.6f},images_s={count/seconds:.3f}", flush=True)
+del batch, value

@@ -14,6 +14,26 @@ TMPDIR="$HOME/tmp" ctest --test-dir build-tsan --output-on-failure \
 This instruments both the CPU library and tests. A TSan startup/runtime failure
 is an environment limitation, not a passing race check.
 
+The same `FLS_ENABLE_TSAN=ON` build can check GALP host ownership with the
+CUDA fault-injection executable (CUDA toolkit headers/compiler must be discoverable):
+
+```bash
+cmake -S . -B build-host-tsan -DCMAKE_BUILD_TYPE=Release -DFLS_BUILD_TESTING=ON \
+  -DFLS_ENABLE_TSAN=ON -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
+  -DGALP_BUILD_TESTS=ON -DGALP_BUILD_TORCH=OFF -DGALP_BUILD_BENCHMARKS=OFF \
+  -DGALP_BUILD_TOOLS=OFF -DGALP_WITH_JPEG_DCT=OFF
+cmake --build build-host-tsan --target galp_cuda_transfer_failure_tests --parallel
+TSAN_OPTIONS=halt_on_error=1 build-host-tsan/galp/tests/galp_cuda_transfer_failure_tests
+```
+
+This executable compiles the real DevicePool, TransferTracker and DeviceArena,
+but supplies thread-safe test CUDA symbols and does **not** link cudart. It checks
+host bookkeeping, ownership and injected interleavings, not driver or GPU races.
+Do not build/run the real CUDA targets under this global TSan configuration.
+Run their ordinary CUDA tests, multi-GPU ownership test and native Torch smoke
+in the normal build separately. A sanitizer-incompatible driver is not a reason
+to skip the host fault-injection race checks.
+
 We welcome contributions of all kinds:
 
 - bug fixes  

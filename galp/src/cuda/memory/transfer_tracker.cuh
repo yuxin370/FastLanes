@@ -30,8 +30,8 @@ public:
 	template <typename Prepare, typename Submit>
 	void submit(cudaStream_t stream, Prepare&& prepare, Submit&& issue, const ReleasePinnedFn& release_pinned) {
 		[[maybe_unused]] diagnostics::SubmitTimer timer;
-		const auto stream_id = key(stream);
-		auto entry = std::make_shared<PendingEntry>();
+		const auto                                stream_id = key(stream);
+		auto                                      entry     = std::make_shared<PendingEntry>();
 		{
 			std::lock_guard lock(mutex_);
 			pending_[stream_id].push_back(entry);
@@ -50,7 +50,9 @@ public:
 				// No DMA: cleanup can run immediately. If cleanup itself fails,
 				// the entry remains owned and retryable, with the original error.
 				cudaError_t cleanup_error = cudaSuccess;
-				try { drain_entry(*entry, release_pinned, cleanup_error); } catch (...) {}
+				try {
+					drain_entry(*entry, release_pinned, cleanup_error);
+				} catch (...) {}
 			}
 			finish_submit(stream_id, entry);
 			std::rethrow_exception(error);
@@ -75,8 +77,9 @@ public:
 
 	void sync_stream(cudaStream_t stream, const ReleasePinnedFn& release_pinned, bool only_pending = false) {
 		const auto stream_id = key(stream);
-		auto entries = snapshot(stream_id);
-		if (only_pending && entries.empty()) return;
+		auto       entries   = snapshot(stream_id);
+		if (only_pending && entries.empty())
+			return;
 		cudaError_t cleanup_error = cudaSuccess;
 		drain(stream_id, entries, release_pinned, Mode::Sync, cleanup_error);
 		CUDA_SAFE_CALL(cleanup_error);
@@ -85,8 +88,8 @@ public:
 	// Caller must have proven completion of the tracked work by a later stream
 	// dependency. Do not race this proof with new submissions on the same stream.
 	void complete_stream(cudaStream_t stream, const ReleasePinnedFn& release_pinned) {
-		const auto stream_id = key(stream);
-		auto entries = snapshot(stream_id);
+		const auto  stream_id     = key(stream);
+		auto        entries       = snapshot(stream_id);
 		cudaError_t cleanup_error = cudaSuccess;
 		drain(stream_id, entries, release_pinned, Mode::Complete, cleanup_error);
 		CUDA_SAFE_CALL(cleanup_error);
@@ -113,14 +116,14 @@ public:
 private:
 	using StreamKey = std::pair<int, uintptr_t>;
 	struct PendingEntry {
-		cudaEvent_t event = nullptr;
-		void* pinned = nullptr;
-		bool recorded = false;
-		bool complete = false;
+		cudaEvent_t event    = nullptr;
+		void*       pinned   = nullptr;
+		bool        recorded = false;
+		bool        complete = false;
 		// These two flags are protected by mutex_. The exclusive submitter or
 		// drainer accesses all other fields without holding that mutex.
 		bool submitting = true;
-		bool draining = false;
+		bool draining   = false;
 	};
 	using Entries = std::vector<std::shared_ptr<PendingEntry>>;
 	enum class Mode { Sync, Complete, Query };
@@ -135,13 +138,15 @@ private:
 			}
 		}
 		~ScopedDevice() {
-			if (restore_) CUDA_LOG_CALL(cudaSetDevice(previous_));
+			if (restore_)
+				CUDA_LOG_CALL(cudaSetDevice(previous_));
 		}
-		ScopedDevice(const ScopedDevice&) = delete;
+		ScopedDevice(const ScopedDevice&)            = delete;
 		ScopedDevice& operator=(const ScopedDevice&) = delete;
+
 	private:
-		int previous_ = -1;
-		bool restore_ = false;
+		int  previous_ = -1;
+		bool restore_  = false;
 	};
 
 	static StreamKey key(cudaStream_t stream) {
@@ -152,18 +157,20 @@ private:
 
 	Entries snapshot(StreamKey stream_id) {
 		std::lock_guard lock(mutex_);
-		const auto it = pending_.find(stream_id);
+		const auto      it = pending_.find(stream_id);
 		return it == pending_.end() ? Entries {} : it->second;
 	}
 
 	void erase_released(StreamKey stream_id) {
 		auto it = pending_.find(stream_id);
-		if (it == pending_.end()) return;
+		if (it == pending_.end())
+			return;
 		std::erase_if(it->second, [](const auto& entry) {
-			return !entry->submitting && !entry->draining && entry->complete &&
-			       entry->event == nullptr && entry->pinned == nullptr;
+			return !entry->submitting && !entry->draining && entry->complete && entry->event == nullptr &&
+			       entry->pinned == nullptr;
 		});
-		if (it->second.empty()) pending_.erase(it);
+		if (it->second.empty())
+			pending_.erase(it);
 	}
 
 	void finish_submit(StreamKey stream_id, const std::shared_ptr<PendingEntry>& entry) {
@@ -175,24 +182,30 @@ private:
 
 	void finish_drain(StreamKey stream_id, const Entries& entries) {
 		std::lock_guard lock(mutex_);
-		for (auto& entry : entries) entry->draining = false;
+		for (auto& entry : entries)
+			entry->draining = false;
 		erase_released(stream_id);
 		changed_.notify_all();
 	}
 
-	void drain(StreamKey stream_id, Entries& entries, const ReleasePinnedFn& release_pinned,
-	           Mode mode, cudaError_t& cleanup_error) {
+	void drain(StreamKey              stream_id,
+	           Entries&               entries,
+	           const ReleasePinnedFn& release_pinned,
+	           Mode                   mode,
+	           cudaError_t&           cleanup_error) {
 		{
 			std::unique_lock lock(mutex_);
 			if (mode == Mode::Query) {
 				std::erase_if(entries, [](const auto& entry) { return entry->submitting || entry->draining; });
 			} else {
 				changed_.wait(lock, [&] {
-					return std::none_of(entries.begin(), entries.end(),
-					                    [](const auto& entry) { return entry->submitting || entry->draining; });
+					return std::none_of(entries.begin(), entries.end(), [](const auto& entry) {
+						return entry->submitting || entry->draining;
+					});
 				});
 			}
-			for (auto& entry : entries) entry->draining = true;
+			for (auto& entry : entries)
+				entry->draining = true;
 		}
 		try {
 			ScopedDevice device(stream_id.first);
@@ -202,9 +215,11 @@ private:
 			}
 			for (auto& entry : entries) {
 				if (mode == Mode::Query && !entry->complete) {
-					if (!entry->recorded) continue;
+					if (!entry->recorded)
+						continue;
 					const auto status = cudaEventQuery(entry->event);
-					if (status == cudaErrorNotReady) continue;
+					if (status == cudaErrorNotReady)
+						continue;
 					CUDA_SAFE_CALL(status);
 				}
 				drain_entry(*entry, release_pinned, cleanup_error);
@@ -220,8 +235,10 @@ private:
 		entry.complete = true;
 		if (entry.event != nullptr) {
 			const auto status = cudaEventDestroy(entry.event);
-			if (status == cudaSuccess) entry.event = nullptr;
-			else if (first_error == cudaSuccess) first_error = status;
+			if (status == cudaSuccess)
+				entry.event = nullptr;
+			else if (first_error == cudaSuccess)
+				first_error = status;
 		}
 		if (entry.pinned != nullptr && release_pinned) {
 			release_pinned(entry.pinned);
@@ -230,8 +247,8 @@ private:
 	}
 
 	diagnostics::Mutex<diagnostics::Tracker> mutex_;
-	std::condition_variable_any changed_;
-	std::map<StreamKey, Entries> pending_;
+	std::condition_variable_any              changed_;
+	std::map<StreamKey, Entries>             pending_;
 };
 } // namespace galp::memory
 #endif

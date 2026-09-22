@@ -2,16 +2,21 @@
 // production pool/tracker/arena are compiled unchanged, without linking cudart.
 #include "../src/cuda/memory/device_arena.cu"
 #include "cuda/memory/gpu_array.cuh"
+#include <barrier>
+#include <condition_variable>
 #include <cstdlib>
+#include <future>
 #include <gtest/gtest.h>
 #include <map>
+#include <thread>
 
 struct CUevent_st {
 	bool complete = false;
+	int  device   = 0;
 };
 
 namespace {
-int                                 current_device           = 0;
+thread_local int                    current_device           = 0;
 int                                 synchronize_calls        = 0;
 int                                 device_synchronize_calls = 0;
 int                                 copies                   = 0;
@@ -20,6 +25,7 @@ int                                 queries                  = 0;
 int                                 fail_query_number        = 0;
 bool                                fail_sync                = false;
 bool                                fail_create              = false;
+bool                                fail_pinned_allocation   = false;
 bool                                fail_record              = false;
 bool                                fail_destroy             = false;
 cudaStream_t                        fail_stream              = nullptr;
@@ -30,8 +36,11 @@ struct PendingCopy {
 	const void*  src;
 	size_t       bytes;
 	cudaStream_t stream;
+	int          device;
 };
-std::vector<PendingCopy> pending_copies;
+std::vector<PendingCopy>          pending_copies;
+std::mutex                        mock_mutex;
+std::function<void(cudaStream_t)> before_copy, before_sync;
 
 cudaStream_t stream(size_t id) {
 	return reinterpret_cast<cudaStream_t>(id);
@@ -51,19 +60,23 @@ cudaError_t CUDARTAPI cudaSetDevice(int device) {
 	return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaMalloc(void** ptr, size_t size) {
+	std::lock_guard lock(mock_mutex);
 	*ptr              = std::malloc(size);
 	allocations[*ptr] = size;
 	return *ptr ? cudaSuccess : cudaErrorMemoryAllocation;
 }
 cudaError_t CUDARTAPI cudaMallocHost(void** ptr, size_t size) {
+	if (fail_pinned_allocation)
+		return cudaErrorMemoryAllocation;
 	return cudaMalloc(ptr, size);
 }
 cudaError_t CUDARTAPI cudaMallocAsync(void** ptr, size_t size, cudaStream_t) {
 	return cudaMalloc(ptr, size);
 }
 cudaError_t CUDARTAPI cudaFree(void* ptr) {
-	const auto begin = reinterpret_cast<uintptr_t>(ptr);
-	const auto end   = begin + allocations.at(ptr);
+	std::lock_guard lock(mock_mutex);
+	const auto      begin = reinterpret_cast<uintptr_t>(ptr);
+	const auto      end   = begin + allocations.at(ptr);
 	for (const auto& copy : pending_copies) {
 		const auto dst = reinterpret_cast<uintptr_t>(copy.dst);
 		const auto src = reinterpret_cast<uintptr_t>(copy.src);
@@ -81,25 +94,31 @@ cudaError_t CUDARTAPI cudaFreeAsync(void* ptr, cudaStream_t) {
 	return cudaFree(ptr);
 }
 cudaError_t CUDARTAPI cudaMemcpyAsync(void* dst, const void* src, size_t size, cudaMemcpyKind, cudaStream_t value) {
+	if (before_copy)
+		before_copy(value);
+	std::lock_guard lock(mock_mutex);
 	++copies;
 	if (copies == fail_copy_number) {
 		return cudaErrorInvalidValue;
 	}
-	pending_copies.push_back({dst, src, size, value});
+	pending_copies.push_back({dst, src, size, value, current_device});
 	return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaEventCreateWithFlags(cudaEvent_t* event, unsigned int) {
+	std::lock_guard lock(mock_mutex);
 	if (fail_create) {
 		return cudaErrorMemoryAllocation;
 	}
-	*event         = new CUevent_st;
-	events[*event] = nullptr;
+	*event           = new CUevent_st;
+	(*event)->device = current_device;
+	events[*event]   = nullptr;
 	return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaEventCreate(cudaEvent_t* event) {
 	return cudaEventCreateWithFlags(event, 0);
 }
 cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event, cudaStream_t value) {
+	std::lock_guard lock(mock_mutex);
 	if (fail_record) {
 		return cudaErrorInvalidValue;
 	}
@@ -107,12 +126,14 @@ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event, cudaStream_t value) {
 	return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaEventQuery(cudaEvent_t event) {
+	std::lock_guard lock(mock_mutex);
 	if (++queries == fail_query_number) {
 		return cudaErrorInvalidValue;
 	}
 	return event->complete ? cudaSuccess : cudaErrorNotReady;
 }
 cudaError_t CUDARTAPI cudaEventDestroy(cudaEvent_t event) {
+	std::lock_guard lock(mock_mutex);
 	if (fail_destroy) {
 		return cudaErrorInvalidValue;
 	}
@@ -121,12 +142,15 @@ cudaError_t CUDARTAPI cudaEventDestroy(cudaEvent_t event) {
 	return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t value) {
+	if (before_sync)
+		before_sync(value);
+	std::lock_guard lock(mock_mutex);
 	++synchronize_calls;
 	if (fail_sync && (fail_stream == nullptr || value == fail_stream)) {
 		return cudaErrorUnknown;
 	}
 	for (auto it = pending_copies.begin(); it != pending_copies.end();) {
-		if (it->stream == value) {
+		if (it->stream == value && it->device == current_device) {
 			std::memcpy(it->dst, it->src, it->bytes);
 			it = pending_copies.erase(it);
 		} else {
@@ -134,17 +158,19 @@ cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t value) {
 		}
 	}
 	for (auto [event, event_stream] : events) {
-		if (event_stream == value) {
+		if (event_stream == value && event->device == current_device) {
 			event->complete = true;
 		}
 	}
 	return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaDeviceSynchronize() {
+	std::lock_guard lock(mock_mutex);
 	++device_synchronize_calls;
 	return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaEventSynchronize(cudaEvent_t event) {
+	std::lock_guard lock(mock_mutex);
 	event->complete = true;
 	return cudaSuccess;
 }
@@ -162,16 +188,19 @@ using galp::memory::TransferTracker;
 
 class CudaTransferFailure : public ::testing::Test {
 	void SetUp() override {
+		current_device = 0;
+		before_copy = before_sync = {};
 		copies = queries = synchronize_calls = device_synchronize_calls = 0;
 		fail_copy_number = fail_query_number = 0;
-		fail_sync = fail_create = fail_record = fail_destroy = false;
-		fail_stream                                          = nullptr;
+		fail_sync = fail_create = fail_record = fail_destroy = fail_pinned_allocation = false;
+		fail_stream                                                                   = nullptr;
 		DevicePool::instance().set_use_async(false);
 		DevicePool::instance().set_small_copy_threshold(0);
 	}
 	void TearDown() override {
-		fail_sync = fail_create = fail_record = fail_destroy = false;
-		auto& pool                                           = DevicePool::instance();
+		before_copy = before_sync = {};
+		fail_sync = fail_create = fail_record = fail_destroy = fail_pinned_allocation = false;
+		auto& pool                                                                    = DevicePool::instance();
 		pool.release_cached();
 		EXPECT_EQ(pool.stats().in_use_bytes, 0U);
 		EXPECT_EQ(pool.pinned_stats().in_use_bytes, 0U);
@@ -274,6 +303,19 @@ TEST_F(CudaTransferFailure, RecordFailureRetainsDeviceAndPinnedUntilStreamComple
 	EXPECT_EQ(pool.pinned_stats().in_use_bytes, 0U);
 }
 
+TEST_F(CudaTransferFailure, PinnedAllocationFailureCancelsBeforeDma) {
+	auto& pool             = DevicePool::instance();
+	int   source           = 42;
+	void* dst              = pool.alloc(sizeof(source));
+	fail_pinned_allocation = true;
+	EXPECT_THROW(pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(1)), CudaError);
+	fail_pinned_allocation = false;
+	EXPECT_EQ(copies, 0);
+	EXPECT_TRUE(events.empty());
+	pool.free(dst);
+	EXPECT_EQ(synchronize_calls, 0);
+}
+
 TEST_F(CudaTransferFailure, ArenaPartialUploadKeepsBackingOnFailedSync) {
 	auto&       pool = DevicePool::instance();
 	int         source[2] {17, 42};
@@ -331,5 +373,217 @@ TEST_F(CudaTransferFailure, SuccessfulUploadStaysAsynchronous) {
 	EXPECT_EQ(device_synchronize_calls, 0);
 	arena.reset();
 	EXPECT_EQ(synchronize_calls, 1);
+}
+
+// A deterministic pause inside an injected CUDA operation, not a timing race.
+class Gate {
+public:
+	void pause() {
+		std::unique_lock lock(mutex_);
+		entered_ = true;
+		changed_.notify_all();
+		changed_.wait(lock, [&] { return open_; });
+	}
+	void wait() {
+		std::unique_lock lock(mutex_);
+		changed_.wait(lock, [&] { return entered_; });
+	}
+	void open() {
+		std::lock_guard lock(mutex_);
+		open_ = true;
+		changed_.notify_all();
+	}
+
+private:
+	std::mutex              mutex_;
+	std::condition_variable changed_;
+	bool                    entered_ = false, open_ = false;
+};
+
+TEST_F(CudaTransferFailure, DifferentAllocationsSubmitConcurrentlyAndReturnIdle) {
+	std::barrier                   start(8);
+	std::vector<std::future<void>> jobs;
+	for (int index = 0; index < 8; ++index) {
+		jobs.push_back(std::async(std::launch::async, [&, index] {
+			CUDA_SAFE_CALL(cudaSetDevice(index % 2));
+			auto&      pool   = DevicePool::instance();
+			const auto value  = stream(static_cast<size_t>(index + 1));
+			int        source = index + 17;
+			void*      dst    = pool.alloc(sizeof(source));
+			start.arrive_and_wait();
+			for (int repeat = 0; repeat < 50; ++repeat) {
+				pool.copy_h2d_on_stream(dst, &source, sizeof(source), value);
+				pool.sync_h2d(value);
+				EXPECT_EQ(*static_cast<int*>(dst), source);
+			}
+			pool.free(dst);
+		}));
+	}
+	for (auto& job : jobs)
+		EXPECT_NO_THROW(job.get());
+}
+
+TEST_F(CudaTransferFailure, CopyRejectsOverlappingCopyAndFree) {
+	auto& pool   = DevicePool::instance();
+	int   source = 42;
+	void* dst    = pool.alloc(sizeof(source));
+	Gate  gate;
+	before_copy = [&](cudaStream_t) {
+		gate.pause();
+	};
+	auto copy =
+	    std::async(std::launch::async, [&] { pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(1)); });
+	gate.wait();
+	EXPECT_THROW(pool.free(dst), std::logic_error);
+	EXPECT_THROW(pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(2)), std::logic_error);
+	EXPECT_EQ(pool.stats().in_use_bytes, sizeof(source));
+	gate.open();
+	EXPECT_NO_THROW(copy.get());
+	pool.free(dst);
+	EXPECT_THROW(pool.free(dst), std::invalid_argument); // not cudaFree(cached_ptr)
+}
+
+TEST_F(CudaTransferFailure, FreeRejectsOverlappingFreeAndCopyWhileWaiting) {
+	auto& pool   = DevicePool::instance();
+	int   source = 42;
+	void* dst    = pool.alloc(sizeof(source));
+	pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(1));
+	Gate gate;
+	before_sync = [&](cudaStream_t) {
+		gate.pause();
+	};
+	auto freeing = std::async(std::launch::async, [&] { pool.free(dst); });
+	gate.wait();
+	EXPECT_THROW(pool.free(dst), std::logic_error);
+	EXPECT_THROW(pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(2)), std::logic_error);
+	gate.open();
+	EXPECT_NO_THROW(freeing.get());
+}
+
+TEST_F(CudaTransferFailure, StreamSwitchKeepsAllocationExclusiveWhileUnlocked) {
+	auto& pool   = DevicePool::instance();
+	int   source = 42;
+	void* dst    = pool.alloc(sizeof(source));
+	pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(1));
+	Gate gate;
+	before_sync = [&](cudaStream_t value) {
+		if (value == stream(1))
+			gate.pause();
+	};
+	auto copy =
+	    std::async(std::launch::async, [&] { pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(2)); });
+	gate.wait();
+	EXPECT_THROW(pool.free(dst), std::logic_error);
+	gate.open();
+	EXPECT_NO_THROW(copy.get());
+	pool.free(dst);
+}
+
+TEST_F(CudaTransferFailure, WaitingStreamDoesNotBlockIndependentSubmission) {
+	for (const bool fail : {false, true}) {
+		TransferTracker tracker;
+		int             pinned = 42;
+		tracker.submit(stream(1), [&](void*& owner) { owner = &pinned; });
+		Gate gate;
+		fail_sync   = fail;
+		fail_stream = stream(1);
+		before_sync = [&](cudaStream_t value) {
+			if (value == stream(1))
+				gate.pause();
+		};
+		int  released = 0;
+		auto sync = std::async(std::launch::async, [&] { tracker.sync_stream(stream(1), [&](void*) { ++released; }); });
+		gate.wait();
+		auto submit = std::async(std::launch::async, [&] { tracker.submit(stream(2), [](void*&) {}); });
+		EXPECT_EQ(submit.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+		EXPECT_FALSE(tracker.empty());
+		gate.open();
+		submit.get();
+		if (fail) {
+			EXPECT_THROW(sync.get(), CudaError);
+			EXPECT_EQ(released, 0);
+		} else {
+			EXPECT_NO_THROW(sync.get());
+			EXPECT_EQ(released, 1);
+		}
+		before_sync = {};
+		fail_sync   = false;
+		tracker.sync_all([&](void*) { ++released; });
+		EXPECT_EQ(released, 1);
+		EXPECT_TRUE(tracker.empty());
+	}
+}
+
+TEST_F(CudaTransferFailure, SyncSnapshotDoesNotConsumeLaterSubmission) {
+	TransferTracker tracker;
+	tracker.submit(stream(1), [](void*&) {});
+	Gate gate;
+	before_sync = [&](cudaStream_t) {
+		gate.pause();
+	};
+	auto sync = std::async(std::launch::async, [&] { tracker.sync_all({}); });
+	gate.wait();
+	auto submit = std::async(std::launch::async, [&] { tracker.submit(stream(1), [](void*&) {}); });
+	EXPECT_EQ(submit.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+	gate.open();
+	submit.get();
+	sync.get();
+	EXPECT_FALSE(tracker.empty());
+	EXPECT_EQ(events.size(), 1U);
+	tracker.sync_all({});
+	EXPECT_TRUE(tracker.empty());
+}
+
+TEST_F(CudaTransferFailure, SubmittingEntrySurvivesConcurrentSyncAndQuery) {
+	TransferTracker tracker;
+	Gate            gate;
+	int             pinned = 42, released = 0;
+	auto            submit = std::async(std::launch::async, [&] {
+        tracker.submit(stream(1), [&](void*& owner) {
+            owner = &pinned;
+            gate.pause();
+        });
+    });
+	gate.wait();
+	tracker.reclaim_finished([&](void*) { ++released; });
+	EXPECT_EQ(released, 0);
+	auto sync = std::async(std::launch::async, [&] { tracker.sync_stream(stream(1), [&](void*) { ++released; }); });
+	EXPECT_EQ(sync.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+	gate.open();
+	submit.get();
+	sync.get();
+	EXPECT_EQ(released, 1);
+	EXPECT_TRUE(tracker.empty());
+}
+
+TEST_F(CudaTransferFailure, PreparationFailureHasNoDmaAndReleasesReservation) {
+	TransferTracker tracker;
+	int             pinned = 42, released = 0;
+	EXPECT_THROW(tracker.submit(
+	                 stream(1),
+	                 [&](void*& owner) {
+		                 owner = &pinned;
+		                 throw std::runtime_error("preparation failed");
+	                 },
+	                 [](void*&) { FAIL() << "DMA must not start"; },
+	                 [&](void*) { ++released; }),
+	             std::runtime_error);
+	EXPECT_EQ(released, 1);
+	EXPECT_TRUE(tracker.empty());
+	EXPECT_EQ(synchronize_calls, 0);
+}
+
+TEST_F(CudaTransferFailure, CrossThreadFreeUsesAllocationDeviceAndWrongDeviceCopyFails) {
+	auto& pool   = DevicePool::instance();
+	int   source = 42;
+	void* dst    = pool.alloc(sizeof(source));
+	pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(1));
+	auto other_device = std::async(std::launch::async, [&] {
+		CUDA_SAFE_CALL(cudaSetDevice(1));
+		EXPECT_THROW(pool.copy_h2d_on_stream(dst, &source, sizeof(source), stream(1)), std::invalid_argument);
+		pool.free(dst);
+		EXPECT_EQ(current_device, 1);
+	});
+	other_device.get();
 }
 } // namespace
