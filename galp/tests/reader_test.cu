@@ -232,8 +232,29 @@ std::filesystem::path pick_fls_file() {
 	return {};
 }
 
+// Discovered CTest cases run in separate processes. Never remove/rebuild a
+// sibling test's fixture while it is opening or mapping the same files.
+std::filesystem::path reader_fixture_root(const std::string& label) {
+	struct Directories {
+		std::vector<std::filesystem::path> paths;
+		~Directories() {
+			for (const auto& path : paths) {
+				std::error_code ignored;
+				std::filesystem::remove_all(path, ignored);
+			}
+		}
+	};
+	static Directories directories;
+	const auto* test = ::testing::UnitTest::GetInstance()->current_test_info();
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto root = std::filesystem::temp_directory_path() /
+	                  (std::string("galp_reader_") + test->name() + "_" + label + "_" + std::to_string(suffix));
+	directories.paths.push_back(root);
+	return root;
+}
+
 std::filesystem::path make_partial_rowgroup_fls_fixture() {
-	const std::filesystem::path root = std::filesystem::path {GALP_TEST_DATA_DIR} / "partial_rowgroup_public_span";
+	const auto root = reader_fixture_root("partial_rowgroup_public_span");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 
@@ -261,8 +282,7 @@ std::filesystem::path make_partial_rowgroup_fls_fixture() {
 }
 
 std::filesystem::path make_sparse_vector_read_fixture() {
-	const std::filesystem::path root =
-	    std::filesystem::path {GALP_TEST_DATA_DIR} / "sparse_vector_physical_ranges";
+	const auto root = reader_fixture_root("sparse_vector_physical_ranges");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 
@@ -288,8 +308,7 @@ std::filesystem::path make_sparse_vector_read_fixture() {
 }
 
 std::filesystem::path make_sparse_vector_bundle_fixture() {
-	const std::filesystem::path root =
-	    std::filesystem::path {GALP_TEST_DATA_DIR} / "sparse_vector_bundle_ranges";
+	const auto root = reader_fixture_root("sparse_vector_bundle_ranges");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 
@@ -328,8 +347,7 @@ std::filesystem::path make_sparse_vector_bundle_fixture() {
 }
 
 std::filesystem::path make_compact_coefficient_read_fixture() {
-	const std::filesystem::path root =
-	    std::filesystem::path {GALP_TEST_DATA_DIR} / "compact_coefficient_ranges";
+	const auto root = reader_fixture_root("compact_coefficient_ranges");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 	const auto standard_path = root / "standard.fls";
@@ -375,8 +393,7 @@ std::filesystem::path make_compact_coefficient_read_fixture() {
 }
 
 std::filesystem::path make_compact_mixed_payload_fixture() {
-	const std::filesystem::path root =
-	    std::filesystem::path {GALP_TEST_DATA_DIR} / "compact_mixed_payload_rowgroups";
+	const auto root = reader_fixture_root("compact_mixed_payload_rowgroups");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 	const auto standard_path = root / "standard.fls";
@@ -1924,7 +1941,7 @@ void expect_cross_rle_decompresses(const std::vector<T>&        run_values,
 }
 
 std::filesystem::path make_cross_rle_i16_fls_fixture() {
-	const std::filesystem::path root = std::filesystem::path {GALP_TEST_DATA_DIR} / "cross_rle_i16";
+	const auto root = reader_fixture_root("cross_rle_i16");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 
@@ -1964,7 +1981,7 @@ std::filesystem::path make_cross_rle_i16_fls_fixture() {
 std::filesystem::path make_forced_i16_fls_fixture(const fastlanes::OperatorToken token,
                                                   const std::string&              label,
                                                   const std::vector<int16_t>&     values) {
-	const std::filesystem::path root = std::filesystem::path {GALP_TEST_DATA_DIR} / label;
+	const auto root = reader_fixture_root(label);
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 
@@ -2344,7 +2361,7 @@ template <typename T>
 std::filesystem::path make_forced_delta_fls_fixture(const fastlanes::OperatorToken token,
 	                                                const std::string&              label,
 	                                                const std::vector<T>&           values) {
-	const std::filesystem::path root = std::filesystem::path {GALP_TEST_DATA_DIR} / label;
+	const auto root = reader_fixture_root(label);
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 	const auto fls_path = root / "data.fls";
@@ -2555,15 +2572,17 @@ TEST(Reader, CompactAllVectorsMatchesOriginalRowgroupOnGpu) {
 		GTEST_SKIP() << "CUDA device not available.";
 	}
 	const char* path_env = std::getenv("GALP_COMPACT_TEST_FILE");
-	if (path_env == nullptr || !std::filesystem::exists(path_env)) {
-		GTEST_SKIP() << "GALP_COMPACT_TEST_FILE does not name an FLS file.";
+	const auto fls_path = path_env ? std::filesystem::path(path_env) : make_sparse_vector_bundle_fixture();
+	ASSERT_TRUE(std::filesystem::exists(fls_path));
+	if (path_env == nullptr) {
+		galp::format::write_sparse_vector_bundle(fls_path, galp::format::sparse_vector_bundle_path(fls_path));
 	}
 	size_t rowgroup_index = 0U;
 	if (const char* rowgroup_env = std::getenv("GALP_COMPACT_TEST_ROWGROUP");
 	    rowgroup_env != nullptr && *rowgroup_env != '\0') {
 		rowgroup_index = std::stoull(rowgroup_env);
 	}
-	galp::format::FlsReader reader(path_env);
+	galp::format::FlsReader reader(fls_path);
 	ASSERT_LT(rowgroup_index, reader.rowgroup_count());
 	auto original = reader.read_rowgroup_zero_copy_materialized(rowgroup_index);
 	const size_t original_n_values = original.n_values;
@@ -2788,7 +2807,7 @@ TEST(Reader, DeltaI08I16ShareOneMixedWorksetAndPreserveColumnOrder) {
 		expected_i16[row] = static_cast<int16_t>((row * 251U + row / 17U) & 0xFFFFU);
 	}
 
-	const auto root = std::filesystem::path {GALP_TEST_DATA_DIR} / "delta_i08_i16_mixed";
+	const auto root = reader_fixture_root("delta_i08_i16_mixed");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
 	const auto fls_path = root / "data.fls";
