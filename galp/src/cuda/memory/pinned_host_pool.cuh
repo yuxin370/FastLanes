@@ -63,7 +63,7 @@ public:
 						free_by_size_.erase(it);
 					}
 					cached_bytes_ -= bucket_size;
-					in_use_[ptr] = bucket_size;
+					in_use_[ptr] = Allocation {bucket_size};
 					record_in_use_allocation_locked(bucket_size, false);
 					return ptr;
 				}
@@ -80,12 +80,14 @@ public:
 		CUDA_SAFE_CALL(status);
 		{
 			std::lock_guard lock(mutex_);
-			in_use_[ptr] = bytes;
+			in_use_[ptr] = Allocation {bytes};
 			record_in_use_allocation_locked(bytes, true);
 		}
 		return ptr;
 	}
 
+	// Overlapping releases of the same live allocation are rejected. Different
+	// allocations may be released concurrently; a failed release can be retried.
 	void release(void* ptr) {
 		if (ptr == nullptr) {
 			return;
@@ -95,23 +97,35 @@ public:
 		if (it == in_use_.end()) {
 			throw std::invalid_argument("PinnedHostPool::release requires a live pool allocation");
 		}
-		const size_t bytes = it->second;
+		if (it->second.releasing) {
+			throw std::logic_error("PinnedHostPool concurrent release on the same allocation is not allowed");
+		}
+		const size_t bytes   = it->second.bytes;
+		it->second.releasing = true;
 		// Until every throwing step succeeds, the caller (including the tracker)
 		// retains its in-use allocation. Never publish it to the cache then throw.
-		if (use_pinned_ && bytes <= cache_limit_bytes_) {
-			evict_until_room_locked(bytes, lock);
-			auto [bucket, inserted] = free_by_size_.try_emplace(bytes);
-			try {
-				bucket->second.push_back(ptr);
-			} catch (...) {
-				if (inserted) free_by_size_.erase(bucket);
-				throw; // keep ptr in-use, and do not leave an empty reusable bucket
+		try {
+			if (use_pinned_ && bytes <= cache_limit_bytes_) {
+				evict_until_room_locked(bytes, lock);
+				auto [bucket, inserted] = free_by_size_.try_emplace(bytes);
+				try {
+					bucket->second.push_back(ptr);
+				} catch (...) {
+					if (inserted)
+						free_by_size_.erase(bucket);
+					throw; // keep ptr in-use, and do not leave an empty reusable bucket
+				}
+				cached_bytes_ += bytes;
+			} else {
+				lock.unlock();
+				CUDA_SAFE_CALL(cudaFreeHost(ptr));
+				lock.lock();
 			}
-			cached_bytes_ += bytes;
-		} else {
-			lock.unlock();
-			CUDA_SAFE_CALL(cudaFreeHost(ptr));
-			lock.lock();
+		} catch (...) {
+			if (!lock.owns_lock())
+				lock.lock();
+			in_use_.at(ptr).releasing = false;
+			throw;
 		}
 		in_use_.erase(ptr); // iterators can be invalidated while mutex_ is unlocked
 		in_use_bytes_ -= bytes;
@@ -244,6 +258,10 @@ private:
 		void*  ptr;
 		size_t bytes;
 	};
+	struct Allocation {
+		size_t bytes;
+		bool   releasing = false;
+	};
 	std::mutex                              cleanup_mutex_;
 	std::optional<PendingFree>              pending_free_;
 	diagnostics::Mutex<diagnostics::Pinned> mutex_;
@@ -258,7 +276,7 @@ private:
 	size_t                                  cuda_allocation_count_ = 0;
 	size_t                                  cuda_allocation_bytes_ = 0;
 	std::map<size_t, std::vector<void*>>    free_by_size_;
-	std::unordered_map<void*, size_t>       in_use_;
+	std::unordered_map<void*, Allocation>   in_use_;
 };
 
 } // namespace galp::memory

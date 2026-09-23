@@ -626,6 +626,74 @@ private:
 	bool                    entered_ = false, open_ = false;
 };
 
+TEST_F(CudaTransferFailure, PinnedReleaseRejectsConcurrentRelease) {
+	for (const bool eviction : {false, true}) {
+		PinnedHostPool pool(eviction ? 64 : 0);
+		void*          old = pool.alloc(64);
+		void*          ptr = pool.alloc(32);
+		pool.release(old);
+		Gate gate;
+		before_free = [&](void*) {
+			gate.pause();
+		};
+		auto releasing = std::async(std::launch::async, [&] { pool.release(ptr); });
+		gate.wait();
+		EXPECT_THROW(pool.release(ptr), std::logic_error);
+		EXPECT_EQ(pool.stats().in_use_bytes, 32U);
+		gate.open();
+		EXPECT_NO_THROW(releasing.get());
+		before_free = {};
+		EXPECT_THROW(pool.release(ptr), std::invalid_argument);
+		pool.release_cached();
+	}
+}
+
+TEST_F(CudaTransferFailure, PinnedFailedReleaseClearsBusyForRetry) {
+	for (const bool eviction : {false, true}) {
+		PinnedHostPool pool(eviction ? 64 : 0);
+		void*          old = pool.alloc(64);
+		void*          ptr = pool.alloc(32);
+		pool.release(old);
+		fail_free_host_number = free_host_calls + 1;
+		Gate gate;
+		before_free = [&](void*) {
+			gate.pause();
+		};
+		auto releasing = std::async(std::launch::async, [&] { pool.release(ptr); });
+		gate.wait();
+		EXPECT_THROW(pool.release(ptr), std::logic_error);
+		gate.open();
+		EXPECT_THROW(releasing.get(), CudaError);
+		before_free = {};
+		EXPECT_EQ(pool.stats().in_use_bytes, 32U);
+		expect_live(ptr);
+		EXPECT_NO_THROW(pool.release(ptr));
+		pool.release_cached();
+		EXPECT_EQ(pool.stats().cached_bytes, 0U);
+		EXPECT_FALSE(pool.has_in_use());
+	}
+}
+
+TEST_F(CudaTransferFailure, PinnedDifferentAllocationsReleaseConcurrently) {
+	PinnedHostPool pool(0);
+	void*          first  = pool.alloc(64);
+	void*          second = pool.alloc(64);
+	Gate           gate;
+	before_free = [&](void* ptr) {
+		if (ptr == first)
+			gate.pause();
+	};
+	auto releasing = std::async(std::launch::async, [&] { pool.release(first); });
+	gate.wait();
+	auto independent = std::async(std::launch::async, [&] { pool.release(second); });
+	EXPECT_EQ(independent.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+	gate.open();
+	EXPECT_NO_THROW(releasing.get());
+	EXPECT_NO_THROW(independent.get());
+	before_free = {};
+	EXPECT_FALSE(pool.has_in_use());
+}
+
 TEST_F(CudaTransferFailure, ConcurrentCacheDrainersKeepPendingBlocksExclusive) {
 	// The same regression covers both pools: a paused CUDA free must not block
 	// ordinary allocation, and another drainer must not free the pending block.
