@@ -40,6 +40,8 @@ if (Python3_Interpreter_FOUND)
                 NAME GalpCompactV3AcceptancePython
                 COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_compact_v3_acceptance.py)
         set_tests_properties(GalpCompactV3AcceptancePython PROPERTIES LABELS "galp;compact-v3;cpu")
+        set_tests_properties(GalpCompactV3AcceptancePython PROPERTIES
+                ENVIRONMENT "PYTHONPATH=${PROJECT_SOURCE_DIR}")
         add_test(
                 NAME GalpPrepareImagenet512ParallelismPython
                 COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_prepare_imagenet512_v3_train.py)
