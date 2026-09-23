@@ -19,6 +19,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -40,7 +41,7 @@ struct DeviceAllocInfo {
 struct DevicePoolStats {
 	size_t in_use_bytes          = 0;
 	size_t peak_in_use_bytes     = 0;
-	size_t cached_bytes          = 0;
+	size_t cached_bytes          = 0; // includes non-reusable pending frees
 	size_t allocation_requests   = 0;
 	size_t cuda_allocation_count = 0;
 	size_t cuda_allocation_bytes = 0;
@@ -235,17 +236,11 @@ public:
 	void release_cached() {
 		sync_h2d();
 
-		std::map<size_t, std::vector<CachedBlock>> sync_free;
 		{
-			std::lock_guard lock(mutex_);
-			sync_free.swap(free_sync_by_size_);
-			free_cached_bytes_ = 0;
-		}
-
-		for (auto& [size, list] : sync_free) {
-			(void)size;
-			for (const CachedBlock& block : list) {
-				free_cached_block(block);
+			std::lock_guard  cleanup(cleanup_mutex_);
+			std::unique_lock lock(mutex_);
+			while (pending_free_ || !free_sync_by_size_.empty()) {
+				free_one_cached_locked(lock, false);
 			}
 		}
 		pinned_pool_.release_cached();
@@ -327,6 +322,10 @@ public:
 			}
 		}
 		free_sync_by_size_.clear();
+		if (pending_free_) {
+			static_cast<void>(cudaSetDevice(pending_free_->block.device));
+			CUDA_LOG_CALL(cudaFree(pending_free_->block.ptr));
+		}
 	}
 
 private:
@@ -441,9 +440,10 @@ private:
 			return;
 		}
 		AllocationOperation operation(*this, ptr, !require_live);
-		if (!operation.owns_record()) return;
+		if (!operation.owns_record())
+			return;
 		std::unique_lock lock(mutex_);
-		auto                         it = in_use_.find(ptr);
+		auto             it = in_use_.find(ptr);
 		if (it->second.sub_alloc) {
 			in_use_.erase(it);
 			operation.removed();
@@ -455,59 +455,63 @@ private:
 			ScopedDevice device(info.device);
 			sync_pending_h2d(info.h2d_stream);
 			lock.lock();
-			it = in_use_.find(ptr);
 		}
-		in_use_.erase(it);
-		operation.removed();
-		in_use_bytes_ = info.size <= in_use_bytes_ ? in_use_bytes_ - info.size : 0;
-		if (enabled_ && !info.async_alloc) {
-			std::vector<CachedBlock> evicted_cached;
-			if (info.size <= free_cache_limit_bytes_) {
-				evict_cached_until_room_locked(info.size, evicted_cached);
-				free_sync_by_size_[info.size].push_back(CachedBlock {ptr, info.device});
-				free_cached_bytes_ += info.size;
-				lock.unlock();
-				for (const CachedBlock& evicted : evicted_cached) {
-					free_cached_block(evicted);
-				}
-				return;
+		// A throwing eviction/free leaves this allocation live and exclusive
+		// until the operation guard unwinds. The caller can retry free(ptr).
+		if (enabled_ && !info.async_alloc && info.size <= free_cache_limit_bytes_) {
+			evict_cached_until_room_locked(info.size, lock);
+			auto [bucket, inserted] = free_sync_by_size_.try_emplace(info.size);
+			try {
+				bucket->second.push_back(CachedBlock {ptr, info.device});
+			} catch (...) {
+				if (inserted) free_sync_by_size_.erase(bucket);
+				throw; // the input allocation still belongs to in_use_
 			}
+			free_cached_bytes_ += info.size;
+		} else {
 			lock.unlock();
 			ScopedDevice device(info.device);
-			CUDA_SAFE_CALL(cudaFree(ptr));
-			return;
-		}
-		lock.unlock();
-		ScopedDevice device(info.device);
-		if (info.async_alloc) {
-			CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream));
-			return;
-		}
-		CUDA_SAFE_CALL(cudaFree(ptr));
-	}
-
-	void evict_cached_until_room_locked(size_t required_bytes, std::vector<CachedBlock>& evicted) {
-		while (free_cached_bytes_ + required_bytes > free_cache_limit_bytes_) {
-			if (!evict_largest_cached_locked(evicted)) {
-				return;
+			if (info.async_alloc) {
+				CUDA_SAFE_CALL(cudaFreeAsync(ptr, info.alloc_stream));
+			} else {
+				CUDA_SAFE_CALL(cudaFree(ptr));
 			}
+			lock.lock();
+		}
+		in_use_.erase(ptr); // no iterator survives an unlocked CUDA operation
+		operation.removed();
+		in_use_bytes_ -= info.size;
+	}
+
+	using Lock = std::unique_lock<diagnostics::Mutex<diagnostics::Device>>;
+
+	void evict_cached_until_room_locked(size_t required_bytes, Lock& lock) {
+		if (free_cached_bytes_ + required_bytes <= free_cache_limit_bytes_)
+			return;
+		lock.unlock();
+		std::lock_guard cleanup(cleanup_mutex_);
+		lock.lock();
+		while (free_cached_bytes_ + required_bytes > free_cache_limit_bytes_) {
+			free_one_cached_locked(lock, true);
 		}
 	}
 
-	bool evict_largest_cached_locked(std::vector<CachedBlock>& evicted) {
-		if (free_sync_by_size_.empty()) {
-			return false;
+	// As in PinnedHostPool, one non-reusable slot retains ownership across a
+	// failed free. CUDA runs outside mutex_; cleanup_mutex_ serializes drainers.
+	void free_one_cached_locked(Lock& lock, bool largest) {
+		if (!pending_free_) {
+			auto it       = largest ? std::prev(free_sync_by_size_.end()) : free_sync_by_size_.begin();
+			pending_free_ = PendingFree {it->second.back(), it->first};
+			it->second.pop_back();
+			if (it->second.empty())
+				free_sync_by_size_.erase(it);
 		}
-
-		auto  bucket_it = std::prev(free_sync_by_size_.end());
-		auto& list      = bucket_it->second;
-		evicted.push_back(list.back());
-		list.pop_back();
-		free_cached_bytes_ -= bucket_it->first;
-		if (list.empty()) {
-			free_sync_by_size_.erase(bucket_it);
-		}
-		return true;
+		const auto pending = *pending_free_;
+		lock.unlock();
+		free_cached_block(pending.block);
+		lock.lock();
+		free_cached_bytes_ -= pending.bytes;
+		pending_free_.reset();
 	}
 
 	bool reusable_size(size_t request_bytes, size_t cached_bytes) const {
@@ -546,7 +550,7 @@ private:
 		tracker_.reclaim_finished(make_release_pinned_fn());
 
 		std::lock_guard lock(mutex_);
-		bool                        has_real_allocs = false;
+		bool            has_real_allocs = false;
 		for (auto& [ptr, info] : in_use_) {
 			(void)ptr;
 			if (!info.sub_alloc) {
@@ -581,20 +585,26 @@ private:
 	}
 
 	diagnostics::Mutex<diagnostics::Device> mutex_;
-	bool       enabled_                = true;
-	bool       use_async_              = true;
-	bool       use_pinned_             = true;
-	size_t     small_copy_threshold_   = 256 * 1024;
-	size_t     free_cache_limit_bytes_ = 0;
-	size_t     max_reuse_slack_bytes_  = 0;
-	size_t     free_cached_bytes_      = 0;
-	size_t     in_use_bytes_           = 0;
-	size_t     peak_in_use_bytes_      = 0;
-	size_t     allocation_requests_    = 0;
-	size_t     cuda_allocation_count_  = 0;
-	size_t     cuda_allocation_bytes_  = 0;
+	bool                                    enabled_                = true;
+	bool                                    use_async_              = true;
+	bool                                    use_pinned_             = true;
+	size_t                                  small_copy_threshold_   = 256 * 1024;
+	size_t                                  free_cache_limit_bytes_ = 0;
+	size_t                                  max_reuse_slack_bytes_  = 0;
+	size_t                                  free_cached_bytes_      = 0;
+	size_t                                  in_use_bytes_           = 0;
+	size_t                                  peak_in_use_bytes_      = 0;
+	size_t                                  allocation_requests_    = 0;
+	size_t                                  cuda_allocation_count_  = 0;
+	size_t                                  cuda_allocation_bytes_  = 0;
 
 	std::map<size_t, std::vector<CachedBlock>> free_sync_by_size_;
+	struct PendingFree {
+		CachedBlock block;
+		size_t      bytes;
+	};
+	std::mutex                                 cleanup_mutex_;
+	std::optional<PendingFree>                 pending_free_; // included in free_cached_bytes_
 	std::unordered_map<void*, DeviceAllocInfo> in_use_;
 
 	PinnedHostPool  pinned_pool_;

@@ -8,7 +8,6 @@
 
 #include "cuda/cuda_macros.cuh"
 #include "cuda/memory/memory_diagnostics.hpp"
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -16,6 +15,8 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -24,7 +25,7 @@ namespace galp::memory {
 struct PinnedHostPoolStats {
 	size_t in_use_bytes          = 0;
 	size_t peak_in_use_bytes     = 0;
-	size_t cached_bytes          = 0;
+	size_t cached_bytes          = 0; // includes non-reusable pending frees
 	size_t allocation_requests   = 0;
 	size_t cuda_allocation_count = 0;
 	size_t cuda_allocation_bytes = 0;
@@ -38,7 +39,8 @@ public:
 	explicit PinnedHostPool(size_t cache_limit_bytes     = 256ULL * 1024ULL * 1024ULL,
 	                        size_t max_reuse_slack_bytes = 64ULL * 1024ULL * 1024ULL)
 	    : cache_limit_bytes_(cache_limit_bytes)
-	    , max_reuse_slack_bytes_(max_reuse_slack_bytes) {}
+	    , max_reuse_slack_bytes_(max_reuse_slack_bytes) {
+	}
 
 	void* alloc(size_t bytes) {
 		if (bytes == 0) {
@@ -68,7 +70,7 @@ public:
 			}
 		}
 
-		void* ptr = nullptr;
+		void* ptr    = nullptr;
 		auto  status = cudaMallocHost(&ptr, bytes);
 		if (status != cudaSuccess) {
 			ptr = nullptr;
@@ -88,31 +90,31 @@ public:
 		if (ptr == nullptr) {
 			return;
 		}
-		std::vector<void*> evicted;
-		bool               free_released = true;
-		{
-			std::lock_guard lock(mutex_);
-			auto                        it = in_use_.find(ptr);
-			if (it != in_use_.end()) {
-				const size_t bytes = it->second;
-				in_use_.erase(it);
-				in_use_bytes_ = bytes <= in_use_bytes_ ? in_use_bytes_ - bytes : 0;
-				if (use_pinned_ && bytes <= cache_limit_bytes_) {
-					evict_until_room_locked(bytes, evicted);
-					if (cached_bytes_ + bytes <= cache_limit_bytes_) {
-						free_by_size_[bytes].push_back(ptr);
-						cached_bytes_ += bytes;
-						free_released = false;
-					}
-				}
+		std::unique_lock lock(mutex_);
+		const auto       it = in_use_.find(ptr);
+		if (it == in_use_.end()) {
+			throw std::invalid_argument("PinnedHostPool::release requires a live pool allocation");
+		}
+		const size_t bytes = it->second;
+		// Until every throwing step succeeds, the caller (including the tracker)
+		// retains its in-use allocation. Never publish it to the cache then throw.
+		if (use_pinned_ && bytes <= cache_limit_bytes_) {
+			evict_until_room_locked(bytes, lock);
+			auto [bucket, inserted] = free_by_size_.try_emplace(bytes);
+			try {
+				bucket->second.push_back(ptr);
+			} catch (...) {
+				if (inserted) free_by_size_.erase(bucket);
+				throw; // keep ptr in-use, and do not leave an empty reusable bucket
 			}
-		}
-		for (void* evicted_ptr : evicted) {
-			CUDA_SAFE_CALL(cudaFreeHost(evicted_ptr));
-		}
-		if (free_released) {
+			cached_bytes_ += bytes;
+		} else {
+			lock.unlock();
 			CUDA_SAFE_CALL(cudaFreeHost(ptr));
+			lock.lock();
 		}
+		in_use_.erase(ptr); // iterators can be invalidated while mutex_ is unlocked
+		in_use_bytes_ -= bytes;
 	}
 
 	// Caller is responsible for draining in-flight transfers and asserting
@@ -128,29 +130,16 @@ public:
 	}
 
 	void set_cache_limit_bytes(size_t bytes) {
-		std::vector<void*> evicted;
-		{
-			std::lock_guard lock(mutex_);
-			cache_limit_bytes_ = bytes;
-			evict_until_limit_locked(evicted);
-		}
-		for (void* ptr : evicted) {
-			CUDA_SAFE_CALL(cudaFreeHost(ptr));
-		}
+		std::unique_lock lock(mutex_);
+		cache_limit_bytes_ = bytes;
+		evict_until_room_locked(0, lock);
 	}
 
 	void release_cached() {
-		std::map<size_t, std::vector<void*>> cached;
-		{
-			std::lock_guard lock(mutex_);
-			cached.swap(free_by_size_);
-			cached_bytes_ = 0;
-		}
-		for (auto& [size, list] : cached) {
-			(void)size;
-			for (void* ptr : list) {
-				CUDA_SAFE_CALL(cudaFreeHost(ptr));
-			}
+		std::lock_guard  cleanup(cleanup_mutex_);
+		std::unique_lock lock(mutex_);
+		while (pending_free_ || !free_by_size_.empty()) {
+			free_one_cached_locked(lock, false);
 		}
 	}
 
@@ -177,6 +166,7 @@ public:
 		cleanup_enabled_ = false;
 		in_use_.clear();
 		free_by_size_.clear();
+		pending_free_.reset();
 		in_use_bytes_ = 0;
 		cached_bytes_ = 0;
 	}
@@ -203,6 +193,9 @@ public:
 			}
 		}
 		free_by_size_.clear();
+		if (pending_free_) {
+			CUDA_LOG_CALL(cudaFreeHost(pending_free_->ptr));
+		}
 	}
 
 private:
@@ -215,42 +208,57 @@ private:
 		}
 	}
 
-	void evict_until_room_locked(size_t required_bytes, std::vector<void*>& evicted) {
-		while (cached_bytes_ + required_bytes > cache_limit_bytes_ && !free_by_size_.empty()) {
-			evict_largest_locked(evicted);
+	using Lock = std::unique_lock<diagnostics::Mutex<diagnostics::Pinned>>;
+
+	void evict_until_room_locked(size_t required_bytes, Lock& lock) {
+		if (cached_bytes_ + required_bytes <= cache_limit_bytes_)
+			return;
+		lock.unlock();
+		std::lock_guard cleanup(cleanup_mutex_);
+		lock.lock();
+		while (cached_bytes_ + required_bytes > cache_limit_bytes_ && (pending_free_ || !free_by_size_.empty())) {
+			free_one_cached_locked(lock, true);
 		}
 	}
 
-	void evict_until_limit_locked(std::vector<void*>& evicted) {
-		while (cached_bytes_ > cache_limit_bytes_ && !free_by_size_.empty()) {
-			evict_largest_locked(evicted);
+	// cleanup_mutex_ serializes only CUDA frees, not allocation/cache reuse.
+	// The single pending slot is an allocation-free ownership transfer. It is
+	// never reusable, survives exceptions, and remains included in cached_bytes_.
+	void free_one_cached_locked(Lock& lock, bool largest) {
+		if (!pending_free_) {
+			auto it       = largest ? std::prev(free_by_size_.end()) : free_by_size_.begin();
+			pending_free_ = PendingFree {it->second.back(), it->first};
+			it->second.pop_back();
+			if (it->second.empty())
+				free_by_size_.erase(it);
 		}
+		const auto block = *pending_free_;
+		lock.unlock();
+		CUDA_SAFE_CALL(cudaFreeHost(block.ptr));
+		lock.lock();
+		cached_bytes_ -= block.bytes;
+		pending_free_.reset();
 	}
 
-	void evict_largest_locked(std::vector<void*>& evicted) {
-		auto  it   = std::prev(free_by_size_.end());
-		auto& list = it->second;
-		evicted.push_back(list.back());
-		list.pop_back();
-		cached_bytes_ -= it->first;
-		if (list.empty()) {
-			free_by_size_.erase(it);
-		}
-	}
-
+	struct PendingFree {
+		void*  ptr;
+		size_t bytes;
+	};
+	std::mutex                              cleanup_mutex_;
+	std::optional<PendingFree>              pending_free_;
 	diagnostics::Mutex<diagnostics::Pinned> mutex_;
-	bool                                 use_pinned_            = true;
-	bool                                 cleanup_enabled_       = true;
-	size_t                               cache_limit_bytes_;
-	size_t                               max_reuse_slack_bytes_;
-	size_t                               in_use_bytes_          = 0;
-	size_t                               peak_in_use_bytes_     = 0;
-	size_t                               cached_bytes_          = 0;
-	size_t                               allocation_requests_   = 0;
-	size_t                               cuda_allocation_count_ = 0;
-	size_t                               cuda_allocation_bytes_ = 0;
-	std::map<size_t, std::vector<void*>> free_by_size_;
-	std::unordered_map<void*, size_t>    in_use_;
+	bool                                    use_pinned_      = true;
+	bool                                    cleanup_enabled_ = true;
+	size_t                                  cache_limit_bytes_;
+	size_t                                  max_reuse_slack_bytes_;
+	size_t                                  in_use_bytes_          = 0;
+	size_t                                  peak_in_use_bytes_     = 0;
+	size_t                                  cached_bytes_          = 0;
+	size_t                                  allocation_requests_   = 0;
+	size_t                                  cuda_allocation_count_ = 0;
+	size_t                                  cuda_allocation_bytes_ = 0;
+	std::map<size_t, std::vector<void*>>    free_by_size_;
+	std::unordered_map<void*, size_t>       in_use_;
 };
 
 } // namespace galp::memory

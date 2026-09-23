@@ -8,6 +8,7 @@
 #include <future>
 #include <gtest/gtest.h>
 #include <map>
+#include <set>
 #include <thread>
 
 struct CUevent_st {
@@ -31,6 +32,12 @@ bool                                fail_destroy             = false;
 cudaStream_t                        fail_stream              = nullptr;
 std::map<cudaEvent_t, cudaStream_t> events;
 std::map<void*, size_t>             allocations;
+std::map<void*, int>                allocation_devices;
+std::set<void*>                     freed_addresses;
+int                                 free_calls = 0, free_host_calls = 0;
+int                                 fail_free_number = 0, fail_free_host_number = 0;
+int                                 duplicate_frees    = 0;
+constexpr size_t                    device_cache_limit = 4096;
 struct PendingCopy {
 	void*        dst;
 	const void*  src;
@@ -41,9 +48,46 @@ struct PendingCopy {
 std::vector<PendingCopy>          pending_copies;
 std::mutex                        mock_mutex;
 std::function<void(cudaStream_t)> before_copy, before_sync;
+std::function<void(void*)>        before_free;
 
 cudaStream_t stream(size_t id) {
 	return reinterpret_cast<cudaStream_t>(id);
+}
+
+cudaError_t free_allocation(void* ptr, bool pinned) {
+	if (before_free)
+		before_free(ptr);
+	std::lock_guard lock(mock_mutex);
+	int&            calls = pinned ? free_host_calls : free_calls;
+	if (++calls == (pinned ? fail_free_host_number : fail_free_number))
+		return cudaErrorUnknown;
+	const auto it = allocations.find(ptr);
+	if (it == allocations.end()) {
+		++duplicate_frees;
+		ADD_FAILURE() << "duplicate/unknown CUDA free: " << ptr;
+		return cudaErrorInvalidValue;
+	}
+	if (!pinned)
+		EXPECT_EQ(allocation_devices.at(ptr), current_device) << "free on wrong CUDA device";
+	const auto begin = reinterpret_cast<uintptr_t>(ptr);
+	const auto end   = begin + it->second;
+	for (const auto& copy : pending_copies) {
+		const auto dst = reinterpret_cast<uintptr_t>(copy.dst);
+		const auto src = reinterpret_cast<uintptr_t>(copy.src);
+		EXPECT_FALSE((dst >= begin && dst < end) || (src >= begin && src < end))
+		    << "freed backing before DMA completed";
+	}
+	freed_addresses.insert(ptr);
+	allocation_devices.erase(ptr);
+	allocations.erase(it);
+	std::free(ptr);
+	return cudaSuccess;
+}
+
+void expect_live(void* ptr) {
+	std::lock_guard lock(mock_mutex);
+	EXPECT_TRUE(allocations.contains(ptr)) << "cache returned released address " << ptr;
+	EXPECT_FALSE(freed_addresses.contains(ptr));
 }
 } // namespace
 
@@ -61,8 +105,10 @@ cudaError_t CUDARTAPI cudaSetDevice(int device) {
 }
 cudaError_t CUDARTAPI cudaMalloc(void** ptr, size_t size) {
 	std::lock_guard lock(mock_mutex);
-	*ptr              = std::malloc(size);
-	allocations[*ptr] = size;
+	*ptr                     = std::malloc(size);
+	allocations[*ptr]        = size;
+	allocation_devices[*ptr] = current_device;
+	freed_addresses.erase(*ptr); // malloc may legitimately reuse an address.
 	return *ptr ? cudaSuccess : cudaErrorMemoryAllocation;
 }
 cudaError_t CUDARTAPI cudaMallocHost(void** ptr, size_t size) {
@@ -74,21 +120,10 @@ cudaError_t CUDARTAPI cudaMallocAsync(void** ptr, size_t size, cudaStream_t) {
 	return cudaMalloc(ptr, size);
 }
 cudaError_t CUDARTAPI cudaFree(void* ptr) {
-	std::lock_guard lock(mock_mutex);
-	const auto      begin = reinterpret_cast<uintptr_t>(ptr);
-	const auto      end   = begin + allocations.at(ptr);
-	for (const auto& copy : pending_copies) {
-		const auto dst = reinterpret_cast<uintptr_t>(copy.dst);
-		const auto src = reinterpret_cast<uintptr_t>(copy.src);
-		EXPECT_FALSE((dst >= begin && dst < end) || (src >= begin && src < end))
-		    << "freed backing before DMA completed";
-	}
-	allocations.erase(ptr);
-	std::free(ptr);
-	return cudaSuccess;
+	return free_allocation(ptr, false);
 }
 cudaError_t CUDARTAPI cudaFreeHost(void* ptr) {
-	return cudaFree(ptr);
+	return free_allocation(ptr, true);
 }
 cudaError_t CUDARTAPI cudaFreeAsync(void* ptr, cudaStream_t) {
 	return cudaFree(ptr);
@@ -184,21 +219,30 @@ namespace {
 using galp::memory::CudaError;
 using galp::memory::DeviceArena;
 using galp::memory::DevicePool;
+using galp::memory::PinnedHostPool;
 using galp::memory::TransferTracker;
 
 class CudaTransferFailure : public ::testing::Test {
 	void SetUp() override {
+		// Set before the first singleton access; keep eviction tests small.
+		setenv("GALP_DEVICE_POOL_CACHE_LIMIT_BYTES", "4096", 1);
 		current_device = 0;
 		before_copy = before_sync = {};
+		before_free               = {};
 		copies = queries = synchronize_calls = device_synchronize_calls = 0;
 		fail_copy_number = fail_query_number = 0;
+		free_calls = free_host_calls = duplicate_frees = 0;
+		fail_free_number = fail_free_host_number = 0;
+		freed_addresses.clear();
 		fail_sync = fail_create = fail_record = fail_destroy = fail_pinned_allocation = false;
 		fail_stream                                                                   = nullptr;
 		DevicePool::instance().set_use_async(false);
 		DevicePool::instance().set_small_copy_threshold(0);
 	}
 	void TearDown() override {
+		fail_free_number = fail_free_host_number = 0;
 		before_copy = before_sync = {};
+		before_free               = {};
 		fail_sync = fail_create = fail_record = fail_destroy = fail_pinned_allocation = false;
 		auto& pool                                                                    = DevicePool::instance();
 		pool.release_cached();
@@ -208,8 +252,190 @@ class CudaTransferFailure : public ::testing::Test {
 		EXPECT_TRUE(allocations.empty());
 		EXPECT_TRUE(pending_copies.empty());
 		EXPECT_EQ(device_synchronize_calls, 0);
+		EXPECT_EQ(duplicate_frees, 0);
 	}
 };
+
+TEST_F(CudaTransferFailure, PinnedReleaseEvictionFailureKeepsOwnership) {
+	PinnedHostPool pool(64);
+	void*          old      = pool.alloc(64);
+	void*          incoming = pool.alloc(32);
+	pool.release(old);
+	fail_free_host_number = 1;
+	EXPECT_THROW(pool.release(incoming), CudaError);
+	EXPECT_EQ(pool.stats().in_use_bytes, 32U);
+	EXPECT_EQ(pool.stats().cached_bytes, 64U);
+	void* other = pool.alloc(64);
+	EXPECT_NE(other, old); // failed-free blocks are not reusable
+	EXPECT_NE(other, incoming);
+	pool.release(incoming);
+	pool.release(other);
+	pool.release_cached();
+	EXPECT_EQ(pool.stats().cached_bytes, 0U);
+}
+
+TEST_F(CudaTransferFailure, PinnedReleaseRetryDoesNotDoubleFree) {
+	PinnedHostPool pool(64);
+	void*          old      = pool.alloc(64);
+	void*          incoming = pool.alloc(32);
+	pool.release(old);
+	fail_free_host_number = 1;
+	EXPECT_THROW(pool.release(incoming), CudaError);
+	EXPECT_NO_THROW(pool.release(incoming));
+	EXPECT_NO_THROW(pool.release_cached());
+	EXPECT_EQ(duplicate_frees, 0);
+	EXPECT_EQ(pool.stats().in_use_bytes, 0U);
+}
+
+TEST_F(CudaTransferFailure, PinnedReleaseCachedPartialFailureIsRetryable) {
+	PinnedHostPool pool;
+	void*          first  = pool.alloc(16);
+	void*          second = pool.alloc(32);
+	void*          third  = pool.alloc(64);
+	pool.release(first);
+	pool.release(second);
+	pool.release(third);
+	fail_free_host_number = 2;
+	EXPECT_THROW(pool.release_cached(), CudaError);
+	EXPECT_TRUE(freed_addresses.contains(first));
+	expect_live(second);
+	expect_live(third);
+	EXPECT_EQ(pool.stats().cached_bytes, 96U);
+	void* reused = pool.alloc(32);
+	EXPECT_NE(reused, second);
+	expect_live(reused);
+	pool.release(reused);
+	EXPECT_NO_THROW(pool.release_cached());
+	EXPECT_EQ(pool.stats().cached_bytes, 0U);
+	EXPECT_TRUE(allocations.empty());
+}
+
+TEST_F(CudaTransferFailure, PinnedReleasedPointerIsNeverReturnedFromCacheAfterFree) {
+	PinnedHostPool pool(64);
+	void*          old      = pool.alloc(64);
+	void*          incoming = pool.alloc(32);
+	pool.release(old);
+	fail_free_host_number = 1;
+	EXPECT_THROW(pool.release(incoming), CudaError);
+	pool.release(incoming);
+	void* reused = pool.alloc(32);
+	expect_live(reused);
+	pool.release(reused);
+	EXPECT_NO_THROW(pool.release_cached());
+}
+
+TEST_F(CudaTransferFailure, DeviceReleaseCachedPartialFailureIsRetryable) {
+	auto& pool   = DevicePool::instance();
+	void* first  = pool.alloc(16);
+	void* second = pool.alloc(32);
+	void* third  = pool.alloc(64);
+	pool.free(first);
+	pool.free(second);
+	pool.free(third);
+	fail_free_number = 2;
+	EXPECT_THROW(pool.release_cached(), CudaError);
+	EXPECT_TRUE(freed_addresses.contains(first));
+	expect_live(second);
+	expect_live(third);
+	EXPECT_EQ(pool.stats().cached_bytes, 96U);
+	void* reused = pool.alloc(32);
+	EXPECT_NE(reused, second);
+	expect_live(reused);
+	pool.free(reused);
+	EXPECT_NO_THROW(pool.release_cached());
+	EXPECT_EQ(pool.stats().cached_bytes, 0U);
+}
+
+TEST_F(CudaTransferFailure, DeviceEvictionFailureKeepsBlockOwned) {
+	auto& pool     = DevicePool::instance();
+	void* old      = pool.alloc(device_cache_limit);
+	void* incoming = pool.alloc(32);
+	pool.free(old);
+	fail_free_number = 1;
+	EXPECT_THROW(pool.free(incoming), CudaError);
+	EXPECT_EQ(pool.stats().in_use_bytes, 32U);
+	EXPECT_EQ(pool.stats().cached_bytes, device_cache_limit);
+	void* other = pool.alloc(device_cache_limit);
+	EXPECT_NE(other, old);
+	expect_live(other);
+	EXPECT_NO_THROW(pool.free(incoming));
+	pool.free(other);
+	pool.release_cached();
+}
+
+TEST_F(CudaTransferFailure, DeviceRetryUsesOriginalCudaDevice) {
+	auto& pool     = DevicePool::instance();
+	void* first    = pool.alloc(16);
+	current_device = 1;
+	void* second   = pool.alloc(32);
+	pool.free(first);
+	pool.free(second);
+	current_device   = 2;
+	fail_free_number = 2;
+	EXPECT_THROW(pool.release_cached(), CudaError);
+	EXPECT_EQ(current_device, 2);
+	EXPECT_NO_THROW(pool.release_cached());
+	EXPECT_EQ(current_device, 2);
+	EXPECT_TRUE(allocations.empty());
+}
+
+TEST_F(CudaTransferFailure, TrackerPinnedEvictionFailureCanRetryWithoutDanglingCache) {
+	PinnedHostPool  pool(64);
+	TransferTracker tracker;
+	void*           old      = pool.alloc(64);
+	void*           incoming = pool.alloc(32);
+	pool.release(old);
+	char destination[32] {};
+	tracker.submit(stream(1), [&](void*& pinned) {
+		pinned = incoming;
+		CUDA_SAFE_CALL(cudaMemcpyAsync(destination, pinned, 32, cudaMemcpyHostToDevice, stream(1)));
+	});
+	const auto release = [&](void* ptr) {
+		pool.release(ptr);
+	};
+	fail_free_host_number = 1;
+	EXPECT_THROW(tracker.sync_all(release), CudaError);
+	EXPECT_FALSE(tracker.empty());
+	EXPECT_EQ(pool.stats().in_use_bytes, 32U);
+	tracker.sync_all(release);
+	EXPECT_TRUE(tracker.empty());
+	void* reused = pool.alloc(32);
+	expect_live(reused);
+	pool.release(reused);
+	EXPECT_NO_THROW(pool.release_cached());
+	EXPECT_FALSE(pool.has_in_use());
+	EXPECT_EQ(pool.stats().cached_bytes, 0U);
+}
+
+TEST_F(CudaTransferFailure, PinnedCacheLimitFailureIsRetryable) {
+	PinnedHostPool pool;
+	void*          ptr = pool.alloc(64);
+	pool.release(ptr);
+	fail_free_host_number = 1;
+	EXPECT_THROW(pool.set_cache_limit_bytes(0), CudaError);
+	EXPECT_EQ(pool.stats().cached_bytes, 64U);
+	void* other = pool.alloc(64);
+	EXPECT_NE(other, ptr);
+	pool.release(other);
+	pool.release_cached();
+	EXPECT_EQ(pool.stats().cached_bytes, 0U);
+}
+
+TEST_F(CudaTransferFailure, UncachedFreeFailureLeavesAllocationLiveForRetry) {
+	PinnedHostPool pinned(0);
+	void*          host   = pinned.alloc(64);
+	fail_free_host_number = 1;
+	EXPECT_THROW(pinned.release(host), CudaError);
+	EXPECT_EQ(pinned.stats().in_use_bytes, 64U);
+	pinned.release(host);
+	EXPECT_EQ(pinned.stats().in_use_bytes, 0U);
+	auto& pool       = DevicePool::instance();
+	void* device     = pool.alloc(device_cache_limit + 1);
+	fail_free_number = 1;
+	EXPECT_THROW(pool.free(device), CudaError);
+	EXPECT_EQ(pool.stats().in_use_bytes, device_cache_limit + 1);
+	pool.free(device);
+}
 
 TEST_F(CudaTransferFailure, SyncAllKeepsFailedAndUnvisitedEntries) {
 	TransferTracker    tracker;
@@ -399,6 +625,45 @@ private:
 	std::condition_variable changed_;
 	bool                    entered_ = false, open_ = false;
 };
+
+TEST_F(CudaTransferFailure, ConcurrentCacheDrainersKeepPendingBlocksExclusive) {
+	// The same regression covers both pools: a paused CUDA free must not block
+	// ordinary allocation, and another drainer must not free the pending block.
+	for (bool pinned : {false, true}) {
+		PinnedHostPool host;
+		auto&          device = DevicePool::instance();
+		const auto     alloc  = [&] {
+            return pinned ? host.alloc(64) : device.alloc(64);
+		};
+		const auto release = [&](void* ptr) {
+			pinned ? host.release(ptr) : device.free(ptr);
+		};
+		const auto drain = [&] {
+			pinned ? host.release_cached() : device.release_cached();
+		};
+		void* old = alloc();
+		release(old);
+		Gate gate;
+		before_free = [&](void* ptr) {
+			if (ptr == old)
+				gate.pause();
+		};
+		auto first = std::async(std::launch::async, drain);
+		gate.wait();
+		auto second     = std::async(std::launch::async, drain);
+		auto allocating = std::async(std::launch::async, alloc);
+		EXPECT_EQ(allocating.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+		gate.open();
+		void* other = allocating.get();
+		EXPECT_NE(other, old);
+		expect_live(other);
+		EXPECT_NO_THROW(first.get());
+		EXPECT_NO_THROW(second.get());
+		before_free = {};
+		release(other);
+		drain();
+	}
+}
 
 TEST_F(CudaTransferFailure, DifferentAllocationsSubmitConcurrentlyAndReturnIdle) {
 	std::barrier                   start(8);
