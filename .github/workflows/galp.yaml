@@ -219,7 +219,7 @@ jobs:
             -DGALP_BUILD_BENCHMARKS=OFF -DGALP_WITH_NVCOMP=OFF \
             -DGALP_BUILD_TORCH=ON -DPython3_EXECUTABLE="$(command -v python3)"
       - name: Build native extension and fixture encoder
-        run: cmake --build build-torch --parallel --target _galp_direct_dct galp_jpeg_dct_tool
+        run: cmake --build build-torch --parallel --target _galp_direct_dct galp_jpeg_dct_tool galp_block_major_access_tool
       - name: Create a small real JPEG manifest
         run: |
           python3 - <<'PY'
@@ -239,7 +239,7 @@ jobs:
           test -f "$GALP_DIRECT_DCT_TEST_MANIFEST"
       - name: Run native import and GPU runtime tests (skips are failures)
         run: |
-          for test in GalpDirectDctTorchImport GalpDirectDctTorchRuntimeSmoke; do
+          for test in GalpDirectDctTorchImport GalpDirectDctTorchRuntimeSmoke GalpDirectDctPlsTorchRuntimeSmoke; do
             ctest --test-dir build-torch -R "^${test}$" --no-tests=error --output-on-failure
           done
       - name: Upload Torch test logs

@@ -167,15 +167,23 @@ if (BUILD_TESTING)
                 LABELS "galp;jpeg-dct;direct-dct;torch;gpu;smoke"
                 SKIP_RETURN_CODE 77
         )
+        set(GALP_PLS_SMOKE_FIXTURE_ARGS)
+        if (TARGET galp_jpeg_dct_tool AND TARGET galp_block_major_access_tool)
+                set(GALP_PLS_SMOKE_FIXTURE_ARGS
+                        --jpeg-tool $<TARGET_FILE:galp_jpeg_dct_tool>
+                        --access-tool $<TARGET_FILE:galp_block_major_access_tool>)
+        endif ()
         add_test(
                 NAME GalpDirectDctPlsTorchRuntimeSmoke
                 COMMAND ${CMAKE_COMMAND} -E env
                         "PYTHONPATH=${PROJECT_SOURCE_DIR}:$<TARGET_FILE_DIR:_galp_direct_dct>"
                         ${Python3_EXECUTABLE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/direct_dct_pls_torch_runtime_smoke.py
+                        ${GALP_PLS_SMOKE_FIXTURE_ARGS}
         )
         set_tests_properties(GalpDirectDctPlsTorchRuntimeSmoke PROPERTIES
                 LABELS "galp;jpeg-dct;direct-dct;pls;torch;gpu;smoke"
                 SKIP_RETURN_CODE 77
+                TIMEOUT 300
         )
 endif ()
