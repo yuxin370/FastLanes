@@ -23,18 +23,20 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
+
 
 HERE = Path(__file__).resolve().parent
 FASTLANES_ROOT = HERE.parents[3]
 
-from galp.benchmarks.system_dct_major.training_pls.published_optimizer import (
+from galp.benchmarks.training_pls.published_optimizer import (
     build_published_optimizer,
 )
-from galp.benchmarks.system_dct_major.training_pls.recipe import (
+from galp.benchmarks.training_pls.recipe import (
     RECIPE_NAME,
     recipe_contract,
 )
-from galp.benchmarks.system_dct_major.training_pls.train import (
+from galp.benchmarks.training_pls.train import (
     compile_published_model,
 )
 from galp.benchmarks.system_rgbnomore.training.augmentation import (
@@ -160,7 +162,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-microbatches", type=int, default=128)
     parser.add_argument("--measurement-microbatches", type=int, default=512)
     parser.add_argument(
-        "--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more")
+        "--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT
     )
     parser.add_argument("--dali-variant", choices=DALI_VARIANTS, default="d2")
     parser.add_argument("--dali-num-threads", type=int, default=4)

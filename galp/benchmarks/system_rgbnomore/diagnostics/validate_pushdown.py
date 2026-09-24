@@ -11,6 +11,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT, sampling_mode
+
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_TORCH_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 if DEFAULT_TORCH_BINDING_DIR.is_dir() and str(DEFAULT_TORCH_BINDING_DIR) not in sys.path:
@@ -22,19 +25,14 @@ import torch
 import _galp_direct_dct as galp_dct
 
 EXAMPLES_DIR = REPO_ROOT / "galp/examples"
-if str(EXAMPLES_DIR) not in sys.path:
-    sys.path.insert(0, str(EXAMPLES_DIR))
 
-from direct_dct_torch_end_to_end_demo import (
+from galp.examples.direct_dct_torch_end_to_end_demo import (
     _build_rgbnomore_val_crop_transform,
     _make_image_ids,
     _read_batch,
 )
-from direct_dct import _component_quant_tables
-try:
-    from .rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
-except ImportError:  # Direct script execution.
-    from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+from galp.benchmarks.system_rgbnomore.diagnostics.direct_dct import _component_quant_tables
+from galp.benchmarks.system_rgbnomore.diagnostics.rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 
 DEFAULT_JPEG_TOOL = REPO_ROOT / "build/galp/tools/jpeg_dct/galp_jpeg_dct_tool"
@@ -135,62 +133,8 @@ def _component_mode(reader: Any, image_id: int) -> str:
     return "grayscale"
 
 
-def _sampling_mode(reader: Any, image_id: int) -> str:
-    components = reader.image_metadata(int(image_id)).get("components", [])
-    by_slot = {
-        int(component.get("semantic_slot_id")): component
-        for component in components
-        if component.get("present") and int(component.get("semantic_slot_id", -1)) in (0, 1, 2)
-    }
-    if 0 not in by_slot:
-        by_local = {
-            int(component.get("local_component_index")): component
-            for component in components
-            if component.get("present") and int(component.get("local_component_index", -1)) in (0, 1, 2)
-        }
-        by_slot = by_local
-    if 0 in by_slot and 1 not in by_slot and 2 not in by_slot:
-        return "grayscale"
-    if not {0, 1, 2}.issubset(by_slot):
-        return "unknown"
-    y = by_slot[0]
-    cb = by_slot[1]
-    cr = by_slot[2]
-    if (
-        int(cb.get("h_samp_factor", 0)) != int(cr.get("h_samp_factor", 0))
-        or int(cb.get("v_samp_factor", 0)) != int(cr.get("v_samp_factor", 0))
-    ):
-        return "unsupported_mismatched_chroma"
-    if (
-        int(cb.get("h_samp_factor", 0)) == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:4:4"
-    if (
-        int(cb.get("h_samp_factor", 0)) * 2 == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) * 2 == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:2:0"
-    if (
-        int(cb.get("h_samp_factor", 0)) * 2 == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:2:2"
-    if (
-        int(cb.get("h_samp_factor", 0)) == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) * 2 == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:4:0"
-    if (
-        int(cb.get("h_samp_factor", 0)) * 4 == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:1:1"
-    return "unsupported"
-
-
 def _sampling_summary(reader: Any, image_ids: list[int]) -> str:
-    modes = sorted({_sampling_mode(reader, image_id) for image_id in image_ids})
+    modes = sorted({sampling_mode(reader, image_id) for image_id in image_ids})
     return modes[0] if len(modes) == 1 else "mixed:" + ",".join(modes)
 
 
@@ -454,7 +398,7 @@ def _validate_fixture_manifest_sampling(manifest: Path, expected_sampling: str) 
     reader = galp_dct.DirectDctReader(str(manifest))
     if int(reader.image_count) != 1:
         raise RuntimeError(f"{manifest} expected one synthetic image, got {reader.image_count}")
-    sampling = _sampling_mode(reader, 0)
+    sampling = sampling_mode(reader, 0)
     if sampling != expected_sampling:
         raise RuntimeError(f"{manifest} expected sampling {expected_sampling}, got {sampling}")
 
@@ -525,7 +469,7 @@ def _parse_args() -> argparse.Namespace:
         description="Compare transformed_dct_grid/rgbnomore_val runtime output with the Python RGB-no-more DCT crop adapter."
     )
     parser.add_argument("manifest")
-    parser.add_argument("--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more"))
+    parser.add_argument("--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument(
@@ -574,7 +518,7 @@ def main() -> None:
 
     for step, image_ids in enumerate(step_image_ids):
         modes = {image_id: _component_mode(reader, image_id) for image_id in image_ids}
-        sampling_modes = {image_id: _sampling_mode(reader, image_id) for image_id in image_ids}
+        sampling_modes = {image_id: sampling_mode(reader, image_id) for image_id in image_ids}
         supported_color_ids = [
             image_id
             for image_id in image_ids

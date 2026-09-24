@@ -1,0 +1,4 @@
+DCTNet/
+FUN/
+*.o
+__pycache__/

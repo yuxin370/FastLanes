@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+/runs/
+
+# Local study notes
+/FEASIBILITY_REPORT_20260819.md
+/NEXT_STAGE.md

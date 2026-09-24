@@ -19,10 +19,7 @@ if DEFAULT_TORCH_BINDING_DIR.is_dir() and str(DEFAULT_TORCH_BINDING_DIR) not in 
     sys.path.append(str(DEFAULT_TORCH_BINDING_DIR))
 
 import _galp_direct_dct as galp_dct
-try:
-    from .rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
-except ImportError:  # Direct script execution.
-    from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
+from galp.benchmarks.system_rgbnomore.diagnostics.rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM
 
 
 def _percentile(values: list[float], quantile: float) -> float:

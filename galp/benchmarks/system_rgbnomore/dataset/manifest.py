@@ -12,10 +12,8 @@ from pathlib import Path
 from typing import Any
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from shared.common import MANIFEST_SCHEMA, fingerprint_file, sha256_file, sha256_json, write_json
+from galp.benchmarks.system_rgbnomore.shared.common import MANIFEST_SCHEMA, fingerprint_file, sha256_file, sha256_json, write_json
 
 
 JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe"}

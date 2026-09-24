@@ -11,12 +11,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from training.artifacts import read_json, sha256_file, sha256_json, verify_artifact_hashes, write_json
-from training.manifest_preflight import DATASET_KIND, SUPPORTED_LAYOUTS
-from training.schema import (
+from galp.benchmarks.system_rgbnomore.training.artifacts import read_json, sha256_file, sha256_json, verify_artifact_hashes, write_json
+from galp.benchmarks.system_rgbnomore.training.manifest_preflight import DATASET_KIND, SUPPORTED_LAYOUTS
+from galp.benchmarks.system_rgbnomore.training.schema import (
     COMPARISON_GROUPS,
     PIPELINES,
     STATUS_DIMENSIONS,

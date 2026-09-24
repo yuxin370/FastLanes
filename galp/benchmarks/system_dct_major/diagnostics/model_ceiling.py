@@ -11,20 +11,20 @@ from pathlib import Path
 
 import torch
 
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
+
 
 HERE = Path(__file__).resolve().parent
 BENCHMARK_ROOT = HERE.parent
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from feature_model import build_workload_model, expected_output_width  # noqa: E402
+from galp.benchmarks.system_dct_major.feature_model import build_workload_model, expected_output_width  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--domain", choices=("dct", "rgb"), required=True)
     parser.add_argument("--workload", choices=("feature-extraction", "evaluation"), required=True)
-    parser.add_argument("--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more"))
+    parser.add_argument("--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=50)

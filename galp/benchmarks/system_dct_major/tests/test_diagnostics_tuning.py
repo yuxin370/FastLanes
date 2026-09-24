@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from diagnostics import run_controlled_cold
+from galp.benchmarks.system_dct_major.diagnostics import run_controlled_cold
 
 
 class ControlledColdDiagnosticsTest(unittest.TestCase):

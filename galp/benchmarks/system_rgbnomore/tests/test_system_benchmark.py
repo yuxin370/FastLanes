@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""CPU-only unit tests for benchmark manifests and summary helpers."""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import subprocess
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
+import torch
+
+
+from galp.benchmarks.system_rgbnomore.shared.common import (  # noqa: E402
+    cached_file_fingerprints,
+    contract_pipeline_name,
+    distribution,
+    galp_manifest_payloads,
+    load_sample_manifest,
+    sample_trace,
+    sha256_json,
+    source_tree_metadata,
+    verify_file_fingerprint,
+)
+from galp.benchmarks.system_rgbnomore.diagnostics.audit_planless_storage_io import _counter_values  # noqa: E402
+from galp.benchmarks.system_rgbnomore.diagnostics.direct_dct import (  # noqa: E402
+    _latency_distribution_ms,
+    _make_benchmark_image_ids,
+    _scale_to_rgbnomore_dct_range,
+    adapt_galp_batch_to_rgbnomore,
+)
+from galp.benchmarks.system_rgbnomore.dataset.manifest import build_manifest, collect_dataset, jpeg_frame, validate_galp_label_map  # noqa: E402
+from galp.benchmarks.system_rgbnomore.inference.pipeline import (  # noqa: E402
+    GalpAdapter,
+    _accumulate_native_counter,
+    _process_memory_snapshot,
+    _resolve_model_stream_priority,
+    _validate_profile_contract,
+)
+from galp.benchmarks.system_rgbnomore.inference.model_factory import (  # noqa: E402
+    MODEL_IDS as INFERENCE_MODEL_IDS,
+    SWINV2_T_MODEL_ID as INFERENCE_SWINV2_T_MODEL_ID,
+    resolve_model as resolve_inference_model,
+)
+from galp.benchmarks.system_rgbnomore.dataset.prepare_dataset import _collect_jpegs, _materialize_selected_data_root  # noqa: E402
+from galp.benchmarks.system_rgbnomore.inference.run import (  # noqa: E402
+    E2E_PIPELINES,
+    PRESETS,
+    _model_performance_gate_contract,
+    _parse_args as _parse_run_args,
+    _source_revision_policy,
+)
+from galp.benchmarks.system_rgbnomore.inference.validate import (  # noqa: E402
+    _aggregate_pipeline,
+    _evaluate_performance_gates,
+    _semantic_compare,
+    _validate_crop_pushdown_accounting,
+    _validate_planless_structural_accounting,
+)
+
+
+class SystemBenchmarkTest(unittest.TestCase):
+    def test_direct_dct_latency_distribution_uses_interpolated_percentiles(self) -> None:
+        summary = _latency_distribution_ms([4.0, 1.0, 3.0, 2.0])
+        self.assertEqual(summary["count"], 4)
+        self.assertEqual(summary["mean"], 2.5)
+        self.assertEqual(summary["p50"], 2.5)
+        self.assertAlmostEqual(summary["p95"], 3.85)
+
+    def test_crop_accounting_rejects_full_vector_pushdown_claim(self) -> None:
+        failures: list[str] = []
+        _validate_crop_pushdown_accounting(
+            {
+                "planned_vector_count": 8,
+                "actual_vector_count": 8,
+                "full_vector_count": 8,
+                "compressed_payload_bytes_read": 100,
+                "full_compressed_payload_bytes": 100,
+                "pread_count": 1,
+                "source_blocks_transformed": 10,
+            },
+            {
+                "storage_read_granularity": "rowgroup",
+                "decode_granularity": "selected-vector",
+                "read_amplification": 1.0,
+            },
+            "test",
+            failures,
+        )
+        self.assertTrue(any("vector pushdown claimed" in failure for failure in failures))
+
+    def test_crop_accounting_rejects_false_physical_io_reduction(self) -> None:
+        failures: list[str] = []
+        _validate_crop_pushdown_accounting(
+            {
+                "planned_vector_count": 4,
+                "actual_vector_count": 4,
+                "full_vector_count": 8,
+                "compressed_payload_bytes_read": 100,
+                "full_compressed_payload_bytes": 100,
+                "pread_count": 12,
+                "source_blocks_transformed": 10,
+            },
+            {
+                "storage_read_granularity": "selected-vector-range",
+                "decode_granularity": "selected-vector",
+                "read_amplification": 1.0,
+            },
+            "test",
+            failures,
+        )
+        self.assertTrue(any("lower I/O claimed" in failure for failure in failures))
+        self.assertTrue(any("transform block reduction" in failure for failure in failures))
+
+    def test_crop_accounting_accepts_honest_rowgroup_crop(self) -> None:
+        failures: list[str] = []
+        _validate_crop_pushdown_accounting(
+            {
+                "planned_vector_count": 8,
+                "actual_vector_count": 8,
+                "full_vector_count": 8,
+                "compressed_payload_bytes_read": 100,
+                "full_compressed_payload_bytes": 100,
+                "pread_count": 1,
+                "source_blocks_transformed": 10,
+            },
+            {
+                "storage_read_granularity": "rowgroup",
+                "decode_granularity": "rowgroup",
+                "read_amplification": 1.0,
+            },
+            "test",
+            failures,
+        )
+        self.assertEqual(failures, [])
+
+    def test_manifest_v3_planless_rowgroups_match_selected_vectors(self) -> None:
+        failures: list[str] = []
+        _validate_planless_structural_accounting(
+            {
+                "rowgroups": 300_000,
+                "actual_vector_count": 300_000,
+                "worksets": 1_000,
+                "internal_syncs": 1_000,
+                "decode_kernels": 1_000,
+            },
+            manifest_version=3,
+            expected_images=50_000,
+            expected_batches=1_000,
+            gate={"image_major_manifest_minimum_version": 2},
+            label="planless",
+            failures=failures,
+        )
+        self.assertEqual(failures, [])
+
+    def test_manifest_v3_planless_rejects_image_count_as_rowgroup_count(self) -> None:
+        failures: list[str] = []
+        _validate_planless_structural_accounting(
+            {
+                "rowgroups": 50_000,
+                "actual_vector_count": 300_000,
+                "worksets": 1_000,
+                "internal_syncs": 1_000,
+                "decode_kernels": 1_000,
+            },
+            manifest_version=3,
+            expected_images=50_000,
+            expected_batches=1_000,
+            gate={"image_major_manifest_minimum_version": 2},
+            label="planless",
+            failures=failures,
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("expected actual_vector_count=300000", failures[0])
+
+    def test_manifest_v2_planless_keeps_one_image_rowgroup_contract(self) -> None:
+        failures: list[str] = []
+        _validate_planless_structural_accounting(
+            {
+                "rowgroups": 50_000,
+                "actual_vector_count": 300_000,
+                "worksets": 1_000,
+                "internal_syncs": 1_000,
+                "decode_kernels": 1_000,
+            },
+            manifest_version=2,
+            expected_images=50_000,
+            expected_batches=1_000,
+            gate={
+                "image_major_manifest_minimum_version": 2,
+                "manifest_v2_rowgroups_per_image": 1,
+            },
+            label="planless",
+            failures=failures,
+        )
+        self.assertEqual(failures, [])
+
+    def test_native_snapshot_gauges_take_max_while_work_counters_sum(self) -> None:
+        totals: dict[str, int] = {}
+        for value in (64, 96, 80):
+            _accumulate_native_counter(totals, "galp_native_pinned_peak_in_use_bytes", value)
+        for value in (4, 7, 6):
+            _accumulate_native_counter(totals, "galp_native_pinned_cuda_allocation_count", value)
+        for value in (1024, 2048, 1536):
+            _accumulate_native_counter(totals, "compact_batch_buffer_capacity_bytes", value)
+        for value in (1200, 2200, 1800):
+            _accumulate_native_counter(totals, "compact_batch_buffer_high_water_bytes", value)
+        for value in (100, 200, 300):
+            _accumulate_native_counter(totals, "compact_batch_buffer_requested_bytes", value)
+            _accumulate_native_counter(totals, "rowgroups", value // 100)
+
+        self.assertEqual(totals["galp_native_pinned_peak_in_use_bytes"], 96)
+        self.assertEqual(totals["galp_native_pinned_cuda_allocation_count"], 7)
+        self.assertEqual(totals["compact_batch_buffer_capacity_bytes"], 2048)
+        self.assertEqual(totals["compact_batch_buffer_high_water_bytes"], 2200)
+        self.assertEqual(totals["compact_batch_buffer_requested_bytes"], 600)
+        self.assertEqual(totals["rowgroups"], 6)
+
+    def test_measured_limited_overlap_is_the_production_default(self) -> None:
+        with mock.patch.object(
+            sys, "argv", ["run.py", "--output-dir", "/tmp/galp-default-contract-test"]
+        ):
+            args = _parse_run_args()
+        self.assertFalse(hasattr(args, "galp_scheduling_policy"))
+        self.assertFalse(hasattr(args, "galp_transform_blocks_per_launch"))
+        self.assertFalse(hasattr(args, "galp_transform_ctas_per_launch"))
+        self.assertEqual(args.pipelines[0], "galp")
+        self.assertEqual(args.dct_source_image_size, 512)
+
+    def test_semantic_profile_contract_rejects_wrong_output(self) -> None:
+        valid_profile = {
+            "id": "rgbnomore-validation-v1",
+            "layout": "transformed_dct_grid",
+            "output_dtype": "float32",
+            "y_output_blocks": (28, 28),
+            "cbcr_output_blocks": (14, 14),
+        }
+        accepted = _validate_profile_contract(valid_profile, context="test")
+        self.assertEqual(accepted["profile_id"], "rgbnomore-validation-v1")
+        with self.assertRaisesRegex(RuntimeError, "semantic profile contract"):
+            _validate_profile_contract(
+                {**valid_profile, "output_dtype": "int16"}, context="test"
+            )
+
+    def test_swinv2_inference_spec_binds_model_and_preprocessing(self) -> None:
+        self.assertEqual(len(INFERENCE_MODEL_IDS), 2)
+        spec = resolve_inference_model(INFERENCE_SWINV2_T_MODEL_ID)
+        self.assertEqual(spec.rgb_size, 256)
+        self.assertEqual(spec.rgb_dataset, "imagenet_swin")
+        self.assertEqual(spec.dct_dataset, "imagenet_dct_swin")
+        self.assertEqual(spec.dct_transform, "Resize_DCT(32)")
+        self.assertEqual(spec.y_shape, (1, 32, 32, 8, 8))
+        self.assertEqual(spec.cbcr_shape, (2, 16, 16, 8, 8))
+        self.assertEqual(spec.dct_profile_id, "rgbnomore-swinv2-validation-v1")
+        accepted = _validate_profile_contract(
+            {
+                "id": spec.dct_profile_id,
+                "layout": "transformed_dct_grid",
+                "output_dtype": "float32",
+                "y_output_blocks": (32, 32),
+                "cbcr_output_blocks": (16, 16),
+            },
+            context="swinv2-test",
+            expected_y_blocks=(32, 32),
+            expected_cbcr_blocks=(16, 16),
+        )
+        self.assertEqual(accepted["profile_id"], spec.dct_profile_id)
+
+    def test_production_cli_rejects_historical_galp_pipeline_names(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run.py",
+                "--output-dir",
+                "/tmp/galp-alias-contract-test",
+                "--pipelines",
+                "galp",
+                "galp_legacy",
+            ],
+        ), self.assertRaises(SystemExit):
+            _parse_run_args()
+
+    def test_contract_pipeline_resolution_is_strict(self) -> None:
+        current = {
+            "pipelines": {
+                "enabled": ["galp"],
+                "galp": {},
+            }
+        }
+        self.assertEqual(contract_pipeline_name(current, "galp"), "galp")
+        with self.assertRaisesRegex(ValueError, "unsupported production pipeline"):
+            contract_pipeline_name(current, "galp_fixed_items")
+
+    def test_model_stream_priority_resolves_framework_range(self) -> None:
+        self.assertEqual(_resolve_model_stream_priority("greatest", (0, -3)), -3)
+        self.assertEqual(_resolve_model_stream_priority("least", (0, -3)), 0)
+        self.assertEqual(_resolve_model_stream_priority(-1, (0, -3)), -1)
+        with self.assertRaisesRegex(ValueError, "invalid model stream priority"):
+            _resolve_model_stream_priority("high", (0, -3))
+
+    def test_in_place_rgbnomore_range_scale_matches_reference(self) -> None:
+        values = torch.arange(-1024, 1017, dtype=torch.float32)
+        reference = (values + 1024.0) / 2040.0 * 2.0 - 1.0
+        actual = _scale_to_rgbnomore_dct_range(values.clone())
+        torch.testing.assert_close(actual, reference, rtol=0.0, atol=torch.finfo(torch.float32).eps)
+        self.assertEqual(float(actual[0]), -1.0)
+        self.assertEqual(float(actual[-1]), 1.0)
+
+    def test_native_float32_direct_dct_adapter_is_zero_copy(self) -> None:
+        y = torch.randn((2, 1, 28, 28, 8, 8), dtype=torch.float32)
+        cbcr = torch.randn((2, 2, 14, 14, 8, 8), dtype=torch.float32)
+        batch = SimpleNamespace(
+            layout="transformed_dct_grid",
+            selected_coefficients=list(range(64)),
+            y=y,
+            cbcr=cbcr,
+        )
+        actual_y, actual_cbcr = adapt_galp_batch_to_rgbnomore(
+            object(),
+            batch,
+            [0, 1],
+            dequantize=True,
+            scale=True,
+            preprocess="rgbnomore-val-pushdown",
+            rgbnomore_dct_val_transform=None,
+        )
+        self.assertIs(actual_y, y)
+        self.assertIs(actual_cbcr, cbcr)
+        with self.assertRaisesRegex(RuntimeError, "already dequantized"):
+            adapt_galp_batch_to_rgbnomore(
+                object(),
+                batch,
+                [0, 1],
+                dequantize=True,
+                scale=False,
+                preprocess="rgbnomore-val-pushdown",
+                rgbnomore_dct_val_transform=None,
+            )
+
+    def test_source_tree_cleanliness_is_scoped_to_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Benchmark Test"], check=True)
+            runtime = root / "runtime.py"
+            runtime.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "runtime.py"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+
+            clean = source_tree_metadata(root, ["runtime.py"])
+            self.assertTrue(clean["benchmark_source_clean"])
+            self.assertFalse(clean["git_dirty"])
+
+            (root / "unrelated.txt").write_text("user data\n", encoding="utf-8")
+            unrelated = source_tree_metadata(root, ["runtime.py"])
+            self.assertTrue(unrelated["benchmark_source_clean"])
+            self.assertTrue(unrelated["git_dirty"])
+
+            runtime.write_text("VALUE = 2\n", encoding="utf-8")
+            dirty = source_tree_metadata(root, ["runtime.py"])
+            self.assertFalse(dirty["benchmark_source_clean"])
+            self.assertTrue(dirty["runtime_git_status"])
+
+    def test_dirty_runtime_sources_are_recorded_as_warning_policy(self) -> None:
+        policy = _source_revision_policy(
+            {
+                "fastlanes": {
+                    "benchmark_source_clean": False,
+                    "runtime_git_status": [" M runtime.py"],
+                },
+                "rgbnomore": {
+                    "benchmark_source_clean": True,
+                    "runtime_git_status": [],
+                },
+            }
+        )
+        self.assertEqual(policy["cleanliness_enforcement"], "warning")
+        self.assertEqual(
+            policy["dirty_sources_at_contract_creation"],
+            {"fastlanes": [" M runtime.py"]},
+        )
+        self.assertTrue(policy["runtime_file_hashes_recorded"])
+        self.assertTrue(policy["runtime_file_changes_during_benchmark_are_errors"])
+
+    def test_process_memory_snapshot_reports_linux_rss_and_peak(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            status = Path(temporary) / "status"
+            status.write_text("Name:\ttest\nVmHWM:\t2048 kB\nVmRSS:\t1024 kB\n", encoding="utf-8")
+            self.assertEqual(
+                _process_memory_snapshot(status),
+                {"rss_bytes": 1024 * 1024, "peak_rss_bytes": 2048 * 1024},
+            )
+
+    def test_pipeline_aggregate_reports_host_peak_rss(self) -> None:
+        payload = {
+            "pipeline": "galp",
+            "domain": "dct",
+            "execution": {"aggregate_exclude_first_repeat": True},
+            "repeats": [
+                {
+                    "repeat": 0,
+                    "throughput_images_per_s": 1.0,
+                    "end_to_end_latency_ms": {"mean": 1.0, "p95": 1.0},
+                    "accuracy_top1": 1.0,
+                    "accuracy_top5": 1.0,
+                    "peak_gpu_memory_allocated_bytes": 1,
+                    "peak_gpu_memory_reserved_bytes": 2,
+                    "peak_gpu_memory_scope": "torch_allocator",
+                    "host_process_rss_after_measurement_bytes": 10,
+                    "host_process_peak_rss_bytes": 20,
+                    "host_process_memory_scope": "main_process",
+                },
+                {
+                    "repeat": 1,
+                    "throughput_images_per_s": 2.0,
+                    "end_to_end_latency_ms": {"mean": 2.0, "p95": 2.0},
+                    "accuracy_top1": 1.0,
+                    "accuracy_top5": 1.0,
+                    "peak_gpu_memory_allocated_bytes": 3,
+                    "peak_gpu_memory_reserved_bytes": 4,
+                    "peak_gpu_memory_scope": "torch_allocator",
+                    "host_process_rss_after_measurement_bytes": 30,
+                    "host_process_peak_rss_bytes": 40,
+                    "host_process_memory_scope": "main_process",
+                },
+            ],
+        }
+        aggregate = _aggregate_pipeline(payload)
+        self.assertEqual(aggregate["host_process_rss_after_measurement_bytes"]["p50"], 30.0)
+        self.assertEqual(aggregate["host_process_peak_rss_bytes"]["p50"], 40.0)
+        self.assertEqual(aggregate["host_process_memory_scope"], "main_process")
+
+    def test_deterministic_shuffled_direct_dct_trace_covers_population_once(self) -> None:
+        reader = SimpleNamespace(image_count=10)
+        args = SimpleNamespace(
+            sampling_policy="all",
+            preprocess="rgbnomore-val-pushdown",
+            image_order="shuffled",
+            shuffle_seed=17,
+            no_wrap_image_ids=True,
+            batch_size=3,
+        )
+        actual = []
+        for step in range(4):
+            image_ids, skipped = _make_benchmark_image_ids(reader, args, step)
+            self.assertEqual(skipped, [])
+            actual.extend(image_ids)
+        expected = list(range(10))
+        import random
+
+        random.Random(17).shuffle(expected)
+        self.assertEqual(actual, expected)
+
+    def test_storage_counter_reader_accepts_pipeline_repeat_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = Path(temporary) / "pipeline.json"
+            result.write_text(
+                json.dumps(
+                    {
+                        "repeats": [
+                            {"native_counters": {"rowgroup_storage_bytes_read": 11}},
+                            {"native_counters": {"rowgroup_storage_bytes_read": 13}},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_counter_values(result), [11, 13])
+
+    def test_selected_dataset_materialization_removes_stale_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "imagenet"
+            selected_root = root / "selected"
+            paths = [
+                source_root / "val/n00000001/a.JPEG",
+                source_root / "val/n00000001/b.JPEG",
+                source_root / "val/n00000002/c.JPEG",
+            ]
+            for index, path in enumerate(paths):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"jpeg-{index}".encode("ascii"))
+
+            initial = _materialize_selected_data_root(paths, selected_root)
+            self.assertEqual(initial["selected_data_count"], 3)
+            self.assertEqual(len(_collect_jpegs(selected_root)), 3)
+
+            stale = selected_root / "val/n00000001/b.JPEG"
+            self.assertTrue(stale.exists())
+            paths[2].unlink()
+            paths[2].write_bytes(b"replacement-c")
+            updated = _materialize_selected_data_root([paths[0], paths[2]], selected_root)
+
+            self.assertEqual(updated["selected_data_count"], 2)
+            self.assertFalse(stale.exists())
+            self.assertEqual(
+                {path.relative_to(selected_root) for path in _collect_jpegs(selected_root)},
+                {Path("val/n00000001/a.JPEG"), Path("val/n00000002/c.JPEG")},
+            )
+            self.assertTrue((selected_root / "val/n00000002/c.JPEG").samefile(paths[2]))
+
+    def test_only_smoke_and_canonical_e2e_presets_exist(self) -> None:
+        self.assertEqual(set(PRESETS), {"smoke", "e2e"})
+        self.assertEqual(PRESETS["e2e"]["batch_size"], 50)
+        self.assertEqual(PRESETS["e2e"]["warmup_batches"], 0)
+        self.assertEqual(PRESETS["e2e"]["measurement_batches"], 1000)
+        self.assertEqual(PRESETS["e2e"]["repeats"], 5)
+        self.assertEqual(
+            E2E_PIPELINES,
+            ("galp", "pytorch", "rgbnomore", "dali"),
+        )
+        self.assertGreater(PRESETS["e2e"]["measurement_batches"], PRESETS["smoke"]["measurement_batches"])
+        vitti = resolve_inference_model()
+        vitti_gates = _model_performance_gate_contract(vitti, "e2e")
+        self.assertEqual(vitti_gates["policy"]["mode"], "enforced")
+        self.assertEqual(
+            vitti_gates["targets"]["minimum_hot_median_to_dali_hot_median_ratio"],
+            1.10,
+        )
+
+    def test_swinv2_does_not_inherit_vitti_performance_thresholds(self) -> None:
+        swin = resolve_inference_model(INFERENCE_SWINV2_T_MODEL_ID)
+        gates = _model_performance_gate_contract(swin, "e2e")
+        self.assertEqual(gates["policy"]["mode"], "report-only")
+        self.assertIn("swinv2", gates["policy"]["profile_id"])
+        self.assertIsNone(
+            gates["targets"]["minimum_hot_median_to_dali_hot_median_ratio"]
+        )
+        self.assertIsNone(gates["targets"]["planning_median_ms_max"])
+        self.assertFalse(gates["targets"]["require_hot_min_above_dali_hot_median"])
+
+    def test_galp_e2e_throughput_gate_is_hard(self) -> None:
+        contract = {
+            "pipelines": {"enabled": ["galp"]},
+            "performance_gates": {"galp": {"minimum_median_throughput_images_per_s": 2500.0}},
+        }
+        aggregates = [{"pipeline": "galp", "throughput_images_per_s": {"p50": 2499.0}}]
+        failures: list[str] = []
+        gates = _evaluate_performance_gates(contract, aggregates, failures)
+        self.assertFalse(gates[0]["ok"])
+        self.assertTrue(any("below required" in failure for failure in failures))
+
+    def test_galp_e2e_relative_dali_and_stability_gates_are_hard(self) -> None:
+        contract = {
+            "pipelines": {"enabled": ["galp", "dali"]},
+            "performance_gates": {
+                "galp": {
+                    "minimum_hot_median_to_dali_hot_median_ratio": 1.10,
+                    "require_hot_min_above_dali_hot_median": True,
+                    "maximum_hot_throughput_cv": 0.05,
+                }
+            },
+        }
+        aggregates = [
+            {
+                "pipeline": "galp",
+                "throughput_images_per_s": {
+                    "p50": 1890.0,
+                    "min": 1750.0,
+                    "cv_population": 0.04,
+                },
+            },
+            {
+                "pipeline": "dali",
+                "throughput_images_per_s": {
+                    "p50": 1720.0,
+                    "min": 1700.0,
+                    "cv_population": 0.03,
+                },
+            },
+        ]
+        failures: list[str] = []
+        gates = _evaluate_performance_gates(contract, aggregates, failures)
+        by_metric = {gate["metric"]: gate for gate in gates}
+        self.assertFalse(by_metric["hot_median_to_dali_hot_median_ratio"]["ok"])
+        self.assertTrue(by_metric["hot_min_throughput_above_dali_hot_median"]["ok"])
+        self.assertTrue(by_metric["galp_hot_throughput_cv"]["ok"])
+        self.assertTrue(by_metric["dali_hot_throughput_cv"]["ok"])
+        self.assertTrue(failures)
+
+    def test_distribution_and_trace_are_deterministic(self) -> None:
+        self.assertEqual(distribution([1.0, 2.0, 3.0])["p50"], 2.0)
+        self.assertAlmostEqual(distribution([1.0, 2.0, 3.0])["cv_population"], (2.0 / 3.0) ** 0.5 / 2.0)
+        rows = [
+            {"ordinal": 0, "sample_id": "val/a.JPEG", "label": 3},
+            {"ordinal": 1, "sample_id": "val/b.JPEG", "label": 4},
+        ]
+        self.assertEqual(sample_trace(rows), sample_trace(list(rows)))
+
+    def test_manifest_fixes_labels_order_and_content_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "imagenet"
+            paths = [
+                data_root / "val/n00000001/a.JPEG",
+                data_root / "val/n00000001/b.JPEG",
+                data_root / "val/n00000002/c.JPEG",
+            ]
+            # Minimal JPEGs with a three-component 4:4:4 SOF marker. The
+            # manifest parser needs headers only; decode is outside this test.
+            jpeg_header = bytes.fromhex("ffd8ffc00011080001000103011100021100031100ffd9")
+            for index, path in enumerate(paths):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(jpeg_header + bytes([index]))
+
+            index_csv = root / "index.csv"
+            with index_csv.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=("Filepath", "Label"))
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {"Filepath": "val/n00000002/c.JPEG", "Label": 20},
+                        {"Filepath": "val/n00000001/b.JPEG", "Label": 10},
+                        {"Filepath": "val/n00000001/a.JPEG", "Label": 10},
+                    ]
+                )
+            label_map = root / "labels.json"
+            label_map.write_text(
+                json.dumps(
+                    {
+                        "format": "galp_rgbnomore_label_map_v1",
+                        "image_count": 3,
+                        "labels": [10, 10, 20],
+                        "sample_ids": [
+                            "val/n00000001/a.JPEG",
+                            "val/n00000001/b.JPEG",
+                            "val/n00000002/c.JPEG",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = root / "manifest.json"
+            payload, digest = build_manifest(
+                data_root=data_root,
+                split="val",
+                index_csv=index_csv,
+                galp_label_map_json=label_map,
+                sample_count=3,
+                seed=7,
+                output=output,
+            )
+            loaded, samples = load_sample_manifest(output, digest)
+            self.assertEqual(loaded["full_dataset_size"], 3)
+            self.assertEqual(loaded["source_geometry"]["validation"], "not_enforced")
+            self.assertEqual({sample["galp_image_id"] for sample in samples}, {0, 1, 2})
+            self.assertEqual({sample["image_width"] for sample in samples}, {1})
+            self.assertEqual({sample["image_height"] for sample in samples}, {1})
+            self.assertTrue(all(len(sample["sha256"]) == 64 for sample in samples))
+            self.assertEqual({sample["label"] for sample in samples}, {10, 20})
+            self.assertEqual(payload, loaded)
+
+            selected_path = Path(samples[0]["path"])
+            original_stat = selected_path.stat()
+            content = selected_path.read_bytes()
+            selected_path.write_bytes(content[:-1] + bytes([content[-1] ^ 0xFF]))
+            os.utime(selected_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            with self.assertRaisesRegex(ValueError, "SHA-256 changed"):
+                load_sample_manifest(output, digest)
+
+    def test_manifest_rejects_native_geometry_for_rgbnomore_512_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "imagenet"
+            path = data_root / "val/n00000001/a.JPEG"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(bytes.fromhex("ffd8ffc00011080001000103011100021100031100ffd9"))
+            self.assertEqual(jpeg_frame(path), {"width": 1, "height": 1, "sampling": "4:4:4"})
+
+            index_csv = root / "index.csv"
+            with index_csv.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=("Filepath", "Label"))
+                writer.writeheader()
+                writer.writerow({"Filepath": "val/n00000001/a.JPEG", "Label": 10})
+            label_map = root / "labels.json"
+            label_map.write_text(
+                json.dumps(
+                    {
+                        "format": "galp_rgbnomore_label_map_v1",
+                        "image_count": 1,
+                        "labels": [10],
+                        "sample_ids": ["val/n00000001/a.JPEG"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "expected every source JPEG to be 512x512"):
+                build_manifest(
+                    data_root=data_root,
+                    split="val",
+                    index_csv=index_csv,
+                    galp_label_map_json=label_map,
+                    sample_count=1,
+                    seed=7,
+                    output=root / "manifest.json",
+                    expected_image_size=512,
+                )
+
+    def test_galp_identity_validation_rejects_same_label_reordering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "imagenet"
+            jpeg_header = bytes.fromhex("ffd8ffc00011080001000103011100021100031100ffd9")
+            for name in ("a.JPEG", "b.JPEG"):
+                path = data_root / "val/n00000001" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(jpeg_header)
+            index_csv = root / "index.csv"
+            with index_csv.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=("Filepath", "Label"))
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {"Filepath": "val/n00000001/a.JPEG", "Label": 10},
+                        {"Filepath": "val/n00000001/b.JPEG", "Label": 10},
+                    ]
+                )
+            entries = collect_dataset(data_root, "val", index_csv)
+            label_map = root / "labels.json"
+            label_map.write_text(
+                json.dumps(
+                    {
+                        "format": "galp_rgbnomore_label_map_v1",
+                        "image_count": 2,
+                        "labels": [10, 10],
+                        "sample_ids": ["val/n00000001/b.JPEG", "val/n00000001/a.JPEG"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "sample identity/order mismatch"):
+                validate_galp_label_map(label_map, entries)
+
+    def test_galp_payload_fingerprints_cover_every_manifest_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fls = root / "shard.fls"
+            metadata = root / "shard.meta.bin"
+            fls.write_bytes(b"fls-payload")
+            metadata.write_bytes(b"metadata-payload")
+
+            def encoded_string(value: str) -> bytes:
+                raw = value.encode("utf-8")
+                return struct.pack("<I", len(raw)) + raw
+
+            manifest = root / "manifest.bin"
+            manifest.write_bytes(
+                b"GJDCTSH1"
+                + struct.pack("<IHIIQI", 1, 2, 128, 256, 1, 1)
+                + struct.pack("<IQIQQQIIQQ", 0, 0, 1, 1, 0, 1, 1, 1, fls.stat().st_size, metadata.stat().st_size)
+                + encoded_string(fls.name)
+                + encoded_string(metadata.name)
+            )
+            payloads = galp_manifest_payloads(manifest)
+            self.assertEqual({item["path"] for item in payloads}, {fls.resolve(), metadata.resolve()})
+            cache = root / "fingerprints.json"
+            fingerprints = cached_file_fingerprints(
+                payloads, cache, cache_format="galp_shard_payload_fingerprints_v1"
+            )
+            self.assertEqual(len(fingerprints), 2)
+            for fingerprint in fingerprints:
+                verify_file_fingerprint(Path(fingerprint["path"]), fingerprint, "payload")
+
+    def test_payload_hashing_requires_explicit_refresh_and_cached_reads_do_not_rehash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "shard.fls"
+            payload.write_bytes(b"large-payload-placeholder")
+            files = [
+                {
+                    "kind": "fls",
+                    "relative_path": payload.name,
+                    "path": payload,
+                    "expected_size": payload.stat().st_size,
+                }
+            ]
+            cache = root / "fingerprints.json"
+            kwargs = {"cache_format": "galp_shard_payload_fingerprints_v1"}
+
+            with self.assertRaisesRegex(ValueError, "missing or stale"):
+                cached_file_fingerprints(files, cache, allow_hash_misses=False, **kwargs)
+
+            cached_file_fingerprints(files, cache, allow_hash_misses=True, **kwargs)
+            with mock.patch("galp.benchmarks.system_rgbnomore.shared.common.fingerprint_file", side_effect=AssertionError("unexpected rehash")):
+                fingerprints = cached_file_fingerprints(files, cache, allow_hash_misses=False, **kwargs)
+            self.assertEqual(len(fingerprints), 1)
+
+    def test_semantic_gate_requires_exact_top1_agreement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            left = root / "left.npz"
+            right = root / "right.npz"
+            identity = {
+                "ordinals": np.asarray([0], dtype=np.int64),
+                "labels": np.asarray([7], dtype=np.int64),
+                "input_0": np.zeros((1, 1), dtype=np.float32),
+                "prediction_ordinals": np.asarray([0], dtype=np.int64),
+                "prediction_labels": np.asarray([7], dtype=np.int64),
+                "top1_predictions": np.asarray([7], dtype=np.int64),
+                "top5_predictions": np.asarray([[7, 1, 2, 3, 4]], dtype=np.int64),
+                "metadata_json": np.asarray(json.dumps({"prediction_agreement_sample_count": 1})),
+            }
+            np.savez(left, **identity, logits=np.asarray([[1.0, 0.999]], dtype=np.float32))
+            np.savez(right, **identity, logits=np.asarray([[0.999, 1.0]], dtype=np.float32))
+            failures: list[str] = []
+            result = _semantic_compare(
+                "galp",
+                "rgbnomore",
+                left,
+                right,
+                {
+                    "input_max_abs": 0.001,
+                    "input_mean_abs": 0.0001,
+                    "logit_max_abs": 0.25,
+                    "logit_cosine_min": 0.999,
+                    "logit_top1_agreement_min": 1.0,
+                    "full_prediction_top1_agreement_min": 1.0,
+                    "full_prediction_sample_count": 1,
+                },
+                "strict",
+                failures,
+            )
+            self.assertGreater(result["logits"]["cosine_mean"], 0.999)
+            self.assertEqual(result["logits"]["top1_agreement"], 0.0)
+            self.assertFalse(result["logits"]["within_tolerance"])
+            self.assertTrue(result["full_prediction"]["within_tolerance"])
+            self.assertTrue(any("logits exceed tolerance" in failure for failure in failures))
+
+    def test_galp_adapter_uses_native_pipeline_in_logical_order(self) -> None:
+        scheduled_batches: list[list[int]] = []
+
+        class Pipeline:
+            def start(self, image_id_batches):
+                scheduled_batches.extend([list(batch) for batch in image_id_batches])
+                self.batches = iter([SourceBatch(list(batch)) for batch in image_id_batches])
+                return self
+
+            def __next__(self):
+                return next(self.batches)
+
+            def close(self):
+                pass
+
+        class SourceBatch:
+            execution_stats = {
+                "fixed_transform_item_count": 0,
+                "planless_image_descriptor_count": 2,
+                "host_expanded_transform_items_created": 0,
+                "host_output_block_source_lists_created": 0,
+                "host_global_transform_sort_items": 0,
+                "device_mapping_fused": True,
+                "projection_item_count": 0,
+                "decoded_projection_item_count": 0,
+                "project_decoded_ycbcr_grid_launch_count": 0,
+                "fixed_grid_output_float32": True,
+                "fixed_grid_output_affine_applied": True,
+                "fixed_grid_finalize_kernel_launch_count": 1,
+            }
+
+            def __init__(self, image_ids: list[int]) -> None:
+                count = len(image_ids)
+                self.global_image_ids = image_ids
+                self.layout = "transformed_dct_grid"
+                self.y = torch.zeros((count, 1, 28, 28, 8, 8), dtype=torch.float32)
+                self.cbcr = torch.zeros((count, 2, 14, 14, 8, 8), dtype=torch.float32)
+                self.metrics = SimpleNamespace(
+                    consumer_wait_ms=0.0,
+                    producer_ms=0.0,
+                    planning_ms=0.0,
+                    io_ms=0.0,
+                )
+
+        adapter = object.__new__(GalpAdapter)
+        adapter.pipeline = Pipeline()
+        adapter.device = torch.device("cpu")
+        adapter.batch_size = 2
+
+        first = [
+            {"galp_image_id": 10, "label": 3, "ordinal": 0},
+            {"galp_image_id": 11, "label": 4, "ordinal": 1},
+        ]
+        second = [
+            {"galp_image_id": 12, "label": 5, "ordinal": 2},
+            {"galp_image_id": 13, "label": 6, "ordinal": 3},
+        ]
+        third = [
+            {"galp_image_id": 14, "label": 7, "ordinal": 4},
+            {"galp_image_id": 15, "label": 8, "ordinal": 5},
+        ]
+        adapter.samples = first + second + third
+        adapter.total_batches = 3
+        adapter.begin_repeat()
+        first_batch = adapter.load(first, second)
+        second_batch = adapter.load(second, third)
+        third_batch = adapter.load(third, None)
+
+        self.assertEqual(scheduled_batches, [[10, 11], [12, 13], [14, 15]])
+        self.assertEqual(first_batch.ordinals, [0, 1])
+        self.assertEqual(second_batch.ordinals, [2, 3])
+        self.assertEqual(third_batch.ordinals, [4, 5])
+
+if __name__ == "__main__":
+    unittest.main()

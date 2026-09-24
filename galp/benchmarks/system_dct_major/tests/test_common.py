@@ -9,10 +9,8 @@ from pathlib import Path
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from common import (  # noqa: E402
+from galp.benchmarks.system_dct_major.common import (  # noqa: E402
     SAMPLE_MANIFEST_SCHEMA,
     chunked,
     collect_sequential_samples,

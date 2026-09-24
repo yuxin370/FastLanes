@@ -24,7 +24,7 @@ from galp.benchmarks.training_audit_policy import (
     TrainingAuditPolicy,
     TrainingAuditState,
 )
-from galp.benchmarks.system_dct_major.training_pls import train
+from galp.benchmarks.training_pls import train
 class ProfileCaptureComplete(RuntimeError):
     def __init__(self, payload: Mapping[str, Any]) -> None:
         super().__init__("native PLS profiling capture completed")

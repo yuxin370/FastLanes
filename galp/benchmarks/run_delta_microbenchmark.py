@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
@@ -18,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Iterable
+
+from galp.benchmarks.common import sha256_file as sha256
 
 
 CSV_COLUMNS = [
@@ -56,14 +57,6 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def check_generated_bindings(repo: Path, build_dir: Path) -> dict[str, Any]:

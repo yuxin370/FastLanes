@@ -15,12 +15,8 @@ from typing import Any, Sequence
 import numpy as np
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-BENCHMARK_ROOT_TEXT = str(BENCHMARK_ROOT)
-if BENCHMARK_ROOT_TEXT in sys.path:
-    sys.path.remove(BENCHMARK_ROOT_TEXT)
-sys.path.insert(0, BENCHMARK_ROOT_TEXT)
 
-from shared.common import (
+from galp.benchmarks.system_rgbnomore.shared.common import (
     GALP_PIPELINES,
     RESULT_SCHEMA,
     distribution,

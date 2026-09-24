@@ -22,13 +22,10 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 BENCHMARK_ROOT = HERE.parent
 REPO_ROOT = BENCHMARK_ROOT.parents[2]
-for path in (BENCHMARK_ROOT, REPO_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
 
-from common import parse_manifest, write_json  # noqa: E402
-from galp.torch import DirectDctReader  # noqa: E402
-from galp.diagnostics.direct_dct import image_metadata  # noqa: E402
+from galp.benchmarks.system_dct_major.common import parse_manifest, write_json
+from galp.torch import DirectDctReader
+from galp.diagnostics.direct_dct import image_metadata
 
 
 def parse_args() -> argparse.Namespace:

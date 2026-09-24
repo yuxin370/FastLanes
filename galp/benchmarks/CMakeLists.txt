@@ -3,6 +3,52 @@ target_include_directories(galp_transfer_contention PRIVATE ../src ${CUDAToolkit
 target_compile_definitions(galp_transfer_contention PRIVATE GALP_MEMORY_DIAGNOSTICS=1)
 target_link_libraries(galp_transfer_contention PRIVATE CUDA::cudart)
 
+if (GALP_WITH_JPEG_DCT AND UNIX)
+        add_executable(galp_dct_storage dct_models/dctnet_storage.cpp)
+        target_include_directories(galp_dct_storage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+        target_link_libraries(galp_dct_storage PRIVATE galp_core galp_compact_format)
+        apply_warnings(galp_dct_storage)
+endif ()
+
+if (GALP_BUILD_TESTS AND GALP_BUILD_TORCH)
+        foreach (suite system_dct_major training_pls dct_retokenization)
+                add_test(NAME GalpBenchmark_${suite}
+                        COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+                                -s galp/benchmarks/${suite}/tests -t .)
+                set_tests_properties(GalpBenchmark_${suite} PROPERTIES
+                        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+                        LABELS "galp;benchmark;cpu")
+        endforeach ()
+        add_test(NAME GalpBenchmark_rgbnomore
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest
+                        galp.benchmarks.system_rgbnomore.tests.test_system_benchmark
+                        galp.benchmarks.system_rgbnomore.tests.test_training_benchmark
+                        galp.benchmarks.system_rgbnomore.tests.test_equal_image_epoch_benchmark
+                        galp.benchmarks.system_rgbnomore.tests.test_prepare_imagenet512_v3_train
+                        galp.benchmarks.system_rgbnomore.tests.test_rgbnomore_fingerprint_cache)
+        set_tests_properties(GalpBenchmark_rgbnomore PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+                LABELS "galp;benchmark;cpu")
+        add_test(NAME GalpBenchmark_profiling
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest
+                        galp.benchmarks.profiling.tests.test_profiling_evidence)
+        set_tests_properties(GalpBenchmark_profiling PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+                LABELS "galp;benchmark;cpu")
+        add_test(NAME GalpBenchmark_coefficient_masks
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+                        -s galp/benchmarks/coefficient_mask_evaluator/tests -t .)
+        set_tests_properties(GalpBenchmark_coefficient_masks PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+                LABELS "galp;benchmark;cpu")
+        add_test(NAME GalpBenchmark_training_gpu
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest
+                        galp.benchmarks.system_rgbnomore.tests.test_training_gpu)
+        set_tests_properties(GalpBenchmark_training_gpu PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+                LABELS "galp;benchmark;gpu")
+endif ()
+
 ## ────────────────────────────────────────────────
 ## Generated bindings library
 ## ────────────────────────────────────────────────
@@ -96,11 +142,6 @@ target_link_libraries(galp_generated_bindings PRIVATE
 apply_warnings(galp_generated_bindings)
 set_target_properties(galp_generated_bindings PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# Build-only compatibility target for older local commands.
-add_custom_target(generated-bindings DEPENDS galp_generated_bindings)
-add_custom_target(generated_bindings DEPENDS galp_generated_bindings)
-
-
 if (GALP_WITH_NVCOMP)
 	add_executable(compressor_bench
 		compressor_bench.cu
@@ -118,9 +159,6 @@ if (GALP_WITH_NVCOMP)
                 galp_alp_support
                 nvcomp::nvcomp)
         target_compile_definitions(compressor_bench PRIVATE FLS_GALP_SOURCE_DIR="${GALP_DATA_ROOT}")
-
-        add_custom_target(compressors_benchmarks DEPENDS compressor_bench)
-        add_custom_target(compressors-benchmarks DEPENDS compressor_bench)
 endif ()
 
 add_executable(micro_bench micro_bench.cu)
@@ -133,6 +171,3 @@ target_link_libraries(micro_bench PRIVATE
         galp_engine
         galp_generated_bindings
         galp_alp_support)
-
-add_custom_target(micro_benchmarks DEPENDS micro_bench)
-add_custom_target(micro-benchmarks DEPENDS micro_bench)

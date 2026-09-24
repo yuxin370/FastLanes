@@ -34,18 +34,26 @@ if (Python3_Interpreter_FOUND)
 	add_test(
 		NAME GalpPublicDirectDctApiPython
 		COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_SOURCE_DIR}
-		        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_public_direct_dct_api.py)
+		        ${Python3_EXECUTABLE} -B -m unittest galp.torch.tests.test_public_direct_dct_api)
 	set_tests_properties(GalpPublicDirectDctApiPython PROPERTIES LABELS "galp;direct-dct;cpu")
+        add_test(NAME GalpExperimentalDirectDctPlsApiPython
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest
+                        galp.torch.tests.test_experimental_direct_dct_pls_api)
+        set_tests_properties(GalpExperimentalDirectDctPlsApiPython PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "galp;direct-dct;cpu")
         add_test(
                 NAME GalpCompactV3AcceptancePython
-                COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_compact_v3_acceptance.py)
-        set_tests_properties(GalpCompactV3AcceptancePython PROPERTIES LABELS "galp;compact-v3;cpu")
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest
+                        galp.tools.jpeg_dct.tests.test_compact_v3_acceptance)
+        set_tests_properties(GalpCompactV3AcceptancePython PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "galp;compact-v3;cpu")
         set_tests_properties(GalpCompactV3AcceptancePython PROPERTIES
                 ENVIRONMENT "PYTHONPATH=${PROJECT_SOURCE_DIR}")
-        add_test(
-                NAME GalpPrepareImagenet512ParallelismPython
-                COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_prepare_imagenet512_v3_train.py)
-        set_tests_properties(GalpPrepareImagenet512ParallelismPython PROPERTIES LABELS "galp;jpeg-dct;pipeline;cpu")
+        add_test(NAME GalpCodegenTemporaryDirectoryPython
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest
+                        galp.scripts.codegen.tests.test_codegen_tmp_safety)
+        set_tests_properties(GalpCodegenTemporaryDirectoryPython PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "galp;codegen;cpu")
 endif ()
 if (GALP_WITH_JPEG_DCT)
 	add_library(galp_direct_dct_shadow_contract STATIC

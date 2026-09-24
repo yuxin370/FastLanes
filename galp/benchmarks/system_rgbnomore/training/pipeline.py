@@ -33,9 +33,6 @@ from galp.benchmarks.system_rgbnomore.training.augmentation import (
 )
 from galp.benchmarks.system_rgbnomore.training.direct_dct_reader import (
     DirectDctTrainingReader,
-    optional_native_execution_stats,
-    optional_native_execution_stats_observation,
-    optional_native_execution_stats_snapshot,
 )
 from galp.benchmarks.system_rgbnomore.training.sample_order import SampleIdentity
 from galp.benchmarks.system_rgbnomore.training.schema import DOMAINS, PIPELINES
@@ -118,9 +115,6 @@ class TrainingBatch:
     native_execution_stats: dict[str, Any] = field(default_factory=dict)
     native_host_snapshot_taken: bool = False
     native_gpu_timings_finalized: bool = False
-    # Compatibility alias for historical report readers. It now means GPU
-    # timing finalization, not merely that a host snapshot was taken.
-    native_stats_finalized: bool = False
     keepalive: list[Any] = field(default_factory=list)
     native_stats_source: Any | None = None
 
@@ -656,36 +650,6 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         self._committed_native_metric_snapshots: list[dict[str, Any]] = []
         self._committed_native_metrics: dict[str, Any] = {}
         self._loader_metrics: dict[str, Any] = {}
-        pls_pool_config = self.config.get("pls_gpu_pool") or {}
-        self._pls_gpu_pool = bool(pls_pool_config.get("enabled", False))
-        self._pls_closed_pool_specs = list(
-            pls_pool_config.get("closed_pool_batches", [])
-        )
-        self._pls_pool_ranges: list[list[int]] = []
-        self._active_pls_pool: dict[str, Any] | None = None
-        self._next_emit_batch = 0
-        self._next_pls_pool = 0
-        self._pls_pool_release_pending = False
-        self._pls_pool_metrics = self._new_pls_pool_metrics()
-
-    def _new_pls_pool_metrics(self) -> dict[str, int | bool | str]:
-        return {
-            "enabled": self._pls_gpu_pool,
-            "pool_lifetime": (
-                "load-complete-pool; consume-completely; release; load-next"
-                if self._pls_gpu_pool
-                else "not-enabled"
-            ),
-            "configured_pool_count": len(self._pls_closed_pool_specs),
-            "materialized_pool_count": 0,
-            "materialized_sample_count": 0,
-            "fully_emitted_release_eligible_pool_count": 0,
-            "released_pool_count": 0,
-            "active_pool_count": 0,
-            "max_materialized_pool_samples": 0,
-            "max_simultaneously_active_pool_count": 0,
-            "simultaneously_active_pool_limit": 1 if self._pls_gpu_pool else 0,
-        }
 
     def _reset_native_repeat(self, scheduled_batches: int) -> None:
         self._native_schedule = []
@@ -771,39 +735,10 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             self.end()
         super().begin(identities, decisions, batch_lengths)
         self._read_indices = []
-        self._active_pls_pool = None
-        self._next_emit_batch = 0
-        self._next_pls_pool = 0
-        self._pls_pool_release_pending = False
-        self._pls_pool_ranges = []
-        self._pls_pool_metrics = self._new_pls_pool_metrics()
-        if self._pls_gpu_pool:
-            batch_cursor = 0
-            for spec in self._pls_closed_pool_specs:
-                optimizer_batches = int(spec["optimizer_batches"])
-                if optimizer_batches <= 0:
-                    raise ValueError("PLS pool must contain at least one optimizer batch")
-                selected_ranges = self._batch_ranges[
-                    batch_cursor : batch_cursor + optimizer_batches
-                ]
-                if len(selected_ranges) != optimizer_batches:
-                    raise ValueError("PLS pool specifications exceed the planned batches")
-                indices = [index for values in selected_ranges for index in values]
-                if len(indices) != int(spec["sample_count"]):
-                    raise ValueError("PLS pool sample count does not match optimizer batches")
-                self._pls_pool_ranges.append(indices)
-                batch_cursor += optimizer_batches
-            if batch_cursor != len(self._batch_ranges):
-                raise ValueError("PLS pool specifications do not cover every planned batch")
-        scheduled_batches = (
-            len(self._pls_pool_ranges) if self._pls_gpu_pool else len(self._batch_ranges)
-        )
+        scheduled_batches = len(self._batch_ranges)
         self._reset_native_repeat(scheduled_batches)
         self._repeat_active = True
-        if self._pls_gpu_pool:
-            self._start_next_pls_pipeline()
-        else:
-            self._start_native_pipeline(self._batch_ranges)
+        self._start_native_pipeline(self._batch_ranges)
 
     @staticmethod
     def _validate_native_provenance(
@@ -846,62 +781,14 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             )
         return values
 
-    @classmethod
-    def _merge_native_loader_metrics(
-        cls, committed: dict[str, Any], current: dict[str, Any]
-    ) -> dict[str, Any]:
-        if not committed:
-            return dict(current)
-        merged = dict(committed)
-        merged["native_metrics_complete"] = bool(
-            committed.get("native_metrics_complete", True)
-        ) and bool(current["native_metrics_complete"])
-        merged["peak_transient_bytes"] = max(
-            int(committed.get("peak_transient_bytes", 0)),
-            int(current["peak_transient_bytes"]),
-        )
-        for loader_name in cls._NATIVE_SUM_METRICS:
-            merged[loader_name] = committed.get(loader_name, 0) + current[loader_name]
-        return merged
-
     def _current_native_metrics(self) -> dict[str, Any]:
-        snapshot = self._current_native_metric_snapshot()
-        return self._native_loader_metrics(
-            snapshot if snapshot is not None else self.reader.metrics()
-        )
-
-    def _current_native_metric_snapshot(self) -> dict[str, Any] | None:
-        snapshot = getattr(self.reader, "metrics_snapshot", None)
-        if not callable(snapshot):
-            return None
-        return dict(snapshot())
-
-    def _aggregate_native_metric_snapshots(
-        self, snapshots: Sequence[Mapping[str, Any]]
-    ) -> dict[str, Any] | None:
-        aggregate = getattr(self.reader, "aggregate_metrics_snapshots", None)
-        if not callable(aggregate):
-            return None
-        return dict(aggregate(snapshots))
+        return self._native_loader_metrics(self.reader.metrics_snapshot())
 
     def _combined_native_metrics(self) -> dict[str, Any]:
         if not self._pipeline_active:
             return dict(self._committed_native_metrics)
-        current_snapshot = self._current_native_metric_snapshot()
-        if current_snapshot is not None:
-            aggregated = self._aggregate_native_metric_snapshots(
-                [*self._committed_native_metric_snapshots, current_snapshot]
-            )
-            if aggregated is not None:
-                return self._native_loader_metrics(aggregated)
-        return self._merge_native_loader_metrics(
-            self._committed_native_metrics,
-            self._native_loader_metrics(
-                current_snapshot
-                if current_snapshot is not None
-                else self.reader.metrics()
-            ),
-        )
+        snapshots = [*self._committed_native_metric_snapshots, self.reader.metrics_snapshot()]
+        return self._native_loader_metrics(self.reader.aggregate_metrics_snapshots(snapshots))
 
     def _freeze_active_prefetch_evidence(self) -> None:
         if not self._pipeline_active:
@@ -914,45 +801,13 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         ]:
             self._prefetched_indices.extend(indices)
 
-    def _close_native_pipeline(
-        self,
-        *,
-        synchronize_consumer: bool,
-        require_complete_metrics: bool,
-        released_pls_pool: bool,
-    ) -> None:
+    def _close_native_pipeline(self) -> None:
         if not self._pipeline_active:
             return
         try:
-            if synchronize_consumer and self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-            current_snapshot = self._current_native_metric_snapshot()
-            current = self._native_loader_metrics(
-                current_snapshot
-                if current_snapshot is not None
-                else self.reader.metrics()
-            )
-            if require_complete_metrics and not current["native_metrics_complete"]:
-                raise RuntimeError(
-                    "GALP native metrics remained incomplete at a PLS pool boundary"
-                )
-            if current_snapshot is not None:
-                self._committed_native_metric_snapshots.append(current_snapshot)
-                aggregated = self._aggregate_native_metric_snapshots(
-                    self._committed_native_metric_snapshots
-                )
-                if aggregated is None:
-                    raise RuntimeError(
-                        "native metrics snapshots require the native canonical aggregator"
-                    )
-                self._committed_native_metrics = self._native_loader_metrics(aggregated)
-            else:
-                # Test-injected/legacy readers may not expose the private native
-                # snapshot API. This compatibility path is not production
-                # metrics authority.
-                self._committed_native_metrics = self._merge_native_loader_metrics(
-                    self._committed_native_metrics, current
-                )
+            self._committed_native_metric_snapshots.append(self.reader.metrics_snapshot())
+            aggregated = self.reader.aggregate_metrics_snapshots(self._committed_native_metric_snapshots)
+            self._committed_native_metrics = self._native_loader_metrics(aggregated)
             self._loader_metrics.update(self._committed_native_metrics)
             self._freeze_active_prefetch_evidence()
         finally:
@@ -961,111 +816,10 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
             self._native_schedule = []
             self._next_native_batch = 0
             self._prefetched_batch_count = 0
-            if released_pls_pool:
-                self._pls_pool_metrics["released_pool_count"] = int(
-                    self._pls_pool_metrics["released_pool_count"]
-                ) + 1
-                self._pls_pool_metrics["active_pool_count"] = 0
-
-    def _start_next_pls_pipeline(self) -> None:
-        if self._next_pls_pool >= len(self._pls_pool_ranges):
-            raise StopIteration
-        self._start_native_pipeline([self._pls_pool_ranges[self._next_pls_pool]])
-        self._next_pls_pool += 1
-        self._pls_pool_metrics["active_pool_count"] = 1
-        self._pls_pool_metrics["max_simultaneously_active_pool_count"] = max(
-            int(self._pls_pool_metrics["max_simultaneously_active_pool_count"]),
-            int(self._pls_pool_metrics["active_pool_count"]),
-        )
-
-    def _load_active_pls_pool(self) -> None:
-        if self._pls_pool_release_pending:
-            self._close_native_pipeline(
-                synchronize_consumer=True,
-                require_complete_metrics=True,
-                released_pls_pool=True,
-            )
-            self._pls_pool_release_pending = False
-            self._start_next_pls_pipeline()
-        elif not self._pipeline_active:
-            self._start_next_pls_pipeline()
-        indices, _image_ids, _transforms, native_batch, wait = (
-            self._consume_native_batch()
-        )
-        self._active_pls_pool = {
-            "indices": indices,
-            "batch": native_batch,
-            "offset": 0,
-            "consumer_wait_seconds": wait,
-            "native_stats_pending": True,
-        }
-        sample_count = len(indices)
-        self._pls_pool_metrics["materialized_pool_count"] = int(
-            self._pls_pool_metrics["materialized_pool_count"]
-        ) + 1
-        self._pls_pool_metrics["materialized_sample_count"] = int(
-            self._pls_pool_metrics["materialized_sample_count"]
-        ) + sample_count
-        self._pls_pool_metrics["max_materialized_pool_samples"] = max(
-            int(self._pls_pool_metrics["max_materialized_pool_samples"]),
-            sample_count,
-        )
-
-    def _next_pls_pool_batch(self) -> TrainingBatch:
-        if self._active_pls_pool is None:
-            self._load_active_pls_pool()
-        assert self._active_pls_pool is not None
-        if self._next_emit_batch >= len(self._batch_ranges):
-            raise StopIteration
-        expected_indices = self._batch_ranges[self._next_emit_batch]
-        offset = int(self._active_pls_pool["offset"])
-        indices = self._active_pls_pool["indices"]
-        observed_indices = indices[offset : offset + len(expected_indices)]
-        if observed_indices != expected_indices:
-            raise RuntimeError("PLS GPU pool does not preserve the scheduled optimizer order")
-        native_batch = self._active_pls_pool["batch"]
-        plan = [self._planned[index] for index in expected_indices]
-        tensors = tuple(
-            tensor[offset : offset + len(expected_indices)] for tensor in native_batch.tensors
-        )
-        stats_pending = bool(self._active_pls_pool["native_stats_pending"])
-        training_batch = TrainingBatch(
-            inputs=tensors,
-            labels=torch.tensor(
-                [item[0].label for item in plan], dtype=torch.long, device=self.device
-            ),
-            identities=[item[1] for item in plan],
-            augmentations=[item[2].as_dict() for item in plan],
-            on_device=all(getattr(value, "device", None) == self.device for value in tensors),
-            stage_seconds={
-                "loader_data_wait": (
-                    float(self._active_pls_pool["consumer_wait_seconds"])
-                    if stats_pending
-                    else 0.0
-                ),
-            },
-            native_stats_source=native_batch if stats_pending else None,
-        )
-        self._active_pls_pool["native_stats_pending"] = False
-        self._active_pls_pool["offset"] = offset + len(expected_indices)
-        self._next_emit_batch += 1
-        if int(self._active_pls_pool["offset"]) == len(indices):
-            self._active_pls_pool = None
-            self._pls_pool_release_pending = True
-            self._pls_pool_metrics["fully_emitted_release_eligible_pool_count"] = int(
-                self._pls_pool_metrics["fully_emitted_release_eligible_pool_count"]
-            ) + 1
-        if self.execution_mode == "audit":
-            self.finalize_batch_metrics(training_batch)
-        return training_batch
 
     def next_batch(self) -> TrainingBatch:
         if not self._repeat_active:
             raise RuntimeError("pipeline repeat has not begun")
-        if self._pls_gpu_pool:
-            if self._next_emit_batch >= len(self._batch_ranges):
-                raise StopIteration
-            return self._next_pls_pool_batch()
         if not self._pipeline_active:
             raise RuntimeError("pipeline repeat has not begun")
         indices, image_ids, transforms, batch, wait = self._consume_native_batch()
@@ -1097,7 +851,6 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         batch.native_execution_stats = execution_stats
         batch.native_host_snapshot_taken = host_snapshot_taken
         batch.native_gpu_timings_finalized = gpu_timings_finalized
-        batch.native_stats_finalized = gpu_timings_finalized
         projection = float(execution_stats.get("projection_ms", 0.0)) / 1000.0
         batch.stage_seconds.update(
             {
@@ -1208,12 +961,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         source = batch.native_stats_source
         if source is None or batch.native_gpu_timings_finalized:
             return
-        stats_method = getattr(source, "native_execution_stats", None)
-        execution_stats = (
-            dict(stats_method())
-            if callable(stats_method)
-            else optional_native_execution_stats(source)
-        )
+        execution_stats = source.native_execution_stats()
         self._apply_batch_metrics(
             batch,
             execution_stats,
@@ -1225,33 +973,10 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
         source = batch.native_stats_source
         if source is None or batch.native_gpu_timings_finalized:
             return
-        observation_method = getattr(
-            source, "native_execution_stats_observation", None
-        )
-        observation = (
-            dict(observation_method())
-            if callable(observation_method)
-            else optional_native_execution_stats_observation(source)
-        )
-        if observation and isinstance(observation.get("stats"), Mapping):
-            execution_stats = dict(observation["stats"])
-            host_snapshot_taken = bool(
-                observation.get("host_snapshot_taken", True)
-            )
-            gpu_timings_finalized = bool(
-                observation.get("gpu_timings_finalized", False)
-            )
-        else:
-            # Compatibility path for injected/legacy readers. A host snapshot
-            # alone never claims that CUDA event timings are finalized.
-            stats_method = getattr(source, "native_execution_stats_snapshot", None)
-            execution_stats = (
-                dict(stats_method())
-                if callable(stats_method)
-                else optional_native_execution_stats_snapshot(source)
-            )
-            host_snapshot_taken = True
-            gpu_timings_finalized = False
+        observation = source.native_execution_stats_observation()
+        execution_stats = dict(observation["stats"])
+        host_snapshot_taken = bool(observation["host_snapshot_taken"])
+        gpu_timings_finalized = bool(observation["gpu_timings_finalized"])
         self._apply_batch_metrics(
             batch,
             execution_stats,
@@ -1273,7 +998,6 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
                 ),
                 "configured_workers": self.workers,
                 "execution_mode": self.execution_mode,
-                "physical_load_segment_gpu_pool": dict(self._pls_pool_metrics),
             }
         )
         return metrics
@@ -1297,11 +1021,7 @@ class GalpTrainingAdapter(TrainingPipelineAdapter):
     def end(self) -> None:
         if self._pipeline_active:
             self._close_native_pipeline(
-                synchronize_consumer=self._pls_gpu_pool,
-                require_complete_metrics=self._pls_gpu_pool,
-                released_pls_pool=self._pls_gpu_pool,
             )
-            self._pls_pool_release_pending = False
         self._repeat_active = False
         self._loader_metrics["closed"] = True
         super().end()

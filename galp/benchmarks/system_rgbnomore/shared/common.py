@@ -13,6 +13,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from galp.benchmarks.common import sha256_file
+
 
 CONTRACT_SCHEMA = "galp_system_benchmark_contract_v2"
 MANIFEST_SCHEMA = "galp_system_benchmark_manifest_v2"
@@ -81,14 +83,6 @@ def sha256_bytes(value: bytes) -> str:
 
 def sha256_json(value: Any) -> str:
     return sha256_bytes(canonical_json_bytes(value))
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def read_json(path: Path) -> Any:

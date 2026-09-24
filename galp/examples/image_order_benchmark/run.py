@@ -26,10 +26,10 @@ from training_order import analyze_training_index
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 SYSTEM_BENCHMARK_DIR = REPO_ROOT / "galp/benchmarks/system_rgbnomore"
-DEFAULT_MANIFEST = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/manifest.bin"
-DEFAULT_LABELS = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val/labels.json"
+DEFAULT_MANIFEST = REPO_ROOT / "galp/data/compressed/imagenet_original_val_fls_v1_rg64/manifest.bin"
+DEFAULT_LABELS = REPO_ROOT / "galp/data/compressed/imagenet_original_val_fls_v1_rg64/labels.json"
 DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
-DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
+DEFAULT_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2/imagenet"
 DEFAULT_INDEX_CSV = DEFAULT_RGBNOMORE_ROOT / "assets/indexbase_val.csv"
 DEFAULT_TRAIN_INDEX_CSV = DEFAULT_RGBNOMORE_ROOT / "assets/indexbase_train.csv"
 DEFAULT_CHECKPOINT = DEFAULT_RGBNOMORE_ROOT / "checkpoints/imgnetDCTViTTi_ep300_75.1.pth"

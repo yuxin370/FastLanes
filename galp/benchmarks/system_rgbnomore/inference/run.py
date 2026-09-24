@@ -15,13 +15,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-BENCHMARK_ROOT_TEXT = str(BENCHMARK_ROOT)
-if BENCHMARK_ROOT_TEXT in sys.path:
-    sys.path.remove(BENCHMARK_ROOT_TEXT)
-sys.path.insert(0, BENCHMARK_ROOT_TEXT)
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
 
-from shared.common import (
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
+from galp.benchmarks.system_rgbnomore.shared.common import (
     CONTRACT_SCHEMA,
     GALP_PIPELINES,
     GALP_RUNTIME_PROFILE,
@@ -36,20 +33,20 @@ from shared.common import (
     source_tree_metadata,
     write_json,
 )
-from dataset.manifest import build_manifest
-from inference.model_factory import DEFAULT_MODEL_ID, MODEL_IDS, resolve_model
+from galp.benchmarks.system_rgbnomore.dataset.manifest import build_manifest
+from galp.benchmarks.system_rgbnomore.inference.model_factory import DEFAULT_MODEL_ID, MODEL_IDS, resolve_model
 
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[3]
-DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
 DEFAULT_E2E_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2"
 DEFAULT_E2E_V3_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v3"
 DEFAULT_DATA_ROOT = DEFAULT_E2E_V3_ROOT / "imagenet_512"
 DEFAULT_INDEX_CSV = DEFAULT_E2E_DATA_ROOT / "indexbase_val.csv"
 DEFAULT_CHECKPOINT_DIR = DEFAULT_E2E_DATA_ROOT / "checkpoints"
-DEFAULT_GALP_MANIFEST = DEFAULT_E2E_V3_ROOT / "compact_v3_tiled_z32_rgbnomore512/manifest.bin"
-DEFAULT_GALP_LABEL_MAP = DEFAULT_E2E_V3_ROOT / "compact_v3_tiled_z32_rgbnomore512/labels.json"
+DEFAULT_COMPRESSED_ROOT = REPO_ROOT / "galp/data/compressed"
+DEFAULT_GALP_MANIFEST = DEFAULT_COMPRESSED_ROOT / "imagenet512_val_compact_v3/manifest.bin"
+DEFAULT_GALP_LABEL_MAP = DEFAULT_COMPRESSED_ROOT / "imagenet512_val_compact_v3/labels.json"
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_BENCHMARK_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
 
@@ -469,7 +466,6 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/benchmarks/system_rgbnomore/inference/pipeline.py",
                     "galp/benchmarks/system_rgbnomore/inference/validate.py",
                     "galp/benchmarks/system_rgbnomore/inference/run.py",
-                    "galp/benchmarks/system_rgbnomore/docs/PLANLESS_DIRECT_DCT_RFC.md",
                     "galp/benchmarks/system_rgbnomore/diagnostics/audit_planless_storage_io.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/benchmark_planless_planning.py",
                     "galp/benchmarks/system_rgbnomore/diagnostics/direct_dct.py",
@@ -514,7 +510,7 @@ def _build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[st
                     "galp/src/jpeg/jpeg_dct_device_runtime.hpp",
                     "galp/src/jpeg/jpeg_dct_cuda_internal.cuh",
                     "galp/tests/jpeg_dct_test.cpp",
-                    "galp/tests/test_system_benchmark.py",
+                    "galp/benchmarks/system_rgbnomore/tests/test_system_benchmark.py",
                     "galp/torch/direct_dct_torch.cpp",
                     "galp/torch/direct_dct.py",
                     "galp/diagnostics/direct_dct.py",
@@ -585,7 +581,7 @@ def run(args: argparse.Namespace) -> int:
     for pipeline in contract["pipelines"]["enabled"]:
         command = [
             str(python),
-            str(HERE / "pipeline.py"),
+            "-m", "galp.benchmarks.system_rgbnomore.inference.pipeline",
             "--pipeline",
             pipeline,
             "--contract",
@@ -614,7 +610,7 @@ def run(args: argparse.Namespace) -> int:
             write_json(output_dir / "commands.json", commands)
             return code
 
-    validation_command = [str(python), str(HERE / "validate.py"), "--contract", str(contract_path), "--output-dir", str(output_dir)]
+    validation_command = [str(python), "-m", "galp.benchmarks.system_rgbnomore.inference.validate", "--contract", str(contract_path), "--output-dir", str(output_dir)]
     commands.append({"name": "validate", "command": validation_command, "env_overrides": {}})
     code = _run_streamed(validation_command, env, output_dir / "validate.log", args.dry_run)
     write_json(output_dir / "commands.json", commands)

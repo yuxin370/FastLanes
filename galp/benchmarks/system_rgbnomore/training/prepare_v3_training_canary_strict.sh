@@ -6,11 +6,12 @@ shopt -s nullglob
 # rejects unsupported JPEG sampling before compression, and every binary used
 # to produce or read the dataset is frozen under the canary root.
 
-REPO="${REPO:-/home/tangyuxin/gfastlanes/FastLanes}"
-PY="${PY:-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python}"
+REPO="${REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
+PY="${PY:-python3}"
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 CLASS_TARS="${CLASS_TARS:-$REPO/galp/data/imagedataset/ILSVRC2012_img_train}"
 INDEX_CSV="${INDEX_CSV:-/home/tangyuxin/RGB-no-more/assets/indexbase_train.csv}"
-CANARY_BASE="${CANARY_BASE:-$REPO/galp/data/system_rgbnomore/e2e_v3/galp-v3-training-canary-strict}"
+CANARY_BASE="${CANARY_BASE:-$REPO/galp/data/compressed/fixtures}"
 CANARY_TAG="${CANARY_TAG:-v3a}"
 TOOL="${TOOL:-$REPO/build/galp/tools/jpeg_dct/galp_jpeg_dct_tool}"
 TORCH_BINDING_DIR="${TORCH_BINDING_DIR:-$REPO/build/galp/torch}"
@@ -37,7 +38,7 @@ EOF
 }
 
 validate_environment() {
-    test -x "$PY" || die "Python is not executable: $PY"
+    command -v "$PY" >/dev/null 2>&1 || die "Python is not executable: $PY"
     test -x "$TOOL" || die "JPEG-DCT tool is not executable: $TOOL"
     test -d "$TORCH_BINDING_DIR" || die "Torch binding directory is missing: $TORCH_BINDING_DIR"
     test -d "$CLASS_TARS" || die "class-tar directory is missing: $CLASS_TARS"
@@ -83,7 +84,7 @@ main() {
     esac
     validate_environment
 
-    local root="$CANARY_BASE/train-$scale-$CANARY_TAG"
+    local root="$CANARY_BASE/imagenet_original_train_${image_count}_compact_v3_strict_${CANARY_TAG}"
     local jpeg_root="$root/jpeg/train"
     local dct_root="$root/dct"
     local manifests="$root/training_manifests"
@@ -132,7 +133,7 @@ main() {
         "$jpeg_root" \
         2>&1 | tee "$root/compress.log"
 
-    PYTHONPATH="$REPO/galp/benchmarks/system_rgbnomore" "$PY" "$PREFLIGHT" \
+    "$PY" "$PREFLIGHT" \
         "$dct_root/manifest.bin" \
         --expected-manifest-version 3 \
         --expected-physical-layout image-major-vector-rowgroups \

@@ -20,8 +20,8 @@ Example:
     PYTHONPATH=build/galp/torch \
     /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
       galp/examples/verify_direct_dct_vs_jpeg.py \
-      galp/data/imagedataset_dct/ImageNet-train-multi/manifest.bin \
-      --jpeg-root /tmp/rgbnomore_imagenet/train \
+      galp/data/compressed/imagenet512_train_compact_v3/dct/manifest.bin \
+      --jpeg-root galp/data/system_rgbnomore/e2e_v3/imagenet_512/train \
       --jpeg-list /tmp/train_jpegs_sorted.txt \
       --sample 32 --seed 0 \
       --output-json /tmp/galp_train_multi_vs_jpeg.json
@@ -110,7 +110,8 @@ def _compare(name: str, galp: torch.Tensor | None, ref: torch.Tensor | None, tol
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("manifest")
-    parser.add_argument("--jpeg-root", type=Path, default=Path("/tmp/rgbnomore_imagenet/train"))
+    parser.add_argument("--jpeg-root", type=Path, required=True,
+                        help="source JPEG directory matching the supplied manifest")
     parser.add_argument("--jpeg-list", type=Path, default=Path("/tmp/train_jpegs_sorted.txt"),
                         help="cached sorted jpeg list; created from --jpeg-root if absent")
     parser.add_argument("--sample", type=int, default=32, help="number of random images to spot-check")

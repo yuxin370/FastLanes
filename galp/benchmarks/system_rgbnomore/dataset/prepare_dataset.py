@@ -21,17 +21,15 @@ from pathlib import Path
 from typing import Any
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from shared.common import cached_file_fingerprints, galp_manifest_payloads
-from dataset.manifest import jpeg_frame
+from galp.benchmarks.system_rgbnomore.shared.common import cached_file_fingerprints, galp_manifest_payloads
+from galp.benchmarks.system_rgbnomore.dataset.manifest import jpeg_frame
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_INPUT_DIR = Path("/tmp/rgbnomore_imagenet/val")
-DEFAULT_OUT_DIR = REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val-rg8"
-DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
+DEFAULT_INPUT_DIR = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2/imagenet/val"
+DEFAULT_OUT_DIR = REPO_ROOT / "galp/data/compressed/imagenet_original_val_fls_v1_rg64"
+DEFAULT_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v2/imagenet"
 DEFAULT_TOOL = REPO_ROOT / "build/galp/tools/jpeg_dct/galp_jpeg_dct_tool"
 DEFAULT_TORCH_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 DEFAULT_SPLIT_IMAGE_COUNTS = {
@@ -53,8 +51,8 @@ def _default_out_dir(split: str) -> Path:
     if split == "val":
         return DEFAULT_OUT_DIR
     if split == "train":
-        return REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-train-multi"
-    return REPO_ROOT / "galp/data/imagedataset_dct/ImageNet-val-rg8"
+        return REPO_ROOT / "galp/data/compressed/imagenet_original_train_fls_v1_rg64"
+    return DEFAULT_OUT_DIR
 
 
 def _default_expected_count(split: str, limit: int | None) -> int:

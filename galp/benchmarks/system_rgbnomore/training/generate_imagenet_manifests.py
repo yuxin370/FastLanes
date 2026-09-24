@@ -29,11 +29,9 @@ from typing import Any, Sequence
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from dataset.manifest import jpeg_sampling
-from training.manifest_preflight import preflight_manifest
+from galp.benchmarks.system_rgbnomore.dataset.manifest import jpeg_sampling
+from galp.benchmarks.system_rgbnomore.training.manifest_preflight import preflight_manifest
 
 
 JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe"}

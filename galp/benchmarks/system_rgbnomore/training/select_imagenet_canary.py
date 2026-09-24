@@ -21,6 +21,8 @@ from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Sequence
 
+from galp.benchmarks.common import sha256_file as _sha256_file
+
 
 SCHEMA_VERSION = "galp-training-imagenet-canary-selection-v1"
 SUPPORTED_SAMPLING = frozenset(("4:4:4", "4:2:0"))
@@ -113,14 +115,6 @@ def _load_candidates(
     if missing:
         raise ValueError(f"ImageNet index is missing labels: {missing}")
     return dict(candidates), wnid_for_label
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while block := handle.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _selection_sha256(records: Sequence[dict[str, Any]]) -> str:

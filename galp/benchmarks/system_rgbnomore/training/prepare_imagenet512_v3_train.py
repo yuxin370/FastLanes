@@ -96,28 +96,6 @@ def _command_text(command: Sequence[str]) -> str:
     return shlex.join(str(item) for item in command)
 
 
-def _resolve_parallelism(args: argparse.Namespace) -> None:
-    legacy = args.compress_threads
-    if legacy is not None:
-        if args.layout_threads is not None and args.layout_threads != legacy:
-            raise ValueError("--compress-threads conflicts with --layout-threads")
-        if (
-            args.shard_decode_threads is not None
-            and args.shard_decode_threads != legacy
-        ):
-            raise ValueError(
-                "--compress-threads conflicts with --shard-decode-threads"
-            )
-        args.layout_threads = legacy
-        args.shard_decode_threads = legacy
-    else:
-        if args.layout_threads is None:
-            args.layout_threads = DEFAULT_LAYOUT_THREADS
-        if args.shard_decode_threads is None:
-            args.shard_decode_threads = DEFAULT_SHARD_DECODE_THREADS
-    args.legacy_compress_threads = legacy
-
-
 def _compress_command(args: argparse.Namespace) -> list[str]:
     return [
         str(args.tool),
@@ -620,12 +598,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dct-root",
         type=Path,
-        default=e2e / "compact_v3_tiled_z32_rgbnomore512_train",
+        default=repo / "galp/data/compressed/imagenet512_train_compact_v3/dct",
     )
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        default=e2e / "compact_v3_tiled_z32_rgbnomore512_train_prepare",
+        default=repo / "galp/data/compressed/imagenet512_train_compact_v3/artifacts",
     )
     parser.add_argument(
         "--tool",
@@ -666,7 +644,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--validation-dct-root",
         type=Path,
-        default=e2e / "compact_v3_tiled_z32_rgbnomore512",
+        default=repo / "galp/data/compressed/imagenet512_val_compact_v3",
     )
     parser.add_argument(
         "--training-manifest-dir",
@@ -676,17 +654,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-image-count", type=int, default=EXPECTED_TRAIN_IMAGES)
     parser.add_argument("--expected-validation-image-count", type=int, default=50_000)
     parser.add_argument("--resize-workers", type=int, default=32)
-    parser.add_argument(
-        "--compress-threads",
-        type=int,
-        default=None,
-        help=(
-            "Legacy layout/decode control. Maps to both new controls and fails "
-            "if an explicitly supplied new value conflicts."
-        ),
-    )
-    parser.add_argument("--layout-threads", type=int, default=None)
-    parser.add_argument("--shard-decode-threads", type=int, default=None)
+    parser.add_argument("--layout-threads", type=int, default=DEFAULT_LAYOUT_THREADS)
+    parser.add_argument("--shard-decode-threads", type=int, default=DEFAULT_SHARD_DECODE_THREADS)
     parser.add_argument("--shard-workers", type=int, default=4)
     parser.add_argument("--encoding-workers-per-shard", type=int, default=1)
     parser.add_argument("--verify-workers", type=int, default=16)
@@ -709,7 +678,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    _resolve_parallelism(args)
     _validate_arguments(args)
     by_wnid = _parse_index(args.index_csv, args.expected_image_count)
     torch_binding = _torch_binding_path(args.torch_binding_dir)
@@ -736,7 +704,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "free_bytes_before": free_bytes,
         "free_gib_before": round(free_bytes / (1024**3), 2),
         "resize_workers": args.resize_workers,
-        "legacy_compress_threads": args.legacy_compress_threads,
         "layout_threads": args.layout_threads,
         "shard_decode_threads": args.shard_decode_threads,
         "shard_workers": args.shard_workers,

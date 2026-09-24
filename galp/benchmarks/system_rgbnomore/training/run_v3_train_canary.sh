@@ -7,11 +7,12 @@ shopt -s nullglob
 # this script extracts a balanced 1 or 10 images per class, then writes and
 # validates an image-major-vector-rowgroups manifest.
 
-export REPO="${REPO:-/home/tangyuxin/gfastlanes/FastLanes}"
-export PY="${PY:-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python}"
+export REPO="${REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
+export PY="${PY:-python3}"
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 export TRAIN_CLASS_TARS="${TRAIN_CLASS_TARS:-$REPO/galp/data/imagedataset/ILSVRC2012_img_train}"
-export CANARY_BASE="${CANARY_BASE:-$REPO/galp/data/system_rgbnomore/e2e_v3/galp-v3-train-canary}"
+export CANARY_BASE="${CANARY_BASE:-$REPO/galp/data/compressed/fixtures}"
 export INDEX_CSV="${INDEX_CSV:-/home/tangyuxin/RGB-no-more/assets/indexbase_train.csv}"
 
 export TOOL="${TOOL:-$REPO/build/galp/tools/jpeg_dct/galp_jpeg_dct_tool}"
@@ -19,7 +20,7 @@ export TORCH_BINDING="${TORCH_BINDING:-$REPO/build/galp/torch}"
 export PREPARE_DATASET="${PREPARE_DATASET:-$REPO/galp/benchmarks/system_rgbnomore/dataset/prepare_dataset.py}"
 export GENERATE_MANIFESTS="${GENERATE_MANIFESTS:-$REPO/galp/benchmarks/system_rgbnomore/training/generate_imagenet_manifests.py}"
 
-export CANARY_TAG="${CANARY_TAG:-v3a}"
+export CANARY_TAG="${CANARY_TAG:-compact_v3}"
 export THREADS="${THREADS:-12}"
 export SHARD_WORKERS="${SHARD_WORKERS:-4}"
 export SHARD_IMAGES="${SHARD_IMAGES:-8192}"
@@ -32,8 +33,8 @@ Usage:
 
 The default is "both".  Outputs are written below:
 
-  $CANARY_BASE/train-1k-$CANARY_TAG
-  $CANARY_BASE/train-10k-$CANARY_TAG
+  $CANARY_BASE/imagenet512_train_1000_$CANARY_TAG
+  $CANARY_BASE/imagenet512_train_10000_$CANARY_TAG
 
 Useful environment overrides:
 
@@ -54,7 +55,7 @@ die() {
 }
 
 validate_environment() {
-    test -x "$PY" || die "Python is not executable: $PY"
+    command -v "$PY" >/dev/null 2>&1 || die "Python is not executable: $PY"
     test -x "$TOOL" || die "GALP JPEG-DCT tool is not executable: $TOOL"
     test -d "$TRAIN_CLASS_TARS" || die "class-tar directory is missing: $TRAIN_CLASS_TARS"
     test -d "$TORCH_BINDING" || die "Torch binding directory is missing: $TORCH_BINDING"
@@ -509,14 +510,14 @@ main() {
 
     case "$target" in
         both)
-            make_v3_train_canary "train-1k-$CANARY_TAG" 1000 100
-            make_v3_train_canary "train-10k-$CANARY_TAG" 10000 1000
+            make_v3_train_canary "imagenet512_train_1000_$CANARY_TAG" 1000 100
+            make_v3_train_canary "imagenet512_train_10000_$CANARY_TAG" 10000 1000
             ;;
         1k)
-            make_v3_train_canary "train-1k-$CANARY_TAG" 1000 100
+            make_v3_train_canary "imagenet512_train_1000_$CANARY_TAG" 1000 100
             ;;
         10k)
-            make_v3_train_canary "train-10k-$CANARY_TAG" 10000 1000
+            make_v3_train_canary "imagenet512_train_10000_$CANARY_TAG" 10000 1000
             ;;
     esac
 }

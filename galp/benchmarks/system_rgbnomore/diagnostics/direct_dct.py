@@ -23,6 +23,9 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT, sampling_mode
+
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_TORCH_BINDING_DIR = REPO_ROOT / "build/galp/torch"
 if DEFAULT_TORCH_BINDING_DIR.is_dir() and str(DEFAULT_TORCH_BINDING_DIR) not in sys.path:
@@ -33,13 +36,9 @@ import torch
 
 import _galp_direct_dct as galp_dct
 
-try:
-    from .rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
-except ImportError:  # Direct script execution.
-    from rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
+from galp.benchmarks.system_rgbnomore.diagnostics.rgbnomore_dct_profile import RGBNOMORE_VAL_DCT_GRID_TRANSFORM_FP32
 
 
-DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
 DEFAULT_DCT_CHECKPOINT = DEFAULT_RGBNOMORE_ROOT / "checkpoints" / "imgnetDCTViTTi_ep300_75.1.pth"
 SUPPORTED_SAMPLING_MODES = ("4:4:4", "4:2:0", "4:2:2", "4:4:0", "4:1:1", "grayscale", "components:4")
 
@@ -50,60 +49,6 @@ def _make_image_ids(step: int, batch_size: int, image_count: int) -> list[int]:
     count = min(batch_size, image_count)
     start = (step * count) % image_count
     return [int((start + index) % image_count) for index in range(count)]
-
-
-def _sampling_mode(reader: Any, image_id: int) -> str:
-    components = reader.image_metadata(int(image_id)).get("components", [])
-    by_slot = {
-        int(component.get("semantic_slot_id")): component
-        for component in components
-        if component.get("present") and int(component.get("semantic_slot_id", -1)) in (0, 1, 2)
-    }
-    if 0 not in by_slot:
-        by_local = {
-            int(component.get("local_component_index")): component
-            for component in components
-            if component.get("present") and int(component.get("local_component_index", -1)) in (0, 1, 2)
-        }
-        by_slot = by_local
-    if 0 in by_slot and 1 not in by_slot and 2 not in by_slot:
-        return "grayscale"
-    if not {0, 1, 2}.issubset(by_slot):
-        return "unknown"
-    y = by_slot[0]
-    cb = by_slot[1]
-    cr = by_slot[2]
-    if (
-        int(cb.get("h_samp_factor", 0)) != int(cr.get("h_samp_factor", 0))
-        or int(cb.get("v_samp_factor", 0)) != int(cr.get("v_samp_factor", 0))
-    ):
-        return "unsupported_mismatched_chroma"
-    if (
-        int(cb.get("h_samp_factor", 0)) == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:4:4"
-    if (
-        int(cb.get("h_samp_factor", 0)) * 2 == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) * 2 == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:2:0"
-    if (
-        int(cb.get("h_samp_factor", 0)) * 2 == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:2:2"
-    if (
-        int(cb.get("h_samp_factor", 0)) == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) * 2 == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:4:0"
-    if (
-        int(cb.get("h_samp_factor", 0)) * 4 == int(y.get("h_samp_factor", 0))
-        and int(cb.get("v_samp_factor", 0)) == int(y.get("v_samp_factor", 0))
-    ):
-        return "4:1:1"
-    return "unsupported"
 
 
 def _make_benchmark_image_ids(
@@ -123,7 +68,7 @@ def _make_benchmark_image_ids(
             population = [
                 image_id
                 for image_id in range(image_count)
-                if not supported_only or _sampling_mode(reader, image_id) in SUPPORTED_SAMPLING_MODES
+                if not supported_only or sampling_mode(reader, image_id) in SUPPORTED_SAMPLING_MODES
             ]
             random.Random(int(getattr(args, "shuffle_seed", 20260718))).shuffle(population)
             setattr(args, "_ordered_image_population", population)
@@ -151,7 +96,7 @@ def _make_benchmark_image_ids(
                 supported_ids = [
                     image_id
                     for image_id in range(image_count)
-                    if _sampling_mode(reader, image_id) in SUPPORTED_SAMPLING_MODES
+                    if sampling_mode(reader, image_id) in SUPPORTED_SAMPLING_MODES
                 ]
                 setattr(args, "_supported_image_ids", supported_ids)
             population = supported_ids
@@ -186,7 +131,7 @@ def _make_benchmark_image_ids(
         image_id = int((start + offset) % image_count)
         offset += 1
         visited += 1
-        sampling = _sampling_mode(reader, image_id)
+        sampling = sampling_mode(reader, image_id)
         if sampling in SUPPORTED_SAMPLING_MODES:
             image_ids.append(image_id)
         else:

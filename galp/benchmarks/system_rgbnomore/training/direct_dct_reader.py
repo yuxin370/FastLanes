@@ -32,57 +32,6 @@ def _json_compatible(value: Any) -> Any:
     return {"type": type(value).__name__, "repr": repr(value)}
 
 
-def _optional_native_execution_stats_attribute(
-    source: Any, attribute: str
-) -> dict[str, Any]:
-    """Return one JSON-safe optional native stats attribute."""
-
-    try:
-        value = getattr(source, attribute)
-        value = value() if callable(value) else value
-        if value is None:
-            return {}
-        if not isinstance(value, Mapping):
-            value = dict(value)
-        return _json_compatible(value)
-    except (AttributeError, TypeError, ValueError, RuntimeError):
-        return {}
-
-
-def optional_native_execution_stats(source: Any) -> dict[str, Any]:
-    """Return complete optional stats, allowing the native completion wait."""
-
-    try:
-        return _json_compatible(public_execution_stats(source))
-    except (AttributeError, TypeError, ValueError, RuntimeError):
-        pass
-    return _optional_native_execution_stats_attribute(source, "execution_stats")
-
-
-def optional_native_execution_stats_snapshot(source: Any) -> dict[str, Any]:
-    """Return a non-blocking native stats snapshot when the runtime exposes it."""
-
-    try:
-        return _json_compatible(public_execution_stats_snapshot(source))
-    except (AttributeError, TypeError, ValueError, RuntimeError):
-        pass
-    return _optional_native_execution_stats_attribute(
-        source, "execution_stats_snapshot"
-    )
-
-
-def optional_native_execution_stats_observation(source: Any) -> dict[str, Any]:
-    """Return non-blocking stats plus independent host/GPU completion state."""
-
-    try:
-        return _json_compatible(public_execution_stats_observation(source))
-    except (AttributeError, TypeError, ValueError, RuntimeError):
-        pass
-    return _optional_native_execution_stats_attribute(
-        source, "_execution_stats_observation"
-    )
-
-
 @dataclass
 class DirectDctTrainingBatch:
     """Layout-independent semantic result returned to the training adapter."""
@@ -106,13 +55,13 @@ class DirectDctTrainingBatch:
         return self.native_batch.metrics
 
     def native_execution_stats(self) -> dict[str, Any]:
-        return optional_native_execution_stats(self.native_batch)
+        return _json_compatible(public_execution_stats(self.native_batch))
 
     def native_execution_stats_snapshot(self) -> dict[str, Any]:
-        return optional_native_execution_stats_snapshot(self.native_batch)
+        return _json_compatible(public_execution_stats_snapshot(self.native_batch))
 
     def native_execution_stats_observation(self) -> dict[str, Any]:
-        return optional_native_execution_stats_observation(self.native_batch)
+        return _json_compatible(public_execution_stats_observation(self.native_batch))
 
 
 class DirectDctTrainingReader:

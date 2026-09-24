@@ -16,7 +16,7 @@ from typing import Any, Sequence
 HERE = Path(__file__).resolve().parent
 BENCHMARK_ROOT = HERE.parent
 REPO_ROOT = BENCHMARK_ROOT.parents[2]
-DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
+DEFAULT_PYTHON = Path(sys.executable)
 SCHEMA = "galp_dct_major_process_cold_v2"
 
 

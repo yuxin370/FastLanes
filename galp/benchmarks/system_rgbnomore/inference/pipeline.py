@@ -19,17 +19,12 @@ import torch
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[4]
-for root in (REPO_ROOT, BENCHMARK_ROOT):
-    root_text = str(root)
-    if root_text in sys.path:
-        sys.path.remove(root_text)
-    sys.path.insert(0, root_text)
 
 from galp.profiles import DirectDctProfile
 from galp.torch import DirectDctReader
 from galp.diagnostics.direct_dct import execution_stats, execution_stats_snapshot
 
-from shared.common import (
+from galp.benchmarks.system_rgbnomore.shared.common import (
     RESULT_SCHEMA,
     GALP_PIPELINES,
     GALP_RUNTIME_PROFILE,
@@ -47,7 +42,7 @@ from shared.common import (
     verify_file_fingerprint,
     write_json,
 )
-from inference.model_factory import build_dct_model, build_rgb_model
+from galp.benchmarks.system_rgbnomore.inference.model_factory import build_dct_model, build_rgb_model
 
 
 HERE = Path(__file__).resolve().parent

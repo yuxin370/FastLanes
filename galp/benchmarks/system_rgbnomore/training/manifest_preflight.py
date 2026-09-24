@@ -17,10 +17,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from shared.manifest_contract import (  # noqa: E402
+from galp.benchmarks.system_rgbnomore.shared.manifest_contract import (  # noqa: E402
     COMPACT_V3_EXTENSION_MAGIC,
     JPEG_DCT_MANIFEST_CONTRACTS,
     MANIFEST_MAGIC,

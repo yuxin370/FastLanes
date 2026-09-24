@@ -12,14 +12,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 BENCHMARK_ROOT = HERE.parent
 REPO_ROOT = BENCHMARK_ROOT.parents[2]
-for path in (BENCHMARK_ROOT, REPO_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
 
-from common import parse_manifest  # noqa: E402
-from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512  # noqa: E402
-from galp.torch import DirectDctReader  # noqa: E402
-from galp.diagnostics.direct_dct import plan_preview  # noqa: E402
+from galp.benchmarks.system_dct_major.common import parse_manifest
+from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
+from galp.torch import DirectDctReader
+from galp.diagnostics.direct_dct import plan_preview
 
 
 def parse_args() -> argparse.Namespace:
