@@ -45,6 +45,11 @@ export PYTHONPATH=$PWD/galp/benchmarks/system_dct_major:$PWD/galp/benchmarks/sys
 Use a new output root after any training-runtime source edit. Contracts are
 immutable and intentionally reject silent source changes.
 
+Reserve the RTX 4090 for each timed run. Check
+`nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv` before and during training, and
+discard any epoch that overlaps another process on that GPU. Use the second
+epoch for the warm-throughput comparison; the first includes cold-start work.
+
 ## Completed paired convergence check through epoch 15
 
 The single-seed convergence objective is already complete. At epoch 15, Native
