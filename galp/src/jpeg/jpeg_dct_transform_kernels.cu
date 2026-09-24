@@ -665,13 +665,22 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 	__shared__ float horizontal[64U];
 	__shared__ uint64_t located_rows[4];
 	__shared__ uint32_t located_binding_bases[4];
-	for (uint64_t launch_block = blockIdx.x; launch_block < output_block_count; launch_block += gridDim.x) {
+	uint64_t            cached_image_component = std::numeric_limits<uint64_t>::max();
+	uint32_t            cached_source_x = 0U, cached_source_y = 0U;
+	// Consecutive projected outputs often share an upsampled source block.
+	// Keep that block dequantized while this CTA processes four neighbors.
+	const uint64_t outputs_per_cta = projection ? 4U : 1U;
+	for (uint64_t task = 0;; ++task) {
+		const uint64_t launch_block =
+		    (blockIdx.x + (task / outputs_per_cta) * gridDim.x) * outputs_per_cta + task % outputs_per_cta;
+		if (launch_block >= output_block_count)
+			break;
 		const uint64_t output_index = output_block_offset + launch_block;
-		const uint64_t linear_block = active_output_blocks_per_image != 0U
-		                                  ? (output_index / active_output_blocks_per_image) * blocks_per_image +
-		                                        active_output_blocks[output_index % active_output_blocks_per_image]
-		                                  : (active_output_blocks == nullptr ? output_index
-		                                                                     : active_output_blocks[output_index]);
+		const uint64_t linear_block =
+		    active_output_blocks_per_image != 0U
+		        ? (output_index / active_output_blocks_per_image) * blocks_per_image +
+		              active_output_blocks[output_index % active_output_blocks_per_image]
+		        : (active_output_blocks == nullptr ? output_index : active_output_blocks[output_index]);
 		if (blocks_per_image == 0U || linear_block >= image_count * blocks_per_image || quant_tables == nullptr) {
 			continue;
 		}
@@ -914,48 +923,53 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 				const bool source_in_bounds = source_x_i >= 0 && source_y_i >= 0 &&
 				                              source_x_i < descriptor.width_in_blocks &&
 				                              source_y_i < descriptor.height_in_blocks;
-				if (lane == 0U) {
-					const auto located = source_in_bounds
-					                         ? locate_planless_row(image,
-					                                               descriptor,
-					                                               static_cast<uint32_t>(source_x_i),
-						                                               static_cast<uint32_t>(source_y_i),
-						                                               logical_to_compact_vectors,
-						                                               image_vector_bindings,
-						                                               block_major_groups,
-					                                               block_major_group_count,
-					                                               block_major_rank_cells,
-					                                               block_major_rank_cell_count,
-					                                               block_major_rank_payload,
-					                                               block_major_rank_payload_size)
-					                         : PlanlessLocatedRow {};
-					located_rows[0]         = located.row;
-					located_binding_bases[0] = located.binding_base;
-				}
-				__syncthreads();
-				if (lane < 64U) {
-					const auto coeff = static_cast<uint8_t>(lane);
-					const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
-					int16_t    value    = 0;
-					const auto compact_binding =
-					    sparse_transform ? sparse_plan->natural_to_compact_binding[coeff]
-					                     : static_cast<uint8_t>(physical);
-					const bool selected = compact_binding != JpegDctDeviceSparseTransformPlan::kMissingBinding;
-					if (selected && located_rows[0] != std::numeric_limits<uint64_t>::max() &&
-					    located_binding_bases[0] != std::numeric_limits<uint32_t>::max()) {
-						const auto binding = column_bindings[located_binding_bases[0] + compact_binding];
-						if (binding.source == DeviceCoeffSource::kI16) {
-							value = binding.column_i16[located_rows[0]];
-						} else if (binding.source == DeviceCoeffSource::kI8) {
-							value = static_cast<int16_t>(binding.column_i8[located_rows[0]]);
-						}
+				const uint64_t image_component = image_index * 3U + component;
+				if (cached_image_component != image_component || cached_source_x != source_x_block ||
+				    cached_source_y != source_y_block) {
+					if (lane == 0U) {
+						const auto located       = source_in_bounds ? locate_planless_row(image,
+                                                                                    descriptor,
+                                                                                    static_cast<uint32_t>(source_x_i),
+                                                                                    static_cast<uint32_t>(source_y_i),
+                                                                                    logical_to_compact_vectors,
+                                                                                    image_vector_bindings,
+                                                                                    block_major_groups,
+                                                                                    block_major_group_count,
+                                                                                    block_major_rank_cells,
+                                                                                    block_major_rank_cell_count,
+                                                                                    block_major_rank_payload,
+                                                                                    block_major_rank_payload_size)
+						                                            : PlanlessLocatedRow {};
+						located_rows[0]          = located.row;
+						located_binding_bases[0] = located.binding_base;
 					}
-					const auto quant = static_cast<int32_t>(
-					    quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
-					source[lane] =
-					    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+					__syncthreads();
+					if (lane < 64U) {
+						const auto coeff    = static_cast<uint8_t>(lane);
+						const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
+						int16_t    value    = 0;
+						const auto compact_binding = sparse_transform ? sparse_plan->natural_to_compact_binding[coeff]
+						                                              : static_cast<uint8_t>(physical);
+						const bool selected = compact_binding != JpegDctDeviceSparseTransformPlan::kMissingBinding;
+						if (selected && located_rows[0] != std::numeric_limits<uint64_t>::max() &&
+						    located_binding_bases[0] != std::numeric_limits<uint32_t>::max()) {
+							const auto binding = column_bindings[located_binding_bases[0] + compact_binding];
+							if (binding.source == DeviceCoeffSource::kI16) {
+								value = binding.column_i16[located_rows[0]];
+							} else if (binding.source == DeviceCoeffSource::kI8) {
+								value = static_cast<int16_t>(binding.column_i8[located_rows[0]]);
+							}
+						}
+						const auto quant = static_cast<int32_t>(
+						    quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
+						source[lane] =
+						    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+					}
+					__syncthreads();
+					cached_image_component = image_component;
+					cached_source_x        = source_x_block;
+					cached_source_y        = source_y_block;
 				}
-				__syncthreads();
 				if (lane < horizontal_count) {
 					const auto frequency      = projection ? projection->horizontal_frequencies[component][lane] : lane;
 					const auto source_y_coeff = frequency / 8U;
@@ -965,8 +979,8 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 					    sparse_transform ? sparse_plan->selected_x_count_by_y[source_y_coeff] : uint8_t {8U};
 					for (uint32_t selected_x = 0U; selected_x < selected_x_count; ++selected_x) {
 						const auto in_x_coeff = sparse_transform
-						                          ? sparse_plan->selected_x_by_y[source_y_coeff * 8U + selected_x]
-						                          : static_cast<uint8_t>(selected_x);
+						                            ? sparse_plan->selected_x_by_y[source_y_coeff * 8U + selected_x]
+						                            : static_cast<uint8_t>(selected_x);
 						const auto wx = planless_axis_phase_weight(phase_matrices,
 						                                           descriptor.x_phase_matrix_base,
 						                                           descriptor.x_up_factor,

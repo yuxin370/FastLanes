@@ -1,5 +1,7 @@
+#include "api/direct_dct_pls_postprocess.hpp"
 #include "core/operator_capabilities.hpp"
 #include "cuda/memory/cuda_raii.cuh"
+#include "cuda/memory/gpu_array.cuh"
 #include "fls/connection.hpp"
 #include "fls/expression/rpn.hpp"
 #include "fls/file/file_footer.hpp"
@@ -341,6 +343,69 @@ void rewrite_image_major_shard_expression(const galp::jpeg::JpegDctTable& table,
 	connection.to_fls(staged_path);
 	galp::jpeg::detail::validate_jpeg_dct_fls_gpu_expressions(staged_path, shard_id);
 	std::filesystem::rename(staged_path, fls_path);
+}
+
+TEST(JpegDct, ProjectedAugmentationPreservesSequentialStatistics) {
+	int device_count = 0;
+	if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+		GTEST_SKIP() << "CUDA device is not available";
+	using namespace galp::jpeg;
+	using namespace galp::jpeg::detail;
+	const std::array<JpegDctOutputChannel, 3>      channels {{{0, 0, 0.F, 1.F}, {1, 0, 0.F, 1.F}, {2, 0, 0.F, 1.F}}};
+	const std::array<int64_t, 3>                   labels {0, 1, 2};
+	const std::array<DirectDctPlsMixupDecision, 1> mixup {{{1.F, 0.F}}};
+	std::array<DirectDctPlsRandAugmentDecision, 3> decisions {};
+	for (auto& decision : decisions) {
+		decision.operations = {DirectDctPlsRandAugmentOp::kBrightness, DirectDctPlsRandAugmentOp::kContrast};
+		// At 140x140 this exposes a changed FP32 summation order after rounding.
+		decision.magnitudes = {0.29999F, 0.F};
+	}
+	decisions[1].operations[0] = DirectDctPlsRandAugmentOp::kAutoContrast;
+	decisions[2].operations[0] = DirectDctPlsRandAugmentOp::kAutoSaturation;
+	auto stream                = std::make_shared<DirectDctPlsCudaPostprocess::Stream>(0);
+	for (const size_t side : {28U, 112U, 140U}) {
+		const size_t       pixels = side * side;
+		std::vector<float> input(3 * channels.size() * pixels);
+		for (size_t i = 0; i < input.size(); ++i)
+			input[i] = (i % 3 == 0) ? -1023.F : 1016.F;
+		auto expected = input;
+		for (size_t image = 0; image < 3; ++image) {
+			const size_t base     = image * channels.size() * pixels;
+			float        mean_abs = 0.F;
+			for (size_t p = 0; p < pixels; ++p)
+				mean_abs += std::abs(input[base + p]);
+			mean_abs /= static_cast<float>(pixels);
+			for (size_t c = 0; c < 3; ++c) {
+				for (size_t p = 0; p < pixels; ++p) {
+					auto& value = expected[base + c * pixels + p];
+					if (image == 0 && c == 0)
+						value = std::fma(mean_abs, decisions[0].magnitudes[0], value);
+					if ((image == 1 && c == 0) || (image == 2 && c != 0))
+						value = value < 0.F ? -1024.F : 1016.F;
+					value = std::nearbyint(std::clamp(value, -1024.F, 1016.F));
+				}
+			}
+		}
+		GPUArray<float>         device_input(input.size(), input.data());
+		GPUArray<float>         targets(9);
+		galp::memory::CudaEvent ready;
+		ready.create_with_flags(cudaEventDisableTiming);
+		ready.record(nullptr);
+		DirectDctGridTensorDescriptor descriptor {nullptr,
+		                                          device_input.get(),
+		                                          {3, channels.size(), side, side, 1, 1},
+		                                          {channels.size() * pixels, pixels, side, 1, 1, 1},
+		                                          DirectDctTensorDataType::kFloat32,
+		                                          DirectDctTensorDevice::kCuda,
+		                                          0};
+		DirectDctPlsCudaPostprocess   postprocess(
+            descriptor, ready.get(), targets.get(), labels, decisions, mixup, 3, 3, stream, channels, channels);
+		ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+		std::vector<float> actual(input.size());
+		ASSERT_EQ(cudaMemcpy(actual.data(), device_input.get(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
+		          cudaSuccess);
+		EXPECT_EQ(actual, expected) << "grid side " << side;
+	}
 }
 
 TEST(JpegDct, PublicAggregatesPreserveLegacyPositionalInitialization) {

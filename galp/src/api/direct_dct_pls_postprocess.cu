@@ -287,11 +287,11 @@ __global__ void projected_stats(const int16_t* source,
                                 int            y_dc,
                                 int            cb_dc,
                                 int            cr_dc) {
-	for (size_t image = blockIdx.x * blockDim.x + threadIdx.x; image < images;
-	     image += size_t(blockDim.x) * gridDim.x) {
+	__shared__ DeviceStats partial[256];
+	for (size_t image = blockIdx.x; image < images; image += gridDim.x) {
 		DeviceStats value {1.e30F, -1.e30F, 0.F, 1.e30F, -1.e30F};
 		const auto* data = source + image * pixels * channels;
-		for (size_t p = 0; p < pixels; ++p) {
+		for (size_t p = threadIdx.x; p < pixels; p += blockDim.x) {
 			float y = data[y_dc * pixels + p], cb = data[cb_dc * pixels + p], cr = data[cr_dc * pixels + p];
 			value.y_min = fminf(value.y_min, y);
 			value.y_max = fmaxf(value.y_max, y);
@@ -299,8 +299,33 @@ __global__ void projected_stats(const int16_t* source,
 			value.c_min = fminf(value.c_min, fminf(cb, cr));
 			value.c_max = fmaxf(value.c_max, fmaxf(cb, cr));
 		}
-		value.y_mean_abs /= pixels;
-		stats[image] = value;
+		partial[threadIdx.x] = value;
+		__syncthreads();
+		for (unsigned stride = blockDim.x / 2; stride != 0; stride /= 2) {
+			if (threadIdx.x < stride) {
+				auto&      left  = partial[threadIdx.x];
+				const auto right = partial[threadIdx.x + stride];
+				left.y_min       = fminf(left.y_min, right.y_min);
+				left.y_max       = fmaxf(left.y_max, right.y_max);
+				left.y_mean_abs += right.y_mean_abs;
+				left.c_min = fminf(left.c_min, right.c_min);
+				left.c_max = fmaxf(left.c_max, right.c_max);
+			}
+			__syncthreads();
+		}
+		if (threadIdx.x == 0) {
+			value = partial[0];
+			// Clamped integer magnitudes sum exactly in FP32 through 16384 pixels.
+			// Larger supported grids retain the original sequential rounding order.
+			if (pixels > 16384) {
+				value.y_mean_abs = 0.F;
+				for (size_t p = 0; p < pixels; ++p)
+					value.y_mean_abs += fabsf(float(data[y_dc * pixels + p]));
+			}
+			value.y_mean_abs /= pixels;
+			stats[image] = value;
+		}
+		__syncthreads();
 	}
 }
 
@@ -526,14 +551,14 @@ void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor   
 		auto* next    = y_b->get();
 		if (enable_randaugment) {
 			for (int stage = 0; stage < 2; ++stage) {
-				projected_stats<<<launch_blocks(count), 256, 0, stream>>>(current,
-				                                                          stats_device->get(),
-				                                                          count,
-				                                                          pixels,
-				                                                          inputs.size(),
-				                                                          lookup[0][0],
-				                                                          lookup[1][0],
-				                                                          lookup[2][0]);
+				projected_stats<<<count, 256, 0, stream>>>(current,
+				                                           stats_device->get(),
+				                                           count,
+				                                           pixels,
+				                                           inputs.size(),
+				                                           lookup[0][0],
+				                                           lookup[1][0],
+				                                           lookup[2][0]);
 				apply_randaugment_kernel<true>
 				    <<<launch_blocks(elements), 256, 0, stream>>>(current,
 				                                                  next,
