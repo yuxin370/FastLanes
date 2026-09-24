@@ -42,6 +42,7 @@ def run_model_only_calibration(
     warmup_updates: int,
     measured_updates: int,
     precision: str = "fp32",
+    cuda_graphs: bool = False,
 ) -> dict[str, Any]:
     policy = validate_audit_policy(audit_policy)
     if domain not in {"rgb", "dct"}:
@@ -65,13 +66,18 @@ def run_model_only_calibration(
     measured_seconds = 0.0
     measured_microbatches = 0
     completed_updates = 0
+    if cuda_graphs:
+        for parameter in model.parameters():
+            parameter.grad = torch.zeros_like(parameter)
 
     def one_update(*, measured: bool) -> None:
         nonlocal audit_seconds, measured_microbatches, completed_updates
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=not cuda_graphs)
         learning_rate = scheduler.prepare_next_update()
         decision = decision_for_next_update(policy, completed_updates)
         for _microbatch in range(gradient_accumulation):
+            if cuda_graphs:
+                torch.compiler.cudagraph_mark_step_begin()
             with autocast_context():
                 logits = execution_model(*inputs)
                 loss = torch.nn.functional.cross_entropy(logits, labels)
@@ -93,6 +99,7 @@ def run_model_only_calibration(
             (loss / gradient_accumulation).backward()
             if measured:
                 measured_microbatches += 1
+            del loss, logits
         gradients = [
             parameter.grad
             for parameter in model.parameters()
@@ -171,6 +178,7 @@ def run_model_only_calibration(
             "audit-policy",
         ],
         "precision": precision,
+        "cuda_graphs_requested": cuda_graphs,
         "microbatch_images": int(microbatch_images),
         "gradient_accumulation": int(gradient_accumulation),
         "warmup_optimizer_updates": int(warmup_updates),

@@ -41,6 +41,8 @@ from galp.benchmarks.model_only_training_calibration import (
     run_model_only_calibration,
 )
 
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
+
 
 HERE = Path(__file__).resolve().parent
 FASTLANES_ROOT = HERE.parents[3]
@@ -79,20 +81,20 @@ from galp.benchmarks.system_rgbnomore.training.sample_order import (
     canonical_epoch_order,
 )
 
-from galp.benchmarks.system_dct_major.training_pls.published_optimizer import (
+from galp.benchmarks.training_pls.published_optimizer import (
     build_published_optimizer,
 )
-from galp.benchmarks.system_dct_major.training_pls.recipe import (
+from galp.benchmarks.training_pls.recipe import (
     recipe_contract,
 )
-from galp.benchmarks.system_dct_major.training_pls.model_registry import (
+from galp.benchmarks.training_pls.model_registry import (
     recipe_for_model,
     source_provenance,
 )
-from galp.benchmarks.system_dct_major.training_pls.train import (
+from galp.benchmarks.training_pls.train import (
     compile_published_model,
 )
-from galp.benchmarks.system_dct_major.training_pls.contracts import code_version
+from galp.benchmarks.training_pls.contracts import code_version
 
 
 CONTRACT_SCHEMA = "galp-equal-image-rgb-epoch-contract-v3"
@@ -396,9 +398,9 @@ def _runtime_files() -> list[Path]:
         HERE / "sample_order.py",
         HERE / "model_factory.py",
         FASTLANES_ROOT
-        / "galp/benchmarks/system_dct_major/training_pls/published_optimizer.py",
-        FASTLANES_ROOT / "galp/benchmarks/system_dct_major/training_pls/recipe.py",
-        FASTLANES_ROOT / "galp/benchmarks/system_dct_major/training_pls/train.py",
+        / "galp/benchmarks/training_pls/published_optimizer.py",
+        FASTLANES_ROOT / "galp/benchmarks/training_pls/recipe.py",
+        FASTLANES_ROOT / "galp/benchmarks/training_pls/train.py",
     ]
 
 
@@ -421,6 +423,7 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
         EXPECTED_TRAIN_IMAGES, epochs=REFERENCE_EPOCHS
     )
     published = recipe_contract(recipe_for_model(args.model))
+    published["execution"]["model_compile"]["mode"] = args.compile_mode
     audit_policy = build_audit_policy(args.audit_mode)
     payload: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA,
@@ -473,9 +476,9 @@ def build_contract(args: argparse.Namespace) -> dict[str, Any]:
         "augmentation": {
             "policy": "standard RGB/JPEG path",
             "decision_source": {
-                "d2": "training.augmentation.derive_augmentation",
+                "d2": "galp.benchmarks.system_rgbnomore.training.augmentation.derive_augmentation",
                 "d3": "DALI native shuffle, image_random_crop, and coin_flip",
-                "pytorch": "training.augmentation.derive_augmentation",
+                "pytorch": "galp.benchmarks.system_rgbnomore.training.augmentation.derive_augmentation",
             },
             "crop": "per-sample RandomResizedCrop RGB",
             "horizontal_flip": "D2/PyTorch keyed; D3 DALI-native",
@@ -666,6 +669,7 @@ def _run_rgb_model_only_calibration(
     model = build_model(rgbnomore_root, "rgb", device, model_id=model_id)
     model.load_state_dict(initial_state, strict=True)
     published = recipe_contract(str(contract["model"]["recipe"]))
+    published["execution"]["model_compile"] = dict(contract["training"]["model_compile"])
     optimizer, weight_decayer, scheduler = build_published_optimizer(
         model,
         learning_rate=float(published["optimizer"]["learning_rate"]),
@@ -703,6 +707,7 @@ def _run_rgb_model_only_calibration(
             contract["model_only_calibration"]["measured_optimizer_updates"]
         ),
         precision=str(contract["training"]["precision"]),
+        cuda_graphs=contract["training"]["model_compile"]["mode"] == "reduce-overhead",
     )
     calibration.update(
         contract_hash=contract["contract_hash"],
@@ -731,9 +736,7 @@ def _all_finite(values: Sequence[torch.Tensor]) -> bool:
 
 
 def _autocast_context(contract: Mapping[str, Any], device: torch.device) -> Any:
-    # Small unit fixtures and legacy v3 contracts predate the explicit
-    # precision field; their historical execution is FP32.
-    precision = str(contract.get("training", {}).get("precision", "fp32"))
+    precision = str(contract["training"]["precision"])
     if precision == "fp32":
         return contextlib.nullcontext()
     if precision == "bf16-autocast":
@@ -883,6 +886,7 @@ def _train_epoch(
     processed_images: int,
 ) -> tuple[dict[str, Any], int, int]:
     audit_policy = validate_audit_policy(contract.get("audit_policy", {}))
+    cuda_graphs = contract["training"]["model_compile"]["mode"] == "reduce-overhead"
     epoch_start_update = int(global_update)
     epoch_started = time.perf_counter()
     boundary_sync_seconds = 0.0
@@ -943,7 +947,7 @@ def _train_epoch(
                 window_begin : window_begin + GRADIENT_ACCUMULATION
             ]
             window_samples = sum(window_lengths)
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=not cuda_graphs)
             learning_rate = scheduler.prepare_next_update()
             audit_decision = decision_for_next_update(audit_policy, global_update)
             if profile_this_epoch and window_begin == profile_begin:
@@ -987,6 +991,8 @@ def _train_epoch(
                     h2d_enqueue_seconds += time.perf_counter() - handoff_started
                 with _autocast_context(contract, device):
                     with _nvtx_range(stage_nvtx, "training.model.forward"):
+                        if cuda_graphs:
+                            torch.compiler.cudagraph_mark_step_begin()
                         logits = execution_model(*inputs)
                     with _nvtx_range(stage_nvtx, "training.loss"):
                         loss = torch.nn.functional.cross_entropy(logits, labels)
@@ -1437,6 +1443,10 @@ def _run_pipeline(
     if tensor_state_sha256(model.state_dict()) != initial_model_hash:
         raise RuntimeError(f"{pipeline} device model differs from canonical state")
     published = recipe_contract(str(contract["model"]["recipe"]))
+    published["execution"]["model_compile"] = dict(contract["training"]["model_compile"])
+    if contract["training"]["model_compile"]["mode"] == "reduce-overhead":
+        for parameter in model.parameters():
+            parameter.grad = torch.zeros_like(parameter)
     total_updates = int(contract["scheduler"]["total_optimizer_updates"])
     optimizer, weight_decayer, scheduler = build_published_optimizer(
         model,
@@ -1753,6 +1763,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pipelines", default="d2,d3,pytorch")
     parser.add_argument("--model", choices=MODEL_IDS, default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--compile-mode", choices=("default", "reduce-overhead"), default="default"
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--audit-mode", choices=AUDIT_MODES, default=DEFAULT_AUDIT_MODE)
     parser.add_argument("--workers", type=int, default=4)
@@ -1789,7 +1802,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="fail closed when the selected logical CUDA device is not the intended GPU",
     )
     parser.add_argument(
-        "--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more")
+        "--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT
     )
     parser.add_argument("--stop-after-epoch", type=int)
     parser.add_argument("--model-only-warmup-updates", type=int, default=5)
