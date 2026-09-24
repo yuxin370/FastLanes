@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute one no-shuffle DCT-major, DALI, or PyTorch pipeline."""
+"""Execute one no-shuffle DCT-major, DALI, FFCV, or PyTorch pipeline."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 import torch
 
-from common import (
+from galp.benchmarks.system_dct_major.common import (
     BLOCK_MAJOR_RUNTIME_PROFILE,
     GALP_PIPELINES,
     PIPELINES,
@@ -37,8 +37,6 @@ from common import (
     sha256_json,
     write_json,
 )
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
 from galp.torch import DirectDctReader
@@ -48,7 +46,7 @@ from galp.diagnostics.direct_dct import (
     execution_stats,
     initialization_stats,
 )
-from feature_model import build_workload_model, expected_output_width
+from galp.benchmarks.system_dct_major.feature_model import build_workload_model, expected_output_width
 
 
 @dataclass
@@ -447,6 +445,163 @@ class DaliAdapter(Adapter):
         self.iterator = None
 
 
+class CoorDLAdapter(DaliAdapter):
+    """Use the upstream CoorDL FileReader and keep its MinIO cache across epochs."""
+
+    def begin_repeat(self) -> None:
+        if self.iterator is not None:
+            return
+        from nvidia.dali import backend, ops, types
+        from nvidia.dali.pipeline import Pipeline
+        from nvidia.dali.plugin.pytorch import DALIGenericIterator
+
+        if "cache_size" not in backend.GetSchema("FileReader").GetArgumentNames():
+            raise RuntimeError(
+                "coordl requires msr-fiddle/CoorDL, not standard NVIDIA DALI; "
+                "use --coordl-python with a compatible CoorDL installation"
+            )
+        execution = self.contract["execution"]
+        config = self.contract["pipelines"][self.name]
+        preprocess = self.contract["preprocess"]["rgb"]
+        if preprocess["resize_shorter"] is not None:
+            raise ValueError("CoorDL baseline requires the fixed-512 center-crop profile")
+
+        # Upstream FileReader accepts a whitespace-delimited list, relative to file_root.
+        # Keeping the full path below / also avoids collisions between dataset views
+        # in CoorDL's fixed /dev/shm/cache namespace.
+        lines = []
+        self.cache_paths = []
+        for sample in self.samples:
+            path = str(Path(sample["path"]).resolve().relative_to("/"))
+            if any(character.isspace() for character in path):
+                raise ValueError(f"CoorDL file_list cannot represent whitespace in path: {path}")
+            for suffix in ("", "-tmp"):
+                cache_path = Path("/dev/shm/cache") / (path + suffix)
+                if cache_path.exists():
+                    raise FileExistsError(f"CoorDL requires a fresh cache; existing entry: {cache_path}")
+                self.cache_paths.append(cache_path)
+            lines.append(f"{path} {int(sample['ordinal'])}\n")
+        file_list = Path(config["file_list"])
+        file_list.write_text("".join(lines), encoding="utf-8")
+
+        class CoorDLPipeline(Pipeline):
+            def __init__(self) -> None:
+                super().__init__(
+                    batch_size=int(execution["batch_size"]),
+                    num_threads=max(1, int(execution["workers"])),
+                    device_id=int(config["device_id"]),
+                    seed=int(execution["seed"]),
+                    prefetch_queue_depth=int(config["prefetch_queue_depth"]),
+                )
+                self.reader = ops.FileReader(
+                    file_root="/",
+                    file_list=str(file_list),
+                    cache_size=int(config["cache_size"]),
+                    num_nodes=1,
+                    node_id=0,
+                    num_shards=1,
+                    shard_id=0,
+                    shuffle_seed=int(execution["seed"]),
+                    random_shuffle=False,
+                    shuffle_after_epoch=False,
+                    # Padding is removed by the iterator; the next epoch starts at 0.
+                    pad_last_batch=True,
+                )
+                self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
+                self.normalize = ops.CropMirrorNormalize(
+                    device="gpu",
+                    output_dtype=types.FLOAT,
+                    output_layout="CHW",
+                    crop=tuple(preprocess["crop_size"]),
+                    crop_pos_x=0.5,
+                    crop_pos_y=0.5,
+                    mean=[127.5, 127.5, 127.5],
+                    std=[127.5, 127.5, 127.5],
+                )
+
+            def define_graph(self):
+                encoded, ordinal = self.reader(name="Reader")
+                return self.normalize(self.decode(encoded)), ordinal
+
+        # CoorDL predates pipeline_def and LastBatchPolicy. Use its published API.
+        self.iterator = DALIGenericIterator(
+            [CoorDLPipeline()],
+            output_map=["image", "ordinal"],
+            size=len(self.samples),
+            auto_reset=False,
+            fill_last_batch=False,
+            last_batch_padded=True,
+        )
+
+    def end_repeat(self) -> None:
+        self.iterator.reset()
+
+    def close(self) -> None:
+        self.iterator = None
+        # CoorDL leaves its shared-memory JPEGs behind. Remove only this run's
+        # entries, which were checked absent before the reader was created.
+        for path in self.cache_paths:
+            path.unlink(missing_ok=True)
+
+
+class FfcvAdapter(Adapter):
+    domain = "rgb"
+    worker_semantics = "ffcv_cpu_threads"
+
+    def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device, name: str) -> None:
+        super().__init__(contract, samples, device, name)
+        if device.type != "cuda":
+            raise ValueError("FFCV requires CUDA")
+        from ffcv.fields.decoders import CenterCropRGBImageDecoder, IntDecoder
+        from ffcv.loader import Loader, OrderOption
+        from ffcv.transforms import ToDevice, ToTensor, ToTorchImage
+
+        self.loader = Loader(
+            contract["pipelines"][name]["beton"],
+            batch_size=int(contract["execution"]["batch_size"]),
+            num_workers=max(1, int(contract["execution"]["workers"])),
+            order=OrderOption.SEQUENTIAL,
+            indices=[int(sample["ordinal"]) for sample in samples],
+            drop_last=False,
+            pipelines={
+                "image": [
+                    CenterCropRGBImageDecoder((224, 224), 224 / 512),
+                    ToTensor(),
+                    ToDevice(device),
+                    ToTorchImage(),
+                ],
+                "ordinal": [IntDecoder(), ToTensor()],
+            },
+        )
+        self.iterator: Iterator[Any] | None = None
+        self._cold_iterator_primed = False
+
+    def begin_repeat(self) -> None:
+        if self._cold_iterator_primed:
+            self._cold_iterator_primed = False
+            return
+        self.iterator = iter(self.loader)
+
+    def prime_cold_start(self) -> None:
+        self.iterator = iter(self.loader)
+        self._cold_iterator_primed = True
+
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        if self.iterator is None:
+            raise RuntimeError("FFCV adapter was not started")
+        images, ordinal_tensor = next(self.iterator)
+        ordinals = [int(item) for item in ordinal_tensor.reshape(-1).tolist()]
+        label_values = [int(self.samples[item]["label"]) for item in ordinals]
+        labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
+        return LoadedBatch(
+            inputs=(images.float().div_(127.5).sub_(1.0),),
+            labels=labels,
+            ordinals=ordinals,
+            label_values=label_values,
+            on_device=True,
+        )
+
+
 def _batch_native_stats(batch: Any) -> dict[str, Any]:
     stats = execution_stats(batch)
     cache = cache_stats(batch)
@@ -473,44 +628,6 @@ def _batch_native_stats(batch: Any) -> dict[str, Any]:
 
 
 
-def _manifest_shard_segments(
-    samples: Sequence[dict[str, Any]], manifest: dict[str, Any]
-) -> list[list[dict[str, Any]]]:
-    """Partition a sequential prefix into complete physical manifest shards."""
-
-    if not samples:
-        return []
-    image_ids = [int(sample["galp_image_id"]) for sample in samples]
-    if image_ids != list(range(len(samples))):
-        raise ValueError("manifest-shard mode requires the canonical sequential image prefix")
-    selected_end = len(samples)
-    segments: list[list[dict[str, Any]]] = []
-    consumed = 0
-    for shard in manifest["shards"]:
-        first = int(shard["first_global_image_index"])
-        count = int(shard["image_count"])
-        end = first + count
-        if first >= selected_end:
-            break
-        if first != consumed:
-            raise ValueError(
-                f"manifest shard ranges are not contiguous at image {consumed}: next starts at {first}"
-            )
-        if end > selected_end:
-            raise ValueError(
-                "manifest-shard sample_count truncates a physical shard: "
-                f"selected [0,{selected_end}), shard {int(shard['shard_id'])} is [{first},{end})"
-            )
-        segment = list(samples[first:end])
-        if len(segment) != count:
-            raise ValueError(f"manifest shard {int(shard['shard_id'])} is not fully represented")
-        segments.append(segment)
-        consumed = end
-    if consumed != selected_end:
-        raise ValueError(
-            f"manifest-shard partition covered {consumed} of {selected_end} selected images"
-        )
-    return segments
 
 
 class GalpAdapter(Adapter):
@@ -537,15 +654,7 @@ class GalpAdapter(Adapter):
                     f"configured block-major access companion index is missing: {companion_index}"
                 )
             os.environ["GALP_BLOCK_MAJOR_ACCESS_DIR"] = str(access_dir)
-        # Construction-time only rollback seam. Publish the selection before
-        # constructing the native pipeline so C++ and Python have one physical
-        # orchestration owner and no per-batch dispatch.
-        self._native_physical_orchestration = os.environ.get(
-            "GALP_PHASE6_NATIVE_PHYSICAL", "1"
-        ) != "0"
-        os.environ["GALP_PHASE6_NATIVE_PHYSICAL"] = (
-            "1" if self._native_physical_orchestration else "0"
-        )
+        os.environ["GALP_PHASE6_NATIVE_PHYSICAL"] = "1"
         reader_started_ns = time.perf_counter_ns()
         self.reader = DirectDctReader(
             self.config["manifest"],
@@ -582,27 +691,6 @@ class GalpAdapter(Adapter):
             list(self.samples[offset : offset + batch_size])
             for offset in range(0, len(self.samples), batch_size)
         ]
-        self._warmup_segments: list[list[dict[str, Any]]] = []
-        self._measurement_segments: list[list[dict[str, Any]]] = []
-        self._shard_by_image_id: dict[int, int] = {}
-        if getattr(self, "_native_physical_orchestration", False):
-            # Bind the hot-path method once at construction. Python owns only
-            # semantic logical batches; native code owns all shard planning
-            # and returns one already assembled logical result per request.
-            self.load = self._load_native_logical  # type: ignore[method-assign]
-        else:
-            parsed_manifest = parse_manifest(Path(self.config["manifest"]))
-            for shard in parsed_manifest["shards"]:
-                first = int(shard["first_global_image_index"])
-                end = first + int(shard["image_count"])
-                for image_id in range(first, min(end, len(self.samples))):
-                    self._shard_by_image_id[image_id] = int(shard["shard_id"])
-            self._measurement_segments = _manifest_shard_segments(self.samples, parsed_manifest)
-        self.segments: list[list[dict[str, Any]]] = []
-        self._next_segment = 0
-        self._current: dict[str, Any] | None = None
-        self._seen_segment_shards: set[int] = set()
-        self._last_segment_shard: int | None = None
         self._process_scope_started_ns: int | None = None
         self._cold_measurement_primed = False
         self._reuse_cold_measurement = False
@@ -618,22 +706,8 @@ class GalpAdapter(Adapter):
         result["native_reader_initialization"] = initialization_stats(self.reader)
         return result
 
-    def _activate_segments(self, segments: Sequence[Sequence[dict[str, Any]]]) -> None:
-        self.segments = [list(segment) for segment in segments]
-        self._next_segment = 0
-        self._current = None
-        self._seen_segment_shards = set()
-        self._last_segment_shard = None
-        self.pipeline.start(
-            [
-                [int(sample["galp_image_id"]) for sample in segment]
-                for segment in self.segments
-            ]
-        )
 
     def _activate_logical_batches(self) -> None:
-        self._next_segment = 0
-        self._current = None
         self.pipeline.start(
             [
                 [int(sample["galp_image_id"]) for sample in batch]
@@ -641,137 +715,30 @@ class GalpAdapter(Adapter):
             ]
         )
 
-    def _segment_shard_ids(self, segment: Sequence[dict[str, Any]]) -> set[int]:
-        mapping = getattr(self, "_shard_by_image_id", {})
-        return {
-            int(mapping[int(sample["galp_image_id"])])
-            for sample in segment
-            if int(sample["galp_image_id"]) in mapping
-        }
 
-    def _load_next_segment(self) -> None:
-        if self._next_segment >= len(self.segments):
-            raise StopIteration("GALP segment stream is exhausted")
-        segment = self.segments[self._next_segment]
-        batch = next(self.pipeline)
-        self._next_segment += 1
-        ready_ns = time.perf_counter_ns()
-        image_ids = [int(item) for item in batch.global_image_ids]
-        y = batch.y
-        cbcr = batch.cbcr
-        if batch.layout != "transformed_dct_grid" or y.dtype != torch.float32 or cbcr.dtype != torch.float32:
-            raise RuntimeError(
-                f"expected native FP32 transformed grid, got layout={batch.layout} y={y.dtype} cbcr={cbcr.dtype}"
-            )
-        if tuple(y.shape[1:]) != (1, 28, 28, 8, 8) or tuple(cbcr.shape[1:]) != (2, 14, 14, 8, 8):
-            raise RuntimeError(f"unexpected transformed grid shapes: y={tuple(y.shape)} cbcr={tuple(cbcr.shape)}")
-        shard_ids = self._segment_shard_ids(segment)
-        cross_shard = int(len(shard_ids) != 1)
-        shard_id = next(iter(shard_ids)) if len(shard_ids) == 1 else None
-        reactivation = int(shard_id is not None and shard_id in self._seen_segment_shards)
-        if shard_id is not None:
-            self._seen_segment_shards.add(shard_id)
-            self._last_segment_shard = shard_id
-        metrics = batch.metrics
-        self._current = {
-            "image_ids": image_ids,
-            "y": y,
-            "cbcr": cbcr,
-            "offset": 0,
-            "batch": batch,
-            "stats_pending": True,
-            "prefetch_telemetry": {
-                "producer_active_ms": metrics.producer_ms,
-                "planning_ms": metrics.planning_ms,
-                "io_staging_ms": metrics.io_ms,
-                "submit_to_ready_ms": metrics.submit_to_ready_ms,
-                # This is the directly observed main-thread input-ready stall:
-                # time spent inside consumption of an asynchronously produced
-                # segment.  It is distinct from producer service time and can
-                # be divided by measured repeat time for the P2 <=2% gate.
-                "consumer_wait_ms": metrics.consumer_wait_ms,
-                "process_scope_ready_ms": (
-                    (ready_ns - self._process_scope_started_ns) / 1.0e6
-                    if self._process_scope_started_ns is not None
-                    else 0.0
-                ),
-            },
-            "scheduler_stats": {
-                # This path is intrinsically manifest-shard scheduled.  Keep
-                # its identity as result telemetry (not as a user option) so
-                # readiness aggregation can recognize the first shard.
-                "segment_mode": "manifest-shard",
-                "segment_shard_id": shard_id if shard_id is not None else -1,
-                "segment_cross_shard_count": cross_shard,
-                "shard_reactivation_count": reactivation,
-            },
-        }
 
-    def _release_consumed_current(self) -> None:
-        current = self._current
-        if current is None:
-            return
-        if int(current["offset"]) < len(current["image_ids"]):
-            raise RuntimeError("cannot release a GALP segment before it is consumed")
-        self._current = None
-        del current
 
-    def _stitch_consumed_parts_before_deferred_allocation(
-        self,
-        y_parts: list[torch.Tensor],
-        cbcr_parts: list[torch.Tensor],
-        keepalive: list[Any],
-    ) -> None:
-        if not y_parts:
-            return
-        if len(y_parts) != len(cbcr_parts):
-            raise RuntimeError("GALP Y/CbCr segment part count mismatch")
-        # A model batch can straddle a physical shard boundary (1024 is not a
-        # multiple of batch 50).  Copy only that small tail before releasing
-        # the old full-shard output; otherwise the views would keep both whole
-        # shard allocations resident while the next output is produced.
-        stitched_y = y_parts[0].clone() if len(y_parts) == 1 else torch.cat(y_parts, dim=0)
-        stitched_cbcr = (
-            cbcr_parts[0].clone() if len(cbcr_parts) == 1 else torch.cat(cbcr_parts, dim=0)
-        )
-        if self.device.type == "cuda":
-            torch.cuda.current_stream(self.device).synchronize()
-        y_parts[:] = [stitched_y]
-        cbcr_parts[:] = [stitched_cbcr]
-        keepalive.clear()
 
     def begin_repeat(self) -> None:
         if getattr(self, "_cold_measurement_primed", False):
             self._cold_measurement_primed = False
             self._reuse_cold_measurement = True
             return
-        if getattr(self, "_native_physical_orchestration", False):
-            self._activate_logical_batches()
-        else:
-            initial = self._warmup_segments if self._warmup_segments else self._measurement_segments
-            self._activate_segments(initial)
+        self._activate_logical_batches()
 
     def begin_measurement(self) -> None:
-        if getattr(self, "_reuse_cold_measurement", False):
+        if self._reuse_cold_measurement:
             self._reuse_cold_measurement = False
             return
-        if getattr(self, "_native_physical_orchestration", False):
-            self._activate_logical_batches()
-        else:
-            self._activate_segments(self._measurement_segments)
+        self._activate_logical_batches()
 
     def prime_cold_start(self) -> None:
-        native_physical = getattr(self, "_native_physical_orchestration", False)
-        scheduled = self._logical_batches if native_physical else self._measurement_segments
-        if self._warmup_segments or not scheduled or self._cold_measurement_primed:
+        if not self._logical_batches or self._cold_measurement_primed:
             return
-        if native_physical:
-            self._activate_logical_batches()
-        else:
-            self._activate_segments(self._measurement_segments)
+        self._activate_logical_batches()
         self._cold_measurement_primed = True
 
-    def _load_native_logical(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
         batch = next(self.pipeline)
         ready_ns = time.perf_counter_ns()
         expected_ids = [int(sample["galp_image_id"]) for sample in expected]
@@ -818,66 +785,9 @@ class GalpAdapter(Adapter):
             keepalive=[batch],
         )
 
-    def _load_pushdown(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
-        remaining = [int(sample["galp_image_id"]) for sample in expected]
-        y_parts: list[torch.Tensor] = []
-        cbcr_parts: list[torch.Tensor] = []
-        native_stats: list[dict[str, Any]] = []
-        keepalive: list[Any] = []
-        while remaining:
-            if self._current is None or int(self._current["offset"]) >= len(self._current["image_ids"]):
-                if self._current is not None:
-                    self._stitch_consumed_parts_before_deferred_allocation(
-                        y_parts,
-                        cbcr_parts,
-                        keepalive,
-                    )
-                    self._release_consumed_current()
-                self._load_next_segment()
-            assert self._current is not None
-            offset = int(self._current["offset"])
-            available = len(self._current["image_ids"]) - offset
-            take = min(len(remaining), available)
-            observed = self._current["image_ids"][offset : offset + take]
-            if observed != remaining[:take]:
-                raise RuntimeError(f"GALP segment order mismatch: expected {remaining[:take]}, got {observed}")
-            y_parts.append(self._current["y"][offset : offset + take])
-            cbcr_parts.append(self._current["cbcr"][offset : offset + take])
-            keepalive.append(self._current["batch"])
-            if self._current["stats_pending"]:
-                # Keep implementation counters out of the timed input path.
-                # They are finalized after the model stream completes.
-                stats = {
-                    "_native_batch": self._current["batch"],
-                    "segment_image_count": len(self._current["image_ids"]),
-                    "segment_first_image_id": self._current["image_ids"][0],
-                    "segment_last_image_id": self._current["image_ids"][-1],
-                }
-                stats.update({f"prefetch_{key}": value for key, value in self._current["prefetch_telemetry"].items()})
-                stats.update(self._current["scheduler_stats"])
-                native_stats.append(stats)
-                self._current["stats_pending"] = False
-            self._current["offset"] = offset + take
-            remaining = remaining[take:]
-        y = y_parts[0] if len(y_parts) == 1 else torch.cat(y_parts, dim=0)
-        cbcr = cbcr_parts[0] if len(cbcr_parts) == 1 else torch.cat(cbcr_parts, dim=0)
-        label_values = [int(sample["label"]) for sample in expected]
-        labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
-        return LoadedBatch(
-            inputs=(y, cbcr),
-            labels=labels,
-            ordinals=[int(sample["ordinal"]) for sample in expected],
-            label_values=label_values,
-            on_device=True,
-            native_stats=native_stats,
-            keepalive=keepalive,
-        )
 
-    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
-        return self._load_pushdown(expected)
 
     def end_repeat(self) -> None:
-        self._current = None
         self.pipeline.close()
 
 
@@ -892,6 +802,10 @@ def make_adapter(name: str, contract: dict[str, Any], samples: Sequence[dict[str
         return RgbNoMoreAdapter(contract, samples, device, name)
     if name == "dali":
         return DaliAdapter(contract, samples, device, name)
+    if name == "coordl":
+        return CoorDLAdapter(contract, samples, device, name)
+    if name == "ffcv":
+        return FfcvAdapter(contract, samples, device, name)
     if name == "pytorch":
         return PyTorchAdapter(contract, samples, device, name)
     raise ValueError(f"unsupported pipeline: {name}")
@@ -928,6 +842,31 @@ def _forward(model: torch.nn.Module, inputs: tuple[torch.Tensor, ...], expected_
     return output
 
 
+def _training_step(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer, batch: LoadedBatch, expected_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    optimizer.zero_grad(set_to_none=True)
+    output = model(*batch.inputs)
+    if output.ndim != 2 or output.shape[1] != expected_width:
+        raise RuntimeError(f"expected [B,{expected_width}] model output, got {tuple(output.shape)}")
+    loss = torch.nn.functional.cross_entropy(output, batch.labels)
+    loss.backward()
+    optimizer.step()
+    return output.detach(), loss.detach()
+
+
+def _training_probe(model: torch.nn.Module, before: list[torch.Tensor]) -> dict[str, bool]:
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    gradients = [p.grad for p in parameters if p.grad is not None]
+    return {
+        "finite_gradients": bool(torch.stack([torch.isfinite(g).all() for g in gradients]).all()),
+        "nonzero_gradients": bool(torch.stack([g.ne(0).any() for g in gradients]).any()),
+        "parameters_updated": bool(torch.stack([
+            p.detach().ne(previous).any() for p, previous in zip(parameters, before, strict=True)
+        ]).any()),
+    }
+
+
 def _prime_model_for_cold_start(
     model: torch.nn.Module,
     domain: str,
@@ -960,14 +899,21 @@ def _release_native_context(batch: LoadedBatch) -> None:
 def _finalize_native_stats(batch: LoadedBatch) -> None:
     """Resolve audit-only implementation counters after model completion."""
 
+    physical_stats = []
     for stats in batch.native_stats:
         source = stats.pop("_native_batch", None)
         if source is None:
+            physical_stats.append(stats)
+            continue
+        observed = _batch_native_stats(source)
+        if observed["rowgroup_count"] == 0:
             continue
         stable_fields = dict(stats)
         stats.clear()
-        stats.update(_batch_native_stats(source))
+        stats.update(observed)
         stats.update(stable_fields)
+        physical_stats.append(stats)
+    batch.native_stats = physical_stats
 
 
 _NATIVE_ALLOCATOR_SNAPSHOT_PREFIXES = (
@@ -1036,6 +982,11 @@ def _merge_allocator_snapshot(totals: dict[str, Any], key: str, value: int | flo
 def _accumulate_native(totals: dict[str, Any], stats: dict[str, Any]) -> None:
     totals["segment_count"] = int(totals.get("segment_count", 0)) + 1
     for key, value in stats.items():
+        if key in {
+            "active_output_schedule_mmap_capacity_bytes",
+            "active_output_schedule_mmap_window_count",
+        } and value == 0:
+            continue
         if key in _NATIVE_INVARIANT_FIELDS:
             previous = totals.get(key)
             if previous is not None and previous != value:
@@ -1137,7 +1088,7 @@ def _write_semantic(path: Path, store: dict[str, list[np.ndarray]], metadata: di
 
 
 def _verify_runtime_inputs(name: str, contract: dict[str, Any]) -> None:
-    model_key = "rgb" if name in {"dali", "pytorch"} else "dct"
+    model_key = "rgb" if name in {"dali", "coordl", "ffcv", "pytorch"} else "dct"
     checkpoint = Path(contract["models"][model_key]["checkpoint"])
     if sha256_file(checkpoint) != contract["models"][model_key]["checkpoint_sha256"]:
         raise RuntimeError(f"{model_key} checkpoint changed after contract creation")
@@ -1218,6 +1169,9 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
     model_key = "rgb" if adapter.domain == "rgb" else "dct"
     model_config = contract["models"][model_key]
     model_started_ns = time.perf_counter_ns()
+    training = contract["workload"]["kind"] == "training-throughput"
+    if training:
+        torch.manual_seed(int(contract["execution"]["seed"]))
     model = build_workload_model(
         domain=adapter.domain,
         workload=contract["workload"]["kind"],
@@ -1226,6 +1180,11 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
         device=device,
         feature_stage=contract["workload"].get("feature_stage", "penultimate"),
     )
+    optimizer = None
+    if training:
+        from galp.benchmarks.system_rgbnomore.training.optimizer import build_optimizer
+
+        optimizer, _ = build_optimizer(model, contract["workload"]["optimizer"])
     model_ready_ns = time.perf_counter_ns()
     expected_width = expected_output_width(contract["workload"]["kind"])
     previous_stream: torch.cuda.Stream | None = None
@@ -1249,6 +1208,9 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
         )
     model_prime_ready_ns = time.perf_counter_ns()
     semantic_limit = int(contract["semantic_validation"]["sample_count"])
+    if training:
+        semantic_limit = min(semantic_limit, int(contract["execution"]["batch_size"]))
+    training_probe = None
     semantic_store: dict[str, list[np.ndarray]] = {}
     semantic_captured = 0
     repeat_records: list[dict[str, Any]] = []
@@ -1283,6 +1245,8 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
         correct1 = 0
         correct5 = 0
         cross_entropy_sum = 0.0
+        if training:
+            training_loss_sum = torch.zeros((), dtype=torch.float64, device=device)
         feature_sum = torch.zeros(expected_width, dtype=torch.float64, device=device)
         feature_square_sum = torch.zeros(expected_width, dtype=torch.float64, device=device)
         predictions_top1: list[np.ndarray] = []
@@ -1314,8 +1278,26 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             if device.type == "cuda":
                 torch.cuda.current_stream(device).synchronize()
             h2d_finished = time.perf_counter_ns()
+            if training and training_probe is None:
+                # Compare initial-model preprocessing semantics before any updates.
+                model.eval()
+                semantic_output = _forward(model, batch.inputs, expected_width)
+                semantic_captured = _capture_semantic(
+                    semantic_store, batch, semantic_output, expected, semantic_limit,
+                )
+                model.train()
+                before = [p.detach().clone() for p in model.parameters() if p.requires_grad]
+                if device.type == "cuda":
+                    torch.cuda.current_stream(device).synchronize()
+                # The first-step audit is outside measured batch latency.
+                audit_finished = time.perf_counter_ns()
+                batch_started += audit_finished - h2d_finished
             model_started = time.perf_counter_ns()
-            output = _forward(model, batch.inputs, expected_width)
+            if training:
+                output, loss = _training_step(model, optimizer, batch, expected_width)
+                training_loss_sum.add_(loss.double() * len(expected))
+            else:
+                output = _forward(model, batch.inputs, expected_width)
             if contract["workload"]["kind"] == "evaluation":
                 cross_entropy_sum += float(
                     torch.nn.functional.cross_entropy(
@@ -1328,13 +1310,18 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                 correct5 += int(matches.sum().item())
                 predictions_top1.append(top5[:, 0].detach().cpu().numpy())
                 predictions_top5.append(top5.detach().cpu().numpy())
-            else:
+            elif not training:
                 feature_sum.add_(output.detach().double().sum(dim=0))
                 feature_square_sum.add_(output.detach().double().square().sum(dim=0))
             if device.type == "cuda":
                 torch.cuda.current_stream(device).synchronize()
             model_finished = time.perf_counter_ns()
             batch_finished = model_finished
+            if training and training_probe is None:
+                training_probe = _training_probe(model, before)
+                if not all(training_probe.values()):
+                    raise RuntimeError(f"training first-step check failed: {training_probe}")
+                del before, semantic_output
             if repeat_to_first_batch_ms is None:
                 repeat_to_first_batch_ms = (batch_finished - repeat_started_ns) / 1.0e6
                 if repeat == 0:
@@ -1352,7 +1339,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                     )
             _finalize_native_stats(batch)
             _release_native_context(batch)
-            if repeat == 0 and semantic_captured < semantic_limit:
+            if not training and repeat == 0 and semantic_captured < semantic_limit:
                 semantic_captured += _capture_semantic(
                     semantic_store,
                     batch,
@@ -1391,6 +1378,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                             "full_compressed_payload_bytes",
                             "pread_count",
                             "rowgroup_count",
+                            "fixed_transform_image_count",
                             "planning_ms",
                             "prefetch_producer_active_ms",
                             "prefetch_ordered_submission_ms",
@@ -1464,7 +1452,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                 float(native_segments[0]["prefetch_submit_to_ready_ms"])
                 if native_segments
                 and "prefetch_submit_to_ready_ms" in native_segments[0]
-                and str(native_segments[0].get("segment_mode")) == "manifest-shard"
+                and native_segments[0].get("segment_mode") in {"manifest-shard", "native-logical-batch"}
                 else None
             ),
             "process_scope_first_shard_ready_ms": (
@@ -1472,7 +1460,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
                 if repeat == 0
                 and native_segments
                 and "prefetch_process_scope_ready_ms" in native_segments[0]
-                and str(native_segments[0].get("segment_mode")) == "manifest-shard"
+                and native_segments[0].get("segment_mode") in {"manifest-shard", "native-logical-batch"}
                 else None
             ),
             "repeat_scope_time_to_first_batch_ms": repeat_to_first_batch_ms,
@@ -1496,7 +1484,10 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             "top_level_h2d_ms": distribution(h2d_ms),
             "model_ms": distribution(model_ms),
             "feature_sink_ms": distribution(sink_ms) if sink_ms else {"count": 0},
-            "throughput_scope": "load+top-level-H2D+model+metrics; optional feature sink reported separately",
+            "throughput_scope": (
+                "load+H2D+zero_grad+forward+cross_entropy+backward+optimizer.step+loss accumulation"
+                if training else "load+top-level-H2D+model+metrics; optional feature sink reported separately"
+            ),
             "cpu_process_seconds": time.process_time() - process_started,
             "host_rss_before_bytes": host_before["rss_bytes"],
             "host_rss_after_bytes": host_after["rss_bytes"],
@@ -1513,7 +1504,20 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             "native_segments": native_segments,
             "sample_trace": measured_trace,
         }
-        if contract["workload"]["kind"] == "evaluation":
+        if training:
+            mean_loss = float(training_loss_sum / images)
+            finite_parameters = bool(torch.stack([
+                torch.isfinite(p).all() for p in model.parameters()
+            ]).all())
+            if not math.isfinite(mean_loss) or not finite_parameters:
+                raise RuntimeError("training produced non-finite loss or parameters")
+            record.update({
+                "training_loss": mean_loss,
+                "optimizer_steps": len(measured_batches),
+                "cumulative_optimizer_steps": (repeat + 1) * len(measured_batches),
+                "finite_parameters": finite_parameters,
+            })
+        elif contract["workload"]["kind"] == "evaluation":
             record.update(
                 {
                     "correct_top1": correct1,
@@ -1582,6 +1586,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
             "loader_preparation_precedes_model_construction": True,
         },
         "semantic_artifact": str(semantic_artifact.resolve()),
+        **({"training_probe": training_probe} if training else {}),
         "repeats": repeat_records,
     }
     write_json(output_path, result)

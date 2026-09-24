@@ -7,15 +7,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from common import (  # noqa: E402
+from galp.benchmarks.system_dct_major.common import (  # noqa: E402
     BLOCK_MAJOR_RUNTIME_PROFILE,
     PIPELINE_RESULT_SCHEMA,
     fingerprint_file,
@@ -23,9 +22,11 @@ from common import (  # noqa: E402
     sha256_json,
     write_sample_manifest,
 )
-from validate import (  # noqa: E402
+from galp.benchmarks.system_dct_major.validate import (  # noqa: E402
+    _active_output_schedule_accounting,
     _compare_raw_mask_oracle,
     _compact_plan_memory_is_consistent,
+    _native_logical_segments_match_manifest,
     _semantic_compare,
     _validate_result,
     _write_csv,
@@ -33,6 +34,29 @@ from validate import (  # noqa: E402
 
 
 class PlanlessResultGateTest(unittest.TestCase):
+    def test_training_gate_requires_real_updates_and_one_step_per_batch(self) -> None:
+        contract = self._contract()
+        contract["workload"]["kind"] = "training-throughput"
+        contract["execution"]["measurement_batches"] = 1
+        result = self._result(contract)
+        result["pipeline"] = "pytorch"
+        result["training_probe"] = {
+            "finite_gradients": True, "nonzero_gradients": True, "parameters_updated": True,
+        }
+        result["repeats"][0].update({
+            "repeat": 0, "optimizer_steps": 1, "cumulative_optimizer_steps": 1,
+            "training_loss": 1.0, "finite_parameters": True,
+        })
+        failures = []
+        _validate_result("pytorch", result, contract, [{"ordinal": 0, "label": 7}], failures)
+        self.assertEqual(failures, [])
+        result["training_probe"]["parameters_updated"] = False
+        result["repeats"][0]["optimizer_steps"] = 0
+        failures = []
+        _validate_result("pytorch", result, contract, [{"ordinal": 0, "label": 7}], failures)
+        self.assertTrue(any("parameters_updated" in failure for failure in failures))
+        self.assertTrue(any("optimizer step count" in failure for failure in failures))
+
     def _contract(self) -> dict:
         return {
             "dataset": {
@@ -43,6 +67,7 @@ class PlanlessResultGateTest(unittest.TestCase):
                 },
             },
             "execution": {"repeats": 1},
+            "workload": {"kind": "evaluation"},
             "pipelines": {
                 "dct_major_pushdown": {
                     "runtime_profile": BLOCK_MAJOR_RUNTIME_PROFILE,
@@ -63,7 +88,14 @@ class PlanlessResultGateTest(unittest.TestCase):
                     "batches": 1,
                     "time_to_first_batch_ms": 1.0,
                     "first_shard_ready_ms": 0.5,
-                    "native_segments": [{"segment_shard_id": 0}],
+                    "native_segments": [{
+                        "segment_shard_id": 0,
+                        "fixed_transform_image_count": 1,
+                        "planless_transform_output_block_count": 4,
+                        "planless_transform_source_contribution_count": 8,
+                        "planless_transform_source_contribution_visit_count": 16,
+                        "active_output_schedule_sidecar_hit_count": 1,
+                    }],
                     "native_totals": {
                         "host_expanded_transform_items_created": 0,
                         "host_output_block_source_lists_created": 0,
@@ -190,6 +222,81 @@ class PlanlessResultGateTest(unittest.TestCase):
             [{"ordinal": 0, "label": 7}],
             failures,
         )
+        self.assertEqual(failures, [])
+
+    def test_mixed_expanded_and_shared_image_schedule_accounting(self) -> None:
+        expanded = {
+            "fixed_transform_image_count": 1024,
+            "planless_transform_output_block_count": 1204224,
+            "planless_transform_source_contribution_count": 4816896,
+            "planless_transform_source_contribution_visit_count": 9633792,
+            "active_output_schedule_sidecar_hit_count": 1,
+        }
+        shared = dict(expanded, active_output_schedule_sidecar_hit_count=0)
+        shared["planless_transform_source_contribution_visit_count"] = 9408
+        self.assertEqual(
+            _active_output_schedule_accounting([expanded, shared, shared, shared]),
+            (4831008, 9662016),
+        )
+        self.assertEqual(_active_output_schedule_accounting([shared]), (4704, 9408))
+        for changes in (
+            {"planless_transform_source_contribution_visit_count": 9407},
+            {"planless_transform_output_block_count": 1204223},
+            {"fixed_transform_image_count": 0},
+            {"active_output_schedule_sidecar_hit_count": 1},
+            {"active_output_schedule_sidecar_miss_count": 1},
+        ):
+            with self.subTest(changes=changes):
+                self.assertIsNone(_active_output_schedule_accounting([dict(shared, **changes)]))
+
+    def test_rejects_schedule_totals_disagreeing_with_physical_segments(self) -> None:
+        contract = self._contract()
+        for counter in (
+            "planless_transform_active_output_index_bytes",
+            "planless_transform_source_contribution_visit_count",
+            "planless_transform_source_contribution_count",
+        ):
+            with self.subTest(counter=counter):
+                result = self._result(contract)
+                result["repeats"][0]["native_totals"][counter] += 1
+                failures: list[str] = []
+                _validate_result(
+                    "dct_major_pushdown", result, contract, [{"ordinal": 0, "label": 7}], failures,
+                )
+                self.assertTrue(failures)
+
+    def test_logical_batch_reports_cover_physical_shards_at_batch_boundaries(self) -> None:
+        shards = [
+            {"first_global_image_index": 0, "image_count": 1024},
+            {"first_global_image_index": 1024, "image_count": 1024},
+        ]
+        segments = [
+            {"segment_first_image_id": 0, "segment_last_image_id": 49, "fixed_transform_image_count": 1024},
+            {"segment_first_image_id": 1000, "segment_last_image_id": 1049, "fixed_transform_image_count": 1024},
+        ]
+        self.assertTrue(_native_logical_segments_match_manifest(segments, shards, 50, 2048))
+        self.assertFalse(_native_logical_segments_match_manifest(segments[:1], shards, 50, 2048))
+        self.assertFalse(_native_logical_segments_match_manifest([segments[0], segments[0]], shards, 50, 2048))
+        self.assertFalse(_native_logical_segments_match_manifest(segments, shards, 50, 2047))
+
+    def test_accepts_logical_batch_physical_stats_without_legacy_shard_metadata(self) -> None:
+        contract = self._contract()
+        contract["execution"]["batch_size"] = 50
+        contract["pipelines"]["dct_major_pushdown"]["manifest"] = "manifest.bin"
+        result = self._result(contract)
+        repeat = result["repeats"][0]
+        repeat["native_segments"][0].update({
+            "segment_mode": "native-logical-batch", "segment_first_image_id": 0,
+            "segment_last_image_id": 0, "fixed_transform_image_count": 1,
+        })
+        for counter in ("segment_cross_shard_count", "shard_reactivation_count"):
+            repeat["native_totals"].pop(counter)
+        failures: list[str] = []
+        with mock.patch(
+            "galp.benchmarks.system_dct_major.validate.parse_manifest",
+            return_value={"shards": [{"first_global_image_index": 0, "image_count": 1}]},
+        ):
+            _validate_result("dct_major_pushdown", result, contract, [{"ordinal": 0, "label": 7}], failures)
         self.assertEqual(failures, [])
 
     def test_accepts_selected_coefficient_storage_for_k_below_64(self) -> None:

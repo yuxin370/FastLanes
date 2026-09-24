@@ -3,25 +3,11 @@
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
-from typing import Any
 
 import torch
 
-from common import REPO_ROOT
-
-
-MODEL_FACTORY = REPO_ROOT / "galp/benchmarks/system_rgbnomore/inference/model_factory.py"
-
-
-def _load_model_factory() -> Any:
-    spec = importlib.util.spec_from_file_location("dct_major_rgbnomore_model_factory", MODEL_FACTORY)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load RGB-no-more model factory: {MODEL_FACTORY}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from galp.benchmarks.system_rgbnomore.inference import model_factory
 
 
 class FeatureExtractor(torch.nn.Module):
@@ -65,24 +51,24 @@ def build_workload_model(
     device: torch.device,
     feature_stage: str = "penultimate",
 ) -> torch.nn.Module:
-    factory = _load_model_factory()
     if domain == "rgb":
-        model = factory.build_rgb_model(rgbnomore_root, checkpoint, device)
+        model = model_factory.build_rgb_model(rgbnomore_root, checkpoint, device)
     elif domain == "dct":
-        model = factory.build_dct_model(rgbnomore_root, checkpoint, device)
+        model = model_factory.build_dct_model(rgbnomore_root, checkpoint, device)
     else:
         raise ValueError(f"unsupported model domain: {domain}")
     if workload == "evaluation":
         return model.eval()
+    if workload == "training-throughput":
+        return model.train()
     if workload == "feature-extraction":
         return FeatureExtractor(model, domain=domain, stage=feature_stage).eval()
     raise ValueError(f"unsupported workload: {workload}")
 
 
 def expected_output_width(workload: str) -> int:
-    if workload == "evaluation":
+    if workload in {"evaluation", "training-throughput"}:
         return 1000
     if workload == "feature-extraction":
         return 192
     raise ValueError(f"unsupported workload: {workload}")
-

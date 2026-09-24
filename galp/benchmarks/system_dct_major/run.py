@@ -16,7 +16,7 @@ from typing import Any, Callable, Sequence
 
 from PIL import Image
 
-from common import (
+from galp.benchmarks.system_dct_major.common import (
     BLOCK_MAJOR_RUNTIME_PROFILE,
     CONTRACT_SCHEMA,
     DEFAULT_PIPELINES,
@@ -38,23 +38,17 @@ from common import (
     write_sample_manifest,
 )
 
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
 
 
-DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
-DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
-DEFAULT_DCT_MAJOR_MANIFEST = Path("/tmp/galp-blockmajor-512-s1024-rg128/manifest.bin")
+DEFAULT_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v3/imagenet_512"
+DEFAULT_DCT_MAJOR_MANIFEST = REPO_ROOT / "galp/data/compressed/imagenet512_val_block_major/manifest.bin"
 DEFAULT_DCT_MAJOR_LABELS = (
     REPO_ROOT
-    / "galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json"
+    / "galp/data/compressed/imagenet512_val_compact_v3/labels.json"
 )
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
-DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
-DEFAULT_RAW_MASK_ORACLE_DIR = (
-    REPO_ROOT
-    / "galp/experiments/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100"
-)
+DEFAULT_PYTHON = Path(sys.executable)
 
 PRESETS = {
     "smoke": {"batch_size": 2, "warmup_batches": 0, "measurement_batches": 2, "repeats": 1, "workers": 2},
@@ -329,6 +323,8 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
     batch_size, warmup_batches, measurement_batches, sample_count = _sample_plan(args)
     repeats = _setting(args, "repeats")
     workers = _setting(args, "workers")
+    if "coordl" in args.pipelines and args.coordl_cache_size is None:
+        raise ValueError("CoorDL requires --coordl-cache-size (number of JPEGs to cache)")
     if warmup_batches != 0:
         raise ValueError(
             "block-major production profile requires warmup_batches=0 so a boundary "
@@ -461,6 +457,20 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "prefetch_queue_depth": int(args.dali_prefetch_depth),
             "random_shuffle": False,
         },
+        "coordl": {
+            "device_id": int(args.device.split(":", 1)[1]) if ":" in args.device else 0,
+            "prefetch_queue_depth": int(args.dali_prefetch_depth),
+            "cache_size": args.coordl_cache_size,
+            "file_list": str(output_dir / "coordl_file_list.txt"),
+            "random_shuffle": False,
+            "role": "CoorDL single-node MinIO JPEG cache; retained across repeats",
+            "source": "https://github.com/msr-fiddle/CoorDL",
+            "paper_doi": "10.14778/3446095.3446100",
+        },
+        "ffcv": {
+            "beton": str((args.ffcv_beton or output_dir / "ffcv.beton").resolve()),
+            "shuffle": False,
+        },
         "pytorch": {
             "prefetch_factor": int(args.prefetch_factor),
             "shuffle": False,
@@ -470,6 +480,7 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
     runtime_files = [
         HERE / "common.py",
         HERE / "feature_model.py",
+        HERE / "ffcv_dataset.py",
         HERE / "pipeline.py",
         HERE / "run.py",
         HERE / "validate.py",
@@ -487,6 +498,16 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
         args.rgbnomore_root / "models/plainvit.py",
         args.rgbnomore_root / "datasets.py",
     ]
+    if args.workload == "training-throughput":
+        runtime_files.append(RGBNOMORE_BENCHMARK_ROOT / "training/optimizer.py")
+    if (
+        args.workload == "evaluation"
+        and "dct_major_coefficient_pushdown" in args.pipelines
+        and coefficient_selection["coefficient_selection_kind"] == "prefix"
+        and coefficient_selection["coefficient_count"] == 32
+        and args.raw_mask_oracle_dir is None
+    ):
+        raise ValueError("first:32 evaluation requires --raw-mask-oracle-dir")
     raw_mask_oracle: dict[str, Any] | None = None
     if args.raw_mask_oracle_dir is not None and coefficient_selection["coefficient_selection_kind"] == "prefix":
         oracle_dir = args.raw_mask_oracle_dir.resolve(strict=True)
@@ -551,12 +572,22 @@ def build_contract(args: argparse.Namespace, output_dir: Path) -> tuple[dict[str
             "drop_last": False,
             "aggregate_exclude_first_repeat": repeats > 1,
             "model_stream_priority": "greatest",
-            "cold_start_model_prime": True,
+            "cold_start_model_prime": args.workload != "training-throughput",
             "cold_file_cache_eviction": bool(args.evict_pipeline_file_cache),
             "cold_protocol": args.cold_protocol,
         },
         "workload": {
             "kind": args.workload,
+            **({
+                "purpose": "fixed-input training throughput; not convergence or validation accuracy",
+                "optimizer": {
+                    "type": "adamw", "learning_rate": 1e-4, "weight_decay": 0.05,
+                    "betas": [0.9, 0.999], "epsilon": 1e-8,
+                },
+                "loss": "cross_entropy",
+                "state_across_repeats": "continue model, optimizer and loader",
+                "semantic_scope": "first batch, initial weights, eval mode, outside step timing",
+            } if args.workload == "training-throughput" else {}),
             "feature_stage": args.feature_stage,
             "materialize_features": bool(args.materialize_features),
             "feature_output": "[N,192] after classhead.ch_tanh" if args.feature_stage == "penultimate" else "[N,192] after LayerNorm+mean pool",
@@ -663,7 +694,7 @@ def _pipeline_cache_paths(contract: dict[str, Any], pipeline: str) -> list[Path]
         Path(contract["dataset"]["sample_manifest"]),
         Path(contract["dataset"]["canonical_index_csv"]),
     }
-    model_key = "rgb" if pipeline in {"dali", "pytorch"} else "dct"
+    model_key = "rgb" if pipeline in {"dali", "coordl", "ffcv", "pytorch"} else "dct"
     paths.add(Path(contract["models"][model_key]["checkpoint"]))
     if pipeline in GALP_PIPELINES:
         snapshot = contract["dataset"]["dct_major_storage"]
@@ -678,6 +709,8 @@ def _pipeline_cache_paths(contract: dict[str, Any], pipeline: str) -> list[Path]
                 for item in fingerprints
                 if isinstance(item, dict) and item.get("path")
             )
+    elif pipeline == "ffcv":
+        paths.add(Path(config["beton"]))
     else:
         samples = load_sample_manifest(
             Path(contract["dataset"]["sample_manifest"]),
@@ -725,11 +758,27 @@ def run(args: argparse.Namespace) -> int:
     if env.get("PYTHONPATH"):
         pythonpath += os.pathsep + env["PYTHONPATH"]
     env["PYTHONPATH"] = pythonpath
+    if "ffcv" in contract["pipelines"]["enabled"] and not args.dry_run and args.ffcv_beton is not None:
+        if not args.ffcv_beton.is_file():
+            raise FileNotFoundError(args.ffcv_beton)
+    if "ffcv" in contract["pipelines"]["enabled"] and not args.dry_run and args.ffcv_beton is None:
+        subprocess.run(
+            [
+                str(python), "-m", "galp.benchmarks.system_dct_major.ffcv_dataset",
+                "--sample-manifest", contract["dataset"]["sample_manifest"],
+                "--output", contract["pipelines"]["ffcv"]["beton"],
+                "--workers", str(_setting(args, "workers")),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+        )
     commands: list[dict[str, Any]] = []
     for pipeline in contract["pipelines"]["enabled"]:
+        pipeline_python = args.coordl_python.resolve() if pipeline == "coordl" and args.coordl_python else python
         command = [
-            str(python),
-            str(HERE / "pipeline.py"),
+            str(pipeline_python),
+            "-m", "galp.benchmarks.system_dct_major.pipeline",
             "--pipeline",
             pipeline,
             "--contract",
@@ -754,7 +803,7 @@ def run(args: argparse.Namespace) -> int:
             return code
     validate_command = [
         str(python),
-        str(HERE / "validate.py"),
+        "-m", "galp.benchmarks.system_dct_major.validate",
         "--contract",
         str(contract_path),
         "--output-dir",
@@ -786,7 +835,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--preset", choices=tuple(PRESETS), default="smoke")
-    parser.add_argument("--workload", choices=("feature-extraction", "evaluation"), default="feature-extraction")
+    parser.add_argument("--workload", choices=("feature-extraction", "evaluation", "training-throughput"), default="feature-extraction")
     parser.add_argument("--feature-stage", choices=("pooled", "penultimate"), default="penultimate")
     parser.add_argument("--materialize-features", action="store_true")
     parser.add_argument("--pipelines", choices=PIPELINES, nargs="+", default=list(DEFAULT_PIPELINES))
@@ -804,7 +853,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rgb-checkpoint", type=Path)
     parser.add_argument("--dct-checkpoint", type=Path)
     parser.add_argument("--torch-binding-dir", type=Path, default=DEFAULT_BINDING_DIR)
-    parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON if DEFAULT_PYTHON.is_file() else Path(sys.executable))
+    parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=11997733)
     parser.add_argument("--batch-size", type=int)
@@ -822,7 +871,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--raw-mask-oracle-dir",
         type=Path,
-        default=(DEFAULT_RAW_MASK_ORACLE_DIR if DEFAULT_RAW_MASK_ORACLE_DIR.is_dir() else None),
+        default=None,
         help="completed coefficient-mask evaluator run used for full per-sample prefix validation",
     )
     parser.add_argument(
@@ -839,10 +888,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--dali-prefetch-depth", type=int, default=2)
+    parser.add_argument("--coordl-cache-size", type=int, help="CoorDL cache capacity in JPEGs (required for coordl)")
+    parser.add_argument("--coordl-python", type=Path, help="Python with CoorDL and benchmark dependencies installed")
+    parser.add_argument("--ffcv-beton", type=Path, help="preconverted canonical FFCV dataset (otherwise create in output-dir)")
     parser.add_argument("--hash-samples", action="store_true")
     parser.add_argument("--hash-payloads", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.coordl_cache_size is not None and args.coordl_cache_size <= 0:
+        parser.error("--coordl-cache-size must be positive")
     resolve_coefficient_selection(args.dct_coeffs)
     return args
 

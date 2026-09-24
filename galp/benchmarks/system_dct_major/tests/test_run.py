@@ -4,14 +4,13 @@ import sys
 import tempfile
 import unittest
 import os
+from unittest import mock
 from pathlib import Path
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from run import (  # noqa: E402
+from galp.benchmarks.system_dct_major.run import (  # noqa: E402
     _block_major_access_contract,
     _validate_fixed_manifest_geometry,
     _prepare_output_dir,
@@ -19,10 +18,31 @@ from run import (  # noqa: E402
     _run_streamed,
     _sample_plan,
     parse_args,
+    run,
 )
 
 
 class RunContractTest(unittest.TestCase):
+    def test_coordl_uses_its_interpreter_while_dali_keeps_the_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "run"
+            args = parse_args([
+                "--output-dir", str(output), "--pipelines", "dali", "coordl",
+                "--coordl-cache-size", "128", "--coordl-python", "/opt/coordl/bin/python", "--dry-run",
+            ])
+            contract = {"pipelines": {"enabled": ["dali", "coordl"]}}
+            with mock.patch(
+                "galp.benchmarks.system_dct_major.run.build_contract",
+                return_value=(contract, output / "contract.json"),
+            ), mock.patch(
+                "galp.benchmarks.system_dct_major.run._run_streamed", return_value=(0, 0.0, None),
+            ) as streamed:
+                self.assertEqual(run(args), 0)
+            commands = [call.args[0] for call in streamed.call_args_list]
+            self.assertEqual(commands[0][0], str(args.python.resolve()))
+            self.assertEqual(commands[1][0], "/opt/coordl/bin/python")
+            self.assertEqual(commands[2][0], str(args.python.resolve()))
+
     def test_fixed_manifest_geometry_rejects_same_order_different_jpeg_view(self) -> None:
         class Reader:
             image_count = 1

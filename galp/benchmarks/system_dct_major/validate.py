@@ -13,7 +13,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from common import (
+from galp.benchmarks.system_dct_major.common import (
     BLOCK_MAJOR_RUNTIME_PROFILE,
     GALP_PIPELINES,
     PIPELINE_RESULT_SCHEMA,
@@ -21,6 +21,7 @@ from common import (
     distribution,
     load_contract,
     load_sample_manifest,
+    parse_manifest,
     read_json,
     sample_trace,
     selected_batches,
@@ -221,6 +222,8 @@ def _aggregate(contract: dict[str, Any], result: dict[str, Any]) -> dict[str, An
         if any("cross_entropy_loss" in item for item in hot)
         else None,
         "host_peak_rss_bytes": distribution([float(item["host_peak_rss_bytes"]) for item in hot]),
+        "training_loss": distribution([float(item["training_loss"]) for item in hot])
+        if contract["workload"]["kind"] == "training-throughput" else None,
         "peak_torch_gpu_allocated_bytes": distribution(
             [float(item["peak_torch_gpu_allocated_bytes"]) for item in hot]
         ),
@@ -538,6 +541,52 @@ def _compare_raw_mask_oracle(
     }
 
 
+def _active_output_schedule_accounting(
+    segments: Sequence[dict[str, Any]],
+) -> tuple[int, int] | None:
+    """Account for expanded or shared-image schedules in the fixed-512 profile."""
+    index_bytes = 0
+    contribution_visits = 0
+    for segment in segments:
+        outputs = int(segment.get("planless_transform_output_block_count", 0))
+        contributions = int(segment.get("planless_transform_source_contribution_count", 0))
+        visits = int(segment.get("planless_transform_source_contribution_visit_count", 0))
+        images = int(segment.get("fixed_transform_image_count", 0))
+        sidecar = (
+            int(segment.get("active_output_schedule_sidecar_hit_count", 0))
+            + int(segment.get("active_output_schedule_sidecar_miss_count", 0))
+        )
+        repetitions = 1 if sidecar or visits == 2 * contributions else images
+        if (
+            repetitions <= 0 or outputs <= 0 or contributions <= 0
+            or outputs % repetitions != 0 or contributions % repetitions != 0
+            or visits * repetitions != 2 * contributions
+        ):
+            return None
+        index_bytes += outputs // repetitions * 4
+        contribution_visits += 2 * (contributions // repetitions)
+    return index_bytes, contribution_visits
+
+
+def _native_logical_segments_match_manifest(
+    segments: Sequence[dict[str, Any]],
+    shards: Sequence[dict[str, Any]],
+    batch_size: int,
+    image_count: int,
+) -> bool:
+    selected = [shard for shard in shards if int(shard["first_global_image_index"]) < image_count]
+    expected = []
+    for shard in selected:
+        batch_first = int(shard["first_global_image_index"]) // batch_size * batch_size
+        expected.append((batch_first, min(batch_first + batch_size, image_count) - 1, int(shard["image_count"])))
+    observed = [
+        (segment.get("segment_first_image_id"), segment.get("segment_last_image_id"),
+         segment.get("fixed_transform_image_count"))
+        for segment in segments
+    ]
+    return observed == expected and sum(int(shard["image_count"]) for shard in selected) == image_count
+
+
 def _validate_result(
     name: str,
     result: dict[str, Any],
@@ -551,9 +600,24 @@ def _validate_result(
     _require(result.get("sample_manifest_sha256") == contract["dataset"]["sample_manifest_sha256"], failures, f"{name}: sample manifest hash mismatch")
     repeats = result.get("repeats")
     _require(isinstance(repeats, list) and len(repeats) == contract["execution"]["repeats"], failures, f"{name}: repeat count mismatch")
+    training = contract["workload"]["kind"] == "training-throughput"
+    if training:
+        probe = result.get("training_probe", {})
+        for key in ("finite_gradients", "nonzero_gradients", "parameters_updated"):
+            _require(probe.get(key) is True, failures, f"{name}: training first-step {key} failed")
     for repeat in repeats if isinstance(repeats, list) else []:
         _require(repeat.get("sample_trace") == expected_trace, failures, f"{name}: no-shuffle sample trace mismatch")
         _require(int(repeat.get("images", -1)) == len(expected_trace), failures, f"{name}: measured image count mismatch")
+        if training:
+            steps = contract["execution"]["measurement_batches"]
+            _require(repeat.get("optimizer_steps") == steps, failures, f"{name}: optimizer step count mismatch")
+            _require(
+                repeat.get("cumulative_optimizer_steps") == (repeat["repeat"] + 1) * steps,
+                failures, f"{name}: cumulative optimizer step count mismatch",
+            )
+            loss = repeat.get("training_loss")
+            _require(isinstance(loss, (int, float)) and math.isfinite(loss), failures, f"{name}: non-finite training loss")
+            _require(repeat.get("finite_parameters") is True, failures, f"{name}: non-finite training parameters")
         first_batch_ms = repeat.get("time_to_first_batch_ms")
         _require(
             isinstance(first_batch_ms, (int, float)) and math.isfinite(float(first_batch_ms)) and first_batch_ms > 0.0,
@@ -581,12 +645,27 @@ def _validate_result(
                 failures,
                 f"{name}: manifest-shard execution reported no shard segments",
             )
-            shard_ids = [int(item.get("segment_shard_id", -1)) for item in native_segments]
-            _require(
-                all(shard_id >= 0 for shard_id in shard_ids) and len(shard_ids) == len(set(shard_ids)),
-                failures,
-                f"{name}: manifest shards were missing or reactivated: {shard_ids}",
+            logical_segments = bool(native_segments) and all(
+                item.get("segment_mode") == "native-logical-batch" for item in native_segments
             )
+            if logical_segments:
+                _require(
+                    _native_logical_segments_match_manifest(
+                        native_segments,
+                        parse_manifest(Path(pipeline_config["manifest"]))["shards"],
+                        int(contract["execution"]["batch_size"]),
+                        len(expected_trace),
+                    ),
+                    failures,
+                    f"{name}: logical-batch physical statistics do not cover each manifest shard exactly once",
+                )
+            else:
+                shard_ids = [int(item.get("segment_shard_id", -1)) for item in native_segments]
+                _require(
+                    all(shard_id >= 0 for shard_id in shard_ids) and len(shard_ids) == len(set(shard_ids)),
+                    failures,
+                    f"{name}: manifest shards were missing or reactivated: {shard_ids}",
+                )
             _require(
                 int(native.get("segment_count", -1)) == len(native_segments),
                 failures,
@@ -600,6 +679,8 @@ def _validate_result(
                 "vector_run_revisit_count",
                 "physical_read_order_inversions",
             ):
+                if logical_segments and counter in {"segment_cross_shard_count", "shard_reactivation_count"}:
+                    continue
                 _require(
                     int(native.get(counter, -1)) == 0,
                     failures,
@@ -676,6 +757,17 @@ def _validate_result(
                 native.get("planless_transform_skipped_output_block_count", 0)
             )
             if full_scan_outputs > 0:
+                schedule_accounting = _active_output_schedule_accounting(repeat["native_segments"])
+                for counter in (
+                    "planless_transform_output_block_count",
+                    "planless_transform_source_contribution_count",
+                ):
+                    _require(
+                        sum(int(segment.get(counter, 0)) for segment in repeat["native_segments"])
+                        == int(native.get(counter, -1)),
+                        failures,
+                        f"{name}: {counter} disagrees with physical segments",
+                    )
                 _require(
                     0 < active_outputs <= full_scan_outputs,
                     failures,
@@ -687,10 +779,11 @@ def _validate_result(
                     "dct_major_pushdown: resident-output skip accounting is inconsistent",
                 )
                 _require(
-                    int(native.get("planless_transform_active_output_index_bytes", -1))
-                    == active_outputs * 4,
+                    schedule_accounting is not None
+                    and int(native.get("planless_transform_active_output_index_bytes", -1))
+                    == schedule_accounting[0],
                     failures,
-                    "dct_major_pushdown: active-output index byte accounting is inconsistent",
+                    f"{name}: active-output index byte accounting is inconsistent",
                 )
                 schedule_builds = int(
                     native.get("planless_transform_active_output_schedule_build_count", 0)
@@ -730,7 +823,7 @@ def _validate_result(
                 # that all segment schedules coexist.
                 persistent_schedule_bytes = (
                     (
-                        active_outputs * 4
+                        int(native.get("planless_transform_active_output_index_bytes", 0))
                         + int(native.get("planless_transform_active_output_offset_bytes", 0))
                     )
                     / schedule_executions
@@ -748,14 +841,12 @@ def _validate_result(
                     failures,
                     "dct_major_pushdown: active-output schedule reported no source contributions",
                 )
-                source_contributions = int(
-                    native.get("planless_transform_source_contribution_count", 0)
-                )
                 _require(
-                    int(native.get("planless_transform_source_contribution_visit_count", -1))
-                    == 2 * source_contributions,
+                    schedule_accounting is not None
+                    and int(native.get("planless_transform_source_contribution_visit_count", -1))
+                    == schedule_accounting[1],
                     failures,
-                    "dct_major_pushdown: deterministic count/fill contribution visits are inconsistent",
+                    f"{name}: deterministic count/fill contribution visits are inconsistent",
                 )
                 _require(
                     int(native.get("planless_transform_output_workset_ownership_count", -1))
@@ -1474,7 +1565,7 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         native = aggregate.get("native_hot_mean", {})
         top1 = aggregate.get("accuracy_top1")
         top5 = aggregate.get("accuracy_top5")
-        ce = aggregate.get("cross_entropy_loss")
+        ce = aggregate.get("training_loss") if summary["workload"] == "training-throughput" else aggregate.get("cross_entropy_loss")
         transform_ms = native.get(
             "fixed_transform_ms", native.get("planless_transform_gpu_kernel_ms")
         )
@@ -1657,7 +1748,7 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
             "## Comparability boundary",
             "",
             "- GALP DCT-major and RGB-no-more use the DCT checkpoint and are a strict same-domain comparison.",
-            "- DALI and PyTorch use the RGB checkpoint. Their comparison is same-domain; ratios against GALP are deployment-level context only.",
+            "- DALI, CoorDL, FFCV and PyTorch use the RGB checkpoint. Their comparison is same-domain; ratios against GALP are deployment-level context only.",
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1741,6 +1832,8 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
     semantic_pairs = [
         ("dct_major_pushdown", "rgbnomore", True),
         ("dali", "pytorch", False),
+        ("coordl", "pytorch", False),
+        ("ffcv", "pytorch", False),
     ]
     semantic_comparisons = [
         _semantic_compare(left, right, results[left], results[right], contract, strict=strict, failures=failures)
@@ -1779,6 +1872,12 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
             speedups[label] = throughput[numerator] / throughput[denominator]
 
     ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
+    ratio("dct_major_over_coordl", "dct_major_pushdown", "coordl")
+    ratio("coordl_over_dali", "coordl", "dali")
+    ratio("coordl_over_pytorch", "coordl", "pytorch")
+    ratio("coordl_over_ffcv", "coordl", "ffcv")
+    ratio("coefficient_pushdown_over_coordl", "dct_major_coefficient_pushdown", "coordl")
+    ratio("dct_major_over_ffcv", "dct_major_pushdown", "ffcv")
     ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
     ratio(
         "coefficient_pushdown_over_galp",
@@ -1786,6 +1885,7 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         "dct_major_pushdown",
     )
     ratio("dali_over_pytorch", "dali", "pytorch")
+    ratio("ffcv_over_pytorch", "ffcv", "pytorch")
 
     cold_speedups: dict[str, float] = {}
 
@@ -1794,6 +1894,12 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
             cold_speedups[label] = cold_throughput[numerator] / cold_throughput[denominator]
 
     cold_ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
+    cold_ratio("dct_major_over_coordl", "dct_major_pushdown", "coordl")
+    cold_ratio("coordl_over_dali", "coordl", "dali")
+    cold_ratio("coordl_over_pytorch", "coordl", "pytorch")
+    cold_ratio("coordl_over_ffcv", "coordl", "ffcv")
+    cold_ratio("coefficient_pushdown_over_coordl", "dct_major_coefficient_pushdown", "coordl")
+    cold_ratio("dct_major_over_ffcv", "dct_major_pushdown", "ffcv")
     cold_ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
     cold_ratio(
         "coefficient_pushdown_over_galp",
@@ -1801,6 +1907,7 @@ def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
         "dct_major_pushdown",
     )
     cold_ratio("dali_over_pytorch", "dali", "pytorch")
+    cold_ratio("ffcv_over_pytorch", "ffcv", "pytorch")
 
     coefficient_comparison: dict[str, Any] | None = None
     baseline_name = "dct_major_pushdown"

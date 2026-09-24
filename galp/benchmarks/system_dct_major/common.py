@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
+from galp.benchmarks.common import sha256_file
+
 
 CONTRACT_SCHEMA = "galp_dct_major_contract_v1"
 SAMPLE_MANIFEST_SCHEMA = "galp_dct_major_samples_v1"
@@ -40,6 +42,8 @@ PIPELINES = (
     "dct_major_coefficient_pushdown",
     "rgbnomore",
     "dali",
+    "coordl",
+    "ffcv",
     "pytorch",
 )
 DEFAULT_PIPELINES = (
@@ -47,21 +51,18 @@ DEFAULT_PIPELINES = (
     "dct_major_coefficient_pushdown",
     "rgbnomore",
     "dali",
+    "ffcv",
     "pytorch",
 )
-WORKLOADS = ("feature-extraction", "evaluation")
+WORKLOADS = ("feature-extraction", "evaluation", "training-throughput")
 JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe"}
 GALP_PIPELINES = ("dct_major_pushdown", "dct_major_coefficient_pushdown")
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 RGBNOMORE_BENCHMARK_ROOT = REPO_ROOT / "galp/benchmarks/system_rgbnomore"
-if str(RGBNOMORE_BENCHMARK_ROOT) not in sys.path:
-    # Keep this benchmark's own ``diagnostics`` and other top-level modules
-    # ahead of the sibling RGB-no-more package while exposing ``shared``.
-    sys.path.append(str(RGBNOMORE_BENCHMARK_ROOT))
 
-from shared.manifest_contract import (  # noqa: E402
+from galp.benchmarks.system_rgbnomore.shared.manifest_contract import (  # noqa: E402
     JPEG_DCT_MANIFEST_CONTRACTS,
     MANIFEST_MAGIC,
     canonical_extension_fields,
@@ -78,14 +79,6 @@ def sha256_bytes(value: bytes) -> str:
 
 def sha256_json(value: Any) -> str:
     return sha256_bytes(canonical_json_bytes(value))
-
-
-def sha256_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def read_json(path: Path) -> Any:
@@ -595,6 +588,12 @@ def load_contract(path: Path) -> dict[str, Any]:
     require(isinstance(enabled, list) and enabled, "pipelines.enabled must be a non-empty list")
     require(len(enabled) == len(set(enabled)), "pipelines.enabled contains duplicates")
     require(all(item in PIPELINES for item in enabled), f"unknown pipeline; expected subset of {PIPELINES}")
+    if "coordl" in enabled:
+        cache_size = contract["pipelines"]["coordl"]["cache_size"]
+        require(
+            isinstance(cache_size, int) and not isinstance(cache_size, bool) and cache_size > 0,
+            "pipelines.coordl.cache_size must be a positive number of JPEGs",
+        )
     galp_configs: dict[str, dict[str, Any]] = {}
     for pipeline_name in GALP_PIPELINES:
         if pipeline_name not in enabled:

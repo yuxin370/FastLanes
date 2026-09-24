@@ -2,33 +2,223 @@ from __future__ import annotations
 
 import sys
 import inspect
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from galp.torch import DirectDctBatch
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from pipeline import (  # noqa: E402
+from galp.benchmarks.system_dct_major.pipeline import (  # noqa: E402
     GalpAdapter,
+    CoorDLAdapter,
+    FfcvAdapter,
     LoadedBatch,
     _accumulate_native,
-    _manifest_shard_segments,
+    _finalize_native_stats,
     _process_io_delta,
     _process_io_snapshot,
     _rgbnomore_fixed_validation_transform,
     _validate_identity,
+    _training_step,
+    _training_probe,
 )
+from galp.benchmarks.system_dct_major.common import BLOCK_MAJOR_RUNTIME_PROFILE
 
 
 class PipelineControlTest(unittest.TestCase):
+    def test_training_step_updates_weights_and_retains_optimizer_state(self) -> None:
+        torch.manual_seed(17)
+        model = torch.nn.Linear(4, 3).train()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batch = LoadedBatch(
+            inputs=(torch.randn(5, 4),), labels=torch.tensor([0, 1, 2, 0, 1]),
+            ordinals=list(range(5)), label_values=[0, 1, 2, 0, 1], on_device=True,
+        )
+        before = [p.detach().clone() for p in model.parameters()]
+        output, loss = _training_step(model, optimizer, batch, 3)
+        self.assertEqual(tuple(output.shape), (5, 3))
+        self.assertFalse(output.requires_grad)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(all(_training_probe(model, before).values()))
+        # A second, partial batch must perform another update without resetting Adam.
+        batch.inputs = (batch.inputs[0][:2],)
+        batch.labels = batch.labels[:2]
+        _training_step(model, optimizer, batch, 3)
+        self.assertTrue(all(int(state["step"]) == 2 for state in optimizer.state.values()))
+
+    def test_training_probe_rejects_missing_update(self) -> None:
+        model = torch.nn.Linear(4, 3)
+        model(torch.ones(2, 4)).sum().backward()
+        before = [p.detach().clone() for p in model.parameters()]
+        self.assertFalse(_training_probe(model, before)["parameters_updated"])
+
+    def test_coordl_retains_reader_and_sample_order_across_partial_epochs(self) -> None:
+        modules = {
+            name: mock.MagicMock() for name in (
+                "nvidia", "nvidia.dali", "nvidia.dali.pipeline", "nvidia.dali.plugin",
+                "nvidia.dali.plugin.pytorch",
+            )
+        }
+        dali = modules["nvidia.dali"]
+        dali.backend.GetSchema.return_value.GetArgumentNames.return_value = ["cache_size"]
+
+        # CoorDL 0.20 uses output_dtype, unlike the modern DALI fn API.
+        def normalize(*, device, output_dtype, output_layout, crop, crop_pos_x, crop_pos_y, mean, std):
+            self.assertEqual(output_dtype, dali.types.FLOAT)
+            self.assertEqual(output_layout, "CHW")
+            self.assertEqual(crop, (224, 224))
+            self.assertEqual((crop_pos_x, crop_pos_y), (0.5, 0.5))
+            self.assertEqual(mean, [127.5] * 3)
+            self.assertEqual(std, [127.5] * 3)
+            return mock.Mock()
+
+        dali.ops.CropMirrorNormalize.side_effect = normalize
+        pipeline_initializations = []
+
+        class Pipeline:
+            def __init__(self, **kwargs):
+                pipeline_initializations.append(kwargs)
+
+        modules["nvidia.dali.pipeline"].Pipeline = Pipeline
+        factory = modules["nvidia.dali.plugin.pytorch"].DALIGenericIterator
+        iterator = factory.return_value
+        samples = [{"path": f"/dataset/image{index}.jpg", "ordinal": index, "label": index + 10} for index in range(3)]
+        batches = [
+            [{"image": torch.zeros(2, 3, 224, 224), "ordinal": torch.tensor([0, 1])}],
+            [{"image": torch.zeros(1, 3, 224, 224), "ordinal": torch.tensor([2])}],
+        ]
+        iterator.__next__.side_effect = batches * 2
+        original_tensor = torch.tensor
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(sys.modules, modules), mock.patch(
+            "galp.benchmarks.system_dct_major.pipeline.torch.tensor",
+            side_effect=lambda values, **kwargs: original_tensor(values, dtype=kwargs["dtype"]),
+        ):
+            file_list = Path(temporary) / "files.txt"
+            contract = {
+                "execution": {"batch_size": 2, "workers": 3, "seed": 17},
+                "preprocess": {"rgb": {"resize_shorter": None, "crop_size": [224, 224]}},
+                "pipelines": {"coordl": {
+                    "cache_size": 2, "file_list": str(file_list), "device_id": 0, "prefetch_queue_depth": 2,
+                }},
+            }
+            adapter = CoorDLAdapter(contract, samples, torch.device("cuda"), "coordl")
+            adapter.prime_cold_start()
+            for _ in range(2):
+                adapter.begin_repeat()
+                first = adapter.load(samples[:2])
+                tail = adapter.load(samples[2:])
+                self.assertEqual(first.ordinals, [0, 1])
+                self.assertEqual(tail.ordinals, [2])
+                self.assertEqual(tail.label_values, [12])
+                self.assertEqual(tail.inputs[0].shape[0], 1)
+                adapter.end_repeat()
+            self.assertEqual(file_list.read_text(), "dataset/image0.jpg 0\ndataset/image1.jpg 1\ndataset/image2.jpg 2\n")
+            self.assertEqual(len(pipeline_initializations), 1)
+            factory.assert_called_once()
+            self.assertEqual(iterator.reset.call_count, 2)
+            self.assertFalse(factory.call_args.kwargs["fill_last_batch"])
+            self.assertTrue(factory.call_args.kwargs["last_batch_padded"])
+            self.assertEqual(factory.call_args.kwargs["size"], 3)
+            reader_args = dali.ops.FileReader.call_args.kwargs
+            self.assertEqual(reader_args["cache_size"], 2)
+            self.assertFalse(reader_args["random_shuffle"])
+            self.assertFalse(reader_args["shuffle_after_epoch"])
+            self.assertTrue(reader_args["pad_last_batch"])
+            with mock.patch.object(Path, "unlink") as unlink:
+                adapter.close()
+                self.assertEqual(unlink.call_count, 6)
+
+    def test_coordl_rejects_standard_dali_instead_of_disabling_cache(self) -> None:
+        modules = {name: mock.MagicMock() for name in (
+            "nvidia", "nvidia.dali", "nvidia.dali.pipeline", "nvidia.dali.plugin",
+            "nvidia.dali.plugin.pytorch",
+        )}
+        modules["nvidia.dali"].backend.GetSchema.return_value.GetArgumentNames.return_value = []
+        with mock.patch.dict(sys.modules, modules):
+            adapter = CoorDLAdapter({}, [], torch.device("cuda"), "coordl")
+            with self.assertRaisesRegex(RuntimeError, "not standard NVIDIA DALI"):
+                adapter.begin_repeat()
+
+    def test_coordl_rejects_existing_cache_before_creating_reader(self) -> None:
+        modules = {name: mock.MagicMock() for name in (
+            "nvidia", "nvidia.dali", "nvidia.dali.pipeline", "nvidia.dali.plugin",
+            "nvidia.dali.plugin.pytorch",
+        )}
+        dali = modules["nvidia.dali"]
+        dali.backend.GetSchema.return_value.GetArgumentNames.return_value = ["cache_size"]
+        contract = {
+            "execution": {}, "pipelines": {"coordl": {}},
+            "preprocess": {"rgb": {"resize_shorter": None}},
+        }
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(Path, "exists", return_value=True):
+            adapter = CoorDLAdapter(contract, [{"path": "/dataset/image.jpg"}], torch.device("cuda"), "coordl")
+            with self.assertRaisesRegex(FileExistsError, "fresh cache"):
+                adapter.begin_repeat()
+        dali.ops.FileReader.assert_not_called()
+
+    def test_ffcv_loader_preserves_order_and_partial_tail(self) -> None:
+        modules = {
+            name: mock.MagicMock() for name in (
+                "ffcv", "ffcv.fields", "ffcv.fields.decoders", "ffcv.loader", "ffcv.transforms",
+            )
+        }
+        batches = [
+            (torch.full((2, 3, 224, 224), 255, dtype=torch.uint8), torch.tensor([0, 1])),
+            (torch.zeros((1, 3, 224, 224), dtype=torch.uint8), torch.tensor([2])),
+        ]
+        loader = modules["ffcv.loader"].Loader
+        loader.return_value.__iter__.return_value = iter(batches)
+        samples = [{"ordinal": index, "label": index + 10} for index in range(3)]
+        contract = {
+            "execution": {"batch_size": 2, "workers": 2},
+            "pipelines": {"ffcv": {"beton": "dataset.beton"}},
+        }
+        original_tensor = torch.tensor
+        with mock.patch.dict(sys.modules, modules), mock.patch(
+            "galp.benchmarks.system_dct_major.pipeline.torch.tensor",
+            side_effect=lambda values, **kwargs: original_tensor(values, dtype=kwargs["dtype"]),
+        ):
+            adapter = FfcvAdapter(contract, samples, torch.device("cuda"), "ffcv")
+            adapter.begin_repeat()
+            first = adapter.load(samples[:2])
+            last = adapter.load(samples[2:])
+        self.assertEqual(loader.call_args.kwargs["indices"], [0, 1, 2])
+        self.assertEqual(loader.call_args.kwargs["drop_last"], False)
+        self.assertEqual(first.ordinals, [0, 1])
+        self.assertEqual(last.label_values, [12])
+        self.assertEqual(first.inputs[0].shape, (2, 3, 224, 224))
+        self.assertEqual(first.inputs[0][0, 0, 0, 0].item(), 1.0)
+        self.assertEqual(last.inputs[0][0, 0, 0, 0].item(), -1.0)
+
+    def test_native_physical_orchestration_is_enabled_before_reader_creation(self) -> None:
+        def make_reader(*args: object, **kwargs: object) -> None:
+            self.assertEqual(os.environ["GALP_PHASE6_NATIVE_PHYSICAL"], "1")
+            raise RuntimeError("reader reached")
+
+        contract = {
+            "pipelines": {
+                "dct_major_coefficient_pushdown": {
+                    "preprocess": "native",
+                    "runtime_profile": BLOCK_MAJOR_RUNTIME_PROFILE,
+                    "manifest": "unused",
+                    "torch_binding_dir": "unused",
+                }
+            }
+        }
+        with mock.patch.dict(os.environ, {"GALP_PHASE6_NATIVE_PHYSICAL": "0"}):
+            with mock.patch("galp.benchmarks.system_dct_major.pipeline.DirectDctReader", side_effect=make_reader):
+                with self.assertRaisesRegex(RuntimeError, "reader reached"):
+                    GalpAdapter(contract, [], torch.device("cuda"), "dct_major_coefficient_pushdown")
+
     def test_native_logical_hot_path_has_no_python_physical_stitch_or_sync(self) -> None:
-        source = inspect.getsource(GalpAdapter._load_native_logical)
+        source = inspect.getsource(GalpAdapter.load)
         for forbidden in ("torch.cat", ".clone(", ".synchronize(", "_load_next_segment"):
             self.assertNotIn(forbidden, source)
 
@@ -40,18 +230,13 @@ class PipelineControlTest(unittest.TestCase):
 
         adapter = object.__new__(GalpAdapter)
         adapter.pipeline = Pipeline()
-        adapter._native_physical_orchestration = True
         adapter._logical_batches = [
             [{"galp_image_id": 1000}, {"galp_image_id": 1001}],
             [{"galp_image_id": 1024}],
         ]
-        adapter._current = {"legacy": "must be cleared"}
-        adapter._next_segment = 9
         adapter._cold_measurement_primed = False
         adapter.begin_repeat()
         self.assertEqual(adapter.pipeline.batches, [[1000, 1001], [1024]])
-        self.assertEqual(adapter._next_segment, 0)
-        self.assertIsNone(adapter._current)
 
     def test_fixed_rgbnomore_transform_preserves_published_resize_reference(self) -> None:
         class Transform(torch.nn.Module):
@@ -75,30 +260,7 @@ class PipelineControlTest(unittest.TestCase):
         self.assertEqual(transform[1].kwargs["orig_min"], -1024)
         self.assertEqual(transform[1].kwargs["orig_max"], 1016)
 
-    def test_manifest_shard_segments_use_exact_manifest_ranges(self) -> None:
-        samples = [{"galp_image_id": image_id} for image_id in range(9)]
-        manifest = {
-            "shards": [
-                {"shard_id": 4, "first_global_image_index": 0, "image_count": 4},
-                {"shard_id": 8, "first_global_image_index": 4, "image_count": 5},
-            ]
-        }
-        segments = _manifest_shard_segments(samples, manifest)
-        self.assertEqual(
-            [[item["galp_image_id"] for item in segment] for segment in segments],
-            [[0, 1, 2, 3], [4, 5, 6, 7, 8]],
-        )
 
-    def test_manifest_shard_segments_reject_partial_tail(self) -> None:
-        samples = [{"galp_image_id": image_id} for image_id in range(6)]
-        manifest = {
-            "shards": [
-                {"shard_id": 0, "first_global_image_index": 0, "image_count": 4},
-                {"shard_id": 1, "first_global_image_index": 4, "image_count": 5},
-            ]
-        }
-        with self.assertRaisesRegex(ValueError, "truncates a physical shard"):
-            _manifest_shard_segments(samples, manifest)
 
     def test_native_allocator_snapshots_are_not_summed_across_segments(self) -> None:
         totals: dict[str, object] = {}
@@ -221,6 +383,46 @@ class PipelineControlTest(unittest.TestCase):
         self.assertAlmostEqual(totals["selected_coefficient_ratio"], 4 / 10)
         self.assertAlmostEqual(totals["physical_page_coverage_ratio"], 7 / 20)
 
+    def test_logical_views_without_new_physical_work_do_not_add_native_segments(self) -> None:
+        physical = {
+            "rowgroup_count": 48,
+            "bounded_read_amplification_ppm": 1_100_000,
+            "active_output_schedule_mmap_capacity_bytes": 16 * 1024 * 1024,
+            "active_output_schedule_mmap_window_count": 2,
+        }
+        empty = {
+            "rowgroup_count": 0,
+            "bounded_read_amplification_ppm": 1_000_000,
+            "active_output_schedule_mmap_capacity_bytes": 0,
+            "active_output_schedule_mmap_window_count": 0,
+        }
+        totals: dict[str, object] = {}
+        without_sidecar = {
+            **physical,
+            "active_output_schedule_mmap_capacity_bytes": 0,
+            "active_output_schedule_mmap_window_count": 0,
+        }
+        for observed in (physical, empty, empty, without_sidecar):
+            batch = LoadedBatch(
+                inputs=(), labels=torch.empty(0), ordinals=[], label_values=[], on_device=True,
+                native_stats=[{"_native_batch": object(), "segment_mode": "native-logical-batch"}],
+            )
+            with mock.patch(
+                "galp.benchmarks.system_dct_major.pipeline._batch_native_stats", return_value=observed
+            ):
+                _finalize_native_stats(batch)
+            self.assertEqual(len(batch.native_stats), int(observed["rowgroup_count"] > 0))
+            for stats in batch.native_stats:
+                _accumulate_native(totals, stats)
+        self.assertEqual(totals["segment_count"], 2)
+        self.assertEqual(totals["rowgroup_count"], 96)
+        for key in ("bounded_read_amplification_ppm", "active_output_schedule_mmap_capacity_bytes",
+                    "active_output_schedule_mmap_window_count"):
+            value = physical[key]
+            self.assertEqual(totals[key], value)
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, key):
+                _accumulate_native(dict(totals), {key: value * 2})
+
     def test_bounded_configuration_is_constant_not_summed_across_segments(self) -> None:
         totals: dict[str, object] = {}
         configuration = {
@@ -253,25 +455,6 @@ class PipelineControlTest(unittest.TestCase):
                 },
             )
 
-    def test_galp_measurement_does_not_reuse_warmup_segment(self) -> None:
-        class Pipeline:
-            def start(self, batches):
-                self.batches = batches
-                return self
-
-        adapter = object.__new__(GalpAdapter)
-        adapter.pipeline = Pipeline()
-        adapter._warmup_segments = [[{"ordinal": 0, "galp_image_id": 0}]]
-        adapter._measurement_segments = [[
-            {"ordinal": 1, "galp_image_id": 1},
-            {"ordinal": 2, "galp_image_id": 2},
-        ]]
-        adapter.begin_repeat()
-        self.assertEqual(adapter.segments, adapter._warmup_segments)
-        adapter.begin_measurement()
-        self.assertEqual(adapter.segments, adapter._measurement_segments)
-        self.assertEqual(adapter._next_segment, 0)
-        self.assertIsNone(adapter._current)
 
     def test_galp_cold_prime_is_reused_by_first_measurement(self) -> None:
         class Pipeline:
@@ -284,8 +467,7 @@ class PipelineControlTest(unittest.TestCase):
 
         adapter = object.__new__(GalpAdapter)
         adapter.pipeline = Pipeline()
-        adapter._warmup_segments = []
-        adapter._measurement_segments = [[
+        adapter._logical_batches = [[
             {"ordinal": 1, "galp_image_id": 1},
             {"ordinal": 2, "galp_image_id": 2},
         ]]
@@ -298,98 +480,7 @@ class PipelineControlTest(unittest.TestCase):
         adapter.begin_repeat()
         adapter.begin_measurement()
         self.assertEqual(adapter.pipeline.starts, [[[1, 2]]])
-        self.assertEqual(adapter._next_segment, 0)
 
-    def test_manifest_shard_prefetch_overlaps_and_model_batches_cross_boundary(self) -> None:
-        class FakePending:
-            producer_active_ms = 1.0
-            planning_ms = 2.0
-            io_staging_ms = 3.0
-            ordered_submission_ms = 4.0
-
-            def __init__(self, image_ids: list[int], value: float) -> None:
-                self.read_calls = 0
-                self.batch = SimpleNamespace(
-                    global_image_ids=image_ids,
-                    y=torch.full((len(image_ids), 1, 28, 28, 8, 8), value),
-                    cbcr=torch.full((len(image_ids), 2, 14, 14, 8, 8), value),
-                    layout="transformed_dct_grid",
-                    execution_stats={"actual_vector_count": len(image_ids)},
-                    cache_stats={},
-                    metrics={
-                        "schema": "galp-direct-dct-metrics-v2",
-                        "complete": True,
-                        "consumer_wait_ms": 0.0,
-                        "submit_to_ready_ms": 1.0,
-                        "producer_ms": 1.0,
-                        "planning_ms": 2.0,
-                        "io_ms": 3.0,
-                        "decode_ms": 0.0,
-                        "transform_ms": 0.0,
-                        "logical_bytes": 0,
-                        "physical_bytes": 0,
-                        "peak_transient_bytes": 0,
-                    },
-                )
-
-            def read(self):
-                self.read_calls += 1
-                return self.batch
-
-        segments = [
-            [{"galp_image_id": image_id} for image_id in range(3)],
-            [{"galp_image_id": image_id} for image_id in range(3, 6)],
-        ]
-        native_pending = [
-            FakePending([0, 1, 2], 1.0),
-            FakePending([3, 4, 5], 2.0),
-        ]
-        class FakePipeline:
-            def start(self, batches):
-                self.offset = 0
-                return self
-
-            def __next__(self):
-                pending = native_pending[self.offset]
-                self.offset += 1
-                return DirectDctBatch(pending.read(), "test-profile")
-
-        adapter = object.__new__(GalpAdapter)
-        adapter.segment_mode = "manifest-shard"
-        adapter.device = torch.device("cpu")
-        adapter.pipeline = FakePipeline()
-        adapter._shard_by_image_id = {image_id: image_id // 3 for image_id in range(6)}
-        adapter._process_scope_started_ns = None
-        adapter._activate_segments(segments)
-
-        first = adapter._load_pushdown(
-            [
-                {"galp_image_id": 0, "label": 10, "ordinal": 0},
-                {"galp_image_id": 1, "label": 11, "ordinal": 1},
-            ]
-        )
-        self.assertEqual(native_pending[0].read_calls, 1)
-        self.assertEqual(native_pending[1].read_calls, 0)
-        self.assertEqual(first.native_stats[0]["segment_mode"], "manifest-shard")
-        self.assertEqual(first.native_stats[0]["segment_shard_id"], 0)
-        self.assertEqual(first.native_stats[0]["segment_cross_shard_count"], 0)
-        self.assertGreaterEqual(first.native_stats[0]["prefetch_consumer_wait_ms"], 0.0)
-
-        boundary = adapter._load_pushdown(
-            [
-                {"galp_image_id": 2, "label": 12, "ordinal": 2},
-                {"galp_image_id": 3, "label": 13, "ordinal": 3},
-            ]
-        )
-        self.assertEqual(native_pending[1].read_calls, 1)
-        self.assertEqual(tuple(boundary.inputs[0].shape), (2, 1, 28, 28, 8, 8))
-        self.assertEqual(boundary.ordinals, [2, 3])
-        self.assertEqual(boundary.label_values, [12, 13])
-        self.assertEqual(float(boundary.inputs[0][0, 0, 0, 0, 0, 0]), 1.0)
-        self.assertEqual(float(boundary.inputs[0][1, 0, 0, 0, 0, 0]), 2.0)
-        self.assertEqual(boundary.native_stats[0]["segment_shard_id"], 1)
-        self.assertEqual(boundary.native_stats[0]["segment_cross_shard_count"], 0)
-        self.assertEqual(boundary.native_stats[0]["shard_reactivation_count"], 0)
 
     def test_identity_validation_uses_host_labels(self) -> None:
         batch = LoadedBatch(

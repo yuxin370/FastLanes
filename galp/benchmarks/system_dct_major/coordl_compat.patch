@@ -1,0 +1,187 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1a310ad..f83529f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -106,11 +106,11 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O2 -g3")
+ set(CUDA_NVCC_FLAGS_RELWITHDEBINFO "${CUDA_NVCC_FLAGS_RELWITHDEBINFO} -g -lineinfo")
+ 
+-# Use -std=c++14 (and not gnu++14)
++# Use -std=c++17 (and not gnu++17)
+-set(CMAKE_CXX_STANDARD 14)
++set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+ 
+-set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -std=c++14")
++set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -std=c++17")
+ 
+ # CXX flags
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-variable -Wno-unused-function -fno-strict-aliasing -fPIC -fvisibility=hidden")
+diff --git a/cmake/Dependencies.common.cmake b/cmake/Dependencies.common.cmake
+index e730dd9..6b56c7e 100644
+--- a/cmake/Dependencies.common.cmake
++++ b/cmake/Dependencies.common.cmake
+@@ -77,7 +77,7 @@ endif()
+ # PyBind
+ ##################################################################
+ if (BUILD_PYTHON)
+-  set(PYBIND11_CPP_STANDARD -std=c++14)
++  set(PYBIND11_CPP_STANDARD -std=c++17)
+   check_and_add_cmake_submodule(${PROJECT_SOURCE_DIR}/third_party/pybind11)
+ endif()
+ 
+diff --git a/cmake/modules/FindNVJPEG.cmake b/cmake/modules/FindNVJPEG.cmake
+index af11a38..4f45eeb 100644
+--- a/cmake/modules/FindNVJPEG.cmake
++++ b/cmake/modules/FindNVJPEG.cmake
+@@ -20,11 +20,13 @@ find_library(NVJPEG_LIBRARY libnvjpeg_static.a nvjpeg
+     PATHS ${NVJPEG_ROOT_DIR} ${CUDA_TOOLKIT_ROOT_DIR}
+     PATH_SUFFIXES lib lib64)
+ 
+-# nvJPEG 9.0 calls itself 0.1.x via API calls, and the header file doesn't tell you which
+-# version it is. There's not a super clean way to determine which CUDA's nvJPEG we have.
+-execute_process(COMMAND strings ${NVJPEG_LIBRARY} COMMAND grep /toolkit/
+-                COMMAND sed "s;^.*toolkit/r\\(\[^/\]\\+\\\).*$;\\1;" COMMAND sort -u
+-                OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE NVJPEG_VERSION)
++# Current nvJPEG headers publish their version directly.
++file(STRINGS "${NVJPEG_INCLUDE_DIR}/nvjpeg.h" NVJPEG_VERSION_LINES REGEX "^#define NVJPEG_VER_(MAJOR|MINOR|PATCH) ")
++foreach(part MAJOR MINOR PATCH)
++  string(REGEX MATCH "NVJPEG_VER_${part} +([0-9]+)" match "${NVJPEG_VERSION_LINES}")
++  set(NVJPEG_${part} "${CMAKE_MATCH_1}")
++endforeach()
++set(NVJPEG_VERSION "${NVJPEG_MAJOR}.${NVJPEG_MINOR}.${NVJPEG_PATCH}")
+ 
+ include(FindPackageHandleStandardArgs)
+ find_package_handle_standard_args(NVJPEG
+diff --git a/dali/kernels/context.h b/dali/kernels/context.h
+index e675e3f..07a963d 100644
+--- a/dali/kernels/context.h
++++ b/dali/kernels/context.h
+@@ -100,15 +100,15 @@ class Scratchpad {
+   template <typename Collection, typename T = std::remove_const_t<element_t<Collection>>>
+   if_array_like<Collection, T*>
+   ToGPU(cudaStream_t stream, const Collection &c) {
+-    T *ptr = Allocate<T>(AllocType::GPU, size(c));
+-    cudaMemcpyAsync(ptr, &c[0], size(c) * sizeof(T), cudaMemcpyHostToDevice, stream);
++    T *ptr = Allocate<T>(AllocType::GPU, dali::size(c));
++    cudaMemcpyAsync(ptr, &c[0], dali::size(c) * sizeof(T), cudaMemcpyHostToDevice, stream);
+     return ptr;
+   }
+ 
+   template <typename Collection, typename T = std::remove_const_t<element_t<Collection>>>
+   if_iterable<Collection, T*>
+   ToHost(const Collection &c) {
+-    T *ptr = Allocate<T>(AllocType::Host, size(c));
++    T *ptr = Allocate<T>(AllocType::Host, dali::size(c));
+     std::copy(begin(c), end(c), ptr);
+     return ptr;
+   }
+@@ -116,7 +116,7 @@ class Scratchpad {
+   template <typename Collection, typename T = std::remove_const_t<element_t<Collection>>>
+   if_iterable<Collection, T*>
+   ToPinned(const Collection &c) {
+-    T *ptr = Allocate<T>(AllocType::Pinned, size(c));
++    T *ptr = Allocate<T>(AllocType::Pinned, dali::size(c));
+     std::copy(begin(c), end(c), ptr);
+     return ptr;
+   }
+@@ -124,7 +124,7 @@ class Scratchpad {
+   template <typename Collection, typename T = std::remove_const_t<element_t<Collection>>>
+   if_iterable<Collection, T*>
+   ToUnified(const Collection &c) {
+-    T *ptr = Allocate<T>(AllocType::Unified, size(c));
++    T *ptr = Allocate<T>(AllocType::Unified, dali::size(c));
+     std::copy(begin(c), end(c), ptr);
+     return ptr;
+   }
+diff --git a/dali/kernels/scratch_copy_impl.h b/dali/kernels/scratch_copy_impl.h
+index ff5a13d..16b0b74 100644
+--- a/dali/kernels/scratch_copy_impl.h
++++ b/dali/kernels/scratch_copy_impl.h
+@@ -59,7 +59,7 @@ void GetCollectionOffsets(size_t base, size_t *offsets,
+   using T = std::remove_cv_t<element_t<Collection>>;
+   base = align_up(base, alignof(T));
+   *offsets = base;
+-  base += size(c) * sizeof(T);
++  base += dali::size(c) * sizeof(T);
+   GetCollectionOffsets(base, offsets + 1, tail...);
+ }
+ 
+diff --git a/dali/kernels/slice/slice_flip_normalize_permute_pad_common.h b/dali/kernels/slice/slice_flip_normalize_permute_pad_common.h
+index b55c2b5..d4f9663 100644
+--- a/dali/kernels/slice/slice_flip_normalize_permute_pad_common.h
++++ b/dali/kernels/slice/slice_flip_normalize_permute_pad_common.h
+@@ -69,7 +69,7 @@ struct SliceFlipNormalizePermutePadProcessedArgs {
+ template <typename Container, typename Permutation>
+ Container permute(const Container &container, const Permutation &source_indices) {
+   auto permuted_container = container;
+-  for (int d = 0, n = size(source_indices); d < n; d++) {
++  for (int d = 0, n = dali::size(source_indices); d < n; d++) {
+     permuted_container[d] = container[source_indices[d]];
+   }
+   return permuted_container;
+@@ -78,7 +78,7 @@ Container permute(const Container &container, const Permutation &source_indices)
+ template <typename Permutation>
+ Permutation inverse_permutation(const Permutation &permutation) {
+   Permutation inv_perm = permutation;
+-  for (int d = 0, n = size(permutation); d < n; d++) {
++  for (int d = 0, n = dali::size(permutation); d < n; d++) {
+     auto perm_d = permutation[d];
+     inv_perm[perm_d] = d;
+   }
+diff --git a/include/dali/core/tensor_view.h b/include/dali/core/tensor_view.h
+index b44b639..c972b7a 100644
+--- a/include/dali/core/tensor_view.h
++++ b/include/dali/core/tensor_view.h
+@@ -37,8 +37,8 @@ struct check_implicit_conversion {
+ 
+ template <typename Shape, typename Position>
+ bool ContainsCoords(const Shape &shape, const Position &pos) {
+-  const int shape_dim = size(shape);
+-  const int pos_dim = size(pos);
++  const int shape_dim = dali::size(shape);
++  const int pos_dim = dali::size(pos);
+   if (pos_dim > shape_dim) {
+     return false;
+   }
+@@ -57,8 +57,8 @@ bool ContainsCoords(const Shape &shape, const Position &pos) {
+ template <typename Shape, typename Position>
+ if_array_like<Position, ptrdiff_t> CalcOffset(const Shape &shape, const Position &pos) {
+   ptrdiff_t ofs = pos[0];
+-  const int pos_dim = size(pos);
+-  const int shape_dim = size(shape);
++  const int pos_dim = dali::size(pos);
++  const int shape_dim = dali::size(shape);
+   int i;
+   for (i = 1; i < pos_dim; i++) {
+     ofs *= shape[i];
+@@ -76,7 +76,7 @@ if_array_like<Position, ptrdiff_t> CalcOffset(const Shape &shape, const Position
+ template <typename Shape>
+ ptrdiff_t CalcOffset(const Shape &shape, const ptrdiff_t &index) {
+   ptrdiff_t ofs = index;
+-  const int shape_dim = size(shape);
++  const int shape_dim = dali::size(shape);
+   for (int i = 1; i < shape_dim; i++) {
+     ofs *= shape[i];
+   }
+diff --git a/include/dali/core/util.h b/include/dali/core/util.h
+index fb58329..b14da48 100644
+--- a/include/dali/core/util.h
++++ b/include/dali/core/util.h
+@@ -15,6 +15,7 @@
+ #ifndef DALI_CORE_UTIL_H_
+ #define DALI_CORE_UTIL_H_
+ 
++#include <cstdint>
+ #include <cstddef>
+ #include <utility>
+ #include <initializer_list>
+@@ -138,7 +139,7 @@ using if_indexable = if_istype<decltype(std::declval<Collection>()[0]), T>;
+ 
+ template <typename Collection, typename T = void>
+ using if_array_like = if_indexable<Collection,
+-                                   if_istype<decltype(size(std::declval<Collection>())), T>>;
++                                   if_istype<decltype(dali::size(std::declval<Collection>())), T>>;
+ 
+ template <typename C>
+ struct element_type {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from collections import OrderedDict
 from pathlib import Path
 
@@ -9,10 +10,9 @@ import torch
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-if str(BENCHMARK_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_ROOT))
 
-from feature_model import FeatureExtractor, expected_output_width  # noqa: E402
+from galp.benchmarks.system_dct_major.feature_model import FeatureExtractor, expected_output_width  # noqa: E402
+from galp.benchmarks.system_dct_major.feature_model import build_workload_model
 
 
 class MeanTokens(torch.nn.Module):
@@ -44,6 +44,19 @@ class FakeModel(torch.nn.Module):
 
 
 class FeatureModelTest(unittest.TestCase):
+    def test_training_workload_enables_training_and_autograd(self) -> None:
+        model = torch.nn.Linear(4, 1000).eval()
+        with mock.patch(
+            "galp.benchmarks.system_dct_major.feature_model.model_factory.build_rgb_model", return_value=model
+        ):
+            actual = build_workload_model(
+                domain="rgb", workload="training-throughput", rgbnomore_root=Path("upstream"),
+                checkpoint=Path("weights.pth"), device=torch.device("cpu"),
+            )
+        self.assertTrue(actual.training)
+        actual(torch.ones(2, 4)).sum().backward()
+        self.assertIsNotNone(actual.weight.grad)
+
     def test_rgb_penultimate_tap_matches_head_prefix(self) -> None:
         model = FakeModel()
         inputs = torch.randn(3, 5, 192)

@@ -13,34 +13,36 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from common import parse_manifest, resolve_coefficient_selection
+from galp.benchmarks.system_dct_major.common import parse_manifest, resolve_coefficient_selection
+
+from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
 
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 DIAGNOSTICS = HERE / "diagnostics"
-DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
-DEFAULT_DATA_ROOT = Path("/tmp/rgbnomore_imagenet")
-DEFAULT_DCT_MAJOR_MANIFEST = Path("/tmp/galp-blockmajor-512-s1024-rg128/manifest.bin")
+DEFAULT_PYTHON = Path(sys.executable)
+DEFAULT_DATA_ROOT = REPO_ROOT / "galp/data/system_rgbnomore/e2e_v3/imagenet_512"
+DEFAULT_DCT_MAJOR_MANIFEST = REPO_ROOT / "galp/data/compressed/imagenet512_val_block_major/manifest.bin"
 DEFAULT_DCT_MAJOR_LABELS = (
     REPO_ROOT
-    / "galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json"
+    / "galp/data/compressed/imagenet512_val_compact_v3/labels.json"
 )
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/galp/torch"
-DEFAULT_RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
-DEFAULT_RAW_MASK_ORACLE_DIR = (
-    REPO_ROOT
-    / "galp/experiments/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100"
-)
 
 ALL_PIPELINES = (
     "dct_major_pushdown",
     "dct_major_coefficient_pushdown",
     "rgbnomore",
     "dali",
+    "ffcv",
     "pytorch",
 )
 SUITE_SCHEMA = "galp_dct_major_complete_suite_v1"
+
+
+def _suite_pipelines(args: argparse.Namespace) -> tuple[str, ...]:
+    return (*ALL_PIPELINES, "coordl") if args.coordl_cache_size is not None else ALL_PIPELINES
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,8 @@ def _common_run_args(args: argparse.Namespace) -> list[str]:
     result = [
         "--data-root",
         str(args.data_root.resolve()),
+        "--split",
+        args.split,
         "--dct-major-manifest",
         str(args.dct_major_manifest.resolve()),
         "--dct-major-label-map",
@@ -84,6 +88,7 @@ def _common_run_args(args: argparse.Namespace) -> list[str]:
         result.extend(("--rgb-checkpoint", str(args.rgb_checkpoint.resolve())))
     if args.dct_checkpoint is not None:
         result.extend(("--dct-checkpoint", str(args.dct_checkpoint.resolve())))
+    result.extend(("--ffcv-beton", str((args.ffcv_beton or args.output_dir / "ffcv.beton").resolve())))
     if args.raw_mask_oracle_dir is not None:
         result.extend(("--raw-mask-oracle-dir", str(args.raw_mask_oracle_dir.resolve())))
     block_major_access_dir = getattr(args, "block_major_access_dir", None)
@@ -93,6 +98,10 @@ def _common_run_args(args: argparse.Namespace) -> list[str]:
         result.append("--hash-samples")
     if args.hash_payloads:
         result.append("--hash-payloads")
+    if args.coordl_cache_size is not None:
+        result.extend(("--coordl-cache-size", str(args.coordl_cache_size)))
+    if args.coordl_python is not None:
+        result.extend(("--coordl-python", str(args.coordl_python.resolve())))
     return result
 
 
@@ -109,7 +118,7 @@ def _run_phase(
     target = output_dir / name
     command = [
         str(args.python.resolve()),
-        str(HERE / "run.py"),
+        "-m", "galp.benchmarks.system_dct_major.run",
         "--output-dir",
         str(target),
         "--preset",
@@ -144,7 +153,7 @@ def _initial_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
             "02_feature_smoke",
             output_dir,
             workload="feature-extraction",
-            pipelines=ALL_PIPELINES,
+            pipelines=_suite_pipelines(args),
             sample_count=first_shard_samples,
             repeats=1,
         ),
@@ -153,7 +162,7 @@ def _initial_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
             "03_evaluation_smoke",
             output_dir,
             workload="evaluation",
-            pipelines=ALL_PIPELINES,
+            pipelines=_suite_pipelines(args),
             sample_count=first_shard_samples,
             repeats=1,
         ),
@@ -167,7 +176,7 @@ def _contract_phase(args: argparse.Namespace, output_dir: Path) -> Phase:
         "00_semantic_contract",
         output_dir,
         workload="evaluation",
-        pipelines=ALL_PIPELINES,
+        pipelines=_suite_pipelines(args),
         sample_count=first_shard_samples,
         repeats=1,
     )
@@ -185,7 +194,7 @@ def _semantic_phase(args: argparse.Namespace, output_dir: Path) -> Phase:
         name="01_coefficient_semantics",
         command=(
             str(args.python.resolve()),
-            str(HERE / "verify_coefficient_semantics.py"),
+            "-m", "galp.benchmarks.system_dct_major.verify_coefficient_semantics",
             "--contract",
             str((output_dir / "00_semantic_contract/contract.json").resolve()),
             "--output",
@@ -198,6 +207,25 @@ def _semantic_phase(args: argparse.Namespace, output_dir: Path) -> Phase:
     )
 
 
+def _ffcv_phase(args: argparse.Namespace, output_dir: Path) -> Phase:
+    target = (args.ffcv_beton or output_dir / "ffcv.beton").resolve()
+    return Phase(
+        name="00_ffcv_dataset",
+        command=(
+            str(args.python.resolve()), "-m", "galp.benchmarks.system_dct_major.ffcv_dataset",
+            "--data-root", str(args.data_root.resolve()),
+            "--split", args.split,
+            "--dct-major-label-map", str(args.dct_major_label_map.resolve()),
+            "--dct-major-manifest", str(args.dct_major_manifest.resolve()),
+            "--sample-count", str(args.formal_samples),
+            "--workers", str(args.workers),
+            "--output", str(target),
+        ),
+        target=target,
+        gpu=False,
+    )
+
+
 def _formal_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
     phases: list[Phase] = []
     for prefix, workload in (("06", "feature-extraction"), ("07", "evaluation")):
@@ -207,7 +235,7 @@ def _formal_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
                 f"{prefix}_formal_{workload.replace('-', '_')}",
                 output_dir,
                 workload=workload,
-                pipelines=ALL_PIPELINES,
+                pipelines=_suite_pipelines(args),
                 sample_count=args.formal_samples,
                 repeats=args.formal_repeats,
             )
@@ -228,7 +256,7 @@ def _formal_phases(args: argparse.Namespace, output_dir: Path) -> list[Phase]:
                 name=f"08_model_ceiling_{index}_{domain}_{workload.replace('-', '_')}",
                 command=(
                     str(args.python.resolve()),
-                    str(DIAGNOSTICS / "model_ceiling.py"),
+                    "-m", "galp.benchmarks.system_dct_major.diagnostics.model_ceiling",
                     "--domain",
                     domain,
                     "--workload",
@@ -326,9 +354,9 @@ def _execute_phase(
 
 def _volume(args: argparse.Namespace) -> dict[str, int]:
     first_shard_samples = int(parse_manifest(args.dct_major_manifest)["shards"][0]["image_count"])
-    smoke = 2 * len(ALL_PIPELINES) * first_shard_samples
+    smoke = 2 * len(_suite_pipelines(args)) * first_shard_samples
     semantic = 8 * args.semantic_samples
-    formal = 2 * len(ALL_PIPELINES) * args.formal_samples * args.formal_repeats
+    formal = 2 * len(_suite_pipelines(args)) * args.formal_samples * args.formal_repeats
     model_ceiling = 4 * args.batch_size * args.ceiling_steps
     return {
         "smoke_pipeline_images": smoke,
@@ -363,6 +391,7 @@ def run(args: argparse.Namespace) -> int:
 
     phases = [
         _contract_phase(args, output_dir),
+        *([] if args.ffcv_beton is not None else [_ffcv_phase(args, output_dir)]),
         _semantic_phase(args, output_dir),
         *_initial_phases(args, output_dir),
         *_formal_phases(args, output_dir),
@@ -415,18 +444,22 @@ def run(args: argparse.Namespace) -> int:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON if DEFAULT_PYTHON.is_file() else Path(sys.executable))
+    parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--split", default="val")
     parser.add_argument("--dct-major-manifest", type=Path, default=DEFAULT_DCT_MAJOR_MANIFEST)
     parser.add_argument("--block-major-access-dir", type=Path, required=True)
     parser.add_argument("--dct-major-label-map", type=Path, default=DEFAULT_DCT_MAJOR_LABELS)
     parser.add_argument("--rgbnomore-root", type=Path, default=DEFAULT_RGBNOMORE_ROOT)
     parser.add_argument("--rgb-checkpoint", type=Path)
     parser.add_argument("--dct-checkpoint", type=Path)
+    parser.add_argument("--ffcv-beton", type=Path, help="reuse a canonical FFCV dataset instead of converting it")
+    parser.add_argument("--coordl-cache-size", type=int, help="include CoorDL with this cache capacity in JPEGs")
+    parser.add_argument("--coordl-python", type=Path, help="Python with CoorDL and benchmark dependencies installed")
     parser.add_argument(
         "--raw-mask-oracle-dir",
         type=Path,
-        default=(DEFAULT_RAW_MASK_ORACLE_DIR if DEFAULT_RAW_MASK_ORACLE_DIR.is_dir() else None),
+        default=None,
     )
     parser.add_argument("--torch-binding-dir", type=Path, default=DEFAULT_BINDING_DIR)
     parser.add_argument("--device", default="cuda:0")
@@ -443,6 +476,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.coordl_cache_size is not None and args.coordl_cache_size <= 0:
+        parser.error("--coordl-cache-size must be positive")
+    if args.coordl_python is not None and args.coordl_cache_size is None:
+        parser.error("--coordl-python requires --coordl-cache-size")
     for name in (
         "workers",
         "batch_size",
@@ -455,7 +492,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.ceiling_warmup < 0:
         parser.error("--ceiling-warmup must be non-negative")
-    resolve_coefficient_selection(args.dct_coeffs)
+    selection = resolve_coefficient_selection(args.dct_coeffs)
+    if (
+        selection["coefficient_selection_kind"] == "prefix"
+        and selection["coefficient_count"] == 32
+        and args.raw_mask_oracle_dir is None
+    ):
+        parser.error("first:32 evaluation requires --raw-mask-oracle-dir")
     return args
 
 
