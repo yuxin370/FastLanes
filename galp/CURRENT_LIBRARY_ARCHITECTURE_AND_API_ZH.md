@@ -257,9 +257,9 @@ import galp.diagnostics.direct_dct as direct_dct_diag
 | 路径 | 正确职责 |
 | --- | --- |
 | `galp/tests/` | C++/CUDA contract 和集成测试 |
-| `galp/torch/test_*.py`、`galp/torch/*_test.py` | Python/Torch contract 与 smoke |
-| `galp/benchmarks/` | 性能协议、训练 runner、对照系统和证据报告 |
-| `galp/experiments/` | 独立研究实验，不反向定义 production API |
+| `galp/torch/tests/`、`galp/torch/*_test.py` | Python/Torch API contract 与设备集成检查 |
+| `galp/benchmarks/*/tests/` | 对应 benchmark 的合同、adapter 和报告测试 |
+| `galp/benchmarks/` | 性能协议、训练 runner、对照系统、研究实验和证据报告 |
 | `galp/examples/` | 可运行示例与验证入口 |
 | `galp/tools/` | 数据转换、检查和辅助命令 |
 | `galp/scripts/codegen/` | generated binding 的生成与一致性检查 |
@@ -759,7 +759,7 @@ else:
 
 ### Experiments
 
-`galp/experiments/` 可以验证新想法，但不能反向污染 production API。实验稳定并产品化后，应把真正通用的合同和实现迁入相应的 `include/src/torch` 层，而不是让正式调用者永久 import 实验目录。
+`galp/benchmarks/` 可以验证新想法，但不能反向污染 production API。实验稳定并产品化后，应把真正通用的合同和实现迁入相应的 `include/src/torch` 层，而不是让正式调用者永久 import 实验目录。
 
 ### Generated artifacts
 
@@ -811,7 +811,7 @@ PLS 应从 `galp.torch.experimental` 或 Advanced C++ header 使用。它目前�
 | C++ 深度集成 Direct-DCT | `<galp/advanced/direct_dct.hpp>` |
 | 调试 planner、cache 或 metrics | `galp.diagnostics.direct_dct` |
 | 做性能对比或科学证据 | `galp/benchmarks/` 中对应 contract/runner |
-| 验证新研究想法 | `galp/experiments/` 中独立 package |
+| 验证新研究想法 | `galp/benchmarks/` 中独立 package |
 
 ## 15. 维护者快速检查清单
 
@@ -1149,8 +1149,8 @@ export PYTHONPATH="$PWD/galp/benchmarks/system_dct_major"
 export TRAIN_JSON="$PWD/galp/data/system_rgbnomore/e2e_v3/training_manifests_official_v3/train.json"
 export VAL_JSON="$PWD/galp/data/system_rgbnomore/e2e_v3/training_manifests_official_v3/val.json"
 export LAYOUT=/mnt/nvme2/home/tangyuxin/pls-experiments/pls-layout-20260811/physical_layout_plan.json
-export PHYSICAL_MANIFEST=/mnt/nvme2/home/tangyuxin/pls-experiments/physical-layout-full-premix-orgseed-20260810/uniform_premix/dct/manifest.bin
-export MAPPING=/mnt/nvme2/home/tangyuxin/pls-experiments/physical-layout-full-premix-orgseed-20260810/uniform_premix/ordered_mapping.csv
+export PHYSICAL_MANIFEST=/home/tangyuxin/gfastlanes/FastLanes/galp/data/compressed/imagenet512_train_block_major_premixed/dct/manifest.bin
+export MAPPING=/home/tangyuxin/gfastlanes/FastLanes/galp/data/compressed/imagenet512_train_block_major_premixed/ordered_mapping.csv
 export MAPPING_SHA256=98f77515e5886c098e46c23cddb41f57098b406ab32790509254c56356dc24ff
 export OUT=/mnt/nvme2/home/tangyuxin/pls-experiments/native-b6-current
 ```
@@ -1282,8 +1282,8 @@ PYTHONPATH="$PWD/build/galp/torch" "$PY" \
   --rgbnomore-root /home/tangyuxin/RGB-no-more \
   --rgb-checkpoint "$PWD/galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth" \
   --dct-checkpoint "$PWD/galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth" \
-  --galp-manifest "$PWD/galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/manifest.bin" \
-  --galp-label-map-json "$PWD/galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json" \
+  --galp-manifest "$PWD/galp/data/compressed/imagenet512_val_compact_v3/manifest.bin" \
+  --galp-label-map-json "$PWD/galp/data/compressed/imagenet512_val_compact_v3/labels.json" \
   --torch-binding-dir "$PWD/build/galp/torch" \
   --device cuda:0 \
   --precision fp32

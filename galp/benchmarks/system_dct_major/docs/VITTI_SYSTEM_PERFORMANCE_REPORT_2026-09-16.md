@@ -292,7 +292,7 @@ RSS取hot repeats峰值的最大值，不含DataLoader子进程。显存只覆�
 | PyTorch | 1250.5 |
 
 该次block-major与v3仅相差约2.2%，repeat区间重叠。原报告还包含TTFT、存储和segment-size诊断，
-保留在[历史汇总](LATEST_EXPERIMENT_REPORT_2026-08-04.md)。不同日期、输出任务和运行时变化
+保留在[历史汇总](EXPERIMENT_REPORT_2026-08-04.md)。不同日期、输出任务和运行时变化
 使这些数字不能证明“布局单项优化导致从1432.7提升至4766.23”。
 
 ## 8. 与SwinV2-T、CNN和eFUN的关系
@@ -326,7 +326,7 @@ DALI D2的43.015秒准备包括本runner的全epoch顺序/增强计划和pipelin
 | 传输与Nsight | [transfer.csv](../../../../benchmark_results/galp_dali_ceiling_4090_20260901_160642/transfer.csv)、[nsys目录](../../../../benchmark_results/galp_dali_ceiling_4090_20260901_160642/nsys/) |
 | 代表性optimizer窗口 | [actual_overlap_optimizer_window.csv](../../../../benchmark_results/galp_dali_ceiling_4090_20260901_160642/actual_overlap_optimizer_window.csv) |
 | 50K分类推理数值与全量正确性 | [2026-08-05 results.json](../../../../benchmark_results/system_rgbnomore/e2e_v3_full50k_20260805_115900/results.json)、[原自动报告](../../../../benchmark_results/system_rgbnomore/e2e_v3_full50k_20260805_115900/report.md) |
-| 旧布局与特征提取 | [2026-08-04汇总](LATEST_EXPERIMENT_REPORT_2026-08-04.md) |
+| 旧布局与特征提取 | [2026-08-04汇总](EXPERIMENT_REPORT_2026-08-04.md) |
 | 历史训练对照 | [2026-08-28 baseline报告](../../../../benchmark_results/dali_fair_4090_20260828/COMPLETE_BASELINE_REPORT_ZH.md)、[2026-08-29 Nsight报告](../../../../benchmark_results/training_nsys_fine_4090_20260829/REPORT_ZH.md) |
 
 原始CSV/JSON保留更多精度；本文在显示时取舍小数。历史训练报告的adapter和检查策略不同，

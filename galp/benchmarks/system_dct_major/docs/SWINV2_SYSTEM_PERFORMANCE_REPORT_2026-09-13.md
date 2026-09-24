@@ -577,7 +577,7 @@ Direct-DCT contract 均未为 SwinV2 写成专用路径，同时同域 baseline 
 - Native 长前缀：
   `/mnt/nvme2/home/tangyuxin/pls-experiments/swinv2-training-suite-4090-20260909-v2/scientific_matrix/runs/B6/seed_11997733`
 - Premixed materialization：
-  `/mnt/nvme2/home/tangyuxin/pls-experiments/physical-layout-full-premix-orgseed-20260810/uniform_premix/materialization_result.json`
+  `/home/tangyuxin/gfastlanes/FastLanes/galp/data/compressed/imagenet512_train_block_major_premixed/materialization_result.json`
 
 五条训练性能路径共享 runtime source tree SHA-256：
 `d04aa2b37b7d432ae771c3a896474e236ba9122d22b5f9279fdcbe206f7c42c4`。

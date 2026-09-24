@@ -18,64 +18,84 @@ sidecar 必须在 contract 快照前完成物化。runner 不允许 native execu
 
 ```bash
 cmake --build build --target _galp_direct_dct -j2
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/run.py --help
+  -m galp.benchmarks.system_dct_major.run --help
 ```
 
-正式 store 必须由 benchmark 使用的 512×512、4:2:0 JPEG view 构建。原始
-ImageNet JPEG（尺寸和 sampling 不固定）即使文件名和排序相同，也不能与这个
-contract 混用：
+正式 store 使用现有 `imagenet512_val_block_major`，源 JPEG 为
+`galp/data/system_rgbnomore/e2e_v3/imagenet_512/val`。这两者来自同一份
+512×512、4:2:0 数据视图；不能混用原始分辨率 JPEG 或离线生成模型目标的备份。
+数据已完成构建及访问索引生成，无需重新压缩；创建其他副本时必须选择新的输出目录。
+完整目录说明见[数据清单](../../../docs/DATASETS.md)。
+
+可在计时外验证已有数据：
 
 ```bash
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/dataset/prepare.py \
-  --input-dir /tmp/rgbnomore_imagenet/val \
-  --output-dir /tmp/galp-blockmajor-512-s1024-rg128 \
-  --layout dct-major \
-  --preset throughput \
-  --shard-images 1024 \
-  --rowgroup-vectors 128 \
-  --rowgroups-per-shard 64
-
 build/galp/tools/jpeg_dct/galp_jpeg_dct_tool \
-  --verify-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
-  --verify-workers 32 \
-  /tmp/rgbnomore_imagenet/val
+  --verify-manifest galp/data/compressed/imagenet512_val_block_major/manifest.bin \
+  --verify-workers 16 \
+  galp/data/system_rgbnomore/e2e_v3/imagenet_512/val
 ```
 
 全量 verifier 必须报告 `coefficient_mismatches: 0` 和 `exact: true`。
 
-首次运行先在计时外构建 block-major descriptors。K64 和 configurable selection
+当前正式目录已包含 `access/`。仅在新建数据副本时，于计时外构建 block-major descriptors。K64 和 configurable selection
 必须命中同一份 ownership schedule；物理 byte/range 计划仍按各自 selection
 独立生成。
 
 ```bash
 cmake --build build --target galp_block_major_access_tool _galp_direct_dct -j2
 build/galp/tools/jpeg_dct/galp_block_major_access_tool \
-  /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
-  --output-dir /tmp/galp-dct-pushdown-access-512 \
-  --output-json /tmp/galp-dct-pushdown-access-512/build.json
+  galp/data/compressed/imagenet512_val_block_major/manifest.bin \
+  --output-dir galp/data/compressed/imagenet512_val_block_major/access \
+  --output-json galp/data/compressed/imagenet512_val_block_major/access/build.json
+```
+
+当前 scheduled-range profile 还要求首分片的
+`access/shard_000000.active_output_schedule.bin`。若尚未生成，在 GPU 可用时先于
+contract 快照执行一次完整首分片读取；这一步不属于计时：
+
+```bash
+PYTHONPATH=.:build/galp/torch \
+GALP_BLOCK_MAJOR_ACCESS_DIR="$PWD/galp/data/compressed/imagenet512_val_block_major/access" \
+GALP_PHASE6_NATIVE_PHYSICAL=1 \
+/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python - <<'PY'
+from galp.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
+from galp.torch import DirectDctReader
+
+reader = DirectDctReader(
+    "galp/data/compressed/imagenet512_val_block_major/manifest.bin",
+    module_path="build/galp/torch",
+)
+pipeline = reader.pipeline(VALIDATION_CENTER_CROP_512, coefficients=range(32))
+pipeline.start([list(range(1024))])
+next(pipeline)
+pipeline.close()
+PY
+test -f galp/data/compressed/imagenet512_val_block_major/access/shard_000000.active_output_schedule.bin
 ```
 
 ## Contract preflight
 
 ```bash
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/run.py \
-  --preset smoke \
+  -m galp.benchmarks.system_dct_major.run \
+  --preset e2e \
   --workload feature-extraction \
-  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
-  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
-  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
+  --sample-count 1024 --repeats 1 \
+  --dct-major-manifest galp/data/compressed/imagenet512_val_block_major/manifest.bin \
+  --dct-major-label-map galp/data/compressed/imagenet512_val_compact_v3/labels.json \
+  --block-major-access-dir galp/data/compressed/imagenet512_val_block_major/access \
   --dct-coeffs first:32 \
+  --raw-mask-oracle-dir galp/benchmarks/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100 \
   --output-dir /tmp/galp-dct-major-contract \
   --dry-run
 ```
 
 检查 `contract.json` 中：
 
-- pipeline 为 `dct_major_pushdown/dct_major_coefficient_pushdown/rgbnomore/dali/pytorch`；
+- pipeline 为 `dct_major_pushdown/dct_major_coefficient_pushdown/rgbnomore/dali/ffcv/pytorch`；
 - GALP baseline 为 `all`/K64，GALP-DCT-pushdown 为显式 `first:32`/K32；
 - GALP runtime profile 为 `block-major-p4-scheduled-bounded-110-v1`；
 - block-major sidecar 文件全部进入 immutable input snapshot；
@@ -85,16 +105,17 @@ build/galp/tools/jpeg_dct/galp_block_major_access_tool \
 ## Smoke
 
 ```bash
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/run.py \
-  --preset smoke \
+  -m galp.benchmarks.system_dct_major.run \
+  --preset e2e \
   --workload feature-extraction \
-  --pipelines dct_major_pushdown dct_major_coefficient_pushdown rgbnomore dali pytorch \
+  --sample-count 1024 --repeats 1 \
+  --pipelines dct_major_pushdown dct_major_coefficient_pushdown rgbnomore dali ffcv pytorch \
   --dct-coeffs first:32 \
-  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
-  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
-  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
+  --dct-major-manifest galp/data/compressed/imagenet512_val_block_major/manifest.bin \
+  --dct-major-label-map galp/data/compressed/imagenet512_val_compact_v3/labels.json \
+  --block-major-access-dir galp/data/compressed/imagenet512_val_block_major/access \
   --output-dir /tmp/galp-dct-major-feature-smoke
 ```
 
@@ -104,17 +125,25 @@ shard，因此 suite smoke 使用第一个完整 shard（当前 manifest 为 1,0
 
 ## Formal
 
+`first:32` evaluation 需要完整的 raw-mask oracle。设置为已完成评估的目录，例如本地
+归并后的运行：
+
 ```bash
-PYTHONPATH=build/galp/torch \
+RAW_MASK_ORACLE_DIR="$PWD/galp/benchmarks/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100"
+```
+
+```bash
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/run.py \
+  -m galp.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload evaluation \
-  --pipelines dct_major_pushdown dct_major_coefficient_pushdown rgbnomore dali pytorch \
+  --raw-mask-oracle-dir "$RAW_MASK_ORACLE_DIR" \
+  --pipelines dct_major_pushdown dct_major_coefficient_pushdown rgbnomore dali ffcv pytorch \
   --dct-coeffs first:32 \
-  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
-  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
-  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
+  --dct-major-manifest galp/data/compressed/imagenet512_val_block_major/manifest.bin \
+  --dct-major-label-map galp/data/compressed/imagenet512_val_compact_v3/labels.json \
+  --block-major-access-dir galp/data/compressed/imagenet512_val_block_major/access \
   --sample-count 50000 \
   --output-dir /tmp/galp-dct-major-evaluation-50k
 ```
@@ -133,12 +162,13 @@ batch 数并保留 partial tail。DCT-major 生产 profile 要求 warmup 为 0�
 ## 完整 suite
 
 ```bash
-PYTHONPATH=build/galp/torch:galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/run_suite.py \
-  --dct-major-manifest /tmp/galp-blockmajor-512-s1024-rg128/manifest.bin \
-  --dct-major-label-map galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
-  --block-major-access-dir /tmp/galp-dct-pushdown-access-512 \
+  -m galp.benchmarks.system_dct_major.run_suite \
+  --raw-mask-oracle-dir "$RAW_MASK_ORACLE_DIR" \
+  --dct-major-manifest galp/data/compressed/imagenet512_val_block_major/manifest.bin \
+  --dct-major-label-map galp/data/compressed/imagenet512_val_compact_v3/labels.json \
+  --block-major-access-dir galp/data/compressed/imagenet512_val_block_major/access \
   --dct-coeffs first:32 \
   --output-dir /tmp/galp-dct-pushdown-k32-suite \
   --dry-run

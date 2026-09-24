@@ -1,6 +1,8 @@
 # GALP 全模型综合报告：ViT、SwinV2、eFUN 与 CNN 的训练、推理和资源分析
 
-整理日期：2026-09-16。本文汇总已完成实验，不新增 GPU 测量。数据来自不同日期的完整运行与独立 profiling，保留各自的配置、统计范围和重复次数。章节采用“模型与设置 → 总体结果 → 存储及资源 → 分模型 breakdown”的顺序。
+初版：2026-09-16；训练汇总更新：2026-09-24。本文汇总已完成实验，不新增 GPU 测量。数据来自不同日期的完整运行与独立 profiling，保留各自的配置、统计范围和重复次数。章节采用“模型与设置 → 总体结果 → 存储及资源 → 分模型 breakdown”的顺序。
+
+> **2026-09-23 训练更新：** 第4节已更新全部9条 DALI 模型 CUDA Graph 路径的完整 E2 数据。GALP block-major 已完成7/7个配置，全部新E2性能及验证结果已更新。ViT/Swin各完成两轮、累计2,504次更新，进程采样只有各自训练进程。DALI CNN的5条Graph路径已确认实际重放；DALI ViT/Swin及本轮GALP尚待profiling。ResNet DCT64新测E2有其他GPU测试并发，见第4.3节。原始数据与限制见[补测报告](DALI_CUDA_GRAPH_TRAINING_SUPPLEMENT_2026-09-22.md)。
 
 ## 1. 模型汇总与来源
 
@@ -40,7 +42,7 @@ ViT 分类头为 LayerNorm→token 平均→Linear(192,192)→Tanh→Linear(192,
 | R4 | Goldberg 等，*Rethinking FUN: Frequency-Domain Utilization Networks*；[论文](https://arxiv.org/abs/2012.03357)、[作者代码](https://github.com/kfirgoldberg/FUN)；revision `6c2b5f4a43a2b514163ff1f3f114d4feeb174d3c`；[本地家族参数核查](../../../experiments/dct_pushdown_inference/EFUN_RESULTS_AND_TRAINING_ZH.md) | base 使用作者 `efun.pth` 的 `state_dict`，不选 EMA；不将作者 V100、batch1 的 FPS 混入本系统结果 |
 | R5 | [Torchvision EfficientNet-B0](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.efficientnet_b0.html)、[本地 eFUN/RGB 适配器](../../../experiments/dct_pushdown_inference/efun_backend.py) | `IMAGENET1K_V1`，`efficientnet_b0_rwightman-7f5810bc.pth`；它不是 eFUN 的同构 RGB checkpoint |
 
-以上 checkpoint 用于预训练推理；CNN/eFUN 训练构造模型后重置参数，从零训练。作者公开精度与本地 ImageNet-512 重编码数据上的精度分别解释。历史 ViT 192 维特征提取实验见 [2026-08-04 报告](LATEST_EXPERIMENT_REPORT_2026-08-04.md)，其输出不是 1000 类 logits，因此不混入分类推理表。
+以上 checkpoint 用于预训练推理；CNN/eFUN 训练构造模型后重置参数，从零训练。作者公开精度与本地 ImageNet-512 重编码数据上的精度分别解释。历史 ViT 192 维特征提取实验见 [2026-08-04 报告](EXPERIMENT_REPORT_2026-08-04.md)，其输出不是 1000 类 logits，因此不混入分类推理表。
 
 ## 2. 实验设置与比较边界
 
@@ -51,27 +53,27 @@ ViT 分类头为 LayerNorm→token 平均→Linear(192,192)→Tanh→Linear(192,
 | GPU | 单张 RTX 4090；训练主报告 UUID `40c637bd-acf5-ea1a-0df8-617138228467`，24 GiB 级显存 |
 | 数据 | ImageNet-512；每训练 epoch 1,281,167 个唯一样本；分类验证/推理 50,000 图，1000 类 |
 | 软件证据 | ViT 9 月训练与 Swin 性能矩阵记录 Torch 2.11.0+cu128/CUDA 12.8；ViT 记录 DALI 2.2.0、driver 590.48.01、Nsight 2025.5.2；不据此假定所有历史运行软件相同 |
-| 运行批次 | ViT 推理 8/5、训练 9/1；Swin 9/11–12；CNN 训练 9/14、推理 9/15；eFUN 9/15–16，DALI 采用 9/16 更新 |
+| 运行批次 | DALI Graph训练更新为9/22；其余历史批次：ViT推理8/5、训练9/1，Swin 9/11–12，CNN训练9/14、推理9/15，eFUN 9/15–16 |
 | 缓存 | 训练主要比较 warm E2；推理未统一强制冷 page cache；不是冷 NVMe 性能排名 |
 | 时间 | 完整训练时间排除单独验证；CNN/eFUN 首轮包含首次编译；推理在线时间不含 GALP 离线提取、编码、重排及索引构建 |
 | 统计范围 | ViT/Swin 推理各 5 repeats，保留 repeat0、聚合 repeat1–4；CNN 单次 50K；eFUN DALI 三次确认取中位，其余路径单次 |
 | 延迟 | ViT/Swin 有实际 batch mean/p95；CNN/eFUN 主表仅提供 `1000×batch/吞吐` 的摊销 batch 间隔，不冒充实测请求延迟或 p95 |
 | 单位 | GB/MB 为十进制；GiB/MiB 为二进制；`—` 表示本次汇总来源未提供该口径的可用数值，绝不表示零 |
 
-CNN 9/15 推理复测未观察到同卡额外计算进程；训练没有同等独占证据。eFUN JPEG 训练主表采用无同卡额外进程记录的复测；最新 DALI 训练仍记录约 21 秒和 4 秒的额外进程，以下用 **†** 标识。无竞争记录也不能排除共享 CPU/I/O 或短时干扰。
+CNN 9/15 推理复测未观察到同卡额外计算进程；历史训练没有同等独占证据。eFUN JPEG训练采用无同卡额外进程记录的复测。9/22 DALI Graph训练的占用记录见第4.1节，**†**标记Swin D2的同卡并发；eFUN旧default训练的并发记录仍保留在历史分析中。无竞争记录也不能排除共享CPU/I/O或短时干扰。
 
 ### 2.2 训练配置
 
 | 设置 | 当前性能矩阵 |
 | --- | --- |
 | Batch | microbatch64 × accumulation16＝通常有效 batch1024；每轮 20,019 microbatches、1252 次更新；不丢尾批 |
-| 初始化 / seed | 从零训练；seed11997733；ViT 性能窗口从 E1 checkpoint 恢复测 E2 |
+| 初始化 / seed | 从零训练；seed11997733；ViT DALI从历史 E1 checkpoint 恢复测 E2；本轮GALP全部从零训练两轮 |
 | 优化器 | AdamW，LR0.003，betas(.9,.999)，epsilon1e−8；内置 decay0，独立 weight decay1e−4；梯度 norm clipping1 |
 | 调度 | 10,000 optimizer-update warmup，300-epoch cosine horizon；**不表示已完成 300 轮** |
 | 精度 / 编译 | ViT 性能研究 FP32，编译在 E2 计时外；Swin BF16 autocast；CNN/eFUN BF16 autocast＋Inductor，TF32 off |
-| 实际训练长度 | CNN/eFUN 每臂完整 2 轮（2504 次更新，仍在 warmup）；Swin 性能矩阵 2 轮，另有 E15 配对及 native 长前缀；ViT 主表为 warm E2 性能研究 |
+| 实际训练长度 | CNN/eFUN 每臂完整 2 轮（2504 次更新，仍在 warmup）；Swin 性能矩阵 2 轮，另有 E15 配对及 native 长前缀；ViT GALP完整两轮、DALI本轮只重测E2 |
 | B6 调度 | 每1024图共享几何决策，4组构成4096图封闭池，延迟 shuffle 并预取下一池；CNN 使用 M4 双 context、32768 transform blocks/launch；eFUN 使用注册的默认 transform 配置 |
-| 数值检查 | CNN/Swin/eFUN 首100次更新严格检查，之后递延检查；ViT 9/1 E2 仍保留更新前 gradient finite 检查；策略差异影响性能解释 |
+| 数值检查 | CNN/Swin/eFUN 首100次更新严格检查，之后递延检查；ViT DALI E2保留历史更新前 gradient finite 检查；本轮ViT GALP使用首100次更新严格检查；策略差异影响性能解释 |
 
 | 模型组 | JPEG / RGB PyTorch 训练 workers | DALI 训练配置 | 推理 batch / 并行 |
 | --- | --- | --- | --- |
@@ -151,72 +153,256 @@ ViT 的 GALP/DALI 约1.012×，没有达到该实验预设的1.10×目标；Swin
 
 ### 4.1 完整 warm Epoch 2
 
+标注 Graph 的16行包括9条 DALI 新结果和7条 GALP block-major 新结果；其余行保留历史 default。RGB/DCT之间仍有模型、输入与检查策略差异，速度比属于系统观测。Graph表示配置为 `reduce-overhead`，实际重放的验证范围另述。
+
 所有行每轮均为1,281,167图；时间含相应 runner 的 epoch 准备和训练循环，验证另计。`ms/更新* = E2秒×1000/1252` 是将整轮开销摊到 optimizer update 的平均间隔，包含16次 microbatch及准备/等待，**不是实测 optimizer kernel 延迟**。没有统一的逐更新 p95，不填造尾延迟。模型流计数与 Nsight kernel 并集不同，也可能与输入重叠。
 
 | 模型 | 路径 | E2 秒 | images/s | ms/更新* | 输入等待秒 | 模型流秒 |
 | --- | --- | --- | --- | --- | --- | --- |
-| ViT-Ti | GALP B6 DCT | 570.325 | 2246.38 | 455.53 | 2.644 | — |
-| ViT-Ti | DALI D2 RGB | 797.185 | 1607.11 | 636.73 | 12.058 | — |
-| ViT-Ti | DALI D3 RGB | 697.740 | 1836.17 | 557.30 | 5.201 | — |
+| ViT-Ti | GALP B6 DCT · Graph | 538.215 | 2380.40 | 429.88 | 0.925 | — |
+| ViT-Ti | DALI D2 RGB · Graph | 618.335 | 2071.96 | 493.88 | 6.087 | — |
+| ViT-Ti | DALI D3 RGB · Graph | 533.138 | 2403.07 | 425.83 | 3.094 | — |
 | ViT-Ti | PyTorch4 RGB | 1363.368 | 939.71 | 1088.95 | 209.918 | — |
 | ViT-Ti | PyTorch48 RGB | 1168.602 | 1096.32 | 933.39 | 7.125 | — |
-| SwinV2-T | GALP B6 DCT | 924.079 | 1386.43 | 738.08 | 11.564 | — |
+| SwinV2-T | GALP B6 DCT · Graph | 959.316 | 1335.50 | 766.23 | 80.288 | — |
 | SwinV2-T | RGB-no-more DCT | 2368.959 | 540.81 | 1892.14 | 126.682 | — |
-| SwinV2-T | DALI D2 RGB | 1221.341 | 1048.98 | 975.51 | 9.182 | — |
-| SwinV2-T | DALI D3 RGB | 1115.530 | 1148.48 | 891.00 | 4.005 | — |
+| SwinV2-T | DALI D2 RGB · Graph † | 1030.794 | 1242.89 | 823.32 | 24.785 | — |
+| SwinV2-T | DALI D3 RGB · Graph | 894.051 | 1432.99 | 714.10 | 22.519 | — |
 | SwinV2-T | PyTorch RGB | 1854.400 | 690.88 | 1481.15 | 5.322 | — |
-| MobileNetV2 DCT-24 | B6 | 1348.257 | 950.24 | 1076.88 | 872.898 | 471.922 |
+| MobileNetV2 DCT-24 | B6 · Graph | 843.557 | 1518.77 | 673.77 | 439.238 | 363.051 |
 | MobileNetV2 DCT-24 | A0 JPEG | 2250.678 | 569.24 | 1797.67 | 940.089 | 1243.840 |
 | MobileNetV2 RGB | rgb_pytorch | 1519.472 | 843.17 | 1213.64 | 127.365 | 1286.082 |
-| MobileNetV2 RGB | rgb_d2 | 1112.430 | 1151.68 | 888.52 | 113.234 | 933.580 |
-| MobileNetV2 RGB | rgb_d3 | 1056.861 | 1212.24 | 844.14 | 29.275 | 991.342 |
-| MobileNetV2 DCT-32 | B6 | 1339.370 | 956.54 | 1069.78 | 851.941 | 482.229 |
+| MobileNetV2 RGB | rgb_d2 · Graph | 422.359 | 3033.36 | 337.35 | 152.604 | 328.069 |
+| MobileNetV2 RGB | rgb_d3 · Graph | 365.137 | 3508.73 | 291.64 | 126.981 | 330.994 |
+| MobileNetV2 DCT-32 | B6 · Graph | 862.590 | 1485.26 | 688.97 | 438.707 | 383.228 |
 | MobileNetV2 DCT-32 | A0 JPEG | 1960.483 | 653.50 | 1565.88 | 516.865 | 1362.390 |
-| ResNet-50 DCT-24 | B6 | 1789.061 | 716.11 | 1428.96 | 1.538 | 1777.644 |
+| ResNet-50 DCT-24 | B6 · Graph | 1770.902 | 723.45 | 1414.46 | 1.379 | 1757.292 |
 | ResNet-50 DCT-24 | A0 JPEG | 1829.811 | 700.16 | 1461.51 | 775.026 | 1766.769 |
 | ResNet-50 RGB | rgb_pytorch | 1477.942 | 866.86 | 1180.46 | 128.042 | 1253.951 |
-| ResNet-50 RGB | rgb_d2 | 1085.047 | 1180.75 | 866.65 | 132.798 | 918.848 |
-| ResNet-50 RGB | rgb_d3 | 1065.848 | 1202.02 | 851.32 | 42.978 | 1008.195 |
-| ResNet-50 DCT-64 | B6 | 1805.918 | 709.43 | 1442.43 | 1.573 | 1794.610 |
+| ResNet-50 RGB | rgb_d2 · Graph | 779.187 | 1644.24 | 622.35 | 494.138 | 685.936 |
+| ResNet-50 RGB | rgb_d3 · Graph | 715.672 | 1790.16 | 571.62 | 459.527 | 687.378 |
+| ResNet-50 DCT-64 | B6 · Graph ‡ | 1792.717 | 714.65 | 1431.88 | 1.411 | 1779.364 |
 | ResNet-50 DCT-64 | A0 JPEG | 2008.343 | 637.92 | 1604.11 | 688.130 | 1891.456 |
 | eFUN | JPEG A0 | 1386.967 | 923.72 | 1107.80 | 81.816 | 1255.389 |
-| eFUN | GALP B6 | 529.811 | 2418.16 | 423.17 | 1.010 | 511.917 |
+| eFUN | GALP B6 · Graph | 413.376 | 3099.27 | 330.17 | 82.492 | 315.799 |
 | EfficientNet-B0 RGB | PyTorch | 1761.882 | 727.16 | 1407.25 | 120.651 | 1538.952 |
-| EfficientNet-B0 RGB | DALI D2 16/4 † | 938.800 | 1364.69 | 749.84 | 90.819 | 809.089 |
+| EfficientNet-B0 RGB | DALI D2 16/4 · Graph | 552.354 | 2319.47 | 441.18 | 217.183 | 451.164 |
 
-† eFUN RGB DALI 使用最新16/4配置，但完整训练仍带已知同卡占用。JPEG采用复测，GALP/PyTorch采用原矩阵。ViT 未完成本批 RGB-no-more DCT 全 epoch，不能拿其 data-only 短测代替。ResNet-50 的四条 DCT 训练臂及 RGB 参照均已有完整两轮结果，不再标为“待补训练”。
+† Swin D2 运行期间采样到其他测试进程，保留为带并发标记的观测；Swin D3及ViT两条路径除训练进程外仅采样到用户指定忽略的 `PHJ_GDS_13`，不据此声称完全独占。DALI CNN/eFUN五条E2采样仅有目标进程；DALI ResNet采用从本次E1 checkpoint恢复的E2重放。ViT DALI本轮只重测E2，E1沿用历史checkpoint；其FP32/历史检查策略与Swin及CNN的BF16配置分别保留。验证时间不计入训练耗时。
 
-Swin同域GALP/RGB-no-more的E2吞吐比为2.56×；CNN的B6/A0比值依次为MobileNet DCT24 1.67×、DCT32 1.46×、ResNet DCT24 1.02×、DCT64 1.11×；eFUN为2.62×。这些比值的裁剪、顺序和精度约束见第2节，不能作为完全相同输入语义下的统一加速排名。
+以下比值仍引用历史 default 数据（不由上表新Graph行计算）：Swin同域GALP/RGB-no-more的E2吞吐比为2.56×；CNN的B6/A0比值依次为MobileNet DCT24 1.67×、DCT32 1.46×、ResNet DCT24 1.02×、DCT64 1.11×；eFUN为2.62×。这些比值的裁剪、顺序和精度约束见第2节，不能作为完全相同输入语义下的统一加速排名。
 
 ### 4.2 训练精度与已完成长度
 
 | 模型 | 路径 | 验证节点 | Top-1 % | Top-5 % | 验证 CE |
 | --- | --- | --- | --- | --- | --- |
-| MobileNetV2 DCT-24 | B6 | E2 | 16.064 | 36.440 | 4.2977 |
+| MobileNetV2 DCT-24 | B6 · Graph | E2 | 16.064 | 36.440 | 4.2977 |
 | MobileNetV2 DCT-24 | A0 JPEG | E2 | 15.596 | 36.082 | 4.3269 |
 | MobileNetV2 RGB | rgb_pytorch | E2 | 19.236 | 40.554 | 4.0798 |
-| MobileNetV2 RGB | rgb_d2 | E2 | 19.460 | 40.934 | 4.0675 |
-| MobileNetV2 RGB | rgb_d3 | E2 | 18.704 | 40.132 | 4.1126 |
-| MobileNetV2 DCT-32 | B6 | E2 | 16.118 | 36.396 | 4.2850 |
+| MobileNetV2 RGB | rgb_d2 · Graph | E2 | 19.460 | 40.934 | 4.0675 |
+| MobileNetV2 RGB | rgb_d3 · Graph | E2 | 18.704 | 40.132 | 4.1126 |
+| MobileNetV2 DCT-32 | B6 · Graph | E2 | 16.118 | 36.396 | 4.2850 |
 | MobileNetV2 DCT-32 | A0 JPEG | E2 | 15.794 | 36.154 | 4.3100 |
-| ResNet-50 DCT-24 | B6 | E2 | 21.476 | 45.388 | 3.8449 |
+| ResNet-50 DCT-24 | B6 · Graph | E2 | 21.476 | 45.388 | 3.8449 |
 | ResNet-50 DCT-24 | A0 JPEG | E2 | 21.646 | 45.748 | 3.8512 |
 | ResNet-50 RGB | rgb_pytorch | E2 | 22.898 | 45.836 | 3.8758 |
-| ResNet-50 RGB | rgb_d2 | E2 | 23.808 | 47.220 | 3.7987 |
-| ResNet-50 RGB | rgb_d3 | E2 | 22.520 | 46.560 | 3.8590 |
-| ResNet-50 DCT-64 | B6 | E2 | 21.942 | 45.930 | 3.8134 |
+| ResNet-50 RGB | rgb_d2 · Graph | E2 | 23.808 | 47.220 | 3.7987 |
+| ResNet-50 RGB | rgb_d3 · Graph | E2 | 22.520 | 46.560 | 3.8590 |
+| ResNet-50 DCT-64 | B6 · Graph ‡ | E2 | 21.942 | 45.930 | 3.8134 |
 | ResNet-50 DCT-64 | A0 JPEG | E2 | 19.446 | 42.550 | 4.1855 |
 | eFUN | JPEG A0 | E2 | 19.372 | 41.744 | 4.0409 |
-| eFUN | GALP B6 | E2 | 19.464 | 41.654 | 4.0503 |
+| eFUN | GALP B6 · Graph | E2 | 19.464 | 41.654 | 4.0503 |
 | EfficientNet-B0 RGB | PyTorch | E2 | 20.924 | 44.068 | 3.8894 |
-| EfficientNet-B0 RGB | DALI D2 16/4 † | E2 | 21.234 | 44.218 | 3.8722 |
+| EfficientNet-B0 RGB | DALI D2 16/4 · Graph | E2 | 21.234 | 44.218 | 3.8722 |
+| ViT-Ti DCT | GALP B6 · Graph | E2 | 3.574 | 10.882 | 5.9372 |
+| SwinV2-T DCT | GALP B6 · Graph | E2 | 15.656 | 34.946 | 4.3978 |
 | SwinV2-T DCT | GALP B6 | 独立E15 | 59.816 | 83.234 | — |
 | SwinV2-T DCT | 配对参考 | 独立E15 | 59.490 | 82.944 | — |
-| ViT-Ti | 性能研究 | E2 | — | — | — |
+| ViT-Ti RGB | DALI D2 RGB · Graph | E2 | 10.936 | 26.968 | 4.8434 |
+| ViT-Ti RGB | DALI D3 RGB · Graph | E2 | 10.550 | 26.326 | 4.8747 |
+| SwinV2-T RGB | DALI D2 RGB · Graph | E2 | 17.350 | 37.178 | 4.2739 |
+| SwinV2-T RGB | DALI D3 RGB · Graph | E2 | 18.632 | 39.490 | 4.1513 |
 
-CNN/eFUN 是单种子、两轮 warmup 结果，只支持当前训练进展，不能证明最终收敛等价。Swin 的性能 E2 与收敛实验 E15 是独立运行；其 native 长前缀训练完成78轮、最后完整验证在E75，Top-1/Top-5为69.426%/89.720%，E15之后没有同长度参考对照。ViT 性能研究没有与本表对应的最终收敛结果。所有预训练推理分数均与这些从零训练分数分开。
+本轮GALP七项都是单种子、两轮 warmup 结果，只支持当前训练进展，不能证明最终收敛等价。Swin 的性能 E2 与收敛实验 E15 是独立运行；其 native 长前缀训练完成78轮、最后完整验证在E75，Top-1/Top-5为69.426%/89.720%，E15之后没有同长度参考对照。ViT 性能研究没有与本表对应的最终收敛结果。所有预训练推理分数均与这些从零训练分数分开。
+
+### 4.3 GALP block-major Graph 完整重测结果
+
+已完成7个配置：MobileNetV2 DCT24/32、ResNet-50 DCT24/64、eFUN、ViT-Ti DCT、SwinV2-T DCT。复用迁移后的完整源训练premix，B6每PLS共享crop、M4封闭池，microbatch64、accumulation16、seed11997733；模型 forward/backward 使用 `reduce-overhead`，输入流水线和optimizer不整体捕获。全部从零训练两轮，每轮1,281,167张并做50K验证；ViT FP32，其余BF16 autocast，TF32关闭。Transformer保留300轮调度，在E2边界停止，不能解释为完成300轮。
+
+这批使用当前benchmark/native实现和`runtime-first-100`检查策略。ViT DALI新结果仍沿用历史逐更新gradient检查，因此两者检查开销并非完全相同；跨日期及代码版本变化也意味着不能将与旧default的时间差全部归因于Graph。CNN/eFUN保持原验证输入；源训练数据是完整block-major源，并非离线模型目标。
+
+截至9月23日，七项均完成计划内两轮，每轮训练1,281,167张并验证50,000张，最终累计2,504次optimizer update。CNN/eFUN的唯一样本计数与训练样本数一致；ViT/Swin的覆盖、契约和数值检查全部通过。Transformer状态 `paused-at-epoch-boundary` 是按 `--stop-after-epoch 2` 正常停止，退出码为0，不是训练失败；仍处于300轮配方的前两轮。下表加速比为历史default耗时/本轮耗时，不能全部归因于Graph。
+
+| 模型 / 原始结果 | 历史 default E2 秒 | 本轮 Graph E2 秒 | images/s | 观测加速比 | 耗时下降 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| [MobileNetV2 DCT-24](../../../../benchmark_results/block_major_graph_training_20260923/mobilenet24/training.json) | 1348.257 | 843.557 | 1518.77 | 1.598× | 37.43% |
+| [MobileNetV2 DCT-32](../../../../benchmark_results/block_major_graph_training_20260923/mobilenet32/training.json) | 1339.370 | 862.590 | 1485.26 | 1.553× | 35.60% |
+| [ResNet-50 DCT-24](../../../../benchmark_results/block_major_graph_training_20260923/resnet24/training.json) | 1789.061 | 1770.902 | 723.45 | 1.010× | 1.02% |
+| [ResNet-50 DCT-64](../../../../benchmark_results/block_major_graph_training_20260923/resnet64/training.json) ‡ | 1805.918 | 1792.717 | 714.65 | 1.007× | 0.73% |
+| [eFUN](../../../../benchmark_results/block_major_graph_training_20260923/efun/training.json) | 529.811 | 413.376 | 3099.27 | 1.282× | 21.98% |
+| [ViT-Ti DCT](../../../../benchmark_results/block_major_graph_training_20260923_transformers/vitti/runs/B6/seed_11997733/metrics.jsonl) | 570.325 | 538.215 | 2380.40 | 1.060× | 5.63% |
+| [SwinV2-T DCT](../../../../benchmark_results/block_major_graph_training_20260923_transformers/swinv2/runs/B6/seed_11997733/metrics.jsonl) | 924.079 | 959.316 | 1335.50 | 0.963× | -3.81% |
+
+‡ ResNet DCT64的E2在第28.71–295.94秒之间采样到其他 `galp_tests`，第96.45–269.62秒之间采样到其他Python GPU进程；时间段表示首次/末次出现，不是连续计算时间。该结果保留为并发条件下的观测，不能以0.73%的耗时差异判断Graph收益。MobileNet DCT24 E2还采样到用户指定忽略的 `PHJ_GDS_*`；MobileNet DCT32、ResNet DCT24和eFUN的E2采样只有各自训练进程。各模型完整进程采样与 `training.json` 同目录。
+
+MobileNet两个配置的输入等待仍约439秒，占E2约51–52%；ResNet模型流约1,757/1,779秒，仍接近整轮时间。eFUN E2为413.376秒，相对DALI RGB EfficientNet-B0 Graph的552.354秒吞吐约1.336×，但两者模型/输入不同，E2 Top-1分别为19.464%/21.234%。MobileNet与ResNet的DCT路径在本轮结果中仍慢于各自DALI RGB参照。五项GALP的E2验证Top-1/Top-5及四位小数CE与历史表一致，这不等于最终收敛验证。
+
+ViT/Swin已在 `benchmark_results/block_major_graph_training_20260923_transformers/` 完成重跑，原先启动失败的日志保留在旧目录。两次完整进程采样分别只有训练PID 1611065/1748397；没有采样到其他计算进程。ViT E1/E2为592.544/538.215秒，Swin为1113.751/959.316秒。两者初始、E1和E2均完成50K验证；本轮E2 Top-1分别为3.574%和15.656%，只代表当前两轮warmup进度。
+
+ViT相对历史default的E2耗时下降5.63%；本轮ViT检查策略也已改变，不能将差异全部归因于Graph。Swin反而增加3.81%，输入等待由历史11.564秒增加至80.288秒（其中next_pool等待80.006秒）。进程采样未发现同卡并发；这些计数不能单独确定等待增加的原因，也不能据此断言Graph本身使训练变慢。
+
+与DALI Graph对照，ViT GALP为538.215秒，DALI D2/D3为618.335/533.138秒：GALP相对D2吞吐1.149×，相对更快的D3为0.991×（耗时多0.95%）。Swin GALP为959.316秒，DALI D2/D3为1030.794/894.051秒：相对D2/D3吞吐分别为1.075×/0.932×，但D2带并发标记；相对D3耗时多7.30%。这些是不同RGB/DCT输入、训练语义及精度结果下的系统对照。所有七项GALP已确认使用 `reduce-overhead`，实际CUDA Graph重放仍待独立profiling。
+
+批量入口：[run_block_major_graph.py](../../run_block_major_graph.py)。运行环境为现有`fastlanes-cuda`，固定RTX 4090 UUID；按用户要求，忽略`/home/zengletian/GPU-HASH-JOIN/GPU-Hash-Join/PHJ_GDS/`下的`PHJ_GDS_*`占用进程（含`PHJ_GDS_13_diff`）；其他同卡计算进程阻止启动，所有进程仍采样。
+
+```bash
+cd /home/tangyuxin/gfastlanes/FastLanes
+/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -u \
+  -m galp.benchmarks.run_block_major_graph --models vitti swinv2 \
+  --output-dir benchmark_results/block_major_graph_training_20260923_transformers --execute
+```
+
+已完成五项结果位于 `benchmark_results/block_major_graph_training_20260923/{模型}/`；ViT/Swin结果位于上面的新目录。每项完成后输出 `BLOCK-MAJOR GRAPH COMPLETE {模型}`；再次执行会跳过已完成项。可用 `--models mobilenet24` 等选择已有配置。CNN/eFUN保存`training.json`，Transformer保存`runs/B6/seed_11997733/metrics.jsonl`和`pause_result.json`，另有各模型`run.log`与`gpu_4090_processes.csv`。新性能数值以完整E2结果为准，真实Graph重放另用profiling确认。
+
+### 4.4 Graph 开关前后，GALP 相对各 baseline 的加速比
+
+加速比统一定义为 `baseline E2秒 / GALP E2秒`，等价于相同样本数下的 `GALP吞吐 / baseline吞吐`；大于1表示GALP快，小于1表示GALP慢。这里的“关闭”是历史 `torch.compile(mode="default")`，保留Inductor编译；“开启”是本轮 `reduce-overhead`。两组跨日期及代码版本，不能将差异视为单因素Graph效应。所有时间为完整1,281,167图的warm E2，不含验证。
+
+**DALI：双方开关一致的系统对照。** D2使用planned crop/flip，D3使用DALI-native随机顺序/增强；两者分别比较，不将D3视为与B6严格相同的训练语义。MobileNet DCT24/32共用主表MobileNet RGB参照，ResNet DCT24/64共用主表ResNet RGB参照；eFUN的RGB参照为不同架构的EfficientNet-B0。
+
+| GALP模型 | 对DALI D2：双方关闭 | 对DALI D2：双方开启 | 对DALI D3：双方关闭 | 对DALI D3：双方开启 |
+| --- | ---: | ---: | ---: | ---: |
+| ViT-Ti | 1.398× | 1.149× | 1.223× | 0.991× |
+| SwinV2-T | 1.322× | 1.075× † | 1.207× | 0.932× |
+| MobileNet DCT24 | 0.825× | 0.501× | 0.784× | 0.433× |
+| MobileNet DCT32 | 0.831× | 0.490× | 0.789× | 0.423× |
+| ResNet DCT24 | 0.606× | 0.440× | 0.596× | 0.404× |
+| ResNet DCT64 ‡ | 0.601× | 0.435× | 0.590× | 0.399× |
+| eFUN | 1.772× | 1.336× | — | — |
+
+† DALI Swin D2 Graph运行有其他GPU进程并发。‡ GALP ResNet DCT64 Graph E2有其他GPU进程并发。这两项保留观测值，不能据小差异作因果判断。其余占用和精度限制沿用第4.1–4.3节。
+
+**其他 baseline：尚无双方开启的对应测量。** 以下右列只将GALP换成本轮Graph结果，baseline仍为历史default，供核对现有数据；不能作为“双方开启Graph”的公平加速比。RGB-no-more/JPEG A0与B6的输入调度、增强语义约束见第2节，即使同DCT模型也不等于仅替换reader。
+
+| GALP模型 | baseline | 双方关闭 | 仅GALP开启，baseline未重测 |
+| --- | --- | ---: | ---: |
+| ViT-Ti | RGB PyTorch 4 workers | 2.391× | 2.533× |
+| ViT-Ti | RGB PyTorch 48 workers | 2.049× | 2.171× |
+| SwinV2-T | RGB-no-more DCT | 2.564× | 2.469× |
+| SwinV2-T | RGB PyTorch | 2.007× | 1.933× |
+| MobileNet DCT24 | 同DCT模型 JPEG A0 | 1.669× | 2.668× |
+| MobileNet DCT24 | RGB PyTorch | 1.127× | 1.801× |
+| MobileNet DCT32 | 同DCT模型 JPEG A0 | 1.464× | 2.273× |
+| MobileNet DCT32 | RGB PyTorch | 1.134× | 1.762× |
+| ResNet DCT24 | 同DCT模型 JPEG A0 | 1.023× | 1.033× |
+| ResNet DCT24 | RGB PyTorch | 0.826× | 0.835× |
+| ResNet DCT64 ‡ | 同DCT模型 JPEG A0 | 1.112× | 1.120× |
+| ResNet DCT64 ‡ | RGB PyTorch | 0.818× | 0.824× |
+| eFUN | 同eFUN模型 JPEG A0 | 2.618× | 3.355× |
+| eFUN | RGB EfficientNet-B0 PyTorch | 3.325× | 4.262× |
+
+**变化原因与证据。** 对同一baseline，有 `开启后的相对加速比 / 关闭后的相对加速比 = GALP自身提速 / baseline自身提速`。DALI模型执行也能使用同一PyTorch优化，因此Graph后GALP自身变快，并不意味着相对DALI的优势增加。
+
+- **MobileNet：DALI收益更大，GALP仍有明显输入等待。** GALP DCT24/32自身分别提速1.598×/1.553×，DALI D2/D3为2.634×/2.894×。DALI D3的model stream从991.342秒降到330.994秒，符合减少模型提交开销的解释；同时输入等待从29.275秒增至126.981秒，说明等待暴露程度改变，不能直接判断解码变慢。GALP两项的输入等待仍约439秒，占E2约51–52%，所以相对DALI优势进一步降低。GALP还包含不同空间尺寸的DCT模型，不能只归因为reader。
+- **ResNet：DCT模型计算量主导，Graph不能消除该差异。** DCT24/64卷积与线性层约13.56 GMAC/image，RGB约4.09，约3.32倍。GALP模型流约1757/1779秒，几乎覆盖整轮，输入等待仅约1.4秒；历史到本轮仅约1%的时间变化。DALI RGB D2/D3自身提速1.393×/1.489×，使GALP相对吞吐降至约0.40–0.44×。DCT64另有并发干扰，不能把小幅变化解释为确定的Graph收益。
+- **eFUN：优势保留，但缩小。** GALP自身提速1.282×，RGB EfficientNet-B0 DALI提速1.700×，因此GALP/DALI由1.772×降至1.336×。GALP模型流从511.917秒降至315.799秒，暴露输入等待由1.010秒增至82.492秒；模型更快后输入重叠关系变化是可能解释。两者架构与精度不同，E2 Top-1为19.464%/21.234%，且旧DALI default有并发记录，不能当作纯pipeline或纯Graph加速。
+- **ViT：对DALI D3的历史优势收敛至基本持平。** GALP自身提速1.060×，DALI D2/D3为1.289×/1.309×，使对D3的加速比由1.223×降为0.991×。GALP输入等待只有0.925秒，因此当前没有明显暴露的供数等待；不能由此把其余时间全部计作模型kernel。GALP新测采用首100次严格检查，DALI仍保留历史逐更新gradient检查；输入域和增强也不同。
+- **Swin：本轮GALP等待增加，DALI优化后反超。** GALP E2从924.079秒增至959.316秒，输入等待从11.564秒增至80.288秒；DALI D3从1115.530秒降至894.051秒。因此对D3由1.207×变成0.932×。GALP采样没有同卡其他计算进程，但现有计数无法区分共享CPU/I/O、预取节奏和运行实现变化等因素，不能断言是Graph直接导致回退。
+
+上述model stream为CUDA event覆盖区间，可能包含提交间隙与等待，并非模型kernel净执行时间；输入等待与模型流也可能重叠，禁止相加作为端到端分解。本轮GALP实际Graph重放尚待profiling，已有DALI CNN五条路径确认重放。当前数据支持的结论是：相对DALI D3，ViT基本持平、Swin略慢、MobileNet和ResNet明显更慢；eFUN相对其已测DALI D2参照仍快约1.34×。对JPEG、RGB PyTorch、RGB-no-more的双方Graph优化后优势尚无测量。
+
+数据来源：GALP历史与新测时间见第4.3节；DALI CNN/eFUN精确值见[training.csv](assets/dali_graph_20260922/training.csv)；ViT历史见[模型报告第4节](VITTI_SYSTEM_PERFORMANCE_REPORT_2026-09-16.md)，Swin历史见[模型报告第4节](SWINV2_SYSTEM_PERFORMANCE_REPORT_2026-09-13.md)及其原始 `results.json`；Transformer Graph值见第4.1节链接的原始结果。历史报告舍入值参与计算的比值保留三位小数。
+
+### 4.5 SwinV2 回退与近期代码修改核查（2026-09-24）
+
+**结论：尚不能认定某次修改造成3.81%的回退；但“模型大幅加快，所以只暴露了更多等待”也缺乏Swin实测支持。** 模型校准总体吞吐几乎相同，池准备计时反而减少，下一池等待及audit主机计时增加。需要优先区分Graph与既有池生命周期的交互、native内存跟踪变化，以及运行时共享资源影响。此次只核查保存结果和源码，没有修改训练/native实现。
+
+**工作量和环境已对齐的部分。** 两次均RTX 4090（相同UUID）、PyTorch 2.11.0+cu128、cuDNN 91900、BF16、microbatch64/accumulation16/M4，初始模型哈希 `3023d064…` 相同。Swin两次audit策略哈希相同，都是 `runtime-first-100`；不要混用ViT检查策略变化的解释。每轮1,281,167张、1252次更新、313个池。E2实际样本顺序摘要 `15265d29…`、池成员摘要 `8497deaf…` 一致；旧指标中已有的所有native计数逐项一致，包括读取57,864,760,046字节、2,839,332次请求、4,089,642个选中向量和4,187,759,520个源block。物理manifest及mapping哈希也一致。数据迁移改变了外层路径和契约摘要，没有观察到本轮读取工作量增加。
+
+| Swin E2 / 校准指标 | 历史 default | 本轮 Graph | 差异 |
+| --- | ---: | ---: | ---: |
+| E2总时间，秒 | 924.079 | 959.316 | +35.237 |
+| next_pool主机等待，秒 | 11.199 | 80.006 | +68.807 |
+| next_microbatch主机等待，秒 | 0.365 | 0.282 | -0.083 |
+| native activation_wait，秒 | 11.190 | 80.000 | +68.810 |
+| prepare_plan累计主机计时，秒 | 104.807 | 99.098 | -5.708 |
+| prepare_materialize累计主机计时，秒 | 259.626 | 159.456 | -100.170 |
+| audit主机计时，秒 | 44.347 | 115.582 | +71.235 |
+| 池边界统计/释放/reclaim主机计时，秒 | 0.985 | 1.333 | +0.348 |
+| 独立model-only校准，images/s | 1377.065 | 1377.272 | +0.015% |
+| 独立model-only校准，秒/122880图 | 89.233 | 89.220 | -0.013 |
+
+`prepare_plan/materialize`是worker主机区间，可能含等待且不代表完整GPU执行时间；其中不包含进入prepare前申请context的等待。`audit_seconds`包括提交有限值检查和读取标量时等待之前GPU工作的时间，增加71秒不等于新增加71秒检查计算。不能把表中各项相加或用model-only校准从E2中相减。校准本身包含optimizer及audit；5次warmup后测120次更新，其中95次仍处于首100次严格检查阶段，因此它也不能证明纯forward/backward kernel没有变快，只能说明该校准口径下没有明显提速。
+
+**源码核查范围与发现。** 历史运行是 `31c9fd0` 上的dirty tree；不能直接把整个旧工作树等同该commit。通过保存的SHA-256找到了历史 `train.py` 和 `galp/torch/direct_dct.py` 的完全匹配内容，位于后续提交 `e57f042`；关键旧PLS C++/Torch桥接文件则与 `31c9fd0` 内容匹配。新测保存的相关runtime源文件哈希与核查时文件一致。native动态库及全部传递依赖没有同等完整的历史二进制快照，以下代码关联不能代替同版本A/B因果验证。
+
+| 修改 | 实际执行影响 | 对本次回退的判断 |
+| --- | --- | --- |
+| benchmark包迁移、导入路径调整 | 匹配旧train.py后，native epoch的池预取、释放、audit循环保持原样 | 没有找到热循环因模块迁移增加工作的证据 |
+| Graph配套改动 | `reduce-overhead`、持久grad、`zero_grad(set_to_none=False)`、每microbatch的step标记 | 确实改变执行与张量生命周期，是必须做同代码开关比较的因素 |
+| 池统计getter | 从 `execution_stats_ref()` 改为 `execution_stats()`，后者等待native完成事件并收集GPU统计 | 新同步真实存在，但该调用所在整段池边界累计仅增加0.348秒，不能把约69秒next_pool等待直接归给这个getter |
+| 9/21–9/23内存所有权修复 | DevicePool记录H2D关联，释放带pending传输的allocation前调用 `sync_pending_h2d`；TransferTracker对有pending记录的stream执行同步，且已把CUDA等待移到锁外 | 存在影响异步重叠的机制；不能仅凭增加锁/检查认定退化，更不能仅凭当前数据排除，需要测该路径调用数和同步时长 |
+| CNN projected输出支持 | 新投影路径由非空output_channels触发；Swin仍走28/14普通DCT分支 | 新投影分支里的 `cudaStreamSynchronize` 不在Swin这条执行路径上，不能作为Swin回退原因 |
+| Swin验证profile/图像ID校验 | 新32/16验证profile及通用reader校验；本轮训练仍为28/14 native PLS | 没有改变本轮训练的形状、样本顺序或读取计数 |
+
+对应代码：[Graph模型入口](../../training_pls/train.py#L145)、[训练循环](../../training_pls/train.py#L1016)、[池边界统计](../../training_pls/train.py#L1221)、[Torch统计getter](../../../torch/direct_dct_pls_torch.cpp#L307)、[释放前同步](../../../src/cuda/memory/device_pool.cuh#L438)、[传输同步](../../../src/cuda/memory/transfer_tracker.cuh#L78)、[普通/投影分支](../../../src/api/direct_dct_pls_postprocess.cu#L633)。这些链接对应核查时工作树。
+
+**最值得验证的重叠机制。** PLS最多允许两个活跃context；worker先在 `context_slots->acquire()` 等待名额，之后才开始记录prepare_plan/materialize。因此，即使已记录的准备时间下降，只要旧池的底层张量/consumer完成得更晚，下一池开始准备也可能更晚。`retire_context()`原本就是空标记，名额随底层backing真实释放；这个设计在旧源码中已存在，并不是最近才改成两池。Graph可能改变输入引用或GPU完成时机，内存跟踪也可能改变释放时机，这是待验证的交互假设。
+
+新测两轮epoch尾均为 `retired_count=312, live_context_count=1`，旧测为313/0；这表明采样时最后一个池的释放状态不同，值得跟踪，但不能据一个epoch尾快照推断全轮阻塞，更不能将其称为泄漏。`next_pool`的80.006秒几乎全部对应native的80.000秒activation_wait，说明等待主要发生在native供池返回之前，而不是Python的next_microbatch转换。
+
+**最小因果验证。** 先固定当前源码、同一native动态库和运行环境，串行重测default及reduce-overhead各两轮：若default也接近959秒，优先检查共同native变化或环境；若default仍接近924秒而Graph约959秒，优先检查Graph/grad缓冲与池生命周期交互。这一步只能区分当前实现中的开关影响；若要锁定某次native提交，还需要在同一Graph模式下比较匹配的旧/新native构建。一次配对仅用于定位，3.8%的稳定性需要重复运行支持。
+
+当前会话的 `nvidia-smi` 无法连接驱动，未执行GPU复测。按[命令与设备限制技能](/home/tangyuxin/.codex/skills/codex-workflow-preferences/SKILL.md)“After one useful diagnostic attempt, explain the blocker briefly and give the user the exact command to run locally.”，以下命令供宿主终端执行。它复用已完成Swin的完整参数，仅改变编译模式和输出目录，保留GPU进程采样；运行期间应保持源码和native构建不变。
+
+```bash
+cd /home/tangyuxin/gfastlanes/FastLanes
+/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -u - <<'PY_AB'
+import json, os, subprocess
+from pathlib import Path
+from galp.benchmarks.run_block_major_graph import GPU, completed
+root = Path.cwd()
+base = root / "benchmark_results/swin_graph_ab_20260924"
+source = root / "benchmark_results/block_major_graph_training_20260923_transformers/swinv2/command.json"
+env = dict(os.environ, CUDA_VISIBLE_DEVICES=GPU, OMP_NUM_THREADS="1",
+           OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", PYTHONDONTWRITEBYTECODE="1",
+           TMPDIR=str(Path.home() / "tmp/dctnet"), MPLCONFIGDIR=str(Path.home() / "tmp/matplotlib"))
+for mode in ("default", "reduce-overhead"):
+    out = base / mode
+    if completed("swinv2", out):
+        print("SKIP", mode, flush=True)
+        continue
+    occupied = subprocess.check_output(["nvidia-smi", "-i", GPU,
+        "--query-compute-apps=pid,process_name", "--format=csv,noheader,nounits"], text=True)
+    busy = [r for r in occupied.splitlines() if not r.split(",", 1)[1].strip().startswith(
+        "/home/zengletian/GPU-HASH-JOIN/GPU-Hash-Join/PHJ_GDS/PHJ_GDS_")]
+    if busy:
+        raise RuntimeError("GPU occupied: " + "\n".join(busy))
+    command = json.loads(source.read_text())
+    command[command.index("--compile-mode") + 1] = mode
+    command[command.index("--output-dir") + 1] = str(out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "command.json").write_text(json.dumps(command, indent=2) + "\n")
+    print("START", mode, flush=True)
+    with (out / "run.log").open("a") as log, (out / "gpu_4090_processes.csv").open("a") as gpu:
+        monitor = subprocess.Popen(["nvidia-smi", "-i", GPU,
+            "--query-compute-apps=timestamp,pid,gpu_uuid,used_gpu_memory,process_name",
+            "--format=csv,noheader,nounits", "-lms", "100"], stdout=gpu)
+        try:
+            subprocess.run(command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        finally:
+            monitor.terminate()
+            monitor.wait()
+    assert completed("swinv2", out), str(out / "run.log")
+    print("COMPLETE", mode, flush=True)
+PY_AB
+```
+
+复测预期输出 `COMPLETE default` 与 `COMPLETE reduce-overhead`；对应指标在各目录的 `runs/B6/seed_11997733/metrics.jsonl`。旧/新原始证据分别为[历史运行](/mnt/nvme2/home/tangyuxin/pls-experiments/swinv2-training-performance-e2-4090-20260912-v1/galp_b6/runs/B6/seed_11997733/)和[Graph运行](../../../../benchmark_results/block_major_graph_training_20260923_transformers/swinv2/runs/B6/seed_11997733/)。
 
 ## 5. 存储、I/O、H2D 与内存总览
+
+第5–8节资源、校准及训练Nsight表沿用历史测量，不作为第4节新Graph结果的分项；已有CNN Graph profiling见[补测报告第3节](DALI_CUDA_GRAPH_TRAINING_SUPPLEMENT_2026-09-22.md)。
 
 ### 5.1 存储成本与完整运行逻辑读取
 
@@ -249,22 +435,22 @@ H2D均为**独立16,384图 Nsight窗口**，没有外推为完整epoch实测。C
 | ViT-Ti | PyTorch4 RGB | 9.865 | — | 2.335 | — |
 | ViT-Ti | PyTorch48 RGB | 9.865 | — | 2.335 | — |
 | SwinV2-T | 全部训练路径 | — | — | — | — |
-| MobileNetV2 DCT-24 | B6 | 3.293 | 14.311 | 1.606 | 6.655 |
+| MobileNetV2 DCT-24 | B6 · Graph | 843.557 | 1518.77 | 673.77 | 439.238 | 363.051 |
 | MobileNetV2 DCT-24 | A0 JPEG | 19.731 | 5.123 | 1.678 | 7.673 |
 | MobileNetV2 RGB | rgb_pytorch | 9.865 | 3.027 | 1.747 | 6.534 |
 | MobileNetV2 RGB | rgb_d2 | 6.491 | 3.312 | 1.711 | 6.842 |
 | MobileNetV2 RGB | rgb_d3 | 6.494 | 3.312 | 1.711 | 6.521 |
-| MobileNetV2 DCT-32 | B6 | 3.293 | 17.377 | 1.645 | 6.616 |
+| MobileNetV2 DCT-32 | B6 · Graph | 862.590 | 1485.26 | 688.97 | 438.707 | 383.228 |
 | MobileNetV2 DCT-32 | A0 JPEG | 27.952 | 4.684 | 1.747 | 7.680 |
-| ResNet-50 DCT-24 | B6 | 1.602 | 12.525 | 6.485 | 5.289 |
+| ResNet-50 DCT-24 | B6 · Graph | 1770.902 | 723.45 | 1414.46 | 1.379 | 1757.292 |
 | ResNet-50 DCT-24 | A0 JPEG | 4.933 | 9.227 | 6.503 | 3.927 |
 | ResNet-50 RGB | rgb_pytorch | 9.865 | 4.443 | 3.042 | 6.045 |
 | ResNet-50 RGB | rgb_d2 | 6.491 | 4.729 | 3.008 | 6.350 |
 | ResNet-50 RGB | rgb_d3 | 6.494 | 4.729 | 3.008 | 6.031 |
-| ResNet-50 DCT-64 | B6 | 1.602 | 17.062 | 6.500 | 5.332 |
+| ResNet-50 DCT-64 | B6 · Graph ‡ | 1792.717 | 714.65 | 1431.88 | 1.411 | 1779.364 |
 | ResNet-50 DCT-64 | A0 JPEG | 14.799 | 9.914 | 6.555 | 4.998 |
 | eFUN | JPEG A0 | 9.868 | — | — | — |
-| eFUN | GALP B6 | 1.224 | — | — | — |
+| eFUN | GALP B6 · Graph | 413.376 | 3099.27 | 330.17 | 82.492 | 315.799 |
 | EfficientNet-B0 RGB | PyTorch | 9.865 | — | — | — |
 | EfficientNet-B0 RGB | DALI D2 16/4 † | 6.512 | — | — | — |
 
@@ -499,16 +685,17 @@ eFUN JPEG/GALP均为210,768个模型kernel，GPU模型工作接近。GALP窗口�
 | 项目 | 当前主表 | 旧值及处理 |
 | --- | --- | --- |
 | RGB DALI推理 | 4线程/prefetch4；三次11.719/11.733/11.782秒，中位11.733 | 16/2交叉确认中位11.929秒；本轮确认耗时少1.64%，不用早期扫描极值宣称收益 |
-| RGB DALI训练 | 16/4；E1/E2 949.099/938.800秒 † | 原4/2为1294.526/1234.752秒；保留历史记录，不能将全部差值归因于调优 |
+| RGB DALI训练 | 16/4＋Graph；E1/E2 722.580/552.354秒，E1带并发 | 历史16/4 default为949.099/938.800秒且有并发；原4/2为1294.526/1234.752秒；不能将全部差值归因于Graph或线程调优 |
 | eFUN JPEG训练 | 复测1434.106/1386.967秒 | 原受干扰矩阵1419.592/1400.919秒，不用于当前比值 |
 | DALI Nsight | 新推理 .952秒、新训练14.252秒窗口 | 旧训练39.536秒采集不参与本表，也不据此声称DALI慢于PyTorch |
 
-两份新DALI trace的采样仅记录对应进程，但这不消除完整训练的†标记。训练model-only为2883.87 images/s（5次warmup、120次测量更新），测量混合严格/延后检查阶段，不能视为完全匹配的硬上限。
+上述历史DALI trace的采样仅记录对应进程，但不能消除历史完整训练的并发记录。历史default训练model-only为2883.87 images/s（5次warmup、120次测量更新），测量混合严格/延后检查阶段，不能作为新Graph结果的计算上限。
 
 ## 9. 原始证据索引与可解释的结论
 
 | 组 / 证据 | 原始记录或已有分报告 |
 | --- | --- |
+| 9/22 DALI Graph完整训练 | [补测报告](DALI_CUDA_GRAPH_TRAINING_SUPPLEMENT_2026-09-22.md)；CNN、Swin、ViT分别见第1、9、10节，均链接原始结果 |
 | ViT总报告 | [VITTI_SYSTEM_PERFORMANCE_REPORT](VITTI_SYSTEM_PERFORMANCE_REPORT_2026-09-16.md) |
 | ViT E2 / 校准 / H2D | [9/1报告](../../../../benchmark_results/galp_dali_ceiling_4090_20260901_160642/REPORT_ZH.md)、[warm_epoch_extended.csv](../../../../benchmark_results/galp_dali_ceiling_4090_20260901_160642/warm_epoch_extended.csv)、[transfer.csv](../../../../benchmark_results/galp_dali_ceiling_4090_20260901_160642/transfer.csv)、[Nsight目录](../../../../benchmark_results/galp_dali_ceiling_4090_20260901_160642/nsys/) |
 | ViT分类推理 | [8/5 results.json](../../../../benchmark_results/system_rgbnomore/e2e_v3_full50k_20260805_115900/results.json) |
@@ -520,7 +707,7 @@ eFUN JPEG/GALP均为210,768个模型kernel，GPU模型工作接近。GALP窗口�
 | CNN显存 / Nsight | [cnn_inference_memory.csv](../../../data/system_rgbnomore/e2e_v3/runs/dctnet_mobilenet24/rtx4090_cnn_complete_20260914/cnn_inference_memory.csv)、[cnn_trace_breakdown.csv](../../../data/system_rgbnomore/e2e_v3/runs/dctnet_mobilenet24/rtx4090_cnn_complete_20260914/cnn_trace_breakdown.csv) |
 | eFUN最新家族与总报告 | [EFUN_RESULTS_AND_TRAINING_ZH](../../../experiments/dct_pushdown_inference/EFUN_RESULTS_AND_TRAINING_ZH.md)、[EFUN_SYSTEM_PERFORMANCE_REPORT](EFUN_SYSTEM_PERFORMANCE_REPORT_2026-09-16.md) |
 | eFUN推理 / GALP训练 / JPEG复测 | [完整推理](../../../data/system_rgbnomore/e2e_v3/runs/efun/rtx4090_20260915/full/)、[GALP E2](../../../data/system_rgbnomore/e2e_v3/runs/efun/training_v1/native_full/epoch_1.json)、[JPEG E2](../../../data/system_rgbnomore/e2e_v3/runs/efun/training_v1_jpeg_rerun_20260915/jpeg_full/epoch_1.json) |
-| eFUN最新DALI结果 † | [推理中位运行](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/inference_confirmation/w4_q4_r1/RGB_dali_50000.json)、[训练E2](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/rgb_d2_clean_full/epoch_1.json)、[配置选择](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/selected.json) |
+| eFUN DALI历史default / 最新Graph | [推理中位运行](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/inference_confirmation/w4_q4_r1/RGB_dali_50000.json)、[历史default训练E2](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/rgb_d2_clean_full/epoch_1.json)、[Graph训练](../../../data/system_rgbnomore/e2e_v3/runs/efun/rtx4090_dali_graph_20260922/rgb_d2_full/training.json) |
 | eFUN Nsight | [原采集目录](../../../data/system_rgbnomore/e2e_v3/runs/efun/nsys_20260915/)、[新DALI推理](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/profiles/inference/breakdown.json)、[新DALI训练](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/profiles/training/breakdown.json)；同目录保留nsys-rep/SQLite/图 |
 
 这些实验共同支持：GALP可以减少在线输入构造、传输与等待，但收益取决于模型计算强度、目标输入布局和调度。Swin给出较严格的同域训练配对；MobileNet显示输入受限情况下的较大收益；ResNet显示模型计算主导时的有限收益；eFUN在不减少任何频率的条件下验证了表示与布局优化的收益。

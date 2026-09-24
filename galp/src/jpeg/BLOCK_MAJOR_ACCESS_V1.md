@@ -109,7 +109,7 @@ fingerprint followed by 64 u16 values.
 
 ## Measured ImageNet-50K footprint
 
-For `galp/data/imagedataset_dct/ImageNet-val/manifest.bin`, the v1 builder
+For `galp/data/compressed/imagenet_original_val_fls_v1_rg64/manifest.bin`, the v1 builder
 produced 30 sidecars totaling 62,996,296 bytes plus a 1,024-byte companion
 index. The unchanged FLS plus metadata dataset is 14,106,589,306 bytes, so the
 measured growth is 0.446580804427%. All 9,251,484 positive block groups matched
@@ -120,7 +120,7 @@ Reproduce the build and emit a machine-readable report with:
 
 ```bash
 ./build/galp/tools/jpeg_dct/galp_block_major_access_tool \
-  galp/data/imagedataset_dct/ImageNet-val/manifest.bin \
+  galp/data/compressed/imagenet_original_val_fls_v1_rg64/manifest.bin \
   --output-dir /tmp/galp-block-major-access-v1-real \
   --output-json /tmp/galp-block-major-access-v1-real.json \
   --exhaustive-rank-validation

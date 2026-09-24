@@ -4,7 +4,7 @@ Build the tools and run a baseline/candidate comparison with fixed ordering and 
 
 ```bash
 cmake --build build --target galp_fls_metadata_tool galp_fls_metadata_benchmark -j2
-python3 galp/benchmarks/metadata/run.py \
+python3 -m galp.benchmarks.metadata.run \
   --baseline /path/to/legacy.fls \
   --candidate /path/to/compacted.fls \
   --output-dir /tmp/galp-fls-metadata-benchmark \
@@ -19,7 +19,7 @@ lookups. The decode phase range-reads one rowgroup and decodes all its vectors; 
 Analyze and aggregate a complete canonical sharded dataset separately:
 
 ```bash
-python3 galp/benchmarks/metadata/breakdown_dataset.py \
+python3 -m galp.benchmarks.metadata.breakdown_dataset \
   --input-dir /path/to/dataset \
   --output-dir /tmp/galp-fls-metadata-breakdown
 ```

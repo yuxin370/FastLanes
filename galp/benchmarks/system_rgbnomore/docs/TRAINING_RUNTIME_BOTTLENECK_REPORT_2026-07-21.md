@@ -91,12 +91,12 @@ cmake --build build -j2 --target _galp_direct_dct galp_tests
 PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 TRAIN=/tmp/galp-training-manifests/train.json
 VAL=/tmp/galp-training-manifests/val.json
-GALP=/home/tangyuxin/gfastlanes/FastLanes/galp/data/imagedataset_dct/ImageNet-train/manifest.bin
+GALP=/home/tangyuxin/gfastlanes/FastLanes/galp/data/compressed/imagenet_original_train_fls_v1_rg64/manifest.bin
 
 PYTHONPATH=galp/benchmarks/system_rgbnomore "$PY" \
-  -m unittest galp.tests.test_training_benchmark
+  -m unittest galp.benchmarks.system_rgbnomore.tests.test_training_benchmark
 
-CUDA_VISIBLE_DEVICES=0 "$PY" galp/benchmarks/system_rgbnomore/training/run.py \
+CUDA_VISIBLE_DEVICES=0 "$PY" -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --execution-mode runtime --phase smoke \
@@ -106,7 +106,7 @@ CUDA_VISIBLE_DEVICES=0 "$PY" galp/benchmarks/system_rgbnomore/training/run.py \
   --warmup-steps 3 --measured-steps 10 \
   --output-dir /tmp/galp-training-runtime-stability-20260721
 
-"$PY" galp/benchmarks/system_rgbnomore/training/validate.py \
+"$PY" -m galp.benchmarks.system_rgbnomore.training.validate \
   /tmp/galp-training-runtime-stability-20260721 --no-write
 ```
 
@@ -114,7 +114,7 @@ After stability passes, sweep GALP queue depth in independent directories:
 
 ```bash
 for DEPTH in 0 2 4; do
-  CUDA_VISIBLE_DEVICES=0 "$PY" galp/benchmarks/system_rgbnomore/training/run.py \
+  CUDA_VISIBLE_DEVICES=0 "$PY" -m galp.benchmarks.system_rgbnomore.training.run \
     --pipeline galp --execution-mode runtime --phase smoke \
     --train-manifest "$TRAIN" --val-manifest "$VAL" --galp-manifest "$GALP" \
     --rgbnomore-root /home/tangyuxin/RGB-no-more \
@@ -127,7 +127,7 @@ done
 Then run the formal five-repeat comparison:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 "$PY" galp/benchmarks/system_rgbnomore/training/run.py \
+CUDA_VISIBLE_DEVICES=0 "$PY" -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --execution-mode runtime --phase step \
@@ -137,7 +137,7 @@ CUDA_VISIBLE_DEVICES=0 "$PY" galp/benchmarks/system_rgbnomore/training/run.py \
   --warmup-steps 10 --measured-steps 100 --repeats 5 \
   --output-dir /tmp/galp-training-runtime-step-20260721
 
-"$PY" galp/benchmarks/system_rgbnomore/training/validate.py \
+"$PY" -m galp.benchmarks.system_rgbnomore.training.validate \
   /tmp/galp-training-runtime-step-20260721 --no-write
 ```
 

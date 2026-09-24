@@ -16,9 +16,9 @@
 profile 固定，不再进入 Python contract 或命令行。
 
 ```bash
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/inference/run.py \
+  -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset e2e \
   --pipelines galp rgbnomore dali pytorch \
   --output-dir /tmp/galp-e2e \
@@ -26,8 +26,8 @@ PYTHONPATH=build/galp/torch \
   --index-csv galp/data/system_rgbnomore/e2e_v2/indexbase_val.csv \
   --rgb-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth \
   --dct-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth \
-  --galp-manifest galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/manifest.bin \
-  --galp-label-map-json galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
+  --galp-manifest galp/data/compressed/imagenet512_val_compact_v3/manifest.bin \
+  --galp-label-map-json galp/data/compressed/imagenet512_val_compact_v3/labels.json \
   --torch-binding-dir build/galp/torch
 ```
 
@@ -80,7 +80,7 @@ future 生命周期、buffer keepalive 和 reclaim 由 native 层封装。
 四管线 smoke：
 
 ```bash
-python3 galp/benchmarks/system_rgbnomore/inference/run.py \
+python3 -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset smoke \
   --output-dir /tmp/galp-system-smoke
 ```
@@ -88,7 +88,7 @@ python3 galp/benchmarks/system_rgbnomore/inference/run.py \
 只比较 DCT：
 
 ```bash
-python3 galp/benchmarks/system_rgbnomore/inference/run.py \
+python3 -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset e2e \
   --pipelines galp rgbnomore \
   --output-dir /tmp/galp-dct-e2e
@@ -97,7 +97,7 @@ python3 galp/benchmarks/system_rgbnomore/inference/run.py \
 只生成 contract 和命令：
 
 ```bash
-python3 galp/benchmarks/system_rgbnomore/inference/run.py \
+python3 -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset smoke \
   --output-dir /tmp/galp-system-dry-run \
   --dry-run
@@ -138,5 +138,5 @@ CPU 审计测试：
 
 ```bash
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  -m unittest -v galp.tests.test_system_benchmark galp.tests.test_training_benchmark
+  -m unittest -v galp.benchmarks.system_rgbnomore.tests.test_system_benchmark galp.benchmarks.system_rgbnomore.tests.test_training_benchmark
 ```

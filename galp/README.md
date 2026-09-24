@@ -78,7 +78,7 @@ FLS rowgroup
 | CLI | `tools/galp_cli/galp_cli.cu` | `read_table`, `benchmark`, launch measurement |
 | ALP extension | `extensions/alp` | CPU ALP encode/decode support for tests and benchmarks |
 | Tool support | `tools/benchmark_support`, `tools/data` | CLI benchmark support and data helpers |
-| Benchmarks | `benchmarks`, `benchmarks/nvcomp` | Generated bindings, microbenchmarks, nvCOMP comparisons |
+| Benchmarks and experiments | [benchmarks](benchmarks/README.md) | Microbenchmarks, system comparisons, shared training and model experiments |
 | Code generation | `scripts/codegen` | Benchmark binding generation |
 | Tests | `tests` | Public API smoke tests, reader tests, CUDA/internal/integration tests; CTest labels carry test categories |
 
@@ -180,7 +180,7 @@ stay-on-GPU runtime facade for direct-DCT ML workloads:
 
 The advanced premixed physical-PLS training path, including its native
 crop/pool-shuffle/CUDA augmentation boundary and deployment prerequisites, is
-documented in the [experimental PLS training guide](benchmarks/system_dct_major/training_pls/README.md).
+documented in the [experimental PLS training guide](benchmarks/training_pls/README.md).
 
 ```cpp
 #include <galp/direct_dct.hpp>
@@ -397,7 +397,7 @@ cmake -S . -B build-galp-bench -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DGALP_BUILD_BENCHMARKS=ON \
   -DGALP_WITH_NVCOMP=OFF
 
-cmake --build build-galp-bench --target generated-bindings micro_bench -j
+cmake --build build-galp-bench --target micro_bench -j
 ```
 
 Enable `GALP_WITH_NVCOMP=ON` only when building nvCOMP compressor comparison
@@ -651,7 +651,7 @@ Common benchmark options:
 `GALP_BUILD_BENCHMARKS=ON`:
 
 ```bash
-cmake --build build-galp-bench --target generated-bindings micro_bench -j
+cmake --build build-galp-bench --target micro_bench -j
 ./build-galp-bench/galp/benchmarks/micro_bench --help
 ```
 

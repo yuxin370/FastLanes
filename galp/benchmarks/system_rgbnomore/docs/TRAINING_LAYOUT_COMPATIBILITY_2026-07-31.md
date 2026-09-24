@@ -62,8 +62,8 @@ directory name:
 ```bash
 export REPO=/home/tangyuxin/gfastlanes/FastLanes
 export PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
-export C1="$REPO/galp/data/system_rgbnomore/e2e_v3/galp-v3-training-canary-strict/train-1k-$CANARY_TAG"
-export C10="$REPO/galp/data/system_rgbnomore/e2e_v3/galp-v3-training-canary-strict/train-10k-$CANARY_TAG"
+export C1="$REPO/galp/data/compressed/fixtures/imagenet_original_train_1000_compact_v3_strict_${CANARY_TAG}"
+export C10="$REPO/galp/data/compressed/fixtures/imagenet_original_train_10000_compact_v3_strict_${CANARY_TAG}"
 
 PYTHONPATH="$REPO/galp/benchmarks/system_rgbnomore" "$PY" -c '
 import json, os
@@ -245,8 +245,8 @@ GALP_COMPACT_V3_ZERO_PAYLOAD_TEST_FILE=/tmp/galp-training-v3-strict-1k-20260731/
 
 PYTHONPATH=galp/benchmarks/system_rgbnomore \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -m unittest -v \
-  galp.tests.test_compact_v3_acceptance \
-  galp.tests.test_training_benchmark
+  galp.tools.jpeg_dct.tests.test_compact_v3_acceptance \
+  galp.benchmarks.system_rgbnomore.tests.test_training_benchmark
 ```
 
 ASan/UBSan and a multi-repeat nonzero-payload performance comparison remain
@@ -274,7 +274,7 @@ export OUT=/tmp/galp-training-v3-1k-repro-20260801-r2
 
 test ! -e "$OUT"
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$BIND" "$PY" \
-  galp/benchmarks/system_rgbnomore/training/run.py \
+  -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --phase smoke --execution-mode runtime \
@@ -291,7 +291,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$BIND" "$PY" \
   --refresh-galp-payload-fingerprints \
   --output-dir "$OUT"
 
-"$PY" galp/benchmarks/system_rgbnomore/training/validate.py "$OUT" --no-write
+"$PY" -m galp.benchmarks.system_rgbnomore.training.validate "$OUT" --no-write
 ```
 
 The runner executes the four pipelines sequentially on the selected GPU.  This
@@ -335,15 +335,17 @@ the slow baseline does not enter the DCT semantic pass/fail decision.
 
 ## v3 10K command (do not run before 1K passes)
 
+当前命令使用统一数据目录。先用 `CANARY_TAG=v3c bash galp/benchmarks/system_rgbnomore/training/prepare_v3_training_canary_strict.sh 10k` 生成原始分辨率样本；该目录不是现有的 512 输入视图副本。历史运行记录保持不变。
+
 ```bash
 cd /home/tangyuxin/gfastlanes/FastLanes
 export PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
-export C10="$PWD/galp/data/system_rgbnomore/e2e_v3/galp-v3-training-canary-strict/train-10k-v3c"
+export C10="$PWD/galp/data/compressed/fixtures/imagenet_original_train_10000_compact_v3_strict_v3c"
 export OUT=/tmp/galp-training-v3-10k-four-pipeline-20260801
 
 test ! -e "$OUT"
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$C10/frozen/torch" "$PY" \
-  galp/benchmarks/system_rgbnomore/training/run.py \
+  -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --phase smoke --execution-mode runtime \
@@ -360,7 +362,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$C10/frozen/torch" "$PY" \
   --refresh-galp-payload-fingerprints \
   --output-dir "$OUT"
 
-"$PY" galp/benchmarks/system_rgbnomore/training/validate.py "$OUT" --no-write
+"$PY" -m galp.benchmarks.system_rgbnomore.training.validate "$OUT" --no-write
 ```
 
 ## v2 regression command
@@ -369,9 +371,9 @@ Use exactly the same runner and adapter.  Only the manifest expectation and
 dataset paths differ:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=build/galp/torch \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/training/run.py \
+  -m galp.benchmarks.system_rgbnomore.training.run \
   --pipeline galp --phase smoke --execution-mode runtime \
   --train-manifest "$V2_TRAIN_JSON" --val-manifest "$V2_VAL_JSON" \
   --galp-manifest "$V2_MANIFEST" \
@@ -402,9 +404,9 @@ the train loop would defeat the public-reader compatibility boundary.
 Inspect the current isolated block-major suite without starting GPU work:
 
 ```bash
-PYTHONPATH=build/galp/torch:galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/run_suite.py \
+  -m galp.benchmarks.system_dct_major.run_suite \
   --block-major-access-dir /tmp/galp-block-major-access-v1-real \
   --output-dir /tmp/galp-dct-major-suite-dryrun \
   --dry-run

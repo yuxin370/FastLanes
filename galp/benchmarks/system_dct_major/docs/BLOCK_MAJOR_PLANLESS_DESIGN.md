@@ -6,7 +6,7 @@
 > only `dct_major_pushdown` with native profile
 > `block-major-p4-scheduled-bounded-110-v1`. See
 > [README](../README.md), [run guide](RUN_GUIDE.md) and
-> [complete suite](COMPLETE_TEST.md) for executable commands.
+> [complete suite](RUN_GUIDE.md) for executable commands.
 
 ## Status and boundary
 
@@ -164,10 +164,10 @@ packing target 0.5%.
 The estimate is reproducible without CUDA execution:
 
 ```bash
-PYTHONPATH=build/galp/torch:galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_dct_major/diagnostics/estimate_block_major_descriptor.py \
-  galp/data/imagedataset_dct/ImageNet-val/manifest.bin \
+  -m galp.benchmarks.system_dct_major.diagnostics.estimate_block_major_descriptor \
+  galp/data/compressed/imagenet_original_val_fls_v1_rg64/manifest.bin \
   --output-json /tmp/galp-block-major-descriptor-estimate.json
 ```
 

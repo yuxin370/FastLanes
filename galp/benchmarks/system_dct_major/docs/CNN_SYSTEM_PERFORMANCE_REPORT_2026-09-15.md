@@ -8,6 +8,8 @@
 
 ## 摘要
 
+> **2026-09-22 更新：** 已补齐 MobileNetV2、ResNet-50 的 DALI D2/D3 CUDA Graph 完整两轮训练。原表和图保留历史 default 结果，新增结果见第4.1.1节及[完整补测报告](DALI_CUDA_GRAPH_TRAINING_SUPPLEMENT_2026-09-22.md)。
+
 GALP 的 block-major 数据路径已在四个官方 CNN DCT 配置上完成推理和两轮从零训练。
 推理采用同一配置的同一官方 DCT checkpoint 比较参考路径 R、新目标表示 N 与旧数据适配 O；
 训练采用相同初始化、优化器和 DCT 增强数学，比较标准逐图 crop/global shuffle 的 A0 与
@@ -183,6 +185,19 @@ ResNet B6 的输入等待只有约1.5秒/epoch，模型 stream 时间接近整�
 
 `model stream` 是 CUDA event 覆盖的流时间，不是 kernel 活跃时间；它包含主线程发射、audit 和流上其他工作的影响。
 A0 的输入等待与模型流时间可以重叠，例如 ResNet DCT24 两项相加超过 wall，不能据此判断计时错误或相加分配百分比。
+
+### 4.1.1 DALI CUDA Graph 补测（2026-09-22）
+
+沿用原 RTX 4090、完整训练集、两轮训练和每轮50K验证；每个RGB模型只运行一次D2和一次D3，分别供对应两个DCT配置参照。
+
+| RGB模型 | DALI | 原E2 s | Graph E2 s | 历史时间比 | Graph img/s | Graph Top-1% |
+|---|---|---|---|---|---|---|
+| MobileNetV2 | rgb_d2 | 1112.43 | 422.36 | 2.63× | 3033.36 | 19.460 |
+| MobileNetV2 | rgb_d3 | 1056.86 | 365.14 | 2.89× | 3508.73 | 18.704 |
+| ResNet-50 | rgb_d2 | 1085.05 | 779.19 | 1.39× | 1644.24 | 23.808 |
+| ResNet-50 | rgb_d3 | 1065.85 | 715.67 | 1.49× | 1790.16 | 22.520 |
+
+这是模型Graph优化，不是DALI默认已启用的模型加速，也不是DCT频率下推或模型FLOPs减少。原B6结果仍属于旧版本与旧compile模式，不构成本轮双方最佳配置的公平消融。跨日期时间比、完整分项、Graph实际重放证据与精度均见[补测报告](DALI_CUDA_GRAPH_TRAINING_SUPPLEMENT_2026-09-22.md)。
 
 ### 4.2 Model-only 与 data-only
 
@@ -607,11 +622,11 @@ SwinV2的15-epoch配对收敛证据也强于本CNN的2-epoch warmup证据。因�
 | 完整CSV与原始汇总 | [rtx4090_cnn_complete_20260914](/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/runs/dctnet_mobilenet24/rtx4090_cnn_complete_20260914) |
 | 同源图像 | [imagenet_512](/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/imagenet_512) |
 | 训练/验证manifest | [training_manifests_official_v3](/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/training_manifests_official_v3) |
-| 56网格目标数据 | [dct_major_dctnet_static64](/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/dct_major_dctnet_static64) |
-| 112网格目标数据 | [dct_major_dctnet_mobilenet32](/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/dct_major_dctnet_mobilenet32) |
-| 源训练premix | [uniform_premix](/mnt/nvme2/home/tangyuxin/pls-experiments/physical-layout-full-premix-orgseed-20260810/uniform_premix) |
+| 56网格目标数据 | [imagenet512_val_resnet56_block_major](/home/tangyuxin/gfastlanes/FastLanes/galp/data/compressed/backup/offline_model_input/imagenet512_val_resnet56_block_major) |
+| 112网格目标数据 | [imagenet512_val_mobilenet112_block_major](/home/tangyuxin/gfastlanes/FastLanes/galp/data/compressed/backup/offline_model_input/imagenet512_val_mobilenet112_block_major) |
+| 源训练premix | [imagenet512_train_block_major_premixed](/home/tangyuxin/gfastlanes/FastLanes/galp/data/compressed/imagenet512_train_block_major_premixed) |
 | 官方checkpoint | [checkpoints](/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v2/checkpoints) |
-| 实验代码 | [dct_pushdown_inference](/home/tangyuxin/gfastlanes/FastLanes/galp/experiments/dct_pushdown_inference) |
+| 实验代码 | [dct_pushdown_inference](/home/tangyuxin/gfastlanes/FastLanes/galp/benchmarks/dct_models) |
 
 模型目录依次为`dctnet_mobilenet24`、`dctnet_mobilenet32`、`dctnet_static24`、`dctnet_static64`。
 以上不是新的数据管理体系：继续使用`e2e_v3/runs/<模型>/<运行名>`、原ordinal和manifest映射。
@@ -620,14 +635,14 @@ SwinV2的15-epoch配对收敛证据也强于本CNN的2-epoch warmup证据。因�
 ```bash
 cd /home/tangyuxin/gfastlanes/FastLanes
 # 已完成任务按原入口复用结果，部分训练可由已保存epoch checkpoint接续
-bash galp/experiments/dct_pushdown_inference/native_training_matrix.sh full rtx4090_native_training_optimized_20260914 B6 4 32768
-bash galp/experiments/dct_pushdown_inference/cnn_training_baselines.sh full rtx4090_cnn_training_baselines_20260914
+bash galp/benchmarks/dct_models/cnn_training_baselines.sh full cnn_training "mobilenet24:native mobilenet32:native resnet24:native resnet64:native"
+bash galp/benchmarks/dct_models/cnn_training_baselines.sh full rtx4090_cnn_training_baselines_20260914
 # 复用本次推理结果；新测量应指定独立memory-run名，保留现有产物
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python galp/experiments/dct_pushdown_inference/complete_cnn_suite.py --inference-only --memory-run rtx4090_cnn_memory_isolated_20260915 --wait-for-gpu
+MEASURE_PROCESS_MEMORY=1 bash galp/benchmarks/dct_models/run_inference.sh "$CUDA_VISIBLE_DEVICES" cnn_memory
 # 重新汇总与生成报告；只处理现有结果，不启动GPU实验
-MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python galp/experiments/dct_pushdown_inference/report_cnn_suite.py --inference-run rtx4090_cnn_memory_isolated_20260915
-MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python galp/experiments/dct_pushdown_inference/plot_cnn_suite.py
-MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python galp/experiments/dct_pushdown_inference/write_cnn_performance_report.py
+MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -m galp.benchmarks.dct_models.report_cnn_suite --inference-run rtx4090_cnn_memory_isolated_20260915
+MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -m galp.benchmarks.dct_models.plot_cnn_suite
+MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -m galp.benchmarks.dct_models.write_cnn_performance_report
 ```
 
 ### 10.2 数值合同、数据表和时间线

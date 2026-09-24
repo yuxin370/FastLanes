@@ -409,7 +409,7 @@ Compact-v3 producer 优化中单独调查。
 ## 11. 1K H100 筛查结果
 
 配置：1000 images，20 batches，warmup 0，5 repeats，物理 GPU 1。r2 使用正确的
-`compact_v3_tiled_z32` manifest，六路严格语义通过。
+当时名为 `compact_v3_tiled_z32` 的 manifest（现为 `galp/data/compressed/imagenet_original_val_compact_v3/manifest.bin`），六路严格语义通过。
 
 | Pipeline | Cold process images/s | Cold TTFT ms | Hot p50 images/s | Hot CV | Endpoint drift | Steady p50 images/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -563,9 +563,9 @@ cd /home/tangyuxin/gfastlanes/FastLanes
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=1 \
-PYTHONPATH=build/galp/torch:galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -B \
-  galp/benchmarks/system_dct_major/run.py \
+  -m galp.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload feature-extraction \
   --pipelines \
@@ -577,9 +577,9 @@ PYTHONPATH=build/galp/torch:galp/torch \
     pytorch \
   --block-major-access-dir /tmp/galp-block-major-access-v1-real \
   --image-major-v3-manifest \
-    galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32/manifest.bin \
+    galp/data/compressed/imagenet_original_val_compact_v3/manifest.bin \
   --image-major-v3-label-map \
-    galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32/labels.json \
+    galp/data/compressed/imagenet_original_val_compact_v3/labels.json \
   --device cuda:0 \
   --dct-major-segment-size 1000 \
   --image-major-segment-size 50 \
@@ -598,9 +598,9 @@ cd /home/tangyuxin/gfastlanes/FastLanes
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=0 \
-PYTHONPATH=build/galp/torch:galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -B \
-  galp/benchmarks/system_dct_major/run.py \
+  -m galp.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload feature-extraction \
   --pipelines dct_major_full dct_major_pushdown \
@@ -627,9 +627,9 @@ cd /home/tangyuxin/gfastlanes/FastLanes
 for segment_size in 500 1000; do
   CUDA_DEVICE_ORDER=PCI_BUS_ID \
   CUDA_VISIBLE_DEVICES=1 \
-  PYTHONPATH=build/galp/torch:galp/torch \
+  PYTHONPATH=.:build/galp/torch \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -B \
-    galp/benchmarks/system_dct_major/run.py \
+    -m galp.benchmarks.system_dct_major.run \
     --preset e2e \
     --workload feature-extraction \
     --pipelines dct_major_pushdown \

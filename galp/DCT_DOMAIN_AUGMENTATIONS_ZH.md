@@ -428,7 +428,7 @@ assert tuple(cbcr.shape) == (2, 2, 14, 14, 8, 8)
 ```python
 from pathlib import Path
 import torch
-from galp.benchmarks.system_dct_major.training_pls.published_augmentation import (
+from galp.benchmarks.training_pls.published_augmentation import (
     apply_published_randaugment,
     apply_published_mixup,
 )
@@ -455,7 +455,7 @@ print(mixup_record)     # 原图和配对图的权重。
 assert tuple(soft_targets.shape) == (2, 1000)
 ```
 
-若使用 `galp.torch.experimental.DirectDctPlsPipeline`，其返回的 microbatch 已经过原生 CUDA RandAugment、归一化和 Mixup，并提供 `targets`；无需再调用上述两个后处理函数。完整训练入口见 [PLS 训练说明](benchmarks/system_dct_major/training_pls/README.md)。
+若使用 `galp.torch.experimental.DirectDctPlsPipeline`，其返回的 microbatch 已经过原生 CUDA RandAugment、归一化和 Mixup，并提供 `targets`；无需再调用上述两个后处理函数。完整训练入口见 [PLS 训练说明](benchmarks/training_pls/README.md)。
 
 ## 8. 支持边界与源码索引
 
@@ -465,8 +465,8 @@ assert tuple(soft_targets.shape) == (2, 1000)
 
 | 需要核对的内容 | 代码入口 |
 | --- | --- |
-| 14 个 RandAugment 名称、固定强度档位、Mixup alpha、训练组合 | [recipe.py](benchmarks/system_dct_major/training_pls/recipe.py) |
-| published 裁剪、验证几何、逐项 Python 运算、随机作用范围 | [published_augmentation.py](benchmarks/system_dct_major/training_pls/published_augmentation.py)：`_published_dct_crop_blocks`、`_magnitude`、`_apply_operation_batch`、`apply_published_mixup` |
+| 14 个 RandAugment 名称、固定强度档位、Mixup alpha、训练组合 | [recipe.py](benchmarks/training_pls/recipe.py) |
+| published 裁剪、验证几何、逐项 Python 运算、随机作用范围 | [published_augmentation.py](benchmarks/training_pls/published_augmentation.py)：`_published_dct_crop_blocks`、`_magnitude`、`_apply_operation_batch`、`apply_published_mixup` |
 | 原生 CUDA 的逐项增强、统计、限幅和标签混合 | [direct_dct_pls_postprocess.cu](src/api/direct_dct_pls_postprocess.cu)：`compute_stats_kernel`、`apply_randaugment_kernel`、`normalize_mixup_kernel` |
 | 原生随机决定和裁剪生成 | [direct_dct_pls.cpp](src/api/direct_dct_pls.cpp)：`published_randaugment_decision`、`published_crop` |
 | profile 几何、数据类型、反量化、源系数缺失语义 | [rgbnomore.hpp](include/galp/profiles/rgbnomore.hpp) |
@@ -476,7 +476,7 @@ assert tuple(soft_targets.shape) == (2, 1000)
 | `transforms` 实际解析字段 | [direct_dct_torch.cpp](torch/direct_dct_torch.cpp)：`parse_transform_requests` |
 | 原生 PLS 的实验性 Python 入口 | [experimental.py](torch/experimental.py) |
 | 基础 v1 配方与水平翻转辅助函数 | [augmentation.py](benchmarks/system_rgbnomore/training/augmentation.py) |
-| 频率掩码条件定义 | [masks.py](experiments/coefficient_mask_evaluator/masks.py) 与 [实验说明](experiments/coefficient_mask_evaluator/README.md) |
+| 频率掩码条件定义 | [masks.py](benchmarks/coefficient_mask_evaluator/masks.py) 与 [实验说明](benchmarks/coefficient_mask_evaluator/README.md) |
 | 已有裁剪、RandAugment 分组／标量一致性测试 | [test_training_pls.py](benchmarks/system_dct_major/tests/test_training_pls.py) |
 | 已有原生随机决定与参考结果对照测试 | [direct_dct_pls_test.cpp](tests/direct_dct_pls_test.cpp) |
 

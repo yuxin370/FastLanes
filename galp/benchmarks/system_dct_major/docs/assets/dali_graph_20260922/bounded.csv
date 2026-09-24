@@ -1,0 +1,4 @@
+backend,pool,default_seconds,graph_seconds,input_wait_seconds,model_stream_seconds,result
+rgb_d2,4096,68.56869647902204,24.162555897026323,10.088496748590842,20.763155064582822,/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/runs/dctnet_mobilenet24/rtx4090_dali_graph_20260922/rgb_d2_full/training.json
+rgb_d3,4096,62.67761508497642,23.14393801894039,7.11758382699918,21.56737893486023,/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/runs/dctnet_mobilenet24/rtx4090_dali_graph_20260922/rgb_d3_full/training.json
+rgb_d3,1024,69.84766502503771,24.053921321057715,7.324230243568309,21.02206587696076,/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3/runs/dctnet_mobilenet24/rtx4090_dali_graph_20260922/rgb_d3_m1_bounded/training.json

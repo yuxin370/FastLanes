@@ -8,6 +8,8 @@
 
 ## 摘要
 
+> **2026-09-22 更新：** 已补齐 RGB EfficientNet-B0 的 DALI D2 模型 CUDA Graph 完整两轮训练。旧表保留 default 历史观测；新结果见第4.1.1节及[补测报告](DALI_CUDA_GRAPH_TRAINING_SUPPLEMENT_2026-09-22.md)。
+
 eFUN 使用全部 192 个 DCT 通道，为检验压缩态传输和输出布局提供了一个不裁剪频率的对照。
 在 50,000 张 ImageNet-512 验证图上，GALP projected 路径用时 10.730 秒，作者 JPEG→DCT
 参考路径用时 41.873 秒，在线推理加速约 **3.90×**；两者全部预测一致，Top-1 均为 75.428%。
@@ -162,6 +164,12 @@ RGB DALI/PyTorch 的 E2 观测比值为 1.88×，但 DALI 带已知同卡占用�
 不能因占用短暂就假定影响为零。旧 DALI 4/2 的 E1/E2 为 1294.526/1234.752 秒，
 仅保留为历史参照。阶段计时存在重叠，模型流时间包含提交及依赖空隙，
 不是纯 GPU kernel 时间；不能从两个模型流时间之差推出算术工作减少。
+
+### 4.1.1 DALI 模型 CUDA Graph 补测
+
+保持RTX 4090、16线程/预取4、完整两轮训练及初始/每轮50K验证。新第二轮耗时 **552.354 秒**，吞吐 **2319.47 images/s**；Top-1 **21.234%**，训练及验证数值与旧版一致。新E2的100ms采样仅记录到本次训练进程；E1记录到额外PID并单独标记。原938.800秒基线带并发占用，因此跨日期时间比不解释为纯Graph收益。此次没有重跑eFUN B6；Graph减少的是模型提交开销，不能解释成DCT频率下推或模型计算量下降。
+
+完整分项、真实Graph重放、GPU breakdown和原始结果见[补测报告](DALI_CUDA_GRAPH_TRAINING_SUPPLEMENT_2026-09-22.md)。
 
 ### 4.2 Model-only 与短测范围
 
@@ -331,7 +339,7 @@ eFUN 补充了一个全频率、频域 CNN 的观测点：即使不删除任何�
 | DALI 推理主结果 | [4/4 三次确认的中位运行](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/inference_confirmation/w4_q4_r1/RGB_dali_50000.json) |
 | DALI 配置扫描及交叉确认 | [调优目录](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/)；[measurements.json](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/measurements.json)、[selected.json](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/selected.json) |
 | Nsight 与逐路径分析 | [原 10 路采集目录](../../../data/system_rgbnomore/e2e_v3/runs/efun/nsys_20260915/)；[替换 DALI 两路的新采集](../../../data/system_rgbnomore/e2e_v3/runs/efun/dali_tuning_20260916/profiles/)；各路径含原始报告、SQLite、breakdown 和图表 |
-| 离线目标数据 | [dct_major_efun](../../../data/system_rgbnomore/e2e_v3/dct_major_efun/) |
+| 离线目标数据 | [imagenet512_val_efun28_block_major](../../../data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/) |
 
 训练脚本与配置保留在原实验目录。重建本报告的数值只需读取已有 JSON 和分析文件，不需要重新启动训练。
 本文没有把探针、未完成 native A0 或受干扰的原 JPEG 运行混入主表。

@@ -40,7 +40,7 @@ set -o pipefail
 PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 
 "$PY" -B \
-  galp/benchmarks/system_rgbnomore/training/prepare_imagenet512_v3_train.py \
+  -m galp.benchmarks.system_rgbnomore.training.prepare_imagenet512_v3_train \
   --phase all \
   --resize-workers 32 \
   --layout-threads 32 \
@@ -52,9 +52,7 @@ PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
   galp/data/system_rgbnomore/e2e_v3/prepare_imagenet512_v3_train.full.log
 ```
 
-`--compress-threads N` 仍作为兼容参数，同时映射 layout scan 和 shard JPEG
-decode；不要将它与取值不同的 `--layout-threads` 或
-`--shard-decode-threads` 混用。准备脚本会在 `plan.json`、`commands.json` 和
+分别使用 `--layout-threads` 和 `--shard-decode-threads` 控制布局扫描与 JPEG 解码。准备脚本会在 `plan.json`、`commands.json` 和
 completion artifact 中记录上述五个阶段的 effective values。正式全量重跑前应先用
 canary 比较 `24 shard × 2 encoding`、`32 × 1` 和 `16 × 2` 的 wall time、RSS
 与内存带宽；当前 100-JPEG canary 的保守候选是 `16 × 2`。
@@ -64,7 +62,7 @@ canary 比较 `24 shard × 2 encoding`、`32 × 1` 和 `16 × 2` 的 wall time�
 
 ```bash
 "$PY" -B \
-  galp/benchmarks/system_rgbnomore/training/prepare_imagenet512_v3_train.py \
+  -m galp.benchmarks.system_rgbnomore.training.prepare_imagenet512_v3_train \
   --phase manifests
 ```
 
@@ -79,7 +77,7 @@ canary 比较 `24 shard × 2 encoding`、`32 × 1` 和 `16 × 2` 的 wall time�
 ```bash
 PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 
-"$PY" galp/benchmarks/system_rgbnomore/training/run.py \
+"$PY" -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --phase smoke \
@@ -116,10 +114,10 @@ PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 E2E=/home/tangyuxin/gfastlanes/FastLanes/galp/data/system_rgbnomore/e2e_v3
 TRAIN="$E2E/training_manifests_official_v3/train.json"
 VAL="$E2E/training_manifests_official_v3/val.json"
-GALP_TRAIN="$E2E/compact_v3_tiled_z32_rgbnomore512_train/manifest.bin"
-GALP_VAL="$E2E/compact_v3_tiled_z32_rgbnomore512/manifest.bin"
+GALP_TRAIN="$PWD/galp/data/compressed/imagenet512_train_compact_v3/dct/manifest.bin"
+GALP_VAL="$PWD/galp/data/compressed/imagenet512_val_compact_v3/manifest.bin"
 
-CUDA_VISIBLE_DEVICES=0 "$PY" galp/benchmarks/system_rgbnomore/training/run.py \
+CUDA_VISIBLE_DEVICES=0 "$PY" -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --execution-mode runtime --phase smoke \
@@ -143,7 +141,7 @@ repeat。v2/v3 acceptance 至少要求三次，单次 smoke 不再足以支持�
 PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
 
 CUDA_VISIBLE_DEVICES=0 "$PY" \
-  galp/benchmarks/system_rgbnomore/training/run.py \
+  -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --phase smoke \
@@ -159,7 +157,7 @@ CUDA_VISIBLE_DEVICES=0 "$PY" \
   --output-dir /tmp/galp-training-smoke
 ```
 
-GALP 正式运行要求已有 `manifest.bin.payload_fingerprints.json`。仅在数据准备或显式刷新时添加 `--refresh-galp-payload-fingerprints`；正式 measured run 复用并校验该缓存，不隐式重哈希全部 FLS shard。
+GALP 正式运行要求已有 `manifest.bin.payload_fingerprints.json`。目录迁移后即使缓存文件仍在，旧路径和文件身份也需通过 `--refresh-galp-payload-fingerprints` 在计时外重建；正式 measured run 复用并校验该缓存，不隐式重哈希全部 FLS shard。
 
 默认初始化模式是 `random`。同域 pair 从同一个已落盘、带 SHA-256 的初始 model/optimizer/scheduler/RNG 状态克隆；first-step 语义 probe 在任何 warmup 前运行，不污染正式 repeat。
 
@@ -169,7 +167,7 @@ GALP 正式运行要求已有 `manifest.bin.payload_fingerprints.json`。仅在�
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 "$PY" \
-  galp/benchmarks/system_rgbnomore/training/run.py \
+  -m galp.benchmarks.system_rgbnomore.training.run \
   --enabled-pipelines galp,rgbnomore,dali,pytorch \
   --required-comparison-groups dct,rgb \
   --phase step \
@@ -190,7 +188,7 @@ CUDA_VISIBLE_DEVICES=0 "$PY" \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 "$PY" \
-  galp/benchmarks/system_rgbnomore/training/run.py \
+  -m galp.benchmarks.system_rgbnomore.training.run \
   --pipeline pytorch \
   --phase convergence \
   --seeds 11997733,11997734,11997735 \
@@ -237,7 +235,7 @@ loss summary count、GALP queue peak 不超过硬容量以及 CUDA peak memory �
 独立复核命令：
 
 ```bash
-"$PY" galp/benchmarks/system_rgbnomore/training/validate.py \
+"$PY" -m galp.benchmarks.system_rgbnomore.training.validate \
   /tmp/galp-training-step --no-write
 ```
 
@@ -263,26 +261,9 @@ GALP repeat 现在分别输出 `native_execution_stats_by_phase.warmup` 与 `.me
 upper-bound 的均值相差不超过 10%、各自 CV 不超过 10%。条件不一致时
 `v3_not_slower_than_v2` 保持 `unverified`，不会把 GPU 降频或后台竞争误判为布局性能。
 
-下面的命令把独立 planner、受控 crop reader 和 v2/v3 训练结果合并为逐门的机器可读报告。缺失的 GPU 结果保持 `unverified`，不会被当作通过：
-
-```bash
-GALP_RUN_GPU_TESTS=1 CUDA_VISIBLE_DEVICES=0 \
-  ./build/galp/tests/galp_tests \
-  --gtest_filter='JpegDct.ManifestV3PlanlessMatchesLegacyAcrossRaggedShardsAndSampling:JpegDct.PlanlessDeviceMatchesLegacyAcrossGeneralityMatrix' \
-  --gtest_output=xml:/tmp/galp-v3-planless-gpu-tests.xml
-
-python3 galp/benchmarks/system_rgbnomore/training/v3_acceptance.py \
-  --baseline-dir /tmp/galp-training-v3-baseline \
-  --v2-dir /tmp/galp-training-v2-final \
-  --v3-dir /tmp/galp-training-v3-final \
-  --planner-v2 /tmp/galp-planner-v2.json \
-  --planner-v3 /tmp/galp-planner-v3.json \
-  --reader-v3 /tmp/galp-reader-v3.json \
-  --gpu-gtest-xml /tmp/galp-v3-planless-gpu-tests.xml \
-  --output /tmp/galp-training-v3-acceptance.json
-```
-
-返回码 `0` 表示所有 blocking gates 通过，`1` 表示已有证据违反 blocking gate，`2` 表示仍缺 required evidence。`--allow-incomplete` 只允许 incomplete 报告返回 `0`，不会掩盖已失败的门。报告不会相加可能重叠的 planner/read/decode/transform stage 时间，也明确禁止把 GALP 与 DALI 的不同模型路径解释为纯 codec 差异。
+当前结果统一由 `training/validate.py` 校验；PLS 训练与收敛比较使用
+`galp.benchmarks.training_pls.run_matrix` 和该包内的报告入口。
+image-major-v3 开发阶段的独立验收脚本已经删除。
 
 ## 10. Equal-image 两 epoch 训练性能比较
 
@@ -304,14 +285,14 @@ horizon；D3 只共享模型与优化器 recipe，不声明顺序或逐样本增
 ```bash
 cd /home/tangyuxin/gfastlanes/FastLanes
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
-PYTHONPATH="$PWD/galp/benchmarks/system_rgbnomore:$PWD/build/galp/torch"
+PYTHONPATH="$PWD:$PWD/build/galp/torch"
 E2E="$PWD/galp/data/system_rgbnomore/e2e_v3"
 OUT=/path/to/new/equal-image-rgb-e2
 
-PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
+PYTHONPATH="$PYTHONPATH" "$PY" -m galp.benchmarks.system_rgbnomore.training.equal_image_epoch_benchmark \
   --train-manifest "$E2E/training_manifests_official_v3/train.json" \
   --val-manifest "$E2E/training_manifests_official_v3/val.json" \
   --output-dir "$OUT" \
@@ -324,7 +305,7 @@ PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
 检查 `contract.json` 和 `execution_plan.json` 后执行：
 
 ```bash
-PYTHONPATH="$PYTHONPATH" "$PY" -m training.equal_image_epoch_benchmark \
+PYTHONPATH="$PYTHONPATH" "$PY" -m galp.benchmarks.system_rgbnomore.training.equal_image_epoch_benchmark \
   --train-manifest "$E2E/training_manifests_official_v3/train.json" \
   --val-manifest "$E2E/training_manifests_official_v3/val.json" \
   --output-dir "$OUT" \
@@ -342,12 +323,11 @@ pipeline 不会重跑。GPU 名称不再硬编码；正式运行应显式设置
 Native B6 完成 E2 后生成四路统一表：
 
 ```bash
-PLS_PYTHONPATH="$PWD/galp/benchmarks/system_dct_major:$PWD/build/galp/torch"
 NATIVE=/path/to/native-pls-b6-e2/runs/B6/seed_11997733
 REPORT=/path/to/new/equal-image-report
 
-PYTHONPATH="$PLS_PYTHONPATH" "$PY" \
-  -m training_pls.report_equal_image_performance \
+PYTHONPATH="$PYTHONPATH" "$PY" \
+  -m galp.benchmarks.training_pls.report_equal_image_performance \
   --standard-root "$OUT" \
   --native-run "$NATIVE" \
   --output-dir "$REPORT" \

@@ -5,7 +5,7 @@
 统一入口是：
 
 ```bash
-galp/benchmarks/system_rgbnomore/inference/run.py
+-m galp.benchmarks.system_rgbnomore.inference.run
 ```
 
 正式 pipeline 只有 `galp`、`rgbnomore`、`dali`、`pytorch`。旧的
@@ -16,9 +16,9 @@ galp/benchmarks/system_rgbnomore/inference/run.py
 
 ```bash
 cmake --build build --target _galp_direct_dct -j2
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
   /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/inference/run.py --help
+  -m galp.benchmarks.system_rgbnomore.inference.run --help
 ```
 
 ## 数据与模型
@@ -37,8 +37,8 @@ rgbnomore-swinv2-t-256-window8-v1
 ```text
 RGB JPEG:   galp/data/system_rgbnomore/e2e_v3/imagenet_512
 Index CSV:  galp/data/system_rgbnomore/e2e_v2/indexbase_val.csv
-GALP:       galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/manifest.bin
-Labels:     galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json
+GALP:       galp/data/compressed/imagenet512_val_compact_v3/manifest.bin
+Labels:     galp/data/compressed/imagenet512_val_compact_v3/labels.json
 RGB model:  galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth
 DCT model:  galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth
 ```
@@ -65,12 +65,12 @@ Swin 注册项会统一选择 RGB `imagenet_swin`、DCT `imagenet_dct_swin`、
 默认 `--dct-source-image-size 512` 会扫描 JPEG SOF 并拒绝数据语义不一致。
 只有自定义 checkpoint/recipe 才应传 `0`。
 
-首次创建或数据发生受控变化后，可显式生成 payload fingerprint：
+首次创建、迁移数据目录或数据发生受控变化后，可显式生成 payload fingerprint：
 
 ```bash
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/inference/run.py \
+  -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset smoke \
   --output-dir /tmp/galp-fingerprint-preflight \
   --refresh-galp-payload-fingerprints \
@@ -82,9 +82,9 @@ PYTHONPATH=build/galp/torch \
 ## Smoke
 
 ```bash
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/inference/run.py \
+  -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset smoke \
   --pipelines galp rgbnomore dali pytorch \
   --output-dir /tmp/galp-rgbnomore-smoke
@@ -95,9 +95,9 @@ Smoke 使用 batch 2、1 个 warmup batch、2 个 measured batch、1 个 repeat�
 SwinV2-T smoke：
 
 ```bash
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/inference/run.py \
+  -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset smoke \
   --model rgbnomore-swinv2-t-256-window8-v1 \
   --pipelines galp rgbnomore dali pytorch \
@@ -107,16 +107,16 @@ PYTHONPATH=build/galp/torch \
 ## 正式 E2E
 
 ```bash
-PYTHONPATH=build/galp/torch \
+PYTHONPATH=.:build/galp/torch \
 /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
-  galp/benchmarks/system_rgbnomore/inference/run.py \
+  -m galp.benchmarks.system_rgbnomore.inference.run \
   --preset e2e \
   --pipelines galp rgbnomore dali pytorch \
   --output-dir /tmp/galp-rgbnomore-e2e \
   --data-root galp/data/system_rgbnomore/e2e_v3/imagenet_512 \
   --index-csv galp/data/system_rgbnomore/e2e_v2/indexbase_val.csv \
-  --galp-manifest galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/manifest.bin \
-  --galp-label-map-json galp/data/system_rgbnomore/e2e_v3/compact_v3_tiled_z32_rgbnomore512/labels.json \
+  --galp-manifest galp/data/compressed/imagenet512_val_compact_v3/manifest.bin \
+  --galp-label-map-json galp/data/compressed/imagenet512_val_compact_v3/labels.json \
   --rgb-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth \
   --dct-checkpoint galp/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth \
   --torch-binding-dir build/galp/torch
