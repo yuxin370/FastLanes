@@ -163,6 +163,10 @@ build_win/
 # GALP local benchmark outputs (results, checkpoints, profiler exports)
 /benchmark_results/
 
+# Local experiment scripts and results
+/experiments/
+/results/
+
 # Generated GALP documentation evidence; source reports remain visible
 /galp/benchmarks/system_rgbnomore/docs/artifacts/
 

@@ -32,6 +32,13 @@ def samples(count, physical_order=False):
             for j, i in enumerate(order[:count])]
 
 
+def prediction_agreement(result, baseline):
+    if result["sample_ids"] != baseline["sample_ids"]:
+        raise ValueError("baseline sample IDs or order differ; use the same evaluation selection and order")
+    matches = sum(a == b for a, b in zip(result["predictions"], baseline["predictions"], strict=True))
+    return matches / len(result["sample_ids"])
+
+
 class Inputs(Dataset):
     def __init__(self, entries, route="R", manifest=None, new_ids=None):
         self.entries = entries
@@ -76,7 +83,7 @@ class Inputs(Dataset):
                 components = [c.round().clamp(-32768, 32767) for c in components]
             x = B.organize(components)
             adaptation = time.perf_counter()-t
-        return x, entry["model_label"], time.perf_counter() - start, size, native, adaptation
+        return x, entry["model_label"], time.perf_counter() - start, size, native, adaptation, entry["logical_sample_id"]
 
 
 def main():
@@ -86,6 +93,7 @@ def main():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--model-threads", type=int, default=8)
     parser.add_argument("--route", choices=["R", "N"] if B.PROFILE == "efun" else ["R", "N", "O", "S"], default="R")
+    parser.add_argument("--physical-order", action="store_true", help="canonical image-ID order for matched block-major comparisons")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--new-data", type=Path)
@@ -97,7 +105,7 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    selected = samples(args.count)
+    selected = samples(args.count, physical_order=args.physical_order)
     (args.output_dir / "profile.json").write_text(json.dumps(B.profile(), indent=2))
     (args.output_dir / f"samples_{args.count}.json").write_text(json.dumps(selected, indent=2))
     net = B.model().to(device)
@@ -125,10 +133,11 @@ def main():
     native_time = adaptation_time = 0
     h2d_time = 0
     predictions = []
+    consumed_ids = []
     capture = Capture(args.profile, images_per_step=args.batch_size)
     start = time.perf_counter()
     with torch.inference_mode():
-        for x, labels, construction, sizes, native, adaptation in batches(loader, capture):
+        for x, labels, construction, sizes, native, adaptation, sample_ids in batches(loader, capture):
             if device.type == "cuda":
                 t = time.perf_counter()
                 with capture.range("input.handoff"):
@@ -151,9 +160,11 @@ def main():
             adaptation_time += float(adaptation.sum())
             read_bytes += int(sizes.sum())
             count += len(labels)
+            consumed_ids.extend(sample_ids)
             predictions.extend(ranked[:, 0].tolist())
             print(f"{args.route} {count}/{args.count} top1={top1/count:.4f}", flush=True)
     wall = time.perf_counter() - start
+    assert count == args.count and consumed_ids == [s["logical_sample_id"] for s in selected]
     result = dict(path=args.route, samples=count, top1=100*top1/count, top5=100*top5/count,
                   ce=ce/count, input_worker_seconds=input_work, model_seconds=model_time,
                   e2e_seconds=wall, logical_read_bytes=read_bytes, physical_read_bytes=None,
@@ -168,6 +179,7 @@ def main():
                   h2d_seconds=h2d_time if device.type == "cuda" else None,
                   workers=args.workers, model_threads=args.model_threads,
                   source_root=str(B.DEFAULT_DATA_ROOT), checkpoint=str(B.CHECKPOINT),
+                  physical_order=args.physical_order, sample_ids=consumed_ids,
                   predictions=predictions)
     if args.route == "S":
         result["numerical_contract"] = "full source read/decode on CPU, crop/resize, round-even, int16 saturation, normalize"
@@ -175,10 +187,10 @@ def main():
     baseline = args.output_dir / f"R_{count}.json"
     if args.route != "R" and baseline.exists():
         previous = json.loads(baseline.read_text())
-        result["prediction_agreement_with_R"] = sum(a==b for a,b in zip(predictions,previous["predictions"]))/count
+        result["prediction_agreement_with_R"] = prediction_agreement(result, previous)
         result["top1_delta_pp_vs_R"] = result["top1"]-previous["top1"]
     (args.output_dir / f"{args.route}_{count}.json").write_text(json.dumps(result, indent=2))
-    print(json.dumps({k:v for k,v in result.items() if k != "predictions"}, indent=2))
+    print(json.dumps({k:v for k,v in result.items() if k not in ("predictions", "sample_ids")}, indent=2))
 
 
 if __name__ == "__main__":

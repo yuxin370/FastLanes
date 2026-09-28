@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 import galp.benchmarks.dct_models.backend as B
 import galp.benchmarks.dct_models.rgb as rgb
-from galp.benchmarks.dct_models.evaluate import samples
+from galp.benchmarks.dct_models.evaluate import prediction_agreement, samples
 from galp.benchmarks.dct_models.capture import Capture
 
 
@@ -23,11 +23,12 @@ def main():
     p.add_argument("--model-threads", type=int, default=8)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--physical-order", action="store_true")
     args = p.parse_args()
     torch.set_num_threads(args.model_threads)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    entries = samples(args.count)
+    entries = samples(args.count, physical_order=args.physical_order)
     net = rgb.model().cuda()
     reference = rgb.Inputs(entries)
     with torch.inference_mode():
@@ -115,14 +116,16 @@ def main():
                   transform_worker_seconds=transform_work if args.route=="pytorch" else None,
                   source_bytes=read_bytes if args.route=="pytorch" else sum(Path(e["path"]).stat().st_size for e in entries),
                   timing_scope="file input through logits and metrics; reader initialization included; model warmup excluded",
+                  physical_order=args.physical_order,
+                  sample_ids=[s["logical_sample_id"] for s in entries],
                   predictions=predictions)
     baseline = args.output_dir / f"RGB_pytorch_{count}.json"
     if args.route=="dali" and baseline.exists():
         previous = json.loads(baseline.read_text())
-        result["prediction_agreement_with_pytorch"] = sum(a==b for a,b in zip(predictions,previous["predictions"]))/count
+        result["prediction_agreement_with_pytorch"] = prediction_agreement(result, previous)
         result["top1_delta_pp_vs_pytorch"] = result["top1"]-previous["top1"]
     (args.output_dir/f"RGB_{args.route}_{count}.json").write_text(json.dumps(result,indent=2))
-    print(json.dumps({k:v for k,v in result.items() if k!="predictions"},indent=2))
+    print(json.dumps({k:v for k,v in result.items() if k not in ("predictions", "sample_ids")},indent=2))
 
 
 if __name__ == "__main__":
