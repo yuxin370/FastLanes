@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 import galp.benchmarks.dct_models.backend as B
-from galp.benchmarks.dct_models.evaluate import samples
+from galp.benchmarks.dct_models.evaluate import prediction_agreement, samples
 from galp.benchmarks.dct_models.capture import Capture
 from galp.benchmarks.dct_models.online_crop import CROP, SOURCE_PROFILE, SourceReference, read_source_jpeg, source_options
 
@@ -110,7 +110,10 @@ def main():
     p.add_argument("--native-runtime", choices=["legacy", "b6"], default="legacy")
     p.add_argument("--shards-per-activation", type=int, choices=[1, 2, 4], default=1)
     p.add_argument("--physical-prefix", action="store_true", help="calibration: use the first count stored images")
+    p.add_argument("--warmup-batches", type=int, default=20)
     args = p.parse_args()
+    if args.warmup_batches < 1:
+        p.error("--warmup-batches must be positive")
     online = args.input_geometry == "source512"
     if online and args.pushdown != "off":
         p.error("source512 resize needs all source frequencies: pass --pushdown off")
@@ -159,8 +162,12 @@ def main():
     if online and args.verify:
         source_reference = SourceReference(B.DEFAULT_RGBNOMORE_ROOT, B.GRID)
     with torch.inference_mode():
-        net(reference(selected[0]["path"])[None].cuda())
+        warm_input = reference(selected[0]["path"])[None].cuda().expand(args.batch_size, -1, -1, -1).contiguous()
+        for _ in range(args.warmup_batches):
+            warm_output = net(warm_input)
+        assert warm_output.shape == (args.batch_size, 1000) and torch.isfinite(warm_output).all()
     torch.cuda.synchronize()
+    del warm_input, warm_output
     args.output_dir.mkdir(parents=True, exist_ok=True)
     predictions = [-1] * args.count
     top1 = top5 = count = decoded_images = 0
@@ -324,16 +331,17 @@ def main():
                   output_layout=args.output_layout,
                   native_options=options, manifest=str(root/"manifest.bin"),
                   checkpoint=str(B.CHECKPOINT), native_shards=shard_stats, predictions=predictions,
+                  sample_ids=[s["logical_sample_id"] for s in selected], warmup_batches=args.warmup_batches,
                   model_profile=B.profile(), stored_profile=stored_profile,
                   peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(),
                   prediction_order="original fixed evaluation ordinal; shard order only affects execution")
     baseline = args.baseline_dir / f"R_{args.count}.json"
     if baseline.exists():
         r = json.loads(baseline.read_text())
-        result["prediction_agreement_with_R"] = sum(a == b for a,b in zip(predictions,r["predictions"]))/count
+        result["prediction_agreement_with_R"] = prediction_agreement(result, r)
         result["top1_delta_pp_vs_R"] = result["top1"] - r["top1"]
     (args.output_dir/f"N_{args.count}.json").write_text(json.dumps(result, indent=2))
-    print(json.dumps({k:v for k,v in result.items() if k not in ("native_shards", "predictions")}, indent=2))
+    print(json.dumps({k:v for k,v in result.items() if k not in ("native_shards", "predictions", "sample_ids")}, indent=2))
 
 
 if __name__ == "__main__":

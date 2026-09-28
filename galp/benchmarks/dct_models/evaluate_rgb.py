@@ -24,7 +24,10 @@ def main():
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--profile", action="store_true")
     p.add_argument("--physical-order", action="store_true")
+    p.add_argument("--warmup-batches", type=int, default=20)
     args = p.parse_args()
+    if args.warmup_batches < 1:
+        p.error("--warmup-batches must be positive")
     torch.set_num_threads(args.model_threads)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -32,9 +35,12 @@ def main():
     net = rgb.model().cuda()
     reference = rgb.Inputs(entries)
     with torch.inference_mode():
-        warm = net(reference[0][0][None].cuda())
-    assert warm.shape == (1,1000) and torch.isfinite(warm).all()
+        warm_input = reference[0][0][None].cuda().expand(args.batch_size, -1, -1, -1).contiguous()
+        for _ in range(args.warmup_batches):
+            warm = net(warm_input)
+    assert warm.shape == (args.batch_size,1000) and torch.isfinite(warm).all()
     torch.cuda.synchronize()
+    del warm, warm_input
     args.output_dir.mkdir(parents=True, exist_ok=True)
     capture = Capture(args.profile, images_per_step=args.batch_size)
     predictions = [-1] * args.count
@@ -116,7 +122,7 @@ def main():
                   transform_worker_seconds=transform_work if args.route=="pytorch" else None,
                   source_bytes=read_bytes if args.route=="pytorch" else sum(Path(e["path"]).stat().st_size for e in entries),
                   timing_scope="file input through logits and metrics; reader initialization included; model warmup excluded",
-                  physical_order=args.physical_order,
+                  physical_order=args.physical_order, warmup_batches=args.warmup_batches,
                   sample_ids=[s["logical_sample_id"] for s in entries],
                   predictions=predictions)
     baseline = args.output_dir / f"RGB_pytorch_{count}.json"

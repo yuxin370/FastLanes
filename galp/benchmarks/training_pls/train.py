@@ -1141,6 +1141,7 @@ def _train_native_physical_epoch(
                     weighted_loss = loss.detach().to(torch.float64) * batch_size
                     update_loss_device = update_loss_device + weighted_loss
                     epoch_loss_device = epoch_loss_device + weighted_loss
+                final_loss_tensor = loss.detach()
                 pool_seen_images += batch_size
                 epoch_microbatches += 1
                 del native_batch, y, cbcr, targets, logits, loss
@@ -1341,6 +1342,7 @@ def _train_native_physical_epoch(
             "optimizer_update": global_update,
             "processed_images": processed_images,
             "train_loss": epoch_loss_sum / epoch_samples,
+            "final_loss": float(final_loss_tensor.item()),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "epoch_samples": epoch_samples,
             "epoch_microbatches": epoch_microbatches,
@@ -2169,6 +2171,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                     update_loss_device + weighted_loss
                                 )
                                 epoch_loss_device = epoch_loss_device + weighted_loss
+                            final_loss_tensor = loss.detach()
                             for planned_position, augmentation in zip(
                                 microbatch_positions[local_index], augmentations[local_index]
                             ):
@@ -2336,6 +2339,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "optimizer_update": global_update,
             "processed_images": processed_images,
             "train_loss": epoch_loss_sum / epoch_samples,
+            "final_loss": float(final_loss_tensor.item()),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "epoch_samples": epoch_samples,
             "epoch_microbatches": epoch_microbatches,

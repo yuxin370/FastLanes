@@ -902,6 +902,7 @@ def run_pipeline(
         return expected_batch(batch_index + 1) if batch_index + 1 < total_batches else None
 
     for repeat in range(repeats):
+        repeat_started = time.perf_counter()
         adapter.begin_repeat()
         for warmup_index in range(warmup_batches):
             expected = expected_batch(warmup_index)
@@ -1070,6 +1071,8 @@ def run_pipeline(
             "repeat": repeat,
             "images": images,
             "seconds": measured_seconds,
+            "repeat_scope_seconds": time.perf_counter() - repeat_started,
+            "repeat_scope_note": "whole repeat including adapter reset, configured warmup and per-batch audits",
             "throughput_images_per_s": images / measured_seconds,
             "end_to_end_latency_ms": distribution(latency_ms),
             "accuracy_top1": None if runtime_profile else correct1 / images,

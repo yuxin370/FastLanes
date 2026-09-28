@@ -448,6 +448,15 @@ class DaliAdapter(Adapter):
 class CoorDLAdapter(DaliAdapter):
     """Use the upstream CoorDL FileReader and keep its MinIO cache across epochs."""
 
+    def load(self, expected):
+        batch = super().load(expected)
+        if self.contract["preprocess"]["rgb"]["resize_shorter"] is not None:
+            # The installed CoorDL Resize operator has no antialias argument.
+            # Preserve checkpoint preprocessing with the GPU tensor operation.
+            pixels = batch.inputs[0].add(1).mul(127.5)
+            batch.inputs = (_normal_rgb_resize_crop(pixels, self.contract),)
+        return batch
+
     def begin_repeat(self) -> None:
         if self.iterator is not None:
             return
@@ -463,8 +472,6 @@ class CoorDLAdapter(DaliAdapter):
         execution = self.contract["execution"]
         config = self.contract["pipelines"][self.name]
         preprocess = self.contract["preprocess"]["rgb"]
-        if preprocess["resize_shorter"] is not None:
-            raise ValueError("CoorDL baseline requires the fixed-512 center-crop profile")
 
         # Upstream FileReader accepts a whitespace-delimited list, relative to file_root.
         # Keeping the full path below / also avoids collisions between dataset views
@@ -512,7 +519,7 @@ class CoorDLAdapter(DaliAdapter):
                     device="gpu",
                     output_dtype=types.FLOAT,
                     output_layout="CHW",
-                    crop=tuple(preprocess["crop_size"]),
+                    crop=(512, 512) if preprocess["resize_shorter"] is not None else tuple(preprocess["crop_size"]),
                     crop_pos_x=0.5,
                     crop_pos_y=0.5,
                     mean=[127.5, 127.5, 127.5],
@@ -544,6 +551,18 @@ class CoorDLAdapter(DaliAdapter):
             path.unlink(missing_ok=True)
 
 
+def _normal_rgb_resize_crop(pixels: torch.Tensor, contract: dict[str, Any]) -> torch.Tensor:
+    """Bilinear antialiased Resize(256), uint8 rounding, then center crop."""
+    preprocess = contract["preprocess"]["rgb"]
+    size = int(preprocess["resize_shorter"])
+    images = torch.nn.functional.interpolate(pixels.float(), size=(size, size),
+                                             mode=preprocess.get("torch_interpolation", "bilinear"),
+                                             align_corners=False, antialias=True).round_().clamp_(0, 255)
+    height, width = preprocess["crop_size"]
+    top, left = (size-height)//2, (size-width)//2
+    return images[:, :, top:top+height, left:left+width].contiguous().div_(127.5).sub_(1)
+
+
 class FfcvAdapter(Adapter):
     domain = "rgb"
     worker_semantics = "ffcv_cpu_threads"
@@ -552,7 +571,7 @@ class FfcvAdapter(Adapter):
         super().__init__(contract, samples, device, name)
         if device.type != "cuda":
             raise ValueError("FFCV requires CUDA")
-        from ffcv.fields.decoders import CenterCropRGBImageDecoder, IntDecoder
+        from ffcv.fields.decoders import CenterCropRGBImageDecoder, IntDecoder, SimpleRGBImageDecoder
         from ffcv.loader import Loader, OrderOption
         from ffcv.transforms import ToDevice, ToTensor, ToTorchImage
 
@@ -561,11 +580,12 @@ class FfcvAdapter(Adapter):
             batch_size=int(contract["execution"]["batch_size"]),
             num_workers=max(1, int(contract["execution"]["workers"])),
             order=OrderOption.SEQUENTIAL,
-            indices=[int(sample["ordinal"]) for sample in samples],
+            indices=contract["pipelines"][name].get("indices", [int(sample["ordinal"]) for sample in samples]),
             drop_last=False,
             pipelines={
                 "image": [
-                    CenterCropRGBImageDecoder((224, 224), 224 / 512),
+                    (SimpleRGBImageDecoder() if contract["preprocess"]["rgb"]["resize_shorter"] is not None
+                     else CenterCropRGBImageDecoder((224, 224), 224 / 512)),
                     ToTensor(),
                     ToDevice(device),
                     ToTorchImage(),
@@ -590,11 +610,17 @@ class FfcvAdapter(Adapter):
         if self.iterator is None:
             raise RuntimeError("FFCV adapter was not started")
         images, ordinal_tensor = next(self.iterator)
+        images = (_normal_rgb_resize_crop(images, self.contract)
+                  if self.contract["preprocess"]["rgb"]["resize_shorter"] is not None
+                  else images.float().div_(127.5).sub_(1.0))
         ordinals = [int(item) for item in ordinal_tensor.reshape(-1).tolist()]
+        if "ordinal_remap" in self.contract["pipelines"][self.name]:
+            remap = self.contract["pipelines"][self.name]["ordinal_remap"]
+            ordinals = [remap[item] for item in ordinals]
         label_values = [int(self.samples[item]["label"]) for item in ordinals]
         labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
         return LoadedBatch(
-            inputs=(images.float().div_(127.5).sub_(1.0),),
+            inputs=(images,),
             labels=labels,
             ordinals=ordinals,
             label_values=label_values,

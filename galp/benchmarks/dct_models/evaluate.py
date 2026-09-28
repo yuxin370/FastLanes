@@ -53,6 +53,9 @@ class Inputs(Dataset):
             torch.set_num_threads(1)
             if self.route == "R":
                 self.reference = B.Reference()
+            elif self.route == "J":
+                from galp.benchmarks.dct_models.online_crop import SourceReference
+                self.reference = SourceReference(B.DEFAULT_RGBNOMORE_ROOT, B.GRID)
             else:
                 from galp.benchmarks.dct_models.storage import Reader
                 from galp.benchmarks.dct_models.dct_geometry import StoredDctAdapter
@@ -70,6 +73,15 @@ class Inputs(Dataset):
             x = self.reference(entry["path"])
             size = Path(entry["path"]).stat().st_size
             native, adaptation = 0., 0.
+        elif self.route == "J":
+            from galp.benchmarks.dct_models.online_crop import read_source_jpeg
+            q, qt = read_source_jpeg(entry["path"])
+            native = time.perf_counter() - start
+            t = time.perf_counter()
+            components = [c.round().clamp(-32768, 32767) for c in self.reference(q, qt)]
+            x = B.organize(components)
+            adaptation = time.perf_counter() - t
+            size = Path(entry["path"]).stat().st_size
         else:
             image_id = entry["galp_image_id"]
             if self.route == "N":
@@ -92,13 +104,16 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--model-threads", type=int, default=8)
-    parser.add_argument("--route", choices=["R", "N"] if B.PROFILE == "efun" else ["R", "N", "O", "S"], default="R")
+    parser.add_argument("--route", choices=["R", "N", "J"] if B.PROFILE == "efun" else ["R", "N", "O", "S", "J"], default="R")
     parser.add_argument("--physical-order", action="store_true", help="canonical image-ID order for matched block-major comparisons")
+    parser.add_argument("--warmup-batches", type=int, default=20)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--new-data", type=Path)
     parser.add_argument("--output-dir", type=Path, default=B.DEFAULT_E2E_V3_ROOT / "runs" / B.RUN_NAME)
     args = parser.parse_args()
+    if args.warmup_batches < 1:
+        parser.error("--warmup-batches must be positive")
     torch.set_num_threads(args.model_threads)
     device = torch.device(args.device)
     if device.type == "cuda":
@@ -115,8 +130,13 @@ def main():
     x = ref(selected[0]["path"])
     torch.testing.assert_close(x, B.organize(components), rtol=0, atol=0)
     with torch.inference_mode():
-        warmup = net(x[None].to(device))
-    assert tuple(warmup.shape) == (1, 1000) and torch.isfinite(warmup).all()
+        warm_input = x[None].to(device).expand(args.batch_size, *x.shape).contiguous()
+        for _ in range(args.warmup_batches):
+            warmup = net(warm_input)
+    assert tuple(warmup.shape) == (args.batch_size, 1000) and torch.isfinite(warmup).all()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    del warmup, warm_input
     manifest, new_ids = None, None
     if args.route == "N":
         if args.new_data is None:
@@ -170,7 +190,7 @@ def main():
                   e2e_seconds=wall, logical_read_bytes=read_bytes, physical_read_bytes=None,
                   initialization_seconds=capture.initialization_seconds,
                   input_wait_seconds=capture.wait_seconds,
-                  read_bytes_kind="source JPEG bytes" if args.route == "R" else "requested GALP payload bytes",
+                  read_bytes_kind="source JPEG bytes" if args.route in ("R", "J") else "requested GALP payload bytes",
                   native_read_decode_worker_seconds=native_time if args.route != "R" else None,
                   adaptation_worker_seconds=adaptation_time if args.route != "R" else None,
                   manifest=str(manifest) if manifest else None,
@@ -179,11 +199,15 @@ def main():
                   h2d_seconds=h2d_time if device.type == "cuda" else None,
                   workers=args.workers, model_threads=args.model_threads,
                   source_root=str(B.DEFAULT_DATA_ROOT), checkpoint=str(B.CHECKPOINT),
-                  physical_order=args.physical_order, sample_ids=consumed_ids,
+                  physical_order=args.physical_order, warmup_batches=args.warmup_batches,
+                  sample_ids=consumed_ids,
                   predictions=predictions)
     if args.route == "S":
         result["numerical_contract"] = "full source read/decode on CPU, crop/resize, round-even, int16 saturation, normalize"
         result["comparison_note"] = "same source content as online native; different physical layout and CPU resize arithmetic"
+    if args.route == "J":
+        result["numerical_contract"] = "source JPEG coefficients on CPU, identical logical crop/resize, round-even, int16 saturation, normalize"
+        result["comparison_note"] = "same geometry/checkpoint as online native; numerical equivalence must pass before causal comparison"
     baseline = args.output_dir / f"R_{count}.json"
     if args.route != "R" and baseline.exists():
         previous = json.loads(baseline.read_text())

@@ -179,6 +179,7 @@ class PipelineControlTest(unittest.TestCase):
         contract = {
             "execution": {"batch_size": 2, "workers": 2},
             "pipelines": {"ffcv": {"beton": "dataset.beton"}},
+            "preprocess": {"rgb": {"resize_shorter": None}},
         }
         original_tensor = torch.tensor
         with mock.patch.dict(sys.modules, modules), mock.patch(

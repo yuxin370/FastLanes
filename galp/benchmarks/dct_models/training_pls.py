@@ -24,6 +24,7 @@ from galp.benchmarks.training_audit_policy import build_audit_policy, decision_f
 from galp.benchmarks.training_pls.published_optimizer import build_published_optimizer
 from galp.benchmarks.training_pls.recipe import SWINV2_RECIPE_NAME, recipe_contract
 from galp.benchmarks.system_rgbnomore.training.model_factory import capture_rng_state, restore_rng_state
+from galp.benchmarks.system_rgbnomore.training.artifacts import tensor_state_sha256
 
 
 def channels():
@@ -137,6 +138,7 @@ def main():
     effective = microbatch * accumulation
     audit = build_audit_policy()
     net = optimizer = decayer = scheduler = execution = None
+    initial_model_hash = None
     if not args.data_only:
         if rgb_backend:
             from galp.benchmarks.dct_models.rgb import model
@@ -148,6 +150,7 @@ def main():
         for module in net.modules():
             if list(module.parameters(recurse=False)):
                 module.reset_parameters()
+        initial_model_hash = tensor_state_sha256(net.state_dict())
         net.cuda()
         if args.compile_mode == "reduce-overhead" and not args.no_compile:
             # Accumulation must not retain gradients owned by a previous graph replay.
@@ -364,6 +367,7 @@ def main():
         backbone=("EfficientNet-B0" if rgb_backend else "eFUN") if B.PROFILE == "efun" else
                  ("MobileNetV2" if B.PROFILE.startswith("mobilenet") else "ResNet-50"), representation="RGB" if rgb_backend else "DCT",
         initialization="from scratch; official CNN layers reset with seed 11997733", full_training_epochs_completed=complete_epochs,
+        initial_model_hash=initial_model_hash,
         resumed_from=str(args.resume) if args.resume else None,
         manifest=str(args.manifest) if args.input_backend == "native" else None,
         mapping=None if rgb_backend else str(args.mapping), training_manifest=str(source_path),
