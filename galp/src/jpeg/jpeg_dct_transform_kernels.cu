@@ -10,6 +10,12 @@ __device__ __constant__ float kReferenceDown2Conversion[8U * 16U] = {
 #include "jpeg/jpeg_dct_reference_down2.inc"
 };
 
+// First eight rows of RGB-no-more's FP32 generate_conversion_matrix(8, 4).
+// Keep its small non-zero entries, as for the shared down2/up2 conversion.
+__device__ __constant__ float kReferenceUp4Conversion[8U * 32U] = {
+#include "jpeg/jpeg_dct_reference_up4.inc"
+};
+
 __device__ __forceinline__ uint8_t natural_to_physical_coeff_device(const uint8_t natural,
                                                                     const uint8_t zigzag_columns) {
 	if (zigzag_columns == 0) {
@@ -904,6 +910,9 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 		// frequencies and the horizontal intermediates needed to produce them.
 		const uint32_t output_frequency_count = projection ? projection->frequency_count[component] : 64U;
 		const uint32_t horizontal_count       = projection ? projection->horizontal_count[component] : 64U;
+		const auto     up_factor              = static_cast<uint32_t>(descriptor.x_up_factor);
+		const bool     reference_upscale =
+		    x_down == 1U && y_down == 1U && descriptor.y_up_factor == up_factor && (up_factor == 2U || up_factor == 4U);
 		if (output_frequency_count == 0U) {
 			continue;
 		}
@@ -969,6 +978,34 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 					cached_image_component = image_component;
 					cached_source_x        = source_x_block;
 					cached_source_y        = source_y_block;
+				}
+				if (reference_upscale) {
+					// Match CPU upsample_dct: scale the source by sqrt(L*M), then
+					// apply the unscaled FP32 conversion vertically and horizontally.
+					// Distributing sqrt(L) into each axis changes half-integer results.
+					const auto* conversion = up_factor == 2U ? kReferenceDown2Conversion : kReferenceUp4Conversion;
+					const auto  stride     = up_factor * 8U;
+					const auto  phase_y    = (output_y % up_factor) * 8U;
+					const auto  phase_x    = (output_x % up_factor) * 8U;
+					float       sum        = 0.0F;
+					for (uint32_t in_y = 0U; in_y < 8U; ++in_y) {
+						const auto value = __fmul_rn(source[in_y * 8U + lane % 8U], static_cast<float>(up_factor));
+						sum = dct_grid_madd_rn(conversion[in_y * stride + phase_y + lane / 8U], value, sum);
+					}
+					vertical[lane] = sum;
+					__syncthreads();
+					if (lane < output_frequency_count) {
+						const auto frequency = projection ? projection->frequencies[component][lane] : lane;
+						sum                  = 0.0F;
+						for (uint32_t in_x = 0U; in_x < 8U; ++in_x) {
+							sum = dct_grid_madd_rn(vertical[(frequency / 8U) * 8U + in_x],
+							                       conversion[in_x * stride + phase_x + frequency % 8U],
+							                       sum);
+						}
+						output_sum = dct_grid_add_rn(output_sum, sum);
+					}
+					__syncthreads();
+					continue;
 				}
 				if (lane < horizontal_count) {
 					const auto frequency      = projection ? projection->horizontal_frequencies[component][lane] : lane;

@@ -16,14 +16,17 @@ from galp.benchmarks.dct_models.capture import Capture, batches
 from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
 
 
-def samples(count):
+def samples(count, physical_order=False):
     manifest = json.loads((B.DEFAULT_E2E_V3_ROOT / "training_manifests_official_v3/val.json").read_text())
     population = manifest["samples"]
     classes = sorted({s["logical_sample_id"].split("/")[1] for s in population})
     labels = {name: index for index, name in enumerate(classes)}
     # Preserve stored IDs/labels; model_label is an explicit checkpoint mapping.
     order = list(range(len(population)))
-    random.Random(11997733).shuffle(order)
+    if physical_order:
+        order.sort(key=lambda i: population[i]["galp_image_id"])
+    else:
+        random.Random(11997733).shuffle(order)
     return [dict(population[i], ordinal=j,
                  model_label=labels[population[i]["logical_sample_id"].split("/")[1]])
             for j, i in enumerate(order[:count])]

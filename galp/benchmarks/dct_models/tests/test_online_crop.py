@@ -1,10 +1,13 @@
-"""CPU checks of online geometry and source-frequency dependencies."""
+"""Online geometry checks and a small native source512 rounding regression."""
+import json
+import os
+import sys
 import unittest
 from pathlib import Path
 
 import torch
 
-from galp.benchmarks.dct_models.online_crop import SourceReference
+from galp.benchmarks.dct_models.online_crop import CROP, SourceReference, read_source_jpeg
 
 from galp.benchmarks.common import DEFAULT_RGBNOMORE_ROOT
 
@@ -55,6 +58,52 @@ class OnlineCropTest(unittest.TestCase):
         q[0] = q[0][4:-4, 4:-4]
         with self.assertRaisesRegex(ValueError, "full source component"):
             SourceReference(self.upstream, 56)(q, tables)
+
+    def test_native_upscale_matches_cpu_at_rounding_boundaries(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA device is not available")
+        repo = Path(__file__).resolve().parents[4]
+        root = repo / "galp/data/compressed/imagenet512_val_block_major"
+        if not (root / "manifest.bin").exists():
+            self.skipTest("source512 ImageNet fixture is not available")
+        torch.set_num_threads(1)  # evaluate route J's worker setting
+        sys.path.insert(0, str(repo / "build/galp/torch"))
+        import _galp_direct_dct as native
+        from unittest.mock import patch
+        from galp.benchmarks.dct_models.evaluate_shards import apply_b6_runtime
+        from galp.benchmarks.dct_models.online_crop import source_options
+
+        entries = json.loads((root / "samples.json").read_text())
+        # Three prefix regressions and the sample whose Top-1 changed. Read one
+        # image at a time, without activating a whole shard or loading a model.
+        reference = SourceReference(self.upstream, 112)
+        with patch.dict(os.environ, GALP_BLOCK_MAJOR_ACCESS_DIR=str(root / "access")):
+            reader = native.DirectDctReader(str(root / "manifest.bin"))
+            for image_id in (0, 1, 2, 22858):
+                with self.subTest(image_id=image_id):
+                    position = next(i for i, s in enumerate(entries) if s["galp_image_id"] == image_id)
+                    q, tables = read_source_jpeg(entries[position]["path"])
+                    expected = torch.stack(reference(q, tables)).round().clamp(-32768, 32767)
+                    options = apply_b6_runtime(source_options(dict(
+                        layout="transformed_dct_grid", enable_planless_execution=True,
+                        cache_capacity_mib=0, plan_cache_capacity=0,
+                        grid_transform=dict(y_output_width_blocks=112, y_output_height_blocks=112,
+                                            cbcr_output_width_blocks=112, cbcr_output_height_blocks=112,
+                                            clamp_min=-32768, clamp_max=32767, output_dtype="float32",
+                                            dequantize=True)), "vector-range-read-selected-decode"))
+                    batch = reader.read_prefetched(reader.prefetch_batch(
+                        [position], transforms=[dict(crop=CROP, horizontal_flip=False)], **options))
+                    actual = torch.cat((batch.y[0], batch.cbcr[0])).flatten(-2).cpu()
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    del batch
+                    # Exercise direct projection independently of grid materialization.
+                    options["grid_transform"]["output_channels"] = [[0, 8, .5, 4.], [1, 0, -1., 2.]]
+                    batch = reader.read_prefetched(reader.prefetch_batch(
+                        [position], transforms=[dict(crop=CROP, horizontal_flip=False)], **options))
+                    projected = torch.stack(((expected[0, ..., 8] - .5) / 4.,
+                                             (expected[1, ..., 0] + 1.) / 2.))
+                    torch.testing.assert_close(batch.projected[0].cpu(), projected, atol=0, rtol=0)
+                    del batch
 
     def test_multi_shard_activation_preserves_noncontiguous_ids_and_tail(self):
         from galp.benchmarks.dct_models.evaluate_shards import activation_groups
