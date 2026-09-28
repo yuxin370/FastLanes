@@ -166,6 +166,10 @@ build_win/
 # Local experiment scripts and results
 /experiments/
 /results/
+/galp/benchmarks/profiling/INPUT_MOTIVATION.md
+/galp/benchmarks/profiling/input_motivation.py
+/galp/benchmarks/profiling/input_motivation_dct.py
+/galp/benchmarks/profiling/plot_input_motivation.py
 
 # Generated GALP documentation evidence; source reports remain visible
 /galp/benchmarks/system_rgbnomore/docs/artifacts/
