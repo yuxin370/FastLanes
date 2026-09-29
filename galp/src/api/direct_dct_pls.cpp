@@ -1109,6 +1109,12 @@ void* DirectDctPlsPoolBatch::cuda_completion_event() const noexcept {
 	return impl_->postprocess ? impl_->postprocess->completion_event() : impl_->batch.cuda_completion_event();
 }
 
+void* DirectDctPlsPoolBatch::microbatch_completion_event(const size_t index) const {
+	if (index >= microbatch_count())
+		throw std::out_of_range("Direct-DCT PLS microbatch index is outside the pool");
+	return impl_->postprocess ? impl_->postprocess->microbatch_completion_event(index) : cuda_completion_event();
+}
+
 DirectDctPlsMicrobatchView DirectDctPlsPoolBatch::microbatch(const size_t index) const {
 	if (!impl_ || index >= microbatch_count()) {
 		throw std::out_of_range("Direct-DCT PLS microbatch index is outside the pool");

@@ -300,7 +300,9 @@ def main():
                         del loss, logits
                     del x, target, batch
                 with capture.range("detail.pool_sync"):
-                    torch.cuda.synchronize()
+                    # Join this consumer stream without draining the next pool's
+                    # input stream. Native leases retain all producer/consumer storage.
+                    torch.cuda.current_stream().synchronize()
                 pool_model_ms = sum(a.elapsed_time(b) for a, b in events)
                 model_ms += pool_model_ms
                 pool_records.append(dict(pool_index=pool.pool_index, images=pool.image_count,

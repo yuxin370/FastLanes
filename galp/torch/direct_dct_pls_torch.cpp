@@ -203,7 +203,7 @@ public:
 		                        ? c10::cuda::getDefaultCUDAStream(device)
 		                        : c10::cuda::getStreamFromExternal(
 		                              reinterpret_cast<cudaStream_t>(stream_identity), device);
-		if (auto* event = owner_->cuda_completion_event(); event != nullptr) {
+		if (auto* event = owner_->microbatch_completion_event(index_); event != nullptr) {
 			C10_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), static_cast<cudaEvent_t>(event), 0U));
 		}
 		storage_lifetime_->register_stream(
@@ -243,7 +243,7 @@ private:
 	}
 
 	void wait_for_completion(const int cuda_device) const {
-		auto* event = owner_->cuda_completion_event();
+		auto* event = owner_->microbatch_completion_event(index_);
 		if (event == nullptr)
 			return;
 		const auto           device = static_cast<c10::DeviceIndex>(cuda_device);

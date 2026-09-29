@@ -198,6 +198,7 @@ public:
 	// Backing ownership and reader diagnostics; use microbatch() for model tensor geometry.
 	[[nodiscard]] const DirectDctBatch&      batch() const noexcept;
 	[[nodiscard]] void*                      cuda_completion_event() const noexcept;
+	[[nodiscard]] void*                      microbatch_completion_event(size_t index) const;
 	[[nodiscard]] DirectDctPlsMicrobatchView microbatch(size_t index) const;
 	// Compatibility marker for callers that explicitly retire a pool. The
 	// bounded context permit now follows the pool backing and is released only

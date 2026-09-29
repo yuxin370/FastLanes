@@ -100,6 +100,7 @@ public:
 	[[nodiscard]] DirectDctGridTensorDescriptor      projected_tensor() const noexcept;
 	[[nodiscard]] DirectDctPlsTargetTensorDescriptor targets() const noexcept;
 	[[nodiscard]] void*                              completion_event() const noexcept;
+	[[nodiscard]] void*                              microbatch_completion_event(size_t index) const;
 
 private:
 	struct Impl;

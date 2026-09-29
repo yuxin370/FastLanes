@@ -12,6 +12,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace galp::jpeg::detail {
 namespace {
@@ -430,6 +431,14 @@ struct DirectDctPlsCudaPostprocess::Impl {
 	int                                      device = -1;
 	std::shared_ptr<Stream>                  stream;
 	galp::memory::CudaEvent                  completion;
+	std::vector<galp::memory::CudaEvent>     microbatch_ready;
+	// Keep asynchronous upload sources alive until the producer finishes.
+	std::vector<int64_t>                                     host_labels;
+	std::vector<DirectDctPlsRandAugmentDecision>             host_decisions;
+	std::vector<DirectDctPlsMixupDecision>                   host_mixup;
+	std::vector<ProjectedChannel>                            host_input_channels, host_output_channels;
+	bool                                                     projected_submitted = false;
+	bool                                                     completion_recorded = false;
 	std::optional<GPUArray<int16_t>>         y_a;
 	std::optional<GPUArray<int16_t>>         y_b;
 	std::optional<GPUArray<int16_t>>         c_a;
@@ -466,6 +475,14 @@ struct DirectDctPlsCudaPostprocess::Impl {
 	~Impl() {
 		if (device >= 0) {
 			(void)cudaSetDevice(device);
+			if (projected_submitted) {
+				// Also covers destruction before a tensor is exported and exceptions
+				// after a partial submission. Do not free in-flight host/device storage.
+				if (completion_recorded)
+					CUDA_LOG_CALL(cudaEventSynchronize(completion.get()));
+				else
+					CUDA_LOG_CALL(cudaStreamSynchronize(stream->impl_->stream.get()));
+			}
 		}
 	}
 };
@@ -522,24 +539,34 @@ void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor   
 	stats_device.emplace(capacity, stream);
 	input_channels_device.emplace(in.size(), stream);
 	output_channels_device.emplace(out.size(), stream);
+	host_labels.assign(labels.begin(), labels.end());
+	host_decisions.assign(randaugment.begin(), randaugment.end());
+	host_mixup.assign(mixup.begin(), mixup.end());
+	host_input_channels  = std::move(in);
+	host_output_channels = std::move(out);
+	microbatch_ready.resize((images + capacity - 1) / capacity);
+	for (auto& ready : microbatch_ready)
+		ready.create_with_flags(cudaEventDisableTiming);
+	projected_submitted = true;
 	check_cuda(
-	    cudaMemcpyAsync(labels_device->get(), labels.data(), labels.size_bytes(), cudaMemcpyHostToDevice, stream),
+	    cudaMemcpyAsync(labels_device->get(), host_labels.data(), labels.size_bytes(), cudaMemcpyHostToDevice, stream),
 	    "upload labels");
 	check_cuda(
 	    cudaMemcpyAsync(
-	        decisions_device->get(), randaugment.data(), randaugment.size_bytes(), cudaMemcpyHostToDevice, stream),
+	        decisions_device->get(), host_decisions.data(), randaugment.size_bytes(), cudaMemcpyHostToDevice, stream),
 	    "upload decisions");
-	check_cuda(cudaMemcpyAsync(mixup_device->get(), mixup.data(), mixup.size_bytes(), cudaMemcpyHostToDevice, stream),
-	           "upload mixup");
+	check_cuda(
+	    cudaMemcpyAsync(mixup_device->get(), host_mixup.data(), mixup.size_bytes(), cudaMemcpyHostToDevice, stream),
+	    "upload mixup");
 	check_cuda(cudaMemcpyAsync(input_channels_device->get(),
-	                           in.data(),
-	                           in.size() * sizeof(ProjectedChannel),
+	                           host_input_channels.data(),
+	                           host_input_channels.size() * sizeof(ProjectedChannel),
 	                           cudaMemcpyHostToDevice,
 	                           stream),
 	           "upload dependency channels");
 	check_cuda(cudaMemcpyAsync(output_channels_device->get(),
-	                           out.data(),
-	                           out.size() * sizeof(ProjectedChannel),
+	                           host_output_channels.data(),
+	                           host_output_channels.size() * sizeof(ProjectedChannel),
 	                           cudaMemcpyHostToDevice,
 	                           stream),
 	           "upload output channels");
@@ -584,18 +611,26 @@ void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor   
 		    output_channels_device->get(),
 		    mixup_device->get() + offset / microbatch_images,
 		    enable_mixup);
+		mixup_targets_kernel<<<launch_blocks(count * classes), 256, 0, stream>>>(labels_device->get() + offset,
+		                                                                         targets + offset * classes,
+		                                                                         mixup_device->get() +
+		                                                                             offset / microbatch_images,
+		                                                                         count,
+		                                                                         classes,
+		                                                                         microbatch_images,
+		                                                                         enable_mixup);
+		microbatch_ready[offset / capacity].record(stream);
 	}
-	mixup_targets_kernel<<<launch_blocks(images * classes), 256, 0, stream>>>(
-	    labels_device->get(), targets, mixup_device->get(), images, classes, microbatch_images, enable_mixup);
 	check_cuda(cudaGetLastError(), "launch projected augmentation and normalization");
 	completion.record(stream);
+	completion_recorded             = true;
 	projected_descriptor            = input;
 	projected_descriptor.float_data = output;
 	projected_descriptor.shape[1]   = outputs.size();
 	projected_descriptor.strides[0] = outputs.size() * pixels;
 	target_descriptor               = {targets, {images, classes}, {classes, 1U}, device};
-	// Host channel vectors must survive their asynchronous H2D copies only.
-	check_cuda(cudaStreamSynchronize(stream), "finish projected postprocess");
+	// Publication does not wait for the whole pool; consumers wait on their
+	// microbatch event. The full completion event still governs backing lifetime.
 }
 
 DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
@@ -830,6 +865,9 @@ DirectDctGridTensorDescriptor DirectDctPlsCudaPostprocess::projected_tensor() co
 }
 DirectDctPlsTargetTensorDescriptor DirectDctPlsCudaPostprocess::targets() const noexcept {
 	return impl_->target_descriptor;
+}
+void* DirectDctPlsCudaPostprocess::microbatch_completion_event(const size_t index) const {
+	return impl_->microbatch_ready.empty() ? completion_event() : impl_->microbatch_ready.at(index).get();
 }
 void* DirectDctPlsCudaPostprocess::completion_event() const noexcept {
 	return static_cast<void*>(impl_->completion.get());

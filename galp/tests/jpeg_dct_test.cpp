@@ -353,7 +353,7 @@ TEST(JpegDct, ProjectedAugmentationPreservesSequentialStatistics) {
 	using namespace galp::jpeg::detail;
 	const std::array<JpegDctOutputChannel, 3>      channels {{{0, 0, 0.F, 1.F}, {1, 0, 0.F, 1.F}, {2, 0, 0.F, 1.F}}};
 	const std::array<int64_t, 3>                   labels {0, 1, 2};
-	const std::array<DirectDctPlsMixupDecision, 1> mixup {{{1.F, 0.F}}};
+	const std::array<DirectDctPlsMixupDecision, 2> mixup {{{0.75F, 0.25F}, {0.5F, 0.5F}}};
 	std::array<DirectDctPlsRandAugmentDecision, 3> decisions {};
 	for (auto& decision : decisions) {
 		decision.operations = {DirectDctPlsRandAugmentOp::kBrightness, DirectDctPlsRandAugmentOp::kContrast};
@@ -386,6 +386,12 @@ TEST(JpegDct, ProjectedAugmentationPreservesSequentialStatistics) {
 				}
 			}
 		}
+		const auto augmented = expected;
+		const auto per_image = channels.size() * pixels;
+		for (size_t i = 0; i < 2 * per_image; ++i) {
+			const auto partner = i < per_image ? i + per_image : i - per_image;
+			expected[i]        = augmented[i] * mixup[0].original + augmented[partner] * mixup[0].rolled;
+		}
 		GPUArray<float>         device_input(input.size(), input.data());
 		GPUArray<float>         targets(9);
 		galp::memory::CudaEvent ready;
@@ -399,12 +405,22 @@ TEST(JpegDct, ProjectedAugmentationPreservesSequentialStatistics) {
 		                                          DirectDctTensorDevice::kCuda,
 		                                          0};
 		DirectDctPlsCudaPostprocess   postprocess(
-            descriptor, ready.get(), targets.get(), labels, decisions, mixup, 3, 3, stream, channels, channels);
-		ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+            descriptor, ready.get(), targets.get(), labels, decisions, mixup, 2, 3, stream, channels, channels);
+		// The tail microbatch has one image. Its event covers both input and
+		// targets, without a device-wide barrier or changing Mixup partners.
+		ASSERT_NE(postprocess.microbatch_completion_event(0), postprocess.microbatch_completion_event(1));
+		ASSERT_EQ(cudaEventSynchronize(static_cast<cudaEvent_t>(postprocess.microbatch_completion_event(1))),
+		          cudaSuccess);
 		std::vector<float> actual(input.size());
 		ASSERT_EQ(cudaMemcpy(actual.data(), device_input.get(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
 		          cudaSuccess);
 		EXPECT_EQ(actual, expected) << "grid side " << side;
+		std::vector<float> actual_targets(9);
+		ASSERT_EQ(
+		    cudaMemcpy(
+		        actual_targets.data(), targets.get(), actual_targets.size() * sizeof(float), cudaMemcpyDeviceToHost),
+		    cudaSuccess);
+		EXPECT_EQ(actual_targets, (std::vector<float> {0.75F, 0.25F, 0.F, 0.25F, 0.75F, 0.F, 0.F, 0.F, 1.F}));
 	}
 }
 
