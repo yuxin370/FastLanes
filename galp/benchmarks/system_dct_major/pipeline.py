@@ -514,7 +514,12 @@ class CoorDLAdapter(DaliAdapter):
                     # Padding is removed by the iterator; the next epoch starts at 0.
                     pad_last_batch=True,
                 )
-                self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
+                # Keep the decoder in the experiment contract: the CPU path is
+                # needed by eFUN, while earlier accepted baselines used mixed.
+                decoder_device = config.get("decoder_device", "cpu")
+                if decoder_device not in ("cpu", "mixed"):
+                    raise ValueError(f"Unsupported CoorDL decoder: {decoder_device}")
+                self.decode = ops.ImageDecoder(device=decoder_device, output_type=types.RGB)
                 self.normalize = ops.CropMirrorNormalize(
                     device="gpu",
                     output_dtype=types.FLOAT,
@@ -528,7 +533,10 @@ class CoorDLAdapter(DaliAdapter):
 
             def define_graph(self):
                 encoded, ordinal = self.reader(name="Reader")
-                return self.normalize(self.decode(encoded)), ordinal
+                decoded = self.decode(encoded)
+                if config.get("decoder_device", "cpu") == "cpu":
+                    decoded = decoded.gpu()
+                return self.normalize(decoded), ordinal
 
         # CoorDL predates pipeline_def and LastBatchPolicy. Use its published API.
         self.iterator = DALIGenericIterator(

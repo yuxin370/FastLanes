@@ -93,6 +93,9 @@ CoorDL README 将新增代码声明为 MIT，仓库还保留 NVIDIA DALI 的 Apa
 归一化、样本 ordinal 和现有计时。第一版范围为 inference / feature extraction：
 与现有 DALI、FFCV 一样使用 RGB 语义诊断；`rgbnomore` 是 PyTorch DCT 参考，
 两条 block-major 路径继续使用现有 DCT 语义校验。RGB/DCT 跨域比值沿用部署对比口径。
+CoorDL 使用自带的 CPU libjpeg 解码器后传至 GPU，避开旧版 mixed 解码器在色度边缘
+与 PIL 的偏差；缓存策略不变。checkpoint-normal-rgb 配置仍在 GPU 上完成抗锯齿缩放、
+中心裁剪和归一化，解码及传输成本计入端到端吞吐。
 缓存容量 `--coordl-cache-size` 的单位是 **JPEG 数量**，
 不是字节；上游将超过样本数的容量截断为样本数。reader 在 repeats 间保留，首轮填充缓存，
 后续轮次读取缓存；建议正式测量使用 `--repeats 5`。尾批在 reader 内 padding，iterator
@@ -110,7 +113,7 @@ feature-extraction 和 evaluation GPU smoke（1024 张图、batch size 50、5 re
 样本顺序、尾批、DCT 严格校验和 `first:32` raw-mask oracle 检查通过。
 CoorDL 对 PyTorch RGB 的特征余弦为 0.99913，logits 余弦为 0.99897；后者略低于
 诊断阈值 0.999，像素级诊断也未通过。两者都使用默认 `use_fast_idct=False`，
-这里保留上游解码实现及现有 RGB 诊断口径，不声明逐像素或 logits 严格等价。
+这些历史结果使用旧版 mixed 解码器，不代表当前 CPU 解码路径，也不声明逐像素或 logits 严格等价。
 两次运行的 `results.json` 均为 `ok=false`，失败项来自吞吐 CV 或首尾漂移超过
 原有 5% 门槛；RGB 差异单独记录为 diagnostic。这次 smoke 不作为正式性能结论。
 
