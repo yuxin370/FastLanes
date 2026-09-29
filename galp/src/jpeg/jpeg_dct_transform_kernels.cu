@@ -552,6 +552,203 @@ __device__ float planless_axis_phase_weight(const float* __restrict phase_matric
 	return 0.0F;
 }
 
+__device__ __forceinline__ uint64_t active_output_index(uint64_t                              index,
+                                                        const uint64_t                        blocks_per_image,
+                                                        const uint32_t*                       blocks,
+                                                        uint64_t                              blocks_per_repeated_image,
+                                                        const uint32_t*                       image_indices,
+                                                        const JpegDctDeviceActiveOutputGroup* groups,
+                                                        const size_t                          group_count) {
+	if (groups != nullptr) {
+		size_t lo = 0, hi = group_count;
+		while (lo + 1 < hi) {
+			const auto mid = lo + (hi - lo) / 2;
+			if (groups[mid].task_begin <= index)
+				lo = mid;
+			else
+				hi = mid;
+		}
+		const auto group = groups[lo];
+		index -= group.task_begin;
+		blocks += group.block_begin;
+		if (group.image_count == 0)
+			return blocks[index];
+		return uint64_t(image_indices[group.image_begin + index / group.block_count]) * blocks_per_image +
+		       blocks[index % group.block_count];
+	}
+	return blocks_per_repeated_image != 0
+	           ? (index / blocks_per_repeated_image) * blocks_per_image + blocks[index % blocks_per_repeated_image]
+	           : (blocks == nullptr ? index : blocks[index]);
+}
+
+__global__ void
+transformed_dct_grid_integer_upsample_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                             const JpegDctDevicePlanlessImageDescriptor* __restrict images,
+                                             const uint32_t* __restrict logical_to_compact_vectors,
+                                             const uint32_t* __restrict image_vector_bindings,
+                                             const uint32_t* __restrict active_output_blocks,
+                                             const uint64_t active_output_blocks_per_image,
+                                             const uint32_t* __restrict active_image_indices,
+                                             const JpegDctDeviceActiveOutputGroup* active_output_groups,
+                                             size_t                                active_output_group_count,
+                                             const JpegDctDeviceBlockMajorGroupBinding* __restrict block_major_groups,
+                                             const size_t block_major_group_count,
+                                             const JpegDctDeviceBlockMajorRankCell* __restrict block_major_rank_cells,
+                                             const size_t block_major_rank_cell_count,
+                                             const uint8_t* __restrict block_major_rank_payload,
+                                             const size_t   block_major_rank_payload_size,
+                                             const uint64_t selected_physical_coefficient_mask,
+                                             const JpegDctDeviceSparseTransformPlan* __restrict sparse_transform_plans,
+                                             const size_t   image_count,
+                                             const uint64_t output_block_offset,
+                                             const uint64_t output_block_count,
+                                             const uint16_t* __restrict quant_tables,
+                                             const float* __restrict phase_matrices,
+                                             const uint32_t y_output_width,
+                                             const uint32_t y_output_height,
+                                             const uint32_t cbcr_output_width,
+                                             const uint32_t cbcr_output_height,
+                                             const int32_t  clamp_min,
+                                             const int32_t  clamp_max,
+                                             float* __restrict y_accum,
+                                             float* __restrict cbcr_accum,
+                                             const JpegDctOutputProjection* projection,
+                                             const bool                     identity_projection) {
+	// One CTA owns a source block and all of its projected output positions.
+	// The general kernel retains its register/shared-memory footprint.
+	__shared__ float    source[64];
+	__shared__ float    intermediate[16 * 64];
+	__shared__ float    tile[16 * 64];
+	__shared__ uint64_t located_row;
+	__shared__ uint32_t located_binding;
+	const uint64_t      y_blocks         = uint64_t(y_output_width) * y_output_height;
+	const uint64_t      c_blocks         = uint64_t(cbcr_output_width) * cbcr_output_height;
+	const auto          blocks_per_image = y_blocks + 2 * c_blocks;
+	for (uint64_t task = blockIdx.x; task < output_block_count; task += gridDim.x) {
+		const auto index     = output_block_offset + task;
+		const auto linear    = active_output_index(index,
+                                                blocks_per_image,
+                                                active_output_blocks,
+                                                active_output_blocks_per_image,
+                                                active_image_indices,
+                                                active_output_groups,
+                                                active_output_group_count);
+		const auto image     = images[linear / blocks_per_image];
+		const auto spatial   = linear % blocks_per_image;
+		const auto component = spatial < y_blocks ? 0U : 1U + uint32_t((spatial - y_blocks) / c_blocks);
+		const auto width     = component == 0 ? y_output_width : cbcr_output_width;
+		const auto xy        = component == 0 ? spatial : (spatial - y_blocks) % c_blocks;
+		const auto ox = uint32_t(xy % width), oy = uint32_t(xy / width);
+		const auto descriptor = image.components[component];
+		const auto ux = descriptor.x_up_factor, uy = descriptor.y_up_factor;
+		const auto sx = ox / ux, sy = oy / uy;
+		const auto frequencies = projection->frequency_count[component];
+		if (!frequencies)
+			continue;
+		if (threadIdx.x == 0) {
+			const auto located = locate_planless_row(image,
+			                                         descriptor,
+			                                         uint32_t(descriptor.crop_x + sx),
+			                                         uint32_t(descriptor.crop_y + sy),
+			                                         logical_to_compact_vectors,
+			                                         image_vector_bindings,
+			                                         block_major_groups,
+			                                         block_major_group_count,
+			                                         block_major_rank_cells,
+			                                         block_major_rank_cell_count,
+			                                         block_major_rank_payload,
+			                                         block_major_rank_payload_size);
+			located_row        = located.row;
+			located_binding    = located.binding_base;
+		}
+		__syncthreads();
+		if (threadIdx.x < 64) {
+			const auto coefficient = uint8_t(threadIdx.x);
+			const auto physical    = natural_to_physical_coeff_device(coefficient, image.zigzag_columns != 0);
+			int16_t    value       = 0;
+			if (located_row != std::numeric_limits<uint64_t>::max() &&
+			    located_binding != std::numeric_limits<uint32_t>::max()) {
+				const auto binding = column_bindings[located_binding + physical];
+				if (binding.source == DeviceCoeffSource::kI16)
+					value = binding.column_i16[located_row];
+				else if (binding.source == DeviceCoeffSource::kI8)
+					value = binding.column_i8[located_row];
+			}
+			const int32_t quant = quant_tables[size_t(descriptor.quant_table_index) * 64 + coefficient];
+			source[coefficient] = float(min(clamp_max, max(clamp_min, int32_t(value) * quant)));
+		}
+		__syncthreads();
+		const bool reference_upscale = ux == uy && (ux == 2 || ux == 4);
+		const auto horizontal_count  = projection->horizontal_count[component];
+		if (!reference_upscale) {
+			// Reuse each horizontal phase across every vertical output phase.
+			for (uint32_t t = threadIdx.x; t < ux * horizontal_count; t += blockDim.x) {
+				const auto x   = t / horizontal_count;
+				const auto f   = projection->horizontal_frequencies[component][t % horizontal_count];
+				float      sum = 0.F;
+				for (uint32_t k = 0; k < 8; ++k)
+					sum = dct_grid_madd_rn(
+					    source[(f / 8) * 8 + k],
+					    planless_axis_phase_weight(
+					        phase_matrices, descriptor.x_phase_matrix_base, ux, 1, sx, ox + x, f % 8, k),
+					    sum);
+				intermediate[x * 64 + f] = sum;
+			}
+			__syncthreads();
+		}
+		for (uint32_t y = 0; y < uy; ++y) {
+			const auto* conversion = ux == 2 ? kReferenceDown2Conversion : kReferenceUp4Conversion;
+			if (reference_upscale) {
+				// Preserve the CPU-reference vertical-first rounding order for 2x/4x.
+				if (threadIdx.x < 64) {
+					const auto f   = threadIdx.x;
+					float      sum = 0.F;
+					for (uint32_t k = 0; k < 8; ++k)
+						sum = dct_grid_madd_rn(
+						    conversion[k * ux * 8 + y * 8 + f / 8], __fmul_rn(source[k * 8 + f % 8], float(ux)), sum);
+					intermediate[f] = sum;
+				}
+				__syncthreads();
+			}
+			for (uint32_t t = threadIdx.x; t < ux * frequencies; t += blockDim.x) {
+				const auto x = t / frequencies, slot = t % frequencies;
+				const auto f   = projection->frequencies[component][slot];
+				float      sum = 0.F;
+				for (uint32_t k = 0; k < 8; ++k) {
+					if (reference_upscale)
+						sum = dct_grid_madd_rn(
+						    intermediate[(f / 8) * 8 + k], conversion[k * ux * 8 + x * 8 + f % 8], sum);
+					else
+						sum = dct_grid_madd_rn(
+						    intermediate[x * 64 + k * 8 + f % 8],
+						    planless_axis_phase_weight(
+						        phase_matrices, descriptor.y_phase_matrix_base, uy, 1, sy, oy + y, f / 8, k),
+						    sum);
+				}
+				tile[slot * ux + x] = dct_grid_add_rn(0.F, sum);
+			}
+			__syncthreads();
+			// Neighboring threads store neighboring spatial positions in each plane.
+			for (uint32_t t = threadIdx.x; t < ux * frequencies; t += blockDim.x)
+				store_planless_dct_grid_value(image,
+				                              component,
+				                              ox + t % ux,
+				                              oy + y,
+				                              y_output_width,
+				                              y_output_height,
+				                              cbcr_output_width,
+				                              cbcr_output_height,
+				                              projection->frequencies[component][t / ux],
+				                              tile[t],
+				                              true,
+				                              y_accum,
+				                              cbcr_accum,
+				                              projection);
+			__syncthreads();
+		}
+	}
+}
+
 __global__ void
 transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column_bindings,
                                      const JpegDctDevicePlanlessImageDescriptor* __restrict images,
@@ -559,6 +756,9 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
                                      const uint32_t* __restrict image_vector_bindings,
                                      const uint32_t* __restrict active_output_blocks,
                                      const uint64_t active_output_blocks_per_image,
+                                     const uint32_t* __restrict active_image_indices,
+                                     const JpegDctDeviceActiveOutputGroup* active_output_groups,
+                                     size_t                                active_output_group_count,
                                      const JpegDctDeviceBlockMajorGroupBinding* __restrict block_major_groups,
                                      const size_t block_major_group_count,
                                      const JpegDctDeviceBlockMajorRankCell* __restrict block_major_rank_cells,
@@ -591,10 +791,13 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 		for (uint64_t task = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; task < output_block_count;
 		     task += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
 			const uint64_t index     = output_block_offset + task;
-			const uint64_t linear = active_output_blocks_per_image != 0U
-			                            ? (index / active_output_blocks_per_image) * blocks_per_image +
-			                                  active_output_blocks[index % active_output_blocks_per_image]
-			                            : (active_output_blocks ? active_output_blocks[index] : index);
+			const uint64_t linear    = active_output_index(index,
+                                                        blocks_per_image,
+                                                        active_output_blocks,
+                                                        active_output_blocks_per_image,
+                                                        active_image_indices,
+                                                        active_output_groups,
+                                                        active_output_group_count);
 			const auto     image     = images[linear / blocks_per_image];
 			const uint32_t component = (linear % blocks_per_image) / spatial;
 			const uint32_t xy        = linear % spatial;
@@ -682,11 +885,13 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 		if (launch_block >= output_block_count)
 			break;
 		const uint64_t output_index = output_block_offset + launch_block;
-		const uint64_t linear_block =
-		    active_output_blocks_per_image != 0U
-		        ? (output_index / active_output_blocks_per_image) * blocks_per_image +
-		              active_output_blocks[output_index % active_output_blocks_per_image]
-		        : (active_output_blocks == nullptr ? output_index : active_output_blocks[output_index]);
+		const uint64_t linear_block = active_output_index(output_index,
+		                                                  blocks_per_image,
+		                                                  active_output_blocks,
+		                                                  active_output_blocks_per_image,
+		                                                  active_image_indices,
+		                                                  active_output_groups,
+		                                                  active_output_group_count);
 		if (blocks_per_image == 0U || linear_block >= image_count * blocks_per_image || quant_tables == nullptr) {
 			continue;
 		}

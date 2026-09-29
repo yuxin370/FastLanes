@@ -1267,6 +1267,8 @@ struct JpegDctDeviceScratch {
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_vector_remap;
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_image_vector_bindings;
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_active_output_blocks;
+	JpegDctDeviceScratchBuffer<uint32_t>                                    planless_active_image_indices;
+	JpegDctDeviceScratchBuffer<JpegDctDeviceActiveOutputGroup>              planless_output_groups;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceSparseTransformPlan>            planless_sparse_transform_plans;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceBlockMajorGroupBinding>        block_major_groups;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceBlockMajorRankCell>            block_major_rank_cells;
@@ -1289,6 +1291,12 @@ struct JpegDctDeviceScratch {
 	std::vector<uint32_t>                                                  host_planless_active_output_blocks;
 	std::vector<uint64_t>                                                  host_planless_active_output_offsets;
 	uint32_t                                                              host_planless_repeated_image_count = 1U;
+	bool                                                                    planless_integer_upsample          = false;
+	bool                                                                    resources_integer_upsample         = false;
+	std::vector<uint64_t>                                                   host_planless_output_block_counts;
+	std::vector<JpegDctDeviceActiveOutputGroup>                             host_planless_output_groups;
+	std::vector<uint64_t>                                                   host_planless_group_offsets;
+	std::vector<uint32_t>                                                   host_planless_image_indices;
 	std::shared_ptr<const void>                                            host_planless_active_output_schedule_mapping;
 	size_t                                                                 host_planless_active_output_workset = 0U;
 	bool                                                                   planless_active_output_schedule_uploaded = false;
@@ -1421,6 +1429,8 @@ struct JpegDctDeviceScratch {
 			planless_vector_remap.release();
 			planless_image_vector_bindings.release();
 			planless_active_output_blocks.release();
+			planless_active_image_indices.release();
+			planless_output_groups.release();
 			planless_sparse_transform_plans.release();
 			block_major_groups.release();
 			block_major_rank_cells.release();
@@ -1795,33 +1805,39 @@ FixedTransformPlanView fixed_transform_plan_for_workset(const std::vector<uint32
 }
 
  void record_planless_transform_resources(JpegDctDeviceScratch& scratch, JpegDctDeviceExecutionStats& stats) {
-	if (!scratch.planless_transform_resources_ready) {
-		cudaFuncAttributes attributes {};
-		CUDA_SAFE_CALL(cudaFuncGetAttributes(&attributes, transformed_dct_grid_planless_kernel));
-		int max_active_ctas_per_sm = 0;
-		CUDA_SAFE_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-		    &max_active_ctas_per_sm, transformed_dct_grid_planless_kernel, kPlanlessTransformThreadsPerCta, 0));
-		int device = 0;
-		int max_threads_per_sm = 0;
-		int warp_size = 0;
-		CUDA_SAFE_CALL(cudaGetDevice(&device));
-		CUDA_SAFE_CALL(cudaDeviceGetAttribute(&max_threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device));
-		CUDA_SAFE_CALL(cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, device));
-		if (attributes.numRegs <= 0 || max_active_ctas_per_sm <= 0 || max_threads_per_sm <= 0 || warp_size <= 0) {
-			throw std::runtime_error("invalid CUDA planless transform kernel resource attributes");
-		}
-		scratch.planless_transform_registers_per_thread = static_cast<size_t>(attributes.numRegs);
-		scratch.planless_transform_static_shared_bytes_per_cta = attributes.sharedSizeBytes;
-		scratch.planless_transform_local_bytes_per_thread = attributes.localSizeBytes;
-		scratch.planless_transform_max_active_ctas_per_sm = static_cast<size_t>(max_active_ctas_per_sm);
-		scratch.cuda_max_threads_per_sm = static_cast<size_t>(max_threads_per_sm);
-		scratch.cuda_warp_size = static_cast<size_t>(warp_size);
-		scratch.planless_transform_resources_ready = true;
-	}
+	 const auto threads_per_cta = scratch.planless_integer_upsample ? 128U : kPlanlessTransformThreadsPerCta;
+	 if (!scratch.planless_transform_resources_ready ||
+	     scratch.resources_integer_upsample != scratch.planless_integer_upsample) {
+		 const auto*        kernel = scratch.planless_integer_upsample
+		                                 ? reinterpret_cast<const void*>(transformed_dct_grid_integer_upsample_kernel)
+		                                 : reinterpret_cast<const void*>(transformed_dct_grid_planless_kernel);
+		 cudaFuncAttributes attributes {};
+		 CUDA_SAFE_CALL(cudaFuncGetAttributes(&attributes, kernel));
+		 int max_active_ctas_per_sm = 0;
+		 CUDA_SAFE_CALL(
+		     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_ctas_per_sm, kernel, threads_per_cta, 0));
+		 int device             = 0;
+		 int max_threads_per_sm = 0;
+		 int warp_size          = 0;
+		 CUDA_SAFE_CALL(cudaGetDevice(&device));
+		 CUDA_SAFE_CALL(cudaDeviceGetAttribute(&max_threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device));
+		 CUDA_SAFE_CALL(cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, device));
+		 if (attributes.numRegs <= 0 || max_active_ctas_per_sm <= 0 || max_threads_per_sm <= 0 || warp_size <= 0) {
+			 throw std::runtime_error("invalid CUDA planless transform kernel resource attributes");
+		 }
+		 scratch.planless_transform_registers_per_thread        = static_cast<size_t>(attributes.numRegs);
+		 scratch.planless_transform_static_shared_bytes_per_cta = attributes.sharedSizeBytes;
+		 scratch.planless_transform_local_bytes_per_thread      = attributes.localSizeBytes;
+		 scratch.planless_transform_max_active_ctas_per_sm      = static_cast<size_t>(max_active_ctas_per_sm);
+		 scratch.cuda_max_threads_per_sm                        = static_cast<size_t>(max_threads_per_sm);
+		 scratch.cuda_warp_size                                 = static_cast<size_t>(warp_size);
+		 scratch.planless_transform_resources_ready             = true;
+		 scratch.resources_integer_upsample                     = scratch.planless_integer_upsample;
+	 }
 	stats.planless_transform_registers_per_thread = scratch.planless_transform_registers_per_thread;
 	stats.planless_transform_static_shared_bytes_per_cta = scratch.planless_transform_static_shared_bytes_per_cta;
 	stats.planless_transform_local_bytes_per_thread = scratch.planless_transform_local_bytes_per_thread;
-	stats.planless_transform_threads_per_cta = kPlanlessTransformThreadsPerCta;
+	stats.planless_transform_threads_per_cta             = threads_per_cta;
 	stats.planless_transform_max_active_ctas_per_sm = scratch.planless_transform_max_active_ctas_per_sm;
 	stats.cuda_max_threads_per_sm = scratch.cuda_max_threads_per_sm;
 	stats.cuda_warp_size = scratch.cuda_warp_size;
@@ -2269,6 +2285,16 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 			                                               scratch.host_planless_active_output_blocks.size(),
 			                                               stream,
 			                                               stats);
+			if (!scratch.host_planless_image_indices.empty())
+				scratch.planless_active_image_indices.upload(scratch.host_planless_image_indices.data(),
+				                                             scratch.host_planless_image_indices.size(),
+				                                             stream,
+				                                             stats);
+			if (!scratch.host_planless_output_groups.empty())
+				scratch.planless_output_groups.upload(scratch.host_planless_output_groups.data(),
+				                                      scratch.host_planless_output_groups.size(),
+				                                      stream,
+				                                      stats);
 			scratch.planless_active_output_schedule_uploaded = true;
 		}
 		if (!scratch.host_planless_active_output_blocks.empty()) {
@@ -2306,15 +2332,77 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	scratch.ensure_planless_transform_timing_events();
 	scratch.planless_transform_start_event.record(stream);
 	scratch.planless_transform_timing_in_flight = true;
+	const uint32_t*                       active_image_indices      = nullptr;
+	const JpegDctDeviceActiveOutputGroup* active_output_groups      = nullptr;
+	size_t                                active_output_group_count = 0;
+	if (!scratch.host_planless_output_groups.empty()) {
+		const auto w              = scratch.host_planless_active_output_workset;
+		const auto begin          = scratch.host_planless_group_offsets[w];
+		const auto end            = scratch.host_planless_group_offsets[w + 1];
+		active_output_group_count = end - begin;
+		active_output_groups      = scratch.planless_output_groups.data + begin;
+		active_image_indices      = scratch.planless_active_image_indices.data;
+		active_output_blocks      = scratch.planless_active_output_blocks.data;
+		const auto& last          = scratch.host_planless_output_groups[end - 1];
+		output_blocks             = last.task_begin + uint64_t(last.block_count) * std::max(last.image_count, 1U);
+	}
 	const uint64_t launch_output_limit = transform_blocks_per_launch == 0
 	                                         ? output_blocks
 	                                         : std::min<uint64_t>(output_blocks, transform_blocks_per_launch);
-	for (uint64_t offset = 0; offset < output_blocks; offset += launch_output_limit) {
-		const auto launch_output_blocks = std::min<uint64_t>(launch_output_limit, output_blocks - offset);
-		const auto limited_cta_limit    = transform_ctas_per_launch == 0
-		                                      ? static_cast<uint64_t>(kLimitedPlanlessTransformCtasPerLaunch)
-		                                      : static_cast<uint64_t>(transform_ctas_per_launch);
-		const auto launch_ctas          = static_cast<unsigned>(
+	auto           host_group          = active_output_group_count == 0
+	                                         ? 0U
+	                                         : scratch.host_planless_group_offsets[scratch.host_planless_active_output_workset];
+	for (uint64_t offset = 0; offset < output_blocks;) {
+		auto     launch_output_blocks   = std::min<uint64_t>(launch_output_limit, output_blocks - offset);
+		uint64_t launch_logical_outputs = launch_output_blocks;
+		if (scratch.planless_integer_upsample) {
+			launch_output_blocks    = 0;
+			launch_logical_outputs  = 0;
+			const uint64_t y_blocks = uint64_t(transform.y_output_width_blocks) * transform.y_output_height_blocks;
+			const uint64_t c_blocks =
+			    uint64_t(transform.cbcr_output_width_blocks) * transform.cbcr_output_height_blocks;
+			for (auto task = offset; task < output_blocks; ++task) {
+				uint64_t linear;
+				if (active_output_group_count != 0) {
+					const auto end =
+					    scratch.host_planless_group_offsets[scratch.host_planless_active_output_workset + 1];
+					while (host_group + 1 < end &&
+					       scratch.host_planless_output_groups[host_group + 1].task_begin <= task)
+						++host_group;
+					const auto& group = scratch.host_planless_output_groups[host_group];
+					const auto  local = task - group.task_begin;
+					linear =
+					    group.image_count == 0
+					        ? scratch.host_planless_active_output_blocks[group.block_begin + local]
+					        : uint64_t(
+					              scratch.host_planless_image_indices[group.image_begin + local / group.block_count]) *
+					                  blocks_per_image +
+					              scratch.host_planless_active_output_blocks[group.block_begin +
+					                                                         local % group.block_count];
+				} else {
+					linear =
+					    active_output_blocks_per_image == 0
+					        ? scratch.host_planless_active_output_blocks[active_output_begin + task]
+					        : (task / active_output_blocks_per_image) * blocks_per_image +
+					              scratch.host_planless_active_output_blocks[active_output_begin +
+					                                                         task % active_output_blocks_per_image];
+				}
+				const auto  spatial   = linear % blocks_per_image;
+				const auto  c         = spatial < y_blocks ? 0U : 1U + uint32_t((spatial - y_blocks) / c_blocks);
+				const auto& component = images[linear / blocks_per_image].components[c];
+				const auto  outputs   = uint64_t(component.x_up_factor) * component.y_up_factor;
+				// Eligibility guarantees that every source tile fits the budget.
+				// Keep tiles whole, but allow a launch to span different geometries.
+				if (transform_blocks_per_launch != 0 && outputs > transform_blocks_per_launch - launch_logical_outputs)
+					break;
+				launch_logical_outputs += outputs;
+				++launch_output_blocks;
+			}
+		}
+		const auto limited_cta_limit = transform_ctas_per_launch == 0
+		                                   ? static_cast<uint64_t>(kLimitedPlanlessTransformCtasPerLaunch)
+		                                   : static_cast<uint64_t>(transform_ctas_per_launch);
+		const auto launch_ctas       = static_cast<unsigned>(
             transform_blocks_per_launch == 0 ? launch_output_blocks
                                              : std::min<uint64_t>(launch_output_blocks, limited_cta_limit));
 		const auto identity_ctas = static_cast<unsigned>((launch_output_blocks + 255U) / 256U);
@@ -2323,40 +2411,81 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 		        ? (transform_blocks_per_launch == 0 ? identity_ctas
 		                                            : std::min(identity_ctas, static_cast<unsigned>(limited_cta_limit)))
 		        : launch_ctas;
-		transformed_dct_grid_planless_kernel<<<dim3(actual_launch_ctas),
-		                                       dim3(identity_projection ? 256U : kPlanlessTransformThreadsPerCta),
-		                                       0,
-		                                       stream>>>(
-		    scratch.column_bindings.data,
-		    scratch.planless_image_descriptors.data,
-		    vector_remap.empty() ? nullptr : scratch.planless_vector_remap.data,
-		    image_vector_bindings.empty() ? nullptr : scratch.planless_image_vector_bindings.data,
-		    active_output_blocks,
-		    active_output_blocks_per_image,
-		    block_major_plan ? scratch.block_major_groups.data : nullptr,
-		    block_major_plan ? block_groups.size() : 0U,
-		    block_major_plan ? scratch.block_major_rank_cells.data : nullptr,
-		    block_major_plan ? block_major_plan->rank_cells.size() : 0U,
-		    block_major_plan && !block_major_plan->rank_payload.empty() ? scratch.block_major_rank_payload.data
-		                                                                : nullptr,
-		    block_major_plan ? block_major_plan->rank_payload.size() : 0U,
-		    selected_physical_mask,
-		    sparse_transform ? scratch.planless_sparse_transform_plans.data : nullptr,
-		    images.size(),
-		    offset,
-		    launch_output_blocks,
-		    quant_tables,
-		    phase_matrices,
-		    transform.y_output_width_blocks,
-		    transform.y_output_height_blocks,
-		    transform.cbcr_output_width_blocks,
-		    transform.cbcr_output_height_blocks,
-		    transform.clamp_min,
-		    transform.clamp_max,
-		    y_accum,
-		    cbcr_accum,
-		    transform.output_channels.empty() ? nullptr : scratch.output_projection.data,
-		    identity_projection);
+		if (scratch.planless_integer_upsample) {
+			transformed_dct_grid_integer_upsample_kernel<<<dim3(actual_launch_ctas), dim3(128U), 0, stream>>>(
+			    scratch.column_bindings.data,
+			    scratch.planless_image_descriptors.data,
+			    vector_remap.empty() ? nullptr : scratch.planless_vector_remap.data,
+			    image_vector_bindings.empty() ? nullptr : scratch.planless_image_vector_bindings.data,
+			    active_output_blocks,
+			    active_output_blocks_per_image,
+			    active_image_indices,
+			    active_output_groups,
+			    active_output_group_count,
+			    block_major_plan ? scratch.block_major_groups.data : nullptr,
+			    block_major_plan ? block_groups.size() : 0U,
+			    block_major_plan ? scratch.block_major_rank_cells.data : nullptr,
+			    block_major_plan ? block_major_plan->rank_cells.size() : 0U,
+			    block_major_plan && !block_major_plan->rank_payload.empty() ? scratch.block_major_rank_payload.data
+			                                                                : nullptr,
+			    block_major_plan ? block_major_plan->rank_payload.size() : 0U,
+			    selected_physical_mask,
+			    sparse_transform ? scratch.planless_sparse_transform_plans.data : nullptr,
+			    images.size(),
+			    offset,
+			    launch_output_blocks,
+			    quant_tables,
+			    phase_matrices,
+			    transform.y_output_width_blocks,
+			    transform.y_output_height_blocks,
+			    transform.cbcr_output_width_blocks,
+			    transform.cbcr_output_height_blocks,
+			    transform.clamp_min,
+			    transform.clamp_max,
+			    y_accum,
+			    cbcr_accum,
+			    transform.output_channels.empty() ? nullptr : scratch.output_projection.data,
+			    identity_projection);
+		} else {
+			transformed_dct_grid_planless_kernel<<<dim3(actual_launch_ctas),
+			                                       dim3(identity_projection ? 256U : kPlanlessTransformThreadsPerCta),
+			                                       0,
+			                                       stream>>>(
+			    scratch.column_bindings.data,
+			    scratch.planless_image_descriptors.data,
+			    vector_remap.empty() ? nullptr : scratch.planless_vector_remap.data,
+			    image_vector_bindings.empty() ? nullptr : scratch.planless_image_vector_bindings.data,
+			    active_output_blocks,
+			    active_output_blocks_per_image,
+			    active_image_indices,
+			    active_output_groups,
+			    active_output_group_count,
+			    block_major_plan ? scratch.block_major_groups.data : nullptr,
+			    block_major_plan ? block_groups.size() : 0U,
+			    block_major_plan ? scratch.block_major_rank_cells.data : nullptr,
+			    block_major_plan ? block_major_plan->rank_cells.size() : 0U,
+			    block_major_plan && !block_major_plan->rank_payload.empty() ? scratch.block_major_rank_payload.data
+			                                                                : nullptr,
+			    block_major_plan ? block_major_plan->rank_payload.size() : 0U,
+			    selected_physical_mask,
+			    sparse_transform ? scratch.planless_sparse_transform_plans.data : nullptr,
+			    images.size(),
+			    offset,
+			    launch_output_blocks,
+			    quant_tables,
+			    phase_matrices,
+			    transform.y_output_width_blocks,
+			    transform.y_output_height_blocks,
+			    transform.cbcr_output_width_blocks,
+			    transform.cbcr_output_height_blocks,
+			    transform.clamp_min,
+			    transform.clamp_max,
+			    y_accum,
+			    cbcr_accum,
+			    transform.output_channels.empty() ? nullptr : scratch.output_projection.data,
+			    identity_projection);
+		}
+
 		CUDA_SAFE_CALL(cudaGetLastError());
 		++stats.materialize_kernel_launch_count;
 		++stats.planless_transform_kernel_launch_count;
@@ -2367,9 +2496,12 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 		}
 		stats.planless_transform_max_blocks_per_launch =
 		    std::max(stats.planless_transform_max_blocks_per_launch, static_cast<size_t>(actual_launch_ctas));
-		stats.planless_transform_max_output_blocks_per_launch =
-		    std::max(stats.planless_transform_max_output_blocks_per_launch, static_cast<size_t>(launch_output_blocks));
+
+		stats.planless_transform_max_output_blocks_per_launch = std::max(
+		    stats.planless_transform_max_output_blocks_per_launch, static_cast<size_t>(launch_logical_outputs));
+		offset += launch_output_blocks;
 	}
+
 	scratch.planless_transform_done_event.record(stream);
 	// Image-major worksets own disjoint image descriptors, so their logical
 	// batch cardinality is the sum across worksets. Every block-major workset
@@ -2377,17 +2509,18 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 	// resident rowgroup bindings; summing here would count the same descriptors
 	// once per bounded workset and falsely make the logical plan look larger.
 	if (block_major_plan || image_major_plan) {
-		stats.planless_image_descriptor_count =
-		    std::max(stats.planless_image_descriptor_count, images.size());
+		stats.planless_image_descriptor_count = std::max(stats.planless_image_descriptor_count, images.size());
 	} else {
 		stats.planless_image_descriptor_count += images.size();
 	}
-	stats.planless_transform_output_block_count += output_blocks;
-	if (sparse_transform) {
-		stats.planless_transform_sparse_output_block_count += output_blocks;
-	} else {
-		stats.planless_transform_dense_output_block_count += output_blocks;
-	}
+	const auto logical_output_blocks =
+	    block_major_plan ? scratch.host_planless_output_block_counts[scratch.host_planless_active_output_workset]
+	                     : output_blocks;
+	stats.planless_transform_output_block_count += logical_output_blocks;
+	if (sparse_transform)
+		stats.planless_transform_sparse_output_block_count += logical_output_blocks;
+	else
+		stats.planless_transform_dense_output_block_count += logical_output_blocks;
 	stats.device_mapping_fused = true;
 }
 
@@ -4853,8 +4986,13 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 	pending.clear();
 	auto transient_tracker = std::make_shared<ActualTransientMemoryTracker>();
 	scratch.host_planless_active_output_blocks.clear();
+	scratch.host_planless_output_groups.clear();
+	scratch.host_planless_group_offsets.clear();
+	scratch.host_planless_image_indices.clear();
 	scratch.host_planless_active_output_offsets.clear();
 	scratch.host_planless_repeated_image_count = 1U;
+	scratch.planless_integer_upsample          = false;
+	scratch.host_planless_output_block_counts.clear();
 	scratch.host_planless_active_output_schedule_mapping.reset();
 	scratch.host_planless_active_output_workset       = 0U;
 	scratch.planless_active_output_schedule_uploaded = false;
@@ -5243,10 +5381,14 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 		    schedule.offsets.size() * sizeof(uint64_t);
 		const auto persistent_schedule_bytes =
 		    static_cast<uint64_t>(schedule.active_output_blocks.size()) * sizeof(uint32_t) +
-		    static_cast<uint64_t>(schedule.offsets.size()) * sizeof(uint64_t);
+		    static_cast<uint64_t>(schedule.offsets.size()) * sizeof(uint64_t) +
+		    schedule.groups.size() * sizeof(JpegDctDeviceActiveOutputGroup) +
+		    schedule.group_offsets.size() * sizeof(uint64_t) + schedule.image_indices.size() * sizeof(uint32_t);
 		const auto persistent_schedule_capacity_bytes =
 		    static_cast<uint64_t>(schedule.active_output_blocks.capacity()) * sizeof(uint32_t) +
-		    static_cast<uint64_t>(schedule.offsets.capacity()) * sizeof(uint64_t);
+		    static_cast<uint64_t>(schedule.offsets.capacity()) * sizeof(uint64_t) +
+		    schedule.groups.capacity() * sizeof(JpegDctDeviceActiveOutputGroup) +
+		    schedule.group_offsets.capacity() * sizeof(uint64_t) + schedule.image_indices.capacity() * sizeof(uint32_t);
 		const auto sidecar_mapped_bytes = schedule.sidecar_mapped_bytes;
 		const auto schedule_base_bytes =
 		    persistent_schedule_bytes > std::numeric_limits<uint64_t>::max() - sidecar_mapped_bytes
@@ -5301,9 +5443,32 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 		execution_stats.active_output_schedule_materialize_ms += schedule.sidecar_materialize_ms;
 		execution_stats.active_output_schedule_persist_ms += schedule.sidecar_persist_ms;
 		execution_stats.planless_transform_active_output_offsets_valid = true;
+		scratch.host_planless_output_block_counts.assign(workset_count, 0U);
+		for (size_t w = 0; w < workset_count; ++w) {
+			if (schedule.groups.empty())
+				scratch.host_planless_output_block_counts[w] =
+				    (schedule.offsets[w + 1] - schedule.offsets[w]) * schedule.repeated_image_count;
+			else
+				for (auto g = schedule.group_offsets[w]; g < schedule.group_offsets[w + 1]; ++g)
+					scratch.host_planless_output_block_counts[w] +=
+					    uint64_t(schedule.groups[g].block_count) * std::max(schedule.groups[g].image_count, 1U);
+		}
+		uint32_t max_integer_outputs = 1U;
+		for (const auto& image : schedule_plan->images)
+			for (const auto& component : image.components)
+				if (component.present)
+					max_integer_outputs =
+					    std::max(max_integer_outputs, uint32_t(component.x_up_factor) * component.y_up_factor);
+		scratch.planless_integer_upsample =
+		    selected_coefficients.size() == 64U &&
+		    (scratch.transform_blocks_per_launch == 0 || max_integer_outputs <= scratch.transform_blocks_per_launch) &&
+		    compact_integer_upsample_schedule(schedule, *schedule_plan, grid_transform);
 		scratch.host_planless_active_output_schedule_mapping = std::move(schedule.sidecar_mapping);
 		scratch.host_planless_active_output_blocks = std::move(schedule.active_output_blocks);
 		scratch.host_planless_repeated_image_count = schedule.repeated_image_count;
+		scratch.host_planless_output_groups                  = std::move(schedule.groups);
+		scratch.host_planless_group_offsets                  = std::move(schedule.group_offsets);
+		scratch.host_planless_image_indices                  = std::move(schedule.image_indices);
 		scratch.host_planless_active_output_offsets = std::move(schedule.offsets);
 		transient_tracker->set_active_schedule_bytes(
 		    static_cast<size_t>(std::min<uint64_t>(

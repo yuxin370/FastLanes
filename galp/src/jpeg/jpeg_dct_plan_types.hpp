@@ -219,6 +219,14 @@ struct JpegDctDeviceBlockMajorRowgroupWorkset {
 	uint32_t workset_index  = 0U;
 };
 
+struct JpegDctDeviceActiveOutputGroup {
+	uint64_t block_begin;
+	uint32_t block_count;
+	uint32_t image_begin;
+	uint32_t image_count;     // Zero denotes a direct slice of absolute output indices.
+	uint64_t task_begin = 0U; // Logical task prefix within this workset.
+};
+
 // Output ownership is stored workset-major.  Offsets has workset_count + 1
 // entries and indexes active_output_blocks.  Each active entry is one logical
 // output block that must run in that workset; source contributions remain
@@ -229,6 +237,11 @@ struct JpegDctDeviceBlockMajorActiveOutputSchedule {
 	// Shared crop/resize geometry stores one image's spatial indices per workset.
 	// CUDA repeats each slice in request order with the logical image stride.
 	uint32_t repeated_image_count = 1U;
+	// Mixed geometries share component-local templates without expanding every
+	// image's output indices. Empty groups retain the direct/whole-batch layout.
+	std::vector<JpegDctDeviceActiveOutputGroup> groups;
+	std::vector<uint64_t>                       group_offsets;
+	std::vector<uint32_t>                       image_indices;
 	// A loaded compressed sidecar keeps its mmap alive through the current
 	// execution window. The process cache retains at most the current/next two
 	// mappings under a byte cap; the expanded uint32 upload vector remains the
@@ -270,6 +283,12 @@ build_block_major_active_output_schedule(const JpegDctDeviceBlockMajorPlanlessPl
                                          const std::vector<JpegDctDeviceBlockMajorRowgroupWorkset>& rowgroup_worksets,
                                          const JpegDctGridTransformSpec&                            transform,
                                          bool allow_repeated_images = true);
+
+// Convert complete integer-upsample tiles to one source-owned task each.
+// Returns false without changing the schedule for other geometries.
+bool compact_integer_upsample_schedule(JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                                       const JpegDctDeviceBlockMajorPlanlessPlan&   plan,
+                                       const JpegDctGridTransformSpec&              transform);
 
 struct JpegDctDeviceRowgroupPlan {
 	uint32_t                                          rowgroup_index  = 0;

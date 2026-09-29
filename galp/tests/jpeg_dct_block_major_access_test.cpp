@@ -862,6 +862,43 @@ TEST(JpegDctBlockMajorPlan, CanonicalTemplateRoundTripsWithStableHitMissDigest) 
 	EXPECT_EQ(profile_miss.stats.canonical_template_audit_digest, hit.stats.canonical_template_audit_digest);
 }
 
+namespace {
+auto expand_active_output_schedule(galp::jpeg::detail::JpegDctDeviceBlockMajorActiveOutputSchedule schedule,
+                                   uint64_t                                                        blocks_per_image) {
+	const auto source  = schedule.active_output_blocks;
+	const auto offsets = schedule.offsets;
+	schedule.active_output_blocks.clear();
+	for (size_t workset = 0; workset + 1 < offsets.size(); ++workset) {
+		schedule.offsets[workset] = schedule.active_output_blocks.size();
+		if (!schedule.groups.empty()) {
+			for (auto g = schedule.group_offsets[workset]; g < schedule.group_offsets[workset + 1]; ++g) {
+				const auto group = schedule.groups[g];
+				EXPECT_EQ(group.task_begin, schedule.active_output_blocks.size() - schedule.offsets[workset]);
+				if (group.image_count == 0) {
+					schedule.active_output_blocks.insert(schedule.active_output_blocks.end(),
+					                                     source.begin() + group.block_begin,
+					                                     source.begin() + group.block_begin + group.block_count);
+					continue;
+				}
+				for (uint32_t i = 0; i < group.image_count; ++i)
+					for (uint32_t b = 0; b < group.block_count; ++b)
+						schedule.active_output_blocks.push_back(
+						    static_cast<uint32_t>(schedule.image_indices[group.image_begin + i] * blocks_per_image +
+						                          source[group.block_begin + b]));
+			}
+		} else {
+			for (uint32_t i = 0; i < schedule.repeated_image_count; ++i)
+				for (auto b = offsets[workset]; b < offsets[workset + 1]; ++b)
+					schedule.active_output_blocks.push_back(static_cast<uint32_t>(i * blocks_per_image + source[b]));
+		}
+		std::sort(schedule.active_output_blocks.begin() + schedule.offsets[workset],
+		          schedule.active_output_blocks.end());
+	}
+	schedule.offsets.back() = schedule.active_output_blocks.size();
+	return schedule;
+}
+} // namespace
+
 TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorksetMajor) {
 	using namespace galp::jpeg;
 	using namespace galp::jpeg::detail;
@@ -930,8 +967,11 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorkse
 	transform.y_output_height_blocks    = 1U;
 	transform.cbcr_output_width_blocks  = 1U;
 	transform.cbcr_output_height_blocks = 1U;
-	const auto schedule0 = build_block_major_active_output_schedule(plan, worksets, transform);
-	const auto schedule1 = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto compact                  = build_block_major_active_output_schedule(plan, worksets, transform);
+	ASSERT_FALSE(compact.groups.empty());
+	const auto schedule0 = expand_active_output_schedule(compact, 4U);
+	const auto schedule1 =
+	    expand_active_output_schedule(build_block_major_active_output_schedule(plan, worksets, transform), 4U);
 	const auto reference = reference_active_output_schedule(plan, worksets, transform);
 	EXPECT_EQ(schedule0.logical_output_block_count, 12U);
 	EXPECT_EQ(schedule0.source_contribution_count, 12U);
@@ -948,7 +988,8 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorkse
 	EXPECT_EQ(schedule0.offsets, schedule1.offsets);
 	EXPECT_EQ(schedule0.active_output_blocks, schedule1.active_output_blocks);
 	for (size_t repeat = 0U; repeat < 100U; ++repeat) {
-		const auto repeated = build_block_major_active_output_schedule(plan, worksets, transform);
+		const auto repeated =
+		    expand_active_output_schedule(build_block_major_active_output_schedule(plan, worksets, transform), 4U);
 		EXPECT_EQ(repeated.offsets, schedule0.offsets);
 		EXPECT_EQ(repeated.active_output_blocks, schedule0.active_output_blocks);
 		EXPECT_EQ(repeated.source_contribution_count, schedule0.source_contribution_count);
@@ -1031,7 +1072,8 @@ TEST(JpegDctBlockMajorPlan, SharedIdentityScheduleRepeatsSpatialOwnershipInReque
 	EXPECT_EQ(sidecar_schedule.active_output_blocks, reference.active_output_blocks);
 	// A different crop invalidates shared ownership and retains the general path.
 	plan.images.back().components[0].crop_x = -1;
-	const auto cropped                      = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto cropped =
+	    expand_active_output_schedule(build_block_major_active_output_schedule(plan, worksets, transform), 10U);
 	const auto cropped_reference            = reference_active_output_schedule(plan, worksets, transform);
 	EXPECT_EQ(cropped.repeated_image_count, 1U);
 	EXPECT_EQ(cropped.offsets, cropped_reference.offsets);
@@ -1048,11 +1090,51 @@ TEST(JpegDctBlockMajorPlan, SharedIdentityScheduleRepeatsSpatialOwnershipInReque
 			component.y_up_factor = 2U;
 		}
 	}
-	const auto upsampled           = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto compact_upsampled   = build_block_major_active_output_schedule(plan, worksets, transform);
+	const auto upsampled           = expand_active_output_schedule(compact_upsampled, 40U);
 	const auto upsampled_reference = reference_active_output_schedule(plan, worksets, transform);
 	EXPECT_EQ(upsampled.repeated_image_count, 1U);
 	EXPECT_EQ(upsampled.offsets, upsampled_reference.offsets);
 	EXPECT_EQ(upsampled.active_output_blocks, upsampled_reference.active_output_blocks);
+	EXPECT_LT(compact_upsampled.active_output_blocks.size(), upsampled_reference.active_output_blocks.size());
+	// Source-owned integer tiles must cover exactly the same output positions,
+	// including padding and mixed geometries. Non-integer/sparse requests retain
+	// the general representation unchanged.
+	auto integer_schedule              = compact_upsampled;
+	transform.output_channels          = {{0U, 0U, 0.F, 1.F}};
+	transform.require_all_coefficients = false;
+	EXPECT_FALSE(compact_integer_upsample_schedule(integer_schedule, plan, transform));
+	EXPECT_EQ(integer_schedule.active_output_blocks, compact_upsampled.active_output_blocks);
+	transform.require_all_coefficients             = true;
+	plan.images.back().components[0].x_down_factor = 3U;
+	EXPECT_FALSE(compact_integer_upsample_schedule(integer_schedule, plan, transform));
+	plan.images.back().components[0].x_down_factor = 1U;
+	plan.images.back().components[0].x_up_factor   = 1U;
+	plan.images.back().components[0].y_up_factor   = 1U;
+	EXPECT_FALSE(compact_integer_upsample_schedule(integer_schedule, plan, transform));
+	plan.images.back().components[0].x_up_factor = 2U;
+	plan.images.back().components[0].y_up_factor = 2U;
+	ASSERT_TRUE(compact_integer_upsample_schedule(integer_schedule, plan, transform));
+	const auto tasks = expand_active_output_schedule(integer_schedule, 40U);
+	for (size_t w = 0; w + 1 < tasks.offsets.size(); ++w) {
+		std::vector<uint32_t> outputs;
+		for (auto i = tasks.offsets[w]; i < tasks.offsets[w + 1]; ++i) {
+			const auto  linear    = tasks.active_output_blocks[i];
+			const auto  local     = linear % 40U;
+			const auto  component = local < 24U ? 0U : 1U + (local - 24U) / 8U;
+			const auto  width     = component == 0 ? 6U : 4U;
+			const auto& geometry  = plan.images[linear / 40U].components[component];
+			for (uint32_t y = 0; y < geometry.y_up_factor; ++y)
+				for (uint32_t x = 0; x < geometry.x_up_factor; ++x)
+					outputs.push_back(linear + y * width + x);
+		}
+		std::sort(outputs.begin(), outputs.end());
+		EXPECT_EQ(outputs,
+		          (std::vector<uint32_t>(
+		              upsampled_reference.active_output_blocks.begin() + upsampled_reference.offsets[w],
+		              upsampled_reference.active_output_blocks.begin() + upsampled_reference.offsets[w + 1])));
+	}
+
 	EXPECT_EQ(upsampled.source_contribution_count, upsampled_reference.source_contribution_count);
 	// Equal online crops can share the same upsampled ownership template too.
 	// Keep the negative crop: padded output blocks must still match the reference.

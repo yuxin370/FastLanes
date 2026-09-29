@@ -1346,64 +1346,116 @@ TEST(JpegDct, TransformedGridSupportsArbitraryCoefficientSelections) {
 	}
 
 	// Arbitrary component/channel order, normalization, flip, and frequency-mixing chroma resize.
-	auto projected_shards                      = shard_options;
-	projected_shards.physical_layout           = galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups;
-	projected_shards.physical_layout_specified = true;
-	const auto projected_dir                   = dir / "projected";
-	galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
-	    {path0, path1}, projected_dir, reader_options, projected_shards);
-	galp::jpeg::JpegDctShardDatasetReader projected_reader(projected_dir / "manifest.bin");
-	for (const uint32_t size : {4U, 2U, 7U}) {
-		galp::jpeg::JpegDctDeviceBatchOptions options;
-		options.layout                 = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
-		options.grid_transform         = galp::profiles::rgbnomore_val_dct_grid_transform();
-		options.cache_capacity_bytes   = 0;
-		options.plan_cache_capacity    = 0;
-		options.decode_batch_rowgroups = 1;
-		auto& spec                     = *options.grid_transform;
-		spec.y_output_width_blocks = spec.y_output_height_blocks = size;
-		spec.cbcr_output_width_blocks = spec.cbcr_output_height_blocks = size;
-		spec.crop_reference_width_blocks = spec.crop_reference_height_blocks = 4;
-		spec.output_data_type = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
-		spec.output_add       = 0.25F;
-		spec.output_scale     = 0.75F;
-		auto cropped          = requests;
-		for (auto& request : cropped)
-			request.source_crop = {0, 0, 32, 32};
-		cropped[1].horizontal_flip = true;
-		auto               full    = projected_reader.ReadDeviceDctBatch(cropped, options);
-		std::vector<float> y(full.y_coefficient_count()), c(full.cbcr_coefficient_count());
-		ASSERT_EQ(cudaMemcpy(y.data(), full.y_float_coefficients(), y.size() * sizeof(float), cudaMemcpyDeviceToHost),
-		          cudaSuccess);
-		ASSERT_EQ(
-		    cudaMemcpy(c.data(), full.cbcr_float_coefficients(), c.size() * sizeof(float), cudaMemcpyDeviceToHost),
-		    cudaSuccess);
-		spec.output_channels   = {{2, 7, 0.125F, 1.7F}, {0, 0, -2.0F, 3.0F}, {1, 4, 0.5F, 0.7F}};
-		auto         projected = projected_reader.ReadDeviceDctBatch(cropped, options);
-		const size_t spatial   = size * size;
-		ASSERT_EQ(projected.projected_shape(), (std::array<size_t, 6> {2, 3, size, size, 1, 1}));
-		ASSERT_EQ(projected.cbcr_coefficient_count(), 0U);
-		ASSERT_EQ(projected.y_coefficient_count(), 2U * 3U * spatial);
-		std::vector<float> actual(projected.y_coefficient_count());
-		ASSERT_EQ(
-		    cudaMemcpy(
-		        actual.data(), projected.y_float_coefficients(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
-		    cudaSuccess);
-		for (size_t image = 0; image < 2; ++image) {
-			for (size_t channel = 0; channel < spec.output_channels.size(); ++channel) {
-				const auto& entry = spec.output_channels[channel];
-				for (size_t xy = 0; xy < spatial; ++xy) {
-					const float value =
-					    entry.component == 0
-					        ? y[(image * spatial + xy) * 64 + entry.frequency]
-					        : c[((image * 2 + entry.component - 1) * spatial + xy) * 64 + entry.frequency];
-					EXPECT_FLOAT_EQ(actual[(image * 3 + channel) * spatial + xy],
-					                (value - entry.subtract) / entry.divide);
+	for (const auto layout : {galp::jpeg::JpegDctPhysicalLayout::kImageMajorVectorRowgroups,
+	                          galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor}) {
+		auto projected_shards                      = shard_options;
+		projected_shards.physical_layout           = layout;
+		projected_shards.physical_layout_specified = true;
+		std::vector<std::filesystem::path> projected_paths {path0, path1};
+		if (layout == galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor) {
+			// Match the production-profile fixture's scale so the real sidecar
+			// satisfies its 1% storage limit. Requests below still read four crops.
+			const auto block_input = dir / "block_input.jpg";
+			write_test_jpeg(block_input, 512, 512);
+			projected_paths.assign(64U, block_input);
+			projected_shards.shard_images                  = 64U;
+			projected_shards.shard_images_specified        = true;
+			projected_shards.rowgroup_vectors_specified    = true;
+			projected_shards.rowgroups_per_shard           = 512U;
+			projected_shards.rowgroups_per_shard_specified = true;
+		}
+		const auto projected_dir =
+		    dir / (layout == galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor ? "block_projected"
+		                                                                                : "image_projected");
+		galp::jpeg::compress_jpeg_dct_dataset_to_sharded_fls(
+		    projected_paths, projected_dir, reader_options, projected_shards);
+		const auto access_dir = projected_dir / "access";
+		if (layout == galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor)
+			(void)galp::jpeg::build_jpeg_dct_block_major_access_dataset(projected_dir / "manifest.bin", access_dir);
+		ScopedEnvironmentVariable             access_environment("GALP_BLOCK_MAJOR_ACCESS_DIR", access_dir.string());
+		galp::jpeg::JpegDctShardDatasetReader projected_reader(projected_dir / "manifest.bin");
+		for (const uint32_t size : {4U, 2U, 7U, 8U, 16U, 32U}) {
+			galp::jpeg::JpegDctDeviceBatchOptions options;
+			options.layout                 = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
+			options.grid_transform         = galp::profiles::rgbnomore_val_dct_grid_transform();
+			options.cache_capacity_bytes   = 0;
+			options.plan_cache_capacity    = 0;
+			options.decode_batch_rowgroups = 1;
+			auto& spec                     = *options.grid_transform;
+			spec.y_output_width_blocks = spec.y_output_height_blocks = size;
+			spec.cbcr_output_width_blocks = spec.cbcr_output_height_blocks = size;
+			spec.crop_reference_width_blocks = spec.crop_reference_height_blocks = 4;
+			spec.require_all_coefficients                                        = true;
+			spec.output_data_type = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+			spec.output_add       = 0.25F;
+			spec.output_scale     = 0.75F;
+			auto cropped          = requests;
+			cropped.insert(cropped.end(), requests.begin(), requests.end());
+			for (auto& request : cropped)
+				request.source_crop = {0, 0, 32, 32};
+			if (layout == galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor) {
+				// Two repeated geometries exercise the mixed-template task stream.
+				cropped[2].source_crop = {16, 16, 32, 32};
+				cropped[3].source_crop = {16, 16, 32, 32};
+			}
+			cropped[1].horizontal_flip = true;
+			auto               full    = projected_reader.ReadDeviceDctBatch(cropped, options);
+			std::vector<float> y(full.y_coefficient_count()), c(full.cbcr_coefficient_count());
+			ASSERT_EQ(
+			    cudaMemcpy(y.data(), full.y_float_coefficients(), y.size() * sizeof(float), cudaMemcpyDeviceToHost),
+			    cudaSuccess);
+			ASSERT_EQ(
+			    cudaMemcpy(c.data(), full.cbcr_float_coefficients(), c.size() * sizeof(float), cudaMemcpyDeviceToHost),
+			    cudaSuccess);
+			spec.output_channels = {{2, 7, 0.125F, 1.7F}, {0, 0, -2.0F, 3.0F}, {1, 4, 0.5F, 0.7F}};
+			// Mixed luma/chroma expansion must preserve whole source tiles while
+			// respecting a budget that is not divisible by their output counts.
+			if (size == 8U || size == 32U) {
+				options.scheduling_policy           = galp::jpeg::JpegDctSchedulingPolicy::kLimitedOverlap;
+				options.transform_blocks_per_launch = 513U;
+				options.transform_ctas_per_launch   = 7U;
+			}
+			auto         projected = projected_reader.ReadDeviceDctBatch(cropped, options);
+			const size_t spatial   = size * size;
+			if (size == 8U || size == 32U) {
+				const auto stats = projected.execution_stats();
+				EXPECT_LE(stats.planless_transform_max_output_blocks_per_launch, 513U);
+				EXPECT_LE(stats.planless_transform_max_blocks_per_launch, 7U);
+				EXPECT_GT(stats.planless_transform_kernel_launch_count, 1U);
+			}
+			if (layout == galp::jpeg::JpegDctPhysicalLayout::kSpatialMajorImageMinor) {
+				const auto stats = projected.execution_stats();
+				EXPECT_GT(stats.planless_transform_active_output_schedule_build_count, 0U);
+				EXPECT_EQ(stats.planless_transform_output_block_count,
+				          full.execution_stats().planless_transform_output_block_count);
+				EXPECT_EQ(stats.planless_transform_dense_output_block_count,
+				          stats.planless_transform_output_block_count);
+			}
+			ASSERT_EQ(projected.projected_shape(), (std::array<size_t, 6> {4, 3, size, size, 1, 1}));
+			ASSERT_EQ(projected.cbcr_coefficient_count(), 0U);
+			ASSERT_EQ(projected.y_coefficient_count(), 4U * 3U * spatial);
+			std::vector<float> actual(projected.y_coefficient_count());
+			ASSERT_EQ(cudaMemcpy(actual.data(),
+			                     projected.y_float_coefficients(),
+			                     actual.size() * sizeof(float),
+			                     cudaMemcpyDeviceToHost),
+			          cudaSuccess);
+			for (size_t image = 0; image < 4; ++image) {
+				for (size_t channel = 0; channel < spec.output_channels.size(); ++channel) {
+					const auto& entry = spec.output_channels[channel];
+					for (size_t xy = 0; xy < spatial; ++xy) {
+						const float value =
+						    entry.component == 0
+						        ? y[(image * spatial + xy) * 64 + entry.frequency]
+						        : c[((image * 2 + entry.component - 1) * spatial + xy) * 64 + entry.frequency];
+						EXPECT_FLOAT_EQ(actual[(image * 3 + channel) * spatial + xy],
+						                (value - entry.subtract) / entry.divide);
+					}
 				}
 			}
+			spec.output_channels.push_back(spec.output_channels[0]);
+			EXPECT_THROW(projected_reader.ReadDeviceDctBatch(cropped, options), std::runtime_error);
 		}
-		spec.output_channels.push_back(spec.output_channels[0]);
-		EXPECT_THROW(projected_reader.ReadDeviceDctBatch(cropped, options), std::runtime_error);
 	}
 
 	std::filesystem::remove_all(dir);

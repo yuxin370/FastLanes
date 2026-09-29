@@ -334,6 +334,7 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	using OwnershipKey = std::array<int64_t, 14>;
 	struct OwnershipTemplate {
 		size_t                                     occurrences   = 0U;
+		std::vector<uint32_t>                      images;
 		bool                                       ready         = false;
 		uint64_t                                   contributions = 0U;
 		std::vector<std::pair<uint32_t, uint32_t>> outputs;
@@ -359,10 +360,23 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 		for (size_t i = 0U; i < scheduled_images; ++i) {
 			const auto& image = plan.images[i];
 			for (size_t c = 0U; c < image.components.size(); ++c) {
-				if (image.components[c].present != 0U)
-					++ownership_templates[ownership_key(image, image.components[c], c)].occurrences;
+				if (image.components[c].present != 0U) {
+					auto& entry = ownership_templates[ownership_key(image, image.components[c], c)];
+					++entry.occurrences;
+				}
 			}
 		}
+	}
+	const bool grouped =
+	    !shared_geometry && std::any_of(ownership_templates.begin(), ownership_templates.end(), [](const auto& entry) {
+		    return entry.second.occurrences > 1U;
+	    });
+	if (grouped) {
+		for (size_t i = 0; i < plan.images.size(); ++i)
+			for (size_t c = 0; c < plan.images[i].components.size(); ++c)
+				if (plan.images[i].components[c].present)
+					ownership_templates.at(ownership_key(plan.images[i], plan.images[i].components[c], c))
+					    .images.push_back(static_cast<uint32_t>(i));
 	}
 	uint64_t              actual_contribution_visits = 0U;
 	std::vector<uint32_t> owner_generations(workset_count, 0U);
@@ -403,8 +417,8 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 				OwnershipTemplate* reusable = nullptr;
 				if (allow_repeated_images) {
 					auto& candidate = ownership_templates.at(ownership_key(image, component, component_index));
-					// Unique crops keep the streaming traversal rather than caching a second full schedule.
-					if (candidate.occurrences > 1U)
+					// Entirely unique batches retain the streaming traversal without a second full schedule.
+					if (grouped || candidate.occurrences > 1U)
 						reusable = &candidate;
 				}
 				const auto image_base = static_cast<uint32_t>(image_index * blocks_per_image);
@@ -507,6 +521,102 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 		return contribution_count;
 	};
 
+	if (grouped) {
+		// Enumerate each distinct component geometry once, including rational
+		// resizes and outputs owned by more than one resident workset.
+		const auto count_start = Clock::now();
+		schedule.source_contribution_count =
+		    enumerate([](uint32_t, uint32_t) {}, [](uint32_t, auto, auto, uint32_t) {});
+		schedule.source_contribution_visit_count = actual_contribution_visits;
+		schedule.active_output_count_ms = std::chrono::duration<double, std::milli>(Clock::now() - count_start).count();
+		const auto fill_start           = Clock::now();
+		struct Slice {
+			uint32_t           workset;
+			OwnershipTemplate* owner;
+			size_t             begin, end;
+			uint32_t           image_begin;
+		};
+		std::vector<Slice> slices;
+		for (auto& [key, entry] : ownership_templates) {
+			const auto image_begin = static_cast<uint32_t>(schedule.image_indices.size());
+			schedule.image_indices.insert(schedule.image_indices.end(), entry.images.begin(), entry.images.end());
+			for (size_t begin = 0; begin < entry.outputs.size();) {
+				size_t end = begin + 1;
+				while (end < entry.outputs.size() && entry.outputs[end].first == entry.outputs[begin].first)
+					++end;
+				slices.push_back({entry.outputs[begin].first, &entry, begin, end, image_begin});
+				begin = end;
+			}
+		}
+		std::stable_sort(
+		    slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.workset < b.workset; });
+		schedule.offsets.assign(workset_count + 1U, 0U);
+		schedule.group_offsets.assign(workset_count + 1U, 0U);
+		for (size_t first = 0; first < slices.size();) {
+			size_t last = first + 1;
+			while (last < slices.size() && slices[last].workset == slices[first].workset)
+				++last;
+			const auto workset     = slices[first].workset;
+			const auto block_start = schedule.active_output_blocks.size();
+			const auto group_start = schedule.groups.size();
+			for (size_t i = first; i < last; ++i) {
+				const auto& slice = slices[i];
+				if (slice.owner->images.size() == 1)
+					continue;
+				const auto count = static_cast<uint32_t>(slice.end - slice.begin);
+				schedule.groups.push_back({schedule.active_output_blocks.size(),
+				                           count,
+				                           slice.image_begin,
+				                           static_cast<uint32_t>(slice.owner->images.size())});
+				for (size_t j = slice.begin; j < slice.end; ++j)
+					schedule.active_output_blocks.push_back(slice.owner->outputs[j].second);
+				schedule.output_workset_ownership_count += uint64_t(count) * slice.owner->images.size();
+			}
+			// Keep unique geometries in one direct slice to bound group metadata
+			// and device lookup work for batches dominated by per-image crops.
+			const auto direct_start = schedule.active_output_blocks.size();
+			for (size_t i = first; i < last; ++i) {
+				const auto& slice = slices[i];
+				if (slice.owner->images.size() != 1)
+					continue;
+				for (size_t j = slice.begin; j < slice.end; ++j)
+					schedule.active_output_blocks.push_back(static_cast<uint32_t>(
+					    slice.owner->images.front() * blocks_per_image + slice.owner->outputs[j].second));
+			}
+			const auto direct_count = schedule.active_output_blocks.size() - direct_start;
+			if (direct_count)
+				schedule.groups.push_back({direct_start, static_cast<uint32_t>(direct_count), 0U, 0U});
+			schedule.output_workset_ownership_count += direct_count;
+			schedule.offsets[workset + 1]       = schedule.active_output_blocks.size() - block_start;
+			schedule.group_offsets[workset + 1] = schedule.groups.size() - group_start;
+			first                               = last;
+		}
+		for (size_t i = 1; i < schedule.offsets.size(); ++i) {
+			schedule.offsets[i] += schedule.offsets[i - 1];
+			schedule.group_offsets[i] += schedule.group_offsets[i - 1];
+		}
+		for (size_t w = 0; w < workset_count; ++w) {
+			uint64_t tasks = 0;
+			for (auto g = schedule.group_offsets[w]; g < schedule.group_offsets[w + 1]; ++g) {
+				auto& group      = schedule.groups[g];
+				group.task_begin = tasks;
+				tasks += uint64_t(group.block_count) * std::max(group.image_count, 1U);
+			}
+		}
+		schedule.active_output_fill_ms = std::chrono::duration<double, std::milli>(Clock::now() - fill_start).count();
+		schedule.temporary_bytes_peak =
+		    slices.capacity() * sizeof(Slice) + group_workset.capacity() * sizeof(uint32_t) +
+		    owner_generations.capacity() * sizeof(uint32_t) + workset_seen.capacity() +
+		    owners.capacity() * sizeof(uint32_t) +
+		    rowgroup_worksets.size() * (sizeof(uint64_t) + sizeof(uint32_t) + 4U * sizeof(void*)) +
+		    ownership_templates.size() * (sizeof(OwnershipKey) + sizeof(OwnershipTemplate) + 4U * sizeof(void*));
+		for (const auto& [key, entry] : ownership_templates)
+			schedule.temporary_bytes_peak += entry.outputs.capacity() * sizeof(std::pair<uint32_t, uint32_t>) +
+			                                 entry.images.capacity() * sizeof(uint32_t);
+		schedule.total_build_ms = std::chrono::duration<double, std::milli>(Clock::now() - total_start).count();
+		return schedule;
+	}
+
 	schedule.offsets.assign(static_cast<size_t>(workset_count) + 1U, 0U);
 	const auto count_start   = Clock::now();
 	const auto count_outputs = [&](const uint32_t workset, const uint64_t count) {
@@ -599,6 +709,72 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	    static_cast<uint64_t>(cursors.capacity()) * sizeof(uint64_t);
 	schedule.total_build_ms = std::chrono::duration<double, std::milli>(Clock::now() - total_start).count();
 	return schedule;
+}
+
+bool detail::compact_integer_upsample_schedule(JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                                               const JpegDctDeviceBlockMajorPlanlessPlan&   plan,
+                                               const JpegDctGridTransformSpec&              transform) {
+	if (!transform.require_all_coefficients || transform.output_channels.empty())
+		return false;
+	bool upsampled = false;
+	for (const auto& image : plan.images) {
+		for (size_t c = 0; c < image.components.size(); ++c) {
+			const auto& component = image.components[c];
+			if (!component.present)
+				continue;
+			const auto width  = c == 0 ? transform.y_output_width_blocks : transform.cbcr_output_width_blocks;
+			const auto height = c == 0 ? transform.y_output_height_blocks : transform.cbcr_output_height_blocks;
+			if (component.x_down_factor != 1 || component.y_down_factor != 1 || component.x_up_factor == 0 ||
+			    component.y_up_factor == 0 || (component.x_up_factor == 1 && component.y_up_factor == 1) ||
+			    component.x_up_factor > 16 || component.y_up_factor > 16 || width % component.x_up_factor != 0 ||
+			    height % component.y_up_factor != 0)
+				return false;
+			upsampled |= component.x_up_factor > 1 || component.y_up_factor > 1;
+		}
+	}
+	if (!upsampled)
+		return false;
+	const uint64_t y_blocks = uint64_t(transform.y_output_width_blocks) * transform.y_output_height_blocks;
+	const uint64_t c_blocks = uint64_t(transform.cbcr_output_width_blocks) * transform.cbcr_output_height_blocks;
+	const auto     blocks_per_image = y_blocks + 2 * c_blocks;
+	size_t         cursor           = 0;
+	const auto     compact_slice    = [&](uint64_t begin, uint64_t end, uint32_t representative, bool local) {
+        for (auto i = begin; i < end; ++i) {
+            const auto  linear  = schedule.active_output_blocks[i];
+            const auto  image   = local ? representative : static_cast<uint32_t>(linear / blocks_per_image);
+            const auto  spatial = linear % blocks_per_image;
+            const auto  c  = spatial < y_blocks ? 0U : 1U + static_cast<uint32_t>((spatial - y_blocks) / c_blocks);
+            const auto  xy = c == 0 ? spatial : (spatial - y_blocks) % c_blocks;
+            const auto  width     = c == 0 ? transform.y_output_width_blocks : transform.cbcr_output_width_blocks;
+            const auto& component = plan.images[image].components[c];
+            if ((xy % width) % component.x_up_factor == 0 && (xy / width) % component.y_up_factor == 0)
+                schedule.active_output_blocks[cursor++] = linear;
+        }
+	};
+	for (size_t w = 0; w + 1 < schedule.offsets.size(); ++w) {
+		const auto begin = schedule.offsets[w], end = schedule.offsets[w + 1];
+		schedule.offsets[w] = cursor;
+		if (schedule.groups.empty()) {
+			compact_slice(begin, end, 0U, schedule.repeated_image_count > 1U);
+		} else {
+			uint64_t tasks = 0;
+			for (auto g = schedule.group_offsets[w]; g < schedule.group_offsets[w + 1]; ++g) {
+				auto&      group = schedule.groups[g];
+				const auto start = cursor;
+				compact_slice(group.block_begin,
+				              group.block_begin + group.block_count,
+				              group.image_count ? schedule.image_indices[group.image_begin] : 0U,
+				              group.image_count != 0U);
+				group.block_begin = start;
+				group.block_count = static_cast<uint32_t>(cursor - start);
+				group.task_begin  = tasks;
+				tasks += uint64_t(group.block_count) * std::max(group.image_count, 1U);
+			}
+		}
+	}
+	schedule.offsets.back() = cursor;
+	schedule.active_output_blocks.resize(cursor);
+	return true;
 }
 
 struct JpegDctShardDatasetReader::Impl {
