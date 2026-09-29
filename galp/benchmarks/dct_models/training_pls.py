@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -102,8 +103,11 @@ def main():
     p.add_argument("--resume", type=Path, help="completed-epoch checkpoint; training restarts at the next epoch")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--initial-validation", action="store_true", help="evaluate scratch initialization before epoch 1")
+    p.add_argument("--short-warmup", action="store_true", help="Exclude page-cache and short loader/model warmup before one measured epoch")
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
+    if args.short_warmup and (args.epochs!=1 or args.resume or args.data_only or args.profile or args.input_backend not in ('native','jpeg')):
+        p.error('short-warmup requires one fresh, unprofiled training epoch')
     pool_images = args.segments_per_pool * 1024
     if pool_images <= 0:
         p.error("segments-per-pool must be positive")
@@ -167,19 +171,19 @@ def main():
             microbatch=microbatch, pool_images=args.segments_per_pool*1024,
             dali_prefetch_depth=args.dali_prefetch_depth)
     elif args.input_backend == "jpeg":
-        if args.condition != "A0":
-            raise ValueError("JPEG reference uses A0 per-sample crop and global shuffle")
         from galp.benchmarks.dct_models.training_jpeg import JpegTrainingPipeline
-        pipeline = JpegTrainingPipeline(args.mapping, output_channels=channels(), grid=B.GRID,
-            workers=args.workers, microbatch=microbatch, pool_images=args.segments_per_pool*1024)
+        pipeline_factory = lambda: JpegTrainingPipeline(args.mapping, output_channels=channels(), grid=B.GRID,
+            workers=args.workers, microbatch=microbatch, pool_images=args.segments_per_pool*1024,condition=args.condition)
+        pipeline=pipeline_factory()
     else:
-        pipeline = DirectDctPlsPipeline(args.manifest, args.mapping, training_seed=11997733,
+        pipeline_factory = lambda: DirectDctPlsPipeline(args.manifest, args.mapping, training_seed=11997733,
             expected_mapping_sha256=args.mapping_sha256,
             crop_policy="per-sample" if args.condition == "A0" else "per-pls",
             order_policy="global" if args.condition == "A0" else "closed-pool",
             segments_per_pool=args.segments_per_pool, microbatch_images=microbatch,
             output_grid_size=B.GRID, output_channels=channels(), transform_blocks_per_launch=args.transform_blocks_per_launch,
             transform_ctas_per_launch=args.transform_ctas_per_launch)
+        pipeline=pipeline_factory()
     if pipeline.sample_count != population:
         raise ValueError("physical data and training manifest population differ")
     monitor_file = (args.output_dir / "gpu_process_memory.csv").open("w")
@@ -205,6 +209,51 @@ def main():
         del state
     initialization_seconds = time.perf_counter()-initialization_started
     try:
+        warmup=None
+        if args.short_warmup:
+            from galp.benchmarks.profiling.input_motivation import cache_pages
+            from galp.benchmarks.system_dct_major.common import parse_manifest
+            paths=([Path(s['fls_path']) for s in parse_manifest(args.manifest)['shards']]
+                if args.input_backend=='native' else [Path(r[2]) for r in pipeline.records])
+            cache=cache_pages(paths,warm=True)
+            initial={k:v.detach().cpu().clone() for k,v in net.state_dict().items()}
+            rng=capture_rng_state()
+            pipeline.start_epoch(0)
+            pool=pipeline.next_pool()
+            batch=next(iter(pool))
+            torch.cuda.synchronize()
+            if args.input_backend=='native': pool.retire()
+            del batch,pool
+            pipeline.close()
+            pipeline=pipeline_factory()
+            for size in (microbatch,population%microbatch or microbatch):
+                x=torch.zeros(size,len(B.CHANNELS),B.GRID,B.GRID,device='cuda')
+                target=torch.nn.functional.one_hot(torch.arange(size,device='cuda')%1000,1000).float()
+                for _ in range(3):
+                    optimizer.zero_grad(set_to_none=args.compile_mode != "reduce-overhead" or args.no_compile)
+                    with torch.autocast('cuda',dtype=torch.bfloat16):
+                        logits=execution(x)
+                        loss=torch.nn.functional.cross_entropy(logits,target)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(net.parameters(),1.)
+                    optimizer.step()
+                    if not bool(torch.isfinite(loss)): raise FloatingPointError('Non-finite excluded warmup')
+            torch.cuda.synchronize()
+            net.load_state_dict(initial)
+            net.zero_grad(set_to_none=True)
+            if args.compile_mode == "reduce-overhead" and not args.no_compile:
+                # Measured accumulation needs gradients allocated outside CUDA Graphs.
+                for param in net.parameters():
+                    param.grad = torch.zeros_like(param)
+            restore_rng_state(rng)
+            optimizer,decayer,scheduler=build_published_optimizer(net,total_updates=math.ceil(population/effective)*300)
+            assert tensor_state_sha256(net.state_dict())==initial_model_hash
+            del initial,x,target,logits,loss
+            before=cache_pages(paths)
+            if before['resident_fraction']!=1: raise RuntimeError('Source pages not warm before epoch')
+            warmup=dict(cache_warm=cache,cache_before=before,synthetic_microbatches=6,initial_state_restored=True,
+                initial_model_hash=initial_model_hash)
+            (args.output_dir/'short_warmup.json').write_text(json.dumps(warmup,indent=2)+'\n')
         if args.initial_validation and net is not None and not args.resume:
             if rgb_backend:
                 from galp.benchmarks.dct_models.training_rgb import validate_rgb
@@ -217,6 +266,7 @@ def main():
             finite = torch.ones((), device="cuda", dtype=torch.bool)
             loss_sum = torch.zeros((), device="cuda")
             seen = np.zeros(population, dtype=np.bool_)
+            order_hash=hashlib.sha256()
             count, model_ms, input_wait = 0, 0., 0.
             pool_records = []
             capture = Capture(args.profile, first=args.profile_warmup_images // pool_images,
@@ -246,6 +296,7 @@ def main():
                     if seen[ids].any() or len(np.unique(ids)) != len(ids):
                         raise ValueError("duplicate physical image position in epoch")
                     seen[ids] = True
+                    order_hash.update(ids.astype('<u8').tobytes())
                     x = batch.projected
                     target = rgb_labels[batch.targets] if rgb_backend else batch.targets[:, label_columns]
                     shape = (3, 224, 224) if rgb_backend else (len(B.CHANNELS), B.GRID, B.GRID)
@@ -279,6 +330,7 @@ def main():
                                         raise FloatingPointError("non-finite loss/logits")
                                     float(loss.detach())
                                 loss_sum += loss.detach() * batch.image_count
+                                final_loss=loss.detach()
                             with capture.range("detail.backward"):
                                 (loss * (batch.image_count / window_images)).backward()
                         if (batch_index + 1) % accumulation == 0 or batch.is_pool_end:
@@ -339,8 +391,9 @@ def main():
                 epoch_setup_seconds=epoch_setup_seconds,
                 input_wait_seconds=input_wait, model_stream_seconds=model_ms/1000, ce=None if args.data_only else float(loss_sum)/count,
                 optimizer_updates=0 if scheduler is None else scheduler.completed_updates,
+                final_loss=None if args.data_only else float(final_loss),sample_order_digest=order_hash.hexdigest(),
                 unique_samples=int(seen.sum()), pools=pool_records, native_prefetch=dict(pipeline.prefetch_stats))
-            if net is not None:
+            if net is not None and args.validation_count:
                 if rgb_backend:
                     from galp.benchmarks.dct_models.training_rgb import validate_rgb
                     record["validation"] = validate_rgb(net, args.validation_count, args.workers)
@@ -385,10 +438,13 @@ def main():
         torch_peak_reserved=torch.cuda.max_memory_reserved(), nvml_process_peak_mib=max(values) if values else None,
         cpu_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         largest_finished_child_peak_rss_kib=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
-        timing="cold epoch E2E includes first compile and pool boundaries; CUDA model stream intervals include audit host gaps; overlapping stages are not additive",
+        warmup=warmup,
+        timing=("one warm epoch after excluded short warmup" if args.short_warmup else "cold epoch E2E includes first compile")+"; pool boundaries included; overlapping stages are not additive",
         augmentation=("existing Transformer RGB crop/flip, bilinear resize 224, mean/std .5; hard labels, no DCT RandAugment/Mixup" if rgb_backend else
                       "source DCT crop/resize/flip; round to integer; RandAugment clamp [-1024,1016], two operations; spatial magnitudes scaled from 28-grid; channel normalization then Mixup"),
-        validation=("per-epoch RGB center-crop validation" if rgb_backend else "per-epoch N validation") + "; bounded training probes are not convergence evidence")
+        validation=(("per-epoch RGB center-crop validation" if rgb_backend else "per-epoch N validation")
+                    if args.validation_count else "disabled for throughput epoch; checkpoint quality evaluated separately")
+                   + "; bounded training probes are not convergence evidence")
     result_path.write_text(json.dumps(result, indent=2)+"\n")
     print(json.dumps({k:v for k,v in result.items() if k not in ("epochs", "audit_policy", "output_channels")}, indent=2), flush=True)
 
