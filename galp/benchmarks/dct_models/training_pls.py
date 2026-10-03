@@ -19,7 +19,7 @@ import torch
 import galp.benchmarks.dct_models.backend as B
 from galp.benchmarks.dct_models.capture import Capture
 
-sys.path.insert(0, str(B.REPO / "build/galp/torch"))
+sys.path.insert(0, str(os.environ.get("IMAGELANES_TRAINING_NATIVE_DIR", B.REPO / "build/galp/torch")))
 from galp.torch.experimental import DirectDctPlsPipeline
 from galp.benchmarks.training_audit_policy import build_audit_policy, decision_for_next_update
 from galp.benchmarks.training_pls.published_optimizer import build_published_optimizer
@@ -32,6 +32,36 @@ def channels():
     pairs = [(c, f) for c, indices in enumerate(B.INDICES) for f in indices]
     return [[c, f, mean, std] for (c, f), mean, std in
             zip(pairs, B.MEAN.flatten().tolist(), B.STD.flatten().tolist())]
+
+
+def warmup_training_step(net, execution, optimizer, decayer, scheduler, x, target, *, set_to_none, context):
+    """Excluded update with checks before a bad gradient can corrupt the model."""
+    def finite(value, stage):
+        if not bool(torch.isfinite(value).all()):
+            raise FloatingPointError(f"Non-finite excluded warmup: {context}: {stage}")
+
+    finite(x, "input")
+    finite(target, "target")
+    for name, value in net.state_dict().items():
+        finite(value, f"initial state {name}")
+    optimizer.zero_grad(set_to_none=set_to_none)
+    lr = scheduler.prepare_next_update()
+    with torch.autocast(x.device.type, dtype=torch.bfloat16):
+        logits = execution(x)
+        finite(logits, "output")
+        loss = torch.nn.functional.cross_entropy(logits, target)
+    finite(loss, "loss")
+    loss.backward()
+    for name, parameter in net.named_parameters():
+        if parameter.grad is not None:
+            finite(parameter.grad, f"gradient {name}")
+    norm = torch.nn.utils.clip_grad_norm_(net.parameters(), 1., error_if_nonfinite=True)
+    finite(norm, "gradient norm")
+    optimizer.step()
+    decayer.step(lr)
+    scheduler.complete_update()
+    for name, value in net.state_dict().items():
+        finite(value, f"updated state {name}")
 
 
 @torch.inference_mode()
@@ -221,23 +251,23 @@ def main():
             pipeline.start_epoch(0)
             pool=pipeline.next_pool()
             batch=next(iter(pool))
+            # Constant zero inputs give eFUN degenerate BN activations and overflowing
+            # backward gradients. Reuse real model-boundary data from loader warmup.
+            warm_x = batch.projected.clone()
+            warm_target = batch.targets[:, label_columns].clone()
             torch.cuda.synchronize()
             if args.input_backend=='native': pool.retire()
             del batch,pool
             pipeline.close()
             pipeline=pipeline_factory()
             for size in (microbatch,population%microbatch or microbatch):
-                x=torch.zeros(size,len(B.CHANNELS),B.GRID,B.GRID,device='cuda')
-                target=torch.nn.functional.one_hot(torch.arange(size,device='cuda')%1000,1000).float()
-                for _ in range(3):
-                    optimizer.zero_grad(set_to_none=args.compile_mode != "reduce-overhead" or args.no_compile)
-                    with torch.autocast('cuda',dtype=torch.bfloat16):
-                        logits=execution(x)
-                        loss=torch.nn.functional.cross_entropy(logits,target)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net.parameters(),1.)
-                    optimizer.step()
-                    if not bool(torch.isfinite(loss)): raise FloatingPointError('Non-finite excluded warmup')
+                for step in range(3):
+                    if args.compile_mode == "reduce-overhead" and not args.no_compile:
+                        torch.compiler.cudagraph_mark_step_begin()
+                    warmup_training_step(net, execution, optimizer, decayer, scheduler,
+                        warm_x[:size], warm_target[:size],
+                        set_to_none=args.compile_mode != "reduce-overhead" or args.no_compile,
+                        context=f"size={size} step={step}")
             torch.cuda.synchronize()
             net.load_state_dict(initial)
             net.zero_grad(set_to_none=True)
@@ -248,10 +278,11 @@ def main():
             restore_rng_state(rng)
             optimizer,decayer,scheduler=build_published_optimizer(net,total_updates=math.ceil(population/effective)*300)
             assert tensor_state_sha256(net.state_dict())==initial_model_hash
-            del initial,x,target,logits,loss
+            del initial, warm_x, warm_target
             before=cache_pages(paths)
             if before['resident_fraction']!=1: raise RuntimeError('Source pages not warm before epoch')
-            warmup=dict(cache_warm=cache,cache_before=before,synthetic_microbatches=6,initial_state_restored=True,
+            warmup=dict(cache_warm=cache,cache_before=before,real_input_microbatches=6,
+                input_source="first epoch-0 microbatch, reused at full and tail sizes",initial_state_restored=True,
                 initial_model_hash=initial_model_hash)
             (args.output_dir/'short_warmup.json').write_text(json.dumps(warmup,indent=2)+'\n')
         if args.initial_validation and net is not None and not args.resume:
