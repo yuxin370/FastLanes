@@ -1084,11 +1084,9 @@ TEST(JpegDct, DeviceBatchReadsCropIntoImageMajorDctBlocks) {
 	          selected_crop_batch.block_count() * selected_coefficients.size());
 	expect_batch_matches_materialized(selected_crop_batch);
 	const auto selected_crop_stats = selected_crop_batch.execution_stats();
-	EXPECT_EQ(selected_crop_stats.decoded_gather_item_count, 0U);
-	EXPECT_EQ(selected_crop_stats.gather_kernel_launch_count, 0U);
-	EXPECT_EQ(selected_crop_stats.decoded_projection_item_count,
-	          selected_crop_batch.block_count() * selected_coefficients.size());
-	EXPECT_GT(selected_crop_stats.materialize_kernel_launch_count, 0U);
+	EXPECT_EQ(selected_crop_stats.decoded_gather_item_count, selected_crop_batch.block_count());
+	EXPECT_GT(selected_crop_stats.gather_kernel_launch_count, 0U);
+	EXPECT_EQ(selected_crop_stats.decoded_projection_item_count, 0U);
 
 	const std::vector<galp::jpeg::JpegDctImageCropRequest> full_image_requests {
 	    galp::jpeg::JpegDctImageCropRequest {0, galp::jpeg::JpegDctCropBox {}},
@@ -2928,6 +2926,37 @@ TEST(JpegDct, CropExecutionModesMatchAndVectorRangeReadsFewerPhysicalBytes) {
 	EXPECT_GT(vector_stats.pread_count, 1U);
 	EXPECT_LT(vector_stats.compressed_payload_bytes_read, vector_stats.full_compressed_payload_bytes);
 	EXPECT_LT(vector_stats.compressed_payload_bytes_read, rowgroup_stats.compressed_payload_bytes_read);
+
+	// Compact output must preserve selected slot order after sparse-vector
+	// remapping without expanding placement metadata per coefficient.
+	auto compact_options   = vector_options;
+	compact_options.layout = galp::jpeg::JpegDctDeviceLayout::kImageMajorComponentBlockCoeff;
+	compact_options.grid_transform.reset();
+	auto                 all_coefficients = reader.ReadDeviceDctBatch(requests, compact_options);
+	std::vector<int16_t> all_host(all_coefficients.coefficient_count());
+	ASSERT_EQ(cudaMemcpy(all_host.data(),
+	                     all_coefficients.device_coefficients(),
+	                     all_host.size() * sizeof(int16_t),
+	                     cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	compact_options.coefficient_selection.coefficients = {5U, 0U, 2U};
+	auto                 selected                      = reader.ReadDeviceDctBatch(requests, compact_options);
+	std::vector<int16_t> selected_host(selected.coefficient_count());
+	ASSERT_EQ(cudaMemcpy(selected_host.data(),
+	                     selected.device_coefficients(),
+	                     selected_host.size() * sizeof(int16_t),
+	                     cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(selected.block_count(), all_coefficients.block_count());
+	for (size_t block = 0; block < selected.block_count(); ++block) {
+		for (size_t slot = 0; slot < selected.coefficients_per_block(); ++slot) {
+			EXPECT_EQ(selected_host[block * selected.coefficients_per_block() + slot],
+			          all_host[block * 64U + selected.selected_coefficients()[slot]]);
+		}
+	}
+	EXPECT_EQ(selected.execution_stats().decoded_projection_item_count, 0U);
+	EXPECT_EQ(selected.execution_stats().decoded_gather_item_count, selected.block_count());
+	EXPECT_LT(selected.execution_stats().actual_vector_count, selected.execution_stats().full_vector_count);
 
 	std::filesystem::remove_all(dir);
 }

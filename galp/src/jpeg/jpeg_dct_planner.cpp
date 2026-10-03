@@ -3387,9 +3387,7 @@ struct JpegDctShardDatasetReader::Impl {
 		const bool output_ycbcr_dct_grid = options.layout == JpegDctDeviceLayout::kYcbcrDctGrid ||
 		                                   options.layout == JpegDctDeviceLayout::kTransformedDctGrid;
 		const auto* grid_transform = options.grid_transform.has_value() ? &*options.grid_transform : nullptr;
-		const bool  materialize_projection_items =
-		    output_ycbcr_dct_grid ||
-		    plan.coefficient_selection_shape.kind != detail::JpegDctCoefficientSelectionKind::kAll;
+		const bool  materialize_projection_items = output_ycbcr_dct_grid;
 		plan.decode_batch_rowgroups =
 		    options.decode_batch_rowgroups == 0 ? kDefaultJpegDctDecodeBatchRowgroups : options.decode_batch_rowgroups;
 		plan.decode_workset_capacity_bytes = options.decode_workset_capacity_bytes == 0U

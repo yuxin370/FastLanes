@@ -2679,150 +2679,70 @@ void project_transformed_dct_grid_batch(const std::vector<BoundCoeffColumns>&   
 		++stats.cached_gather_kernel_launch_count;
 	}
 
-	void gather_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>& sources,
-	                                   const std::vector<DecodedRowgroupWork>& works,
-	                                   int16_t* output,
-	                                   JpegDctDeviceScratch& scratch,
-	                                   JpegDctDeviceExecutionStats& stats,
-	                                   cudaStream_t stream) {
-		if (sources.empty() || works.empty()) {
-			return;
-		}
-		if (sources.size() != works.size()) {
-			throw std::runtime_error("JPEG DCT decoded gather source/work count mismatch");
-		}
-
-		auto& column_bindings = scratch.host_column_bindings;
-		auto& gather_items    = scratch.host_decoded_gather_items;
-		column_bindings.clear();
-		gather_items.clear();
-
-		size_t total_gather_items = 0;
-		for (const auto& work : works) {
-			if (work.gather_items != nullptr) {
-				total_gather_items += work.gather_items->size();
-			}
-		}
-		column_bindings.reserve(works.size() * kJpegDctCoefficientCount);
-		gather_items.reserve(total_gather_items);
-
-		for (size_t source_idx = 0; source_idx < works.size(); ++source_idx) {
-			const auto& source = sources[source_idx];
-			const auto& work   = works[source_idx];
-			std::array<uint32_t, kJpegDctCoefficientCount> binding_index_by_physical {};
-			append_dense_column_bindings(source, column_bindings, binding_index_by_physical);
-			if (work.gather_items == nullptr) {
-				continue;
-			}
-			if (source_idx > std::numeric_limits<uint32_t>::max()) {
-				throw std::runtime_error("JPEG DCT decoded gather source index overflow");
-			}
-			for (const auto& item : *work.gather_items) {
-				gather_items.push_back(JpegDctDeviceDecodedGatherBatchItem {
-				    static_cast<uint32_t>(source_idx), item.row_in_rowgroup, item.output_block_index});
-			}
-		}
-		if (gather_items.empty()) {
-			return;
-		}
-
-		constexpr unsigned kThreads = 256;
-		scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
-		scratch.decoded_gather_items.upload(gather_items.data(), gather_items.size(), stream, stats);
-		const size_t total = gather_items.size() * kJpegDctCoefficientCount;
-		const dim3   block(kThreads);
-		const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads));
-		gather_decoded_dct_blocks_batch_kernel<<<grid, block, 0, stream>>>(
-		    scratch.column_bindings.data, scratch.decoded_gather_items.data, gather_items.size(), output);
-		CUDA_SAFE_CALL(cudaGetLastError());
-		++stats.gather_kernel_launch_count;
-		stats.gather_item_count += gather_items.size();
-		stats.decoded_gather_item_count += gather_items.size();
-	}
-
-	void project_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>& sources,
-	                                    const std::vector<DecodedRowgroupWork>& works,
-                                    const size_t coefficients_per_block,
-                                    const bool use_dense_bindings,
-                                    int16_t* output,
-                                    JpegDctDeviceScratch& scratch,
-                                    JpegDctDeviceExecutionStats& stats,
-                                    cudaStream_t stream) {
-	if (sources.empty() || works.empty() || coefficients_per_block == 0) {
+void gather_decoded_rowgroup_batch(const std::vector<BoundCoeffColumns>&   sources,
+                                   const std::vector<DecodedRowgroupWork>& works,
+                                   const std::vector<uint8_t>&             selected_coefficients,
+                                   int16_t*                                output,
+                                   JpegDctDeviceScratch&                   scratch,
+                                   JpegDctDeviceExecutionStats&            stats,
+                                   cudaStream_t                            stream) {
+	if (sources.empty() || works.empty()) {
 		return;
 	}
 	if (sources.size() != works.size()) {
-		throw std::runtime_error("JPEG DCT projection source/work count mismatch");
+		throw std::runtime_error("JPEG DCT decoded gather source/work count mismatch");
 	}
 
-	auto& column_bindings  = scratch.host_column_bindings;
-	auto& projection_items = scratch.host_projection_items;
+	auto& column_bindings = scratch.host_column_bindings;
+	auto& gather_items    = scratch.host_decoded_gather_items;
 	column_bindings.clear();
-	projection_items.clear();
-	const auto build_start = Clock::now();
+	gather_items.clear();
 
-	size_t total_projection_items = 0;
-	size_t total_active_columns   = 0;
+	size_t total_gather_items = 0;
 	for (const auto& work : works) {
-		if (work.projection_items != nullptr) {
-			total_projection_items += work.projection_items->size();
+		if (work.gather_items != nullptr) {
+			total_gather_items += work.gather_items->size();
 		}
-		total_active_columns +=
-		    use_dense_bindings ? kJpegDctCoefficientCount : work.active_physical_coefficients.size();
 	}
-	column_bindings.reserve(total_active_columns);
-	projection_items.reserve(total_projection_items);
+	const size_t coefficients_per_block = selected_coefficients.size();
+	column_bindings.reserve(works.size() * coefficients_per_block);
+	gather_items.reserve(total_gather_items);
 
 	for (size_t source_idx = 0; source_idx < works.size(); ++source_idx) {
-		const auto& source = sources[source_idx];
-		const auto& work   = works[source_idx];
+		const auto&                                    source = sources[source_idx];
+		const auto&                                    work   = works[source_idx];
 		std::array<uint32_t, kJpegDctCoefficientCount> binding_index_by_physical {};
-		if (use_dense_bindings) {
-			append_dense_column_bindings(source, column_bindings, binding_index_by_physical);
-		} else {
-			append_compact_column_bindings(
-			    source, work.active_physical_coefficients, column_bindings, binding_index_by_physical);
-		}
-		if (work.projection_items == nullptr) {
+		append_compact_column_bindings(source, selected_coefficients, column_bindings, binding_index_by_physical);
+		if (work.gather_items == nullptr) {
 			continue;
 		}
-		for (const auto& item : *work.projection_items) {
-			const auto physical_coeff = static_cast<size_t>(item.physical_coefficient_column_id);
-			if (physical_coeff >= binding_index_by_physical.size() ||
-			    binding_index_by_physical[physical_coeff] == std::numeric_limits<uint32_t>::max()) {
-				throw std::runtime_error("JPEG DCT projection references a physical column that was not bound");
-			}
-			projection_items.push_back(JpegDctDeviceProjectionBatchItem {binding_index_by_physical[physical_coeff],
-			    item.row_in_rowgroup,
-			    item.output_block_index,
-			    item.selected_coefficient_slot,
-			    item.logical_coefficient_id,
-			    item.physical_coefficient_column_id,
-			    item.output_coefficient_id,
-			    item.output_grid_tensor});
+		if (source_idx > std::numeric_limits<uint32_t>::max()) {
+			throw std::runtime_error("JPEG DCT decoded gather source index overflow");
+		}
+		for (const auto& item : *work.gather_items) {
+			gather_items.push_back(JpegDctDeviceDecodedGatherBatchItem {
+			    static_cast<uint32_t>(source_idx), item.row_in_rowgroup, item.output_block_index});
 		}
 	}
-	if (projection_items.empty()) {
-		stats.projection_item_build_ms += elapsed_ms(build_start, Clock::now());
+	if (gather_items.empty()) {
 		return;
 	}
-	stats.projection_item_build_ms += elapsed_ms(build_start, Clock::now());
 
 	constexpr unsigned kThreads = 256;
 	scratch.column_bindings.upload(column_bindings.data(), column_bindings.size(), stream, stats);
-	scratch.batch_projection_items.upload(projection_items.data(), projection_items.size(), stream, stats);
-	const dim3 block(kThreads);
-	const dim3 grid(static_cast<unsigned>((projection_items.size() + kThreads - 1U) / kThreads));
-	project_dct_coefficients_batch_kernel<<<grid, block, 0, stream>>>(scratch.column_bindings.data,
-	    scratch.batch_projection_items.data,
-	    projection_items.size(),
-	    coefficients_per_block,
-	    output);
+	scratch.decoded_gather_items.upload(gather_items.data(), gather_items.size(), stream, stats);
+	const size_t total = gather_items.size() * coefficients_per_block;
+	const dim3   block(kThreads);
+	const dim3   grid(static_cast<unsigned>((total + kThreads - 1U) / kThreads));
+	gather_decoded_dct_blocks_batch_kernel<<<grid, block, 0, stream>>>(scratch.column_bindings.data,
+	                                                                   scratch.decoded_gather_items.data,
+	                                                                   gather_items.size(),
+	                                                                   coefficients_per_block,
+	                                                                   output);
 	CUDA_SAFE_CALL(cudaGetLastError());
-	++stats.materialize_kernel_launch_count;
-	stats.projection_item_count += projection_items.size();
-	stats.decoded_projection_item_count += projection_items.size();
-	stats.jpeg_dct_projection_items_materialized += projection_items.size();
+	++stats.gather_kernel_launch_count;
+	stats.gather_item_count += gather_items.size();
+	stats.decoded_gather_item_count += gather_items.size();
 }
 
 void project_decoded_ycbcr_grid_batch(const std::vector<BoundCoeffColumns>&   sources,
@@ -4451,7 +4371,7 @@ prepare_decoded_rowgroup_work_from_materialized(galp::execution::Rowgroup       
 			    rowgroup_plan.fixed_transform_items, *work.selected_vectors, cfg.unpack_n_vectors);
 			work.fixed_transform_items = &work.owned_fixed_transform_items;
 		}
-	} else if (selection_shape.kind == JpegDctCoefficientSelectionKind::kAll && !force_projection) {
+	} else if (!force_projection) {
 		work.active_physical_coefficients = selected_coefficients;
 	} else {
 		const std::vector<JpegDctDeviceProjectionItem>* logical_projection_items = nullptr;
@@ -4704,8 +4624,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 	auto& sources = scratch.host_bound_sources;
 	const bool materializes_dense_cache =
 	    cache != nullptr && cache->capacity > 0 && selects_all_coefficients(selected_coefficients);
-	const bool uses_decoded_gather =
-	    selection_shape.kind == JpegDctCoefficientSelectionKind::kAll && !output_ycbcr_dct_grid;
+	const bool uses_decoded_gather = !output_ycbcr_dct_grid;
 	const bool batch_has_expanded_fixed_transform =
 	    output_transformed_dct_grid && std::any_of(works.begin(), works.end(), [](const auto& work) {
 		    return work.fixed_transform_items != nullptr && !work.fixed_transform_items->empty();
@@ -4776,7 +4695,8 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		                                   execution_stats,
 		                                   materialize_stream);
 	} else if (uses_decoded_gather) {
-		gather_decoded_rowgroup_batch(sources, works, output, scratch, execution_stats, materialize_stream);
+		gather_decoded_rowgroup_batch(
+		    sources, works, selected_coefficients, output, scratch, execution_stats, materialize_stream);
 	} else if (output_ycbcr_dct_grid) {
 		project_decoded_ycbcr_grid_batch(sources,
 		                                 works,
@@ -4788,15 +4708,7 @@ void execute_decoded_rowgroup_batch(std::vector<DecodedRowgroupWork>&       work
 		                                 scratch,
 		                                 execution_stats,
 		                                 materialize_stream);
-	} else {
-		project_decoded_rowgroup_batch(sources,
-		                               works,
-		                               selected_coefficients.size(),
-		                               materializes_dense_cache,
-		                               output,
-		                               scratch,
-		                               execution_stats,
-		                               materialize_stream);
+
 	}
 	if (materializes_dense_cache) {
 		auto& materialize_items = scratch.host_materialize_items;

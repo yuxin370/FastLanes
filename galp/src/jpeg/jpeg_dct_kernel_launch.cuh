@@ -6,11 +6,6 @@
 
 namespace galp::jpeg::detail {
 
-__global__ void project_dct_coefficients_batch_kernel(const DeviceCoeffBinding*               column_bindings,
-                                                      const JpegDctDeviceProjectionBatchItem* items,
-                                                      size_t                                  item_count,
-                                                      size_t                                  coefficients_per_block,
-                                                      int16_t*                                out);
 __global__ void project_dct_ycbcr_grid_batch_kernel(const DeviceCoeffBinding*               column_bindings,
                                                     const JpegDctDeviceProjectionBatchItem* items,
                                                     size_t                                  item_count,
@@ -21,7 +16,9 @@ __global__ void project_dct_ycbcr_grid_batch_kernel(const DeviceCoeffBinding*   
 __global__ void gather_decoded_dct_blocks_batch_kernel(const DeviceCoeffBinding*                  column_bindings,
                                                        const JpegDctDeviceDecodedGatherBatchItem* items,
                                                        size_t                                     item_count,
-                                                       int16_t*                                   out);
+                                                       size_t   coefficients_per_block,
+                                                       int16_t* out);
+
 __global__ void materialize_dense_dct_rowgroup_batch_kernel(const DeviceCoeffBinding*                column_bindings,
                                                             const JpegDctDeviceMaterializeBatchItem* items,
                                                             size_t                                   item_count);

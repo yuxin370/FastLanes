@@ -2,27 +2,6 @@
 
 namespace galp::jpeg::detail {
 
-__global__ void project_dct_coefficients_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
-                                                      const JpegDctDeviceProjectionBatchItem* __restrict items,
-                                                      const size_t item_count,
-                                                      const size_t coefficients_per_block,
-                                                      int16_t* __restrict out) {
-	const size_t item_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-	if (item_idx >= item_count) {
-		return;
-	}
-	const auto item    = items[item_idx];
-	const auto binding = column_bindings[item.binding_index];
-	int16_t    value   = 0;
-	if (binding.source == DeviceCoeffSource::kI16) {
-		value = binding.column_i16[item.row_in_rowgroup];
-	} else if (binding.source == DeviceCoeffSource::kI8) {
-		value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
-	}
-	out[selected_dct_output_offset(item.output_block_index, item.selected_coefficient_slot, coefficients_per_block)] =
-	    value;
-}
-
 __global__ void project_dct_ycbcr_grid_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
                                                     const JpegDctDeviceProjectionBatchItem* __restrict items,
                                                     const size_t item_count,
@@ -63,23 +42,24 @@ __global__ void project_dct_ycbcr_grid_batch_kernel(const DeviceCoeffBinding* __
 __global__ void gather_decoded_dct_blocks_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
                                                        const JpegDctDeviceDecodedGatherBatchItem* __restrict items,
                                                        const size_t item_count,
+                                                       const size_t coefficients_per_block,
                                                        int16_t* __restrict out) {
 	const size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-	const size_t total  = item_count * kJpegDctCoefficientCount;
+	const size_t total  = item_count * coefficients_per_block;
 	if (linear >= total) {
 		return;
 	}
-	const size_t item_idx  = linear / kJpegDctCoefficientCount;
-	const size_t coeff_idx = linear % kJpegDctCoefficientCount;
+	const size_t item_idx  = linear / coefficients_per_block;
+	const size_t coeff_idx = linear % coefficients_per_block;
 	const auto   item      = items[item_idx];
-	const auto   binding   = column_bindings[item.source_index * kJpegDctCoefficientCount + coeff_idx];
+	const auto   binding   = column_bindings[item.source_index * coefficients_per_block + coeff_idx];
 	int16_t      value     = 0;
 	if (binding.source == DeviceCoeffSource::kI16) {
 		value = binding.column_i16[item.row_in_rowgroup];
 	} else if (binding.source == DeviceCoeffSource::kI8) {
 		value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
 	}
-	out[item.output_block_index * kJpegDctCoefficientCount + coeff_idx] = value;
+	out[item.output_block_index * coefficients_per_block + coeff_idx] = value;
 }
 
 __global__ void materialize_dense_dct_rowgroup_batch_kernel(const DeviceCoeffBinding* __restrict column_bindings,
