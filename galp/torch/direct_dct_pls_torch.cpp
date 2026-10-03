@@ -265,8 +265,10 @@ class TorchDirectDctPlsPool : public std::enable_shared_from_this<TorchDirectDct
 public:
 	explicit TorchDirectDctPlsPool(galp::jpeg::DirectDctPlsPoolBatch pool)
 	    : owner_(std::make_shared<NativePool>(std::move(pool)))
-	    , storage_lifetime_(std::make_shared<PlsExternalTensorLifetime>(
-	          owner_, static_cast<c10::DeviceIndex>(owner_->batch().cuda_device()))) {
+	    , storage_lifetime_(owner_->image_count() == 0U
+	                            ? nullptr
+	                            : std::make_shared<PlsExternalTensorLifetime>(
+	                                  owner_, static_cast<c10::DeviceIndex>(owner_->batch().cuda_device()))) {
 	}
 	~TorchDirectDctPlsPool() {
 		retire();
@@ -487,7 +489,10 @@ public:
 	                          const uint32_t                           output_grid_size,
 	                          const std::vector<std::array<float, 4>>& output_channels,
 	                          const size_t                             transform_blocks_per_launch,
-	                          const size_t                             transform_ctas_per_launch) {
+	                          const size_t                             transform_ctas_per_launch,
+	                          const uint32_t                           rank,
+	                          const uint32_t                           world_size,
+	                          const std::string&                       io_backend) {
 		if (profile_id != galp::profiles::kRgbNoMoreTrainingPlsProfileId) {
 			throw std::invalid_argument("DirectDctPlsPipeline requires registered profile 'rgbnomore-training-pls-v1'");
 		}
@@ -498,10 +503,17 @@ public:
 		options.schedule.training_seed     = training_seed;
 		options.schedule.segments_per_pool = segments_per_pool;
 		options.schedule.microbatch_images = microbatch_images;
+		options.schedule.rank              = rank;
+		options.schedule.world_size        = world_size;
 		options.schedule.crop_policy       = parse_crop_policy(crop_policy);
 		options.schedule.order_policy      = parse_order_policy(order_policy);
 		options.device =
 		    galp::profiles::materialize_direct_dct_options(galp::profiles::resolve_direct_dct_profile(profile_id));
+		if (io_backend == "pread") {
+			options.device.crop_execution_mode = galp::jpeg::JpegDctCropExecutionMode::kBoundedRangeReadSelectedDecode;
+		} else if (io_backend != "io_uring") {
+			throw std::invalid_argument("PLS io_backend must be 'io_uring' or 'pread'");
+		}
 
 		if (output_grid_size != 0U || !output_channels.empty()) {
 			if (output_grid_size == 0U || output_channels.empty())
@@ -672,7 +684,10 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	                  uint32_t,
 	                  const std::vector<std::array<float, 4>>&,
 	                  size_t,
-	                  size_t>(),
+	                  size_t,
+	                  uint32_t,
+	                  uint32_t,
+	                  const std::string&>(),
 	         py::arg("manifest_path"),
 	         py::arg("premixed_mapping_csv"),
 	         py::arg("training_seed"),
@@ -687,7 +702,10 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	         py::arg("output_grid_size")            = 0U,
 	         py::arg("output_channels")             = std::vector<std::array<float, 4>> {},
 	         py::arg("transform_blocks_per_launch") = 0U,
-	         py::arg("transform_ctas_per_launch")   = 0U)
+	         py::arg("transform_ctas_per_launch")   = 0U,
+	         py::arg("rank")                        = 0U,
+	         py::arg("world_size")                  = 1U,
+	         py::arg("io_backend")                  = "io_uring")
 	    .def("start_epoch", &TorchDirectDctPlsPipeline::start_epoch, py::arg("epoch"))
 	    .def("next_pool", &TorchDirectDctPlsPipeline::next_pool)
 	    .def("close", &TorchDirectDctPlsPipeline::close)

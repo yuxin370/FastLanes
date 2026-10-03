@@ -838,6 +838,9 @@ DirectDctPlsEpochSchedule::DirectDctPlsEpochSchedule(const DirectDctPlsLayout&  
 	if (options_.segments_per_pool == 0U || options_.microbatch_images == 0U) {
 		throw std::invalid_argument("Direct-DCT PLS M and microbatch size must be positive");
 	}
+	if (options_.world_size == 0U || options_.rank >= options_.world_size) {
+		throw std::invalid_argument("Direct-DCT PLS rank must be smaller than positive world_size");
+	}
 	if (options_.order_policy == DirectDctPlsOrderPolicy::kGlobal) {
 		global_order_.resize(layout.sample_count());
 		std::iota(global_order_.begin(), global_order_.end(), 0U);
@@ -877,6 +880,23 @@ DirectDctPlsPoolPlan DirectDctPlsEpochSchedule::next_pool() {
 	pool.epoch                  = options_.epoch;
 	pool.pool_index             = next_pool_index_++;
 	pool.first_microbatch_index = next_microbatch_index_;
+	const auto shard            = [this](DirectDctPlsPoolPlan plan) {
+        if (options_.world_size == 1U) {
+            return plan;
+        }
+        std::vector<uint32_t> local;
+        const auto            micro = static_cast<size_t>(options_.microbatch_images);
+        for (size_t begin = options_.rank * micro; begin < plan.ordered_positions.size();
+             begin += options_.world_size * micro) {
+            const auto end = std::min(begin + micro, plan.ordered_positions.size());
+            local.insert(local.end(),
+                         plan.ordered_positions.begin() + static_cast<std::ptrdiff_t>(begin),
+                         plan.ordered_positions.begin() + static_cast<std::ptrdiff_t>(end));
+        }
+        plan.ordered_positions = std::move(local);
+        plan.first_microbatch_index += options_.rank;
+        return plan;
+	};
 	if (options_.order_policy == DirectDctPlsOrderPolicy::kGlobal) {
 		const auto capacity = static_cast<size_t>(options_.segments_per_pool) * layout_->segment_images();
 		const auto end      = std::min(global_order_.size(), next_pls_ + capacity);
@@ -885,7 +905,7 @@ DirectDctPlsPoolPlan DirectDctPlsEpochSchedule::next_pool() {
 		next_pls_ = end;
 		next_microbatch_index_ +=
 		    (pool.ordered_positions.size() + options_.microbatch_images - 1U) / options_.microbatch_images;
-		return pool;
+		return shard(std::move(pool));
 	}
 	const auto end = std::min(pls_order_.size(), next_pls_ + options_.segments_per_pool);
 	pool.virtual_pls_ids.assign(pls_order_.begin() + static_cast<std::ptrdiff_t>(next_pls_),
@@ -902,7 +922,7 @@ DirectDctPlsPoolPlan DirectDctPlsEpochSchedule::next_pool() {
 	next_pls_ = end;
 	next_microbatch_index_ +=
 	    (pool.ordered_positions.size() + options_.microbatch_images - 1U) / options_.microbatch_images;
-	return pool;
+	return shard(std::move(pool));
 }
 
 DirectDctPlsAugmentationDecision derive_direct_dct_pls_augmentation(const DirectDctPlsSample&          sample,
@@ -1219,7 +1239,14 @@ struct DirectDctPlsPipeline::Impl {
 			return {};
 		}
 		context_slots->prepare_started();
-		const auto plan_started = PlsPoolClock::now();
+		// Every rank observes every global pool boundary, even when the last
+		// pool has no microbatch for this rank. No decode or CUDA storage is needed.
+		if (source.plan.ordered_positions.empty()) {
+			context_slots->prepare_completed(0.0, 0.0, 0.0);
+			return {DirectDctPlsPoolBatch(
+			    std::move(source.plan), {}, {}, options.schedule.microbatch_images, std::move(context_owner))};
+		}
+		const auto                                              plan_started = PlsPoolClock::now();
 		std::vector<JpegDctImageCropRequest>                    requests;
 		std::vector<int64_t>                                    labels;
 		std::vector<detail::DirectDctPlsRandAugmentDecision>    randaugment;
@@ -1243,7 +1270,7 @@ struct DirectDctPlsPipeline::Impl {
 			mixup.push_back(detail::derive_published_mixup_decision(
 			    source.schedule.training_seed,
 			    source.schedule.epoch,
-			    source.plan.first_microbatch_index + index));
+			    source.plan.first_microbatch_index + index * source.schedule.world_size));
 		}
 		auto prepared          = runtime.PrepareBatch(requests, options.device);
 		const auto plan_done   = PlsPoolClock::now();

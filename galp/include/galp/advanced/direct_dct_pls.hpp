@@ -76,6 +76,9 @@ struct DirectDctPlsScheduleOptions {
 	uint32_t                epoch             = 0U;
 	uint32_t                segments_per_pool = 4U;
 	uint32_t                microbatch_images = 64U;
+	// Partition complete microbatches after the common epoch/pool shuffle.
+	uint32_t                rank              = 0U;
+	uint32_t                world_size        = 1U;
 	DirectDctPlsCropPolicy  crop_policy       = DirectDctPlsCropPolicy::kPerPls;
 	DirectDctPlsOrderPolicy order_policy      = DirectDctPlsOrderPolicy::kClosedPool;
 };

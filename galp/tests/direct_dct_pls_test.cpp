@@ -1,6 +1,7 @@
 #include "api/direct_dct_pls_postprocess.hpp"
 #include "galp/advanced/direct_dct_pls.hpp"
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -60,6 +61,87 @@ TEST(DirectDctPls, PhysicalOrderScheduleNeverShufflesAcrossEpochs) {
 		EXPECT_EQ(second.virtual_pls_ids, (std::vector<uint32_t> {2U}));
 		EXPECT_EQ(second.ordered_positions, (std::vector<uint32_t> {8U, 9U}));
 		EXPECT_FALSE(schedule.has_next());
+	}
+}
+
+TEST(DirectDctPls, DistributedMicrobatchesPreserveSerialOrderAndMixupKeys) {
+	auto layout = small_layout();
+	galp::jpeg::DirectDctPlsScheduleOptions options;
+	options.training_seed     = 11997733U;
+	options.epoch             = 7U;
+	options.segments_per_pool = 2U;
+	options.microbatch_images = 2U;
+	galp::jpeg::DirectDctPlsEpochSchedule         serial(layout, options);
+	std::vector<galp::jpeg::DirectDctPlsPoolPlan> plans;
+	while (serial.has_next())
+		plans.push_back(serial.next_pool());
+	std::vector<uint32_t> coverage(10U, 0U);
+	for (uint32_t rank = 0U; rank < 4U; ++rank) {
+		options.rank       = rank;
+		options.world_size = 4U;
+		galp::jpeg::DirectDctPlsEpochSchedule distributed(layout, options);
+		for (const auto& full : plans) {
+			const auto local = distributed.next_pool();
+			EXPECT_EQ(local.pool_index, full.pool_index);
+			EXPECT_EQ(local.first_microbatch_index, full.first_microbatch_index + rank);
+			std::vector<uint32_t> expected;
+			for (size_t i = rank * 2U; i < full.ordered_positions.size(); i += 8U) {
+				for (size_t j = i; j < std::min(i + 2U, full.ordered_positions.size()); ++j) {
+					expected.push_back(full.ordered_positions[j]);
+				}
+			}
+			EXPECT_EQ(local.ordered_positions, expected);
+			for (auto id : local.ordered_positions)
+				++coverage[id];
+		}
+		EXPECT_FALSE(distributed.has_next());
+	}
+	EXPECT_EQ(coverage, std::vector<uint32_t>(10U, 1U));
+	options.rank = 4U;
+	EXPECT_THROW(galp::jpeg::DirectDctPlsEpochSchedule(layout, options), std::invalid_argument);
+}
+
+TEST(DirectDctPls, DistributedFullImageNetCoverage) {
+	const auto* manifest_path = std::getenv("GALP_DDP_FULL_MANIFEST");
+	const auto* mapping_path = std::getenv("GALP_DDP_FULL_MAPPING");
+	if (manifest_path == nullptr || mapping_path == nullptr) {
+		GTEST_SKIP() << "full dataset metadata was not supplied";
+	}
+	const auto manifest = galp::jpeg::read_jpeg_dct_shard_manifest(manifest_path);
+	const auto layout = galp::jpeg::DirectDctPlsLayout::LoadPremixedCsv(mapping_path, manifest);
+	ASSERT_EQ(layout.sample_count(), 1281167U);
+	for (uint32_t epoch : {0U, 1U}) {
+		galp::jpeg::DirectDctPlsScheduleOptions options;
+		options.training_seed = 11997733U;
+		options.epoch         = epoch;
+		galp::jpeg::DirectDctPlsEpochSchedule         serial(layout, options);
+		std::vector<galp::jpeg::DirectDctPlsPoolPlan> plans;
+		size_t                                        updates = 0U;
+		while (serial.has_next()) {
+			plans.push_back(serial.next_pool());
+			updates += (plans.back().ordered_positions.size() + 1023U) / 1024U;
+		}
+		EXPECT_EQ(updates, 1252U);
+		std::vector<uint32_t> coverage(layout.sample_count(), 0U);
+		for (uint32_t rank = 0U; rank < 8U; ++rank) {
+			options.rank       = rank;
+			options.world_size = 8U;
+			galp::jpeg::DirectDctPlsEpochSchedule schedule(layout, options);
+			for (const auto& full : plans) {
+				const auto            local = schedule.next_pool();
+				std::vector<uint32_t> expected;
+				for (size_t begin = rank * 64U; begin < full.ordered_positions.size(); begin += 512U) {
+					for (size_t i = begin; i < std::min(begin + 64U, full.ordered_positions.size()); ++i) {
+						expected.push_back(full.ordered_positions[i]);
+					}
+				}
+				ASSERT_EQ(local.ordered_positions, expected);
+				for (auto id : local.ordered_positions)
+					++coverage[id];
+			}
+			EXPECT_FALSE(schedule.has_next());
+		}
+		EXPECT_EQ(coverage, std::vector<uint32_t>(layout.sample_count(), 1U));
 	}
 }
 
