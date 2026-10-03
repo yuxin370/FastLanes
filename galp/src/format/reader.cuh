@@ -269,12 +269,19 @@ public:
 	                                                                      ZeroCopyReadTiming*          timing = nullptr);
 	ZeroCopyRowgroup      read_rowgroup_zero_copy_compiled(const SparseVectorReadPlan& plan,
 	                                                       ZeroCopyReadTiming*         timing = nullptr);
+	// Submit bounded ranges from one workset together, preserving caller order.
+	std::vector<ZeroCopyRowgroup>
+	                      read_rowgroups_zero_copy_compiled(const std::vector<const SparseVectorReadPlan*>& plans,
+	                                                        std::vector<ZeroCopyReadTiming>&                timings);
 	Rowgroup              materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) const;
 	Rowgroup              read_rowgroup_zero_copy_materialized(size_t rowgroup_idx = 0);
 	Rowgroup              read_rowgroup(size_t rowgroup_idx = 0);
 	std::vector<Rowgroup> read_table();
 
 private:
+	ZeroCopyRowgroup   read_rowgroup_zero_copy_compiled_impl(const SparseVectorReadPlan&     plan,
+	                                                         ZeroCopyReadTiming*             timing,
+	                                                         std::shared_ptr<fastlanes::Buf> preloaded);
 	ZeroCopySchemaPlan build_shared_zero_copy_schema_plan() const;
 
 	std::shared_ptr<fastlanes::File>                        m_file;

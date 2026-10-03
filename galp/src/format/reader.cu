@@ -59,12 +59,18 @@ struct SparseRowgroupAccessIndex {
 	std::string                               fallback_reason;
 	std::vector<SparseByteRange>              index_ranges;
 	std::vector<SparseByteRange>              shared_ranges;
-	std::vector<std::vector<SparseByteRange>> vector_ranges;
+	// Segment-major cumulative endpoints retain the physical vector order without
+	// expanding an offset/size pair for every vector and segment.
+	std::vector<std::vector<size_t>> segment_offsets;
+
+	[[nodiscard]] SparseByteRange vector_range(size_t segment, uint32_t first, uint32_t last) const {
+		const auto& offsets = segment_offsets[segment];
+		return {offsets[first], offsets[size_t(last) + 1U] - offsets[first]};
+	}
 	// For every logical column, identify its non-shared segment positions in
-	// vector_ranges.  This lets a single sparse plan intersect spatial vectors
+	// segment_offsets. This lets a single sparse plan intersect spatial vectors
 	// with coefficient columns without rebuilding descriptor geometry.
 	std::vector<std::vector<size_t>>           column_vector_range_indices;
-	std::vector<size_t>                       vector_storage_bytes;
 	std::vector<std::byte>                    static_prefix;
 };
 
@@ -630,19 +636,19 @@ build_sparse_rowgroup_access_index(fastlanes::File& file, const fastlanes::Rowgr
 	}
 	entry->index_ranges = segment_index_ranges(segments);
 	const auto rowgroup_bytes = static_cast<size_t>(rowgroup.m_size());
-	std::vector<std::byte> index_backing(rowgroup_bytes, std::byte {0});
+	// Only metadata ranges below are read. Do not fault/zero the full payload
+	// merely to retain its logical offsets while resolving entrypoints.
+	auto index_backing = std::make_unique_for_overwrite<std::byte[]>(rowgroup_bytes);
 	for (const auto& range : entry->index_ranges) {
-		file.ReadRangeUnchecked(index_backing.data() + range.offset, rowgroup.m_offset() + range.offset, range.size);
+		file.ReadRangeUnchecked(index_backing.get() + range.offset, rowgroup.m_offset() + range.offset, range.size);
 	}
-	entry->shared_ranges = segment_shared_ranges(segments, index_backing.data());
+	entry->shared_ranges = segment_shared_ranges(segments, index_backing.get());
 	for (const auto& range : entry->shared_ranges) {
-		file.ReadRangeUnchecked(index_backing.data() + range.offset, rowgroup.m_offset() + range.offset, range.size);
+		file.ReadRangeUnchecked(index_backing.get() + range.offset, rowgroup.m_offset() + range.offset, range.size);
 	}
-	entry->static_prefix = pack_ranges(index_backing.data(), entry->index_ranges);
-	const auto shared_prefix = pack_ranges(index_backing.data(), entry->shared_ranges);
+	entry->static_prefix     = pack_ranges(index_backing.get(), entry->index_ranges);
+	const auto shared_prefix = pack_ranges(index_backing.get(), entry->shared_ranges);
 	entry->static_prefix.insert(entry->static_prefix.end(), shared_prefix.begin(), shared_prefix.end());
-	entry->vector_ranges.resize(rowgroup.m_n_vec());
-	entry->vector_storage_bytes.assign(rowgroup.m_n_vec(), 0U);
 	const auto* columns = rowgroup.m_column_descriptors();
 	if (columns == nullptr) {
 		throw std::runtime_error("sparse rowgroup column descriptors are missing");
@@ -661,20 +667,18 @@ build_sparse_rowgroup_access_index(fastlanes::File& file, const fastlanes::Rowgr
 				continue;
 			}
 			entry->column_vector_range_indices[column_index].push_back(vector_range_index++);
-			for (uint32_t vector = 0U; vector < rowgroup.m_n_vec(); ++vector) {
-				const auto range = segment_vector_range(*segment, index_backing.data(), vector);
-				entry->vector_ranges[vector].push_back(range);
-				if (range.size > std::numeric_limits<size_t>::max() - entry->vector_storage_bytes[vector]) {
-					throw std::runtime_error("sparse rowgroup vector byte count overflow");
-				}
-				entry->vector_storage_bytes[vector] += range.size;
+			const auto* points  = index_backing.get() + segment->entrypoint_offset();
+			auto&       offsets = entry->segment_offsets.emplace_back(size_t(rowgroup.m_n_vec()) + 1U);
+			offsets[0]          = segment->data_offset();
+			uint64_t previous   = 0;
+			for (uint32_t vector = 0; vector < rowgroup.m_n_vec(); ++vector) {
+				const auto end = entrypoint_value(points, segment->entry_point_t(), vector);
+				if (end < previous || end > segment->data_size())
+					throw std::runtime_error("invalid cumulative entrypoint in sparse vector bundle");
+				offsets[size_t(vector) + 1U] = static_cast<size_t>(segment->data_offset() + end);
+				previous                     = end;
 			}
 		}
-	}
-	if (std::any_of(entry->vector_ranges.begin(), entry->vector_ranges.end(), [&](const auto& ranges) {
-		    return ranges.size() != vector_range_index;
-	    })) {
-		throw std::logic_error("sparse rowgroup column/vector range index is inconsistent");
 	}
 	entry->supported = true;
 	entry->fallback_reason.clear();
@@ -2258,8 +2262,8 @@ SparseReadRecipeWriteStats write_sparse_read_recipe(
 		record.shared_ranges    = access->shared_ranges;
 		std::vector<detail::SparseByteRange> source_ranges;
 		for (const auto vector : selection.selected_vectors) {
-			const auto& ranges = access->vector_ranges.at(vector);
-			source_ranges.insert(source_ranges.end(), ranges.begin(), ranges.end());
+			for (size_t segment = 0; segment < access->segment_offsets.size(); ++segment)
+				source_ranges.push_back(access->vector_range(segment, vector, vector));
 		}
 		record.source_ranges = detail::coalesce_ranges(std::move(source_ranges));
 		record.selected_storage_bytes = detail::total_range_bytes(record.source_ranges);
@@ -2760,21 +2764,36 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 		plan->strategy = SparseVectorReadPlan::Impl::Strategy::kSourceRanges;
 		std::vector<detail::SparseByteRange> ranges;
 		const auto gather_begin = std::chrono::steady_clock::now();
+		// Cumulative segment entrypoints make consecutive vectors one physical
+		// interval. Resolve run endpoints instead of expanding every vector/column
+		// pair and sorting that much larger list.
+		std::vector<std::pair<uint32_t, uint32_t>> runs;
 		for (const auto vector : vectors) {
-			const auto& vector_ranges = access->vector_ranges.at(vector);
-			if (materialized_columns.empty()) {
-				ranges.insert(ranges.end(), vector_ranges.begin(), vector_ranges.end());
-				continue;
+			if (runs.empty() || vector != runs.back().second + 1U) {
+				runs.emplace_back(vector, vector);
+			} else {
+				runs.back().second = vector;
 			}
+		}
+		const auto append_segment = [&](const size_t range_index) {
+			for (const auto& [first, last] : runs) {
+				ranges.push_back(access->vector_range(range_index, first, last));
+			}
+		};
+		if (materialized_columns.empty()) {
+			for (size_t range_index = 0; range_index < access->segment_offsets.size(); ++range_index) {
+				append_segment(range_index);
+			}
+		} else {
 			for (const auto physical_column : physical_columns) {
 				if (physical_column >= access->column_vector_range_indices.size()) {
 					throw std::logic_error("selected physical column is absent from sparse access geometry");
 				}
 				for (const auto range_index : access->column_vector_range_indices[physical_column]) {
-					if (range_index >= vector_ranges.size()) {
+					if (range_index >= access->segment_offsets.size()) {
 						throw std::logic_error("selected column/vector sparse range index is out of bounds");
 					}
-					ranges.push_back(vector_ranges[range_index]);
+					append_segment(range_index);
 				}
 			}
 		}
@@ -2825,7 +2844,8 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 		plan->storage_bytes        = plan->envelope_size;
 		for (const auto vector : vectors) {
 			size_t source_cursor = static_cast<size_t>(bundle.vector_offsets.at(vector));
-			for (const auto& range : access->vector_ranges.at(vector)) {
+			for (size_t segment = 0; segment < access->segment_offsets.size(); ++segment) {
+				const auto range = access->vector_range(segment, vector, vector);
 				plan->envelope_copies.push_back({source_cursor, range.offset, range.size});
 				plan->selected_storage_bytes += range.size;
 				source_cursor += range.size;
@@ -2858,8 +2878,8 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 		run.size          = static_cast<size_t>(packed_end - packed_begin);
 		run.packed_offset = plan->packed_bytes;
 		for (uint32_t vector = run_begin; vector < run_end; ++vector) {
-			const auto& ranges = access->vector_ranges.at(vector);
-			run.logical_ranges.insert(run.logical_ranges.end(), ranges.begin(), ranges.end());
+			for (size_t segment = 0; segment < access->segment_offsets.size(); ++segment)
+				run.logical_ranges.push_back(access->vector_range(segment, vector, vector));
 		}
 		const size_t logical_bytes = std::accumulate(
 		    run.logical_ranges.begin(), run.logical_ranges.end(), size_t {0},
@@ -3085,7 +3105,8 @@ void FlsReader::read_rowgroup_bytes_selected_vectors_into(const size_t          
 			for (const uint32_t vector : unique_vectors) {
 				size_t packed_cursor = static_cast<size_t>(bundle_entry.vector_offsets.at(vector));
 				const size_t packed_end = static_cast<size_t>(bundle_entry.vector_offsets.at(vector + 1U));
-				for (const auto& range : access_index.vector_ranges.at(vector)) {
+				for (size_t segment = 0; segment < access_index.segment_offsets.size(); ++segment) {
+					const auto range = access_index.vector_range(segment, vector, vector);
 					if (packed_cursor > packed_end || range.size > packed_end - packed_cursor ||
 					    packed_cursor > envelope.size() || range.size > envelope.size() - packed_cursor) {
 						throw std::runtime_error("truncated sparse vector bundle envelope vector payload");
@@ -3138,9 +3159,9 @@ void FlsReader::read_rowgroup_bytes_selected_vectors_into(const size_t          
 			std::vector<fastlanes::FileScatterReadTarget> scatter_targets;
 			size_t packed_size = 0U;
 			for (uint32_t vector = run_begin; vector < run_end; ++vector) {
-				const auto& vector_ranges = access_index.vector_ranges.at(vector);
-				scatter_targets.reserve(scatter_targets.size() + vector_ranges.size());
-				for (const auto& range : vector_ranges) {
+				scatter_targets.reserve(scatter_targets.size() + access_index.segment_offsets.size());
+				for (size_t segment = 0; segment < access_index.segment_offsets.size(); ++segment) {
+					const auto range = access_index.vector_range(segment, vector, vector);
 					if (range.size > std::numeric_limits<size_t>::max() - packed_size) {
 						throw std::runtime_error("sparse vector bundle selected-vector payload size overflow");
 					}
@@ -3209,8 +3230,8 @@ void FlsReader::read_rowgroup_bytes_selected_vectors_into(const size_t          
 
 	std::vector<detail::SparseByteRange> payload_ranges;
 	for (const uint32_t vector : unique_vectors) {
-		const auto& ranges = access_index.vector_ranges.at(vector);
-		payload_ranges.insert(payload_ranges.end(), ranges.begin(), ranges.end());
+		for (size_t segment = 0; segment < access_index.segment_offsets.size(); ++segment)
+			payload_ranges.push_back(access_index.vector_range(segment, vector, vector));
 	}
 	read_ranges(std::move(payload_ranges));
 	if (timing != nullptr) {
@@ -4197,8 +4218,86 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors_packed(
 	return zero_copy;
 }
 
+std::vector<ZeroCopyRowgroup>
+FlsReader::read_rowgroups_zero_copy_compiled(const std::vector<const SparseVectorReadPlan*>& plans,
+                                             std::vector<ZeroCopyReadTiming>&                timings) {
+	// The caller bounds this batch by its existing decode-workset memory budget.
+	// Keep independent backing allocations so views retain their usual ownership.
+	std::vector<std::shared_ptr<fastlanes::Buf>> backing;
+	std::vector<fastlanes::FileRangeReadTarget>  targets;
+	size_t                                       bytes       = 0;
+	uint32_t                                     queue_depth = 0;
+	timings.assign(plans.size(), {});
+	backing.reserve(plans.size());
+	for (size_t index = 0; index < plans.size(); ++index) {
+		const auto* compiled = plans[index];
+		if (!compiled || !compiled->impl_ || compiled->impl_->owner != m_sparse_plan_owner)
+			throw std::invalid_argument("batched sparse plan is empty or belongs to a different reader");
+		const auto& plan = *compiled->impl_;
+		if (plan.strategy != SparseVectorReadPlan::Impl::Strategy::kBoundedSourceRanges ||
+		    plan.submission_backend != SparseVectorReadPlan::SubmissionBackend::kIoUring ||
+		    (index != 0 && plan.io_uring_queue_depth != queue_depth))
+			throw std::invalid_argument("batched sparse reads require bounded io_uring plans with equal queue depth");
+		queue_depth = plan.io_uring_queue_depth;
+		const auto* rowgroup =
+		    table_descriptor()->m_rowgroup_descriptors()->Get(static_cast<flatbuffers::uoffset_t>(plan.rowgroup_index));
+		auto  logical = std::make_shared<fastlanes::Buf>(plan.rowgroup_bytes);
+		auto* data    = reinterpret_cast<std::byte*>(logical->mutable_data());
+		std::memset(data, 0, plan.rowgroup_bytes);
+		for (const auto& range : plan.source_ranges) {
+			if (range.offset > plan.rowgroup_bytes || range.size > plan.rowgroup_bytes - range.offset ||
+			    range.offset > std::numeric_limits<uint64_t>::max() - rowgroup->m_offset())
+				throw std::runtime_error("batched sparse source range is out of bounds");
+			targets.push_back({data + range.offset, rowgroup->m_offset() + range.offset, range.size});
+			if (range.size != 0)
+				++timings[index].io_uring_read_request_count;
+		}
+		if (plan.storage_bytes > std::numeric_limits<size_t>::max() - bytes)
+			throw std::overflow_error("batched sparse read byte count overflow");
+		bytes += plan.storage_bytes;
+		timings[index].storage_bytes             = plan.storage_bytes;
+		timings[index].io_uring_completion_count = timings[index].io_uring_read_request_count;
+		timings[index].used_io_uring             = true;
+		backing.push_back(std::move(logical));
+	}
+	std::vector<ZeroCopyRowgroup> result;
+	if (plans.empty())
+		return result;
+	const auto   start = std::chrono::steady_clock::now();
+	const auto   read  = m_file->ReadRangesIoUringUnchecked(targets, queue_depth);
+	const auto   end   = std::chrono::steady_clock::now();
+	const size_t requests =
+	    std::count_if(targets.begin(), targets.end(), [](const auto& target) { return target.size != 0; });
+	if (read.bytes != bytes || read.read_request_count < requests || read.completion_count != read.read_request_count)
+		throw std::runtime_error("batched sparse io_uring result differs from the frozen physical plan");
+	// Shared submission costs (and any short-read continuations) are attributed
+	// once, to the first rowgroup; per-rowgroup byte counts remain exact.
+	auto& shared = timings.front();
+	shared.io_uring_read_request_count += read.read_request_count - requests;
+	shared.io_uring_completion_count += read.completion_count - requests;
+	shared.io_uring_submit_syscall_count    = read.submit_syscall_count;
+	shared.io_uring_wait_syscall_count      = read.wait_syscall_count;
+	shared.io_uring_ring_mapped_bytes       = read.ring_mapped_bytes;
+	shared.io_uring_newly_mapped_ring_bytes = read.newly_mapped_ring_bytes;
+	shared.io_uring_ms = shared.pread_ms = std::chrono::duration<double, std::milli>(end - start).count();
+	result.reserve(plans.size());
+	for (size_t index = 0; index < plans.size(); ++index) {
+		timings[index].pread_start = start;
+		timings[index].pread_end   = end;
+		result.push_back(
+		    read_rowgroup_zero_copy_compiled_impl(*plans[index], &timings[index], std::move(backing[index])));
+	}
+	return result;
+}
+
 ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorReadPlan& compiled,
 	                                                          ZeroCopyReadTiming* const timing) {
+	return read_rowgroup_zero_copy_compiled_impl(compiled, timing, {});
+}
+
+ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled_impl(const SparseVectorReadPlan&     compiled,
+                                                                  ZeroCopyReadTiming* const       timing,
+                                                                  std::shared_ptr<fastlanes::Buf> preloaded) {
 	if (!compiled.impl_) {
 		throw std::invalid_argument("compiled sparse vector read plan is empty");
 	}
@@ -4225,9 +4324,11 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 		throw std::runtime_error("compiled sparse vector read plan no longer matches its rowgroup");
 	}
 
-	auto logical = std::make_shared<fastlanes::Buf>(plan.rowgroup_bytes);
+	const bool  already_read = static_cast<bool>(preloaded);
+	auto        logical = already_read ? std::move(preloaded) : std::make_shared<fastlanes::Buf>(plan.rowgroup_bytes);
 	auto* const logical_data = reinterpret_cast<std::byte*>(logical->mutable_data());
-	std::memset(logical_data, 0, plan.rowgroup_bytes);
+	if (!already_read)
+		std::memset(logical_data, 0, plan.rowgroup_bytes);
 	const auto restore_static_prefix = [&]() {
 		const auto start = std::chrono::steady_clock::now();
 		size_t prefix_cursor = 0U;
@@ -4281,7 +4382,7 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 				throw std::runtime_error("compiled sparse source range is out of bounds");
 			}
 		}
-		if (bounded_source_ranges &&
+		if (!already_read && bounded_source_ranges &&
 		    plan.submission_backend == SparseVectorReadPlan::SubmissionBackend::kIoUring) {
 			std::vector<fastlanes::FileRangeReadTarget> targets;
 			targets.reserve(plan.source_ranges.size());
@@ -4317,7 +4418,7 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_compiled(const SparseVectorR
 				timing->pread_end = end;
 				timing->used_io_uring = true;
 			}
-		} else {
+		} else if (!already_read) {
 			for (const auto& range : plan.source_ranges) {
 				const auto start = std::chrono::steady_clock::now();
 				m_file->ReadRangeUnchecked(

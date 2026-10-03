@@ -1150,6 +1150,22 @@ TEST(Reader, CompiledSparseVectorReadPlanMatchesSourceReadsAndIsReaderBound) {
 	EXPECT_THROW(other_reader.read_rowgroup_zero_copy_compiled(plan), std::invalid_argument);
 }
 
+TEST(Reader, CompiledSparseRunsPreserveAdjacentVectorsAndHoles) {
+	const auto              fls_path = make_sparse_vector_read_fixture();
+	galp::format::FlsReader reader(fls_path);
+	for (const std::vector<uint32_t> selected :
+	     {std::vector<uint32_t> {6U, 2U, 3U, 4U, 2U}, std::vector<uint32_t> {0U, 1U, 6U, 7U}}) {
+		const auto                       plan = reader.compile_sparse_vector_read_plan(0U, selected);
+		galp::format::ZeroCopyReadTiming compiled_timing {}, reference_timing {};
+		auto                             actual = reader.read_rowgroup_zero_copy_compiled(plan, &compiled_timing);
+		auto expected = reader.read_rowgroup_zero_copy_selected_vectors(0U, selected, &reference_timing);
+		ASSERT_EQ(actual.backing_span.size(), expected.backing_span.size());
+		EXPECT_EQ(std::memcmp(actual.backing_span.data(), expected.backing_span.data(), actual.backing_span.size()), 0);
+		EXPECT_EQ(compiled_timing.storage_bytes, reference_timing.storage_bytes);
+		EXPECT_EQ(compiled_timing.pread_count, reference_timing.pread_count);
+	}
+}
+
 TEST(Reader, BoundedSparseReadClearsMergedHolesAndRestoresStaticPrefix) {
 	const auto fls_path = make_sparse_vector_bundle_fixture();
 	galp::format::FlsReader reader(fls_path);
@@ -1229,6 +1245,38 @@ TEST(Reader, BoundedSparseReadIoUringPreservesBackingAndBatchesSubmissions) {
 	galp::format::ZeroCopyReadTiming reused_timing {};
 	(void)reader.read_rowgroup_zero_copy_compiled(io_uring_plan, &reused_timing);
 	EXPECT_EQ(reused_timing.io_uring_newly_mapped_ring_bytes, 0U);
+
+	const auto other_exact  = reader.compile_sparse_vector_read_plan(0U, {0U, 5U});
+	const auto other_ranges = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{17U, 0U, other_exact.full_storage_bytes(), other_exact.exact_source_ranges()}}, options);
+	const auto other_plan = other_exact.with_bounded_coalescing(
+	    other_ranges.rowgroups.front(), galp::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	auto                                          other = reader.read_rowgroup_zero_copy_compiled(other_plan);
+	std::vector<galp::format::ZeroCopyReadTiming> batch_timings;
+	auto batch = reader.read_rowgroups_zero_copy_compiled({&other_plan, &io_uring_plan, &other_plan}, batch_timings);
+	ASSERT_EQ(batch.size(), 3U);
+	for (size_t index = 0; index < batch.size(); ++index) {
+		const auto& expected = index == 1 ? sync : other;
+		ASSERT_EQ(batch[index].backing_span.size(), expected.backing_span.size());
+		EXPECT_EQ(
+		    std::memcmp(batch[index].backing_span.data(), expected.backing_span.data(), expected.backing_span.size()),
+		    0);
+		EXPECT_TRUE(batch_timings[index].used_io_uring);
+		EXPECT_TRUE(batch_timings[index].used_bounded_gap_read);
+		EXPECT_EQ(batch_timings[index].storage_bytes,
+		          index == 1 ? io_uring_plan.storage_bytes() : other_plan.storage_bytes());
+		EXPECT_EQ(batch_timings[index].io_uring_newly_mapped_ring_bytes, 0U);
+	}
+	EXPECT_NE(batch[0].backing_span.data(), batch[2].backing_span.data());
+	const auto requests = other_plan.estimated_pread_count() * 2 + io_uring_plan.estimated_pread_count();
+	EXPECT_EQ(batch_timings[0].io_uring_submit_syscall_count, (requests + 7U) / 8U);
+	EXPECT_EQ(batch_timings[1].io_uring_submit_syscall_count, 0U);
+	EXPECT_EQ(batch_timings[2].io_uring_submit_syscall_count, 0U);
+	galp::format::FlsReader other_reader(fls_path);
+	EXPECT_THROW(other_reader.read_rowgroups_zero_copy_compiled({&io_uring_plan}, batch_timings),
+	             std::invalid_argument);
+	EXPECT_THROW(reader.read_rowgroups_zero_copy_compiled({&sync_plan}, batch_timings), std::invalid_argument);
+	EXPECT_TRUE(reader.read_rowgroups_zero_copy_compiled({}, batch_timings).empty());
 #endif
 }
 

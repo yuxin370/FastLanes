@@ -189,6 +189,9 @@ struct FileIoUringState {
 			pending.push_back(Pending {static_cast<std::byte*>(target.data), target.offset, target.size, 0U});
 		}
 
+		// Reuse completion storage across queue-sized submissions. Clearing the
+		// entire request list for every submission made fragmented reads quadratic.
+		std::vector<int32_t> completions(pending.size(), std::numeric_limits<int32_t>::min());
 		for (size_t batch_begin = 0U; batch_begin < pending.size(); batch_begin += entries) {
 			const size_t batch_end = std::min(pending.size(), batch_begin + entries);
 			std::vector<size_t> active;
@@ -199,7 +202,7 @@ struct FileIoUringState {
 			while (!active.empty()) {
 				publish(active, fd, pending, file_path);
 				submit(active.size(), file_path, stats);
-				std::vector<int32_t> completions(pending.size(), std::numeric_limits<int32_t>::min());
+
 				wait_and_collect(active.size(), completions, file_path, stats);
 				std::vector<size_t> retry;
 				retry.reserve(active.size());
@@ -222,6 +225,7 @@ struct FileIoUringState {
 					}
 					item.completed += static_cast<n_t>(result);
 					if (item.completed != item.size) {
+						completions[index] = std::numeric_limits<int32_t>::min();
 						retry.push_back(index);
 					}
 				}

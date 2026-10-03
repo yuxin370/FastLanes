@@ -5496,21 +5496,47 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 		const auto read_chunk = [&](const size_t chunk_index) {
 			const auto                             chunk = bounded_read_chunks.at(chunk_index);
 			std::vector<DecodedRowgroupReadResult> results(chunk.end - chunk.begin);
-			// Keep physical reads ordered; the persistent worker overlaps this chunk
-			// with decoding the previous one without spawning threads per workset.
-			for (size_t local = 0U; local < results.size(); ++local) {
+			// Preserve physical order and the chunk's memory bound, but amortize
+			// io_uring submissions across adjacent rowgroups from the same file.
+			for (size_t local = 0U; local < results.size();) {
 				const auto  miss_index = chunk.begin + local;
 				const auto& rowgroup   = *misses[miss_index].rowgroup;
-				results[local]         = read_decoded_rowgroup(*readers[miss_index],
-                                                       rowgroup,
-                                                       selected_coefficients,
-                                                       batch_unpack_n_vectors,
-                                                       /*use_pinned_backing=*/false,
-                                                       rowgroup.compiled_sparse_read_plan.get());
-				transient_tracker->add_ring_fixed_buffer_bytes(
-				    results[local].io_timing.io_uring_newly_mapped_ring_bytes);
-				results[local].rowgroup.transient_memory_accounting = transient_tracker->acquire_compressed_backing(
-				    results[local].rowgroup.backing_storage_capacity_bytes);
+				const auto* plan       = rowgroup.compiled_sparse_read_plan.get();
+				size_t      end        = local + 1;
+				if (plan && plan->backend() == galp::format::SparseVectorReadPlan::Backend::kBoundedSourceRanges &&
+				    plan->submission_backend() == galp::format::SparseVectorReadPlan::SubmissionBackend::kIoUring) {
+					while (end < results.size()) {
+						const auto  next      = chunk.begin + end;
+						const auto* next_plan = misses[next].rowgroup->compiled_sparse_read_plan.get();
+						if (readers[next] != readers[miss_index] || !next_plan ||
+						    next_plan->backend() != plan->backend() ||
+						    next_plan->submission_backend() != plan->submission_backend() ||
+						    next_plan->io_uring_queue_depth() != plan->io_uring_queue_depth())
+							break;
+						++end;
+					}
+				}
+				if (end - local > 1) {
+					std::vector<const galp::format::SparseVectorReadPlan*> plans;
+					for (size_t i = local; i < end; ++i)
+						plans.push_back(misses[chunk.begin + i].rowgroup->compiled_sparse_read_plan.get());
+					std::vector<galp::format::ZeroCopyReadTiming> timings;
+					auto views = readers[miss_index]->read_rowgroups_zero_copy_compiled(plans, timings);
+					for (size_t i = local; i < end; ++i) {
+						results[i].rowgroup =
+						    readers[miss_index]->materialize_zero_copy_rowgroup(std::move(views[i - local]));
+						results[i].io_timing = std::move(timings[i - local]);
+					}
+				} else {
+					results[local] = read_decoded_rowgroup(
+					    *readers[miss_index], rowgroup, selected_coefficients, batch_unpack_n_vectors, false, plan);
+				}
+				for (; local < end; ++local) {
+					transient_tracker->add_ring_fixed_buffer_bytes(
+					    results[local].io_timing.io_uring_newly_mapped_ring_bytes);
+					results[local].rowgroup.transient_memory_accounting = transient_tracker->acquire_compressed_backing(
+					    results[local].rowgroup.backing_storage_capacity_bytes);
+				}
 			}
 			return results;
 		};
