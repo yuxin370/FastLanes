@@ -1224,6 +1224,7 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
                 resize_x=224,
                 resize_y=224,
                 interp_type=types.INTERP_LINEAR,
+                antialias=bool(dali_config.get("resize_antialias", True)),
             )
             images = fn.crop_mirror_normalize(
                 images,
