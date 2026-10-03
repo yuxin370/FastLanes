@@ -12,6 +12,8 @@ inline constexpr std::string_view kRgbNoMoreValidationCenterCrop512ProfileId =
     "rgbnomore-validation-center-crop-512-v1";
 inline constexpr std::string_view kRgbNoMoreSwinV2ValidationProfileId =
     "rgbnomore-swinv2-validation-v1";
+inline constexpr std::string_view kRgbNoMoreSwinV2BlockMajorValidationProfileId =
+    "rgbnomore-swinv2-block-major-validation-v1";
 inline constexpr std::string_view kRgbNoMoreTrainingPlsProfileId = "rgbnomore-training-pls-v1";
 
 // Optional application profile. No RGB-no-more name or geometry is required by
@@ -93,6 +95,16 @@ inline RegisteredDirectDctProfile rgbnomore_swinv2_validation_profile() {
 	    std::move(output),
 	    compact_v3_runtime_policy(),
 	};
+}
+
+inline RegisteredDirectDctProfile rgbnomore_swinv2_block_major_validation_profile() {
+	auto profile      = rgbnomore_swinv2_validation_profile();
+	profile.id        = kRgbNoMoreSwinV2BlockMajorValidationProfileId;
+	profile.output.id = profile.id;
+	// The ViT active-output sidecar has different output geometry. Compile
+	// Swin's activity from its 32/16-block output using the bounded reader.
+	profile.runtime = block_major_dynamic_crop_bounded_runtime_policy();
+	return profile;
 }
 
 // The fixed-512 variant changes the runtime policy, not RGB-no-more's model

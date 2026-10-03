@@ -61,7 +61,7 @@ SemanticProfileRegistry::SemanticProfile SemanticProfileRegistry::resolve(const 
 		    {},
 		};
 	}
-	if (profile_id == kProfileIds[2]) {
+	if (profile_id == kProfileIds[2] || profile_id == kProfileIds[4]) {
 		auto spec                               = rgbnomore_validation_transform();
 		spec.y_output_width_blocks              = 32U;
 		spec.y_output_height_blocks             = 32U;
@@ -70,7 +70,7 @@ SemanticProfileRegistry::SemanticProfile SemanticProfileRegistry::resolve(const 
 		spec.preferred_small_crop_width_blocks  = {2U, 4U, 16U, 32U};
 		spec.preferred_small_crop_height_blocks = {2U, 4U, 16U, 32U};
 		return SemanticProfile {
-		    kProfileIds[2],
+		    profile_id,
 		    jpeg::JpegDctDeviceLayout::kTransformedDctGrid,
 		    std::move(spec),
 		    {},

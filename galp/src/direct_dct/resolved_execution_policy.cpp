@@ -68,7 +68,8 @@ ResolvedExecutionPolicy resolve_execution_policy(const std::string_view semantic
 		    0U,
 		};
 	}
-	if (semantic_profile_id == SemanticProfileRegistry::kProfileIds[3]) {
+	if (semantic_profile_id == SemanticProfileRegistry::kProfileIds[3] ||
+	    semantic_profile_id == SemanticProfileRegistry::kProfileIds[4]) {
 		auto compact = compact_policy(semantic_profile_id);
 		return ResolvedExecutionPolicy {
 		    compact.source_profile_id,

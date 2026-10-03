@@ -16,6 +16,7 @@ inline std::vector<std::string> available_direct_dct_profile_ids() {
 	    std::string(kRgbNoMoreValidationCenterCrop512ProfileId),
 	    std::string(kRgbNoMoreSwinV2ValidationProfileId),
 	    std::string(kRgbNoMoreTrainingPlsProfileId),
+	    std::string(kRgbNoMoreSwinV2BlockMajorValidationProfileId),
 	};
 }
 
@@ -31,6 +32,9 @@ inline RegisteredDirectDctProfile resolve_direct_dct_profile(const std::string_v
 	}
 	if (profile_id == kRgbNoMoreTrainingPlsProfileId) {
 		return rgbnomore_training_pls_profile();
+	}
+	if (profile_id == kRgbNoMoreSwinV2BlockMajorValidationProfileId) {
+		return rgbnomore_swinv2_block_major_validation_profile();
 	}
 	throw std::invalid_argument(
 	    "unknown Direct-DCT profile '" + std::string(profile_id) +
