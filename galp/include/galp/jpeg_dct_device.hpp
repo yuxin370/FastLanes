@@ -19,6 +19,10 @@
 
 namespace galp::jpeg {
 
+namespace detail {
+class DirectDctPlsCudaPostprocess;
+}
+
 inline constexpr size_t kDefaultJpegDctDecodeBatchRowgroups                   = 64;
 inline constexpr size_t kDefaultJpegDctDevicePlanCacheCapacity                = 128;
 inline constexpr size_t kDefaultJpegDctDeviceRowgroupPrefetchDepth            = 4;
@@ -413,7 +417,11 @@ public:
 	[[nodiscard]] std::array<size_t, 6>                             projected_shape() const noexcept;
 
 private:
-	std::unique_ptr<Impl> impl_;
+	friend class detail::DirectDctPlsCudaPostprocess;
+	// PLS owns the unpublished transformed batch and waits for its completion
+	// before reusing these accumulators as the normalized model input.
+	[[nodiscard]] std::array<float*, 2> transform_workspace_async() const noexcept;
+	std::unique_ptr<Impl>               impl_;
 };
 
 } // namespace galp::jpeg

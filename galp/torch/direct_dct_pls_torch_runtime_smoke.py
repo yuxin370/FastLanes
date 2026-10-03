@@ -8,6 +8,7 @@ import gc
 import os
 from pathlib import Path
 import tempfile
+import time
 import torch
 import _galp_direct_dct as native_backend
 
@@ -52,6 +53,30 @@ def main() -> int:
 def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
     microbatch_images = 2 if synthetic else int(os.environ.get("GALP_DIRECT_DCT_PLS_TEST_MICROBATCH", "64"))
     baseline = native_backend._lifetime_reclaim_stats_for_test()
+    if synthetic:
+        # Leave the prepared pool in the native prefetch queue: exporting it
+        # would add a Python-side producer lease and mask native early cleanup.
+        unclaimed = DirectDctPlsPipeline(
+            manifest, mapping, training_seed=11997733,
+            expected_mapping_sha256=mapping_sha256,
+            segments_per_pool=4, microbatch_images=microbatch_images,
+            profile=TRAINING_PLS,
+        ).start_epoch(7)
+        deadline = time.monotonic() + 30
+        while unclaimed.prefetch_stats["prepare_completed_count"] == 0:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("PLS did not prepare the unclaimed smoke pool")
+            time.sleep(0.001)
+        unclaimed.close()
+        del unclaimed
+        gc.collect()
+        # Do not synchronize before closing: native destruction must protect
+        # in-flight work without an exported tensor or consumer event.
+        torch.cuda.synchronize()
+        after_close = native_backend._lifetime_reclaim_stats_for_test()
+        for pool_name in ("device_pool", "pinned_pool"):
+            if after_close[pool_name]["in_use_bytes"] != baseline[pool_name]["in_use_bytes"]:
+                raise RuntimeError(f"unclaimed PLS pool retained allocations in {pool_name}")
     pipeline = DirectDctPlsPipeline(
         manifest,
         mapping,
@@ -73,10 +98,27 @@ def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
     if any(tensor.device != y.device for tensor in (cbcr, targets)):
         raise RuntimeError("PLS tensor CUDA devices disagree")
     if synthetic:
-        if sorted(zip(microbatch.global_image_ids, microbatch.labels)) != [(0, 7), (1, 23)]:
+        expected_labels = {0: 7, 1: 23, 2: 41}
+        if microbatch.labels != [expected_labels[i] for i in microbatch.global_image_ids]:
             raise RuntimeError("PLS sample identities/labels differ from the synthetic input")
-        if y.shape[0] != 2 or pool.image_count != 2 or pool.microbatch_count != 1:
-            raise RuntimeError("synthetic PLS smoke must consume exactly one two-image batch")
+        if y.shape[0] != 2 or pool.image_count != 3 or pool.microbatch_count != 2:
+            raise RuntimeError("synthetic PLS smoke requires a full microbatch and a one-image tail")
+        # The second microbatch reuses augmentation scratch. Its one-image
+        # Mixup partner must wrap within the tail, never into the previous batch.
+        tail = next(pool)
+        tail_y, tail_cbcr, tail_targets = tail.tensors
+        if len(tail.global_image_ids) != 1 or not tail.is_pool_end:
+            raise RuntimeError("PLS did not publish the partial final microbatch")
+        tail_label = expected_labels[tail.global_image_ids[0]]
+        expected_target = torch.nn.functional.one_hot(
+            torch.tensor([tail_label], device=tail_targets.device), 1000
+        ).float()
+        torch.testing.assert_close(tail_targets, expected_target, rtol=0, atol=1e-6)
+        if not bool(torch.isfinite(tail_y).all() and torch.isfinite(tail_cbcr).all()):
+            raise RuntimeError("PLS tail inputs are non-finite")
+        if set(microbatch.global_image_ids + tail.global_image_ids) != set(expected_labels):
+            raise RuntimeError("PLS scratch reuse changed sample coverage")
+        del tail_y, tail_cbcr, tail_targets, tail
 
     if tuple(y.shape[1:]) != (1, 28, 28, 8, 8):
         raise RuntimeError(f"unexpected PLS Y shape: {tuple(y.shape)}")

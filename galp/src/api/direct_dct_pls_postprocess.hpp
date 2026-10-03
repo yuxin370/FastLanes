@@ -65,7 +65,8 @@ public:
 		std::unique_ptr<Impl> impl_;
 	};
 
-	// Projected mode compacts the unpublished source allocation in place.
+	// Reuses the unpublished source's float storage: projected mode compacts
+	// in place; Y/CbCr mode overwrites completed transform accumulators.
 	DirectDctPlsCudaPostprocess(DirectDctBatch&                                  source,
 	                            std::span<const int64_t>                         labels,
 	                            std::span<const DirectDctPlsRandAugmentDecision> randaugment,

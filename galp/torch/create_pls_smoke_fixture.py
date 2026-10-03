@@ -16,7 +16,7 @@ def create_fixture(root: Path, jpeg_tool: str, access_tool: str) -> tuple[Path, 
     source = root / "jpeg"
     source.mkdir(parents=True)
     rng = random.Random(11997733)
-    for index in range(2):
+    for index in range(3):
         Image.frombytes("RGB", (512, 512), rng.randbytes(512 * 512 * 3)).save(
             source / f"{index}.jpg", quality=95, subsampling=2
         )
@@ -38,7 +38,7 @@ def create_fixture(root: Path, jpeg_tool: str, access_tool: str) -> tuple[Path, 
             "planned_physical_position", "virtual_pls_id", "position_in_pls",
             "galp_image_id", "logical_sample_id", "label",
         ])
-        for index, label in enumerate((7, 23)):
+        for index, label in enumerate((7, 23, 41)):
             writer.writerow((index, 0, index, index, f"synthetic-{index}", label))
     return manifest, mapping, hashlib.sha256(mapping.read_bytes()).hexdigest()
 

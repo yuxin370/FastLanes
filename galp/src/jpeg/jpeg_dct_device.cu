@@ -230,6 +230,10 @@ const int16_t* JpegDctDeviceBatch::device_coefficients_async() const noexcept {
 	                                                : nullptr;
 }
 
+std::array<float*, 2> JpegDctDeviceBatch::transform_workspace_async() const noexcept {
+	return {impl_->y_accum->get(), impl_->cbcr_accum->get()};
+}
+
 const int16_t* JpegDctDeviceBatch::y_coefficients_async() const noexcept {
 	return impl_ && impl_->y_coefficients.has_value() ? const_cast<GPUArray<int16_t>&>(*impl_->y_coefficients).get()
 	                                                  : nullptr;

@@ -437,14 +437,12 @@ struct DirectDctPlsCudaPostprocess::Impl {
 	std::vector<DirectDctPlsRandAugmentDecision>             host_decisions;
 	std::vector<DirectDctPlsMixupDecision>                   host_mixup;
 	std::vector<ProjectedChannel>                            host_input_channels, host_output_channels;
-	bool                                                     projected_submitted = false;
+	bool                                                     work_submitted      = false;
 	bool                                                     completion_recorded = false;
-	std::optional<GPUArray<int16_t>>         y_a;
+	std::optional<GPUArray<int16_t>>                         y_a;
 	std::optional<GPUArray<int16_t>>         y_b;
 	std::optional<GPUArray<int16_t>>         c_a;
 	std::optional<GPUArray<int16_t>>         c_b;
-	std::optional<GPUArray<float>>           y_output;
-	std::optional<GPUArray<float>>           c_output;
 	std::optional<GPUArray<float>>           targets_output;
 	float*                                  external_targets = nullptr;
 	std::optional<GPUArray<int64_t>>         labels_device;
@@ -475,7 +473,7 @@ struct DirectDctPlsCudaPostprocess::Impl {
 	~Impl() {
 		if (device >= 0) {
 			(void)cudaSetDevice(device);
-			if (projected_submitted) {
+			if (work_submitted) {
 				// Also covers destruction before a tensor is exported and exceptions
 				// after a partial submission. Do not free in-flight host/device storage.
 				if (completion_recorded)
@@ -547,7 +545,7 @@ void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor   
 	microbatch_ready.resize((images + capacity - 1) / capacity);
 	for (auto& ready : microbatch_ready)
 		ready.create_with_flags(cudaEventDisableTiming);
-	projected_submitted = true;
+	work_submitted = true;
 	check_cuda(
 	    cudaMemcpyAsync(labels_device->get(), host_labels.data(), labels.size_bytes(), cudaMemcpyHostToDevice, stream),
 	    "upload labels");
@@ -688,24 +686,20 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 
 		constexpr size_t y_per_image = 1U * 28U * 28U * 8U * 8U;
 		constexpr size_t c_per_image = 2U * 14U * 14U * 8U * 8U;
-		const auto       y_count     = labels.size() * y_per_image;
-		const auto       c_count     = labels.size() * c_per_image;
-		impl_->y_a.emplace(y_count, stream);
-		impl_->y_b.emplace(y_count, stream);
-		impl_->c_a.emplace(c_count, stream);
-		impl_->c_b.emplace(c_count, stream);
-		impl_->y_output.emplace(y_count, stream);
-		impl_->c_output.emplace(c_count, stream);
+		const auto       capacity    = std::min<size_t>(microbatch_images, labels.size());
+		impl_->y_a.emplace(capacity * y_per_image, stream);
+		impl_->y_b.emplace(capacity * y_per_image, stream);
+		impl_->c_a.emplace(capacity * c_per_image, stream);
+		impl_->c_b.emplace(capacity * c_per_image, stream);
+		const auto [y_output, c_output] = source.device_batch().transform_workspace_async();
 		impl_->targets_output.emplace(labels.size() * model_classes, stream);
 		impl_->labels_device.emplace(labels.size(), stream);
 		impl_->decisions_device.emplace(randaugment.size(), stream);
 		impl_->mixup_device.emplace(mixup.size(), stream);
-		impl_->stats_device.emplace(labels.size(), stream);
-		check_cuda(cudaMemcpyAsync(impl_->labels_device->get(),
-		                           labels.data(),
-		                           labels.size_bytes(),
-		                           cudaMemcpyHostToDevice,
-		                           stream),
+		impl_->stats_device.emplace(capacity, stream);
+		impl_->work_submitted = true;
+		check_cuda(cudaMemcpyAsync(
+		               impl_->labels_device->get(), labels.data(), labels.size_bytes(), cudaMemcpyHostToDevice, stream),
 		           "upload labels");
 		check_cuda(cudaMemcpyAsync(impl_->decisions_device->get(),
 		                           randaugment.data(),
@@ -713,96 +707,103 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 		                           cudaMemcpyHostToDevice,
 		                           stream),
 		           "upload RandAugment decisions");
-		check_cuda(cudaMemcpyAsync(impl_->mixup_device->get(),
-		                           mixup.data(),
-		                           mixup.size_bytes(),
-		                           cudaMemcpyHostToDevice,
-		                           stream),
+		check_cuda(cudaMemcpyAsync(
+		               impl_->mixup_device->get(), mixup.data(), mixup.size_bytes(), cudaMemcpyHostToDevice, stream),
 		           "upload Mixup decisions");
 
-		if (y_source.dtype == DirectDctTensorDataType::kFloat32) {
-			convert_to_int16_kernel<<<launch_blocks(y_count), 256, 0, stream>>>(
-			    y_source.float_data, impl_->y_a->get(), y_count);
-			convert_to_int16_kernel<<<launch_blocks(c_count), 256, 0, stream>>>(
-			    c_source.float_data, impl_->c_a->get(), c_count);
-		} else {
-			convert_to_int16_kernel<<<launch_blocks(y_count), 256, 0, stream>>>(
-			    y_source.data, impl_->y_a->get(), y_count);
-			convert_to_int16_kernel<<<launch_blocks(c_count), 256, 0, stream>>>(
-			    c_source.data, impl_->c_a->get(), c_count);
-		}
-		check_cuda(cudaGetLastError(), "launch input conversion");
-
-		auto* y_current = impl_->y_a->get();
-		auto* y_next    = impl_->y_b->get();
-		auto* c_current = impl_->c_a->get();
-		auto* c_next    = impl_->c_b->get();
-		if (enable_randaugment) {
-			for (int stage = 0; stage < 2; ++stage) {
-				compute_stats_kernel<<<launch_blocks(labels.size()), 256, 0, stream>>>(
-				    y_current, c_current, impl_->stats_device->get(), labels.size());
-				apply_randaugment_kernel<false>
-				    <<<launch_blocks(y_count), 256, 0, stream>>>(y_current,
-				                                                 y_next,
-				                                                 impl_->decisions_device->get(),
-				                                                 impl_->stats_device->get(),
-				                                                 labels.size(),
-				                                                 stage,
-				                                                 1,
-				                                                 28,
-				                                                 28,
-				                                                 true);
-				apply_randaugment_kernel<false>
-				    <<<launch_blocks(c_count), 256, 0, stream>>>(c_current,
-				                                                 c_next,
-				                                                 impl_->decisions_device->get(),
-				                                                 impl_->stats_device->get(),
-				                                                 labels.size(),
-				                                                 stage,
-				                                                 2,
-				                                                 14,
-				                                                 14,
-				                                                 false);
-				std::swap(y_current, y_next);
-				std::swap(c_current, c_next);
+		// Augmentation is image-local and Mixup only reads within a microbatch.
+		// Reuse the two ping-pong workspaces without changing pool order or outputs.
+		for (size_t offset = 0; offset < labels.size(); offset += capacity) {
+			const auto count   = std::min(capacity, labels.size() - offset);
+			const auto y_count = count * y_per_image;
+			const auto c_count = count * c_per_image;
+			if (y_source.dtype == DirectDctTensorDataType::kFloat32) {
+				convert_to_int16_kernel<<<launch_blocks(y_count), 256, 0, stream>>>(
+				    y_source.float_data + offset * y_per_image, impl_->y_a->get(), y_count);
+				convert_to_int16_kernel<<<launch_blocks(c_count), 256, 0, stream>>>(
+				    c_source.float_data + offset * c_per_image, impl_->c_a->get(), c_count);
+			} else {
+				convert_to_int16_kernel<<<launch_blocks(y_count), 256, 0, stream>>>(
+				    y_source.data + offset * y_per_image, impl_->y_a->get(), y_count);
+				convert_to_int16_kernel<<<launch_blocks(c_count), 256, 0, stream>>>(
+				    c_source.data + offset * c_per_image, impl_->c_a->get(), c_count);
 			}
-			check_cuda(cudaGetLastError(), "launch RandAugment");
+			check_cuda(cudaGetLastError(), "launch input conversion");
+
+			auto* y_current = impl_->y_a->get();
+			auto* y_next    = impl_->y_b->get();
+			auto* c_current = impl_->c_a->get();
+			auto* c_next    = impl_->c_b->get();
+			if (enable_randaugment) {
+				for (int stage = 0; stage < 2; ++stage) {
+					compute_stats_kernel<<<launch_blocks(count), 256, 0, stream>>>(
+					    y_current, c_current, impl_->stats_device->get(), count);
+					apply_randaugment_kernel<false>
+					    <<<launch_blocks(y_count), 256, 0, stream>>>(y_current,
+					                                                 y_next,
+					                                                 impl_->decisions_device->get() + offset,
+					                                                 impl_->stats_device->get(),
+					                                                 count,
+					                                                 stage,
+					                                                 1,
+					                                                 28,
+					                                                 28,
+					                                                 true);
+					apply_randaugment_kernel<false>
+					    <<<launch_blocks(c_count), 256, 0, stream>>>(c_current,
+					                                                 c_next,
+					                                                 impl_->decisions_device->get() + offset,
+					                                                 impl_->stats_device->get(),
+					                                                 count,
+					                                                 stage,
+					                                                 2,
+					                                                 14,
+					                                                 14,
+					                                                 false);
+					std::swap(y_current, y_next);
+					std::swap(c_current, c_next);
+				}
+				check_cuda(cudaGetLastError(), "launch RandAugment");
+			}
+			normalize_mixup_kernel<<<launch_blocks(y_count), 256, 0, stream>>>(y_current,
+			                                                                   y_output + offset * y_per_image,
+			                                                                   impl_->mixup_device->get() +
+			                                                                       offset / microbatch_images,
+			                                                                   count,
+			                                                                   y_per_image,
+			                                                                   microbatch_images,
+			                                                                   enable_mixup);
+			normalize_mixup_kernel<<<launch_blocks(c_count), 256, 0, stream>>>(c_current,
+			                                                                   c_output + offset * c_per_image,
+			                                                                   impl_->mixup_device->get() +
+			                                                                       offset / microbatch_images,
+			                                                                   count,
+			                                                                   c_per_image,
+			                                                                   microbatch_images,
+			                                                                   enable_mixup);
+			mixup_targets_kernel<<<launch_blocks(count * model_classes), 256, 0, stream>>>(
+			    impl_->labels_device->get() + offset,
+			    impl_->targets_output->get() + offset * model_classes,
+			    impl_->mixup_device->get() + offset / microbatch_images,
+			    count,
+			    model_classes,
+			    microbatch_images,
+			    enable_mixup);
+			check_cuda(cudaGetLastError(), "launch normalization and Mixup");
 		}
-		normalize_mixup_kernel<<<launch_blocks(y_count), 256, 0, stream>>>(y_current,
-		                                                                          impl_->y_output->get(),
-		                                                                          impl_->mixup_device->get(),
-		                                                                          labels.size(),
-		                                                                          y_per_image,
-		                                                                          microbatch_images,
-		                                                                          enable_mixup);
-		normalize_mixup_kernel<<<launch_blocks(c_count), 256, 0, stream>>>(c_current,
-		                                                                          impl_->c_output->get(),
-		                                                                          impl_->mixup_device->get(),
-		                                                                          labels.size(),
-		                                                                          c_per_image,
-		                                                                          microbatch_images,
-		                                                                          enable_mixup);
-		mixup_targets_kernel<<<launch_blocks(labels.size() * model_classes), 256, 0, stream>>>(
-		    impl_->labels_device->get(),
-		    impl_->targets_output->get(),
-		    impl_->mixup_device->get(),
-		    labels.size(),
-		    model_classes,
-		    microbatch_images,
-		    enable_mixup);
-		check_cuda(cudaGetLastError(), "launch normalization and Mixup");
 		impl_->completion.record(stream);
+		impl_->completion_recorded = true;
 
 		impl_->y_descriptor            = y_source;
 		impl_->y_descriptor.data       = nullptr;
-		impl_->y_descriptor.float_data = impl_->y_output->get();
+		impl_->y_descriptor.float_data = y_output;
 		impl_->y_descriptor.dtype      = DirectDctTensorDataType::kFloat32;
 		impl_->c_descriptor            = c_source;
 		impl_->c_descriptor.data       = nullptr;
-		impl_->c_descriptor.float_data = impl_->c_output->get();
+		impl_->c_descriptor.float_data = c_output;
 		impl_->c_descriptor.dtype      = DirectDctTensorDataType::kFloat32;
 		impl_->target_descriptor       = {
-		    impl_->targets_output->get(),
+            impl_->targets_output->get(),
             {labels.size(), model_classes},
             {model_classes, 1U},
             impl_->device,
