@@ -105,6 +105,44 @@ class OnlineCropTest(unittest.TestCase):
                     torch.testing.assert_close(batch.projected[0].cpu(), projected, atol=0, rtol=0)
                     del batch
 
+    def test_bounded_pipeline_delivers_projected_ranges_on_consumer_stream(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA device is not available")
+        repo = Path(__file__).resolve().parents[4]
+        root = repo / "galp/data/compressed/imagenet512_val_block_major"
+        if not (root / "manifest.bin").exists():
+            self.skipTest("source512 ImageNet fixture is not available")
+        sys.path.insert(0, str(repo / "build/galp/torch"))
+        import _galp_direct_dct as native
+        from contextlib import closing
+        from unittest.mock import patch
+        from galp.benchmarks.dct_models.evaluate_shards import apply_b6_runtime, native_options
+        from galp.benchmarks.dct_models.online_crop import source_options
+
+        options = apply_b6_runtime(source_options(native_options(False, True), "vector-range-read-selected-decode"))
+        # Nonconsecutive/duplicate images and a tail exercise delivery ownership.
+        ids = [2, 0, 2]
+        transforms = [dict(crop=CROP, horizontal_flip=(i == 1)) for i in range(len(ids))]
+        with patch.dict(os.environ, GALP_BLOCK_MAJOR_ACCESS_DIR=str(root / "access")):
+            reader = native.DirectDctReader(str(root / "manifest.bin"))
+            reference = reader.read_prefetched(reader.prefetch_batch(ids, transforms=transforms, **options))
+            expected = reference.projected.cpu()
+            del reference
+            with closing(reader.pipeline_batch_options(**options, output_batch_images=2)) as pipeline:
+                pipeline.reset([ids] * 3, transforms_by_batch=[transforms] * 3)
+                stream = torch.cuda.Stream()
+                for _ in range(3):
+                    batch = next(pipeline)
+                    with torch.cuda.stream(stream):
+                        first = batch.projected_range(0, 2).clone()
+                        tail = batch.projected_range(2, 1).clone()
+                    stream.synchronize()
+                    torch.testing.assert_close(torch.cat((first, tail)).cpu(), expected, atol=0, rtol=0)
+                    with self.assertRaises(IndexError):
+                        batch.projected_range(2, 2)
+                    del batch, first, tail
+                self.assertLessEqual(pipeline._native_state_for_test["peak_live_output_slots"], 2)
+
     def test_multi_shard_activation_preserves_noncontiguous_ids_and_tail(self):
         from galp.benchmarks.dct_models.evaluate_shards import activation_groups
         shards = [dict(shard_id=i, first_global_image_index=i*1024,

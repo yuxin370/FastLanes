@@ -116,6 +116,7 @@ public:
 	[[nodiscard]] size_t                    image_count() const noexcept;
 	[[nodiscard]] int                       cuda_device() const noexcept;
 	[[nodiscard]] void*                     cuda_completion_event() const noexcept;
+	[[nodiscard]] void*                         cuda_image_completion_event(size_t image_index) const;
 
 	[[nodiscard]] const std::vector<uint32_t>&                      global_image_ids() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctImageCropRequest>&       transform_requests() const noexcept;

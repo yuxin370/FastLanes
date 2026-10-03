@@ -1663,3 +1663,100 @@ TEST(JpegDctBlockMajorPlan, MissingSidecarSelectsExplicitLegacyFallbackBoundary)
 }
 
 } // namespace
+
+TEST(JpegDctBlockMajorPlan, WeightedLaunchesPreserveMixedGeometryOrderAndDependencyCuts) {
+	using namespace galp::jpeg::detail;
+	JpegDctDeviceBlockMajorPlanlessPlan plan;
+	plan.images.resize(2);
+	for (size_t image = 0; image < 2; ++image) {
+		const std::array<uint16_t, 3> weights =
+		    image == 0 ? std::array<uint16_t, 3> {4, 6, 9} : std::array<uint16_t, 3> {2, 4, 1};
+		for (size_t c = 0; c < 3; ++c) {
+			plan.images[image].components[c].x_up_factor = weights[c];
+			plan.images[image].components[c].y_up_factor = 1;
+		}
+	}
+	galp::jpeg::JpegDctGridTransformSpec transform;
+	transform.y_output_width_blocks = transform.y_output_height_blocks = 4;
+	transform.cbcr_output_width_blocks = transform.cbcr_output_height_blocks = 4;
+	const auto check = [&](const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+	                       const std::vector<std::vector<uint64_t>>&          weights) {
+		for (const bool tiled : {false, true}) {
+			const auto runs = build_transform_work_runs(schedule, plan, transform, tiled);
+			ASSERT_EQ(runs.size(), weights.size());
+			for (size_t w = 0; w < weights.size(); ++w) {
+				for (uint64_t start = 0; start < weights[w].size(); ++start) {
+					const auto limit = std::min<uint64_t>(start + 3, weights[w].size());
+					for (const uint64_t budget : {0U, 13U, 17U}) {
+						uint64_t end = start, outputs = 0;
+						while (end < limit && (budget == 0 || outputs + (tiled ? weights[w][end] : 1) <= budget)) {
+							outputs += tiled ? weights[w][end] : 1U;
+							++end;
+						}
+						EXPECT_EQ(plan_transform_launch(runs[w], start, limit, budget),
+						          (std::pair<uint64_t, uint64_t> {end - start, outputs}));
+					}
+				}
+			}
+		}
+	};
+	JpegDctDeviceBlockMajorActiveOutputSchedule direct;
+	direct.offsets              = {0, 6};
+	direct.active_output_blocks = {0, 16, 32, 48, 64, 80};
+	check(direct, {{4, 6, 9, 2, 4, 1}});
+	auto repeated                 = direct;
+	repeated.offsets              = {0, 4};
+	repeated.active_output_blocks = {0, 1, 16, 32};
+	repeated.repeated_image_count = 2;
+	check(repeated, {{4, 4, 6, 9, 2, 2, 4, 1}});
+	JpegDctDeviceBlockMajorActiveOutputSchedule grouped;
+	grouped.offsets              = {0, 2, 4};
+	grouped.active_output_blocks = {0, 16, 32, 80};
+	grouped.image_indices        = {1, 0, 1};
+	grouped.groups               = {{0, 2, 0, 3, 0}, {2, 2, 0, 0, 0}};
+	grouped.group_offsets        = {0, 1, 2};
+	check(grouped, {{2, 4, 4, 6, 2, 4}, {9, 1}});
+}
+
+TEST(JpegDctBlockMajorPlan, OutputBatchCompletionWaitsForEveryWorksetContribution) {
+	using namespace galp::jpeg::detail;
+	JpegDctDeviceBlockMajorActiveOutputSchedule schedule;
+	schedule.offsets = {0, 4, 7};
+	// Image 0 has a late contribution; image 1 finishes in workset 0.
+	// Images 2/3 share delivery batch 1 and finish in workset 1.
+	schedule.active_output_blocks = {0, 10, 20, 30, 21, 1, 31};
+	auto points                   = build_output_batch_completion_schedule(schedule, 10, 4, 2);
+	ASSERT_EQ(points.size(), 2U);
+	EXPECT_TRUE(points[0].empty());
+	ASSERT_EQ(points[1].size(), 2U);
+	EXPECT_EQ(points[1][0].output_batch, 0U);
+	EXPECT_EQ(points[1][0].task_end, 2U);
+	EXPECT_EQ(points[1][1].output_batch, 1U);
+	EXPECT_EQ(points[1][1].task_end, 3U);
+
+	// Shared templates retain request order, including a partial delivery tail.
+	schedule                      = {};
+	schedule.offsets              = {0, 1, 2};
+	schedule.active_output_blocks = {0, 1};
+	schedule.repeated_image_count = 3;
+	points                        = build_output_batch_completion_schedule(schedule, 10, 3, 2);
+	EXPECT_TRUE(points[0].empty());
+	ASSERT_EQ(points[1].size(), 2U);
+	EXPECT_EQ(points[1][0].task_end, 2U);
+	EXPECT_EQ(points[1][1].task_end, 3U);
+
+	// Mixed templates may finish images out of request order.
+	schedule.repeated_image_count = 1;
+	schedule.image_indices        = {2, 0, 1};
+	schedule.group_offsets        = {0, 1, 2};
+	schedule.groups               = {{0, 1, 0, 3, 0}, {1, 1, 1, 2, 0}};
+	points                        = build_output_batch_completion_schedule(schedule, 10, 3, 1);
+	ASSERT_EQ(points[0].size(), 1U);
+	EXPECT_EQ(points[0][0].output_batch, 2U);
+	EXPECT_EQ(points[0][0].task_end, 1U);
+	ASSERT_EQ(points[1].size(), 2U);
+	EXPECT_EQ(points[1][0].output_batch, 0U);
+	EXPECT_EQ(points[1][0].task_end, 1U);
+	EXPECT_EQ(points[1][1].output_batch, 1U);
+	EXPECT_EQ(points[1][1].task_end, 2U);
+}

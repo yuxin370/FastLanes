@@ -213,6 +213,8 @@ struct JpegDctDeviceBatchOptions {
 	uint32_t                    bounded_read_amplification_ppm = 1'000'000U;
 	uint32_t                    bounded_read_local_amplification_ppm = 0U;
 	size_t                      bounded_read_max_run_bytes = 0U;
+	// Optional image-range delivery; zero retains whole-batch completion.
+	size_t output_batch_images = 0U;
 };
 
 struct JpegDctDeviceImageLayout {
@@ -402,6 +404,7 @@ public:
 	[[nodiscard]] const JpegDctDeviceExecutionStats&                execution_stats_ref() const noexcept;
 	[[nodiscard]] JpegDctDeviceLayout                               layout() const noexcept;
 	[[nodiscard]] void*                                             cuda_completion_event() const noexcept;
+	[[nodiscard]] void* cuda_image_completion_event(size_t image_index) const;
 	[[nodiscard]] const std::vector<JpegDctDeviceImageLayout>&      image_layouts() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceBlockMetadata>&    block_metadata() const noexcept;
 	[[nodiscard]] const std::vector<JpegDctDeviceRowgroupMetadata>& rowgroups() const noexcept;

@@ -33,7 +33,7 @@ struct JpegDctOutputProjection {
 	uint8_t  frequencies[3][64];
 	uint8_t  horizontal_count[3];
 	uint8_t  horizontal_frequencies[3][64];
-	bool     direct_identity;
+	bool     finalize_on_store;
 	float    add;
 	float    scale;
 	float    subtract[192];

@@ -6,6 +6,7 @@ target geometry or full source512 coefficients with online center crop/resize.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 import sys
@@ -193,36 +194,39 @@ def main():
         transforms = [dict(crop=CROP, horizontal_flip=False) for _ in ids] if online else None
         return ids, transforms
 
-    def submit(shard):
-        ids, transforms = requests(shard)
-        return reader.prefetch_batch(ids, transforms=transforms, **options)
-
-    pending = submit(shards[0])
-    with torch.inference_mode():
+    # Native output permits allow GPU preparation to overlap consumption;
+    # the manual prefetch API defers GPU submission until read_prefetched().
+    streamed_projection = args.output_layout == "projected" and not args.verify
+    pipeline = reader.pipeline_batch_options(
+        **options, output_batch_images=args.batch_size if streamed_projection else 0)
+    batch_requests = [requests(shard) for shard in shards]
+    pipeline.reset([ids for ids, _ in batch_requests],
+                   transforms_by_batch=[transforms for _, transforms in batch_requests] if online else None)
+    with closing(pipeline), torch.inference_mode():
         for shard_index, shard in enumerate(shards):
             capture.step(shard_index)
             t = time.perf_counter()
             with capture.range("input.wait"):
-                batch = reader.read_prefetched(pending)
+                batch = next(pipeline)
                 if args.output_layout == "projected":
-                    x = batch.projected
+                    x = None if streamed_projection else batch.projected
                     y = cbcr = None
                 else:
                     y, cbcr = batch.y, batch.cbcr
-                torch.cuda.current_stream().synchronize()
+                if not streamed_projection:
+                    torch.cuda.current_stream().synchronize()
             wait_seconds += time.perf_counter() - t
-            decoded_images += len(x) if args.output_layout == "projected" else len(y)
-            # Native manages the next preparation; at most one active + one next shard.
-            with capture.range("input.prefetch_submit"):
-                pending = submit(shards[shard_index + 1]) if shard_index + 1 < len(shards) else None
+            image_ids = batch.global_image_ids
+            decoded_images += len(image_ids)
             t = time.perf_counter()
             with capture.range("input.organize"):
                 if args.output_layout == "grid":
                     x = organize_batch(y, cbcr)
-                torch.cuda.current_stream().synchronize()
+                if not streamed_projection:
+                    torch.cuda.current_stream().synchronize()
             organize_seconds += time.perf_counter() - t
             image_ids = shard["image_ids"]
-            local = [i for i in range(len(x)) if image_ids[i] in ordinal_by_position]
+            local = [i for i in range(len(image_ids)) if image_ids[i] in ordinal_by_position]
             if args.verify:
                 if online:
                     # Identical online transform after complete source decoding.
@@ -266,14 +270,25 @@ def main():
                                        logits_max_abs=float((a-b).abs().max())))
             # Select a requested subset once, then use zero-copy batch views.
             ordinals_in_shard = [ordinal_by_position[image_ids[i]] for i in local]
-            if len(local) != len(x):
+            if not streamed_projection and len(local) != len(x):
                 x = x[local]
             shard_labels = torch.tensor([selected[o]["model_label"] for o in ordinals_in_shard], device="cuda")
             for offset in range(0, len(local), args.batch_size):
                 ordinals = ordinals_in_shard[offset:offset+args.batch_size]
                 labels = shard_labels[offset:offset+args.batch_size]
-                inputs = x[offset:offset+args.batch_size]
-                torch.cuda.current_stream().synchronize()
+                if streamed_projection:
+                    wait_started = time.perf_counter()
+                    selected_local = local[offset:offset+args.batch_size]
+                    first, last = selected_local[0], selected_local[-1]
+                    with capture.range("input.wait"):
+                        inputs = batch.projected_range(first, last - first + 1)
+                        if last - first + 1 != len(selected_local):
+                            inputs = inputs[[index - first for index in selected_local]]
+                        torch.cuda.current_stream().synchronize()
+                    wait_seconds += time.perf_counter() - wait_started
+                else:
+                    inputs = x[offset:offset+args.batch_size]
+                    torch.cuda.current_stream().synchronize()
                 t = time.perf_counter()
                 with capture.range("model.forward"):
                     logits = net(inputs)
@@ -314,13 +329,14 @@ def main():
                   decoded_images=decoded_images, shard_activations=source_shard_count,
                   activation_count=len(shard_stats), shards_per_activation=args.shards_per_activation,
                   native_runtime=args.native_runtime, physical_prefix=args.physical_prefix,
+                  output_batch_images=args.batch_size if streamed_projection else 0,
                   top1=100*top1/count, top5=100*top5/count, ce=ce/count,
                   e2e_seconds=wall, reader_initialization_seconds=init_seconds,
                   input_wait_seconds=wait_seconds, organization_seconds=organize_seconds,
                   model_seconds=model_seconds, precision="float32", device="cuda",
                   device_name=torch.cuda.get_device_name(),
                   batch_size=args.batch_size, model_threads=args.model_threads,
-                  prefetch="one active + one preparing activation; native futures",
+                  prefetch="native pipeline; at most two materialized output slots",
                   timing_scope="files through logits, includes reader startup; model warmup excluded",
                   verification_run=args.verify, checks=checks,
                   pushdown=args.pushdown,

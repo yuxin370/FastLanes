@@ -384,8 +384,11 @@ __device__ __forceinline__ void store_planless_dct_grid_value(const JpegDctDevic
 		    ((static_cast<uint64_t>(image.request_index) * projection->count + channel) * y_output_height + output_y) *
 		        y_output_width +
 		    stored_x;
-		if (projection->direct_identity) {
-			const float value = finalize_dct_grid_float(stored_value, projection->add, projection->scale);
+		if (projection->finalize_on_store) {
+			// Match the former zero-initialized accumulation before finalization,
+			// including signed zero after a horizontal flip.
+			const float sum   = accumulate ? __fadd_rn(0.0F, stored_value) : stored_value;
+			const float value = finalize_dct_grid_float(sum, projection->add, projection->scale);
 			y_accum[index]    = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
 		} else if (accumulate)
 			y_accum[index] += stored_value;
@@ -633,13 +636,13 @@ transformed_dct_grid_integer_upsample_kernel(const DeviceCoeffBinding* __restric
                                                 active_image_indices,
                                                 active_output_groups,
                                                 active_output_group_count);
-		const auto image     = images[linear / blocks_per_image];
+		const auto& image     = images[linear / blocks_per_image];
 		const auto spatial   = linear % blocks_per_image;
 		const auto component = spatial < y_blocks ? 0U : 1U + uint32_t((spatial - y_blocks) / c_blocks);
 		const auto width     = component == 0 ? y_output_width : cbcr_output_width;
 		const auto xy        = component == 0 ? spatial : (spatial - y_blocks) % c_blocks;
 		const auto ox = uint32_t(xy % width), oy = uint32_t(xy / width);
-		const auto descriptor = image.components[component];
+		const auto& descriptor = image.components[component];
 		const auto ux = descriptor.x_up_factor, uy = descriptor.y_up_factor;
 		const auto sx = ox / ux, sy = oy / uy;
 		const auto frequencies = projection->frequency_count[component];
@@ -798,7 +801,7 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
                                                         active_image_indices,
                                                         active_output_groups,
                                                         active_output_group_count);
-			const auto     image     = images[linear / blocks_per_image];
+			const auto&    image     = images[linear / blocks_per_image];
 			const uint32_t component = (linear % blocks_per_image) / spatial;
 			const uint32_t xy        = linear % spatial;
 			const uint32_t x = xy % y_output_width, y = xy / y_output_width;
@@ -820,8 +823,8 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
                                           block_major_rank_payload,
                                           block_major_rank_payload_size)
 			            : PlanlessLocatedRow {};
-			if (projection->direct_identity && (located.row == std::numeric_limits<uint64_t>::max() ||
-			                                    located.binding_base == std::numeric_limits<uint32_t>::max()))
+			if (projection->finalize_on_store && (located.row == std::numeric_limits<uint64_t>::max() ||
+			                                      located.binding_base == std::numeric_limits<uint32_t>::max()))
 				continue;
 			const auto* sparse = selected_physical_coefficient_mask != kAllPhysicalCoefficientMask
 			                         ? &sparse_transform_plans[image.zigzag_columns != 0U ? 1U : 0U]
@@ -910,8 +913,8 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 			output_y                 = static_cast<uint32_t>(channel_local / cbcr_output_width);
 			output_x                 = static_cast<uint32_t>(channel_local % cbcr_output_width);
 		}
-		const auto image      = images[image_index];
-		const auto descriptor = image.components[component];
+		const auto& image      = images[image_index];
+		const auto& descriptor = image.components[component];
 		if (descriptor.present == 0U || descriptor.x_up_factor == 0U || descriptor.y_up_factor == 0U ||
 		    descriptor.x_down_factor == 0U || descriptor.y_down_factor == 0U) {
 			continue;

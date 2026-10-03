@@ -533,6 +533,12 @@ void* DirectDctBatch::cuda_completion_event() const noexcept {
 	return batch_.cuda_completion_event();
 }
 
+void* DirectDctBatch::cuda_image_completion_event(const size_t image_index) const {
+	if (image_index >= image_count())
+		throw std::out_of_range("output image index exceeds batch size");
+	return logical_ ? cuda_completion_event() : batch_.cuda_image_completion_event(image_index);
+}
+
 const std::vector<uint32_t>& DirectDctBatch::global_image_ids() const noexcept {
 	return global_image_ids_;
 }

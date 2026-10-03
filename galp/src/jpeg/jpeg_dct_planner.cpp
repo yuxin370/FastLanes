@@ -711,6 +711,155 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	return schedule;
 }
 
+std::vector<std::vector<detail::JpegDctOutputReadyPoint>>
+detail::build_output_batch_completion_schedule(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                                               const uint64_t                                     blocks_per_image,
+                                               const size_t                                       image_count,
+                                               const size_t                                       batch_images) {
+	if (batch_images == 0 || blocks_per_image == 0)
+		throw std::invalid_argument("output completion requires nonzero batch and image geometry");
+	const size_t                                      worksets = schedule.offsets.size() - 1U;
+	std::vector<std::vector<JpegDctOutputReadyPoint>> result(worksets);
+	std::vector<std::pair<size_t, uint64_t>> last(image_count / batch_images + (image_count % batch_images != 0),
+	                                              {worksets, 0});
+	const auto                               visit = [&](size_t w, uint64_t image, uint64_t task_end) {
+        auto& point = last.at(image / batch_images);
+        if (point.first == worksets || std::pair {w, task_end} > point)
+            point = {w, task_end};
+	};
+	for (size_t w = 0; w < worksets; ++w) {
+		if (!schedule.groups.empty()) {
+			for (auto g = schedule.group_offsets[w]; g < schedule.group_offsets[w + 1]; ++g) {
+				const auto& group = schedule.groups[g];
+				if (group.image_count != 0) {
+					for (uint64_t i = 0; i < group.image_count; ++i)
+						visit(w,
+						      schedule.image_indices[group.image_begin + i],
+						      group.task_begin + (i + 1) * group.block_count);
+				} else {
+					for (uint64_t i = 0; i < group.block_count; ++i)
+						visit(w,
+						      schedule.active_output_blocks[group.block_begin + i] / blocks_per_image,
+						      group.task_begin + i + 1);
+				}
+			}
+		} else {
+			const auto begin = schedule.offsets[w], end = schedule.offsets[w + 1];
+			if (schedule.repeated_image_count > 1) {
+				if (end != begin)
+					for (uint64_t i = 0; i < schedule.repeated_image_count; ++i)
+						visit(w, i, (i + 1) * (end - begin));
+			} else {
+				for (auto i = begin; i < end; ++i)
+					visit(w, schedule.active_output_blocks[i] / blocks_per_image, i - begin + 1);
+			}
+		}
+	}
+	for (size_t batch = 0; batch < last.size(); ++batch) {
+		const auto [w, task_end] = last[batch];
+		if (w != worksets)
+			result[w].push_back({task_end, batch});
+	}
+	for (auto& points : result)
+		std::sort(points.begin(), points.end(), [](const auto& a, const auto& b) {
+			return a.task_end < b.task_end || (a.task_end == b.task_end && a.output_batch < b.output_batch);
+		});
+	return result;
+}
+
+std::vector<std::vector<detail::JpegDctTransformWorkRun>>
+detail::build_transform_work_runs(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                                  const JpegDctDeviceBlockMajorPlanlessPlan&         plan,
+                                  const JpegDctGridTransformSpec&                    transform,
+                                  const bool                                         source_tiles) {
+	const uint64_t y_blocks = uint64_t(transform.y_output_width_blocks) * transform.y_output_height_blocks;
+	const uint64_t c_blocks = uint64_t(transform.cbcr_output_width_blocks) * transform.cbcr_output_height_blocks;
+	const uint64_t blocks_per_image = y_blocks + 2 * c_blocks;
+	std::vector<std::vector<JpegDctTransformWorkRun>> result(schedule.offsets.size() - 1U);
+	for (size_t w = 0; w < result.size(); ++w) {
+		auto&      runs  = result[w];
+		uint64_t   tasks = 0, outputs = 0;
+		const auto append = [&](uint64_t count, uint32_t weight) {
+			if (count == 0)
+				return;
+			tasks += count;
+			outputs += count * weight;
+			if (!runs.empty() && runs.back().outputs_per_task == weight)
+				runs.back() = {tasks, outputs, weight};
+			else
+				runs.push_back({tasks, outputs, weight});
+		};
+		const auto weight = [&](uint64_t image, uint32_t component) {
+			const auto& c = plan.images[image].components[component];
+			return source_tiles ? uint32_t(c.x_up_factor) * c.y_up_factor : 1U;
+		};
+		const auto component = [&](uint64_t linear) {
+			const auto spatial = linear % blocks_per_image;
+			return spatial < y_blocks ? 0U : 1U + uint32_t((spatial - y_blocks) / c_blocks);
+		};
+		// Shared spatial templates are scanned once, then repeated as component
+		// runs. This never expands every image's output blocks on the host.
+		const auto append_slice =
+		    [&](uint64_t begin, uint64_t count, uint32_t image_begin, uint32_t image_count, bool indexed_images) {
+			    if (image_count == 0) {
+				    for (uint64_t i = begin; i < begin + count; ++i) {
+					    const auto linear = schedule.active_output_blocks[i];
+					    append(1, weight(linear / blocks_per_image, component(linear)));
+				    }
+				    return;
+			    }
+			    std::vector<std::pair<uint64_t, uint32_t>> components;
+			    for (uint64_t i = begin; i < begin + count; ++i) {
+				    const auto c = component(schedule.active_output_blocks[i]);
+				    if (!components.empty() && components.back().second == c)
+					    ++components.back().first;
+				    else
+					    components.emplace_back(1, c);
+			    }
+			    for (uint32_t i = 0; i < image_count; ++i) {
+				    const auto image = indexed_images ? schedule.image_indices[image_begin + i] : i;
+				    for (const auto& [n, c] : components)
+					    append(n, weight(image, c));
+			    }
+		    };
+		if (schedule.groups.empty()) {
+			append_slice(schedule.offsets[w],
+			             schedule.offsets[w + 1] - schedule.offsets[w],
+			             0,
+			             schedule.repeated_image_count > 1 ? schedule.repeated_image_count : 0,
+			             false);
+		} else {
+			for (auto g = schedule.group_offsets[w]; g < schedule.group_offsets[w + 1]; ++g) {
+				const auto& group = schedule.groups[g];
+				append_slice(group.block_begin, group.block_count, group.image_begin, group.image_count, true);
+			}
+		}
+	}
+	return result;
+}
+
+std::pair<uint64_t, uint64_t> detail::plan_transform_launch(const std::vector<JpegDctTransformWorkRun>& runs,
+                                                            const uint64_t                              task_begin,
+                                                            const uint64_t                              task_limit,
+                                                            const uint64_t                              output_budget) {
+	const auto prefix = [&](uint64_t task) {
+		const auto run =
+		    std::lower_bound(runs.begin(), runs.end(), task, [](const auto& r, uint64_t t) { return r.task_end < t; });
+		return run->output_end - (run->task_end - task) * run->outputs_per_task;
+	};
+	const auto begin = prefix(task_begin), end = prefix(task_limit);
+	if (output_budget == 0 || end - begin <= output_budget)
+		return {task_limit - task_begin, end - begin};
+	const auto limit = begin + output_budget;
+	const auto run =
+	    std::upper_bound(runs.begin(), runs.end(), limit, [](uint64_t n, const auto& r) { return n < r.output_end; });
+	const auto remaining = run->output_end - limit;
+	const auto task_end  = run->task_end - (remaining + run->outputs_per_task - 1) / run->outputs_per_task;
+	if (task_end == task_begin)
+		throw std::invalid_argument("transform output budget cannot fit one task");
+	return {task_end - task_begin, prefix(task_end) - begin};
+}
+
 bool detail::compact_integer_upsample_schedule(JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
                                                const JpegDctDeviceBlockMajorPlanlessPlan&   plan,
                                                const JpegDctGridTransformSpec&              transform) {
@@ -2398,6 +2547,7 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
 		plan.async_planless_completion  = options.async_planless_completion;
+		plan.output_batch_images                   = options.output_batch_images;
 		plan.transform_submission_gate   = options.transform_submission_gate;
 		plan.block_major_double_buffer_policy = options.block_major_double_buffer_policy;
 		plan.decode_workset_capacity_bytes = options.decode_workset_capacity_bytes == 0U
@@ -2793,6 +2943,7 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
 		plan.async_planless_completion  = options.async_planless_completion;
+		plan.output_batch_images                   = options.output_batch_images;
 		plan.transform_submission_gate   = options.transform_submission_gate;
 		plan.block_major_double_buffer_policy = options.block_major_double_buffer_policy;
 		plan.rowgroup_prefetch.enabled   = options.enable_rowgroup_prefetch;
@@ -3405,6 +3556,7 @@ struct JpegDctShardDatasetReader::Impl {
 		plan.transform_ctas_per_launch   = options.transform_ctas_per_launch;
 		plan.use_low_priority_streams    = options.use_low_priority_streams;
 		plan.async_planless_completion  = options.async_planless_completion;
+		plan.output_batch_images                   = options.output_batch_images;
 		plan.transform_submission_gate   = options.transform_submission_gate;
 		plan.block_major_double_buffer_policy = options.block_major_double_buffer_policy;
 		plan.rowgroup_prefetch.enabled   = options.enable_rowgroup_prefetch;
@@ -4194,15 +4346,14 @@ struct JpegDctShardDatasetReader::Impl {
 	                                         const JpegDctDeviceBatchOptions&            options) {
 		std::ostringstream key;
 		key << static_cast<int>(options.layout) << ':' << options.decode_batch_rowgroups << ':'
-		    << options.decode_workset_capacity_bytes << ':'
-		    << options.enable_rowgroup_prefetch << ':' << options.rowgroup_prefetch_depth << ':'
-		    << options.rowgroup_prefetch_workers << ':' << options.rowgroup_prefetch_min_decode_batches << ':'
-		    << options.enable_planless_execution << ':' << static_cast<int>(options.scheduling_policy) << ':'
-		    << options.transform_blocks_per_launch << ':' << options.transform_ctas_per_launch << ':'
-		    << options.use_low_priority_streams << ':' << static_cast<int>(options.crop_execution_mode) << ':'
-		    << options.bounded_read_amplification_ppm << ':'
-		    << options.bounded_read_local_amplification_ppm << ':'
-		    << options.bounded_read_max_run_bytes << ':';
+		    << options.decode_workset_capacity_bytes << ':' << options.enable_rowgroup_prefetch << ':'
+		    << options.rowgroup_prefetch_depth << ':' << options.rowgroup_prefetch_workers << ':'
+		    << options.rowgroup_prefetch_min_decode_batches << ':' << options.enable_planless_execution << ':'
+		    << static_cast<int>(options.scheduling_policy) << ':' << options.transform_blocks_per_launch << ':'
+		    << options.transform_ctas_per_launch << ':' << options.use_low_priority_streams << ':'
+		    << static_cast<int>(options.crop_execution_mode) << ':' << options.bounded_read_amplification_ppm << ':'
+		    << options.bounded_read_local_amplification_ppm << ':' << options.bounded_read_max_run_bytes << ':'
+		    << options.output_batch_images << ':';
 		if (options.grid_transform.has_value()) {
 			const auto& spec = *options.grid_transform;
 			key << spec.y_output_width_blocks << ',' << spec.y_output_height_blocks << ','

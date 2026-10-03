@@ -1814,6 +1814,28 @@ struct TorchDirectDctBatch {
 		return value.squeeze(-1).squeeze(-1);
 	}
 
+	// A view retains the same storage lease as the full batch, but waits only
+	// for the last writers of the requested images on the consumer stream.
+	torch::Tensor projected_range(const size_t first, const size_t count) {
+		if (first > batch->image_count() || count > batch->image_count() - first)
+			throw std::out_of_range("projected range exceeds batch size");
+		const auto           device = tensor_device_index();
+		c10::cuda::CUDAGuard guard(device);
+		const auto           stream   = c10::cuda::getCurrentCUDAStream(device);
+		void*                previous = nullptr;
+		for (size_t image = first; image < first + count; ++image) {
+			auto* event = batch->cuda_image_completion_event(image);
+			if (event != nullptr && event != previous)
+				C10_CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), static_cast<cudaEvent_t>(event), 0));
+			previous = event;
+		}
+		register_current_consumer_stream();
+		return grid_tensor(batch->projected_tensor_async(), projected_tensor)
+		    .squeeze(-1)
+		    .squeeze(-1)
+		    .narrow(0, static_cast<int64_t>(first), static_cast<int64_t>(count));
+	}
+
 	torch::Tensor y() {
 		wait_for_batch_completion();
 		register_current_consumer_stream();
@@ -2564,7 +2586,7 @@ private:
 
 class TorchDirectDctPipeline {
 public:
-	enum class Backend : uint8_t { kLegacy, kNative };
+	enum class Backend : uint8_t { kLegacy, kNative, kNativeLogical };
 
 	TorchDirectDctPipeline(std::shared_ptr<TorchDirectDctReaderState> state,
 	                       galp::jpeg::JpegDctDeviceBatchOptions     options,
@@ -2573,11 +2595,16 @@ public:
 	    : state_(std::move(state)),
 	      options_(std::move(options)),
 	      semantic_profile_id_(std::move(semantic_profile_id)) {
-		if (backend == Backend::kNative) {
+		if (backend != Backend::kLegacy) {
 			auto runtime = std::shared_ptr<galp::jpeg::DirectDctRuntime>(
 			    &state_->runtime, [](galp::jpeg::DirectDctRuntime*) {});
-			native_delegate_ = std::make_unique<galp::direct_dct::NativeLogicalBatchPipeline>(
-			    std::move(runtime), state_->manifest_path, semantic_profile_id_, options_);
+			if (backend == Backend::kNativeLogical) {
+				native_delegate_ = std::make_unique<galp::direct_dct::NativeLogicalBatchPipeline>(
+				    std::move(runtime), semantic_profile_id_, options_);
+			} else {
+				native_delegate_ = std::make_unique<galp::direct_dct::NativeLogicalBatchPipeline>(
+				    std::move(runtime), state_->manifest_path, semantic_profile_id_, options_);
+			}
 			lifetime_backend_ = requested_phase4_lifetime_backend();
 		}
 	}
@@ -2851,6 +2878,7 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	py::class_<TorchDirectDctBatch>(m, "DirectDctBatch")
 	    .def_property_readonly("coefficients", &TorchDirectDctBatch::coefficients)
 	    .def_property_readonly("projected", &TorchDirectDctBatch::projected)
+	    .def("projected_range", &TorchDirectDctBatch::projected_range, py::arg("first"), py::arg("count"))
 	    .def_property_readonly("y", &TorchDirectDctBatch::y)
 	    .def_property_readonly("cbcr", &TorchDirectDctBatch::cbcr)
 	    .def("record_stream",
@@ -3263,7 +3291,83 @@ PYBIND11_MODULE(_galp_direct_dct, m) {
 	        py::arg("block_major_double_buffer")   = "auto",
 	        py::arg("bounded_read_amplification_cap") = 1.0,
 	        py::arg("bounded_read_local_amplification_cap") = 0.0,
-	        py::arg("bounded_read_max_run_bytes") = 0U)
+	        py::arg("bounded_read_max_run_bytes")           = 0U)
+	    .def(
+	        "pipeline_batch_options",
+	        [](TorchDirectDctReader& reader,
+	           const std::string&    dct_coeffs,
+	           const size_t          cache_capacity_mib,
+	           const size_t          decode_batch_rowgroups,
+	           const bool            enable_rowgroup_prefetch,
+	           const size_t          rowgroup_prefetch_depth,
+	           const size_t          rowgroup_prefetch_workers,
+	           const size_t          rowgroup_prefetch_min_decode_batches,
+	           const std::string&    layout,
+	           const py::object&     grid_transform,
+	           const size_t          plan_cache_capacity,
+	           const bool            enable_planless_execution,
+	           const std::string&    scheduling_policy,
+	           const size_t          transform_blocks_per_launch,
+	           const size_t          transform_ctas_per_launch,
+	           const bool            use_low_priority_streams,
+	           const std::string&    crop_execution_mode,
+	           const size_t          decode_workset_capacity_mib,
+	           const std::string&    block_major_double_buffer,
+	           const bool            async_planless_completion,
+	           const double          bounded_read_amplification_cap,
+	           const double          bounded_read_local_amplification_cap,
+	           const size_t          bounded_read_max_run_bytes,
+	           const size_t          output_batch_images) {
+		        auto options                = make_batch_options(dct_coeffs,
+                                                  cache_capacity_mib,
+                                                  decode_batch_rowgroups,
+                                                  enable_rowgroup_prefetch,
+                                                  rowgroup_prefetch_depth,
+                                                  rowgroup_prefetch_workers,
+                                                  rowgroup_prefetch_min_decode_batches,
+                                                  layout,
+                                                  grid_transform,
+                                                  plan_cache_capacity,
+                                                  enable_planless_execution,
+                                                  decode_workset_capacity_mib,
+                                                  crop_execution_mode,
+                                                  scheduling_policy,
+                                                  transform_blocks_per_launch,
+                                                  transform_ctas_per_launch,
+                                                  use_low_priority_streams,
+                                                  block_major_double_buffer,
+                                                  async_planless_completion,
+                                                  bounded_read_amplification_cap,
+                                                  bounded_read_local_amplification_cap,
+                                                  bounded_read_max_run_bytes);
+		        options.output_batch_images = output_batch_images;
+		        return std::make_shared<TorchDirectDctPipeline>(
+		            reader.shared_state(), options, "configured", TorchDirectDctPipeline::Backend::kNativeLogical);
+	        },
+	        py::arg("dct_coeffs")                = "all",
+	        py::arg("cache_capacity_mib")        = kDefaultDirectDctCacheCapacityMiB,
+	        py::arg("decode_batch_rowgroups")    = galp::jpeg::kDefaultJpegDctDecodeBatchRowgroups,
+	        py::arg("enable_rowgroup_prefetch")  = true,
+	        py::arg("rowgroup_prefetch_depth")   = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchDepth,
+	        py::arg("rowgroup_prefetch_workers") = galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchWorkers,
+	        py::arg("rowgroup_prefetch_min_decode_batches") =
+	            galp::jpeg::kDefaultJpegDctDeviceRowgroupPrefetchMinDecodeBatches,
+	        py::arg("layout")                               = "compact",
+	        py::arg("grid_transform")                       = py::none(),
+	        py::arg("plan_cache_capacity")                  = galp::jpeg::kDefaultJpegDctDevicePlanCacheCapacity,
+	        py::arg("enable_planless_execution")            = true,
+	        py::arg("scheduling_policy")                    = "fully-overlapped",
+	        py::arg("transform_blocks_per_launch")          = 0,
+	        py::arg("transform_ctas_per_launch")            = 0,
+	        py::arg("use_low_priority_streams")             = false,
+	        py::arg("crop_execution_mode")                  = "auto",
+	        py::arg("decode_workset_capacity_mib")          = kDefaultDirectDctDecodeWorksetCapacityMiB,
+	        py::arg("block_major_double_buffer")            = "auto",
+	        py::arg("async_planless_completion")            = false,
+	        py::arg("bounded_read_amplification_cap")       = 1.0,
+	        py::arg("bounded_read_local_amplification_cap") = 0.0,
+	        py::arg("bounded_read_max_run_bytes")           = 0U,
+	        py::arg("output_batch_images")                  = 0U)
 	    .def(
 	        "prefetch_batch",
 	        [](TorchDirectDctReader& reader,

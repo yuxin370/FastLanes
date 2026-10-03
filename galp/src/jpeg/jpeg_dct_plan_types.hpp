@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace galp::format {
@@ -284,6 +285,37 @@ build_block_major_active_output_schedule(const JpegDctDeviceBlockMajorPlanlessPl
                                          const JpegDctGridTransformSpec&                            transform,
                                          bool allow_repeated_images = true);
 
+struct JpegDctOutputReadyPoint {
+	uint64_t task_end;
+	size_t   output_batch;
+};
+
+// Run-length encoded work prefixes; task order is unchanged. A source-owned
+// tile can produce several output blocks while an ordinary task produces one.
+struct JpegDctTransformWorkRun {
+	uint64_t task_end;
+	uint64_t output_end;
+	uint32_t outputs_per_task;
+};
+
+[[nodiscard]] std::vector<std::vector<JpegDctTransformWorkRun>>
+build_transform_work_runs(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                          const JpegDctDeviceBlockMajorPlanlessPlan&         plan,
+                          const JpegDctGridTransformSpec&                    transform,
+                          bool                                               source_tiles);
+
+// Returns {task count, output count}, respecting both dependency and work limits.
+[[nodiscard]] std::pair<uint64_t, uint64_t> plan_transform_launch(const std::vector<JpegDctTransformWorkRun>& runs,
+                                                                  uint64_t task_begin,
+                                                                  uint64_t task_limit,
+                                                                  uint64_t output_budget);
+
+[[nodiscard]] std::vector<std::vector<JpegDctOutputReadyPoint>>
+build_output_batch_completion_schedule(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                                       uint64_t                                           blocks_per_image,
+                                       size_t                                             image_count,
+                                       size_t                                             batch_images);
+
 // Convert complete integer-upsample tiles to one source-owned task each.
 // Returns false without changing the schedule for other geometries.
 bool compact_integer_upsample_schedule(JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
@@ -487,6 +519,7 @@ struct JpegDctDeviceBatchPlan {
 	size_t                                     transform_ctas_per_launch   = 0;
 	bool                                       use_low_priority_streams    = false;
 	bool                                       async_planless_completion   = false;
+	size_t                                                output_batch_images         = 0U;
 	std::shared_ptr<JpegDctDeviceTransformSubmissionGate> transform_submission_gate;
 	JpegDctBlockMajorDoubleBufferPolicy        block_major_double_buffer_policy =
 	    JpegDctBlockMajorDoubleBufferPolicy::kAutomatic;

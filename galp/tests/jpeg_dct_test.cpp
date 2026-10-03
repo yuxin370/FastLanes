@@ -1388,7 +1388,7 @@ TEST(JpegDct, TransformedGridSupportsArbitraryCoefficientSelections) {
 			(void)galp::jpeg::build_jpeg_dct_block_major_access_dataset(projected_dir / "manifest.bin", access_dir);
 		ScopedEnvironmentVariable             access_environment("GALP_BLOCK_MAJOR_ACCESS_DIR", access_dir.string());
 		galp::jpeg::JpegDctShardDatasetReader projected_reader(projected_dir / "manifest.bin");
-		for (const uint32_t size : {4U, 2U, 7U, 8U, 16U, 32U}) {
+		for (const uint32_t size : {4U, 2U, 7U, 8U, 12U, 16U, 32U}) {
 			galp::jpeg::JpegDctDeviceBatchOptions options;
 			options.layout                 = galp::jpeg::JpegDctDeviceLayout::kTransformedDctGrid;
 			options.grid_transform         = galp::profiles::rgbnomore_val_dct_grid_transform();
@@ -1429,6 +1429,7 @@ TEST(JpegDct, TransformedGridSupportsArbitraryCoefficientSelections) {
 				options.transform_blocks_per_launch = 513U;
 				options.transform_ctas_per_launch   = 7U;
 			}
+			options.output_batch_images = 2U;
 			auto         projected = projected_reader.ReadDeviceDctBatch(cropped, options);
 			const size_t spatial   = size * size;
 			if (size == 8U || size == 32U) {
@@ -1444,16 +1445,28 @@ TEST(JpegDct, TransformedGridSupportsArbitraryCoefficientSelections) {
 				          full.execution_stats().planless_transform_output_block_count);
 				EXPECT_EQ(stats.planless_transform_dense_output_block_count,
 				          stats.planless_transform_output_block_count);
+				if (size % 4U == 0)
+					EXPECT_EQ(stats.fixed_grid_finalize_kernel_launch_count, 0U);
 			}
 			ASSERT_EQ(projected.projected_shape(), (std::array<size_t, 6> {4, 3, size, size, 1, 1}));
 			ASSERT_EQ(projected.cbcr_coefficient_count(), 0U);
 			ASSERT_EQ(projected.y_coefficient_count(), 4U * 3U * spatial);
 			std::vector<float> actual(projected.y_coefficient_count());
-			ASSERT_EQ(cudaMemcpy(actual.data(),
-			                     projected.y_float_coefficients(),
-			                     actual.size() * sizeof(float),
-			                     cudaMemcpyDeviceToHost),
-			          cudaSuccess);
+			cudaStream_t       consumer;
+			ASSERT_EQ(cudaStreamCreateWithFlags(&consumer, cudaStreamNonBlocking), cudaSuccess);
+			for (size_t image = 0; image < cropped.size(); ++image) {
+				ASSERT_EQ(cudaStreamWaitEvent(
+				              consumer, static_cast<cudaEvent_t>(projected.cuda_image_completion_event(image)), 0),
+				          cudaSuccess);
+				EXPECT_EQ(cudaMemcpyAsync(actual.data() + image * 3U * spatial,
+				                          projected.y_float_coefficients_async() + image * 3U * spatial,
+				                          3U * spatial * sizeof(float),
+				                          cudaMemcpyDeviceToHost,
+				                          consumer),
+				          cudaSuccess);
+			}
+			EXPECT_EQ(cudaStreamSynchronize(consumer), cudaSuccess);
+			EXPECT_EQ(cudaStreamDestroy(consumer), cudaSuccess);
 			for (size_t image = 0; image < 4; ++image) {
 				for (size_t channel = 0; channel < spec.output_channels.size(); ++channel) {
 					const auto& entry = spec.output_channels[channel];

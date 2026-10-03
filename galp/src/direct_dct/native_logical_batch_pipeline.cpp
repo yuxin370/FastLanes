@@ -134,6 +134,7 @@ void hash_options(StableFingerprint& hash, const jpeg::JpegDctDeviceBatchOptions
 	hash.integral(options.cache_capacity_bytes);
 	hash.integral(options.decode_batch_rowgroups);
 	hash.integral(options.plan_cache_capacity);
+	hash.integral(options.output_batch_images);
 	hash.integral(options.enable_rowgroup_prefetch);
 	hash.integral(options.rowgroup_prefetch_depth);
 	hash.integral(options.rowgroup_prefetch_workers);
@@ -319,6 +320,9 @@ public:
 	}
 
 	[[nodiscard]] size_t materialized_output_bytes(const Batch& batch) const {
+		if (batch.device_batch().projected_shape()[1] != 0) {
+			return batch.projected_tensor_async().element_count() * sizeof(float);
+		}
 		const auto layout = batch.device_batch().layout();
 		if (layout != jpeg::JpegDctDeviceLayout::kYcbcrDctGrid &&
 		    layout != jpeg::JpegDctDeviceLayout::kTransformedDctGrid) {
