@@ -1383,6 +1383,7 @@ def _train_native_physical_epoch(
             "flip_key_digest": "native-owned-by-rgbnomore-training-pls-v1",
             "randaugment_digest": "native-owned-by-rgbnomore-training-pls-v1",
             "mixup_digest": "native-owned-by-rgbnomore-training-pls-v1",
+            "augmentation_digest_semantics": "ownership markers; augmentation hashes are not observed",
             "execution_backend": NATIVE_PHYSICAL_BACKEND,
             "native_crop_pushdown": True,
             "native_physical_order": True,
@@ -2360,6 +2361,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "flip_key_digest": flip_hash.hexdigest(),
             "randaugment_digest": randaugment_hash.hexdigest(),
             "mixup_digest": mixup_hash.hexdigest(),
+            "augmentation_digest_semantics": "crop/flip key streams and executed RandAugment/Mixup decision records",
             "audit": epoch_audit_summary(
                 resolved_audit_policy,
                 start_update=epoch_start_update,

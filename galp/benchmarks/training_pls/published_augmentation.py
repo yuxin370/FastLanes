@@ -616,25 +616,17 @@ def _apply_operation_batch(
     )
 
 
-def apply_published_randaugment(
-    inputs: tuple[torch.Tensor, torch.Tensor],
+def published_randaugment_records(
     *,
     training_seed: int,
     epoch: int,
     logical_sample_ids: Sequence[str],
-    rgbnomore_root: Path,
-) -> tuple[tuple[torch.Tensor, torch.Tensor], list[list[dict[str, Any]]]]:
-    """Apply exact keyed semantics, grouped by operation to avoid tiny GPU calls."""
-
-    y, cbcr = (normalized_to_published_int16(value) for value in inputs)
-    if len(logical_sample_ids) != y.shape[0] or y.shape[0] != cbcr.shape[0]:
-        raise ValueError("RandAugment identities do not match DCT batch cardinality")
-    dops = _dct_ops(rgbnomore_root)
+) -> list[list[dict[str, Any]]]:
+    """Logical decisions, independent of tensor execution and timing."""
     records: list[list[dict[str, Any]]] = [[] for _ in logical_sample_ids]
     available = [list(DCT_RANDAUGMENT_OPERATIONS) for _ in logical_sample_ids]
     chroma_operations = {"Grayscale", "Color", "AutoSaturation", "ChromaDrop"}
     for operation_index in range(2):
-        groups: dict[tuple[str, float], list[tuple[int, int]]] = defaultdict(list)
         for index, logical_id in enumerate(logical_sample_ids):
             key = randaugment_key(
                 training_seed=training_seed,
@@ -663,7 +655,6 @@ def apply_published_randaugment(
             if signed and stable_seed("dct-randaugment-sign", key) % 2:
                 magnitude *= -1.0
             internal_seed = stable_seed("dct-randaugment-internal", key)
-            groups[(operation, magnitude)].append((index, internal_seed))
             records[index].append(
                 {
                     "operation_index": operation_index,
@@ -673,6 +664,30 @@ def apply_published_randaugment(
                     "internal_seed": internal_seed,
                 }
             )
+    return records
+
+
+def apply_published_randaugment(
+    inputs: tuple[torch.Tensor, torch.Tensor],
+    *,
+    training_seed: int,
+    epoch: int,
+    logical_sample_ids: Sequence[str],
+    rgbnomore_root: Path,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], list[list[dict[str, Any]]]]:
+    """Apply exact keyed semantics, grouped by operation to avoid tiny GPU calls."""
+    y, cbcr = (normalized_to_published_int16(value) for value in inputs)
+    if len(logical_sample_ids) != y.shape[0] or y.shape[0] != cbcr.shape[0]:
+        raise ValueError("RandAugment identities do not match DCT batch cardinality")
+    dops = _dct_ops(rgbnomore_root)
+    records = published_randaugment_records(
+        training_seed=training_seed, epoch=epoch, logical_sample_ids=logical_sample_ids
+    )
+    for operation_index in range(2):
+        groups: dict[tuple[str, float], list[tuple[int, int]]] = defaultdict(list)
+        for index, sample_records in enumerate(records):
+            record = sample_records[operation_index]
+            groups[(record["operation"], record["magnitude"])].append((index, record["internal_seed"]))
         for (operation, magnitude), members in groups.items():
             indices = torch.as_tensor(
                 [index for index, _seed in members], device=y.device
@@ -690,16 +705,13 @@ def apply_published_randaugment(
     return ((y.float() + 4.0) / 1020.0, (cbcr.float() + 4.0) / 1020.0), records
 
 
-def apply_published_mixup(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-    labels: torch.Tensor,
+def published_mixup_record(
     *,
     training_seed: int,
     epoch: int,
     microbatch_index: int,
     alpha: float = 0.2,
-    classes: int = 1000,
-) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, dict[str, Any]]:
+) -> dict[str, Any]:
     key = mixup_key(
         training_seed=training_seed,
         epoch=epoch,
@@ -713,6 +725,29 @@ def apply_published_mixup(
         ).sort(descending=True).values
     original = float(components[0].item())
     rolled = float(components[1].item())
+    return {
+        "key": key,
+        "seed": generator_seed,
+        "lambda_original": original,
+        "lambda_rolled": rolled,
+        "pairing": "roll-by-one",
+    }
+
+
+def apply_published_mixup(
+    inputs: tuple[torch.Tensor, torch.Tensor],
+    labels: torch.Tensor,
+    *,
+    training_seed: int,
+    epoch: int,
+    microbatch_index: int,
+    alpha: float = 0.2,
+    classes: int = 1000,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, dict[str, Any]]:
+    record = published_mixup_record(
+        training_seed=training_seed, epoch=epoch, microbatch_index=microbatch_index, alpha=alpha
+    )
+    original, rolled = record["lambda_original"], record["lambda_rolled"]
     mixed_inputs = tuple(
         value * original + value.roll(1, dims=0) * rolled for value in inputs
     )
@@ -720,10 +755,4 @@ def apply_published_mixup(
         dtype=inputs[0].dtype
     )
     mixed_labels = one_hot * original + one_hot.roll(1, dims=0) * rolled
-    return mixed_inputs, mixed_labels, {
-        "key": key,
-        "seed": generator_seed,
-        "lambda_original": original,
-        "lambda_rolled": rolled,
-        "pairing": "roll-by-one",
-    }
+    return mixed_inputs, mixed_labels, record
