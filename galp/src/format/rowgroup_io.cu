@@ -3,10 +3,11 @@
 // ────────────────────────────────────────────────────────
 // galp/src/format/rowgroup_io.cu
 // ────────────────────────────────────────────────────────
-#include "format/rowgroup_io.cuh"
-#include "format/compact_descriptor_v3.hpp"
 #include "fls/expression/rpn.hpp"
+#include "format/compact_descriptor_v3.hpp"
+#include "format/rowgroup_io.cuh"
 #include "galp/errors.hpp"
+#include <algorithm>
 #include <flatbuffers/base.h>
 #include <limits>
 #include <span>
@@ -49,6 +50,18 @@ const std::string& zero_copy_column_name(const ZeroCopyColumn& col) {
 }
 
 fastlanes::SegmentView zero_copy_segment(const ZeroCopyColumn& col, const uint32_t segment_idx) {
+	if (col.selected_segments != nullptr) {
+		const auto* descriptor = col.column_descriptor->segment_descriptors()->Get(segment_idx);
+		const auto& views      = *col.selected_segments;
+		const auto  found =
+		    std::lower_bound(views.begin(), views.end(), descriptor, [](const auto& view, const auto* key) {
+			    return std::less<>()(view.first, key);
+		    });
+		if (found == views.end() || found->first != descriptor)
+			throw std::logic_error("selected segment view is absent");
+		return found->second;
+	}
+
 	if (col.column_view != nullptr) {
 		return col.column_view->GetSegment(segment_idx);
 	}
@@ -167,6 +180,7 @@ ZeroCopyColumn make_zero_copy_column_from_plan(const ZeroCopyRowgroup& rowgroup,
 	                            ? &(*rowgroup.rowgroup_view)[static_cast<fastlanes::n_t>(plan_col.column_index)]
 	                            : nullptr;
 	col.column_span       = rowgroup.backing_span;
+	col.selected_segments = rowgroup.selected_segments.get();
 	col.skip_decompress   = plan_col.skip_decompress;
 	col.alias_of          = plan_col.alias_of;
 	return col;

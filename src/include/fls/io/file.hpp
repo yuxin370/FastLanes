@@ -30,6 +30,7 @@ struct FileRangeReadTarget {
 	void* data   = nullptr;
 	n_t   offset = 0;
 	n_t   size   = 0;
+	std::span<const FileScatterReadTarget> scatter {};
 };
 
 struct FileRangeBatchReadResult {
@@ -71,6 +72,8 @@ public:
 	void ReadRange(void* dst, n_t offset, n_t size);
 	//
 	void ReadRangeUnchecked(void* dst, n_t offset, n_t size);
+	// Resolve the shared file handle once, then read discontiguous ranges with pread.
+	void ReadRangesUnchecked(std::span<const FileRangeReadTarget> targets);
 	// Read one contiguous file range directly into multiple destination spans.
 	// Returns the number of physical read syscalls issued.
 	n_t ReadScatterUnchecked(std::span<const FileScatterReadTarget> targets, n_t offset);

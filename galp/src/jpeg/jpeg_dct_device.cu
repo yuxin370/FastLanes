@@ -3497,6 +3497,44 @@ void compile_jpeg_dct_device_batch_io_impl(JpegDctDeviceBatchPlan& plan, JpegDct
 	const auto reader_key = [](const std::filesystem::path& path, const bool sparse) {
 		return path.lexically_normal().string() + (sparse ? "#sparse-vector" : "#rowgroup-only");
 	};
+	if (block_major_planless) {
+		// Forced sparse requests already need these indexes. Resolve independent
+		// rowgroups on the existing I/O workers before serial range compilation.
+		std::vector<JpegDctDeviceRowgroupPlan*> sparse_rowgroups;
+		for (auto& shard : *plan.shards) {
+			for (auto& rowgroup : shard.rowgroups) {
+				if (!rowgroup.has_vector_plan || !rowgroup.sparse_storage_read ||
+				    batch_unpack_n_vectors != kJpegDctDeviceUnpackNVectors || rowgroup.selected_vectors.empty()) {
+					continue;
+				}
+				const auto* path = rowgroup.source_fls_path == nullptr ? shard.fls_path : rowgroup.source_fls_path;
+				if (path == nullptr) {
+					throw std::runtime_error("JPEG DCT compiled I/O plan has no source path");
+				}
+				if (!rowgroup.prepared_reader) {
+					rowgroup.prepared_reader =
+					    block_major_reader(*path, true, rowgroup.source_shard_id, rowgroup.source_payload_crc64);
+				}
+				sparse_rowgroups.push_back(&rowgroup);
+			}
+		}
+		std::vector<double> endpoint_ms(sparse_rowgroups.size());
+		std::atomic<size_t> next_rowgroup {0U};
+		context.worker_pool.run(std::min(sparse_rowgroups.size(), std::max<size_t>(1U, plan.rowgroup_prefetch.workers)),
+		                        [&] {
+			                        for (;;) {
+				                        const auto index = next_rowgroup.fetch_add(1U, std::memory_order_relaxed);
+				                        if (index >= sparse_rowgroups.size()) {
+					                        return;
+				                        }
+				                        const auto  start    = Clock::now();
+				                        const auto& rowgroup = *sparse_rowgroups[index];
+				                        rowgroup.prepared_reader->sparse_vector_read_supported(rowgroup.rowgroup_index);
+				                        endpoint_ms[index] = elapsed_ms(start, Clock::now());
+			                        }
+		                        });
+		plan.sparse_endpoint_resolution_ms += std::accumulate(endpoint_ms.begin(), endpoint_ms.end(), 0.0);
+	}
 	if (!block_major_planless) {
 		for (auto& shard : *plan.shards) {
 			for (auto& rowgroup : shard.rowgroups) {
@@ -4321,7 +4359,8 @@ prepare_decoded_rowgroup_work_from_materialized(galp::execution::Rowgroup       
 	work.rowgroup_index = rowgroup_plan.rowgroup_index;
 	work.cache_key      = JpegDctDeviceDecodedRowgroupCacheKey {shard_id, rowgroup_plan.rowgroup_index};
 	work.rowgroup       = std::move(rowgroup);
-	work.logical_rowgroup_n_vecs = work.rowgroup.n_vecs;
+	work.logical_rowgroup_n_vecs =
+	    work.rowgroup.source_n_vecs != 0 ? work.rowgroup.source_n_vecs : work.rowgroup.n_vecs;
 	work.owns_rowgroup  = true;
 	// JPEG's projection/selected-vector path appends columns directly instead
 	// of using append_expressions(), so resolve external dictionaries here.
@@ -4354,7 +4393,7 @@ prepare_decoded_rowgroup_work_from_materialized(galp::execution::Rowgroup       
 	size_t                     selected_vector_count = 0;
 	JpegDctRuntimePolicyResult policy {};
 	const bool                 can_reuse_vector_plan = rowgroup_plan.has_vector_plan &&
-	                                   rowgroup_plan.full_vector_count == work.rowgroup.n_vecs &&
+	                                   rowgroup_plan.full_vector_count == work.logical_rowgroup_n_vecs &&
 	                                   cfg.unpack_n_vectors == kJpegDctDeviceUnpackNVectors;
 	if (can_reuse_vector_plan) {
 		work.selected_vectors = &rowgroup_plan.selected_vectors;
@@ -4430,6 +4469,13 @@ prepare_decoded_rowgroup_work_from_materialized(galp::execution::Rowgroup       
 	if (!work.decodes_full_rowgroup && work.rowgroup.packed_device_payload != nullptr &&
 	    std::getenv("GALP_VECTOR_BUNDLE_COMPACT_SELECTED") != nullptr) {
 		galp::runtime::compact_selected_vectors(work.rowgroup, *work.selected_vectors);
+		work.owned_decode_vectors.resize(work.rowgroup.n_vecs);
+		std::iota(work.owned_decode_vectors.begin(), work.owned_decode_vectors.end(), uint32_t {0});
+		work.decode_vectors = &work.owned_decode_vectors;
+	}
+	if (work.rowgroup.source_n_vecs != 0) {
+		if (!can_reuse_vector_plan || work.decodes_full_rowgroup || cfg.unpack_n_vectors != 1)
+			throw std::logic_error("compact read requires the selected-vector decode plan");
 		work.owned_decode_vectors.resize(work.rowgroup.n_vecs);
 		std::iota(work.owned_decode_vectors.begin(), work.owned_decode_vectors.end(), uint32_t {0});
 		work.decode_vectors = &work.owned_decode_vectors;
@@ -5470,12 +5516,16 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 						++end;
 					}
 				}
-				if (end - local > 1) {
+				if (end - local > 1 ||
+				    (plan && plan->backend() == galp::format::SparseVectorReadPlan::Backend::kBoundedSourceRanges &&
+				     plan->submission_backend() == galp::format::SparseVectorReadPlan::SubmissionBackend::kIoUring)) {
 					std::vector<const galp::format::SparseVectorReadPlan*> plans;
 					for (size_t i = local; i < end; ++i)
 						plans.push_back(misses[chunk.begin + i].rowgroup->compiled_sparse_read_plan.get());
 					std::vector<galp::format::ZeroCopyReadTiming> timings;
-					auto views = readers[miss_index]->read_rowgroups_zero_copy_compiled(plans, timings);
+					auto views = batch_unpack_n_vectors == 1 && selects_all_coefficients(selected_coefficients)
+					                 ? readers[miss_index]->read_rowgroups_zero_copy_compact(plans, timings)
+					                 : readers[miss_index]->read_rowgroups_zero_copy_compiled(plans, timings);
 					for (size_t i = local; i < end; ++i) {
 						results[i].rowgroup =
 						    readers[miss_index]->materialize_zero_copy_rowgroup(std::move(views[i - local]));

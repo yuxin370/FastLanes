@@ -55,23 +55,25 @@ struct SparseByteRange {
 };
 
 struct SparseRowgroupAccessIndex {
-	bool                                      supported = false;
-	std::string                               fallback_reason;
-	std::vector<SparseByteRange>              index_ranges;
-	std::vector<SparseByteRange>              shared_ranges;
-	// Segment-major cumulative endpoints retain the physical vector order without
-	// expanding an offset/size pair for every vector and segment.
-	std::vector<std::vector<size_t>> segment_offsets;
+	bool                         supported = false;
+	std::string                  fallback_reason;
+	std::vector<SparseByteRange> index_ranges;
+	std::vector<SparseByteRange> shared_ranges;
+	// Keep the file's compact cumulative endpoints in static_prefix. Only the
+	// segment base and the location/type of its endpoints need separate storage.
+	struct SegmentOffsets {
+		size_t                    data_offset;
+		size_t                    points_offset;
+		fastlanes::EntryPointType type;
+	};
+	std::vector<SegmentOffsets> segment_offsets;
 
-	[[nodiscard]] SparseByteRange vector_range(size_t segment, uint32_t first, uint32_t last) const {
-		const auto& offsets = segment_offsets[segment];
-		return {offsets[first], offsets[size_t(last) + 1U] - offsets[first]};
-	}
+	[[nodiscard]] SparseByteRange vector_range(size_t segment, uint32_t first, uint32_t last) const;
 	// For every logical column, identify its non-shared segment positions in
 	// segment_offsets. This lets a single sparse plan intersect spatial vectors
 	// with coefficient columns without rebuilding descriptor geometry.
-	std::vector<std::vector<size_t>>           column_vector_range_indices;
-	std::vector<std::byte>                    static_prefix;
+	std::vector<std::vector<size_t>> column_vector_range_indices;
+	std::vector<std::byte>           static_prefix;
 };
 
 struct SparseDatasetAccessIndex {
@@ -448,6 +450,15 @@ uint64_t entrypoint_value(const std::byte* const data,
 	}
 }
 
+SparseByteRange
+SparseRowgroupAccessIndex::vector_range(const size_t segment, const uint32_t first, const uint32_t last) const {
+	const auto&  offsets = segment_offsets[segment];
+	const auto*  points  = static_prefix.data() + offsets.points_offset;
+	const size_t begin   = first == 0U ? 0U : entrypoint_value(points, offsets.type, first - 1U);
+	const size_t end     = entrypoint_value(points, offsets.type, last);
+	return {offsets.data_offset + begin, end - begin};
+}
+
 size_t segment_entrypoint_count(const fastlanes::SegmentDescriptor& segment) {
 	const size_t point_width = fastlanes::sizeof_entry_point_type(segment.entry_point_t());
 	if (point_width == 0U || segment.entrypoint_size() % point_width != 0U) {
@@ -629,26 +640,56 @@ uint64_t sparse_selection_digest(const std::vector<uint64_t>& words) {
 
 std::shared_ptr<const SparseRowgroupAccessIndex>
 build_sparse_rowgroup_access_index(fastlanes::File& file, const fastlanes::RowgroupDescriptor& rowgroup) {
-	auto entry = std::make_shared<SparseRowgroupAccessIndex>();
+	auto       entry    = std::make_shared<SparseRowgroupAccessIndex>();
 	const auto segments = rowgroup_segment_descriptors(rowgroup);
 	if (!validate_sparse_vector_segments(rowgroup, segments, &entry->fallback_reason)) {
 		return entry;
 	}
-	entry->index_ranges = segment_index_ranges(segments);
-	const auto rowgroup_bytes = static_cast<size_t>(rowgroup.m_size());
-	// Only metadata ranges below are read. Do not fault/zero the full payload
-	// merely to retain its logical offsets while resolving entrypoints.
-	auto index_backing = std::make_unique_for_overwrite<std::byte[]>(rowgroup_bytes);
+	entry->index_ranges      = segment_index_ranges(segments);
+	const size_t index_bytes = total_range_bytes(entry->index_ranges);
+	entry->static_prefix.resize(index_bytes);
+	std::vector<size_t> packed_offsets;
+	packed_offsets.reserve(entry->index_ranges.size());
+	std::vector<fastlanes::FileRangeReadTarget> targets;
+	targets.reserve(entry->index_ranges.size());
+	size_t cursor = 0U;
 	for (const auto& range : entry->index_ranges) {
-		file.ReadRangeUnchecked(index_backing.get() + range.offset, rowgroup.m_offset() + range.offset, range.size);
+		packed_offsets.push_back(cursor);
+		targets.push_back({entry->static_prefix.data() + cursor, rowgroup.m_offset() + range.offset, range.size});
+		cursor += range.size;
 	}
-	entry->shared_ranges = segment_shared_ranges(segments, index_backing.get());
+	file.ReadRangesUnchecked(targets);
+	const auto packed_offset = [&](const size_t source_offset) {
+		const auto range = std::prev(std::upper_bound(
+		    entry->index_ranges.begin(),
+		    entry->index_ranges.end(),
+		    source_offset,
+		    [](const size_t offset, const SparseByteRange& candidate) { return offset < candidate.offset; }));
+		return packed_offsets[static_cast<size_t>(range - entry->index_ranges.begin())] + source_offset - range->offset;
+	};
+	for (const auto* segment : segments) {
+		if (segment_entrypoint_count(*segment) != 1U) {
+			continue;
+		}
+		const auto* points = entry->static_prefix.data() + packed_offset(segment->entrypoint_offset());
+		const auto  end    = entrypoint_value(points, segment->entry_point_t(), 0U);
+		if (end > segment->data_size()) {
+			throw std::runtime_error("invalid shared entrypoint in sparse vector bundle");
+		}
+		entry->shared_ranges.push_back({static_cast<size_t>(segment->data_offset()), static_cast<size_t>(end)});
+	}
+	entry->shared_ranges      = coalesce_ranges(std::move(entry->shared_ranges));
+	const size_t shared_bytes = total_range_bytes(entry->shared_ranges);
+	if (shared_bytes > std::numeric_limits<size_t>::max() - index_bytes) {
+		throw std::overflow_error("sparse static prefix byte count overflow");
+	}
+	entry->static_prefix.resize(index_bytes + shared_bytes);
+	targets.clear();
 	for (const auto& range : entry->shared_ranges) {
-		file.ReadRangeUnchecked(index_backing.get() + range.offset, rowgroup.m_offset() + range.offset, range.size);
+		targets.push_back({entry->static_prefix.data() + cursor, rowgroup.m_offset() + range.offset, range.size});
+		cursor += range.size;
 	}
-	entry->static_prefix     = pack_ranges(index_backing.get(), entry->index_ranges);
-	const auto shared_prefix = pack_ranges(index_backing.get(), entry->shared_ranges);
-	entry->static_prefix.insert(entry->static_prefix.end(), shared_prefix.begin(), shared_prefix.end());
+	file.ReadRangesUnchecked(targets);
 	const auto* columns = rowgroup.m_column_descriptors();
 	if (columns == nullptr) {
 		throw std::runtime_error("sparse rowgroup column descriptors are missing");
@@ -667,16 +708,16 @@ build_sparse_rowgroup_access_index(fastlanes::File& file, const fastlanes::Rowgr
 				continue;
 			}
 			entry->column_vector_range_indices[column_index].push_back(vector_range_index++);
-			const auto* points  = index_backing.get() + segment->entrypoint_offset();
-			auto&       offsets = entry->segment_offsets.emplace_back(size_t(rowgroup.m_n_vec()) + 1U);
-			offsets[0]          = segment->data_offset();
-			uint64_t previous   = 0;
+			const size_t points_offset = packed_offset(segment->entrypoint_offset());
+			const auto*  points        = entry->static_prefix.data() + points_offset;
+			entry->segment_offsets.push_back(
+			    {static_cast<size_t>(segment->data_offset()), points_offset, segment->entry_point_t()});
+			uint64_t previous = 0;
 			for (uint32_t vector = 0; vector < rowgroup.m_n_vec(); ++vector) {
 				const auto end = entrypoint_value(points, segment->entry_point_t(), vector);
 				if (end < previous || end > segment->data_size())
 					throw std::runtime_error("invalid cumulative entrypoint in sparse vector bundle");
-				offsets[size_t(vector) + 1U] = static_cast<size_t>(segment->data_offset() + end);
-				previous                     = end;
+				previous = end;
 			}
 		}
 	}
@@ -701,10 +742,11 @@ std::shared_ptr<const SparseRowgroupAccessIndex> sparse_rowgroup_access(
 	if (!dataset_index || rowgroup_index >= dataset_index->rowgroup_count) {
 		throw std::out_of_range("sparse rowgroup access index is out of range");
 	}
-	std::lock_guard<std::mutex> guard(dataset_index->mutex);
-	if (const auto found = dataset_index->rowgroups.find(rowgroup_index);
-	    found != dataset_index->rowgroups.end()) {
-		return found->second;
+	{
+		std::lock_guard<std::mutex> guard(dataset_index->mutex);
+		if (const auto found = dataset_index->rowgroups.find(rowgroup_index); found != dataset_index->rowgroups.end()) {
+			return found->second;
+		}
 	}
 	const auto* rowgroups = table_descriptor.m_rowgroup_descriptors();
 	const auto* rowgroup = rowgroups == nullptr
@@ -718,8 +760,10 @@ std::shared_ptr<const SparseRowgroupAccessIndex> sparse_rowgroup_access(
 	} else {
 		built = build_sparse_rowgroup_access_index(file, *rowgroup);
 	}
-	dataset_index->rowgroups.emplace(rowgroup_index, built);
-	return built;
+	// Independent rowgroups may resolve their metadata concurrently. Publish only
+	// after construction; a concurrent request for this same rowgroup can reuse it.
+	std::lock_guard<std::mutex> guard(dataset_index->mutex);
+	return dataset_index->rowgroups.emplace(rowgroup_index, std::move(built)).first->second;
 }
 
 fastlanes::TableDescriptorHandle load_table_descriptor(fastlanes::File&              file,
@@ -1785,6 +1829,7 @@ struct SparseVectorReadPlan::Impl {
 	size_t                         storage_bytes        = 0U;
 	size_t                         selected_storage_bytes = 0U;
 	std::vector<uint8_t>           materialized_columns;
+	std::vector<uint32_t>                                    selected_vectors;
 	Strategy                       strategy             = Strategy::kFullRowgroup;
 	std::string                    fallback_reason;
 	std::vector<detail::SparseByteRange> exact_source_ranges;
@@ -2715,6 +2760,7 @@ SparseVectorReadPlan FlsReader::compile_sparse_vector_read_plan(
 	plan->rowgroup_bytes        = rowgroup_bytes;
 	plan->full_vector_count     = vector_count;
 	plan->selected_vector_count = vectors.size();
+	plan->selected_vectors                                    = vectors;
 	plan->materialized_columns  = materialized_columns;
 	const auto recipe_lookup_begin = std::chrono::steady_clock::now();
 	const auto selection_words = detail::sparse_selection_words(vector_count, vectors);
@@ -3389,13 +3435,16 @@ void FlsReader::read_rowgroup_bytes_selected_columns_into(const size_t          
 	}
 }
 
-ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t          rowgroup_idx,
-                                                                 std::shared_ptr<void> backing_owner,
-                                                                 std::byte* const      backing_data,
-                                                                 const size_t          backing_capacity,
-                                                                 const bool            backing_is_pinned,
-	                                                             ZeroCopyReadTiming*   timing,
-	                                                             const bool prefer_compact_direct_geometry) {
+ZeroCopyRowgroup
+FlsReader::make_zero_copy_rowgroup_from_backing(const size_t          rowgroup_idx,
+                                                std::shared_ptr<void> backing_owner,
+                                                std::byte* const      backing_data,
+                                                const size_t          backing_capacity,
+                                                const bool            backing_is_pinned,
+                                                ZeroCopyReadTiming*   timing,
+                                                const bool            prefer_compact_direct_geometry,
+                                                std::shared_ptr<const SelectedSegmentViews> selected_segments,
+                                                size_t                                      selected_n_vecs) {
 	const auto  setup_start = std::chrono::steady_clock::now();
 	OwnedCompactRowgroupDescriptor compact_rowgroup;
 	std::shared_ptr<const CompactV3DirectRowgroup> compact_direct;
@@ -3430,8 +3479,9 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 	if (rg == nullptr && compact_direct == nullptr) {
 		throw std::runtime_error("rowgroup descriptor is missing");
 	}
-	const size_t rg_bytes = compact_direct != nullptr ? compact_direct->record.payload_size
-	                                                : static_cast<size_t>(rg->m_size());
+	const size_t rg_bytes = selected_segments != nullptr ? backing_capacity
+	                        : compact_direct != nullptr  ? compact_direct->record.payload_size
+	                                                     : static_cast<size_t>(rg->m_size());
 	if ((rg_bytes != 0U && backing_data == nullptr) || backing_capacity < rg_bytes) {
 		throw std::runtime_error("external rowgroup backing is null or too small");
 	}
@@ -3441,10 +3491,13 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 		backing_owner.reset();
 	}
 
-	const size_t n_vecs   = compact_direct != nullptr ? 1U : static_cast<size_t>(rg->m_n_vec());
+	const size_t n_vecs   = selected_segments != nullptr ? selected_n_vecs
+	                        : compact_direct != nullptr  ? 1U
+	                                                     : static_cast<size_t>(rg->m_n_vec());
 	const size_t n_values = n_vecs * galp::codec::consts::VALUES_PER_VECTOR;
-	const size_t n_tuples = compact_direct != nullptr ? compact_direct->record.real_row_count
-	                                                : static_cast<size_t>(rg->m_n_tuples());
+	const size_t n_tuples = selected_segments != nullptr ? n_values
+	                        : compact_direct != nullptr  ? compact_direct->record.real_row_count
+	                                                     : static_cast<size_t>(rg->m_n_tuples());
 
 	auto backing_span = fastlanes::span<std::byte> {effective_backing_data, rg_bytes};
 	const auto* col_descs = rg == nullptr ? nullptr : rg->m_column_descriptors();
@@ -3455,7 +3508,7 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 	      detail::rowgroup_matches_zero_copy_plan(*rg, m_zero_copy_schema_plan->columns)));
 
 	std::shared_ptr<fastlanes::RowgroupView> view;
-	if (!use_schema_plan && compact_direct == nullptr) {
+	if (!use_schema_plan && compact_direct == nullptr && selected_segments == nullptr) {
 		if (rg == nullptr) {
 			throw std::runtime_error("zero-copy rowgroup fallback descriptor is missing");
 		}
@@ -3463,6 +3516,7 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 	}
 
 	ZeroCopyRowgroup out {};
+	out.selected_segments         = std::move(selected_segments);
 	out.rowgroup_index         = rowgroup_idx;
 	out.n_values               = n_values;
 	out.n_vecs                 = n_vecs;
@@ -3578,8 +3632,9 @@ ZeroCopyRowgroup FlsReader::make_zero_copy_rowgroup_from_backing(const size_t   
 		col.name              = (m_load_column_names && col_desc.name()) ? col_desc.name()->str() : std::string {};
 		col.token             = ops->Get(0);
 		col.column_descriptor = &col_desc;
+		col.selected_segments = out.selected_segments.get();
 		col.operand_tokens    = rpn->operand_tokens();
-		col.column_view       = &(*view)[static_cast<fastlanes::n_t>(col_idx)];
+		col.column_view       = view != nullptr ? &(*view)[static_cast<fastlanes::n_t>(col_idx)] : nullptr;
 		col.column_span       = backing_span;
 		if (col.token == fastlanes::OperatorToken::EXP_EQUAL && col.operand_tokens && col.operand_tokens->size() >= 1) {
 			col.skip_decompress = true;
@@ -4216,6 +4271,342 @@ ZeroCopyRowgroup FlsReader::read_rowgroup_zero_copy_selected_vectors_packed(
 	                                                      timing);
 	zero_copy.packed_device_payload = std::move(device_payload);
 	return zero_copy;
+}
+
+std::vector<ZeroCopyRowgroup>
+FlsReader::read_rowgroups_zero_copy_compact(const std::vector<const SparseVectorReadPlan*>& plans,
+                                            std::vector<ZeroCopyReadTiming>&                timings) {
+	bool     compact_supported = true;
+	uint32_t queue_depth       = 0;
+	for (const auto* compiled : plans) {
+		if (!compiled || !compiled->impl_ || compiled->impl_->owner != m_sparse_plan_owner)
+			throw std::invalid_argument("compact sparse plan is empty or belongs to a different reader");
+		const auto& plan = *compiled->impl_;
+		if (plan.strategy != SparseVectorReadPlan::Impl::Strategy::kBoundedSourceRanges ||
+		    plan.submission_backend != SparseVectorReadPlan::SubmissionBackend::kIoUring ||
+		    (queue_depth != 0 && plan.io_uring_queue_depth != queue_depth))
+			throw std::invalid_argument("compact sparse reads require bounded io_uring plans with equal queue depth");
+		queue_depth          = plan.io_uring_queue_depth;
+		const auto* rowgroup = table_descriptor()->m_rowgroup_descriptors()->Get(plan.rowgroup_index);
+		// Projected/nested columns and partial tail rowgroups retain their existing
+		// representation; only complete flat vector-addressable rowgroups compact.
+		// Recipe access restores the static prefix without per-segment geometry.
+		compact_supported &=
+		    !plan.recipe_hit && plan.materialized_columns.empty() &&
+		    rowgroup->m_n_tuples() == size_t(rowgroup->m_n_vec()) * galp::codec::consts::VALUES_PER_VECTOR;
+		for (const auto* column : *rowgroup->m_column_descriptors()) {
+			compact_supported &= column->children() == nullptr || column->children()->size() == 0;
+			if (const auto* segments = column->segment_descriptors())
+				for (const auto* segment : *segments)
+					compact_supported &= segment->entry_point_t() != fastlanes::EntryPointType::UINT64;
+		}
+	}
+	if (!compact_supported)
+		return read_rowgroups_zero_copy_compiled(plans, timings);
+	std::vector<ZeroCopyRowgroup>                              result;
+	std::vector<fastlanes::FileRangeReadTarget>                targets;
+	std::vector<std::vector<fastlanes::FileScatterReadTarget>> scatter_targets;
+	std::vector<std::unique_ptr<std::byte[]>>                  discard_buffers;
+	timings.assign(plans.size(), {});
+	size_t read_bytes = 0;
+	for (size_t index = 0; index < plans.size(); ++index) {
+		const auto  setup_start = std::chrono::steady_clock::now();
+		const auto& plan        = *plans[index]->impl_;
+		const auto& access      = *plan.access;
+		const auto* original    = table_descriptor()->m_rowgroup_descriptors()->Get(plan.rowgroup_index);
+		const auto  segments    = detail::rowgroup_segment_descriptors(*original);
+		std::vector<fastlanes::SegmentDescriptorT> compact_segments(segments.size());
+		// Metadata is small. Only selected compressed payload ranges receive storage.
+		struct ReadRange {
+			size_t destination;
+			size_t source;
+			size_t bytes;
+		};
+		struct PrefixCopy {
+			size_t           destination;
+			const std::byte* source;
+			size_t           bytes;
+		};
+		std::vector<ReadRange>  reads;
+		std::vector<PrefixCopy> copies;
+		std::vector<ReadRange>  entrypoint_copies;
+		std::vector<std::byte>  compact_index;
+		size_t                  index_bytes = 0;
+		for (const auto* segment : segments)
+			index_bytes += fastlanes::sizeof_entry_point_type(segment->entry_point_t()) *
+			               (detail::segment_entrypoint_count(*segment) == 1 ? 1 : plan.selected_vector_count);
+		compact_index.reserve(index_bytes);
+		const auto allocate_points = [&](size_t destination, size_t size) {
+			const size_t source = compact_index.size();
+			compact_index.resize(source + size);
+			entrypoint_copies.push_back({destination, source, size});
+			return std::span<std::byte>(compact_index.data() + source, size);
+		};
+		size_t cursor = 0, vector_segment = 0;
+		struct PrefixRange {
+			size_t offset, size, packed;
+		};
+		std::vector<PrefixRange> prefix_ranges;
+		size_t                   prefix_cursor = 0;
+		for (const auto* ranges : {&access.index_ranges, &access.shared_ranges}) {
+			for (const auto& range : *ranges) {
+				prefix_ranges.push_back({range.offset, range.size, prefix_cursor});
+				prefix_cursor += range.size;
+			}
+		}
+		std::sort(prefix_ranges.begin(), prefix_ranges.end(), [](const auto& a, const auto& b) {
+			return a.offset < b.offset;
+		});
+		const auto prefix_at = [&](const size_t offset, const size_t size) {
+			auto it = std::upper_bound(prefix_ranges.begin(),
+			                           prefix_ranges.end(),
+			                           offset,
+			                           [](const size_t key, const auto& range) { return key < range.offset; });
+			if (it == prefix_ranges.begin())
+				throw std::logic_error("compact prefix offset is absent");
+			--it;
+			if (offset - it->offset + size > it->size)
+				throw std::logic_error("compact prefix range is absent");
+			return access.static_prefix.data() + it->packed + offset - it->offset;
+		};
+		std::unordered_map<const fastlanes::SegmentDescriptor*, std::vector<std::byte>> compact_shared;
+		for (const auto* column : *original->m_column_descriptors()) {
+			const auto token = column->encoding_rpn()->operator_tokens()->Get(0);
+			if (token != fastlanes::OperatorToken::EXP_CROSS_RLE_I08 &&
+			    token != fastlanes::OperatorToken::EXP_CROSS_RLE_I16)
+				continue;
+			const auto*  operands    = column->encoding_rpn()->operand_tokens();
+			const auto*  values      = column->segment_descriptors()->Get(operands->Get(operands->size() - 2));
+			const auto*  lengths     = column->segment_descriptors()->Get(operands->Get(operands->size() - 1));
+			const size_t value_width = token == fastlanes::OperatorToken::EXP_CROSS_RLE_I08 ? 1 : 2;
+			const size_t value_bytes = detail::entrypoint_value(
+			    prefix_at(values->entrypoint_offset(), fastlanes::sizeof_entry_point_type(values->entry_point_t())),
+			    values->entry_point_t(),
+			    0);
+			const size_t length_bytes = detail::entrypoint_value(
+			    prefix_at(lengths->entrypoint_offset(), fastlanes::sizeof_entry_point_type(lengths->entry_point_t())),
+			    lengths->entry_point_t(),
+			    0);
+			const size_t run_count = length_bytes / sizeof(uint32_t);
+			if (length_bytes % sizeof(uint32_t) != 0 || value_bytes / value_width < run_count)
+				throw std::runtime_error("invalid compact CROSS_RLE shared segments");
+			const auto* source_values    = prefix_at(values->data_offset(), value_bytes);
+			const auto* source_lengths   = prefix_at(lengths->data_offset(), length_bytes);
+			auto&       selected_values  = compact_shared[values];
+			auto&       selected_lengths = compact_shared[lengths];
+			size_t      run = 0, run_start = 0;
+			const auto  run_length = [&]() {
+                if (run >= run_count)
+                    throw std::runtime_error("compact CROSS_RLE runs do not cover selected vectors");
+                uint32_t length;
+                std::memcpy(&length, source_lengths + run * sizeof(length), sizeof(length));
+                if (length == 0 || length > std::numeric_limits<size_t>::max() - run_start)
+                    throw std::runtime_error("invalid compact CROSS_RLE run length");
+                return length;
+			};
+			for (const auto vector : plan.selected_vectors) {
+				const size_t begin = size_t(vector) * galp::codec::consts::VALUES_PER_VECTOR;
+				const size_t end   = begin + galp::codec::consts::VALUES_PER_VECTOR;
+				while (run_start + run_length() <= begin)
+					run_start += run_length(), ++run;
+				size_t position = begin;
+				while (position < end) {
+					const size_t next   = std::min(end, run_start + run_length());
+					uint32_t     length = next - position;
+					const auto*  value  = source_values + run * value_width;
+					if (!selected_values.empty() &&
+					    std::memcmp(
+					        selected_values.data() + selected_values.size() - value_width, value, value_width) == 0) {
+						uint32_t previous;
+						std::memcpy(&previous,
+						            selected_lengths.data() + selected_lengths.size() - sizeof(previous),
+						            sizeof(previous));
+						length += previous;
+						std::memcpy(selected_lengths.data() + selected_lengths.size() - sizeof(length),
+						            &length,
+						            sizeof(length));
+					} else {
+						selected_values.insert(selected_values.end(), value, value + value_width);
+						const auto* bytes = reinterpret_cast<const std::byte*>(&length);
+						selected_lengths.insert(selected_lengths.end(), bytes, bytes + sizeof(length));
+					}
+					position = next;
+					if (position == run_start + run_length() && position < end)
+						run_start += run_length(), ++run;
+				}
+			}
+		}
+		for (size_t segment_index = 0; segment_index < segments.size(); ++segment_index) {
+			const auto&  source           = *segments[segment_index];
+			auto&        destination      = compact_segments[segment_index];
+			const bool   shared           = detail::segment_entrypoint_count(source) == 1;
+			const size_t width            = fastlanes::sizeof_entry_point_type(source.entry_point_t());
+			cursor                        = (cursor + 7) & ~size_t(7);
+			destination.entrypoint_offset = cursor;
+			destination.entrypoint_size   = width * (shared ? 1 : plan.selected_vectors.size());
+			cursor += destination.entrypoint_size;
+			cursor                  = (cursor + 7) & ~size_t(7);
+			destination.data_offset = cursor;
+			if (shared) {
+				const auto*  point    = prefix_at(source.entrypoint_offset(), width);
+				const auto   remapped = compact_shared.find(&source);
+				const size_t bytes    = remapped != compact_shared.end()
+				                            ? remapped->second.size()
+				                            : detail::entrypoint_value(point, source.entry_point_t(), 0);
+				if (remapped != compact_shared.end()) {
+					auto points = allocate_points(destination.entrypoint_offset, width);
+					std::memcpy(points.data(), &bytes, width);
+				} else {
+					copies.push_back({destination.entrypoint_offset, point, width});
+				}
+				if (bytes != 0)
+					copies.push_back({cursor,
+					                  remapped != compact_shared.end() ? remapped->second.data()
+					                                                   : prefix_at(source.data_offset(), bytes),
+					                  bytes});
+				cursor += bytes;
+			} else {
+				const auto current_segment = vector_segment++;
+				auto       points = allocate_points(destination.entrypoint_offset, destination.entrypoint_size);
+				for (size_t vector_index = 0; vector_index < plan.selected_vectors.size(); ++vector_index) {
+					const auto   vector = plan.selected_vectors[vector_index];
+					const auto   range  = access.vector_range(current_segment, vector, vector);
+					const size_t bytes  = range.size;
+					if (bytes != 0) {
+						if (!reads.empty() && reads.back().source + reads.back().bytes == range.offset &&
+						    reads.back().destination + reads.back().bytes == cursor) {
+							reads.back().bytes += bytes;
+						} else {
+							reads.push_back({cursor, range.offset, bytes});
+						}
+					}
+					cursor += bytes;
+					const uint64_t end = cursor - destination.data_offset;
+					std::memcpy(points.data() + vector_index * width, &end, width);
+				}
+			}
+			destination.data_size = cursor - destination.data_offset;
+		}
+		auto  backing = std::make_shared<fastlanes::Buf>(cursor);
+		auto* data    = reinterpret_cast<std::byte*>(backing->mutable_data());
+		for (const auto& copy : entrypoint_copies)
+			std::memcpy(data + copy.destination, compact_index.data() + copy.source, copy.bytes);
+		for (const auto& copy : copies)
+			std::memcpy(data + copy.destination, copy.source, copy.bytes);
+		auto selected_views = std::make_shared<SelectedSegmentViews>();
+		selected_views->reserve(segments.size());
+		for (size_t i = 0; i < segments.size(); ++i) {
+			const auto&                   segment = compact_segments[i];
+			auto*                         points  = data + segment.entrypoint_offset;
+			fastlanes::entry_point_view_t view;
+			switch (segments[i]->entry_point_t()) {
+			case fastlanes::EntryPointType::UINT8:
+				view =
+				    fastlanes::EntryPointView<uint8_t>({reinterpret_cast<uint8_t*>(points), segment.entrypoint_size});
+				break;
+			case fastlanes::EntryPointType::UINT16:
+				view = fastlanes::EntryPointView<uint16_t>(
+				    {reinterpret_cast<uint16_t*>(points), segment.entrypoint_size / 2});
+				break;
+			case fastlanes::EntryPointType::UINT32:
+				view = fastlanes::EntryPointView<uint32_t>(
+				    {reinterpret_cast<uint32_t*>(points), segment.entrypoint_size / 4});
+				break;
+			default:
+				throw std::runtime_error("unsupported compact segment entrypoint type");
+			}
+			selected_views->emplace_back(
+			    segments[i], fastlanes::SegmentView {std::move(view), {data + segment.data_offset, segment.data_size}});
+		}
+		std::sort(selected_views->begin(), selected_views->end(), [](const auto& a, const auto& b) {
+			return std::less<>()(a.first, b.first);
+		});
+		auto& timing = timings[index];
+		timing.zero_copy_view_setup_ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count();
+		std::sort(reads.begin(), reads.end(), [](const auto& a, const auto& b) { return a.source < b.source; });
+		auto   discard        = std::make_unique_for_overwrite<std::byte[]>(plan.merged_gap_bytes);
+		size_t discard_cursor = 0, selected_range = 0;
+		for (const auto& physical : plan.source_ranges) {
+			std::vector<fastlanes::FileScatterReadTarget> spans;
+			size_t                                        position          = physical.offset;
+			const size_t                                  end               = position + physical.size;
+			size_t                                        submission_offset = position;
+			while (position < end) {
+				while (selected_range < reads.size() &&
+				       reads[selected_range].source + reads[selected_range].bytes <= position)
+					++selected_range;
+				if (selected_range == reads.size() || position < reads[selected_range].source) {
+					const size_t next =
+					    selected_range == reads.size() ? end : std::min(end, reads[selected_range].source);
+					if (next - position > plan.merged_gap_bytes - discard_cursor)
+						throw std::logic_error("compact read gap exceeds physical plan");
+					spans.push_back({discard.get() + discard_cursor, next - position});
+					discard_cursor += next - position;
+					position = next;
+				} else {
+					const auto&  read = reads[selected_range];
+					const size_t next = std::min(end, read.source + read.bytes);
+					spans.push_back({data + read.destination + position - read.source, next - position});
+					position = next;
+				}
+				// Linux READV accepts at most 1024 spans per request. Preserve
+				// the same physical bytes when a highly fragmented run exceeds it.
+				if (spans.size() == 1024U || position == end) {
+					scatter_targets.push_back(std::move(spans));
+					targets.push_back({nullptr,
+					                   original->m_offset() + submission_offset,
+					                   position - submission_offset,
+					                   scatter_targets.back()});
+					spans.clear();
+					submission_offset = position;
+					++timing.io_uring_read_request_count;
+				}
+			}
+			timing.storage_bytes += physical.size;
+		}
+		discard_buffers.push_back(std::move(discard));
+		timing.io_uring_completion_count = timing.io_uring_read_request_count;
+		timing.used_io_uring             = true;
+		timing.used_bounded_gap_read     = true;
+		timing.merged_gap_bytes          = plan.merged_gap_bytes;
+		read_bytes += timing.storage_bytes;
+		timing.selected_storage_bytes = plan.selected_storage_bytes;
+		timing.sparse_read_supported = timing.used_sparse_read = true;
+		auto view                 = make_zero_copy_rowgroup_from_backing(plan.rowgroup_index,
+                                                         backing,
+                                                         data,
+                                                         backing->Capacity(),
+                                                         false,
+                                                         &timing,
+                                                         false,
+                                                         selected_views,
+                                                         plan.selected_vector_count);
+		view.source_n_vecs        = plan.full_vector_count;
+		timing.full_storage_bytes = plan.rowgroup_bytes;
+		result.push_back(std::move(view));
+	}
+	if (plans.empty())
+		return result;
+	const auto start = std::chrono::steady_clock::now();
+	const auto read  = m_file->ReadRangesIoUringUnchecked(targets, plans.front()->impl_->io_uring_queue_depth);
+	const auto end   = std::chrono::steady_clock::now();
+	if (read.bytes != read_bytes || read.read_request_count < targets.size() ||
+	    read.completion_count != read.read_request_count)
+		throw std::runtime_error("compact sparse read byte count mismatch");
+	auto& shared = timings.front();
+	shared.io_uring_read_request_count += read.read_request_count - targets.size();
+	shared.io_uring_completion_count += read.completion_count - targets.size();
+	shared.io_uring_submit_syscall_count    = read.submit_syscall_count;
+	shared.io_uring_wait_syscall_count      = read.wait_syscall_count;
+	shared.io_uring_ring_mapped_bytes       = read.ring_mapped_bytes;
+	shared.io_uring_newly_mapped_ring_bytes = read.newly_mapped_ring_bytes;
+	shared.io_uring_ms = shared.pread_ms = std::chrono::duration<double, std::milli>(end - start).count();
+	for (auto& timing : timings) {
+		timing.pread_start = start;
+		timing.pread_end   = end;
+	}
+	return result;
 }
 
 std::vector<ZeroCopyRowgroup>

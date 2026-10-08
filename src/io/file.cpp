@@ -14,8 +14,9 @@
 #if !defined(_WIN32)
 #include <cerrno>
 #endif
+#include <climits>
 #include <cstddef>
-#include <cstdint>    // for int64_t
+#include <cstdint> // for int64_t
 #include <limits>
 #if defined(__linux__)
 #include <linux/io_uring.h>
@@ -168,6 +169,7 @@ struct FileIoUringState {
 			n_t        offset    = 0U;
 			n_t        size      = 0U;
 			n_t        completed = 0U;
+			std::vector<iovec> scatter;
 		};
 		std::vector<Pending> pending;
 		pending.reserve(targets.size());
@@ -177,7 +179,7 @@ struct FileIoUringState {
 			if (target.size == 0U) {
 				continue;
 			}
-			if (target.data == nullptr) {
+			if (target.data == nullptr && target.scatter.empty()) {
 				throw std::invalid_argument("io_uring read destination is null");
 			}
 			if (target.offset > static_cast<n_t>(std::numeric_limits<off_t>::max()) ||
@@ -186,51 +188,84 @@ struct FileIoUringState {
 				throw std::overflow_error("io_uring read range exceeds the supported offset/length domain");
 			}
 			stats.bytes += target.size;
-			pending.push_back(Pending {static_cast<std::byte*>(target.data), target.offset, target.size, 0U});
+			Pending item {static_cast<std::byte*>(target.data), target.offset, target.size, 0U, {}};
+			if (!target.scatter.empty()) {
+				if (target.scatter.size() > static_cast<size_t>(IOV_MAX))
+					throw std::invalid_argument("io_uring scatter target exceeds IOV_MAX");
+				n_t size = 0;
+				item.scatter.reserve(target.scatter.size());
+				for (const auto& span : target.scatter) {
+					if (span.data == nullptr || span.size == 0 || span.size > target.size - size)
+						throw std::invalid_argument("invalid io_uring scatter destination");
+					size += span.size;
+					item.scatter.push_back({span.data, static_cast<size_t>(span.size)});
+				}
+				if (size != target.size)
+					throw std::invalid_argument("io_uring scatter size mismatch");
+			}
+			pending.push_back(std::move(item));
 		}
 
 		// Reuse completion storage across queue-sized submissions. Clearing the
 		// entire request list for every submission made fragmented reads quadratic.
 		std::vector<int32_t> completions(pending.size(), std::numeric_limits<int32_t>::min());
-		for (size_t batch_begin = 0U; batch_begin < pending.size(); batch_begin += entries) {
-			const size_t batch_end = std::min(pending.size(), batch_begin + entries);
-			std::vector<size_t> active;
-			active.reserve(batch_end - batch_begin);
-			for (size_t index = batch_begin; index < batch_end; ++index) {
-				active.push_back(index);
-			}
-			while (!active.empty()) {
-				publish(active, fd, pending, file_path);
-				submit(active.size(), file_path, stats);
-
-				wait_and_collect(active.size(), completions, file_path, stats);
-				std::vector<size_t> retry;
-				retry.reserve(active.size());
-				for (const size_t index : active) {
-					const int32_t result = completions[index];
-					if (result == std::numeric_limits<int32_t>::min()) {
-						throw std::runtime_error("io_uring omitted a submitted completion: " + file_path.string());
-					}
-					if (result < 0) {
-						errno = -result;
-						throw make_io_error(file_path, "io_uring read failed");
-					}
-					if (result == 0) {
-						throw std::runtime_error("unexpected EOF while io_uring-reading: " + file_path.string());
-					}
-					auto& item = pending[index];
-					const n_t remaining = item.size - item.completed;
-					if (static_cast<n_t>(result) > remaining) {
-						throw std::runtime_error("io_uring completed more bytes than requested: " + file_path.string());
-					}
-					item.completed += static_cast<n_t>(result);
-					if (item.completed != item.size) {
-						completions[index] = std::numeric_limits<int32_t>::min();
-						retry.push_back(index);
-					}
+		try {
+			for (size_t batch_begin = 0U; batch_begin < pending.size(); batch_begin += entries) {
+				const size_t        batch_end = std::min(pending.size(), batch_begin + entries);
+				std::vector<size_t> active;
+				active.reserve(batch_end - batch_begin);
+				for (size_t index = batch_begin; index < batch_end; ++index) {
+					active.push_back(index);
 				}
-				active = std::move(retry);
+				while (!active.empty()) {
+					publish(active, fd, pending, file_path);
+					submit(active.size(), file_path, stats);
+
+					wait_and_collect(active.size(), completions, file_path, stats);
+					std::vector<size_t> retry;
+					retry.reserve(active.size());
+					for (const size_t index : active) {
+						const int32_t result = completions[index];
+						if (result == std::numeric_limits<int32_t>::min()) {
+							throw std::runtime_error("io_uring omitted a submitted completion: " + file_path.string());
+						}
+						if (result < 0) {
+							errno = -result;
+							throw make_io_error(file_path, "io_uring read failed");
+						}
+						if (result == 0) {
+							throw std::runtime_error("unexpected EOF while io_uring-reading: " + file_path.string());
+						}
+						auto&     item      = pending[index];
+						const n_t remaining = item.size - item.completed;
+						if (static_cast<n_t>(result) > remaining) {
+							throw std::runtime_error("io_uring completed more bytes than requested: " +
+							                         file_path.string());
+						}
+						item.completed += static_cast<n_t>(result);
+						if (item.completed != item.size) {
+							if (!item.scatter.empty()) {
+								size_t consumed = static_cast<size_t>(result), first = 0;
+								while (consumed >= item.scatter[first].iov_len) {
+									consumed -= item.scatter[first++].iov_len;
+								}
+								item.scatter.erase(item.scatter.begin(),
+								                   item.scatter.begin() + static_cast<std::ptrdiff_t>(first));
+								item.scatter.front().iov_base =
+								    static_cast<std::byte*>(item.scatter.front().iov_base) + consumed;
+								item.scatter.front().iov_len -= consumed;
+							}
+							completions[index] = std::numeric_limits<int32_t>::min();
+							retry.push_back(index);
+						}
+					}
+					active = std::move(retry);
+				}
 			}
+		} catch (...) {
+			// Cancel before destroying the iovec arrays referenced by submissions.
+			cleanup();
+			throw;
 		}
 		return stats;
 	}
@@ -288,11 +323,12 @@ private:
 			const uint32_t sqe_index = (tail + static_cast<uint32_t>(position)) & *sq_mask;
 			auto& sqe = sqes[sqe_index];
 			std::memset(&sqe, 0, sizeof(sqe));
-			sqe.opcode    = IORING_OP_READ;
+			sqe.opcode    = item.scatter.empty() ? IORING_OP_READ : IORING_OP_READV;
 			sqe.fd        = fd;
 			sqe.off       = item.offset + item.completed;
-			sqe.addr      = reinterpret_cast<uint64_t>(item.data + item.completed);
-			sqe.len       = static_cast<uint32_t>(item.size - item.completed);
+			sqe.addr      = item.scatter.empty() ? reinterpret_cast<uint64_t>(item.data + item.completed)
+			                                     : reinterpret_cast<uint64_t>(item.scatter.data());
+			sqe.len = static_cast<uint32_t>(item.scatter.empty() ? item.size - item.completed : item.scatter.size());
 			sqe.user_data = target_index;
 			sq_array[sqe_index] = sqe_index;
 		}
@@ -450,6 +486,19 @@ void File::ReadRangeUnchecked(void* dst, const n_t offset, const n_t size) {
 #else
 	open_read_handle();
 	pread_exact(m_fd, m_path, dst, offset, size);
+#endif
+}
+
+void File::ReadRangesUnchecked(const std::span<const FileRangeReadTarget> targets) {
+#if defined(_WIN32)
+	for (const auto& target : targets) {
+		ReadRangeUnchecked(target.data, target.offset, target.size);
+	}
+#else
+	open_read_handle();
+	for (const auto& target : targets) {
+		pread_exact(m_fd, m_path, target.data, target.offset, target.size);
+	}
 #endif
 }
 

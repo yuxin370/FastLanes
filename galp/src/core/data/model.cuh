@@ -121,6 +121,7 @@ struct Rowgroup {
 	// columns vector retains its original indexing for aliases/dictionaries.
 	std::vector<uint8_t> materialized_column_indices;
 	std::shared_ptr<const PackedRowgroupDevicePayload> packed_device_payload;
+	size_t                                             source_n_vecs = 0;
 };
 
 struct Table {

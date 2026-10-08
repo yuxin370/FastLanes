@@ -31,7 +31,10 @@ using HostColumnVariant = galp::execution::EncodedPayload;
 using Column            = galp::execution::Column;
 using Rowgroup          = galp::execution::Rowgroup;
 
+using SelectedSegmentViews = std::vector<std::pair<const fastlanes::SegmentDescriptor*, fastlanes::SegmentView>>;
+
 struct ZeroCopyColumn {
+	const SelectedSegmentViews*          selected_segments = nullptr;
 	size_t                               column_index = 0;
 	std::string                          name;
 	const std::string*                   name_ref          = nullptr;
@@ -77,6 +80,8 @@ struct ZeroCopyRowgroup {
 	// materialized; dependency columns are discovered recursively.
 	std::vector<uint8_t>                                                materialized_column_indices;
 	std::shared_ptr<const galp::execution::PackedRowgroupDevicePayload> packed_device_payload;
+	size_t                                                              source_n_vecs = 0;
+	std::shared_ptr<const SelectedSegmentViews>                         selected_segments;
 };
 
 struct ZeroCopyReadTiming {

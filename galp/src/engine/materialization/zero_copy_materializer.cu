@@ -26,6 +26,7 @@ Rowgroup materialize_zero_copy_rowgroup(ZeroCopyRowgroup zero_copy) {
 	const size_t column_count    = use_schema_plan ? schema_plan->columns.size() : zero_copy.columns.size();
 
 	Rowgroup out {zero_copy.n_values, zero_copy.n_vecs, zero_copy.n_tuples, {}};
+	out.source_n_vecs = zero_copy.source_n_vecs;
 	out.columns.resize(column_count);
 	out.materialized_column_indices = zero_copy.materialized_column_indices;
 	SmallBuildState build_state(column_count);

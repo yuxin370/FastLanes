@@ -197,13 +197,23 @@ public:
 	                                               size_t                      backing_capacity,
 	                                               ZeroCopyReadTiming*         timing = nullptr);
 
-	ZeroCopyRowgroup make_zero_copy_rowgroup_from_backing(size_t                rowgroup_idx,
-	                                                      std::shared_ptr<void> backing_owner,
-	                                                      std::byte*            backing_data,
-	                                                      size_t                backing_capacity,
-	                                                      bool                  backing_is_pinned = false,
-	                                                      ZeroCopyReadTiming*   timing            = nullptr,
-	                                                      bool                  prefer_compact_direct_geometry = false);
+	ZeroCopyRowgroup
+	make_zero_copy_rowgroup_from_backing(size_t                rowgroup_idx,
+	                                     std::shared_ptr<void> backing_owner,
+	                                     std::byte*            backing_data,
+	                                     size_t                backing_capacity,
+	                                     bool                  backing_is_pinned                       = false,
+	                                     ZeroCopyReadTiming*   timing                                  = nullptr,
+	                                     bool                  prefer_compact_direct_geometry          = false,
+	                                     std::shared_ptr<const SelectedSegmentViews> selected_segments = {},
+	                                     size_t                                      selected_n_vecs   = 0);
+
+	// Selected vectors have dense physical indices in the returned backing;
+	// source_n_vecs retains the logical vector count for decode/placement mapping.
+	// Projected/nested columns and partial tails keep the ordinary source layout.
+	std::vector<ZeroCopyRowgroup>
+	read_rowgroups_zero_copy_compact(const std::vector<const SparseVectorReadPlan*>& plans,
+	                                 std::vector<ZeroCopyReadTiming>&                timings);
 
 	ZeroCopyRowgroup read_rowgroup_zero_copy_into(size_t                rowgroup_idx,
 	                                              std::shared_ptr<void> backing_owner,

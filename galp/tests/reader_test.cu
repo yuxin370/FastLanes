@@ -21,6 +21,7 @@
 #include "fls/connection.hpp"
 #include "fls/expression/data_type.hpp"
 #include "fls/expression/rpn.hpp"
+#include "fls/footer/segment_descriptor.hpp"
 #include "fls/io/file.hpp"
 #include "fls/reader/table_reader.hpp"
 #include "fls/table/memory_table.hpp"
@@ -39,6 +40,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <limits>
@@ -307,7 +309,7 @@ std::filesystem::path make_sparse_vector_read_fixture() {
 	return fls_path;
 }
 
-std::filesystem::path make_sparse_vector_bundle_fixture() {
+std::filesystem::path make_sparse_vector_bundle_fixture(const size_t rowgroup_count = 1U) {
 	const auto root = reader_fixture_root("sparse_vector_bundle_ranges");
 	std::filesystem::remove_all(root);
 	std::filesystem::create_directories(root);
@@ -328,7 +330,7 @@ std::filesystem::path make_sparse_vector_bundle_fixture() {
 	}
 	{
 		std::ofstream csv(csv_path);
-		for (size_t row = 0; row < 8U * galp::codec::consts::VALUES_PER_VECTOR; ++row) {
+		for (size_t row = 0; row < rowgroup_count * 8U * galp::codec::consts::VALUES_PER_VECTOR; ++row) {
 			for (size_t column = 0; column < 8U; ++column) {
 				if (column != 0U) {
 					csv << '|';
@@ -1026,6 +1028,30 @@ TEST(SparseReadCoalescer, GreedyGapOrderIsOptimalUnderByteOnlyBudget) {
 	}
 }
 
+TEST(Reader, BatchedMetadataReadsPreserveDestinationsAndReportEof) {
+	const auto root = reader_fixture_root("batched_metadata");
+	std::filesystem::create_directories(root);
+	const auto        path   = root / "ranges.bin";
+	const std::string source = "0123456789abcdefghijklmnopqrstuv";
+	{
+		std::ofstream output(path, std::ios::binary);
+		output.write(source.data(), static_cast<std::streamsize>(source.size()));
+	}
+	fastlanes::File      file(path);
+	std::array<char, 12> first, second;
+	first.fill('!');
+	second.fill('!');
+	const std::array<fastlanes::FileRangeReadTarget, 2> targets {
+	    {{first.data() + 1, 3, 5}, {second.data() + 2, 21, 7}}};
+	file.ReadRangesUnchecked(targets);
+	EXPECT_EQ(std::string(first.data(), first.size()), "!34567!!!!!!");
+	EXPECT_EQ(std::string(second.data(), second.size()), "!!lmnopqr!!!");
+	const std::array<fastlanes::FileRangeReadTarget, 1> truncated {{{first.data() + 1, 28, 8}}};
+	EXPECT_THROW(file.ReadRangesUnchecked(truncated), std::runtime_error);
+	EXPECT_EQ(std::string(first.data(), 5), "!stuv");
+	EXPECT_EQ(first.back(), '!');
+}
+
 TEST(Reader, SparseVectorReadUsesPhysicalSegmentRangesAndReportsFallback) {
 	const auto              fls_path = make_sparse_vector_read_fixture();
 	galp::format::FlsReader reader(fls_path);
@@ -1150,9 +1176,167 @@ TEST(Reader, CompiledSparseVectorReadPlanMatchesSourceReadsAndIsReaderBound) {
 	EXPECT_THROW(other_reader.read_rowgroup_zero_copy_compiled(plan), std::invalid_argument);
 }
 
+TEST(Reader, DirectCompactSparseReadPreservesSelectedSegments) {
+	const auto                  fls_path = make_sparse_vector_bundle_fixture();
+	galp::format::FlsReader     reader(fls_path);
+	const std::vector<uint32_t> selected {1U, 3U, 4U, 6U};
+	const auto                  exact  = reader.compile_sparse_vector_read_plan(0U, selected);
+	const auto                  ranges = galp::format::coalesce_sparse_read_ranges_bounded(
+        {{0U, 0U, exact.full_storage_bytes(), exact.exact_source_ranges()}}, {});
+	const auto plan = exact.with_bounded_coalescing(
+	    ranges.rowgroups.front(), galp::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	std::vector<galp::format::ZeroCopyReadTiming> timings;
+	auto                    compact  = reader.read_rowgroups_zero_copy_compact({&plan, &plan}, timings);
+	const auto              original = reader.read_rowgroup_zero_copy(0U);
+	galp::format::FlsReader other_reader(fls_path);
+	std::vector<galp::format::ZeroCopyReadTiming> rejected_timings;
+	EXPECT_THROW(other_reader.read_rowgroups_zero_copy_compact({&plan}, rejected_timings), std::invalid_argument);
+	EXPECT_THROW(reader.read_rowgroups_zero_copy_compact({&exact}, rejected_timings), std::invalid_argument);
+	const auto ordinary = reader.read_rowgroup_zero_copy_compiled(plan);
+	EXPECT_EQ(ordinary.source_n_vecs, 0U);
+	EXPECT_EQ(ordinary.n_vecs, original.n_vecs);
+	for (size_t index = 0; index < compact.size(); ++index) {
+		const auto& actual = compact[index];
+		EXPECT_EQ(actual.n_vecs, selected.size());
+		EXPECT_EQ(actual.source_n_vecs, original.n_vecs);
+		EXPECT_LT(actual.backing_span.size(), original.backing_span.size());
+		EXPECT_EQ(timings[index].storage_bytes, plan.storage_bytes());
+		const auto* columns = original.rowgroup_descriptor->m_column_descriptors();
+		for (size_t column = 0; column < columns->size(); ++column) {
+			const auto*                  source_segments = columns->Get(column)->segment_descriptors();
+			galp::format::ZeroCopyColumn compact_column;
+			compact_column.column_descriptor = columns->Get(column);
+			compact_column.selected_segments = actual.selected_segments.get();
+			for (size_t segment = 0; segment < source_segments->size(); ++segment) {
+				const auto* descriptor = source_segments->Get(segment);
+				const bool  shared =
+				    descriptor->entrypoint_size() == fastlanes::sizeof_entry_point_type(descriptor->entry_point_t());
+				auto source = fastlanes::make_segment_view(original.backing_span, *descriptor);
+				auto target = galp::format::zero_copy_segment(compact_column, segment);
+				for (size_t vector = 0; vector < selected.size(); ++vector) {
+					source.PointTo(shared ? 0 : selected[vector]);
+					target.PointTo(shared ? 0 : vector);
+					ASSERT_EQ(source.Size(), target.Size());
+					EXPECT_EQ(std::memcmp(source.data, target.data, source.Size()), 0);
+				}
+			}
+		}
+	}
+}
+
+TEST(Reader, DirectCompactSparseReadClipsCrossRleRuns) {
+	const auto root = reader_fixture_root("compact_cross_rle");
+	std::filesystem::create_directories(root);
+	const auto          path = root / "data.fls";
+	std::vector<int8_t> values(8U * galp::codec::consts::VALUES_PER_VECTOR);
+	for (size_t row = 0; row < values.size(); ++row)
+		values[row] = static_cast<int8_t>((row / 1500U) % 3U);
+	const std::array<fastlanes::MemoryColumn, 1> columns {{{"value", std::span<const int8_t>(values)}}};
+	const fastlanes::MemoryTable                 table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions                options;
+	options.n_vectors_per_rowgroup = 8U;
+	options.force_schema           = true;
+	options.forced_schema          = {fastlanes::OperatorToken::EXP_CROSS_RLE_I08};
+	fastlanes::Connection writer;
+	fastlanes::load_memory_table(writer, table, options);
+	writer.to_fls(path);
+	galp::format::FlsReader     reader(path);
+	const std::vector<uint32_t> selected {0U, 2U, 3U, 7U};
+	const auto                  exact     = reader.compile_sparse_vector_read_plan(0, selected);
+	const auto                  coalesced = galp::format::coalesce_sparse_read_ranges_bounded(
+        {{0, 0, exact.full_storage_bytes(), exact.exact_source_ranges()}}, {});
+	const auto plan = exact.with_bounded_coalescing(
+	    coalesced.rowgroups.front(), galp::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	std::vector<galp::format::ZeroCopyReadTiming> timings;
+	const auto                                    compact = reader.read_rowgroups_zero_copy_compact({&plan}, timings);
+	ASSERT_EQ(compact.front().n_vecs, selected.size());
+	galp::format::ZeroCopyColumn column;
+	column.column_descriptor = compact.front().rowgroup_descriptor->m_column_descriptors()->Get(0);
+	column.selected_segments = compact.front().selected_segments.get();
+	const auto* operands     = column.column_descriptor->encoding_rpn()->operand_tokens();
+	auto        run_values   = galp::format::zero_copy_segment(column, operands->Get(operands->size() - 2));
+	auto        run_lengths  = galp::format::zero_copy_segment(column, operands->Get(operands->size() - 1));
+	run_values.PointTo(0);
+	run_lengths.PointTo(0);
+	std::vector<int8_t> decoded;
+	for (size_t run = 0; run < run_lengths.Size() / sizeof(uint32_t); ++run) {
+		uint32_t length;
+		std::memcpy(&length, run_lengths.data + run * sizeof(length), sizeof(length));
+		decoded.insert(decoded.end(), length, reinterpret_cast<const int8_t*>(run_values.data)[run]);
+	}
+	ASSERT_EQ(decoded.size(), selected.size() * galp::codec::consts::VALUES_PER_VECTOR);
+	for (size_t row = 0; row < decoded.size(); ++row)
+		EXPECT_EQ(decoded[row], values[size_t(selected[row / 1024U]) * 1024U + row % 1024U]);
+}
+
+TEST(Reader, IoUringScatterPreservesDestinationsAndShortReadBoundary) {
+	const auto             fls_path = make_sparse_vector_bundle_fixture();
+	fastlanes::File        file(fls_path);
+	std::vector<std::byte> expected(2048);
+	file.ReadRangeUnchecked(expected.data(), 0, expected.size());
+	std::array<std::byte, 23>                             first;
+	std::array<std::byte, 41>                             second;
+	std::array<std::byte, 7>                              third;
+	std::array<std::byte, 13>                             fourth;
+	std::array<std::byte, 17>                             contiguous;
+	const std::array<fastlanes::FileScatterReadTarget, 2> a {
+	    {{first.data(), first.size()}, {second.data(), second.size()}}};
+	const std::array<fastlanes::FileScatterReadTarget, 2> b {
+	    {{third.data(), third.size()}, {fourth.data(), fourth.size()}}};
+	const std::array<fastlanes::FileRangeReadTarget, 3> targets {
+	    {{nullptr, 32, 64, a}, {nullptr, 512, 20, b}, {contiguous.data(), 1024, contiguous.size()}}};
+	const auto result = file.ReadRangesIoUringUnchecked(targets, 2);
+	EXPECT_EQ(result.bytes, 101U);
+	EXPECT_EQ(result.read_request_count, 3U);
+	EXPECT_EQ(std::memcmp(first.data(), expected.data() + 32, first.size()), 0);
+	EXPECT_EQ(std::memcmp(second.data(), expected.data() + 55, second.size()), 0);
+	EXPECT_EQ(std::memcmp(third.data(), expected.data() + 512, third.size()), 0);
+	EXPECT_EQ(std::memcmp(fourth.data(), expected.data() + 519, fourth.size()), 0);
+	EXPECT_EQ(std::memcmp(contiguous.data(), expected.data() + 1024, contiguous.size()), 0);
+	std::array<std::byte, 5> tail_a;
+	std::array<std::byte, 9> tail_b;
+	tail_b.fill(std::byte {0x7f});
+	std::array<std::byte, 10> tail;
+	file.ReadRangeUnchecked(tail.data(), file.Size() - tail.size(), tail.size());
+	const std::array<fastlanes::FileScatterReadTarget, 2> spans {
+	    {{tail_a.data(), tail_a.size()}, {tail_b.data(), tail_b.size()}}};
+	const std::array<fastlanes::FileRangeReadTarget, 1> truncated {{{nullptr, file.Size() - 10, 14, spans}}};
+	EXPECT_THROW(file.ReadRangesIoUringUnchecked(truncated, 2), std::runtime_error);
+	EXPECT_EQ(std::memcmp(tail_a.data(), tail.data(), 5), 0);
+	EXPECT_EQ(std::memcmp(tail_b.data(), tail.data() + 5, 5), 0);
+	for (size_t i = 5; i < tail_b.size(); ++i)
+		EXPECT_EQ(tail_b[i], std::byte {0x7f});
+}
+
+TEST(Reader, ConcurrentSparseIndexPreparationPreservesSelectedReads) {
+	const auto              fls_path = make_sparse_vector_bundle_fixture(4U);
+	galp::format::FlsReader reader(fls_path);
+	galp::format::FlsReader reference(fls_path);
+	ASSERT_EQ(reader.rowgroup_count(), 4U);
+	std::promise<void>                                       ready;
+	const auto                                               start = ready.get_future().share();
+	std::vector<std::future<galp::format::ZeroCopyRowgroup>> reads;
+	const std::vector<size_t>                                rowgroups {0U, 1U, 0U, 2U, 3U, 1U};
+	for (const auto rowgroup : rowgroups) {
+		reads.push_back(std::async(std::launch::async, [&, rowgroup, start] {
+			start.wait();
+			const auto plan = reader.compile_sparse_vector_read_plan(rowgroup, {1U, 3U, 6U});
+			return reader.read_rowgroup_zero_copy_compiled(plan);
+		}));
+	}
+	ready.set_value();
+	for (size_t index = 0; index < reads.size(); ++index) {
+		const auto actual   = reads[index].get();
+		const auto expected = reference.read_rowgroup_zero_copy_selected_vectors(rowgroups[index], {1U, 3U, 6U});
+		ASSERT_EQ(actual.backing_span.size(), expected.backing_span.size());
+		EXPECT_EQ(std::memcmp(actual.backing_span.data(), expected.backing_span.data(), actual.backing_span.size()), 0);
+	}
+}
+
 TEST(Reader, CompiledSparseRunsPreserveAdjacentVectorsAndHoles) {
 	const auto              fls_path = make_sparse_vector_read_fixture();
 	galp::format::FlsReader reader(fls_path);
+	auto                    full = reader.read_rowgroup_zero_copy(0U);
 	for (const std::vector<uint32_t> selected :
 	     {std::vector<uint32_t> {6U, 2U, 3U, 4U, 2U}, std::vector<uint32_t> {0U, 1U, 6U, 7U}}) {
 		const auto                       plan = reader.compile_sparse_vector_read_plan(0U, selected);
@@ -1163,6 +1347,17 @@ TEST(Reader, CompiledSparseRunsPreserveAdjacentVectorsAndHoles) {
 		EXPECT_EQ(std::memcmp(actual.backing_span.data(), expected.backing_span.data(), actual.backing_span.size()), 0);
 		EXPECT_EQ(compiled_timing.storage_bytes, reference_timing.storage_bytes);
 		EXPECT_EQ(compiled_timing.pread_count, reference_timing.pread_count);
+		const auto* segments = full.rowgroup_descriptor->m_column_descriptors()->Get(0)->segment_descriptors();
+		for (const auto* segment : *segments) {
+			auto actual_segment = fastlanes::make_segment_view(actual.backing_span, *segment);
+			auto full_segment   = fastlanes::make_segment_view(full.backing_span, *segment);
+			for (const auto vector : selected) {
+				actual_segment.PointTo(vector);
+				full_segment.PointTo(vector);
+				ASSERT_EQ(actual_segment.Size(), full_segment.Size());
+				EXPECT_EQ(std::memcmp(actual_segment.data, full_segment.data, full_segment.Size()), 0);
+			}
+		}
 	}
 }
 
@@ -1341,6 +1536,37 @@ TEST(Reader, SparseReadRecipeRoundTripsAndPreservesReaderBinding) {
 	EXPECT_TRUE(miss_plan.uses_sparse_read());
 	galp::format::FlsReader other_reader(fls_path, options);
 	EXPECT_THROW(other_reader.read_rowgroup_zero_copy_compiled(recipe_plan), std::invalid_argument);
+}
+
+TEST(Reader, DirectCompactSparseReadPreservesRecipeBackedPlans) {
+	const auto         fls_path           = make_sparse_vector_read_fixture();
+	const auto         recipe_path        = fls_path.parent_path() / "compact.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0x1020304050607080);
+	(void)galp::format::write_sparse_read_recipe(fls_path, recipe_path, source_fingerprint, {{0U, {1U, 6U}}});
+
+	galp::format::FlsReaderOptions options;
+	options.sparse_read_recipe_path               = recipe_path;
+	options.sparse_read_recipe_source_fingerprint = source_fingerprint;
+	galp::format::FlsReader reader(fls_path, options);
+	const auto              exact = reader.compile_sparse_vector_read_plan(0U, {1U, 6U});
+	ASSERT_TRUE(exact.recipe_hit());
+	const auto ranges = galp::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, exact.full_storage_bytes(), exact.exact_source_ranges()}}, {});
+	const auto plan = exact.with_bounded_coalescing(
+	    ranges.rowgroups.front(), galp::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	ASSERT_TRUE(plan.recipe_hit());
+
+	std::vector<galp::format::ZeroCopyReadTiming> timings;
+	const auto                                    actual   = reader.read_rowgroups_zero_copy_compact({&plan}, timings);
+	const auto                                    expected = reader.read_rowgroup_zero_copy_compiled(plan);
+	ASSERT_EQ(actual.size(), 1U);
+	ASSERT_EQ(timings.size(), 1U);
+	EXPECT_EQ(actual.front().n_vecs, expected.n_vecs);
+	EXPECT_EQ(actual.front().source_n_vecs, expected.source_n_vecs);
+	ASSERT_EQ(actual.front().backing_span.size(), expected.backing_span.size());
+	EXPECT_EQ(
+	    std::memcmp(actual.front().backing_span.data(), expected.backing_span.data(), expected.backing_span.size()), 0);
+	EXPECT_EQ(timings.front().storage_bytes, plan.storage_bytes());
 }
 
 TEST(Reader, SparseReadRecipeRejectsIdentityCorruptionTruncationAndTrailingBytes) {
