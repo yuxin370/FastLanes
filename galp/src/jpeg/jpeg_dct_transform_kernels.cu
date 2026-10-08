@@ -621,7 +621,6 @@ transformed_dct_grid_integer_upsample_kernel(const DeviceCoeffBinding* __restric
 	// The general kernel retains its register/shared-memory footprint.
 	__shared__ float    source[64];
 	__shared__ float    intermediate[16 * 64];
-	__shared__ float    tile[16 * 64];
 	__shared__ uint64_t located_row;
 	__shared__ uint32_t located_binding;
 	const uint64_t      y_blocks         = uint64_t(y_output_width) * y_output_height;
@@ -713,8 +712,9 @@ transformed_dct_grid_integer_upsample_kernel(const DeviceCoeffBinding* __restric
 				}
 				__syncthreads();
 			}
+			// Compute in spatial store order so each thread writes its own result.
 			for (uint32_t t = threadIdx.x; t < ux * frequencies; t += blockDim.x) {
-				const auto x = t / frequencies, slot = t % frequencies;
+				const auto x = t % ux, slot = t / ux;
 				const auto f   = projection->frequencies[component][slot];
 				float      sum = 0.F;
 				for (uint32_t k = 0; k < 8; ++k) {
@@ -728,25 +728,21 @@ transformed_dct_grid_integer_upsample_kernel(const DeviceCoeffBinding* __restric
 						        phase_matrices, descriptor.y_phase_matrix_base, uy, 1, sy, oy + y, f / 8, k),
 						    sum);
 				}
-				tile[slot * ux + x] = dct_grid_add_rn(0.F, sum);
-			}
-			__syncthreads();
-			// Neighboring threads store neighboring spatial positions in each plane.
-			for (uint32_t t = threadIdx.x; t < ux * frequencies; t += blockDim.x)
 				store_planless_dct_grid_value(image,
 				                              component,
-				                              ox + t % ux,
+				                              ox + x,
 				                              oy + y,
 				                              y_output_width,
 				                              y_output_height,
 				                              cbcr_output_width,
 				                              cbcr_output_height,
-				                              projection->frequencies[component][t / ux],
-				                              tile[t],
+				                              f,
+				                              dct_grid_add_rn(0.F, sum),
 				                              true,
 				                              y_accum,
 				                              cbcr_accum,
 				                              projection);
+			}
 			__syncthreads();
 		}
 	}

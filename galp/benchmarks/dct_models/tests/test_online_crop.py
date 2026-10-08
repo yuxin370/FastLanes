@@ -97,11 +97,16 @@ class OnlineCropTest(unittest.TestCase):
                     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                     del batch
                     # Exercise direct projection independently of grid materialization.
-                    options["grid_transform"]["output_channels"] = [[0, 8, .5, 4.], [1, 0, -1., 2.]]
+                    # Interleave components and select multiple frequencies so
+                    # projected stores exercise both phase and channel ordering.
+                    options["grid_transform"]["output_channels"] = [
+                        [0, 8, .5, 4.], [1, 0, -1., 2.], [0, 63, 2., 8.], [2, 17, -2., 4.]]
                     batch = reader.read_prefetched(reader.prefetch_batch(
                         [position], transforms=[dict(crop=CROP, horizontal_flip=False)], **options))
                     projected = torch.stack(((expected[0, ..., 8] - .5) / 4.,
-                                             (expected[1, ..., 0] + 1.) / 2.))
+                                             (expected[1, ..., 0] + 1.) / 2.,
+                                             (expected[0, ..., 63] - 2.) / 8.,
+                                             (expected[2, ..., 17] + 2.) / 4.))
                     torch.testing.assert_close(batch.projected[0].cpu(), projected, atol=0, rtol=0)
                     del batch
 
