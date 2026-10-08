@@ -606,6 +606,9 @@ class FfcvAdapter(Adapter):
 
     def begin_repeat(self) -> None:
         if self._cold_iterator_primed:
+            # Priming precedes model-stream creation. FFCV must wait for its
+            # copies and protect reused buffers on the actual consumer stream.
+            self.iterator.current_stream = torch.cuda.current_stream(self.device)
             self._cold_iterator_primed = False
             return
         self.iterator = iter(self.loader)
