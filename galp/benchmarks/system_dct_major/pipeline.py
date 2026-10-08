@@ -368,6 +368,11 @@ class DaliAdapter(Adapter):
         execution = self.contract["execution"]
         config = self.contract["pipelines"][self.name]
         paths = [str(sample["path"]) for sample in self.samples]
+        if "l3" in config:
+            from galp.benchmarks.l3.codec import load_plugin
+            from galp.benchmarks.l3.prepare import encoded_path
+            load_plugin(config["l3"]["library"])
+            paths = [str(encoded_path(config["l3"]["root"], sample["sample_id"])) for sample in self.samples]
         ordinals = [int(sample["ordinal"]) for sample in self.samples]
         preprocess = self.contract["preprocess"]["rgb"]
 
@@ -380,7 +385,8 @@ class DaliAdapter(Adapter):
                 pad_last_batch=False,
                 name="Reader",
             )
-            images = fn.decoders.image(encoded, device="mixed", output_type=types.RGB)
+            images = (fn.l3_decoder(encoded, device="mixed") if "l3" in config
+                      else fn.decoders.image(encoded, device="mixed", output_type=types.RGB))
             if preprocess["resize_shorter"] is not None:
                 images = fn.resize(
                     images,
@@ -1598,6 +1604,7 @@ def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str,
         "contract": str(contract_path.resolve()),
         "contract_sha256": sha256_json(contract),
         "sample_manifest_sha256": contract["dataset"]["sample_manifest_sha256"],
+        "input_format": "L3" if "l3" in contract["pipelines"].get(name, {}) else None,
         "execution": contract["execution"],
         "workload": contract["workload"],
         "model": model_config,

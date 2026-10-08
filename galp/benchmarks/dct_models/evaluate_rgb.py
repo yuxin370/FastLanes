@@ -15,7 +15,9 @@ from galp.benchmarks.dct_models.capture import Capture
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--route", choices=["pytorch", "dali"], required=True)
+    p.add_argument("--route", choices=["pytorch", "dali", "l3"], required=True)
+    p.add_argument("--l3-root", type=Path)
+    p.add_argument("--l3-library", type=Path)
     p.add_argument("--count", type=int, default=50000)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--workers", type=int, default=64)
@@ -26,11 +28,18 @@ def main():
     p.add_argument("--physical-order", action="store_true")
     p.add_argument("--warmup-batches", type=int, default=20)
     args = p.parse_args()
+    if args.route == "l3" and (args.l3_root is None or args.l3_library is None):
+        p.error("L3 requires --l3-root and --l3-library")
     if args.warmup_batches < 1:
         p.error("--warmup-batches must be positive")
     torch.set_num_threads(args.model_threads)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    # L3 paper §4.4 prioritizes model work over decoding the next batch.
+    # Apply the same model stream policy to every RGB input route.
+    model_stream = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
+    model_stream.wait_stream(torch.cuda.current_stream())
+    torch.cuda.set_stream(model_stream)
     entries = samples(args.count, physical_order=args.physical_order)
     net = rgb.model().cuda()
     reference = rgb.Inputs(entries)
@@ -41,6 +50,9 @@ def main():
     assert warm.shape == (args.batch_size,1000) and torch.isfinite(warm).all()
     torch.cuda.synchronize()
     del warm, warm_input
+    if args.route == "l3":
+        from galp.benchmarks.l3.prepare import encoded_path
+        entries = [dict(e, path=str(encoded_path(args.l3_root, e["logical_sample_id"]))) for e in entries]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     capture = Capture(args.profile, images_per_step=args.batch_size)
     predictions = [-1] * args.count
@@ -55,7 +67,8 @@ def main():
                                 worker_init_fn=rgb.worker_init, pin_memory=True, shuffle=False,
                                 prefetch_factor=2 if args.workers else None)
         else:
-            loader = rgb.dali_loader(entries, args.batch_size, args.workers, args.dali_prefetch_depth)
+            loader = rgb.dali_loader(entries, args.batch_size, args.workers, args.dali_prefetch_depth,
+                                     l3_library=args.l3_library if args.route == "l3" else None)
         iterator = iter(loader)
         init = time.perf_counter()-start
         step = 0
@@ -110,9 +123,11 @@ def main():
                   ce=ce/count, e2e_seconds=wall, initialization_seconds=init, input_wait_seconds=wait,
                   handoff_seconds=handoff, model_seconds=model_time, batch_size=args.batch_size,
                   workers=args.workers, model_threads=args.model_threads, precision="float32", tf32=False,
-                  dali_prefetch_queue_depth=args.dali_prefetch_depth if args.route == "dali" else None,
+                  model_stream_priority=model_stream.priority,
+                  dali_prefetch_queue_depth=args.dali_prefetch_depth if args.route != "pytorch" else None,
+                  l3_library=str(args.l3_library) if args.route == "l3" else None,
                   device_name=torch.cuda.get_device_name(), model=type(net).__name__, checkpoint=str(rgb.CHECKPOINT),
-                  source_root=str(B.DEFAULT_DATA_ROOT), source_version="imagenet_512",
+                  source_root=str(args.l3_root if args.route == "l3" else B.DEFAULT_DATA_ROOT), source_version="imagenet_512",
                   preprocessing=dict(resize=256, crop=224, color="RGB", mean=rgb.MEAN, std=rgb.STD,
                                      interpolation=rgb.INTERPOLATION.value, antialias=True,
                                      note="Torchvision EfficientNet_B0_Weights.IMAGENET1K_V1" if B.PROFILE == "efun"
@@ -126,7 +141,7 @@ def main():
                   sample_ids=[s["logical_sample_id"] for s in entries],
                   predictions=predictions)
     baseline = args.output_dir / f"RGB_pytorch_{count}.json"
-    if args.route=="dali" and baseline.exists():
+    if args.route!="pytorch" and baseline.exists():
         previous = json.loads(baseline.read_text())
         result["prediction_agreement_with_pytorch"] = prediction_agreement(result, previous)
         result["top1_delta_pp_vs_pytorch"] = result["top1"]-previous["top1"]

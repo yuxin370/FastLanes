@@ -95,16 +95,21 @@ def worker_init(_):
     torch.set_num_threads(1)
 
 
-def dali_loader(entries, batch_size, workers, prefetch_queue_depth=2):
+def dali_loader(entries, batch_size, workers, prefetch_queue_depth=2, l3_library=None):
     from nvidia.dali import fn, pipeline_def, types
     from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+
+    if l3_library is not None:
+        from galp.benchmarks.l3.codec import load_plugin
+        load_plugin(l3_library)
 
     @pipeline_def
     def pipeline():
         encoded, ordinal = fn.readers.file(files=[s["path"] for s in entries],
                                           labels=[s["ordinal"] for s in entries],
                                           random_shuffle=False, pad_last_batch=False, name="Reader")
-        images = fn.decoders.image(encoded, device="mixed", output_type=types.RGB)
+        images = (fn.decoders.image(encoded, device="mixed", output_type=types.RGB) if l3_library is None
+                  else fn.l3_decoder(encoded, device="mixed"))
         images = fn.resize(images, device="gpu", resize_shorter=256,
                            interp_type=types.INTERP_CUBIC if INTERPOLATION == T.InterpolationMode.BICUBIC
                            else types.INTERP_LINEAR, antialias=True)

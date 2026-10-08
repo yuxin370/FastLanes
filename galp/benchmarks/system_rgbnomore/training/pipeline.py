@@ -1099,6 +1099,16 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
         self._dali_augmentation_mode = effective_augmentation
 
         paths = [str(item[0].path) for item in self._planned]
+        l3_config = self.config.get("l3")
+        if l3_config is not None:
+            from galp.benchmarks.l3.codec import load_plugin
+            from galp.benchmarks.l3.prepare import encoded_path
+            if self._dali_augmentation_mode != "planned":
+                raise ValueError("L3 training uses the paper's planned crop/flip workload")
+            load_plugin(l3_config["library"])
+            paths = [str(encoded_path(l3_config["root"], item[0].logical_sample_id))
+                     for item in self._planned]
+            self._dali_decoder_mode = "l3-full-decode-then-slice"
         if self._dali_augmentation_mode == "planned":
             anchors = np.asarray(
                 [
@@ -1199,7 +1209,11 @@ class DaliTrainingAdapter(TrainingPipelineAdapter):
                 ),
                 "hw_decoder_load": float(dali_config.get("hw_decoder_load", 0.65)),
             }
-            if self._dali_augmentation_mode == "native":
+            if l3_config is not None:
+                images = fn.l3_decoder(encoded, device="mixed")
+                images = fn.slice(images, anchors_node, shapes_node, device="gpu", axes=[0, 1],
+                                  normalized_anchor=True, normalized_shape=True)
+            elif self._dali_augmentation_mode == "native":
                 images = fn.decoders.image_random_crop(
                     encoded,
                     random_area=[0.05, 1.0],

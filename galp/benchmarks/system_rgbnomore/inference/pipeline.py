@@ -377,6 +377,11 @@ class DaliAdapter(PipelineAdapter):
         execution = self.contract["execution"]
         config = self.contract["pipelines"]["dali"]
         paths = [str(sample["path"]) for sample in self.samples]
+        if "l3" in config:
+            from galp.benchmarks.l3.codec import load_plugin
+            from galp.benchmarks.l3.prepare import encoded_path
+            load_plugin(config["l3"]["library"])
+            paths = [str(encoded_path(config["l3"]["root"], sample["sample_id"])) for sample in self.samples]
         ordinals = [int(sample["ordinal"]) for sample in self.samples]
 
         @pipeline_def
@@ -388,7 +393,8 @@ class DaliAdapter(PipelineAdapter):
                 pad_last_batch=False,
                 name="Reader",
             )
-            images = fn.decoders.image(encoded, device="mixed", output_type=types.RGB)
+            images = (fn.l3_decoder(encoded, device="mixed") if "l3" in config
+                      else fn.decoders.image(encoded, device="mixed", output_type=types.RGB))
             images = fn.resize(
                 images,
                 device="gpu",
@@ -1160,6 +1166,7 @@ def run_pipeline(
         "contract_sha256": sha256_json(contract),
         "sample_manifest": str(manifest_path.resolve()),
         "sample_manifest_sha256": contract["dataset"]["manifest_sha256"],
+        "input_format": "L3" if "l3" in contract["pipelines"].get(name, {}) else None,
         "model": _model_metadata(contract, adapter.domain),
         "execution": dict(execution),
         "cuda_scheduling": {
