@@ -280,6 +280,95 @@ reference semantics.  Generic native runtime policies are defined separately
 and are observable through `reader.profile_info(profile)` but are not Python
 tuning options.
 
+### CNN model profiles and training policies
+
+The model-facing `DirectDctPipeline` constructor accepts either an existing
+registered `DirectDctProfile` or a `DctModelProfile` for CNN projection.
+`DctModelProfile` describes the existing source512 path: online DCT geometry,
+dequantization, int16-range clamping, round-to-even/int16 saturation, and
+float32 NCHW output with channel normalization. It does not expose execution
+tuning or arbitrary numerical recipes.
+
+```python
+from galp.profiles import DctModelProfile
+from galp.torch import DirectDctPipeline, TrainingPolicy
+
+# Values come from the model's input contract/checkpoint preprocessing.
+profile = DctModelProfile(
+    output_grid_size=112,
+    output_channels=channel_pairs,  # ordered (component, natural frequency)
+    normalization=normalization,   # ordered (subtract, divide) per channel
+    source_frequency_policy="all",
+)
+
+with DirectDctPipeline(manifest, profile=profile, batch_size=64) as pipeline:
+    pipeline.reset(preparation_id_batches, transforms_by_batch=transforms)
+    for batch in pipeline:
+        logits = model(batch.projected)
+        ids = batch.sample_ids
+```
+
+For example, each entry in `transforms` can contain
+`{"crop": [32, 32, 448, 448], "horizontal_flip": False}` for every image in
+the corresponding preparation batch. Crop coordinates are source pixels.
+Preparation batches retain exactly the submitted IDs, order and boundaries;
+they are **not** repartitioned into 64-image storage reads. CNN iteration
+returns native zero-copy range views of at most `batch_size` images, including
+tails. Accessing `batch.projected` waits only for that view's producers.
+Registered Transformer profiles retain the explicit submitted batch boundaries
+and expose `batch.y` and `batch.cbcr` as before.
+
+Source frequency selection is separate from output channels. A tuple of
+storage-column indices in `source_frequency_policy` masks omitted source
+coefficients before resizing and can change the model input. Use `"all"`
+for the existing CNN reference and for projected training. This first facade
+does not add prepared-input geometry or new augmentation recipes.
+
+Training uses the same constructor, with ordering and the existing PLS
+RandAugment/Mixup recipe expressed separately:
+
+```python
+training = TrainingPolicy(
+    mapping=mapping_csv,
+    seed=11997733,
+    expected_mapping_sha256=mapping_sha256,
+    segments_per_pool=4,
+)
+with DirectDctPipeline(
+    manifest, profile=profile, training=training, batch_size=64,
+) as pipeline:
+    pipeline.start_epoch(epoch)
+    for batch in pipeline:
+        logits = model(batch.projected)
+        targets = batch.targets  # soft targets in the mapping's class order
+        # Existing loss, gradient accumulation and optimizer logic follows.
+```
+
+Transformer training instead passes `galp.profiles.rgbnomore.TRAINING_PLS`
+and consumes `batch.y`, `batch.cbcr`, and `batch.targets`. PLS retains control
+of pools, randomness, augmentation, and microbatch boundaries. The facade uses
+the existing PLS runtime defaults; CNN inference retains the established
+source512 CNN runtime configuration. It does not unify their schedulers.
+Aggregate `pipeline.metrics` remains an inference-only API.
+
+The existing `DirectDctReader` and experimental PLS entry points remain usable.
+On either path, call `batch.record_stream(consumer_stream)` before using a
+returned tensor on a different CUDA stream. Ordinary tensor references retain
+native storage; the facade never clones or concatenates input tensors.
+Datasets still need their existing native access indexes. When indexes reside
+outside the default `block_major_access_v1` directory, use the existing
+`GALP_BLOCK_MAJOR_ACCESS_DIR` environment variable.
+
+`python -m galp.torch.api_facade_ab --help` describes the bounded GPU A/B
+check. It compares exact inputs (and training targets) separately from warmed,
+alternating input-pipeline timings, using the same native binary in both arms.
+CNN cases take an existing `N_*.json` as the old entry point's configuration;
+training cases also take the existing mapping CSV. These timings test API
+overhead, not full-model throughput or convergence. Construction is excluded;
+reset/start-epoch, preparation, iteration, and a small GPU consumer are timed.
+For Transformer inference, `--baseline-python` accepts a copy of the pre-change
+`galp/torch/direct_dct.py` to compare against the previous facade itself.
+
 The runtime keeps the existing JPEG DCT crop and coefficient-selection
 pushdown, cache, prefetch, and decode-batch behavior. Registered profiles may
 also fuse DCT-grid transforms and model-ready affine conversion. It does not

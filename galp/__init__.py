@@ -5,6 +5,6 @@ import stable readers from :mod:`galp.torch` and semantic profiles from
 :mod:`galp.profiles`.
 """
 
-from .profiles import DirectDctProfile
+from .profiles import DirectDctProfile, DctModelProfile
 
-__all__ = ["DirectDctProfile"]
+__all__ = ["DirectDctProfile", "DctModelProfile"]

@@ -88,6 +88,10 @@ class DirectDctPlsMicrobatch:
         return [int(value) for value in self._native.global_image_ids]
 
     @property
+    def sample_ids(self) -> list[int]:
+        return self.global_image_ids
+
+    @property
     def labels(self) -> list[int]:
         return [int(value) for value in self._native.labels]
 

@@ -199,6 +199,7 @@ class PublicDirectDctApiTest(unittest.TestCase):
                 "DirectDctMetrics",
                 "DirectDctPipeline",
                 "DirectDctReader",
+                "TrainingPolicy",
             },
         )
         self.assertFalse(hasattr(galp.torch, "DirectDctFuture"))

@@ -5,6 +5,7 @@ from .direct_dct import (
     DirectDctMetrics,
     DirectDctPipeline,
     DirectDctReader,
+    TrainingPolicy,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "DirectDctMetrics",
     "DirectDctPipeline",
     "DirectDctReader",
+    "TrainingPolicy",
 ]
