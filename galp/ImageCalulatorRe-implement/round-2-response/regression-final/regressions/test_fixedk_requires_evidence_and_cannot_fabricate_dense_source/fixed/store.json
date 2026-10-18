@@ -1,0 +1,104 @@
+{
+  "attribution": "paper-guided reimplementation with a JPEG-DCT adapter",
+  "block_size": 8,
+  "codec": "numpy.savez_compressed / ZIP_DEFLATED",
+  "content_fingerprint": "edd7d8e6ce8428af85d4839bf5405e97394ea4c5dcec4306d5a8fdffe94cf6c3",
+  "conversion_cpu_s": 0.0005427039999972294,
+  "conversion_wall_s": 0.0005428140284493566,
+  "dependency_evidence": "frequency-only test",
+  "dtype_policy": "paper",
+  "files": {
+    "group_000000.npz": {
+      "decoded_bytes": 464,
+      "q_payload_bytes": 117,
+      "sha256": "cee210a2f6a51e0fd751f2a6007c0bbc6e631fc6bf73287bf4fee9882d0b91d7",
+      "size_bytes": 443
+    }
+  },
+  "groups": [
+    {
+      "block_offsets": [
+        0,
+        12,
+        16,
+        20
+      ],
+      "images": [
+        "0"
+      ],
+      "table_file": "group_000000.npz",
+      "units": [
+        {
+          "diagonal": null,
+          "dtype": "<i4",
+          "file": "group_000000.npz",
+          "values": 20
+        }
+      ],
+      "value_offsets": [
+        0,
+        12,
+        16,
+        20
+      ]
+    }
+  ],
+  "images": [
+    {
+      "component_offset": 0,
+      "group": 0,
+      "mask_family": [
+        "native_triangle_k1",
+        "native_triangle_k1",
+        "native_triangle_k1"
+      ],
+      "masks": [
+        [
+          0
+        ],
+        [
+          0
+        ],
+        [
+          0
+        ]
+      ],
+      "metadata": {
+        "block_size": 8,
+        "components": [
+          {
+            "block_grid": [
+              3,
+              4
+            ],
+            "component_id": 0
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 1
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 2
+          }
+        ],
+        "image_id": "0",
+        "label": 0,
+        "split": "test"
+      }
+    }
+  ],
+  "method": "ic_matched_fixedk",
+  "numpy_version": "2.4.6",
+  "serialization_order": "image/component/raster-block/stored-mask-order",
+  "source_artifact": null,
+  "storage_group_images": 1,
+  "variant": "adapted",
+  "version": 1
+}

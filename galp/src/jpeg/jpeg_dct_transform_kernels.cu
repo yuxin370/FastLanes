@@ -31,12 +31,20 @@ __device__ __forceinline__ uint8_t natural_to_physical_coeff_device(const uint8_
 
 inline constexpr uint64_t kAllPhysicalCoefficientMask = ~uint64_t {0};
 
-__device__ __forceinline__ float
-finalize_dct_grid_float(const float value, const float output_add, const float output_scale) {
+__device__ __forceinline__ float finalize_dct_grid_float(const float value,
+                                                         const float output_add,
+                                                         const float output_scale,
+                                                         const float output_divide,
+                                                         const float output_shift) {
 	float rounded = nearbyintf(value);
 	rounded       = fminf(32767.0F, fmaxf(-32768.0F, rounded));
 	rounded       = __fadd_rn(rounded, output_add);
-	return __fmul_rn(rounded, output_scale);
+	// Division and the final shift must not be folded into a reciprocal or FMA:
+	// RGB-no-more checkpoint inference observes these FP32 rounding boundaries.
+	if (output_divide != 1.0F)
+		rounded = __fdiv_rn(rounded, output_divide);
+	rounded = __fmul_rn(rounded, output_scale);
+	return output_shift == 0.0F ? rounded : __fadd_rn(rounded, output_shift);
 }
 
 __device__ __forceinline__ float dct_grid_madd_rn(const float lhs, const float rhs, const float accum) {
@@ -388,8 +396,9 @@ __device__ __forceinline__ void store_planless_dct_grid_value(const JpegDctDevic
 			// Match the former zero-initialized accumulation before finalization,
 			// including signed zero after a horizontal flip.
 			const float sum   = accumulate ? __fadd_rn(0.0F, stored_value) : stored_value;
-			const float value = finalize_dct_grid_float(sum, projection->add, projection->scale);
-			y_accum[index]    = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
+			const float value = finalize_dct_grid_float(
+			    sum, projection->add, projection->scale, projection->output_divide, projection->shift);
+			y_accum[index] = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
 		} else if (accumulate)
 			y_accum[index] += stored_value;
 		else
@@ -423,12 +432,14 @@ __global__ void finalize_projected_dct_kernel(float*                         out
                                               const JpegDctOutputProjection* projection,
                                               const float                    add,
                                               const float                    scale,
+                                              const float                    divide,
+                                              const float                    shift,
                                               const bool                     initialize) {
 	const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 	if (index >= count)
 		return;
 	const size_t channel = (index / spatial) % projection->count;
-	const float  value   = finalize_dct_grid_float(initialize ? 0.0F : output[index], add, scale);
+	const float  value   = finalize_dct_grid_float(initialize ? 0.0F : output[index], add, scale, divide, shift);
 	output[index]        = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
 }
 
@@ -456,7 +467,9 @@ __global__ void round_affine_dct_grid_accum_pair_kernel(float* __restrict y_in_o
                                                         float* __restrict cbcr_in_out,
                                                         const size_t cbcr_count,
                                                         const float  output_add,
-                                                        const float  output_scale) {
+                                                        const float  output_scale,
+                                                        const float  output_divide,
+                                                        const float  output_shift) {
 	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 	if (idx >= y_count + cbcr_count) {
 		return;
@@ -464,9 +477,8 @@ __global__ void round_affine_dct_grid_accum_pair_kernel(float* __restrict y_in_o
 	const bool   is_y      = idx < y_count;
 	const size_t local_idx = is_y ? idx : idx - y_count;
 	float*       in_out    = is_y ? y_in_out : cbcr_in_out;
-	// Match two separate FP32 eager elementwise operations. Explicit rounding
-	// prevents contraction into an FMA, which would change boundary values.
-	in_out[local_idx] = finalize_dct_grid_float(in_out[local_idx], output_add, output_scale);
+	in_out[local_idx] =
+	    finalize_dct_grid_float(in_out[local_idx], output_add, output_scale, output_divide, output_shift);
 }
 
 __device__ uint64_t planless_rectangle_intersection_count(const uint64_t width,
@@ -780,7 +792,10 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
                                      float* __restrict y_accum,
                                      float* __restrict cbcr_accum,
                                      const JpegDctOutputProjection* projection,
-                                     const bool                     identity_projection) {
+                                     const bool                     identity_projection,
+                                     const JpegDctSplitDown2Block*  split_down2_blocks,
+                                     float*                         split_down2_source,
+                                     const uint32_t                 workset_index) {
 	// Identity projection: neighboring threads own neighboring output blocks,
 	// so each channel is written in spatial order instead of across NCHW planes.
 	// Locate the source once per block and reuse it for every requested channel.
@@ -933,6 +948,11 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 		if (use_reference_down2_axes) {
 			const auto source_width       = x_down * 8U;
 			const auto source_block_count = x_down * y_down;
+			const auto split =
+			    split_down2_blocks != nullptr ? split_down2_blocks[linear_block] : JpegDctSplitDown2Block {};
+			float* saved_source = split.slot != std::numeric_limits<uint32_t>::max()
+			                          ? split_down2_source + size_t(split.slot) * 256U
+			                          : nullptr;
 			// Keep the block at two warps: the transform produces 64 coefficients, and
 			// the largest canonical down2 source contains only four coefficients per
 			// lane.  A 256-thread block left six warps idle after the source load and
@@ -1017,11 +1037,20 @@ transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column
 				}
 				const auto composed_y = subblock_y * 8U + coeff / 8U;
 				const auto composed_x = subblock_x * 8U + coeff % 8U;
-				composed[composed_y * source_width + composed_x] =
+				const auto index      = composed_y * source_width + composed_x;
+				const auto dequantized =
 				    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+				if (saved_source != nullptr) {
+					if (located_rows[source_block_slot] != std::numeric_limits<uint64_t>::max() &&
+					    located_binding_bases[source_block_slot] != std::numeric_limits<uint32_t>::max())
+						saved_source[index] = dequantized;
+					composed[index] = saved_source[index];
+				} else {
+					composed[index] = dequantized;
+				}
 			}
 			__syncthreads();
-			if (source_block_count == 1U) {
+			if (source_block_count == 1U || (saved_source != nullptr && workset_index != split.last_workset)) {
 				continue;
 			}
 			for (uint32_t vertical_linear = lane; vertical_linear < 8U * source_width; vertical_linear += blockDim.x) {

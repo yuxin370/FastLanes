@@ -1,0 +1,12 @@
+{
+  "status": "passed",
+  "models": [
+    "mobilenet24",
+    "resnet24",
+    "vitti"
+  ],
+  "updates_per_backend": 10,
+  "cpu_evidence": "models/*/*.verified.json",
+  "cuda_gate": "not_run",
+  "headline_eligible": false
+}

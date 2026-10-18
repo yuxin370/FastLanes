@@ -1,0 +1,54 @@
+{
+  "calibration_trace": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/models/resnet24/contract/calibration_trace.jsonl",
+    "sha256": "cd10251f590f61237d4165ce465bbbe21730c0b4c793885ebd9a619e36c88258"
+  },
+  "decode_budget_bytes": 536870912,
+  "host_input_budget_bytes": 4294967296,
+  "label_mapping": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/models/resnet24/contract/labels.json",
+    "sha256": "08e7ae3b9471a270d7a6dc0abca6a4bc5eb1628ff7f7dc39dc821ea01761589e"
+  },
+  "model_microbatch_size": 2,
+  "model_profile": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/models/resnet24/contract/profile.json",
+    "sha256": "9354ecb8870f95c6f07f01360ff4637aa9c46d2215efb857345b2171465b42bb"
+  },
+  "precision": "bf16-autocast",
+  "preparation_pool_size": 2,
+  "reader_memory_budget_bytes": 1073741824,
+  "repository_revision": "13fabad2b337945ea32d50dd6b6cbebc5563b031",
+  "request_trace": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/models/resnet24/contract/trace.jsonl",
+    "sha256": "db1a8e04d336b98c4fb997145b42706538ea695c2f64b25041ac358b4d10459e"
+  },
+  "source_manifest": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/source/source.json",
+    "sha256": "abad042685dedba8c6931654a1fc403a861b0b5345e7ea756020f02f2d082c42"
+  },
+  "tail_policy": "keep",
+  "tolerance": {
+    "atol": 0.0,
+    "rationale": "same CPU reference operations; exact by default; explicit nonzero values require external calibration",
+    "rtol": 0.0
+  },
+  "torch_threads": 1,
+  "trace_generation_seed": 11997733,
+  "training": {
+    "accumulation": 16,
+    "accumulation_closes_at": "pool_and_epoch",
+    "compile": false,
+    "initialization": "from_scratch",
+    "population_size": 3,
+    "precision": "bf16-autocast",
+    "recipe": "rgbnomore-swinv2-t-dct-224-v1",
+    "schedule_epochs": 300,
+    "target_effective_batch": 32,
+    "total_updates": 20,
+    "total_updates_override": true,
+    "updates_per_epoch": 2,
+    "warmup_updates": 2
+  },
+  "version": 1,
+  "workers": 1
+}

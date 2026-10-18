@@ -105,6 +105,8 @@ void hash_transform(StableFingerprint& hash, const jpeg::JpegDctGridTransformSpe
 	hash.enumeration(transform.output_data_type);
 	hash.floating(transform.output_add);
 	hash.floating(transform.output_scale);
+	hash.floating(transform.output_divide);
+	hash.floating(transform.output_shift);
 	hash.integral(transform.dequantize);
 	hash.integral(transform.require_all_coefficients);
 	hash.integral(transform.allow_grayscale);

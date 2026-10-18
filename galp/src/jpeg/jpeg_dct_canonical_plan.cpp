@@ -724,6 +724,11 @@ uint64_t jpeg_dct_canonical_transform_digest(const JpegDctGridTransformSpec& tra
 		append_le<uint16_t>(bytes, ratio.vertical_numerator);
 		append_le<uint16_t>(bytes, ratio.vertical_denominator);
 	}
+	// Existing training/CNN sidecars keep their identity when these operations are absent.
+	if (transform.output_divide != 1.0F || transform.output_shift != 0.0F) {
+		append_le<uint32_t>(bytes, std::bit_cast<uint32_t>(transform.output_divide));
+		append_le<uint32_t>(bytes, std::bit_cast<uint32_t>(transform.output_shift));
+	}
 	return crc64_update(0U, bytes.data(), bytes.size());
 }
 

@@ -1,4 +1,5 @@
 #include "direct_dct/native_batch_lifetime.hpp"
+#include "cuda/memory/device_pool.cuh"
 #include "galp/direct_dct.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -141,6 +142,11 @@ public:
 	}
 
 private:
+	NativeBatchReclaimQueue() {
+		// Deferred batches must be destroyed before the pool that owns their storage.
+		static_cast<void>(galp::memory::DevicePool::instance());
+	}
+
 	std::mutex                                  mutex_;
 	std::deque<std::shared_ptr<NativeBatchLease>> pending_;
 	size_t pending_reclaim_peak_ = 0U;

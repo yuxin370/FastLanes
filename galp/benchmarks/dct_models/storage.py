@@ -19,8 +19,8 @@ def pack_image(path, coefficients, tables):
 
 
 class Reader:
-    def __init__(self, manifest):
-        self.process = subprocess.Popen([str(BRIDGE), "read-manifest", str(manifest)],
+    def __init__(self, manifest, *, command="read-manifest"):
+        self.process = subprocess.Popen([str(BRIDGE), command, str(manifest)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def read(self, image_id):

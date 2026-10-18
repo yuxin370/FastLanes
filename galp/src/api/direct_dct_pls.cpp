@@ -1149,7 +1149,10 @@ DirectDctPlsMicrobatchView DirectDctPlsPoolBatch::microbatch(const size_t index)
 	const auto c       = impl_->postprocess ? impl_->postprocess->cbcr_tensor() : impl_->batch.cbcr_tensor_async();
 	auto       targets = impl_->postprocess ? impl_->postprocess->targets() : DirectDctPlsTargetTensorDescriptor {};
 	if (!targets.empty()) {
-		targets.data += offset * targets.strides[0];
+		if (targets.hard_labels)
+			targets.hard_labels += offset;
+		else
+			targets.data += offset * targets.strides[0];
 		targets.shape[0] = count;
 	}
 	return DirectDctPlsMicrobatchView {
@@ -1260,17 +1263,21 @@ struct DirectDctPlsPipeline::Impl {
 			    sample, metadata.image_width, metadata.image_height, source.schedule);
 			requests.push_back(std::move(augmentation.request));
 			labels.push_back(sample.label);
-			randaugment.push_back(detail::derive_published_randaugment_decision(sample, source.schedule));
+			randaugment.push_back(options.enable_published_randaugment
+			                          ? detail::derive_published_randaugment_decision(sample, source.schedule)
+			                          : detail::DirectDctPlsRandAugmentDecision {});
 		}
 		std::vector<detail::DirectDctPlsMixupDecision> mixup;
 		const auto microbatch_count =
 		    (labels.size() + source.schedule.microbatch_images - 1U) / source.schedule.microbatch_images;
 		mixup.reserve(microbatch_count);
 		for (size_t index = 0U; index < microbatch_count; ++index) {
-			mixup.push_back(detail::derive_published_mixup_decision(
-			    source.schedule.training_seed,
-			    source.schedule.epoch,
-			    source.plan.first_microbatch_index + index * source.schedule.world_size));
+			mixup.push_back(options.enable_published_mixup
+			                    ? detail::derive_published_mixup_decision(source.schedule.training_seed,
+			                                                              source.schedule.epoch,
+			                                                              source.plan.first_microbatch_index +
+			                                                                  index * source.schedule.world_size)
+			                    : detail::DirectDctPlsMixupDecision {});
 		}
 		auto prepared          = runtime.PrepareBatch(requests, options.device);
 		const auto plan_done   = PlsPoolClock::now();

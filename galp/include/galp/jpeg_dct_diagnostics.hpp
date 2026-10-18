@@ -267,6 +267,8 @@ struct JpegDctDeviceExecutionStats {
 	bool   fixed_grid_output_affine_applied        = false;
 	float  fixed_grid_output_add                   = 0.0F;
 	float  fixed_grid_output_scale                 = 1.0F;
+	float  fixed_grid_output_divide                = 1.0F;
+	float  fixed_grid_output_shift                 = 0.0F;
 	// Crop-pushdown accounting is deliberately explicit about each stage.
 	// `planned_vector_count` is the crop-selected count, while
 	// `actual_vector_count` is the count actually submitted to decode after
@@ -427,6 +429,10 @@ struct JpegDctDeviceExecutionStats {
 	size_t actual_transient_compressed_backing_live_peak_bytes  = 0U;
 	size_t actual_transient_decoded_arena_used_peak_bytes       = 0U;
 	size_t actual_transient_decoded_arena_capacity_peak_bytes   = 0U;
+	size_t actual_transient_split_source_used_peak_bytes         = 0U;
+	size_t actual_transient_split_source_capacity_peak_bytes     = 0U;
+	size_t actual_transient_split_metadata_used_peak_bytes       = 0U;
+	size_t actual_transient_split_metadata_capacity_peak_bytes   = 0U;
 	size_t actual_transient_ring_fixed_buffer_peak_bytes        = 0U;
 	size_t actual_transient_active_schedule_peak_bytes          = 0U;
 	size_t actual_transient_kernel_referenced_backing_peak_bytes = 0U;

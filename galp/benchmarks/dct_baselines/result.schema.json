@@ -1,0 +1,1223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FastLens matched-baseline diagnostic result v0.2",
+  "description": "Draft interchange schema, not an existing FastLens API. Null means unmeasured or inapplicable, never zero. Schema validity alone does not establish numerical equivalence or publication eligibility.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "method",
+    "variant",
+    "comparison_scope",
+    "run_kind",
+    "measurement_mode",
+    "cache_mode",
+    "headline_eligible",
+    "artifacts",
+    "environment",
+    "resolved_parameters",
+    "counts",
+    "metrics",
+    "correctness",
+    "quality",
+    "offline_cost",
+    "synthetic_delivery",
+    "notes",
+    "fingerprints"
+  ],
+  "properties": {
+    "experiment_type": {"type": "string"},
+    "execution_partition": {"type": "object", "additionalProperties": {"type": "string"}},
+    "loaded_model_state_sha256": {"type": ["string", "null"]},
+    "schema_version": {
+      "const": "0.2-diagnostic"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "failed",
+        "invalid"
+      ]
+    },
+    "method": {
+      "enum": [
+        "cpu_dct",
+        "fastlens",
+        "ic_matched_shared",
+        "ic_matched_fixedk",
+        "ic_matched_batched",
+        "fs_matched_b8",
+        "ic_native",
+        "fs_native",
+        "enhanced_control"
+      ]
+    },
+    "variant": {
+      "type": "string",
+      "minLength": 1
+    },
+    "comparison_scope": {
+      "enum": [
+        "source_representation_matched",
+        "accuracy_matched",
+        "native_sanity",
+        "mechanism_only"
+      ]
+    },
+    "run_kind": {
+      "enum": [
+        "input_only",
+        "inference",
+        "training_epoch",
+        "conversion",
+        "quality_sweep",
+        "model_only",
+        "native_sanity"
+      ]
+    },
+    "measurement_mode": {
+      "enum": [
+        "actual",
+        "emulated",
+        "modeled"
+      ],
+      "description": "actual: observed timed execution, with warmth recorded separately in cache_mode; emulated: timed execution with injected bandwidth/delay; modeled: analytical estimate, not measured wall-clock time."
+    },
+    "cache_mode": {
+      "enum": [
+        "cold_verified",
+        "file_warm",
+        "decoded_host",
+        "gpu_resident",
+        "mixed_measured",
+        "unverified",
+        "not_applicable"
+      ]
+    },
+    "headline_eligible": {
+      "type": "boolean",
+      "description": "Candidate for the primary measured matched table, subject to external semantic gates. Native, modeled, emulated, failed, and unverified runs must be false."
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resolved_contract",
+        "source_manifest",
+        "model_profile",
+        "request_trace",
+        "checkpoint",
+        "correctness_evidence",
+        "cache_evidence",
+        "store",
+        "label_mapping"
+      ],
+      "properties": {
+        "resolved_contract": {
+          "$ref": "#/$defs/artifact"
+        },
+        "source_manifest": {
+          "$ref": "#/$defs/nullableArtifact"
+        },
+        "model_profile": {
+          "$ref": "#/$defs/nullableArtifact"
+        },
+        "request_trace": {
+          "$ref": "#/$defs/nullableArtifact"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/nullableArtifact"
+        },
+        "correctness_evidence": {
+          "$ref": "#/$defs/nullableArtifact"
+        },
+        "cache_evidence": {
+          "$ref": "#/$defs/nullableArtifact"
+        },
+        "label_mapping": {
+          "$ref": "#/$defs/artifact"
+        },
+        "backend": {"type": ["object", "null"]},
+        "store": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": [
+            "manifest",
+            "content_fingerprint"
+          ],
+          "properties": {
+            "manifest": {
+              "$ref": "#/$defs/artifact"
+            },
+            "content_fingerprint": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_revision",
+        "hardware",
+        "software"
+      ],
+      "properties": {
+        "repository_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hardware": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "software": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "resolved_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_microbatch_size",
+        "preparation_pool_size",
+        "storage_group_images",
+        "workers",
+        "prefetch",
+        "precision",
+        "source_frequencies",
+        "output_channels",
+        "model",
+        "profile_id",
+        "decode_budget_bytes",
+        "reader_memory_budget_bytes",
+        "host_input_budget_bytes"
+      ],
+      "properties": {
+        "model_microbatch_size": {
+          "$ref": "#/$defs/positiveIntegerOrNull"
+        },
+        "preparation_pool_size": {
+          "$ref": "#/$defs/positiveIntegerOrNull"
+        },
+        "storage_group_images": {
+          "$ref": "#/$defs/positiveIntegerOrNull"
+        },
+        "workers": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "prefetch": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "torch_threads": {"type": "integer", "minimum": 1},
+        "measurement_min_seconds": {"type": "number", "minimum": 0},
+        "warmup_seconds": {"type": "number", "minimum": 0},
+        "cpu_loader": {"enum": ["threadpool", "dataloader", null]},
+        "decoded_cache_bytes_per_reader": {"type": "integer", "minimum": 0},
+        "cache_policy": {"enum": ["cold_each_pass", "continuous_post_warmup"]},
+        "profile_stages": {"type": "boolean"},
+        "precision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_frequencies": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Explicit per-component source-frequency sets; must not be inferred from output channel count."
+        },
+        "output_channels": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Final model-visible tensor/channel mapping, recorded separately from source frequencies."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "profile_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decode_budget_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reader_memory_budget_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "host_input_budget_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_occurrences",
+        "unique_images",
+        "optimizer_updates",
+        "requested_q_values",
+        "physically_decoded_q_values",
+        "full_grid_requested_q_values"
+      ],
+      "properties": {
+        "dataset_passes": {"type": "integer", "minimum": 1},
+        "sample_occurrences": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "unique_images": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "optimizer_updates": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "requested_q_values": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "physically_decoded_q_values": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "full_grid_requested_q_values": {
+          "$ref": "#/$defs/countOrNull"
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "elapsed_wall_s",
+        "throughput_images_s",
+        "estimated_elapsed_s",
+        "estimated_throughput_images_s",
+        "first_batch_latency_s",
+        "batch_latency_s",
+        "io",
+        "h2d",
+        "storage",
+        "memory",
+        "cpu_core_seconds"
+      ],
+      "properties": {
+        "first_pass_wall_s": {"type": "number", "minimum": 0},
+        "pass_wall_s": {"type": "array", "items": {"type": "number", "minimum": 0}},
+        "elapsed_wall_s": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "throughput_images_s": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "estimated_elapsed_s": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "estimated_throughput_images_s": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "first_batch_latency_s": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "batch_latency_s": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "p50",
+            "p95",
+            "p99"
+          ],
+          "properties": {
+            "p50": {
+              "$ref": "#/$defs/nonnegativeOrNull"
+            },
+            "p95": {
+              "$ref": "#/$defs/nonnegativeOrNull"
+            },
+            "p99": {
+              "$ref": "#/$defs/nonnegativeOrNull"
+            }
+          }
+        },
+        "io": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "compressed_payload_read_bytes",
+            "metadata_read_bytes",
+            "application_read_bytes",
+            "physical_storage_read_bytes",
+            "read_operations",
+            "file_open_operations"
+          ],
+          "properties": {
+            "compressed_payload_read_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "metadata_read_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "application_read_bytes": {
+              "$ref": "#/$defs/countOrNull",
+              "description": "All completed application-read bytes, including repeated reads, metadata and alignment; distinct from physical device bytes."
+            },
+            "physical_storage_read_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "read_operations": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "file_open_operations": {
+              "$ref": "#/$defs/countOrNull"
+            }
+          }
+        },
+        "h2d": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "total_bytes",
+            "coefficient_payload_bytes",
+            "metadata_indices_labels_padding_bytes"
+          ],
+          "properties": {
+            "total_bytes": {
+              "$ref": "#/$defs/countOrNull",
+              "description": "Complete H2D traffic; the coefficient and other-byte categories must sum to this total when all are measured."
+            },
+            "coefficient_payload_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "metadata_indices_labels_padding_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            }
+          }
+        },
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "coefficient_data_bytes",
+            "metadata_index_label_bytes",
+            "total_unique_bytes",
+            "allocated_disk_bytes",
+            "temporary_peak_bytes"
+          ],
+          "properties": {
+            "coefficient_data_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "metadata_index_label_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "total_unique_bytes": {
+              "$ref": "#/$defs/countOrNull",
+              "description": "Complete persistent representation, including all required profiles/copies; count shared physical objects once."
+            },
+            "allocated_disk_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "temporary_peak_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            }
+          }
+        },
+        "memory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "host_rss_peak_bytes",
+            "pinned_peak_bytes",
+            "gpu_allocated_peak_bytes",
+            "gpu_reserved_peak_bytes",
+            "active_decoded_peak_bytes",
+            "gathered_output_peak_bytes",
+            "reader_memory_peak_bytes"
+          ],
+          "properties": {
+            "host_rss_peak_bytes": {
+              "$ref": "#/$defs/countOrNull",
+              "description": "State the process/worker aggregation convention in notes."
+            },
+            "pinned_peak_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "gpu_allocated_peak_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "gpu_reserved_peak_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "active_decoded_peak_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "gathered_output_peak_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            },
+            "reader_memory_peak_bytes": {
+              "$ref": "#/$defs/countOrNull"
+            }
+          }
+        },
+        "cpu_core_seconds": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "source_q_exact",
+        "quantization_tables_exact",
+        "dependency_closure_verified",
+        "final_tensor_match",
+        "logits_match",
+        "training_update_match",
+        "max_abs_tensor_error",
+        "max_relative_tensor_error"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_run",
+            "not_applicable"
+          ]
+        },
+        "source_q_exact": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "quantization_tables_exact": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "dependency_closure_verified": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "final_tensor_match": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "logits_match": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "training_update_match": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_abs_tensor_error": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "max_relative_tensor_error": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "split",
+        "sample_count",
+        "top1_fraction",
+        "top5_fraction",
+        "allowed_loss_percentage_points",
+        "observed_loss_percentage_points"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "measured",
+            "inherited_common_checkpoint",
+            "not_measured",
+            "not_applicable"
+          ]
+        },
+        "split": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sample_count": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "top1_fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "top5_fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "allowed_loss_percentage_points": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "observed_loss_percentage_points": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -100,
+          "maximum": 100
+        }
+      }
+    },
+    "offline_cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "included_in_elapsed_wall",
+        "conversion_wall_s",
+        "cpu_core_hours",
+        "gpu_hours",
+        "search_trials",
+        "profile_copies"
+      ],
+      "properties": {
+        "included_in_elapsed_wall": {
+          "type": "boolean"
+        },
+        "conversion_wall_s": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "cpu_core_hours": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "gpu_hours": {
+          "$ref": "#/$defs/nonnegativeOrNull"
+        },
+        "search_trials": {
+          "$ref": "#/$defs/countOrNull"
+        },
+        "profile_copies": {
+          "$ref": "#/$defs/countOrNull"
+        }
+      }
+    },
+    "synthetic_delivery": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "specification",
+            "aggregate_bandwidth_bytes_s",
+            "component_evidence"
+          ],
+          "properties": {
+            "specification": {
+              "type": "string",
+              "minLength": 1
+            },
+            "aggregate_bandwidth_bytes_s": {
+              "$ref": "#/$defs/nonnegativeOrNull"
+            },
+            "component_evidence": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/artifact"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "fingerprints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store",
+        "implementation",
+        "native_binding"
+      ],
+      "properties": {
+        "store": {
+          "anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+        },
+        "implementation": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "measurement_mode": {
+            "const": "modeled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "headline_eligible": {
+            "const": false
+          },
+          "synthetic_delivery": {
+            "type": "object"
+          },
+          "metrics": {
+            "properties": {
+              "elapsed_wall_s": {
+                "const": null
+              },
+              "throughput_images_s": {
+                "const": null
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "metrics": {
+            "properties": {
+              "estimated_elapsed_s": {
+                "const": null
+              },
+              "estimated_throughput_images_s": {
+                "const": null
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "measurement_mode": {
+            "enum": [
+              "emulated",
+              "modeled"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "headline_eligible": {
+            "const": false
+          },
+          "synthetic_delivery": {
+            "type": "object"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "synthetic_delivery": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          },
+          "measurement_mode": {
+            "enum": [
+              "actual",
+              "emulated"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "properties": {
+              "elapsed_wall_s": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          },
+          "measurement_mode": {
+            "const": "modeled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "properties": {
+              "estimated_elapsed_s": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "estimated_throughput_images_s": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "enum": [
+              "ic_native",
+              "fs_native"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "comparison_scope": {
+            "enum": [
+              "accuracy_matched",
+              "native_sanity",
+              "mechanism_only"
+            ]
+          },
+          "headline_eligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "quality": {
+            "properties": {
+              "status": {
+                "const": "measured"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "quality": {
+            "properties": {
+              "sample_count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "top1_fraction": {
+                "type": "number"
+              },
+              "split": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "headline_eligible": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          },
+          "comparison_scope": {
+            "const": "source_representation_matched"
+          },
+          "measurement_mode": {
+            "enum": [
+              "actual"
+            ]
+          },
+          "cache_mode": {
+            "enum": [
+              "cold_verified",
+              "file_warm",
+              "mixed_measured"
+            ]
+          },
+          "method": {
+            "enum": [
+              "cpu_dct",
+              "fastlens",
+              "ic_matched_shared",
+              "ic_matched_fixedk",
+              "ic_matched_batched",
+              "fs_matched_b8"
+            ]
+          },
+          "run_kind": {
+            "enum": [
+              "input_only",
+              "inference",
+              "training_epoch"
+            ]
+          },
+          "artifacts": {
+            "properties": {
+              "source_manifest": {
+                "type": "object"
+              },
+              "model_profile": {
+                "type": "object"
+              },
+              "request_trace": {
+                "type": "object"
+              },
+              "checkpoint": {
+                "type": "object"
+              },
+              "correctness_evidence": {
+                "type": "object"
+              },
+              "cache_evidence": {
+                "type": "object"
+              }
+            }
+          },
+          "resolved_parameters": {
+            "properties": {
+              "model_microbatch_size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "precision": {
+                "type": "string",
+                "minLength": 1
+              },
+              "source_frequencies": {
+                "type": "object",
+                "minProperties": 1
+              },
+              "output_channels": {
+                "type": "object",
+                "minProperties": 1
+              }
+            }
+          },
+          "counts": {
+            "properties": {
+              "sample_occurrences": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "unique_images": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "requested_q_values": {
+                "type": "integer"
+              },
+              "physically_decoded_q_values": {
+                "type": "integer"
+              }
+            }
+          },
+          "metrics": {
+            "properties": {
+              "throughput_images_s": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "io": {
+                "properties": {
+                  "compressed_payload_read_bytes": {
+                    "type": "integer"
+                  },
+                  "metadata_read_bytes": {
+                    "type": "integer"
+                  },
+                  "application_read_bytes": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "h2d": {
+                "properties": {
+                  "total_bytes": {
+                    "type": "integer"
+                  },
+                  "coefficient_payload_bytes": {
+                    "type": "integer"
+                  },
+                  "metadata_indices_labels_padding_bytes": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "storage": {
+                "properties": {
+                  "coefficient_data_bytes": {
+                    "type": "integer"
+                  },
+                  "metadata_index_label_bytes": {
+                    "type": "integer"
+                  },
+                  "total_unique_bytes": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          },
+          "correctness": {
+            "properties": {
+              "status": {
+                "const": "passed"
+              },
+              "source_q_exact": {
+                "const": true
+              },
+              "quantization_tables_exact": {
+                "const": true
+              },
+              "dependency_closure_verified": {
+                "const": true
+              },
+              "final_tensor_match": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "headline_eligible": {
+            "const": true
+          },
+          "cache_mode": {
+            "const": "cold_verified"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "properties": {
+              "io": {
+                "properties": {
+                  "physical_storage_read_bytes": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "headline_eligible": {
+            "const": true
+          },
+          "run_kind": {
+            "const": "inference"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "correctness": {
+            "properties": {
+              "logits_match": {
+                "const": true
+              }
+            }
+          },
+          "quality": {
+            "properties": {
+              "status": {
+                "const": "measured"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "headline_eligible": {
+            "const": true
+          },
+          "run_kind": {
+            "const": "training_epoch"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "correctness": {
+            "properties": {
+              "training_update_match": {
+                "const": true
+              }
+            }
+          },
+          "counts": {
+            "properties": {
+              "optimizer_updates": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "nullableArtifact": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/artifact"
+        }
+      ]
+    },
+    "nonnegativeOrNull": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "countOrNull": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "positiveIntegerOrNull": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    }
+  }
+}

@@ -291,6 +291,85 @@ int main(int argc, char** argv) {
 				read_image(root / it->fls_file_name, md, id - it->first_global_image_index, reader);
 				std::cout.flush();
 			}
+		} else if (std::string(argv[1]) == "read-source-manifest") {
+			if (argc != 3)
+				throw std::runtime_error("read-source-manifest MANIFEST (uint32 global IDs on stdin)");
+			const auto                manifest = read_jpeg_dct_shard_manifest(argv[2]);
+			const auto                root     = std::filesystem::path(argv[2]).parent_path();
+			JpegDctShardDatasetReader reader(argv[2]);
+			JpegDctDatasetMetadata    md;
+			std::string               current_meta;
+			uint32_t                  id;
+			while (std::cin.read(reinterpret_cast<char*>(&id), 4)) {
+				auto shard = std::find_if(manifest.shards.begin(), manifest.shards.end(), [&](const auto& entry) {
+					return id >= entry.first_global_image_index &&
+					       id < entry.first_global_image_index + entry.image_count;
+				});
+				if (shard == manifest.shards.end())
+					throw std::runtime_error("image ordinal outside manifest");
+				if (current_meta != shard->metadata_file_name) {
+					md           = d::read_jpeg_dct_metadata_file(root / shard->metadata_file_name);
+					current_meta = shard->metadata_file_name;
+				}
+				const auto&    image   = md.images.at(id - shard->first_global_image_index);
+				const auto     start   = std::chrono::steady_clock::now();
+				const auto     decoded = reader.MaterializeImageDct(id);
+				nlohmann::json semantics {{"width", image.image_width}, {"height", image.image_height}};
+				semantics["components"] = nlohmann::json::array();
+				int max_h = 0, max_v = 0;
+				for (const auto& component : image.components) {
+					max_h = std::max(max_h, component.h_samp_factor);
+					max_v = std::max(max_v, component.v_samp_factor);
+				}
+				for (const auto& component : image.components) {
+					semantics["components"].push_back(
+					    {{"component_id", component.component_id},
+					     {"sampling", {component.h_samp_factor, component.v_samp_factor}},
+					     {"table_id", component.quant_tbl_no},
+					     {"block_grid", {component.height_in_blocks, component.width_in_blocks}},
+					     {"valid_pixels",
+					      {(image.image_height * component.v_samp_factor + max_v - 1) / max_v,
+					       (image.image_width * component.h_samp_factor + max_h - 1) / max_h}}});
+				}
+				std::vector<std::vector<JpegDctCoefficientRow>> grids;
+				for (const auto& component : image.components)
+					grids.emplace_back(size_t(component.height_in_blocks) * component.width_in_blocks);
+				for (const auto& block : decoded.blocks) {
+					const auto component =
+					    std::find_if(image.components.begin(), image.components.end(), [&](const auto& c) {
+						    return c.semantic_slot_id == block.semantic_slot_id;
+					    });
+					auto& row = grids.at(component - image.components.begin())
+					                .at(size_t(block.block_y) * component->width_in_blocks + block.block_x);
+					for (size_t k = 0; k < 64; ++k)
+						row[md.zigzag_columns ? d::kZigzagColumnToNaturalIndex[k] : k] = block.coefficients[k];
+				}
+				const uint32_t count = static_cast<uint32_t>(image.components.size());
+				put(&count, 1);
+				for (size_t c = 0; c < image.components.size(); ++c) {
+					const auto&    component = image.components[c];
+					const uint32_t shape[3]  = {static_cast<uint32_t>(component.local_component_index),
+					                            component.height_in_blocks,
+					                            component.width_in_blocks};
+					put(shape, 3);
+					const auto qt =
+					    std::find_if(image.quant_tables.begin(), image.quant_tables.end(), [&](const auto& table) {
+						    return table.table_id == component.quant_tbl_no;
+					    });
+					if (qt == image.quant_tables.end())
+						throw std::runtime_error("missing quantization table");
+					put(qt->values.data(), 64);
+					for (const auto& row : grids[c])
+						put(row.data(), row.size());
+				}
+				const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+				std::cerr << nlohmann::json {{"read_decode_seconds", seconds},
+				                             {"payload_read_bytes", nullptr},
+				                             {"metadata", semantics}}
+				                 .dump()
+				          << '\n';
+				std::cout.flush();
+			}
 		} else if (std::string(argv[1]) == "info-manifest") {
 			if (argc != 3)
 				throw std::runtime_error("info-manifest MANIFEST");

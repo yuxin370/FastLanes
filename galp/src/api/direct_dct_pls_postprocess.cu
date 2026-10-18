@@ -346,11 +346,15 @@ __global__ void projected_normalize_mixup(const int16_t*                   sourc
 		const auto  channel = channels[c];
 		const float value =
 		    (float(source[(image * input_channels + channel.source) * pixels + p]) - channel.subtract) / channel.divide;
-		const auto  partner = image == 0 ? images - 1 : image - 1;
-		const float rolled =
-		    (float(source[(partner * input_channels + channel.source) * pixels + p]) - channel.subtract) /
-		    channel.divide;
-		target[i] = enabled ? value * mixup->original + rolled * mixup->rolled : value;
+		if (!enabled) {
+			target[i] = value;
+		} else {
+			const auto  partner = image == 0 ? images - 1 : image - 1;
+			const float rolled =
+			    (float(source[(partner * input_channels + channel.source) * pixels + p]) - channel.subtract) /
+			    channel.divide;
+			target[i] = value * mixup->original + rolled * mixup->rolled;
+		}
 	}
 }
 
@@ -528,9 +532,9 @@ void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor   
 	auto* output = const_cast<float*>(input.float_data);
 	y_a.emplace(capacity * inputs.size() * pixels, stream);
 	y_b.emplace(capacity * inputs.size() * pixels, stream);
-	if (!external_targets)
+	if (enable_mixup && !external_targets)
 		targets_output.emplace(images * classes, stream);
-	auto* targets = external_targets ? external_targets : targets_output->get();
+	auto* targets = external_targets ? external_targets : (enable_mixup ? targets_output->get() : nullptr);
 	labels_device.emplace(images, stream);
 	decisions_device.emplace(images, stream);
 	mixup_device.emplace(mixup.size(), stream);
@@ -609,14 +613,16 @@ void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor   
 		    output_channels_device->get(),
 		    mixup_device->get() + offset / microbatch_images,
 		    enable_mixup);
-		mixup_targets_kernel<<<launch_blocks(count * classes), 256, 0, stream>>>(labels_device->get() + offset,
-		                                                                         targets + offset * classes,
-		                                                                         mixup_device->get() +
-		                                                                             offset / microbatch_images,
-		                                                                         count,
-		                                                                         classes,
-		                                                                         microbatch_images,
-		                                                                         enable_mixup);
+		if (enable_mixup) {
+			mixup_targets_kernel<<<launch_blocks(count * classes), 256, 0, stream>>>(labels_device->get() + offset,
+			                                                                         targets + offset * classes,
+			                                                                         mixup_device->get() +
+			                                                                             offset / microbatch_images,
+			                                                                         count,
+			                                                                         classes,
+			                                                                         microbatch_images,
+			                                                                         enable_mixup);
+		}
 		microbatch_ready[offset / capacity].record(stream);
 	}
 	check_cuda(cudaGetLastError(), "launch projected augmentation and normalization");
@@ -626,7 +632,10 @@ void DirectDctPlsCudaPostprocess::Impl::project(DirectDctGridTensorDescriptor   
 	projected_descriptor.float_data = output;
 	projected_descriptor.shape[1]   = outputs.size();
 	projected_descriptor.strides[0] = outputs.size() * pixels;
-	target_descriptor               = {targets, {images, classes}, {classes, 1U}, device};
+	target_descriptor =
+	    enable_mixup
+	        ? DirectDctPlsTargetTensorDescriptor {targets, {images, classes}, {classes, 1U}, device}
+	        : DirectDctPlsTargetTensorDescriptor {nullptr, {images, 1U}, {1U, 1U}, device, labels_device->get()};
 	// Publication does not wait for the whole pool; consumers wait on their
 	// microbatch event. The full completion event still governs backing lifetime.
 }
@@ -692,7 +701,8 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 		impl_->c_a.emplace(capacity * c_per_image, stream);
 		impl_->c_b.emplace(capacity * c_per_image, stream);
 		const auto [y_output, c_output] = source.device_batch().transform_workspace_async();
-		impl_->targets_output.emplace(labels.size() * model_classes, stream);
+		if (enable_mixup)
+			impl_->targets_output.emplace(labels.size() * model_classes, stream);
 		impl_->labels_device.emplace(labels.size(), stream);
 		impl_->decisions_device.emplace(randaugment.size(), stream);
 		impl_->mixup_device.emplace(mixup.size(), stream);
@@ -781,14 +791,16 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 			                                                                   c_per_image,
 			                                                                   microbatch_images,
 			                                                                   enable_mixup);
-			mixup_targets_kernel<<<launch_blocks(count * model_classes), 256, 0, stream>>>(
-			    impl_->labels_device->get() + offset,
-			    impl_->targets_output->get() + offset * model_classes,
-			    impl_->mixup_device->get() + offset / microbatch_images,
-			    count,
-			    model_classes,
-			    microbatch_images,
-			    enable_mixup);
+			if (enable_mixup) {
+				mixup_targets_kernel<<<launch_blocks(count * model_classes), 256, 0, stream>>>(
+				    impl_->labels_device->get() + offset,
+				    impl_->targets_output->get() + offset * model_classes,
+				    impl_->mixup_device->get() + offset / microbatch_images,
+				    count,
+				    model_classes,
+				    microbatch_images,
+				    enable_mixup);
+			}
 			check_cuda(cudaGetLastError(), "launch normalization and Mixup");
 		}
 		impl_->completion.record(stream);
@@ -802,12 +814,13 @@ DirectDctPlsCudaPostprocess::DirectDctPlsCudaPostprocess(
 		impl_->c_descriptor.data       = nullptr;
 		impl_->c_descriptor.float_data = c_output;
 		impl_->c_descriptor.dtype      = DirectDctTensorDataType::kFloat32;
-		impl_->target_descriptor       = {
-            impl_->targets_output->get(),
-            {labels.size(), model_classes},
-            {model_classes, 1U},
-            impl_->device,
-        };
+		impl_->target_descriptor =
+		    enable_mixup ? DirectDctPlsTargetTensorDescriptor {impl_->targets_output->get(),
+		                                                       {labels.size(), model_classes},
+		                                                       {model_classes, 1U},
+		                                                       impl_->device}
+		                 : DirectDctPlsTargetTensorDescriptor {
+		                       nullptr, {labels.size(), 1U}, {1U, 1U}, impl_->device, impl_->labels_device->get()};
 	} catch (...) {
 		impl_.reset();
 		throw;

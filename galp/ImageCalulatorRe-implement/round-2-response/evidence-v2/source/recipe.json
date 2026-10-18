@@ -1,0 +1,8 @@
+{
+  "encoder": "Pillow",
+  "encoder_version": "12.2.0",
+  "provenance": "this reproduce.py; synthetic, not ImageNet",
+  "quality": 82,
+  "resize": "none; generated 512x512 RGB fixture",
+  "subsampling": 2
+}

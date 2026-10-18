@@ -15,6 +15,8 @@ from galp.benchmarks.training_audit_policy import validate_audit_policy
 from galp.benchmarks.training_pls.contracts import (
     NATIVE_PHYSICAL_BACKEND,
     STANDARD_DCT_BACKEND,
+    DCT_REFERENCE_BACKENDS,
+    EXECUTION_MODES,
     blocking_code_identity,
     condition_identity_hash,
 )
@@ -189,6 +191,8 @@ def _read_pls_contract(run: Path) -> dict[str, Any]:
 
 
 def _execution_backend(contract: Mapping[str, Any]) -> str:
+    if "execution_backend" in contract:
+        return str(contract["execution_backend"])
     mode = str(contract.get("execution_mode", ""))
     if mode == "native_physical_pls":
         return NATIVE_PHYSICAL_BACKEND
@@ -312,6 +316,7 @@ def build_report(
     ):
         raise ValueError("native B6 run-manifest integrity hash mismatch")
 
+    reference_pipeline = "rgbnomore_dct"
     rgbnomore_condition: dict[str, Any] | None = None
     rgbnomore_environment: dict[str, Any] | None = None
     native_mapping_hash: str | None = None
@@ -319,13 +324,15 @@ def build_report(
     if rgbnomore_run is not None:
         rgbnomore_condition = _read_pls_contract(rgbnomore_run)
         rgbnomore_environment = _read_json(rgbnomore_run / "environment.json")
-        if _execution_backend(rgbnomore_condition) != STANDARD_DCT_BACKEND:
+        if _execution_backend(rgbnomore_condition) not in DCT_REFERENCE_BACKENDS:
             raise ValueError(
                 "--rgbnomore-run is not a standard RGB-no-more DCT run"
             )
+        if "baseline_store" in rgbnomore_condition.get("standard_dct_reference", {}):
+            reference_pipeline = rgbnomore_condition["standard_dct_reference"]["baseline_store"]["method"]
         if (
             rgbnomore_environment.get("execution_mode")
-            != "standard_rgbnomore_dct"
+            != EXECUTION_MODES[_execution_backend(rgbnomore_condition)]
             or rgbnomore_environment.get("physical_fls_observed") is not False
             or rgbnomore_environment.get("physical_gpu_pool") is not False
         ):
@@ -335,7 +342,7 @@ def build_report(
         paired_differences = {
             field: {
                 "native_b6": native_condition.get(field),
-                "rgbnomore_dct": rgbnomore_condition.get(field),
+                reference_pipeline: rgbnomore_condition.get(field),
             }
             for field in PAIRED_IDENTITY_FIELDS
             if native_condition.get(field) != rgbnomore_condition.get(field)
@@ -408,7 +415,7 @@ def build_report(
     }
     all_gpu_identities["native_b6"] = native_gpu
     if rgbnomore_environment is not None:
-        all_gpu_identities["rgbnomore_dct"] = _gpu_identity(
+        all_gpu_identities[reference_pipeline] = _gpu_identity(
             rgbnomore_environment
         )
     if any(identity != standard_gpu for identity in all_gpu_identities.values()):
@@ -441,7 +448,7 @@ def build_report(
         native_condition["code_version"]
     )
     if rgbnomore_condition is not None:
-        source_identities["rgbnomore_dct"] = blocking_code_identity(
+        source_identities[reference_pipeline] = blocking_code_identity(
             rgbnomore_condition["code_version"]
         )
     if len({tuple(sorted(value.items())) for value in source_identities.values()}) != 1:
@@ -502,12 +509,12 @@ def build_report(
         if int(rgbnomore_status.get("seed", -1)) != next(iter(seeds)):
             raise ValueError("RGB-no-more DCT training seed differs")
         rgbnomore_records = _read_jsonl(rgbnomore_run / "metrics.jsonl")
-        epoch_maps["rgbnomore_dct"] = _epoch_map(
+        epoch_maps[reference_pipeline] = _epoch_map(
             rgbnomore_records, "RGB-no-more DCT"
         )
         for epoch in EXPECTED_EPOCHS:
             native_epoch = epoch_maps["native_b6"][epoch]
-            rgbnomore_epoch = epoch_maps["rgbnomore_dct"][epoch]
+            rgbnomore_epoch = epoch_maps[reference_pipeline][epoch]
             for digest in ("sample_order_digest", "pool_membership_digest"):
                 if native_epoch.get(digest) != rgbnomore_epoch.get(digest):
                     raise ValueError(
@@ -556,7 +563,7 @@ def build_report(
         "native_b6": _read_json(native_run / "model_only_dct.json")
     }
     if rgbnomore_run is not None:
-        dct_model_only_by_pipeline["rgbnomore_dct"] = _read_json(
+        dct_model_only_by_pipeline[reference_pipeline] = _read_json(
             rgbnomore_run / "model_only_dct.json"
         )
     for pipeline, calibration in rgb_model_only_by_pipeline.items():
@@ -571,7 +578,7 @@ def build_report(
             raise ValueError(f"{pipeline} model-only calibration identity differs")
     dct_conditions = {"native_b6": native_condition}
     if rgbnomore_condition is not None:
-        dct_conditions["rgbnomore_dct"] = rgbnomore_condition
+        dct_conditions[reference_pipeline] = rgbnomore_condition
     for pipeline, calibration in dct_model_only_by_pipeline.items():
         observed_condition = dct_conditions[pipeline]
         if (
@@ -625,14 +632,14 @@ def build_report(
     native_warm_ips = float(epoch_maps["native_b6"][2]["images_per_second"])
     domains = {
         "native_b6": "dct",
-        "rgbnomore_dct": "dct",
+        reference_pipeline: "dct",
         "d2": "rgb",
         "d3": "rgb",
         "pytorch": "rgb",
     }
     pipeline_order = (
         "native_b6",
-        *(("rgbnomore_dct",) if rgbnomore_run is not None else ()),
+        *((reference_pipeline,) if rgbnomore_run is not None else ()),
         *standard_pipelines,
     )
     for pipeline in pipeline_order:
@@ -641,7 +648,7 @@ def build_report(
             ips = float(source["images_per_second"])
             model_only = (
                 dct_model_only_by_pipeline[pipeline]
-                if pipeline in DCT_PIPELINES
+                if pipeline in ("native_b6", reference_pipeline)
                 else rgb_model_only_by_pipeline[pipeline]
             )
             epoch_seconds = float(source["epoch_seconds"])
@@ -660,7 +667,7 @@ def build_report(
                     "pipeline": pipeline,
                     "input_domain": domains[pipeline],
                     "epoch": epoch,
-                    "observation": "cold" if epoch == 1 else "warm-primary",
+                    "observation": "order diagnostic; cache residency unmeasured" if epoch == 1 else "primary repeat; cache residency unmeasured",
                     "epoch_samples": int(source["epoch_samples"]),
                     "epoch_microbatches": int(source["epoch_microbatches"]),
                     "epoch_optimizer_updates": int(source["epoch_optimizer_updates"]),
@@ -740,10 +747,10 @@ def build_report(
         ("same_scheduler_family", contract["scheduler"]["type"] == native_condition["scheduler"]["type"] and contract["scheduler"]["warmup_optimizer_updates"] == native_condition["scheduler"]["warmup_optimizer_updates"], None),
         ("same_audit_policy", len(audit_hashes) == 1, next(iter(audit_hashes))),
         ("same_timing_scope", True, sorted(timing_fields)),
-        ("same_model_domain", False, {"native_b6": "dct", "rgbnomore_dct": "dct" if rgbnomore_run is not None else "not-run", "rgb": "rgb"}),
+        ("same_model_domain", False, {"native_b6": "dct", reference_pipeline: "dct" if rgbnomore_run is not None else "not-run", "rgb": "rgb"}),
         ("same_model_parameter_count", int(dct_model_only_by_pipeline["native_b6"]["model_parameter_count"]) == int(next(iter(rgb_model_only_by_pipeline.values()))["model_parameter_count"]), {"dct": dct_model_only_by_pipeline["native_b6"]["model_parameter_count"], "rgb": next(iter(rgb_model_only_by_pipeline.values()))["model_parameter_count"]}),
         ("same_augmentation", False, {"native_b6": native_recipe_augmentation, "rgb": rgb_augmentation}),
-        ("same_sample_order", False, {"native_b6": native_condition["order_policy"], "rgbnomore_dct": rgbnomore_condition["order_policy"] if rgbnomore_condition is not None else "not-run", "d2_pytorch": "canonical", "d3": "DALI-native"}),
+        ("same_sample_order", False, {"native_b6": native_condition["order_policy"], reference_pipeline: rgbnomore_condition["order_policy"] if rgbnomore_condition is not None else "not-run", "d2_pytorch": "canonical", "d3": "DALI-native"}),
         ("same_crop_policy", False, {"native_b6": native_condition["crop_policy"], "d2_pytorch": "per-sample-planned", "d3": "DALI-native"}),
         ("same_mixup_randaugment", False, {"native_b6": {"mixup": True, "randaugment": True}, "rgb": {"mixup": False, "randaugment": False}}),
         ("same_source_code_runtime_hashes", True, source_identities),
@@ -752,9 +759,9 @@ def build_report(
             rgbnomore_condition is None
             or all(
                 epoch_maps["native_b6"][epoch].get("sample_order_digest")
-                == epoch_maps["rgbnomore_dct"][epoch].get("sample_order_digest")
+                == epoch_maps[reference_pipeline][epoch].get("sample_order_digest")
                 and epoch_maps["native_b6"][epoch].get("pool_membership_digest")
-                == epoch_maps["rgbnomore_dct"][epoch].get("pool_membership_digest")
+                == epoch_maps[reference_pipeline][epoch].get("pool_membership_digest")
                 for epoch in EXPECTED_EPOCHS
             ),
             "not-run" if rgbnomore_condition is None else "epoch-1-and-2-match",
@@ -768,7 +775,7 @@ def build_report(
             ),
             {
                 "native_b6": native_mapping_hash,
-                "rgbnomore_dct": rgbnomore_mapping_hash,
+                reference_pipeline: rgbnomore_mapping_hash,
             },
         ),
         (
@@ -821,8 +828,8 @@ def build_report(
         "hardware": standard_gpu,
         "workload": {
             "epochs": [1, 2],
-            "epoch_1_role": "cold observation",
-            "epoch_2_role": "primary warm observation",
+            "epoch_1_role": "order diagnostic; post-verification for IC/FS; cache residency unmeasured",
+            "epoch_2_role": "primary repeat; cache residency unmeasured",
             "samples_per_epoch": EXPECTED_SAMPLES,
             "microbatch_images": 64,
             "gradient_accumulation": 16,
@@ -872,7 +879,7 @@ def build_report(
             "pipeline_only_cross_domain_claim": False,
             "recipe_matched_cross_domain_claim": False,
             "epoch_1_cold_comparison": False,
-            "epoch_2_warm_comparison": True,
+            "epoch_2_warm_comparison": False,
             "accuracy_or_convergence_claim": False,
             "long_run_throughput_qualification": False,
         },
@@ -896,6 +903,10 @@ def build_report(
             },
         },
     }
+    if reference_pipeline != "rgbnomore_dct":
+        report["dct_reference_backend"] = _execution_backend(rgbnomore_condition)
+        report["baseline_store"] = rgbnomore_condition["standard_dct_reference"]["baseline_store"]
+        report["headline_eligible"] = False
     return report, rows
 
 
@@ -961,7 +972,7 @@ def _write_outputs(
         f"Model: `{report['model_id']}`; precision: "
         f"`{report['precision']}`.",
         "",
-        "Epoch 2 is the registered warm observation. Percentages below are "
+        "Epoch 2 is the primary repeat observation; cache residency is unmeasured. Percentages below are "
         "individual observations against epoch wall time and are not additive.",
         "",
         "| Pipeline | img/s | vs Native B6 | prep % | exposed wait % | audit % | boundary sync % | model-only img/s |",
@@ -970,7 +981,7 @@ def _write_outputs(
     native_ips = float(warm["native_b6"]["images_per_second"])
     display_order = (
         "native_b6",
-        "rgbnomore_dct",
+        *(name for name in warm if name != "native_b6" and name not in STANDARD_PIPELINES),
         *STANDARD_PIPELINES,
     )
     for pipeline in (name for name in display_order if name in warm):
@@ -1014,9 +1025,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pytorch-root", type=Path)
     parser.add_argument("--native-run", type=Path, required=True)
     parser.add_argument(
-        "--rgbnomore-run",
+        "--rgbnomore-run", "--dct-reference-run",
         type=Path,
-        help="standard-rgbnomore-dct B6 run stopped after epoch 2",
+        help="JPEG or matched IC/FS DCT reference run stopped after epoch 2",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(

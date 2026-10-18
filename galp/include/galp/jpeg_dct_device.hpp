@@ -81,9 +81,12 @@ struct JpegDctGridTransformSpec {
 	JpegDctGridOutputDataType         output_data_type             = JpegDctGridOutputDataType::kInt16;
 	float                             output_add                   = 0.0F;
 	float                             output_scale                 = 1.0F;
-	bool                              dequantize                   = true;
-	bool                              require_all_coefficients     = true;
-	bool                              allow_grayscale              = false;
+	// Ordered FP32 operations: ((rounded + add) / divide) * scale + shift.
+	float                             output_divide            = 1.0F;
+	float                             output_shift             = 0.0F;
+	bool                              dequantize               = true;
+	bool                              require_all_coefficients = true;
+	bool                              allow_grayscale          = false;
 	std::vector<uint32_t>             preferred_small_crop_width_blocks;
 	std::vector<uint32_t>             preferred_small_crop_height_blocks;
 	std::vector<JpegDctSamplingRatio> allowed_chroma_sampling_ratios;

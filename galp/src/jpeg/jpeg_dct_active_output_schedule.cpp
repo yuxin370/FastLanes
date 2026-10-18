@@ -415,6 +415,10 @@ uint64_t jpeg_dct_active_output_transform_digest(const JpegDctGridTransformSpec&
 		hash = hash_scalar(hash, ratio.vertical_numerator);
 		hash = hash_scalar(hash, ratio.vertical_denominator);
 	}
+	if (transform.output_divide != 1.0F || transform.output_shift != 0.0F) {
+		hash = hash_float(hash, transform.output_divide);
+		hash = hash_float(hash, transform.output_shift);
+	}
 	return hash;
 }
 

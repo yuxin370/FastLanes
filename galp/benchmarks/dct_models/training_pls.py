@@ -111,7 +111,9 @@ def main():
     p.add_argument("--mapping", type=Path, required=True)
     p.add_argument("--mapping-sha256", required=True)
     p.add_argument("--condition", choices=["A0", "B6", "RGB"], required=True)
-    p.add_argument("--input-backend", choices=["native", "jpeg", "rgb_pytorch", "rgb_d2", "rgb_d3"], default="native")
+    p.add_argument("--input-backend", choices=["native", "jpeg", "ic", "fs", "rgb_pytorch", "rgb_d2", "rgb_d3"], default="native")
+    p.add_argument("--baseline-store", type=Path, help="original-JPEG matched IC/FS store for the existing training experiment")
+    p.add_argument("--baseline-evidence", type=Path, help="completed numerical verification for this store; recorded with results")
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--dali-prefetch-depth", type=int, choices=[2, 4], default=2)
     p.add_argument("--segments-per-pool", type=int, default=4)
@@ -136,6 +138,25 @@ def main():
     p.add_argument("--short-warmup", action="store_true", help="Exclude page-cache and short loader/model warmup before one measured epoch")
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
+    baseline_backend = args.input_backend in ('ic', 'fs')
+    if baseline_backend != (args.baseline_store is not None):
+        p.error('IC/FS require --baseline-store; other input backends do not use it')
+    baseline_evidence = None
+    if args.baseline_evidence:
+        from galp.benchmarks.dct_baselines.contracts import artifact, load_artifact
+        baseline_evidence = json.loads(args.baseline_evidence.read_text())
+        from galp.benchmarks.dct_baselines.store import StoreReader
+        expected_store = None
+        if baseline_backend:
+            with StoreReader(args.baseline_store) as reader:
+                expected_store = reader.identity
+                reader.verify_content()
+        if (not baseline_backend or baseline_evidence['status'] != 'passed' or
+                baseline_evidence['phase'] != 'verification' or baseline_evidence['backend'].get('store') != expected_store):
+            raise ValueError('baseline evidence does not verify this IC/FS store')
+        contract = load_artifact(baseline_evidence['resolved_contract'])
+        if load_artifact(contract['model_profile'])['model'] != B.PROFILE:
+            raise ValueError('baseline evidence verifies a different model profile')
     if args.short_warmup and (args.epochs!=1 or args.resume or args.data_only or args.profile or args.input_backend not in ('native','jpeg')):
         p.error('short-warmup requires one fresh, unprofiled training epoch')
     pool_images = args.segments_per_pool * 1024
@@ -146,6 +167,10 @@ def main():
         p.error("profile warmup and the 16384-image capture must contain complete pools")
     initialization_started = time.perf_counter()
     rgb_backend = args.input_backend.startswith("rgb_")
+    if not rgb_backend:
+        from galp.benchmarks.dct_baselines.contracts import artifact
+        if artifact(args.mapping)['sha256'] != args.mapping_sha256:
+            raise ValueError('premixed mapping SHA-256 differs')
     if rgb_backend != (args.condition == "RGB"):
         raise ValueError("RGB condition requires an RGB input backend")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -200,11 +225,16 @@ def main():
         pipeline = RgbTrainingPipeline(variant=args.input_backend.removeprefix("rgb_"), workers=args.workers,
             microbatch=microbatch, pool_images=args.segments_per_pool*1024,
             dali_prefetch_depth=args.dali_prefetch_depth)
-    elif args.input_backend == "jpeg":
+    elif args.input_backend in ("jpeg", "ic", "fs"):
         from galp.benchmarks.dct_models.training_jpeg import JpegTrainingPipeline
         pipeline_factory = lambda: JpegTrainingPipeline(args.mapping, output_channels=channels(), grid=B.GRID,
-            workers=args.workers, microbatch=microbatch, pool_images=args.segments_per_pool*1024,condition=args.condition)
+            workers=args.workers, microbatch=microbatch, pool_images=args.segments_per_pool*1024,condition=args.condition,
+            store=args.baseline_store)
         pipeline=pipeline_factory()
+        if baseline_backend:
+            method = pipeline.store_identity['method']
+            if (args.input_backend == 'ic' and not method.startswith('ic_matched_')) or (args.input_backend == 'fs' and method != 'fs_matched_b8'):
+                raise ValueError('input backend does not match the baseline store method')
     else:
         pipeline_factory = lambda: DirectDctPlsPipeline(args.manifest, args.mapping, training_seed=11997733,
             expected_mapping_sha256=args.mapping_sha256,
@@ -230,6 +260,8 @@ def main():
             raise ValueError("resume profile, condition, or pool size differs")
         if state.get("input_backend", "native") != args.input_backend:
             raise ValueError("resume input backend differs")
+        if baseline_backend and state['baseline_store_identity'] != pipeline.store_identity:
+            raise ValueError('resume baseline source/store identity differs')
         net.load_state_dict(state["model"], strict=True)
         optimizer.load_state_dict(state["optimizer"])
         decayer.load_state_dict(state["decayer"])
@@ -436,7 +468,8 @@ def main():
             if full and net is not None:
                 torch.save(dict(model=net.state_dict(), optimizer=optimizer.state_dict(), decayer=decayer.state_dict(),
                     scheduler=scheduler.state_dict(), completed_epochs=complete_epochs, profile=B.PROFILE, condition=args.condition,
-                    input_backend=args.input_backend, segments_per_pool=args.segments_per_pool, rng_state=capture_rng_state()),
+                    input_backend=args.input_backend, baseline_store_identity=pipeline.store_identity if baseline_backend else None,
+                    segments_per_pool=args.segments_per_pool, rng_state=capture_rng_state()),
                     args.output_dir / f"epoch_{epoch}.pth")
             if args.max_pools:
                 break
@@ -470,12 +503,32 @@ def main():
         cpu_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         largest_finished_child_peak_rss_kib=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
         warmup=warmup,
-        timing=("one warm epoch after excluded short warmup" if args.short_warmup else "cold epoch E2E includes first compile")+"; pool boundaries included; overlapping stages are not additive",
+        timing=("one warm epoch after excluded short warmup" if args.short_warmup else
+                "post-verification epoch E2E includes first compile; cache residency unmeasured" if baseline_backend else
+                "epoch E2E includes first compile; cache residency unmeasured")+"; pool boundaries included; overlapping stages are not additive",
         augmentation=("existing Transformer RGB crop/flip, bilinear resize 224, mean/std .5; hard labels, no DCT RandAugment/Mixup" if rgb_backend else
                       "source DCT crop/resize/flip; round to integer; RandAugment clamp [-1024,1016], two operations; spatial magnitudes scaled from 28-grid; channel normalization then Mixup"),
         validation=(("per-epoch RGB center-crop validation" if rgb_backend else "per-epoch N validation")
                     if args.validation_count else "disabled for throughput epoch; checkpoint quality evaluated separately")
                    + "; bounded training probes are not convergence evidence")
+    if baseline_backend:
+        from galp.benchmarks.dct_baselines.contracts import artifact
+        result.update(baseline_store=pipeline.store_identity,
+                      store_content_verification=pipeline.store_content_verification,
+                      correctness_evidence=artifact(args.baseline_evidence) if baseline_evidence else None,
+                      headline_eligible=False,
+                      input_reader_scope='merged read-many per model microbatch; bounded whole-member decode/scatter; no decoded cache')
+    if not rgb_backend:
+        import inspect
+        from galp.benchmarks.dct_models.matched_training import training_identity
+        from galp.benchmarks.dct_baselines.store import fingerprint
+        result['matched_identity'] = training_identity(args, profile=B.PROFILE, channels=channels(), grid=B.GRID,
+            model_code=[artifact(B.__file__), artifact(inspect.getfile(type(net)))] if net is not None else [artifact(B.__file__)],
+            initial_model_hash=initial_model_hash, recipe=recipe, source=source_path,
+            runtime=dict(device=result['device'], device_uuid=result['device_uuid'], torch=torch.__version__,
+                         cuda=torch.version.cuda, cudnn=torch.backends.cudnn.version(),
+                         training_native_binding=artifact(sys.modules['_galp_direct_dct'].__file__)))
+        result['matched_identity_sha256'] = fingerprint(result['matched_identity'])
     result_path.write_text(json.dumps(result, indent=2)+"\n")
     print(json.dumps({k:v for k,v in result.items() if k not in ("epochs", "audit_policy", "output_channels")}, indent=2), flush=True)
 

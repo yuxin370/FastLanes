@@ -319,6 +319,7 @@ def main():
     p.add_argument('--microbatch', type=int, default=64)
     p.add_argument('--global-batch', type=int, default=1024)
     p.add_argument('--segments-per-pool', type=int, default=4)
+    p.add_argument('--crop-policy', choices=['per-pls', 'per-sample'], default='per-pls')
     p.add_argument('--precision', choices=['fp32', 'bf16'], default='bf16')
     p.add_argument('--seed', type=int, default=11997733)
     p.add_argument('--torch-threads', type=int, default=4)
@@ -351,7 +352,7 @@ def main():
     pipeline = DirectDctPlsPipeline(args.manifest, args.mapping, training_seed=args.seed,
         expected_mapping_sha256=args.mapping_sha256, rank=rank, world_size=world,
         microbatch_images=args.microbatch, segments_per_pool=args.segments_per_pool,
-        io_backend=args.io_backend,
+        io_backend=args.io_backend, crop_policy=args.crop_policy,
         **pipeline_options(args.model))
     columns = (torch.tensor(label_columns(args.mapping), device=device) if args.model == 'mobilenet24' else None)
     updates_per_epoch = math.ceil(pipeline.sample_count / args.global_batch)
@@ -359,6 +360,7 @@ def main():
     contract = dict(model=args.model, initialization='seeded scratch', initial_model_sha256=initial_hash,
         seed=args.seed, world_size=world, microbatch=args.microbatch, global_batch=args.global_batch,
         precision=args.precision, epochs=args.epochs, segments_per_pool=args.segments_per_pool,
+        crop_policy=args.crop_policy,
         samples=pipeline.sample_count, mapping_sha256=args.mapping_sha256,
         manifest_sha256=hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         io_backend=args.io_backend,

@@ -46,6 +46,14 @@ for spec in $SPECS; do
       ;;
   esac
   CONDITION=A0; WORKERS=${CNN_DATA_WORKERS:-16}
+  BASELINE_EXTRA=()
+  if [[ "$BACKEND" == ic ]]; then
+    : "${CNN_IC_STORE:?Set CNN_IC_STORE to the matched original-JPEG IC store}"
+    BASELINE_EXTRA=(--baseline-store "$CNN_IC_STORE")
+  elif [[ "$BACKEND" == fs ]]; then
+    : "${CNN_FS_STORE:?Set CNN_FS_STORE to the matched original-JPEG Frequency-Store}"
+    BASELINE_EXTRA=(--baseline-store "$CNN_FS_STORE")
+  fi
   if [[ "$BACKEND" == native ]]; then CONDITION=B6; fi
   if [[ "$BACKEND" == rgb_* ]]; then CONDITION=RGB; fi
   if [[ "$BACKEND" == rgb_d* ]]; then WORKERS=4; fi
@@ -65,7 +73,7 @@ for spec in $SPECS; do
   done
   COMMAND=("${DRIVER[@]}" --manifest "${INPUTS[0]}" --mapping "${INPUTS[1]}"
     --mapping-sha256 "${INPUTS[2]}" --condition "$CONDITION" --input-backend "$BACKEND"
-    --workers "$WORKERS" --segments-per-pool 4 --transform-blocks-per-launch "$BLOCKS" --output-dir "$OUT" "${EXTRA[@]}" "${MODEL_EXTRA[@]}" "${RESUME[@]}")
+    --workers "$WORKERS" --segments-per-pool 4 --transform-blocks-per-launch "$BLOCKS" --output-dir "$OUT" "${EXTRA[@]}" "${MODEL_EXTRA[@]}" "${BASELINE_EXTRA[@]}" "${RESUME[@]}")
   if [[ "$MODE" == plan ]]; then
     printf '%q ' "${COMMAND[@]}"
     printf '\n'

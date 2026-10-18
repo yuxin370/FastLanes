@@ -1,0 +1,27 @@
+{
+  "decode_budget_bytes": 1048576,
+  "host_input_budget_bytes": 4194304,
+  "label_mapping": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence/regressions/test_cpu_window_excludes_initialization_and_capacity_accounting/ic/store.json",
+    "sha256": "3263fd4e0d040deaca743d39607cc1786e43c728f916bbdc6d25c5151fd6c160"
+  },
+  "model_microbatch_size": 2,
+  "model_profile": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence/regressions/test_cpu_window_excludes_initialization_and_capacity_accounting/ic/store.json",
+    "sha256": "3263fd4e0d040deaca743d39607cc1786e43c728f916bbdc6d25c5151fd6c160"
+  },
+  "precision": "fp32",
+  "preparation_pool_size": 2,
+  "reader_memory_budget_bytes": 2097152,
+  "repository_revision": "test",
+  "request_trace": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence/regressions/test_cpu_window_excludes_initialization_and_capacity_accounting/ic/store.json",
+    "sha256": "3263fd4e0d040deaca743d39607cc1786e43c728f916bbdc6d25c5151fd6c160"
+  },
+  "source_manifest": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence/regressions/test_cpu_window_excludes_initialization_and_capacity_accounting/ic/store.json",
+    "sha256": "3263fd4e0d040deaca743d39607cc1786e43c728f916bbdc6d25c5151fd6c160"
+  },
+  "torch_threads": 1,
+  "workers": 2
+}

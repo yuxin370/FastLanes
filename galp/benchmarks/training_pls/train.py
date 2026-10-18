@@ -37,9 +37,13 @@ from galp.benchmarks.model_only_training_calibration import (
 
 from .contracts import (
     EXECUTION_BACKENDS,
+    DCT_REFERENCE_BACKENDS,
+    IC_DCT_BACKEND,
+    FS_DCT_BACKEND,
+    BACKEND_IMPLEMENTATIONS,
+    EXECUTION_MODES,
     NATIVE_PHYSICAL_BACKEND,
     SEMANTIC_BACKEND,
-    STANDARD_DCT_BACKEND,
     blocking_code_identity,
     code_provenance_differences,
     code_version,
@@ -358,6 +362,7 @@ def _validate_contract(
     physical_galp_manifest: Path | None,
     premixed_mapping_csv: Path | None,
     expected_mapping_sha256: str | None,
+    baseline_store: Path | None = None,
     model_id: str | None = None,
     model_configuration: Mapping[str, Any] | None = None,
     model_source_provenance: Sequence[Mapping[str, str]] | None = None,
@@ -387,31 +392,17 @@ def _validate_contract(
     if execution_backend not in EXECUTION_BACKENDS:
         raise ValueError(f"unsupported execution backend: {execution_backend!r}")
     native_physical = execution_backend == NATIVE_PHYSICAL_BACKEND
-    standard_dct = execution_backend == STANDARD_DCT_BACKEND
+    standard_dct = execution_backend in DCT_REFERENCE_BACKENDS
     expected = {
         "condition_id": condition_id,
         "training_seed": seed,
         "recipe_hash": recipe_hash,
         "layout_hash": layout_hash,
-        "execution_mode": (
-            "native_physical_pls"
-            if native_physical
-            else (
-                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
-            )
-        ),
+        "execution_mode": EXECUTION_MODES[execution_backend],
         "semantic_emulation": execution_backend == SEMANTIC_BACKEND,
         "physical_fls_observed": native_physical,
         "physical_gpu_pool": native_physical,
-        "backend_implementation": (
-            "galp-native-direct-dct-pls-block-major-v1"
-            if native_physical
-            else (
-                "rgbnomore-jpeg-dct-premixed-reference-v2"
-                if standard_dct
-                else "shared-galp-direct-dct-semantic-backend-v2"
-            )
-        ),
+        "backend_implementation": BACKEND_IMPLEMENTATIONS[execution_backend],
     }
     if model_id is not None:
         if model_configuration is None or model_source_provenance is None:
@@ -486,6 +477,14 @@ def _validate_contract(
                 "standard DCT reference contract does not match run arguments: "
                 f"expected {expected_reference}, got {observed_reference}"
             )
+        if execution_backend in (IC_DCT_BACKEND, FS_DCT_BACKEND):
+            from galp.benchmarks.dct_baselines.store import StoreReader
+            if baseline_store is None:
+                raise ValueError("IC/FS requires a baseline store")
+            with StoreReader(baseline_store) as reader:
+                identity = reader.identity
+            if reference["baseline_store"]["store"] != identity:
+                raise ValueError("IC/FS store differs from the immutable run manifest")
     provenance_differences = code_provenance_differences(planned_code, current_code)
     validation = {
         "schema_version": "galp-pls-run-manifest-validation-v1",
@@ -1453,7 +1452,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"{model_spec.supported_conditions}; got {args.condition!r}"
         )
     native_physical = args.execution_backend == NATIVE_PHYSICAL_BACKEND
-    standard_dct = args.execution_backend == STANDARD_DCT_BACKEND
+    standard_dct = args.execution_backend in DCT_REFERENCE_BACKENDS
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     layout = load_layout_mapping(args.layout_plan)
@@ -1470,6 +1469,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         layout_hash=layout.layout_hash,
         execution_backend=args.execution_backend,
+        baseline_store=args.baseline_store,
         physical_galp_manifest=args.physical_galp_manifest,
         premixed_mapping_csv=args.premixed_mapping_csv,
         expected_mapping_sha256=args.expected_mapping_sha256,
@@ -1508,6 +1508,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             base_mapping=layout,
             samples=train_samples,
         )
+        if args.baseline_store is not None:
+            from galp.benchmarks.dct_baselines.store import training_store_identity
+            identity = training_store_identity(args.baseline_store,
+                [(s.logical_sample_id, s.label, s.path) for s in train_samples], args.execution_backend)
+            if identity != contract["standard_dct_reference"]["baseline_store"]:
+                raise ValueError("IC/FS store/source identity changed after planning")
+            from galp.benchmarks.dct_baselines.store import StoreReader
+            with StoreReader(args.baseline_store) as reader:
+                store_content_verification = reader.verify_content()
     if {sample.logical_sample_id for sample in train_samples} & {
         sample.logical_sample_id for sample in val_samples
     }:
@@ -1629,13 +1638,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     environment = _device_environment(device)
     environment.update(
-        execution_mode=(
-            "native_physical_pls"
-            if native_physical
-            else (
-                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
-            )
-        ),
+        execution_mode=EXECUTION_MODES[args.execution_backend],
         semantic_emulation=args.execution_backend == SEMANTIC_BACKEND,
         physical_fls_observed=native_physical,
         physical_gpu_pool=native_physical,
@@ -1651,18 +1654,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         audit_policy=contract["audit_policy"],
         process_isolation="one-condition-seed-per-process",
         cache_state=(
-            "not forcibly dropped; epoch 1 is cold/order diagnostic and epoch 2 "
-            "is warm-primary"
+            "not forcibly dropped; cache residency unmeasured; epoch 1 is "
+            + ("post-verification/order diagnostic" if args.baseline_store is not None else "order diagnostic")
+            + "; epoch 2 follows epoch 1, without a verified warm-cache claim"
         ),
-        backend_implementation=(
-            "galp-native-direct-dct-pls-block-major-v1"
-            if native_physical
-            else (
-                "rgbnomore-jpeg-dct-premixed-reference-v2"
-                if standard_dct
-                else "shared-galp-direct-dct-semantic-backend-v2"
-            )
-        ),
+        backend_implementation=BACKEND_IMPLEMENTATIONS[args.execution_backend],
         train_manifest=train_meta,
         validation_manifest=val_meta,
         galp_torch_module_path=str(args.galp_torch_module_path.resolve()),
@@ -1777,6 +1773,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "rgbnomore_root": str(args.rgbnomore_root.resolve()),
                 "execution_mode": "runtime",
                 "benchmark": "standard-rgbnomore-dct-reference-v2",
+                "baseline_store": args.baseline_store,
             }
             if standard_dct
             else _adapter_config(
@@ -2039,6 +2036,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         boundary_sync_seconds = 0.0
         adapter_close_seconds = 0.0
         epoch_loader_stage_seconds: dict[str, float] = {}
+        epoch_baseline_io: dict[str, float] = {}
         for pool_index, pool_pls_ids, positions in epoch_position_pools(
             layout,
             condition_id=args.condition,
@@ -2205,6 +2203,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                     + float(value)
                                 )
                             adapter.snapshot_batch_metrics(batch)
+                            if args.baseline_store is not None:
+                                for name, value in batch.native_counters.items():
+                                    key = "baseline_"+name
+                                    if name.endswith("peak_bytes"):
+                                        epoch_baseline_io[name] = max(epoch_baseline_io.get(name, 0), value)
+                                        loader_totals[key] = max(loader_totals.get(key, 0), value)
+                                    else:
+                                        epoch_baseline_io[name] = epoch_baseline_io.get(name, 0)+value
+                                        loader_totals[key] = loader_totals.get(key, 0)+value
                             epoch_microbatches += 1
                             del batch, inputs, labels, mixed_labels, logits, loss
                         gradients = _optimizer_gradients(
@@ -2400,6 +2407,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 },
             },
         }
+        if args.baseline_store is not None:
+            epoch_record["baseline_io"] = epoch_baseline_io
+            epoch_record["baseline_io_scope"] = "consumed microbatches including worker initialization; unused lookahead is not measured"
         metrics.append(epoch_record)
         completed_epoch = epoch + 1
         if completed_epoch in validation_grid:
@@ -2555,13 +2565,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "state": "completed",
         "condition": args.condition,
         "seed": args.seed,
-        "execution_mode": (
-            "native_physical_pls"
-            if native_physical
-            else (
-                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
-            )
-        ),
+        "execution_mode": EXECUTION_MODES[args.execution_backend],
         "semantic_emulation": args.execution_backend == SEMANTIC_BACKEND,
         "physical_fls_observed": native_physical,
         "physical_gpu_pool": native_physical,
@@ -2583,15 +2587,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             (output_dir / "model_only_dct.json").resolve()
         ),
         "model_execution": recipe["execution"],
-        "backend_implementation": (
-            "galp-native-direct-dct-pls-block-major-v1"
-            if native_physical
-            else (
-                "rgbnomore-jpeg-dct-premixed-reference-v2"
-                if standard_dct
-                else "shared-galp-direct-dct-semantic-backend-v2"
-            )
-        ),
+        "backend_implementation": BACKEND_IMPLEMENTATIONS[args.execution_backend],
         "final_top1": final_validation["validation_top1"],
         "final_top5": final_validation["validation_top5"],
         "final_validation_loss": final_validation["validation_loss"],
@@ -2637,6 +2633,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         result["standard_dct_reference"] = dict(
             contract["standard_dct_reference"]
         )
+        if args.baseline_store is not None:
+            result["baseline_store"] = identity
+            result["store_content_verification"] = store_content_verification
+            result["headline_eligible"] = False
+            result["claim_boundary"] = "Matched original JPEG q/Q through the existing training loop; merged bounded whole-member reads per microbatch, without decoded caching."
     # Calibration compiles and executes a separate model.  Run it only after
     # the formal epochs and their runtime/memory observations are complete so
     # the cold epoch cannot depend on whether a calibration artifact existed.
@@ -2688,6 +2689,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=EXECUTION_BACKENDS,
         default=SEMANTIC_BACKEND,
     )
+    parser.add_argument("--baseline-store", type=Path)
     parser.add_argument("--physical-galp-manifest", type=Path)
     parser.add_argument("--premixed-mapping-csv", type=Path)
     parser.add_argument("--expected-mapping-sha256")
@@ -2750,7 +2752,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             raise ValueError(
                 "--expected-mapping-sha256 differs from --premixed-mapping-csv"
             )
-    elif args.execution_backend == STANDARD_DCT_BACKEND:
+    elif args.execution_backend in DCT_REFERENCE_BACKENDS:
         if args.physical_galp_manifest is not None:
             raise ValueError(
                 "standard-rgbnomore-dct reads source JPEGs and cannot accept "
@@ -2779,6 +2781,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError(
             "physical PLS paths require --execution-backend native-physical-pls"
         )
+    if args.execution_backend in (IC_DCT_BACKEND, FS_DCT_BACKEND):
+        if args.baseline_store is None or not (args.baseline_store / "store.json").is_file():
+            raise ValueError("IC/FS requires --baseline-store containing store.json")
+    elif args.baseline_store is not None:
+        raise ValueError("--baseline-store requires an IC/FS execution backend")
     return args
 
 

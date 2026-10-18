@@ -860,6 +860,16 @@ TEST(JpegDctBlockMajorPlan, CanonicalTemplateRoundTripsWithStableHitMissDigest) 
 	// The audit digest intentionally describes that payload and must therefore
 	// remain stable for this output-only transform change.
 	EXPECT_EQ(profile_miss.stats.canonical_template_audit_digest, hit.stats.canonical_template_audit_digest);
+	for (const bool division : {false, true}) {
+		different_transform = transform;
+		if (division)
+			different_transform.output_divide = 2040.0F;
+		else
+			different_transform.output_shift = -1.0F;
+		const auto ordered_miss = planner.Plan(requests, different_transform);
+		EXPECT_EQ(ordered_miss.stats.canonical_template_hit_count, 0U);
+		EXPECT_EQ(ordered_miss.stats.canonical_template_miss_count, 1U);
+	}
 }
 
 namespace {
@@ -1000,6 +1010,63 @@ TEST(JpegDctBlockMajorPlan, ActiveOutputOwnershipIsOneTimeDeterministicAndWorkse
 		EXPECT_TRUE(std::is_sorted(begin, end));
 		EXPECT_EQ(std::adjacent_find(begin, end), end);
 	}
+}
+
+TEST(JpegDctBlockMajorPlan, SplitDown2RetainsOnlyCrossWorksetSourcesAndTheirLastOwner) {
+	using namespace galp::jpeg;
+	using namespace galp::jpeg::detail;
+	JpegDctDeviceBlockMajorPlanlessPlan plan;
+	plan.images.resize(4);
+	for (auto& image : plan.images) {
+		auto& c       = image.components[0];
+		c.present     = 1;
+		c.x_up_factor = c.y_up_factor = 1;
+		c.x_down_factor = c.y_down_factor = 2;
+	}
+	// Identity and upsampling do not need the down2 source retention.
+	plan.images[1].components[0].x_down_factor = plan.images[1].components[0].y_down_factor = 1;
+	plan.images[2].components[0].x_up_factor                                                = 2;
+	JpegDctGridTransformSpec transform;
+	transform.y_output_width_blocks    = 2;
+	transform.y_output_height_blocks   = 1;
+	transform.cbcr_output_width_blocks = transform.cbcr_output_height_blocks = 1;
+	JpegDctDeviceBlockMajorActiveOutputSchedule schedule;
+	schedule.logical_output_block_count = 16;
+	schedule.offsets                    = {0, 2, 4};
+	schedule.active_output_blocks       = {0, 1, 0, 1};
+	schedule.repeated_image_count       = 4;
+	const auto repeated                 = build_split_down2_plan(schedule, plan, transform);
+	EXPECT_EQ(repeated.source_value_count, 4U * 256U);
+	for (const auto block : {0U, 1U, 12U, 13U}) {
+		EXPECT_NE(repeated.blocks[block].slot, std::numeric_limits<uint32_t>::max());
+		EXPECT_EQ(repeated.blocks[block].last_workset, 1U);
+	}
+	EXPECT_EQ(repeated.blocks[4].slot, std::numeric_limits<uint32_t>::max());
+	EXPECT_EQ(repeated.blocks[8].slot, std::numeric_limits<uint32_t>::max());
+
+	// The compact mixed-geometry schedule stores relative blocks and image IDs.
+	schedule.groups        = {{0, 2, 0, 2, 0}, {2, 2, 0, 2, 0}};
+	schedule.group_offsets = {0, 1, 2};
+	schedule.image_indices = {3, 0};
+	const auto grouped     = build_split_down2_plan(schedule, plan, transform);
+	EXPECT_EQ(grouped.source_value_count, repeated.source_value_count);
+	EXPECT_EQ(grouped.blocks[12].slot, 0U);
+	EXPECT_EQ(grouped.blocks[0].slot, 2U);
+
+	// Direct slices keep absolute output IDs, and a third owner must win.
+	schedule.groups               = {{0, 2, 0, 0, 0}, {2, 1, 0, 0, 0}, {3, 1, 0, 0, 0}};
+	schedule.group_offsets        = {0, 1, 2, 3};
+	schedule.offsets              = {0, 2, 3, 4};
+	schedule.active_output_blocks = {0, 1, 0, 0};
+	const auto direct             = build_split_down2_plan(schedule, plan, transform);
+	EXPECT_EQ(direct.source_value_count, 256U);
+	EXPECT_EQ(direct.blocks[0].last_workset, 2U);
+	EXPECT_EQ(direct.blocks[1].slot, std::numeric_limits<uint32_t>::max());
+	schedule.groups.clear();
+	schedule.repeated_image_count = 1;
+	EXPECT_EQ(build_split_down2_plan(schedule, plan, transform).source_value_count, 256U);
+	schedule.offsets = {0, 2};
+	EXPECT_TRUE(build_split_down2_plan(schedule, plan, transform).blocks.empty());
 }
 
 TEST(JpegDctBlockMajorPlan, SharedIdentityScheduleRepeatsSpatialOwnershipInRequestOrder) {
@@ -1720,12 +1787,15 @@ TEST(JpegDctBlockMajorPlan, WeightedLaunchesPreserveMixedGeometryOrderAndDepende
 
 TEST(JpegDctBlockMajorPlan, OutputBatchCompletionWaitsForEveryWorksetContribution) {
 	using namespace galp::jpeg::detail;
+	std::vector<JpegDctDevicePlanlessImageDescriptor> images(4);
+	for (uint32_t i = 0; i < images.size(); ++i)
+		images[i].request_index = i;
 	JpegDctDeviceBlockMajorActiveOutputSchedule schedule;
 	schedule.offsets = {0, 4, 7};
 	// Image 0 has a late contribution; image 1 finishes in workset 0.
 	// Images 2/3 share delivery batch 1 and finish in workset 1.
 	schedule.active_output_blocks = {0, 10, 20, 30, 21, 1, 31};
-	auto points                   = build_output_batch_completion_schedule(schedule, 10, 4, 2);
+	auto points                   = build_output_batch_completion_schedule(schedule, 10, images, 2);
 	ASSERT_EQ(points.size(), 2U);
 	EXPECT_TRUE(points[0].empty());
 	ASSERT_EQ(points[1].size(), 2U);
@@ -1739,7 +1809,8 @@ TEST(JpegDctBlockMajorPlan, OutputBatchCompletionWaitsForEveryWorksetContributio
 	schedule.offsets              = {0, 1, 2};
 	schedule.active_output_blocks = {0, 1};
 	schedule.repeated_image_count = 3;
-	points                        = build_output_batch_completion_schedule(schedule, 10, 3, 2);
+	images.resize(3);
+	points = build_output_batch_completion_schedule(schedule, 10, images, 2);
 	EXPECT_TRUE(points[0].empty());
 	ASSERT_EQ(points[1].size(), 2U);
 	EXPECT_EQ(points[1][0].task_end, 2U);
@@ -1750,7 +1821,7 @@ TEST(JpegDctBlockMajorPlan, OutputBatchCompletionWaitsForEveryWorksetContributio
 	schedule.image_indices        = {2, 0, 1};
 	schedule.group_offsets        = {0, 1, 2};
 	schedule.groups               = {{0, 1, 0, 3, 0}, {1, 1, 1, 2, 0}};
-	points                        = build_output_batch_completion_schedule(schedule, 10, 3, 1);
+	points                        = build_output_batch_completion_schedule(schedule, 10, images, 1);
 	ASSERT_EQ(points[0].size(), 1U);
 	EXPECT_EQ(points[0][0].output_batch, 2U);
 	EXPECT_EQ(points[0][0].task_end, 1U);
@@ -1759,4 +1830,49 @@ TEST(JpegDctBlockMajorPlan, OutputBatchCompletionWaitsForEveryWorksetContributio
 	EXPECT_EQ(points[1][0].task_end, 1U);
 	EXPECT_EQ(points[1][1].output_batch, 1U);
 	EXPECT_EQ(points[1][1].task_end, 2U);
+}
+
+TEST(JpegDctBlockMajorPlan, OutputCompletionUsesRequestSlotsAfterPhysicalSorting) {
+	using namespace galp::jpeg::detail;
+	std::vector<JpegDctDevicePlanlessImageDescriptor> images(2);
+	images[0].request_index = 1;
+	images[1].request_index = 0;
+	JpegDctDeviceBlockMajorActiveOutputSchedule schedule;
+	schedule.offsets              = {0, 1, 2};
+	schedule.active_output_blocks = {0, 10};
+	auto points                   = build_output_batch_completion_schedule(schedule, 10, images, 1);
+	ASSERT_EQ(points[0].size(), 1U);
+	ASSERT_EQ(points[1].size(), 1U);
+	EXPECT_EQ(points[0][0].output_batch, 1U);
+	EXPECT_EQ(points[1][0].output_batch, 0U);
+
+	// Each occurrence has its own slot even when sources repeat. Check both
+	// compact schedule forms with a reordered full batch and a one-image tail.
+	images.resize(3);
+	images[0].request_index       = 2;
+	images[1].request_index       = 0;
+	images[2].request_index       = 1;
+	schedule.offsets              = {0, 1, 2, 3};
+	schedule.active_output_blocks = {0, 1, 2};
+	schedule.repeated_image_count = 3;
+	points                        = build_output_batch_completion_schedule(schedule, 10, images, 2);
+	EXPECT_TRUE(points[0].empty());
+	EXPECT_TRUE(points[1].empty());
+	ASSERT_EQ(points[2].size(), 2U);
+	EXPECT_EQ(points[2][0].output_batch, 1U);
+	EXPECT_EQ(points[2][0].task_end, 1U);
+	EXPECT_EQ(points[2][1].output_batch, 0U);
+	EXPECT_EQ(points[2][1].task_end, 3U);
+
+	schedule.image_indices = {0, 1, 2};
+	schedule.groups        = {{0, 1, 0, 3, 0}, {1, 1, 0, 3, 0}, {2, 1, 0, 3, 0}};
+	schedule.group_offsets = {0, 1, 2, 3};
+	const auto grouped     = build_output_batch_completion_schedule(schedule, 10, images, 2);
+	EXPECT_TRUE(grouped[0].empty());
+	EXPECT_TRUE(grouped[1].empty());
+	ASSERT_EQ(grouped[2].size(), 2U);
+	for (size_t i = 0; i < 2; ++i) {
+		EXPECT_EQ(grouped[2][i].output_batch, points[2][i].output_batch);
+		EXPECT_EQ(grouped[2][i].task_end, points[2][i].task_end);
+	}
 }

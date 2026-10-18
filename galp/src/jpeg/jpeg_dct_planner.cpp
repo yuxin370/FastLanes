@@ -711,19 +711,77 @@ detail::JpegDctDeviceBlockMajorActiveOutputSchedule detail::build_block_major_ac
 	return schedule;
 }
 
+detail::JpegDctSplitDown2Plan
+detail::build_split_down2_plan(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                               const JpegDctDeviceBlockMajorPlanlessPlan&         plan,
+                               const JpegDctGridTransformSpec&                    transform) {
+	JpegDctSplitDown2Plan result;
+	if (schedule.offsets.size() <= 2U)
+		return result;
+	const auto uses_down2 = [](const auto& c) {
+		return c.present && c.x_up_factor == 1U && c.y_up_factor == 1U && c.x_down_factor >= 1U &&
+		       c.y_down_factor >= 1U && c.x_down_factor <= 2U && c.y_down_factor <= 2U &&
+		       c.x_down_factor * c.y_down_factor > 1U;
+	};
+	if (std::none_of(plan.images.begin(), plan.images.end(), [&](const auto& image) {
+		    return std::any_of(image.components.begin(), image.components.end(), uses_down2);
+	    }))
+		return result;
+	const uint64_t y_blocks = uint64_t(transform.y_output_width_blocks) * transform.y_output_height_blocks;
+	const uint64_t c_blocks = uint64_t(transform.cbcr_output_width_blocks) * transform.cbcr_output_height_blocks;
+	const uint64_t blocks_per_image = y_blocks + 2U * c_blocks;
+	result.blocks.resize(schedule.logical_output_block_count);
+	uint32_t   slots = 0U;
+	const auto visit = [&](uint32_t w, uint64_t block) {
+		const auto  local     = block % blocks_per_image;
+		const auto  component = local < y_blocks ? 0U : 1U + (local - y_blocks) / c_blocks;
+		const auto& c         = plan.images[block / blocks_per_image].components[component];
+		if (!uses_down2(c))
+			return;
+		auto& entry = result.blocks[block];
+		if (entry.last_workset != std::numeric_limits<uint32_t>::max() && entry.last_workset != w &&
+		    entry.slot == std::numeric_limits<uint32_t>::max())
+			entry.slot = slots++;
+		entry.last_workset = w;
+	};
+	for (uint32_t w = 0; w + 1 < schedule.offsets.size(); ++w) {
+		if (!schedule.groups.empty()) {
+			for (auto g = schedule.group_offsets[w]; g < schedule.group_offsets[w + 1]; ++g) {
+				const auto& group = schedule.groups[g];
+				for (uint32_t image = 0; image < std::max(group.image_count, 1U); ++image) {
+					const uint64_t base =
+					    group.image_count == 0U
+					        ? 0U
+					        : uint64_t(schedule.image_indices[group.image_begin + image]) * blocks_per_image;
+					for (uint32_t i = 0; i < group.block_count; ++i)
+						visit(w, base + schedule.active_output_blocks[group.block_begin + i]);
+				}
+			}
+		} else {
+			for (uint32_t image = 0; image < schedule.repeated_image_count; ++image)
+				for (auto i = schedule.offsets[w]; i < schedule.offsets[w + 1]; ++i)
+					visit(w, uint64_t(image) * blocks_per_image + schedule.active_output_blocks[i]);
+		}
+	}
+	if (slots == 0U)
+		return {};
+	result.source_value_count = size_t(slots) * 16U * 16U;
+	return result;
+}
+
 std::vector<std::vector<detail::JpegDctOutputReadyPoint>>
 detail::build_output_batch_completion_schedule(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
                                                const uint64_t                                     blocks_per_image,
-                                               const size_t                                       image_count,
-                                               const size_t                                       batch_images) {
+                                               const std::vector<JpegDctDevicePlanlessImageDescriptor>& images,
+                                               const size_t                                             batch_images) {
 	if (batch_images == 0 || blocks_per_image == 0)
 		throw std::invalid_argument("output completion requires nonzero batch and image geometry");
 	const size_t                                      worksets = schedule.offsets.size() - 1U;
 	std::vector<std::vector<JpegDctOutputReadyPoint>> result(worksets);
-	std::vector<std::pair<size_t, uint64_t>> last(image_count / batch_images + (image_count % batch_images != 0),
+	std::vector<std::pair<size_t, uint64_t>> last(images.size() / batch_images + (images.size() % batch_images != 0),
 	                                              {worksets, 0});
 	const auto                               visit = [&](size_t w, uint64_t image, uint64_t task_end) {
-        auto& point = last.at(image / batch_images);
+        auto& point = last.at(images.at(image).request_index / batch_images);
         if (point.first == worksets || std::pair {w, task_end} > point)
             point = {w, task_end};
 	};
@@ -1651,11 +1709,13 @@ struct JpegDctShardDatasetReader::Impl {
 		    spec.clamp_max > std::numeric_limits<int16_t>::max() || spec.clamp_min > spec.clamp_max) {
 			throw std::runtime_error("transformed DCT grid clamp range must be ordered and fit int16");
 		}
-		if (!std::isfinite(spec.output_add) || !std::isfinite(spec.output_scale)) {
-			throw std::runtime_error("transformed DCT grid FP32 output affine must be finite");
+		if (!std::isfinite(spec.output_add) || !std::isfinite(spec.output_scale) ||
+		    !std::isfinite(spec.output_divide) || spec.output_divide == 0.0F || !std::isfinite(spec.output_shift)) {
+			throw std::runtime_error("transformed DCT grid FP32 output affine must be finite with a nonzero divisor");
 		}
 		if (spec.output_data_type == JpegDctGridOutputDataType::kInt16 &&
-		    (spec.output_add != 0.0F || spec.output_scale != 1.0F)) {
+		    (spec.output_add != 0.0F || spec.output_scale != 1.0F || spec.output_divide != 1.0F ||
+		     spec.output_shift != 0.0F)) {
 			throw std::runtime_error("transformed DCT grid int16 output cannot apply an FP32 affine");
 		}
 		if (!spec.dequantize) {
@@ -4362,8 +4422,8 @@ struct JpegDctShardDatasetReader::Impl {
 			    << spec.crop_origin_alignment_blocks << ',' << spec.chroma_crop_scale_x << ','
 			    << spec.chroma_crop_scale_y << ',' << spec.clamp_min << ',' << spec.clamp_max << ','
 			    << static_cast<int>(spec.output_data_type) << ',' << std::hexfloat << spec.output_add << ','
-			    << spec.output_scale << std::defaultfloat << ',' << spec.dequantize << ','
-			    << spec.require_all_coefficients << ',' << spec.allow_grayscale << ':';
+			    << spec.output_scale << ',' << spec.output_divide << ',' << spec.output_shift << std::defaultfloat
+			    << ',' << spec.dequantize << ',' << spec.require_all_coefficients << ',' << spec.allow_grayscale << ':';
 			for (const auto& c : spec.output_channels) {
 				key << static_cast<unsigned>(c.component) << ',' << static_cast<unsigned>(c.frequency) << ','
 				    << std::hexfloat << c.subtract << ',' << c.divide << std::defaultfloat << ';';

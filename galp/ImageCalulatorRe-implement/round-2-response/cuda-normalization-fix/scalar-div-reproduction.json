@@ -1,0 +1,8 @@
+{
+  "scope": "CPU arithmetic reproduction of CUDA scalar reciprocal optimization on the actual first calibration input; not a GPU execution",
+  "elements": 301056,
+  "mismatched_elements": 79376,
+  "max_absolute_difference": 0.00048828125,
+  "source_image": "synthetic/n00000002/2.JPEG",
+  "host_observed_max_absolute_difference": 0.00048828125
+}

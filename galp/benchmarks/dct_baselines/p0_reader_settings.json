@@ -1,0 +1,26 @@
+{
+  "ic_shared": {
+    "pool_size": 256,
+    "workers": 8,
+    "prefetch_factor": 2,
+    "decode_budget_mib": 1024,
+    "reader_budget_mib": 2560,
+    "decoded_cache_mib": 2048
+  },
+  "ic_batched": {
+    "pool_size": 256,
+    "workers": 8,
+    "prefetch_factor": 2,
+    "decode_budget_mib": 1024,
+    "reader_budget_mib": 2816,
+    "decoded_cache_mib": 2048
+  },
+  "fs": {
+    "pool_size": 256,
+    "workers": 8,
+    "prefetch_factor": 2,
+    "decode_budget_mib": 1024,
+    "reader_budget_mib": 1536,
+    "decoded_cache_mib": 512
+  }
+}

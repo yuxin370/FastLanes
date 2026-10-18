@@ -56,8 +56,11 @@ inline jpeg::JpegDctGridTransformSpec rgbnomore_val_dct_grid_transform() {
 inline jpeg::JpegDctGridTransformSpec rgbnomore_val_dct_grid_transform_fp32() {
 	auto spec             = rgbnomore_val_dct_grid_transform();
 	spec.output_data_type = jpeg::JpegDctGridOutputDataType::kFloat32;
-	spec.output_add       = 4.0F;
-	spec.output_scale     = 1.0F / 1020.0F;
+	// Preserve the upstream ToRange operation order, including division rounding.
+	spec.output_add    = 1024.0F;
+	spec.output_divide = 2040.0F;
+	spec.output_scale  = 2.0F;
+	spec.output_shift  = -1.0F;
 	return spec;
 }
 

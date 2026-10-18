@@ -1,0 +1,226 @@
+{
+  "scope": "NumPy-only original contracts.py/store.py; only common.sha256_file shimmed",
+  "implementation_hashes": {
+    "store.py": "4c33ead0dc179688a180555ad023f0af374f510535b09fe39548d0bac3695db2",
+    "contracts.py": "69f2873798746939ed2e1e7eb758e011f8317eedeb8aebeb3c1e93852aabcf18"
+  },
+  "payload_rewrite": [
+    {
+      "method": "ic_matched_shared",
+      "member": "q",
+      "rejected": {
+        "preflight": "store payload content changed: group_000000.npz",
+        "decode": "store payload content changed: group_000000.npz"
+      }
+    },
+    {
+      "method": "ic_matched_shared",
+      "member": "tables",
+      "rejected": {
+        "preflight": "store payload content changed: group_000000.npz",
+        "decode": "store payload content changed: group_000000.npz"
+      }
+    },
+    {
+      "method": "fs_matched_b8",
+      "member": "q",
+      "rejected": {
+        "preflight": "store payload content changed: group_000000_d000.npz",
+        "decode": "store payload content changed: group_000000_d000.npz"
+      }
+    },
+    {
+      "method": "fs_matched_b8",
+      "member": "tables",
+      "rejected": {
+        "preflight": "store payload content changed: group_000000_tables.npz",
+        "decode": "store payload content changed: group_000000_tables.npz"
+      }
+    }
+  ],
+  "lifetimes": [
+    {
+      "workers": 1,
+      "member_bytes": 19968,
+      "live_decoded_peak_bytes": 19968,
+      "alive_after_read": 0,
+      "counters": {
+        "application_read_bytes": 74234,
+        "compressed_payload_read_bytes": 58937,
+        "metadata_read_bytes": 15297,
+        "file_opens": 8,
+        "read_calls": 8,
+        "decoded_q_values": 36864,
+        "decoded_q_bytes": 147456,
+        "requested_q_values": 144,
+        "unique_requested_q_values": 144,
+        "decoded_cache_hits": 0,
+        "decoded_cache_misses": 8,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 0,
+        "active_decoded_peak_bytes": 19968,
+        "output_peak_bytes": 3648,
+        "reader_memory_peak_bytes": 23616,
+        "full_grid_requested_q_values": 432
+      }
+    },
+    {
+      "workers": 4,
+      "member_bytes": 19968,
+      "live_decoded_peak_bytes": 39936,
+      "alive_after_read": 0,
+      "counters": {
+        "application_read_bytes": 74234,
+        "compressed_payload_read_bytes": 58937,
+        "metadata_read_bytes": 15297,
+        "file_opens": 8,
+        "read_calls": 8,
+        "decoded_q_values": 36864,
+        "decoded_q_bytes": 147456,
+        "requested_q_values": 144,
+        "unique_requested_q_values": 144,
+        "decoded_cache_hits": 0,
+        "decoded_cache_misses": 8,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 0,
+        "active_decoded_peak_bytes": 39936,
+        "output_peak_bytes": 3648,
+        "reader_memory_peak_bytes": 43584,
+        "full_grid_requested_q_values": 432
+      }
+    }
+  ],
+  "scatter_cache": [
+    {
+      "method": "ic_matched_shared",
+      "initial_counters": {
+        "application_read_bytes": 17173,
+        "compressed_payload_read_bytes": 13571,
+        "metadata_read_bytes": 3602,
+        "file_opens": 5,
+        "read_calls": 5,
+        "decoded_q_values": 7936,
+        "decoded_q_bytes": 31744,
+        "requested_q_values": 270,
+        "unique_requested_q_values": 225,
+        "decoded_cache_hits": 0,
+        "decoded_cache_misses": 5,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 33664,
+        "active_decoded_peak_bytes": 27136,
+        "output_peak_bytes": 3384,
+        "reader_memory_peak_bytes": 37048,
+        "full_grid_requested_q_values": 570
+      },
+      "cached_counters": {
+        "application_read_bytes": 0,
+        "compressed_payload_read_bytes": 0,
+        "metadata_read_bytes": 0,
+        "file_opens": 0,
+        "read_calls": 0,
+        "decoded_q_values": 0,
+        "decoded_q_bytes": 0,
+        "requested_q_values": 270,
+        "unique_requested_q_values": 225,
+        "decoded_cache_hits": 5,
+        "decoded_cache_misses": 0,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 0,
+        "active_decoded_peak_bytes": 0,
+        "output_peak_bytes": 3384,
+        "reader_memory_peak_bytes": 37048,
+        "full_grid_requested_q_values": 570
+      }
+    },
+    {
+      "method": "ic_matched_batched",
+      "initial_counters": {
+        "application_read_bytes": 27389,
+        "compressed_payload_read_bytes": 22844,
+        "metadata_read_bytes": 4545,
+        "file_opens": 3,
+        "read_calls": 3,
+        "decoded_q_values": 14336,
+        "decoded_q_bytes": 57344,
+        "requested_q_values": 270,
+        "unique_requested_q_values": 225,
+        "decoded_cache_hits": 0,
+        "decoded_cache_misses": 3,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 60800,
+        "active_decoded_peak_bytes": 60800,
+        "output_peak_bytes": 3384,
+        "reader_memory_peak_bytes": 64184,
+        "full_grid_requested_q_values": 570
+      },
+      "cached_counters": {
+        "application_read_bytes": 0,
+        "compressed_payload_read_bytes": 0,
+        "metadata_read_bytes": 0,
+        "file_opens": 0,
+        "read_calls": 0,
+        "decoded_q_values": 0,
+        "decoded_q_bytes": 0,
+        "requested_q_values": 270,
+        "unique_requested_q_values": 225,
+        "decoded_cache_hits": 3,
+        "decoded_cache_misses": 0,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 0,
+        "active_decoded_peak_bytes": 0,
+        "output_peak_bytes": 3384,
+        "reader_memory_peak_bytes": 64184,
+        "full_grid_requested_q_values": 570
+      }
+    },
+    {
+      "method": "fs_matched_b8",
+      "initial_counters": {
+        "application_read_bytes": 13588,
+        "compressed_payload_read_bytes": 7057,
+        "metadata_read_bytes": 6531,
+        "file_opens": 21,
+        "read_calls": 21,
+        "decoded_q_values": 5824,
+        "decoded_q_bytes": 6272,
+        "requested_q_values": 270,
+        "unique_requested_q_values": 225,
+        "decoded_cache_hits": 0,
+        "decoded_cache_misses": 21,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 9728,
+        "active_decoded_peak_bytes": 2636,
+        "output_peak_bytes": 2790,
+        "reader_memory_peak_bytes": 12518,
+        "full_grid_requested_q_values": 570
+      },
+      "cached_counters": {
+        "application_read_bytes": 0,
+        "compressed_payload_read_bytes": 0,
+        "metadata_read_bytes": 0,
+        "file_opens": 0,
+        "read_calls": 0,
+        "decoded_q_values": 0,
+        "decoded_q_bytes": 0,
+        "requested_q_values": 270,
+        "unique_requested_q_values": 225,
+        "decoded_cache_hits": 21,
+        "decoded_cache_misses": 0,
+        "cache_evictions": 0,
+        "decoded_cache_peak_bytes": 0,
+        "active_decoded_peak_bytes": 0,
+        "output_peak_bytes": 2790,
+        "reader_memory_peak_bytes": 12518,
+        "full_grid_requested_q_values": 570
+      }
+    }
+  ],
+  "cache_admission": {
+    "all_data_cached": true,
+    "cached_bytes": 1664,
+    "output_bytes": 1664,
+    "actual_retained_needed": 3328,
+    "budget_bytes": 3584,
+    "rejected_because_nonexistent_decode_reserved": "reader budget cannot hold requested outputs/cache and one whole NPZ member"
+  }
+}

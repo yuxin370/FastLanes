@@ -1,0 +1,542 @@
+{
+  "headline_eligible": false,
+  "models": [
+    "mobilenet24",
+    "resnet24",
+    "vitti"
+  ],
+  "runs": [
+    {
+      "initial_model_sha256": "117f42b663d1b46fb2d159fdc96aa55669b2f7dfa59ca384dc1de02d5836fc33",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "fs_matched_b8",
+      "model": "mobilenet24",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/fs_matched_b8.calibration.json",
+        "sha256": "b1ea2939c39af503a171e5a19a4715eab367db8efd945cba4b63e9e02090d984"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/fs_matched_b8.verified.json",
+        "sha256": "8785afae68005fc0157657f2f982d158a3b7748f6653a2d00a940dd0cacba412"
+      },
+      "precision": "bf16-autocast",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/initial.pt",
+        "sha256": "a80a3c8e4e54850a872edf0ba67daa3b0cd06cda7add79ffe7bab3c0ddb8b455"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "c05c82f19487901cde502f99db2bf9bed2d6bcb22f0817673b954ec1b630984b",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/fs_matched_b8/store.json",
+          "sha256": "49da12fecb3ec3b3ef8e614e94aafad79264c302b90dac2a3a18ed3af5e53cff"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "117f42b663d1b46fb2d159fdc96aa55669b2f7dfa59ca384dc1de02d5836fc33",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "ic_matched_batched",
+      "model": "mobilenet24",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/ic_matched_batched.calibration.json",
+        "sha256": "5da70756f98b000389304feb6285bf207acc7414fe306fe12e1c7ac8cccd659d"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/ic_matched_batched.verified.json",
+        "sha256": "863e7e21eb39126389a4ef66939181d62322d2256cee466801248ab136bb07a3"
+      },
+      "precision": "bf16-autocast",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/initial.pt",
+        "sha256": "a80a3c8e4e54850a872edf0ba67daa3b0cd06cda7add79ffe7bab3c0ddb8b455"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "4707a4398bf965733eab8202284b46501731c00c4bacd12d24cd78298e3dd648",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/ic_matched_batched/store.json",
+          "sha256": "2bf1fa93a5d6cfde5a43e5c1547bdc358fb9b874e7e25b1b6144d86daa32cc4a"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "117f42b663d1b46fb2d159fdc96aa55669b2f7dfa59ca384dc1de02d5836fc33",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "ic_matched_shared",
+      "model": "mobilenet24",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/ic_matched_shared.calibration.json",
+        "sha256": "ef853ea7c9397ab6a0e75c70951b7248b9166454a688b17100d7a1231f8c2419"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/ic_matched_shared.verified.json",
+        "sha256": "6839d440c5bb2c981d7e9122c18b9a04b73ab80c48aad4f6f638a2b22e0b05a0"
+      },
+      "precision": "bf16-autocast",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/mobilenet24/initial.pt",
+        "sha256": "a80a3c8e4e54850a872edf0ba67daa3b0cd06cda7add79ffe7bab3c0ddb8b455"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "e3582e44fad06cdf84113bf8ada36ca84587764665868799d74bf8c6d6bd6cf9",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/ic_matched_shared/store.json",
+          "sha256": "7939235625f92805471d6410acee485d2b75885868af11fb5de8d1bb722ce708"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "d6f99d397364878f1ae90b7a30bdc7e4b7f912f6900059a1f8fcc1a14d1537c4",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "fs_matched_b8",
+      "model": "resnet24",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/fs_matched_b8.calibration.json",
+        "sha256": "9ba09d27731453b9ae73467892bace916224da351b5cc263ad97ff463b57e24c"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/fs_matched_b8.verified.json",
+        "sha256": "4821d91daa548d975bf288826de2ac08eca3c5e1c4eca739be69f7ed8decd797"
+      },
+      "precision": "bf16-autocast",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/initial.pt",
+        "sha256": "e0f3812b1bc177b62eef5f13ddc670dd4077bbdce6cb67c0ca820a19ed0afad3"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "c05c82f19487901cde502f99db2bf9bed2d6bcb22f0817673b954ec1b630984b",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/fs_matched_b8/store.json",
+          "sha256": "49da12fecb3ec3b3ef8e614e94aafad79264c302b90dac2a3a18ed3af5e53cff"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "d6f99d397364878f1ae90b7a30bdc7e4b7f912f6900059a1f8fcc1a14d1537c4",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "ic_matched_batched",
+      "model": "resnet24",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/ic_matched_batched.calibration.json",
+        "sha256": "0dfbeb6c53a9f907e8f0ee2a7cac225e00a3d8136052f717e9cfd7eb38b051a6"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/ic_matched_batched.verified.json",
+        "sha256": "c618eeae098fb5daef569181a6cb5609e5117fcedca0b374c3d0dd3d26985b51"
+      },
+      "precision": "bf16-autocast",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/initial.pt",
+        "sha256": "e0f3812b1bc177b62eef5f13ddc670dd4077bbdce6cb67c0ca820a19ed0afad3"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "4707a4398bf965733eab8202284b46501731c00c4bacd12d24cd78298e3dd648",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/ic_matched_batched/store.json",
+          "sha256": "2bf1fa93a5d6cfde5a43e5c1547bdc358fb9b874e7e25b1b6144d86daa32cc4a"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "d6f99d397364878f1ae90b7a30bdc7e4b7f912f6900059a1f8fcc1a14d1537c4",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "ic_matched_shared",
+      "model": "resnet24",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/ic_matched_shared.calibration.json",
+        "sha256": "e3129cfbb2bf28444a3f4c44592dfede5a60a31d8760706adfba28751a4efcd7"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/ic_matched_shared.verified.json",
+        "sha256": "087f181cc6cf9b3db891cfed4075be6e30ade547d1e4a577f1b7d2646e512ba7"
+      },
+      "precision": "bf16-autocast",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/resnet24/initial.pt",
+        "sha256": "e0f3812b1bc177b62eef5f13ddc670dd4077bbdce6cb67c0ca820a19ed0afad3"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "e3582e44fad06cdf84113bf8ada36ca84587764665868799d74bf8c6d6bd6cf9",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/ic_matched_shared/store.json",
+          "sha256": "7939235625f92805471d6410acee485d2b75885868af11fb5de8d1bb722ce708"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "0035118ee21e8aa11d7cf32f2499652d6b90fef0143f469946f8af5d96bfd74b",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "fs_matched_b8",
+      "model": "vitti",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/fs_matched_b8.calibration.json",
+        "sha256": "47d1ed766e07a7d06f75edac4e8a55d4cda91a41291b1ccc191cda45560df2a4"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/fs_matched_b8.verified.json",
+        "sha256": "c8c3f864e6e579b7dd46110a269414430cebf769cb6b6f2b6c589cf5d7febecb"
+      },
+      "precision": "fp32",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/initial.pt",
+        "sha256": "ca88e9a22c0294ab26da3fd7a2ed12fdcffe8073156ff1f31255f5ce4049d93c"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "c05c82f19487901cde502f99db2bf9bed2d6bcb22f0817673b954ec1b630984b",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/fs_matched_b8/store.json",
+          "sha256": "49da12fecb3ec3b3ef8e614e94aafad79264c302b90dac2a3a18ed3af5e53cff"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "0035118ee21e8aa11d7cf32f2499652d6b90fef0143f469946f8af5d96bfd74b",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "ic_matched_batched",
+      "model": "vitti",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/ic_matched_batched.calibration.json",
+        "sha256": "84ed1394f377045bf26bcd0e442377c39599b152e4bb14509c8be0eb68851441"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/ic_matched_batched.verified.json",
+        "sha256": "b7f003f16d1d3bd39eb2e1fd1b43bc10bf515cf7375264bd9656d883ad7f4606"
+      },
+      "precision": "fp32",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/initial.pt",
+        "sha256": "ca88e9a22c0294ab26da3fd7a2ed12fdcffe8073156ff1f31255f5ce4049d93c"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "4707a4398bf965733eab8202284b46501731c00c4bacd12d24cd78298e3dd648",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/ic_matched_batched/store.json",
+          "sha256": "2bf1fa93a5d6cfde5a43e5c1547bdc358fb9b874e7e25b1b6144d86daa32cc4a"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    },
+    {
+      "initial_model_sha256": "0035118ee21e8aa11d7cf32f2499652d6b90fef0143f469946f8af5d96bfd74b",
+      "max_abs_errors": {
+        "gradients": 0.0,
+        "inputs": 0.0,
+        "logits": 0.0,
+        "loss": 0.0,
+        "optimizer": 0.0,
+        "parameters": 0.0
+      },
+      "method": "ic_matched_shared",
+      "model": "vitti",
+      "original_calibration": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/ic_matched_shared.calibration.json",
+        "sha256": "ffeba994445e71cd53f23bc03d49aa778b7ffacfca4fb5ae5c1e87a26c0622c9"
+      },
+      "original_evidence": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/ic_matched_shared.verified.json",
+        "sha256": "8721659348c5426eee24db185c839765a291646f57d1d02b87611b32e2b8ce6c"
+      },
+      "precision": "fp32",
+      "runtime": {
+        "cuda": "12.8",
+        "cudnn_deterministic": true,
+        "device": "cuda:0",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "matmul_precision": "highest",
+        "tf32": false,
+        "torch": "2.11.0+cu128"
+      },
+      "snapshot": {
+        "path": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546/vitti/initial.pt",
+        "sha256": "ca88e9a22c0294ab26da3fd7a2ed12fdcffe8073156ff1f31255f5ce4049d93c"
+      },
+      "status": "passed",
+      "store": {
+        "content_fingerprint": "e3582e44fad06cdf84113bf8ada36ca84587764665868799d74bf8c6d6bd6cf9",
+        "manifest": {
+          "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/stores/ic_matched_shared/store.json",
+          "sha256": "7939235625f92805471d6410acee485d2b75885868af11fb5de8d1bb722ce708"
+        }
+      },
+      "tolerance": {
+        "inputs": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "model": {
+          "atol": 0.0,
+          "rtol": 0.0
+        },
+        "state": {
+          "atol": 0.0,
+          "rtol": 0.0
+        }
+      },
+      "updates": 10
+    }
+  ],
+  "scope": "H100 synthetic JPEG correctness; IC/IC-b/FS only; no FastLens CUDA or performance qualification",
+  "source_run": "/home/tangyuxin/tmp/dct-round2-h100-20261009-205546",
+  "status": "passed",
+  "store_variants": [
+    "ic_matched_shared",
+    "ic_matched_batched",
+    "fs_matched_b8"
+  ],
+  "updates_per_verification": 10,
+  "verification_runs": 9
+}

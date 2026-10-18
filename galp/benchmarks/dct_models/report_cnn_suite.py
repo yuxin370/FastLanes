@@ -35,10 +35,33 @@ def contended(run, directory, suffix):
     return path.exists() and bool(json.loads(path.read_text())['competing_pids'])
 
 
+def training_rows(name, route, folder):
+    """The same epoch columns for archived runs and newly supplied baselines."""
+    final = json.loads((folder/'training.json').read_text()) if (folder/'training.json').exists() else {}
+    rows = []
+    for epoch_file in sorted(folder.glob('epoch_*.json')):
+        r = json.loads(epoch_file.read_text())
+        v = r.get('validation', {})
+        rows.append(dict(model=name if not route.startswith('rgb_') else name.split(' DCT-')[0]+' RGB',
+            route=route, epoch=r['epoch']+1, samples=r['samples'], unique_samples=r['unique_samples'],
+            full_epoch=r['full_epoch'], e2e_seconds=r['seconds'], images_per_second=r['images_per_second'],
+            input_wait_seconds=r['input_wait_seconds'], model_stream_seconds=r['model_stream_seconds'],
+            training_ce=r['ce'], validation_samples=v.get('samples'), top1=v.get('top1'), top5=v.get('top5'), ce=v.get('ce'),
+            nvml_process_peak_mib=final.get('nvml_process_peak_mib'),
+            torch_peak_allocated_bytes=final.get('torch_peak_allocated'), cpu_peak_rss_kib=final.get('cpu_peak_rss_kib'),
+            full_run_complete=bool(final), result=str(epoch_file), input_backend=final.get('input_backend'),
+            condition=final.get('condition'), baseline_store=final.get('baseline_store'),
+            correctness_evidence=final.get('correctness_evidence'), headline_eligible=final.get('headline_eligible'),
+            device=final.get('device'), device_uuid=final.get('device_uuid'), precision=final.get('precision'),
+            initial_model_hash=final.get('initial_model_hash'), training_manifest=final.get('training_manifest')))
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output-dir', type=Path, default=DATA/'runs/dctnet_mobilenet24/rtx4090_cnn_complete_20260914')
     p.add_argument('--inference-run', default='rtx4090_cnn_memory_20260914')
+    p.add_argument('--additional-training', type=Path, nargs='*', default=[], help='append completed training.json/epoch_*.json run directories to the existing tables')
     args = p.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     inference, training, probes, memory, data_only, traces = [], [], [], [], [], []
@@ -73,18 +96,7 @@ def main():
             folders += [(backend, DATA/'runs'/directory/'rtx4090_cnn_training_baselines_20260914'/f'{backend}_full')
                         for backend in ('rgb_pytorch', 'rgb_d2', 'rgb_d3')]
         for route, folder in folders:
-            final = json.loads((folder/'training.json').read_text()) if (folder/'training.json').exists() else {}
-            for epoch_file in sorted(folder.glob('epoch_*.json')):
-                r = json.loads(epoch_file.read_text())
-                v = r.get('validation', {})
-                training.append(dict(model=name if not route.startswith('rgb_') else name.split(' DCT-')[0]+' RGB',
-                    route=route, epoch=r['epoch']+1, samples=r['samples'], unique_samples=r['unique_samples'],
-                    full_epoch=r['full_epoch'], e2e_seconds=r['seconds'], images_per_second=r['images_per_second'],
-                    input_wait_seconds=r['input_wait_seconds'], model_stream_seconds=r['model_stream_seconds'],
-                    training_ce=r['ce'], validation_samples=v.get('samples'), top1=v.get('top1'), top5=v.get('top5'), ce=v.get('ce'),
-                    nvml_process_peak_mib=final.get('nvml_process_peak_mib'),
-                    torch_peak_allocated_bytes=final.get('torch_peak_allocated'), cpu_peak_rss_kib=final.get('cpu_peak_rss_kib'),
-                    full_run_complete=bool(final), result=str(epoch_file)))
+            training.extend(training_rows(name, route, folder))
         probe_path=DATA/'runs'/directory/'rtx4090_native_training_optimized_20260914/B6_probe_m4_inplace/training.json'
         if probe_path.exists():
             r=json.loads(probe_path.read_text())
@@ -110,6 +122,14 @@ def main():
                     window_seconds=r['window_seconds'], gpu_input_seconds=r['gpu'].get('input', {}).get('union_seconds', 0),
                     gpu_model_seconds=r['gpu'].get('model', {}).get('union_seconds', 0), gpu_idle_seconds=r['gpu_idle_seconds'],
                     overlap_seconds=r['model_input_overlap_seconds'], result=str(path)))
+    for folder in args.additional_training:
+        final = json.loads((folder/'training.json').read_text())
+        name = final['backbone']+' '+final['representation']
+        if final['representation'] == 'DCT':
+            name += '-'+str(len(final['output_channels']))
+        store = final.get('baseline_store')
+        route = store['method']+' '+final['condition'] if store else final['input_backend']+' '+final['condition']
+        training.extend(training_rows(name, route, folder))
     write_csv(args.output_dir/'cnn_inference.csv', inference)
     write_csv(args.output_dir/'cnn_training.csv', training)
     write_csv(args.output_dir/'cnn_training_memory_probes.csv', probes)
@@ -117,7 +137,8 @@ def main():
     write_csv(args.output_dir/'cnn_data_only.csv', data_only)
     write_csv(args.output_dir/'cnn_trace_breakdown.csv', traces)
     text = ['# CNN inference + training 实测结果', '',
-        '主表使用 RTX 4090。仅汇总已写完的结果；PRO 6000 后端正确性短测不混入性能表。', '',
+        '历史主表使用 RTX 4090。新增训练路径保留 device/device_uuid 和正确性证据；跨 GPU 结果不能直接计算加速比。'
+        '仅汇总已写完的结果；PRO 6000 后端正确性短测不混入性能表。', '',
         f'本轮推理补测目录：`{args.inference_run}`。检测到其他 GPU 计算进程竞争的补测不进入主表；'
         '未取得合格补测时，推理 CSV 的 result 列仍指向先前结果，不算作本轮测量完成。', '',
         '## 1. Models and Experimental Setup', '',

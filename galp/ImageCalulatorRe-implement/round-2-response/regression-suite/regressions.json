@@ -1,0 +1,127 @@
+{
+  "fixture_exports": [
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_bounded_decoded_cache_hits_and_eviction",
+      "status": "passed",
+      "test": "StoreTests.test_bounded_decoded_cache_hits_and_eviction"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_corrupt_member_fails_without_fallback",
+      "status": "passed",
+      "test": "StoreTests.test_corrupt_member_fails_without_fallback"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_fixedk_requires_evidence_and_cannot_fabricate_dense_source",
+      "status": "passed",
+      "test": "StoreTests.test_fixedk_requires_evidence_and_cannot_fabricate_dense_source"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_matched_roundtrip_ragged_grayscale_tail_reordering_and_repeat",
+      "status": "passed",
+      "test": "StoreTests.test_matched_roundtrip_ragged_grayscale_tail_reordering_and_repeat"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_native_and_matched_cannot_be_mixed",
+      "status": "passed",
+      "test": "StoreTests.test_native_and_matched_cannot_be_mixed"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_partial_diagonal_reads_whole_group_and_spatial_grid",
+      "status": "passed",
+      "test": "StoreTests.test_partial_diagonal_reads_whole_group_and_spatial_grid"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_signed_width_edges_common_width_and_overflow",
+      "status": "passed",
+      "test": "StoreTests.test_signed_width_edges_common_width_and_overflow"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_b32_ic_icb_fs_same_native_tensor_and_63_columns",
+      "status": "passed",
+      "test": "NativeTests.test_b32_ic_icb_fs_same_native_tensor_and_63_columns"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_dct_against_independent_scalar_formula_and_sampling",
+      "status": "passed",
+      "test": "NativeTests.test_dct_against_independent_scalar_formula_and_sampling"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_diagonals_partition_every_frequency_once",
+      "status": "passed",
+      "test": "NativeTests.test_diagonals_partition_every_frequency_once"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_mosaic_shape_structural_zeros_and_b8_triangle",
+      "status": "passed",
+      "test": "NativeTests.test_mosaic_shape_structural_zeros_and_b8_triangle"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_normalization_uses_train_only_and_includes_structural_zeros",
+      "status": "passed",
+      "test": "NativeTests.test_normalization_uses_train_only_and_includes_structural_zeros"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_aligned_edge_crops_quantization_saturation_and_flip_match_dense_y_oracle",
+      "status": "passed",
+      "test": "MaterializationTests.test_aligned_edge_crops_quantization_saturation_and_flip_match_dense_y_oracle"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_transformer_rounding_and_separate_tensor_shapes_match_upstream_test_transforms",
+      "status": "passed",
+      "test": "MaterializationTests.test_transformer_rounding_and_separate_tensor_shapes_match_upstream_test_transforms"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_real_io_replay_preserves_tail_counts_and_schema_fields",
+      "status": "passed",
+      "test": "ReplayTests.test_real_io_replay_preserves_tail_counts_and_schema_fields"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_original_q_qtable_and_odd_geometry_across_supported_sampling",
+      "status": "passed",
+      "test": "JpegTests.test_original_q_qtable_and_odd_geometry_across_supported_sampling"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_frozen_trace_preserves_epochs_duplicates_and_tail_mixup",
+      "status": "passed",
+      "test": "FrozenTraceTests.test_frozen_trace_preserves_epochs_duplicates_and_tail_mixup"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_existing_performance_report_preserves_ic_fs_names_and_metrics",
+      "status": "passed",
+      "test": "CompatibilityReportTests.test_existing_performance_report_preserves_ic_fs_names_and_metrics"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_cross_group_decode_lifetimes_are_bounded_without_cache",
+      "status": "passed",
+      "test": "StorageRegressions.test_cross_group_decode_lifetimes_are_bounded_without_cache"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_legal_q_or_table_rewrite_rejects_the_old_content_identity",
+      "status": "passed",
+      "test": "StorageRegressions.test_legal_q_or_table_rewrite_rejects_the_old_content_identity"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_inference_label_mapping_range_type_and_sorted_remapping",
+      "status": "passed",
+      "test": "TraceLabels.test_inference_label_mapping_range_type_and_sorted_remapping"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_cpu_window_excludes_initialization_and_capacity_accounting",
+      "status": "passed",
+      "test": "WindowAndReport.test_cpu_window_excludes_initialization_and_capacity_accounting"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_report_groups_by_implementation_store_model_and_device",
+      "status": "passed",
+      "test": "WindowAndReport.test_report_groups_by_implementation_store_model_and_device"
+    },
+    {
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_real_jpeg_ic_fs_cpu_trace_and_calibration_gates",
+      "status": "passed",
+      "test": "UnifiedTrainingTests.test_real_jpeg_ic_fs_cpu_trace_and_calibration_gates"
+    }
+  ],
+  "full_temporary_directory_suite": "run separately on host",
+  "readonly_tests": 10,
+  "status": "passed"
+}

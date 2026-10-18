@@ -1,0 +1,72 @@
+{
+  "audit_policy": {
+    "audit_mode": "runtime-first-100",
+    "audit_policy_hash": "cc31d09525050fd62cf57e64f724f99cb35b4bc1965ac1f59ad9bc3a5270d16e",
+    "audit_policy_version": 1,
+    "checked_updates": "global-updates-1..100",
+    "deferred_checks": [
+      "loss-logits-finite-device-accumulator",
+      "gradient-finite-device-accumulator",
+      "parameter-finite-epoch-boundary",
+      "coverage-and-contract-epoch-boundary"
+    ],
+    "gradient_finite_policy": "synchronous-for-updates-1..100; then-device-accumulated-before-clipping-and-read-at-epoch-boundary",
+    "loss_logits_finite_policy": "synchronous-for-updates-1..100; then-device-accumulated-and-read-once-at-epoch-boundary",
+    "loss_readback_frequency": "every-microbatch-for-updates-1..100; then-fixed-logging-window-or-epoch-boundary",
+    "parameter_finite_policy": "synchronous-for-updates-1..100; then-synchronous-at-epoch-boundary",
+    "schema_version": "galp-training-audit-policy-v1",
+    "strict_update_count": 100,
+    "synchronization_policy": "identical-strict-audit-through-global-update-100; no-per-microbatch-or-per-update-host-readback-afterward",
+    "training_math_invariants": {
+      "gradient_accumulation_unchanged": true,
+      "gradient_clipping_unchanged": true,
+      "numeric_update_order_unchanged": true,
+      "optimizer_unchanged": true,
+      "scheduler_unchanged": true
+    }
+  },
+  "backend_implementation": "fs-original-jpeg-q-reference-v1",
+  "code_version": {
+    "training_runtime_source_tree_sha256": "source-hash",
+    "training_source_scope": "galp-training-runtime-v2"
+  },
+  "condition_hash": "1387648e2ddc5d4682f8629425fc8b4f6921239c2b87e39dcd738f5bd5b38ff6",
+  "condition_id": "B6",
+  "crop_policy": "per-pls",
+  "execution_backend": "fs-matched-dct",
+  "execution_mode": "fs_matched_dct",
+  "gradient_accumulation": 16,
+  "headline_eligible": false,
+  "initial_model_hash": "dct-initial",
+  "microbatch_size": 64,
+  "mixup": {
+    "alpha": 0.2
+  },
+  "model_id": "vitti",
+  "optimizer_configuration": {
+    "type": "adamw"
+  },
+  "order_policy": "closed-pool",
+  "physical_fls_observed": false,
+  "physical_gpu_pool": false,
+  "precision": "fp32",
+  "randaugment": {
+    "num_operations": 2
+  },
+  "required_gpu_name_substring": "RTX 4090",
+  "run_manifest_hash": "ce369215b3c971a7b672111237ee8e689ddee0253533e632870ecc077a21e6a8",
+  "run_manifest_schema": "galp-pls-run-manifest-v2",
+  "scheduler": {
+    "type": "rgbnomore-warmup-then-cosine",
+    "warmup_optimizer_updates": 10000
+  },
+  "schema_version": "galp-pls-condition-contract-v3",
+  "semantic_emulation": false,
+  "standard_dct_reference": {
+    "baseline_store": {
+      "method": "fs_matched_b8"
+    },
+    "premixed_mapping_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "training_seed": 11997733
+}

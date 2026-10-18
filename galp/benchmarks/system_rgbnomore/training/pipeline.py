@@ -462,9 +462,11 @@ class _RgbNoMoreDctDataset(torch.utils.data.Dataset):
         plan: Sequence[tuple[TrainingSample, SampleIdentity, AugmentationDecision]],
         read_indices: Any,
         rgbnomore_root: Path,
+        baseline_store: Path | None = None,
     ) -> None:
         self.plan = list(plan)
         self.read_indices = read_indices
+        self.baseline_store, self.store_reader = baseline_store, None
         root_text = str(rgbnomore_root.resolve())
         if root_text not in sys.path:
             sys.path.insert(0, root_text)
@@ -508,32 +510,68 @@ class _RgbNoMoreDctDataset(torch.utils.data.Dataset):
         )
         return top, left, height, width
 
+    def __getitems__(self, indices):
+        if self.baseline_store is None:
+            return [self[index] for index in indices]
+        from dataclasses import asdict
+        from galp.benchmarks.dct_baselines.contracts import ReadRequest
+        from galp.benchmarks.dct_baselines.store import StoreReader
+        start = time.perf_counter()
+        first_read = self.store_reader is None
+        if first_read:
+            self.store_reader = StoreReader(self.baseline_store)
+        requests = []
+        for index in indices:
+            sample, _, decision = self.plan[index]
+            metadata = self.store_reader.images[sample.logical_sample_id]["metadata"]
+            regions = tuple(self._component_crop(decision, block_height=c["block_grid"][0],
+                                                 block_width=c["block_grid"][1]) for c in metadata["components"])
+            requests.append(ReadRequest(sample.logical_sample_id, (tuple(range(64)),)*3, regions))
+        views, counters = self.store_reader.read(self.store_reader.plan(requests))
+        if first_read:
+            counters.add(self.store_reader.initialization_counters)
+        read_decode = time.perf_counter()-start
+        result = []
+        for position, (index, view) in enumerate(zip(indices, views)):
+            q = [torch.from_numpy(value.copy()).to(torch.int16) for value in view.dense()]
+            tables = torch.stack([torch.from_numpy(value.copy()).to(torch.int16) for value in view.tables])
+            item = self._transform(index, tables, q[0][None], torch.stack(q[1:]),
+                                   read_decode if position == 0 else 0., cropped=True)
+            observed = asdict(counters) if position == 0 else {key: 0 for key in asdict(counters)}
+            result.append((*item, observed))
+        return result
+
     def __getitem__(self, index: int):
-        sample, _identity, decision = self.plan[index]
+        if self.baseline_store is not None:
+            return self.__getitems__([index])[0]
+        sample, _, _ = self.plan[index]
         start = time.perf_counter()
         dct_manip = importlib.import_module("dct_manip")
-        dops = importlib.import_module("utils.dct_ops")
         _dimensions, quantization, y, cbcr = dct_manip.read_coefficients(str(sample.path))
-        read_decode_seconds = time.perf_counter() - start
+        return self._transform(index, quantization, y, cbcr, time.perf_counter()-start)
 
+    def _transform(self, index, quantization, y, cbcr, read_decode_seconds, *, cropped=False):
+        sample, _identity, decision = self.plan[index]
+        dops = importlib.import_module("utils.dct_ops")
         start = time.perf_counter()
         y = torch.clamp(y * quantization[0], min=-1024, max=1016)
         if cbcr is None:
             cbcr = torch.zeros((2, y.shape[1] // 2, y.shape[2] // 2, 8, 8), dtype=y.dtype)
         else:
             cbcr = torch.clamp(cbcr * quantization[1:3, None, None], min=-1024, max=1016)
-        y_crop = self._component_crop(
-            decision,
-            block_width=int(y.shape[2]),
-            block_height=int(y.shape[1]),
-        )
-        cbcr_crop = self._component_crop(
-            decision,
-            block_width=int(cbcr.shape[2]),
-            block_height=int(cbcr.shape[1]),
-        )
-        y = dops.crop_dct(y, *y_crop)
-        cbcr = dops.crop_dct(cbcr, *cbcr_crop)
+        if not cropped:
+            y_crop = self._component_crop(
+                decision,
+                block_width=int(y.shape[2]),
+                block_height=int(y.shape[1]),
+            )
+            cbcr_crop = self._component_crop(
+                decision,
+                block_width=int(cbcr.shape[2]),
+                block_height=int(cbcr.shape[1]),
+            )
+            y = dops.crop_dct(y, *y_crop)
+            cbcr = dops.crop_dct(cbcr, *cbcr_crop)
         y = dops.resize_dct(y, 28, dtype=torch.float32)
         cbcr = dops.resize_dct(cbcr, 14, dtype=torch.float32)
         if decision.horizontal_flip:
@@ -573,7 +611,8 @@ class RgbNoMoreTrainingAdapter(TrainingPipelineAdapter):
         else:
             self._read_indices = []
         dataset = _RgbNoMoreDctDataset(
-            self._planned, self._read_indices, Path(self.config["rgbnomore_root"])
+            self._planned, self._read_indices, Path(self.config["rgbnomore_root"]),
+            baseline_store=self.config.get("baseline_store"),
         )
         loader = torch.utils.data.DataLoader(
             dataset,
@@ -590,7 +629,11 @@ class RgbNoMoreTrainingAdapter(TrainingPipelineAdapter):
         if self._iterator is None:
             raise RuntimeError("pipeline repeat has not begun")
         begin = time.perf_counter()
-        y, cbcr, labels, indices, read_decode, augmentation, preprocess = next(self._iterator)
+        values = next(self._iterator)
+        y, cbcr, labels, indices, read_decode, augmentation, preprocess = values[:7]
+        counters = {}
+        if self.config.get("baseline_store") is not None:
+            counters = {key: float(v.max()) if key.endswith("peak_bytes") else float(v.sum()) for key, v in values[7].items()}
         wait = time.perf_counter() - begin
         indices_list = [int(index) for index in indices.tolist()]
         plan = [self._planned[index] for index in indices_list]
@@ -600,6 +643,7 @@ class RgbNoMoreTrainingAdapter(TrainingPipelineAdapter):
             identities=[item[1] for item in plan],
             augmentations=[item[2].as_dict() for item in plan],
             on_device=False,
+            native_counters=counters,
             stage_seconds={
                 "loader_data_wait": wait,
                 "read_decode": float(read_decode.sum().item()),

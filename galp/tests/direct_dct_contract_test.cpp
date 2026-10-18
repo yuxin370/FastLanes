@@ -68,6 +68,8 @@ void expect_transform_equal(const galp::jpeg::JpegDctGridTransformSpec& legacy,
 	expect_named_equal("output_data_type", legacy.output_data_type, shadow.output_data_type);
 	expect_named_equal("output_add", legacy.output_add, shadow.output_add);
 	expect_named_equal("output_scale", legacy.output_scale, shadow.output_scale);
+	expect_named_equal("output_divide", legacy.output_divide, shadow.output_divide);
+	expect_named_equal("output_shift", legacy.output_shift, shadow.output_shift);
 	expect_named_equal("dequantize", legacy.dequantize, shadow.dequantize);
 	expect_named_equal("require_all_coefficients", legacy.require_all_coefficients, shadow.require_all_coefficients);
 	expect_named_equal("allow_grayscale", legacy.allow_grayscale, shadow.allow_grayscale);
@@ -186,8 +188,10 @@ TEST(DirectDctShadowContract, SwinV2ValidationHasExplicitModelSemantics) {
 	EXPECT_EQ(spec.cbcr_output_width_blocks, 16U);
 	EXPECT_EQ(spec.cbcr_output_height_blocks, 16U);
 	EXPECT_EQ(spec.output_data_type, galp::jpeg::JpegDctGridOutputDataType::kFloat32);
-	EXPECT_FLOAT_EQ(spec.output_add, 4.0F);
-	EXPECT_FLOAT_EQ(spec.output_scale, 1.0F / 1020.0F);
+	EXPECT_FLOAT_EQ(spec.output_add, 1024.0F);
+	EXPECT_FLOAT_EQ(spec.output_divide, 2040.0F);
+	EXPECT_FLOAT_EQ(spec.output_scale, 2.0F);
+	EXPECT_FLOAT_EQ(spec.output_shift, -1.0F);
 	EXPECT_EQ(profile.runtime.id, "compact-v3-planless-limited-o512-c512-v1");
 }
 

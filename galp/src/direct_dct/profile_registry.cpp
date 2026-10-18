@@ -37,8 +37,10 @@ jpeg::JpegDctGridTransformSpec rgbnomore_transform() {
 jpeg::JpegDctGridTransformSpec rgbnomore_validation_transform() {
 	auto spec             = rgbnomore_transform();
 	spec.output_data_type = jpeg::JpegDctGridOutputDataType::kFloat32;
-	spec.output_add       = 4.0F;
-	spec.output_scale     = 1.0F / 1020.0F;
+	spec.output_add       = 1024.0F;
+	spec.output_divide    = 2040.0F;
+	spec.output_scale     = 2.0F;
+	spec.output_shift     = -1.0F;
 	return spec;
 }
 

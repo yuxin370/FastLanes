@@ -1711,7 +1711,9 @@ TEST(JpegDct, DirectDctRuntimeExposesStayOnGpuTensorDescriptor) {
 }
 
 TEST(JpegDct, DirectDctRuntimeExposesTransformedGridTensorDescriptors) {
-	int        device_count  = 0;
+	// This test creates its own dataset; do not inherit a production dataset's companion index.
+	ScopedEnvironmentVariable access_environment("GALP_BLOCK_MAJOR_ACCESS_DIR", "");
+	int                       device_count  = 0;
 	const auto device_status = cudaGetDeviceCount(&device_count);
 	if (device_status != cudaSuccess || device_count == 0) {
 		GTEST_SKIP() << "CUDA device is not available";
@@ -1825,6 +1827,30 @@ TEST(JpegDct, DirectDctRuntimeExposesTransformedGridTensorDescriptors) {
 	EXPECT_EQ(float_stats.fixed_grid_finalize_kernel_launch_count, 1U);
 	EXPECT_FLOAT_EQ(float_stats.fixed_grid_output_add, 4.0F);
 	EXPECT_FLOAT_EQ(float_stats.fixed_grid_output_scale, 1.0F / 1020.0F);
+
+	// The checkpoint transform observes division and subtraction rounding;
+	// reducing it to (q+4)/1020 changes the model input.
+	float_transform.output_add    = 1024.0F;
+	float_transform.output_divide = 2040.0F;
+	float_transform.output_scale  = 2.0F;
+	float_transform.output_shift  = -1.0F;
+	float_options.grid_transform  = float_transform;
+	auto ordered_batch            = runtime.ReadBatch(image_ids, galp::jpeg::JpegDctCropBox {}, float_options);
+	ASSERT_EQ(cudaMemcpy(y_float.data(),
+	                     ordered_batch.y_float_device_data(),
+	                     y_float.size() * sizeof(float),
+	                     cudaMemcpyDeviceToHost),
+	          cudaSuccess);
+	ASSERT_EQ(cudaMemcpy(cbcr_float.data(), ordered_batch.cbcr_float_device_data(), cbcr_float.size() * sizeof(float),
+	                     cudaMemcpyDeviceToHost), cudaSuccess);
+	const auto expect_range = [](const std::vector<int16_t>& integer, const std::vector<float>& actual) {
+		for (size_t i = 0; i < integer.size(); ++i) {
+			const float quotient = static_cast<float>((static_cast<double>(integer[i]) + 1024.0) / 2040.0);
+			EXPECT_EQ(actual[i], quotient * 2.0F - 1.0F) << "coefficient index " << i;
+		}
+	};
+	expect_range(y_int16, y_float);
+	expect_range(cbcr_int16, cbcr_float);
 
 	std::filesystem::remove_all(dir);
 }

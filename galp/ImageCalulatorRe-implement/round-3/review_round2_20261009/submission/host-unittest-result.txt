@@ -1,0 +1,7 @@
+Source: user-provided host stdout in this conversation, 2026-10-09.
+Command: /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -B -m unittest discover -s galp/benchmarks/dct_baselines/tests -t . -v
+Dependency installed on host: jsonschema 4.26.0.
+
+Ran 34 tests in 13.418s
+
+OK

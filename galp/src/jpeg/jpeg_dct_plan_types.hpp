@@ -290,6 +290,23 @@ struct JpegDctOutputReadyPoint {
 	size_t   output_batch;
 };
 
+// A down2 output may read source blocks from several decode worksets. Keep
+// those source values until the final owner, then perform the two FP32 passes
+// once; summing separately resized partials changes integer rounding.
+struct JpegDctSplitDown2Block {
+	uint32_t slot         = std::numeric_limits<uint32_t>::max();
+	uint32_t last_workset = std::numeric_limits<uint32_t>::max();
+};
+
+struct JpegDctSplitDown2Plan {
+	std::vector<JpegDctSplitDown2Block> blocks;
+	size_t                              source_value_count = 0U;
+};
+
+[[nodiscard]] JpegDctSplitDown2Plan build_split_down2_plan(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
+                                                           const JpegDctDeviceBlockMajorPlanlessPlan&         plan,
+                                                           const JpegDctGridTransformSpec& transform);
+
 // Run-length encoded work prefixes; task order is unchanged. A source-owned
 // tile can produce several output blocks while an ordinary task produces one.
 struct JpegDctTransformWorkRun {
@@ -311,10 +328,10 @@ build_transform_work_runs(const JpegDctDeviceBlockMajorActiveOutputSchedule& sch
                                                                   uint64_t output_budget);
 
 [[nodiscard]] std::vector<std::vector<JpegDctOutputReadyPoint>>
-build_output_batch_completion_schedule(const JpegDctDeviceBlockMajorActiveOutputSchedule& schedule,
-                                       uint64_t                                           blocks_per_image,
-                                       size_t                                             image_count,
-                                       size_t                                             batch_images);
+build_output_batch_completion_schedule(const JpegDctDeviceBlockMajorActiveOutputSchedule&       schedule,
+                                       uint64_t                                                 blocks_per_image,
+                                       const std::vector<JpegDctDevicePlanlessImageDescriptor>& images,
+                                       size_t                                                   batch_images);
 
 // Convert complete integer-upsample tiles to one source-owned task each.
 // Returns false without changing the schedule for other geometries.

@@ -134,29 +134,38 @@ public:
 	}
 
 	torch::Tensor targets() {
-		storage_lifetime_->register_current(
-		    galp::direct_dct::ConsumerDependency::Source::kGetterCompatibility);
+		storage_lifetime_->register_current(galp::direct_dct::ConsumerDependency::Source::kGetterCompatibility);
 		if (targets_.defined())
 			return targets_;
 		const auto  current    = view();
 		const auto& descriptor = current.targets;
-		if (descriptor.empty() || descriptor.data == nullptr) {
+		if (descriptor.empty() || (descriptor.data == nullptr && descriptor.hard_labels == nullptr)) {
 			throw std::runtime_error("native PLS pipeline did not produce model targets");
 		}
 		wait_for_completion(descriptor.cuda_device);
-		const auto device   = static_cast<c10::DeviceIndex>(descriptor.cuda_device);
-		auto       options  = torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, device));
-		auto       lifetime = storage_lifetime_;
+		const auto device  = static_cast<c10::DeviceIndex>(descriptor.cuda_device);
+		const bool hard    = descriptor.hard_labels != nullptr;
+		auto       options = torch::TensorOptions()
+		                   .dtype(hard ? torch::kInt64 : torch::kFloat32)
+		                   .device(torch::Device(torch::kCUDA, device));
+		const std::vector<int64_t> shape    = hard ? std::vector<int64_t> {static_cast<int64_t>(descriptor.shape[0])}
+		                                           : std::vector<int64_t> {static_cast<int64_t>(descriptor.shape[0]),
+		                                                                   static_cast<int64_t>(descriptor.shape[1])};
+		const std::vector<int64_t> strides  = hard ? std::vector<int64_t> {1}
+		                                           : std::vector<int64_t> {static_cast<int64_t>(descriptor.strides[0]),
+		                                                                   static_cast<int64_t>(descriptor.strides[1])};
+		auto                       lifetime = storage_lifetime_;
 		lifetime->retain_storage_reference();
-		targets_            = torch::from_blob(
-            const_cast<float*>(descriptor.data),
-            {static_cast<int64_t>(descriptor.shape[0]), static_cast<int64_t>(descriptor.shape[1])},
-            {static_cast<int64_t>(descriptor.strides[0]), static_cast<int64_t>(descriptor.strides[1])},
+		targets_ = torch::from_blob(
+		    hard ? static_cast<void*>(const_cast<int64_t*>(descriptor.hard_labels))
+		         : static_cast<void*>(const_cast<float*>(descriptor.data)),
+		    shape,
+		    strides,
 		    [lifetime = std::move(lifetime)](void*) mutable {
 			    lifetime->release_storage_reference();
 			    lifetime.reset();
 		    },
-            options);
+		    options);
 		return targets_;
 	}
 
@@ -492,7 +501,9 @@ public:
 	                          const size_t                             transform_ctas_per_launch,
 	                          const uint32_t                           rank,
 	                          const uint32_t                           world_size,
-	                          const std::string&                       io_backend) {
+	                          const std::string&                       io_backend,
+	                          const bool                               enable_randaugment,
+	                          const bool                               enable_mixup) {
 		if (profile_id != galp::profiles::kRgbNoMoreTrainingPlsProfileId) {
 			throw std::invalid_argument("DirectDctPlsPipeline requires registered profile 'rgbnomore-training-pls-v1'");
 		}
@@ -525,10 +536,12 @@ public:
 			grid.require_all_coefficients                                        = true;
 			grid.output_add                                                      = 0.0F;
 			grid.output_scale                                                    = 1.0F;
+			grid.output_divide                                                   = 1.0F;
+			grid.output_shift                                                    = 0.0F;
 			grid.clamp_min                                                       = -32768;
 			grid.clamp_max                                                       = 32767;
-			grid.output_data_type = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
-			auto channels = make_projected_training_channels(output_channels);
+			grid.output_data_type   = galp::jpeg::JpegDctGridOutputDataType::kFloat32;
+			auto channels           = make_projected_training_channels(output_channels);
 			grid.output_channels    = std::move(channels.input);
 			options.output_channels = std::move(channels.output);
 		}
@@ -538,6 +551,8 @@ public:
 			options.device.transform_ctas_per_launch = transform_ctas_per_launch;
 		options.segment_images          = segment_images;
 		options.model_classes           = model_classes;
+		options.enable_published_randaugment = enable_randaugment;
+		options.enable_published_mixup       = enable_mixup;
 		options.expected_mapping_sha256 = expected_mapping_sha256;
 		pipeline_ =
 		    std::make_unique<galp::jpeg::DirectDctPlsPipeline>(manifest_path, premixed_mapping_csv, std::move(options));
@@ -687,7 +702,9 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	                  size_t,
 	                  uint32_t,
 	                  uint32_t,
-	                  const std::string&>(),
+	                  const std::string&,
+	                  bool,
+	                  bool>(),
 	         py::arg("manifest_path"),
 	         py::arg("premixed_mapping_csv"),
 	         py::arg("training_seed"),
@@ -705,7 +722,9 @@ void bind_direct_dct_pls_torch(py::module_& module) {
 	         py::arg("transform_ctas_per_launch")   = 0U,
 	         py::arg("rank")                        = 0U,
 	         py::arg("world_size")                  = 1U,
-	         py::arg("io_backend")                  = "io_uring")
+	         py::arg("io_backend")                  = "io_uring",
+	         py::arg("enable_randaugment")          = true,
+	         py::arg("enable_mixup")                = true)
 	    .def("start_epoch", &TorchDirectDctPlsPipeline::start_epoch, py::arg("epoch"))
 	    .def("next_pool", &TorchDirectDctPlsPipeline::next_pool)
 	    .def("close", &TorchDirectDctPlsPipeline::close)

@@ -172,6 +172,8 @@ class DirectDctPlsPipeline:
         rank: int = 0,
         world_size: int = 1,
         io_backend: str = "io_uring",
+        enable_randaugment: bool = True,
+        enable_mixup: bool = True,
         output_channels: list[list[float]] | None = None,
         module_path: str | Path | None = None,
         native_module: ModuleType | Any | None = None,
@@ -199,6 +201,8 @@ class DirectDctPlsPipeline:
             profile_id=_profile_id(profile),
             **(dict(rank=int(rank), world_size=int(world_size)) if world_size != 1 or rank != 0 else {}),
             **(dict(io_backend=io_backend) if io_backend != "io_uring" else {}),
+            **(dict(enable_randaugment=False) if not enable_randaugment else {}),
+            **(dict(enable_mixup=False) if not enable_mixup else {}),
             **(dict(output_grid_size=int(output_grid_size), output_channels=output_channels)
                if output_grid_size or output_channels else {}),
             **(dict(transform_blocks_per_launch=int(transform_blocks_per_launch))

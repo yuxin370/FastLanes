@@ -25,6 +25,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jpeg-tool")
     parser.add_argument("--access-tool")
+    parser.add_argument("--basic-augmentation", action="store_true")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         if os.environ.get("GALP_REQUIRE_CUDA_SMOKE") == "1":
@@ -37,7 +38,7 @@ def main() -> int:
     if any((manifest, mapping, mapping_sha256)) and not all((manifest, mapping, mapping_sha256)):
         raise RuntimeError("external PLS fixture requires manifest, mapping and mapping SHA-256")
     if manifest:
-        return run_smoke(manifest, mapping, mapping_sha256)
+        return run_smoke(manifest, mapping, mapping_sha256, basic=args.basic_augmentation)
     if not args.jpeg_tool or not args.access_tool:
         if os.environ.get("GALP_REQUIRE_CUDA_SMOKE") == "1":
             raise RuntimeError("PLS smoke requires fixture encoder tools or an external fixture")
@@ -47,10 +48,10 @@ def main() -> int:
         manifest, mapping, mapping_sha256 = create_fixture(
             Path(directory), args.jpeg_tool, args.access_tool
         )
-        return run_smoke(manifest, mapping, mapping_sha256, synthetic=True)
+        return run_smoke(manifest, mapping, mapping_sha256, synthetic=True, basic=args.basic_augmentation)
 
 
-def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
+def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False, basic=False) -> int:
     microbatch_images = 2 if synthetic else int(os.environ.get("GALP_DIRECT_DCT_PLS_TEST_MICROBATCH", "64"))
     baseline = native_backend._lifetime_reclaim_stats_for_test()
     if synthetic:
@@ -61,6 +62,7 @@ def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
             expected_mapping_sha256=mapping_sha256,
             segments_per_pool=4, microbatch_images=microbatch_images,
             profile=TRAINING_PLS,
+            enable_randaugment=not basic, enable_mixup=not basic,
         ).start_epoch(7)
         deadline = time.monotonic() + 30
         while unclaimed.prefetch_stats["prepare_completed_count"] == 0:
@@ -85,6 +87,7 @@ def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
         segments_per_pool=4,
         microbatch_images=microbatch_images,
         profile=TRAINING_PLS,
+        enable_randaugment=not basic, enable_mixup=not basic,
     ).start_epoch(7)
     pool = pipeline.next_pool()
     if pool.image_count > 4096 or pool.microbatch_count <= 0:
@@ -93,8 +96,10 @@ def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
     y, cbcr, targets = microbatch.tensors
     torch.cuda.synchronize()
 
-    if any(tensor.dtype != torch.float32 or not tensor.is_cuda for tensor in (y, cbcr, targets)):
+    if any(tensor.dtype != torch.float32 or not tensor.is_cuda for tensor in (y, cbcr)):
         raise RuntimeError("PLS must return CUDA float32 tensors")
+    if not targets.is_cuda or targets.dtype != (torch.int64 if basic else torch.float32):
+        raise RuntimeError("PLS targets do not match the augmentation policy")
     if any(tensor.device != y.device for tensor in (cbcr, targets)):
         raise RuntimeError("PLS tensor CUDA devices disagree")
     if synthetic:
@@ -110,9 +115,9 @@ def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
         if len(tail.global_image_ids) != 1 or not tail.is_pool_end:
             raise RuntimeError("PLS did not publish the partial final microbatch")
         tail_label = expected_labels[tail.global_image_ids[0]]
-        expected_target = torch.nn.functional.one_hot(
-            torch.tensor([tail_label], device=tail_targets.device), 1000
-        ).float()
+        expected_target = torch.tensor([tail_label], device=tail_targets.device)
+        if not basic:
+            expected_target = torch.nn.functional.one_hot(expected_target, 1000).float()
         torch.testing.assert_close(tail_targets, expected_target, rtol=0, atol=1e-6)
         if not bool(torch.isfinite(tail_y).all() and torch.isfinite(tail_cbcr).all()):
             raise RuntimeError("PLS tail inputs are non-finite")
@@ -124,11 +129,13 @@ def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False) -> int:
         raise RuntimeError(f"unexpected PLS Y shape: {tuple(y.shape)}")
     if tuple(cbcr.shape[1:]) != (2, 14, 14, 8, 8):
         raise RuntimeError(f"unexpected PLS CbCr shape: {tuple(cbcr.shape)}")
-    if targets.shape != (y.shape[0], 1000):
+    if targets.shape != ((y.shape[0],) if basic else (y.shape[0], 1000)):
         raise RuntimeError(f"unexpected PLS target shape: {tuple(targets.shape)}")
     if not bool(torch.isfinite(y).all() and torch.isfinite(cbcr).all() and torch.isfinite(targets).all()):
         raise RuntimeError("PLS pipeline emitted non-finite model tensors")
-    if not torch.allclose(targets.sum(dim=1), torch.ones(y.shape[0], device=y.device)):
+    if basic:
+        torch.testing.assert_close(targets, torch.tensor(microbatch.labels, device=y.device), rtol=0, atol=0)
+    elif not torch.allclose(targets.sum(dim=1), torch.ones(y.shape[0], device=y.device)):
         raise RuntimeError("PLS Mixup targets do not sum to one")
     if len(microbatch.global_image_ids) != y.shape[0] or len(microbatch.labels) != y.shape[0]:
         raise RuntimeError("PLS model tensor and identity cardinalities differ")

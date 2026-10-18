@@ -1,0 +1,966 @@
+{
+  "images": [
+    {
+      "block_size": 8,
+      "components": [
+        {
+          "block_grid": [
+            64,
+            64
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "85252d3815cf9ffebe6c1f44258bcf63ef301be37b3854f90d0030fa7756272e",
+          "component_id": 1,
+          "sampling": [
+            2,
+            2
+          ],
+          "table_id": 0,
+          "valid_pixels": [
+            512,
+            512
+          ]
+        },
+        {
+          "block_grid": [
+            32,
+            32
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "dd683c1158a4cdc575a66d57aef9c93f326ebd2005a5667934d894b72374cc5a",
+          "component_id": 2,
+          "sampling": [
+            1,
+            1
+          ],
+          "table_id": 1,
+          "valid_pixels": [
+            256,
+            256
+          ]
+        },
+        {
+          "block_grid": [
+            32,
+            32
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "f11a3075558b4374e48ff3edbf88ff1c79ae14b0eb8a5f915262776a9e7d0c6f",
+          "component_id": 3,
+          "sampling": [
+            1,
+            1
+          ],
+          "table_id": 1,
+          "valid_pixels": [
+            256,
+            256
+          ]
+        }
+      ],
+      "frequency_order": "natural-u-major-v-minor-v1",
+      "height": 512,
+      "image_id": "synthetic/n00000000/0.JPEG",
+      "jpeg_sha256": "1ae0082cb3f0f712f7b1a09d4546713b4504941e4c6f743f5376a3237cf363dc",
+      "label": 0,
+      "padding": "retain libjpeg edge blocks; no added MCU dummy blocks",
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/source/0.jpg",
+      "quantization_tables": [
+        [
+          [
+            6,
+            4,
+            4,
+            6,
+            9,
+            14,
+            18,
+            22
+          ],
+          [
+            4,
+            4,
+            5,
+            7,
+            9,
+            21,
+            22,
+            20
+          ],
+          [
+            5,
+            5,
+            6,
+            9,
+            14,
+            21,
+            25,
+            20
+          ],
+          [
+            5,
+            6,
+            8,
+            10,
+            18,
+            31,
+            29,
+            22
+          ],
+          [
+            6,
+            8,
+            13,
+            20,
+            24,
+            39,
+            37,
+            28
+          ],
+          [
+            9,
+            13,
+            20,
+            23,
+            29,
+            37,
+            41,
+            33
+          ],
+          [
+            18,
+            23,
+            28,
+            31,
+            37,
+            44,
+            43,
+            36
+          ],
+          [
+            26,
+            33,
+            34,
+            35,
+            40,
+            36,
+            37,
+            36
+          ]
+        ],
+        [
+          [
+            6,
+            6,
+            9,
+            17,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            6,
+            8,
+            9,
+            24,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            9,
+            9,
+            20,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            17,
+            24,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ]
+        ],
+        [
+          [
+            6,
+            6,
+            9,
+            17,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            6,
+            8,
+            9,
+            24,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            9,
+            9,
+            20,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            17,
+            24,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ]
+        ]
+      ],
+      "split": "train",
+      "width": 512
+    },
+    {
+      "block_size": 8,
+      "components": [
+        {
+          "block_grid": [
+            64,
+            64
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "0f08f30aa04143a8a53d9ee74608650939d06553bd8c2d2e358de070081d0640",
+          "component_id": 1,
+          "sampling": [
+            2,
+            2
+          ],
+          "table_id": 0,
+          "valid_pixels": [
+            512,
+            512
+          ]
+        },
+        {
+          "block_grid": [
+            32,
+            32
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "5c3c8a4f331d4a51d529a14df55e583102e8c13f20b8b03abd9ca48af77823e5",
+          "component_id": 2,
+          "sampling": [
+            1,
+            1
+          ],
+          "table_id": 1,
+          "valid_pixels": [
+            256,
+            256
+          ]
+        },
+        {
+          "block_grid": [
+            32,
+            32
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "8790e1cd72d5f06f7cf9c872b3a6f9c2f42a22dc878091f21a7868aea87bcfd9",
+          "component_id": 3,
+          "sampling": [
+            1,
+            1
+          ],
+          "table_id": 1,
+          "valid_pixels": [
+            256,
+            256
+          ]
+        }
+      ],
+      "frequency_order": "natural-u-major-v-minor-v1",
+      "height": 512,
+      "image_id": "synthetic/n00000001/1.JPEG",
+      "jpeg_sha256": "14014c90e5d534e10128f53f69013caf3f64cb4e496a7f194320e269e125788d",
+      "label": 1,
+      "padding": "retain libjpeg edge blocks; no added MCU dummy blocks",
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/source/1.jpg",
+      "quantization_tables": [
+        [
+          [
+            6,
+            4,
+            4,
+            6,
+            9,
+            14,
+            18,
+            22
+          ],
+          [
+            4,
+            4,
+            5,
+            7,
+            9,
+            21,
+            22,
+            20
+          ],
+          [
+            5,
+            5,
+            6,
+            9,
+            14,
+            21,
+            25,
+            20
+          ],
+          [
+            5,
+            6,
+            8,
+            10,
+            18,
+            31,
+            29,
+            22
+          ],
+          [
+            6,
+            8,
+            13,
+            20,
+            24,
+            39,
+            37,
+            28
+          ],
+          [
+            9,
+            13,
+            20,
+            23,
+            29,
+            37,
+            41,
+            33
+          ],
+          [
+            18,
+            23,
+            28,
+            31,
+            37,
+            44,
+            43,
+            36
+          ],
+          [
+            26,
+            33,
+            34,
+            35,
+            40,
+            36,
+            37,
+            36
+          ]
+        ],
+        [
+          [
+            6,
+            6,
+            9,
+            17,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            6,
+            8,
+            9,
+            24,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            9,
+            9,
+            20,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            17,
+            24,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ]
+        ],
+        [
+          [
+            6,
+            6,
+            9,
+            17,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            6,
+            8,
+            9,
+            24,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            9,
+            9,
+            20,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            17,
+            24,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ]
+        ]
+      ],
+      "split": "train",
+      "width": 512
+    },
+    {
+      "block_size": 8,
+      "components": [
+        {
+          "block_grid": [
+            64,
+            64
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "3472465282bb6d2e652e3aaf8d8e1a0063044b78648b65409503669db6ee508d",
+          "component_id": 1,
+          "sampling": [
+            2,
+            2
+          ],
+          "table_id": 0,
+          "valid_pixels": [
+            512,
+            512
+          ]
+        },
+        {
+          "block_grid": [
+            32,
+            32
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "4d0316cba98556d0dc4eea4c9aac99cdb3b46838986555c3662140807282d28b",
+          "component_id": 2,
+          "sampling": [
+            1,
+            1
+          ],
+          "table_id": 1,
+          "valid_pixels": [
+            256,
+            256
+          ]
+        },
+        {
+          "block_grid": [
+            32,
+            32
+          ],
+          "coefficient_dtype": "<i2",
+          "coefficient_sha256": "822410a16dcc5a897bf282f5302d044ef9f00d47cc2aace69d747d2863790e69",
+          "component_id": 3,
+          "sampling": [
+            1,
+            1
+          ],
+          "table_id": 1,
+          "valid_pixels": [
+            256,
+            256
+          ]
+        }
+      ],
+      "frequency_order": "natural-u-major-v-minor-v1",
+      "height": 512,
+      "image_id": "synthetic/n00000002/2.JPEG",
+      "jpeg_sha256": "a72a92693f2faccabe5fd49797fe08385aac2e1b86340820019a13e8de2762ff",
+      "label": 2,
+      "padding": "retain libjpeg edge blocks; no added MCU dummy blocks",
+      "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/source/2.jpg",
+      "quantization_tables": [
+        [
+          [
+            6,
+            4,
+            4,
+            6,
+            9,
+            14,
+            18,
+            22
+          ],
+          [
+            4,
+            4,
+            5,
+            7,
+            9,
+            21,
+            22,
+            20
+          ],
+          [
+            5,
+            5,
+            6,
+            9,
+            14,
+            21,
+            25,
+            20
+          ],
+          [
+            5,
+            6,
+            8,
+            10,
+            18,
+            31,
+            29,
+            22
+          ],
+          [
+            6,
+            8,
+            13,
+            20,
+            24,
+            39,
+            37,
+            28
+          ],
+          [
+            9,
+            13,
+            20,
+            23,
+            29,
+            37,
+            41,
+            33
+          ],
+          [
+            18,
+            23,
+            28,
+            31,
+            37,
+            44,
+            43,
+            36
+          ],
+          [
+            26,
+            33,
+            34,
+            35,
+            40,
+            36,
+            37,
+            36
+          ]
+        ],
+        [
+          [
+            6,
+            6,
+            9,
+            17,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            6,
+            8,
+            9,
+            24,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            9,
+            9,
+            20,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            17,
+            24,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ]
+        ],
+        [
+          [
+            6,
+            6,
+            9,
+            17,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            6,
+            8,
+            9,
+            24,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            9,
+            9,
+            20,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            17,
+            24,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ],
+          [
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36,
+            36
+          ]
+        ]
+      ],
+      "split": "train",
+      "width": 512
+    }
+  ],
+  "preprocessing_recipe": {
+    "encoder": "Pillow",
+    "encoder_version": "12.2.0",
+    "provenance": "this reproduce.py; synthetic, not ImageNet",
+    "quality": 82,
+    "resize": "none; generated 512x512 RGB fixture",
+    "subsampling": 2
+  },
+  "representation": "original_jpeg_quantized_dct",
+  "selection": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/evidence-v2/source/selection.json",
+    "sha256": "7e57820f784cdbe3db8ac97b62a4c98b68a29578386bf707e02e74baa288930c"
+  },
+  "version": 1
+}

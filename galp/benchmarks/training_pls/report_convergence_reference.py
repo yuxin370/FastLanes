@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 from .contracts import (
     NATIVE_PHYSICAL_BACKEND,
     STANDARD_DCT_BACKEND,
+    DCT_REFERENCE_BACKENDS,
     blocking_code_identity,
     condition_identity_hash,
 )
@@ -102,6 +103,8 @@ def _validate_contract(path: Path) -> dict[str, Any]:
 
 
 def _execution_backend(contract: Mapping[str, Any]) -> str:
+    if "execution_backend" in contract:
+        return str(contract["execution_backend"])
     mode = str(contract.get("execution_mode", ""))
     if mode == "native_physical_pls":
         return NATIVE_PHYSICAL_BACKEND
@@ -147,7 +150,7 @@ def build_report(
     reference_contract = _validate_contract(reference_run / "run_manifest.json")
     if _execution_backend(native_contract) != NATIVE_PHYSICAL_BACKEND:
         raise ValueError("--native-run is not a native physical B6 run")
-    if _execution_backend(reference_contract) != STANDARD_DCT_BACKEND:
+    if _execution_backend(reference_contract) not in DCT_REFERENCE_BACKENDS:
         raise ValueError("--reference-run is not a standard RGB-no-more DCT run")
     identity_differences = {
         field: {
@@ -278,7 +281,7 @@ def build_report(
     reference_code = blocking_code_identity(reference_contract["code_version"])
     report = {
         "schema_version": REPORT_SCHEMA,
-        "comparison": "native-b6-vs-standard-rgbnomore-dct",
+        "comparison": "native-b6-vs-" + _execution_backend(reference_contract),
         "model_id": native_contract["model_id"],
         "seed": int(native_contract["training_seed"]),
         "max_epoch": max_epoch,

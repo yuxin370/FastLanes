@@ -1,0 +1,92 @@
+{
+  "scope": "Locally executed pure upload update_windows function on uploaded traces; no torch/GPU/model execution",
+  "results": [
+    {
+      "model": "mobilenet24",
+      "declared_accumulation": 16,
+      "window_count": 10,
+      "microbatches_per_window": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "samples_per_window": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    {
+      "model": "resnet24",
+      "declared_accumulation": 16,
+      "window_count": 10,
+      "microbatches_per_window": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "samples_per_window": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    {
+      "model": "vitti",
+      "declared_accumulation": 16,
+      "window_count": 10,
+      "microbatches_per_window": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "samples_per_window": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    }
+  ]
+}

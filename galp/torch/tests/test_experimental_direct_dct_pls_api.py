@@ -91,6 +91,20 @@ def _native_module():
 
 
 class ExperimentalDirectDctPlsApiTest(unittest.TestCase):
+    def test_basic_augmentation_disables_native_operations(self) -> None:
+        pipeline = DirectDctPlsPipeline(
+            "dataset/manifest.bin",
+            "dataset/ordered_mapping.csv",
+            training_seed=11997733,
+            expected_mapping_sha256="0" * 64,
+            enable_randaugment=False,
+            enable_mixup=False,
+            native_module=_native_module(),
+        )
+        options = pipeline._native.arguments[-1]
+        self.assertFalse(options["enable_randaugment"])
+        self.assertFalse(options["enable_mixup"])
+
     def test_stable_namespace_does_not_export_experimental_pls(self) -> None:
         self.assertNotIn("DirectDctPlsPipeline", galp.torch.__all__)
         self.assertFalse(hasattr(galp.torch, "DirectDctPlsPipeline"))

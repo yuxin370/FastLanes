@@ -36,6 +36,8 @@ struct JpegDctOutputProjection {
 	bool     finalize_on_store;
 	float    add;
 	float    scale;
+	float    output_divide;
+	float    shift;
 	float    subtract[192];
 	float    divide[192];
 };
@@ -45,12 +47,20 @@ __global__ void finalize_projected_dct_kernel(float*                         out
                                               const JpegDctOutputProjection* projection,
                                               float                          add,
                                               float                          scale,
+                                              float                          divide,
+                                              float                          shift,
                                               bool                           initialize);
 
 __global__ void round_dct_grid_accum_pair_kernel(
     const float* y_in, size_t y_count, const float* cbcr_in, size_t cbcr_count, int16_t* y_out, int16_t* cbcr_out);
-__global__ void round_affine_dct_grid_accum_pair_kernel(
-    float* y_in_out, size_t y_count, float* cbcr_in_out, size_t cbcr_count, float output_add, float output_scale);
+__global__ void round_affine_dct_grid_accum_pair_kernel(float* y_in_out,
+                                                        size_t y_count,
+                                                        float* cbcr_in_out,
+                                                        size_t cbcr_count,
+                                                        float  output_add,
+                                                        float  output_scale,
+                                                        float  output_divide,
+                                                        float  output_shift);
 __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding*                   column_bindings,
                                                      const JpegDctDevicePlanlessImageDescriptor* images,
                                                      const uint32_t* logical_to_compact_vectors,
@@ -82,7 +92,10 @@ __global__ void transformed_dct_grid_planless_kernel(const DeviceCoeffBinding*  
                                                      float*                                  y_accum,
                                                      float*                                  cbcr_accum,
                                                      const JpegDctOutputProjection*          projection,
-                                                     bool                                    identity_projection);
+                                                     bool                                    identity_projection,
+                                                     const JpegDctSplitDown2Block*           split_down2_blocks,
+                                                     float*                                  split_down2_source,
+                                                     uint32_t                                workset_index);
 __global__ void
                 transformed_dct_grid_integer_upsample_kernel(const DeviceCoeffBinding*                   column_bindings,
                                                              const JpegDctDevicePlanlessImageDescriptor* images,

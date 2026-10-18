@@ -1,0 +1,69 @@
+{
+  "scope": "isolated NumPy/SciPy core tests; only absent galp.benchmarks.common.sha256_file is shimmed",
+  "checks": [
+    {
+      "name": "ic_matched_shared roundtrip",
+      "passed": true,
+      "coverage": "ragged and grayscale where applicable; uint16 Q >32767; out-of-order K; spatial slice; duplicate/order/tail; byte accounting"
+    },
+    {
+      "name": "ic_matched_batched roundtrip",
+      "passed": true,
+      "coverage": "ragged and grayscale where applicable; uint16 Q >32767; out-of-order K; spatial slice; duplicate/order/tail; byte accounting"
+    },
+    {
+      "name": "fs_matched_b8 roundtrip",
+      "passed": true,
+      "coverage": "ragged and grayscale where applicable; uint16 Q >32767; out-of-order K; spatial slice; duplicate/order/tail; byte accounting"
+    },
+    {
+      "name": "ic_matched_fixedk roundtrip",
+      "passed": true,
+      "coverage": "ragged and grayscale where applicable; uint16 Q >32767; out-of-order K; spatial slice; duplicate/order/tail; byte accounting"
+    },
+    {
+      "name": "diagonal partitions and native-mask exact equality",
+      "passed": true
+    },
+    {
+      "name": "FS complete-column overread with partial diagonal + crop + duplicate",
+      "passed": true,
+      "decoded_q_values": 80,
+      "logical_q_values": 6,
+      "unique_q_values": 3
+    },
+    {
+      "name": "decoded cache hits and bounded LRU eviction",
+      "passed": true
+    },
+    {
+      "name": "FS dtype signed range and overflow",
+      "passed": true
+    },
+    {
+      "name": "native SciPy DCT-II oracle, 6048 candidates, B8 triangle36, IC/IC-b/FS B32 mosaic",
+      "passed": true
+    }
+  ],
+  "payload_mutation_reproducer": {
+    "store_manifest_artifact_unchanged": true,
+    "payload_artifact_changed": true,
+    "reader_accepted_changed_q": [
+      -129,
+      -128
+    ],
+    "reader_accepted_changed_Q": [
+      32526,
+      1
+    ],
+    "runner_executed": false,
+    "static_gate_implication": "runner.py:168,207-210 binds evidence only to store.json, so this mutation leaves its store identity condition satisfied"
+  },
+  "decoded_working_set_reproducer": {
+    "decoded_cache_budget_bytes": 0,
+    "requested_q_values": 4,
+    "whole_groups_simultaneously_live": 4,
+    "whole_q_bytes_simultaneously_live": 16384,
+    "note": "Small synthetic retention proof. This is not an RSS benchmark or observed OOM."
+  }
+}

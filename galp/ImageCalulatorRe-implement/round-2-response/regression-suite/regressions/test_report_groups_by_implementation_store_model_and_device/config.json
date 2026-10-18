@@ -1,0 +1,27 @@
+{
+  "decode_budget_bytes": 1048576,
+  "host_input_budget_bytes": 4194304,
+  "label_mapping": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_report_groups_by_implementation_store_model_and_device/ic/store.json",
+    "sha256": "4c5ff06a444f5d1281a4c76bc9db7e5c34d6a06d6e42e99c93b85f62bb381037"
+  },
+  "model_microbatch_size": 2,
+  "model_profile": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_report_groups_by_implementation_store_model_and_device/ic/store.json",
+    "sha256": "4c5ff06a444f5d1281a4c76bc9db7e5c34d6a06d6e42e99c93b85f62bb381037"
+  },
+  "precision": "fp32",
+  "preparation_pool_size": 2,
+  "reader_memory_budget_bytes": 2097152,
+  "repository_revision": "test",
+  "request_trace": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_report_groups_by_implementation_store_model_and_device/ic/store.json",
+    "sha256": "4c5ff06a444f5d1281a4c76bc9db7e5c34d6a06d6e42e99c93b85f62bb381037"
+  },
+  "source_manifest": {
+    "path": "/home/tangyuxin/gfastlanes/FastLanes/galp/ImageCalulatorRe-implement/round-2-response/regression-suite/regressions/test_report_groups_by_implementation_store_model_and_device/ic/store.json",
+    "sha256": "4c5ff06a444f5d1281a4c76bc9db7e5c34d6a06d6e42e99c93b85f62bb381037"
+  },
+  "torch_threads": 1,
+  "workers": 2
+}

@@ -144,6 +144,8 @@ struct DirectDctPlsTargetTensorDescriptor {
 	std::array<size_t, 2> shape {0U, 0U};
 	std::array<size_t, 2> strides {0U, 1U};
 	int                   cuda_device = -1;
+	// Mixup-disabled pipelines expose original integer labels without a dense target matrix.
+	const int64_t* hard_labels = nullptr;
 
 	[[nodiscard]] bool empty() const noexcept {
 		return shape[0] == 0U || shape[1] == 0U;

@@ -1,0 +1,284 @@
+{
+  "attribution": "paper-guided reimplementation with a JPEG-DCT adapter",
+  "block_size": 8,
+  "codec": "numpy.savez_compressed / ZIP_DEFLATED",
+  "content_fingerprint": "1d739c098bda0077070d7714958bd5e4ffeea029144c71265422168b9a71963e",
+  "conversion_cpu_s": 0.001698369999999727,
+  "conversion_wall_s": 0.0016983100213110447,
+  "dependency_evidence": "test explicit frequency-only request",
+  "dtype_policy": "paper",
+  "files": {
+    "group_000000.npz": {
+      "decoded_bytes": 624,
+      "q_payload_bytes": 217,
+      "sha256": "039742c9caed8d4b5390808278c2929b75b26292c3460e32ac3a81a69e9c70bc",
+      "size_bytes": 543
+    },
+    "group_000001.npz": {
+      "decoded_bytes": 624,
+      "q_payload_bytes": 221,
+      "sha256": "2f35c66cb8df19aa1120f8f78fef516db062b156454998543e4e8d31f7609bb2",
+      "size_bytes": 547
+    },
+    "group_000002.npz": {
+      "decoded_bytes": 624,
+      "q_payload_bytes": 221,
+      "sha256": "ad9846853a38afbc4ea35238b482bf62162dc3a5b675a1f30998c6acb04b4cee",
+      "size_bytes": 547
+    }
+  },
+  "groups": [
+    {
+      "block_offsets": [
+        0,
+        12,
+        16,
+        20
+      ],
+      "images": [
+        "0"
+      ],
+      "table_file": "group_000000.npz",
+      "units": [
+        {
+          "diagonal": null,
+          "dtype": "<i4",
+          "file": "group_000000.npz",
+          "values": 60
+        }
+      ],
+      "value_offsets": [
+        0,
+        36,
+        48,
+        60
+      ]
+    },
+    {
+      "block_offsets": [
+        0,
+        12,
+        16,
+        20
+      ],
+      "images": [
+        "1"
+      ],
+      "table_file": "group_000001.npz",
+      "units": [
+        {
+          "diagonal": null,
+          "dtype": "<i4",
+          "file": "group_000001.npz",
+          "values": 60
+        }
+      ],
+      "value_offsets": [
+        0,
+        36,
+        48,
+        60
+      ]
+    },
+    {
+      "block_offsets": [
+        0,
+        12,
+        16,
+        20
+      ],
+      "images": [
+        "2"
+      ],
+      "table_file": "group_000002.npz",
+      "units": [
+        {
+          "diagonal": null,
+          "dtype": "<i4",
+          "file": "group_000002.npz",
+          "values": 60
+        }
+      ],
+      "value_offsets": [
+        0,
+        36,
+        48,
+        60
+      ]
+    }
+  ],
+  "images": [
+    {
+      "component_offset": 0,
+      "group": 0,
+      "mask_family": [
+        "matched_arbitrary_adapter",
+        "matched_arbitrary_adapter",
+        "matched_arbitrary_adapter"
+      ],
+      "masks": [
+        [
+          0,
+          8,
+          63
+        ],
+        [
+          0,
+          8,
+          63
+        ],
+        [
+          0,
+          8,
+          63
+        ]
+      ],
+      "metadata": {
+        "block_size": 8,
+        "components": [
+          {
+            "block_grid": [
+              3,
+              4
+            ],
+            "component_id": 0
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 1
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 2
+          }
+        ],
+        "image_id": "0",
+        "label": 0,
+        "split": "test"
+      }
+    },
+    {
+      "component_offset": 0,
+      "group": 1,
+      "mask_family": [
+        "matched_arbitrary_adapter",
+        "matched_arbitrary_adapter",
+        "matched_arbitrary_adapter"
+      ],
+      "masks": [
+        [
+          0,
+          8,
+          63
+        ],
+        [
+          0,
+          8,
+          63
+        ],
+        [
+          0,
+          8,
+          63
+        ]
+      ],
+      "metadata": {
+        "block_size": 8,
+        "components": [
+          {
+            "block_grid": [
+              3,
+              4
+            ],
+            "component_id": 0
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 1
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 2
+          }
+        ],
+        "image_id": "1",
+        "label": 1,
+        "split": "test"
+      }
+    },
+    {
+      "component_offset": 0,
+      "group": 2,
+      "mask_family": [
+        "matched_arbitrary_adapter",
+        "matched_arbitrary_adapter",
+        "matched_arbitrary_adapter"
+      ],
+      "masks": [
+        [
+          0,
+          8,
+          63
+        ],
+        [
+          0,
+          8,
+          63
+        ],
+        [
+          0,
+          8,
+          63
+        ]
+      ],
+      "metadata": {
+        "block_size": 8,
+        "components": [
+          {
+            "block_grid": [
+              3,
+              4
+            ],
+            "component_id": 0
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 1
+          },
+          {
+            "block_grid": [
+              2,
+              2
+            ],
+            "component_id": 2
+          }
+        ],
+        "image_id": "2",
+        "label": 2,
+        "split": "test"
+      }
+    }
+  ],
+  "method": "ic_matched_fixedk",
+  "numpy_version": "2.4.6",
+  "serialization_order": "image/component/raster-block/stored-mask-order",
+  "source_artifact": null,
+  "storage_group_images": 1,
+  "variant": "adapted",
+  "version": 1
+}

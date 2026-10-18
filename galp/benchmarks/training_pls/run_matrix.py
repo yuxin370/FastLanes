@@ -27,8 +27,10 @@ from galp.benchmarks.training_audit_policy import (
 
 from .contracts import (
     EXECUTION_BACKENDS,
+    DCT_REFERENCE_BACKENDS,
+    IC_DCT_BACKEND,
+    FS_DCT_BACKEND,
     NATIVE_PHYSICAL_BACKEND,
-    STANDARD_DCT_BACKEND,
     build_condition_contract,
     code_version,
     condition_identity_hash,
@@ -300,7 +302,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     physical_execution: dict[str, Any] | None = None
     standard_dct_reference: dict[str, Any] | None = None
     audit_policy = build_audit_policy(args.audit_mode)
-    if args.execution_backend in (NATIVE_PHYSICAL_BACKEND, STANDARD_DCT_BACKEND):
+    if args.execution_backend in (NATIVE_PHYSICAL_BACKEND, *DCT_REFERENCE_BACKENDS):
         actual_mapping_hash = sha256_file(args.premixed_mapping_csv.resolve())
         if actual_mapping_hash != args.expected_mapping_sha256:
             raise ValueError(
@@ -327,7 +329,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "cuda_mixup": True,
             "sample_order_policy_from_condition_contract": True,
         }
-    elif args.execution_backend == STANDARD_DCT_BACKEND:
+    elif args.execution_backend in DCT_REFERENCE_BACKENDS:
         standard_dct_reference = {
             "premixed_mapping_csv": str(args.premixed_mapping_csv.resolve()),
             "premixed_mapping_sha256": actual_mapping_hash,
@@ -337,6 +339,13 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "segment_images": 1024,
         }
+        if args.execution_backend in (IC_DCT_BACKEND, FS_DCT_BACKEND):
+            from galp.benchmarks.dct_baselines.store import training_store_identity
+            samples = json.loads(args.train_manifest.read_text())["samples"]
+            standard_dct_reference["baseline_store"] = training_store_identity(
+                args.baseline_store, [(s["logical_sample_id"], s["label"], s["path"]) for s in samples],
+                args.execution_backend,
+            )
     code = code_version(REPO_ROOT)
     model_sources = source_provenance(args.rgbnomore_root, args.model)
     initial_hashes = _initial_model_hashes(
@@ -532,17 +541,19 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                     args.expected_mapping_sha256,
                 ]
             )
-        elif args.execution_backend == STANDARD_DCT_BACKEND:
+        elif args.execution_backend in DCT_REFERENCE_BACKENDS:
             argv.extend(
                 [
                     "--execution-backend",
-                    STANDARD_DCT_BACKEND,
+                    args.execution_backend,
                     "--premixed-mapping-csv",
                     str(args.premixed_mapping_csv.resolve()),
                     "--expected-mapping-sha256",
                     args.expected_mapping_sha256,
                 ]
             )
+            if args.baseline_store is not None:
+                argv.extend(["--baseline-store", str(args.baseline_store.resolve())])
         argv.append("--integration-check-first-100")
         if args.stop_after_epoch is not None:
             argv.extend(["--stop-after-epoch", str(args.stop_after_epoch)])
@@ -731,6 +742,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=EXECUTION_BACKENDS,
         default="semantic-emulation",
     )
+    parser.add_argument("--baseline-store", type=Path)
     parser.add_argument("--physical-galp-manifest", type=Path)
     parser.add_argument("--premixed-mapping-csv", type=Path)
     parser.add_argument("--expected-mapping-sha256")
@@ -788,7 +800,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             raise ValueError(
                 "--expected-mapping-sha256 must contain 64 hex characters"
             ) from error
-    elif args.execution_backend == STANDARD_DCT_BACKEND:
+    elif args.execution_backend in DCT_REFERENCE_BACKENDS:
         if args.physical_galp_manifest is not None:
             raise ValueError(
                 "standard-rgbnomore-dct reads source JPEGs and cannot accept "
@@ -814,6 +826,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "physical PLS paths are accepted only with "
             "--execution-backend native-physical-pls"
         )
+    if args.execution_backend in (IC_DCT_BACKEND, FS_DCT_BACKEND):
+        if args.baseline_store is None or not (args.baseline_store / "store.json").is_file():
+            raise ValueError("IC/FS requires --baseline-store containing store.json")
+    elif args.baseline_store is not None:
+        raise ValueError("--baseline-store requires an IC/FS execution backend")
     return args
 
 

@@ -19,6 +19,8 @@ from galp.benchmarks.training_audit_policy import build_audit_policy
 from galp.benchmarks.training_pls.contracts import (
     NATIVE_PHYSICAL_BACKEND,
     STANDARD_DCT_BACKEND,
+    IC_DCT_BACKEND,
+    FS_DCT_BACKEND,
     TRAINING_SOURCE_SCOPE,
     blocking_code_identity,
     build_condition_contract,
@@ -491,6 +493,36 @@ class RecipeAndContractTests(unittest.TestCase):
         self.assertEqual(
             contract["condition_hash"], condition_identity_hash(contract)
         )
+
+    def test_ic_fs_reference_contracts_preserve_the_training_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train, val = root / "train.json", root / "val.json"
+            train.write_text("{}")
+            val.write_text("{}")
+            hashes = []
+            for backend, method in ((IC_DCT_BACKEND, "ic_matched_shared"), (FS_DCT_BACKEND, "fs_matched_b8")):
+                recipe = recipe_contract(SWINV2_RECIPE_NAME)
+                contract = build_condition_contract(condition_id="B6", seed=11997733,
+                    train_manifest=train, val_manifest=val, layout_plan={"layout_hash": "layout"},
+                    recipe=recipe, total_optimizer_updates=375600, initial_model_hash="initial",
+                    code={"training_source_scope": TRAINING_SOURCE_SCOPE,
+                          "training_runtime_source_tree_sha256": "source"},
+                    device="cuda:0", model_source_provenance=[], audit_policy=build_audit_policy(),
+                    required_gpu_name_substring="RTX 4090",
+                    execution_backend=backend, standard_dct_reference={
+                        "premixed_mapping_csv": "/data/mapping.csv", "premixed_mapping_sha256": "a"*64,
+                        "baseline_store": {"method": method, "store": {
+                            "manifest": {"path": "/data/store.json", "sha256": "b"*64},
+                            "content_fingerprint": "c"*64}}})
+                self.assertEqual(contract["optimizer_configuration"], recipe["optimizer"])
+                self.assertEqual(contract["model_configuration"], recipe["model"])
+                self.assertEqual(contract["initial_model_hash"], "initial")
+                self.assertEqual(contract["execution_backend"], backend)
+                self.assertIn(method, contract["standard_dct_reference"]["training_input"])
+                self.assertFalse(contract["headline_eligible"])
+                hashes.append(contract["condition_hash"])
+            self.assertNotEqual(*hashes)
 
     def test_optimizer_update_rejects_an_empty_gradient_set(self) -> None:
         model = torch.nn.Linear(2, 2)

@@ -1281,6 +1281,9 @@ struct JpegDctDeviceScratch {
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_vector_remap;
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_image_vector_bindings;
 	JpegDctDeviceScratchBuffer<uint32_t>                                   planless_active_output_blocks;
+	JpegDctDeviceScratchBuffer<JpegDctSplitDown2Block>                      split_down2_blocks;
+	JpegDctDeviceScratchBuffer<float>                                       split_down2_source;
+	JpegDctSplitDown2Plan                                                   host_split_down2;
 	JpegDctDeviceScratchBuffer<uint32_t>                                    planless_active_image_indices;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceActiveOutputGroup>              planless_output_groups;
 	JpegDctDeviceScratchBuffer<JpegDctDeviceSparseTransformPlan>            planless_sparse_transform_plans;
@@ -2094,6 +2097,8 @@ void finish_projected_output_batch(const size_t                    batch,
 		    scratch.output_projection.data,
 		    transform.output_add,
 		    transform.output_scale,
+		    transform.output_divide,
+		    transform.output_shift,
 		    false);
 		CUDA_SAFE_CALL(cudaGetLastError());
 		++stats.materialize_kernel_launch_count;
@@ -2336,6 +2341,15 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 		}
 		if (!scratch.planless_active_output_schedule_uploaded &&
 		    !scratch.host_planless_active_output_blocks.empty()) {
+			if (!scratch.host_split_down2.blocks.empty()) {
+				scratch.split_down2_blocks.upload(
+				    scratch.host_split_down2.blocks.data(), scratch.host_split_down2.blocks.size(), stream, stats);
+				scratch.split_down2_source.ensure_capacity(scratch.host_split_down2.source_value_count, stream, stats);
+				CUDA_SAFE_CALL(cudaMemsetAsync(scratch.split_down2_source.data,
+				                               0,
+				                               scratch.host_split_down2.source_value_count * sizeof(float),
+				                               stream));
+			}
 			scratch.planless_active_output_blocks.upload(scratch.host_planless_active_output_blocks.data(),
 			                                               scratch.host_planless_active_output_blocks.size(),
 			                                               stream,
@@ -2506,7 +2520,11 @@ void project_planless_transformed_dct_grid_batch(const std::vector<BoundCoeffCol
 			    y_accum,
 			    cbcr_accum,
 			    transform.output_channels.empty() ? nullptr : scratch.output_projection.data,
-			    identity_projection);
+			    identity_projection,
+			    block_major_plan && !scratch.host_split_down2.blocks.empty() ? scratch.split_down2_blocks.data
+			                                                                 : nullptr,
+			    scratch.split_down2_source.data,
+			    static_cast<uint32_t>(scratch.host_planless_active_output_workset));
 		}
 
 		CUDA_SAFE_CALL(cudaGetLastError());
@@ -2933,10 +2951,18 @@ void round_fixed_ycbcr_grid_outputs(float*                          y_accum,
 		                                                          scratch.output_projection.data,
 		                                                          transform.output_add,
 		                                                          transform.output_scale,
+		                                                          transform.output_divide,
+		                                                          transform.output_shift,
 		                                                          false);
 	} else if (transform.output_channels.empty() && float_output) {
-		round_affine_dct_grid_accum_pair_kernel<<<grid, block, 0, stream>>>(
-		    y_accum, active_y_count, cbcr_accum, active_cbcr_count, transform.output_add, transform.output_scale);
+		round_affine_dct_grid_accum_pair_kernel<<<grid, block, 0, stream>>>(y_accum,
+		                                                                    active_y_count,
+		                                                                    cbcr_accum,
+		                                                                    active_cbcr_count,
+		                                                                    transform.output_add,
+		                                                                    transform.output_scale,
+		                                                                    transform.output_divide,
+		                                                                    transform.output_shift);
 	} else if (transform.output_channels.empty()) {
 		round_dct_grid_accum_pair_kernel<<<grid, block, 0, stream>>>(
 		    y_accum, active_y_count, cbcr_accum, active_cbcr_count, y_output, cbcr_output);
@@ -3026,6 +3052,10 @@ public:
 		size_t compressed_backing_live_peak_bytes = 0U;
 		size_t decoded_arena_used_peak_bytes = 0U;
 		size_t decoded_arena_capacity_peak_bytes = 0U;
+		size_t split_source_used_peak_bytes         = 0U;
+		size_t split_source_capacity_peak_bytes     = 0U;
+		size_t split_metadata_used_peak_bytes       = 0U;
+		size_t split_metadata_capacity_peak_bytes   = 0U;
 		size_t ring_fixed_buffer_peak_bytes = 0U;
 		size_t active_schedule_peak_bytes = 0U;
 		size_t kernel_referenced_backing_peak_bytes = 0U;
@@ -3074,6 +3104,22 @@ public:
 		    std::max(metrics_.decoded_arena_used_peak_bytes, decoded_arena_used_bytes_);
 		metrics_.decoded_arena_capacity_peak_bytes =
 		    std::max(metrics_.decoded_arena_capacity_peak_bytes, decoded_arena_capacity_bytes_);
+		update_high_water_locked();
+	}
+
+	void set_split_buffers(const size_t source_used,
+	                       const size_t source_capacity,
+	                       const size_t metadata_used,
+	                       const size_t metadata_capacity) {
+		std::lock_guard<std::mutex> guard(mutex_);
+		split_used_bytes_                     = checked_add(source_used, metadata_used, "split used");
+		split_capacity_bytes_                 = checked_add(source_capacity, metadata_capacity, "split capacity");
+		metrics_.split_source_used_peak_bytes = std::max(metrics_.split_source_used_peak_bytes, source_used);
+		metrics_.split_source_capacity_peak_bytes =
+		    std::max(metrics_.split_source_capacity_peak_bytes, source_capacity);
+		metrics_.split_metadata_used_peak_bytes = std::max(metrics_.split_metadata_used_peak_bytes, metadata_used);
+		metrics_.split_metadata_capacity_peak_bytes =
+		    std::max(metrics_.split_metadata_capacity_peak_bytes, metadata_capacity);
 		update_high_water_locked();
 	}
 
@@ -3143,28 +3189,35 @@ private:
 	}
 
 	void update_high_water_locked() {
-		const auto used = checked_add(
-		    checked_add(compressed_live_bytes_, decoded_arena_used_bytes_, "used"),
-		    checked_add(active_schedule_bytes_, ring_fixed_buffer_bytes_, "used"),
-		    "used");
-		const auto allocated = checked_add(
-		    checked_add(compressed_live_bytes_, decoded_arena_capacity_bytes_, "allocated"),
-		    checked_add(active_schedule_bytes_, ring_fixed_buffer_bytes_, "allocated"),
-		    "allocated");
+		const auto used = checked_add(checked_add(compressed_live_bytes_, decoded_arena_used_bytes_, "used"),
+		                              checked_add(checked_add(active_schedule_bytes_, ring_fixed_buffer_bytes_, "used"),
+		                                          split_used_bytes_,
+		                                          "used"),
+		                              "used");
+		const auto allocated =
+		    checked_add(checked_add(compressed_live_bytes_, decoded_arena_capacity_bytes_, "allocated"),
+		                checked_add(checked_add(active_schedule_bytes_, ring_fixed_buffer_bytes_, "allocated"),
+		                            split_capacity_bytes_,
+		                            "allocated"),
+		                "allocated");
 		metrics_.total_used_high_water_bytes = std::max(metrics_.total_used_high_water_bytes, used);
 		metrics_.total_allocated_high_water_bytes =
 		    std::max(metrics_.total_allocated_high_water_bytes, allocated);
 	}
 
 	void update_high_water_with_schedule_locked(const size_t schedule_bytes) {
-		const auto used = checked_add(
-		    checked_add(compressed_live_bytes_, decoded_arena_used_bytes_, "schedule-build used"),
-		    checked_add(schedule_bytes, ring_fixed_buffer_bytes_, "schedule-build used"),
-		    "schedule-build used");
-		const auto allocated = checked_add(
-		    checked_add(compressed_live_bytes_, decoded_arena_capacity_bytes_, "schedule-build allocated"),
-		    checked_add(schedule_bytes, ring_fixed_buffer_bytes_, "schedule-build allocated"),
-		    "schedule-build allocated");
+		const auto used =
+		    checked_add(checked_add(compressed_live_bytes_, decoded_arena_used_bytes_, "schedule-build used"),
+		                checked_add(checked_add(schedule_bytes, ring_fixed_buffer_bytes_, "schedule-build used"),
+		                            split_used_bytes_,
+		                            "schedule-build used"),
+		                "schedule-build used");
+		const auto allocated =
+		    checked_add(checked_add(compressed_live_bytes_, decoded_arena_capacity_bytes_, "schedule-build allocated"),
+		                checked_add(checked_add(schedule_bytes, ring_fixed_buffer_bytes_, "schedule-build allocated"),
+		                            split_capacity_bytes_,
+		                            "schedule-build allocated"),
+		                "schedule-build allocated");
 		metrics_.total_used_high_water_bytes = std::max(metrics_.total_used_high_water_bytes, used);
 		metrics_.total_allocated_high_water_bytes =
 		    std::max(metrics_.total_allocated_high_water_bytes, allocated);
@@ -3178,10 +3231,10 @@ private:
 		};
 		const auto used = saturating_add(
 		    saturating_add(compressed_live_bytes_, decoded_arena_used_bytes_),
-		    saturating_add(active_schedule_bytes_, ring_fixed_buffer_bytes_));
+		    saturating_add(saturating_add(active_schedule_bytes_, ring_fixed_buffer_bytes_), split_used_bytes_));
 		const auto allocated = saturating_add(
 		    saturating_add(compressed_live_bytes_, decoded_arena_capacity_bytes_),
-		    saturating_add(active_schedule_bytes_, ring_fixed_buffer_bytes_));
+		    saturating_add(saturating_add(active_schedule_bytes_, ring_fixed_buffer_bytes_), split_capacity_bytes_));
 		metrics_.total_used_high_water_bytes = std::max(metrics_.total_used_high_water_bytes, used);
 		metrics_.total_allocated_high_water_bytes =
 		    std::max(metrics_.total_allocated_high_water_bytes, allocated);
@@ -3192,6 +3245,8 @@ private:
 	size_t compressed_live_bytes_ = 0U;
 	size_t decoded_arena_used_bytes_ = 0U;
 	size_t decoded_arena_capacity_bytes_ = 0U;
+	size_t             split_used_bytes_                = 0U;
+	size_t             split_capacity_bytes_            = 0U;
 	size_t ring_fixed_buffer_bytes_ = 0U;
 	size_t active_schedule_bytes_ = 0U;
 	size_t kernel_referenced_backing_bytes_ = 0U;
@@ -4975,6 +5030,12 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 	auto& pending = scratch.host_pending_works;
 	pending.clear();
 	auto transient_tracker = std::make_shared<ActualTransientMemoryTracker>();
+	// These allocations belong to the reusable reader scratch, including on a
+	// later request that needs no split-source values of its own.
+	transient_tracker->set_split_buffers(0U,
+	                                     scratch.split_down2_source.capacity * sizeof(float),
+	                                     0U,
+	                                     scratch.split_down2_blocks.capacity * sizeof(JpegDctSplitDown2Block));
 	scratch.host_planless_active_output_blocks.clear();
 	scratch.host_planless_output_groups.clear();
 	scratch.host_planless_group_offsets.clear();
@@ -5369,16 +5430,30 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 		    schedule.active_output_blocks.size() * sizeof(uint32_t);
 		execution_stats.planless_transform_active_output_offset_bytes +=
 		    schedule.offsets.size() * sizeof(uint64_t);
+		scratch.host_split_down2 = build_split_down2_plan(schedule, *schedule_plan, grid_transform);
+		// Reserve before decoding so the full live working set includes the split
+		// source and its device map. Upload/initialization still use the transform stream.
+		scratch.split_down2_source.ensure_capacity(
+		    scratch.host_split_down2.source_value_count, scratch.stream_for_transform(), execution_stats);
+		scratch.split_down2_blocks.ensure_capacity(
+		    scratch.host_split_down2.blocks.size(), scratch.stream_for_transform(), execution_stats);
+		transient_tracker->set_split_buffers(scratch.host_split_down2.source_value_count * sizeof(float),
+		                                     scratch.split_down2_source.capacity * sizeof(float),
+		                                     scratch.host_split_down2.blocks.size() * sizeof(JpegDctSplitDown2Block),
+		                                     scratch.split_down2_blocks.capacity * sizeof(JpegDctSplitDown2Block));
 		const auto persistent_schedule_bytes =
 		    static_cast<uint64_t>(schedule.active_output_blocks.size()) * sizeof(uint32_t) +
 		    static_cast<uint64_t>(schedule.offsets.size()) * sizeof(uint64_t) +
 		    schedule.groups.size() * sizeof(JpegDctDeviceActiveOutputGroup) +
-		    schedule.group_offsets.size() * sizeof(uint64_t) + schedule.image_indices.size() * sizeof(uint32_t);
+		    schedule.group_offsets.size() * sizeof(uint64_t) + schedule.image_indices.size() * sizeof(uint32_t) +
+		    scratch.host_split_down2.blocks.size() * sizeof(JpegDctSplitDown2Block);
 		const auto persistent_schedule_capacity_bytes =
 		    static_cast<uint64_t>(schedule.active_output_blocks.capacity()) * sizeof(uint32_t) +
 		    static_cast<uint64_t>(schedule.offsets.capacity()) * sizeof(uint64_t) +
 		    schedule.groups.capacity() * sizeof(JpegDctDeviceActiveOutputGroup) +
-		    schedule.group_offsets.capacity() * sizeof(uint64_t) + schedule.image_indices.capacity() * sizeof(uint32_t);
+		    schedule.group_offsets.capacity() * sizeof(uint64_t) +
+		    schedule.image_indices.capacity() * sizeof(uint32_t) +
+		    scratch.host_split_down2.blocks.capacity() * sizeof(JpegDctSplitDown2Block);
 		const auto sidecar_mapped_bytes = schedule.sidecar_mapped_bytes;
 		const auto schedule_base_bytes =
 		    persistent_schedule_bytes > std::numeric_limits<uint64_t>::max() - sidecar_mapped_bytes
@@ -5461,7 +5536,7 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 			const auto c_blocks =
 			    uint64_t(grid_transform.cbcr_output_width_blocks) * grid_transform.cbcr_output_height_blocks;
 			scratch.output_ready_points = build_output_batch_completion_schedule(
-			    schedule, y_blocks + 2 * c_blocks, schedule_plan->images.size(), scratch.output_batch_images);
+			    schedule, y_blocks + 2 * c_blocks, schedule_plan->images, scratch.output_batch_images);
 		}
 		scratch.host_planless_active_output_schedule_mapping = std::move(schedule.sidecar_mapping);
 		scratch.host_planless_active_output_blocks = std::move(schedule.active_output_blocks);
@@ -5930,6 +6005,17 @@ void execute_unified_image_major_plan(const std::vector<JpegDctDeviceShardPlan>&
 		throw std::runtime_error("JPEG DCT deterministic fixed-transform plan was not fully consumed");
 	}
 	const auto actual_transient = transient_tracker->snapshot();
+	execution_stats.actual_transient_split_source_used_peak_bytes = std::max(
+	    execution_stats.actual_transient_split_source_used_peak_bytes, actual_transient.split_source_used_peak_bytes);
+	execution_stats.actual_transient_split_source_capacity_peak_bytes =
+	    std::max(execution_stats.actual_transient_split_source_capacity_peak_bytes,
+	             actual_transient.split_source_capacity_peak_bytes);
+	execution_stats.actual_transient_split_metadata_used_peak_bytes =
+	    std::max(execution_stats.actual_transient_split_metadata_used_peak_bytes,
+	             actual_transient.split_metadata_used_peak_bytes);
+	execution_stats.actual_transient_split_metadata_capacity_peak_bytes =
+	    std::max(execution_stats.actual_transient_split_metadata_capacity_peak_bytes,
+	             actual_transient.split_metadata_capacity_peak_bytes);
 	execution_stats.actual_transient_current_chunk_compressed_peak_bytes = std::max(
 	    execution_stats.actual_transient_current_chunk_compressed_peak_bytes,
 	    actual_transient.current_chunk_compressed_peak_bytes);
@@ -6675,14 +6761,14 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan    
 	impl->execution_stats.fixed_grid_output_float32 =
 	    impl->grid_output_data_type == JpegDctGridOutputDataType::kFloat32;
 	impl->execution_stats.fixed_grid_output_affine_applied = impl->execution_stats.fixed_grid_output_float32;
-	impl->execution_stats.fixed_grid_output_add   = plan.grid_transform.output_add;
-	impl->execution_stats.fixed_grid_output_scale = plan.grid_transform.output_scale;
-	const bool has_weighted_grid_output =
-	    output_weighted_grid &&
-	    (impl->ycbcr_dct_grid_shape.y_count() != 0U || impl->ycbcr_dct_grid_shape.cbcr_count() != 0U);
-	if (plan.async_planless_completion &&
-	    (!plan.uses_planless_fixed_transform || !has_weighted_grid_output || !plan.unify_rowgroups_across_shards ||
-	     plan.cache != nullptr)) {
+	impl->execution_stats.fixed_grid_output_add            = plan.grid_transform.output_add;
+	impl->execution_stats.fixed_grid_output_scale          = plan.grid_transform.output_scale;
+	impl->execution_stats.fixed_grid_output_divide         = plan.grid_transform.output_divide;
+	impl->execution_stats.fixed_grid_output_shift          = plan.grid_transform.output_shift;
+	const bool has_weighted_grid_output = output_weighted_grid && (impl->ycbcr_dct_grid_shape.y_count() != 0U ||
+		                                                           impl->ycbcr_dct_grid_shape.cbcr_count() != 0U);
+	if (plan.async_planless_completion && (!plan.uses_planless_fixed_transform || !has_weighted_grid_output ||
+		                                   !plan.unify_rowgroups_across_shards || plan.cache != nullptr)) {
 		throw std::runtime_error("asynchronous JPEG DCT completion is only supported by uncached planless FP32 output");
 	}
 	if (plan.async_planless_completion && plan.transform_submission_gate) {
@@ -6739,8 +6825,10 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan    
 					});
 				});
 		}
-		projection.add                     = plan.grid_transform.output_add;
-		projection.scale                   = plan.grid_transform.output_scale;
+		projection.add                       = plan.grid_transform.output_add;
+		projection.scale                     = plan.grid_transform.output_scale;
+		projection.output_divide             = plan.grid_transform.output_divide;
+		projection.shift                     = plan.grid_transform.output_shift;
 		scratch.finalize_projection_on_store = projection.finalize_on_store;
 
 		std::fill(std::begin(projection.channel), std::end(projection.channel), int16_t {-1});
@@ -6809,6 +6897,8 @@ JpegDctDeviceBatch execute_jpeg_dct_device_batch_plan(JpegDctDeviceBatchPlan    
 						scratch.output_projection.data,
 						plan.grid_transform.output_add,
 						plan.grid_transform.output_scale,
+						plan.grid_transform.output_divide,
+						plan.grid_transform.output_shift,
 						true);
 					CUDA_SAFE_CALL(cudaGetLastError());
 				} else {

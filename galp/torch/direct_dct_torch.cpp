@@ -176,8 +176,10 @@ std::optional<galp::jpeg::JpegDctGridTransformSpec> parse_grid_transform(const p
 			throw std::invalid_argument("grid_transform output_dtype must be 'int16' or 'float32'");
 		}
 	}
-	spec.output_add   = dict.contains("output_add") ? dict["output_add"].cast<float>() : 0.0F;
-	spec.output_scale = dict.contains("output_scale") ? dict["output_scale"].cast<float>() : 1.0F;
+	spec.output_add               = dict.contains("output_add") ? dict["output_add"].cast<float>() : 0.0F;
+	spec.output_scale             = dict.contains("output_scale") ? dict["output_scale"].cast<float>() : 1.0F;
+	spec.output_divide            = dict.contains("output_divide") ? dict["output_divide"].cast<float>() : 1.0F;
+	spec.output_shift             = dict.contains("output_shift") ? dict["output_shift"].cast<float>() : 0.0F;
 	spec.dequantize               = optional_bool("dequantize", true);
 	spec.require_all_coefficients = optional_bool("require_all_coefficients", true);
 	spec.allow_grayscale          = optional_bool("allow_grayscale", false);
@@ -874,6 +876,11 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	    stats.actual_transient_decoded_arena_used_peak_bytes;
 	out["actual_transient_decoded_arena_capacity_peak_bytes"] =
 	    stats.actual_transient_decoded_arena_capacity_peak_bytes;
+	out["actual_transient_split_source_used_peak_bytes"]     = stats.actual_transient_split_source_used_peak_bytes;
+	out["actual_transient_split_source_capacity_peak_bytes"] = stats.actual_transient_split_source_capacity_peak_bytes;
+	out["actual_transient_split_metadata_used_peak_bytes"]   = stats.actual_transient_split_metadata_used_peak_bytes;
+	out["actual_transient_split_metadata_capacity_peak_bytes"] =
+	    stats.actual_transient_split_metadata_capacity_peak_bytes;
 	out["actual_transient_ring_fixed_buffer_peak_bytes"] =
 	    stats.actual_transient_ring_fixed_buffer_peak_bytes;
 	out["actual_transient_active_schedule_peak_bytes"] =
@@ -947,13 +954,15 @@ py::dict execution_stats_to_dict(const galp::jpeg::JpegDctDeviceExecutionStats& 
 	out["fixed_grid_round_event_handoff_count"]          = stats.fixed_grid_round_event_handoff_count;
 	out["fixed_grid_finalize_kernel_launch_count"]       = stats.fixed_grid_finalize_kernel_launch_count;
 	out["fixed_grid_output_float32"]                     = stats.fixed_grid_output_float32;
-	out["fixed_grid_output_affine_applied"]              = stats.fixed_grid_output_affine_applied;
-	out["fixed_grid_output_add"]                         = stats.fixed_grid_output_add;
-	out["fixed_grid_output_scale"]                       = stats.fixed_grid_output_scale;
-	out["workset_upload_count"]                          = stats.workset_upload_count;
-	out["scratch_upload_count"]                          = stats.scratch_upload_count;
-	out["scratch_allocation_count"]                      = stats.scratch_allocation_count;
-	out["internal_sync_count"]                           = stats.internal_sync_count;
+	out["fixed_grid_output_affine_applied"]               = stats.fixed_grid_output_affine_applied;
+	out["fixed_grid_output_add"]                          = stats.fixed_grid_output_add;
+	out["fixed_grid_output_scale"]                        = stats.fixed_grid_output_scale;
+	out["fixed_grid_output_divide"]                       = stats.fixed_grid_output_divide;
+	out["fixed_grid_output_shift"]                        = stats.fixed_grid_output_shift;
+	out["workset_upload_count"]                           = stats.workset_upload_count;
+	out["scratch_upload_count"]                           = stats.scratch_upload_count;
+	out["scratch_allocation_count"]                       = stats.scratch_allocation_count;
+	out["internal_sync_count"]                            = stats.internal_sync_count;
 	out["cached_gather_sync_count"]                      = stats.cached_gather_sync_count;
 	out["decoded_batch_sync_count"]                      = stats.decoded_batch_sync_count;
 	out["cached_gather_event_handoff_count"]             = stats.cached_gather_event_handoff_count;
@@ -1534,6 +1543,11 @@ public:
 	}
 
 private:
+	DeferredDirectDctBatchReleaseQueue() {
+		// Deferred batches must be destroyed before the pool that owns their storage.
+		static_cast<void>(galp::memory::DevicePool::instance());
+	}
+
 	struct PendingRelease {
 		at::cuda::CUDAEvent                         ready;
 		std::shared_ptr<galp::jpeg::DirectDctBatch> owner;

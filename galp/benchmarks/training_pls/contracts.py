@@ -22,13 +22,32 @@ CONTRACT_DIFF_SCHEMA = "galp-pls-condition-contract-diff-v3"
 RUN_MANIFEST_SCHEMA = "galp-pls-run-manifest-v2"
 TRAINING_SOURCE_SCOPE = "galp-training-runtime-v2"
 STANDARD_DCT_BACKEND = "standard-rgbnomore-dct"
+IC_DCT_BACKEND = "ic-matched-dct"
+FS_DCT_BACKEND = "fs-matched-dct"
+DCT_REFERENCE_BACKENDS = (STANDARD_DCT_BACKEND, IC_DCT_BACKEND, FS_DCT_BACKEND)
 SEMANTIC_BACKEND = "semantic-emulation"
 NATIVE_PHYSICAL_BACKEND = "native-physical-pls"
 EXECUTION_BACKENDS = (
     SEMANTIC_BACKEND,
     NATIVE_PHYSICAL_BACKEND,
     STANDARD_DCT_BACKEND,
+    IC_DCT_BACKEND,
+    FS_DCT_BACKEND,
 )
+BACKEND_IMPLEMENTATIONS = {
+    SEMANTIC_BACKEND: "shared-galp-direct-dct-semantic-backend-v2",
+    NATIVE_PHYSICAL_BACKEND: "galp-native-direct-dct-pls-block-major-v1",
+    STANDARD_DCT_BACKEND: "rgbnomore-jpeg-dct-premixed-reference-v2",
+    IC_DCT_BACKEND: "ic-original-jpeg-q-reference-v1",
+    FS_DCT_BACKEND: "fs-original-jpeg-q-reference-v1",
+}
+EXECUTION_MODES = {
+    SEMANTIC_BACKEND: "semantic_emulation",
+    NATIVE_PHYSICAL_BACKEND: "native_physical_pls",
+    STANDARD_DCT_BACKEND: "standard_rgbnomore_dct",
+    IC_DCT_BACKEND: "ic_matched_dct",
+    FS_DCT_BACKEND: "fs_matched_dct",
+}
 
 _TRAINING_PLS_RUNTIME_MODULES = frozenset(
     {
@@ -57,6 +76,8 @@ _TRAINING_RUNTIME_EXTERNAL_PATHS = frozenset(
         "galp/benchmarks/system_rgbnomore/training/direct_dct_reader.py",
         "galp/benchmarks/system_rgbnomore/training/model_factory.py",
         "galp/benchmarks/system_rgbnomore/training/pipeline.py",
+        "galp/benchmarks/dct_baselines/store.py",
+        "galp/benchmarks/dct_baselines/contracts.py",
         "galp/benchmarks/system_rgbnomore/training/sample_order.py",
         "galp/benchmarks/system_rgbnomore/training/equal_image_epoch_benchmark.py",
         "galp/benchmarks/training_pls/report_equal_image_performance.py",
@@ -245,7 +266,7 @@ def build_condition_contract(
     if execution_backend not in EXECUTION_BACKENDS:
         raise ValueError(f"unsupported execution backend: {execution_backend!r}")
     native_physical = execution_backend == NATIVE_PHYSICAL_BACKEND
-    standard_dct = execution_backend == STANDARD_DCT_BACKEND
+    standard_dct = execution_backend in DCT_REFERENCE_BACKENDS
     resolved_audit_policy = validate_audit_policy(audit_policy)
     if native_physical and physical_execution is None:
         raise ValueError("native-physical-pls requires a physical execution contract")
@@ -350,26 +371,12 @@ def build_condition_contract(
             "permanent": "every formal validation epoch",
             "resume_granularity": "completed epoch",
         },
-        "backend_implementation": (
-            "galp-native-direct-dct-pls-block-major-v1"
-            if native_physical
-            else (
-                "rgbnomore-jpeg-dct-premixed-reference-v2"
-                if standard_dct
-                else "shared-galp-direct-dct-semantic-backend-v2"
-            )
-        ),
+        "backend_implementation": BACKEND_IMPLEMENTATIONS[execution_backend],
         "recipe_hash": recipe["recipe_hash"],
         "code_version": dict(code),
         "execution_device": str(device),
         "required_gpu_name_substring": str(required_gpu_name_substring),
-        "execution_mode": (
-            "native_physical_pls"
-            if native_physical
-            else (
-                "standard_rgbnomore_dct" if standard_dct else "semantic_emulation"
-            )
-        ),
+        "execution_mode": EXECUTION_MODES[execution_backend],
         "semantic_emulation": execution_backend == SEMANTIC_BACKEND,
         "physical_fls_observed": native_physical,
         "physical_gpu_pool": native_physical,
@@ -396,6 +403,12 @@ def build_condition_contract(
                 "storage-reduction claim"
             ),
         }
+        if execution_backend in (IC_DCT_BACKEND, FS_DCT_BACKEND):
+            if "baseline_store" not in resolved_standard_reference:
+                raise ValueError("IC/FS reference lacks baseline_store identity")
+            contract["execution_backend"] = execution_backend
+            contract["headline_eligible"] = False
+            contract["standard_dct_reference"]["training_input"] = "original JPEG q/Q from " + resolved_standard_reference["baseline_store"]["method"]
     contract["condition_hash"] = condition_identity_hash(contract)
     contract["run_manifest_hash"] = sha256_json(contract)
     return contract
