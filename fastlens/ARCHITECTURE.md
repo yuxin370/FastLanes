@@ -1,6 +1,6 @@
 # FastLens architecture and interfaces
 
-FastLens is an independent GPU image-input system. Its implementation is in
+FastLens is a GPU image-input system. Its implementation is in
 `fastlens/`; a modified FastLanes library is an internal dependency under
 `third_party/fastlanes/`. The root CMake project builds both. Dependency
 provenance and modifications are documented in `third_party/fastlanes/CHANGES.md`.

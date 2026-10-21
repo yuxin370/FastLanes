@@ -8,7 +8,7 @@ and direct construction of model-ready tensors. It stores JPEG DCT coefficients
 in a compressed columnar representation and supplies DCT-domain training and
 inference workloads through a PyTorch-compatible pipeline.
 
-FastLens is an independent project. Its implementation lives in `fastlens/`, with
+The FastLens implementation lives in `fastlens/`, with
 a modified FastLanes library included as an internal dependency in
 `third_party/fastlanes/`. The root CMake project builds both. This repository
 contains the implementation, usage examples, tests, published result tables and
