@@ -2,8 +2,8 @@
 
 > 这里的 N 目标副本仅用于历史复现，已隔离至 `backup/offline_model_input/`；正式在线系统数据见[统一数据清单](../../docs/DATASETS.md)。
 
-See [家族模型、完整结果与下一阶段训练配置](EFUN_RESULTS_AND_TRAINING_ZH.md)
-for the consolidated model/result tables and the four-arm training matrix.
+See the [published result tables](../paper/results/README.md) for the
+configurations adopted by the final paper.
 
 `efun.py` selects `efun_backend.py` and runs the existing CNN drivers. It reuses
 sample selection, labels, FASTLENS encoding, native grid/projected reads, timing,
@@ -35,7 +35,7 @@ different model/checkpoint. The old DCTNet `O` adapter is not an eFUN baseline.
 ## Setup and CPU checks
 
 ```bash
-PYTHON=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+PYTHON=python3
 EXP=fastlens/benchmarks/dct_models
 DATA=fastlens/data/system_rgbnomore/e2e_v3
 export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2
@@ -171,11 +171,7 @@ rgb_pytorch` or `rgb_d2`, using the existing system training/validation recipe
 pretrained inference transforms. `--initial-validation` records the scratch
 baseline before training; the configured full matrix enables it. The eFUN DALI
 training entrypoint now uses 16 workers and `--dali-prefetch-depth 4`, selected
-from repeated training probes. See [the results report](EFUN_RESULTS_AND_TRAINING_ZH.md#6-dali-配置调优2026-09-16)
-for the completed full-training results and their concurrent-GPU-process flags.
-The selected configuration completed two full epochs in 949.099 / 938.800 s
-with unchanged training/validation metrics, but brief extra GPU processes
-were observed in both runs; these timings are not uncontended measurements.
+from repeated training probes. Historical tuning records are not distributed.
 
 The RTX 4090 results use 50K images, FP32, TF32 disabled and batch 64.
 PyTorch uses the original 16-worker run. DALI uses 4 threads and prefetch depth 4,
@@ -231,7 +227,7 @@ DCT-domain contract. It is not a reproduction of the author's training recipe.
 Validation uses the eFUN target storage generated above.
 
 ```bash
-PHYSICAL=/home/tangyuxin/gfastlanes/FastLanes/fastlens/data/compressed/imagenet512_train_block_major_premixed
+PHYSICAL=./fastlens/data/compressed/imagenet512_train_block_major_premixed
 mapfile -t INPUTS < <("$PYTHON" - "$PHYSICAL/materialization_contract.json" <<'PY'
 import json, sys
 from pathlib import Path

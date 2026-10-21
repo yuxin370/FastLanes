@@ -2,7 +2,7 @@
 # Confirm decoded-cache candidates with real inference under the common RAM cap.
 set -euo pipefail
 cd "$(dirname "$0")/../../../.."
-export PYTHON=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+export PYTHON="${PYTHON:-python3}"
 export CUDA_VISIBLE_DEVICES=GPU-40c637bd-acf5-ea1a-0df8-617138228467
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export TMPDIR="$HOME/tmp"

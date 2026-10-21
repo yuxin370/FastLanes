@@ -1139,20 +1139,20 @@ duplicate reads / inversions    0 / 0
 先准备环境和路径：
 
 ```bash
-cd /home/tangyuxin/gfastlanes/FastLanes
+cd .
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
-export PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+export PY=python3
 export PYTHONPATH="$PWD/fastlens/benchmarks/system_dct_major"
 
 export TRAIN_JSON="$PWD/fastlens/data/system_rgbnomore/e2e_v3/training_manifests_official_v3/train.json"
 export VAL_JSON="$PWD/fastlens/data/system_rgbnomore/e2e_v3/training_manifests_official_v3/val.json"
-export LAYOUT=/mnt/nvme2/home/tangyuxin/pls-experiments/pls-layout-20260811/physical_layout_plan.json
-export PHYSICAL_MANIFEST=/home/tangyuxin/gfastlanes/FastLanes/fastlens/data/compressed/imagenet512_train_block_major_premixed/dct/manifest.bin
-export MAPPING=/home/tangyuxin/gfastlanes/FastLanes/fastlens/data/compressed/imagenet512_train_block_major_premixed/ordered_mapping.csv
+export LAYOUT=$FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-layout-20260811/physical_layout_plan.json
+export PHYSICAL_MANIFEST=./fastlens/data/compressed/imagenet512_train_block_major_premixed/dct/manifest.bin
+export MAPPING=./fastlens/data/compressed/imagenet512_train_block_major_premixed/ordered_mapping.csv
 export MAPPING_SHA256=98f77515e5886c098e46c23cddb41f57098b406ab32790509254c56356dc24ff
-export OUT=/mnt/nvme2/home/tangyuxin/pls-experiments/native-b6-current
+export OUT=$FASTLENS_EXPERIMENT_ROOT/pls-experiments/native-b6-current
 ```
 
 运行 B6：
@@ -1264,12 +1264,12 @@ FASTLENS 是同轮 DALI 的 `97.98%`，且 FASTLENS 与 RGB-no-more 的 50,000 �
 ### 18.2 完整 E2E 推理命令
 
 ```bash
-cd /home/tangyuxin/gfastlanes/FastLanes
+cd .
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
-export PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
-export OUT=/mnt/nvme2/home/tangyuxin/pls-experiments/inference-e2e-current
+export PY=python3
+export OUT=$FASTLENS_EXPERIMENT_ROOT/pls-experiments/inference-e2e-current
 
 PYTHONPATH="$PWD/build/fastlens/torch" "$PY" \
   fastlens/benchmarks/system_rgbnomore/inference/run.py \
@@ -1279,7 +1279,7 @@ PYTHONPATH="$PWD/build/fastlens/torch" "$PY" \
   --python "$PY" \
   --data-root "$PWD/fastlens/data/system_rgbnomore/e2e_v3/imagenet_512" \
   --index-csv "$PWD/fastlens/data/system_rgbnomore/e2e_v2/indexbase_val.csv" \
-  --rgbnomore-root /home/tangyuxin/RGB-no-more \
+  --rgbnomore-root $HOME/RGB-no-more \
   --rgb-checkpoint "$PWD/fastlens/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth" \
   --dct-checkpoint "$PWD/fastlens/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth" \
   --fastlens-manifest "$PWD/fastlens/data/compressed/imagenet512_val_compact_v3/manifest.bin" \

@@ -722,7 +722,8 @@ DirectDctPlsLayout DirectDctPlsLayout::LoadPremixedCsv(const std::filesystem::pa
 	const auto planned_column = required_column(header, "planned_physical_position");
 	const auto pls_column     = required_column(header, "virtual_pls_id");
 	const auto in_pls_column  = required_column(header, "position_in_pls");
-	const auto source_column  = required_column(header, "fastlens_image_id");
+	// The persisted mapping column retains its historical format name.
+	const auto source_column  = required_column(header, "galp_image_id");
 	const auto logical_column = required_column(header, "logical_sample_id");
 	const auto label_column   = required_column(header, "label");
 	const auto max_column =
@@ -748,7 +749,7 @@ DirectDctPlsLayout DirectDctPlsLayout::LoadPremixedCsv(const std::filesystem::pa
 		sample.global_image_index = planned_position;
 		sample.virtual_pls_id     = checked_u32(parse_u64(fields[pls_column], "virtual_pls_id"), "virtual_pls_id");
 		sample.position_in_pls    = checked_u32(parse_u64(fields[in_pls_column], "position_in_pls"), "position_in_pls");
-		sample.source_image_id    = checked_u32(parse_u64(fields[source_column], "fastlens_image_id"), "fastlens_image_id");
+		sample.source_image_id    = checked_u32(parse_u64(fields[source_column], "galp_image_id"), "galp_image_id");
 		sample.logical_sample_id  = fields[logical_column];
 		sample.label              = parse_i64(fields[label_column], "label");
 		if (sample.label < 0 || static_cast<uint64_t>(sample.label) >= model_classes) {

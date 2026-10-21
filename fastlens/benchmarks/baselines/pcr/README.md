@@ -47,7 +47,7 @@ are excluded.
 From the repository root, with the existing CUDA environment on PATH:
 
 ```bash
-export PATH=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin:$PATH
+export PATH=$CONDA_PREFIX/bin:$PATH
 export PYTHONDONTWRITEBYTECODE=1 TMPDIR="$HOME/tmp"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export CUDA_MPS_PIPE_DIRECTORY="$HOME/tmp/pcr-paper-config/no-mps"

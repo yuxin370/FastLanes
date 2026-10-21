@@ -459,7 +459,7 @@ SwinV2的15-epoch配对收敛证据也强于本CNN的2-epoch warmup证据。因�
     paths=[('报告对应推理运行',DATA/'runs/dctnet_mobilenet24'/RUN),('完整CSV与原始汇总',SUMMARY),
         ('同源图像',DATA/'imagenet_512'),('训练/验证manifest',DATA/'training_manifests_official_v3'),
         ('56网格目标数据',ARCHIVED_DATA/'imagenet512_val_resnet56_block_major'),('112网格目标数据',ARCHIVED_DATA/'imagenet512_val_mobilenet112_block_major'),
-        ('源训练premix',Path('/home/tangyuxin/gfastlanes/FastLanes/fastlens/data/compressed/imagenet512_train_block_major_premixed')),
+        ('源训练premix',(Path(__file__).resolve().parents[3] / 'fastlens/data/compressed/imagenet512_train_block_major_premixed')),
         ('官方checkpoint',DATA.parent/'e2e_v2/checkpoints'),('实验代码',HERE)]
     add(table(['对象','实际路径'],[[n,link(p)] for n,p in paths]))
     add('''模型目录依次为`dctnet_mobilenet24`、`dctnet_mobilenet32`、`dctnet_static24`、`dctnet_static64`。
@@ -467,16 +467,16 @@ SwinV2的15-epoch配对收敛证据也强于本CNN的2-epoch warmup证据。因�
 原始数据和旧失败运行均保留；报告只选定完成且通过竞争检查的本次推理复测。
 
 ```bash
-cd /home/tangyuxin/gfastlanes/FastLanes
+cd .
 # 已完成任务按原入口复用结果，部分训练可由已保存epoch checkpoint接续
 bash fastlens/benchmarks/dct_models/cnn_training_baselines.sh full cnn_training "mobilenet24:native mobilenet32:native resnet24:native resnet64:native"
 bash fastlens/benchmarks/dct_models/cnn_training_baselines.sh full rtx4090_cnn_training_baselines_20260914
 # 复用本次推理结果；新测量应指定独立memory-run名，保留现有产物
 MEASURE_PROCESS_MEMORY=1 bash fastlens/benchmarks/dct_models/run_inference.sh "$CUDA_VISIBLE_DEVICES" cnn_memory
 # 重新汇总与生成报告；只处理现有结果，不启动GPU实验
-MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python fastlens/benchmarks/dct_models/report_cnn_suite.py --inference-run rtx4090_cnn_memory_isolated_20260915
-MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python fastlens/benchmarks/dct_models/plot_cnn_suite.py
-MPLCONFIGDIR=/home/tangyuxin/tmp/matplotlib /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python fastlens/benchmarks/dct_models/write_cnn_performance_report.py
+MPLCONFIGDIR=$HOME/tmp/matplotlib python3 fastlens/benchmarks/dct_models/report_cnn_suite.py --inference-run rtx4090_cnn_memory_isolated_20260915
+MPLCONFIGDIR=$HOME/tmp/matplotlib python3 fastlens/benchmarks/dct_models/plot_cnn_suite.py
+MPLCONFIGDIR=$HOME/tmp/matplotlib python3 fastlens/benchmarks/dct_models/write_cnn_performance_report.py
 ```
 
 ### 10.2 数值合同、数据表和时间线''')

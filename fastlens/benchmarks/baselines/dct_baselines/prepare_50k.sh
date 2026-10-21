@@ -2,7 +2,7 @@
 # Freeze the existing full validation JPEGs and build the three matched stores.
 set -euo pipefail
 cd "$(dirname "$0")/../../../.."
-export PYTHON="${PYTHON:-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python}"
+export PYTHON="${PYTHON:-python3}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export TMPDIR="$HOME/tmp"
 output="${1:-$HOME/tmp/dct-50k-$(date +%Y%m%d-%H%M%S)}"

@@ -49,7 +49,7 @@ def main():
     command = [str(source) if item == str(original) else item for item in command if item != '-rdc=true']
     command[command.index('-c')] = '-shared'
     command[command.index('-o') + 1] = str(args.output.resolve() / 'libpool_memory_control.so')
-    command += ['--cudart=shared', '-Xlinker=-rpath,/home/tangyuxin/miniconda3/envs/fastlanes-cuda/lib']
+    command += ['--cudart=shared', '-Xlinker=-rpath,' + str(Path(command[0]).resolve().parent.parent / 'lib')]
     subprocess.run(command, cwd=spec['directory'], check=True)
 
 

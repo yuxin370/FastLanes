@@ -90,7 +90,6 @@ those dependencies:
 ```bash
 cmake -S . -B build-fastlens -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DFLS_BUILD_FASTLENS=ON \
   -DBUILD_TESTING=OFF \
   -DFASTLENS_BUILD_TESTS=OFF \
   -DFASTLENS_BUILD_TOOLS=ON \
@@ -282,7 +281,7 @@ which also arranges the GoogleTest dependency:
 ```bash
 cmake -S . -B build-fastlens-tests -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
+  -DFASTLENS_BUILD_TESTS=ON \
   -DBUILD_TESTING=ON \
   -DFASTLENS_BUILD_TESTS=ON \
   -DFASTLENS_BUILD_BENCHMARKS=OFF \

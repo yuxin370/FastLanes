@@ -21,7 +21,7 @@ def prepare_layout(output):
     from fastlens.benchmarks.training_pls.layout import load_layout_plan
     from fastlens.benchmarks.training_pls.recipe import sha256_json
 
-    source = Path("/mnt/nvme2/home/tangyuxin/pls-experiments/pls-layout-20260811/physical_layout_plan.json")
+    source = (Path(os.environ.get('FASTLENS_EXPERIMENT_ROOT', Path.home() / 'fastlens-experiments')) / 'pls-experiments/pls-layout-20260811/physical_layout_plan.json')
     layout = load_layout_plan(source)
     raw = (MANIFESTS / "train.json").read_bytes()
     old_field = ('"fastlens_manifest": ' + json.dumps(layout["galp_manifest"])).encode()

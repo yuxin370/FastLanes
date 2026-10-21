@@ -17,7 +17,7 @@ profile 固定，不再进入 Python contract 或命令行。
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
   --preset e2e \
   --pipelines fastlens rgbnomore dali pytorch \
@@ -137,6 +137,6 @@ scheduler matrix、fixed-items/planless A/B 和 crop-I/O A/B runner 已删除。
 CPU 审计测试：
 
 ```bash
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m unittest -v fastlens.benchmarks.baselines.system_rgbnomore.tests.test_system_benchmark fastlens.benchmarks.baselines.system_rgbnomore.tests.test_training_benchmark
 ```

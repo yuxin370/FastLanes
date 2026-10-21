@@ -16,6 +16,7 @@ correct DCT-domain implementation is available.
 """
 
 from __future__ import annotations
+import os
 
 import argparse
 import importlib
@@ -801,7 +802,7 @@ def _parse_args() -> argparse.Namespace:
         default="none",
         help="Optional Y/CbCr grid postprocess. rgbnomore-val-crop applies RGB-no-more DCT val center-crop+resize.",
     )
-    parser.add_argument("--rgbnomore-root", type=Path, default=Path("/home/tangyuxin/RGB-no-more"))
+    parser.add_argument("--rgbnomore-root", type=Path, default=(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more'))))
     parser.add_argument("--model", choices=("tiny-dct-vit", "tiny-dct-mlp"), default="tiny-dct-vit")
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=0)

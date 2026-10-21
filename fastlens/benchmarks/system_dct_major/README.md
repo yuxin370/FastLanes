@@ -61,7 +61,7 @@ K32 仍是丢弃部分系数的近似路径，其既有全量 oracle 差异并�
 ```bash
 export PYTHONPATH="$PWD:$PWD/build/fastlens/torch${PYTHONPATH:+:$PYTHONPATH}"
 CUDA_VISIBLE_DEVICES=0 TMPDIR="$HOME/tmp" \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e --workload training-throughput \
   --pipelines dct_major_pushdown dct_major_coefficient_pushdown rgbnomore dali ffcv pytorch coordl \
@@ -117,8 +117,7 @@ CoorDL 对 PyTorch RGB 的特征余弦为 0.99913，logits 余弦为 0.99897；�
 两次运行的 `results.json` 均为 `ok=false`，失败项来自吞吐 CV 或首尾漂移超过
 原有 5% 门槛；RGB 差异单独记录为 diagnostic。这次 smoke 不作为正式性能结论。
 
-50K、5 轮的完整七管线结果见 [CoorDL 全量实验报告](docs/COORDL_FULL_EXPERIMENT_2026-09-24.md)。
-报告保留首测和一次稳定性复测，并明确记录 K32 全量 raw-mask oracle 一致率未达标。
+最终论文采用的结果见 [论文结果表](../paper/results/README.md)。开发阶段的独立报告不随投稿分发。
 
 ### 构建当前 Python 可用的 CoorDL
 
@@ -133,7 +132,7 @@ C++ 开发文件。本次使用 OpenCV 4.13、Protobuf 6.31.1 和 CMake 3.28。
 
 ```bash
 coordl_repo="$PWD"
-coordl_env=/home/tangyuxin/miniconda3/envs/fastlanes-cuda
+coordl_env=$CONDA_PREFIX
 coordl_source="$HOME/tmp/coordl-baseline-source"
 coordl_build="$HOME/tmp/coordl-build-cu128"
 coordl_cuda="$HOME/tmp/coordl-cuda-12.8"
@@ -167,7 +166,7 @@ export COORDL_PYTHON="$coordl_build/coordl-python"
 
 `89` 对应本次 RTX 4090。构建输出和 `future` 均放在独立目录，通过启动器的
 `PYTHONPATH` 选择 CoorDL，不覆盖环境中的普通 DALI。
-当前机器已准备好 `/home/tangyuxin/tmp/coordl-build-cu128/coordl-python`，可直接复用。
+当前机器已准备好 `$HOME/tmp/coordl-build-cu128/coordl-python`，可直接复用。
 
 在仓库根目录，用准备好的 CoorDL 环境检查必要接口；应输出 `CoorDL FileReader available`：
 
@@ -181,7 +180,7 @@ export COORDL_PYTHON=/path/to/compatible-coordl/bin/python
 
 ```bash
 export PYTHONPATH="$PWD:$PWD/build/fastlens/torch${PYTHONPATH:+:$PYTHONPATH}"
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e --workload feature-extraction \
   --pipelines dct_major_pushdown dct_major_coefficient_pushdown rgbnomore dali coordl ffcv pytorch \
@@ -260,7 +259,7 @@ RAW_MASK_ORACLE_DIR="$PWD/fastlens/benchmarks/coefficient_mask_evaluator/runs/im
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload feature-extraction \
@@ -277,7 +276,7 @@ PYTHONPATH=.:build/fastlens/torch \
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload feature-extraction \
@@ -293,7 +292,7 @@ PYTHONPATH=.:build/fastlens/torch \
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload evaluation \
@@ -317,7 +316,7 @@ ABBA、crop A/B 或 plan-audit compare。
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  python3 \
   -m fastlens.benchmarks.system_dct_major.run_suite \
   --raw-mask-oracle-dir "$RAW_MASK_ORACLE_DIR" \
   --dct-major-manifest fastlens/data/compressed/imagenet512_val_block_major/manifest.bin \
@@ -335,7 +334,7 @@ phase。
 
 ```bash
 PYTHONPATH=. \
-  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  python3 \
   -m unittest discover -s fastlens/benchmarks/system_dct_major/tests -v
 ```
 

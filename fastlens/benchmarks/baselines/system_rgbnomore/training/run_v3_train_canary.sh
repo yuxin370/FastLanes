@@ -13,7 +13,7 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 export TRAIN_CLASS_TARS="${TRAIN_CLASS_TARS:-$REPO/fastlens/data/imagedataset/ILSVRC2012_img_train}"
 export CANARY_BASE="${CANARY_BASE:-$REPO/fastlens/data/compressed/fixtures}"
-export INDEX_CSV="${INDEX_CSV:-/home/tangyuxin/RGB-no-more/assets/indexbase_train.csv}"
+export INDEX_CSV="${INDEX_CSV:-${RGBNOMORE_ROOT:-$HOME/RGB-no-more}/assets/indexbase_train.csv}"
 
 export TOOL="${TOOL:-$REPO/build/fastlens/tools/jpeg_dct/fastlens_jpeg_dct_tool}"
 export TORCH_BINDING="${TORCH_BINDING:-$REPO/build/fastlens/torch}"

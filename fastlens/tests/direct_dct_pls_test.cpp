@@ -203,7 +203,7 @@ TEST(DirectDctPls, PremixedCsvMustMatchPhysicalShardBoundaries) {
 	const auto csv = root / "ordered_mapping.csv";
 	{
 		std::ofstream output(csv);
-		output << "planned_physical_position,virtual_pls_id,position_in_pls,manifest_index,fastlens_image_id,logical_"
+		output << "planned_physical_position,virtual_pls_id,position_in_pls,manifest_index,galp_image_id,logical_"
 		          "sample_id,label,source_path\n";
 		for (uint32_t image = 0U; image < 6U; ++image) {
 			const auto pls    = image < 4U ? 0U : 1U;
@@ -228,7 +228,7 @@ TEST(DirectDctPls, PremixedCsvMustMatchPhysicalShardBoundaries) {
 	             std::runtime_error);
 	for (const auto invalid_label : {-1, 2}) {
 		std::ofstream output(csv);
-		output << "planned_physical_position,virtual_pls_id,position_in_pls,manifest_index,fastlens_image_id,logical_"
+		output << "planned_physical_position,virtual_pls_id,position_in_pls,manifest_index,galp_image_id,logical_"
 		          "sample_id,label,source_path\n";
 		for (uint32_t image = 0U; image < 6U; ++image) {
 			const auto pls    = image < 4U ? 0U : 1U;

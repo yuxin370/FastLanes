@@ -39,7 +39,7 @@ not agree, and use the device-name guard:
 
 ```bash
 CUDA_VISIBLE_DEVICES=GPU-d6e80e78-00d8-8e4b-0c81-a403bebe0d76 \
-  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  python3 \
   -m fastlens.benchmarks.coefficient_mask_evaluator.evaluate \
   --output-dir fastlens/benchmarks/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100 \
   --expected-device-name 'NVIDIA H100 80GB HBM3' \

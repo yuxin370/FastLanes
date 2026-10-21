@@ -164,7 +164,7 @@ non-zero exit.
 
 ## Acceptance probes
 
-`galp_compact_v3_runtime_audit` is intentionally a fresh-process probe rather
+`fastlens_compact_v3_runtime_audit` is intentionally a fresh-process probe rather
 than an in-process benchmark helper. Memory mode reports RSS/PSS before and
 after manifest/metadata loading, first planning, and bounded compact-descriptor
 touches, including the actually resident `.fls` mmap pages:

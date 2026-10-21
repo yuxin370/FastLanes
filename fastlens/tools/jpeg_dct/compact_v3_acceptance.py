@@ -48,9 +48,9 @@ from shared.common import (  # noqa: E402
 
 ACCEPTANCE_FASTLENS_PIPELINES = FASTLENS_PIPELINES
 DEFAULT_PIPELINE = REPO_ROOT / "fastlens/benchmarks/baselines/system_rgbnomore/inference/pipeline.py"
-DEFAULT_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
+DEFAULT_PYTHON = (Path(sys.executable))
 DEFAULT_RUNTIME_AUDIT = (
-    REPO_ROOT / "build/fastlens/tools/jpeg_dct/galp_compact_v3_runtime_audit"
+    REPO_ROOT / "build/fastlens/tools/jpeg_dct/fastlens_compact_v3_runtime_audit"
 )
 MANIFEST_MAGIC = b"GJDCTSH1"
 COMPACT_EXTENSION_MAGIC = b"GJDCCV31"

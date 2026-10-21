@@ -57,9 +57,8 @@ The SwinV2-T entry adapts the RGB-no-more DCT architecture to the existing
 with the project's 256-crop/window-8 checkpoint and therefore makes no
 official pretrained-accuracy claim. It is suitable for measured throughput,
 memory and from-scratch convergence comparisons under the same B6 data path.
-The active SwinV2 B6 convergence suite, equal-image baselines, resume commands,
-and breakdown reports are defined in
-[`SWINV2_FULL_BASELINE_RUNBOOK.md`](SWINV2_FULL_BASELINE_RUNBOOK.md).
+The published convergence configuration and commands are in the
+[paper convergence entry](../paper/section_6_2_5/training_convergence/README.md).
 
 SwinV2 is intentionally registered for `B6` only. `A0`, `A1`, and `B2`
 remain readable/executable only for the historical ViT-Ti factorial experiment;
@@ -204,10 +203,10 @@ Once N6 has validation records, overlay the matched shuffle controls with:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.plot_premixed_progress \
-  --experiment-root /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811 \
+  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
   --seed 11997733 \
   --conditions A1,B6,N6 \
-  --run N6=/mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/explorations/premixed_m4_no_shuffle_n6/runs/N6/seed_11997733 \
+  --run N6=$FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/explorations/premixed_m4_no_shuffle_n6/runs/N6/seed_11997733 \
   --x-axis processed-images
 ```
 
@@ -253,7 +252,7 @@ runs to reach the same epoch or to have a `final_result.json`:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.plot_premixed_progress \
-  --experiment-root /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811 \
+  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
   --seed 11997733 \
   --x-axis epoch
 ```
@@ -270,9 +269,9 @@ CSV so superseded inline validation records are not used:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.plot_premixed_progress \
-  --experiment-root /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811 \
+  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
   --seed 11997733 \
-  --canonical-csv /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/stages/seed_11997733_historical_revalidation/canonical_historical_validation.csv \
+  --canonical-csv $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/stages/seed_11997733_historical_revalidation/canonical_historical_validation.csv \
   --x-axis epoch
 ```
 
@@ -286,10 +285,10 @@ trusting stale `run_status.json` values as proof of an active process:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.audit_goal \
-  --experiment-root /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811 \
-  --layout-plan /mnt/nvme2/home/tangyuxin/pls-experiments/pls-layout-20260811/physical_layout_plan.json \
-  --formal-report-dir /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/formal_report \
-  --output-dir /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/audits/current \
+  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
+  --layout-plan $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-layout-20260811/physical_layout_plan.json \
+  --formal-report-dir $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/formal_report \
+  --output-dir $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/audits/current \
   --comparison-id premixed-layout-M4-seed-11997733 \
   --comparison-seed 11997733 \
   --comparison-run A0=/absolute/A0/run \
@@ -309,10 +308,10 @@ rejects missing validation points or permanent checkpoints):
 
 ```bash
 python -m fastlens.benchmarks.training_pls.report_premixed_milestone \
-  --experiment-root /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811 \
+  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
   --seed 11997733 \
   --epoch 50 \
-  --output-dir /mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811/premixed_milestones/epoch_050
+  --output-dir $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/premixed_milestones/epoch_050
 ```
 
 This report provides exact fixed-budget metrics, single-seed 2×2 contrasts,

@@ -19,7 +19,6 @@ def file_sha(path):
 def capture():
     paths = subprocess.check_output(['git', 'ls-files', 'fastlens'], cwd=ROOT, text=True).splitlines()
     paths = [p for p in paths if Path(p).suffix in ('.py', '.cpp', '.cu', '.cuh', '.hpp', '.h')]
-    paths += [name for name in ('fastlens/benchmarks/execution/run_logged.py', 'fastlens/benchmarks/execution/revision_results.py', 'fastlens/benchmarks/paper/shared/training_window_rgb.py', 'fastlens/benchmarks/development/historical/p0_adapters.py', 'fastlens/benchmarks/development/historical/swin_inference_once.py', 'fastlens/benchmarks/development/historical/vit_inference_once.py', 'fastlens/benchmarks/development/historical/paired_rgb_once.py', 'fastlens/benchmarks/paper/shared/cnn_control.py')]
     native = next((ROOT/'build/fastlens/torch').glob('_fastlens_direct_dct.*.so'))
     paths += [str(native.relative_to(ROOT))]
     hashes = {p: file_sha(ROOT/p) for p in sorted(paths)}

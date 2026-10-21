@@ -6,8 +6,7 @@
    全局随机与 rowgroup 对齐连续时，完整 JPEG-Ti 推理吞吐相差多少；
 2. 连续 batch 是否改变推理结果，以及它造成的类别聚集是否会让训练顺序敏感。
 
-2026-07-13 的 RTX 4090 正式实测、统计检验和原始 artifact 摘要见
-[`RESULTS_2026-07-13_RTX4090.md`](RESULTS_2026-07-13_RTX4090.md)。
+这是辅助示例；最终论文的实验入口及结果见 [paper](../../benchmarks/paper/README.md)。
 
 ## 三个性能条件
 
@@ -50,7 +49,7 @@ batch、batch 内保持连续”两种顺序，并在同一个未参与训练的
 
 ```bash
 PYTHONPATH=build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   fastlens/examples/run_image_order_benchmark.py \
   --output-dir /tmp/fastlens-image-order-e2e
 ```
@@ -59,7 +58,7 @@ PYTHONPATH=build/fastlens/torch \
 
 ```bash
 PYTHONPATH=build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   fastlens/examples/run_image_order_benchmark.py \
   --output-dir /tmp/fastlens-image-order-selection \
   --selection-only

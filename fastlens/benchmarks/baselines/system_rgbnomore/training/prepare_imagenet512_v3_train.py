@@ -590,7 +590,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--index-csv",
         type=Path,
-        default=Path("/home/tangyuxin/RGB-no-more/assets/indexbase_train.csv"),
+        default=(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more')) / 'assets/indexbase_train.csv'),
     )
     parser.add_argument(
         "--jpeg-train-root", type=Path, default=e2e / "imagenet_512/train"
@@ -639,7 +639,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--validation-index-csv",
         type=Path,
-        default=Path("/home/tangyuxin/RGB-no-more/assets/indexbase_val.csv"),
+        default=(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more')) / 'assets/indexbase_val.csv'),
     )
     parser.add_argument(
         "--validation-dct-root",

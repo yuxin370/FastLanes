@@ -1,51 +1,33 @@
-# Development benchmarks and checks
+# Supporting benchmarks and checks
 
-These programs support codec and pipeline development. They do not reproduce a
-paper figure. Reviewer entry points are in [`../paper/`](../paper/README.md).
+Reviewer experiment entry points are in [`../paper/`](../paper/README.md).
+This directory retains source needed by the build and correctness checks;
+historical run queues, report generators and their tests are not distributed.
 
 | Source / command | Purpose |
 | --- | --- |
 | `micro_bench.cu` | Codec decode microbenchmarks |
-| `compressor_bench.cu` | nvCOMP compression comparisons |
+| `compressor_bench.cu` | Optional nvCOMP comparisons |
 | `run_delta_microbenchmark.py`, `delta_register_resource_probe.cu` | DELTA throughput and compiler resource measurements |
-| `transfer_contention.cpp` | CUDA transfer/contention diagnostics |
+| `transfer_contention.cpp` | CUDA transfer diagnostics |
 | `python -m fastlens.benchmarks.development.check` | Parallel CPU regression suites; no performance measurements |
-| `tests/` | Regression tests moved from the former root `experiments/` |
-| `diagnostics/` | Profiling, correctness investigations and exploratory controls |
-| `historical/` | Dated experiment queues, retries and continuation scripts |
-| `reports/` | Historical analysis, result selection and report generation |
+| `diagnostics/` | Profiling and input-correctness helpers |
 
-Historical scripts retain their original experiment-specific defaults and may
-require old runtime snapshots, artifacts or source files that are no longer
-available. They are retained for traceability, not as reviewer reproduction
-commands. Use `paper/` for the final PDF; report generators can select results
-for other manuscript versions and must not replace `paper/results/`.
-Some old snapshot builders still name `p0_adapters.py`, `training_ffcv_crop.py`
-and `remaining_baseline_inputs.py`; those historical files were already absent
-before this reorganization. Final-paper entries do not import these files.
-
-The CMake target names and binary locations are unchanged:
+Build with `FASTLENS_BUILD_TESTS=ON` and `FASTLENS_BUILD_BENCHMARKS=ON`;
+`compressor_bench` also requires nvCOMP and `FASTLENS_WITH_NVCOMP=ON`.
 
 ```bash
 cmake --build build --target micro_bench fastlens_transfer_contention --parallel
-python -m fastlens.benchmarks.development.run_delta_microbenchmark --help
 python -m fastlens.benchmarks.development.check
 ```
 
-Configure with `FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON` and
-`FASTLENS_BUILD_BENCHMARKS=ON`; `compressor_bench` additionally requires installed
-nvCOMP and `FASTLENS_WITH_NVCOMP=ON`. The paper build command is also a convenient
-way to configure native/Torch dependencies before building these targets.
-
-CPU tests are kept with their shared implementation packages; the former
-root experiment tests are collected from `tests/`. `check --jobs N` limits parallel suites and hides CUDA in each
-child process. Use the environment with PyTorch/torchvision, NumPy, Pillow,
-einops and psutil; PCR coefficient tests additionally require `jpegtran` on PATH.
-GPU integration and model/checkpoint tests remain explicit, including:
+`check --jobs N` limits parallel suites and hides CUDA in each child process.
+Use an environment with PyTorch/torchvision, NumPy, Pillow, einops and psutil;
+coefficient checks also require `jpegtran` on PATH. GPU tests remain explicit:
 
 ```bash
 ctest --test-dir build -L gpu --output-on-failure
 ```
 
-The known native lifetime smoke failure and its exact manifest requirement are
-recorded in the [paper verification notes](../paper/README.md#核查结论).
+The [paper guide](../paper/README.md) documents external input requirements and
+known runtime limitations. Test outputs are not published measurement tables.

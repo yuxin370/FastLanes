@@ -14,7 +14,7 @@ def cpu_tests(jobs, env):
     commands = [
         ['discover', '-s', f'fastlens/benchmarks/{suite}/tests', '-t', '.']
         for suite in ('system_dct_major', 'training_pls', 'dct_retokenization',
-                      'coefficient_mask_evaluator', 'profiling', 'baselines/dct_baselines', 'development')
+                      'coefficient_mask_evaluator', 'profiling', 'baselines/dct_baselines')
     ]
     commands += [
         [f'fastlens.benchmarks.baselines.system_rgbnomore.tests.{name}' for name in (

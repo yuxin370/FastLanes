@@ -50,7 +50,7 @@ P3 custom-clamp/padding edge case is deferred and is not covered by this update.
 Run the directed CUDA regression after rebuilding `_fastlens_direct_dct`:
 
 ```bash
-export PYTHON=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+export PYTHON=python3
 export CUDA_VISIBLE_DEVICES=GPU-d6e80e78-00d8-8e4b-0c81-a403bebe0d76
 "$PYTHON" -B -m fastlens.torch.streamed_projection_test \
   --manifest fastlens/data/compressed/imagenet512_val_block_major/manifest.bin \
@@ -268,7 +268,7 @@ later, use `--resume-measurements` without `--reuse-verification`.
 For the current 50K baseline run, after the requested gates have passed:
 
 ```bash
-ROOT=/home/tangyuxin/tmp/dct-50k-20261013-152452
+ROOT=$HOME/tmp/dct-50k-20261013-152452
 bash fastlens/benchmarks/baselines/dct_baselines/run_inference_pilot.sh \
   "$ROOT" "$ROOT/h100-remeasure-$(date +%Y%m%d-%H%M%S)" \
   --ic-protocol --expected-images 50000 --settings "$ROOT/reader_settings.json" \
@@ -404,7 +404,7 @@ boundary and use `--resume-measurements` to retain completed measurements.
    are checked for each new contract. This explicitly measures decoded-cache
    reuse; a fully cached 8194-image result must not be extrapolated to 50K.
 3. The confirmation in
-   `/home/tangyuxin/tmp/dct-reader-confirm-4090-20261013-115959/summary.json`
+   `$HOME/tmp/dct-reader-confirm-4090-20261013-115959/summary.json`
    passed all 36 measurements and 12 numerical gates. Inputs and logits were
    exact; the largest sampled process-tree RSS sum was 22.71 GiB. Freeze
    `p0_reader_settings.json`: eight workers, pool256, prefetch2; IC-shared and
@@ -418,7 +418,7 @@ boundary and use `--resume-measurements` to retain completed measurements.
 4. Build the complete 50K source and stores with the frozen configuration:
 
 ```bash
-cd /home/tangyuxin/gfastlanes/FastLanes
+cd .
 bash fastlens/benchmarks/baselines/dct_baselines/prepare_50k.sh
 ```
 
@@ -472,7 +472,7 @@ the existing `fastlens_dct_storage` target; rebuild it after this patch:
 `cmake --build build --target fastlens_dct_storage -j2`.
 
 ```bash
-export PYTHON=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+export PYTHON=python3
 "$PYTHON" -m unittest discover -s fastlens/benchmarks/baselines/dct_baselines/tests -t .
 "$PYTHON" -m fastlens.benchmarks.baselines.dct_baselines --help
 ```
@@ -866,7 +866,7 @@ and original JPEG coefficients. Paths below are placeholders for those stores;
 the tiny round-2 stores cannot be used with the full training mapping.
 
 ```bash
-export PYTHON=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+export PYTHON=python3
 export CUDA_VISIBLE_DEVICES=GPU-d6e80e78-00d8-8e4b-0c81-a403bebe0d76
 "$PYTHON" -B -m fastlens.benchmarks.dct_models.matched_training launch \
   --profile resnet24 --manifest /path/to/dct/manifest.bin \
@@ -1014,7 +1014,7 @@ numerical fixture, not a full training epoch or an accuracy experiment.
 Run on the host H100, from the repository root:
 
 ```bash
-export PYTHON=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+export PYTHON=python3
 export CUDA_VISIBLE_DEVICES=GPU-d6e80e78-00d8-8e4b-0c81-a403bebe0d76
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 set -o pipefail

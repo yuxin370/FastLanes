@@ -792,7 +792,7 @@ int main(const int argc, char** argv) {
 		emit_result(options, payload);
 		return 0;
 	} catch (const std::exception& error) {
-		std::cerr << "galp_compact_v3_runtime_audit: " << error.what() << '\n';
+		std::cerr << "fastlens_compact_v3_runtime_audit: " << error.what() << '\n';
 		return 2;
 	}
 }

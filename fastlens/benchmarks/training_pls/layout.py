@@ -54,8 +54,8 @@ def _optional_pyarrow():
 
 def _parquet_helper_python() -> Path:
     candidates = (
-        Path("/home/tangyuxin/transformers/.venv_transformers/bin/python"),
-        Path("/home/tangyuxin/langchain-playground/rag/.lcenv/bin/python"),
+        (Path.home() / 'transformers/.venv_transformers/bin/python'),
+        (Path.home() / 'langchain-playground/rag/.lcenv/bin/python'),
     )
     for candidate in candidates:
         if not candidate.is_file():

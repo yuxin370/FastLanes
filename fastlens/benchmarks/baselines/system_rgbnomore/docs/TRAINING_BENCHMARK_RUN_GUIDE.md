@@ -1,7 +1,6 @@
 # RGB-no-more 四管线训练 Benchmark 运行指南
 
-v2/v3 共用 reader、严格 manifest preflight、v3 canary 与 block-major 暂缓边界见
-[`TRAINING_LAYOUT_COMPATIBILITY_2026-07-31.md`](TRAINING_LAYOUT_COMPATIBILITY_2026-07-31.md)。
+最终论文配置和外部输入要求见 [论文复现入口](../../../paper/README.md)。
 
 ## 1. 数据 manifest
 
@@ -35,9 +34,9 @@ validation accuracy。
 先准备完整 512×512 train JPEG 和 Compact-v3：
 
 ```bash
-cd /home/tangyuxin/gfastlanes/FastLanes
+cd .
 set -o pipefail
-PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+PY=python3
 
 "$PY" -B \
   -m fastlens.benchmarks.baselines.system_rgbnomore.training.prepare_imagenet512_v3_train \
@@ -75,7 +74,7 @@ canary 比较 `24 shard × 2 encoding`、`32 × 1` 和 `16 × 2` 的 wall time�
 这一步不创建模型，也不要求 GPU：
 
 ```bash
-PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+PY=python3
 
 "$PY" -m fastlens.benchmarks.baselines.system_rgbnomore.training.run \
   --enabled-pipelines fastlens,rgbnomore,dali,pytorch \
@@ -110,8 +109,8 @@ native-owned 有界 Pipeline，Python 不维护 FIFO、future、backpressure 或
 下列短命令使用当前正式数据路径：
 
 ```bash
-PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
-E2E=/home/tangyuxin/gfastlanes/FastLanes/fastlens/data/system_rgbnomore/e2e_v3
+PY=python3
+E2E=./fastlens/data/system_rgbnomore/e2e_v3
 TRAIN="$E2E/training_manifests_official_v3/train.json"
 VAL="$E2E/training_manifests_official_v3/val.json"
 FASTLENS_TRAIN="$PWD/fastlens/data/compressed/imagenet512_train_compact_v3/dct/manifest.bin"
@@ -138,7 +137,7 @@ repeat。v2/v3 acceptance 至少要求三次，单次 smoke 不再足以支持�
 ## 4. 四管线 GPU smoke
 
 ```bash
-PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+PY=python3
 
 CUDA_VISIBLE_DEVICES=0 "$PY" \
   -m fastlens.benchmarks.baselines.system_rgbnomore.training.run \
@@ -283,11 +282,11 @@ horizon；D3 只共享模型与优化器 recipe，不声明顺序或逐样本增
 先生成不可变 contract，不启动训练：
 
 ```bash
-cd /home/tangyuxin/gfastlanes/FastLanes
+cd .
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 
-PY=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+PY=python3
 PYTHONPATH="$PWD:$PWD/build/fastlens/torch"
 E2E="$PWD/fastlens/data/system_rgbnomore/e2e_v3"
 OUT=/path/to/new/equal-image-rgb-e2

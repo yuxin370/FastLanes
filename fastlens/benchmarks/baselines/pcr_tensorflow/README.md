@@ -65,7 +65,7 @@ The original release checkout is pinned to
 ```bash
 export TMPDIR="$HOME/tmp"
 PCR_TF_ROOT="$HOME/tmp/pcr-tf-reproduction"
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python -m venv \
+python3 -m venv \
   --system-site-packages "$PCR_TF_ROOT/venv"
 PCR_TF_PY="$PCR_TF_ROOT/venv/bin/python"
 "$PCR_TF_PY" -m pip install tensorflow-cpu==2.15.1 protobuf==4.25.3
@@ -118,7 +118,7 @@ all augmentation parameters come from the existing deterministic decisions.
 "$PCR_TF_PY" -m fastlens.benchmarks.baselines.pcr_tensorflow.prepare \
   --training-manifest results/preparation/p0_ffcv/samples.json \
   --output "$PCR_TF_ROOT/train98560" --build-dir "$PCR_TF_ROOT" \
-  --workers 16 --jpegtran /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/jpegtran
+  --workers 16 --jpegtran $CONDA_PREFIX/bin/jpegtran
 "$PCR_TF_PY" fastlens/benchmarks/paper/shared/remaining_baseline_training.py \
   --gpu H100 --model mobilenet24 --path pcr --check \
   --pcr-data "$PCR_TF_ROOT/train98560" --pcr-op "$PCR_TF_ROOT/pcr_dataset.so" \

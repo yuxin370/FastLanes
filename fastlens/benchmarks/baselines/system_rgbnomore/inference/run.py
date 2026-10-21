@@ -49,7 +49,7 @@ DEFAULT_COMPRESSED_ROOT = REPO_ROOT / "fastlens/data/compressed"
 DEFAULT_FASTLENS_MANIFEST = DEFAULT_COMPRESSED_ROOT / "imagenet512_val_compact_v3/manifest.bin"
 DEFAULT_FASTLENS_LABEL_MAP = DEFAULT_COMPRESSED_ROOT / "imagenet512_val_compact_v3/labels.json"
 DEFAULT_BINDING_DIR = REPO_ROOT / "build/fastlens/torch"
-DEFAULT_BENCHMARK_PYTHON = Path("/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python")
+DEFAULT_BENCHMARK_PYTHON = (Path(sys.executable))
 
 
 PRESETS = {

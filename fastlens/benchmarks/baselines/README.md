@@ -22,7 +22,7 @@ CoorDL and FFCV adapters are in
 [`system_rgbnomore/shared/paper_adapters.py`](system_rgbnomore/shared/paper_adapters.py),
 with the measured training inputs and FFCV crop decoder under
 `system_rgbnomore/training/`. Final-paper scheduling and result collection are
-in `../paper/`; dated queues are retained in `../development/historical/`.
+in `../paper/`; historical run queues are excluded from this submission.
 
 Examples:
 

@@ -26,7 +26,7 @@ def main():
     root = base/args.run
     root.mkdir(exist_ok=False)
     driver = [sys.executable, str(exp/'efun.py')]
-    physical = Path('/home/tangyuxin/gfastlanes/FastLanes/fastlens/data/compressed/imagenet512_train_block_major_premixed')
+    physical = (Path(__file__).resolve().parents[3] / 'fastlens/data/compressed/imagenet512_train_block_major_premixed')
     contract = json.loads((physical/'materialization_contract.json').read_text())
     train = [*driver, 'training_pls', '--manifest', str(physical/'dct/manifest.bin'),
              '--mapping', contract['ordered_mapping'], '--mapping-sha256', contract['ordered_mapping_sha256'],

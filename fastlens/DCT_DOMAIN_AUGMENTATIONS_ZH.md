@@ -438,7 +438,7 @@ augmented, records = apply_published_randaugment(
     training_seed=11997733,
     epoch=7,
     logical_sample_ids=["sample-0", "sample-1"],
-    rgbnomore_root=Path("/home/tangyuxin/RGB-no-more"),  # 改为实际依赖目录。
+    rgbnomore_root=Path("$HOME/RGB-no-more"),  # 改为实际依赖目录。
 )
 labels = torch.tensor([3, 8], dtype=torch.long, device=y.device)
 mixed, soft_targets, mixup_record = apply_published_mixup(

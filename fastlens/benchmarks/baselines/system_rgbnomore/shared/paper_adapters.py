@@ -214,7 +214,7 @@ class CpuDctWindow:
                         logical_sample_id=logical_id, virtual_pls_id=i//1024, crop_policy='per-pls',
                         source_width=512, source_height=512).decision)
             self.adapter = RgbNoMoreTrainingAdapter(samples, batch_size=64, workers=8,
-                device=torch.device('cuda:0'), config={'phase': 'train', 'rgbnomore_root': '/home/tangyuxin/RGB-no-more'})
+                device=torch.device('cuda:0'), config={'phase': 'train', 'rgbnomore_root': str(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more')))})
             self.adapter.begin(identities, decisions, [len(batch) for batch in self.batches])
         else:
             from fastlens.benchmarks.dct_models import backend as B
@@ -237,7 +237,7 @@ class CpuDctWindow:
                 labels = batch.labels.cuda(non_blocking=True)
                 inputs, _ = apply_published_randaugment(inputs, training_seed=11997733, epoch=2,
                     logical_sample_ids=[item.logical_sample_id for item in identities],
-                    rgbnomore_root=Path('/home/tangyuxin/RGB-no-more'))
+                    rgbnomore_root=(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more'))))
                 inputs, targets, _ = apply_published_mixup(inputs, labels, training_seed=11997733,
                     epoch=2, microbatch_index=self.microbatch)
             else:

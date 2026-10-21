@@ -29,7 +29,7 @@ SCHEMA_VERSION = "galp-pls-premixed-progress-plot-v2"
 DEFAULT_EXPERIMENT_ROOT = Path(
     os.environ.get(
         "PLS_EXPERIMENT_ROOT",
-        "/mnt/nvme2/home/tangyuxin/pls-experiments/pls-core-v2-20260811",
+        str(Path(os.environ.get('FASTLENS_EXPERIMENT_ROOT', Path.home() / 'fastlens-experiments')) / 'pls-experiments/pls-core-v2-20260811'),
     )
 )
 CONDITION_LABELS = {

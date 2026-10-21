@@ -17,7 +17,7 @@
 ```bash
 cmake --build build --target _fastlens_direct_dct -j2
 PYTHONPATH=.:build/fastlens/torch \
-  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  python3 \
   -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run --help
 ```
 
@@ -69,7 +69,7 @@ Swin 注册项会统一选择 RGB `imagenet_swin`、DCT `imagenet_dct_swin`、
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
   --preset smoke \
   --output-dir /tmp/fastlens-fingerprint-preflight \
@@ -83,7 +83,7 @@ PYTHONPATH=.:build/fastlens/torch \
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
   --preset smoke \
   --pipelines fastlens rgbnomore dali pytorch \
@@ -96,7 +96,7 @@ SwinV2-T smoke：
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
   --preset smoke \
   --model rgbnomore-swinv2-t-256-window8-v1 \
@@ -108,7 +108,7 @@ PYTHONPATH=.:build/fastlens/torch \
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
   --preset e2e \
   --pipelines fastlens rgbnomore dali pytorch \

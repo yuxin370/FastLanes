@@ -165,7 +165,7 @@ The estimate is reproducible without CUDA execution:
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.diagnostics.estimate_block_major_descriptor \
   fastlens/data/compressed/imagenet_original_val_fls_v1_rg64/manifest.bin \
   --output-json /tmp/fastlens-block-major-descriptor-estimate.json

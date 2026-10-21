@@ -18,7 +18,7 @@ wrapper independent of FASTLENS). ``import torch`` must happen first so that its
 
 Example:
     PYTHONPATH=build/fastlens/torch \
-    /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+    python3 \
       fastlens/examples/verify_direct_dct_vs_jpeg.py \
       fastlens/data/compressed/imagenet512_train_compact_v3/dct/manifest.bin \
       --jpeg-root fastlens/data/system_rgbnomore/e2e_v3/imagenet_512/train \

@@ -67,12 +67,12 @@ B6 runtime 对齐 `fastlens/include/fastlens/profiles/direct_dct.hpp` 的 dynami
 优先选择空闲 PRO 6000/H100；运行器每条路径启动前检查空闲，运行时以 100 ms 采样检查外部进程，发现即中止该次和后续测试。
 
 ```bash
-cd /home/tangyuxin/gfastlanes/FastLanes
+cd .
 export CUDA_VISIBLE_DEVICES=GPU-e796262d-3449-6af1-586d-8460d8836d1b
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export TMPDIR="$HOME/tmp/dctnet" MPLCONFIGDIR="$HOME/tmp/matplotlib"
 mkdir -p "$TMPDIR" "$MPLCONFIGDIR"
-PYTHON=/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python
+PYTHON=python3
 EXP=fastlens/benchmarks/dct_models
 SOURCE=fastlens/data/compressed/imagenet512_val_block_major
 RESULT=fastlens/data/system_rgbnomore/e2e_v3/runs/cnn_online_pushdown_20260916

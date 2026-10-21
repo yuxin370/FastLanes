@@ -2,6 +2,7 @@
 """CPU audit tests for the formal four-pipeline training benchmark."""
 
 from __future__ import annotations
+import os
 
 import copy
 import csv
@@ -116,7 +117,7 @@ from fastlens.benchmarks.baselines.system_rgbnomore.training.schema import (  # 
 from fastlens.benchmarks.baselines.system_rgbnomore.training.validate import validate_output  # noqa: E402
 
 
-RGBNOMORE_ROOT = Path("/home/tangyuxin/RGB-no-more")
+RGBNOMORE_ROOT = (Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more')))
 
 
 def _optimizer_config() -> dict[str, object]:

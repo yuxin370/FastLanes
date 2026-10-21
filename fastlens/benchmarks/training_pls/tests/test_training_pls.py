@@ -2,6 +2,7 @@
 """Focused tests for the four-condition core PLS model-effect experiment."""
 
 from __future__ import annotations
+import os
 
 import json
 import math
@@ -880,7 +881,7 @@ class RecipeAndContractTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(
-        Path("/home/tangyuxin/RGB-no-more/models/swinv2.py").is_file(),
+        (Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more')) / 'models/swinv2.py').is_file(),
         "RGB-no-more SwinV2 source is unavailable",
     )
     def test_swinv2_dct_native_forward_matches_registered_contract(self) -> None:

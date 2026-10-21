@@ -38,7 +38,7 @@ def mixup(inputs, labels, microbatch):
 class RgbAugmentation:
     def __init__(self):
         import torch
-        sys.path.insert(0, '/home/tangyuxin/RGB-no-more')
+        sys.path.insert(0, str(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more'))))
         from utils.custom_transforms import RandAugment_bv, _apply_op
         self.torch = torch
         self.ra = RandAugment_bv(num_ops=2, magnitude=3, num_magnitude_bins=11, fill=128)

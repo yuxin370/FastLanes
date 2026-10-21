@@ -5,7 +5,7 @@ Choose the entry point by purpose:
 | Directory | Purpose |
 | --- | --- |
 | [`paper/`](paper/README.md) | Reviewer reproduction of `fastlens-final.pdf`, organized by section and experiment, with measured defaults |
-| [`development/`](development/README.md) | Microbenchmarks, diagnostics, regression tests, historical queues and report generators |
+| [`development/`](development/README.md) | Supporting microbenchmarks, diagnostics and CPU regression checks |
 | [`baselines/`](baselines/README.md) | RGB/IC/FS/L3/PCR/nvCOMP comparison implementations and their tests |
 | [`paper/results/`](paper/results/README.md) | Complete published result tables, trial records and plotting inputs |
 | Other packages below | Shared data readers, models, training recipes and benchmark implementations used by those entry points |
@@ -44,11 +44,8 @@ Unit tests remain beside the implementations they test; `development.check`
 collects the CPU suites without launching paper measurements.
 
 See each package README for low-level APIs and external dependencies. Data,
-checkpoints and profiler captures stay outside Git. The former root `experiments/`
-has been split by purpose. Historical scheduling and retry scripts are retained
-in `development/historical/`; their report generators are in `development/reports/`.
-Old reports and workspace notes are in
-[`benchmark_results/archive/experiments/`](../../benchmark_results/archive/experiments/).
+checkpoints, profiler captures, historical queues and development reports are
+excluded from the submission. Published measurements are in `paper/results/`.
 Reviewers should use the chapter entries in `paper/`.
 
 ## What is not required to run a benchmark?
@@ -58,6 +55,3 @@ old reports are outputs or reference material. They are not executable
 dependencies. The tests, CMake file, shared headers, data readers, models and
 training recipes are needed for building, validating or running their respective
 workloads; a file is not redundant merely because it is not an entry point.
-
-See the [cleanup inventory](CLEANUP.md) for concrete build/cache candidates,
-historical studies and result directories that should be retained.

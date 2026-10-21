@@ -19,7 +19,7 @@ sidecar 必须在 contract 快照前完成物化。runner 不允许 native execu
 ```bash
 cmake --build build --target _fastlens_direct_dct -j2
 PYTHONPATH=.:build/fastlens/torch \
-  /home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+  python3 \
   -m fastlens.benchmarks.system_dct_major.run --help
 ```
 
@@ -60,7 +60,7 @@ contract 快照执行一次完整首分片读取；这一步不属于计时：
 PYTHONPATH=.:build/fastlens/torch \
 FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/access" \
 FASTLENS_PHASE6_NATIVE_PHYSICAL=1 \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python - <<'PY'
+python3 - <<'PY'
 from fastlens.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
 from fastlens.torch import DirectDctReader
 
@@ -79,7 +79,7 @@ test -f fastlens/data/compressed/imagenet512_val_block_major/access/shard_000000
 ## Contract preflight
 
 ```bash
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload feature-extraction \
@@ -106,7 +106,7 @@ test -f fastlens/data/compressed/imagenet512_val_block_major/access/shard_000000
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload feature-extraction \
@@ -134,7 +134,7 @@ RAW_MASK_ORACLE_DIR="$PWD/fastlens/benchmarks/coefficient_mask_evaluator/runs/im
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run \
   --preset e2e \
   --workload evaluation \
@@ -163,7 +163,7 @@ batch 数并保留 partial tail。DCT-major 生产 profile 要求 warmup 为 0�
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-/home/tangyuxin/miniconda3/envs/fastlanes-cuda/bin/python \
+python3 \
   -m fastlens.benchmarks.system_dct_major.run_suite \
   --raw-mask-oracle-dir "$RAW_MASK_ORACLE_DIR" \
   --dct-major-manifest fastlens/data/compressed/imagenet512_val_block_major/manifest.bin \

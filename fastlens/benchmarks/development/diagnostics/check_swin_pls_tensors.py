@@ -49,7 +49,7 @@ def main():
                 logical_sample_id=sample.logical_sample_id,virtual_pls_id=int(record['virtual_pls_id']),
                 crop_policy='per-pls',source_width=width,source_height=height).decision)
         reference=RgbNoMoreTrainingAdapter(samples,batch_size=64,workers=0,device=device,
-            config={'rgbnomore_root':'/home/tangyuxin/RGB-no-more'})
+            config={'rgbnomore_root':str(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more')))})
         reference.begin(batch.identities,decisions)
         ref=reference.next_batch()
         inputs=tuple(x.to(device) for x in ref.inputs)
@@ -57,7 +57,7 @@ def main():
         ids=[s.logical_sample_id for s in samples]
         if args.augmentation=='full':
             inputs,_=apply_published_randaugment(inputs,training_seed=11997733,epoch=args.epoch,
-                logical_sample_ids=ids,rgbnomore_root=Path('/home/tangyuxin/RGB-no-more'))
+                logical_sample_ids=ids,rgbnomore_root=(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more'))))
             inputs,targets,_=apply_published_mixup(inputs,labels,training_seed=11997733,epoch=args.epoch,
                 microbatch_index=microbatch_index,alpha=.2,classes=1000)
         else:

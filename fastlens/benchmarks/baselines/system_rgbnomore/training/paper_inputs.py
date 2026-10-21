@@ -1,4 +1,5 @@
 """Existing baseline readers under the restored-state, basic-augmentation protocol."""
+import os
 import json
 from pathlib import Path
 
@@ -28,7 +29,7 @@ class BasicCpuDctWindow(CpuDctWindow):
                         logical_sample_id=row['logical_sample_id'], virtual_pls_id=int(row['virtual_pls_id']),
                         crop_policy='per-pls', source_width=512, source_height=512).decision)
             self.adapter = RgbNoMoreTrainingAdapter(samples, batch_size=64, workers=8,
-                device=torch.device('cuda:0'), config={'rgbnomore_root': '/home/tangyuxin/RGB-no-more'})
+                device=torch.device('cuda:0'), config={'rgbnomore_root': str(Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more')))})
             self.adapter.begin(identities, decisions, [len(b) for b in self.batches])
         else:
             from fastlens.benchmarks.dct_models import backend as B
