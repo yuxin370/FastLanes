@@ -1,4 +1,4 @@
-# Published results for `fastlens-final.pdf`
+# Published results for `fastlens.pdf`
 
 These are the complete retained tables for the final PDF's evaluation, dated
 2026-10-18. The tables contain the adopted measurement points, without adding

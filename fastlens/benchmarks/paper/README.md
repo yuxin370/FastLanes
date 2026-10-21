@@ -1,6 +1,6 @@
 # FastLens final-paper reproduction
 
-This directory follows **Sections 6.2–6.5 of [fastlens-final.pdf](../../docs/paper/outputs/fastlens-final.pdf)** (PDF date
+This directory follows **Sections 6.2–6.5 of [fastlens.pdf](../../docs/paper/outputs/fastlens.pdf)** (PDF date
 2026-10-18). It is the reviewer entry point. Development checks are in
 [`../development/`](../development/README.md); reader/model implementations remain
 shared in `../baselines/` and the model/training packages. Section-specific workers

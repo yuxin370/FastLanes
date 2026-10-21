@@ -4,7 +4,7 @@ Choose the entry point by purpose:
 
 | Directory | Purpose |
 | --- | --- |
-| [`paper/`](paper/README.md) | Reviewer reproduction of `fastlens-final.pdf`, organized by section and experiment, with measured defaults |
+| [`paper/`](paper/README.md) | Reviewer reproduction of `fastlens.pdf`, organized by section and experiment, with measured defaults |
 | [`development/`](development/README.md) | Supporting microbenchmarks, diagnostics and CPU regression checks |
 | [`baselines/`](baselines/README.md) | RGB/IC/FS/L3/nvCOMP comparison implementations and their tests |
 | [`paper/results/`](paper/results/README.md) | Complete published result tables, trial records and plotting inputs |

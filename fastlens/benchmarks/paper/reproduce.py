@@ -1,4 +1,4 @@
-"""Build paper dependencies or redraw fastlens-final.pdf's measured figures."""
+"""Build paper dependencies or redraw fastlens.pdf's measured figures."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import os

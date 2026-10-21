@@ -75,7 +75,7 @@ tmp
 ######################################### from the fls_benchamrks integration
 .vagrant/
 *.pdf
-!fastlens/docs/paper/outputs/fastlens-final.pdf
+!fastlens/docs/paper/outputs/fastlens.pdf
 plot/*.log
 plot/*.tex
 .Rhistory
