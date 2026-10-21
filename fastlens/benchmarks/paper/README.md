@@ -151,36 +151,28 @@ but the dataset check remains enforced. Use the matching historical dataset
 bundle, or perform a fresh input validation before collecting a new H2D run;
 this replay is not currently verified end to end.
 
-### 核查结论
+### 结果口径与已知限制
 
-- 四组源数据共522条逐次记录（含12条未用于最终图的 ResNet resident 对照），`raw_result` 在本机全部存在。
+- 四组源数据共522条逐次记录（含12条未用于最终图的 ResNet resident 对照），原始大型运行树不包含在仓库中。
   按逐轮比值中位数再跨七配置取算术平均，RTX4090/H100 训练为3.80×/4.20×，
   推理为6.17×/7.95×，与最终 PDF 一致。
 - 六条 RGB baseline 下，训练领先9/10，推理为最快 RGB 的97.7%，
   DCT resident 达成率99.1%；包含 PCR 的当前稿件属于另一版本。
 - FastLens 训练存储107.317 GB、JPEG 的2.12倍；compressed-transfer 对照的
   H2D 减少87.7%，均与原始计数一致。
-- Table 2 的45条导出记录与 `$HOME/tmp/dct-selected-first-20261015/h100/summary.json`
-  逐项一致，每配置一次正式测量。Compact 的60个点中53个单次、7个三次中位数，
+- Table 2 的45条导出记录与最终 PDF 逐项一致，每配置一次正式测量。Compact 的60个点中53个单次、7个三次中位数，
   不能描述成统一三次重复统计。
 - 四条收敛曲线各300个 epoch。Swin shared/independent 最终 Top-1 为
   78.888/79.052%，MobileNet 为71.976/71.764%。
-- 本次执行构建、CPU 检查和图表重建；未重跑全部50K推理、65,536-image窗口或300-epoch训练。
-  统一 CPU 入口472项测试中2项跳过；十二个论文入口共25项帮助/默认命令检查及11个测量脚本帮助检查通过。
-  目录整理后110条历史 H2D 回放命令的脚本路径及6处插桩边界已核对；完整回放仍受上述数据身份差异限制。
-  十张重绘 PNG 与更名前逐字节一致。
-  重新准备的9张训练图像上，CPU-DCT、两种 IC 和 FastLens 完成输入/标签核对及 ViT 训练遍历。
-  FS 预取路径曾触发输入一致性门禁：190,512 个元素中2,182个不一致，最大绝对差约0.00610；
-  普通 FS reader 直接比较及后续单独 CPU check-only 通过，但该差异尚未稳定定位。未放宽1e-5阈值，
-
-  不能将该路径标为完整验证通过。这些小样本运行均不作为论文吞吐结论。
+- 完整50K推理、65,536-image窗口和300-epoch训练需要准备对应外部输入。
+  FS 预取路径曾触发输入一致性门禁，差异尚未稳定定位；验证阈值保持1e-5，
+  不能将该路径标为完整验证通过。
 - 仍未通过的既有检查：`FastLensDirectDctTorchRuntimeSmoke` 在 RTX4090、
   `imagenet512_val_compact_v3/manifest.bin` 上报
   `consumer-stream delay completed before lifetime verification`。
   未设置 `FASTLENS_DIRECT_DCT_TEST_MANIFEST` 时该检查会跳过，不能把跳过当通过；
   换用 block-major 验证 manifest 则在异步 planless 输出契约处被拒绝。
-  原生 import、PLS GPU smoke 和上述 compact GPU 路径已通过，本轮对 `fastlens/torch` 和 native 实现只进行命名及历史格式兼容整理，
-  未改变生命周期算法。复查命令如下，GPU 序号按本机配置选择：
+  PLS GPU smoke 可独立验证；它不能替代该生命周期检查。复查命令如下，GPU 序号按本机配置选择：
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 \
@@ -189,6 +181,5 @@ FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build \
   -R '^FastLensDirectDctTorchRuntimeSmoke$' --output-on-failure
 ```
 
-nvCOMP compression 和 TensorFlow PCR 的完整运行未在本轮验证；它们需要各自的
-外部依赖。GPU 生命周期失败及长周期测量未执行的边界，不能由 CPU 测试或 CLI
-加载检查替代。
+nvCOMP compression 和 TensorFlow PCR 属于辅助源码，需要各自的外部依赖，
+不属于最终 PDF 的默认实验配置。CPU 测试或 CLI 加载检查不能替代完整 GPU 测量。

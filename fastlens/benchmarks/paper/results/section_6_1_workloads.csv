@@ -1,0 +1,8 @@
+workload,rgb_parameters_million,dct_parameters_million,dct_input,rgb_top1_percent,dct_top1_percent,source
+ViT-Ti,5.72,5.64,Y 28x28 blocks; C 14x14 blocks,74.09,75.14,"fastlens-final.pdf, Table 1 (published rounded values)"
+SwinV2-T,28.35,28.34,224: Y 28x28 and C 14x14 blocks; 256: Y 32x32 and C 16x16 blocks,79.01,79.37,"fastlens-final.pdf, Table 1 (published rounded values)"
+MV2-DCT24,3.50,3.50,24x112x112,70.75,67.70,"fastlens-final.pdf, Table 1 (published rounded values)"
+MV2-DCT32,3.50,3.50,32x112x112,70.75,69.49,"fastlens-final.pdf, Table 1 (published rounded values)"
+RN50-DCT24,25.56,25.53,24x56x56,74.78,75.69,"fastlens-final.pdf, Table 1 (published rounded values)"
+RN50-DCT64,25.56,25.55,64x56x56,74.78,74.15,"fastlens-final.pdf, Table 1 (published rounded values)"
+eFUN-DCT,5.29,4.23,192x28x28,76.77,73.35,"fastlens-final.pdf, Table 1 (published rounded values)"

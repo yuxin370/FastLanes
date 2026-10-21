@@ -1,0 +1,9 @@
+gpu,arm,total_h2d_bytes,raw_result
+4090,raw_int16,10009376000,results/paper_rerun_20261006/4090/core/raw_int16/diagnostic/summary.json
+4090,compressed,1232027096,results/paper_rerun_20261006/4090/core/compressed/diagnostic/summary.json
+4090,grid,1234103448,results/paper_rerun_20261006/4090/core/grid/diagnostic/summary.json
+4090,direct,1232027096,results/paper_rerun_20261006/4090/core/direct/diagnostic/summary.json
+H100,raw_int16,10009376000,results/paper_rerun_20261006/H100/core/raw_int16/diagnostic/summary.json
+H100,compressed,1232027096,results/paper_rerun_20261006/H100/core/compressed/diagnostic/summary.json
+H100,grid,1234103448,results/paper_rerun_20261006/H100/core/grid/diagnostic/summary.json
+H100,direct,1232027096,results/paper_rerun_20261006/H100/core/direct/diagnostic/summary.json

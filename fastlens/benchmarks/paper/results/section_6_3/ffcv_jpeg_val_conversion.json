@@ -1,0 +1,12 @@
+{
+  "format": "FFCV JPEG; original ImageNet-512 JPEG bytes, no re-encoding",
+  "write_mode": "jpg",
+  "source": "results/rgb_baseline_confirmation_20261004/measured/H100/mobilenet24_ffcv/trial_1/samples.json",
+  "samples": 50000,
+  "conversion_s": 3.6704373340471648,
+  "jpeg_bytes": 2051552155,
+  "representation_bytes": 2157072256,
+  "metadata_bytes": 22461127,
+  "payload_verification": "All stored JPEG bytes, labels and ordinals verified",
+  "workers": 16
+}

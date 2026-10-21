@@ -1,0 +1,2 @@
+gpu,experiment,configuration,timing_scope,trials,control_median_s,optimized_median_s,throughput_ratio,control_min_s,control_max_s,optimized_min_s,optimized_max_s,control_read_bytes,optimized_read_bytes,control_workset_h2d_bytes,optimized_workset_h2d_bytes,source_csv
+4090,frequency,K8,input_preparation_without_model,3,3.8012531339772977,3.5715909759746864,1.0643024801965002,3.6507339710369706,3.8146473450469784,3.3168467869400047,3.571596374968067,346195565,140566019,401955488,146781672,results/paper_rerun_20261007/4090/frequency/frequency.csv

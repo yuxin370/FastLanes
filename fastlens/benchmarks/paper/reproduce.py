@@ -56,7 +56,7 @@ def main():
     else:
         build_dir = args.build_dir.resolve()
         run(['cmake', '-S', ROOT, '-B', build_dir, '-DCMAKE_BUILD_TYPE=Release',
-             '-DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON', '-DFASTLENS_BUILD_BENCHMARKS=ON',
+             '-DFASTLENS_BUILD_BENCHMARKS=ON',
              '-DFASTLENS_BUILD_TESTS=ON', '-DFASTLENS_BUILD_TOOLS=ON', '-DFASTLENS_BUILD_TORCH=ON', '-DFASTLENS_WITH_JPEG_DCT=ON',
              f'-DFASTLENS_WITH_NVCOMP={"ON" if args.nvcomp else "OFF"}',
              f'-DPython3_EXECUTABLE={sys.executable}'], env)

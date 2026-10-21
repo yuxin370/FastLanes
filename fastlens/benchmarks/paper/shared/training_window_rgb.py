@@ -33,10 +33,10 @@ def build_window_model(profile, domain, device):
         model_id = VITTI_MODEL_ID if profile == 'vitti' else SWINV2_T_MODEL_ID
         if domain == 'dct':
             from fastlens.benchmarks.training_pls.train import build_paired_model
-            model, initial_hash = build_paired_model(Path('/home/tangyuxin/RGB-no-more'),
+            model, initial_hash = build_paired_model((Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more'))),
                 model_id=model_id, seed=SEED, device=device)
         else:
-            model = build_model(Path('/home/tangyuxin/RGB-no-more'), 'rgb', device, model_id=model_id)
+            model = build_model((Path(os.environ.get('RGBNOMORE_ROOT', Path.home() / 'RGB-no-more'))), 'rgb', device, model_id=model_id)
             initial_hash = tensor_state_sha256(model.state_dict())
         initialization = 'registered seeded scratch training constructor; seed=11997733'
     else:
