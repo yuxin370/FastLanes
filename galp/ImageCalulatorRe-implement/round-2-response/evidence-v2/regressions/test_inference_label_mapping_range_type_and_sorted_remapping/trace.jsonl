@@ -1,1 +1,0 @@
-{"occurrence_id": "a", "image_id": "a", "epoch": 0, "view_id": 0, "logical_slot": 0, "microbatch_id": 0, "profile_id": "test", "crop_box": [0, 0, 512, 512], "flip": false, "resize_geometry": [56, 56, 56], "augmentation_parameters": {}, "mixup_partner_occurrence": null, "mixup_lambda": 1.0, "target_parameters": {}, "target_label": 0}

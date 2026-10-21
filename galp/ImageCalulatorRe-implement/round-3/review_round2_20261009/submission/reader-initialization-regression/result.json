@@ -1,7 +1,0 @@
-{
-  "status": "passed",
-  "test": "StorageRegressions.test_cross_group_decode_lifetimes_are_bounded_without_cache",
-  "added_assertions": "manifest initialization actual read count/bytes match declared counters",
-  "implementation_change": "hash already-read manifest bytes instead of opening the file again",
-  "fixture": "reader-initialization-regression"
-}

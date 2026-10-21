@@ -1,1 +1,0 @@
-{"gpu_name": "NVIDIA GeForce RTX 4090", "gpu_uuid": "gpu-1", "hostname": "host", "torch": "test", "torch_cuda_build": "test", "execution_mode": "native_physical_pls", "physical_fls_observed": true, "physical_gpu_pool": true}
