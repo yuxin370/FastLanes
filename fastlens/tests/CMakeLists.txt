@@ -176,11 +176,13 @@ target_link_libraries(fastlens_tests PRIVATE
         FastLanes::core
 )
 target_include_directories(fastlens_tests PRIVATE
+        ${FastLanes_SOURCE_DIR}/data/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../src
         ${CMAKE_CURRENT_SOURCE_DIR}/../tools/benchmark_support/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../tools/data/include)
 
 target_compile_definitions(fastlens_tests PRIVATE
+        FLS_CMAKE_SOURCE_DIR="${FastLanes_SOURCE_DIR}"
         FLS_FASTLENS_SOURCE_DIR="${FASTLENS_DATA_ROOT}"
         FASTLENS_TEST_DATA_DIR="${FASTLENS_TEST_DATA_DIR}"
 )

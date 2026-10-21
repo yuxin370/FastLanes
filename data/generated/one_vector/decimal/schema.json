@@ -1,8 +1,0 @@
-{
-  "columns": [
-    {
-      "name": "decimal",
-      "type": "decimal(3, 1)"
-    }
-  ]
-}

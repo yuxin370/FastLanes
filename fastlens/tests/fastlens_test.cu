@@ -3,12 +3,12 @@
 // ────────────────────────────────────────────────────────
 // fastlens/tests/fastlens_test.cu
 // ────────────────────────────────────────────────────────
-#include "fastlens_extensions/alp/alp_bindings.cuh"
-#include "data/fastlanes_data.hpp"
-#include "cuda/device_utils.cuh"
-#include "cuda/launch/dispatch.cuh"
 #include "codecs/decode/alp.cuh"
 #include "codecs/encodings/all.cuh"
+#include "cuda/device_utils.cuh"
+#include "cuda/launch/dispatch.cuh"
+#include "data/fastlens.hpp"
+#include "fastlens_extensions/alp/alp_bindings.cuh"
 #include "fastlens_tools/data/generate_binaries.hpp"
 #include <cuda_runtime.h>
 #include <filesystem>
@@ -135,16 +135,16 @@ inline void test_alp(const std::filesystem::path& path) {
 	auto data_vec = read_file<T>(path);
 
 	fastlens::codec::host::ALPColumn<T> column = fastlens::codec::alp::encode(data_vec.data(), data_vec.size(), true);
-	GPUArray<T>                     d_decompression_result(data_vec.size());
-	constexpr int32_t               UNPACK_N_VECTORS = 1;
-	const ThreadblockMapping<T>     mapping(UNPACK_N_VECTORS, column.get_n_vecs());
+	GPUArray<T>                         d_decompression_result(data_vec.size());
+	constexpr int32_t                   UNPACK_N_VECTORS = 1;
+	const ThreadblockMapping<T>         mapping(UNPACK_N_VECTORS, column.get_n_vecs());
 
 	fastlens::codec::device::ALPColumn<T> d_column = column.copy_to_device();
 	fastlens::kernels::device::decompress_column<T,
-	                                         UNPACK_N_VECTORS,
-	                                         1,
-	                                         ALPDecompressor<T, UNPACK_N_VECTORS>,
-	                                         fastlens::codec::device::ALPColumn<T>>
+	                                             UNPACK_N_VECTORS,
+	                                             1,
+	                                             ALPDecompressor<T, UNPACK_N_VECTORS>,
+	                                             fastlens::codec::device::ALPColumn<T>>
 	    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK>>>(d_column, d_decompression_result.get());
 
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -163,17 +163,17 @@ inline void test_alp(const std::filesystem::path& path) {
 
 template <typename T>
 inline void test_fastlens_data(const std::vector<T>& data_vec) {
-	fastlens::codec::host::ALPColumn<T>           column = fastlens::codec::alp::encode(data_vec.data(), data_vec.size(), true);
+	fastlens::codec::host::ALPColumn<T> column = fastlens::codec::alp::encode(data_vec.data(), data_vec.size(), true);
 	fastlens::codec::host::ALPExtendedColumn<T>   column_extended = column.create_extended_column();
 	fastlens::codec::device::ALPExtendedColumn<T> d_column        = column_extended.copy_to_device();
-	GPUArray<T>                               d_decompression_result(data_vec.size());
-	constexpr int32_t                         UNPACK_N_VECTORS = 1;
-	const ThreadblockMapping<T>               mapping(UNPACK_N_VECTORS, column.get_n_vecs());
+	GPUArray<T>                                   d_decompression_result(data_vec.size());
+	constexpr int32_t                             UNPACK_N_VECTORS = 1;
+	const ThreadblockMapping<T>                   mapping(UNPACK_N_VECTORS, column.get_n_vecs());
 	fastlens::kernels::device::decompress_column<T,
-	                                         UNPACK_N_VECTORS,
-	                                         1,
-	                                         ALPExtendedDecompressor<T, UNPACK_N_VECTORS>,
-	                                         fastlens::codec::device::ALPExtendedColumn<T>>
+	                                             UNPACK_N_VECTORS,
+	                                             1,
+	                                             ALPExtendedDecompressor<T, UNPACK_N_VECTORS>,
+	                                             fastlens::codec::device::ALPExtendedColumn<T>>
 	    <<<mapping.n_blocks, mapping.N_THREADS_PER_BLOCK>>>(d_column, d_decompression_result.get());
 
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());

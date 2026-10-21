@@ -1,0 +1,313 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# CMakeLists.txt
+# ────────────────────────────────────────────────────────
+cmake_minimum_required(VERSION 3.22)
+
+# Requirements : -------------------------------------------------------------------------------------------------------
+# On non-Windows platforms, default to Clang unless the user explicitly sets a compiler
+# (e.g. -DCMAKE_CXX_COMPILER=g++).  On Windows, let CMake use the default (MSVC from vcvars).
+if (NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+    if (NOT DEFINED CMAKE_CXX_COMPILER)
+        find_program(CLANG_CXX NAMES clang++ REQUIRED)
+        find_program(CLANG_C NAMES clang REQUIRED)
+        set(CMAKE_C_COMPILER "${CLANG_C}" CACHE STRING "C Compiler" FORCE)
+        set(CMAKE_CXX_COMPILER "${CLANG_CXX}" CACHE STRING "C++ Compiler" FORCE)
+    endif ()
+endif ()
+
+
+#  ---------------------------------------------------------------------------------------------------------------------
+# Prevent Windows <minwindef.h> from defining min/max macros,
+# which collide with std::numeric_limits<…>::max() and
+# Flatbuffers’ own max() methods.
+#
+# Defining NOMINMAX here ensures that any inclusion of
+# windows.h or other Win32 headers won’t inject those macros.
+# ----------------------------------------------------------------------------------------------------------------------
+add_compile_definitions(NOMINMAX)
+
+
+# Project : ------------------------------------------------------------------------------------------------------------
+project(FastLanes)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
+
+#-----------------------------------------------------------------------------------------------------------------------
+include(FetchContent)
+include(CheckCXXCompilerFlag)
+include(CMakePrintHelpers)
+# https://stackoverflow.com/questions/56089330/cmake-creates-lots-of-targets-i-didnt-specify
+set_property(GLOBAL PROPERTY CTEST_TARGETS_ADDED 1)
+include(CTest)
+include(GNUInstallDirs)
+include(enable_sanitizer)
+
+# Checks : -------------------------------------------------------------------------------------------------------
+if (MSVC)
+    message(STATUS "-- FLS: Building with MSVC ${CMAKE_CXX_COMPILER_VERSION}")
+elseif ("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU")
+    message(STATUS "-- FLS: Building with GCC ${CMAKE_CXX_COMPILER_VERSION}")
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+        message(FATAL_ERROR "Only GCC >= 11 is supported (C++20 requirement)!")
+    endif ()
+elseif (NOT "${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
+    message(FATAL_ERROR "Only Clang, GCC, and MSVC are supported!")
+elseif (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+    message(FATAL_ERROR "Only Clang >= 13 is supported!")
+endif ()
+
+# Disallow configuring in the source tree
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(FATAL_ERROR "-- FLS : Please run CMake in a separate build directory!")
+endif ()
+include(compiler_flags)
+
+# Options : ------------------------------------------------------------------------------------------------------------
+option(FLS_BUILD_TESTING "Build Test" OFF)
+option(FLS_BUILD_BENCHMARKING "Enable Benchmark Build" OFF)
+option(FLS_BUILD_EXAMPLES "Build Examples" OFF)
+option(FLS_BUILD_CUDA "Build FastLanes CUDA reader" OFF)
+option(FLS_BUILD_GTEST "Build GTEST" OFF)
+option(FLS_BUILD_PYTHON "Build FastLanes Python bindings" OFF)
+option(FLS_BUILD_SHARED_LIBS "Build FastLanes library as shared" OFF)
+option(FLS_ENABLE_INSTALL "Generate install targets for FastLanes" ON)
+option(FLS_ENABLE_CLANG_TIDY "Enable clang_tidy on all targets" OFF)
+option(FLS_ENABLE_IWYU "Enable include-what-you-use tool" OFF)
+option(FLS_ENABLE_DOC "Enable Doc build" OFF)
+option(FLS_ENABLE_TABLE_LOG "Enable Table Log" OFF)
+option(FLS_ENABLE_VERBOSE_OUTPUT "Enable verbose output" OFF)
+option(FLS_ENABLE_DATA "Enable Data" OFF)
+option(FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING "Build FSST" OFF)
+
+# Definitions: ---------------------------------------------------------------------------------------------------------
+add_compile_definitions(FLS_CMAKE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+if (FLS_ENABLE_CLANG_TIDY)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Enabling CLANG-TIDY.")
+    find_program(CLANG_TIDY_EXE NAMES clang-tidy)
+    if (NOT CLANG_TIDY_EXE)
+        message(FATAL_ERROR "-- FLS: clang-tidy not found.")
+    else ()
+        if (NOT DEFINED CMAKE_CXX_CLANG_TIDY)
+            set(CMAKE_CXX_CLANG_TIDY
+                    ${CLANG_TIDY_EXE};
+                    --quiet;
+                    --config-file=${FastLanes_SOURCE_DIR}/.clang-tidy)
+            message("-- FLS: Using project-level .clang-tidy")
+        else ()
+            message(FATAL_ERROR "-- FLS: Do not override the clang-tidy configuration. Use the project-level .clang-tidy file instead. Current setting: ${CMAKE_CXX_CLANG_TIDY}")
+        endif ()
+
+        execute_process(
+                COMMAND ${CLANG_TIDY_EXE} --version
+                OUTPUT_VARIABLE CLANG_TIDY_VERSION
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        message("-- FLS: clang-tidy version: ${CLANG_TIDY_VERSION}")
+
+    endif ()
+endif ()
+
+
+# GTEST : --------------------------------------------------------------------------------------------------------------
+if (FLS_BUILD_TESTING OR FLS_BUILD_CUDA OR FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING OR FLS_BUILD_GTEST)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Building GTEST:")
+    include(GoogleTest)
+    # Gtest: -----------------------------------------------------------------------------------------------------------
+    FetchContent_Declare(googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            GIT_TAG v1.15.2
+    )
+    # For Windows: Prevent overriding the parent project's compiler/linker settings
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    # Silence clang-tidy warnings from googletest (we don't want to lint third-party code)
+    foreach (_t gtest gtest_main gmock gmock_main)
+        if (TARGET ${_t})
+            set_target_properties(${_t} PROPERTIES CXX_CLANG_TIDY "")
+        endif ()
+    endforeach ()
+
+    # On Windows, GoogleTest uses Microsoft-specific language extensions like `__try`
+    # that trigger Clang's -Wlanguage-extension-token warning. Since we build with -Werror,
+    # selectively disable that warning (and suppress all warnings with -w) ONLY for GoogleTest.
+    if (MSVC)
+        foreach (_t gtest gtest_main gmock gmock_main)
+            if (TARGET ${_t})
+                get_target_property(_aliased ${_t} ALIASED_TARGET)
+                if (NOT _aliased)
+                    target_compile_options(${_t} PRIVATE /w)
+                endif ()
+            endif ()
+        endforeach ()
+    elseif (WIN32)
+        foreach (_t gtest gtest_main gmock gmock_main)
+            if (TARGET ${_t})
+                get_target_property(_aliased ${_t} ALIASED_TARGET)
+                if (NOT _aliased)
+                    target_compile_options(${_t} PRIVATE -Wno-language-extension-token -w)
+                endif ()
+            endif ()
+        endforeach ()
+    endif ()
+
+    # On Linux with Clang or GCC, libstdc++ deprecates get_temporary_buffer (used by stable_sort),
+    # which triggers -Wdeprecated-declarations; with -Werror that breaks the build.
+    # Relax ONLY this warning for GoogleTest targets.
+    if (UNIX AND NOT APPLE)
+        foreach (_t gtest gtest_main gmock gmock_main)
+            if (TARGET ${_t})
+                get_target_property(_aliased ${_t} ALIASED_TARGET)
+                if (NOT _aliased)
+                    target_compile_options(${_t} PRIVATE
+                            $<$<COMPILE_LANG_AND_ID:CXX,Clang,GNU>:
+                            -Wno-error=deprecated-declarations
+                            -Wno-deprecated-declarations>)
+                endif ()
+            endif ()
+        endforeach ()
+    endif ()
+endif ()
+
+
+# ALP: -----------------------------------------------------------------------------------------------------------------
+if (true)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Building ALP Lib.")
+    add_compile_definitions(ALP_N_VECTORS_PER_ROWGROUP=64)
+    set(ALP_ENABLE_ADAPTIVE_MODE OFF CACHE BOOL "Enable adaptive mode" FORCE)
+endif ()
+
+
+if (true)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Building FastLanes Lib.")
+
+    # Source: ----------------------------------------------------------------------------------------------------------
+    if (FLS_BUILD_SHARED_LIBS)
+        message("-- FLS: Shared is enabled!")
+    endif ()
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+endif ()
+
+# CLANG TIDY : --------------------------------------------------------------------------------------------------------------
+if (FLS_ENABLE_CLANG_TIDY)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Disabling CLANG-TIDY.")
+    set(CMAKE_CXX_CLANG_TIDY "")
+endif ()
+
+# CUDA : ---------------------------------------------------------------------------------------------------------------
+if (FLS_BUILD_CUDA)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("--: Building CU-FastLanes Lib.")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/cuda)
+endif ()
+
+
+# DATA : ---------------------------------------------------------------------------------------------------------------
+if (FLS_BUILD_TESTING OR
+        FLS_BUILD_BENCHMARKING OR
+        FLS_BUILD_EXAMPLES OR
+        FLS_ENABLE_DATA OR
+        FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Enabling Data.")
+
+
+    # If the user has set FASTLANES_DATA_DIR in their environment, use that:
+    if (DEFINED ENV{FASTLANES_DATA_DIR})
+        set(data_SOURCE_DIR "$ENV{FASTLANES_DATA_DIR}")
+        message("-- FLS : Using FASTLANES_DATA_DIR from environment: ${data_SOURCE_DIR}")
+    else ()
+        include(FetchContent)
+        # FetchContent_Declare(
+        #         data
+        #         GIT_REPOSITORY https://github.com/cwida/FastLanes_Data.git
+        #         GIT_TAG main
+        # )
+        # FetchContent_MakeAvailable(data)
+        set(data_SOURCE_DIR "${data_SOURCE_DIR}")  # from FetchContent
+        message("-- FLS : Fetched FastLanes_Data into: ${data_SOURCE_DIR}")
+    endif ()
+
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/data/include)
+    add_compile_definitions(FASTLANES_DATA_DIR="${data_SOURCE_DIR}")
+    cmake_print_variables(data_SOURCE_DIR)
+endif ()
+
+if (FLS_ENABLE_IWYU)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Enabling IWYU")
+    find_program(iwyu_path NAMES include-what-you-use iwyu REQUIRED)
+    if (NOT iwyu_path)
+        message(WARNING "-- FLS_ERROR: Could not find the program include-what-you-use")
+    endif ()
+endif ()
+
+# Verbose : ------------------------------------------------------------------------------------------------------------
+if (FLS_ENABLE_VERBOSE_OUTPUT)
+    include(verbose_options)
+    print_verbose_options()
+endif ()
+
+# Benchmark : ----------------------------------------------------------------------------------------------------------
+if (FLS_BUILD_BENCHMARKING)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("- Benchmark:")
+
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/benchmark)
+endif ()
+
+# Test: ----------------------------------------------------------------------------------------------------------------
+if (FLS_BUILD_TESTING)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Build Testing.")
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/test/include)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+endif ()
+
+
+# FSST: ----------------------------------------------------------------------------------------------------------------
+if (FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("-- FLS: Adding FSST Testing and Benchmarking.")
+    add_subdirectory(fsst)
+endif ()
+
+# Example : ------------------------------------------------------------------------------------------------------------
+if (FLS_BUILD_EXAMPLES)
+    message("---------------------------------------------------------------------------------------------------------")
+    message("- Examples:")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/examples)
+endif ()
+
+# Playground : ---------------------------------------------------------------------------------------------------------
+if (EXISTS "${FastLanes_SOURCE_DIR}/playground/CMakeLists.txt")
+    message("---------------------------------------------------------------------------------------------------------")
+    message("- FLS: Adding Playground ")
+    add_subdirectory(playground)
+endif ()
+# Python : -------------------------------------------------------------------------------------------------------------
+if (FLS_BUILD_PYTHON)
+    message("----------------------------------------------------------------------------------------------------------")
+    message("- FLS: Building FastLanes Python Extension")
+
+    add_subdirectory(python)   # your module’s CMakeLists.txt
+endif ()
+
+# FSST: ----------------------------------------------------------------------------------------------------------------

@@ -10,9 +10,8 @@ if (FASTLENS_WITH_JPEG_DCT AND UNIX)
         apply_warnings(fastlens_input_boundary_controls)
         set_target_properties(fastlens_input_boundary_controls PROPERTIES OUTPUT_NAME input_boundary_controls)
         target_include_directories(fastlens_input_boundary_controls SYSTEM PRIVATE
-                ../src ../include ${CUDAToolkit_INCLUDE_DIRS}
-                $<TARGET_PROPERTY:FastLanes,INTERFACE_INCLUDE_DIRECTORIES>)
-        target_link_libraries(fastlens_input_boundary_controls PRIVATE ${CMAKE_DL_LIBS})
+                ../src ../include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(fastlens_input_boundary_controls PRIVATE FastLanes::headers ${CMAKE_DL_LIBS})
         add_executable(fastlens_dct_storage dct_models/dctnet_storage.cpp)
         target_include_directories(fastlens_dct_storage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
         target_link_libraries(fastlens_dct_storage PRIVATE fastlens_core fastlens_compact_format)

@@ -75,7 +75,8 @@ endif ()
 find_path(THRUST_INCLUDE_DIR
         NAMES thrust/version.h
         thrust/device_uvector.h
-        HINTS ${CUDAToolkit_INCLUDE_DIRS})
+        HINTS ${CUDAToolkit_INCLUDE_DIRS} "${CUDAToolkit_BIN_DIR}/../include"
+        PATH_SUFFIXES cccl)
 
 if (NOT THRUST_INCLUDE_DIR)
     message(FATAL_ERROR "Need Thrust ≥ 2.2 (with device_uvector.h) in CUDA Toolkit")

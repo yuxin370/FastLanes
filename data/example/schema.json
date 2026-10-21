@@ -1,9 +1,0 @@
-{
-  "columns": [
-    {
-      "name": "FastLanes",
-      "type": "string",
-      "nullability": "NULL"
-    }
-  ]
-}

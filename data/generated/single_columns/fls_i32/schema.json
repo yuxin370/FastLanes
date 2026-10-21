@@ -1,8 +1,0 @@
-{
-  "columns": [
-    {
-      "name": "Language",
-      "type": "FLS_I32"
-    }
-  ]
-}

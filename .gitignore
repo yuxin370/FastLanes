@@ -26,13 +26,31 @@ build*/
 data/fls/
 data/dct_blocks/
 
-# FastLens local documentation and data
+# Publish the final PDF and plotting sources; keep local manuscript drafts private.
 fastlens/docs/*
+!fastlens/docs/paper/
+fastlens/docs/paper/*
+!fastlens/docs/paper/scripts/
+fastlens/docs/paper/scripts/*
+!fastlens/docs/paper/scripts/chart_style.py
+!fastlens/docs/paper/scripts/plot_matched_dct.py
+!fastlens/docs/paper/scripts/plot_compact_training.py
+!fastlens/docs/paper/scripts/plot_deployment.py
+!fastlens/docs/paper/scripts/plot_deployment_training.py
+!fastlens/docs/paper/scripts/plot_deployment_inference.py
+!fastlens/docs/paper/scripts/plot_training_resident_attainment.py
+!fastlens/docs/paper/scripts/plot_training_convergence.py
+!fastlens/docs/paper/scripts/plot_compact_staging.py
+!fastlens/docs/paper/scripts/plot_h2d_traffic.py
+!fastlens/docs/paper/scripts/plot_core_ablations.py
+!fastlens/docs/paper/scripts/plot_locality.py
+!fastlens/docs/paper/scripts/plot_read_bandwidth.py
+!fastlens/docs/paper/outputs/
+fastlens/docs/paper/outputs/*
 fastlens/data
 /fastlens/scripts/*
 !/fastlens/scripts/codegen/
 !/fastlens/scripts/codegen/**
-scripts/my_tool/*
 #########################################
 # Editor temporary/working/backup files #
 .#*
@@ -57,6 +75,7 @@ tmp
 ######################################### from the fls_benchamrks integration
 .vagrant/
 *.pdf
+!fastlens/docs/paper/outputs/fastlens-final.pdf
 plot/*.log
 plot/*.tex
 .Rhistory
@@ -135,7 +154,7 @@ target/
 .cargo/
 
 # Don’t commit the crate’s lockfile (library convention)
-rust/Cargo.lock
+/third_party/fastlanes/rust/Cargo.lock
 
 # VSCode’s Rust extension
 .vscode/
@@ -163,14 +182,9 @@ build_win/
 # FASTLENS local benchmark outputs (results, checkpoints, profiler exports)
 /benchmark_results/
 
-# Local experiment scripts and results, including relocated paper tables
-/experiments/
+# Local raw experiment results; published tables live under benchmarks/paper/results.
 /results/
-/fastlens/benchmarks/paper/results/
 /fastlens/benchmarks/profiling/INPUT_MOTIVATION.md
-/fastlens/benchmarks/profiling/input_motivation.py
-/fastlens/benchmarks/profiling/input_motivation_dct.py
-/fastlens/benchmarks/profiling/plot_input_motivation.py
 
 # Generated FASTLENS documentation evidence; source reports remain visible
 /fastlens/benchmarks/baselines/system_rgbnomore/docs/artifacts/
@@ -194,3 +208,43 @@ build_win/
 # Local failure samples and review exports
 /failed.jpeg
 /review_exports/
+
+# Local tool configuration is not part of the research artifact.
+/.agents/
+/.aws/
+/.codex/
+/.claude/
+
+# Include only the FastLanes dependency and fixture-generation source needed here.
+/third_party/fastlanes/*
+!/third_party/fastlanes/CMakeLists.txt
+!/third_party/fastlanes/CHANGES.md
+!/third_party/fastlanes/LICENSE
+!/third_party/fastlanes/.clang-format
+!/third_party/fastlanes/.clang-tidy
+!/third_party/fastlanes/src/
+!/third_party/fastlanes/cmake/
+!/third_party/fastlanes/data/
+/third_party/fastlanes/data/*
+!/third_party/fastlanes/data/include/
+!/third_party/fastlanes/scripts/
+/third_party/fastlanes/scripts/*
+!/third_party/fastlanes/scripts/generate_synthetic_data.py
+!/third_party/fastlanes/scripts/generator_helpers/
+
+# Local development instructions, histories, and reports are not submission material.
+/AGENTS.md
+/fastlens/PYTHON_API_REFACTOR_PLAN.md
+/fastlens/benchmarks/CLEANUP.md
+/fastlens/benchmarks/development/historical/
+/fastlens/benchmarks/development/reports/
+/fastlens/benchmarks/development/tests/
+/fastlens/benchmarks/system_dct_major/docs/*
+!/fastlens/benchmarks/system_dct_major/docs/RUN_GUIDE.md
+!/fastlens/benchmarks/system_dct_major/docs/BLOCK_MAJOR_PLANLESS_DESIGN.md
+/fastlens/benchmarks/baselines/system_rgbnomore/docs/*
+!/fastlens/benchmarks/baselines/system_rgbnomore/docs/E2E_COMPARISON_RUN_GUIDE.md
+!/fastlens/benchmarks/baselines/system_rgbnomore/docs/TRAINING_BENCHMARK_RUN_GUIDE.md
+/fastlens/benchmarks/dct_models/EFUN_RESULTS_AND_TRAINING_ZH.md
+/fastlens/benchmarks/training_pls/SWINV2_FULL_BASELINE_RUNBOOK.md
+/fastlens/examples/image_order_benchmark/RESULTS_*.md

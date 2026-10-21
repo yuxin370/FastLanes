@@ -59,7 +59,8 @@ if (NOT TARGET Thrust::Thrust)
     # FastLensTargets.cmake as a compatibility fallback.
     find_path(FASTLENS_THRUST_INCLUDE_DIR
             NAMES thrust/version.h thrust/device_uvector.h
-            HINTS ${CUDAToolkit_INCLUDE_DIRS})
+            HINTS ${CUDAToolkit_INCLUDE_DIRS} "${CUDAToolkit_BIN_DIR}/../include"
+            PATH_SUFFIXES cccl)
     if (NOT FASTLENS_THRUST_INCLUDE_DIR)
         set(FastLens_FOUND FALSE)
         set(FastLens_NOT_FOUND_MESSAGE

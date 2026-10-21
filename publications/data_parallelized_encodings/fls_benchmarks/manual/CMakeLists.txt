@@ -1,6 +1,0 @@
-add_subdirectory(rle)
-add_subdirectory(rsum)
-add_subdirectory(add)
-add_subdirectory(lemire_bitunpack_4way)
-#add_subdirectory(lemire_bitunpack_scalar)
-add_subdirectory(lemire_bitunpack_scalar_refactored_by_duckdb)

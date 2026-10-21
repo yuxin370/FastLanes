@@ -1,2 +1,0 @@
-file_name,compression_ratio,throughput_bulk (MB/s),compression_ratio,throughput_compression (MB/s),throughput_decompression (MB/s),
-test_0,1.53768,47.6669,0.686701,47.2912,1736.86

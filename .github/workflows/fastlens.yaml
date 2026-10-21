@@ -62,7 +62,6 @@ jobs:
             -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
             -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
             -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
-            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
             -DFASTLENS_BUILD_TESTS=ON \
             -DFASTLENS_BUILD_TOOLS=ON \
             -DFASTLENS_BUILD_BENCHMARKS=OFF \
@@ -149,6 +148,7 @@ jobs:
         run: |
           "$FASTLENS_CUDA_ENV/bin/python3" -m venv "$RUNNER_TEMP/fastlens-fixture-venv"
           "$RUNNER_TEMP/fastlens-fixture-venv/bin/python" -m pip install Faker
+          cd third_party/fastlanes
           PYTHONPATH="$PWD/scripts" "$RUNNER_TEMP/fastlens-fixture-venv/bin/python" - <<'PY'
           import random
           from generator_helpers.fastlens_generator import fls_fastlens
@@ -169,12 +169,11 @@ jobs:
             -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
             -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
             -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
-            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
             -DFASTLENS_BUILD_TESTS=ON \
             -DFASTLENS_BUILD_TOOLS=ON \
             -DFASTLENS_BUILD_BENCHMARKS=OFF \
             -DFASTLENS_WITH_NVCOMP=OFF
-          cmake -LA -N build | grep -E '^(CMAKE_BUILD_TYPE|FASTLENS_BUILD_TESTS|FASTLENS_BUILD_TOOLS|FASTLENS_BUILD_BENCHMARKS|FASTLENS_WITH_NVCOMP|FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING):'
+          cmake -LA -N build | grep -E '^(CMAKE_BUILD_TYPE|FASTLENS_BUILD_TESTS|FASTLENS_BUILD_TOOLS|FASTLENS_BUILD_BENCHMARKS|FASTLENS_WITH_NVCOMP):'
 
       - name: Build FASTLENS targets
         run: >
@@ -217,7 +216,6 @@ jobs:
             -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
             -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
             -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
-            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
             -DFLS_ENABLE_TSAN=ON \
             -DFASTLENS_BUILD_TESTS=ON -DFASTLENS_BUILD_TOOLS=OFF \
             -DFASTLENS_BUILD_BENCHMARKS=OFF -DFASTLENS_WITH_NVCOMP=OFF \
@@ -284,7 +282,6 @@ jobs:
             -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
             -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
             -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
-            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
             -DFASTLENS_BUILD_TESTS=ON -DFASTLENS_BUILD_TOOLS=ON \
             -DFASTLENS_BUILD_BENCHMARKS=OFF -DFASTLENS_WITH_NVCOMP=OFF \
             -DFASTLENS_BUILD_TORCH=ON -DPython3_EXECUTABLE="$FASTLENS_CUDA_ENV/bin/python3"
