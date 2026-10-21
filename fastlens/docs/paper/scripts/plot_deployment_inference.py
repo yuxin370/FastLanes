@@ -2,28 +2,22 @@
 """Plot completed full-validation reruns with three-trial medians and ranges."""
 import numpy as np
 from chart_style import RESULTS, BAR_COLORS, BAR_STYLE, HATCHES, plt, read, save
-from plot_deployment_training import MODELS, SYSTEMS, pcr_trials
+from plot_deployment_training import MODELS, SYSTEMS
 
 BASELINES = RESULTS / 'end_to_end/remaining/summary.csv'
 SWIN = RESULTS / 'end_to_end/swin_inference/summary.csv'
 FIGSIZE = (7.0, 1.65)
 
 
-def inference_data(include_pcr=True):
+def inference_data():
     results = {(r['gpu'], r['model'], r['path']): r for r in read(BASELINES)
                if r['phase'] == 'inference'}
     results.update({(r['gpu'], 'swinv2', r['path']): r for r in read(SWIN)})
     data = {}
-    paths = ('pytorch', 'dali', 'coordl', 'ffcv_raw', 'ffcv_jpeg', 'l3', 'pcr', 'cpu_dct', 'imagelanes')
+    paths = ('pytorch', 'dali', 'coordl', 'ffcv_raw', 'ffcv_jpeg', 'l3', 'cpu_dct', 'imagelanes')
     for gpu in ('4090', 'H100'):
         for model, _ in MODELS:
             for system, path in zip(SYSTEMS, paths):
-                if path == 'pcr':
-                    if not include_pcr:
-                        continue
-                    rates = [r['images_per_s'] for r in pcr_trials('inference', gpu, model)]
-                    data[gpu, model, system] = (np.median(rates), min(rates), max(rates))
-                    continue
                 source_model = 'mobilenet24' if model == 'mobilenet32' and path not in ('cpu_dct', 'imagelanes') else model
                 result = results[gpu, source_model, path]
                 assert int(result['trials']) == 3
@@ -32,7 +26,7 @@ def inference_data(include_pcr=True):
 
 
 def plot(axes, systems=SYSTEMS):
-    data = inference_data(include_pcr='PCR' in systems)
+    data = inference_data()
     x = np.arange(len(MODELS))
     width = .76 / len(systems)
     for ax, gpu in zip(axes, ('4090', 'H100')):

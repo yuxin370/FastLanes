@@ -15,7 +15,7 @@ WIDTH = 3.35
 COLORS = {
     "Model only": "#bfc5cb", "PyTorch": "#7f8790", "DALI": "#e0a348",
     "CoorDL": "#6aaed6", "FFCV": "#9b86b5", "L3": "#b87968",
-    "PCR": "#9b8c54", "CPU-DCT": "#376f9f", "FastLens": "#43967a",
+    "CPU-DCT": "#376f9f", "FastLens": "#43967a",
 }
 BLUE, ORANGE, GREEN = COLORS["CPU-DCT"], COLORS["DALI"], COLORS["FastLens"]
 # Distinct soft hues for bars, with blue emphasis and warm/cool contrast.
@@ -26,13 +26,13 @@ BAR_PALETTE = (
 BAR_COLORS = {
     "PyTorch": BAR_PALETTE[0], "DALI": BAR_PALETTE[1],
     "CoorDL": BAR_PALETTE[2], "FFCV": BAR_PALETTE[3],
-    "FFCV JPEG": BAR_PALETTE[4], "L3": BAR_PALETTE[5], "PCR": "#d3c394",
+    "FFCV JPEG": BAR_PALETTE[4], "L3": BAR_PALETTE[5],
     "CPU-DCT": BAR_PALETTE[6], "FastLens": BAR_PALETTE[7],
 }
 BAR_STYLE = {"edgecolor": "black", "linewidth": .4}
 HATCHES = {
     "PyTorch": "---", "DALI": "//", "CoorDL": "\\\\", "FFCV": "--",
-    "FFCV JPEG": "\\\\\\", "L3": "xx", "PCR": "..", "CPU-DCT": "///", "FastLens": "",
+    "FFCV JPEG": "\\\\\\", "L3": "xx", "CPU-DCT": "///", "FastLens": "",
 }
 
 plt.rcParams.update({

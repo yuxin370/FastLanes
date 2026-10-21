@@ -11,7 +11,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT))
-PATHS = ('pytorch', 'dali', 'coordl', 'l3', 'cpu_dct', 'pcr')
+PATHS = ('pytorch', 'dali', 'coordl', 'l3', 'cpu_dct')
 
 
 from fastlens.benchmarks.paper.section_6_2_4.resident_training.resident_training_window import InitialExecutionState
@@ -28,12 +28,7 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--check', action='store_true')
     p.add_argument('--correctness-report', type=Path)
-    p.add_argument('--pcr-data', type=Path)
-    p.add_argument('--pcr-op', type=Path)
-    p.add_argument('--pcr-upstream-release', type=Path)
     args = p.parse_args()
-    if args.path == 'pcr' and not all((args.pcr_data, args.pcr_op, args.pcr_upstream_release)):
-        p.error('PCR requires --pcr-data, --pcr-op, and --pcr-upstream-release')
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / 'result.json').exists():
         raise FileExistsError(args.output / 'result.json')
@@ -75,11 +70,7 @@ def main():
     expected_state = initial.hashes(model, optimizer, decay, scheduler)
     execute = torch.compile(model, backend='inductor', options={'triton.cudagraphs': False}, dynamic=False)
     precision = 'fp32' if args.model == 'vitti' else 'bf16-autocast'
-    if args.path == 'pcr':
-        from fastlens.benchmarks.baselines.pcr_tensorflow.training import training_inputs as pcr_training_inputs, check_input
-        make_source, paths, samples, decisions, variant = pcr_training_inputs(args, device)
-    else:
-        make_source, paths, samples, decisions, variant = training_inputs(args.model, args.path, device, args.output)
+    make_source, paths, samples, decisions, variant = training_inputs(args.model, args.path, device, args.output)
     print('Preparing warm input pages and real inputs', flush=True)
     cache_warm = None if args.check else cache_pages(paths, warm=True)
     source = make_source()
@@ -113,9 +104,7 @@ def main():
                 assert all(v.is_cuda and v.shape[0] == 64 for v in x) and target.is_cuda
                 assert target.dtype == torch.int64
             if args.check and not input_checked:
-                if args.path == 'pcr':
-                    check_input(x[0], target, batch.identities, samples, decisions, args.output)
-                elif domain == 'rgb':
+                if domain == 'rgb':
                     check_rgb_input(x[0], target, batch.identities, samples, decisions,
                         pipeline=args.path, device=device, dali_config=variant, output=args.output)
                 else:
@@ -202,8 +191,6 @@ def main():
         compile='inductor/default', cuda_graphs=False, tf32=False, profile=False,
         CUBLAS_WORKSPACE_CONFIG=os.environ.get('CUBLAS_WORKSPACE_CONFIG'), command=sys.argv,
         scope='Basic augmentation; distinct dataset samples; restored state and input sequence after warmup.')
-    if args.path == 'pcr':
-        result['pcr'], result['dali'] = variant, None
     (args.output / 'sample_ids.json').write_text(json.dumps(ids) + '\n')
     (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps({k: result[k] for k in ('path', 'model', 'images_per_s', 'restoration_verified', 'unique_samples')}), flush=True)

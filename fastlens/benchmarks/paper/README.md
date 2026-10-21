@@ -8,7 +8,7 @@ live beside their `run.py`; workers reused across sections live in `shared/`.
 Process execution and logging are in `../execution/`. Historical queue, retry and
 continuation scripts are in `../development/historical/`.
 
-The final PDF contains six RGB baselines, without PCR. The current paper LaTeX
+The final PDF contains six RGB baselines. The current paper LaTeX
 has since changed and does not compile to this exact final PDF.
 
 ## Start here
@@ -157,7 +157,7 @@ this replay is not currently verified end to end.
   按逐轮比值中位数再跨七配置取算术平均，RTX4090/H100 训练为3.80×/4.20×，
   推理为6.17×/7.95×，与最终 PDF 一致。
 - 六条 RGB baseline 下，训练领先9/10，推理为最快 RGB 的97.7%，
-  DCT resident 达成率99.1%；包含 PCR 的当前稿件属于另一版本。
+  DCT resident 达成率99.1%。
 - FastLens 训练存储107.317 GB、JPEG 的2.12倍；compressed-transfer 对照的
   H2D 减少87.7%，均与原始计数一致。
 - Table 2 的45条导出记录与最终 PDF 逐项一致，每配置一次正式测量。Compact 的60个点中53个单次、7个三次中位数，
@@ -181,5 +181,5 @@ FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build \
   -R '^FastLensDirectDctTorchRuntimeSmoke$' --output-on-failure
 ```
 
-nvCOMP compression 和 TensorFlow PCR 属于辅助源码，需要各自的外部依赖，
+nvCOMP compression 属于辅助源码，需要相应的外部依赖，
 不属于最终 PDF 的默认实验配置。CPU 测试或 CLI 加载检查不能替代完整 GPU 测量。

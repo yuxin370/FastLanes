@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """Plot resident attainment: median and min--max of three per-round ratios.
 
-Best RGB selects the fastest of seven RGB paths within each round. FastLens DCT
+Best RGB selects the fastest of six RGB paths within each round. FastLens DCT
 uses its matched DCT resident reference; values above 100% are retained.
 """
 import argparse
 import numpy as np
 
 from chart_style import RESULTS, WIDTH, BAR_PALETTE, BAR_COLORS, plt, read, save
-from plot_deployment_training import MODELS, pcr_training_rates
+from plot_deployment_training import MODELS
 
 
-def resident_data(include_pcr=True):
+def resident_data():
     trials = read(RESULTS / "end_to_end/resident/trials.csv")
     trials += [r for r in read(RESULTS / "end_to_end/remaining/trials.csv")
                if r["phase"] == "training"]
     rates = {(r["gpu"], r["model"], r["path"], int(r["trial"])): float(r["images_per_s"])
              for r in trials}
     rgb_paths = ("pytorch", "dali", "coordl", "l3", "ffcv_raw", "ffcv_jpeg")
-    if include_pcr:
-        rates.update(pcr_training_rates())
-        rgb_paths += ("pcr",)
     data = {}
     for gpu in ("4090", "H100"):
         for model, _ in MODELS:
@@ -34,8 +31,8 @@ def resident_data(include_pcr=True):
     return data
 
 
-def main(without_pcr=False):
-    data = resident_data(include_pcr=not without_pcr)
+def main():
+    data = resident_data()
     fig, axes = plt.subplots(2, 1, figsize=(WIDTH, 1.72), sharex=True, sharey=True)
     fig.subplots_adjust(left=.18, right=.98, bottom=.17, top=.78, hspace=.70)
     for ax, gpu in zip(axes, ("4090", "H100")):
@@ -63,11 +60,10 @@ def main(without_pcr=False):
     fig.legend(*axes[0].get_legend_handles_labels(), ncol=2, loc="upper center",
                bbox_to_anchor=(.57, 1), frameon=False, fontsize=7,
                handlelength=1, handletextpad=.4, columnspacing=1.5, borderaxespad=0)
-    save(fig, "evaluation/training_resident_attainment_without_pcr" if without_pcr
-         else "evaluation/training_resident_attainment")
+    save(fig, "evaluation/training_resident_attainment")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--without-pcr', action='store_true', help='Use the six RGB paths in fastlens-final.pdf.')
-    main(without_pcr=parser.parse_args().without_pcr)
+    parser.parse_args()
+    main()

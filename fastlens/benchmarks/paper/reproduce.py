@@ -21,8 +21,8 @@ def figures(output, artifacts, jobs, env):
                FASTLENS_ARTIFACT_ROOT=str(artifacts.resolve()))
     commands = [
         ['plot_matched_dct.py'], ['plot_compact_training.py'],
-        ['plot_deployment.py', '--without-pcr'],
-        ['plot_training_resident_attainment.py', '--without-pcr'],
+        ['plot_deployment.py'],
+        ['plot_training_resident_attainment.py'],
         ['plot_training_convergence.py'], ['plot_compact_staging.py'],
         ['plot_h2d_traffic.py'], ['plot_core_ablations.py'], ['plot_locality.py'],
         ['plot_read_bandwidth.py'],

@@ -21,15 +21,15 @@ def write_tables():
             + phase + ' uses ' + scope + '.}',
             r'\fontsize{8}{9}\selectfont\setlength{\tabcolsep}{3pt}',
             r'\renewcommand{\arraystretch}{1.15}',
-            r'\begin{tabular}{@{}lrrrrrrrrr@{}}',
+            r'\begin{tabular}{@{}lrrrrrrrr@{}}',
             r'\toprule',
             r'Model & \shortstack{PyTorch\\RGB} & \shortstack{DALI\\RGB} & \shortstack{CoorDL\\RGB} & '
             r'\shortstack{FFCV raw\\RGB} & \shortstack{FFCV JPEG\\RGB} & \shortstack{L3\\RGB} & '
-            r'\shortstack{PCR\\RGB} & \shortstack{PyTorch\\DCT} & \shortstack{\sys{}\\DCT} \\',
+            r'\shortstack{PyTorch\\DCT} & \shortstack{\sys{}\\DCT} \\',
             r'\midrule',
         ])
         for gpu in ('4090', 'H100'):
-            lines.append(r'\multicolumn{10}{@{}l}{\textit{' + ('RTX 4090' if gpu == '4090' else gpu) + r'}} \\')
+            lines.append(r'\multicolumn{9}{@{}l}{\textit{' + ('RTX 4090' if gpu == '4090' else gpu) + r'}} \\')
             for model, label in MODELS:
                 cells = []
                 for system in SYSTEMS:
@@ -43,7 +43,7 @@ def write_tables():
             r'\par\smallskip',
             r'\begin{minipage}{\textwidth}\footnotesize',
             r'MV2-24 and MV2-32 reuse the same MobileNetV2 RGB measurements. '
-            r'The RGB reference for eFUN is EfficientNet-B0. PCR reads all progressive scans. Values are rounded to whole images/s.',
+            r'The RGB reference for eFUN is EfficientNet-B0. Values are rounded to whole images/s.',
             r'\end{minipage}',
             r'\end{table*}',
             '',
@@ -51,12 +51,11 @@ def write_tables():
     (PAPER / 'tables/deployment_results.tex').write_text('\n'.join(lines))
 
 
-def main(without_pcr=False):
-    systems = [system for system in SYSTEMS if not (without_pcr and system == 'PCR')]
+def main():
     figure, axes = plt.subplots(2, 2, figsize=(7.0, 1.80), sharex=True, sharey="row")
     figure.subplots_adjust(left=.095, right=.99, bottom=.13, top=.81, wspace=.12, hspace=.24)
-    plot_training(axes[0], systems)
-    plot_inference(axes[1], systems)
+    plot_training(axes[0])
+    plot_inference(axes[1])
     for ax in axes[1]:
         ax.set_title("")
     axes[0, 0].set_ylabel("Training")
@@ -66,13 +65,10 @@ def main(without_pcr=False):
     figure.legend(handles, labels, ncol=len(handles), loc="upper center",
                   bbox_to_anchor=(.5, 1), fontsize=7, handlelength=1.1, handletextpad=.3,
                   columnspacing=.6, borderaxespad=0, frameon=False)
-    save(figure, "evaluation/08_deployment_without_pcr" if without_pcr else "evaluation/08_deployment")
-    if not without_pcr:
-        write_tables()
+    save(figure, "evaluation/08_deployment")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--without-pcr', action='store_true',
-                        help='Export an additional deployment figure with PCR omitted.')
-    main(without_pcr=parser.parse_args().without_pcr)
+    parser.parse_args()
+    main()

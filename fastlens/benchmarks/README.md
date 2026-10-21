@@ -6,7 +6,7 @@ Choose the entry point by purpose:
 | --- | --- |
 | [`paper/`](paper/README.md) | Reviewer reproduction of `fastlens-final.pdf`, organized by section and experiment, with measured defaults |
 | [`development/`](development/README.md) | Supporting microbenchmarks, diagnostics and CPU regression checks |
-| [`baselines/`](baselines/README.md) | RGB/IC/FS/L3/PCR/nvCOMP comparison implementations and their tests |
+| [`baselines/`](baselines/README.md) | RGB/IC/FS/L3/nvCOMP comparison implementations and their tests |
 | [`paper/results/`](paper/results/README.md) | Complete published result tables, trial records and plotting inputs |
 | Other packages below | Shared data readers, models, training recipes and benchmark implementations used by those entry points |
 
@@ -38,8 +38,7 @@ python -m fastlens.benchmarks.paper.section_6_2_2.compact_input.run --help
 
 Development-only studies (`dct_retokenization/`, `coefficient_mask_evaluator/`,
 `metadata/`, `model_only_training_calibration.py`, `run_block_major_graph.py`) are
-not final-paper experiment entries. `baselines/pcr/` and `baselines/pcr_tensorflow/` support a later
-manuscript version and are not included in the final PDF's six RGB baselines.
+not final-paper experiment entries.
 Unit tests remain beside the implementations they test; `development.check`
 collects the CPU suites without launching paper measurements.
 

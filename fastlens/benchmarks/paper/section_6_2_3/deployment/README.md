@@ -1,6 +1,6 @@
 # §6.2.3 — Deployment performance (Figure 11a)
 
-Five DCT profiles; six RGB baselines; no PCR. The two MobileNet DCT profiles share one RGB model. Training/inference and model filters use the same protocol as matched DCT, so no duplicate measurement implementation is maintained.
+Five DCT profiles; six RGB baselines. The two MobileNet DCT profiles share one RGB model. Training/inference and model filters use the same protocol as matched DCT, so no duplicate measurement implementation is maintained.
 
 ```bash
 python -m fastlens.benchmarks.paper.section_6_2_3.deployment.run --help

@@ -21,7 +21,6 @@ def cpu_tests(jobs, env):
             'test_system_benchmark', 'test_training_benchmark', 'test_equal_image_epoch_benchmark',
             'test_prepare_imagenet512_v3_train', 'test_rgbnomore_fingerprint_cache')],
         ['fastlens.benchmarks.dct_models.tests.test_evaluation'],
-        ['fastlens.benchmarks.baselines.pcr.test_pcr'],
     ]
     env = dict(env, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1')
 

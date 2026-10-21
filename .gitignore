@@ -184,6 +184,9 @@ build_win/
 
 # Local raw experiment results; published tables live under benchmarks/paper/results.
 /results/
+# PCR experiments are kept outside this submission.
+/fastlens/benchmarks/baselines/pcr/
+/fastlens/benchmarks/baselines/pcr_tensorflow/
 /fastlens/benchmarks/profiling/INPUT_MOTIVATION.md
 
 # Generated FASTLENS documentation evidence; source reports remain visible

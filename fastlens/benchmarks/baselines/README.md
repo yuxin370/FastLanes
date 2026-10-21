@@ -10,8 +10,6 @@ the final-paper experiment entry points and measured defaults are in
 | [`system_rgbnomore/`](system_rgbnomore/README.md) | PyTorch/RGB-no-more and DALI readers, RGB/DCT comparison runners, shared model and training support | Yes |
 | [`l3/`](l3/README.md) | L3 codec, DALI operator, storage accounting and model-input baseline | Yes |
 | [`ffcv/`](ffcv/README.md) | FFCV input preparation and verification | Yes |
-| [`pcr/`](pcr/README.md) | Native progressive-JPEG baseline | Later manuscript only |
-| [`pcr_tensorflow/`](pcr_tensorflow/README.md) | TensorFlow PCR reproduction | Later manuscript only |
 | `nvcomp/` | nvCOMP implementations and their C++ headers | Development compression comparisons |
 
 The RGB package also contains the native FastLens comparison arm because its
