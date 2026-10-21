@@ -26,12 +26,12 @@ build*/
 data/fls/
 data/dct_blocks/
 
-#galp/
-galp/docs/*
-galp/data
-/galp/scripts/*
-!/galp/scripts/codegen/
-!/galp/scripts/codegen/**
+# FastLens local documentation and data
+fastlens/docs/*
+fastlens/data
+/fastlens/scripts/*
+!/fastlens/scripts/codegen/
+!/fastlens/scripts/codegen/**
 scripts/my_tool/*
 #########################################
 # Editor temporary/working/backup files #
@@ -157,24 +157,25 @@ build_win.bat
 cmake_output.txt
 build_win/
 
-# Content fingerprints cached beside large GALP shard manifests.
+# Content fingerprints cached beside large FASTLENS shard manifests.
 *.payload_fingerprints.json
 
-# GALP local benchmark outputs (results, checkpoints, profiler exports)
+# FASTLENS local benchmark outputs (results, checkpoints, profiler exports)
 /benchmark_results/
 
-# Local experiment scripts and results
+# Local experiment scripts and results, including relocated paper tables
 /experiments/
 /results/
-/galp/benchmarks/profiling/INPUT_MOTIVATION.md
-/galp/benchmarks/profiling/input_motivation.py
-/galp/benchmarks/profiling/input_motivation_dct.py
-/galp/benchmarks/profiling/plot_input_motivation.py
+/fastlens/benchmarks/paper/results/
+/fastlens/benchmarks/profiling/INPUT_MOTIVATION.md
+/fastlens/benchmarks/profiling/input_motivation.py
+/fastlens/benchmarks/profiling/input_motivation_dct.py
+/fastlens/benchmarks/profiling/plot_input_motivation.py
 
-# Generated GALP documentation evidence; source reports remain visible
-/galp/benchmarks/system_rgbnomore/docs/artifacts/
+# Generated FASTLENS documentation evidence; source reports remain visible
+/fastlens/benchmarks/baselines/system_rgbnomore/docs/artifacts/
 
-# Local GALP benchmark outputs at the repository root
+# Local FASTLENS benchmark outputs at the repository root
 /canonical_rgbnomore_index.csv
 /commands.json
 /contract.json
@@ -188,4 +189,8 @@ build_win/
 
 # Local duplicate workspace files
 /CALUDE.md
-/galp/benchmarks/system_dct_major/docs/* copy.md
+/fastlens/benchmarks/system_dct_major/docs/* copy.md
+
+# Local failure samples and review exports
+/failed.jpeg
+/review_exports/

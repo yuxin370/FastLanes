@@ -1,0 +1,2149 @@
+#!/usr/bin/env python3
+"""Validate DCT-major correctness, physical pushdown evidence, and performance."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import json
+import math
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from fastlens.benchmarks.system_dct_major.common import (
+    BLOCK_MAJOR_RUNTIME_PROFILE,
+    FASTLENS_PIPELINES,
+    PIPELINE_RESULT_SCHEMA,
+    SUMMARY_SCHEMA,
+    distribution,
+    load_contract,
+    load_sample_manifest,
+    parse_manifest,
+    read_json,
+    sample_trace,
+    selected_batches,
+    sha256_file,
+    sha256_json,
+    write_json,
+)
+
+
+def _require(condition: bool, failures: list[str], message: str) -> None:
+    if not condition:
+        failures.append(message)
+
+
+def _compact_plan_memory_is_consistent(native: dict[str, Any]) -> bool:
+    """Validate cumulative compact-plan bytes against the per-segment peak."""
+
+    segment_count = int(native.get("segment_count", 0))
+    compact_bytes = int(native.get("compact_plan_bytes", 0))
+    compact_peak = int(native.get("compact_plan_peak_bytes", 0))
+    return (
+        segment_count > 0
+        and compact_bytes > 0
+        and compact_peak > 0
+        and compact_bytes <= compact_peak * segment_count
+    )
+
+
+def _load_result(path: Path) -> dict[str, Any]:
+    payload = read_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"pipeline result is not an object: {path}")
+    return payload
+
+
+def _hot_repeats(contract: dict[str, Any], result: dict[str, Any]) -> list[dict[str, Any]]:
+    repeats = list(result["repeats"])
+    if contract["execution"].get("aggregate_exclude_first_repeat") and len(repeats) > 1:
+        return repeats[1:]
+    return repeats
+
+
+def _sum_hot_native(contract: dict[str, Any], result: dict[str, Any]) -> dict[str, float]:
+    records = _hot_repeats(contract, result)
+    keys = {
+        key
+        for repeat in records
+        for key, value in repeat.get("native_totals", {}).items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    return {
+        key: sum(float(repeat.get("native_totals", {}).get(key, 0.0)) for repeat in records) / len(records)
+        for key in keys
+    }
+
+
+def _aggregate(contract: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    cold = result["repeats"][0]
+    hot = _hot_repeats(contract, result)
+    throughput = [float(item["throughput_images_per_s"]) for item in hot]
+    steady = [
+        float(item["steady_throughput_images_per_s"])
+        for item in hot
+        if item.get("steady_throughput_images_per_s") is not None
+    ]
+
+    def native_distribution(key: str) -> dict[str, float | int] | None:
+        values = [
+            float(item["native_totals"][key])
+            for item in hot
+            if isinstance(item.get("native_totals", {}).get(key), (int, float))
+        ]
+        return distribution(values) if values else None
+
+    def process_io_distribution(key: str) -> dict[str, float | int] | None:
+        values = [
+            float(item["process_io"][key])
+            for item in hot
+            if isinstance(item.get("process_io"), dict)
+            and isinstance(item["process_io"].get(key), (int, float))
+        ]
+        return distribution(values) if len(values) == len(hot) else None
+
+    controlled_io = contract["execution"].get("cold_protocol") == "controlled-io"
+    cold_throughput = (
+        float(cold["repeat_scope_throughput_images_per_s"])
+        if controlled_io
+        else float(cold.get("process_scope_throughput_images_per_s") or cold["throughput_images_per_s"])
+    )
+    cold_ttfb = (
+        float(cold["repeat_scope_time_to_first_batch_ms"])
+        if controlled_io
+        else float(cold.get("process_scope_time_to_first_batch_ms") or cold["time_to_first_batch_ms"])
+    )
+    cold_seconds = float(cold["images"]) / cold_throughput
+    cold_input_ready_stall_ms = float(
+        cold.get("native_totals", {}).get("prefetch_consumer_wait_ms", 0.0)
+    )
+
+    def input_ready_stall_percent(item: dict[str, Any]) -> float:
+        seconds = float(item.get("seconds", 0.0))
+        wait_ms = float(item.get("native_totals", {}).get("prefetch_consumer_wait_ms", 0.0))
+        return 100.0 * wait_ms / (seconds * 1000.0) if seconds > 0.0 else 0.0
+
+    return {
+        "pipeline": result["pipeline"],
+        "display_name": result.get("display_name", result["pipeline"]),
+        "domain": result["domain"],
+        "coefficient_selection": {
+            key: result.get("pipeline_config", {}).get(key)
+            for key in (
+                "coefficient_spec",
+                "coefficient_selection_kind",
+                "coefficient_count",
+                "resolved_zigzag_column_indices",
+                "resolved_natural_indices",
+                "coefficient_seed",
+                "coefficient_mask_stage",
+            )
+            if key in result.get("pipeline_config", {})
+        },
+        "cold_start": {
+            "repeat": int(cold["repeat"]),
+            "scope": "controlled-repeat-scope" if controlled_io else "process-scope",
+            "seconds": cold_seconds,
+            "throughput_images_per_s": cold_throughput,
+            "time_to_first_batch_ms": cold_ttfb,
+            "batch_loop_throughput_images_per_s": float(cold["throughput_images_per_s"]),
+            "batch_loop_time_to_first_batch_ms": float(cold["time_to_first_batch_ms"]),
+            "first_shard_ready_ms": (
+                float(
+                    cold.get("first_shard_ready_ms")
+                    if controlled_io
+                    else cold.get("process_scope_first_shard_ready_ms")
+                    or cold.get("first_shard_ready_ms")
+                )
+                if cold.get("first_shard_ready_ms") is not None
+                or (not controlled_io and cold.get("process_scope_first_shard_ready_ms") is not None)
+                else None
+            ),
+            "steady_throughput_images_per_s": (
+                float(cold["steady_throughput_images_per_s"])
+                if cold.get("steady_throughput_images_per_s") is not None
+                else None
+            ),
+            "loader_mean_ms": float(cold["loader_submit_ms"]["mean"]),
+            "h2d_mean_ms": float(cold["top_level_h2d_ms"]["mean"]),
+            "model_mean_ms": float(cold["model_ms"]["mean"]),
+            "batch_latency_p50_ms": float(cold["latency_ms"]["p50"]),
+            "batch_latency_p95_ms": float(cold["latency_ms"]["p95"]),
+            "gpu_utilization_mean_percent": (
+                float(cold["gpu_utilization_percent"]["mean"])
+                if int(cold.get("gpu_utilization_percent", {}).get("count", 0)) > 0
+                else None
+            ),
+            "native_totals": cold.get("native_totals", {}),
+            "process_io": cold.get("process_io"),
+            "input_ready_stall_ms": cold_input_ready_stall_ms,
+            "input_ready_stall_percent": (
+                100.0 * cold_input_ready_stall_ms / (cold_seconds * 1000.0)
+                if cold_seconds > 0.0
+                else 0.0
+            ),
+        },
+        "throughput_images_per_s": distribution(throughput),
+        "throughput_endpoint_drift": (
+            abs(throughput[-1] - throughput[0]) / throughput[0]
+            if len(throughput) > 1 and throughput[0]
+            else 0.0
+        ),
+        "time_to_first_batch_ms": distribution([float(item["time_to_first_batch_ms"]) for item in hot]),
+        "steady_throughput_images_per_s": distribution(steady) if steady else None,
+        "latency_mean_ms": distribution([float(item["latency_ms"]["mean"]) for item in hot]),
+        "batch_latency_p50_ms": distribution([float(item["latency_ms"]["p50"]) for item in hot]),
+        "batch_latency_p95_ms": distribution([float(item["latency_ms"]["p95"]) for item in hot]),
+        "loader_mean_ms": distribution([float(item["loader_submit_ms"]["mean"]) for item in hot]),
+        "process_io_logical_read_bytes": process_io_distribution("logical_read_bytes"),
+        "process_io_storage_read_bytes": process_io_distribution("storage_read_bytes"),
+        "process_io_read_syscalls": process_io_distribution("read_syscalls"),
+        "input_ready_stall_percent": distribution(
+            [input_ready_stall_percent(item) for item in hot]
+        ),
+        "h2d_mean_ms": distribution([float(item["top_level_h2d_ms"]["mean"]) for item in hot]),
+        "model_mean_ms": distribution([float(item["model_ms"]["mean"]) for item in hot]),
+        "accuracy_top1": distribution(
+            [float(item["accuracy_top1"]) for item in hot if "accuracy_top1" in item]
+        )
+        if any("accuracy_top1" in item for item in hot)
+        else None,
+        "accuracy_top5": distribution(
+            [float(item["accuracy_top5"]) for item in hot if "accuracy_top5" in item]
+        )
+        if any("accuracy_top5" in item for item in hot)
+        else None,
+        "cross_entropy_loss": distribution(
+            [float(item["cross_entropy_loss"]) for item in hot if "cross_entropy_loss" in item]
+        )
+        if any("cross_entropy_loss" in item for item in hot)
+        else None,
+        "host_peak_rss_bytes": distribution([float(item["host_peak_rss_bytes"]) for item in hot]),
+        "training_loss": distribution([float(item["training_loss"]) for item in hot])
+        if contract["workload"]["kind"] == "training-throughput" else None,
+        "peak_torch_gpu_allocated_bytes": distribution(
+            [float(item["peak_torch_gpu_allocated_bytes"]) for item in hot]
+        ),
+        "peak_torch_gpu_reserved_bytes": distribution(
+            [float(item["peak_torch_gpu_reserved_bytes"]) for item in hot]
+        ),
+        "gpu_utilization_percent": distribution(
+            [
+                float(item["gpu_utilization_percent"]["mean"])
+                for item in hot
+                if int(item.get("gpu_utilization_percent", {}).get("count", 0)) > 0
+            ]
+        )
+        if any(int(item.get("gpu_utilization_percent", {}).get("count", 0)) > 0 for item in hot)
+        else None,
+        "galp_native_device_peak_in_use_bytes": native_distribution(
+            "galp_native_device_peak_in_use_bytes"
+        ),
+        "galp_native_pinned_peak_in_use_bytes": native_distribution(
+            "galp_native_pinned_peak_in_use_bytes"
+        ),
+        "compact_plan_peak_bytes": native_distribution("compact_plan_peak_bytes"),
+        "native_hot_mean": _sum_hot_native(contract, result),
+    }
+
+
+def _artifact(path: str) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as payload:
+        return {name: np.asarray(payload[name]) for name in payload.files if name != "metadata_json"}
+
+
+def _array_metrics(left: np.ndarray, right: np.ndarray) -> dict[str, Any]:
+    if left.shape != right.shape:
+        return {"shape_match": False, "left_shape": list(left.shape), "right_shape": list(right.shape)}
+    if left.size == 0:
+        return {"shape_match": True, "max_abs": 0.0, "mean_abs": 0.0, "cosine_mean": 1.0}
+    lhs = left.astype(np.float64)
+    rhs = right.astype(np.float64)
+    delta = np.abs(lhs - rhs)
+    flat_lhs = lhs.reshape(lhs.shape[0], -1)
+    flat_rhs = rhs.reshape(rhs.shape[0], -1)
+    denominator = np.linalg.norm(flat_lhs, axis=1) * np.linalg.norm(flat_rhs, axis=1)
+    cosine = np.divide(
+        np.sum(flat_lhs * flat_rhs, axis=1),
+        denominator,
+        out=np.ones_like(denominator),
+        where=denominator != 0,
+    )
+    return {
+        "shape_match": True,
+        "max_abs": float(delta.max()),
+        "mean_abs": float(delta.mean()),
+        "cosine_mean": float(cosine.mean()),
+    }
+
+
+def _semantic_compare(
+    left_name: str,
+    right_name: str,
+    left: dict[str, Any],
+    right: dict[str, Any],
+    contract: dict[str, Any],
+    *,
+    strict: bool,
+    failures: list[str],
+) -> dict[str, Any]:
+    lhs = _artifact(left["semantic_artifact"])
+    rhs = _artifact(right["semantic_artifact"])
+    thresholds = contract["semantic_validation"]
+    result: dict[str, Any] = {
+        "pipelines": [left_name, right_name],
+        "enforcement": "strict" if strict else "diagnostic",
+        "inputs": {},
+    }
+    identity_ok = np.array_equal(lhs.get("ordinals"), rhs.get("ordinals")) and np.array_equal(
+        lhs.get("labels"), rhs.get("labels")
+    )
+    result["sample_identity_match"] = bool(identity_ok)
+    if strict and not identity_ok:
+        failures.append(f"semantic {left_name}/{right_name}: sample identity differs")
+    common_inputs = sorted(set(name for name in lhs if name.startswith("input_")).intersection(rhs))
+    inputs_ok = True
+    for name in common_inputs:
+        metrics = _array_metrics(lhs[name], rhs[name])
+        max_abs_limit = float(thresholds["input_max_abs"])
+        mean_abs_limit = float(thresholds.get("input_mean_abs", math.inf))
+        ok = bool(
+            metrics.get("shape_match")
+            and metrics.get("max_abs", math.inf) <= max_abs_limit
+            and metrics.get("mean_abs", math.inf) <= mean_abs_limit
+        )
+        metrics["max_abs_limit"] = max_abs_limit
+        metrics["mean_abs_limit"] = mean_abs_limit
+        metrics["ok"] = ok
+        result["inputs"][name] = metrics
+        inputs_ok = inputs_ok and ok
+        if strict and not ok:
+            failures.append(f"semantic {left_name}/{right_name}: {name} differs")
+    output_metrics = _array_metrics(lhs["output"], rhs["output"])
+    output_kind = "feature" if contract["workload"]["kind"] == "feature-extraction" else "logit"
+    cosine_min = float(thresholds.get(f"{output_kind}_cosine_min", thresholds.get("cosine_min", 1.0)))
+    max_abs_limit = thresholds.get(f"{output_kind}_max_abs")
+    mean_abs_limit = thresholds.get(f"{output_kind}_mean_abs")
+    output_ok = bool(
+        output_metrics.get("shape_match")
+        and output_metrics.get("cosine_mean", -1.0) >= cosine_min
+        and (max_abs_limit is None or output_metrics.get("max_abs", math.inf) <= float(max_abs_limit))
+        and (mean_abs_limit is None or output_metrics.get("mean_abs", math.inf) <= float(mean_abs_limit))
+    )
+    output_metrics["cosine_min"] = cosine_min
+    if max_abs_limit is not None:
+        output_metrics["max_abs_limit"] = float(max_abs_limit)
+    if mean_abs_limit is not None:
+        output_metrics["mean_abs_limit"] = float(mean_abs_limit)
+    output_metrics["ok"] = output_ok
+    result["output"] = output_metrics
+    prediction_ok = True
+    if contract["workload"]["kind"] == "evaluation":
+        semantic_top1_agreement = float(np.mean(np.argmax(lhs["output"], axis=1) == np.argmax(rhs["output"], axis=1)))
+        semantic_top1_min = float(thresholds.get("semantic_top1_agreement_min", 1.0))
+        semantic_prediction_ok = semantic_top1_agreement >= semantic_top1_min
+        prediction_ok = prediction_ok and semantic_prediction_ok
+        result["semantic_top1_agreement"] = semantic_top1_agreement
+        result["semantic_top1_agreement_min"] = semantic_top1_min
+        if strict and not semantic_prediction_ok:
+            failures.append(f"semantic {left_name}/{right_name}: semantic Top-1 agreement is too low")
+    if contract["workload"]["kind"] == "evaluation" and "top1_predictions" in lhs and "top1_predictions" in rhs:
+        full_top1_agreement = float(np.mean(lhs["top1_predictions"] == rhs["top1_predictions"]))
+        full_top1_min = float(thresholds.get("full_prediction_top1_agreement_min", 1.0))
+        full_prediction_ok = full_top1_agreement >= full_top1_min
+        prediction_ok = prediction_ok and full_prediction_ok
+        result["full_top1_prediction_agreement"] = full_top1_agreement
+        result["full_top1_prediction_agreement_min"] = full_top1_min
+        if strict and not full_prediction_ok:
+            failures.append(f"semantic {left_name}/{right_name}: full Top-1 agreement is too low")
+    result["ok"] = bool(identity_ok and inputs_ok and output_ok and prediction_ok)
+    if strict and not output_ok:
+        failures.append(f"semantic {left_name}/{right_name}: model output differs")
+    return result
+
+
+def _compare_raw_mask_oracle(
+    native_result: dict[str, Any],
+    contract: dict[str, Any],
+    failures: list[str],
+) -> dict[str, Any] | None:
+    """Compare full native predictions with the audited raw-JPEG mask run."""
+
+    if contract["workload"]["kind"] != "evaluation":
+        return None
+    selection = native_result.get("pipeline_config", {})
+    oracle = contract.get("semantic_validation", {}).get("raw_mask_oracle")
+    if oracle is None:
+        if (
+            selection.get("coefficient_selection_kind") == "prefix"
+            and int(selection.get("coefficient_count", 0)) == 32
+        ):
+            failures.append("FASTLENS first:32 evaluation is missing the raw-mask oracle contract")
+        return None
+
+    condition_id = str(oracle["condition_id"])
+    predictions_column = f"{condition_id}__top1_class"
+    predictions_fingerprint = oracle["per_sample_top1"]
+    curve_fingerprint = oracle["prefix_accuracy_curve"]
+    metadata_fingerprint = oracle["run_metadata"]
+    predictions_path = Path(predictions_fingerprint["path"])
+    curve_path = Path(curve_fingerprint["path"])
+    metadata_path = Path(metadata_fingerprint["path"])
+    for path, fingerprint in (
+        (predictions_path, predictions_fingerprint),
+        (curve_path, curve_fingerprint),
+        (metadata_path, metadata_fingerprint),
+    ):
+        _require(
+            path.is_file() and sha256_file(path) == fingerprint.get("sha256"),
+            failures,
+            f"raw-mask oracle artifact changed: {path}",
+        )
+    if not predictions_path.is_file() or not curve_path.is_file() or not metadata_path.is_file():
+        return None
+
+    metadata = read_json(metadata_path)
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    signature = metadata_dict.get("run_signature", {})
+    signature = signature if isinstance(signature, dict) else {}
+    oracle_conditions = {
+        str(item.get("condition_id")): item
+        for item in signature.get("conditions", [])
+        if isinstance(item, dict)
+    }
+    oracle_condition = oracle_conditions.get(condition_id)
+    expected_checkpoint_sha256 = contract["models"]["dct"]["checkpoint_sha256"]
+    expected_stage = str(selection["coefficient_mask_stage"])
+    expected_natural_indices = list(selection["resolved_natural_indices"])
+    _require(metadata_dict.get("status") == "complete", failures, "raw-mask oracle run is incomplete")
+    _require(
+        signature.get("checkpoint_sha256") == expected_checkpoint_sha256,
+        failures,
+        "raw-mask oracle checkpoint differs from the FASTLENS DCT checkpoint",
+    )
+    _require(
+        signature.get("mask_application_stage") == expected_stage,
+        failures,
+        "raw-mask oracle coefficient mask stage differs from the FASTLENS contract",
+    )
+    _require(
+        isinstance(oracle_condition, dict)
+        and oracle_condition.get("natural_indices") == expected_natural_indices,
+        failures,
+        f"raw-mask oracle condition {condition_id} differs from the resolved coefficient selection",
+    )
+    _require(
+        int(signature.get("sample_count", -1)) >= int(contract["dataset"]["sample_count"]),
+        failures,
+        "raw-mask oracle does not cover the FASTLENS evaluation sample count",
+    )
+
+    artifact = _artifact(native_result["semantic_artifact"])
+    native_predictions = np.asarray(artifact.get("top1_predictions", []), dtype=np.int64)
+    samples = load_sample_manifest(
+        Path(contract["dataset"]["sample_manifest"]),
+        contract["dataset"]["sample_manifest_sha256"],
+    )
+    oracle_predictions: list[int] = []
+    identity_match = True
+    with gzip.open(predictions_path, "rt", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if predictions_column not in (reader.fieldnames or []):
+            failures.append(f"raw-mask oracle has no column {predictions_column}")
+            return None
+        for sample, row in zip(samples, reader, strict=False):
+            logical_id = sample.get("sample_id") or sample.get("logical_sample_id")
+            identity_match = identity_match and str(row.get("logical_sample_id")) == str(logical_id)
+            identity_match = identity_match and int(row.get("label", -1)) == int(sample["label"])
+            oracle_predictions.append(int(row[predictions_column]))
+    oracle_array = np.asarray(oracle_predictions, dtype=np.int64)
+    identity_match = identity_match and len(oracle_array) == len(samples)
+    _require(identity_match, failures, "raw-mask oracle sample identity/order differs from the FASTLENS contract")
+    _require(
+        native_predictions.shape == oracle_array.shape,
+        failures,
+        "raw-mask oracle/native full prediction shapes differ",
+    )
+    agreement = (
+        float(np.mean(native_predictions == oracle_array))
+        if native_predictions.shape == oracle_array.shape and native_predictions.size
+        else 0.0
+    )
+    minimum_agreement = float(
+        contract["semantic_validation"].get("full_prediction_top1_agreement_min", 0.999)
+    )
+    _require(
+        agreement >= minimum_agreement,
+        failures,
+        f"native/raw-mask full Top-1 agreement {agreement:.6f} is below {minimum_agreement:.6f}",
+    )
+
+    oracle_row: dict[str, str] | None = None
+    with curve_path.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            if row.get("condition_id") == condition_id:
+                oracle_row = row
+                break
+    _require(oracle_row is not None, failures, f"raw-mask accuracy curve has no row {condition_id}")
+    curve_accuracy = float(oracle_row["accuracy_top1"]) if oracle_row is not None else math.nan
+    oracle_labels = np.asarray([int(sample["label"]) for sample in samples], dtype=np.int64)
+    oracle_accuracy = (
+        float(np.mean(oracle_array == oracle_labels))
+        if oracle_array.shape == oracle_labels.shape and oracle_array.size
+        else math.nan
+    )
+    if len(samples) == int(signature.get("sample_count", -1)):
+        _require(
+            math.isclose(oracle_accuracy, curve_accuracy, rel_tol=0.0, abs_tol=1.0e-12),
+            failures,
+            "raw-mask per-sample predictions disagree with the published full accuracy curve",
+        )
+    native_accuracy = float(native_result["repeats"][0]["accuracy_top1"])
+    accuracy_delta = native_accuracy - oracle_accuracy
+    configured_maximum_delta = float(
+        contract["semantic_validation"].get("native_oracle_accuracy_delta_max", 0.0005)
+    )
+    # A smoke prefix cannot represent an accuracy delta smaller than one
+    # sample.  Keep the published full-run threshold for formal 50K, while
+    # allowing at most one-sample resolution on shorter exact-order prefixes.
+    maximum_delta = max(
+        configured_maximum_delta,
+        1.0 / len(oracle_array) if len(oracle_array) else math.inf,
+    )
+    _require(
+        abs(accuracy_delta) <= maximum_delta,
+        failures,
+        f"native/raw-mask Top-1 delta {100.0 * accuracy_delta:.6f} pp exceeds {100.0 * maximum_delta:.6f} pp",
+    )
+    return {
+        "condition_id": condition_id,
+        "checkpoint_sha256": expected_checkpoint_sha256,
+        "coefficient_mask_stage": expected_stage,
+        "sample_count": len(oracle_array),
+        "sample_identity_match": identity_match,
+        "full_top1_prediction_agreement": agreement,
+        "full_top1_prediction_agreement_min": minimum_agreement,
+        "native_accuracy_top1": native_accuracy,
+        "oracle_accuracy_top1": oracle_accuracy,
+        "oracle_full_curve_accuracy_top1": curve_accuracy,
+        "accuracy_delta_percentage_points": 100.0 * accuracy_delta,
+        "accuracy_delta_max_percentage_points": 100.0 * maximum_delta,
+        "configured_accuracy_delta_max_percentage_points": 100.0 * configured_maximum_delta,
+        "ok": bool(
+            identity_match
+            and native_predictions.shape == oracle_array.shape
+            and agreement >= minimum_agreement
+            and abs(accuracy_delta) <= maximum_delta
+        ),
+    }
+
+
+def _active_output_schedule_accounting(
+    segments: Sequence[dict[str, Any]],
+) -> tuple[int, int] | None:
+    """Account for expanded or shared-image schedules in the fixed-512 profile."""
+    index_bytes = 0
+    contribution_visits = 0
+    for segment in segments:
+        outputs = int(segment.get("planless_transform_output_block_count", 0))
+        contributions = int(segment.get("planless_transform_source_contribution_count", 0))
+        visits = int(segment.get("planless_transform_source_contribution_visit_count", 0))
+        images = int(segment.get("fixed_transform_image_count", 0))
+        sidecar = (
+            int(segment.get("active_output_schedule_sidecar_hit_count", 0))
+            + int(segment.get("active_output_schedule_sidecar_miss_count", 0))
+        )
+        repetitions = 1 if sidecar or visits == 2 * contributions else images
+        if (
+            repetitions <= 0 or outputs <= 0 or contributions <= 0
+            or outputs % repetitions != 0 or contributions % repetitions != 0
+            or visits * repetitions != 2 * contributions
+        ):
+            return None
+        index_bytes += outputs // repetitions * 4
+        contribution_visits += 2 * (contributions // repetitions)
+    return index_bytes, contribution_visits
+
+
+def _native_logical_segments_match_manifest(
+    segments: Sequence[dict[str, Any]],
+    shards: Sequence[dict[str, Any]],
+    batch_size: int,
+    image_count: int,
+) -> bool:
+    selected = [shard for shard in shards if int(shard["first_global_image_index"]) < image_count]
+    expected = []
+    for shard in selected:
+        batch_first = int(shard["first_global_image_index"]) // batch_size * batch_size
+        expected.append((batch_first, min(batch_first + batch_size, image_count) - 1, int(shard["image_count"])))
+    observed = [
+        (segment.get("segment_first_image_id"), segment.get("segment_last_image_id"),
+         segment.get("fixed_transform_image_count"))
+        for segment in segments
+    ]
+    return observed == expected and sum(int(shard["image_count"]) for shard in selected) == image_count
+
+
+def _validate_result(
+    name: str,
+    result: dict[str, Any],
+    contract: dict[str, Any],
+    expected_trace: list[dict[str, int]],
+    failures: list[str],
+) -> None:
+    _require(result.get("schema_version") == PIPELINE_RESULT_SCHEMA, failures, f"{name}: bad result schema")
+    _require(result.get("pipeline") == name, failures, f"{name}: pipeline identity mismatch")
+    _require(result.get("contract_sha256") == sha256_json(contract), failures, f"{name}: contract hash mismatch")
+    _require(result.get("sample_manifest_sha256") == contract["dataset"]["sample_manifest_sha256"], failures, f"{name}: sample manifest hash mismatch")
+    repeats = result.get("repeats")
+    _require(isinstance(repeats, list) and len(repeats) == contract["execution"]["repeats"], failures, f"{name}: repeat count mismatch")
+    training = contract["workload"]["kind"] == "training-throughput"
+    if training:
+        probe = result.get("training_probe", {})
+        for key in ("finite_gradients", "nonzero_gradients", "parameters_updated"):
+            _require(probe.get(key) is True, failures, f"{name}: training first-step {key} failed")
+    for repeat in repeats if isinstance(repeats, list) else []:
+        _require(repeat.get("sample_trace") == expected_trace, failures, f"{name}: no-shuffle sample trace mismatch")
+        _require(int(repeat.get("images", -1)) == len(expected_trace), failures, f"{name}: measured image count mismatch")
+        if training:
+            steps = contract["execution"]["measurement_batches"]
+            _require(repeat.get("optimizer_steps") == steps, failures, f"{name}: optimizer step count mismatch")
+            _require(
+                repeat.get("cumulative_optimizer_steps") == (repeat["repeat"] + 1) * steps,
+                failures, f"{name}: cumulative optimizer step count mismatch",
+            )
+            loss = repeat.get("training_loss")
+            _require(isinstance(loss, (int, float)) and math.isfinite(loss), failures, f"{name}: non-finite training loss")
+            _require(repeat.get("finite_parameters") is True, failures, f"{name}: non-finite training parameters")
+        first_batch_ms = repeat.get("time_to_first_batch_ms")
+        _require(
+            isinstance(first_batch_ms, (int, float)) and math.isfinite(float(first_batch_ms)) and first_batch_ms > 0.0,
+            failures,
+            f"{name}: invalid time-to-first-batch measurement",
+        )
+        steady = repeat.get("steady_throughput_images_per_s")
+        if int(repeat.get("batches", 0)) > 1:
+            _require(
+                isinstance(steady, (int, float)) and math.isfinite(float(steady)) and steady > 0.0,
+                failures,
+                f"{name}: missing steady-state throughput",
+            )
+        pipeline_config = contract["pipelines"].get(name, {})
+        if name in FASTLENS_PIPELINES:
+            _require(
+                pipeline_config.get("runtime_profile") == BLOCK_MAJOR_RUNTIME_PROFILE,
+                failures,
+                f"{name}: missing current native runtime profile",
+            )
+            native = repeat.get("native_totals", {})
+            native_segments = repeat.get("native_segments", [])
+            _require(
+                isinstance(native_segments, list) and bool(native_segments),
+                failures,
+                f"{name}: manifest-shard execution reported no shard segments",
+            )
+            logical_segments = bool(native_segments) and all(
+                item.get("segment_mode") == "native-logical-batch" for item in native_segments
+            )
+            if logical_segments:
+                _require(
+                    _native_logical_segments_match_manifest(
+                        native_segments,
+                        parse_manifest(Path(pipeline_config["manifest"]))["shards"],
+                        int(contract["execution"]["batch_size"]),
+                        len(expected_trace),
+                    ),
+                    failures,
+                    f"{name}: logical-batch physical statistics do not cover each manifest shard exactly once",
+                )
+            else:
+                shard_ids = [int(item.get("segment_shard_id", -1)) for item in native_segments]
+                _require(
+                    all(shard_id >= 0 for shard_id in shard_ids) and len(shard_ids) == len(set(shard_ids)),
+                    failures,
+                    f"{name}: manifest shards were missing or reactivated: {shard_ids}",
+                )
+            _require(
+                int(native.get("segment_count", -1)) == len(native_segments),
+                failures,
+                f"{name}: one native plan/result is required for every manifest shard",
+            )
+            for counter in (
+                "segment_cross_shard_count",
+                "shard_reactivation_count",
+                "duplicate_physical_read_count",
+                "rowgroup_revisit_count",
+                "vector_run_revisit_count",
+                "physical_read_order_inversions",
+            ):
+                if logical_segments and counter in {"segment_cross_shard_count", "shard_reactivation_count"}:
+                    continue
+                _require(
+                    int(native.get(counter, -1)) == 0,
+                    failures,
+                    f"{name}: {counter} must be zero in manifest-shard mode, got {native.get(counter)!r}",
+                )
+            first_shard_ready = repeat.get("first_shard_ready_ms")
+            _require(
+                isinstance(first_shard_ready, (int, float))
+                and math.isfinite(float(first_shard_ready))
+                and float(first_shard_ready) > 0.0,
+                failures,
+                f"{name}: missing first-shard ready time",
+            )
+        if name in FASTLENS_PIPELINES:
+            native = repeat.get("native_totals", {})
+            coefficient_count = pipeline_config.get("coefficient_count")
+            if isinstance(coefficient_count, int):
+                selected_coefficient_count = int(native.get("selected_coefficient_count", -1))
+                full_coefficient_count = int(native.get("full_coefficient_count", -1))
+                _require(
+                    selected_coefficient_count > 0
+                    and full_coefficient_count > 0
+                    and math.isclose(
+                        selected_coefficient_count / full_coefficient_count,
+                        coefficient_count / 64.0,
+                        rel_tol=1.0e-12,
+                        abs_tol=1.0e-12,
+                    )
+                    and math.isclose(
+                        float(native.get("selected_coefficient_ratio", math.nan)),
+                        coefficient_count / 64.0,
+                        rel_tol=1.0e-12,
+                        abs_tol=1.0e-12,
+                    ),
+                    failures,
+                    f"{name}: native selected/full coefficient metrics disagree with K={coefficient_count}",
+                )
+            _require(
+                isinstance(contract["dataset"].get("block_major_access"), dict),
+                failures,
+                "dct_major_pushdown: missing immutable block-major descriptor contract",
+            )
+            _require(
+                contract["dataset"].get("block_major_access", {}).get("passes_one_percent") is True,
+                failures,
+                "dct_major_pushdown: block-major descriptor did not pass the 1% storage gate",
+            )
+            for counter in (
+                "host_expanded_transform_items_created",
+                "host_output_block_source_lists_created",
+                "host_global_transform_sort_items",
+            ):
+                _require(
+                    int(native.get(counter, -1)) == 0,
+                    failures,
+                    f"dct_major_pushdown: {counter} must be zero, got {native.get(counter)!r}",
+                )
+            _require(
+                int(native.get("planless_transform_kernel_launch_count", 0)) > 0,
+                failures,
+                "dct_major_pushdown: no planless transform kernel was launched",
+            )
+            _require(
+                int(native.get("planless_image_descriptor_count", -1)) == int(repeat.get("images", -2)),
+                failures,
+                "dct_major_pushdown: logical planless image descriptor count must equal measured images, "
+                f"got {native.get('planless_image_descriptor_count')!r} for {repeat.get('images')!r}",
+            )
+            full_scan_outputs = int(
+                native.get("planless_transform_full_scan_output_block_count", 0)
+            )
+            active_outputs = int(native.get("planless_transform_output_block_count", 0))
+            skipped_outputs = int(
+                native.get("planless_transform_skipped_output_block_count", 0)
+            )
+            if full_scan_outputs > 0:
+                schedule_accounting = _active_output_schedule_accounting(repeat["native_segments"])
+                for counter in (
+                    "planless_transform_output_block_count",
+                    "planless_transform_source_contribution_count",
+                ):
+                    _require(
+                        sum(int(segment.get(counter, 0)) for segment in repeat["native_segments"])
+                        == int(native.get(counter, -1)),
+                        failures,
+                        f"{name}: {counter} disagrees with physical segments",
+                    )
+                _require(
+                    0 < active_outputs <= full_scan_outputs,
+                    failures,
+                    "dct_major_pushdown: resident-output schedule is empty or exceeds its full scan",
+                )
+                _require(
+                    skipped_outputs == full_scan_outputs - active_outputs,
+                    failures,
+                    "dct_major_pushdown: resident-output skip accounting is inconsistent",
+                )
+                _require(
+                    schedule_accounting is not None
+                    and int(native.get("planless_transform_active_output_index_bytes", -1))
+                    == schedule_accounting[0],
+                    failures,
+                    f"{name}: active-output index byte accounting is inconsistent",
+                )
+                schedule_builds = int(
+                    native.get("planless_transform_active_output_schedule_build_count", 0)
+                )
+                schedule_hits = int(
+                    native.get("active_output_schedule_sidecar_hit_count", 0)
+                )
+                schedule_executions = schedule_builds + schedule_hits
+                schedule_worksets = int(
+                    native.get("planless_transform_active_output_workset_count", -1)
+                )
+                _require(
+                    schedule_executions == int(native.get("segment_count", -1)),
+                    failures,
+                    "dct_major_pushdown: active-output schedule must be built or loaded exactly once per segment",
+                )
+                _require(
+                    schedule_worksets == int(native.get("workset_count", -2)),
+                    failures,
+                    "dct_major_pushdown: active-output workset coverage disagrees with execution",
+                )
+                _require(
+                    int(native.get("planless_transform_active_output_offset_bytes", -1))
+                    == (schedule_worksets + schedule_executions) * 8,
+                    failures,
+                    "dct_major_pushdown: active-output offset byte accounting is inconsistent",
+                )
+                _require(
+                    int(native.get("planless_transform_active_output_offsets_valid", 0))
+                    == schedule_executions,
+                    failures,
+                    "dct_major_pushdown: active-output offsets were not monotonic/bounded for every segment",
+                )
+                # Native peak is a per-segment maximum while index/offset bytes
+                # above are totals across segments. A maximum must cover at
+                # least the average persistent schedule, without pretending
+                # that all segment schedules coexist.
+                persistent_schedule_bytes = (
+                    (
+                        int(native.get("planless_transform_active_output_index_bytes", 0))
+                        + int(native.get("planless_transform_active_output_offset_bytes", 0))
+                    )
+                    / schedule_executions
+                    if schedule_executions > 0
+                    else float("inf")
+                )
+                _require(
+                    int(native.get("planless_transform_active_output_schedule_peak_bytes", -1))
+                    >= persistent_schedule_bytes,
+                    failures,
+                    "dct_major_pushdown: active-output schedule peak does not cover its persistent arrays",
+                )
+                _require(
+                    int(native.get("planless_transform_source_contribution_count", 0)) > 0,
+                    failures,
+                    "dct_major_pushdown: active-output schedule reported no source contributions",
+                )
+                _require(
+                    schedule_accounting is not None
+                    and int(native.get("planless_transform_source_contribution_visit_count", -1))
+                    == schedule_accounting[1],
+                    failures,
+                    f"{name}: deterministic count/fill contribution visits are inconsistent",
+                )
+                _require(
+                    int(native.get("planless_transform_output_workset_ownership_count", -1))
+                    == active_outputs,
+                    failures,
+                    "dct_major_pushdown: output/workset ownership count disagrees with the active index",
+                )
+                coordinate_entries = int(native.get("coordinate_group_index_entries", -1))
+                coordinate_populated = int(native.get("coordinate_group_index_populated", -1))
+                coordinate_holes = int(native.get("coordinate_group_index_holes", -1))
+                _require(
+                    int(native.get("coordinate_group_lookup_count", 0)) > 0
+                    and coordinate_populated > 0
+                    and coordinate_entries == coordinate_populated + coordinate_holes,
+                    failures,
+                    "dct_major_pushdown: coordinate-to-group index accounting is inconsistent",
+                )
+                _require(
+                    int(native.get("coordinate_group_index_bytes", -1)) >= coordinate_entries * 4,
+                    failures,
+                    "dct_major_pushdown: coordinate-to-group index byte accounting is incomplete",
+                )
+                expected_density = (
+                    coordinate_populated / coordinate_entries if coordinate_entries > 0 else 0.0
+                )
+                _require(
+                    abs(float(native.get("coordinate_group_index_density", -1.0)) - expected_density)
+                    <= 1.0e-12,
+                    failures,
+                    "dct_major_pushdown: coordinate-to-group index density is inconsistent",
+                )
+                split_schedule_ms = sum(
+                    float(native.get(key, -1.0))
+                    for key in (
+                        "planless_transform_group_workset_build_ms",
+                        "planless_transform_active_output_count_ms",
+                        "planless_transform_active_output_prefix_ms",
+                        "planless_transform_active_output_fill_ms",
+                    )
+                )
+                _require(
+                    split_schedule_ms >= 0.0
+                    and split_schedule_ms
+                    <= float(native.get("planless_transform_active_output_planning_ms", 0.0)),
+                    failures,
+                    "dct_major_pushdown: split active-output timings are missing or exceed total planning",
+                )
+                _require(
+                    float(native.get("planless_transform_active_output_planning_ms", 0.0)) > 0.0,
+                    failures,
+                    "dct_major_pushdown: active-output CPU schedule timing is missing",
+                )
+                _require(
+                    float(native.get("planless_transform_gpu_kernel_ms", 0.0)) > 0.0,
+                    failures,
+                    "dct_major_pushdown: separately timed planless CUDA kernel elapsed is missing",
+                )
+            strategy_count = sum(
+                int(native.get(key, 0))
+                for key in (
+                    "run_interval_exact_rowgroup_count",
+                    "run_interval_bounded_rowgroup_count",
+                    "bitmap_exact_rowgroup_count",
+                    "full_rowgroup_strategy_count",
+                )
+            )
+            _require(
+                strategy_count == int(native.get("rowgroup_count", -1)),
+                failures,
+                "dct_major_pushdown: adaptive strategy counts do not cover every rowgroup",
+            )
+            planned_vectors = int(native.get("planned_vector_count", -1))
+            actual_vectors = int(native.get("actual_vector_count", -2))
+            _require(
+                planned_vectors > 0 and planned_vectors == actual_vectors,
+                failures,
+                "dct_major_pushdown: selected decode requires positive planned=actual vectors, "
+                f"got {planned_vectors}/{actual_vectors}",
+            )
+            _require(
+                int(native.get("sparse_read_fallback_rowgroup_count", -1)) == 0,
+                failures,
+                "dct_major_pushdown: selected-range execution used sparse fallback",
+            )
+            cap_ppm = 1_100_000
+            local_cap_ppm = 0
+            max_run_bytes = 0
+            _require(
+                int(native.get("bounded_read_amplification_ppm", -1)) == cap_ppm
+                and int(native.get("bounded_read_local_amplification_ppm", -1)) == local_cap_ppm
+                and int(native.get("bounded_read_max_run_bytes", -1)) == max_run_bytes,
+                failures,
+                "dct_major_pushdown: runtime bounded-read configuration differs from the native profile",
+            )
+            exact_bytes = int(native.get("bounded_exact_storage_bytes", -1))
+            physical_bytes = int(native.get("bounded_physical_storage_bytes", -1))
+            gap_bytes = int(native.get("bounded_merged_gap_bytes", -1))
+            full_bytes = int(native.get("full_compressed_payload_bytes", -1))
+            selected_bytes = int(native.get("selected_compressed_payload_bytes", -1))
+            actual_read_bytes = int(native.get("compressed_payload_bytes_read", -1))
+            _require(
+                exact_bytes > 0
+                and gap_bytes == physical_bytes - exact_bytes,
+                failures,
+                "dct_major_pushdown: bounded-subset exact/physical/gap byte accounting is inconsistent",
+            )
+            _require(
+                selected_bytes > 0
+                and actual_read_bytes == selected_bytes + gap_bytes
+                and actual_read_bytes <= (selected_bytes * cap_ppm) // 1_000_000
+                and actual_read_bytes <= full_bytes
+                and physical_bytes <= (exact_bytes * cap_ppm) // 1_000_000,
+                failures,
+                "dct_major_pushdown: selected/physical bytes exceed the whole-run cap or full payload",
+            )
+            expected_read_amplification = (
+                actual_read_bytes / selected_bytes if selected_bytes > 0 else 0.0
+            )
+            _require(
+                math.isclose(
+                    float(native.get("read_amplification", math.nan)),
+                    expected_read_amplification,
+                    rel_tol=1.0e-12,
+                    abs_tol=1.0e-12,
+                ),
+                failures,
+                "dct_major_pushdown: read amplification is not the whole-run physical/exact ratio",
+            )
+            _require(
+                int(native.get("merged_gap_bytes", -1)) == gap_bytes
+                and int(native.get("hole_clear_bytes", -1)) == gap_bytes
+                and int(native.get("static_prefix_restore_bytes", 0)) > 0,
+                failures,
+                "dct_major_pushdown: bounded hole clear/static-prefix accounting is inconsistent",
+            )
+            physical_runs = int(native.get("bounded_physical_run_count", -1))
+            exact_extents = int(native.get("bounded_exact_extent_count", -1))
+            io_requests = int(native.get("io_uring_read_request_count", -1))
+            io_completions = int(native.get("io_uring_completion_count", -2))
+            io_submits = int(native.get("io_uring_submit_syscall_count", -1))
+            _require(
+                0 < physical_runs <= exact_extents and physical_runs <= io_requests,
+                failures,
+                "dct_major_pushdown: bounded physical run/submission accounting is inconsistent",
+            )
+            _require(
+                native.get("bounded_io_backend") == "io-uring"
+                and int(native.get("bounded_io_uring_queue_depth", -1)) == 256
+                and int(native.get("pread_count", -1))
+                == int(native.get("full_rowgroup_strategy_count", -2))
+                and io_requests == io_completions
+                and io_requests >= physical_runs
+                and 0 < io_submits < io_requests
+                and int(native.get("io_uring_setup_count", 0)) > 0
+                and int(native.get("io_uring_ring_mapped_bytes", 0)) > 0
+                and int(native.get("io_uring_fallback_count", -1)) == 0,
+                failures,
+                "dct_major_pushdown: native profile did not use valid batched io_uring submissions",
+            )
+            segment_count = int(native.get("segment_count", 0))
+            sidecar_hits = int(native.get("active_output_schedule_sidecar_hit_count", 0))
+            sidecar_misses = int(native.get("active_output_schedule_sidecar_miss_count", 0))
+            schedule_builds = int(
+                native.get("planless_transform_active_output_schedule_build_count", -1)
+            )
+            _require(
+                segment_count > 0
+                and sidecar_hits == 1
+                and sidecar_misses == 0
+                and schedule_builds == segment_count - 1
+                and int(native.get("active_output_schedule_sidecar_reject_count", -1)) == 0
+                and int(native.get("active_output_schedule_sidecar_persist_count", -1)) == 0
+                and int(native.get("active_output_schedule_sidecar_bytes", 0)) > 0
+                and int(native.get("active_output_schedule_interval_count", 0)) > 0
+                and int(native.get("active_output_schedule_mmap_capacity_bytes", 0))
+                == 16 * 1024 * 1024
+                and int(native.get("active_output_schedule_mmap_window_count", 0)) == 2
+                and int(native.get("active_output_schedule_mapped_bytes_peak", 0)) > 0,
+                failures,
+                "dct_major_pushdown: frozen shard-0 schedule sidecar evidence is inconsistent",
+            )
+            coefficient_count = int(pipeline_config.get("coefficient_count", 64))
+            expected_storage_read_granularity = (
+                "selected-coefficient-range"
+                if coefficient_count < 64
+                else "bounded-selected-vector-range"
+            )
+            _require(
+                int(native.get("run_interval_bounded_rowgroup_count", 0)) > 0
+                and int(native.get("run_interval_bounded_rowgroup_count", 0))
+                + int(native.get("full_rowgroup_strategy_count", 0))
+                == int(native.get("rowgroup_count", -1))
+                and int(native.get("run_interval_exact_rowgroup_count", -1)) == 0
+                and int(native.get("bitmap_exact_rowgroup_count", -1)) == 0
+                and native.get("storage_read_granularity")
+                == expected_storage_read_granularity
+                and native.get("decode_granularity") == "selected-vector",
+                failures,
+                f"{name}: native profile left the bounded/full-rowgroup + "
+                f"{expected_storage_read_granularity} + selected-decode policy",
+            )
+            capacity = int(native.get("decode_workset_capacity_bytes", 0))
+            expected_capacity = 512 * 1024 * 1024
+            estimated_peak = max(
+                int(native.get("max_estimated_decode_workset_bytes", 0)),
+                int(native.get("bounded_double_buffer_peak_estimated_bytes", 0)),
+            )
+            _require(
+                capacity == expected_capacity,
+                failures,
+                f"dct_major_pushdown: runtime workset capacity {capacity} differs from contract {expected_capacity}",
+            )
+            _require(
+                0 < estimated_peak <= capacity,
+                failures,
+                f"dct_major_pushdown: estimated workset peak {estimated_peak} exceeds capacity {capacity}",
+            )
+            _require(
+                int(native.get("oversized_decode_rowgroup_count", 0)) == 0,
+                failures,
+                "dct_major_pushdown: at least one rowgroup exceeded the byte budget",
+            )
+            _require(
+                int(native.get("host_io_staged_rowgroups", 0)) == 0,
+                failures,
+                "dct_major_pushdown: full-segment host I/O staging was used",
+            )
+            actual_used = int(native.get("actual_transient_total_used_high_water_bytes", 0))
+            actual_allocated = int(
+                native.get("actual_transient_total_allocated_high_water_bytes", 0)
+            )
+            _require(
+                0 < actual_used <= actual_allocated <= 512 * 1024 * 1024
+                and native.get("actual_transient_memory_gate_passed") is True,
+                failures,
+                "dct_major_pushdown: actual transient high-water is missing or exceeds 512 MiB",
+            )
+            segment_count = int(native.get("segment_count", 0))
+            _require(
+                _compact_plan_memory_is_consistent(native),
+                failures,
+                "dct_major_pushdown: cumulative compact plan bytes/per-segment peak are missing "
+                f"or inconsistent across {segment_count} segments",
+            )
+
+            _require(
+                int(native.get("exact_batch_plan_cache_enabled", 0)) == 0,
+                failures,
+                "dct_major_pushdown: runtime enabled the exact expanded-plan cache",
+            )
+            for counter in ("plan_cache_hits", "plan_cache_misses", "plan_cache_evictions"):
+                _require(
+                    int(native.get(counter, 0)) == 0,
+                    failures,
+                    f"dct_major_pushdown: {counter} must remain zero on the planless path",
+                )
+
+            # The block-major implementation keeps axis programs in the
+            # compact batch and owns FLS readers/sparse plans only for that
+            # batch.  It must not quietly fall through to the historical
+            # thread-local transform or sparse-vector caches, whose retention
+            # is controlled by entry count rather than the formal byte budget.
+            for counter in (
+                "sparse_vector_cache_hits",
+                "sparse_vector_cache_misses",
+                "dct_resize_weight_cache_hits",
+                "dct_resize_weight_cache_misses",
+                "dct_conversion_matrix_cache_hits",
+                "dct_conversion_matrix_cache_misses",
+            ):
+                _require(
+                    int(native.get(counter, 0)) == 0,
+                    failures,
+                    f"dct_major_pushdown: persistent helper cache counter {counter} must remain zero",
+                )
+
+            decoded_capacity = int(native.get("decoded_rowgroup_cache_capacity_bytes", 0))
+            expected_decoded_capacity = 0
+            decoded_current = int(native.get("decoded_rowgroup_cache_current_bytes", 0))
+            decoded_peak = int(native.get("decoded_rowgroup_cache_peak_bytes", 0))
+            decoded_entries = int(native.get("decoded_rowgroup_cache_current_rowgroups", 0))
+            decoded_peak_entries = int(native.get("decoded_rowgroup_cache_peak_rowgroups", 0))
+            _require(
+                decoded_capacity == expected_decoded_capacity,
+                failures,
+                "dct_major_pushdown: decoded-rowgroup cache byte capacity differs from the contract",
+            )
+            _require(
+                0 <= decoded_current <= decoded_peak <= decoded_capacity,
+                failures,
+                "dct_major_pushdown: decoded-rowgroup cache current/peak exceeds its byte capacity",
+            )
+            if decoded_capacity == 0:
+                _require(
+                    decoded_entries == 0 and decoded_peak_entries == 0,
+                    failures,
+                    "dct_major_pushdown: disabled decoded-rowgroup cache retained entries",
+                )
+                for counter in (
+                    "decoded_rowgroup_cache_hits",
+                    "decoded_rowgroup_cache_misses",
+                    "decoded_rowgroup_cache_inserts",
+                    "decoded_rowgroup_cache_evictions",
+                ):
+                    _require(
+                        int(native.get(counter, 0)) == 0,
+                        failures,
+                        f"dct_major_pushdown: disabled decoded-rowgroup cache reported {counter}",
+                    )
+
+
+def _write_csv(
+    path: Path,
+    results: Sequence[dict[str, Any]],
+    block_major_access: dict[str, Any] | None,
+) -> None:
+    columns = (
+        "pipeline",
+        "domain",
+        "coefficient_spec",
+        "coefficient_count",
+        "repeat",
+        "images",
+        "seconds",
+        "throughput_images_per_s",
+        "time_to_first_batch_ms",
+        "first_shard_ready_ms",
+        "steady_throughput_images_per_s",
+        "latency_mean_ms",
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "loader_mean_ms",
+        "h2d_mean_ms",
+        "model_mean_ms",
+        "gpu_utilization_mean_percent",
+        "accuracy_top1",
+        "accuracy_top5",
+        "cross_entropy_loss",
+        "planning_ms",
+        "planning_item_count",
+        "sort_item_count",
+        "compact_plan_bytes",
+        "compact_plan_peak_bytes",
+        "selected_compressed_payload_bytes",
+        "compressed_payload_bytes_read",
+        "full_compressed_payload_bytes",
+        "selected_coefficient_count",
+        "full_coefficient_count",
+        "selected_coefficient_ratio",
+        "physical_io_saving",
+        "read_amplification",
+        "process_io_logical_read_bytes",
+        "process_io_storage_read_bytes",
+        "process_io_read_syscalls",
+        "input_ready_stall_ms",
+        "input_ready_stall_percent",
+        "pread_count",
+        "rowgroup_count",
+        "planned_vector_count",
+        "actual_vector_count",
+        "full_vector_count",
+        "duplicate_physical_read_count",
+        "rowgroup_revisit_count",
+        "vector_run_revisit_count",
+        "physical_read_order_inversions",
+        "decoded_coefficient_bytes",
+        "decode_ms",
+        "transform_ms",
+        "requested_source_block_count",
+        "host_peak_rss_bytes",
+        "native_pinned_peak_bytes",
+        "native_gpu_peak_bytes",
+        "torch_gpu_allocated_peak_bytes",
+        "torch_gpu_reserved_peak_bytes",
+        "decode_workset_capacity_bytes",
+        "decode_workset_peak_estimated_bytes",
+        "oversized_decode_rowgroups",
+        "run_interval_exact_rowgroups",
+        "bitmap_exact_rowgroups",
+        "full_rowgroup_strategy_count",
+        "run_interval_bounded_rowgroups",
+        "bounded_exact_storage_bytes",
+        "bounded_physical_storage_bytes",
+        "bounded_merged_gap_bytes",
+        "bounded_exact_extent_count",
+        "bounded_physical_run_count",
+        "bounded_selected_gap_count",
+        "bounded_read_amplification_ppm",
+        "bounded_read_local_amplification_ppm",
+        "bounded_read_max_run_bytes",
+        "hole_clear_bytes",
+        "static_prefix_restore_bytes",
+        "actual_transient_total_used_high_water_bytes",
+        "actual_transient_total_allocated_high_water_bytes",
+        "actual_transient_memory_gate_passed",
+        "adaptive_run_interval_estimated_ns",
+        "adaptive_bitmap_estimated_ns",
+        "adaptive_full_rowgroup_estimated_ns",
+        "adaptive_selected_memory_fit_rowgroups",
+        "adaptive_full_memory_fit_rowgroups",
+        "decoded_rowgroup_cache_capacity_bytes",
+        "decoded_rowgroup_cache_current_bytes",
+        "decoded_rowgroup_cache_peak_bytes",
+        "decoded_rowgroup_cache_current_rowgroups",
+        "decoded_rowgroup_cache_peak_rowgroups",
+        "decoded_rowgroup_cache_hits",
+        "decoded_rowgroup_cache_misses",
+        "decoded_rowgroup_cache_hit_rate",
+        "decoded_rowgroup_cache_inserts",
+        "decoded_rowgroup_cache_evictions",
+        "plan_cache_hits",
+        "plan_cache_misses",
+        "plan_cache_evictions",
+        "sparse_vector_cache_hits",
+        "sparse_vector_cache_misses",
+        "dct_resize_weight_cache_hits",
+        "dct_resize_weight_cache_misses",
+        "dct_conversion_matrix_cache_hits",
+        "dct_conversion_matrix_cache_misses",
+        "descriptor_bytes",
+        "base_storage_bytes",
+        "total_storage_bytes_with_descriptor",
+        "descriptor_storage_increase_percent",
+    )
+
+    def native(native_totals: dict[str, Any], *names: str) -> float | int:
+        for name in names:
+            value = native_totals.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value
+        return 0
+
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        for result in results:
+            for repeat in result["repeats"]:
+                native_totals = repeat.get("native_totals", {})
+                compressed = float(native(native_totals, "compressed_payload_bytes_read"))
+                selected_compressed = float(
+                    native(native_totals, "selected_compressed_payload_bytes")
+                )
+                full_compressed = float(native(native_totals, "full_compressed_payload_bytes"))
+                read_denominator = selected_compressed or full_compressed
+                process_io = repeat.get("process_io") or {}
+                cache_hits = float(native(native_totals, "decoded_rowgroup_cache_hits"))
+                cache_misses = float(native(native_totals, "decoded_rowgroup_cache_misses"))
+                repeat_seconds = float(repeat.get("seconds", 0.0))
+                input_ready_stall_ms = float(
+                    native(native_totals, "prefetch_consumer_wait_ms")
+                )
+                writer.writerow(
+                    {
+                        "pipeline": result["pipeline"],
+                        "domain": result["domain"],
+                        "coefficient_spec": result.get("pipeline_config", {}).get(
+                            "coefficient_spec"
+                        ),
+                        "coefficient_count": result.get("pipeline_config", {}).get(
+                            "coefficient_count"
+                        ),
+                        "repeat": repeat["repeat"],
+                        "images": repeat["images"],
+                        "seconds": repeat["seconds"],
+                        "throughput_images_per_s": repeat["throughput_images_per_s"],
+                        "time_to_first_batch_ms": repeat["time_to_first_batch_ms"],
+                        "first_shard_ready_ms": repeat.get("process_scope_first_shard_ready_ms")
+                        or repeat.get("first_shard_ready_ms"),
+                        "steady_throughput_images_per_s": repeat.get("steady_throughput_images_per_s"),
+                        "latency_mean_ms": repeat["latency_ms"]["mean"],
+                        "latency_p50_ms": repeat["latency_ms"].get(
+                            "p50", repeat["latency_ms"]["mean"]
+                        ),
+                        "latency_p95_ms": repeat["latency_ms"].get(
+                            "p95", repeat["latency_ms"]["mean"]
+                        ),
+                        "loader_mean_ms": repeat["loader_submit_ms"]["mean"],
+                        "h2d_mean_ms": repeat.get("top_level_h2d_ms", {}).get("mean", 0.0),
+                        "model_mean_ms": repeat["model_ms"]["mean"],
+                        "gpu_utilization_mean_percent": (
+                            repeat["gpu_utilization_percent"].get("mean")
+                            if int(repeat.get("gpu_utilization_percent", {}).get("count", 0)) > 0
+                            else None
+                        ),
+                        "accuracy_top1": repeat.get("accuracy_top1"),
+                        "accuracy_top5": repeat.get("accuracy_top5"),
+                        "cross_entropy_loss": repeat.get("cross_entropy_loss"),
+                        "planning_ms": native(native_totals, "planning_ms", "prefetch_planning_ms"),
+                        "planning_item_count": native(
+                            native_totals, "host_expanded_transform_items_created"
+                        ),
+                        "sort_item_count": native(native_totals, "host_global_transform_sort_items"),
+                        "compact_plan_bytes": native(native_totals, "compact_plan_bytes"),
+                        "compact_plan_peak_bytes": native(native_totals, "compact_plan_peak_bytes"),
+                        "selected_compressed_payload_bytes": selected_compressed,
+                        "compressed_payload_bytes_read": compressed,
+                        "full_compressed_payload_bytes": full_compressed,
+                        "selected_coefficient_count": native(
+                            native_totals, "selected_coefficient_count"
+                        ),
+                        "full_coefficient_count": native(
+                            native_totals, "full_coefficient_count"
+                        ),
+                        "selected_coefficient_ratio": native(
+                            native_totals, "selected_coefficient_ratio"
+                        ),
+                        "physical_io_saving": (
+                            1.0 - compressed / full_compressed if full_compressed else 0.0
+                        ),
+                        "read_amplification": (
+                            compressed / read_denominator if read_denominator else 0.0
+                        ),
+                        "process_io_logical_read_bytes": process_io.get(
+                            "logical_read_bytes"
+                        ),
+                        "process_io_storage_read_bytes": process_io.get(
+                            "storage_read_bytes"
+                        ),
+                        "process_io_read_syscalls": process_io.get("read_syscalls"),
+                        "input_ready_stall_ms": input_ready_stall_ms,
+                        "input_ready_stall_percent": (
+                            100.0 * input_ready_stall_ms / (repeat_seconds * 1000.0)
+                            if repeat_seconds > 0.0
+                            else 0.0
+                        ),
+                        "pread_count": native(native_totals, "pread_count"),
+                        "rowgroup_count": native(native_totals, "rowgroup_count"),
+                        "planned_vector_count": native(native_totals, "planned_vector_count"),
+                        "actual_vector_count": native(native_totals, "actual_vector_count"),
+                        "full_vector_count": native(native_totals, "full_vector_count"),
+                        "duplicate_physical_read_count": native(
+                            native_totals, "duplicate_physical_read_count"
+                        ),
+                        "rowgroup_revisit_count": native(native_totals, "rowgroup_revisit_count"),
+                        "vector_run_revisit_count": native(
+                            native_totals, "vector_run_revisit_count"
+                        ),
+                        "physical_read_order_inversions": native(
+                            native_totals, "physical_read_order_inversions"
+                        ),
+                        "decoded_coefficient_bytes": native(native_totals, "decoded_coefficient_bytes"),
+                        "decode_ms": native(native_totals, "decode_ms"),
+                        "transform_ms": native(
+                            native_totals,
+                            "fixed_transform_ms",
+                            "planless_transform_gpu_kernel_ms",
+                        ),
+                        "requested_source_block_count": native(
+                            native_totals, "requested_source_block_count"
+                        ),
+                        "host_peak_rss_bytes": repeat["host_peak_rss_bytes"],
+                        "native_pinned_peak_bytes": native(
+                            native_totals, "galp_native_pinned_peak_in_use_bytes"
+                        ),
+                        "native_gpu_peak_bytes": native(
+                            native_totals, "galp_native_device_peak_in_use_bytes"
+                        ),
+                        "torch_gpu_allocated_peak_bytes": repeat["peak_torch_gpu_allocated_bytes"],
+                        "torch_gpu_reserved_peak_bytes": repeat["peak_torch_gpu_reserved_bytes"],
+                        "decode_workset_capacity_bytes": native(
+                            native_totals, "decode_workset_capacity_bytes"
+                        ),
+                        "decode_workset_peak_estimated_bytes": max(
+                            int(native(native_totals, "max_estimated_decode_workset_bytes")),
+                            int(native(native_totals, "bounded_double_buffer_peak_estimated_bytes")),
+                        ),
+                        "oversized_decode_rowgroups": native(
+                            native_totals, "oversized_decode_rowgroup_count"
+                        ),
+                        "run_interval_exact_rowgroups": native(
+                            native_totals, "run_interval_exact_rowgroup_count"
+                        ),
+                        "bitmap_exact_rowgroups": native(
+                            native_totals, "bitmap_exact_rowgroup_count"
+                        ),
+                        "full_rowgroup_strategy_count": native(
+                            native_totals, "full_rowgroup_strategy_count"
+                        ),
+                        "run_interval_bounded_rowgroups": native(
+                            native_totals, "run_interval_bounded_rowgroup_count"
+                        ),
+                        "bounded_exact_storage_bytes": native(
+                            native_totals, "bounded_exact_storage_bytes"
+                        ),
+                        "bounded_physical_storage_bytes": native(
+                            native_totals, "bounded_physical_storage_bytes"
+                        ),
+                        "bounded_merged_gap_bytes": native(
+                            native_totals, "bounded_merged_gap_bytes"
+                        ),
+                        "bounded_exact_extent_count": native(
+                            native_totals, "bounded_exact_extent_count"
+                        ),
+                        "bounded_physical_run_count": native(
+                            native_totals, "bounded_physical_run_count"
+                        ),
+                        "bounded_selected_gap_count": native(
+                            native_totals, "bounded_selected_gap_count"
+                        ),
+                        "bounded_read_amplification_ppm": native(
+                            native_totals, "bounded_read_amplification_ppm"
+                        ),
+                        "bounded_read_local_amplification_ppm": native(
+                            native_totals, "bounded_read_local_amplification_ppm"
+                        ),
+                        "bounded_read_max_run_bytes": native(
+                            native_totals, "bounded_read_max_run_bytes"
+                        ),
+                        "hole_clear_bytes": native(native_totals, "hole_clear_bytes"),
+                        "static_prefix_restore_bytes": native(
+                            native_totals, "static_prefix_restore_bytes"
+                        ),
+                        "actual_transient_total_used_high_water_bytes": native(
+                            native_totals, "actual_transient_total_used_high_water_bytes"
+                        ),
+                        "actual_transient_total_allocated_high_water_bytes": native(
+                            native_totals, "actual_transient_total_allocated_high_water_bytes"
+                        ),
+                        "actual_transient_memory_gate_passed": bool(
+                            native_totals.get("actual_transient_memory_gate_passed", False)
+                        ),
+                        "adaptive_run_interval_estimated_ns": native(
+                            native_totals, "adaptive_run_interval_estimated_ns"
+                        ),
+                        "adaptive_bitmap_estimated_ns": native(
+                            native_totals, "adaptive_bitmap_estimated_ns"
+                        ),
+                        "adaptive_full_rowgroup_estimated_ns": native(
+                            native_totals, "adaptive_full_rowgroup_estimated_ns"
+                        ),
+                        "adaptive_selected_memory_fit_rowgroups": native(
+                            native_totals, "adaptive_selected_memory_fit_rowgroup_count"
+                        ),
+                        "adaptive_full_memory_fit_rowgroups": native(
+                            native_totals, "adaptive_full_memory_fit_rowgroup_count"
+                        ),
+                        "decoded_rowgroup_cache_capacity_bytes": native(
+                            native_totals, "decoded_rowgroup_cache_capacity_bytes"
+                        ),
+                        "decoded_rowgroup_cache_current_bytes": native(
+                            native_totals, "decoded_rowgroup_cache_current_bytes"
+                        ),
+                        "decoded_rowgroup_cache_peak_bytes": native(
+                            native_totals, "decoded_rowgroup_cache_peak_bytes"
+                        ),
+                        "decoded_rowgroup_cache_current_rowgroups": native(
+                            native_totals, "decoded_rowgroup_cache_current_rowgroups"
+                        ),
+                        "decoded_rowgroup_cache_peak_rowgroups": native(
+                            native_totals, "decoded_rowgroup_cache_peak_rowgroups"
+                        ),
+                        "decoded_rowgroup_cache_hits": cache_hits,
+                        "decoded_rowgroup_cache_misses": cache_misses,
+                        "decoded_rowgroup_cache_hit_rate": (
+                            cache_hits / (cache_hits + cache_misses)
+                            if cache_hits + cache_misses
+                            else 0.0
+                        ),
+                        "decoded_rowgroup_cache_inserts": native(
+                            native_totals, "decoded_rowgroup_cache_inserts"
+                        ),
+                        "decoded_rowgroup_cache_evictions": native(
+                            native_totals, "decoded_rowgroup_cache_evictions"
+                        ),
+                        "plan_cache_hits": native(native_totals, "plan_cache_hits"),
+                        "plan_cache_misses": native(native_totals, "plan_cache_misses"),
+                        "plan_cache_evictions": native(native_totals, "plan_cache_evictions"),
+                        "sparse_vector_cache_hits": native(native_totals, "sparse_vector_cache_hits"),
+                        "sparse_vector_cache_misses": native(native_totals, "sparse_vector_cache_misses"),
+                        "dct_resize_weight_cache_hits": native(
+                            native_totals, "dct_resize_weight_cache_hits"
+                        ),
+                        "dct_resize_weight_cache_misses": native(
+                            native_totals, "dct_resize_weight_cache_misses"
+                        ),
+                        "dct_conversion_matrix_cache_hits": native(
+                            native_totals, "dct_conversion_matrix_cache_hits"
+                        ),
+                        "dct_conversion_matrix_cache_misses": native(
+                            native_totals, "dct_conversion_matrix_cache_misses"
+                        ),
+                        "descriptor_bytes": (
+                            block_major_access["descriptor_bytes"] if block_major_access else 0
+                        ),
+                        "base_storage_bytes": (
+                            block_major_access["base_storage_bytes"] if block_major_access else 0
+                        ),
+                        "total_storage_bytes_with_descriptor": (
+                            block_major_access["total_storage_bytes_with_descriptor"]
+                            if block_major_access
+                            else 0
+                        ),
+                        "descriptor_storage_increase_percent": (
+                            block_major_access["storage_increase_percent"]
+                            if block_major_access
+                            else 0.0
+                        ),
+                    }
+                )
+
+
+def _write_report(path: Path, summary: dict[str, Any]) -> None:
+    lines = [
+        "# DCT-major no-shuffle benchmark",
+        "",
+        f"Validation: **{'PASS' if summary['ok'] else 'FAIL'}**",
+        "",
+        f"Workload: `{summary['workload']}`; sample order: `fastlens_image_id_ascending`; shuffle: `false`.",
+        f"Preprocess: `{summary.get('preprocess_profile', 'unspecified')}`.",
+        "",
+        "| Pipeline | Domain | Coeff spec | K | Top-1 | Top-5 | CE | Physical read | Decode ms | Transform ms | Model ms | Cold img/s | Hot img/s |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for aggregate in summary["aggregates"]:
+        selection = aggregate.get("coefficient_selection", {})
+        native = aggregate.get("native_hot_mean", {})
+        top1 = aggregate.get("accuracy_top1")
+        top5 = aggregate.get("accuracy_top5")
+        ce = aggregate.get("training_loss") if summary["workload"] == "training-throughput" else aggregate.get("cross_entropy_loss")
+        transform_ms = native.get(
+            "fixed_transform_ms", native.get("planless_transform_gpu_kernel_ms")
+        )
+        top1_text = f"{100.0 * float(top1['p50']):.3f}%" if top1 is not None else "n/a"
+        lines.append(
+            f"| {aggregate.get('display_name', aggregate['pipeline'])} | {aggregate['domain']} | "
+            f"{selection.get('coefficient_spec', 'n/a')} | "
+            f"{selection.get('coefficient_count', 'n/a')} | "
+            f"{top1_text} | "
+        )
+        lines[-1] += (
+            f"{100.0 * float(top5['p50']):.3f}% | " if top5 is not None else "n/a | "
+        )
+        lines[-1] += f"{float(ce['p50']):.6f} | " if ce is not None else "n/a | "
+        lines[-1] += (
+            f"{int(native['bounded_physical_storage_bytes'])} | "
+            if "bounded_physical_storage_bytes" in native
+            else "n/a | "
+        )
+        lines[-1] += (
+            f"{float(native['decode_ms']):.3f} | " if "decode_ms" in native else "n/a | "
+        )
+        lines[-1] += (
+            f"{float(transform_ms):.3f} | " if transform_ms is not None else "n/a | "
+        )
+        lines[-1] += (
+            f"{aggregate['model_mean_ms']['p50']:.3f} | "
+            f"{aggregate['cold_start']['throughput_images_per_s']:.3f} | "
+            f"{aggregate['throughput_images_per_s']['p50']:.3f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Timing decomposition",
+            "",
+            "| Pipeline | Cold first shard ready (ms) | Batch p50 (ms) | Batch p95 (ms) | Load (ms) | Input-ready stall (%) | H2D (ms) | Model (ms) | GPU util mean (%) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for aggregate in summary["aggregates"]:
+        cold = aggregate["cold_start"]
+        first_shard = cold.get("first_shard_ready_ms")
+        gpu_util = aggregate.get("gpu_utilization_percent")
+        first_shard_text = f"{first_shard:.3f}" if first_shard is not None else "n/a"
+        gpu_util_text = f"{gpu_util['p50']:.3f}" if gpu_util is not None else "n/a"
+        lines.append(
+            f"| {aggregate['pipeline']} | "
+            f"{first_shard_text} | "
+            f"{aggregate['batch_latency_p50_ms']['p50']:.3f} | "
+            f"{aggregate['batch_latency_p95_ms']['p50']:.3f} | "
+            f"{aggregate['loader_mean_ms']['p50']:.3f} | "
+            f"{aggregate['input_ready_stall_percent']['p50']:.3f} | "
+            f"{aggregate['h2d_mean_ms']['p50']:.3f} | "
+            f"{aggregate['model_mean_ms']['p50']:.3f} | "
+            f"{gpu_util_text} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Peak resources (hot-repeat p50)",
+            "",
+            "| Pipeline | Host RSS (MiB) | Torch GPU allocated (MiB) | Torch GPU reserved (MiB) | Native pinned (MiB) | Native GPU (MiB) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    mib = float(1024**2)
+    for aggregate in summary["aggregates"]:
+        native_pinned = aggregate.get("galp_native_pinned_peak_in_use_bytes")
+        native_gpu = aggregate.get("galp_native_device_peak_in_use_bytes")
+        lines.append(
+            f"| {aggregate['pipeline']} | "
+            f"{aggregate['host_peak_rss_bytes']['p50'] / mib:.3f} | "
+            f"{aggregate['peak_torch_gpu_allocated_bytes']['p50'] / mib:.3f} | "
+            f"{aggregate['peak_torch_gpu_reserved_bytes']['p50'] / mib:.3f} | "
+            f"{native_pinned['p50'] / mib if native_pinned is not None else 0.0:.3f} | "
+            f"{native_gpu['p50'] / mib if native_gpu is not None else 0.0:.3f} |"
+        )
+    lines.extend(["", "## Cold-start speedups (primary)", ""])
+    for name, value in summary["cold_speedups"].items():
+        lines.append(f"- `{name}`: `{value:.6f}x`.")
+    lines.extend(["", "## Hot-repeat speedups (diagnostic)", ""])
+    for name, value in summary["speedups"].items():
+        lines.append(f"- `{name}`: `{value:.6f}x`.")
+    comparison = summary.get("coefficient_comparison")
+    if comparison is not None:
+        lines.extend(
+            [
+                "",
+                "## FASTLENS K64 versus selected coefficients",
+                "",
+                "| Metric | FASTLENS K64 | FASTLENS selected | Selected/K64 |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+        )
+        for metric in comparison["metric_rows"]:
+            ratio = metric.get("ratio")
+            ratio_text = f"{float(ratio):.6f}" if ratio is not None else "n/a"
+            if metric["name"] == "Top-1" and "delta_percentage_points" in metric:
+                ratio_text = f"{float(metric['delta_percentage_points']):+.6f} pp"
+            lines.append(
+                f"| {metric['name']} | {metric['galp_k64']} | "
+                f"{metric['galp_selected']} | {ratio_text} |"
+            )
+    lines.extend(["", "## Stability", ""])
+    for aggregate in summary["aggregates"]:
+        lines.append(
+            f"- `{aggregate['pipeline']}`: throughput CV="
+            f"`{aggregate['throughput_images_per_s']['cv_population']:.6f}`, endpoint drift="
+            f"`{aggregate['throughput_endpoint_drift']:.6f}`."
+        )
+    lines.extend(["", "## Semantic comparisons", ""])
+    for comparison in summary["semantic_comparisons"]:
+        if comparison["ok"]:
+            comparison_status = "PASS"
+        elif comparison["enforcement"] == "diagnostic":
+            comparison_status = "DIAGNOSTIC-DRIFT"
+        else:
+            comparison_status = "FAIL"
+        lines.append(
+            f"- `{comparison['pipelines'][0]}` vs `{comparison['pipelines'][1]}`: "
+            f"{comparison_status} ({comparison['enforcement']}); "
+            f"output max_abs=`{comparison['output'].get('max_abs', float('nan')):.6g}`."
+        )
+    oracle = summary.get("raw_mask_oracle_comparison")
+    if oracle is not None:
+        lines.extend(
+            [
+                "",
+                "## Raw-mask oracle",
+                "",
+                f"- Condition: `{oracle['condition_id']}`; samples: `{oracle['sample_count']}`.",
+                f"- Full per-sample Top-1 agreement: "
+                f"`{100.0 * oracle['full_top1_prediction_agreement']:.6f}%` "
+                f"(minimum `{100.0 * oracle['full_top1_prediction_agreement_min']:.6f}%`).",
+                f"- Native/oracle Top-1: `{100.0 * oracle['native_accuracy_top1']:.6f}%` / "
+                f"`{100.0 * oracle['oracle_accuracy_top1']:.6f}%`; delta "
+                f"`{oracle['accuracy_delta_percentage_points']:+.6f} pp`.",
+                f"- Checkpoint SHA-256: `{oracle['checkpoint_sha256']}`; mask stage: "
+                f"`{oracle['coefficient_mask_stage']}`.",
+            ]
+        )
+    lines.extend(["", "## Block-major sidecar storage", ""])
+    storage = summary["block_major_access_storage"]
+    if storage is None:
+        lines.append("- Block-major access descriptor was not part of this contract.")
+    else:
+        lines.extend(
+            [
+                f"- Descriptor files: `{storage['shard_count']}` shards plus companion index.",
+                f"- Descriptor bytes: `{storage['descriptor_bytes']}`.",
+                f"- Active-output schedule bytes: "
+                f"`{storage.get('active_output_schedule_bytes', 0)}`.",
+                f"- Base manifest/FLS/metadata bytes: `{storage['base_storage_bytes']}`.",
+                f"- Total with all sidecars: "
+                f"`{storage.get('total_storage_bytes_with_sidecars', storage['total_storage_bytes_with_descriptor'])}`.",
+                f"- All-sidecar storage increase: "
+                f"`{storage.get('all_sidecar_storage_increase_percent', storage['storage_increase_percent']):.6f}%` "
+                f"(1% gate: PASS; 0.5% target: {'PASS' if storage['passes_half_percent'] else 'MISS'}).",
+            ]
+        )
+    total_storage = summary.get("storage_evidence", {})
+    if total_storage:
+        lines.extend(
+            [
+                f"- JPEG bytes: `{total_storage['jpeg_bytes']}`.",
+                f"- FLS payload bytes: `{total_storage['fls_payload_bytes']}`.",
+                f"- Metadata bytes: `{total_storage['metadata_bytes']}`.",
+                f"- Block-major access sidecar bytes: `{total_storage['sidecar_bytes']}`.",
+                f"- Total block-major bytes: `{total_storage['total_block_major_bytes']}` "
+                f"(`{total_storage['relative_to_jpeg']:.6f}x` JPEG, "
+                f"`{total_storage['relative_to_raw_rgb']:.6f}x` raw RGB).",
+            ]
+        )
+    if summary["failures"]:
+        lines.extend(["", "## Failures", ""])
+        lines.extend(f"- {failure}" for failure in summary["failures"])
+    lines.extend(
+        [
+            "",
+            "## Comparability boundary",
+            "",
+            "- FASTLENS DCT-major and RGB-no-more use the DCT checkpoint and are a strict same-domain comparison.",
+            "- DALI, CoorDL, FFCV and PyTorch use the RGB checkpoint. Their comparison is same-domain; ratios against FASTLENS are deployment-level context only.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def validate(contract_path: Path, output_dir: Path) -> dict[str, Any]:
+    contract = load_contract(contract_path)
+    samples = load_sample_manifest(
+        Path(contract["dataset"]["sample_manifest"]),
+        contract["dataset"]["sample_manifest_sha256"],
+    )
+    _, measured = selected_batches(contract, samples)
+    expected_trace = sample_trace(measured)
+    failures: list[str] = []
+    if contract["preprocess"].get("profile") == "fixed-center-224-from-512":
+        geometry = contract["dataset"].get("source_geometry_validation") or {}
+        manifest_geometry = contract["dataset"].get("manifest_geometry_validation") or {}
+        _require(
+            int(geometry.get("validated_image_count", -1)) == len(samples)
+            and [geometry.get("source_width"), geometry.get("source_height")] == [512, 512]
+            and [geometry.get("crop_origin_x"), geometry.get("crop_origin_y")] == [144, 144]
+            and [geometry.get("crop_width"), geometry.get("crop_height")] == [224, 224],
+            failures,
+            "fixed 512 source / center crop (144,144,224,224) geometry was not fully validated",
+        )
+        _require(
+            int(manifest_geometry.get("validated_image_count", -1))
+            == int(contract["dataset"]["dct_major_storage"]["header"]["image_count"])
+            and [
+                manifest_geometry.get("source_width"),
+                manifest_geometry.get("source_height"),
+            ]
+            == [512, 512]
+            and manifest_geometry.get("jpeg_sampling") == "4:2:0"
+            and manifest_geometry.get("y_blocks") == [64, 64]
+            and manifest_geometry.get("cbcr_blocks") == [32, 32],
+            failures,
+            "native DCT-major manifest was not fully validated as the same fixed-512 4:2:0 view",
+        )
+        _require(
+            contract["preprocess"]["rgb"].get("resize_shorter") is None
+            and contract["preprocess"]["dct"].get("source_grid_size_blocks") == [64, 64]
+            and contract["preprocess"]["dct"].get("crop_reference_size_blocks") == [32, 32]
+            and contract["preprocess"]["dct"].get("center_crop_size_blocks") == [56, 56],
+            failures,
+            "fixed crop profile does not encode RGB-no-more 64 -> crop 56 -> resize 28 semantics",
+        )
+    results: dict[str, dict[str, Any]] = {}
+    for name in contract["pipelines"]["enabled"]:
+        path = output_dir / f"pipeline_{name}.json"
+        if not path.is_file():
+            failures.append(f"missing pipeline result: {path}")
+            continue
+        result = _load_result(path)
+        _validate_result(name, result, contract, expected_trace, failures)
+        results[name] = result
+
+    source_changes: list[str] = []
+    for label, fingerprint in contract.get("source_fingerprints", {}).items():
+        path = Path(fingerprint["path"])
+        if not path.is_file() or sha256_file(path) != fingerprint.get("sha256"):
+            source_changes.append(label)
+    _require(not source_changes, failures, f"runtime source files changed: {source_changes}")
+
+    access = contract.get("dataset", {}).get("block_major_access") or {}
+    changed_schedules: list[str] = []
+    for fingerprint in access.get("active_output_schedules", []):
+        path = Path(fingerprint["path"])
+        if (
+            not path.is_file()
+            or path.stat().st_size != int(fingerprint.get("size_bytes", -1))
+            or sha256_file(path) != fingerprint.get("sha256")
+        ):
+            changed_schedules.append(str(path))
+    _require(
+        not changed_schedules,
+        failures,
+        f"active-output schedule sidecars changed after contract snapshot: {changed_schedules}",
+    )
+
+    semantic_pairs = [
+        ("dct_major_pushdown", "rgbnomore", True),
+        ("dali", "pytorch", False),
+        ("coordl", "pytorch", False),
+        ("ffcv", "pytorch", False),
+    ]
+    semantic_comparisons = [
+        _semantic_compare(left, right, results[left], results[right], contract, strict=strict, failures=failures)
+        for left, right, strict in semantic_pairs
+        if left in results and right in results
+    ]
+    raw_mask_oracle_comparison = (
+        _compare_raw_mask_oracle(
+            results["dct_major_coefficient_pushdown"], contract, failures
+        )
+        if "dct_major_coefficient_pushdown" in results
+        else None
+    )
+    aggregate_list = [_aggregate(contract, results[name]) for name in contract["pipelines"]["enabled"] if name in results]
+    aggregates = {item["pipeline"]: item for item in aggregate_list}
+    maximum_cv = float(contract["stability_gates"]["maximum_hot_cv"])
+    maximum_endpoint_drift = float(contract["stability_gates"]["maximum_endpoint_drift"])
+    for name, aggregate in aggregates.items():
+        cv = float(aggregate["throughput_images_per_s"]["cv_population"])
+        _require(cv <= maximum_cv, failures, f"{name}: hot throughput CV {cv:.6f} exceeds {maximum_cv:.6f}")
+        endpoint_drift = float(aggregate["throughput_endpoint_drift"])
+        _require(
+            endpoint_drift <= maximum_endpoint_drift,
+            failures,
+            f"{name}: throughput endpoint drift {endpoint_drift:.6f} exceeds {maximum_endpoint_drift:.6f}",
+        )
+    speedups: dict[str, float] = {}
+    throughput = {name: float(item["throughput_images_per_s"]["p50"]) for name, item in aggregates.items()}
+    cold_throughput = {
+        name: float(item["cold_start"]["throughput_images_per_s"])
+        for name, item in aggregates.items()
+    }
+
+    def ratio(label: str, numerator: str, denominator: str) -> None:
+        if numerator in throughput and denominator in throughput and throughput[denominator] > 0.0:
+            speedups[label] = throughput[numerator] / throughput[denominator]
+
+    ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
+    ratio("dct_major_over_coordl", "dct_major_pushdown", "coordl")
+    ratio("coordl_over_dali", "coordl", "dali")
+    ratio("coordl_over_pytorch", "coordl", "pytorch")
+    ratio("coordl_over_ffcv", "coordl", "ffcv")
+    ratio("coefficient_pushdown_over_coordl", "dct_major_coefficient_pushdown", "coordl")
+    ratio("dct_major_over_ffcv", "dct_major_pushdown", "ffcv")
+    ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
+    ratio(
+        "coefficient_pushdown_over_galp",
+        "dct_major_coefficient_pushdown",
+        "dct_major_pushdown",
+    )
+    ratio("dali_over_pytorch", "dali", "pytorch")
+    ratio("ffcv_over_pytorch", "ffcv", "pytorch")
+
+    cold_speedups: dict[str, float] = {}
+
+    def cold_ratio(label: str, numerator: str, denominator: str) -> None:
+        if numerator in cold_throughput and denominator in cold_throughput and cold_throughput[denominator] > 0.0:
+            cold_speedups[label] = cold_throughput[numerator] / cold_throughput[denominator]
+
+    cold_ratio("dct_major_over_dali", "dct_major_pushdown", "dali")
+    cold_ratio("dct_major_over_coordl", "dct_major_pushdown", "coordl")
+    cold_ratio("coordl_over_dali", "coordl", "dali")
+    cold_ratio("coordl_over_pytorch", "coordl", "pytorch")
+    cold_ratio("coordl_over_ffcv", "coordl", "ffcv")
+    cold_ratio("coefficient_pushdown_over_coordl", "dct_major_coefficient_pushdown", "coordl")
+    cold_ratio("dct_major_over_ffcv", "dct_major_pushdown", "ffcv")
+    cold_ratio("dct_major_over_pytorch", "dct_major_pushdown", "pytorch")
+    cold_ratio(
+        "coefficient_pushdown_over_galp",
+        "dct_major_coefficient_pushdown",
+        "dct_major_pushdown",
+    )
+    cold_ratio("dali_over_pytorch", "dali", "pytorch")
+    cold_ratio("ffcv_over_pytorch", "ffcv", "pytorch")
+
+    coefficient_comparison: dict[str, Any] | None = None
+    baseline_name = "dct_major_pushdown"
+    pushdown_name = "dct_major_coefficient_pushdown"
+    if baseline_name in aggregates and pushdown_name in aggregates:
+        baseline = aggregates[baseline_name]
+        pushdown = aggregates[pushdown_name]
+        baseline_native = baseline["native_hot_mean"]
+        pushdown_native = pushdown["native_hot_mean"]
+
+        def native_ratio(key: str) -> float | None:
+            denominator = float(baseline_native.get(key, 0.0))
+            return float(pushdown_native.get(key, 0.0)) / denominator if denominator > 0.0 else None
+
+        accuracy_delta_pp: float | None = None
+        if baseline.get("accuracy_top1") and pushdown.get("accuracy_top1"):
+            accuracy_delta_pp = 100.0 * (
+                float(pushdown["accuracy_top1"]["p50"])
+                - float(baseline["accuracy_top1"]["p50"])
+            )
+            _require(
+                abs(accuracy_delta_pp) <= 1.0,
+                failures,
+                f"FASTLENS coefficient pushdown Top-1 delta {accuracy_delta_pp:.6f} pp exceeds 1.0 pp",
+            )
+        selected_payload_ratio = native_ratio("selected_compressed_payload_bytes")
+        physical_read_ratio = native_ratio("bounded_physical_storage_bytes")
+        coefficient_comparison = {
+            "baseline": baseline_name,
+            "pushdown": pushdown_name,
+            "coefficient_count_ratio": (
+                float(pushdown["coefficient_selection"].get("coefficient_count", 0))
+                / float(baseline["coefficient_selection"].get("coefficient_count", 64))
+            ),
+            "selected_payload_ratio": selected_payload_ratio,
+            "physical_read_ratio": physical_read_ratio,
+            "hot_end_to_end_speedup": speedups.get("coefficient_pushdown_over_galp"),
+            "cold_end_to_end_speedup": cold_speedups.get("coefficient_pushdown_over_galp"),
+            "top1_delta_percentage_points": accuracy_delta_pp,
+            "selected_payload_bytes": {
+                "galp_k64": baseline_native.get("selected_compressed_payload_bytes"),
+                "galp_selected": pushdown_native.get("selected_compressed_payload_bytes"),
+            },
+            "physical_read_bytes": {
+                "galp_k64": baseline_native.get("bounded_physical_storage_bytes"),
+                "galp_selected": pushdown_native.get("bounded_physical_storage_bytes"),
+            },
+            "decoded_vectors": {
+                "galp_k64": baseline_native.get("actual_vector_count"),
+                "galp_selected": pushdown_native.get("actual_vector_count"),
+            },
+        }
+
+        def metric_row(
+            name: str,
+            baseline_value: float | int | None,
+            selected_value: float | int | None,
+            *,
+            delta_percentage_points: float | None = None,
+        ) -> dict[str, Any]:
+            ratio_value = (
+                float(selected_value) / float(baseline_value)
+                if baseline_value is not None
+                and selected_value is not None
+                and float(baseline_value) != 0.0
+                else None
+            )
+            row = {
+                "name": name,
+                "galp_k64": baseline_value,
+                "galp_selected": selected_value,
+                "ratio": ratio_value,
+            }
+            if delta_percentage_points is not None:
+                row["delta_percentage_points"] = delta_percentage_points
+            return row
+
+        baseline_transform = baseline_native.get(
+            "fixed_transform_ms", baseline_native.get("planless_transform_gpu_kernel_ms")
+        )
+        pushdown_transform = pushdown_native.get(
+            "fixed_transform_ms", pushdown_native.get("planless_transform_gpu_kernel_ms")
+        )
+        metric_rows = [
+            metric_row(
+                "coefficient count",
+                baseline["coefficient_selection"].get("coefficient_count"),
+                pushdown["coefficient_selection"].get("coefficient_count"),
+            ),
+            metric_row(
+                "selected compressed payload bytes",
+                baseline_native.get("selected_compressed_payload_bytes"),
+                pushdown_native.get("selected_compressed_payload_bytes"),
+            ),
+            metric_row(
+                "physical bytes read",
+                baseline_native.get("bounded_physical_storage_bytes"),
+                pushdown_native.get("bounded_physical_storage_bytes"),
+            ),
+            metric_row(
+                "decoded vectors",
+                baseline_native.get("actual_vector_count"),
+                pushdown_native.get("actual_vector_count"),
+            ),
+            metric_row(
+                "decode time (ms)",
+                baseline_native.get("decode_ms"),
+                pushdown_native.get("decode_ms"),
+            ),
+            metric_row(
+                "transform time (ms)",
+                baseline_transform,
+                pushdown_transform,
+            ),
+            metric_row(
+                "model time (ms)",
+                baseline["model_mean_ms"]["p50"],
+                pushdown["model_mean_ms"]["p50"],
+            ),
+            metric_row(
+                "hot E2E throughput (images/s)",
+                baseline["throughput_images_per_s"]["p50"],
+                pushdown["throughput_images_per_s"]["p50"],
+            ),
+        ]
+        if accuracy_delta_pp is not None:
+            metric_rows.append(
+                metric_row(
+                    "Top-1",
+                    baseline["accuracy_top1"]["p50"],
+                    pushdown["accuracy_top1"]["p50"],
+                    delta_percentage_points=accuracy_delta_pp,
+                )
+            )
+        coefficient_comparison["metric_rows"] = metric_rows
+        if int(pushdown["coefficient_selection"].get("coefficient_count", 64)) < 64:
+            _require(
+                selected_payload_ratio is not None and selected_payload_ratio < 1.0,
+                failures,
+                "coefficient pushdown did not reduce selected compressed payload bytes",
+            )
+            _require(
+                physical_read_ratio is not None and physical_read_ratio < 1.0,
+                failures,
+                "coefficient pushdown did not reduce actual bounded physical read bytes",
+            )
+
+    dct_storage = contract["dataset"]["dct_major_storage"]
+    access_storage = contract["dataset"].get("block_major_access") or {}
+    fls_payload_bytes = sum(
+        int(payload["size_bytes"])
+        for payload in dct_storage["payloads"]
+        if payload.get("kind") == "fls"
+    )
+    metadata_bytes = sum(
+        int(payload["size_bytes"])
+        for payload in dct_storage["payloads"]
+        if payload.get("kind") == "metadata"
+    )
+    sidecar_bytes = int(
+        access_storage.get(
+            "all_sidecar_bytes",
+            access_storage.get("descriptor_bytes", 0),
+        )
+    )
+    manifest_bytes = int(dct_storage["manifest"]["size_bytes"])
+    jpeg_bytes = int(
+        contract["dataset"].get("jpeg_full_dataset_bytes")
+        or contract["dataset"]["jpeg_selected_bytes"]
+    )
+    raw_rgb_bytes = int(contract["dataset"]["raw_rgb_selected_bytes"])
+    total_block_major_bytes = fls_payload_bytes + metadata_bytes + manifest_bytes + sidecar_bytes
+    storage_evidence = {
+        "jpeg_bytes": jpeg_bytes,
+        "fls_payload_bytes": fls_payload_bytes,
+        "metadata_bytes": metadata_bytes + manifest_bytes,
+        "sidecar_bytes": sidecar_bytes,
+        "total_block_major_bytes": total_block_major_bytes,
+        "relative_to_jpeg": total_block_major_bytes / jpeg_bytes if jpeg_bytes else 0.0,
+        "relative_to_raw_rgb": total_block_major_bytes / raw_rgb_bytes if raw_rgb_bytes else 0.0,
+    }
+
+    summary = {
+        "schema_version": SUMMARY_SCHEMA,
+        "ok": not failures,
+        "failures": failures,
+        "contract": str(contract_path.resolve()),
+        "contract_sha256": sha256_json(contract),
+        "workload": contract["workload"]["kind"],
+        "preprocess_profile": contract["preprocess"].get("profile"),
+        "expected_sample_trace": expected_trace,
+        "aggregates": aggregate_list,
+        "speedups": speedups,
+        "cold_speedups": cold_speedups,
+        "coefficient_comparison": coefficient_comparison,
+        "block_major_access_storage": contract["dataset"].get("block_major_access"),
+        "storage_evidence": storage_evidence,
+        "semantic_comparisons": semantic_comparisons,
+        "raw_mask_oracle_comparison": raw_mask_oracle_comparison,
+        "source_changes": source_changes,
+        "pipeline_results": [results[name] for name in contract["pipelines"]["enabled"] if name in results],
+    }
+    write_json(output_dir / "results.json", summary)
+    write_json(
+        output_dir / "validation.json",
+        {
+            "ok": summary["ok"],
+            "failures": failures,
+            "block_major_access_storage": contract["dataset"].get("block_major_access"),
+            "semantic_comparisons": semantic_comparisons,
+            "raw_mask_oracle_comparison": raw_mask_oracle_comparison,
+        },
+    )
+    _write_csv(
+        output_dir / "results.csv",
+        summary["pipeline_results"],
+        contract["dataset"].get("block_major_access"),
+    )
+    _write_report(output_dir / "report.md", summary)
+    return summary
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--contract", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    summary = validate(args.contract, args.output_dir)
+    print("RESULT_JSON " + json.dumps({"ok": summary["ok"], "failures": len(summary["failures"])}, sort_keys=True))
+    if not summary["ok"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

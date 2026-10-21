@@ -1,0 +1,1121 @@
+// ────────────────────────────────────────────────────────
+// |                      FastLanes                       |
+// ────────────────────────────────────────────────────────
+// fastlens/tools/benchmark_support/pipeline.cu
+// ────────────────────────────────────────────────────────
+#include "fastlens_tools/benchmark_support/pipeline.cuh"
+
+#if FASTLENS_WITH_JPEG_DCT
+
+#include "cuda/cuda_macros.cuh"
+#include "jpeg/jpeg_dct_policy.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+namespace fastlens::execution {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(const Clock::time_point start, const Clock::time_point end) {
+	return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+double external_plan_overhead_ms(const double measured_plan_ms, const fastlens::jpeg::JpegDctDeviceBatch& executed_batch) {
+	return detail::external_plan_overhead_ms(measured_plan_ms, executed_batch.execution_stats().planning_ms);
+}
+
+struct BlockKey {
+	uint32_t request_index      = 0;
+	uint32_t global_image_index = 0;
+	uint32_t semantic_slot_id   = 0;
+	uint32_t block_x            = 0;
+	uint32_t block_y            = 0;
+
+	bool operator==(const BlockKey& other) const noexcept {
+		return request_index == other.request_index && global_image_index == other.global_image_index &&
+		       semantic_slot_id == other.semantic_slot_id && block_x == other.block_x && block_y == other.block_y;
+	}
+};
+
+struct BlockKeyHash {
+	size_t operator()(const BlockKey& key) const noexcept {
+		size_t h = key.request_index;
+		h ^= static_cast<size_t>(key.global_image_index) + 0x9e3779b97f4a7c15ULL + (h << 6U) + (h >> 2U);
+		h ^= static_cast<size_t>(key.semantic_slot_id) + 0x9e3779b97f4a7c15ULL + (h << 6U) + (h >> 2U);
+		h ^= static_cast<size_t>(key.block_x) + 0x9e3779b97f4a7c15ULL + (h << 6U) + (h >> 2U);
+		h ^= static_cast<size_t>(key.block_y) + 0x9e3779b97f4a7c15ULL + (h << 6U) + (h >> 2U);
+		return h;
+	}
+};
+
+struct AutoBlockEstimate {
+	size_t image_count     = 0;
+	size_t selected_blocks = 0;
+	size_t full_blocks     = 0;
+};
+
+BlockKey block_key(const fastlens::jpeg::JpegDctDeviceBlockMetadata& block) {
+	return BlockKey {
+	    block.request_index, block.global_image_index, block.semantic_slot_id, block.block_x, block.block_y};
+}
+
+std::vector<uint32_t> resolve_image_ids(fastlens::jpeg::JpegDctShardDatasetReader& reader,
+                                        const std::vector<uint32_t>&           requested) {
+	if (!requested.empty()) {
+		return requested;
+	}
+	const auto image_count = reader.image_count();
+	if (image_count > std::numeric_limits<uint32_t>::max()) {
+		throw std::runtime_error("JPEG DCT manifest image count exceeds uint32_t image ids");
+	}
+	std::vector<uint32_t> image_ids;
+	image_ids.reserve(static_cast<size_t>(image_count));
+	for (uint64_t image_id = 0; image_id < image_count; ++image_id) {
+		image_ids.push_back(static_cast<uint32_t>(image_id));
+	}
+	return image_ids;
+}
+
+std::vector<fastlens::jpeg::JpegDctImageCropRequest> make_requests(const std::vector<uint32_t>&      image_ids,
+                                                               const size_t                      begin,
+                                                               const size_t                      end,
+                                                               const fastlens::jpeg::JpegDctCropBox& crop) {
+	std::vector<fastlens::jpeg::JpegDctImageCropRequest> requests;
+	requests.reserve(end - begin);
+	for (size_t i = begin; i < end; ++i) {
+		requests.push_back(fastlens::jpeg::JpegDctImageCropRequest {image_ids[i], crop});
+	}
+	return requests;
+}
+
+bool has_crop(const fastlens::jpeg::JpegDctCropBox& crop) {
+	return crop.width != 0 && crop.height != 0;
+}
+
+uint32_t ceil_mul_div_u32(const uint32_t lhs, const uint32_t rhs, const uint32_t divisor) {
+	if (divisor == 0) {
+		throw std::runtime_error("JPEG DCT crop planning encountered a zero image dimension");
+	}
+	const uint64_t product = static_cast<uint64_t>(lhs) * static_cast<uint64_t>(rhs);
+	return static_cast<uint32_t>((product + divisor - 1U) / divisor);
+}
+
+uint32_t floor_mul_div_u32(const uint32_t lhs, const uint32_t rhs, const uint32_t divisor) {
+	if (divisor == 0) {
+		throw std::runtime_error("JPEG DCT crop planning encountered a zero image dimension");
+	}
+	return static_cast<uint32_t>((static_cast<uint64_t>(lhs) * static_cast<uint64_t>(rhs)) / divisor);
+}
+
+fastlens::jpeg::JpegDctCropBox effective_crop_box(const fastlens::jpeg::JpegImageMetadata& image,
+                                              fastlens::jpeg::JpegDctCropBox           crop) {
+	if (image.image_width == 0 || image.image_height == 0) {
+		throw std::runtime_error("JPEG DCT crop planning requires per-image dimensions");
+	}
+	if (!has_crop(crop)) {
+		crop.x      = 0;
+		crop.y      = 0;
+		crop.width  = image.image_width;
+		crop.height = image.image_height;
+		return crop;
+	}
+	if (crop.x >= image.image_width || crop.y >= image.image_height) {
+		throw std::out_of_range("JPEG DCT crop starts outside the source image");
+	}
+	if (crop.width > image.image_width - crop.x) {
+		crop.width = image.image_width - crop.x;
+	}
+	if (crop.height > image.image_height - crop.y) {
+		crop.height = image.image_height - crop.y;
+	}
+	return crop;
+}
+
+size_t component_block_count_for_crop(const fastlens::jpeg::JpegImageMetadata&     image,
+                                      const fastlens::jpeg::JpegComponentMetadata& component,
+                                      const fastlens::jpeg::JpegDctCropBox&        requested_crop) {
+	if (!component.present || component.width_in_blocks == 0 || component.height_in_blocks == 0) {
+		return 0;
+	}
+	const auto     crop = effective_crop_box(image, requested_crop);
+	const uint32_t x0 =
+	    std::min(component.width_in_blocks, floor_mul_div_u32(crop.x, component.width_in_blocks, image.image_width));
+	const uint32_t y0 =
+	    std::min(component.height_in_blocks, floor_mul_div_u32(crop.y, component.height_in_blocks, image.image_height));
+	const uint32_t x1 = std::min(component.width_in_blocks,
+	                             ceil_mul_div_u32(crop.x + crop.width, component.width_in_blocks, image.image_width));
+	const uint32_t y1 =
+	    std::min(component.height_in_blocks,
+	             ceil_mul_div_u32(crop.y + crop.height, component.height_in_blocks, image.image_height));
+	return static_cast<size_t>(x1 - x0) * static_cast<size_t>(y1 - y0);
+}
+
+AutoBlockEstimate estimate_auto_blocks_from_metadata(fastlens::jpeg::JpegDctShardDatasetReader& reader,
+                                                     const std::vector<uint32_t>&           image_ids,
+                                                     const size_t                           begin,
+                                                     const size_t                           end,
+                                                     const fastlens::jpeg::JpegDctCropBox&      crop) {
+	AutoBlockEstimate estimate;
+	estimate.image_count = end - begin;
+	for (size_t i = begin; i < end; ++i) {
+		const auto image = reader.ImageMetadata(image_ids[i]);
+		for (const auto& component : image.components) {
+			if (!component.present || component.width_in_blocks == 0 || component.height_in_blocks == 0) {
+				continue;
+			}
+			estimate.full_blocks +=
+			    static_cast<size_t>(component.width_in_blocks) * static_cast<size_t>(component.height_in_blocks);
+			estimate.selected_blocks += component_block_count_for_crop(image, component, crop);
+		}
+	}
+	return estimate;
+}
+
+const fastlens::jpeg::JpegComponentMetadata* find_component(const fastlens::jpeg::JpegImageMetadata& image,
+                                                        const uint32_t                       semantic_slot_id) {
+	for (const auto& component : image.components) {
+		if (component.semantic_slot_id == semantic_slot_id) {
+			return &component;
+		}
+	}
+	return nullptr;
+}
+
+std::vector<int16_t> copy_coefficients_to_host(const fastlens::jpeg::JpegDctDeviceBatch& batch) {
+	std::vector<int16_t> host(batch.coefficient_count());
+	if (!host.empty()) {
+		CUDA_SAFE_CALL(cudaMemcpy(
+		    host.data(), batch.device_coefficients(), host.size() * sizeof(int16_t), cudaMemcpyDeviceToHost));
+	}
+	return host;
+}
+
+void update_stage_coefficient_stats(PipelineBenchmarkStageResult& stage,
+                                    const size_t                  output_coefficients_per_block,
+                                    const size_t                  decoded_coefficients_per_block) {
+	stage.coefficients_per_block     = output_coefficients_per_block;
+	stage.selected_coefficient_count = output_coefficients_per_block;
+	stage.full_coefficient_count     = fastlens::jpeg::detail::kJpegDctCoefficientCount;
+	stage.selected_coefficient_ratio = static_cast<double>(output_coefficients_per_block) /
+	                                   static_cast<double>(fastlens::jpeg::detail::kJpegDctCoefficientCount);
+	stage.decoded_coefficients_per_block = decoded_coefficients_per_block;
+}
+
+void accumulate_cache_stats(PipelineBenchmarkStageResult& stage, const fastlens::jpeg::JpegDctDeviceBatch& batch) {
+	const auto cache_stats = batch.cache_stats();
+	stage.cache_hits += cache_stats.hits;
+	stage.cache_misses += cache_stats.misses;
+	stage.dense_cache_hits   = stage.cache_hits;
+	stage.dense_cache_misses = stage.cache_misses;
+	stage.cache_inserts += cache_stats.inserts;
+	stage.cache_evictions += cache_stats.evictions;
+	stage.cache_resident_bytes     = cache_stats.resident_bytes;
+	stage.cache_resident_rowgroups = cache_stats.resident_rowgroups;
+}
+
+void refresh_runtime_policy_summary(PipelineBenchmarkStageResult& stage) {
+	if (stage.runtime_policy_selected_rowgroups == 0 && stage.runtime_policy_full_rowgroups == 0) {
+		stage.runtime_policy_decision = "none";
+	} else if (stage.runtime_policy_selected_rowgroups != 0 && stage.runtime_policy_full_rowgroups != 0) {
+		stage.runtime_policy_decision = "mixed";
+	} else if (stage.runtime_policy_selected_rowgroups != 0) {
+		stage.runtime_policy_decision = "selected-vector";
+	} else {
+		stage.runtime_policy_decision = "full-rowgroup";
+	}
+	stage.runtime_policy_reason =
+	    "selected=" + std::to_string(stage.runtime_policy_selected_rowgroups) +
+	    ",full=" + std::to_string(stage.runtime_policy_full_rowgroups) +
+	    ",tail_full=" + std::to_string(stage.runtime_policy_tail_full_rowgroups) +
+	    ",ratio_full=" + std::to_string(stage.runtime_policy_ratio_full_rowgroups) +
+	    ",low_saving_full=" + std::to_string(stage.runtime_policy_low_saving_full_rowgroups) +
+	    ",max_selected_ratio=" + std::to_string(fastlens::jpeg::detail::kMaxSelectedVectorRatioForPushdown) +
+	    ",min_saved_vectors=" + std::to_string(fastlens::jpeg::detail::kMinSavedVectorsForPushdown);
+}
+
+void accumulate_execution_stats(PipelineBenchmarkStageResult& stage, const fastlens::jpeg::JpegDctDeviceBatch& batch) {
+	const auto stats = batch.execution_stats();
+	stage.planned_selected_vector_count += stats.planned_selected_vector_count;
+	stage.selected_vector_count += stats.selected_vector_count;
+	stage.full_vector_count += stats.full_vector_count;
+	stage.planned_saved_vector_count += stats.planned_saved_vector_count;
+	stage.actual_saved_vector_count += stats.actual_saved_vector_count;
+	stage.rowgroup_count += stats.rowgroup_count;
+	stage.planned_selected_vector_ratio =
+	    stage.full_vector_count == 0
+	        ? 0.0
+	        : static_cast<double>(stage.planned_selected_vector_count) / static_cast<double>(stage.full_vector_count);
+	stage.selected_vector_ratio = stage.full_vector_count == 0 ? 0.0
+	                                                           : static_cast<double>(stage.selected_vector_count) /
+	                                                                 static_cast<double>(stage.full_vector_count);
+	stage.workset_count += stats.workset_count;
+	stage.decode_kernel_launch_count += stats.decode_kernel_launch_count;
+	stage.gather_kernel_launch_count += stats.gather_kernel_launch_count;
+	stage.prefix_gather_kernel_launch_count += stats.prefix_gather_kernel_launch_count;
+	stage.cached_gather_kernel_launch_count += stats.cached_gather_kernel_launch_count;
+	stage.materialize_kernel_launch_count += stats.materialize_kernel_launch_count;
+	stage.gather_item_count += stats.gather_item_count;
+	stage.decoded_gather_item_count += stats.decoded_gather_item_count;
+	stage.cached_gather_item_count += stats.cached_gather_item_count;
+	stage.projection_item_count += stats.projection_item_count;
+	stage.decoded_projection_item_count += stats.decoded_projection_item_count;
+	stage.workset_upload_count += stats.workset_upload_count;
+	stage.scratch_upload_count += stats.scratch_upload_count;
+	stage.scratch_allocation_count += stats.scratch_allocation_count;
+	stage.internal_sync_count += stats.internal_sync_count;
+	stage.cached_gather_sync_count += stats.cached_gather_sync_count;
+	stage.decoded_batch_sync_count += stats.decoded_batch_sync_count;
+	stage.cached_gather_event_handoff_count += stats.cached_gather_event_handoff_count;
+	stage.sparse_vector_cache_hits += stats.sparse_vector_cache_hits;
+	stage.sparse_vector_cache_misses += stats.sparse_vector_cache_misses;
+	stage.runtime_policy_selected_rowgroups += stats.runtime_policy_selected_rowgroups;
+	stage.runtime_policy_full_rowgroups += stats.runtime_policy_full_rowgroups;
+	stage.runtime_policy_tail_full_rowgroups += stats.runtime_policy_tail_full_rowgroups;
+	stage.runtime_policy_ratio_full_rowgroups += stats.runtime_policy_ratio_full_rowgroups;
+	stage.runtime_policy_low_saving_full_rowgroups += stats.runtime_policy_low_saving_full_rowgroups;
+	stage.prefetch_initial_cache_hit_rowgroup_count += stats.prefetch_initial_cache_hit_rowgroup_count;
+	stage.prefetch_candidate_rowgroup_count += stats.prefetch_candidate_rowgroup_count;
+	stage.prefetch_active_shard_count += stats.prefetch_active_shard_count;
+	stage.prefetch_config_disabled_shard_count += stats.prefetch_config_disabled_shard_count;
+	stage.prefetch_all_hit_shard_count += stats.prefetch_all_hit_shard_count;
+	stage.prefetch_small_batch_disabled_shard_count += stats.prefetch_small_batch_disabled_shard_count;
+	stage.prefetch_selected_vector_disabled_shard_count += stats.prefetch_selected_vector_disabled_shard_count;
+	stage.prefetch_selected_vector_miss_rowgroup_count += stats.prefetch_selected_vector_miss_rowgroup_count;
+	stage.prefetch_initial_hit_runtime_miss_count += stats.prefetch_initial_hit_runtime_miss_count;
+	stage.prefetch_skipped_repeated_runtime_miss_count += stats.prefetch_skipped_repeated_runtime_miss_count;
+	stage.prefetched_rowgroup_count += stats.prefetched_rowgroup_count;
+	stage.prefetch_consumed_as_hit_count += stats.prefetch_consumed_as_hit_count;
+	stage.prefetch_skipped_repeated_rowgroup_count += stats.prefetch_skipped_repeated_rowgroup_count;
+	stage.prefetch_consumed_as_hit_read_ms += stats.prefetch_consumed_as_hit_read_ms;
+	stage.prefetch_consumed_as_hit_wait_ms += stats.prefetch_consumed_as_hit_wait_ms;
+	refresh_runtime_policy_summary(stage);
+	stage.device_planning_ms += stats.planning_ms;
+	stage.plan_ms += stats.planning_ms;
+	stage.workset_build_ms += stats.workset_build_ms;
+	stage.workset_upload_ms += stats.workset_upload_ms;
+	stage.decode_ms += stats.decode_ms;
+	stage.gather_ms += stats.gather_ms;
+	stage.decoded_gather_ms += stats.decoded_gather_ms;
+	stage.cached_gather_ms += stats.cached_gather_ms;
+	stage.projection_ms += stats.projection_ms;
+	stage.decoded_projection_ms += stats.decoded_projection_ms;
+	stage.prefetch_wait_ms += stats.prefetch_wait_ms;
+	stage.prefetch_depth_block_ms += stats.prefetch_depth_block_ms;
+	stage.prefetch_queue_start_ms += stats.prefetch_queue_start_ms;
+	stage.prefetch_rowgroup_read_ms += stats.prefetch_rowgroup_read_ms;
+	stage.prefetch_ready_ahead_ms += stats.prefetch_ready_ahead_ms;
+	stage.sync_rowgroup_read_ms += stats.sync_rowgroup_read_ms;
+}
+
+void accumulate_rowgroups(PipelineBenchmarkStageResult&            stage,
+                          const fastlens::jpeg::JpegDctDeviceBatch&    batch,
+                          std::set<std::pair<uint32_t, uint32_t>>& seen_rowgroups) {
+	stage.rowgroup_visits += batch.rowgroup_count();
+	for (const auto& rowgroup : batch.rowgroups()) {
+		if (!seen_rowgroups.insert({rowgroup.shard_id, rowgroup.rowgroup_index}).second) {
+			++stage.repeated_rowgroups;
+		}
+	}
+	stage.unique_rowgroups = seen_rowgroups.size();
+}
+
+detail::AutoPipelinePolicyDecision
+choose_auto_pipeline_policy(const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& crop_plan,
+                            const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& full_plan,
+                            const size_t                                      decode_batch_rowgroups,
+                            const size_t                                      pushdown_reuse_candidate_rowgroups = 0,
+                            const size_t                                      full_reuse_candidate_rowgroups = 0) {
+	return detail::choose_auto_pipeline_policy_from_estimates(
+	    crop_plan.block_metadata().size(),
+	    full_plan.block_metadata().size(),
+	    crop_plan.rowgroups().size(),
+	    full_plan.rowgroups().size(),
+	    crop_plan.estimated_selected_vector_count(),
+	    full_plan.full_vector_count(),
+	    detail::estimate_auto_worksets_for_rowgroups(crop_plan.rowgroups(), decode_batch_rowgroups),
+	    detail::estimate_auto_worksets_for_rowgroups(full_plan.rowgroups(), decode_batch_rowgroups),
+	    detail::kAutoJpegDctCoefficientCount,
+	    detail::kAutoJpegDctCoefficientCount,
+	    pushdown_reuse_candidate_rowgroups,
+	    full_reuse_candidate_rowgroups);
+}
+
+detail::AutoPipelinePolicyDecision
+choose_auto_pipeline_policy(const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& crop_plan,
+                            const fastlens::jpeg::JpegDctDeviceBatchPlanEstimate& full_estimate,
+                            const size_t                                      decode_batch_rowgroups,
+                            const size_t                                      pushdown_reuse_candidate_rowgroups = 0,
+                            const size_t                                      full_reuse_candidate_rowgroups = 0) {
+	return detail::choose_auto_pipeline_policy_from_estimates(
+	    crop_plan.block_metadata().size(),
+	    full_estimate.block_count,
+	    crop_plan.rowgroups().size(),
+	    full_estimate.rowgroups.size(),
+	    crop_plan.estimated_selected_vector_count(),
+	    full_estimate.full_vector_count,
+	    detail::estimate_auto_worksets_for_rowgroups(crop_plan.rowgroups(), decode_batch_rowgroups),
+	    detail::estimate_auto_worksets_for_rowgroups(full_estimate.rowgroups, decode_batch_rowgroups),
+	    detail::kAutoJpegDctCoefficientCount,
+	    detail::kAutoJpegDctCoefficientCount,
+	    pushdown_reuse_candidate_rowgroups,
+	    full_reuse_candidate_rowgroups);
+}
+
+detail::AutoPipelinePolicyDecision
+make_auto_coefficient_selection_policy_decision(const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& coefficient_plan,
+                                                const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& no_dct_plan,
+                                                const size_t                                      decode_batch_rowgroups,
+                                                const size_t pushdown_reuse_candidate_rowgroups = 0,
+                                                const size_t full_reuse_candidate_rowgroups = 0) {
+	return detail::choose_auto_coefficient_selection_policy_from_estimates(
+	    coefficient_plan.block_metadata().size(),
+	    no_dct_plan.block_metadata().size(),
+	    coefficient_plan.rowgroups().size(),
+	    no_dct_plan.rowgroups().size(),
+	    coefficient_plan.estimated_selected_vector_count(),
+	    no_dct_plan.estimated_selected_vector_count(),
+	    detail::estimate_auto_worksets_for_rowgroups(coefficient_plan.rowgroups(), decode_batch_rowgroups),
+	    detail::estimate_auto_worksets_for_rowgroups(no_dct_plan.rowgroups(), decode_batch_rowgroups),
+	    coefficient_plan.coefficients_per_block(),
+	    coefficient_plan.coefficients_per_block(),
+	    pushdown_reuse_candidate_rowgroups,
+	    full_reuse_candidate_rowgroups);
+}
+
+void refresh_auto_pipeline_policy_ratios(PipelineBenchmarkResult& result) {
+	result.auto_policy_selected_block_ratio   = result.auto_policy_full_blocks == 0
+	                                                ? 0.0
+	                                                : static_cast<double>(result.auto_policy_selected_blocks) /
+                                                        static_cast<double>(result.auto_policy_full_blocks);
+	result.auto_policy_selected_vector_ratio  = result.auto_policy_full_vectors == 0
+	                                                ? 0.0
+	                                                : static_cast<double>(result.auto_policy_selected_vectors) /
+                                                         static_cast<double>(result.auto_policy_full_vectors);
+	result.auto_policy_touched_rowgroup_ratio = result.auto_policy_full_rowgroups == 0
+	                                                ? 0.0
+	                                                : static_cast<double>(result.auto_policy_touched_rowgroups) /
+	                                                      static_cast<double>(result.auto_policy_full_rowgroups);
+	result.auto_policy_pushdown_reuse_candidate_ratio =
+	    result.auto_policy_touched_rowgroups == 0
+	        ? 0.0
+	        : static_cast<double>(result.auto_policy_pushdown_reuse_candidate_rowgroups) /
+	              static_cast<double>(result.auto_policy_touched_rowgroups);
+	result.auto_policy_full_reuse_candidate_ratio =
+	    result.auto_policy_full_rowgroups == 0
+	        ? 0.0
+	        : static_cast<double>(result.auto_policy_full_reuse_candidate_rowgroups) /
+	              static_cast<double>(result.auto_policy_full_rowgroups);
+	result.auto_policy_avg_full_blocks_per_rowgroup = result.auto_policy_full_rowgroups == 0
+	                                                      ? 0.0
+	                                                      : static_cast<double>(result.auto_policy_full_blocks) /
+	                                                            static_cast<double>(result.auto_policy_full_rowgroups);
+}
+
+void accumulate_auto_pipeline_policy_plan(PipelineBenchmarkResult&                          result,
+                                          const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& crop_plan,
+                                          const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& full_plan,
+                                          const detail::AutoPipelinePolicyDecision&         decision,
+                                          std::set<std::pair<uint32_t, uint32_t>>& pushdown_policy_seen_rowgroups,
+                                          std::set<std::pair<uint32_t, uint32_t>>& full_policy_seen_rowgroups) {
+	result.auto_policy_selected_blocks += crop_plan.block_metadata().size();
+	result.auto_policy_full_blocks += full_plan.block_metadata().size();
+	result.auto_policy_selected_vectors += crop_plan.estimated_selected_vector_count();
+	result.auto_policy_full_vectors += full_plan.estimated_selected_vector_count();
+	result.auto_policy_touched_rowgroups += crop_plan.rowgroups().size();
+	result.auto_policy_full_rowgroups += full_plan.rowgroups().size();
+	result.auto_policy_pushdown_reuse_candidate_rowgroups +=
+	    detail::count_auto_reuse_candidate_rowgroups(crop_plan.rowgroups(), pushdown_policy_seen_rowgroups);
+	result.auto_policy_full_reuse_candidate_rowgroups +=
+	    detail::count_auto_reuse_candidate_rowgroups(full_plan.rowgroups(), full_policy_seen_rowgroups);
+	result.auto_policy_estimated_pushdown_worksets += decision.estimated_pushdown_worksets;
+	result.auto_policy_estimated_full_worksets += decision.estimated_full_worksets;
+	result.auto_policy_estimated_pushdown_gather_items += decision.estimated_pushdown_gather_items;
+	result.auto_policy_estimated_full_gather_items += decision.estimated_full_gather_items;
+	refresh_auto_pipeline_policy_ratios(result);
+}
+
+void accumulate_auto_pipeline_policy_plan(PipelineBenchmarkResult&                          result,
+                                          const fastlens::jpeg::JpegDctDeviceBatchPreparedPlan& crop_plan,
+                                          const fastlens::jpeg::JpegDctDeviceBatchPlanEstimate& full_estimate,
+                                          const detail::AutoPipelinePolicyDecision&         decision,
+                                          std::set<std::pair<uint32_t, uint32_t>>& pushdown_policy_seen_rowgroups,
+                                          std::set<std::pair<uint32_t, uint32_t>>& full_policy_seen_rowgroups) {
+	result.auto_policy_selected_blocks += crop_plan.block_metadata().size();
+	result.auto_policy_full_blocks += full_estimate.block_count;
+	result.auto_policy_selected_vectors += crop_plan.estimated_selected_vector_count();
+	result.auto_policy_full_vectors += full_estimate.full_vector_count;
+	result.auto_policy_touched_rowgroups += crop_plan.rowgroups().size();
+	result.auto_policy_full_rowgroups += full_estimate.rowgroups.size();
+	result.auto_policy_pushdown_reuse_candidate_rowgroups +=
+	    detail::count_auto_reuse_candidate_rowgroups(crop_plan.rowgroups(), pushdown_policy_seen_rowgroups);
+	result.auto_policy_full_reuse_candidate_rowgroups +=
+	    detail::count_auto_reuse_candidate_rowgroups(full_estimate.rowgroups, full_policy_seen_rowgroups);
+	result.auto_policy_estimated_pushdown_worksets += decision.estimated_pushdown_worksets;
+	result.auto_policy_estimated_full_worksets += decision.estimated_full_worksets;
+	result.auto_policy_estimated_pushdown_gather_items += decision.estimated_pushdown_gather_items;
+	result.auto_policy_estimated_full_gather_items += decision.estimated_full_gather_items;
+	refresh_auto_pipeline_policy_ratios(result);
+}
+
+void accumulate_auto_pipeline_policy_fast_estimate(PipelineBenchmarkResult&                  result,
+                                                   const AutoBlockEstimate&                  estimate,
+                                                   const detail::AutoPipelinePolicyDecision& decision) {
+	result.auto_policy_selected_blocks += estimate.selected_blocks;
+	result.auto_policy_full_blocks += estimate.full_blocks;
+	// Fast decisions use block counts as the policy proxy. Exact vector/rowgroup
+	// accounting remains available when a window falls back to the precise estimate path.
+	result.auto_policy_selected_vectors += estimate.selected_blocks;
+	result.auto_policy_full_vectors += estimate.full_blocks;
+	result.auto_policy_estimated_pushdown_worksets += decision.estimated_pushdown_worksets;
+	result.auto_policy_estimated_full_worksets += decision.estimated_full_worksets;
+	result.auto_policy_estimated_pushdown_gather_items += decision.estimated_pushdown_gather_items;
+	result.auto_policy_estimated_full_gather_items += decision.estimated_full_gather_items;
+	refresh_auto_pipeline_policy_ratios(result);
+}
+
+void record_auto_pipeline_policy_reason(PipelineBenchmarkResult&               result,
+                                        const detail::AutoPipelinePolicyReason reason) {
+	switch (reason) {
+	case detail::AutoPipelinePolicyReason::EmptyWindow:
+		++result.auto_policy_empty_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::CropCoversFullWindow:
+		++result.auto_policy_crop_covers_full_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::CoefficientSelectionPushdown:
+		++result.auto_policy_coefficient_pushdown_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::VerySmallCrop:
+		++result.auto_policy_very_small_crop_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::SmallWindowFixedOverhead:
+		++result.auto_policy_small_window_full_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::LargeWindowAmortizesPushdown:
+		++result.auto_policy_large_window_pushdown_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::WorksetOverheadTooHigh:
+		++result.auto_policy_workset_overhead_full_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::TinyRowgroupsFixedOverhead:
+		++result.auto_policy_tiny_rowgroups_full_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::TouchesMostRowgroups:
+		++result.auto_policy_touches_most_rowgroups_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::GatherOutputTooHigh:
+		++result.auto_policy_gather_output_full_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::CropSavesEnoughBlocks:
+		++result.auto_policy_saves_enough_blocks_windows;
+		break;
+	case detail::AutoPipelinePolicyReason::SavingsTooSmall:
+		++result.auto_policy_savings_too_small_windows;
+		break;
+	}
+}
+
+void accumulate_pushdown_window(PipelineBenchmarkStageResult&            stage,
+                                const fastlens::jpeg::JpegDctDeviceBatch&    batch,
+                                const double                             read_decode_ms,
+                                std::set<std::pair<uint32_t, uint32_t>>& seen_rowgroups) {
+	++stage.windows;
+	update_stage_coefficient_stats(stage, batch.coefficients_per_block(), batch.coefficients_per_block());
+	stage.requests += batch.image_count();
+	stage.input_blocks += batch.block_count();
+	stage.output_blocks += batch.block_count();
+	stage.output_coefficients += batch.coefficient_count();
+	stage.output_bytes += batch.coefficient_bytes();
+	stage.decoded_coefficients += batch.coefficient_count();
+	stage.decoded_bytes += batch.coefficient_bytes();
+	stage.peak_window_images        = std::max(stage.peak_window_images, batch.image_count());
+	stage.peak_window_input_blocks  = std::max(stage.peak_window_input_blocks, batch.block_count());
+	stage.peak_window_output_blocks = std::max(stage.peak_window_output_blocks, batch.block_count());
+	stage.peak_window_output_bytes  = std::max(stage.peak_window_output_bytes, batch.coefficient_bytes());
+	stage.read_decode_ms += read_decode_ms;
+	accumulate_cache_stats(stage, batch);
+	accumulate_execution_stats(stage, batch);
+	accumulate_rowgroups(stage, batch, seen_rowgroups);
+}
+
+void accumulate_projected_window(PipelineBenchmarkStageResult&            stage,
+                                 const fastlens::jpeg::JpegDctDeviceBatch&    batch,
+                                 const size_t                             output_blocks,
+                                 const size_t                             output_coefficients_per_block,
+                                 const double                             plan_ms,
+                                 const double                             read_decode_ms,
+                                 const double                             transform_ms,
+                                 std::set<std::pair<uint32_t, uint32_t>>& seen_rowgroups) {
+	++stage.windows;
+	update_stage_coefficient_stats(stage, output_coefficients_per_block, batch.coefficients_per_block());
+	stage.requests += batch.image_count();
+	stage.input_blocks += batch.block_count();
+	stage.output_blocks += output_blocks;
+	stage.output_coefficients += output_blocks * output_coefficients_per_block;
+	stage.output_bytes += output_blocks * output_coefficients_per_block * sizeof(int16_t);
+	stage.decoded_coefficients += batch.coefficient_count();
+	stage.decoded_bytes += batch.coefficient_bytes();
+	stage.peak_window_images        = std::max(stage.peak_window_images, batch.image_count());
+	stage.peak_window_input_blocks  = std::max(stage.peak_window_input_blocks, batch.block_count());
+	stage.peak_window_output_blocks = std::max(stage.peak_window_output_blocks, output_blocks);
+	stage.peak_window_output_bytes =
+	    std::max(stage.peak_window_output_bytes, output_blocks * output_coefficients_per_block * sizeof(int16_t));
+	stage.plan_ms += plan_ms;
+	stage.read_decode_ms += read_decode_ms;
+	stage.transform_ms += transform_ms;
+	accumulate_cache_stats(stage, batch);
+	accumulate_execution_stats(stage, batch);
+	accumulate_rowgroups(stage, batch, seen_rowgroups);
+}
+
+std::vector<size_t> crop_full_batch_to_pushdown_blocks(const fastlens::jpeg::JpegDctDeviceBatch& pushdown,
+                                                       const fastlens::jpeg::JpegDctDeviceBatch& full) {
+	std::unordered_map<BlockKey, size_t, BlockKeyHash> full_index;
+	const auto&                                        full_blocks = full.block_metadata();
+	full_index.reserve(full_blocks.size());
+	for (size_t block_idx = 0; block_idx < full_blocks.size(); ++block_idx) {
+		full_index.emplace(block_key(full_blocks[block_idx]), block_idx);
+	}
+
+	std::vector<size_t> selected;
+	selected.reserve(pushdown.block_count());
+	for (const auto& block : pushdown.block_metadata()) {
+		const auto it = full_index.find(block_key(block));
+		if (it == full_index.end()) {
+			throw std::runtime_error("full-then-crop baseline missed a pushdown-selected DCT block");
+		}
+		selected.push_back(it->second);
+	}
+	return selected;
+}
+
+bool block_intersects_crop(const fastlens::jpeg::JpegDctDeviceBlockMetadata& block,
+                           const fastlens::jpeg::JpegImageMetadata&          image,
+                           const fastlens::jpeg::JpegDctCropBox&             requested_crop) {
+	const auto* component = find_component(image, block.semantic_slot_id);
+	if (component == nullptr || !component->present || component->width_in_blocks == 0 ||
+	    component->height_in_blocks == 0) {
+		return false;
+	}
+
+	const auto     crop = effective_crop_box(image, requested_crop);
+	const uint32_t x0 =
+	    std::min(component->width_in_blocks, floor_mul_div_u32(crop.x, component->width_in_blocks, image.image_width));
+	const uint32_t y0 = std::min(component->height_in_blocks,
+	                             floor_mul_div_u32(crop.y, component->height_in_blocks, image.image_height));
+	const uint32_t x1 = std::min(component->width_in_blocks,
+	                             ceil_mul_div_u32(crop.x + crop.width, component->width_in_blocks, image.image_width));
+	const uint32_t y1 =
+	    std::min(component->height_in_blocks,
+	             ceil_mul_div_u32(crop.y + crop.height, component->height_in_blocks, image.image_height));
+	return block.block_x >= x0 && block.block_x < x1 && block.block_y >= y0 && block.block_y < y1;
+}
+
+std::vector<size_t> crop_full_batch_to_requested_blocks(fastlens::jpeg::JpegDctShardDatasetReader& reader,
+                                                        const fastlens::jpeg::JpegDctDeviceBatch&  full,
+                                                        const fastlens::jpeg::JpegDctCropBox&      crop) {
+	std::vector<size_t> selected;
+	selected.reserve(full.block_count());
+	if (!has_crop(crop)) {
+		selected.resize(full.block_count());
+		for (size_t block_idx = 0; block_idx < selected.size(); ++block_idx) {
+			selected[block_idx] = block_idx;
+		}
+		return selected;
+	}
+
+	std::unordered_map<uint32_t, fastlens::jpeg::JpegImageMetadata> image_metadata;
+	for (size_t block_idx = 0; block_idx < full.block_metadata().size(); ++block_idx) {
+		const auto& block   = full.block_metadata()[block_idx];
+		auto [it, inserted] = image_metadata.try_emplace(block.global_image_index);
+		if (inserted) {
+			it->second = reader.ImageMetadata(block.global_image_index);
+		}
+		if (block_intersects_crop(block, it->second, crop)) {
+			selected.push_back(block_idx);
+		}
+	}
+	return selected;
+}
+
+void verify_equal_blocks(const fastlens::jpeg::JpegDctDeviceBatch& selected,
+                         const fastlens::jpeg::JpegDctDeviceBatch& reference,
+                         const std::vector<size_t>&            selected_full_blocks) {
+	if (selected.block_count() != selected_full_blocks.size()) {
+		throw std::runtime_error("selected and reference DCT block counts differ");
+	}
+	const auto& selected_coefficients = selected.selected_coefficients();
+	if (selected_coefficients.empty() || selected.coefficients_per_block() != selected_coefficients.size()) {
+		throw std::runtime_error("selected DCT coefficient metadata does not match output layout");
+	}
+	if (reference.coefficients_per_block() != fastlens::jpeg::detail::kJpegDctCoefficientCount) {
+		throw std::runtime_error("reference batch must expose all 64 DCT coefficients for subset validation");
+	}
+	const auto selected_host  = copy_coefficients_to_host(selected);
+	const auto reference_host = copy_coefficients_to_host(reference);
+	for (size_t block_idx = 0; block_idx < selected_full_blocks.size(); ++block_idx) {
+		const auto full_block_idx = selected_full_blocks[block_idx];
+		const auto push_offset    = block_idx * selected.coefficients_per_block();
+		const auto full_offset    = full_block_idx * reference.coefficients_per_block();
+		if (push_offset + selected.coefficients_per_block() > selected_host.size() ||
+		    full_offset + reference.coefficients_per_block() > reference_host.size()) {
+			throw std::runtime_error("DCT coefficient validation encountered an out-of-range block");
+		}
+		for (size_t coeff_slot = 0; coeff_slot < selected_coefficients.size(); ++coeff_slot) {
+			const auto coeff_idx = selected_coefficients[coeff_slot];
+			if (selected_host[push_offset + coeff_slot] != reference_host[full_offset + coeff_idx]) {
+				throw std::runtime_error("selected and reference DCT coefficient subset differ");
+			}
+		}
+	}
+}
+
+} // namespace
+
+PipelineBenchmarkResult benchmark_jpeg_dct_pipeline(const std::filesystem::path&   manifest_path,
+                                                    const PipelineBenchmarkConfig& cfg) {
+	if (cfg.window_images == 0) {
+		throw std::invalid_argument("pipeline benchmark window_images must be greater than zero");
+	}
+	if (cfg.decode_batch_rowgroups == 0) {
+		throw std::invalid_argument("pipeline benchmark decode_batch_rowgroups must be greater than zero");
+	}
+
+	fastlens::jpeg::JpegDctShardDatasetReader metadata_reader(manifest_path);
+	auto                                  image_ids = resolve_image_ids(metadata_reader, cfg.image_ids);
+
+	PipelineBenchmarkResult result;
+	result.dataset_images            = metadata_reader.image_count();
+	result.mode                      = cfg.mode;
+	const auto selected_coefficients = fastlens::jpeg::detail::normalize_coefficient_selection(cfg.coefficient_selection);
+	const bool has_coefficient_selection = !fastlens::jpeg::detail::selects_all_coefficients(selected_coefficients);
+	if (cfg.mode == PipelineBenchmarkMode::DctCompare && !has_coefficient_selection) {
+		throw std::invalid_argument("pipeline benchmark dct-compare mode requires a DCT coefficient subset");
+	}
+
+	fastlens::jpeg::JpegDctDeviceBatchOptions pushdown_batch_options;
+	pushdown_batch_options.cache_capacity_bytes                 = cfg.cache_capacity_bytes;
+	pushdown_batch_options.decode_batch_rowgroups               = cfg.decode_batch_rowgroups;
+	pushdown_batch_options.coefficient_selection                = cfg.coefficient_selection;
+	pushdown_batch_options.enable_rowgroup_prefetch             = cfg.enable_rowgroup_prefetch;
+	pushdown_batch_options.rowgroup_prefetch_depth              = cfg.rowgroup_prefetch_depth;
+	pushdown_batch_options.rowgroup_prefetch_workers            = cfg.rowgroup_prefetch_workers;
+	pushdown_batch_options.rowgroup_prefetch_min_decode_batches = cfg.rowgroup_prefetch_min_decode_batches;
+
+	fastlens::jpeg::JpegDctDeviceBatchOptions baseline_batch_options;
+	baseline_batch_options.cache_capacity_bytes                 = cfg.cache_capacity_bytes;
+	baseline_batch_options.decode_batch_rowgroups               = cfg.decode_batch_rowgroups;
+	baseline_batch_options.enable_rowgroup_prefetch             = cfg.enable_rowgroup_prefetch;
+	baseline_batch_options.rowgroup_prefetch_depth              = cfg.rowgroup_prefetch_depth;
+	baseline_batch_options.rowgroup_prefetch_workers            = cfg.rowgroup_prefetch_workers;
+	baseline_batch_options.rowgroup_prefetch_min_decode_batches = cfg.rowgroup_prefetch_min_decode_batches;
+
+	std::set<std::pair<uint32_t, uint32_t>> pushdown_rowgroups;
+	std::set<std::pair<uint32_t, uint32_t>> baseline_rowgroups;
+	std::set<std::pair<uint32_t, uint32_t>> auto_pushdown_policy_rowgroups;
+	std::set<std::pair<uint32_t, uint32_t>> auto_full_policy_rowgroups;
+	const bool run_pushdown = cfg.mode == PipelineBenchmarkMode::Pushdown || cfg.mode == PipelineBenchmarkMode::Compare;
+	const bool run_baseline =
+	    cfg.mode == PipelineBenchmarkMode::FullThenCrop || cfg.mode == PipelineBenchmarkMode::Compare;
+	const bool run_auto        = cfg.mode == PipelineBenchmarkMode::Auto;
+	const bool run_dct_compare = cfg.mode == PipelineBenchmarkMode::DctCompare;
+
+	std::unique_ptr<fastlens::jpeg::JpegDctShardDatasetReader> pushdown_reader;
+	std::unique_ptr<fastlens::jpeg::JpegDctShardDatasetReader> baseline_reader;
+	if (run_pushdown || run_dct_compare || (run_auto && (has_crop(cfg.crop) || has_coefficient_selection))) {
+		pushdown_reader = std::make_unique<fastlens::jpeg::JpegDctShardDatasetReader>(manifest_path);
+	}
+	if (run_baseline || run_dct_compare || run_auto) {
+		baseline_reader = std::make_unique<fastlens::jpeg::JpegDctShardDatasetReader>(manifest_path);
+	}
+
+	for (size_t begin = 0; begin < image_ids.size(); begin += cfg.window_images) {
+		const size_t end = std::min(image_ids.size(), begin + cfg.window_images);
+
+		if (run_dct_compare) {
+			auto requests = make_requests(image_ids, begin, end, cfg.crop);
+
+			const auto push_plan_start = Clock::now();
+			auto       push_plan       = pushdown_reader->PrepareDeviceDctBatch(requests, pushdown_batch_options);
+			const auto push_plan_end   = Clock::now();
+			const auto push_read_start = Clock::now();
+			auto       push_batch      = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(push_plan));
+			const auto push_read_end   = Clock::now();
+			result.pushdown.plan_ms +=
+			    external_plan_overhead_ms(elapsed_ms(push_plan_start, push_plan_end), push_batch);
+			accumulate_pushdown_window(
+			    result.pushdown, push_batch, elapsed_ms(push_read_start, push_read_end), pushdown_rowgroups);
+
+			const auto post_plan_start = Clock::now();
+			auto       post_plan       = baseline_reader->PrepareDeviceDctBatch(requests, baseline_batch_options);
+			const auto post_plan_end   = Clock::now();
+			const auto post_read_start = Clock::now();
+			auto       post_batch      = baseline_reader->ReadPreparedDeviceDctBatch(std::move(post_plan));
+			const auto post_read_end   = Clock::now();
+
+			const auto          transform_start      = Clock::now();
+			std::vector<size_t> selected_post_blocks = crop_full_batch_to_pushdown_blocks(push_batch, post_batch);
+			const auto          transform_end        = Clock::now();
+
+			accumulate_projected_window(
+			    result.dct_post_decode,
+			    post_batch,
+			    selected_post_blocks.size(),
+			    selected_coefficients.size(),
+			    external_plan_overhead_ms(elapsed_ms(post_plan_start, post_plan_end), post_batch),
+			    elapsed_ms(post_read_start, post_read_end),
+			    elapsed_ms(transform_start, transform_end),
+			    baseline_rowgroups);
+
+			if (cfg.verify_outputs) {
+				const auto verify_start = Clock::now();
+				try {
+					verify_equal_blocks(push_batch, post_batch, selected_post_blocks);
+				} catch (const std::exception& e) {
+					result.outputs_match = false;
+					result.mismatch      = e.what();
+				}
+				const auto verify_end = Clock::now();
+				result.verify_ms += elapsed_ms(verify_start, verify_end);
+			}
+			continue;
+		}
+
+		if (run_auto) {
+			if (!has_crop(cfg.crop)) {
+				const auto auto_policy_start = Clock::now();
+				auto       full_requests     = make_requests(image_ids, begin, end, fastlens::jpeg::JpegDctCropBox {});
+				if (has_coefficient_selection) {
+					auto coefficient_plan =
+					    pushdown_reader->PrepareDeviceDctBatch(full_requests, pushdown_batch_options);
+					auto no_dct_plan = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
+					const auto pushdown_reuse_candidates = detail::estimate_auto_reuse_candidate_rowgroups(
+					    coefficient_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+					const auto no_dct_reuse_candidates =
+					    detail::estimate_auto_reuse_candidate_rowgroups(no_dct_plan.rowgroups(), auto_full_policy_rowgroups);
+					const auto decision = make_auto_coefficient_selection_policy_decision(
+					    coefficient_plan,
+					    no_dct_plan,
+					    pushdown_batch_options.decode_batch_rowgroups,
+					    pushdown_reuse_candidates,
+					    no_dct_reuse_candidates);
+					const auto auto_policy_end = Clock::now();
+					const auto auto_policy_ms  = elapsed_ms(auto_policy_start, auto_policy_end);
+					result.auto_policy_ms += auto_policy_ms;
+					result.auto_policy_reason = decision.reason;
+					++result.auto_policy_estimate_windows;
+					accumulate_auto_pipeline_policy_plan(result,
+					                                     coefficient_plan,
+					                                     no_dct_plan,
+					                                     decision,
+					                                     auto_pushdown_policy_rowgroups,
+					                                     auto_full_policy_rowgroups);
+					record_auto_pipeline_policy_reason(result, decision.reason_code);
+
+					if (decision.use_pushdown) {
+						++result.auto_pushdown_windows;
+						const auto read_start  = Clock::now();
+						auto coefficient_batch = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(coefficient_plan));
+						const auto read_end    = Clock::now();
+						result.pushdown.plan_ms += external_plan_overhead_ms(auto_policy_ms, coefficient_batch);
+						accumulate_pushdown_window(
+						    result.pushdown, coefficient_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
+					} else {
+						++result.auto_no_dct_pushdown_windows;
+						const auto read_start = Clock::now();
+						auto       no_dct_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(no_dct_plan));
+						const auto read_end     = Clock::now();
+
+						accumulate_projected_window(result.auto_no_dct_pushdown,
+						                            no_dct_batch,
+						                            no_dct_batch.block_count(),
+						                            selected_coefficients.size(),
+						                            external_plan_overhead_ms(auto_policy_ms, no_dct_batch),
+						                            elapsed_ms(read_start, read_end),
+						                            0.0,
+						                            baseline_rowgroups);
+					}
+					continue;
+				}
+				auto       full_plan = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
+				const auto pushdown_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(full_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+				const auto full_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(full_plan.rowgroups(), auto_full_policy_rowgroups);
+				const auto decision = choose_auto_pipeline_policy(full_plan,
+				                                                  full_plan,
+				                                                  baseline_batch_options.decode_batch_rowgroups,
+				                                                  pushdown_reuse_candidates,
+				                                                  full_reuse_candidates);
+				const auto auto_policy_end = Clock::now();
+				const auto auto_policy_ms  = elapsed_ms(auto_policy_start, auto_policy_end);
+				result.auto_policy_ms += auto_policy_ms;
+				result.auto_policy_reason = decision.reason;
+				accumulate_auto_pipeline_policy_plan(
+				    result, full_plan, full_plan, decision, auto_pushdown_policy_rowgroups, auto_full_policy_rowgroups);
+				record_auto_pipeline_policy_reason(result, decision.reason_code);
+
+				++result.auto_full_then_crop_windows;
+				const auto read_start = Clock::now();
+				auto       full_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
+				const auto read_end   = Clock::now();
+
+				const size_t output_blocks = full_batch.block_count();
+
+				accumulate_projected_window(result.full_then_crop,
+				                            full_batch,
+				                            output_blocks,
+				                            selected_coefficients.size(),
+				                            external_plan_overhead_ms(auto_policy_ms, full_batch),
+				                            elapsed_ms(read_start, read_end),
+				                            0.0,
+				                            baseline_rowgroups);
+				continue;
+			}
+
+			const auto fast_policy_start = Clock::now();
+			const auto block_estimate =
+			    estimate_auto_blocks_from_metadata(metadata_reader, image_ids, begin, end, cfg.crop);
+			const auto fast_decision = detail::choose_auto_pipeline_policy_from_block_estimate(
+			    block_estimate.selected_blocks, block_estimate.full_blocks, block_estimate.image_count);
+			const auto fast_policy_end = Clock::now();
+			const auto fast_policy_ms  = elapsed_ms(fast_policy_start, fast_policy_end);
+			if (fast_decision.has_value() && !has_coefficient_selection) {
+				result.auto_policy_ms += fast_policy_ms;
+				result.auto_policy_reason = fast_decision->reason;
+				++result.auto_policy_fast_gate_windows;
+				accumulate_auto_pipeline_policy_fast_estimate(result, block_estimate, *fast_decision);
+				record_auto_pipeline_policy_reason(result, fast_decision->reason_code);
+
+				if (fast_decision->use_pushdown) {
+					++result.auto_pushdown_windows;
+					const auto plan_start    = Clock::now();
+					auto       push_requests = make_requests(image_ids, begin, end, cfg.crop);
+					auto       crop_plan     = pushdown_reader->PrepareDeviceDctBatch(push_requests, pushdown_batch_options);
+					const auto plan_end      = Clock::now();
+					const auto read_start = Clock::now();
+					auto       push_batch = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(crop_plan));
+					const auto read_end   = Clock::now();
+					result.pushdown.plan_ms +=
+					    external_plan_overhead_ms(fast_policy_ms + elapsed_ms(plan_start, plan_end), push_batch);
+					accumulate_pushdown_window(
+					    result.pushdown, push_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
+				} else {
+					++result.auto_full_then_crop_windows;
+					const auto plan_start    = Clock::now();
+					auto       full_requests = make_requests(image_ids, begin, end, fastlens::jpeg::JpegDctCropBox {});
+					auto       full_plan     = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
+					const auto plan_end      = Clock::now();
+					const auto read_start = Clock::now();
+					auto       full_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
+					const auto read_end   = Clock::now();
+
+					const auto          transform_start = Clock::now();
+					std::vector<size_t> selected_full_blocks =
+					    crop_full_batch_to_requested_blocks(*baseline_reader, full_batch, cfg.crop);
+					const auto transform_end = Clock::now();
+
+					accumulate_projected_window(
+					    result.full_then_crop,
+					    full_batch,
+					    selected_full_blocks.size(),
+					    selected_coefficients.size(),
+					    external_plan_overhead_ms(fast_policy_ms + elapsed_ms(plan_start, plan_end), full_batch),
+					    elapsed_ms(read_start, read_end),
+					    elapsed_ms(transform_start, transform_end),
+					    baseline_rowgroups);
+				}
+				continue;
+			}
+
+			const auto auto_policy_start = Clock::now();
+			auto       push_requests     = make_requests(image_ids, begin, end, cfg.crop);
+			auto       full_requests     = make_requests(image_ids, begin, end, fastlens::jpeg::JpegDctCropBox {});
+			auto       crop_plan         = pushdown_reader->PrepareDeviceDctBatch(push_requests, pushdown_batch_options);
+			if (has_coefficient_selection) {
+				auto no_dct_plan = baseline_reader->PrepareDeviceDctBatch(push_requests, baseline_batch_options);
+				const auto pushdown_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(crop_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+				const auto no_dct_reuse_candidates =
+				    detail::estimate_auto_reuse_candidate_rowgroups(no_dct_plan.rowgroups(), auto_full_policy_rowgroups);
+				const auto decision = make_auto_coefficient_selection_policy_decision(
+				    crop_plan,
+				    no_dct_plan,
+				    pushdown_batch_options.decode_batch_rowgroups,
+				    pushdown_reuse_candidates,
+				    no_dct_reuse_candidates);
+				const auto auto_policy_end = Clock::now();
+				const auto auto_policy_ms  = fast_policy_ms + elapsed_ms(auto_policy_start, auto_policy_end);
+				result.auto_policy_ms += auto_policy_ms;
+				result.auto_policy_reason = decision.reason;
+				++result.auto_policy_estimate_windows;
+				accumulate_auto_pipeline_policy_plan(result,
+				                                     crop_plan,
+				                                     no_dct_plan,
+				                                     decision,
+				                                     auto_pushdown_policy_rowgroups,
+				                                     auto_full_policy_rowgroups);
+				record_auto_pipeline_policy_reason(result, decision.reason_code);
+
+				if (decision.use_pushdown) {
+					++result.auto_pushdown_windows;
+					const auto read_start = Clock::now();
+					auto       push_batch = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(crop_plan));
+					const auto read_end   = Clock::now();
+					result.pushdown.plan_ms += external_plan_overhead_ms(auto_policy_ms, push_batch);
+					accumulate_pushdown_window(
+					    result.pushdown, push_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
+				} else {
+					++result.auto_no_dct_pushdown_windows;
+					const auto read_start = Clock::now();
+					auto       no_dct_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(no_dct_plan));
+					const auto read_end     = Clock::now();
+					accumulate_projected_window(result.auto_no_dct_pushdown,
+					                            no_dct_batch,
+					                            no_dct_batch.block_count(),
+					                            selected_coefficients.size(),
+					                            external_plan_overhead_ms(auto_policy_ms, no_dct_batch),
+					                            elapsed_ms(read_start, read_end),
+					                            0.0,
+					                            baseline_rowgroups);
+				}
+				continue;
+			}
+			auto       full_estimate     = baseline_reader->EstimateDeviceDctBatch(full_requests, baseline_batch_options);
+			const auto pushdown_reuse_candidates =
+			    detail::estimate_auto_reuse_candidate_rowgroups(crop_plan.rowgroups(), auto_pushdown_policy_rowgroups);
+			const auto full_reuse_candidates =
+			    detail::estimate_auto_reuse_candidate_rowgroups(full_estimate.rowgroups, auto_full_policy_rowgroups);
+			const auto decision = choose_auto_pipeline_policy(crop_plan,
+			                                                  full_estimate,
+			                                                  pushdown_batch_options.decode_batch_rowgroups,
+			                                                  pushdown_reuse_candidates,
+			                                                  full_reuse_candidates);
+			const auto auto_policy_end = Clock::now();
+			const auto auto_policy_ms  = fast_policy_ms + elapsed_ms(auto_policy_start, auto_policy_end);
+			result.auto_policy_ms += auto_policy_ms;
+			result.auto_policy_reason = decision.reason;
+			++result.auto_policy_estimate_windows;
+			accumulate_auto_pipeline_policy_plan(
+			    result, crop_plan, full_estimate, decision, auto_pushdown_policy_rowgroups, auto_full_policy_rowgroups);
+			record_auto_pipeline_policy_reason(result, decision.reason_code);
+
+			if (decision.use_pushdown) {
+				++result.auto_pushdown_windows;
+				const auto read_start = Clock::now();
+				auto       push_batch = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(crop_plan));
+				const auto read_end   = Clock::now();
+				result.pushdown.plan_ms += external_plan_overhead_ms(auto_policy_ms, push_batch);
+				accumulate_pushdown_window(
+				    result.pushdown, push_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
+			} else {
+				++result.auto_full_then_crop_windows;
+				const auto plan_start = Clock::now();
+				auto       full_plan  = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
+				const auto plan_end   = Clock::now();
+				const auto read_start = Clock::now();
+				auto       full_batch = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
+				const auto read_end   = Clock::now();
+
+				const auto          transform_start = Clock::now();
+				std::vector<size_t> selected_full_blocks =
+				    crop_full_batch_to_requested_blocks(*baseline_reader, full_batch, cfg.crop);
+				const auto transform_end = Clock::now();
+
+				accumulate_projected_window(
+				    result.full_then_crop,
+				    full_batch,
+				    selected_full_blocks.size(),
+				    selected_coefficients.size(),
+				    external_plan_overhead_ms(auto_policy_ms + elapsed_ms(plan_start, plan_end), full_batch),
+				    elapsed_ms(read_start, read_end),
+				    elapsed_ms(transform_start, transform_end),
+				    baseline_rowgroups);
+			}
+			continue;
+		}
+
+		fastlens::jpeg::JpegDctDeviceBatch pushdown_batch;
+		if (run_pushdown) {
+			const auto plan_start    = Clock::now();
+			auto       push_requests = make_requests(image_ids, begin, end, cfg.crop);
+			auto       push_plan     = pushdown_reader->PrepareDeviceDctBatch(push_requests, pushdown_batch_options);
+			const auto plan_end      = Clock::now();
+			const auto read_start    = Clock::now();
+			pushdown_batch           = pushdown_reader->ReadPreparedDeviceDctBatch(std::move(push_plan));
+			const auto read_end      = Clock::now();
+			result.pushdown.plan_ms += external_plan_overhead_ms(elapsed_ms(plan_start, plan_end), pushdown_batch);
+			accumulate_pushdown_window(
+			    result.pushdown, pushdown_batch, elapsed_ms(read_start, read_end), pushdown_rowgroups);
+		}
+
+		if (run_baseline) {
+			const auto plan_start    = Clock::now();
+			auto       full_requests = make_requests(image_ids, begin, end, fastlens::jpeg::JpegDctCropBox {});
+			auto       full_plan     = baseline_reader->PrepareDeviceDctBatch(full_requests, baseline_batch_options);
+			const auto plan_end      = Clock::now();
+			const auto read_start    = Clock::now();
+			auto       full_batch    = baseline_reader->ReadPreparedDeviceDctBatch(std::move(full_plan));
+			const auto read_end      = Clock::now();
+
+			const auto          transform_start = Clock::now();
+			std::vector<size_t> selected_full_blocks;
+			if (run_pushdown) {
+				selected_full_blocks = crop_full_batch_to_pushdown_blocks(pushdown_batch, full_batch);
+			} else {
+				selected_full_blocks = crop_full_batch_to_requested_blocks(*baseline_reader, full_batch, cfg.crop);
+			}
+			const auto transform_end = Clock::now();
+
+			accumulate_projected_window(result.full_then_crop,
+			                            full_batch,
+			                            selected_full_blocks.size(),
+			                            selected_coefficients.size(),
+			                            external_plan_overhead_ms(elapsed_ms(plan_start, plan_end), full_batch),
+			                            elapsed_ms(read_start, read_end),
+			                            elapsed_ms(transform_start, transform_end),
+			                            baseline_rowgroups);
+
+			if (cfg.verify_outputs && run_pushdown) {
+				const auto verify_start = Clock::now();
+				try {
+					verify_equal_blocks(pushdown_batch, full_batch, selected_full_blocks);
+				} catch (const std::exception& e) {
+					result.outputs_match = false;
+					result.mismatch      = e.what();
+				}
+				const auto verify_end = Clock::now();
+				result.verify_ms += elapsed_ms(verify_start, verify_end);
+			}
+		}
+	}
+
+	result.pushdown.total_ms = result.pushdown.plan_ms + result.pushdown.read_decode_ms + result.pushdown.transform_ms +
+	                           result.pushdown.sink_ms;
+	result.full_then_crop.total_ms = result.full_then_crop.plan_ms + result.full_then_crop.read_decode_ms +
+	                                 result.full_then_crop.transform_ms + result.full_then_crop.sink_ms;
+	result.auto_no_dct_pushdown.total_ms =
+	    result.auto_no_dct_pushdown.plan_ms + result.auto_no_dct_pushdown.read_decode_ms +
+	    result.auto_no_dct_pushdown.transform_ms + result.auto_no_dct_pushdown.sink_ms;
+	result.dct_post_decode.total_ms = result.dct_post_decode.plan_ms + result.dct_post_decode.read_decode_ms +
+	                                  result.dct_post_decode.transform_ms + result.dct_post_decode.sink_ms;
+	if (run_auto) {
+		// Each selected auto window folds its policy/prepared-plan time into the chosen stage's plan_ms.
+		result.auto_total_ms =
+		    result.pushdown.total_ms + result.full_then_crop.total_ms + result.auto_no_dct_pushdown.total_ms;
+	}
+	return result;
+}
+
+} // namespace fastlens::execution
+
+#endif // FASTLENS_WITH_JPEG_DCT

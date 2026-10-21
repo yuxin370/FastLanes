@@ -1,2 +1,0 @@
-add_executable(bench_galp bench_data_parallelize_patch.cpp)
-target_link_libraries(bench_galp PUBLIC FastLanes::benchmarker)

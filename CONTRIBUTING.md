@@ -5,7 +5,7 @@ ThreadSanitizer, use a separate build (TSan cannot be combined with ASan):
 
 ```bash
 cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Release -DFLS_BUILD_TESTING=ON \
-  -DFLS_ENABLE_TSAN=ON -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=OFF
+  -DFLS_ENABLE_TSAN=ON -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=OFF
 cmake --build build-tsan --target unit_test --parallel
 TMPDIR="$HOME/tmp" ctest --test-dir build-tsan --output-on-failure \
   -R 'ParallelPreparation|ParallelEncoder.AutomaticWizard'
@@ -14,16 +14,16 @@ TMPDIR="$HOME/tmp" ctest --test-dir build-tsan --output-on-failure \
 This instruments both the CPU library and tests. A TSan startup/runtime failure
 is an environment limitation, not a passing race check.
 
-The same `FLS_ENABLE_TSAN=ON` build can check GALP host ownership with the
+The same `FLS_ENABLE_TSAN=ON` build can check FASTLENS host ownership with the
 CUDA fault-injection executable (CUDA toolkit headers/compiler must be discoverable):
 
 ```bash
 cmake -S . -B build-host-tsan -DCMAKE_BUILD_TYPE=Release -DFLS_BUILD_TESTING=ON \
-  -DFLS_ENABLE_TSAN=ON -DFLS_ENABLE_GALP_TESTING_AND_BENCHMARKING=ON \
-  -DGALP_BUILD_TESTS=ON -DGALP_BUILD_TORCH=OFF -DGALP_BUILD_BENCHMARKS=OFF \
-  -DGALP_BUILD_TOOLS=OFF -DGALP_WITH_JPEG_DCT=OFF
-cmake --build build-host-tsan --target galp_cuda_transfer_failure_tests --parallel
-TSAN_OPTIONS=halt_on_error=1 build-host-tsan/galp/tests/galp_cuda_transfer_failure_tests
+  -DFLS_ENABLE_TSAN=ON -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
+  -DFASTLENS_BUILD_TESTS=ON -DFASTLENS_BUILD_TORCH=OFF -DFASTLENS_BUILD_BENCHMARKS=OFF \
+  -DFASTLENS_BUILD_TOOLS=OFF -DFASTLENS_WITH_JPEG_DCT=OFF
+cmake --build build-host-tsan --target fastlens_cuda_transfer_failure_tests --parallel
+TSAN_OPTIONS=halt_on_error=1 build-host-tsan/fastlens/tests/fastlens_cuda_transfer_failure_tests
 ```
 
 This executable compiles the real DevicePool, TransferTracker and DeviceArena,

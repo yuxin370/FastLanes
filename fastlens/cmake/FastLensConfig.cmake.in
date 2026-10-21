@@ -1,0 +1,76 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(CUDAToolkit)
+
+if (@FASTLENS_WITH_JPEG_DCT@ AND NOT TARGET JPEG::JPEG)
+    find_package(JPEG QUIET)
+    if (NOT TARGET JPEG::JPEG)
+        find_path(FASTLENS_JPEG_INCLUDE_DIR NAMES jpeglib.h)
+        find_library(FASTLENS_JPEG_LIBRARY NAMES jpeg)
+        if (FASTLENS_JPEG_INCLUDE_DIR AND FASTLENS_JPEG_LIBRARY)
+            add_library(JPEG::JPEG UNKNOWN IMPORTED)
+            set_target_properties(JPEG::JPEG PROPERTIES
+                    IMPORTED_LOCATION "${FASTLENS_JPEG_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${FASTLENS_JPEG_INCLUDE_DIR}")
+        endif ()
+    endif ()
+    if (NOT TARGET JPEG::JPEG)
+        set(FastLens_FOUND FALSE)
+        set(FastLens_NOT_FOUND_MESSAGE
+                "FastLens was built with JPEG DCT support and requires the JPEG::JPEG target.")
+        return()
+    endif ()
+endif ()
+
+if (NOT TARGET FLS::FastLanes)
+    find_package(FLS CONFIG QUIET)
+endif ()
+
+# Compatibility fallback for the current FastLanes build/install layout, which
+# exports FLSTargets.cmake but does not yet install a standard FLSConfig.cmake.
+if (NOT TARGET FLS::FastLanes)
+    set(_fastlens_fls_targets_candidates
+            "${PACKAGE_PREFIX_DIR}/FLSTargets.cmake"
+            "${CMAKE_CURRENT_LIST_DIR}/../FLS/FLSTargets.cmake")
+    foreach (_fastlens_fls_targets IN LISTS _fastlens_fls_targets_candidates)
+        if (NOT TARGET FLS::FastLanes AND EXISTS "${_fastlens_fls_targets}")
+            include("${_fastlens_fls_targets}")
+        endif ()
+    endforeach ()
+    unset(_fastlens_fls_targets)
+    unset(_fastlens_fls_targets_candidates)
+endif ()
+
+if (NOT TARGET FLS::FastLanes)
+    set(FastLens_FOUND FALSE)
+    set(FastLens_NOT_FOUND_MESSAGE "FastLens requires the FLS::FastLanes target.")
+    return()
+endif ()
+
+if (NOT TARGET Thrust::Thrust)
+    find_package(Thrust CONFIG QUIET)
+endif ()
+
+if (NOT TARGET Thrust::Thrust)
+    # CUDA Toolkit installations used by this project provide Thrust headers
+    # without a CMake package target, so create the imported target expected by
+    # FastLensTargets.cmake as a compatibility fallback.
+    find_path(FASTLENS_THRUST_INCLUDE_DIR
+            NAMES thrust/version.h thrust/device_uvector.h
+            HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    if (NOT FASTLENS_THRUST_INCLUDE_DIR)
+        set(FastLens_FOUND FALSE)
+        set(FastLens_NOT_FOUND_MESSAGE
+                "FastLens requires Thrust with device_uvector.h, but it was not found.")
+        return()
+    endif ()
+    add_library(Thrust::Thrust INTERFACE IMPORTED)
+    set_target_properties(Thrust::Thrust PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${FASTLENS_THRUST_INCLUDE_DIR}")
+endif ()
+
+include("${CMAKE_CURRENT_LIST_DIR}/FastLensTargets.cmake")
+
+check_required_components(FastLens)

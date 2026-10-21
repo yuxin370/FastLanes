@@ -1,0 +1,46 @@
+#ifndef FASTLENS_PROFILES_REGISTRY_HPP
+#define FASTLENS_PROFILES_REGISTRY_HPP
+
+#include "fastlens/profiles/rgbnomore.hpp"
+
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace fastlens::profiles {
+
+inline std::vector<std::string> available_direct_dct_profile_ids() {
+	return {
+	    std::string(kRgbNoMoreValidationProfileId),
+	    std::string(kRgbNoMoreValidationCenterCrop512ProfileId),
+	    std::string(kRgbNoMoreSwinV2ValidationProfileId),
+	    std::string(kRgbNoMoreTrainingPlsProfileId),
+	    std::string(kRgbNoMoreSwinV2BlockMajorValidationProfileId),
+	};
+}
+
+inline RegisteredDirectDctProfile resolve_direct_dct_profile(const std::string_view profile_id) {
+	if (profile_id == kRgbNoMoreValidationProfileId) {
+		return rgbnomore_validation_profile();
+	}
+	if (profile_id == kRgbNoMoreValidationCenterCrop512ProfileId) {
+		return rgbnomore_validation_center_crop_512_profile();
+	}
+	if (profile_id == kRgbNoMoreSwinV2ValidationProfileId) {
+		return rgbnomore_swinv2_validation_profile();
+	}
+	if (profile_id == kRgbNoMoreTrainingPlsProfileId) {
+		return rgbnomore_training_pls_profile();
+	}
+	if (profile_id == kRgbNoMoreSwinV2BlockMajorValidationProfileId) {
+		return rgbnomore_swinv2_block_major_validation_profile();
+	}
+	throw std::invalid_argument(
+	    "unknown Direct-DCT profile '" + std::string(profile_id) +
+	    "'; call available_direct_dct_profiles() for the registered profile ids");
+}
+
+} // namespace fastlens::profiles
+
+#endif // FASTLENS_PROFILES_REGISTRY_HPP

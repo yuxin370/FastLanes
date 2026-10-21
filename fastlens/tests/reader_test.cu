@@ -1,0 +1,4144 @@
+// ────────────────────────────────────────────────────────
+// |                      FastLanes                       |
+// ────────────────────────────────────────────────────────
+// fastlens/tests/reader_test.cu
+// ────────────────────────────────────────────────────────
+#include "codecs/encodings/all.cuh"
+#include "cuda/launch/launch.cuh"
+#include "cuda/memory/cuda_raii.cuh"
+#include "cuda/memory/device_pool.cuh"
+#include "cuda/memory/gpu_array.cuh"
+#include "cuda/memory/pinned_host_pool.cuh"
+#include "engine/materialization/metadata.cuh"
+#include "engine/materialization/pinned_d2h.cuh"
+#include "engine/materialization/selected_vector_compactor.hpp"
+#include "engine/operators/column.cuh"
+#include "engine/operators/rowgroup.cuh"
+#include "engine/pipeline/pipeline.cuh"
+#include "engine/table/table.cuh"
+#include "engine/workset/append.cuh"
+#include "engine/workset/upload.cuh"
+#include "fls/connection.hpp"
+#include "fls/expression/data_type.hpp"
+#include "fls/expression/rpn.hpp"
+#include "fls/footer/segment_descriptor.hpp"
+#include "fls/io/file.hpp"
+#include "fls/reader/table_reader.hpp"
+#include "fls/table/memory_table.hpp"
+#include "fls/table/rowgroup.hpp"
+#include "format/compact_descriptor_v3.hpp"
+#include "format/compact_read_plan.hpp"
+#include "format/reader.cuh"
+#include "format/rowgroup_io.cuh"
+#include "fastlens/fastlens.hpp"
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <cuda_runtime.h>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <gtest/gtest.h>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <span>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+#include <type_traits>
+#include <unordered_set>
+#include <variant>
+
+namespace {
+
+bool cuda_available_for_reader_tests();
+
+TEST(CompactSegment, RangeIsCheckedBeforeIndexing) {
+	fastlens::format::CompactV3DirectRowgroup rowgroup;
+	fastlens::format::CompactV3DirectColumn   direct_column;
+	fastlens::format::ZeroCopyColumn          column;
+	column.compact_rowgroup = &rowgroup;
+	column.compact_column   = &direct_column;
+
+	direct_column.segment_count = 1;
+	EXPECT_THROW(fastlens::format::zero_copy_segment(column, 0), std::out_of_range);
+
+	rowgroup.segments.resize(4);
+	direct_column.segment_begin = 4;
+	EXPECT_THROW(fastlens::format::zero_copy_segment(column, 0), std::out_of_range);
+	direct_column.segment_begin = 5;
+	EXPECT_THROW(fastlens::format::zero_copy_segment(column, 0), std::out_of_range);
+	direct_column.segment_begin = 3;
+	direct_column.segment_count = 2;
+	EXPECT_THROW(fastlens::format::zero_copy_segment(column, 0), std::out_of_range);
+	direct_column.segment_count = 1;
+	EXPECT_NO_THROW(fastlens::format::zero_copy_segment(column, 0));
+	EXPECT_THROW(fastlens::format::zero_copy_segment(column, 1), std::out_of_range);
+}
+
+TEST(DevicePool, CachedAllocationsStayOnTheirDevice) {
+	int device_count = 0;
+	if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+		GTEST_SKIP() << "Two CUDA devices are required for the cache ownership test.";
+	}
+	int original_device = 0;
+	ASSERT_EQ(cudaGetDevice(&original_device), cudaSuccess);
+	fastlens::memory::device_release_cached();
+
+	ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+	void* first = fastlens::memory::device_malloc(1024);
+	fastlens::memory::device_free(first);
+	EXPECT_GE(fastlens::memory::device_pool_stats().cached_bytes, 1024U);
+	ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+	void*                 second = fastlens::memory::device_malloc(1024);
+	cudaPointerAttributes attributes {};
+	EXPECT_EQ(cudaPointerGetAttributes(&attributes, second), cudaSuccess);
+	EXPECT_EQ(attributes.device, 1);
+	ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+	fastlens::memory::device_free(second);
+	fastlens::memory::device_release_cached();
+	EXPECT_EQ(cudaSetDevice(original_device), cudaSuccess);
+}
+
+TEST(GPUArray, RejectsOverflow) {
+	EXPECT_THROW((GPUArray<uint64_t>(std::numeric_limits<size_t>::max())), std::overflow_error);
+	EXPECT_THROW((GPUArray<uint64_t>(1, std::numeric_limits<size_t>::max(), nullptr)), std::overflow_error);
+}
+
+TEST(DevicePool, GPUArrayReleasesFailedCopy) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for failed-copy cleanup test.";
+	}
+	const size_t before = fastlens::memory::device_pool_stats().in_use_bytes;
+	EXPECT_THROW((GPUArray<uint8_t>(1, static_cast<const uint8_t*>(nullptr))), fastlens::memory::CudaError);
+	EXPECT_EQ(fastlens::memory::device_pool_stats().in_use_bytes, before);
+}
+
+TEST(PinnedHostPool, ReusesBestFitAndBoundsReleasedMemory) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for pinned-host pool test.";
+	}
+	fastlens::memory::PinnedHostPool pool(/*cache_limit_bytes=*/8192, /*max_reuse_slack_bytes=*/4096);
+	void* const                 first  = pool.alloc(4096);
+	void* const                 second = pool.alloc(4096);
+	ASSERT_NE(first, nullptr);
+	ASSERT_NE(second, nullptr);
+	EXPECT_NE(first, second);
+
+	auto stats = pool.stats();
+	EXPECT_EQ(stats.in_use_bytes, 8192U);
+	EXPECT_EQ(stats.cached_bytes, 0U);
+	EXPECT_EQ(stats.cuda_allocation_count, 2U);
+
+	pool.release(first);
+	void* const reused = pool.alloc(2048);
+	EXPECT_EQ(reused, first);
+	stats = pool.stats();
+	EXPECT_EQ(stats.in_use_bytes, 8192U);
+	EXPECT_EQ(stats.cached_bytes, 0U);
+	EXPECT_EQ(stats.cuda_allocation_count, 2U);
+
+	pool.release(second);
+	pool.release(reused);
+	stats = pool.stats();
+	EXPECT_EQ(stats.in_use_bytes, 0U);
+	EXPECT_EQ(stats.cached_bytes, 8192U);
+
+	void* const larger = pool.alloc(8192);
+	ASSERT_NE(larger, nullptr);
+	EXPECT_EQ(pool.stats().cuda_allocation_count, 3U);
+	pool.release(larger);
+	stats = pool.stats();
+	EXPECT_EQ(stats.cached_bytes, 8192U);
+	EXPECT_LE(stats.cached_bytes, 8192U);
+
+	pool.set_cache_limit_bytes(4096);
+	EXPECT_EQ(pool.stats().cached_bytes, 0U);
+}
+
+TEST(DevicePool, CallerOwnedPinnedUploadUsesTrackedStreamWithoutRestaging) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for caller-owned pinned upload test.";
+	}
+	auto& pool = fastlens::memory::DevicePool::instance();
+	fastlens::memory::CudaStream stream(cudaStreamNonBlocking);
+	auto* const host = static_cast<uint32_t*>(pool.alloc_pinned(sizeof(uint32_t)));
+	auto* const device = static_cast<uint32_t*>(fastlens::memory::device_malloc(sizeof(uint32_t)));
+	ASSERT_NE(host, nullptr);
+	ASSERT_NE(device, nullptr);
+	*host = 0x5A17C0DEU;
+
+	fastlens::memory::device_memcpy_pinned_h2d_async(device, host, sizeof(uint32_t), stream.get());
+	fastlens::memory::sync_h2d(stream.get());
+	uint32_t roundtrip = 0U;
+	ASSERT_EQ(cudaMemcpy(&roundtrip, device, sizeof(uint32_t), cudaMemcpyDeviceToHost), cudaSuccess);
+	EXPECT_EQ(roundtrip, *host);
+
+	pool.release_pinned(host);
+	fastlens::memory::device_free(device);
+}
+
+class ScopedEnvironmentVariable {
+public:
+	ScopedEnvironmentVariable(std::string name, const char* const value)
+	    : name_(std::move(name)) {
+		if (const char* const existing = std::getenv(name_.c_str()); existing != nullptr) {
+			had_value_ = true;
+			old_value_ = existing;
+		}
+		if ((value == nullptr ? ::unsetenv(name_.c_str()) : ::setenv(name_.c_str(), value, 1)) != 0) {
+			throw std::runtime_error("failed to update test environment variable " + name_);
+		}
+	}
+
+	~ScopedEnvironmentVariable() {
+		if (had_value_) {
+			(void)::setenv(name_.c_str(), old_value_.c_str(), 1);
+		} else {
+			(void)::unsetenv(name_.c_str());
+		}
+	}
+
+	ScopedEnvironmentVariable(const ScopedEnvironmentVariable&)            = delete;
+	ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) = delete;
+
+private:
+	std::string name_;
+	std::string old_value_;
+	bool        had_value_ = false;
+};
+
+std::filesystem::path pick_fls_file() {
+	const char* env_path = std::getenv("FLS_READER_TEST_FILE");
+	if (env_path && std::filesystem::exists(env_path)) {
+		return std::filesystem::path(env_path);
+	}
+
+	const std::filesystem::path fastlens_root = FLS_FASTLENS_SOURCE_DIR;
+	const std::filesystem::path repo_root = fastlens_root.parent_path();
+
+	const std::filesystem::path candidate1 = repo_root / "data/fls/fastlens-test/data.fls";
+	if (std::filesystem::exists(candidate1)) {
+		return candidate1;
+	}
+
+	const std::filesystem::path candidate2 = fastlens_root / "data/fls/fastlens-test/data.fls";
+	if (std::filesystem::exists(candidate2)) {
+		return candidate2;
+	}
+
+	return {};
+}
+
+// Discovered CTest cases run in separate processes. Never remove/rebuild a
+// sibling test's fixture while it is opening or mapping the same files.
+std::filesystem::path reader_fixture_root(const std::string& label) {
+	struct Directories {
+		std::vector<std::filesystem::path> paths;
+		~Directories() {
+			for (const auto& path : paths) {
+				std::error_code ignored;
+				std::filesystem::remove_all(path, ignored);
+			}
+		}
+	};
+	static Directories directories;
+	const auto* test = ::testing::UnitTest::GetInstance()->current_test_info();
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto root = std::filesystem::temp_directory_path() /
+	                  (std::string("fastlens_reader_") + test->name() + "_" + label + "_" + std::to_string(suffix));
+	directories.paths.push_back(root);
+	return root;
+}
+
+std::filesystem::path make_partial_rowgroup_fls_fixture() {
+	const auto root = reader_fixture_root("partial_rowgroup_public_span");
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+
+	const auto csv_path    = root / "generated.csv";
+	const auto schema_path = root / "schema.json";
+	const auto fls_path    = root / "data.fls";
+
+	{
+		std::ofstream schema(schema_path);
+		schema << R"({"columns":[{"name":"value","type":"FLS_I08"}]})";
+	}
+	{
+		std::ofstream csv(csv_path);
+		for (size_t row = 0; row < 1030U; ++row) {
+			csv << (row % 100U) << '\n';
+		}
+	}
+
+	fastlanes::Connection writer;
+	writer.set_n_vectors_per_rowgroup(1)
+	    .force_schema_pool({fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08})
+	    .read_csv(root)
+	    .to_fls(fls_path);
+	return fls_path;
+}
+
+std::filesystem::path make_sparse_vector_read_fixture() {
+	const auto root = reader_fixture_root("sparse_vector_physical_ranges");
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+
+	const auto csv_path    = root / "generated.csv";
+	const auto schema_path = root / "schema.json";
+	const auto fls_path    = root / "data.fls";
+	{
+		std::ofstream schema(schema_path);
+		schema << R"({"columns":[{"name":"value","type":"FLS_I08"}]})";
+	}
+	{
+		std::ofstream csv(csv_path);
+		for (size_t row = 0; row < 8U * fastlens::codec::consts::VALUES_PER_VECTOR; ++row) {
+			csv << static_cast<int>((row * 17U + row / 1024U) % 101U) - 50 << '\n';
+		}
+	}
+	fastlanes::Connection writer;
+	writer.set_n_vectors_per_rowgroup(8)
+	    .force_schema_pool({fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08})
+	    .read_csv(root)
+	    .to_fls(fls_path);
+	return fls_path;
+}
+
+std::filesystem::path make_sparse_vector_bundle_fixture(const size_t rowgroup_count = 1U) {
+	const auto root = reader_fixture_root("sparse_vector_bundle_ranges");
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+
+	const auto csv_path    = root / "generated.csv";
+	const auto schema_path = root / "schema.json";
+	const auto fls_path    = root / "data.fls";
+	{
+		std::ofstream schema(schema_path);
+		schema << R"({"columns":[)";
+		for (size_t column = 0; column < 8U; ++column) {
+			if (column != 0U) {
+				schema << ',';
+			}
+			schema << R"({"name":"c)" << column << R"(","type":"FLS_I08"})";
+		}
+		schema << "]}";
+	}
+	{
+		std::ofstream csv(csv_path);
+		for (size_t row = 0; row < rowgroup_count * 8U * fastlens::codec::consts::VALUES_PER_VECTOR; ++row) {
+			for (size_t column = 0; column < 8U; ++column) {
+				if (column != 0U) {
+					csv << '|';
+				}
+				csv << static_cast<int>((row * 17U + column * 29U + row / 1024U) % 101U) - 50;
+			}
+			csv << '\n';
+		}
+	}
+	fastlanes::Connection writer;
+	writer.set_n_vectors_per_rowgroup(8)
+	    .force_schema_pool({fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08})
+	    .read_csv(root)
+	    .to_fls(fls_path);
+	return fls_path;
+}
+
+std::filesystem::path make_compact_coefficient_read_fixture() {
+	const auto root = reader_fixture_root("compact_coefficient_ranges");
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto standard_path = root / "standard.fls";
+	const auto compact_path  = root / "compact.fls";
+
+	std::array<std::vector<int16_t>, 8> values;
+	std::array<fastlanes::MemoryColumn, 8> columns;
+	for (size_t column = 0U; column < columns.size(); ++column) {
+		values[column].reserve(3U * fastlens::codec::consts::VALUES_PER_VECTOR);
+		for (size_t row = 0U; row < 3U * fastlens::codec::consts::VALUES_PER_VECTOR; ++row) {
+			values[column].push_back(static_cast<int16_t>((row * 17U + column * 29U) % 509U));
+		}
+		columns[column].name = "dct_zz_" + std::to_string(column);
+		columns[column].data = std::span<const int16_t>(values[column]);
+	}
+	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 1U;
+	options.force_schema           = true;
+	options.forced_schema.assign(columns.size(), fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+	fastlanes::Connection writer;
+	fastlanes::load_memory_table(writer, table, options);
+	writer.inline_footer();
+	writer.to_fls(standard_path);
+
+	fastlens::format::CompactV3BuildOptions compact_options;
+	compact_options.vector_size   = fastlens::codec::consts::VALUES_PER_VECTOR;
+	compact_options.spatial_order = 3U;
+	for (uint32_t image_index = 0U; image_index < 3U; ++image_index) {
+		fastlens::format::CompactV3ImageInput image;
+		image.first_rowgroup     = image_index;
+		image.rowgroup_count     = 1U;
+		image.real_row_count     = fastlens::codec::consts::VALUES_PER_VECTOR;
+		image.first_physical_row =
+		    static_cast<uint64_t>(image_index) * fastlens::codec::consts::VALUES_PER_VECTOR;
+		image.components.push_back(fastlens::format::CompactV3ComponentInput {
+		    0U, 32U, 32U, 32U, 32U, 0U, 0U});
+		compact_options.images.push_back(std::move(image));
+	}
+	(void)fastlens::format::compact_standard_fls_to_v3(
+	    standard_path, compact_path, compact_options);
+	return compact_path;
+}
+
+std::filesystem::path make_compact_mixed_payload_fixture() {
+	const auto root = reader_fixture_root("compact_mixed_payload_rowgroups");
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto standard_path = root / "standard.fls";
+	const auto compact_path  = root / "compact.fls";
+
+	std::array<std::vector<int16_t>, 2> values;
+	for (size_t row = 0U; row < 3U * fastlens::codec::consts::VALUES_PER_VECTOR; ++row) {
+		const size_t rowgroup = row / fastlens::codec::consts::VALUES_PER_VECTOR;
+		const size_t local    = row % fastlens::codec::consts::VALUES_PER_VECTOR;
+		if (rowgroup == 1U) {
+			values[0].push_back(17);
+			values[1].push_back(-23);
+		} else {
+			values[0].push_back(
+			    static_cast<int16_t>(static_cast<int>((local * 17U + rowgroup * 31U) % 509U) - 254));
+			values[1].push_back(
+			    static_cast<int16_t>(static_cast<int>((local * 29U + rowgroup * 47U) % 997U) - 498));
+		}
+	}
+	std::array<fastlanes::MemoryColumn, 2> columns;
+	columns[0].name = "dct_zz_00";
+	columns[0].data = std::span<const int16_t>(values[0]);
+	columns[1].name = "dct_zz_01";
+	columns[1].data = std::span<const int16_t>(values[1]);
+	const fastlanes::MemoryTable        table {std::span<const fastlanes::MemoryColumn>(columns)};
+	const std::array<fastlanes::n_t, 3> rowgroup_rows {{fastlens::codec::consts::VALUES_PER_VECTOR,
+	                                                   fastlens::codec::consts::VALUES_PER_VECTOR,
+	                                                   fastlens::codec::consts::VALUES_PER_VECTOR}};
+	fastlanes::MemoryTableOptions       options;
+	options.n_vectors_per_rowgroup = 1U;
+	options.rowgroup_n_tuples      = std::span<const fastlanes::n_t>(rowgroup_rows);
+	fastlanes::Connection writer;
+	fastlanes::load_memory_table(writer, table, options);
+	writer.inline_footer();
+	writer.to_fls(standard_path);
+
+	fastlens::format::CompactV3BuildOptions compact_options;
+	compact_options.vector_size   = fastlens::codec::consts::VALUES_PER_VECTOR;
+	compact_options.spatial_order = 3U;
+	(void)fastlens::format::compact_standard_fls_to_v3(standard_path, compact_path, compact_options);
+	return compact_path;
+}
+
+TEST(Reader, CompactV3StaticMetadataRebindPreservesDescriptorAndBoundsPayloadHandles) {
+	const auto compact_path = make_compact_coefficient_read_fixture();
+	const auto mapping_before = fastlens::format::compact_descriptor_v3_mapping_stats();
+	const auto handles_before = fastlanes::File::read_handle_stats();
+	{
+		fastlens::format::FlsReaderOptions options;
+		auto original = std::make_unique<fastlens::format::FlsReader>(compact_path, options);
+		ASSERT_TRUE(original->is_compact_v3());
+		auto static_metadata = original->share_static_metadata();
+		ASSERT_NE(static_metadata, nullptr);
+		EXPECT_GT(static_metadata->retained_bytes(), 0U);
+		EXPECT_EQ(original->static_metadata_bytes(), static_metadata->retained_bytes());
+
+		const auto mapped = fastlens::format::compact_descriptor_v3_mapping_stats();
+		EXPECT_EQ(mapped.current_mapping_count, mapping_before.current_mapping_count + 1U);
+		{
+			fastlens::format::FlsReader rebound(compact_path, options, static_metadata);
+			EXPECT_TRUE(rebound.is_compact_v3());
+			EXPECT_EQ(rebound.share_static_metadata(), static_metadata);
+			EXPECT_EQ(rebound.rowgroup_count(), original->rowgroup_count());
+			EXPECT_EQ(rebound.sparse_initialization_stats().descriptor_open_ms, 0.0);
+			fastlens::format::ZeroCopyReadTiming timing {};
+			auto rowgroup = rebound.read_rowgroup_zero_copy(0U, &timing);
+			EXPECT_FALSE(rowgroup.backing_span.empty());
+			const auto handles_live = fastlanes::File::read_handle_stats();
+			EXPECT_EQ(handles_live.current_open_handles, handles_before.current_open_handles + 1U);
+		}
+		const auto handles_released = fastlanes::File::read_handle_stats();
+		EXPECT_EQ(handles_released.current_open_handles, handles_before.current_open_handles);
+
+		const auto different_path = compact_path.parent_path() / "different-name.fls";
+		std::filesystem::copy_file(compact_path, different_path,
+		                           std::filesystem::copy_options::overwrite_existing);
+		EXPECT_THROW((void)fastlens::format::FlsReader(different_path, options, static_metadata),
+		             std::invalid_argument);
+		EXPECT_EQ(fastlens::format::compact_descriptor_v3_mapping_stats().current_mapping_count,
+		          mapping_before.current_mapping_count + 1U);
+	}
+	const auto mapping_after = fastlens::format::compact_descriptor_v3_mapping_stats();
+	EXPECT_EQ(mapping_after.current_mapping_count, mapping_before.current_mapping_count);
+	EXPECT_EQ(mapping_after.unmap_count, mapping_before.unmap_count + 1U);
+}
+
+size_t get_n_values(const fastlens::format::HostColumnVariant& host) {
+	return std::visit([](auto&& col) { return col.get_n_values(); }, host);
+}
+
+TEST(Reader, CompactV3CoefficientPrefixReadsExactPhysicalRanges) {
+	const auto compact_path = make_compact_coefficient_read_fixture();
+	fastlens::format::FlsReader reader(compact_path);
+	ASSERT_TRUE(reader.is_compact_v3());
+	EXPECT_FALSE(reader.has_sparse_vector_bundle());
+	EXPECT_THROW((void)reader.table_descriptor(), std::runtime_error);
+
+	fastlens::format::ZeroCopyReadTiming full_timing {};
+	auto full = reader.read_rowgroup_zero_copy(0U, &full_timing);
+	fastlens::format::ZeroCopyReadTiming prefix_timing {};
+	auto prefix = reader.read_rowgroup_zero_copy_selected_columns(0U, {0U, 1U, 2U, 3U}, &prefix_timing);
+	EXPECT_TRUE(prefix_timing.sparse_read_supported);
+	EXPECT_TRUE(prefix_timing.used_sparse_read);
+	EXPECT_TRUE(prefix_timing.used_coefficient_range_read);
+	EXPECT_EQ(prefix_timing.selected_coefficient_count, 4U);
+	EXPECT_EQ(prefix_timing.full_coefficient_count, 8U);
+	EXPECT_EQ(prefix_timing.pread_count, prefix_timing.coalesced_read_run_count);
+	EXPECT_LT(prefix_timing.storage_bytes, full_timing.storage_bytes);
+	EXPECT_LE(prefix_timing.logical_storage_bytes, prefix_timing.storage_bytes);
+	EXPECT_LE(prefix_timing.physical_page_bytes, prefix_timing.full_physical_page_bytes);
+
+	const auto* descriptors = prefix.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(descriptors, nullptr);
+	ASSERT_EQ(descriptors->size(), 8U);
+	for (size_t column = 0U; column < 4U; ++column) {
+		const auto* descriptor = descriptors->Get(static_cast<flatbuffers::uoffset_t>(column));
+		ASSERT_NE(descriptor, nullptr);
+		ASSERT_LE(static_cast<size_t>(descriptor->column_offset()) + descriptor->total_size(),
+		          prefix.backing_span.size());
+		EXPECT_EQ(std::memcmp(prefix.backing_span.data() + descriptor->column_offset(),
+		                      full.backing_span.data() + descriptor->column_offset(),
+		                      descriptor->total_size()),
+		          0)
+		    << "column=" << column;
+	}
+
+	auto materialized_prefix = reader.materialize_zero_copy_rowgroup(std::move(prefix));
+	EXPECT_EQ(materialized_prefix.materialized_column_indices, (std::vector<uint8_t> {0U, 1U, 2U, 3U}));
+	ASSERT_EQ(materialized_prefix.columns.size(), 8U);
+	for (size_t column = 0U; column < 4U; ++column) {
+		EXPECT_EQ(materialized_prefix.columns[column].token, fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+		EXPECT_EQ(get_n_values(materialized_prefix.columns[column].host), materialized_prefix.n_values);
+	}
+}
+
+TEST(Reader, CompactV3FullRowgroupsUseScatterReadsAndPreserveCallerOrder) {
+	const auto              compact_path = make_compact_coefficient_read_fixture();
+	fastlens::format::FlsReader reader(compact_path);
+	ASSERT_TRUE(reader.is_compact_v3());
+	ASSERT_EQ(reader.rowgroup_count(), 3U);
+	const auto largest_images = reader.compact_largest_image_backing_bytes(2U);
+	ASSERT_EQ(largest_images.size(), 2U);
+	std::vector<size_t> expected_image_bytes;
+	for (size_t rowgroup = 0U; rowgroup < reader.rowgroup_count(); ++rowgroup) {
+		const size_t payload = reader.rowgroup_storage_bytes(rowgroup);
+		constexpr size_t alignment = fastlens::format::kCompactBatchRowgroupAlignment;
+		expected_image_bytes.push_back((payload + alignment - 1U) & ~(alignment - 1U));
+	}
+	std::sort(expected_image_bytes.begin(), expected_image_bytes.end(), std::greater<size_t> {});
+	EXPECT_EQ(largest_images,
+	          (std::vector<size_t> {expected_image_bytes[0U], expected_image_bytes[1U]}));
+
+	std::vector<fastlens::format::ZeroCopyReadTiming> scatter_timings;
+	auto scatter = reader.read_compact_rowgroups_zero_copy_scatter({2U, 0U, 1U}, &scatter_timings);
+	ASSERT_EQ(scatter.size(), 3U);
+	ASSERT_EQ(scatter_timings.size(), 3U);
+	EXPECT_EQ(scatter[0].rowgroup_index, 2U);
+	EXPECT_EQ(scatter[1].rowgroup_index, 0U);
+	EXPECT_EQ(scatter[2].rowgroup_index, 1U);
+	for (const auto& rowgroup : scatter) {
+		EXPECT_NE(rowgroup.compact_direct_owner, nullptr);
+		EXPECT_EQ(rowgroup.rowgroup_descriptor, nullptr);
+	}
+
+	size_t scatter_bytes   = 0U;
+	size_t scatter_preads  = 0U;
+	size_t scatter_preadvs = 0U;
+	size_t scatter_runs    = 0U;
+	for (size_t index = 0U; index < scatter.size(); ++index) {
+		scatter_bytes += scatter_timings[index].storage_bytes;
+		scatter_preads += scatter_timings[index].pread_count;
+		scatter_preadvs += scatter_timings[index].preadv_count;
+		scatter_runs += scatter_timings[index].coalesced_read_run_count;
+		fastlens::format::ZeroCopyReadTiming individual_timing {};
+		auto individual = reader.read_rowgroup_zero_copy(scatter[index].rowgroup_index, &individual_timing);
+		ASSERT_EQ(scatter[index].backing_span.size(), individual.backing_span.size());
+		EXPECT_EQ(std::memcmp(scatter[index].backing_span.data(),
+		                      individual.backing_span.data(),
+		                      scatter[index].backing_span.size()),
+		          0);
+	}
+	EXPECT_EQ(scatter_preads, 1U);
+	EXPECT_EQ(scatter_preadvs, 1U);
+	EXPECT_EQ(scatter_runs, 1U);
+	EXPECT_EQ(scatter_bytes,
+	          reader.rowgroup_storage_bytes(0U) + reader.rowgroup_storage_bytes(1U) +
+	              reader.rowgroup_storage_bytes(2U));
+	ASSERT_NE(scatter[0].backing_owner, nullptr);
+	EXPECT_EQ(scatter[0].backing_owner.get(), scatter[1].backing_owner.get());
+	EXPECT_EQ(scatter[0].backing_owner.get(), scatter[2].backing_owner.get());
+
+	std::vector<fastlens::format::ZeroCopyReadTiming> parallel_timings;
+	auto parallel =
+	    reader.read_compact_rowgroups_zero_copy_scatter({2U, 0U, 1U}, &parallel_timings, /*view_workers=*/4U);
+	ASSERT_EQ(parallel.size(), scatter.size());
+	ASSERT_EQ(parallel_timings.size(), scatter_timings.size());
+	for (size_t index = 0U; index < parallel.size(); ++index) {
+		EXPECT_EQ(parallel[index].rowgroup_index, scatter[index].rowgroup_index);
+		ASSERT_EQ(parallel[index].backing_span.size(), scatter[index].backing_span.size());
+		EXPECT_EQ(std::memcmp(parallel[index].backing_span.data(),
+		                      scatter[index].backing_span.data(),
+		                      scatter[index].backing_span.size()),
+		          0);
+	}
+	ASSERT_NE(parallel[0].backing_owner, nullptr);
+	EXPECT_EQ(parallel[0].backing_owner.get(), parallel[1].backing_owner.get());
+	EXPECT_EQ(parallel[0].backing_owner.get(), parallel[2].backing_owner.get());
+
+	fastlens::format::FlsReaderOptions runtime_options;
+	runtime_options.load_column_names                  = false;
+	runtime_options.enable_sparse_vector_reads         = false;
+	runtime_options.build_shared_zero_copy_schema_plan = false;
+	fastlens::format::FlsReader runtime_reader(compact_path, runtime_options);
+	auto runtime_views = runtime_reader.read_compact_rowgroups_zero_copy_scatter(
+	    {2U, 0U, 1U}, nullptr, /*view_workers=*/4U);
+	ASSERT_EQ(runtime_views.size(), scatter.size());
+	for (size_t index = 0U; index < runtime_views.size(); ++index) {
+		EXPECT_EQ(runtime_views[index].rowgroup_index, scatter[index].rowgroup_index);
+		EXPECT_NE(runtime_views[index].schema_plan, nullptr);
+		EXPECT_EQ(runtime_views[index].rowgroup_view, nullptr);
+		EXPECT_TRUE(runtime_views[index].columns.empty());
+	}
+
+	const std::vector<size_t> scatter_order {2U, 0U, 1U};
+	const size_t external_capacity = reader.compact_batch_backing_bytes(scatter_order);
+	ASSERT_GE(external_capacity, scatter_bytes);
+	auto external_backing = std::make_shared<std::vector<std::byte>>(external_capacity);
+	std::vector<fastlens::format::ZeroCopyReadTiming> external_timings;
+	auto external = reader.read_compact_rowgroups_zero_copy_scatter_into(
+	    scatter_order,
+	    std::static_pointer_cast<void>(external_backing),
+	    external_backing->data(),
+	    external_backing->size(),
+	    /*backing_is_pinned=*/true,
+	    &external_timings);
+	ASSERT_EQ(external.size(), scatter.size());
+	ASSERT_EQ(external_timings.size(), scatter.size());
+	for (size_t index = 0U; index < external.size(); ++index) {
+		EXPECT_TRUE(external[index].backing_is_pinned);
+		EXPECT_TRUE(external_timings[index].used_pinned_backing);
+		EXPECT_EQ(external[index].backing_owner.get(), external_backing.get());
+		ASSERT_EQ(external[index].backing_span.size(), scatter[index].backing_span.size());
+		EXPECT_EQ(std::memcmp(external[index].backing_span.data(),
+		                      scatter[index].backing_span.data(),
+		                      scatter[index].backing_span.size()),
+		          0);
+	}
+	const auto* const first_backing = external.front().backing_span.data();
+	bool              observed_alignment_padding = false;
+	size_t            previous_end = external.front().backing_span.size();
+	for (size_t index = 1U; index < external.size(); ++index) {
+		const size_t offset = static_cast<size_t>(external[index].backing_span.data() - first_backing);
+		EXPECT_EQ(offset % fastlens::format::kCompactBatchRowgroupAlignment, 0U);
+		EXPECT_GE(offset, previous_end);
+		observed_alignment_padding = observed_alignment_padding || offset > previous_end;
+		previous_end = offset + external[index].backing_span.size();
+	}
+	EXPECT_TRUE(observed_alignment_padding);
+	size_t registered_columns = 0U;
+	for (auto& rowgroup : external) {
+		auto materialized = reader.materialize_zero_copy_rowgroup(std::move(rowgroup));
+		for (const auto& column : materialized.columns) {
+			if (!column.host_owned_by_backing) {
+				continue;
+			}
+			++registered_columns;
+			EXPECT_TRUE(column.backing_is_pinned);
+			EXPECT_EQ(column.backing_base, external_backing->data());
+			EXPECT_EQ(column.backing_bytes, external_capacity);
+		}
+	}
+	EXPECT_GT(registered_columns, 0U);
+
+	const std::vector<uint8_t>                    selected_columns {0U, 1U, 2U, 3U};
+	std::vector<fastlens::format::ZeroCopyReadTiming> prefix_timings;
+	auto                                          prefix =
+	    reader.read_compact_rowgroups_zero_copy_selected_columns({2U, 0U, 1U}, selected_columns, &prefix_timings);
+	ASSERT_EQ(prefix.size(), 3U);
+	ASSERT_EQ(prefix_timings.size(), 3U);
+	for (const auto& rowgroup : prefix) {
+		EXPECT_NE(rowgroup.compact_direct_owner, nullptr);
+		EXPECT_EQ(rowgroup.rowgroup_descriptor, nullptr);
+	}
+	const auto   descriptor   = fastlens::format::CompactDescriptorV3::Open(compact_path);
+	const auto   prefix_plan  = fastlens::format::compile_compact_read_plan(descriptor, {0U, 1U, 2U}, selected_columns);
+	const size_t prefix_bytes = std::accumulate(
+	    prefix_timings.begin(), prefix_timings.end(), size_t {0U}, [](const size_t sum, const auto& timing) {
+		    return sum + timing.storage_bytes;
+	    });
+	const size_t prefix_pages = std::accumulate(
+	    prefix_timings.begin(), prefix_timings.end(), size_t {0U}, [](const size_t sum, const auto& timing) {
+		    return sum + timing.physical_page_bytes;
+	    });
+	EXPECT_EQ(prefix_bytes, prefix_plan.stats().read_bytes);
+	EXPECT_EQ(prefix_pages, prefix_plan.stats().physical_page_bytes);
+	EXPECT_LT(prefix_bytes, scatter_bytes);
+	EXPECT_TRUE(std::all_of(prefix_timings.begin(), prefix_timings.end(), [](const auto& timing) {
+		return timing.preadv_count == 0U && timing.used_coefficient_range_read;
+	}));
+}
+
+TEST(Reader, CompactV3MetadataOnlyRowgroupsUseValidatedZeroIoPaths) {
+	const auto compact_path = make_compact_mixed_payload_fixture();
+	const auto descriptor   = fastlens::format::CompactDescriptorV3::Open(compact_path);
+	ASSERT_EQ(descriptor.rowgroup_count(), 3U);
+	EXPECT_GT(descriptor.rowgroup(0U).payload_size, 0U);
+	EXPECT_EQ(descriptor.rowgroup(1U).payload_size, 0U);
+	EXPECT_GT(descriptor.rowgroup(2U).payload_size, 0U);
+
+	fastlens::format::FlsReader reader(compact_path);
+	EXPECT_EQ(reader.rowgroup_storage_bytes(1U), 0U);
+	fastlens::format::ZeroCopyReadTiming full_timing {};
+	auto full = reader.read_rowgroup_zero_copy(1U, &full_timing);
+	EXPECT_EQ(full.backing_span.size(), 0U);
+	EXPECT_NE(full.backing_span.data(), nullptr);
+	EXPECT_FALSE(full.backing_is_pinned);
+	EXPECT_EQ(full_timing.storage_bytes, 0U);
+	EXPECT_EQ(full_timing.pread_count, 0U);
+	EXPECT_EQ(full_timing.preadv_count, 0U);
+	EXPECT_EQ(full_timing.coalesced_read_run_count, 0U);
+	EXPECT_EQ(full_timing.selected_coefficient_count, 2U);
+	const auto materialized = reader.materialize_zero_copy_rowgroup(std::move(full));
+	ASSERT_EQ(materialized.columns.size(), 2U);
+	const auto constant_value = [](const fastlens::format::Column& column) -> int16_t {
+		if (const auto* value = std::get_if<fastlens::codec::host::CONSTANTColumn<int8_t>>(&column.host)) {
+			return value->value;
+		}
+		if (const auto* value = std::get_if<fastlens::codec::host::CONSTANTColumn<int16_t>>(&column.host)) {
+			return value->value;
+		}
+		throw std::runtime_error("metadata-only test column did not materialize as an I8/I16 constant");
+	};
+	EXPECT_EQ(constant_value(materialized.columns[0]), 17);
+	EXPECT_EQ(constant_value(materialized.columns[1]), -23);
+
+	fastlens::format::ZeroCopyReadTiming vector_timing {};
+	auto selected_vector = reader.read_rowgroup_zero_copy_selected_vectors(1U, {0U}, &vector_timing);
+	EXPECT_EQ(selected_vector.backing_span.size(), 0U);
+	EXPECT_EQ(vector_timing.pread_count, 0U);
+
+	fastlens::format::ZeroCopyReadTiming column_timing {};
+	auto selected_columns = reader.read_rowgroup_zero_copy_selected_columns(1U, {0U, 1U}, &column_timing);
+	EXPECT_EQ(selected_columns.backing_span.size(), 0U);
+	EXPECT_EQ(selected_columns.materialized_column_indices, (std::vector<uint8_t> {0U, 1U}));
+	EXPECT_EQ(column_timing.storage_bytes, 0U);
+	EXPECT_EQ(column_timing.pread_count, 0U);
+	EXPECT_TRUE(column_timing.used_coefficient_range_read);
+	EXPECT_EQ(column_timing.sparse_fallback_reason, "metadata-only-rowgroup-zero-io");
+
+	std::vector<fastlens::format::ZeroCopyReadTiming> scatter_timings;
+	auto scatter = reader.read_compact_rowgroups_zero_copy_scatter({2U, 1U, 0U}, &scatter_timings);
+	ASSERT_EQ(scatter.size(), 3U);
+	ASSERT_EQ(scatter_timings.size(), 3U);
+	EXPECT_EQ(scatter[0].rowgroup_index, 2U);
+	EXPECT_EQ(scatter[1].rowgroup_index, 1U);
+	EXPECT_EQ(scatter[2].rowgroup_index, 0U);
+	EXPECT_GT(scatter[0].backing_span.size(), 0U);
+	EXPECT_EQ(scatter[1].backing_span.size(), 0U);
+	EXPECT_GT(scatter[2].backing_span.size(), 0U);
+	EXPECT_NE(scatter[1].compact_direct_owner, nullptr);
+	EXPECT_EQ(scatter[1].rowgroup_descriptor, nullptr);
+	EXPECT_EQ(scatter[1].schema_plan, nullptr);
+	EXPECT_EQ(scatter[1].rowgroup_view, nullptr);
+	EXPECT_EQ(scatter[1].columns.size(), 2U);
+	EXPECT_EQ(scatter_timings[1].storage_bytes, 0U);
+	EXPECT_EQ(scatter_timings[1].physical_page_bytes, 0U);
+	EXPECT_EQ(scatter_timings[1].pread_count, 0U);
+	const size_t total_preads = scatter_timings[0].pread_count + scatter_timings[1].pread_count +
+	                            scatter_timings[2].pread_count;
+	const size_t total_preadvs = scatter_timings[0].preadv_count + scatter_timings[1].preadv_count +
+	                             scatter_timings[2].preadv_count;
+	EXPECT_EQ(total_preads, 1U);
+	EXPECT_EQ(total_preadvs, 1U);
+	EXPECT_THROW((void)reader.read_compact_rowgroups_zero_copy_scatter({1U, 1U}), std::invalid_argument);
+
+	std::vector<fastlens::format::ZeroCopyReadTiming> batch_column_timings;
+	auto batch_columns =
+	    reader.read_compact_rowgroups_zero_copy_selected_columns({2U, 1U, 0U}, {0U}, &batch_column_timings);
+	ASSERT_EQ(batch_columns.size(), 3U);
+	ASSERT_EQ(batch_column_timings.size(), 3U);
+	EXPECT_EQ(batch_columns[1].backing_span.size(), 0U);
+	EXPECT_EQ(batch_column_timings[1].pread_count, 0U);
+	EXPECT_EQ(batch_column_timings[1].sparse_fallback_reason, "metadata-only-rowgroup-zero-io");
+
+	auto prefetch_reader = std::make_shared<fastlens::format::FlsReader>(compact_path);
+	auto pinned_pool     = fastlens::runtime::PinnedRowgroupBufferPool::create(1U);
+	fastlens::runtime::RowgroupPrefetchQueue queue(prefetch_reader,
+	                                           std::vector<size_t> {1U},
+	                                           /*depth=*/1U,
+	                                           /*num_workers=*/1U,
+	                                           pinned_pool);
+	auto prefetched = queue.pop();
+	EXPECT_EQ(prefetched.rowgroup_index, 1U);
+	EXPECT_EQ(prefetched.storage_bytes, 0U);
+	EXPECT_EQ(prefetched.pread_count, 0U);
+	EXPECT_FALSE(prefetched.used_pinned_backing);
+	EXPECT_EQ(prefetched.timing.pinned_acquire_ms, 0.0);
+	fastlens::execution::free_rowgroup(prefetched.rowgroup);
+}
+
+TEST(Reader, CompactV3Strict1kMetadataOnlyIntegration) {
+	const char* const path = std::getenv("FASTLENS_COMPACT_V3_ZERO_PAYLOAD_TEST_FILE");
+	if (path == nullptr || *path == '\0') {
+		GTEST_SKIP() << "FASTLENS_COMPACT_V3_ZERO_PAYLOAD_TEST_FILE is not set";
+	}
+	const auto descriptor = fastlens::format::CompactDescriptorV3::Open(path);
+	std::vector<size_t>   zero_rowgroups;
+	std::vector<uint32_t> image_indices;
+	for (size_t rowgroup_index = 0U; rowgroup_index < descriptor.rowgroup_count(); ++rowgroup_index) {
+		const auto record = descriptor.rowgroup(rowgroup_index);
+		if (record.payload_size == 0U) {
+			zero_rowgroups.push_back(rowgroup_index);
+			image_indices.push_back(record.local_image_index);
+		}
+	}
+	ASSERT_EQ(zero_rowgroups.size(), 6U);
+	std::sort(image_indices.begin(), image_indices.end());
+	image_indices.erase(std::unique(image_indices.begin(), image_indices.end()), image_indices.end());
+	EXPECT_EQ(image_indices, (std::vector<uint32_t> {6U, 106U, 286U, 917U}));
+
+	fastlens::format::FlsReader reader(path);
+	std::vector<fastlens::format::ZeroCopyReadTiming> scatter_timings;
+	auto scatter = reader.read_compact_rowgroups_zero_copy_scatter(zero_rowgroups, &scatter_timings);
+	ASSERT_EQ(scatter.size(), zero_rowgroups.size());
+	ASSERT_EQ(scatter_timings.size(), zero_rowgroups.size());
+	for (size_t position = 0U; position < scatter.size(); ++position) {
+		EXPECT_EQ(scatter[position].rowgroup_index, zero_rowgroups[position]);
+		EXPECT_EQ(scatter[position].backing_span.size(), 0U);
+		EXPECT_NE(scatter[position].backing_span.data(), nullptr);
+		EXPECT_EQ(scatter_timings[position].storage_bytes, 0U);
+		EXPECT_EQ(scatter_timings[position].physical_page_bytes, 0U);
+		EXPECT_EQ(scatter_timings[position].pread_count, 0U);
+		auto materialized = reader.materialize_zero_copy_rowgroup(std::move(scatter[position]));
+		ASSERT_EQ(materialized.columns.size(), descriptor.column_count());
+		for (const auto& column : materialized.columns) {
+			EXPECT_TRUE((std::holds_alternative<fastlens::codec::host::CONSTANTColumn<int8_t>>(column.host) ||
+			             std::holds_alternative<fastlens::codec::host::CONSTANTColumn<int16_t>>(column.host)));
+			EXPECT_TRUE(column.token == fastlanes::OperatorToken::EXP_CONSTANT_I08 ||
+			            column.token == fastlanes::OperatorToken::EXP_CONSTANT_I16 ||
+			            column.token == fastlanes::OperatorToken::EXP_EQUAL);
+		}
+	}
+}
+
+TEST(SparseReadCoalescer, CanonicalizesRangesAndHonorsExactCap) {
+	fastlens::format::SparseReadBoundedCoalesceOptions options;
+	const auto result = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{7U, 3U, 100U, {{30U, 10U}, {0U, 0U}, {5U, 10U}, {0U, 10U}, {15U, 5U}}}},
+	    options);
+	ASSERT_EQ(result.rowgroups.size(), 1U);
+	const auto& rowgroup = result.rowgroups.front();
+	ASSERT_EQ(rowgroup.exact_ranges.size(), 2U);
+	EXPECT_EQ(rowgroup.exact_ranges[0].offset, 0U);
+	EXPECT_EQ(rowgroup.exact_ranges[0].size, 20U);
+	EXPECT_EQ(rowgroup.exact_ranges[1].offset, 30U);
+	EXPECT_EQ(rowgroup.exact_ranges[1].size, 10U);
+	EXPECT_EQ(rowgroup.exact_storage_bytes, 30U);
+	EXPECT_EQ(rowgroup.physical_storage_bytes, 30U);
+	EXPECT_EQ(rowgroup.merged_gap_bytes, 0U);
+	EXPECT_EQ(result.exact_extent_count, 2U);
+	EXPECT_EQ(result.physical_run_count, 2U);
+}
+
+TEST(SparseReadCoalescer, CapBoundaryStableTieAndShardBudgetAreDeterministic) {
+	fastlens::format::SparseReadBoundedCoalesceOptions boundary_options;
+	boundary_options.whole_run_amplification_ppm = 1'100'000U;
+	const auto exact_hit = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, 110U, {{0U, 50U}, {60U, 50U}}}}, boundary_options);
+	EXPECT_EQ(exact_hit.physical_storage_bytes, 110U);
+	EXPECT_EQ(exact_hit.physical_run_count, 1U);
+	EXPECT_EQ(exact_hit.merged_gap_bytes, 10U);
+	const auto one_byte_over = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, 111U, {{0U, 50U}, {61U, 50U}}}}, boundary_options);
+	EXPECT_EQ(one_byte_over.physical_storage_bytes, 100U);
+	EXPECT_EQ(one_byte_over.physical_run_count, 2U);
+
+	fastlens::format::SparseReadBoundedCoalesceOptions tie_options;
+	tie_options.whole_run_amplification_ppm    = 1'010'000U;
+	tie_options.per_shard_amplification_ppm    = 1'100'000U;
+	tie_options.per_rowgroup_amplification_ppm = 1'100'000U;
+	const auto tied = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{2U, 0U, 102U, {{0U, 50U}, {52U, 50U}}},
+	     {1U, 9U, 102U, {{0U, 50U}, {52U, 50U}}}},
+	    tie_options);
+	ASSERT_EQ(tied.rowgroups.size(), 2U);
+	EXPECT_EQ(tied.rowgroups[0].physical_ranges.size(), 2U);
+	EXPECT_EQ(tied.rowgroups[1].physical_ranges.size(), 1U);
+	EXPECT_EQ(tied.merged_gap_bytes, 2U);
+
+	fastlens::format::SparseReadBoundedCoalesceOptions shard_options;
+	shard_options.whole_run_amplification_ppm    = 1'100'000U;
+	shard_options.per_shard_amplification_ppm    = 1'050'000U;
+	shard_options.per_rowgroup_amplification_ppm = 1'100'000U;
+	const auto shard_limited = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{4U, 0U, 110U, {{0U, 50U}, {60U, 50U}}},
+	     {4U, 1U, 110U, {{0U, 50U}, {60U, 50U}}}},
+	    shard_options);
+	EXPECT_EQ(shard_limited.merged_gap_bytes, 10U);
+	EXPECT_EQ(shard_limited.rowgroups[0].physical_ranges.size(), 1U);
+	EXPECT_EQ(shard_limited.rowgroups[1].physical_ranges.size(), 2U);
+
+	fastlens::format::SparseReadBoundedCoalesceOptions rowgroup_options;
+	rowgroup_options.whole_run_amplification_ppm    = 1'100'000U;
+	rowgroup_options.per_shard_amplification_ppm    = 1'100'000U;
+	rowgroup_options.per_rowgroup_amplification_ppm = 1'050'000U;
+	const auto rowgroup_limited = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{4U, 0U, 110U, {{0U, 50U}, {60U, 50U}}},
+	     {4U, 1U, 110U, {{0U, 50U}, {60U, 50U}}}},
+	    rowgroup_options);
+	EXPECT_EQ(rowgroup_limited.merged_gap_bytes, 0U);
+	EXPECT_EQ(rowgroup_limited.physical_run_count, 4U);
+}
+
+TEST(SparseReadCoalescer, MaxRunOverflowAndOutOfBoundsAreChecked) {
+	fastlens::format::SparseReadBoundedCoalesceOptions options;
+	options.whole_run_amplification_ppm = 1'100'000U;
+	options.max_physical_run_bytes      = 20U;
+	const auto limited = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, 21U, {{0U, 10U}, {11U, 10U}}}}, options);
+	EXPECT_EQ(limited.physical_run_count, 2U);
+	EXPECT_EQ(limited.max_run_rejected_gap_count, 1U);
+	EXPECT_THROW((void)fastlens::format::coalesce_sparse_read_ranges_bounded(
+	                 {{0U,
+	                   0U,
+	                   std::numeric_limits<size_t>::max(),
+	                   {{std::numeric_limits<size_t>::max() - 2U, 4U}}}},
+	                 options),
+	             std::out_of_range);
+	EXPECT_THROW((void)fastlens::format::coalesce_sparse_read_ranges_bounded(
+	                 {{0U, 0U, 10U, {{9U, 2U}}}}, options),
+	             std::out_of_range);
+	EXPECT_THROW((void)fastlens::format::coalesce_sparse_read_ranges_bounded(
+	                 {{0U, 0U, std::numeric_limits<size_t>::max(), {{0U, 1U}}},
+	                  {1U, 0U, std::numeric_limits<size_t>::max(), {{0U, 1U}}}},
+	                 options),
+	             std::overflow_error);
+	options.whole_run_amplification_ppm = 1'100'001U;
+	EXPECT_THROW((void)fastlens::format::coalesce_sparse_read_ranges_bounded({}, options),
+	             std::invalid_argument);
+}
+
+TEST(SparseReadCoalescer, PropertyPreservesExactCoverageWithoutDuplicatePhysicalBytes) {
+	for (size_t fixture = 0U; fixture < 24U; ++fixture) {
+		std::vector<fastlens::format::SparseReadRange> exact;
+		size_t cursor = fixture % 5U;
+		for (size_t index = 0U; index < 8U; ++index) {
+			const size_t size = 7U + (fixture * 3U + index * 5U) % 19U;
+			exact.push_back({cursor, size});
+			cursor += size + 1U + (fixture * 11U + index * 7U) % 13U;
+		}
+		const size_t full_bytes = cursor + 17U;
+		const size_t exact_bytes = std::accumulate(
+		    exact.begin(), exact.end(), size_t {0U}, [](const size_t total, const auto& range) {
+			    return total + range.size;
+		    });
+		for (const uint32_t cap_ppm : {1'000'000U, 1'020'000U, 1'050'000U, 1'100'000U}) {
+			fastlens::format::SparseReadBoundedCoalesceOptions options;
+			options.whole_run_amplification_ppm = cap_ppm;
+			const auto result = fastlens::format::coalesce_sparse_read_ranges_bounded(
+			    {{3U, fixture, full_bytes, exact}}, options);
+			ASSERT_EQ(result.rowgroups.size(), 1U);
+			const auto& rowgroup = result.rowgroups.front();
+			EXPECT_EQ(rowgroup.exact_storage_bytes, exact_bytes);
+			EXPECT_EQ(rowgroup.physical_storage_bytes,
+			          std::accumulate(rowgroup.physical_ranges.begin(),
+			                          rowgroup.physical_ranges.end(),
+			                          size_t {0U},
+			                          [](const size_t total, const auto& range) {
+				                          return total + range.size;
+			                          }));
+			EXPECT_EQ(rowgroup.merged_gap_bytes,
+			          std::accumulate(rowgroup.merged_holes.begin(),
+			                          rowgroup.merged_holes.end(),
+			                          size_t {0U},
+			                          [](const size_t total, const auto& range) {
+				                          return total + range.size;
+			                          }));
+			EXPECT_LE(rowgroup.physical_storage_bytes,
+			          static_cast<size_t>(static_cast<unsigned __int128>(exact_bytes) * cap_ppm /
+			                              fastlens::format::kSparseReadAmplificationScale));
+			for (size_t index = 1U; index < rowgroup.physical_ranges.size(); ++index) {
+				const auto& previous = rowgroup.physical_ranges[index - 1U];
+				const auto& current  = rowgroup.physical_ranges[index];
+				EXPECT_LT(previous.offset + previous.size, current.offset);
+			}
+			for (const auto& source : exact) {
+				size_t covering_runs = 0U;
+				for (const auto& physical : rowgroup.physical_ranges) {
+					covering_runs += physical.offset <= source.offset &&
+					                 physical.offset + physical.size >= source.offset + source.size
+					                     ? 1U
+					                     : 0U;
+				}
+				EXPECT_EQ(covering_runs, 1U);
+			}
+		}
+	}
+}
+
+TEST(SparseReadCoalescer, GreedyGapOrderIsOptimalUnderByteOnlyBudget) {
+	const std::vector<fastlens::format::SparseReadRange> exact {
+	    {0U, 25U}, {26U, 25U}, {53U, 25U}, {82U, 25U}}; // gaps 1, 2, 4; exact=100
+	for (size_t budget = 0U; budget <= 7U; ++budget) {
+		fastlens::format::SparseReadBoundedCoalesceOptions options;
+		options.whole_run_amplification_ppm =
+		    fastlens::format::kSparseReadAmplificationScale + static_cast<uint32_t>(budget * 10'000U);
+		const auto result = fastlens::format::coalesce_sparse_read_ranges_bounded(
+		    {{0U, 0U, 107U, exact}}, options);
+		size_t brute_force_best = 0U;
+		for (size_t mask = 0U; mask < 8U; ++mask) {
+			const size_t bytes = ((mask & 1U) != 0U ? 1U : 0U) +
+			                     ((mask & 2U) != 0U ? 2U : 0U) +
+			                     ((mask & 4U) != 0U ? 4U : 0U);
+			if (bytes <= budget) {
+				brute_force_best = std::max(brute_force_best, static_cast<size_t>(std::popcount(mask)));
+			}
+		}
+		EXPECT_EQ(result.selected_gap_count, brute_force_best) << "budget=" << budget;
+		EXPECT_EQ(result.physical_run_count, exact.size() - brute_force_best) << "budget=" << budget;
+		EXPECT_LE(result.physical_storage_bytes, 100U + budget);
+		const auto& rowgroup = result.rowgroups.front();
+		for (const auto& source : exact) {
+			const size_t source_end = source.offset + source.size;
+			EXPECT_TRUE(std::any_of(rowgroup.physical_ranges.begin(), rowgroup.physical_ranges.end(),
+			                        [&](const auto& physical) {
+				                        return physical.offset <= source.offset &&
+				                               physical.offset + physical.size >= source_end;
+			                        }));
+		}
+	}
+}
+
+TEST(Reader, BatchedMetadataReadsPreserveDestinationsAndReportEof) {
+	const auto root = reader_fixture_root("batched_metadata");
+	std::filesystem::create_directories(root);
+	const auto        path   = root / "ranges.bin";
+	const std::string source = "0123456789abcdefghijklmnopqrstuv";
+	{
+		std::ofstream output(path, std::ios::binary);
+		output.write(source.data(), static_cast<std::streamsize>(source.size()));
+	}
+	fastlanes::File      file(path);
+	std::array<char, 12> first, second;
+	first.fill('!');
+	second.fill('!');
+	const std::array<fastlanes::FileRangeReadTarget, 2> targets {
+	    {{first.data() + 1, 3, 5}, {second.data() + 2, 21, 7}}};
+	file.ReadRangesUnchecked(targets);
+	EXPECT_EQ(std::string(first.data(), first.size()), "!34567!!!!!!");
+	EXPECT_EQ(std::string(second.data(), second.size()), "!!lmnopqr!!!");
+	const std::array<fastlanes::FileRangeReadTarget, 1> truncated {{{first.data() + 1, 28, 8}}};
+	EXPECT_THROW(file.ReadRangesUnchecked(truncated), std::runtime_error);
+	EXPECT_EQ(std::string(first.data(), 5), "!stuv");
+	EXPECT_EQ(first.back(), '!');
+}
+
+TEST(Reader, SparseVectorReadUsesPhysicalSegmentRangesAndReportsFallback) {
+	const auto              fls_path = make_sparse_vector_read_fixture();
+	fastlens::format::FlsReader reader(fls_path);
+	ASSERT_EQ(reader.rowgroup_count(), 1U);
+	std::string capability_reason;
+	ASSERT_TRUE(reader.sparse_vector_read_supported(0, &capability_reason)) << capability_reason;
+
+	fastlens::format::ZeroCopyReadTiming sparse_timing {};
+	auto sparse = reader.read_rowgroup_zero_copy_selected_vectors(0, {1U, 6U}, &sparse_timing);
+	fastlens::format::ZeroCopyReadTiming full_timing {};
+	auto                             full             = reader.read_rowgroup_zero_copy(0, &full_timing);
+	const auto                       external_bytes   = reader.rowgroup_storage_bytes(0);
+	auto                             external_backing = std::make_shared<std::vector<std::byte>>(external_bytes);
+	fastlens::format::ZeroCopyReadTiming external_timing {};
+	auto external = reader.read_rowgroup_zero_copy_into(0,
+	                                                   std::static_pointer_cast<void>(external_backing),
+	                                                   external_backing->data(),
+	                                                   external_backing->size(),
+	                                                   /*backing_is_pinned=*/true,
+	                                                   &external_timing);
+	EXPECT_TRUE(external.backing_is_pinned);
+	EXPECT_TRUE(external_timing.used_pinned_backing);
+	EXPECT_EQ(external_timing.storage_bytes, full_timing.storage_bytes);
+	auto external_rowgroup = reader.materialize_zero_copy_rowgroup(std::move(external));
+	ASSERT_FALSE(external_rowgroup.columns.empty());
+	for (const auto& column : external_rowgroup.columns) {
+		if (!column.skip_decompress) {
+			EXPECT_TRUE(column.host_owned_by_backing);
+			EXPECT_TRUE(column.backing_is_pinned);
+			EXPECT_EQ(column.backing_base, external_backing->data());
+			EXPECT_EQ(column.backing_bytes, external_bytes);
+		}
+	}
+	fastlens::execution::free_rowgroup(external_rowgroup);
+	ASSERT_TRUE(sparse_timing.sparse_read_supported);
+	ASSERT_TRUE(sparse_timing.used_sparse_read);
+	EXPECT_TRUE(sparse_timing.sparse_fallback_reason.empty());
+	EXPECT_GT(sparse_timing.pread_count, 1U);
+	EXPECT_LT(sparse_timing.storage_bytes, sparse_timing.full_storage_bytes);
+	EXPECT_EQ(sparse_timing.full_storage_bytes, full_timing.storage_bytes);
+
+	const auto* columns = sparse.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(columns, nullptr);
+	ASSERT_EQ(columns->size(), 1U);
+	const auto* segments = columns->Get(0)->segment_descriptors();
+	ASSERT_NE(segments, nullptr);
+	ASSERT_GT(segments->size(), 0U);
+	for (flatbuffers::uoffset_t segment_index = 0; segment_index < segments->size(); ++segment_index) {
+		const auto* descriptor = segments->Get(segment_index);
+		auto sparse_segment = fastlanes::make_segment_view(sparse.backing_span, *descriptor);
+		auto full_segment   = fastlanes::make_segment_view(full.backing_span, *descriptor);
+		for (const uint32_t vector : {1U, 6U}) {
+			sparse_segment.PointTo(vector);
+			full_segment.PointTo(vector);
+			ASSERT_EQ(sparse_segment.Size(), full_segment.Size());
+			EXPECT_EQ(std::memcmp(sparse_segment.data, full_segment.data, sparse_segment.Size()), 0);
+		}
+	}
+
+	fastlens::format::ZeroCopyReadTiming fallback_timing {};
+	auto fallback = reader.read_rowgroup_zero_copy_selected_vectors(
+	    0, {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U}, &fallback_timing);
+	(void)fallback;
+	EXPECT_TRUE(fallback_timing.sparse_read_supported);
+	EXPECT_FALSE(fallback_timing.used_sparse_read);
+	EXPECT_EQ(fallback_timing.sparse_fallback_reason, "selected-vectors-cover-full-rowgroup");
+	EXPECT_EQ(fallback_timing.storage_bytes, fallback_timing.full_storage_bytes);
+	EXPECT_EQ(fallback_timing.pread_count, 1U);
+}
+
+TEST(Reader, RowgroupOnlyModeSkipsSparseIndexAndPreservesFullReads) {
+	const auto fls_path = make_sparse_vector_read_fixture();
+	fastlens::format::FlsReaderOptions options;
+	options.load_column_names                 = false;
+	options.enable_sparse_vector_reads         = false;
+	options.build_shared_zero_copy_schema_plan = false;
+	fastlens::format::FlsReader reader(fls_path, options);
+	ASSERT_EQ(reader.rowgroup_count(), 1U);
+	EXPECT_FALSE(reader.has_sparse_vector_bundle());
+	std::string capability_reason;
+	EXPECT_FALSE(reader.sparse_vector_read_supported(0U, &capability_reason));
+	EXPECT_EQ(capability_reason, "sparse-access-index-disabled");
+	EXPECT_THROW((void)reader.compile_sparse_vector_read_plan(0U, {1U}), std::runtime_error);
+
+	fastlens::format::ZeroCopyReadTiming timing {};
+	auto zero_copy = reader.read_rowgroup_zero_copy(0U, &timing);
+	EXPECT_EQ(timing.pread_count, 1U);
+	EXPECT_EQ(timing.storage_bytes, reader.rowgroup_storage_bytes(0U));
+	auto rowgroup = reader.materialize_zero_copy_rowgroup(std::move(zero_copy));
+	ASSERT_FALSE(rowgroup.columns.empty());
+	fastlens::execution::free_rowgroup(rowgroup);
+}
+
+TEST(Reader, CompiledSparseVectorReadPlanMatchesSourceReadsAndIsReaderBound) {
+	const auto fls_path = make_sparse_vector_read_fixture();
+	fastlens::format::FlsReader reader(fls_path);
+	const auto plan = reader.compile_sparse_vector_read_plan(0, {6U, 1U, 6U});
+	EXPECT_FALSE(plan.empty());
+	EXPECT_EQ(plan.rowgroup_index(), 0U);
+	EXPECT_EQ(plan.selected_vector_count(), 2U);
+	EXPECT_TRUE(plan.uses_sparse_read());
+	EXPECT_FALSE(plan.uses_packed_device_scatter());
+	EXPECT_EQ(plan.full_storage_bytes(), reader.rowgroup_storage_bytes(0U));
+	EXPECT_EQ(plan.backend(), fastlens::format::SparseVectorReadPlan::Backend::kSourceRanges);
+	EXPECT_GT(plan.estimated_pread_count(), 0U);
+
+	fastlens::format::ZeroCopyReadTiming compiled_timing {};
+	auto compiled = reader.read_rowgroup_zero_copy_compiled(plan, &compiled_timing);
+	fastlens::format::ZeroCopyReadTiming reference_timing {};
+	auto reference = reader.read_rowgroup_zero_copy_selected_vectors(0, {1U, 6U}, &reference_timing);
+	ASSERT_EQ(compiled.backing_span.size(), reference.backing_span.size());
+	EXPECT_EQ(std::memcmp(compiled.backing_span.data(),
+	                      reference.backing_span.data(),
+	                      compiled.backing_span.size()),
+	          0);
+	EXPECT_EQ(compiled_timing.storage_bytes, plan.storage_bytes());
+	EXPECT_EQ(compiled_timing.storage_bytes, reference_timing.storage_bytes);
+	EXPECT_EQ(compiled_timing.pread_count, reference_timing.pread_count);
+	EXPECT_EQ(compiled_timing.pread_count, plan.estimated_pread_count());
+
+	fastlens::format::FlsReader other_reader(fls_path);
+	EXPECT_THROW(other_reader.read_rowgroup_zero_copy_compiled(plan), std::invalid_argument);
+}
+
+TEST(Reader, DirectCompactSparseReadPreservesSelectedSegments) {
+	const auto                  fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader     reader(fls_path);
+	const std::vector<uint32_t> selected {1U, 3U, 4U, 6U};
+	const auto                  exact  = reader.compile_sparse_vector_read_plan(0U, selected);
+	const auto                  ranges = fastlens::format::coalesce_sparse_read_ranges_bounded(
+        {{0U, 0U, exact.full_storage_bytes(), exact.exact_source_ranges()}}, {});
+	const auto plan = exact.with_bounded_coalescing(
+	    ranges.rowgroups.front(), fastlens::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	std::vector<fastlens::format::ZeroCopyReadTiming> timings;
+	auto                    compact  = reader.read_rowgroups_zero_copy_compact({&plan, &plan}, timings);
+	const auto              original = reader.read_rowgroup_zero_copy(0U);
+	fastlens::format::FlsReader other_reader(fls_path);
+	std::vector<fastlens::format::ZeroCopyReadTiming> rejected_timings;
+	EXPECT_THROW(other_reader.read_rowgroups_zero_copy_compact({&plan}, rejected_timings), std::invalid_argument);
+	EXPECT_THROW(reader.read_rowgroups_zero_copy_compact({&exact}, rejected_timings), std::invalid_argument);
+	const auto ordinary = reader.read_rowgroup_zero_copy_compiled(plan);
+	EXPECT_EQ(ordinary.source_n_vecs, 0U);
+	EXPECT_EQ(ordinary.n_vecs, original.n_vecs);
+	for (size_t index = 0; index < compact.size(); ++index) {
+		const auto& actual = compact[index];
+		EXPECT_EQ(actual.n_vecs, selected.size());
+		EXPECT_EQ(actual.source_n_vecs, original.n_vecs);
+		EXPECT_LT(actual.backing_span.size(), original.backing_span.size());
+		EXPECT_EQ(timings[index].storage_bytes, plan.storage_bytes());
+		const auto* columns = original.rowgroup_descriptor->m_column_descriptors();
+		for (size_t column = 0; column < columns->size(); ++column) {
+			const auto*                  source_segments = columns->Get(column)->segment_descriptors();
+			fastlens::format::ZeroCopyColumn compact_column;
+			compact_column.column_descriptor = columns->Get(column);
+			compact_column.selected_segments = actual.selected_segments.get();
+			for (size_t segment = 0; segment < source_segments->size(); ++segment) {
+				const auto* descriptor = source_segments->Get(segment);
+				const bool  shared =
+				    descriptor->entrypoint_size() == fastlanes::sizeof_entry_point_type(descriptor->entry_point_t());
+				auto source = fastlanes::make_segment_view(original.backing_span, *descriptor);
+				auto target = fastlens::format::zero_copy_segment(compact_column, segment);
+				for (size_t vector = 0; vector < selected.size(); ++vector) {
+					source.PointTo(shared ? 0 : selected[vector]);
+					target.PointTo(shared ? 0 : vector);
+					ASSERT_EQ(source.Size(), target.Size());
+					EXPECT_EQ(std::memcmp(source.data, target.data, source.Size()), 0);
+				}
+			}
+		}
+	}
+}
+
+TEST(Reader, DirectCompactSparseReadClipsCrossRleRuns) {
+	const auto root = reader_fixture_root("compact_cross_rle");
+	std::filesystem::create_directories(root);
+	const auto          path = root / "data.fls";
+	std::vector<int8_t> values(8U * fastlens::codec::consts::VALUES_PER_VECTOR);
+	for (size_t row = 0; row < values.size(); ++row)
+		values[row] = static_cast<int8_t>((row / 1500U) % 3U);
+	const std::array<fastlanes::MemoryColumn, 1> columns {{{"value", std::span<const int8_t>(values)}}};
+	const fastlanes::MemoryTable                 table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions                options;
+	options.n_vectors_per_rowgroup = 8U;
+	options.force_schema           = true;
+	options.forced_schema          = {fastlanes::OperatorToken::EXP_CROSS_RLE_I08};
+	fastlanes::Connection writer;
+	fastlanes::load_memory_table(writer, table, options);
+	writer.to_fls(path);
+	fastlens::format::FlsReader     reader(path);
+	const std::vector<uint32_t> selected {0U, 2U, 3U, 7U};
+	const auto                  exact     = reader.compile_sparse_vector_read_plan(0, selected);
+	const auto                  coalesced = fastlens::format::coalesce_sparse_read_ranges_bounded(
+        {{0, 0, exact.full_storage_bytes(), exact.exact_source_ranges()}}, {});
+	const auto plan = exact.with_bounded_coalescing(
+	    coalesced.rowgroups.front(), fastlens::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	std::vector<fastlens::format::ZeroCopyReadTiming> timings;
+	const auto                                    compact = reader.read_rowgroups_zero_copy_compact({&plan}, timings);
+	ASSERT_EQ(compact.front().n_vecs, selected.size());
+	fastlens::format::ZeroCopyColumn column;
+	column.column_descriptor = compact.front().rowgroup_descriptor->m_column_descriptors()->Get(0);
+	column.selected_segments = compact.front().selected_segments.get();
+	const auto* operands     = column.column_descriptor->encoding_rpn()->operand_tokens();
+	auto        run_values   = fastlens::format::zero_copy_segment(column, operands->Get(operands->size() - 2));
+	auto        run_lengths  = fastlens::format::zero_copy_segment(column, operands->Get(operands->size() - 1));
+	run_values.PointTo(0);
+	run_lengths.PointTo(0);
+	std::vector<int8_t> decoded;
+	for (size_t run = 0; run < run_lengths.Size() / sizeof(uint32_t); ++run) {
+		uint32_t length;
+		std::memcpy(&length, run_lengths.data + run * sizeof(length), sizeof(length));
+		decoded.insert(decoded.end(), length, reinterpret_cast<const int8_t*>(run_values.data)[run]);
+	}
+	ASSERT_EQ(decoded.size(), selected.size() * fastlens::codec::consts::VALUES_PER_VECTOR);
+	for (size_t row = 0; row < decoded.size(); ++row)
+		EXPECT_EQ(decoded[row], values[size_t(selected[row / 1024U]) * 1024U + row % 1024U]);
+}
+
+TEST(Reader, IoUringScatterPreservesDestinationsAndShortReadBoundary) {
+	const auto             fls_path = make_sparse_vector_bundle_fixture();
+	fastlanes::File        file(fls_path);
+	std::vector<std::byte> expected(2048);
+	file.ReadRangeUnchecked(expected.data(), 0, expected.size());
+	std::array<std::byte, 23>                             first;
+	std::array<std::byte, 41>                             second;
+	std::array<std::byte, 7>                              third;
+	std::array<std::byte, 13>                             fourth;
+	std::array<std::byte, 17>                             contiguous;
+	const std::array<fastlanes::FileScatterReadTarget, 2> a {
+	    {{first.data(), first.size()}, {second.data(), second.size()}}};
+	const std::array<fastlanes::FileScatterReadTarget, 2> b {
+	    {{third.data(), third.size()}, {fourth.data(), fourth.size()}}};
+	const std::array<fastlanes::FileRangeReadTarget, 3> targets {
+	    {{nullptr, 32, 64, a}, {nullptr, 512, 20, b}, {contiguous.data(), 1024, contiguous.size()}}};
+	const auto result = file.ReadRangesIoUringUnchecked(targets, 2);
+	EXPECT_EQ(result.bytes, 101U);
+	EXPECT_EQ(result.read_request_count, 3U);
+	EXPECT_EQ(std::memcmp(first.data(), expected.data() + 32, first.size()), 0);
+	EXPECT_EQ(std::memcmp(second.data(), expected.data() + 55, second.size()), 0);
+	EXPECT_EQ(std::memcmp(third.data(), expected.data() + 512, third.size()), 0);
+	EXPECT_EQ(std::memcmp(fourth.data(), expected.data() + 519, fourth.size()), 0);
+	EXPECT_EQ(std::memcmp(contiguous.data(), expected.data() + 1024, contiguous.size()), 0);
+	std::array<std::byte, 5> tail_a;
+	std::array<std::byte, 9> tail_b;
+	tail_b.fill(std::byte {0x7f});
+	std::array<std::byte, 10> tail;
+	file.ReadRangeUnchecked(tail.data(), file.Size() - tail.size(), tail.size());
+	const std::array<fastlanes::FileScatterReadTarget, 2> spans {
+	    {{tail_a.data(), tail_a.size()}, {tail_b.data(), tail_b.size()}}};
+	const std::array<fastlanes::FileRangeReadTarget, 1> truncated {{{nullptr, file.Size() - 10, 14, spans}}};
+	EXPECT_THROW(file.ReadRangesIoUringUnchecked(truncated, 2), std::runtime_error);
+	EXPECT_EQ(std::memcmp(tail_a.data(), tail.data(), 5), 0);
+	EXPECT_EQ(std::memcmp(tail_b.data(), tail.data() + 5, 5), 0);
+	for (size_t i = 5; i < tail_b.size(); ++i)
+		EXPECT_EQ(tail_b[i], std::byte {0x7f});
+}
+
+TEST(Reader, ConcurrentSparseIndexPreparationPreservesSelectedReads) {
+	const auto              fls_path = make_sparse_vector_bundle_fixture(4U);
+	fastlens::format::FlsReader reader(fls_path);
+	fastlens::format::FlsReader reference(fls_path);
+	ASSERT_EQ(reader.rowgroup_count(), 4U);
+	std::promise<void>                                       ready;
+	const auto                                               start = ready.get_future().share();
+	std::vector<std::future<fastlens::format::ZeroCopyRowgroup>> reads;
+	const std::vector<size_t>                                rowgroups {0U, 1U, 0U, 2U, 3U, 1U};
+	for (const auto rowgroup : rowgroups) {
+		reads.push_back(std::async(std::launch::async, [&, rowgroup, start] {
+			start.wait();
+			const auto plan = reader.compile_sparse_vector_read_plan(rowgroup, {1U, 3U, 6U});
+			return reader.read_rowgroup_zero_copy_compiled(plan);
+		}));
+	}
+	ready.set_value();
+	for (size_t index = 0; index < reads.size(); ++index) {
+		const auto actual   = reads[index].get();
+		const auto expected = reference.read_rowgroup_zero_copy_selected_vectors(rowgroups[index], {1U, 3U, 6U});
+		ASSERT_EQ(actual.backing_span.size(), expected.backing_span.size());
+		EXPECT_EQ(std::memcmp(actual.backing_span.data(), expected.backing_span.data(), actual.backing_span.size()), 0);
+	}
+}
+
+TEST(Reader, CompiledSparseRunsPreserveAdjacentVectorsAndHoles) {
+	const auto              fls_path = make_sparse_vector_read_fixture();
+	fastlens::format::FlsReader reader(fls_path);
+	auto                    full = reader.read_rowgroup_zero_copy(0U);
+	for (const std::vector<uint32_t> selected :
+	     {std::vector<uint32_t> {6U, 2U, 3U, 4U, 2U}, std::vector<uint32_t> {0U, 1U, 6U, 7U}}) {
+		const auto                       plan = reader.compile_sparse_vector_read_plan(0U, selected);
+		fastlens::format::ZeroCopyReadTiming compiled_timing {}, reference_timing {};
+		auto                             actual = reader.read_rowgroup_zero_copy_compiled(plan, &compiled_timing);
+		auto expected = reader.read_rowgroup_zero_copy_selected_vectors(0U, selected, &reference_timing);
+		ASSERT_EQ(actual.backing_span.size(), expected.backing_span.size());
+		EXPECT_EQ(std::memcmp(actual.backing_span.data(), expected.backing_span.data(), actual.backing_span.size()), 0);
+		EXPECT_EQ(compiled_timing.storage_bytes, reference_timing.storage_bytes);
+		EXPECT_EQ(compiled_timing.pread_count, reference_timing.pread_count);
+		const auto* segments = full.rowgroup_descriptor->m_column_descriptors()->Get(0)->segment_descriptors();
+		for (const auto* segment : *segments) {
+			auto actual_segment = fastlanes::make_segment_view(actual.backing_span, *segment);
+			auto full_segment   = fastlanes::make_segment_view(full.backing_span, *segment);
+			for (const auto vector : selected) {
+				actual_segment.PointTo(vector);
+				full_segment.PointTo(vector);
+				ASSERT_EQ(actual_segment.Size(), full_segment.Size());
+				EXPECT_EQ(std::memcmp(actual_segment.data, full_segment.data, full_segment.Size()), 0);
+			}
+		}
+	}
+}
+
+TEST(Reader, BoundedSparseReadClearsMergedHolesAndRestoresStaticPrefix) {
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader reader(fls_path);
+	const auto exact_plan = reader.compile_sparse_vector_read_plan(0U, {1U, 3U, 6U});
+	ASSERT_EQ(exact_plan.backend(), fastlens::format::SparseVectorReadPlan::Backend::kSourceRanges);
+	const auto exact_ranges = exact_plan.exact_source_ranges();
+	ASSERT_GT(exact_ranges.size(), 1U);
+
+	fastlens::format::SparseReadBoundedCoalesceOptions options;
+	options.whole_run_amplification_ppm = 1'100'000U;
+	const auto coalesced = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{17U, exact_plan.rowgroup_index(), exact_plan.full_storage_bytes(), exact_ranges}}, options);
+	ASSERT_EQ(coalesced.rowgroups.size(), 1U);
+	ASSERT_GT(coalesced.merged_gap_bytes, 0U);
+	const auto bounded_plan = exact_plan.with_bounded_coalescing(coalesced.rowgroups.front());
+	EXPECT_EQ(bounded_plan.backend(), fastlens::format::SparseVectorReadPlan::Backend::kBoundedSourceRanges);
+	EXPECT_EQ(bounded_plan.storage_bytes(), coalesced.physical_storage_bytes);
+	EXPECT_EQ(bounded_plan.merged_gap_bytes(), coalesced.merged_gap_bytes);
+	EXPECT_EQ(bounded_plan.estimated_pread_count(), coalesced.physical_run_count);
+	EXPECT_EQ(bounded_plan.exact_source_ranges().size(), exact_ranges.size());
+
+	fastlens::format::ZeroCopyReadTiming exact_timing {};
+	auto exact = reader.read_rowgroup_zero_copy_compiled(exact_plan, &exact_timing);
+	fastlens::format::ZeroCopyReadTiming bounded_timing {};
+	auto bounded = reader.read_rowgroup_zero_copy_compiled(bounded_plan, &bounded_timing);
+	ASSERT_EQ(bounded.backing_span.size(), exact.backing_span.size());
+	EXPECT_EQ(std::memcmp(bounded.backing_span.data(), exact.backing_span.data(), exact.backing_span.size()), 0);
+	EXPECT_TRUE(bounded_timing.used_bounded_gap_read);
+	EXPECT_EQ(bounded_timing.selected_storage_bytes, exact_plan.storage_bytes());
+	EXPECT_EQ(bounded_timing.storage_bytes, bounded_plan.storage_bytes());
+	EXPECT_EQ(bounded_timing.merged_gap_bytes, bounded_plan.merged_gap_bytes());
+	EXPECT_EQ(bounded_timing.hole_clear_bytes, bounded_plan.merged_gap_bytes());
+	EXPECT_GT(bounded_timing.static_prefix_restore_bytes, 0U);
+	EXPECT_EQ(bounded_timing.pread_count, bounded_plan.estimated_pread_count());
+}
+
+TEST(Reader, BoundedSparseReadIoUringPreservesBackingAndBatchesSubmissions) {
+#if !defined(__linux__)
+	GTEST_SKIP() << "io_uring is Linux-only";
+#else
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader reader(fls_path);
+	const auto exact_plan = reader.compile_sparse_vector_read_plan(0U, {1U, 3U, 6U});
+	const auto exact_ranges = exact_plan.exact_source_ranges();
+	ASSERT_GT(exact_ranges.size(), 1U);
+
+	fastlens::format::SparseReadBoundedCoalesceOptions options;
+	options.whole_run_amplification_ppm = 1'100'000U;
+	const auto coalesced = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{17U, exact_plan.rowgroup_index(), exact_plan.full_storage_bytes(), exact_ranges}}, options);
+	ASSERT_EQ(coalesced.rowgroups.size(), 1U);
+	const auto sync_plan = exact_plan.with_bounded_coalescing(coalesced.rowgroups.front());
+	const auto io_uring_plan = exact_plan.with_bounded_coalescing(
+	    coalesced.rowgroups.front(),
+	    fastlens::format::SparseVectorReadPlan::SubmissionBackend::kIoUring,
+	    /*io_uring_queue_depth=*/8U);
+
+	fastlens::format::ZeroCopyReadTiming sync_timing {};
+	auto sync = reader.read_rowgroup_zero_copy_compiled(sync_plan, &sync_timing);
+	fastlens::format::ZeroCopyReadTiming io_uring_timing {};
+	auto io_uring = reader.read_rowgroup_zero_copy_compiled(io_uring_plan, &io_uring_timing);
+	ASSERT_EQ(io_uring.backing_span.size(), sync.backing_span.size());
+	EXPECT_EQ(std::memcmp(io_uring.backing_span.data(), sync.backing_span.data(), sync.backing_span.size()), 0);
+	EXPECT_TRUE(io_uring_timing.used_bounded_gap_read);
+	EXPECT_TRUE(io_uring_timing.used_io_uring);
+	EXPECT_EQ(io_uring_timing.storage_bytes, sync_timing.storage_bytes);
+	EXPECT_EQ(io_uring_timing.pread_count, 0U);
+	EXPECT_GE(io_uring_timing.io_uring_read_request_count, coalesced.physical_run_count);
+	EXPECT_EQ(io_uring_timing.io_uring_completion_count,
+	          io_uring_timing.io_uring_read_request_count);
+	EXPECT_GT(io_uring_timing.io_uring_submit_syscall_count, 0U);
+	EXPECT_LT(io_uring_timing.io_uring_submit_syscall_count, io_uring_timing.io_uring_read_request_count);
+	EXPECT_GT(io_uring_timing.io_uring_ring_mapped_bytes, 0U);
+	EXPECT_EQ(io_uring_timing.io_uring_newly_mapped_ring_bytes,
+	          io_uring_timing.io_uring_ring_mapped_bytes);
+
+	fastlens::format::ZeroCopyReadTiming reused_timing {};
+	(void)reader.read_rowgroup_zero_copy_compiled(io_uring_plan, &reused_timing);
+	EXPECT_EQ(reused_timing.io_uring_newly_mapped_ring_bytes, 0U);
+
+	const auto other_exact  = reader.compile_sparse_vector_read_plan(0U, {0U, 5U});
+	const auto other_ranges = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{17U, 0U, other_exact.full_storage_bytes(), other_exact.exact_source_ranges()}}, options);
+	const auto other_plan = other_exact.with_bounded_coalescing(
+	    other_ranges.rowgroups.front(), fastlens::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	auto                                          other = reader.read_rowgroup_zero_copy_compiled(other_plan);
+	std::vector<fastlens::format::ZeroCopyReadTiming> batch_timings;
+	auto batch = reader.read_rowgroups_zero_copy_compiled({&other_plan, &io_uring_plan, &other_plan}, batch_timings);
+	ASSERT_EQ(batch.size(), 3U);
+	for (size_t index = 0; index < batch.size(); ++index) {
+		const auto& expected = index == 1 ? sync : other;
+		ASSERT_EQ(batch[index].backing_span.size(), expected.backing_span.size());
+		EXPECT_EQ(
+		    std::memcmp(batch[index].backing_span.data(), expected.backing_span.data(), expected.backing_span.size()),
+		    0);
+		EXPECT_TRUE(batch_timings[index].used_io_uring);
+		EXPECT_TRUE(batch_timings[index].used_bounded_gap_read);
+		EXPECT_EQ(batch_timings[index].storage_bytes,
+		          index == 1 ? io_uring_plan.storage_bytes() : other_plan.storage_bytes());
+		EXPECT_EQ(batch_timings[index].io_uring_newly_mapped_ring_bytes, 0U);
+	}
+	EXPECT_NE(batch[0].backing_span.data(), batch[2].backing_span.data());
+	const auto requests = other_plan.estimated_pread_count() * 2 + io_uring_plan.estimated_pread_count();
+	EXPECT_EQ(batch_timings[0].io_uring_submit_syscall_count, (requests + 7U) / 8U);
+	EXPECT_EQ(batch_timings[1].io_uring_submit_syscall_count, 0U);
+	EXPECT_EQ(batch_timings[2].io_uring_submit_syscall_count, 0U);
+	fastlens::format::FlsReader other_reader(fls_path);
+	EXPECT_THROW(other_reader.read_rowgroups_zero_copy_compiled({&io_uring_plan}, batch_timings),
+	             std::invalid_argument);
+	EXPECT_THROW(reader.read_rowgroups_zero_copy_compiled({&sync_plan}, batch_timings), std::invalid_argument);
+	EXPECT_TRUE(reader.read_rowgroups_zero_copy_compiled({}, batch_timings).empty());
+#endif
+}
+
+TEST(Reader, SparseReadRecipeRoundTripsAndPreservesReaderBinding) {
+	const auto fls_path    = make_sparse_vector_read_fixture();
+	const auto recipe_path = fls_path.parent_path() / "canonical.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0x1020304050607080);
+
+	fastlens::format::FlsReader baseline_reader(fls_path);
+	const auto baseline_plan = baseline_reader.compile_sparse_vector_read_plan(0U, {6U, 1U, 6U});
+	ASSERT_FALSE(baseline_plan.recipe_hit());
+	const auto baseline_ranges = baseline_plan.exact_source_ranges();
+	ASSERT_FALSE(baseline_ranges.empty());
+
+	const auto write_stats = fastlens::format::write_sparse_read_recipe(
+	    fls_path,
+	    recipe_path,
+	    source_fingerprint,
+	    {{0U, {6U, 1U, 6U}}});
+	EXPECT_FALSE(write_stats.reused_existing);
+	EXPECT_EQ(write_stats.rowgroup_count, 1U);
+	EXPECT_EQ(write_stats.selected_vector_count, 2U);
+	EXPECT_EQ(write_stats.sidecar_bytes, std::filesystem::file_size(recipe_path));
+	EXPECT_EQ(write_stats.exact_range_count, baseline_ranges.size());
+	EXPECT_EQ(write_stats.exact_storage_bytes, baseline_plan.storage_bytes());
+
+	fastlens::format::FlsReaderOptions options;
+	options.sparse_read_recipe_path               = recipe_path;
+	options.sparse_read_recipe_source_fingerprint = source_fingerprint;
+	options.sparse_read_recipe_rehydrate_workers  = 4U;
+	fastlens::format::FlsReader recipe_reader(fls_path, options);
+	const auto& init = recipe_reader.sparse_initialization_stats();
+	EXPECT_TRUE(init.sparse_recipe_loaded);
+	EXPECT_EQ(init.sparse_recipe_record_count, 1U);
+	EXPECT_EQ(init.sparse_recipe_sidecar_bytes, write_stats.sidecar_bytes);
+	EXPECT_EQ(init.sparse_recipe_rehydrate_workers, 1U);
+	EXPECT_GT(init.sparse_recipe_rehydrate_ms, 0.0);
+	EXPECT_GT(init.sparse_recipe_rehydrate_service_ms, 0.0);
+	EXPECT_GT(init.sparse_recipe_source_metadata_bytes, 0U);
+	EXPECT_GT(init.sparse_recipe_source_metadata_pread_count, 0U);
+	const auto recipe_plan = recipe_reader.compile_sparse_vector_read_plan(0U, {1U, 6U});
+	ASSERT_TRUE(recipe_plan.recipe_hit());
+	EXPECT_EQ(recipe_plan.recipe_rehydrate_ms(), 0.0);
+	EXPECT_EQ(recipe_plan.recipe_source_metadata_bytes(), 0U);
+	EXPECT_EQ(recipe_plan.recipe_source_metadata_pread_count(), 0U);
+	EXPECT_EQ(recipe_plan.storage_bytes(), baseline_plan.storage_bytes());
+	EXPECT_EQ(recipe_plan.estimated_pread_count(), baseline_plan.estimated_pread_count());
+	const auto recipe_ranges = recipe_plan.exact_source_ranges();
+	ASSERT_EQ(recipe_ranges.size(), baseline_ranges.size());
+	for (size_t index = 0U; index < recipe_ranges.size(); ++index) {
+		EXPECT_EQ(recipe_ranges[index].offset, baseline_ranges[index].offset);
+		EXPECT_EQ(recipe_ranges[index].size, baseline_ranges[index].size);
+	}
+
+	auto baseline = baseline_reader.read_rowgroup_zero_copy_compiled(baseline_plan);
+	auto restored = recipe_reader.read_rowgroup_zero_copy_compiled(recipe_plan);
+	ASSERT_EQ(restored.backing_span.size(), baseline.backing_span.size());
+	EXPECT_EQ(std::memcmp(restored.backing_span.data(), baseline.backing_span.data(), baseline.backing_span.size()), 0);
+
+	const auto miss_plan = recipe_reader.compile_sparse_vector_read_plan(0U, {1U, 3U});
+	EXPECT_FALSE(miss_plan.recipe_hit());
+	EXPECT_TRUE(miss_plan.uses_sparse_read());
+	fastlens::format::FlsReader other_reader(fls_path, options);
+	EXPECT_THROW(other_reader.read_rowgroup_zero_copy_compiled(recipe_plan), std::invalid_argument);
+}
+
+TEST(Reader, DirectCompactSparseReadPreservesRecipeBackedPlans) {
+	const auto         fls_path           = make_sparse_vector_read_fixture();
+	const auto         recipe_path        = fls_path.parent_path() / "compact.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0x1020304050607080);
+	(void)fastlens::format::write_sparse_read_recipe(fls_path, recipe_path, source_fingerprint, {{0U, {1U, 6U}}});
+
+	fastlens::format::FlsReaderOptions options;
+	options.sparse_read_recipe_path               = recipe_path;
+	options.sparse_read_recipe_source_fingerprint = source_fingerprint;
+	fastlens::format::FlsReader reader(fls_path, options);
+	const auto              exact = reader.compile_sparse_vector_read_plan(0U, {1U, 6U});
+	ASSERT_TRUE(exact.recipe_hit());
+	const auto ranges = fastlens::format::coalesce_sparse_read_ranges_bounded(
+	    {{0U, 0U, exact.full_storage_bytes(), exact.exact_source_ranges()}}, {});
+	const auto plan = exact.with_bounded_coalescing(
+	    ranges.rowgroups.front(), fastlens::format::SparseVectorReadPlan::SubmissionBackend::kIoUring, 8U);
+	ASSERT_TRUE(plan.recipe_hit());
+
+	std::vector<fastlens::format::ZeroCopyReadTiming> timings;
+	const auto                                    actual   = reader.read_rowgroups_zero_copy_compact({&plan}, timings);
+	const auto                                    expected = reader.read_rowgroup_zero_copy_compiled(plan);
+	ASSERT_EQ(actual.size(), 1U);
+	ASSERT_EQ(timings.size(), 1U);
+	EXPECT_EQ(actual.front().n_vecs, expected.n_vecs);
+	EXPECT_EQ(actual.front().source_n_vecs, expected.source_n_vecs);
+	ASSERT_EQ(actual.front().backing_span.size(), expected.backing_span.size());
+	EXPECT_EQ(
+	    std::memcmp(actual.front().backing_span.data(), expected.backing_span.data(), expected.backing_span.size()), 0);
+	EXPECT_EQ(timings.front().storage_bytes, plan.storage_bytes());
+}
+
+TEST(Reader, SparseReadRecipeRejectsIdentityCorruptionTruncationAndTrailingBytes) {
+	const auto fls_path    = make_sparse_vector_read_fixture();
+	const auto recipe_path = fls_path.parent_path() / "validation.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0xA1B2C3D4E5F60718);
+	(void)fastlens::format::write_sparse_read_recipe(
+	    fls_path,
+	    recipe_path,
+	    source_fingerprint,
+	    {{0U, {1U, 6U}}});
+
+	const auto expect_rejected = [&](const std::filesystem::path& path, const uint64_t fingerprint) {
+		fastlens::format::FlsReaderOptions options;
+		options.sparse_read_recipe_path               = path;
+		options.sparse_read_recipe_source_fingerprint = fingerprint;
+		EXPECT_THROW((void)fastlens::format::FlsReader(fls_path, options), std::runtime_error);
+	};
+	expect_rejected(recipe_path, source_fingerprint ^ 1U);
+
+	const auto read_bytes = [](const std::filesystem::path& path) {
+		std::ifstream input(path, std::ios::binary);
+		return std::vector<char>(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+	};
+	const auto write_bytes = [](const std::filesystem::path& path, const std::vector<char>& bytes) {
+		std::ofstream output(path, std::ios::binary | std::ios::trunc);
+		output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+	};
+	const auto pristine = read_bytes(recipe_path);
+	ASSERT_GT(pristine.size(), 128U);
+
+	auto corrupted = pristine;
+	corrupted.back() ^= 0x01;
+	const auto corrupt_path = recipe_path.parent_path() / "corrupt.sparse_read_recipe.bin";
+	write_bytes(corrupt_path, corrupted);
+	expect_rejected(corrupt_path, source_fingerprint);
+
+	auto truncated = pristine;
+	truncated.pop_back();
+	const auto truncated_path = recipe_path.parent_path() / "truncated.sparse_read_recipe.bin";
+	write_bytes(truncated_path, truncated);
+	expect_rejected(truncated_path, source_fingerprint);
+
+	auto trailing = pristine;
+	trailing.push_back('\0');
+	const auto trailing_path = recipe_path.parent_path() / "trailing.sparse_read_recipe.bin";
+	write_bytes(trailing_path, trailing);
+	expect_rejected(trailing_path, source_fingerprint);
+
+	auto bad_version = pristine;
+	bad_version[8] ^= 0x01;
+	const auto version_path = recipe_path.parent_path() / "version.sparse_read_recipe.bin";
+	write_bytes(version_path, bad_version);
+	expect_rejected(version_path, source_fingerprint);
+
+	auto bad_endian = pristine;
+	bad_endian[12] ^= 0x01;
+	const auto endian_path = recipe_path.parent_path() / "endian.sparse_read_recipe.bin";
+	write_bytes(endian_path, bad_endian);
+	expect_rejected(endian_path, source_fingerprint);
+
+	const auto source_size = std::filesystem::file_size(fls_path);
+	ASSERT_GT(source_size, 256U);
+	{
+		std::fstream source(fls_path, std::ios::binary | std::ios::in | std::ios::out);
+		const auto mutation_offset = static_cast<std::streamoff>(source_size / 2U);
+		source.seekg(mutation_offset);
+		char value = 0;
+		source.read(&value, 1);
+		ASSERT_TRUE(source);
+		value ^= 0x01;
+		source.seekp(mutation_offset);
+		source.write(&value, 1);
+		source.close();
+		ASSERT_TRUE(source);
+	}
+	EXPECT_EQ(std::filesystem::file_size(fls_path), source_size);
+	expect_rejected(recipe_path, source_fingerprint);
+}
+
+TEST(Reader, SparseReadRecipeBuilderIsAtomicAndSingleFlight) {
+	const auto fls_path    = make_sparse_vector_read_fixture();
+	const auto recipe_path = fls_path.parent_path() / "single_flight.sparse_read_recipe.bin";
+	constexpr uint64_t source_fingerprint = UINT64_C(0x3141592653589793);
+	const std::vector<fastlens::format::SparseReadRecipeSelection> selections {{0U, {1U, 6U}}};
+	const auto first = fastlens::format::write_sparse_read_recipe(
+	    fls_path, recipe_path, source_fingerprint, selections);
+	ASSERT_FALSE(first.reused_existing);
+	const auto second = fastlens::format::write_sparse_read_recipe(
+	    fls_path, recipe_path, source_fingerprint, selections);
+	EXPECT_TRUE(second.reused_existing);
+	EXPECT_EQ(second.sidecar_crc64, first.sidecar_crc64);
+	EXPECT_EQ(second.sidecar_bytes, first.sidecar_bytes);
+
+	std::filesystem::remove(recipe_path);
+	std::array<fastlens::format::SparseReadRecipeWriteStats, 8> stats {};
+	std::array<std::exception_ptr, 8> failures {};
+	std::array<std::thread, 8> writers;
+	for (size_t index = 0U; index < writers.size(); ++index) {
+		writers[index] = std::thread([&, index] {
+			try {
+				stats[index] = fastlens::format::write_sparse_read_recipe(
+				    fls_path, recipe_path, source_fingerprint, selections);
+			} catch (...) {
+				failures[index] = std::current_exception();
+			}
+		});
+	}
+	for (auto& writer : writers) {
+		writer.join();
+	}
+	size_t created = 0U;
+	for (size_t index = 0U; index < stats.size(); ++index) {
+		ASSERT_EQ(failures[index], nullptr);
+		created += stats[index].reused_existing ? 0U : 1U;
+		EXPECT_EQ(stats[index].sidecar_crc64, first.sidecar_crc64);
+		EXPECT_EQ(stats[index].sidecar_bytes, first.sidecar_bytes);
+	}
+	EXPECT_EQ(created, 1U);
+	for (const auto& entry : std::filesystem::directory_iterator(recipe_path.parent_path())) {
+		EXPECT_EQ(entry.path().filename().string().find("single_flight.sparse_read_recipe.bin.tmp"),
+		          std::string::npos);
+	}
+}
+
+TEST(Reader, SparseVectorBundlePreservesSegmentsAndCollapsesPhysicalReads) {
+	const ScopedEnvironmentVariable bundle_policy("FASTLENS_VECTOR_BUNDLE_READ_POLICY", nullptr);
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader exact_reader(fls_path);
+	fastlens::format::ZeroCopyReadTiming exact_timing {};
+	auto exact = exact_reader.read_rowgroup_zero_copy_selected_vectors(0, {1U, 3U, 6U}, &exact_timing);
+	ASSERT_TRUE(exact_timing.used_sparse_read);
+	ASSERT_FALSE(exact_timing.used_vector_bundle_read);
+
+	const auto bundle_path = fastlens::format::sparse_vector_bundle_path(fls_path);
+	fastlens::format::write_sparse_vector_bundle(fls_path, bundle_path);
+	fastlens::format::FlsReader bundled_reader(fls_path);
+	ASSERT_TRUE(bundled_reader.has_sparse_vector_bundle());
+	fastlens::format::ZeroCopyReadTiming bundle_timing {};
+	auto bundled = bundled_reader.read_rowgroup_zero_copy_selected_vectors(0, {1U, 3U, 6U}, &bundle_timing);
+	ASSERT_TRUE(bundle_timing.used_sparse_read);
+	ASSERT_TRUE(bundle_timing.used_vector_bundle_read);
+	// The immutable entrypoint/shared prefix is cached when the reader opens,
+	// so runtime I/O consists only of the three disjoint selected-vector runs.
+	EXPECT_EQ(bundle_timing.pread_count, 3U);
+	EXPECT_LT(bundle_timing.pread_count, exact_timing.pread_count);
+	EXPECT_EQ(bundle_timing.storage_bytes, exact_timing.storage_bytes);
+	EXPECT_EQ(bundle_timing.full_storage_bytes, exact_timing.full_storage_bytes);
+
+	const auto* columns = bundled.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(columns, nullptr);
+	for (flatbuffers::uoffset_t column_index = 0; column_index < columns->size(); ++column_index) {
+		const auto* segments = columns->Get(column_index)->segment_descriptors();
+		ASSERT_NE(segments, nullptr);
+		for (flatbuffers::uoffset_t segment_index = 0; segment_index < segments->size(); ++segment_index) {
+			const auto* descriptor = segments->Get(segment_index);
+			auto bundle_segment = fastlanes::make_segment_view(bundled.backing_span, *descriptor);
+			auto exact_segment  = fastlanes::make_segment_view(exact.backing_span, *descriptor);
+			for (const uint32_t vector : {1U, 3U, 6U}) {
+				bundle_segment.PointTo(vector);
+				exact_segment.PointTo(vector);
+				ASSERT_EQ(bundle_segment.Size(), exact_segment.Size());
+				EXPECT_EQ(std::memcmp(bundle_segment.data, exact_segment.data, bundle_segment.Size()), 0);
+			}
+		}
+	}
+}
+
+TEST(Reader, CompiledSparseVectorBundlePlansMatchLogicalPackedAndEnvelopeReads) {
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	const auto bundle_path = fastlens::format::sparse_vector_bundle_path(fls_path);
+	fastlens::format::write_sparse_vector_bundle(fls_path, bundle_path);
+	fastlens::format::FlsReader reader(fls_path);
+	const std::vector<uint32_t> selected {1U, 3U, 6U};
+	const auto expect_selected_segments_equal = [&](const fastlens::format::ZeroCopyRowgroup& actual,
+	                                                const fastlens::format::ZeroCopyRowgroup& expected) {
+		const auto* columns = actual.rowgroup_descriptor->m_column_descriptors();
+		ASSERT_NE(columns, nullptr);
+		for (flatbuffers::uoffset_t column_index = 0; column_index < columns->size(); ++column_index) {
+			const auto* segments = columns->Get(column_index)->segment_descriptors();
+			ASSERT_NE(segments, nullptr);
+			for (flatbuffers::uoffset_t segment_index = 0; segment_index < segments->size(); ++segment_index) {
+				const auto* descriptor = segments->Get(segment_index);
+				auto actual_segment = fastlanes::make_segment_view(actual.backing_span, *descriptor);
+				auto expected_segment = fastlanes::make_segment_view(expected.backing_span, *descriptor);
+				for (const auto vector : selected) {
+					actual_segment.PointTo(vector);
+					expected_segment.PointTo(vector);
+					ASSERT_EQ(actual_segment.Size(), expected_segment.Size());
+					EXPECT_EQ(std::memcmp(actual_segment.data, expected_segment.data, actual_segment.Size()), 0)
+					    << "column=" << column_index << " segment=" << segment_index << " vector=" << vector;
+				}
+			}
+		}
+	};
+
+	const auto logical_plan = reader.compile_sparse_vector_read_plan(0, selected);
+	fastlens::format::ZeroCopyReadTiming logical_timing {};
+	auto compiled_logical = reader.read_rowgroup_zero_copy_compiled(logical_plan, &logical_timing);
+	EXPECT_GT(logical_timing.selected_storage_bytes, 0U);
+	EXPECT_EQ(logical_timing.selected_storage_bytes, logical_timing.storage_bytes);
+	auto reference_logical = reader.read_rowgroup_zero_copy_selected_vectors(0, selected);
+	expect_selected_segments_equal(compiled_logical, reference_logical);
+
+	const auto packed_plan = reader.compile_sparse_vector_read_plan(0, selected, true);
+	EXPECT_TRUE(packed_plan.uses_packed_device_scatter());
+	auto compiled_packed = reader.read_rowgroup_zero_copy_compiled(packed_plan);
+	auto reference_packed = reader.read_rowgroup_zero_copy_selected_vectors_packed(0, selected);
+	ASSERT_NE(compiled_packed.packed_device_payload, nullptr);
+	ASSERT_NE(reference_packed.packed_device_payload, nullptr);
+	const auto& compiled_payload = *compiled_packed.packed_device_payload;
+	const auto& reference_payload = *reference_packed.packed_device_payload;
+	ASSERT_EQ(compiled_payload.ranges.size(), reference_payload.ranges.size());
+	for (size_t range_index = 0; range_index < compiled_payload.ranges.size(); ++range_index) {
+		EXPECT_EQ(compiled_payload.ranges[range_index].packed_offset,
+		          reference_payload.ranges[range_index].packed_offset);
+		EXPECT_EQ(compiled_payload.ranges[range_index].logical_offset,
+		          reference_payload.ranges[range_index].logical_offset);
+		EXPECT_EQ(compiled_payload.ranges[range_index].size,
+		          reference_payload.ranges[range_index].size);
+	}
+	ASSERT_EQ(compiled_payload.packed_bytes, reference_payload.packed_bytes);
+	EXPECT_EQ(std::memcmp(compiled_payload.packed_data,
+	                      reference_payload.packed_data,
+	                      compiled_payload.packed_bytes),
+	          0);
+
+	const ScopedEnvironmentVariable envelope_policy("FASTLENS_VECTOR_BUNDLE_READ_POLICY", "envelope");
+	const auto envelope_plan = reader.compile_sparse_vector_read_plan(0, selected);
+	EXPECT_EQ(envelope_plan.backend(), fastlens::format::SparseVectorReadPlan::Backend::kBundleEnvelope);
+	EXPECT_EQ(envelope_plan.estimated_pread_count(), 1U);
+	fastlens::format::ZeroCopyReadTiming envelope_timing {};
+	auto compiled_envelope = reader.read_rowgroup_zero_copy_compiled(envelope_plan, &envelope_timing);
+	auto reference_envelope = reader.read_rowgroup_zero_copy_selected_vectors(0, selected);
+	EXPECT_TRUE(envelope_timing.used_vector_bundle_envelope_read);
+	EXPECT_EQ(envelope_timing.pread_count, 1U);
+	EXPECT_GT(envelope_timing.selected_storage_bytes, 0U);
+	EXPECT_LT(envelope_timing.selected_storage_bytes, envelope_timing.storage_bytes);
+	expect_selected_segments_equal(compiled_envelope, reference_envelope);
+}
+
+TEST(Reader, StandardColumnReadSkipsOtherColumnsWithoutVectorIndex) {
+	const auto                       fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader          reader(fls_path, false, false);
+	auto                             full = reader.read_rowgroup_zero_copy(0U);
+	const std::vector<uint8_t>       selected {0U, 3U};
+	fastlens::format::ZeroCopyReadTiming timing {};
+	auto                             actual = reader.read_rowgroup_zero_copy_selected_columns(0U, selected, &timing);
+	EXPECT_EQ(actual.materialized_column_indices, selected);
+	EXPECT_TRUE(timing.used_coefficient_range_read);
+	EXPECT_TRUE(timing.used_sparse_read);
+	EXPECT_LT(timing.storage_bytes, timing.full_storage_bytes / 2U);
+	EXPECT_GT(timing.pread_count, 0U);
+	EXPECT_EQ(timing.pread_count, timing.coalesced_read_run_count);
+	for (const auto index : selected) {
+		const auto* segments = full.rowgroup_descriptor->m_column_descriptors()->Get(index)->segment_descriptors();
+		for (const auto* descriptor : *segments) {
+			auto a = fastlanes::make_segment_view(actual.backing_span, *descriptor);
+			auto b = fastlanes::make_segment_view(full.backing_span, *descriptor);
+			for (size_t vector = 0U; vector < full.n_vecs; ++vector) {
+				a.PointTo(vector);
+				b.PointTo(vector);
+				ASSERT_EQ(a.Size(), b.Size());
+				EXPECT_EQ(std::memcmp(a.data, b.data, a.Size()), 0);
+			}
+		}
+	}
+	EXPECT_THROW(reader.read_rowgroup_zero_copy_selected_columns(0U, {8U}), std::out_of_range);
+}
+
+TEST(Reader, SparsePlanIntersectsSelectedVectorsAndColumns) {
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader reader(fls_path);
+	const std::vector<uint32_t> selected_vectors {1U, 3U, 6U};
+	const std::vector<uint8_t> selected_columns {0U, 1U};
+
+	const auto all_column_plan = reader.compile_sparse_vector_read_plan(0U, selected_vectors);
+	fastlens::format::ZeroCopyReadTiming all_column_timing {};
+	auto all_column = reader.read_rowgroup_zero_copy_compiled(all_column_plan, &all_column_timing);
+
+	const auto intersected_plan =
+	    reader.compile_sparse_vector_read_plan(0U, selected_vectors, selected_columns);
+	fastlens::format::ZeroCopyReadTiming intersected_timing {};
+	auto intersected = reader.read_rowgroup_zero_copy_compiled(intersected_plan, &intersected_timing);
+	EXPECT_EQ(intersected.materialized_column_indices, selected_columns);
+	EXPECT_TRUE(intersected_timing.used_coefficient_range_read);
+	EXPECT_EQ(intersected_timing.selected_coefficient_count, selected_columns.size());
+	EXPECT_LT(intersected_timing.storage_bytes, all_column_timing.storage_bytes);
+
+	const auto* columns = intersected.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(columns, nullptr);
+	for (const auto column_index : selected_columns) {
+		const auto* column = columns->Get(column_index);
+		ASSERT_NE(column, nullptr);
+		const auto* segments = column->segment_descriptors();
+		ASSERT_NE(segments, nullptr);
+		for (flatbuffers::uoffset_t segment_index = 0U; segment_index < segments->size(); ++segment_index) {
+			const auto* descriptor = segments->Get(segment_index);
+			auto actual = fastlanes::make_segment_view(intersected.backing_span, *descriptor);
+			auto expected = fastlanes::make_segment_view(all_column.backing_span, *descriptor);
+			for (const auto vector : selected_vectors) {
+				actual.PointTo(vector);
+				expected.PointTo(vector);
+				ASSERT_EQ(actual.Size(), expected.Size());
+				EXPECT_EQ(std::memcmp(actual.data, expected.data, actual.Size()), 0)
+				    << "column=" << static_cast<size_t>(column_index)
+				    << " segment=" << segment_index << " vector=" << vector;
+			}
+		}
+	}
+}
+
+TEST(Reader, SparseVectorBundlePackedDeviceRangesRebuildSelectedSegments) {
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	const auto bundle_path = fastlens::format::sparse_vector_bundle_path(fls_path);
+	fastlens::format::write_sparse_vector_bundle(fls_path, bundle_path);
+	fastlens::format::FlsReader reader(fls_path);
+	fastlens::format::ZeroCopyReadTiming packed_timing {};
+	auto packed = reader.read_rowgroup_zero_copy_selected_vectors_packed(0, {1U, 3U, 6U}, &packed_timing);
+	auto full   = reader.read_rowgroup_zero_copy(0);
+	ASSERT_TRUE(packed_timing.used_vector_bundle_read);
+	ASSERT_NE(packed.packed_device_payload, nullptr);
+	const auto& payload = *packed.packed_device_payload;
+	std::vector<std::byte> rebuilt(payload.logical_bytes, std::byte {0});
+	for (const auto& range : payload.ranges) {
+		ASSERT_LE(range.packed_offset + range.size, payload.packed_bytes);
+		ASSERT_LE(range.logical_offset + range.size, payload.logical_bytes);
+		std::memcpy(rebuilt.data() + range.logical_offset, payload.packed_data + range.packed_offset, range.size);
+	}
+	const fastlanes::span<std::byte> rebuilt_span {rebuilt.data(), rebuilt.size()};
+	const auto* columns = packed.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(columns, nullptr);
+	for (flatbuffers::uoffset_t column_index = 0; column_index < columns->size(); ++column_index) {
+		const auto* segments = columns->Get(column_index)->segment_descriptors();
+		ASSERT_NE(segments, nullptr);
+		for (flatbuffers::uoffset_t segment_index = 0; segment_index < segments->size(); ++segment_index) {
+			const auto* descriptor = segments->Get(segment_index);
+			auto rebuilt_segment = fastlanes::make_segment_view(rebuilt_span, *descriptor);
+			auto full_segment    = fastlanes::make_segment_view(full.backing_span, *descriptor);
+			for (const uint32_t vector : {1U, 3U, 6U}) {
+				rebuilt_segment.PointTo(vector);
+				full_segment.PointTo(vector);
+				ASSERT_EQ(rebuilt_segment.Size(), full_segment.Size());
+				EXPECT_EQ(std::memcmp(rebuilt_segment.data, full_segment.data, rebuilt_segment.Size()), 0);
+			}
+		}
+	}
+}
+
+TEST(Reader, SparseVectorBundlePackedDeviceRangesDecodeSelectedVectorsOnGpu) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	const auto bundle_path = fastlens::format::sparse_vector_bundle_path(fls_path);
+	fastlens::format::write_sparse_vector_bundle(fls_path, bundle_path);
+	fastlens::format::FlsReader reader(fls_path);
+	auto zero_copy = reader.read_rowgroup_zero_copy_selected_vectors_packed(0, {1U, 3U, 6U});
+	auto rowgroup  = reader.materialize_zero_copy_rowgroup(std::move(zero_copy));
+	auto expressions = fastlens::expression::assemble(rowgroup);
+
+	fastlens::runtime::ExecutionWorkset      workset {};
+	fastlens::runtime::ExecutionWorksetGuard guard(workset);
+	fastlens::execution::ExecutionConfig     config {};
+	config.unpack_n_vectors = 1U;
+	config.launch_strategy  = fastlens::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	const std::vector<uint32_t> selected_vectors {1U, 3U, 6U};
+	fastlens::runtime::append_rowgroup_columns_selected_vectors(workset, rowgroup, config, selected_vectors);
+	fastlens::runtime::upload_workset(workset, config);
+	fastlens::runtime::run_workset(workset, 1U, config);
+	const auto result = fastlens::runtime::materialize_workset(workset, expressions, config);
+	ASSERT_EQ(result.columns.size(), 8U);
+	for (size_t column = 0; column < result.columns.size(); ++column) {
+		ASSERT_TRUE(result.columns[column].has_value());
+		const auto& output = std::get<std::shared_ptr<int8_t[]>>(result.columns[column]->values);
+		for (size_t selected_index = 0; selected_index < selected_vectors.size(); ++selected_index) {
+			for (size_t offset = 0; offset < fastlens::codec::consts::VALUES_PER_VECTOR; ++offset) {
+				const size_t source_row = static_cast<size_t>(selected_vectors[selected_index]) *
+				                              fastlens::codec::consts::VALUES_PER_VECTOR +
+				                          offset;
+				const auto expected = static_cast<int8_t>(
+				    static_cast<int>((source_row * 17U + column * 29U + source_row / 1024U) % 101U) - 50);
+				ASSERT_EQ(output[selected_index * fastlens::codec::consts::VALUES_PER_VECTOR + offset], expected)
+				    << "column=" << column << " selected_index=" << selected_index << " offset=" << offset;
+			}
+		}
+	}
+	fastlens::execution::free_rowgroup(rowgroup);
+}
+
+TEST(Reader, MixedDispatchCoversImplicitFullAndExplicitSelectedExpressions) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader reader(fls_path);
+	auto rowgroup   = reader.read_rowgroup(0);
+	auto expressions = fastlens::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 8U);
+
+	fastlens::runtime::ExecutionWorkset      workset {};
+	fastlens::runtime::ExecutionWorksetGuard guard(workset);
+	fastlens::execution::ExecutionConfig     config {};
+	config.unpack_n_vectors = 1U;
+	config.launch_strategy  = fastlens::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	fastlens::runtime::reserve_batch_expr_storage(workset, expressions.size() * 2U);
+	fastlens::runtime::append_rowgroup_columns(
+	    workset, rowgroup, config, /*expr_index_base=*/0U, /*use_global_expr_index=*/true);
+	const std::vector<uint32_t> selected_vectors {1U, 3U, 6U};
+	fastlens::runtime::append_rowgroup_columns_selected_vectors(
+	    workset, rowgroup, config, selected_vectors, expressions.size(), /*use_global_expr_index=*/true);
+
+	std::vector<fastlens::expression::Expression> combined_expressions = expressions;
+	combined_expressions.insert(combined_expressions.end(), expressions.begin(), expressions.end());
+	fastlens::runtime::upload_workset(workset, config);
+	fastlens::runtime::run_workset(workset, 1U, config);
+	const auto result = fastlens::runtime::materialize_workset(workset, combined_expressions, config);
+	ASSERT_EQ(result.columns.size(), combined_expressions.size());
+	for (size_t column = 0; column < expressions.size(); ++column) {
+		ASSERT_TRUE(result.columns[column].has_value());
+		ASSERT_TRUE(result.columns[expressions.size() + column].has_value());
+		const auto& full = std::get<std::shared_ptr<int8_t[]>>(result.columns[column]->values);
+		const auto& selected =
+		    std::get<std::shared_ptr<int8_t[]>>(result.columns[expressions.size() + column]->values);
+		for (size_t row = 0; row < rowgroup.n_tuples; ++row) {
+			const auto expected = static_cast<int8_t>(
+			    static_cast<int>((row * 17U + column * 29U + row / 1024U) % 101U) - 50);
+			ASSERT_EQ(full[row], expected) << "full column=" << column << " row=" << row;
+		}
+		for (size_t selected_index = 0; selected_index < selected_vectors.size(); ++selected_index) {
+			for (size_t offset = 0; offset < fastlens::codec::consts::VALUES_PER_VECTOR; ++offset) {
+				const size_t source_row = static_cast<size_t>(selected_vectors[selected_index]) *
+				                              fastlens::codec::consts::VALUES_PER_VECTOR +
+				                          offset;
+				const auto expected = static_cast<int8_t>(
+				    static_cast<int>((source_row * 17U + column * 29U + source_row / 1024U) % 101U) - 50);
+				ASSERT_EQ(selected[selected_index * fastlens::codec::consts::VALUES_PER_VECTOR + offset], expected)
+				    << "selected column=" << column << " selected_index=" << selected_index
+				    << " offset=" << offset;
+			}
+		}
+	}
+	fastlens::execution::free_rowgroup(rowgroup);
+}
+
+TEST(Reader, SparseVectorBundleEnvelopeUsesOneReadAndPreservesSegments) {
+	const auto fls_path = make_sparse_vector_bundle_fixture();
+	fastlens::format::FlsReader exact_reader(fls_path);
+	fastlens::format::ZeroCopyReadTiming exact_timing {};
+	auto exact = exact_reader.read_rowgroup_zero_copy_selected_vectors(0, {1U, 3U, 6U}, &exact_timing);
+	ASSERT_TRUE(exact_timing.used_sparse_read);
+	ASSERT_FALSE(exact_timing.used_vector_bundle_read);
+
+	const auto bundle_path = fastlens::format::sparse_vector_bundle_path(fls_path);
+	fastlens::format::write_sparse_vector_bundle(fls_path, bundle_path);
+	const ScopedEnvironmentVariable bundle_policy("FASTLENS_VECTOR_BUNDLE_READ_POLICY", "envelope");
+	fastlens::format::FlsReader bundled_reader(fls_path);
+	fastlens::format::ZeroCopyReadTiming bundle_timing {};
+	auto bundled = bundled_reader.read_rowgroup_zero_copy_selected_vectors(0, {1U, 3U, 6U}, &bundle_timing);
+	ASSERT_TRUE(bundle_timing.used_sparse_read);
+	ASSERT_TRUE(bundle_timing.used_vector_bundle_read);
+	ASSERT_TRUE(bundle_timing.used_vector_bundle_envelope_read);
+	EXPECT_EQ(bundle_timing.pread_count, 1U);
+	EXPECT_GT(bundle_timing.storage_bytes, exact_timing.storage_bytes);
+	EXPECT_LT(bundle_timing.storage_bytes, bundle_timing.full_storage_bytes);
+	EXPECT_EQ(bundle_timing.full_storage_bytes, exact_timing.full_storage_bytes);
+
+	const auto* columns = bundled.rowgroup_descriptor->m_column_descriptors();
+	ASSERT_NE(columns, nullptr);
+	for (flatbuffers::uoffset_t column_index = 0; column_index < columns->size(); ++column_index) {
+		const auto* segments = columns->Get(column_index)->segment_descriptors();
+		ASSERT_NE(segments, nullptr);
+		for (flatbuffers::uoffset_t segment_index = 0; segment_index < segments->size(); ++segment_index) {
+			const auto* descriptor = segments->Get(segment_index);
+			auto bundle_segment = fastlanes::make_segment_view(bundled.backing_span, *descriptor);
+			auto exact_segment  = fastlanes::make_segment_view(exact.backing_span, *descriptor);
+			for (const uint32_t vector : {1U, 3U, 6U}) {
+				bundle_segment.PointTo(vector);
+				exact_segment.PointTo(vector);
+				ASSERT_EQ(bundle_segment.Size(), exact_segment.Size());
+				EXPECT_EQ(std::memcmp(bundle_segment.data, exact_segment.data, bundle_segment.Size()), 0);
+			}
+		}
+	}
+}
+
+TEST(Reader, SparseVectorCapabilityRejectsUnsupportedNestedChildOperator) {
+	flatbuffers::FlatBufferBuilder builder;
+	const std::vector<fastlanes::OperatorToken> child_tokens {fastlanes::OperatorToken::EXP_NULL_I16};
+	const auto child_rpn = fastlanes::CreateRPNDirect(builder, &child_tokens);
+	const auto child = fastlanes::CreateColumnDescriptor(
+	    builder, fastlanes::DataType::INT16, child_rpn);
+	const auto children = builder.CreateVector(std::vector<flatbuffers::Offset<fastlanes::ColumnDescriptor>> {child});
+	const std::vector<fastlanes::OperatorToken> parent_tokens {fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08};
+	const auto parent_rpn = fastlanes::CreateRPNDirect(builder, &parent_tokens);
+	const auto parent = fastlanes::CreateColumnDescriptor(
+	    builder, fastlanes::DataType::INT8, parent_rpn, 0, 0, children);
+	builder.Finish(parent);
+
+	const auto* descriptor = flatbuffers::GetRoot<fastlanes::ColumnDescriptor>(builder.GetBufferPointer());
+	ASSERT_NE(descriptor, nullptr);
+	std::string reason;
+	EXPECT_FALSE(fastlens::format::detail::validate_sparse_column_operators(*descriptor, &reason));
+	EXPECT_EQ(reason, "operator-sparse-read-unsupported:EXP_NULL_I16");
+}
+
+template <typename T>
+std::string format_value(T value) {
+	if constexpr (std::is_same_v<T, int8_t>) {
+		return std::to_string(static_cast<int>(value));
+	} else if constexpr (std::is_same_v<T, uint8_t>) {
+		return std::to_string(static_cast<unsigned>(value));
+	} else {
+		return std::to_string(static_cast<long long>(value));
+	}
+}
+
+template <typename OutT, typename ExpT>
+std::string
+format_window(const OutT* out, const std::vector<ExpT>& expected, size_t start, size_t end, bool cast_out_to_u8) {
+	std::ostringstream os;
+	for (size_t row = start; row < end; ++row) {
+		if (row > start) {
+			os << ", ";
+		}
+		if (cast_out_to_u8) {
+			os << format_value(static_cast<uint8_t>(out[row]));
+		} else {
+			os << format_value(out[row]);
+		}
+		os << "/" << format_value(expected[row]);
+	}
+	return os.str();
+}
+
+std::unordered_set<fastlanes::OperatorToken> supported_tokens() {
+	std::unordered_set<fastlanes::OperatorToken> out;
+	for (const auto& capability : fastlens::expression::kOperatorCapabilities) {
+		if (capability.gpu_supported) {
+			out.insert(capability.token);
+		}
+	}
+	return out;
+}
+
+bool cuda_available_for_reader_tests() {
+	int        device_count = 0;
+	const auto cuda_status  = cudaGetDeviceCount(&device_count);
+	return cuda_status == cudaSuccess && device_count > 0;
+}
+
+struct RecordingTableExecutionObserver : fastlens::runtime::NoopTableExecutionObserver {
+	std::vector<size_t> read_rowgroups;
+	std::vector<bool>   read_from_prefetch;
+
+	void on_rowgroup_read(const fastlens::runtime::RowgroupReadResult& result, const bool from_prefetch) {
+		read_rowgroups.push_back(result.rowgroup_index);
+		read_from_prefetch.push_back(from_prefetch);
+	}
+};
+
+template <typename T>
+typename fastlens::codec::utils::same_width_uint<T>::type to_column_bits(const T value) {
+	typename fastlens::codec::utils::same_width_uint<T>::type out {};
+	std::memcpy(&out, &value, sizeof(T));
+	return out;
+}
+
+template <typename T>
+fastlens::codec::host::CROSSRLEColumn<T> make_test_cross_rle_column(const std::vector<T>&        values,
+                                                                const std::vector<uint32_t>& lengths,
+                                                                const size_t                n_values) {
+	using UIntT = typename fastlens::codec::utils::same_width_uint<T>::type;
+	if (values.size() != lengths.size()) {
+		throw std::runtime_error("test CROSS_RLE values/lengths mismatch");
+	}
+
+	const size_t n_runs = values.size();
+	auto*        raw_values = n_runs == 0 ? nullptr : new UIntT[n_runs];
+	auto*        raw_lengths = n_runs == 0 ? nullptr : new uint32_t[n_runs];
+	auto*        raw_positions = n_runs == 0 ? nullptr : new uint32_t[n_runs];
+
+	uint32_t pos = 0;
+	for (size_t i = 0; i < n_runs; ++i) {
+		raw_values[i]    = to_column_bits(values[i]);
+		raw_lengths[i]   = lengths[i];
+		raw_positions[i] = pos;
+		pos += lengths[i];
+	}
+
+	const size_t n_vecs = fastlens::codec::utils::get_n_vecs_from_size(n_values);
+	auto*        offsets = new uint32_t[n_vecs + 1];
+	size_t       cur = 0;
+	size_t       run = 0;
+	for (size_t vec = 0; vec < n_vecs; ++vec) {
+		const size_t target_start = vec * fastlens::codec::consts::VALUES_PER_VECTOR;
+		while (run < n_runs && cur + lengths[run] <= target_start) {
+			cur += lengths[run];
+			++run;
+		}
+		offsets[vec] = static_cast<uint32_t>(run);
+	}
+	offsets[n_vecs] = static_cast<uint32_t>(n_runs);
+
+	return fastlens::codec::host::CROSSRLEColumn<T> {n_values,
+	                                             n_runs,
+	                                             raw_values,
+	                                             raw_lengths,
+	                                             offsets,
+	                                             raw_positions};
+}
+
+template <typename T>
+void expect_cross_rle_decompresses(const std::vector<T>&        run_values,
+                                   const std::vector<uint32_t>& run_lengths,
+                                   const std::vector<T>&        expected) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for CROSS_RLE dispatch test.";
+	}
+
+	fastlens::execution::Rowgroup rowgroup {};
+	rowgroup.n_values = expected.size();
+	rowgroup.n_vecs   = fastlens::codec::utils::get_n_vecs_from_size(expected.size());
+	rowgroup.n_tuples = expected.size();
+	rowgroup.columns.push_back(fastlens::execution::Column {
+	    "value",
+	    std::is_same_v<T, int8_t> ? fastlanes::OperatorToken::EXP_CROSS_RLE_I08
+	                              : fastlanes::OperatorToken::EXP_CROSS_RLE_I16,
+	    make_test_cross_rle_column(run_values, run_lengths, expected.size())});
+
+	auto expressions = fastlens::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 1U);
+	const auto result = fastlens::execution::decompress_rowgroup(expressions);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+
+	const auto& values = result.columns[0]->values;
+	ASSERT_TRUE(std::holds_alternative<std::shared_ptr<T[]>>(values));
+	const auto out = std::get<std::shared_ptr<T[]>>(values);
+	ASSERT_NE(out, nullptr);
+	for (size_t i = 0; i < expected.size(); ++i) {
+		EXPECT_EQ(out[i], expected[i]) << "row=" << i;
+	}
+}
+
+std::filesystem::path make_cross_rle_i16_fls_fixture() {
+	const auto root = reader_fixture_root("cross_rle_i16");
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+
+	const auto csv_path    = root / "generated.csv";
+	const auto schema_path = root / "schema.json";
+	const auto fls_path    = root / "data.fls";
+
+	{
+		std::ofstream schema(schema_path);
+		schema << R"({"columns":[{"name":"value","type":"FLS_I16"}]})";
+	}
+	{
+		std::ofstream csv(csv_path);
+		for (int row = 0; row < 1536; ++row) {
+			int value = 0;
+			if (row < 256) {
+				value = -32768;
+			} else if (row < 512) {
+				value = -7;
+			} else if (row < 1024) {
+				value = 4096;
+			} else {
+				value = 32767;
+			}
+			csv << value << '\n';
+		}
+	}
+
+	fastlanes::Connection writer;
+	writer.set_n_vectors_per_rowgroup(2)
+	    .force_schema_pool({fastlanes::OperatorToken::EXP_CROSS_RLE_I16})
+	    .read_csv(root)
+	    .to_fls(fls_path);
+	return fls_path;
+}
+
+std::filesystem::path make_forced_i16_fls_fixture(const fastlanes::OperatorToken token,
+                                                  const std::string&              label,
+                                                  const std::vector<int16_t>&     values) {
+	const auto root = reader_fixture_root(label);
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+
+	const auto fls_path = root / "data.fls";
+	const std::array<fastlanes::MemoryColumn, 1> columns {
+	    fastlanes::MemoryColumn {"value", std::span<const int16_t>(values.data(), values.size())}};
+	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 70;
+	// Forced schemas intentionally bypass wizard statistics. Constants need
+	// the wizard's max-value metadata, whereas uncompressed is safely forced.
+	if (token != fastlanes::OperatorToken::EXP_CONSTANT_I16) {
+		options.force_schema  = true;
+		options.forced_schema = {token};
+	}
+	fastlanes::write_memory_table_to_fls(table, fls_path, options);
+	return fls_path;
+}
+
+void expect_forced_i16_gpu_roundtrip(const fastlanes::OperatorToken token,
+                                     const std::string&              label,
+                                     const std::vector<int16_t>&     expected) {
+	const auto fls_path = make_forced_i16_fls_fixture(token, label, expected);
+
+	const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	ASSERT_NE(td->m_rowgroup_descriptors(), nullptr);
+	ASSERT_EQ(td->m_rowgroup_descriptors()->size(), 1U);
+	const auto* rg = td->m_rowgroup_descriptors()->Get(0);
+	ASSERT_NE(rg, nullptr);
+	ASSERT_GT(rg->m_n_vec(), 64U);
+	ASSERT_NE(rg->m_column_descriptors(), nullptr);
+	ASSERT_EQ(rg->m_column_descriptors()->size(), 1U);
+	const auto* col = rg->m_column_descriptors()->Get(0);
+	ASSERT_NE(col, nullptr);
+	ASSERT_NE(col->encoding_rpn(), nullptr);
+	ASSERT_NE(col->encoding_rpn()->operator_tokens(), nullptr);
+	ASSERT_EQ(col->encoding_rpn()->operator_tokens()->size(), 1U);
+	ASSERT_EQ(col->encoding_rpn()->operator_tokens()->Get(0), token);
+
+	fastlens::format::FlsReader reader(fls_path);
+	auto                    rowgroup = reader.read_rowgroup(0);
+	ASSERT_EQ(rowgroup.n_tuples, expected.size());
+	ASSERT_EQ(rowgroup.columns.size(), 1U);
+	EXPECT_EQ(rowgroup.columns[0].token, token);
+	if (token == fastlanes::OperatorToken::EXP_CONSTANT_I16) {
+		EXPECT_TRUE((std::holds_alternative<fastlens::codec::host::CONSTANTColumn<int16_t>>(rowgroup.columns[0].host)));
+	} else {
+		EXPECT_TRUE((std::holds_alternative<fastlens::codec::host::BPColumn<int16_t>>(rowgroup.columns[0].host)));
+	}
+
+	auto expressions = fastlens::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 1U);
+	fastlens::execution::ExecutionConfig config {};
+	config.unpack_n_vectors = 1;
+	config.write_out        = true;
+	const auto result       = fastlens::execution::decompress_rowgroup(expressions, config);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+	ASSERT_EQ(result.columns[0]->meta.value_count, rowgroup.n_values);
+	const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[0]->values);
+	ASSERT_NE(output, nullptr);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		ASSERT_EQ(output[row], expected[row]) << "token=" << fastlanes::token_to_string(token) << " row=" << row;
+	}
+	for (size_t row = expected.size(); row < rowgroup.n_values; ++row) {
+		ASSERT_EQ(output[row], expected.back())
+		    << "padded token=" << fastlanes::token_to_string(token) << " row=" << row;
+	}
+}
+
+struct ExternalDictI16Fixture {
+	std::filesystem::path   root;
+	std::filesystem::path   fls_path;
+	std::vector<int16_t>    source;
+	std::vector<int16_t>    mapped;
+	fastlanes::OperatorToken expected_ref_token;
+};
+
+ExternalDictI16Fixture make_external_dict_i16_fixture(const size_t cardinality, const std::string& label) {
+	if (cardinality == 0 || cardinality > 1024) {
+		throw std::invalid_argument("external dictionary fixture cardinality is outside the test range");
+	}
+	const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+	ExternalDictI16Fixture fixture;
+	fixture.root = std::filesystem::temp_directory_path() /
+	               ("fastlens_external_dict_i16_" + label + "_" + std::to_string(suffix));
+	fixture.fls_path = fixture.root / "data.fls";
+	fixture.expected_ref_token = cardinality <= 256U ? fastlanes::OperatorToken::EXP_DICT_I16_U08
+	                                                : fastlanes::OperatorToken::EXP_DICT_I16_U16;
+	std::filesystem::create_directories(fixture.root);
+
+	const size_t n_values = 12U * fastlens::codec::consts::VALUES_PER_VECTOR;
+	fixture.source.resize(n_values);
+	fixture.mapped.resize(n_values);
+	for (size_t row = 0; row < n_values; ++row) {
+		const size_t rank    = row % cardinality;
+		const size_t mapping = (rank * 37U) % cardinality;
+		fixture.source[row]  = static_cast<int16_t>(static_cast<int>(rank) - static_cast<int>(cardinality / 2U));
+		fixture.mapped[row]  = static_cast<int16_t>(static_cast<int>(mapping) * 41 - 15000);
+	}
+	{
+		std::ofstream schema(fixture.root / "schema.json");
+		schema << R"({"columns":[{"name":"source","type":"FLS_I16"},{"name":"mapped","type":"FLS_I16"}]})";
+	}
+	{
+		std::ofstream csv(fixture.root / "generated.csv");
+		for (size_t row = 0; row < n_values; ++row) {
+			csv << fixture.source[row] << '|' << fixture.mapped[row] << '\n';
+		}
+	}
+	fastlanes::Connection writer;
+	writer.set_n_vectors_per_rowgroup(12).read_csv(fixture.root).to_fls(fixture.fls_path);
+	return fixture;
+}
+
+void set_external_dict_source(fastlens::execution::Column& column, const uint32_t source_index) {
+	bool updated = false;
+	std::visit(
+	    [&](auto& payload) {
+		    using PayloadT = std::decay_t<decltype(payload)>;
+		    if constexpr (std::is_same_v<PayloadT, fastlens::codec::host::DICTREFColumn<int16_t, uint8_t>> ||
+		                  std::is_same_v<PayloadT, fastlens::codec::host::DICTREFColumn<int16_t, uint16_t>>) {
+			    payload.index_column_index = source_index;
+			    updated                     = true;
+		    }
+	    },
+	    column.host);
+	if (!updated) {
+		throw std::runtime_error("test expected an unresolved I16 external dictionary");
+	}
+}
+
+fastlens::execution::Column make_test_alias_column(const size_t n_values, const size_t target, const std::string& name) {
+	fastlens::execution::Column alias {};
+	alias.name            = name;
+	alias.token           = fastlanes::OperatorToken::EXP_EQUAL;
+	alias.host            = fastlens::codec::host::CONSTANTColumn<int16_t> {n_values, 0};
+	alias.skip_decompress = true;
+	alias.alias_of        = target;
+	return alias;
+}
+
+TEST(ExternalDictionaryI16, Full) {
+	for (const auto& [cardinality, label] :
+	     std::array<std::pair<size_t, const char*>, 2> {{{61U, "u8"}, {300U, "u16"}}}) {
+		auto fixture = make_external_dict_i16_fixture(cardinality, label);
+		SCOPED_TRACE(label);
+
+		const auto  descriptor_handle = fastlens::format::detail::load_table_descriptor(fixture.fls_path);
+		const auto* descriptor        = descriptor_handle.Get();
+		ASSERT_NE(descriptor, nullptr);
+		ASSERT_NE(descriptor->m_rowgroup_descriptors(), nullptr);
+		ASSERT_EQ(descriptor->m_rowgroup_descriptors()->size(), 1U);
+		const auto* rowgroup_descriptor = descriptor->m_rowgroup_descriptors()->Get(0);
+		ASSERT_NE(rowgroup_descriptor, nullptr);
+		ASSERT_NE(rowgroup_descriptor->m_column_descriptors(), nullptr);
+		ASSERT_EQ(rowgroup_descriptor->m_column_descriptors()->size(), 2U);
+		const auto* ref_descriptor = rowgroup_descriptor->m_column_descriptors()->Get(1);
+		ASSERT_NE(ref_descriptor, nullptr);
+		ASSERT_NE(ref_descriptor->encoding_rpn(), nullptr);
+		ASSERT_EQ(ref_descriptor->encoding_rpn()->operator_tokens()->Get(0), fixture.expected_ref_token);
+
+		fastlens::format::FlsReader reader(fixture.fls_path);
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		ASSERT_EQ(rowgroup.columns.size(), 2U);
+		ASSERT_TRUE(rowgroup.backing_storage);
+		EXPECT_EQ(rowgroup.columns[1].token, fixture.expected_ref_token);
+
+		const uint16_t* borrowed_keys = nullptr;
+		if (fixture.expected_ref_token == fastlanes::OperatorToken::EXP_DICT_I16_U08) {
+			const auto& dict_ref =
+			    std::get<fastlens::codec::host::DICTREFColumn<int16_t, uint8_t>>(rowgroup.columns[1].host);
+			EXPECT_FALSE(dict_ref.keys.owns());
+			borrowed_keys = dict_ref.keys.get();
+		} else {
+			const auto& dict_ref =
+			    std::get<fastlens::codec::host::DICTREFColumn<int16_t, uint16_t>>(rowgroup.columns[1].host);
+			EXPECT_FALSE(dict_ref.keys.owns());
+			borrowed_keys = dict_ref.keys.get();
+		}
+		ASSERT_NE(borrowed_keys, nullptr);
+
+		auto expressions = fastlens::expression::assemble(rowgroup);
+		fastlens::execution::resolve_dict_refs(expressions);
+		EXPECT_FALSE(fastlens::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+		EXPECT_TRUE(rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U08 ||
+		            rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U08 ||
+		            rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U16 ||
+		            rowgroup.columns[1].token == fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U16);
+		std::visit(
+		    [&](const auto& column) {
+			    using ColumnT = std::decay_t<decltype(column)>;
+			    if constexpr (std::is_same_v<ColumnT, fastlens::codec::host::DICTFFORColumn<int16_t, uint8_t>> ||
+			                  std::is_same_v<ColumnT, fastlens::codec::host::DICTFFORColumn<int16_t, uint16_t>> ||
+			                  std::is_same_v<ColumnT, fastlens::codec::host::DICTSLPATCHColumn<int16_t, uint8_t>> ||
+			                  std::is_same_v<ColumnT, fastlens::codec::host::DICTSLPATCHColumn<int16_t, uint16_t>>) {
+				    EXPECT_EQ(column.keys.get(), borrowed_keys);
+				    EXPECT_FALSE(column.keys.owns());
+			    }
+		    },
+		    rowgroup.columns[1].host);
+
+		if (cuda_available_for_reader_tests()) {
+			fastlens::execution::ExecutionConfig config {};
+			config.unpack_n_vectors = 4;
+			config.write_out        = true;
+			const auto result       = fastlens::execution::decompress_rowgroup(expressions, config);
+			ASSERT_EQ(result.columns.size(), 2U);
+			ASSERT_TRUE(result.columns[1].has_value());
+			const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+			for (size_t row = 0; row < fixture.mapped.size(); ++row) {
+				ASSERT_EQ(output[row], fixture.mapped[row]) << "row=" << row;
+			}
+		}
+		fastlens::execution::free_rowgroup(rowgroup);
+		std::filesystem::remove_all(fixture.root);
+	}
+}
+
+TEST(ExternalDictionaryI16, AliasChain) {
+	auto fixture = make_external_dict_i16_fixture(61U, "alias_chain");
+	fastlens::format::FlsReader reader(fixture.fls_path);
+	auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+	ASSERT_EQ(rowgroup.columns.size(), 2U);
+	set_external_dict_source(rowgroup.columns[1], 2U);
+	rowgroup.columns.push_back(make_test_alias_column(rowgroup.n_values, 3U, "alias_1"));
+	rowgroup.columns.push_back(make_test_alias_column(rowgroup.n_values, 0U, "alias_2"));
+
+	auto expressions = fastlens::expression::assemble(rowgroup);
+	EXPECT_NO_THROW(fastlens::execution::resolve_dict_refs(expressions));
+	EXPECT_FALSE(fastlens::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+	EXPECT_EQ(rowgroup.columns[1].token, fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U08);
+
+	fastlens::execution::free_rowgroup(rowgroup);
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(ExternalDictionaryI16, DependencyErrors) {
+	auto fixture = make_external_dict_i16_fixture(300U, "dependency_errors");
+	fastlens::format::FlsReader reader(fixture.fls_path);
+	const auto expect_error = [](auto&& action, const std::string& expected_fragment) {
+		try {
+			action();
+			FAIL() << "expected DICTREF resolution to fail";
+		} catch (const std::exception& error) {
+			EXPECT_NE(std::string(error.what()).find(expected_fragment), std::string::npos) << error.what();
+		}
+	};
+
+	{
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		set_external_dict_source(rowgroup.columns[1], 99U);
+		auto expressions = fastlens::expression::assemble(rowgroup);
+		expect_error([&] { fastlens::execution::resolve_dict_refs(expressions); }, "rowgroup has 2 columns");
+		fastlens::execution::free_rowgroup(rowgroup);
+	}
+	{
+		auto rowgroup  = reader.read_rowgroup_zero_copy_materialized(0);
+		auto expressions = fastlens::expression::assemble(rowgroup);
+		expressions[0].column = nullptr;
+		expect_error([&] { fastlens::execution::resolve_dict_refs(expressions); }, "source column 0 is missing");
+		fastlens::execution::free_rowgroup(rowgroup);
+	}
+	{
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		rowgroup.columns[0].host = fastlens::codec::host::CONSTANTColumn<int16_t> {rowgroup.n_values, 0};
+		rowgroup.columns[0].token = fastlanes::OperatorToken::EXP_CONSTANT_I16;
+		auto expressions = fastlens::expression::assemble(rowgroup);
+		expect_error([&] { fastlens::execution::resolve_dict_refs(expressions); }, "expects a 16-bit BP/FFOR/SLPATCH");
+		fastlens::execution::free_rowgroup(rowgroup);
+	}
+
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(ExternalDictionaryI16, CycleDetection) {
+	auto fixture = make_external_dict_i16_fixture(61U, "cycle");
+	fastlens::format::FlsReader reader(fixture.fls_path);
+	auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+	set_external_dict_source(rowgroup.columns[1], 2U);
+	rowgroup.columns.push_back(make_test_alias_column(rowgroup.n_values, 1U, "cycle_alias"));
+	auto expressions = fastlens::expression::assemble(rowgroup);
+	try {
+		fastlens::execution::resolve_dict_refs(expressions);
+		FAIL() << "expected a DICTREF dependency cycle";
+	} catch (const std::exception& error) {
+		EXPECT_NE(std::string(error.what()).find("DICTREF dependency cycle detected: 1 -> 2 -> 1"), std::string::npos)
+		    << error.what();
+	}
+	fastlens::execution::free_rowgroup(rowgroup);
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(ExternalDictionaryI16, SelectedVectors) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	auto fixture = make_external_dict_i16_fixture(300U, "selected_vectors");
+	fastlens::format::FlsReader reader(fixture.fls_path);
+	auto rowgroup   = reader.read_rowgroup_zero_copy_materialized(0);
+	auto expressions = fastlens::expression::assemble(rowgroup);
+	ASSERT_TRUE(fastlens::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+
+	fastlens::runtime::ExecutionWorkset      workset {};
+	fastlens::runtime::ExecutionWorksetGuard guard(workset);
+	fastlens::execution::ExecutionConfig     config {};
+	config.unpack_n_vectors = 2;
+	config.launch_strategy  = fastlens::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	const std::vector<uint32_t> selected_vectors {1U, 6U, 10U};
+	fastlens::runtime::append_rowgroup_columns_selected_vectors(workset, rowgroup, config, selected_vectors);
+	EXPECT_FALSE(fastlens::execution::has_unresolved_dict_ref(rowgroup.columns[1].host));
+	fastlens::runtime::upload_workset(workset, config);
+	fastlens::runtime::run_workset(workset, 1U, config);
+	const auto result = fastlens::runtime::materialize_workset(workset, expressions, config);
+	ASSERT_EQ(result.columns.size(), 2U);
+	ASSERT_TRUE(result.columns[1].has_value());
+	const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+	for (size_t chunk = 0; chunk < selected_vectors.size(); ++chunk) {
+		for (size_t row = 0; row < 2U * fastlens::codec::consts::VALUES_PER_VECTOR; ++row) {
+			const size_t source = static_cast<size_t>(selected_vectors[chunk]) *
+			                          fastlens::codec::consts::VALUES_PER_VECTOR +
+			                      row;
+			const size_t destination = chunk * 2U * fastlens::codec::consts::VALUES_PER_VECTOR + row;
+			ASSERT_EQ(output[destination], fixture.mapped[source]) << "chunk=" << chunk << " row=" << row;
+		}
+	}
+
+	fastlens::execution::free_rowgroup(rowgroup);
+	std::filesystem::remove_all(fixture.root);
+}
+
+TEST(Reader, CapabilityTableIsUniqueAndCoversNewI16Tokens) {
+	std::unordered_set<fastlanes::OperatorToken> seen;
+	for (const auto& capability : fastlens::expression::kOperatorCapabilities) {
+		EXPECT_TRUE(seen.insert(capability.token).second) << fastlanes::token_to_string(capability.token);
+		EXPECT_EQ(fastlens::expression::capability_for_token(capability.token), &capability);
+		EXPECT_EQ(fastlens::expression::is_supported_token(capability.token), capability.gpu_supported);
+		EXPECT_EQ(fastlens::expression::is_sparse_read_supported_token(capability.token),
+		          capability.sparse_read_supported);
+	}
+	EXPECT_TRUE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_CONSTANT_I16));
+	EXPECT_TRUE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_UNCOMPRESSED_I16));
+	EXPECT_TRUE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_DELTA_I08));
+	EXPECT_TRUE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_DELTA_I16));
+	EXPECT_FALSE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_NULL_I16));
+	EXPECT_FALSE(fastlens::expression::is_sparse_read_supported_token(fastlanes::OperatorToken::EXP_NULL_I16));
+	EXPECT_TRUE(fastlens::expression::is_sparse_read_supported_token(fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08));
+	EXPECT_TRUE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_DICT_I16_U08));
+	EXPECT_TRUE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_DICT_I16_U16));
+}
+
+TEST(Reader, ConstantI16GpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const std::vector<int16_t> expected(65U * fastlens::codec::consts::VALUES_PER_VECTOR + 7U, -12345);
+	expect_forced_i16_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_CONSTANT_I16, "constant_i16_large_partial", expected);
+}
+
+TEST(Reader, UncompressedI16GpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	std::vector<int16_t> expected(65U * fastlens::codec::consts::VALUES_PER_VECTOR + 7U);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		expected[row] = static_cast<int16_t>((row * 251U + row / 17U) & 0xFFFFU);
+	}
+	expect_forced_i16_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_UNCOMPRESSED_I16, "uncompressed_i16_large_partial", expected);
+}
+
+template <typename T>
+std::filesystem::path make_forced_delta_fls_fixture(const fastlanes::OperatorToken token,
+	                                                const std::string&              label,
+	                                                const std::vector<T>&           values) {
+	const auto root = reader_fixture_root(label);
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto fls_path = root / "data.fls";
+	const std::array<fastlanes::MemoryColumn, 1> columns {
+	    fastlanes::MemoryColumn {"value", std::span<const T>(values.data(), values.size())}};
+	const fastlanes::MemoryTable table {std::span<const fastlanes::MemoryColumn>(columns)};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 70;
+	options.force_schema           = true;
+	options.forced_schema          = {token};
+	fastlanes::write_memory_table_to_fls(table, fls_path, options);
+	return fls_path;
+}
+
+TEST(ExternalDictionaryI16, RawIndexPayloadsAndOwnedKeys) {
+	const auto run_case = [&]<typename SourceT, typename IndexT>(
+	                          const fastlanes::OperatorToken source_token,
+	                          const fastlanes::OperatorToken resolved_token,
+	                          const std::string&              label,
+	                          const size_t                    key_count,
+	                          const std::vector<SourceT>&     indexes) {
+		const auto fls_path = make_forced_delta_fls_fixture(source_token, label, indexes);
+		fastlens::format::FlsReader reader(fls_path);
+		auto rowgroup = reader.read_rowgroup_zero_copy_materialized(0);
+		ASSERT_EQ(rowgroup.columns.size(), 1U);
+
+		auto* keys = new uint16_t[key_count];
+		std::vector<int16_t> expected_keys(key_count);
+		for (size_t index = 0; index < key_count; ++index) {
+			expected_keys[index] = static_cast<int16_t>(-15000 + static_cast<int>(index) * 41);
+			keys[index]          = to_column_bits(expected_keys[index]);
+		}
+		const auto* original_keys = keys;
+		fastlens::execution::Column target {};
+		target.name  = "external";
+		target.token = std::is_same_v<IndexT, uint8_t> ? fastlanes::OperatorToken::EXP_DICT_I16_U08
+		                                              : fastlanes::OperatorToken::EXP_DICT_I16_U16;
+		target.host = fastlens::codec::host::DICTREFColumn<int16_t, IndexT> {
+		    rowgroup.n_values, 0U, keys, key_count};
+		rowgroup.columns.push_back(std::move(target));
+
+		auto expressions = fastlens::expression::assemble(rowgroup);
+		fastlens::execution::resolve_dict_refs(expressions);
+		EXPECT_EQ(rowgroup.columns[1].token, resolved_token);
+		std::visit(
+		    [&](const auto& column) {
+			    using ColumnT = std::decay_t<decltype(column)>;
+			    if constexpr (std::is_same_v<ColumnT, fastlens::codec::host::DICTFFORColumn<int16_t, IndexT>> ||
+			                  std::is_same_v<ColumnT, fastlens::codec::host::DICTSLPATCHColumn<int16_t, IndexT>>) {
+				    EXPECT_EQ(column.keys.get(), original_keys);
+				    EXPECT_TRUE(column.keys.owns());
+			    }
+		    },
+		    rowgroup.columns[1].host);
+
+		if (cuda_available_for_reader_tests()) {
+			fastlens::execution::ExecutionConfig config {};
+			config.unpack_n_vectors = 1;
+			config.write_out        = true;
+			const auto result       = fastlens::execution::decompress_rowgroup(expressions, config);
+			ASSERT_EQ(result.columns.size(), 2U);
+			ASSERT_TRUE(result.columns[1].has_value());
+			const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+			for (size_t row = 0; row < indexes.size(); ++row) {
+				const auto index = static_cast<size_t>(static_cast<IndexT>(indexes[row]));
+				ASSERT_LT(index, expected_keys.size());
+				ASSERT_EQ(output[row], expected_keys[index]) << "row=" << row;
+			}
+		}
+		fastlens::execution::free_rowgroup(rowgroup);
+	};
+
+	const size_t n_values = 4U * fastlens::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int8_t> bp_i8(n_values);
+	std::vector<int16_t> ffor_i16(n_values);
+	std::vector<int16_t> slpatch_i16(n_values);
+	for (size_t row = 0; row < n_values; ++row) {
+		bp_i8[row]      = static_cast<int8_t>(row % 61U);
+		ffor_i16[row]   = static_cast<int16_t>(row % 300U);
+		slpatch_i16[row] = static_cast<int16_t>((row % 257U == 0U) ? 299U : (row % 7U));
+	}
+	run_case.template operator()<int8_t, uint8_t>(fastlanes::OperatorToken::EXP_UNCOMPRESSED_I08,
+	                                               fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U08,
+	                                               "external_raw_bp_i8",
+	                                               61U,
+	                                               bp_i8);
+	run_case.template operator()<int16_t, uint16_t>(fastlanes::OperatorToken::EXP_FFOR_I16,
+	                                                 fastlanes::OperatorToken::EXP_DICT_I16_FFOR_U16,
+	                                                 "external_raw_ffor_i16",
+	                                                 300U,
+	                                                 ffor_i16);
+	run_case.template operator()<int16_t, uint16_t>(fastlanes::OperatorToken::EXP_FFOR_SLPATCH_I16,
+	                                                 fastlanes::OperatorToken::EXP_DICT_I16_FFOR_SLPATCH_U16,
+	                                                 "external_raw_slpatch_i16",
+	                                                 300U,
+	                                                 slpatch_i16);
+}
+
+template <typename T>
+void expect_forced_delta_cpu_gpu_roundtrip(const fastlanes::OperatorToken token,
+	                                       const std::string&              label,
+	                                       const std::vector<T>&           expected) {
+	const auto fls_path = make_forced_delta_fls_fixture<T>(token, label, expected);
+	const auto handle   = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* table   = handle.Get();
+	ASSERT_NE(table, nullptr);
+	ASSERT_NE(table->m_rowgroup_descriptors(), nullptr);
+	ASSERT_EQ(table->m_rowgroup_descriptors()->size(), 1U);
+	const auto* rg = table->m_rowgroup_descriptors()->Get(0);
+	ASSERT_NE(rg, nullptr);
+	ASSERT_GT(rg->m_n_vec(), 64U);
+	ASSERT_NE(rg->m_column_descriptors(), nullptr);
+	const auto* column = rg->m_column_descriptors()->Get(0);
+	ASSERT_NE(column, nullptr);
+	ASSERT_EQ(column->encoding_rpn()->operator_tokens()->Get(0), token);
+	ASSERT_EQ(column->encoding_rpn()->operand_tokens()->size(), 4U);
+
+	// FastLanes CPU is the format oracle; compare it bit-for-bit before
+	// checking every GPU launch configuration.
+	auto connection = fastlanes::connect();
+	auto table_reader = connection->read_fls(fls_path);
+	auto rowgroup_reader = table_reader->get_rowgroup_reader(0);
+	auto cpu_rowgroup = rowgroup_reader->materialize();
+	const auto* cpu_column = std::get_if<fastlanes::up<fastlanes::TypedCol<T>>>(&cpu_rowgroup->internal_rowgroup[0]);
+	ASSERT_NE(cpu_column, nullptr);
+	ASSERT_NE(cpu_column->get(), nullptr);
+	for (size_t row = 0; row < expected.size(); ++row) {
+		ASSERT_EQ((*cpu_column)->data[row], expected[row]) << "CPU row=" << row;
+	}
+
+	fastlens::format::FlsReader reader(fls_path);
+	auto                    rowgroup = reader.read_rowgroup(0);
+	ASSERT_EQ(rowgroup.n_tuples, expected.size());
+	ASSERT_EQ(rowgroup.columns.size(), 1U);
+	EXPECT_TRUE((std::holds_alternative<fastlens::codec::host::DELTAColumn<T>>(rowgroup.columns[0].host)));
+	auto expressions = fastlens::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 1U);
+	for (const auto decoder :
+	     {fastlens::execution::DeltaDecoder::Stateful, fastlens::execution::DeltaDecoder::Register}) {
+		SCOPED_TRACE(decoder == fastlens::execution::DeltaDecoder::Register ? "register" : "stateful");
+		fastlens::execution::ExecutionConfig standalone_config {};
+		standalone_config.unpack_n_vectors = 4;
+		standalone_config.write_out        = true;
+		standalone_config.delta_decoder    = decoder;
+		const auto standalone = fastlens::execution::decompress(expressions[0], standalone_config);
+		const auto& standalone_output = std::get<std::shared_ptr<T[]>>(standalone);
+		for (size_t row = 0; row < expected.size(); ++row) {
+			ASSERT_EQ(standalone_output[row], expected[row]) << "standalone GPU row=" << row;
+		}
+		const auto standalone_hot = fastlens::execution::decompress(expressions[0], standalone_config);
+		const auto& standalone_hot_output = std::get<std::shared_ptr<T[]>>(standalone_hot);
+		for (size_t row = 0; row < expected.size(); ++row) {
+			ASSERT_EQ(standalone_hot_output[row], expected[row]) << "hot standalone GPU row=" << row;
+		}
+
+		for (const unsigned unpack_n_vectors : {1U, 2U, 4U}) {
+			for (const auto strategy :
+			     {fastlens::execution::LaunchStrategy::MixedDispatch, fastlens::execution::LaunchStrategy::TypedBatches}) {
+				SCOPED_TRACE(std::string("unpack=") + std::to_string(unpack_n_vectors) +
+				             (strategy == fastlens::execution::LaunchStrategy::MixedDispatch ? " mixed" : " typed"));
+				fastlens::execution::ExecutionConfig config {};
+				config.unpack_n_vectors = unpack_n_vectors;
+				config.launch_strategy  = strategy;
+				config.delta_decoder    = decoder;
+				config.write_out        = true;
+				const auto result       = fastlens::execution::decompress_rowgroup(expressions, config);
+				ASSERT_EQ(result.columns.size(), 1U);
+				ASSERT_TRUE(result.columns[0].has_value());
+				const auto& output = std::get<std::shared_ptr<T[]>>(result.columns[0]->values);
+				ASSERT_NE(output, nullptr);
+				for (size_t row = 0; row < expected.size(); ++row) {
+					ASSERT_EQ(output[row], expected[row]) << "GPU row=" << row;
+				}
+			}
+		}
+
+		fastlens::runtime::ExecutionWorkset selected_workset {};
+		fastlens::runtime::ExecutionWorksetGuard selected_guard(selected_workset);
+		fastlens::execution::ExecutionConfig selected_config {};
+		selected_config.unpack_n_vectors = 4;
+		selected_config.launch_strategy  = fastlens::execution::LaunchStrategy::MixedDispatch;
+		selected_config.delta_decoder    = decoder;
+		selected_config.write_out        = true;
+		const std::vector<uint32_t> selected_vectors {1U, 17U, 61U};
+		fastlens::runtime::append_rowgroup_columns_selected_vectors(
+		    selected_workset, rowgroup, selected_config, selected_vectors);
+		fastlens::runtime::upload_workset(selected_workset, selected_config);
+		fastlens::runtime::run_workset(selected_workset, 1, selected_config);
+		const auto selected_result =
+		    fastlens::runtime::materialize_workset(selected_workset, expressions, selected_config);
+		ASSERT_EQ(selected_result.columns.size(), 1U);
+		ASSERT_TRUE(selected_result.columns[0].has_value());
+		const auto& selected_output = std::get<std::shared_ptr<T[]>>(selected_result.columns[0]->values);
+		for (size_t chunk = 0; chunk < selected_vectors.size(); ++chunk) {
+			for (size_t row = 0; row < 4U * fastlens::codec::consts::VALUES_PER_VECTOR; ++row) {
+				const size_t expected_row =
+				    static_cast<size_t>(selected_vectors[chunk]) * fastlens::codec::consts::VALUES_PER_VECTOR + row;
+				const size_t output_row = chunk * 4U * fastlens::codec::consts::VALUES_PER_VECTOR + row;
+				ASSERT_EQ(selected_output[output_row], expected[expected_row])
+				    << "selected chunk=" << chunk << " row=" << row;
+			}
+		}
+	}
+}
+
+TEST(Reader, CompactAllVectorsMatchesOriginalRowgroupOnGpu) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const char* path_env = std::getenv("FASTLENS_COMPACT_TEST_FILE");
+	const auto fls_path = path_env ? std::filesystem::path(path_env) : make_sparse_vector_bundle_fixture();
+	ASSERT_TRUE(std::filesystem::exists(fls_path));
+	if (path_env == nullptr) {
+		fastlens::format::write_sparse_vector_bundle(fls_path, fastlens::format::sparse_vector_bundle_path(fls_path));
+	}
+	size_t rowgroup_index = 0U;
+	if (const char* rowgroup_env = std::getenv("FASTLENS_COMPACT_TEST_ROWGROUP");
+	    rowgroup_env != nullptr && *rowgroup_env != '\0') {
+		rowgroup_index = std::stoull(rowgroup_env);
+	}
+	fastlens::format::FlsReader reader(fls_path);
+	ASSERT_LT(rowgroup_index, reader.rowgroup_count());
+	auto original = reader.read_rowgroup_zero_copy_materialized(rowgroup_index);
+	const size_t original_n_values = original.n_values;
+	auto original_expressions = fastlens::expression::assemble(original);
+	fastlens::execution::ExecutionConfig config {};
+	config.unpack_n_vectors = 1U;
+	config.write_out        = true;
+	const auto expected = fastlens::execution::decompress_rowgroup(original_expressions, config);
+
+	auto compact = reader.read_rowgroup_zero_copy_materialized(rowgroup_index);
+	auto resolved = fastlens::expression::assemble(compact);
+	fastlens::execution::resolve_dict_refs(resolved);
+	std::vector<uint32_t> vectors(compact.n_vecs);
+	std::iota(vectors.begin(), vectors.end(), uint32_t {0});
+	fastlens::runtime::compact_selected_vectors(compact, vectors);
+	auto compact_expressions = fastlens::expression::assemble(compact);
+	const auto actual = fastlens::execution::decompress_rowgroup(compact_expressions, config);
+
+	ASSERT_EQ(actual.columns.size(), expected.columns.size());
+	for (size_t column = 0; column < expected.columns.size(); ++column) {
+		ASSERT_TRUE(expected.columns[column].has_value()) << "column=" << column;
+		ASSERT_TRUE(actual.columns[column].has_value()) << "column=" << column;
+		std::visit(
+		    [&](const auto& expected_ptr) {
+			    using PtrT = std::decay_t<decltype(expected_ptr)>;
+			    const auto& actual_ptr = std::get<PtrT>(actual.columns[column]->values);
+			    for (size_t row = 0; row < original_n_values; ++row) {
+				    ASSERT_EQ(actual_ptr[row], expected_ptr[row]) << "column=" << column << " row=" << row;
+			    }
+		    },
+		    expected.columns[column]->values);
+	}
+
+	for (uint32_t source_vector = 0; source_vector < original.n_vecs; ++source_vector) {
+		auto single = reader.read_rowgroup_zero_copy_materialized(rowgroup_index);
+		auto single_resolved = fastlens::expression::assemble(single);
+		fastlens::execution::resolve_dict_refs(single_resolved);
+		fastlens::runtime::compact_selected_vectors(single, std::vector<uint32_t> {source_vector});
+		auto single_expressions = fastlens::expression::assemble(single);
+		const auto single_actual = fastlens::execution::decompress_rowgroup(single_expressions, config);
+		const size_t source_begin = static_cast<size_t>(source_vector) * fastlens::codec::consts::VALUES_PER_VECTOR;
+		const size_t compare_count = std::min<size_t>(fastlens::codec::consts::VALUES_PER_VECTOR,
+		                                              original_n_values - source_begin);
+		for (size_t column = 0; column < expected.columns.size(); ++column) {
+			ASSERT_TRUE(single_actual.columns[column].has_value()) << "column=" << column;
+			std::visit(
+			    [&](const auto& expected_ptr) {
+				    using PtrT = std::decay_t<decltype(expected_ptr)>;
+				    const auto& actual_ptr = std::get<PtrT>(single_actual.columns[column]->values);
+				    for (size_t row = 0; row < compare_count; ++row) {
+					    ASSERT_EQ(actual_ptr[row], expected_ptr[source_begin + row])
+					        << "source_vector=" << source_vector << " column=" << column << " row=" << row;
+				    }
+			    },
+			    expected.columns[column]->values);
+		}
+	}
+
+	if (reader.has_sparse_vector_bundle()) {
+		std::vector<uint32_t> sparse_vectors;
+		if (const char* vectors_env = std::getenv("FASTLENS_COMPACT_TEST_VECTORS");
+		    vectors_env != nullptr && *vectors_env != '\0') {
+			std::istringstream input(vectors_env);
+			std::string token;
+			while (std::getline(input, token, ',')) {
+				sparse_vectors.push_back(static_cast<uint32_t>(std::stoul(token)));
+			}
+		} else {
+			for (uint32_t vector = 0; vector < original.n_vecs; ++vector) {
+				if (vector % 3U != 2U) {
+					sparse_vectors.push_back(vector);
+				}
+			}
+		}
+		const ScopedEnvironmentVariable mirror("FASTLENS_VECTOR_BUNDLE_DEVICE_SCATTER_CPU_MIRROR", "1");
+		const ScopedEnvironmentVariable mirror_limit(
+		    "FASTLENS_VECTOR_BUNDLE_DEVICE_SCATTER_CPU_MIRROR_MAX_BYTES", "1536");
+		auto sparse = reader.materialize_zero_copy_rowgroup(
+		    reader.read_rowgroup_zero_copy_selected_vectors_packed(rowgroup_index, sparse_vectors));
+		auto sparse_resolved = fastlens::expression::assemble(sparse);
+		fastlens::execution::resolve_dict_refs(sparse_resolved);
+		fastlens::runtime::compact_selected_vectors(sparse, sparse_vectors);
+		auto sparse_expressions = fastlens::expression::assemble(sparse);
+		const auto sparse_actual = fastlens::execution::decompress_rowgroup(sparse_expressions, config);
+		for (size_t column = 0; column < expected.columns.size(); ++column) {
+			ASSERT_TRUE(sparse_actual.columns[column].has_value()) << "column=" << column;
+			std::visit(
+			    [&](const auto& expected_ptr) {
+				    using PtrT = std::decay_t<decltype(expected_ptr)>;
+				    const auto& actual_ptr = std::get<PtrT>(sparse_actual.columns[column]->values);
+				    for (size_t selected_index = 0; selected_index < sparse_vectors.size(); ++selected_index) {
+					    const size_t source_begin = static_cast<size_t>(sparse_vectors[selected_index]) *
+					                                fastlens::codec::consts::VALUES_PER_VECTOR;
+					    const size_t compare_count = std::min<size_t>(
+					        fastlens::codec::consts::VALUES_PER_VECTOR, original_n_values - source_begin);
+					    for (size_t row = 0; row < compare_count; ++row) {
+						    ASSERT_EQ(actual_ptr[selected_index * fastlens::codec::consts::VALUES_PER_VECTOR + row],
+						              expected_ptr[source_begin + row])
+						        << "source_vector=" << sparse_vectors[selected_index] << " column=" << column
+						        << " row=" << row;
+					    }
+				    }
+			    },
+			    expected.columns[column]->values);
+		}
+	}
+}
+
+TEST(Reader, DeltaI08CpuGpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	std::vector<int8_t> expected(65U * fastlens::codec::consts::VALUES_PER_VECTOR + 7U);
+	int8_t             value = -101;
+	for (size_t row = 0; row < expected.size(); ++row) {
+		value         = static_cast<int8_t>(value + static_cast<int8_t>((row % 9U) - 4));
+		expected[row] = value;
+	}
+	expect_forced_delta_cpu_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_DELTA_I08, "delta_i08_large_partial", expected);
+}
+
+TEST(Reader, DeltaI16CpuGpuRoundtripHandlesLargePartialRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	std::vector<int16_t> expected(65U * fastlens::codec::consts::VALUES_PER_VECTOR + 7U);
+	int16_t              value = -30000;
+	for (size_t row = 0; row < expected.size(); ++row) {
+		value         = static_cast<int16_t>(value + static_cast<int16_t>((row % 31U) - 15));
+		expected[row] = value;
+	}
+	expect_forced_delta_cpu_gpu_roundtrip(
+	    fastlanes::OperatorToken::EXP_DELTA_I16, "delta_i16_large_partial", expected);
+}
+
+TEST(DeltaDecode, SelectedVectors) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	constexpr size_t vector_count = 10U;
+	const size_t     n_values     = vector_count * fastlens::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int8_t> expected(n_values);
+	uint8_t             bits = 241U;
+	for (size_t row = 0; row < n_values; ++row) {
+		bits = static_cast<uint8_t>(bits + static_cast<uint8_t>((row * 5U + 3U) & 0x1FU));
+		std::memcpy(&expected[row], &bits, sizeof(bits));
+	}
+
+	const auto fls_path = make_forced_delta_fls_fixture(
+	    fastlanes::OperatorToken::EXP_DELTA_I08, "delta_decode_selected_vectors", expected);
+	fastlens::format::FlsReader reader(fls_path);
+	auto                    rowgroup   = reader.read_rowgroup(0);
+	auto                    expressions = fastlens::expression::assemble(rowgroup);
+
+	fastlens::runtime::ExecutionWorkset      workset {};
+	fastlens::runtime::ExecutionWorksetGuard guard(workset);
+	fastlens::execution::ExecutionConfig     config {};
+	config.unpack_n_vectors = 2;
+	config.launch_strategy  = fastlens::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	const std::vector<uint32_t> selected_vectors {1U, 7U};
+	fastlens::runtime::append_rowgroup_columns_selected_vectors(workset, rowgroup, config, selected_vectors);
+	fastlens::runtime::upload_workset(workset, config);
+	fastlens::runtime::run_workset(workset, 1U, config);
+	const auto result = fastlens::runtime::materialize_workset(workset, expressions, config);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+	const auto& output = std::get<std::shared_ptr<int8_t[]>>(result.columns[0]->values);
+	for (size_t chunk = 0; chunk < selected_vectors.size(); ++chunk) {
+		for (size_t row = 0; row < 2U * fastlens::codec::consts::VALUES_PER_VECTOR; ++row) {
+			const size_t source = static_cast<size_t>(selected_vectors[chunk]) *
+			                          fastlens::codec::consts::VALUES_PER_VECTOR +
+			                      row;
+			const size_t destination = chunk * 2U * fastlens::codec::consts::VALUES_PER_VECTOR + row;
+			ASSERT_EQ(output[destination], expected[source]) << "chunk=" << chunk << " row=" << row;
+		}
+	}
+}
+
+TEST(DeltaDecode, VectorTail) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	constexpr size_t vector_count = 7U;
+	const size_t     n_values     = vector_count * fastlens::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int16_t> expected(n_values);
+	uint16_t              bits = 65500U;
+	for (size_t row = 0; row < n_values; ++row) {
+		bits = static_cast<uint16_t>(bits + static_cast<uint16_t>((row * 29U + 7U) & 0x1FFU));
+		std::memcpy(&expected[row], &bits, sizeof(bits));
+	}
+
+	const auto fls_path = make_forced_delta_fls_fixture(
+	    fastlanes::OperatorToken::EXP_DELTA_I16, "delta_decode_vector_tail", expected);
+	fastlens::format::FlsReader reader(fls_path);
+	auto                    rowgroup   = reader.read_rowgroup(0);
+	auto                    expressions = fastlens::expression::assemble(rowgroup);
+	ASSERT_EQ(rowgroup.n_vecs, vector_count);
+	fastlens::execution::ExecutionConfig config {};
+	config.unpack_n_vectors = 4;
+	config.launch_strategy  = fastlens::execution::LaunchStrategy::MixedDispatch;
+	config.write_out        = true;
+	const auto result       = fastlens::execution::decompress_rowgroup(expressions, config);
+	ASSERT_EQ(result.columns.size(), 1U);
+	ASSERT_TRUE(result.columns[0].has_value());
+	const auto& output = std::get<std::shared_ptr<int16_t[]>>(result.columns[0]->values);
+	for (size_t row = 0; row < n_values; ++row) {
+		ASSERT_EQ(output[row], expected[row]) << "row=" << row;
+	}
+}
+
+TEST(Reader, DeltaI08I16ShareOneMixedWorksetAndPreserveColumnOrder) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+	const size_t n_values = 8U * fastlens::codec::consts::VALUES_PER_VECTOR;
+	std::vector<int8_t>  expected_i8(n_values);
+	std::vector<int16_t> expected_i16(n_values);
+	for (size_t row = 0; row < n_values; ++row) {
+		expected_i8[row]  = static_cast<int8_t>((row * 7U + row / 13U) & 0xFFU);
+		expected_i16[row] = static_cast<int16_t>((row * 251U + row / 17U) & 0xFFFFU);
+	}
+
+	const auto root = reader_fixture_root("delta_i08_i16_mixed");
+	std::filesystem::remove_all(root);
+	std::filesystem::create_directories(root);
+	const auto fls_path = root / "data.fls";
+	const std::array<fastlanes::MemoryColumn, 2> columns {
+	    fastlanes::MemoryColumn {"i8", std::span<const int8_t>(expected_i8)},
+	    fastlanes::MemoryColumn {"i16", std::span<const int16_t>(expected_i16)}};
+	fastlanes::MemoryTableOptions options;
+	options.n_vectors_per_rowgroup = 12;
+	options.force_schema           = true;
+	options.forced_schema          = {fastlanes::OperatorToken::EXP_DELTA_I08,
+	                                  fastlanes::OperatorToken::EXP_DELTA_I16};
+	fastlanes::write_memory_table_to_fls(
+	    fastlanes::MemoryTable {std::span<const fastlanes::MemoryColumn>(columns)}, fls_path, options);
+
+	fastlens::format::FlsReader reader(fls_path);
+	auto                    rowgroup = reader.read_rowgroup(0);
+	auto                    expressions = fastlens::expression::assemble(rowgroup);
+	ASSERT_EQ(expressions.size(), 2U);
+
+	for (const auto decoder :
+	     {fastlens::execution::DeltaDecoder::Stateful, fastlens::execution::DeltaDecoder::Register}) {
+		SCOPED_TRACE(decoder == fastlens::execution::DeltaDecoder::Register ? "register" : "stateful");
+		fastlens::runtime::ExecutionWorkset workset {};
+		fastlens::runtime::ExecutionWorksetGuard guard(workset);
+		fastlens::execution::ExecutionConfig config {};
+		config.unpack_n_vectors = 4;
+		config.launch_strategy  = fastlens::execution::LaunchStrategy::MixedDispatch;
+		config.delta_decoder    = decoder;
+		config.write_out        = true;
+		fastlens::runtime::append_expressions(workset, expressions, config);
+		fastlens::runtime::upload_workset(workset, config);
+		ASSERT_FALSE(workset.slots.mixed.empty());
+		bool saw_i8  = false;
+		bool saw_i16 = false;
+		for (const auto& slot : workset.slots.mixed) {
+			for (const auto& work : {slot.first, slot.second}) {
+				if (!fastlens::execution::is_valid_work_item(work)) {
+					continue;
+				}
+				saw_i8  = saw_i8 || work.type == fastlens::execution::TypeTag::I8;
+				saw_i16 = saw_i16 || work.type == fastlens::execution::TypeTag::I16;
+			}
+		}
+		EXPECT_TRUE(saw_i8);
+		EXPECT_TRUE(saw_i16);
+		size_t launches = 0;
+		fastlens::runtime::run_workset(workset, 1, config, nullptr, &launches);
+		EXPECT_EQ(launches, 1U);
+		const auto result = fastlens::runtime::materialize_workset(workset, expressions, config);
+		ASSERT_EQ(result.columns.size(), 2U);
+		ASSERT_TRUE(result.columns[0].has_value());
+		ASSERT_TRUE(result.columns[1].has_value());
+		const auto& out_i8  = std::get<std::shared_ptr<int8_t[]>>(result.columns[0]->values);
+		const auto& out_i16 = std::get<std::shared_ptr<int16_t[]>>(result.columns[1]->values);
+		for (size_t row = 0; row < n_values; ++row) {
+			ASSERT_EQ(out_i8[row], expected_i8[row]) << "i8 row=" << row;
+			ASSERT_EQ(out_i16[row], expected_i16[row]) << "i16 row=" << row;
+		}
+	}
+}
+
+TEST(Materialize, KickPinnedD2HPreservesZeroLengthEntries) {
+	fastlens::runtime::ExecutionWorkset workset {};
+	auto&                           batch = workset.buffers.host_batches.get<int8_t>();
+	batch.device_exprs.emplace_back();
+	batch.device_exprs.back().plan     = fastlens::execution::PlanKind::UNCOMPRESSED;
+	batch.device_exprs.back().n_values = 0;
+	batch.device_exprs.back().out      = nullptr;
+	batch.output_offsets.push_back(0);
+	batch.expr_indices.push_back(0);
+
+	auto pending = fastlens::runtime::kick_pinned_d2h_materialize(workset);
+	EXPECT_TRUE(batch.device_exprs.empty());
+	ASSERT_TRUE(pending.active);
+	ASSERT_EQ(pending.entries.size(), 1U);
+	EXPECT_EQ(pending.entries[0].global_expr_index, 0U);
+	EXPECT_EQ(pending.entries[0].n_values, 0U);
+
+	fastlens::execution::RowgroupData result {};
+	result.columns.resize(1);
+	fastlens::runtime::finalize_pinned_d2h_materialize(
+	    pending, [&](const size_t global_expr_index) -> fastlens::execution::MaterializedColumn* {
+		    if (global_expr_index >= result.columns.size()) {
+			    return nullptr;
+		    }
+		    auto& slot = result.columns[global_expr_index];
+		    if (!slot.has_value()) {
+			    slot.emplace();
+		    }
+		    return &(*slot);
+	    });
+
+	ASSERT_TRUE(result.columns[0].has_value());
+	EXPECT_EQ(result.columns[0]->meta.column_index, 0U);
+	EXPECT_EQ(result.columns[0]->meta.value_count, 0U);
+	EXPECT_EQ(result.columns[0]->meta.value_type, fastlens::format::DataType::I8);
+	std::visit([](const auto& ptr) { EXPECT_NE(ptr.get(), nullptr); }, result.columns[0]->values);
+	EXPECT_FALSE(pending.active);
+	EXPECT_TRUE(pending.entries.empty());
+}
+
+TEST(Materialize, KickPinnedD2HCanDeferWorksetStateClear) {
+	fastlens::runtime::ExecutionWorkset workset {};
+	auto&                           batch = workset.buffers.host_batches.get<int8_t>();
+	batch.device_exprs.emplace_back();
+	batch.device_exprs.back().plan     = fastlens::execution::PlanKind::UNCOMPRESSED;
+	batch.device_exprs.back().n_values = 0;
+	batch.device_exprs.back().out      = nullptr;
+	batch.output_offsets.push_back(0);
+	batch.expr_indices.push_back(0);
+
+	auto pending = fastlens::runtime::kick_pinned_d2h_materialize(workset, /*clear_workset_state=*/false);
+	EXPECT_FALSE(batch.device_exprs.empty());
+	ASSERT_TRUE(pending.active);
+	ASSERT_EQ(pending.entries.size(), 1U);
+
+	fastlens::runtime::clear_materialize_workset_state(workset);
+	fastlens::runtime::discard_pinned_d2h_materialize(pending);
+	EXPECT_TRUE(batch.device_exprs.empty());
+	EXPECT_FALSE(pending.active);
+}
+
+TEST(Reader, CrossRleI16TokenMaterializesAsI16Column) {
+	const auto fls_path = make_cross_rle_i16_fls_fixture();
+
+	const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	ASSERT_NE(td->m_rowgroup_descriptors(), nullptr);
+	ASSERT_GT(td->m_rowgroup_descriptors()->size(), 0U);
+	const auto* rg = td->m_rowgroup_descriptors()->Get(0);
+	ASSERT_NE(rg, nullptr);
+	ASSERT_NE(rg->m_column_descriptors(), nullptr);
+	ASSERT_EQ(rg->m_column_descriptors()->size(), 1U);
+	const auto* col_desc = rg->m_column_descriptors()->Get(0);
+	ASSERT_NE(col_desc, nullptr);
+	ASSERT_NE(col_desc->encoding_rpn(), nullptr);
+	ASSERT_NE(col_desc->encoding_rpn()->operator_tokens(), nullptr);
+	ASSERT_EQ(col_desc->encoding_rpn()->operator_tokens()->Get(0), fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+
+	fastlens::format::FlsReader rdr(fls_path);
+	auto                    rowgroup = rdr.read_rowgroup(0);
+	ASSERT_EQ(rowgroup.columns.size(), 1U);
+	EXPECT_EQ(rowgroup.columns[0].token, fastlanes::OperatorToken::EXP_CROSS_RLE_I16);
+	EXPECT_TRUE((std::holds_alternative<fastlens::codec::host::CROSSRLEColumn<int16_t>>(rowgroup.columns[0].host)));
+	EXPECT_TRUE(fastlens::expression::is_supported_token(fastlanes::OperatorToken::EXP_CROSS_RLE_I16));
+	EXPECT_NO_THROW({
+		auto expressions = fastlens::expression::assemble(rowgroup);
+		EXPECT_EQ(expressions.size(), 1U);
+	});
+}
+
+TEST(Reader, CrossRleI16DispatchMatchesI08EquivalentRuns) {
+	const std::vector<uint32_t> lengths {3, 5, 2, 6};
+	expect_cross_rle_decompresses<int8_t>(
+	    {1, -2, -2, 7}, lengths, {1, 1, 1, -2, -2, -2, -2, -2, -2, -2, 7, 7, 7, 7, 7, 7});
+	expect_cross_rle_decompresses<int16_t>(
+	    {1, -2, -2, 7}, lengths, {1, 1, 1, -2, -2, -2, -2, -2, -2, -2, 7, 7, 7, 7, 7, 7});
+}
+
+TEST(Reader, CrossRleI16DispatchHandlesBoundaryValuesAndMultipleRuns) {
+	expect_cross_rle_decompresses<int16_t>(
+	    {std::numeric_limits<int16_t>::min(), -1, 0, std::numeric_limits<int16_t>::max()},
+	    {2, 3, 4, 7},
+	    {std::numeric_limits<int16_t>::min(),
+	     std::numeric_limits<int16_t>::min(),
+	     -1,
+	     -1,
+	     -1,
+	     0,
+	     0,
+	     0,
+	     0,
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max(),
+	     std::numeric_limits<int16_t>::max()});
+}
+
+TEST(Reader, CrossRleI16DispatchHandlesSingleRun) {
+	expect_cross_rle_decompresses<int16_t>({-12345}, {16}, std::vector<int16_t>(16, -12345));
+}
+
+TEST(Reader, CrossRleI16DispatchHandlesEmptyInput) {
+	expect_cross_rle_decompresses<int16_t>({}, {}, {});
+}
+
+bool rowgroup_supported(const fastlanes::RowgroupDescriptor*                rg,
+                        const std::unordered_set<fastlanes::OperatorToken>& supported,
+                        std::vector<fastlanes::OperatorToken>&              unsupported) {
+	unsupported.clear();
+	if (!rg || !rg->m_column_descriptors()) {
+		return false;
+	}
+	for (uint32_t i = 0; i < rg->m_column_descriptors()->size(); ++i) {
+		const auto* col = rg->m_column_descriptors()->Get(i);
+		if (!col) {
+			unsupported.push_back(fastlanes::OperatorToken::EXP_EQUAL);
+			continue;
+		}
+		const auto* rpn = col->encoding_rpn();
+		if (!rpn || !rpn->operator_tokens() || rpn->operator_tokens()->size() != 1) {
+			unsupported.push_back(fastlanes::OperatorToken::EXP_EQUAL);
+			continue;
+		}
+		const auto token = rpn->operator_tokens()->Get(0);
+		if (!supported.count(token)) {
+			unsupported.push_back(token);
+		}
+	}
+	return unsupported.empty();
+}
+
+void compare_rowgroup_outputs(const fastlens::format::Rowgroup&                    rowgroup,
+                              const fastlanes::Rowgroup&                       expected_rowgroup,
+                              const fastlanes::RowgroupDescriptor*             rg,
+                              const std::vector<fastlens::expression::Expression>& expressions,
+                              bool                                             verbose,
+                              size_t*                                          compared_columns_out,
+                              const fastlens::execution::RowgroupData*             precomputed = nullptr) {
+	ASSERT_NE(rg, nullptr);
+	ASSERT_NE(rg->m_column_descriptors(), nullptr);
+	ASSERT_EQ(rowgroup.columns.size(), rg->m_column_descriptors()->size());
+	ASSERT_EQ(rowgroup.n_vecs, static_cast<size_t>(rg->m_n_vec()));
+
+	const size_t expected_rows = static_cast<size_t>(expected_rowgroup.RowCount());
+	ASSERT_GE(rowgroup.n_values, expected_rows);
+
+	fastlens::execution::RowgroupData        local_result;
+	const fastlens::execution::RowgroupData* rowgroup_result_ptr = precomputed;
+	if (rowgroup_result_ptr == nullptr) {
+		local_result        = fastlens::execution::decompress_rowgroup(expressions);
+		rowgroup_result_ptr = &local_result;
+	}
+	ASSERT_EQ(rowgroup_result_ptr->columns.size(), rowgroup.columns.size());
+
+	size_t compared_columns = 0;
+
+	for (size_t i = 0; i < rowgroup.columns.size(); ++i) {
+		const auto& col_desc = *rg->m_column_descriptors()->Get(static_cast<uint32_t>(i));
+		const auto* rpn      = col_desc.encoding_rpn();
+		ASSERT_NE(rpn, nullptr);
+		ASSERT_EQ(rpn->operator_tokens()->size(), 1U);
+
+		const auto expected_token = rpn->operator_tokens()->Get(0);
+		EXPECT_EQ(rowgroup.columns[i].token, expected_token);
+		EXPECT_EQ(expressions[i].column->host.index(), rowgroup.columns[i].host.index());
+		EXPECT_EQ(get_n_values(rowgroup.columns[i].host), rowgroup.n_values);
+
+		const auto* name_ptr   = col_desc.name();
+		const auto  col_name   = name_ptr ? name_ptr->str() : std::string("<unnamed>");
+		const auto  dtype_name = fastlanes::ToStr(col_desc.data_type());
+		const auto  token_str  = fastlanes::token_to_string(expected_token);
+		const auto  n_values   = get_n_values(rowgroup.columns[i].host);
+
+		std::ostringstream trace;
+		trace << "col=" << i << " name=" << col_name << " dtype=" << dtype_name << " token=" << token_str
+		      << " n_values=" << n_values << " n_vecs=" << rowgroup.n_vecs << " expected_rows=" << expected_rows;
+		if (rowgroup.columns[i].skip_decompress) {
+			trace << " skip_decompress=1";
+		}
+		SCOPED_TRACE(trace.str());
+		if (verbose) {
+			std::cerr << "[ReaderTest] " << trace.str() << "\n";
+		}
+
+		if (rowgroup.columns[i].skip_decompress) {
+			continue;
+		}
+
+		ASSERT_TRUE(rowgroup_result_ptr->columns[i].has_value());
+		auto& column_data = *rowgroup_result_ptr->columns[i];
+		std::visit([&](auto& ptr) { ASSERT_NE(ptr, nullptr); }, column_data.values);
+
+		bool compared_this = false;
+		std::visit(
+		    [&](auto& ptr) {
+			    using OutT      = std::remove_pointer_t<decltype(ptr.get())>;
+			    const OutT* out = ptr.get();
+
+			    if (auto* col =
+			            std::get_if<fastlanes::up<fastlanes::col_i08>>(&expected_rowgroup.internal_rowgroup[i])) {
+				    if constexpr (std::is_same_v<OutT, int8_t>) {
+					    compared_this    = true;
+					    const auto& data = (*col)->data;
+					    ASSERT_GE(data.size(), expected_rows);
+					    bool   mismatch = false;
+					    size_t row_idx  = 0;
+					    for (size_t row = 0; row < expected_rows; ++row) {
+						    if (out[row] != data[row]) {
+							    mismatch = true;
+							    row_idx  = row;
+							    break;
+						    }
+					    }
+					    if (mismatch) {
+						    const size_t       start = row_idx > 4 ? row_idx - 4 : 0;
+						    const size_t       end   = std::min(row_idx + 5, expected_rows);
+						    std::ostringstream os;
+						    os << "Mismatch at column " << i << " row " << row_idx
+						       << " out=" << format_value(out[row_idx]) << " expected=" << format_value(data[row_idx])
+						       << "\n";
+						    os << "Expected data size=" << data.size() << " rowgroup_n_values=" << rowgroup.n_values
+						       << "\n";
+						    os << "Window out/expected [" << start << "," << end
+						       << "): " << format_window(out, data, start, end, false);
+						    ADD_FAILURE() << os.str();
+					    }
+				    } else {
+					    ADD_FAILURE() << "column " << i << " expected int8 output, got int16";
+					    compared_this = true;
+				    }
+			    } else if (auto* col = std::get_if<fastlanes::up<fastlanes::col_i16>>(
+			                   &expected_rowgroup.internal_rowgroup[i])) {
+				    if constexpr (std::is_same_v<OutT, int16_t>) {
+					    compared_this    = true;
+					    const auto& data = (*col)->data;
+					    ASSERT_GE(data.size(), expected_rows);
+					    bool   mismatch = false;
+					    size_t row_idx  = 0;
+					    for (size_t row = 0; row < expected_rows; ++row) {
+						    if (out[row] != data[row]) {
+							    mismatch = true;
+							    row_idx  = row;
+							    break;
+						    }
+					    }
+					    if (mismatch) {
+						    const size_t       start = row_idx > 4 ? row_idx - 4 : 0;
+						    const size_t       end   = std::min(row_idx + 5, expected_rows);
+						    std::ostringstream os;
+						    os << "Mismatch at column " << i << " row " << row_idx
+						       << " out=" << format_value(out[row_idx]) << " expected=" << format_value(data[row_idx])
+						       << "\n";
+						    os << "Expected data size=" << data.size() << " rowgroup_n_values=" << rowgroup.n_values
+						       << "\n";
+						    os << "Window out/expected [" << start << "," << end
+						       << "): " << format_window(out, data, start, end, false);
+						    ADD_FAILURE() << os.str();
+					    }
+				    } else {
+					    ADD_FAILURE() << "column " << i << " expected int16 output, got int8";
+					    compared_this = true;
+				    }
+			    } else if (auto* col = std::get_if<fastlanes::up<fastlanes::u08_col_t>>(
+			                   &expected_rowgroup.internal_rowgroup[i])) {
+				    if constexpr (std::is_same_v<OutT, int8_t>) {
+					    compared_this    = true;
+					    const auto& data = (*col)->data;
+					    ASSERT_GE(data.size(), expected_rows);
+					    bool   mismatch = false;
+					    size_t row_idx  = 0;
+					    for (size_t row = 0; row < expected_rows; ++row) {
+						    if (static_cast<uint8_t>(out[row]) != data[row]) {
+							    mismatch = true;
+							    row_idx  = row;
+							    break;
+						    }
+					    }
+					    if (mismatch) {
+						    const size_t       start = row_idx > 4 ? row_idx - 4 : 0;
+						    const size_t       end   = std::min(row_idx + 5, expected_rows);
+						    std::ostringstream os;
+						    os << "Mismatch at column " << i << " row " << row_idx
+						       << " out=" << format_value(static_cast<uint8_t>(out[row_idx]))
+						       << " expected=" << format_value(data[row_idx]) << "\n";
+						    os << "Expected data size=" << data.size() << " rowgroup_n_values=" << rowgroup.n_values
+						       << "\n";
+						    os << "Window out/expected [" << start << "," << end
+						       << "): " << format_window(out, data, start, end, true);
+						    ADD_FAILURE() << os.str();
+					    }
+				    } else {
+					    ADD_FAILURE() << "column " << i << " expected uint8 output, got int16";
+					    compared_this = true;
+				    }
+			    }
+		    },
+		    column_data.values);
+
+		if (compared_this) {
+			++compared_columns;
+		}
+	}
+
+	if (compared_columns_out) {
+		*compared_columns_out = compared_columns;
+	}
+}
+
+} // namespace
+
+TEST(Reader, UnsupportedFormatErrorCarriesContext) {
+	const fastlens::UnsupportedFormatError error("EXP_UNSUPPORTED", 7, 11, "col");
+	EXPECT_EQ(error.token(), "EXP_UNSUPPORTED");
+	EXPECT_EQ(error.rowgroup_index(), 7U);
+	EXPECT_EQ(error.column_index(), 11U);
+	EXPECT_EQ(error.column_name(), "col");
+	const std::string message = error.what();
+	EXPECT_NE(message.find("EXP_UNSUPPORTED"), std::string::npos);
+	EXPECT_NE(message.find("rowgroup=7"), std::string::npos);
+	EXPECT_NE(message.find("column=11"), std::string::npos);
+}
+
+TEST(Reader, UnsupportedTokenContractIsDeterministic) {
+	try {
+		fastlens::format::throw_unsupported_zero_copy_token(fastlanes::OperatorToken::EXP_ALP_DBL, 2, 3, "dbl");
+		FAIL() << "Expected fastlens::UnsupportedFormatError";
+	} catch (const fastlens::UnsupportedFormatError& e) {
+		EXPECT_EQ(e.token(), "EXP_ALP_DBL");
+		EXPECT_EQ(e.rowgroup_index(), 2U);
+		EXPECT_EQ(e.column_index(), 3U);
+		EXPECT_EQ(e.column_name(), "dbl");
+		const std::string message = e.what();
+		EXPECT_NE(message.find("EXP_ALP_DBL"), std::string::npos);
+		EXPECT_NE(message.find("rowgroup=2"), std::string::npos);
+		EXPECT_NE(message.find("column=3"), std::string::npos);
+	} catch (const std::exception& e) { FAIL() << "Expected fastlens::UnsupportedFormatError, got: " << e.what(); }
+}
+
+TEST(Reader, UnsupportedTokensSurfaceStructuredError) {
+	const std::filesystem::path              fastlens_root  = FLS_FASTLENS_SOURCE_DIR;
+	const std::filesystem::path              repo_root  = fastlens_root.parent_path();
+	const std::vector<std::filesystem::path> candidates = {
+	    repo_root / "data/fls/cifar/data.fls",
+	    repo_root / "data/fls/celebA/data.fls",
+	    repo_root / "data/fls/lfwa/data.fls",
+	    repo_root / "data/fls/imagenet-64/image.fls",
+	    repo_root / "data/fls/tiny-imagenet/data.fls",
+	    repo_root / "data/fls/svhn/data.fls",
+	};
+
+	bool saw_existing_fixture = false;
+	for (const auto& fls_path : candidates) {
+		if (!std::filesystem::exists(fls_path)) {
+			continue;
+		}
+		saw_existing_fixture = true;
+
+		const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+		const auto* td        = td_handle.Get();
+		ASSERT_NE(td, nullptr);
+		ASSERT_NE(td->m_rowgroup_descriptors(), nullptr);
+
+		fastlens::format::FlsReader rdr(fls_path);
+		for (uint32_t rg_idx = 0; rg_idx < td->m_rowgroup_descriptors()->size(); ++rg_idx) {
+			try {
+				(void)rdr.read_rowgroup_zero_copy_materialized(rg_idx);
+			} catch (const fastlens::UnsupportedFormatError& e) {
+				EXPECT_EQ(e.rowgroup_index(), static_cast<size_t>(rg_idx));
+				EXPECT_FALSE(e.token().empty());
+				return;
+			} catch (const std::exception& e) { FAIL() << "Expected fastlens::UnsupportedFormatError, got: " << e.what(); }
+		}
+	}
+
+	if (!saw_existing_fixture) {
+		GTEST_SKIP() << "No FLS fixtures found for unsupported-format contract test.";
+	}
+	GTEST_SKIP() << "FLS fixtures did not contain an unsupported operator token.";
+}
+
+TEST(Reader, ParseFlsRowgroup0) {
+	const auto fls_path = pick_fls_file();
+	if (fls_path.empty()) {
+		GTEST_SKIP() << "No .fls file found for reader test (set FLS_READER_TEST_FILE).";
+	}
+
+	int         device_count = 0;
+	const auto  cuda_status  = cudaGetDeviceCount(&device_count);
+	const char* cuda_error   = cudaGetErrorString(cuda_status);
+	if (cuda_status != cudaSuccess || device_count <= 0) {
+		GTEST_SKIP() << "CUDA device not available for reader test: " << cuda_error;
+	}
+
+	const bool verbose = std::getenv("FLS_READER_TEST_VERBOSE") != nullptr;
+
+	auto conn = fastlanes::connect();
+	ASSERT_TRUE(conn != nullptr);
+	auto table_reader = conn->read_fls(fls_path);
+	ASSERT_TRUE(table_reader != nullptr);
+	auto rowgroup_reader = table_reader->get_rowgroup_reader(0);
+	ASSERT_TRUE(rowgroup_reader != nullptr);
+	auto expected_rowgroup = rowgroup_reader->materialize();
+	ASSERT_NE(expected_rowgroup.get(), nullptr);
+	const size_t expected_rows = static_cast<size_t>(expected_rowgroup->RowCount());
+
+	const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	ASSERT_GT(td->m_rowgroup_descriptors()->size(), 0U);
+
+	const auto* rg = td->m_rowgroup_descriptors()->Get(0);
+	ASSERT_NE(rg, nullptr);
+
+	const auto                            supported = supported_tokens();
+	std::vector<fastlanes::OperatorToken> unsupported;
+	const bool                            all_supported = rowgroup_supported(rg, supported, unsupported);
+
+	if (!all_supported) {
+		std::stringstream ss;
+		ss << "Reader test skipped: unsupported operator tokens in file: ";
+		for (auto t : unsupported) {
+			ss << fastlanes::token_to_string(t) << " ";
+		}
+		GTEST_SKIP() << ss.str();
+	}
+
+	fastlens::format::FlsReader rdr(fls_path);
+	auto                    rowgroup    = rdr.read_rowgroup(0);
+	auto                    expressions = fastlens::expression::assemble(rowgroup);
+
+	size_t compared_columns = 0;
+	compare_rowgroup_outputs(rowgroup, *expected_rowgroup, rg, expressions, verbose, &compared_columns);
+
+	if (compared_columns == 0) {
+		GTEST_SKIP() << "No comparable int8/int16 columns in rowgroup for reader validation.";
+	}
+}
+
+TEST(Reader, DecompressTable) {
+	const auto fls_path = pick_fls_file();
+	if (fls_path.empty()) {
+		GTEST_SKIP() << "No .fls file found for reader test (set FLS_READER_TEST_FILE).";
+	}
+
+	int        device_count = 0;
+	const auto cuda_status  = cudaGetDeviceCount(&device_count);
+	if (cuda_status != cudaSuccess || device_count <= 0) {
+		GTEST_SKIP() << "CUDA device not available for reader test.";
+	}
+
+	fastlens::format::FlsReader rdr(fls_path);
+	const size_t            expected_rowgroups = rdr.rowgroup_count();
+	ASSERT_GT(expected_rowgroups, 0U);
+
+	const auto supported = supported_tokens();
+	auto       conn      = fastlanes::connect();
+	ASSERT_TRUE(conn != nullptr);
+	auto table_reader = conn->read_fls(fls_path);
+	ASSERT_TRUE(table_reader != nullptr);
+
+	const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	ASSERT_GT(td->m_rowgroup_descriptors()->size(), 0U);
+
+	auto should_decompress = [&](size_t rg_idx) {
+		const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
+		if (rg == nullptr) {
+			ADD_FAILURE() << "Rowgroup descriptor missing at index " << rg_idx;
+			return false;
+		}
+		std::vector<fastlanes::OperatorToken> unsupported;
+		if (!rowgroup_supported(rg, supported, unsupported)) {
+			if (std::getenv("FLS_READER_TEST_VERBOSE") != nullptr) {
+				std::stringstream ss;
+				ss << "[ReaderTest] Rowgroup " << rg_idx << " skipped: unsupported tokens: ";
+				for (auto t : unsupported) {
+					ss << fastlanes::token_to_string(t) << " ";
+				}
+				std::cerr << ss.str() << "\n";
+			}
+			return false;
+		}
+		return true;
+	};
+
+	size_t              expected_total_columns = 0;
+	std::vector<size_t> expected_column_counts;
+	for (uint32_t rg_idx = 0; rg_idx < td->m_rowgroup_descriptors()->size(); ++rg_idx) {
+		if (!should_decompress(rg_idx)) {
+			continue;
+		}
+		const auto* rg = td->m_rowgroup_descriptors()->Get(rg_idx);
+		ASSERT_NE(rg, nullptr);
+		expected_total_columns += rg->m_column_descriptors()->size();
+		expected_column_counts.push_back(rg->m_column_descriptors()->size());
+	}
+
+	bool compared_any = false;
+	for (const auto scope : {fastlens::execution::TableDecompressionScope::PerRowgroup,
+	                         fastlens::execution::TableDecompressionScope::WholeTable}) {
+		SCOPED_TRACE(scope == fastlens::execution::TableDecompressionScope::PerRowgroup ? "PerRowgroup" : "WholeTable");
+		size_t                                    total_compared = 0;
+		fastlens::execution::TableDecompressionConfig cfg {};
+		cfg.scope = scope;
+
+		const auto table_result = fastlens::execution::decompress_table(
+		    fls_path,
+		    cfg,
+		    should_decompress,
+		    [&](size_t                                           rg_idx,
+		        fastlens::format::Rowgroup&                          rowgroup,
+		        const std::vector<fastlens::expression::Expression>& expressions,
+		        const fastlens::execution::RowgroupData&             result) {
+			    const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
+			    ASSERT_NE(rg, nullptr);
+
+			    auto rowgroup_reader = table_reader->get_rowgroup_reader(static_cast<fastlanes::n_t>(rg_idx));
+			    ASSERT_TRUE(rowgroup_reader != nullptr);
+			    auto expected_rowgroup = rowgroup_reader->materialize();
+			    ASSERT_NE(expected_rowgroup.get(), nullptr);
+
+			    size_t compared_columns = 0;
+			    compare_rowgroup_outputs(
+			        rowgroup, *expected_rowgroup, rg, expressions, false, &compared_columns, &result);
+			    total_compared += compared_columns;
+		    });
+		ASSERT_GT(table_result.total_columns, 0U);
+		ASSERT_EQ(table_result.total_columns, expected_total_columns);
+		ASSERT_EQ(table_result.column_counts, expected_column_counts);
+		compared_any = compared_any || (total_compared > 0);
+	}
+
+	if (!compared_any) {
+		GTEST_SKIP() << "No comparable columns across table for reader validation.";
+	}
+}
+
+TEST(Reader, DecompressTableCallbackThrowLeavesPipelineReusable) {
+	const auto fls_path = pick_fls_file();
+	if (fls_path.empty()) {
+		GTEST_SKIP() << "No .fls file found for reader test (set FLS_READER_TEST_FILE).";
+	}
+
+	int        device_count = 0;
+	const auto cuda_status  = cudaGetDeviceCount(&device_count);
+	if (cuda_status != cudaSuccess || device_count <= 0) {
+		GTEST_SKIP() << "CUDA device not available for reader test.";
+	}
+
+	fastlens::format::FlsReader rdr(fls_path);
+	ASSERT_GT(rdr.rowgroup_count(), 0U);
+
+	const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	ASSERT_NE(td->m_rowgroup_descriptors(), nullptr);
+
+	const auto supported         = supported_tokens();
+	auto       should_decompress = [&](const size_t rg_idx) {
+        if (rg_idx >= td->m_rowgroup_descriptors()->size()) {
+            return false;
+        }
+        const auto* rg = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
+        if (rg == nullptr) {
+            return false;
+        }
+        std::vector<fastlanes::OperatorToken> unsupported;
+        return rowgroup_supported(rg, supported, unsupported);
+	};
+
+	bool has_supported_rowgroup = false;
+	for (size_t rg_idx = 0; rg_idx < rdr.rowgroup_count(); ++rg_idx) {
+		has_supported_rowgroup = has_supported_rowgroup || should_decompress(rg_idx);
+	}
+	if (!has_supported_rowgroup) {
+		GTEST_SKIP() << "No supported rowgroups in file for callback exception cleanup test.";
+	}
+
+	fastlens::execution::TableDecompressionConfig cfg {};
+	cfg.scope                       = fastlens::execution::TableDecompressionScope::WholeTable;
+	cfg.streaming_target_rowgroups  = 1;
+	cfg.streaming_target_work_items = 1;
+
+	size_t throwing_callbacks = 0;
+	EXPECT_THROW(fastlens::execution::decompress_table(fls_path,
+	                                               cfg,
+	                                               should_decompress,
+	                                               [&](size_t,
+	                                                   fastlens::format::Rowgroup&,
+	                                                   const std::vector<fastlens::expression::Expression>&,
+	                                                   const fastlens::execution::RowgroupData&) {
+		                                               ++throwing_callbacks;
+		                                               throw std::runtime_error("intentional callback failure");
+	                                               }),
+	             std::runtime_error);
+	EXPECT_GT(throwing_callbacks, 0U);
+
+	size_t     retry_callbacks = 0;
+	const auto retry_result    = fastlens::execution::decompress_table(fls_path,
+                                                                cfg,
+                                                                should_decompress,
+                                                                [&](size_t,
+                                                                    fastlens::format::Rowgroup&,
+                                                                    const std::vector<fastlens::expression::Expression>&,
+                                                                    const fastlens::execution::RowgroupData& result) {
+                                                                    ++retry_callbacks;
+                                                                    EXPECT_FALSE(result.columns.empty());
+                                                                });
+	EXPECT_GT(retry_callbacks, 0U);
+	EXPECT_GT(retry_result.total_columns, 0U);
+}
+
+TEST(Reader, PublicNoWriteDecompressReturnsMetadata) {
+	const auto fls_path = pick_fls_file();
+	if (fls_path.empty()) {
+		GTEST_SKIP() << "No .fls file found for reader test (set FLS_READER_TEST_FILE).";
+	}
+
+	int        device_count = 0;
+	const auto cuda_status  = cudaGetDeviceCount(&device_count);
+	if (cuda_status != cudaSuccess || device_count <= 0) {
+		GTEST_SKIP() << "CUDA device not available for reader test.";
+	}
+
+	const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	const auto* rowgroups = td->m_rowgroup_descriptors();
+	ASSERT_NE(rowgroups, nullptr);
+	ASSERT_GT(rowgroups->size(), 0U);
+
+	const auto          supported              = supported_tokens();
+	size_t              expected_total_columns = 0;
+	std::vector<size_t> expected_column_counts;
+	for (uint32_t rg_idx = 0; rg_idx < rowgroups->size(); ++rg_idx) {
+		const auto* rg = rowgroups->Get(rg_idx);
+		ASSERT_NE(rg, nullptr);
+
+		std::vector<fastlanes::OperatorToken> unsupported;
+		if (!rowgroup_supported(rg, supported, unsupported)) {
+			GTEST_SKIP() << "Sample contains rowgroups unsupported by public table decompression.";
+		}
+
+		const auto* columns = rg->m_column_descriptors();
+		ASSERT_NE(columns, nullptr);
+		expected_total_columns += columns->size();
+		expected_column_counts.push_back(columns->size());
+	}
+
+	fastlens::Reader            reader(fls_path);
+	fastlens::DecompressOptions options {};
+	options.write_output = false;
+
+	for (const auto scope : {fastlens::TableDecompressionScope::PerRowgroup, fastlens::TableDecompressionScope::WholeTable}) {
+		SCOPED_TRACE(scope == fastlens::TableDecompressionScope::PerRowgroup ? "PerRowgroup" : "WholeTable");
+		options.scope = scope;
+
+		fastlens::Table table;
+		ASSERT_NO_THROW({ table = reader.decompress(options); });
+		EXPECT_EQ(table.rowgroup_count(), static_cast<size_t>(rowgroups->size()));
+		EXPECT_EQ(table.total_columns(), expected_total_columns);
+		EXPECT_EQ(table.rowgroup_column_counts(), expected_column_counts);
+	}
+}
+
+TEST(Reader, PublicWriteOutputDataAccessReturnsSpans) {
+	const auto fls_path = pick_fls_file();
+	if (fls_path.empty()) {
+		GTEST_SKIP() << "No .fls file found for reader test (set FLS_READER_TEST_FILE).";
+	}
+
+	int        device_count = 0;
+	const auto cuda_status  = cudaGetDeviceCount(&device_count);
+	if (cuda_status != cudaSuccess || device_count <= 0) {
+		GTEST_SKIP() << "CUDA device not available for reader test.";
+	}
+
+	const auto  td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td        = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	const auto* rowgroups = td->m_rowgroup_descriptors();
+	ASSERT_NE(rowgroups, nullptr);
+	ASSERT_GT(rowgroups->size(), 0U);
+
+	const auto supported = supported_tokens();
+	for (uint32_t rg_idx = 0; rg_idx < rowgroups->size(); ++rg_idx) {
+		const auto* rg = rowgroups->Get(rg_idx);
+		ASSERT_NE(rg, nullptr);
+		std::vector<fastlanes::OperatorToken> unsupported;
+		if (!rowgroup_supported(rg, supported, unsupported)) {
+			GTEST_SKIP() << "Sample contains rowgroups unsupported by public table decompression.";
+		}
+	}
+
+	fastlens::Reader            reader(fls_path);
+	fastlens::DecompressOptions options {};
+	options.write_output = true;
+	options.scope        = fastlens::TableDecompressionScope::PerRowgroup;
+
+	fastlens::Table table;
+	ASSERT_NO_THROW({ table = reader.decompress(options); });
+	ASSERT_EQ(table.rowgroup_count(), static_cast<size_t>(rowgroups->size()));
+
+	const auto* rg_desc = rowgroups->Get(0);
+	ASSERT_NE(rg_desc, nullptr);
+	ASSERT_NE(rg_desc->m_column_descriptors(), nullptr);
+	auto connection = fastlanes::connect();
+	ASSERT_TRUE(connection != nullptr);
+	auto table_reader    = connection->read_fls(fls_path);
+	auto rowgroup_reader = table_reader->get_rowgroup_reader(0);
+	ASSERT_TRUE(rowgroup_reader != nullptr);
+	auto expected_rowgroup = rowgroup_reader->materialize();
+	ASSERT_NE(expected_rowgroup.get(), nullptr);
+	const size_t expected_rows = static_cast<size_t>(expected_rowgroup->RowCount());
+
+	const auto rg_view = table.rowgroup(0);
+	ASSERT_EQ(rg_view.column_count(), static_cast<size_t>(rg_desc->m_column_descriptors()->size()));
+
+	bool compared = false;
+	for (size_t col_idx = 0; col_idx < rg_view.column_count(); ++col_idx) {
+		const auto col_view = rg_view.column(col_idx);
+		if (auto* col =
+		        std::get_if<fastlanes::up<fastlanes::col_i08>>(&expected_rowgroup->internal_rowgroup[col_idx])) {
+			ASSERT_EQ(col_view.type(), fastlens::DataType::I8);
+			const auto values = col_view.values<int8_t>();
+			EXPECT_THROW((void)col_view.values<int16_t>(), std::bad_variant_access);
+			ASSERT_EQ(values.size(), expected_rows);
+			const auto& expected = (*col)->data;
+			for (size_t row = 0; row < expected_rows; ++row) {
+				ASSERT_EQ(values[row], expected[row]) << "column=" << col_idx << " row=" << row;
+			}
+			compared = true;
+			break;
+		}
+		if (auto* col =
+		        std::get_if<fastlanes::up<fastlanes::col_i16>>(&expected_rowgroup->internal_rowgroup[col_idx])) {
+			ASSERT_EQ(col_view.type(), fastlens::DataType::I16);
+			const auto values = col_view.values<int16_t>();
+			EXPECT_THROW((void)col_view.values<int8_t>(), std::bad_variant_access);
+			ASSERT_EQ(values.size(), expected_rows);
+			const auto& expected = (*col)->data;
+			for (size_t row = 0; row < expected_rows; ++row) {
+				ASSERT_EQ(values[row], expected[row]) << "column=" << col_idx << " row=" << row;
+			}
+			compared = true;
+			break;
+		}
+		if (auto* col =
+		        std::get_if<fastlanes::up<fastlanes::u08_col_t>>(&expected_rowgroup->internal_rowgroup[col_idx])) {
+			ASSERT_EQ(col_view.type(), fastlens::DataType::I8);
+			const auto values = col_view.values<int8_t>();
+			EXPECT_THROW((void)col_view.values<int16_t>(), std::bad_variant_access);
+			ASSERT_EQ(values.size(), expected_rows);
+			const auto& expected = (*col)->data;
+			for (size_t row = 0; row < expected_rows; ++row) {
+				ASSERT_EQ(static_cast<uint8_t>(values[row]), expected[row]) << "column=" << col_idx << " row=" << row;
+			}
+			compared = true;
+			break;
+		}
+	}
+
+	ASSERT_TRUE(compared) << "No i8/i16 column was available to validate public span access.";
+}
+
+TEST(Reader, PublicWriteOutputUsesLogicalTupleCountForPartialRowgroups) {
+	int        device_count = 0;
+	const auto cuda_status  = cudaGetDeviceCount(&device_count);
+	if (cuda_status != cudaSuccess || device_count <= 0) {
+		GTEST_SKIP() << "CUDA device not available for reader test.";
+	}
+
+	const auto fls_path = make_partial_rowgroup_fls_fixture();
+
+	fastlens::Reader            reader(fls_path);
+	fastlens::DecompressOptions options {};
+	options.write_output = true;
+	options.scope        = fastlens::TableDecompressionScope::PerRowgroup;
+
+	fastlens::Table table;
+	ASSERT_NO_THROW({ table = reader.decompress(options); });
+	ASSERT_EQ(table.rowgroup_count(), 2U);
+
+	const auto final_rowgroup = table.rowgroup(1);
+	ASSERT_EQ(final_rowgroup.column_count(), 1U);
+	const auto column = final_rowgroup.column(0);
+	ASSERT_EQ(column.type(), fastlens::DataType::I8);
+	EXPECT_EQ(column.size(), 6U);
+	const auto values = column.values<int8_t>();
+	ASSERT_EQ(values.size(), 6U);
+	for (size_t row = 0; row < values.size(); ++row) {
+		EXPECT_EQ(values[row], static_cast<int8_t>((1024U + row) % 100U));
+	}
+}
+
+TEST(Reader, RowgroupPrefetchQueueHonorsExplicitSchedule) {
+	const auto fls_path = make_partial_rowgroup_fls_fixture();
+
+	auto reader = std::make_shared<fastlens::format::FlsReader>(fls_path, /*load_column_names=*/false);
+	ASSERT_EQ(reader->rowgroup_count(), 2U);
+
+	fastlens::runtime::RowgroupPrefetchQueue queue(reader,
+	                                           std::vector<size_t> {1U},
+	                                           /*depth=*/2,
+	                                           /*num_workers=*/1);
+	auto                                 result = queue.pop();
+	EXPECT_EQ(result.rowgroup_index, 1U);
+	EXPECT_EQ(result.rowgroup.n_tuples, 6U);
+	fastlens::execution::free_rowgroup(result.rowgroup);
+}
+
+TEST(Reader, WholeTablePrefetchBuildsPredicateScheduleBeforeRead) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available for reader test.";
+	}
+
+	const auto fls_path = make_partial_rowgroup_fls_fixture();
+
+	fastlens::runtime::TableExecutionRequest request {};
+	request.config.scope                       = fastlens::execution::TableDecompressionScope::WholeTable;
+	request.config.enable_rowgroup_prefetch    = true;
+	request.config.prefetch_depth              = 2;
+	request.config.prefetch_workers            = 1;
+	request.config.streaming_target_rowgroups  = 1;
+	request.config.streaming_target_work_items = 1;
+	request.config.execution.write_out         = false;
+	request.materialize_results                = false;
+	request.load_column_names                  = false;
+
+	RecordingTableExecutionObserver observer {};
+	std::vector<size_t>             callbacks;
+	auto                            result = fastlens::runtime::execute_table_pipeline(
+        fls_path,
+        request,
+        [](const size_t rowgroup_index) { return rowgroup_index == 1U; },
+        [&](const size_t                                  rowgroup_index,
+            fastlens::format::Rowgroup&,
+            const std::vector<fastlens::expression::Expression>&,
+            const fastlens::execution::RowgroupData*) { callbacks.push_back(rowgroup_index); },
+        observer);
+
+	const std::vector<size_t> expected_rowgroups {1U};
+	const std::vector<bool>   expected_from_prefetch {true};
+	EXPECT_EQ(observer.read_rowgroups, expected_rowgroups);
+	EXPECT_EQ(observer.read_from_prefetch, expected_from_prefetch);
+	EXPECT_EQ(callbacks, expected_rowgroups);
+	EXPECT_EQ(result.rowgroups, 1U);
+}
+
+TEST(Reader, MultiVectorUnpackHandlesPartialTailRowgroup) {
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+
+	const auto fls_path = make_partial_rowgroup_fls_fixture();
+
+	fastlens::format::FlsReader rdr(fls_path);
+	ASSERT_EQ(rdr.rowgroup_count(), 2U);
+
+	const auto td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td       = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+	const auto* rowgroups = td->m_rowgroup_descriptors();
+	ASSERT_NE(rowgroups, nullptr);
+	const auto* rg_desc = rowgroups->Get(1);
+	ASSERT_NE(rg_desc, nullptr);
+	ASSERT_NE(static_cast<size_t>(rg_desc->m_n_vec()) % 4U, 0U);
+
+	auto rowgroup    = rdr.read_rowgroup(1);
+	auto expressions = fastlens::expression::assemble(rowgroup);
+
+	fastlens::execution::ExecutionConfig cfg_u1 {};
+	cfg_u1.unpack_n_vectors = 1;
+	cfg_u1.write_out        = true;
+	const auto result_u1    = fastlens::execution::decompress_rowgroup(expressions, cfg_u1);
+
+	for (const auto strategy :
+	     {fastlens::execution::LaunchStrategy::MixedDispatch, fastlens::execution::LaunchStrategy::TypedBatches}) {
+		SCOPED_TRACE(strategy == fastlens::execution::LaunchStrategy::MixedDispatch ? "mixed_u4_tail" : "typed_u4_tail");
+
+		fastlens::execution::ExecutionConfig cfg_u4 {};
+		cfg_u4.unpack_n_vectors = 4;
+		cfg_u4.launch_strategy  = strategy;
+		cfg_u4.write_out        = true;
+		const auto result_u4    = fastlens::execution::decompress_rowgroup(expressions, cfg_u4);
+
+		ASSERT_EQ(result_u1.columns.size(), result_u4.columns.size());
+		ASSERT_FALSE(result_u1.columns.empty());
+		ASSERT_TRUE(result_u1.columns[0].has_value());
+		ASSERT_TRUE(result_u4.columns[0].has_value());
+
+		const size_t n_vals = result_u1.columns[0]->meta.value_count;
+		ASSERT_EQ(n_vals, result_u4.columns[0]->meta.value_count);
+		const auto& ptr_u1 = std::get<std::shared_ptr<int8_t[]>>(result_u1.columns[0]->values);
+		const auto& ptr_u4 = std::get<std::shared_ptr<int8_t[]>>(result_u4.columns[0]->values);
+		for (size_t row = 0; row < n_vals; ++row) {
+			EXPECT_EQ(ptr_u1[row], ptr_u4[row]) << "row=" << row;
+		}
+	}
+
+}
+
+TEST(Reader, MultiVectorUnpackMatchesSingleVector) {
+	const auto fls_path = pick_fls_file();
+	if (fls_path.empty()) {
+		GTEST_SKIP() << "No .fls file found (set FLS_READER_TEST_FILE).";
+	}
+	if (!cuda_available_for_reader_tests()) {
+		GTEST_SKIP() << "CUDA device not available.";
+	}
+
+	fastlens::format::FlsReader rdr(fls_path);
+	const size_t            n_rowgroups = rdr.rowgroup_count();
+	ASSERT_GT(n_rowgroups, 0U);
+
+	const auto supported = supported_tokens();
+	const auto td_handle = fastlens::format::detail::load_table_descriptor(fls_path);
+	const auto* td       = td_handle.Get();
+	ASSERT_NE(td, nullptr);
+
+	size_t compared_total = 0;
+
+	for (size_t rg_idx = 0; rg_idx < n_rowgroups; ++rg_idx) {
+		const auto* rg_desc = td->m_rowgroup_descriptors()->Get(static_cast<uint32_t>(rg_idx));
+		if (!rg_desc) continue;
+		std::vector<fastlanes::OperatorToken> unsup;
+		if (!rowgroup_supported(rg_desc, supported, unsup)) continue;
+
+		auto rowgroup    = rdr.read_rowgroup(static_cast<uint32_t>(rg_idx));
+		auto expressions = fastlens::expression::assemble(rowgroup);
+
+		fastlens::execution::ExecutionConfig cfg_u1 {};
+		cfg_u1.unpack_n_vectors = 1;
+		cfg_u1.write_out        = true;
+		const auto result_u1    = fastlens::execution::decompress_rowgroup(expressions, cfg_u1);
+
+		for (const auto strategy :
+		     {fastlens::execution::LaunchStrategy::MixedDispatch, fastlens::execution::LaunchStrategy::TypedBatches}) {
+			SCOPED_TRACE(strategy == fastlens::execution::LaunchStrategy::MixedDispatch ? "mixed_u4" : "typed_u4");
+
+			fastlens::execution::ExecutionConfig cfg_u4 {};
+			cfg_u4.unpack_n_vectors = 4;
+			cfg_u4.launch_strategy  = strategy;
+			cfg_u4.write_out        = true;
+			const auto result_u4    = fastlens::execution::decompress_rowgroup(expressions, cfg_u4);
+
+			ASSERT_EQ(result_u1.columns.size(), result_u4.columns.size());
+			for (size_t col = 0; col < result_u1.columns.size(); ++col) {
+				if (!result_u1.columns[col].has_value()) continue;
+				ASSERT_TRUE(result_u4.columns[col].has_value())
+				    << "rg=" << rg_idx << " col=" << col << " missing in unpack=4";
+
+				const size_t n_vals = result_u1.columns[col]->meta.value_count;
+				std::visit(
+				    [&](auto& ptr_u1) {
+					    using T      = std::remove_pointer_t<decltype(ptr_u1.get())>;
+					    auto& ptr_u4 = std::get<std::shared_ptr<T[]>>(result_u4.columns[col]->values);
+					    for (size_t row = 0; row < n_vals; ++row) {
+						    if (ptr_u1[row] != ptr_u4[row]) {
+							    ADD_FAILURE() << "rg=" << rg_idx << " col=" << col << " row=" << row
+							                  << " u1=" << static_cast<int64_t>(ptr_u1[row])
+							                  << " u4=" << static_cast<int64_t>(ptr_u4[row]);
+							    return;
+						    }
+					    }
+					    ++compared_total;
+				    },
+				    result_u1.columns[col]->values);
+			}
+		}
+	}
+
+	EXPECT_GT(compared_total, 0U) << "No columns were compared.";
+}

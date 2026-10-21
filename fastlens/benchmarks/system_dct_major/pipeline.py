@@ -1,0 +1,1669 @@
+#!/usr/bin/env python3
+"""Execute one no-shuffle DCT-major, DALI, FFCV, or PyTorch pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import importlib
+import json
+import math
+import os
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+import numpy as np
+import torch
+
+from fastlens.benchmarks.system_dct_major.common import (
+    BLOCK_MAJOR_RUNTIME_PROFILE,
+    FASTLENS_PIPELINES,
+    PIPELINES,
+    PIPELINE_RESULT_SCHEMA,
+    REPO_ROOT,
+    distribution,
+    file_identity,
+    load_contract,
+    load_sample_manifest,
+    parse_manifest,
+    sample_trace,
+    selected_batches,
+    sha256_file,
+    sha256_json,
+    write_json,
+)
+
+from fastlens.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
+from fastlens.torch import DirectDctReader
+from fastlens.diagnostics.direct_dct import (
+    binding_import_ms,
+    cache_stats,
+    execution_stats,
+    initialization_stats,
+)
+from fastlens.benchmarks.system_dct_major.feature_model import build_workload_model, expected_output_width
+
+
+@dataclass
+class LoadedBatch:
+    inputs: tuple[torch.Tensor, ...]
+    labels: torch.Tensor
+    ordinals: list[int]
+    label_values: list[int]
+    on_device: bool
+    native_stats: list[dict[str, Any]] = field(default_factory=list)
+    keepalive: list[Any] = field(default_factory=list)
+
+
+class _GpuUtilizationSampler:
+    """Sample NVML-backed utilization without placing work on the model stream."""
+
+    def __init__(self, device: torch.device, interval_seconds: float = 0.1) -> None:
+        self.device = device
+        self.interval_seconds = interval_seconds
+        self.values: list[float] = []
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.device.type != "cuda" or not hasattr(torch.cuda, "utilization"):
+            return
+
+        def sample() -> None:
+            while not self._stop.is_set():
+                try:
+                    self.values.append(float(torch.cuda.utilization(self.device)))
+                except Exception as error:  # pragma: no cover - depends on NVML deployment
+                    self.error = f"{type(error).__name__}: {error}"
+                    return
+                self._stop.wait(self.interval_seconds)
+
+        self._thread = threading.Thread(target=sample, name="fastlens-gpu-utilization", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+
+def _process_memory_snapshot(status_path: Path = Path("/proc/self/status")) -> dict[str, int]:
+    values = {"rss_bytes": 0, "peak_rss_bytes": 0}
+    if not status_path.is_file():
+        return values
+    mapping = {"VmRSS": "rss_bytes", "VmHWM": "peak_rss_bytes"}
+    for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        name, _, tail = line.partition(":")
+        if name not in mapping:
+            continue
+        fields = tail.strip().split()
+        if fields:
+            values[mapping[name]] = int(fields[0]) * 1024
+    return values
+
+
+def _process_io_snapshot(io_path: Path = Path("/proc/self/io")) -> dict[str, int] | None:
+    """Read Linux task-group I/O counters, including storage-layer read bytes."""
+
+    if not io_path.is_file():
+        return None
+    mapping = {
+        "rchar": "logical_read_bytes",
+        "read_bytes": "storage_read_bytes",
+        "syscr": "read_syscalls",
+    }
+    values: dict[str, int] = {}
+    try:
+        lines = io_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        name, _, tail = line.partition(":")
+        if name not in mapping:
+            continue
+        try:
+            values[mapping[name]] = int(tail.strip())
+        except ValueError:
+            return None
+    return values if len(values) == len(mapping) else None
+
+
+def _process_io_delta(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if before is None or after is None or before.keys() != after.keys():
+        return None
+    return {name: max(0, after[name] - before[name]) for name in before}
+
+
+def _loader_kwargs(contract: dict[str, Any], pipeline_name: str) -> dict[str, Any]:
+    execution = contract["execution"]
+    workers = int(execution["workers"])
+    config = contract["pipelines"].get(pipeline_name, {})
+    result: dict[str, Any] = {
+        "batch_size": int(execution["batch_size"]),
+        "shuffle": False,
+        "num_workers": workers,
+        "pin_memory": str(execution["device"]).startswith("cuda"),
+        "drop_last": False,
+    }
+    if workers > 0:
+        result["persistent_workers"] = True
+        result["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+    return result
+
+
+class CanonicalRgbDataset(torch.utils.data.Dataset):
+    def __init__(self, samples: Sequence[dict[str, Any]], transform: Any) -> None:
+        self.samples = list(samples)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int, int]:
+        from PIL import Image
+
+        sample = self.samples[index]
+        with Image.open(sample["path"]) as image:
+            tensor = self.transform(image.convert("RGB"))
+        return tensor, int(sample["label"]), int(sample["ordinal"])
+
+
+class IndexedDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset: torch.utils.data.Dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> tuple[Any, int, int]:
+        inputs, label = self.dataset[index]
+        return inputs, int(label), index
+
+
+class Adapter:
+    domain: str
+    worker_semantics: str
+
+    def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device, name: str) -> None:
+        self.contract = contract
+        self.samples = list(samples)
+        self.device = device
+        self.name = name
+
+    def begin_repeat(self) -> None:
+        raise NotImplementedError
+
+    def prime_cold_start(self) -> None:
+        """Start reversible loader preparation while the model is being constructed."""
+
+        return None
+
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        raise NotImplementedError
+
+    def begin_measurement(self) -> None:
+        pass
+
+    def end_repeat(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _rgbnomore_fixed_validation_transform(ctrans: Any) -> torch.nn.Sequential:
+    """Materialize the published fixed-512 DCT validation transform.
+
+    A 512-pixel luma grid has 64 blocks.  RGB-no-more's validation transform
+    uses a 32-block resize reference followed by a 28-block crop, which is
+    equivalent to cropping 56 source blocks and resizing them to 28.  A plain
+    ``CenterCrop_DCT(28)`` would instead select only the central 28 source
+    blocks and is a different model input.
+    """
+
+    return torch.nn.Sequential(
+        ctrans.ResizedCenterCrop_DCT(32, 28),
+        ctrans.ToRange(
+            val_min=-1,
+            val_max=1,
+            orig_min=-1024,
+            orig_max=1016,
+            dtype=torch.float32,
+        ),
+    )
+
+
+class PyTorchAdapter(Adapter):
+    domain = "rgb"
+    worker_semantics = "torch_dataloader_processes"
+
+    def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device, name: str) -> None:
+        super().__init__(contract, samples, device, name)
+        root = Path(contract["models"]["rgbnomore_root"])
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        datasets = importlib.import_module("datasets")
+        if contract["preprocess"]["profile"] == "fixed-center-224-from-512":
+            transforms = importlib.import_module("torchvision.transforms")
+            ctrans = importlib.import_module("utils.custom_transforms")
+            transform = transforms.Compose(
+                [
+                    transforms.CenterCrop(224),
+                    ctrans.ToTensor_range(val_min=-1, val_max=1),
+                    transforms.ConvertImageDtype(torch.float32),
+                ]
+            )
+        else:
+            transform = datasets.get_transform(dataset="imagenet", type="test", dtype=torch.float32)
+        self.loader = torch.utils.data.DataLoader(
+            CanonicalRgbDataset(samples, transform),
+            **_loader_kwargs(contract, name),
+        )
+        self.iterator: Iterator[Any] | None = None
+        self._cold_iterator_primed = False
+
+    def begin_repeat(self) -> None:
+        if self._cold_iterator_primed:
+            self._cold_iterator_primed = False
+            return
+        self.iterator = iter(self.loader)
+
+    def prime_cold_start(self) -> None:
+        self.iterator = iter(self.loader)
+        self._cold_iterator_primed = True
+
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        if self.iterator is None:
+            raise RuntimeError("PyTorch adapter was not started")
+        images, labels, ordinals = next(self.iterator)
+        return LoadedBatch(
+            inputs=(images,),
+            labels=labels.long(),
+            ordinals=[int(item) for item in ordinals.tolist()],
+            label_values=[int(item) for item in labels.tolist()],
+            on_device=False,
+        )
+
+
+class RgbNoMoreAdapter(Adapter):
+    domain = "dct"
+    worker_semantics = "torch_dataloader_processes"
+
+    def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device, name: str) -> None:
+        super().__init__(contract, samples, device, name)
+        root = Path(contract["models"]["rgbnomore_root"])
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        datasets = importlib.import_module("datasets")
+        base = datasets.imagenet_dataset_indexing(
+            indexfile=contract["dataset"]["canonical_index_csv"],
+            type="test",
+            basepath="",
+            load_mode="DCT",
+            dtype=torch.float32,
+        )
+        if contract["preprocess"]["profile"] == "fixed-center-224-from-512":
+            ctrans = importlib.import_module("utils.custom_transforms")
+            transform = _rgbnomore_fixed_validation_transform(ctrans)
+        else:
+            transform = datasets.get_transform(dataset="imagenet_dct", type="test", dtype=torch.float32)
+        transformed = datasets.SubsetWithTransform(base, dataset="imagenet_dct", transform=transform)
+        self.loader = torch.utils.data.DataLoader(
+            IndexedDataset(transformed),
+            **_loader_kwargs(contract, name),
+        )
+        self.iterator: Iterator[Any] | None = None
+        self._cold_iterator_primed = False
+
+    def begin_repeat(self) -> None:
+        if self._cold_iterator_primed:
+            self._cold_iterator_primed = False
+            return
+        self.iterator = iter(self.loader)
+
+    def prime_cold_start(self) -> None:
+        self.iterator = iter(self.loader)
+        self._cold_iterator_primed = True
+
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        if self.iterator is None:
+            raise RuntimeError("RGB-no-more adapter was not started")
+        (input_y, input_cbcr), labels, ordinals = next(self.iterator)
+        return LoadedBatch(
+            inputs=(input_y, input_cbcr),
+            labels=labels.long(),
+            ordinals=[int(self.samples[int(item)]["ordinal"]) for item in ordinals.tolist()],
+            label_values=[int(item) for item in labels.tolist()],
+            on_device=False,
+        )
+
+
+class DaliAdapter(Adapter):
+    domain = "rgb"
+    worker_semantics = "dali_cpu_threads"
+
+    def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device, name: str) -> None:
+        super().__init__(contract, samples, device, name)
+        if device.type != "cuda":
+            raise ValueError("DALI requires CUDA")
+        self.iterator: Any | None = None
+        self._cold_iterator_primed = False
+
+    def begin_repeat(self) -> None:
+        if self._cold_iterator_primed:
+            self._cold_iterator_primed = False
+            return
+        from nvidia.dali import fn, pipeline_def, types
+        from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+
+        execution = self.contract["execution"]
+        config = self.contract["pipelines"][self.name]
+        paths = [str(sample["path"]) for sample in self.samples]
+        if "l3" in config:
+            from fastlens.benchmarks.baselines.l3.codec import load_plugin
+            from fastlens.benchmarks.baselines.l3.prepare import encoded_path
+            load_plugin(config["l3"]["library"])
+            paths = [str(encoded_path(config["l3"]["root"], sample["sample_id"])) for sample in self.samples]
+        ordinals = [int(sample["ordinal"]) for sample in self.samples]
+        preprocess = self.contract["preprocess"]["rgb"]
+
+        @pipeline_def
+        def create_pipeline():
+            encoded, ordinal = fn.readers.file(
+                files=paths,
+                labels=ordinals,
+                random_shuffle=False,
+                pad_last_batch=False,
+                name="Reader",
+            )
+            images = (fn.l3_decoder(encoded, device="mixed") if "l3" in config
+                      else fn.decoders.image(encoded, device="mixed", output_type=types.RGB))
+            if preprocess["resize_shorter"] is not None:
+                images = fn.resize(
+                    images,
+                    device="gpu",
+                    resize_shorter=int(preprocess["resize_shorter"]),
+                    interp_type=types.INTERP_LINEAR,
+                    antialias=True,
+                )
+            images = fn.crop_mirror_normalize(
+                images,
+                device="gpu",
+                dtype=types.FLOAT,
+                output_layout="CHW",
+                crop=tuple(preprocess["crop_size"]),
+                crop_pos_x=(0.5 if preprocess.get("crop_origin") == [144, 144] else 0.499999),
+                crop_pos_y=(0.5 if preprocess.get("crop_origin") == [144, 144] else 0.499999),
+                mean=[127.5, 127.5, 127.5],
+                std=[127.5, 127.5, 127.5],
+            )
+            return images, ordinal
+
+        pipeline = create_pipeline(
+            batch_size=int(execution["batch_size"]),
+            num_threads=max(1, int(execution["workers"])),
+            device_id=int(config.get("device_id", self.device.index or 0)),
+            seed=int(execution["seed"]),
+            prefetch_queue_depth=int(config.get("prefetch_queue_depth", 2)),
+        )
+        pipeline.build()
+        self.iterator = DALIGenericIterator(
+            [pipeline],
+            output_map=["image", "ordinal"],
+            reader_name="Reader",
+            auto_reset=False,
+            last_batch_policy=LastBatchPolicy.PARTIAL,
+            last_batch_padded=False,
+        )
+
+    def prime_cold_start(self) -> None:
+        self.begin_repeat()
+        self._cold_iterator_primed = True
+
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        if self.iterator is None:
+            raise RuntimeError("DALI adapter was not started")
+        batch = next(self.iterator)[0]
+        images = batch["image"][: len(expected)]
+        ordinals = [int(item) for item in batch["ordinal"].reshape(-1)[: len(expected)].cpu().tolist()]
+        label_values = [int(self.samples[item]["label"]) for item in ordinals]
+        labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
+        return LoadedBatch(
+            inputs=(images,),
+            labels=labels,
+            ordinals=ordinals,
+            label_values=label_values,
+            on_device=True,
+        )
+
+    def end_repeat(self) -> None:
+        if self.iterator is not None:
+            self.iterator.reset()
+        self.iterator = None
+
+
+class CoorDLAdapter(DaliAdapter):
+    """Use the upstream CoorDL FileReader and keep its MinIO cache across epochs."""
+
+    def load(self, expected):
+        batch = super().load(expected)
+        if self.contract["preprocess"]["rgb"]["resize_shorter"] is not None:
+            # The installed CoorDL Resize operator has no antialias argument.
+            # Preserve checkpoint preprocessing with the GPU tensor operation.
+            pixels = batch.inputs[0].add(1).mul(127.5)
+            batch.inputs = (_normal_rgb_resize_crop(pixels, self.contract),)
+        return batch
+
+    def begin_repeat(self) -> None:
+        if self.iterator is not None:
+            return
+        from nvidia.dali import backend, ops, types
+        from nvidia.dali.pipeline import Pipeline
+        from nvidia.dali.plugin.pytorch import DALIGenericIterator
+
+        if "cache_size" not in backend.GetSchema("FileReader").GetArgumentNames():
+            raise RuntimeError(
+                "coordl requires msr-fiddle/CoorDL, not standard NVIDIA DALI; "
+                "use --coordl-python with a compatible CoorDL installation"
+            )
+        execution = self.contract["execution"]
+        config = self.contract["pipelines"][self.name]
+        preprocess = self.contract["preprocess"]["rgb"]
+
+        # Upstream FileReader accepts a whitespace-delimited list, relative to file_root.
+        # Keeping the full path below / also avoids collisions between dataset views
+        # in CoorDL's fixed /dev/shm/cache namespace.
+        lines = []
+        self.cache_paths = []
+        for sample in self.samples:
+            path = str(Path(sample["path"]).resolve().relative_to("/"))
+            if any(character.isspace() for character in path):
+                raise ValueError(f"CoorDL file_list cannot represent whitespace in path: {path}")
+            for suffix in ("", "-tmp"):
+                cache_path = Path("/dev/shm/cache") / (path + suffix)
+                if cache_path.exists():
+                    raise FileExistsError(f"CoorDL requires a fresh cache; existing entry: {cache_path}")
+                self.cache_paths.append(cache_path)
+            lines.append(f"{path} {int(sample['ordinal'])}\n")
+        file_list = Path(config["file_list"])
+        file_list.write_text("".join(lines), encoding="utf-8")
+
+        class CoorDLPipeline(Pipeline):
+            def __init__(self) -> None:
+                super().__init__(
+                    batch_size=int(execution["batch_size"]),
+                    num_threads=max(1, int(execution["workers"])),
+                    device_id=int(config["device_id"]),
+                    seed=int(execution["seed"]),
+                    prefetch_queue_depth=int(config["prefetch_queue_depth"]),
+                )
+                self.reader = ops.FileReader(
+                    file_root="/",
+                    file_list=str(file_list),
+                    cache_size=int(config["cache_size"]),
+                    num_nodes=1,
+                    node_id=0,
+                    num_shards=1,
+                    shard_id=0,
+                    shuffle_seed=int(execution["seed"]),
+                    random_shuffle=False,
+                    shuffle_after_epoch=False,
+                    # Padding is removed by the iterator; the next epoch starts at 0.
+                    pad_last_batch=True,
+                )
+                # Keep the decoder in the experiment contract: the CPU path is
+                # needed by eFUN, while earlier accepted baselines used mixed.
+                decoder_device = config.get("decoder_device", "cpu")
+                if decoder_device not in ("cpu", "mixed"):
+                    raise ValueError(f"Unsupported CoorDL decoder: {decoder_device}")
+                self.decode = ops.ImageDecoder(device=decoder_device, output_type=types.RGB)
+                self.normalize = ops.CropMirrorNormalize(
+                    device="gpu",
+                    output_dtype=types.FLOAT,
+                    output_layout="CHW",
+                    crop=(512, 512) if preprocess["resize_shorter"] is not None else tuple(preprocess["crop_size"]),
+                    crop_pos_x=0.5,
+                    crop_pos_y=0.5,
+                    mean=[127.5, 127.5, 127.5],
+                    std=[127.5, 127.5, 127.5],
+                )
+
+            def define_graph(self):
+                encoded, ordinal = self.reader(name="Reader")
+                decoded = self.decode(encoded)
+                if config.get("decoder_device", "cpu") == "cpu":
+                    decoded = decoded.gpu()
+                return self.normalize(decoded), ordinal
+
+        # CoorDL predates pipeline_def and LastBatchPolicy. Use its published API.
+        self.iterator = DALIGenericIterator(
+            [CoorDLPipeline()],
+            output_map=["image", "ordinal"],
+            size=len(self.samples),
+            auto_reset=False,
+            fill_last_batch=False,
+            last_batch_padded=True,
+        )
+
+    def end_repeat(self) -> None:
+        self.iterator.reset()
+
+    def close(self) -> None:
+        self.iterator = None
+        # CoorDL leaves its shared-memory JPEGs behind. Remove only this run's
+        # entries, which were checked absent before the reader was created.
+        for path in self.cache_paths:
+            path.unlink(missing_ok=True)
+
+
+def _normal_rgb_resize_crop(pixels: torch.Tensor, contract: dict[str, Any]) -> torch.Tensor:
+    """Bilinear antialiased Resize(256), uint8 rounding, then center crop."""
+    preprocess = contract["preprocess"]["rgb"]
+    size = int(preprocess["resize_shorter"])
+    images = torch.nn.functional.interpolate(pixels.float(), size=(size, size),
+                                             mode=preprocess.get("torch_interpolation", "bilinear"),
+                                             align_corners=False, antialias=True).round_().clamp_(0, 255)
+    height, width = preprocess["crop_size"]
+    top, left = (size-height)//2, (size-width)//2
+    return images[:, :, top:top+height, left:left+width].contiguous().div_(127.5).sub_(1)
+
+
+class FfcvAdapter(Adapter):
+    domain = "rgb"
+    worker_semantics = "ffcv_cpu_threads"
+
+    def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device, name: str) -> None:
+        super().__init__(contract, samples, device, name)
+        if device.type != "cuda":
+            raise ValueError("FFCV requires CUDA")
+        from ffcv.fields.decoders import CenterCropRGBImageDecoder, IntDecoder, SimpleRGBImageDecoder
+        from ffcv.loader import Loader, OrderOption
+        from ffcv.transforms import ToDevice, ToTensor, ToTorchImage
+
+        self.loader = Loader(
+            contract["pipelines"][name]["beton"],
+            batch_size=int(contract["execution"]["batch_size"]),
+            num_workers=max(1, int(contract["execution"]["workers"])),
+            order=OrderOption.SEQUENTIAL,
+            indices=contract["pipelines"][name].get("indices", [int(sample["ordinal"]) for sample in samples]),
+            drop_last=False,
+            pipelines={
+                "image": [
+                    (SimpleRGBImageDecoder() if contract["preprocess"]["rgb"]["resize_shorter"] is not None
+                     else CenterCropRGBImageDecoder((224, 224), 224 / 512)),
+                    ToTensor(),
+                    ToDevice(device),
+                    ToTorchImage(),
+                ],
+                "ordinal": [IntDecoder(), ToTensor()],
+            },
+        )
+        self.iterator: Iterator[Any] | None = None
+        self._cold_iterator_primed = False
+
+    def begin_repeat(self) -> None:
+        if self._cold_iterator_primed:
+            # Priming precedes model-stream creation. FFCV must wait for its
+            # copies and protect reused buffers on the actual consumer stream.
+            self.iterator.current_stream = torch.cuda.current_stream(self.device)
+            self._cold_iterator_primed = False
+            return
+        self.iterator = iter(self.loader)
+
+    def prime_cold_start(self) -> None:
+        self.iterator = iter(self.loader)
+        self._cold_iterator_primed = True
+
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        if self.iterator is None:
+            raise RuntimeError("FFCV adapter was not started")
+        images, ordinal_tensor = next(self.iterator)
+        images = (_normal_rgb_resize_crop(images, self.contract)
+                  if self.contract["preprocess"]["rgb"]["resize_shorter"] is not None
+                  else images.float().div_(127.5).sub_(1.0))
+        ordinals = [int(item) for item in ordinal_tensor.reshape(-1).tolist()]
+        if "ordinal_remap" in self.contract["pipelines"][self.name]:
+            remap = self.contract["pipelines"][self.name]["ordinal_remap"]
+            ordinals = [remap[item] for item in ordinals]
+        label_values = [int(self.samples[item]["label"]) for item in ordinals]
+        labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
+        return LoadedBatch(
+            inputs=(images,),
+            labels=labels,
+            ordinals=ordinals,
+            label_values=label_values,
+            on_device=True,
+        )
+
+
+def _batch_native_stats(batch: Any) -> dict[str, Any]:
+    stats = execution_stats(batch)
+    cache = cache_stats(batch)
+    if cache:
+        stats.update(
+            {
+                "decoded_rowgroup_cache_capacity_bytes": int(cache.get("capacity_bytes", 0)),
+                "decoded_rowgroup_cache_current_bytes": int(cache.get("resident_bytes", 0)),
+                "decoded_rowgroup_cache_peak_bytes": int(
+                    cache.get("peak_resident_bytes", cache.get("resident_bytes", 0))
+                ),
+                "decoded_rowgroup_cache_current_rowgroups": int(cache.get("resident_rowgroups", 0)),
+                "decoded_rowgroup_cache_peak_rowgroups": int(
+                    cache.get("peak_resident_rowgroups", cache.get("resident_rowgroups", 0))
+                ),
+                "decoded_rowgroup_cache_hits": int(cache.get("hits", 0)),
+                "decoded_rowgroup_cache_misses": int(cache.get("misses", 0)),
+                "decoded_rowgroup_cache_inserts": int(cache.get("inserts", 0)),
+                "decoded_rowgroup_cache_evictions": int(cache.get("evictions", 0)),
+            }
+        )
+    return stats
+
+
+
+
+
+
+class FastLensAdapter(Adapter):
+    domain = "dct"
+    worker_semantics = "fastlens_native_segment_prefetch"
+
+    def __init__(self, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device, name: str) -> None:
+        super().__init__(contract, samples, device, name)
+        if device.type != "cuda":
+            raise ValueError("FASTLENS Direct-DCT requires CUDA")
+        self.config = contract["pipelines"][name]
+        self.preprocess = str(self.config["preprocess"])
+        self.runtime_profile = str(self.config.get("runtime_profile", ""))
+        if self.runtime_profile != BLOCK_MAJOR_RUNTIME_PROFILE:
+            raise ValueError(
+                f"FASTLENS block-major pipeline requires runtime_profile={BLOCK_MAJOR_RUNTIME_PROFILE!r}"
+            )
+        block_major_access_dir = self.config.get("block_major_access_dir")
+        if block_major_access_dir is not None:
+            access_dir = Path(block_major_access_dir).resolve()
+            companion_index = access_dir / "manifest.block_major_access.bin"
+            if not companion_index.is_file():
+                raise FileNotFoundError(
+                    f"configured block-major access companion index is missing: {companion_index}"
+                )
+            os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(access_dir)
+        os.environ["FASTLENS_PHASE6_NATIVE_PHYSICAL"] = "1"
+        reader_started_ns = time.perf_counter_ns()
+        self.reader = DirectDctReader(
+            self.config["manifest"],
+            module_path=self.config["torch_binding_dir"],
+        )
+        profile_info = self.reader.profile_info(VALIDATION_CENTER_CROP_512)
+        if profile_info["runtime_policy_id"] != BLOCK_MAJOR_RUNTIME_PROFILE:
+            raise RuntimeError("FASTLENS native profile does not match the benchmark contract")
+        self.pipeline = self.reader.pipeline(
+            VALIDATION_CENTER_CROP_512,
+            dct_coeffs=str(self.config["native_coefficient_spec"]),
+        )
+        reader_ready_ns = time.perf_counter_ns()
+        self.startup_timings = {
+            "binding_extension_import_ms": binding_import_ms(self.reader),
+        }
+        self.startup_timings["direct_dct_reader_python_constructor_ms"] = (
+            reader_ready_ns - reader_started_ns
+        ) / 1.0e6
+        self.startup_timings["native_reader_initialization"] = initialization_stats(
+            self.reader
+        )
+        if int(self.reader.image_count) < len(samples):
+            raise ValueError(f"FASTLENS manifest has {self.reader.image_count} images for {len(samples)} samples")
+        warmup_images = int(contract["execution"]["batch_size"]) * int(
+            contract["execution"]["warmup_batches"]
+        )
+        if warmup_images != 0:
+            raise ValueError(
+                "block-major production profile requires zero warmup images to preserve one activation per shard"
+            )
+        batch_size = int(contract["execution"]["batch_size"])
+        self._logical_batches = [
+            list(self.samples[offset : offset + batch_size])
+            for offset in range(0, len(self.samples), batch_size)
+        ]
+        self._process_scope_started_ns: int | None = None
+        self._cold_measurement_primed = False
+        self._reuse_cold_measurement = False
+
+    def set_process_scope_start(self, started_ns: int) -> None:
+        self._process_scope_started_ns = int(started_ns)
+
+    def startup_diagnostics(self) -> dict[str, Any]:
+        result = dict(self.startup_timings)
+        # Descriptor mmap/ValidateSource is lazy and normally occurs in the
+        # real first-segment prefetch, so refresh the native snapshot at report
+        # time rather than freezing a construction-only zero.
+        result["native_reader_initialization"] = initialization_stats(self.reader)
+        return result
+
+
+    def _activate_logical_batches(self) -> None:
+        self.pipeline.start(
+            [
+                [int(sample["galp_image_id"]) for sample in batch]
+                for batch in self._logical_batches
+            ]
+        )
+
+
+
+
+
+    def begin_repeat(self) -> None:
+        if getattr(self, "_cold_measurement_primed", False):
+            self._cold_measurement_primed = False
+            self._reuse_cold_measurement = True
+            return
+        self._activate_logical_batches()
+
+    def begin_measurement(self) -> None:
+        if self._reuse_cold_measurement:
+            self._reuse_cold_measurement = False
+            return
+        self._activate_logical_batches()
+
+    def prime_cold_start(self) -> None:
+        if not self._logical_batches or self._cold_measurement_primed:
+            return
+        self._activate_logical_batches()
+        self._cold_measurement_primed = True
+
+    def load(self, expected: Sequence[dict[str, Any]]) -> LoadedBatch:
+        batch = next(self.pipeline)
+        ready_ns = time.perf_counter_ns()
+        expected_ids = [int(sample["galp_image_id"]) for sample in expected]
+        image_ids = [int(item) for item in batch.global_image_ids]
+        if image_ids != expected_ids:
+            raise RuntimeError(
+                f"FASTLENS native logical order mismatch: expected {expected_ids}, got {image_ids}"
+            )
+        y = batch.y
+        cbcr = batch.cbcr
+        if batch.layout != "transformed_dct_grid" or y.dtype != torch.float32 or cbcr.dtype != torch.float32:
+            raise RuntimeError(
+                f"expected native FP32 transformed grid, got layout={batch.layout} y={y.dtype} cbcr={cbcr.dtype}"
+            )
+        if tuple(y.shape[1:]) != (1, 28, 28, 8, 8) or tuple(cbcr.shape[1:]) != (2, 14, 14, 8, 8):
+            raise RuntimeError(f"unexpected transformed grid shapes: y={tuple(y.shape)} cbcr={tuple(cbcr.shape)}")
+        metrics = batch.metrics
+        stats = {
+            "_native_batch": batch,
+            "segment_mode": "native-logical-batch",
+            "segment_image_count": len(image_ids),
+            "segment_first_image_id": image_ids[0],
+            "segment_last_image_id": image_ids[-1],
+            "prefetch_producer_active_ms": metrics.producer_ms,
+            "prefetch_planning_ms": metrics.planning_ms,
+            "prefetch_io_staging_ms": metrics.io_ms,
+            "prefetch_submit_to_ready_ms": metrics.submit_to_ready_ms,
+            "prefetch_consumer_wait_ms": metrics.consumer_wait_ms,
+            "prefetch_process_scope_ready_ms": (
+                (ready_ns - self._process_scope_started_ns) / 1.0e6
+                if self._process_scope_started_ns is not None
+                else 0.0
+            ),
+        }
+        label_values = [int(sample["label"]) for sample in expected]
+        labels = torch.tensor(label_values, dtype=torch.long, device=self.device)
+        return LoadedBatch(
+            inputs=(y, cbcr),
+            labels=labels,
+            ordinals=[int(sample["ordinal"]) for sample in expected],
+            label_values=label_values,
+            on_device=True,
+            native_stats=[stats],
+            keepalive=[batch],
+        )
+
+
+
+    def end_repeat(self) -> None:
+        self.pipeline.close()
+
+
+def _is_fastlens_pipeline(name: str) -> bool:
+    return name in FASTLENS_PIPELINES
+
+
+def make_adapter(name: str, contract: dict[str, Any], samples: Sequence[dict[str, Any]], device: torch.device) -> Adapter:
+    if _is_fastlens_pipeline(name):
+        return FastLensAdapter(contract, samples, device, name)
+    if name == "rgbnomore":
+        return RgbNoMoreAdapter(contract, samples, device, name)
+    if name == "dali":
+        return DaliAdapter(contract, samples, device, name)
+    if name == "coordl":
+        return CoorDLAdapter(contract, samples, device, name)
+    if name == "ffcv":
+        return FfcvAdapter(contract, samples, device, name)
+    if name == "pytorch":
+        return PyTorchAdapter(contract, samples, device, name)
+    raise ValueError(f"unsupported pipeline: {name}")
+
+
+def _to_device(batch: LoadedBatch, device: torch.device) -> LoadedBatch:
+    if batch.on_device:
+        return batch
+    return LoadedBatch(
+        inputs=tuple(tensor.to(device, non_blocking=True) for tensor in batch.inputs),
+        labels=batch.labels.to(device, non_blocking=True),
+        ordinals=batch.ordinals,
+        label_values=batch.label_values,
+        on_device=True,
+        native_stats=batch.native_stats,
+        keepalive=batch.keepalive,
+    )
+
+
+def _validate_identity(batch: LoadedBatch, expected: Sequence[dict[str, Any]]) -> None:
+    expected_ordinals = [int(item["ordinal"]) for item in expected]
+    if batch.ordinals != expected_ordinals:
+        raise RuntimeError(f"sample order mismatch: {batch.ordinals} != {expected_ordinals}")
+    expected_labels = [int(item["label"]) for item in expected]
+    if batch.label_values != expected_labels:
+        raise RuntimeError(f"label mismatch: {batch.label_values} != {expected_labels}")
+
+
+def _forward(model: torch.nn.Module, inputs: tuple[torch.Tensor, ...], expected_width: int) -> torch.Tensor:
+    with torch.inference_mode():
+        output = model(*inputs)
+    if output.ndim != 2 or output.shape[1] != expected_width:
+        raise RuntimeError(f"expected [B,{expected_width}] model output, got {tuple(output.shape)}")
+    return output
+
+
+def _training_step(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer, batch: LoadedBatch, expected_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    optimizer.zero_grad(set_to_none=True)
+    output = model(*batch.inputs)
+    if output.ndim != 2 or output.shape[1] != expected_width:
+        raise RuntimeError(f"expected [B,{expected_width}] model output, got {tuple(output.shape)}")
+    loss = torch.nn.functional.cross_entropy(output, batch.labels)
+    loss.backward()
+    optimizer.step()
+    return output.detach(), loss.detach()
+
+
+def _training_probe(model: torch.nn.Module, before: list[torch.Tensor]) -> dict[str, bool]:
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    gradients = [p.grad for p in parameters if p.grad is not None]
+    return {
+        "finite_gradients": bool(torch.stack([torch.isfinite(g).all() for g in gradients]).all()),
+        "nonzero_gradients": bool(torch.stack([g.ne(0).any() for g in gradients]).any()),
+        "parameters_updated": bool(torch.stack([
+            p.detach().ne(previous).any() for p, previous in zip(parameters, before, strict=True)
+        ]).any()),
+    }
+
+
+def _prime_model_for_cold_start(
+    model: torch.nn.Module,
+    domain: str,
+    batch_size: int,
+    device: torch.device,
+    expected_width: int,
+) -> None:
+    if batch_size <= 0:
+        return
+    if domain == "rgb":
+        inputs = (torch.zeros((batch_size, 3, 224, 224), dtype=torch.float32, device=device),)
+    elif domain == "dct":
+        inputs = (
+            torch.zeros((batch_size, 1, 28, 28, 8, 8), dtype=torch.float32, device=device),
+            torch.zeros((batch_size, 2, 14, 14, 8, 8), dtype=torch.float32, device=device),
+        )
+    else:
+        raise ValueError(f"unsupported model domain: {domain}")
+    _forward(model, inputs, expected_width)
+    if device.type == "cuda":
+        torch.cuda.current_stream(device).synchronize()
+
+
+def _release_native_context(batch: LoadedBatch) -> None:
+    """Drop audit references; tensor owners defer native release automatically."""
+
+    batch.keepalive.clear()
+
+
+def _finalize_native_stats(batch: LoadedBatch) -> None:
+    """Resolve audit-only implementation counters after model completion."""
+
+    physical_stats = []
+    for stats in batch.native_stats:
+        source = stats.pop("_native_batch", None)
+        if source is None:
+            physical_stats.append(stats)
+            continue
+        observed = _batch_native_stats(source)
+        if observed["rowgroup_count"] == 0:
+            continue
+        stable_fields = dict(stats)
+        stats.clear()
+        stats.update(observed)
+        stats.update(stable_fields)
+        physical_stats.append(stats)
+    batch.native_stats = physical_stats
+
+
+_NATIVE_ALLOCATOR_SNAPSHOT_PREFIXES = (
+    "galp_native_device_",
+    "galp_native_pinned_",
+)
+
+_NATIVE_ALLOCATOR_LAST_VALUE_FIELDS = frozenset(
+    {
+        "galp_native_device_in_use_bytes",
+        "galp_native_device_cached_bytes",
+        "galp_native_pinned_in_use_bytes",
+        "galp_native_pinned_cached_bytes",
+    }
+)
+
+_NATIVE_INVARIANT_FIELDS = frozenset(
+    {
+        "bounded_read_amplification_ppm",
+        "bounded_read_local_amplification_ppm",
+        "bounded_read_max_run_bytes",
+        "bounded_io_backend",
+        "bounded_io_uring_queue_depth",
+        "active_output_schedule_mmap_capacity_bytes",
+        "active_output_schedule_mmap_window_count",
+        "cuda_greatest_stream_priority",
+        "cuda_least_stream_priority",
+        "cuda_warp_size",
+        "direct_dct_decode_stream_priority",
+        "direct_dct_h2d_stream_priority",
+        "direct_dct_low_priority_streams",
+        "direct_dct_round_stream_priority",
+        "direct_dct_stream_priority",
+        "direct_dct_transform_stream_priority",
+        "fixed_grid_output_add",
+        "fixed_grid_output_affine_applied",
+        "fixed_grid_output_float32",
+        "fixed_grid_output_scale",
+    }
+)
+
+_NATIVE_DERIVED_RATIO_FIELDS = frozenset(
+    {
+        "coordinate_group_index_density",
+        "physical_page_coverage_ratio",
+        "read_amplification",
+        "selected_coefficient_ratio",
+    }
+)
+
+
+def _merge_allocator_snapshot(totals: dict[str, Any], key: str, value: int | float) -> None:
+    """Merge a process-global allocator snapshot without inventing segment work."""
+
+    if key in _NATIVE_ALLOCATOR_LAST_VALUE_FIELDS:
+        # These are instantaneous gauges.  Segment stats are consumed in
+        # logical order, so the last observation preserves their meaning.
+        totals[key] = value
+        return
+    # Allocation requests/counts/bytes are monotonic snapshots; peak fields
+    # are high-water gauges.  Max is robust to asynchronous observation order
+    # and is also the safe default for future allocator snapshot fields.
+    totals[key] = max(totals.get(key, value), value)
+
+
+def _accumulate_native(totals: dict[str, Any], stats: dict[str, Any]) -> None:
+    totals["segment_count"] = int(totals.get("segment_count", 0)) + 1
+    for key, value in stats.items():
+        if key in {
+            "active_output_schedule_mmap_capacity_bytes",
+            "active_output_schedule_mmap_window_count",
+        } and value == 0:
+            continue
+        if key in _NATIVE_INVARIANT_FIELDS:
+            previous = totals.get(key)
+            if previous is not None and previous != value:
+                raise RuntimeError(f"native invariant changed across segments: {key}")
+            totals[key] = value
+            continue
+        if isinstance(value, bool):
+            if key == "actual_transient_memory_gate_passed":
+                totals[key] = bool(totals.get(key, True)) and value
+            else:
+                totals[key] = int(totals.get(key, 0)) + int(value)
+        elif isinstance(value, int):
+            if key.startswith(_NATIVE_ALLOCATOR_SNAPSHOT_PREFIXES):
+                _merge_allocator_snapshot(totals, key, value)
+            elif any(
+                token in key
+                for token in (
+                    "peak",
+                    "high_water",
+                    "max_",
+                    "capacity",
+                    "registers_per_thread",
+                    "threads_per_cta",
+                )
+            ):
+                totals[key] = max(int(totals.get(key, 0)), value)
+            elif key in {
+                "decoded_rowgroup_cache_capacity_bytes",
+                "decoded_rowgroup_cache_current_bytes",
+                "decoded_rowgroup_cache_current_rowgroups",
+            }:
+                totals[key] = value
+            elif key in {"segment_first_image_id"}:
+                totals[key] = min(int(totals.get(key, value)), value)
+            elif key in {"segment_last_image_id"}:
+                totals[key] = max(int(totals.get(key, value)), value)
+            else:
+                totals[key] = int(totals.get(key, 0)) + value
+        elif isinstance(value, float) and math.isfinite(value):
+            if key.startswith(_NATIVE_ALLOCATOR_SNAPSHOT_PREFIXES):
+                _merge_allocator_snapshot(totals, key, value)
+            elif key not in _NATIVE_DERIVED_RATIO_FIELDS:
+                totals[key] = float(totals.get(key, 0.0)) + value
+        elif isinstance(value, str) and value:
+            previous = str(totals.get(key, ""))
+            if not previous:
+                totals[key] = value
+            elif previous != value:
+                totals[key] = "mixed"
+    coordinate_entries = int(totals.get("coordinate_group_index_entries", 0))
+    if coordinate_entries > 0:
+        totals["coordinate_group_index_density"] = (
+            int(totals.get("coordinate_group_index_populated", 0)) / coordinate_entries
+        )
+    ratio_sources = {
+        "read_amplification": (
+            "compressed_payload_bytes_read",
+            "selected_compressed_payload_bytes",
+        ),
+        "selected_coefficient_ratio": (
+            "selected_coefficient_count",
+            "full_coefficient_count",
+        ),
+        "physical_page_coverage_ratio": (
+            "physical_page_bytes_covered",
+            "full_physical_page_bytes",
+        ),
+    }
+    for ratio_key, (numerator_key, denominator_key) in ratio_sources.items():
+        denominator = int(totals.get(denominator_key, 0))
+        totals[ratio_key] = (
+            int(totals.get(numerator_key, 0)) / denominator if denominator > 0 else 0.0
+        )
+
+
+def _capture_semantic(
+    store: dict[str, list[np.ndarray]],
+    batch: LoadedBatch,
+    output: torch.Tensor,
+    expected: Sequence[dict[str, Any]],
+    remaining: int,
+) -> int:
+    count = min(remaining, len(expected))
+    if count <= 0:
+        return 0
+    store.setdefault("ordinals", []).append(np.asarray(batch.ordinals[:count], dtype=np.int64))
+    store.setdefault("labels", []).append(np.asarray([item["label"] for item in expected[:count]], dtype=np.int64))
+    store.setdefault("output", []).append(output[:count].detach().float().cpu().numpy())
+    for index, tensor in enumerate(batch.inputs):
+        store.setdefault(f"input_{index}", []).append(tensor[:count].detach().float().cpu().numpy())
+    return count
+
+
+def _write_semantic(path: Path, store: dict[str, list[np.ndarray]], metadata: dict[str, Any]) -> None:
+    arrays = {name: np.concatenate(parts, axis=0) for name, parts in store.items() if parts}
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **arrays)
+
+
+def _verify_runtime_inputs(name: str, contract: dict[str, Any]) -> None:
+    model_key = "rgb" if name in {"dali", "coordl", "ffcv", "pytorch"} else "dct"
+    checkpoint = Path(contract["models"][model_key]["checkpoint"])
+    if sha256_file(checkpoint) != contract["models"][model_key]["checkpoint_sha256"]:
+        raise RuntimeError(f"{model_key} checkpoint changed after contract creation")
+    if _is_fastlens_pipeline(name):
+        config = contract["pipelines"][name]
+        observed = parse_manifest(Path(config["manifest"]))
+        expected_version = 1
+        if int(observed["version"]) != expected_version:
+            raise RuntimeError(f"{name} manifest version changed: {observed['version']} != {expected_version}")
+        snapshot_key = "dct_major_storage"
+        snapshot = contract["dataset"][snapshot_key]
+        if not isinstance(snapshot, dict):
+            raise RuntimeError(f"{name} storage snapshot is missing: {snapshot_key}")
+        for payload in snapshot["payloads"]:
+            path = Path(payload["path"])
+            if not path.is_file() or file_identity(path) != payload["file_identity"]:
+                raise RuntimeError(f"{name} payload identity changed after contract creation: {path}")
+            if payload.get("sha256") and sha256_file(path) != payload["sha256"]:
+                raise RuntimeError(f"{name} payload SHA-256 changed after contract creation: {path}")
+        if name.startswith("dct_major") and config.get("block_major_access_dir") is not None:
+            access = contract["dataset"].get("block_major_access")
+            if not isinstance(access, dict):
+                raise RuntimeError(f"{name} has a descriptor directory without a descriptor contract")
+            fingerprints = [
+                access.get("companion_index"),
+                *access.get("shards", []),
+                *access.get("active_output_schedules", []),
+            ]
+            for fingerprint in fingerprints:
+                if not isinstance(fingerprint, dict):
+                    raise RuntimeError(f"{name} block-major sidecar fingerprint is missing")
+                path = Path(fingerprint["path"])
+                if not path.is_file() or file_identity(path) != fingerprint["file_identity"]:
+                    raise RuntimeError(f"{name} block-major sidecar identity changed: {path}")
+                if sha256_file(path) != fingerprint["sha256"]:
+                    raise RuntimeError(f"{name} block-major sidecar SHA-256 changed: {path}")
+
+
+def run_pipeline(name: str, contract_path: Path, output_path: Path) -> dict[str, Any]:
+    pipeline_started_ns = time.perf_counter_ns()
+    contract = load_contract(contract_path)
+    if name not in contract["pipelines"]["enabled"]:
+        raise ValueError(f"pipeline is not enabled: {name}")
+    _verify_runtime_inputs(name, contract)
+    samples = load_sample_manifest(
+        Path(contract["dataset"]["sample_manifest"]),
+        contract["dataset"]["sample_manifest_sha256"],
+    )
+    if sha256_file(Path(contract["dataset"]["canonical_index_csv"])) != contract["dataset"]["canonical_index_sha256"]:
+        raise RuntimeError("canonical no-shuffle index changed after contract creation")
+    for sample in samples:
+        path = Path(sample["path"])
+        if not path.is_file() or file_identity(path) != sample["file_identity"]:
+            raise RuntimeError(f"sample identity changed after contract creation: {path}")
+        if sample.get("sha256") and sha256_file(path) != sample["sha256"]:
+            raise RuntimeError(f"sample SHA-256 changed after contract creation: {path}")
+    warmup_batches, measured_batches = selected_batches(contract, samples)
+    adapter_samples = [sample for batch in (*warmup_batches, *measured_batches) for sample in batch]
+    device = torch.device(contract["execution"]["device"])
+    cuda_probe_started_ns = time.perf_counter_ns()
+    cuda_available_ready_ns = cuda_probe_started_ns
+    cuda_device_ready_ns = cuda_probe_started_ns
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+        cuda_available_ready_ns = time.perf_counter_ns()
+        torch.cuda.set_device(device)
+        cuda_device_ready_ns = time.perf_counter_ns()
+    adapter_started_ns = time.perf_counter_ns()
+    adapter = make_adapter(name, contract, adapter_samples, device)
+    adapter_ready_ns = time.perf_counter_ns()
+    if isinstance(adapter, FastLensAdapter):
+        adapter.set_process_scope_start(pipeline_started_ns)
+    cold_prime_started_ns = time.perf_counter_ns()
+    if contract["execution"].get("cold_protocol", "application-overlapped") == "application-overlapped":
+        adapter.prime_cold_start()
+    cold_prime_submitted_ns = time.perf_counter_ns()
+    model_key = "rgb" if adapter.domain == "rgb" else "dct"
+    model_config = contract["models"][model_key]
+    model_started_ns = time.perf_counter_ns()
+    training = contract["workload"]["kind"] == "training-throughput"
+    if training:
+        torch.manual_seed(int(contract["execution"]["seed"]))
+    model = build_workload_model(
+        domain=adapter.domain,
+        workload=contract["workload"]["kind"],
+        rgbnomore_root=Path(contract["models"]["rgbnomore_root"]),
+        checkpoint=Path(model_config["checkpoint"]),
+        device=device,
+        feature_stage=contract["workload"].get("feature_stage", "penultimate"),
+    )
+    optimizer = None
+    if training:
+        from fastlens.benchmarks.baselines.system_rgbnomore.training.optimizer import build_optimizer
+
+        optimizer, _ = build_optimizer(model, contract["workload"]["optimizer"])
+    model_ready_ns = time.perf_counter_ns()
+    expected_width = expected_output_width(contract["workload"]["kind"])
+    previous_stream: torch.cuda.Stream | None = None
+    model_stream: torch.cuda.Stream | None = None
+    model_stream_priority: int | None = None
+    if device.type == "cuda":
+        previous_stream = torch.cuda.current_stream(device)
+        previous_stream.synchronize()
+        _least_priority, greatest_priority = torch.cuda.Stream.priority_range()
+        model_stream_priority = int(greatest_priority)
+        model_stream = torch.cuda.Stream(device=device, priority=model_stream_priority)
+        torch.cuda.set_stream(model_stream)
+    model_prime_started_ns = time.perf_counter_ns()
+    if bool(contract["execution"].get("cold_start_model_prime", True)):
+        _prime_model_for_cold_start(
+            model,
+            adapter.domain,
+            int(contract["execution"]["batch_size"]),
+            device,
+            expected_width,
+        )
+    model_prime_ready_ns = time.perf_counter_ns()
+    semantic_limit = int(contract["semantic_validation"]["sample_count"])
+    if training:
+        semantic_limit = min(semantic_limit, int(contract["execution"]["batch_size"]))
+    training_probe = None
+    semantic_store: dict[str, list[np.ndarray]] = {}
+    semantic_captured = 0
+    repeat_records: list[dict[str, Any]] = []
+    measured_trace = sample_trace(measured_batches)
+    semantic_artifact = output_path.with_name(f"semantic_{name}.npz")
+
+    for repeat in range(int(contract["execution"]["repeats"])):
+        repeat_started_ns = time.perf_counter_ns()
+        adapter.begin_repeat()
+        for expected in warmup_batches:
+            batch = _to_device(adapter.load(expected), device)
+            _validate_identity(batch, expected)
+            _forward(model, batch.inputs, expected_width)
+            if device.type == "cuda":
+                torch.cuda.current_stream(device).synchronize()
+            _release_native_context(batch)
+            del batch
+
+        adapter.begin_measurement()
+        if device.type == "cuda":
+            torch.cuda.current_stream(device).synchronize()
+            torch.cuda.reset_peak_memory_stats(device)
+        gpu_utilization = _GpuUtilizationSampler(device)
+        gpu_utilization.start()
+        latency_ms: list[float] = []
+        load_ms: list[float] = []
+        h2d_ms: list[float] = []
+        model_ms: list[float] = []
+        sink_ms: list[float] = []
+        native_totals: dict[str, Any] = {}
+        native_segments: list[dict[str, Any]] = []
+        correct1 = 0
+        correct5 = 0
+        cross_entropy_sum = 0.0
+        if training:
+            training_loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        feature_sum = torch.zeros(expected_width, dtype=torch.float64, device=device)
+        feature_square_sum = torch.zeros(expected_width, dtype=torch.float64, device=device)
+        predictions_top1: list[np.ndarray] = []
+        predictions_top5: list[np.ndarray] = []
+        process_started = time.process_time()
+        host_before = _process_memory_snapshot()
+        process_io_before = _process_io_snapshot()
+        feature_sink: np.memmap | None = None
+        feature_sink_offset = 0
+        repeat_to_first_batch_ms: float | None = None
+        process_scope_to_first_batch_ms: float | None = None
+        if contract["workload"]["kind"] == "feature-extraction" and contract["workload"].get("materialize_features") and repeat == 0:
+            feature_count = sum(len(batch) for batch in measured_batches)
+            feature_sink = np.lib.format.open_memmap(
+                output_path.with_name(f"features_{name}.npy"),
+                mode="w+",
+                dtype=np.float32,
+                shape=(feature_count, expected_width),
+            )
+
+        for expected in measured_batches:
+            batch_started = time.perf_counter_ns()
+            load_started = batch_started
+            batch = adapter.load(expected)
+            load_finished = time.perf_counter_ns()
+            _validate_identity(batch, expected)
+            h2d_started = time.perf_counter_ns()
+            batch = _to_device(batch, device)
+            if device.type == "cuda":
+                torch.cuda.current_stream(device).synchronize()
+            h2d_finished = time.perf_counter_ns()
+            if training and training_probe is None:
+                # Compare initial-model preprocessing semantics before any updates.
+                model.eval()
+                semantic_output = _forward(model, batch.inputs, expected_width)
+                semantic_captured = _capture_semantic(
+                    semantic_store, batch, semantic_output, expected, semantic_limit,
+                )
+                model.train()
+                before = [p.detach().clone() for p in model.parameters() if p.requires_grad]
+                if device.type == "cuda":
+                    torch.cuda.current_stream(device).synchronize()
+                # The first-step audit is outside measured batch latency.
+                audit_finished = time.perf_counter_ns()
+                batch_started += audit_finished - h2d_finished
+            model_started = time.perf_counter_ns()
+            if training:
+                output, loss = _training_step(model, optimizer, batch, expected_width)
+                training_loss_sum.add_(loss.double() * len(expected))
+            else:
+                output = _forward(model, batch.inputs, expected_width)
+            if contract["workload"]["kind"] == "evaluation":
+                cross_entropy_sum += float(
+                    torch.nn.functional.cross_entropy(
+                        output, batch.labels, reduction="sum"
+                    ).item()
+                )
+                top5 = output.topk(5, dim=1).indices
+                matches = top5.eq(batch.labels.reshape(-1, 1))
+                correct1 += int(matches[:, :1].sum().item())
+                correct5 += int(matches.sum().item())
+                predictions_top1.append(top5[:, 0].detach().cpu().numpy())
+                predictions_top5.append(top5.detach().cpu().numpy())
+            elif not training:
+                feature_sum.add_(output.detach().double().sum(dim=0))
+                feature_square_sum.add_(output.detach().double().square().sum(dim=0))
+            if device.type == "cuda":
+                torch.cuda.current_stream(device).synchronize()
+            model_finished = time.perf_counter_ns()
+            batch_finished = model_finished
+            if training and training_probe is None:
+                training_probe = _training_probe(model, before)
+                if not all(training_probe.values()):
+                    raise RuntimeError(f"training first-step check failed: {training_probe}")
+                del before, semantic_output
+            if repeat_to_first_batch_ms is None:
+                repeat_to_first_batch_ms = (batch_finished - repeat_started_ns) / 1.0e6
+                if repeat == 0:
+                    process_scope_to_first_batch_ms = (batch_finished - pipeline_started_ns) / 1.0e6
+                    print(
+                        "FASTLENS_FIRST_OUTPUT_READY "
+                        + json.dumps(
+                            {
+                                "pipeline": name,
+                                "process_scope_time_to_first_batch_ms": process_scope_to_first_batch_ms,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+            _finalize_native_stats(batch)
+            _release_native_context(batch)
+            if not training and repeat == 0 and semantic_captured < semantic_limit:
+                semantic_captured += _capture_semantic(
+                    semantic_store,
+                    batch,
+                    output,
+                    expected,
+                    semantic_limit - semantic_captured,
+                )
+            if feature_sink is not None:
+                sink_started = time.perf_counter_ns()
+                host_features = output.detach().float().cpu().numpy()
+                feature_sink[feature_sink_offset : feature_sink_offset + len(expected)] = host_features
+                feature_sink_offset += len(expected)
+                sink_ms.append((time.perf_counter_ns() - sink_started) / 1.0e6)
+            for stats in batch.native_stats:
+                _accumulate_native(native_totals, stats)
+                native_segments.append(
+                    {
+                        key: stats.get(key)
+                        for key in (
+                            "segment_image_count",
+                            "segment_first_image_id",
+                            "segment_last_image_id",
+                            "segment_mode",
+                            "segment_shard_id",
+                            "segment_cross_shard_count",
+                            "shard_reactivation_count",
+                            "duplicate_physical_read_count",
+                            "rowgroup_revisit_count",
+                            "vector_run_revisit_count",
+                            "physical_read_order_inversions",
+                            "planned_vector_count",
+                            "actual_vector_count",
+                            "full_vector_count",
+                            "selected_compressed_payload_bytes",
+                            "compressed_payload_bytes_read",
+                            "full_compressed_payload_bytes",
+                            "pread_count",
+                            "rowgroup_count",
+                            "fixed_transform_image_count",
+                            "planning_ms",
+                            "prefetch_producer_active_ms",
+                            "prefetch_ordered_submission_ms",
+                            "prefetch_submit_to_ready_ms",
+                            "prefetch_consumer_wait_ms",
+                            "prefetch_process_scope_ready_ms",
+                            "sync_rowgroup_read_ms",
+                            "workset_count",
+                            "workset_build_ms",
+                            "workset_upload_ms",
+                            "decode_ms",
+                            "fixed_transform_ms",
+                            "planless_transform_active_output_planning_ms",
+                            "planless_transform_group_workset_build_ms",
+                            "planless_transform_active_output_count_ms",
+                            "planless_transform_active_output_prefix_ms",
+                            "planless_transform_active_output_fill_ms",
+                            "planless_transform_gpu_kernel_ms",
+                            "planless_transform_output_block_count",
+                            "planless_transform_source_contribution_count",
+                            "planless_transform_source_contribution_visit_count",
+                            "planless_transform_output_workset_ownership_count",
+                            "planless_transform_active_output_schedule_build_count",
+                            "active_output_schedule_sidecar_hit_count",
+                            "active_output_schedule_sidecar_miss_count",
+                            "active_output_schedule_sidecar_reject_count",
+                            "active_output_schedule_sidecar_persist_count",
+                            "active_output_schedule_sidecar_bytes",
+                            "active_output_schedule_interval_count",
+                            "active_output_schedule_mapped_bytes_peak",
+                            "active_output_schedule_load_ms",
+                            "active_output_schedule_validation_ms",
+                            "active_output_schedule_materialize_ms",
+                            "active_output_schedule_persist_ms",
+                            "coordinate_group_lookup_count",
+                            "coordinate_group_index_entries",
+                            "coordinate_group_index_populated",
+                            "coordinate_group_index_holes",
+                            "coordinate_group_index_bytes",
+                            "coordinate_group_index_density",
+                        )
+                        if key in stats
+                    }
+                )
+            latency_ms.append((batch_finished - batch_started) / 1.0e6)
+            load_ms.append((load_finished - load_started) / 1.0e6)
+            h2d_ms.append((h2d_finished - h2d_started) / 1.0e6)
+            model_ms.append((model_finished - model_started) / 1.0e6)
+            # Release per-model-batch views before the next adapter.load().
+            # Tensor ownership and the native pipeline then determine when an
+            # exhausted segment can be reclaimed.
+            del batch
+
+        if feature_sink is not None:
+            feature_sink.flush()
+        gpu_utilization.stop()
+        process_io = _process_io_delta(process_io_before, _process_io_snapshot())
+        host_after = _process_memory_snapshot()
+        seconds = sum(latency_ms) / 1000.0
+        images = sum(len(batch) for batch in measured_batches)
+        steady_images = sum(len(batch) for batch in measured_batches[1:])
+        steady_seconds = sum(latency_ms[1:]) / 1000.0
+        record: dict[str, Any] = {
+            "repeat": repeat,
+            "images": images,
+            "batches": len(measured_batches),
+            "seconds": seconds,
+            "throughput_images_per_s": images / seconds,
+            "time_to_first_batch_ms": latency_ms[0],
+            "first_shard_ready_ms": (
+                float(native_segments[0]["prefetch_submit_to_ready_ms"])
+                if native_segments
+                and "prefetch_submit_to_ready_ms" in native_segments[0]
+                and native_segments[0].get("segment_mode") in {"manifest-shard", "native-logical-batch"}
+                else None
+            ),
+            "process_scope_first_shard_ready_ms": (
+                float(native_segments[0]["prefetch_process_scope_ready_ms"])
+                if repeat == 0
+                and native_segments
+                and "prefetch_process_scope_ready_ms" in native_segments[0]
+                and native_segments[0].get("segment_mode") in {"manifest-shard", "native-logical-batch"}
+                else None
+            ),
+            "repeat_scope_time_to_first_batch_ms": repeat_to_first_batch_ms,
+            "repeat_scope_seconds": (time.perf_counter_ns() - repeat_started_ns) / 1.0e9,
+            "repeat_scope_throughput_images_per_s": (
+                images / ((time.perf_counter_ns() - repeat_started_ns) / 1.0e9)
+            ),
+            "process_scope_time_to_first_batch_ms": process_scope_to_first_batch_ms,
+            "process_scope_throughput_images_per_s": (
+                images / ((time.perf_counter_ns() - pipeline_started_ns) / 1.0e9)
+                if repeat == 0
+                else None
+            ),
+            "steady_images": steady_images,
+            "steady_seconds": steady_seconds,
+            "steady_throughput_images_per_s": (
+                steady_images / steady_seconds if steady_images and steady_seconds else None
+            ),
+            "latency_ms": distribution(latency_ms),
+            "loader_submit_ms": distribution(load_ms),
+            "top_level_h2d_ms": distribution(h2d_ms),
+            "model_ms": distribution(model_ms),
+            "feature_sink_ms": distribution(sink_ms) if sink_ms else {"count": 0},
+            "throughput_scope": (
+                "load+H2D+zero_grad+forward+cross_entropy+backward+optimizer.step+loss accumulation"
+                if training else "load+top-level-H2D+model+metrics; optional feature sink reported separately"
+            ),
+            "cpu_process_seconds": time.process_time() - process_started,
+            "host_rss_before_bytes": host_before["rss_bytes"],
+            "host_rss_after_bytes": host_after["rss_bytes"],
+            "host_peak_rss_bytes": host_after["peak_rss_bytes"],
+            "process_io": process_io,
+            "peak_torch_gpu_allocated_bytes": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
+            "peak_torch_gpu_reserved_bytes": int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else 0,
+            "gpu_utilization_percent": (
+                distribution(gpu_utilization.values)
+                if gpu_utilization.values
+                else {"count": 0, "error": gpu_utilization.error}
+            ),
+            "native_totals": native_totals,
+            "native_segments": native_segments,
+            "sample_trace": measured_trace,
+        }
+        if training:
+            mean_loss = float(training_loss_sum / images)
+            finite_parameters = bool(torch.stack([
+                torch.isfinite(p).all() for p in model.parameters()
+            ]).all())
+            if not math.isfinite(mean_loss) or not finite_parameters:
+                raise RuntimeError("training produced non-finite loss or parameters")
+            record.update({
+                "training_loss": mean_loss,
+                "optimizer_steps": len(measured_batches),
+                "cumulative_optimizer_steps": (repeat + 1) * len(measured_batches),
+                "finite_parameters": finite_parameters,
+            })
+        elif contract["workload"]["kind"] == "evaluation":
+            record.update(
+                {
+                    "correct_top1": correct1,
+                    "correct_top5": correct5,
+                    "accuracy_top1": correct1 / images,
+                    "accuracy_top5": correct5 / images,
+                    "cross_entropy_loss": cross_entropy_sum / images,
+                    "top1_predictions_sha256": hashlib.sha256(np.concatenate(predictions_top1).tobytes()).hexdigest(),
+                    "top5_predictions_sha256": hashlib.sha256(np.concatenate(predictions_top5).tobytes()).hexdigest(),
+                }
+            )
+            if repeat == 0:
+                semantic_store["top1_predictions"] = [np.concatenate(predictions_top1)]
+                semantic_store["top5_predictions"] = [np.concatenate(predictions_top5)]
+        else:
+            record.update(
+                {
+                    "feature_sum": feature_sum.detach().cpu().tolist(),
+                    "feature_square_sum": feature_square_sum.detach().cpu().tolist(),
+                }
+            )
+        repeat_records.append(record)
+        adapter.end_repeat()
+
+    _write_semantic(
+        semantic_artifact,
+        semantic_store,
+        {
+            "pipeline": name,
+            "workload": contract["workload"],
+            "sample_count": semantic_captured,
+            "output_width": expected_width,
+        },
+    )
+    result = {
+        "schema_version": PIPELINE_RESULT_SCHEMA,
+        "pipeline": name,
+        "display_name": contract["pipelines"][name].get("display_name", name),
+        "domain": adapter.domain,
+        "worker_semantics": adapter.worker_semantics,
+        "contract": str(contract_path.resolve()),
+        "contract_sha256": sha256_json(contract),
+        "sample_manifest_sha256": contract["dataset"]["sample_manifest_sha256"],
+        "input_format": "L3" if "l3" in contract["pipelines"].get(name, {}) else None,
+        "execution": contract["execution"],
+        "workload": contract["workload"],
+        "model": model_config,
+        "pipeline_config": contract["pipelines"][name],
+        "model_stream_priority": model_stream_priority,
+        "cold_start_scope": {
+            "definition": (
+                "run_pipeline entry through first measured repeat; includes input verification, reader/adapter "
+                "construction, model/checkpoint construction, explicitly submitted loader preparation, data path, "
+                "model, and metrics; includes adapter-local binding/profile imports but excludes interpreter and "
+                "top-level module import before run_pipeline"
+            ),
+            "adapter_construction_ms": (adapter_ready_ns - adapter_started_ns) / 1.0e6,
+            "adapter_subphases": (
+                adapter.startup_diagnostics() if hasattr(adapter, "startup_diagnostics") else {}
+            ),
+            "cuda_availability_probe_ms": (cuda_available_ready_ns - cuda_probe_started_ns) / 1.0e6,
+            "cuda_set_device_ms": (cuda_device_ready_ns - cuda_available_ready_ns) / 1.0e6,
+            "loader_prime_submit_ms": (cold_prime_submitted_ns - cold_prime_started_ns) / 1.0e6,
+            "model_construction_ms": (model_ready_ns - model_started_ns) / 1.0e6,
+            "model_prime_ms": (model_prime_ready_ns - model_prime_started_ns) / 1.0e6,
+            "model_prime_enabled": bool(contract["execution"].get("cold_start_model_prime", True)),
+            "loader_preparation_precedes_model_construction": True,
+        },
+        "semantic_artifact": str(semantic_artifact.resolve()),
+        **({"training_probe": training_probe} if training else {}),
+        "repeats": repeat_records,
+    }
+    write_json(output_path, result)
+    adapter.close()
+    if previous_stream is not None:
+        previous_stream.synchronize()
+        torch.cuda.set_stream(previous_stream)
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pipeline", choices=PIPELINES, required=True)
+    parser.add_argument("--contract", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    result = run_pipeline(args.pipeline, args.contract, args.output)
+    print(
+        "RESULT_JSON "
+        + json.dumps(
+            {
+                "pipeline": args.pipeline,
+                "repeats": len(result["repeats"]),
+                "throughput_images_per_s": [item["throughput_images_per_s"] for item in result["repeats"]],
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

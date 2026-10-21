@@ -175,8 +175,8 @@ enum class OperatorToken : uint16_t {
 	EXP_RLE_U08_SLPATCH_U16              = 152,
 	EXP_DELTA_U08                        = 153,
 	EXP_RLE_U08_U16                      = 154,
-	EXP_GALP_FLT                         = 155,
-	EXP_GALP_DBL                         = 156
+	EXP_FASTLENS_FLT                     = 155,
+	EXP_FASTLENS_DBL                     = 156
 };
 
 inline const OperatorToken (&EnumValuesOperatorToken())[157] {
@@ -335,8 +335,8 @@ inline const OperatorToken (&EnumValuesOperatorToken())[157] {
 	                                       OperatorToken::EXP_RLE_U08_SLPATCH_U16,
 	                                       OperatorToken::EXP_DELTA_U08,
 	                                       OperatorToken::EXP_RLE_U08_U16,
-	                                       OperatorToken::EXP_GALP_FLT,
-	                                       OperatorToken::EXP_GALP_DBL};
+	                                       OperatorToken::EXP_FASTLENS_FLT,
+	                                       OperatorToken::EXP_FASTLENS_DBL};
 	return values;
 }
 
@@ -496,14 +496,14 @@ inline const char* const* EnumNamesOperatorToken() {
 	                                       "EXP_RLE_U08_SLPATCH_U16",
 	                                       "EXP_DELTA_U08",
 	                                       "EXP_RLE_U08_U16",
-	                                       "EXP_GALP_FLT",
-	                                       "EXP_GALP_DBL",
+	                                       "EXP_FASTLENS_FLT",
+	                                       "EXP_FASTLENS_DBL",
 	                                       nullptr};
 	return names;
 }
 
 inline const char* EnumNameOperatorToken(OperatorToken e) {
-	if (::flatbuffers::IsOutRange(e, OperatorToken::INVALID, OperatorToken::EXP_GALP_DBL))
+	if (::flatbuffers::IsOutRange(e, OperatorToken::INVALID, OperatorToken::EXP_FASTLENS_DBL))
 		return "";
 	const size_t index = static_cast<size_t>(e);
 	return EnumNamesOperatorToken()[index];

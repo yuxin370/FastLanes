@@ -391,13 +391,13 @@ void make_enc_alp_expr(PhysicalExpr&      physical_expr,
 }
 
 /*--------------------------------------------------------------------------------------------------------------------*\
- * make_galp_expr
+ * make_fastlens_expr
 \*--------------------------------------------------------------------------------------------------------------------*/
 template <typename PT>
-void make_enc_galp_expr(PhysicalExpr&      physical_expr,
-                        const rowgroup_pt& rowgroup,
-                        ColumnDescriptorT& column_descriptor,
-                        InterpreterState&  state) {
+void make_enc_fastlens_expr(PhysicalExpr&      physical_expr,
+                            const rowgroup_pt& rowgroup,
+                            ColumnDescriptorT& column_descriptor,
+                            InterpreterState&  state) {
 	auto&       operators = physical_expr.operators;
 	const auto& column    = rowgroup[column_descriptor.idx];
 
@@ -679,12 +679,12 @@ sp<PhysicalExpr> Interpreter::Encoding::Interpret(ColumnDescriptorT& column_desc
 			make_enc_alp_expr<flt_pt>(*physical_expr, physical_rowgroup, column_descriptor, state);
 			break;
 		}
-		case EXP_GALP_FLT: {
-			make_enc_galp_expr<flt_pt>(*physical_expr, physical_rowgroup, column_descriptor, state);
+		case EXP_FASTLENS_FLT: {
+			make_enc_fastlens_expr<flt_pt>(*physical_expr, physical_rowgroup, column_descriptor, state);
 			break;
 		}
-		case EXP_GALP_DBL: {
-			make_enc_galp_expr<dbl_pt>(*physical_expr, physical_rowgroup, column_descriptor, state);
+		case EXP_FASTLENS_DBL: {
+			make_enc_fastlens_expr<dbl_pt>(*physical_expr, physical_rowgroup, column_descriptor, state);
 			break;
 		}
 		case EXP_ALP_RD_DBL: {

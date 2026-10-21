@@ -1,0 +1,229 @@
+enable_language(CUDA)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# ────────────────────────────────────────────────
+# 0. Global settings
+# ────────────────────────────────────────────────
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+
+option(FASTLENS_BUILD_TESTS "Build FASTLENS tests" ${BUILD_TESTING})
+option(FASTLENS_BUILD_BENCHMARKS "Build FASTLENS benchmarks" OFF)
+option(FASTLENS_BUILD_TOOLS "Build FASTLENS command-line tools" ON)
+option(FASTLENS_BUILD_EXAMPLES "Build FASTLENS examples" OFF)
+option(FASTLENS_BUILD_TORCH "Build optional PyTorch direct-DCT runtime bindings" OFF)
+option(FASTLENS_INSTALL_TORCH_PACKAGE "Install the FASTLENS Python package and PyTorch binding" OFF)
+option(FASTLENS_WITH_NVCOMP "Build nvCOMP compressor comparison targets" OFF)
+option(FASTLENS_WITH_JPEG_DCT "Build JPEG DCT dataset reader/compressor" ON)
+option(FASTLENS_CUDA_EMBED_SOURCE_IN_PTX "Embed CUDA source in PTX for diagnostic builds" OFF)
+if (DEFINED FLS_ENABLE_INSTALL)
+    set(FASTLENS_ENABLE_INSTALL_DEFAULT ${FLS_ENABLE_INSTALL})
+else ()
+    set(FASTLENS_ENABLE_INSTALL_DEFAULT ON)
+endif ()
+option(FASTLENS_ENABLE_INSTALL "Generate FASTLENS install and package targets" ${FASTLENS_ENABLE_INSTALL_DEFAULT})
+
+# ────────────────────────────────────────────────
+# 1. CUDA Toolkit
+# ────────────────────────────────────────────────
+find_package(CUDAToolkit REQUIRED)
+
+if (FASTLENS_WITH_JPEG_DCT)
+    find_package(JPEG QUIET)
+    if (NOT JPEG_FOUND)
+        find_path(FASTLENS_JPEG_INCLUDE_DIR NAMES jpeglib.h)
+        find_library(FASTLENS_JPEG_LIBRARY NAMES jpeg)
+        if (FASTLENS_JPEG_INCLUDE_DIR AND FASTLENS_JPEG_LIBRARY)
+            add_library(JPEG::JPEG UNKNOWN IMPORTED)
+            set_target_properties(JPEG::JPEG PROPERTIES
+                    IMPORTED_LOCATION "${FASTLENS_JPEG_LIBRARY}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${FASTLENS_JPEG_INCLUDE_DIR}")
+            set(JPEG_FOUND ON)
+        endif ()
+    endif ()
+    if (NOT JPEG_FOUND)
+        message(WARNING
+                "FASTLENS_WITH_JPEG_DCT=ON but CMake could not find the libjpeg-compatible API "
+                "(jpeglib.h and libjpeg.so). Disabling the JPEG DCT reader/compressor. "
+                "The libturbojpeg0-dev package provides the TurboJPEG API only and is not sufficient for "
+                "jpeg_read_coefficients. Install libjpeg-turbo8-dev or libjpeg-dev, or pass "
+                "-DJPEG_INCLUDE_DIR=/path/to/include -DJPEG_LIBRARY=/path/to/libjpeg.so.")
+        set(FASTLENS_WITH_JPEG_DCT OFF)
+    endif ()
+endif ()
+
+# ────────────────────────────────────────────────
+# 2. nvCOMP (optional; required only for compressor comparison targets)
+# ────────────────────────────────────────────────
+if (FASTLENS_WITH_NVCOMP)
+    find_package(nvcomp CONFIG REQUIRED)
+
+    get_target_property(NVCOMP_VERSION nvcomp::nvcomp VERSION)
+    get_target_property(NVCOMP_INC_DIRS nvcomp::nvcomp INTERFACE_INCLUDE_DIRECTORIES)
+    get_target_property(NVCOMP_LIBS nvcomp::nvcomp INTERFACE_LINK_LIBRARIES)
+
+    message(STATUS "nvCOMP version ..........: ${NVCOMP_VERSION}")
+    message(STATUS "nvCOMP include dirs .....: ${NVCOMP_INC_DIRS}")
+    message(STATUS "nvCOMP libs .............: ${NVCOMP_LIBS}")
+endif ()
+
+# ────────────────────────────────────────────────
+# 3. Thrust / CCCL – prefer toolkit copy, fall back to CCCL ≥ 2.3
+# ────────────────────────────────────────────────
+find_path(THRUST_INCLUDE_DIR
+        NAMES thrust/version.h
+        thrust/device_uvector.h
+        HINTS ${CUDAToolkit_INCLUDE_DIRS})
+
+if (NOT THRUST_INCLUDE_DIR)
+    message(FATAL_ERROR "Need Thrust ≥ 2.2 (with device_uvector.h) in CUDA Toolkit")
+endif ()
+
+add_library(Thrust::Thrust INTERFACE IMPORTED)
+target_include_directories(Thrust::Thrust INTERFACE ${THRUST_INCLUDE_DIR})
+
+# ────────────────────────────────────────────────
+# 4. User-tunable options & warnings
+# ────────────────────────────────────────────────
+option(FASTLENS_VERBOSE_BUILD "Print every compile/link command" OFF)
+if (FASTLENS_VERBOSE_BUILD)
+    set(CMAKE_VERBOSE_MAKEFILE ON)
+endif ()
+
+# Respect explicitly configured launchers. Otherwise use the same optional
+# ccache executable for both host C++ and CUDA compilation.
+find_program(FASTLENS_CCACHE_EXECUTABLE NAMES ccache)
+if (FASTLENS_CCACHE_EXECUTABLE)
+    if (NOT DEFINED CACHE{CMAKE_CXX_COMPILER_LAUNCHER})
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${FASTLENS_CCACHE_EXECUTABLE}" CACHE STRING
+            "Launcher for C++ compilation")
+    endif ()
+    if (NOT DEFINED CACHE{CMAKE_CUDA_COMPILER_LAUNCHER})
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${FASTLENS_CCACHE_EXECUTABLE}" CACHE STRING
+            "Launcher for CUDA compilation")
+    endif ()
+endif ()
+
+set(COMMON_WARNINGS "")
+set(CLANG_ONLY_WARNINGS
+        -Wno-c++98-compat-local-type-template-args
+        -Wno-c++98-compat-pedantic
+        -Wno-c++98-compat
+        -Wno-padded
+        -Wno-float-equal
+        -Wno-global-constructors
+        -Wno-exit-time-destructors
+        -Wno-float-conversion
+        -Wno-sign-conversion
+        -Wno-implicit-int-float-conversion
+        -Wno-unused-parameter
+        -Wno-unused-variable
+)
+
+# set(NVCC_ANALYZE_FLAGS
+#     --resource-usage
+#     --keep
+#     --keep-dir=${CMAKE_BINARY_DIR}/nvcc_keep
+#     -Xptxas=-v
+# )
+
+
+macro(apply_warnings tgt)
+	    target_compile_options(${tgt} PRIVATE
+	            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo --diag-suppress=550>
+	            $<$<COMPILE_LANGUAGE:CXX>:${COMMON_WARNINGS}>
+	            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:${CLANG_ONLY_WARNINGS}>
+	            $<$<COMPILE_LANGUAGE:CUDA>:${COMMON_WARNINGS}>)
+	    if (FASTLENS_CUDA_EMBED_SOURCE_IN_PTX)
+	        target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-src-in-ptx>)
+	    endif ()
+endmacro()
+
+# Sample data root for tests and benchmarks. Attach the definition to those
+# targets instead of the core library to keep source paths out of installed
+# artifacts.
+set(FASTLENS_DATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH
+    "Root directory containing data/floats and data/doubles for fastlens tests and benchmarks")
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+        set(FASTLENS_INCLUDE_BOUNDARY_CHECK_COMMAND
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check_include_boundaries.py
+                        --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/..
+                        --fastlens-root ${CMAKE_CURRENT_SOURCE_DIR})
+        add_custom_target(fastlens_include_boundary_checks
+                ${FASTLENS_INCLUDE_BOUNDARY_CHECK_COMMAND}
+                COMMENT "Checking FASTLENS include boundaries"
+                VERBATIM)
+else ()
+        set(FASTLENS_INCLUDE_BOUNDARY_CHECK_COMMAND)
+        message(STATUS "Python3 interpreter not found; fastlens_include_boundary_checks target is unavailable")
+endif ()
+
+add_custom_target(fastlens_api_boundary_checks
+	COMMAND ${CMAKE_COMMAND}
+	        -DFASTLENS_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+	        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FastLensPublicApiBoundaryCheck.cmake
+        ${FASTLENS_INCLUDE_BOUNDARY_CHECK_COMMAND}
+        COMMENT "Checking FASTLENS public API and include boundaries"
+        VERBATIM)
+
+# ────────────────────────────────────────────────
+# 5. FASTLENS core static library
+# ────────────────────────────────────────────────
+add_subdirectory(src)
+
+# ────────────────────────────────────────────────
+# 6. Optional extension libraries
+# ────────────────────────────────────────────────
+add_subdirectory(extensions/alp)
+
+# ────────────────────────────────────────────────
+# 7. Shared benchmark support
+# ────────────────────────────────────────────────
+if (FASTLENS_BUILD_TOOLS OR (FASTLENS_BUILD_TESTS AND FASTLENS_WITH_JPEG_DCT))
+    add_subdirectory(tools/benchmark_support)
+endif ()
+
+# ────────────────────────────────────────────────
+# 8. Tests
+# ────────────────────────────────────────────────
+if (FASTLENS_BUILD_TESTS)
+    add_subdirectory(tests)
+endif ()
+
+## ────────────────────────────────────────────────
+## 9. Benchmarks
+## ────────────────────────────────────────────────
+if (FASTLENS_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif ()
+
+## ────────────────────────────────────────────────
+## 10. Tools
+## ────────────────────────────────────────────────
+if (FASTLENS_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif ()
+
+## ────────────────────────────────────────────────
+## 11. Examples
+## ────────────────────────────────────────────────
+if (FASTLENS_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif ()
+
+## ────────────────────────────────────────────────
+## 12. Optional PyTorch bindings
+## ────────────────────────────────────────────────
+if (FASTLENS_BUILD_TORCH)
+    if (NOT FASTLENS_WITH_JPEG_DCT)
+        message(FATAL_ERROR "FASTLENS_BUILD_TORCH requires FASTLENS_WITH_JPEG_DCT=ON")
+    endif ()
+    add_subdirectory(torch)
+elseif (FASTLENS_INSTALL_TORCH_PACKAGE)
+    message(FATAL_ERROR "FASTLENS_INSTALL_TORCH_PACKAGE requires FASTLENS_BUILD_TORCH=ON")
+endif ()

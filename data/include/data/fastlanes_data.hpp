@@ -14,7 +14,7 @@
 #include "data/example.hpp"
 #include "data/fannie_mae.hpp"
 #include "data/fc_bench.hpp"
-#include "data/galp.hpp"
+#include "data/fastlens.hpp"
 #include "data/generated.hpp"
 #include "data/issues.hpp"
 #include "data/mnist.hpp"

@@ -26,7 +26,7 @@ license = { file = "LICENSE" }
 keywords = ["fastlanes", "file-format"]
 
 [project.optional-dependencies]
-galp = ["torch>=2.11"]
+fastlens = ["torch>=2.11"]
 
 [tool.setuptools_scm]
 write_to = "python/pyfastlanes/_version.py"
@@ -58,15 +58,15 @@ sdist.include = [
     "CMakeLists.txt",
     "cmake/**",
     "src/**",
-    "galp/CMakeLists.txt",
-    "galp/__init__.py",
-    "galp/cmake/**",
-    "galp/diagnostics/**",
-    "galp/extensions/**",
-    "galp/include/**",
-    "galp/profiles/**",
-    "galp/src/**",
-    "galp/torch/**",
+    "fastlens/CMakeLists.txt",
+    "fastlens/__init__.py",
+    "fastlens/cmake/**",
+    "fastlens/diagnostics/**",
+    "fastlens/extensions/**",
+    "fastlens/include/**",
+    "fastlens/profiles/**",
+    "fastlens/src/**",
+    "fastlens/torch/**",
 ]
 
 [tool.scikit-build.wheel]

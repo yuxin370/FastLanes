@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Generate disjoint train/validation JSON files for the training benchmark.
+
+Two modes are supported:
+
+* legacy held-out mode uses one JPEG/FASTLENS population and deterministically
+  splits it into train/validation subsets;
+* official-split mode accepts independent ImageNet train and validation JPEG
+  roots plus their independent FASTLENS manifests.  This is the production mode
+  that matches RGB-no-more training/evaluation dataset semantics.
+
+In both modes ``fastlens_image_id`` is the sorted-path ordinal in the corresponding
+FASTLENS manifest, never a cross-manifest global ID.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import random
+import struct
+import sys
+from itertools import chain
+from pathlib import Path
+from typing import Any, Sequence
+
+
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
+
+from fastlens.benchmarks.baselines.system_rgbnomore.dataset.manifest import jpeg_sampling
+from fastlens.benchmarks.baselines.system_rgbnomore.training.manifest_preflight import preflight_manifest
+
+
+JPEG_SUFFIXES = {".jpg", ".jpeg", ".jpe"}
+LABEL_MAPPING = "imagenet-1k-zero-based"
+MANIFEST_FORMAT = "galp-rgbnomore-training-manifest-v1"
+SUPPORTED_JPEG_SAMPLING = {"4:2:0", "4:4:4"}
+
+
+def _normalize(value: str) -> str:
+    normalized = value.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _load_labels(index_csv: Path) -> dict[str, int]:
+    labels: dict[str, int] = {}
+    with index_csv.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames is None or not {"Filepath", "Label"}.issubset(reader.fieldnames):
+            raise ValueError(f"{index_csv} must contain Filepath and Label columns")
+        for row_number, row in enumerate(reader, start=2):
+            sample_id = _normalize(str(row["Filepath"]))
+            label = int(row["Label"])
+            if not 0 <= label < 1000:
+                raise ValueError(f"{index_csv}:{row_number} has invalid label {label}")
+            if sample_id in labels:
+                raise ValueError(f"{index_csv}:{row_number} duplicates {sample_id!r}")
+            labels[sample_id] = label
+    if not labels:
+        raise ValueError(f"{index_csv} contains no samples")
+    return labels
+
+
+def _collect_jpegs(jpeg_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for directory, subdirectories, filenames in os.walk(jpeg_root):
+        subdirectories.sort()
+        paths.extend(
+            Path(directory) / filename
+            for filename in filenames
+            if Path(filename).suffix.lower() in JPEG_SUFFIXES
+        )
+    paths.sort()
+    if not paths:
+        raise ValueError(f"no JPEG files found below {jpeg_root}")
+    return paths
+
+
+def _fastlens_image_count(manifest: Path) -> int:
+    # Manifest-envelope knowledge is centralized in manifest_preflight.  This
+    # generator only consumes its stable semantic result.
+    return preflight_manifest(manifest).image_count
+
+
+def _selection_sha256(indices: Sequence[int]) -> str:
+    digest = hashlib.sha256()
+    for image_id in indices:
+        digest.update(struct.pack("<Q", image_id))
+    return digest.hexdigest()
+
+
+def _select_indices(
+    paths: Sequence[Path], *, train_count: int, val_count: int, seed: int
+) -> tuple[list[int], list[int], dict[int, str]]:
+    population = len(paths)
+    if val_count <= 0 or val_count >= population:
+        raise ValueError(f"val-count must be in [1,{population - 1}], got {val_count}")
+    if train_count < 0:
+        raise ValueError("train-count must be non-negative; use 0 for all remaining samples")
+    rng = random.Random(seed)
+    if train_count == 0:
+        sampling = {image_id: jpeg_sampling(path) for image_id, path in enumerate(paths)}
+        eligible = [
+            image_id
+            for image_id, mode in sampling.items()
+            if mode in SUPPORTED_JPEG_SAMPLING
+        ]
+        if val_count >= len(eligible):
+            raise ValueError(
+                f"val-count must be smaller than the {len(eligible)} eligible JPEG population"
+            )
+        rng.shuffle(eligible)
+        val_indices = eligible[:val_count]
+        train_indices = eligible[val_count:]
+    else:
+        if train_count + val_count > population:
+            raise ValueError(
+                f"train-count + val-count exceeds the {population}-image population"
+            )
+        required = train_count + val_count
+        selected: list[int] = []
+        seen: set[int] = set()
+        sampling: dict[int, str] = {}
+        while len(selected) < required and len(seen) < population:
+            image_id = rng.randrange(population)
+            if image_id in seen:
+                continue
+            seen.add(image_id)
+            mode = jpeg_sampling(paths[image_id])
+            sampling[image_id] = mode
+            if mode in SUPPORTED_JPEG_SAMPLING:
+                selected.append(image_id)
+        if len(selected) != required:
+            raise ValueError(
+                f"requested {required} samples, but found only {len(selected)} eligible JPEGs"
+            )
+        val_indices = selected[:val_count]
+        train_indices = selected[val_count:]
+    selected_sampling = {
+        image_id: sampling[image_id] for image_id in chain(train_indices, val_indices)
+    }
+    return train_indices, val_indices, selected_sampling
+
+
+def _select_split_indices(
+    paths: Sequence[Path], *, count: int, seed: int, split: str
+) -> tuple[list[int], dict[int, str]]:
+    """Select one independent split while preserving manifest-local IDs."""
+
+    if count < 0:
+        raise ValueError(f"{split}-count must be non-negative; use 0 for all samples")
+    population = len(paths)
+    if count > population:
+        raise ValueError(
+            f"{split}-count {count} exceeds the {population}-image population"
+        )
+    if count == 0:
+        indices = list(range(population))
+        sampling = {image_id: jpeg_sampling(paths[image_id]) for image_id in indices}
+        unsupported = [
+            image_id
+            for image_id, mode in sampling.items()
+            if mode not in SUPPORTED_JPEG_SAMPLING
+        ]
+        if unsupported:
+            preview = ", ".join(
+                f"{paths[image_id]}={sampling[image_id]}" for image_id in unsupported[:5]
+            )
+            raise ValueError(
+                f"official {split} split contains {len(unsupported)} JPEGs outside "
+                f"the supported sampling contract {sorted(SUPPORTED_JPEG_SAMPLING)}; "
+                f"first: {preview}"
+            )
+        return indices, sampling
+
+    rng = random.Random(seed)
+    indices: list[int] = []
+    sampling: dict[int, str] = {}
+    seen: set[int] = set()
+    while len(indices) < count and len(seen) < population:
+        image_id = rng.randrange(population)
+        if image_id in seen:
+            continue
+        seen.add(image_id)
+        mode = jpeg_sampling(paths[image_id])
+        sampling[image_id] = mode
+        if mode in SUPPORTED_JPEG_SAMPLING:
+            indices.append(image_id)
+    if len(indices) != count:
+        raise ValueError(
+            f"requested {count} {split} samples, but found only {len(indices)} "
+            "eligible JPEGs"
+        )
+    return indices, {image_id: sampling[image_id] for image_id in indices}
+
+
+def _sample_id(path: Path, jpeg_root: Path, source_split: str) -> str:
+    return f"{source_split}/{path.relative_to(jpeg_root).as_posix()}"
+
+
+def _build_samples(
+    indices: Sequence[int],
+    *,
+    paths: Sequence[Path],
+    labels: dict[str, int],
+    jpeg_root: Path,
+    source_split: str,
+    sampling: dict[int, str],
+    probe_dimensions: bool,
+    progress_interval: int,
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for ordinal, image_id in enumerate(indices, start=1):
+        path = paths[image_id]
+        sample_id = _sample_id(path, jpeg_root, source_split)
+        sample: dict[str, Any] = {
+            "logical_sample_id": sample_id,
+            "path": str(path),
+            "label": labels[sample_id],
+            "galp_image_id": image_id,
+            "jpeg_sampling": sampling[image_id],
+        }
+        if probe_dimensions:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                sample["width"], sample["height"] = map(int, image.size)
+        samples.append(sample)
+        if progress_interval > 0 and ordinal % progress_interval == 0:
+            print(f"prepared {ordinal}/{len(indices)} samples", file=sys.stderr)
+    return samples
+
+
+def _write_json(path: Path, payload: dict[str, Any], *, overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"refusing to overwrite {path}; pass --overwrite")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--jpeg-root", type=Path, required=True)
+    parser.add_argument("--index-csv", type=Path, required=True)
+    parser.add_argument("--fastlens-manifest", type=Path, required=True)
+    parser.add_argument("--validation-jpeg-root", type=Path)
+    parser.add_argument("--validation-index-csv", type=Path)
+    parser.add_argument("--fastlens-validation-manifest", type=Path)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--source-split", default="train")
+    parser.add_argument("--validation-source-split", default="val")
+    parser.add_argument(
+        "--train-count",
+        type=int,
+        default=100_000,
+        help="Number of training samples; use 0 for every sample not held out for validation.",
+    )
+    parser.add_argument(
+        "--val-count",
+        type=int,
+        default=10_000,
+        help=(
+            "Validation samples; in official-split mode use 0 for the complete "
+            "independent validation population."
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=11_997_733)
+    parser.add_argument(
+        "--probe-dimensions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Read and store JPEG dimensions now instead of during benchmark startup.",
+    )
+    parser.add_argument("--progress-interval", type=int, default=10_000)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    jpeg_root = args.jpeg_root.resolve()
+    index_csv = args.index_csv.resolve()
+    fastlens_manifest = args.fastlens_manifest.resolve()
+    official_values = (
+        args.validation_jpeg_root,
+        args.validation_index_csv,
+        args.fastlens_validation_manifest,
+    )
+    official_mode = any(value is not None for value in official_values)
+    if official_mode and not all(value is not None for value in official_values):
+        raise ValueError(
+            "official-split mode requires --validation-jpeg-root, "
+            "--validation-index-csv, and --fastlens-validation-manifest together"
+        )
+    if not jpeg_root.is_dir():
+        raise FileNotFoundError(jpeg_root)
+    if not index_csv.is_file():
+        raise FileNotFoundError(index_csv)
+    if not fastlens_manifest.is_file():
+        raise FileNotFoundError(fastlens_manifest)
+
+    paths = _collect_jpegs(jpeg_root)
+    labels = _load_labels(index_csv)
+    if len(labels) != len(paths):
+        raise ValueError(
+            f"JPEG/index population mismatch: {len(paths)} files versus {len(labels)} index rows"
+        )
+    for path in paths:
+        sample_id = _sample_id(path, jpeg_root, args.source_split)
+        if sample_id not in labels:
+            raise ValueError(f"JPEG is missing from label index: {sample_id}")
+
+    manifest_count = _fastlens_image_count(fastlens_manifest)
+    if manifest_count != len(paths):
+        raise ValueError(
+            f"FASTLENS/JPEG population mismatch: manifest has {manifest_count} images, "
+            f"JPEG root has {len(paths)}"
+        )
+
+    common = {
+        "format": MANIFEST_FORMAT,
+        "label_mapping": LABEL_MAPPING,
+        "selection_seed": args.seed,
+        "jpeg_sampling_eligibility": sorted(SUPPORTED_JPEG_SAMPLING),
+    }
+    if official_mode:
+        validation_jpeg_root = args.validation_jpeg_root.resolve()
+        validation_index_csv = args.validation_index_csv.resolve()
+        validation_fastlens_manifest = args.fastlens_validation_manifest.resolve()
+        if not validation_jpeg_root.is_dir():
+            raise FileNotFoundError(validation_jpeg_root)
+        if not validation_index_csv.is_file():
+            raise FileNotFoundError(validation_index_csv)
+        if not validation_fastlens_manifest.is_file():
+            raise FileNotFoundError(validation_fastlens_manifest)
+
+        validation_paths = _collect_jpegs(validation_jpeg_root)
+        validation_labels = _load_labels(validation_index_csv)
+        if len(validation_labels) != len(validation_paths):
+            raise ValueError(
+                "validation JPEG/index population mismatch: "
+                f"{len(validation_paths)} files versus {len(validation_labels)} index rows"
+            )
+        for path in validation_paths:
+            sample_id = _sample_id(
+                path, validation_jpeg_root, args.validation_source_split
+            )
+            if sample_id not in validation_labels:
+                raise ValueError(
+                    f"validation JPEG is missing from label index: {sample_id}"
+                )
+        validation_manifest_count = _fastlens_image_count(validation_fastlens_manifest)
+        if validation_manifest_count != len(validation_paths):
+            raise ValueError(
+                "validation FASTLENS/JPEG population mismatch: manifest has "
+                f"{validation_manifest_count} images, JPEG root has "
+                f"{len(validation_paths)}"
+            )
+
+        train_indices, train_sampling = _select_split_indices(
+            paths, count=args.train_count, seed=args.seed, split="train"
+        )
+        val_indices, val_sampling = _select_split_indices(
+            validation_paths,
+            count=args.val_count,
+            seed=args.seed ^ 0x9E3779B9,
+            split="validation",
+        )
+        train_payload = {
+            **common,
+            "split": "train",
+            "source_split": args.source_split,
+            "validation_semantics": "official-imagenet-validation",
+            "jpeg_root": str(jpeg_root),
+            "source_index_csv": str(index_csv),
+            "galp_manifest": str(fastlens_manifest),
+            "population_count": len(paths),
+            "selection_sha256": _selection_sha256(train_indices),
+            "samples": _build_samples(
+                train_indices,
+                paths=paths,
+                labels=labels,
+                jpeg_root=jpeg_root,
+                source_split=args.source_split,
+                sampling=train_sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
+        val_payload = {
+            **common,
+            "split": "val",
+            "source_split": args.validation_source_split,
+            "validation_semantics": "official-imagenet-validation",
+            "jpeg_root": str(validation_jpeg_root),
+            "source_index_csv": str(validation_index_csv),
+            "galp_manifest": str(validation_fastlens_manifest),
+            "population_count": len(validation_paths),
+            "selection_sha256": _selection_sha256(val_indices),
+            "samples": _build_samples(
+                val_indices,
+                paths=validation_paths,
+                labels=validation_labels,
+                jpeg_root=validation_jpeg_root,
+                source_split=args.validation_source_split,
+                sampling=val_sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
+    else:
+        train_indices, val_indices, sampling = _select_indices(
+            paths,
+            train_count=args.train_count,
+            val_count=args.val_count,
+            seed=args.seed,
+        )
+        heldout_common = {
+            **common,
+            "source_split": args.source_split,
+            "validation_semantics": "deterministic-heldout-from-imagenet-train",
+            "jpeg_root": str(jpeg_root),
+            "source_index_csv": str(index_csv),
+            "galp_manifest": str(fastlens_manifest),
+            "population_count": len(paths),
+        }
+        train_payload = {
+            **heldout_common,
+            "split": "train",
+            "selection_sha256": _selection_sha256(train_indices),
+            "samples": _build_samples(
+                train_indices,
+                paths=paths,
+                labels=labels,
+                jpeg_root=jpeg_root,
+                source_split=args.source_split,
+                sampling=sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
+        val_payload = {
+            **heldout_common,
+            "split": "val",
+            "selection_sha256": _selection_sha256(val_indices),
+            "samples": _build_samples(
+                val_indices,
+                paths=paths,
+                labels=labels,
+                jpeg_root=jpeg_root,
+                source_split=args.source_split,
+                sampling=sampling,
+                probe_dimensions=args.probe_dimensions,
+                progress_interval=args.progress_interval,
+            ),
+        }
+    output_dir = args.output_dir.resolve()
+    train_path = output_dir / "train.json"
+    val_path = output_dir / "val.json"
+    _write_json(train_path, train_payload, overwrite=args.overwrite)
+    _write_json(val_path, val_payload, overwrite=args.overwrite)
+    print(
+        json.dumps(
+            {
+                "train_json": str(train_path),
+                "train_samples": len(train_indices),
+                "val_json": str(val_path),
+                "val_samples": len(val_indices),
+                "validation_semantics": train_payload["validation_semantics"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

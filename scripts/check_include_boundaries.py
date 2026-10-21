@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Check lightweight GALP include-boundary rules.
+"""Check lightweight FASTLENS include-boundary rules.
 
 This script intentionally checks only lightweight include and CMake target
 boundaries. It does not move files, inspect transitive dependencies, or classify
-algorithms. Production engine source membership is taken from the galp_engine source list
+algorithms. Production engine source membership is taken from the fastlens_engine source list
 rather than inferred only from paths.
 """
 
@@ -46,45 +46,45 @@ PRIVATE_IMPLEMENTATION_PREFIXES = (
     "alp/",
     "compression/",
     "decompression/",
-    "galp/internal/",
+    "fastlens/internal/",
     "memory/",
 )
 
 BENCHMARK_GENERATED_PREFIXES = (
-    "galp_bench/generated/",
+    "fastlens_bench/generated/",
     "generated/bindings/",
     "benchmarks/generated/bindings/",
-    "benchmarks/include/galp_bench/generated/",
-    "galp/benchmarks/generated/bindings/",
-    "galp/benchmarks/include/galp_bench/generated/",
+    "benchmarks/include/fastlens_bench/generated/",
+    "fastlens/benchmarks/generated/bindings/",
+    "fastlens/benchmarks/include/fastlens_bench/generated/",
     "benchmark/generated/bindings/",
-    "benchmark/include/galp_bench/generated/",
-    "galp/benchmark/generated/bindings/",
-    "galp/benchmark/include/galp_bench/generated/",
+    "benchmark/include/fastlens_bench/generated/",
+    "fastlens/benchmark/generated/bindings/",
+    "fastlens/benchmark/include/fastlens_bench/generated/",
 )
 
 BENCHMARK_HEADER_PREFIXES = (
-    "galp_bench/",
+    "fastlens_bench/",
     "benchmarks/",
-    "galp/benchmarks/",
+    "fastlens/benchmarks/",
     "benchmark/",
-    "galp/benchmark/",
+    "fastlens/benchmark/",
 )
 
 TEST_HEADER_PREFIXES = (
     "tests/",
-    "galp/tests/",
+    "fastlens/tests/",
     "test/",
-    "galp/test/",
+    "fastlens/test/",
 )
 
 SUPPORT_HEADER_PREFIXES = (
-    "galp_extensions/",
-    "galp_tools/benchmark_support/",
-    "galp_tools/data/",
-    "galp_support/",
+    "fastlens_extensions/",
+    "fastlens_tools/benchmark_support/",
+    "fastlens_tools/data/",
+    "fastlens_support/",
     "support/",
-    "galp/support/",
+    "fastlens/support/",
 )
 
 BENCHMARK_HEADER_BASENAMES = {
@@ -93,12 +93,12 @@ BENCHMARK_HEADER_BASENAMES = {
 }
 
 PUBLIC_HEADER_ALLOWLIST: dict[str, set[str]] = {}
-FORBIDDEN_GALP_CORE_LINKS = {
-    "galp_benchmark_support",
-    "galp_generated_bindings",
+FORBIDDEN_FASTLENS_CORE_LINKS = {
+    "fastlens_benchmark_support",
+    "fastlens_generated_bindings",
     "generated-bindings",
-    "galp_tests",
-    "galp_alp_support",
+    "fastlens_tests",
+    "fastlens_alp_support",
 }
 FORBIDDEN_CORE_SOURCE_ROOTS = (
     "benchmarks",
@@ -111,14 +111,14 @@ FORBIDDEN_CORE_SOURCE_ROOTS = (
     "benchmark",
 )
 FORBIDDEN_EXPOSED_INCLUDE_PARTS = (
-    "galp/benchmarks/include",
-    "galp/extensions",
-    "galp/src",
-    "galp/support/include",
-    "galp/benchmark/include",
-    "galp/src/include",
-    "galp/tools/benchmark_support",
-    "galp/tools/data",
+    "fastlens/benchmarks/include",
+    "fastlens/extensions",
+    "fastlens/src",
+    "fastlens/support/include",
+    "fastlens/benchmark/include",
+    "fastlens/src/include",
+    "fastlens/tools/benchmark_support",
+    "fastlens/tools/data",
     "benchmarks/include",
     "extensions",
     "support/include",
@@ -156,18 +156,18 @@ def is_source_file(path: Path) -> bool:
     return path.suffix in SOURCE_EXTENSIONS
 
 
-def iter_source_files(galp_root: Path) -> list[Path]:
+def iter_source_files(fastlens_root: Path) -> list[Path]:
     scan_roots = [
-        galp_root / "include",
-        galp_root / "src",
-        galp_root / "benchmarks",
-        galp_root / "extensions",
-        galp_root / "tests",
-        galp_root / "benchmark",
-        galp_root / "support",
-        galp_root / "test",
-        galp_root / "tools",
-        galp_root / "examples",
+        fastlens_root / "include",
+        fastlens_root / "src",
+        fastlens_root / "benchmarks",
+        fastlens_root / "extensions",
+        fastlens_root / "tests",
+        fastlens_root / "benchmark",
+        fastlens_root / "support",
+        fastlens_root / "test",
+        fastlens_root / "tools",
+        fastlens_root / "examples",
     ]
     files: list[Path] = []
     for root in scan_roots:
@@ -223,13 +223,13 @@ def parse_cmake_source_set(cmake_file: Path, variable: str) -> list[str]:
     return [entry for _, entry in parse_cmake_source_set_entries(cmake_file, variable)]
 
 
-def galp_core_sources(galp_root: Path) -> set[str]:
-    source_entries = parse_cmake_source_set(galp_root / "src" / "CMakeLists.txt", "GALP_ENGINE_SOURCES")
-    return {(galp_root / "src" / entry).resolve().as_posix() for entry in source_entries}
+def fastlens_core_sources(fastlens_root: Path) -> set[str]:
+    source_entries = parse_cmake_source_set(fastlens_root / "src" / "CMakeLists.txt", "FASTLENS_ENGINE_SOURCES")
+    return {(fastlens_root / "src" / entry).resolve().as_posix() for entry in source_entries}
 
 
-def iter_cmake_files(galp_root: Path) -> list[Path]:
-    return sorted(galp_root.rglob("CMakeLists.txt"))
+def iter_cmake_files(fastlens_root: Path) -> list[Path]:
+    return sorted(fastlens_root.rglob("CMakeLists.txt"))
 
 
 def strip_cmake_comment(line: str) -> str:
@@ -265,11 +265,11 @@ def cmake_call_args(command: str, text: str) -> list[str]:
     body = re.sub(rf"^\s*{re.escape(command)}\s*\(", "", text, count=1, flags=re.IGNORECASE).strip()
     if body.endswith(")"):
         body = body[:-1]
-    return [token.strip('"') for token in re.findall(r'"[^"]*"|[^\s()]+', body)]
+    return [token.strip('"''"') for token in re.findall(r'"[^"]*"|[^\s()]+', body)]
 
 
-def collect_targets_under(galp_root: Path, subdir: str) -> set[str]:
-    root = galp_root / subdir
+def collect_targets_under(fastlens_root: Path, subdir: str) -> set[str]:
+    root = fastlens_root / subdir
     if not root.exists():
         return set()
     targets: set[str] = set()
@@ -340,36 +340,36 @@ def path_is_under(path: Path, root: Path) -> bool:
 
 
 def exposed_include_path_violation(token: str) -> str | None:
-    normalized = normalize_header(token.strip('"'))
+    normalized = normalize_header(token.strip('"''"'))
     if any(part in normalized for part in FORBIDDEN_EXPOSED_INCLUDE_PARTS):
         return "install/export/public usage requirements must not expose private, benchmark, or support include dirs"
     return None
 
 
-def galp_core_link_violation(token: str, forbidden_targets: set[str]) -> str | None:
+def fastlens_core_link_violation(token: str, forbidden_targets: set[str]) -> str | None:
     if token in CMAKE_SCOPES:
         return None
-    if token in forbidden_targets or token in FORBIDDEN_GALP_CORE_LINKS:
-        return "galp_core must not link benchmark, test, support, or benchmark-generated targets"
+    if token in forbidden_targets or token in FORBIDDEN_FASTLENS_CORE_LINKS:
+        return "fastlens_core must not link benchmark, test, support, or benchmark-generated targets"
 
     lowered = token.lower()
     if "gtest" in lowered or "gmock" in lowered:
-        return "galp_core must not link test-only dependencies"
+        return "fastlens_core must not link test-only dependencies"
     if "benchmark" in lowered:
-        return "galp_core must not link benchmark-only dependencies"
+        return "fastlens_core must not link benchmark-only dependencies"
     if "nvcomp" in lowered:
-        return "galp_core must not link benchmark-only nvCOMP dependencies"
+        return "fastlens_core must not link benchmark-only nvCOMP dependencies"
     return None
 
 
-def check_galp_core_sources(galp_root: Path, repo_root: Path) -> list[tuple[str, int, str, str, str]]:
-    cmake_file = galp_root / "src" / "CMakeLists.txt"
+def check_fastlens_core_sources(fastlens_root: Path, repo_root: Path) -> list[tuple[str, int, str, str, str]]:
+    cmake_file = fastlens_root / "src" / "CMakeLists.txt"
     violations: list[tuple[str, int, str, str, str]] = []
-    forbidden_roots = [(name, galp_root / name) for name in FORBIDDEN_CORE_SOURCE_ROOTS]
+    forbidden_roots = [(name, fastlens_root / name) for name in FORBIDDEN_CORE_SOURCE_ROOTS]
 
-    for line_number, entry in parse_cmake_source_set_entries(cmake_file, "GALP_ENGINE_SOURCES"):
+    for line_number, entry in parse_cmake_source_set_entries(cmake_file, "FASTLENS_ENGINE_SOURCES"):
         entry_path = Path(entry)
-        source_path = entry_path if entry_path.is_absolute() else (galp_root / "src" / entry)
+        source_path = entry_path if entry_path.is_absolute() else (fastlens_root / "src" / entry)
         resolved = source_path.resolve()
         for root_name, root in forbidden_roots:
             if path_is_under(resolved, root):
@@ -378,7 +378,7 @@ def check_galp_core_sources(galp_root: Path, repo_root: Path) -> list[tuple[str,
                         rel_to_repo(cmake_file, repo_root),
                         line_number,
                         entry,
-                        f"galp_core sources must not include files from galp/{root_name}/",
+                        f"fastlens_core sources must not include files from fastlens/{root_name}/",
                         "references",
                     )
                 )
@@ -386,21 +386,21 @@ def check_galp_core_sources(galp_root: Path, repo_root: Path) -> list[tuple[str,
     return violations
 
 
-def check_cmake_boundaries(galp_root: Path, repo_root: Path) -> list[tuple[str, int, str, str, str]]:
+def check_cmake_boundaries(fastlens_root: Path, repo_root: Path) -> list[tuple[str, int, str, str, str]]:
     violations: list[tuple[str, int, str, str, str]] = []
     forbidden_targets = (
-        collect_targets_under(galp_root, "benchmarks")
-        | collect_targets_under(galp_root, "extensions")
-        | collect_targets_under(galp_root, "tests")
-        | collect_targets_under(galp_root, "tools")
-        | collect_targets_under(galp_root, "benchmark")
-        | collect_targets_under(galp_root, "test")
-        | collect_targets_under(galp_root, "support")
+        collect_targets_under(fastlens_root, "benchmarks")
+        | collect_targets_under(fastlens_root, "extensions")
+        | collect_targets_under(fastlens_root, "tests")
+        | collect_targets_under(fastlens_root, "tools")
+        | collect_targets_under(fastlens_root, "benchmark")
+        | collect_targets_under(fastlens_root, "test")
+        | collect_targets_under(fastlens_root, "support")
     )
 
-    violations.extend(check_galp_core_sources(galp_root, repo_root))
+    violations.extend(check_fastlens_core_sources(fastlens_root, repo_root))
 
-    for cmake_file in iter_cmake_files(galp_root):
+    for cmake_file in iter_cmake_files(fastlens_root):
         file_rel = rel_to_repo(cmake_file, repo_root)
         for command, line_number, text in iter_cmake_calls(cmake_file):
             command_lower = command.lower()
@@ -408,13 +408,13 @@ def check_cmake_boundaries(galp_root: Path, repo_root: Path) -> list[tuple[str, 
             if not args:
                 continue
 
-            if command_lower == "target_link_libraries" and args[0] == "galp_core":
+            if command_lower == "target_link_libraries" and args[0] == "fastlens_core":
                 for token in args[1:]:
-                    reason = galp_core_link_violation(token, forbidden_targets)
+                    reason = fastlens_core_link_violation(token, forbidden_targets)
                     if reason is not None:
                         violations.append((file_rel, line_number, token, reason, "references"))
 
-            if command_lower == "target_include_directories" and args[0] == "galp_core":
+            if command_lower == "target_include_directories" and args[0] == "fastlens_core":
                 scope: str | None = None
                 for token in args[1:]:
                     if token in CMAKE_SCOPES:
@@ -435,10 +435,10 @@ def check_cmake_boundaries(galp_root: Path, repo_root: Path) -> list[tuple[str, 
     return violations
 
 
-def check_legacy_roots(galp_root: Path, repo_root: Path) -> list[tuple[str, int, str, str, str]]:
+def check_legacy_roots(fastlens_root: Path, repo_root: Path) -> list[tuple[str, int, str, str, str]]:
     violations: list[tuple[str, int, str, str, str]] = []
     for root_name in FORBIDDEN_LEGACY_ROOTS:
-        root = galp_root / root_name
+        root = fastlens_root / root_name
         if not root.exists():
             continue
         if any((root / marker).exists() for marker in LEGACY_ALIAS_MARKERS):
@@ -448,20 +448,20 @@ def check_legacy_roots(galp_root: Path, repo_root: Path) -> list[tuple[str, int,
                 rel_to_repo(root, repo_root),
                 1,
                 rel_to_repo(root, repo_root),
-                "legacy GALP root must not be reintroduced unless explicitly marked as a migration compatibility alias",
+                "legacy FASTLENS root must not be reintroduced unless explicitly marked as a migration compatibility alias",
                 "references",
             )
         )
     return violations
 
 
-def is_public_header(path: Path, galp_root: Path) -> bool:
-    public_root = galp_root / "include" / "galp"
+def is_public_header(path: Path, fastlens_root: Path) -> bool:
+    public_root = fastlens_root / "include" / 'fastlens'
     return path.resolve().is_relative_to(public_root.resolve()) and path.suffix in {".h", ".hh", ".hpp", ".hxx", ".cuh"}
 
 
-def is_private_header(path: Path, galp_root: Path) -> bool:
-    private_root = galp_root / "src"
+def is_private_header(path: Path, fastlens_root: Path) -> bool:
+    private_root = fastlens_root / "src"
     return path.resolve().is_relative_to(private_root.resolve()) and path.suffix in {".h", ".hh", ".hpp", ".hxx", ".cuh"}
 
 
@@ -474,31 +474,31 @@ def main() -> int:
         help="repository root; defaults to the parent of scripts/",
     )
     parser.add_argument(
-        "--galp-root",
+        "--fastlens-root",
         type=Path,
         default=None,
-        help="GALP subtree root; defaults to <repo-root>/galp",
+        help="FASTLENS subtree root; defaults to <repo-root>/fastlens",
     )
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
-    galp_root = (args.galp_root or (repo_root / "galp")).resolve()
-    if not galp_root.exists():
-        print(f"error: GALP root does not exist: {galp_root}", file=sys.stderr)
+    fastlens_root = (args.fastlens_root or (repo_root / 'fastlens')).resolve()
+    if not fastlens_root.exists():
+        print(f"error: FASTLENS root does not exist: {fastlens_root}", file=sys.stderr)
         return 2
 
     try:
-        core_sources = galp_core_sources(galp_root)
+        core_sources = fastlens_core_sources(fastlens_root)
     except OSError as exc:
-        print(f"error: failed to read galp_core source list: {exc}", file=sys.stderr)
+        print(f"error: failed to read fastlens_core source list: {exc}", file=sys.stderr)
         return 2
 
     violations: list[tuple[str, int, str, str, str]] = []
-    for path in iter_source_files(galp_root):
+    for path in iter_source_files(fastlens_root):
         file_rel = rel_to_repo(path, repo_root)
         is_core_source = path.resolve().as_posix() in core_sources
-        is_public = is_public_header(path, galp_root)
-        is_private = is_private_header(path, galp_root)
+        is_public = is_public_header(path, fastlens_root)
+        is_private = is_private_header(path, fastlens_root)
 
         for line_number, header in parse_includes(path):
             reason: str | None = None
@@ -511,8 +511,8 @@ def main() -> int:
             if reason is not None:
                 violations.append((file_rel, line_number, header, reason, "includes"))
 
-    violations.extend(check_cmake_boundaries(galp_root, repo_root))
-    violations.extend(check_legacy_roots(galp_root, repo_root))
+    violations.extend(check_cmake_boundaries(fastlens_root, repo_root))
+    violations.extend(check_legacy_roots(fastlens_root, repo_root))
 
     for file_rel, line_number, item, reason, verb in violations:
         print(f"{file_rel}:{line_number}: {verb} {item} -- {reason}")

@@ -170,7 +170,7 @@ If you use FastLanes in your research or projects, please cite:
     doi = {10.1145/3626717}
 }
 
-@inproceedings{hepke2025galp,
+@inproceedings{hepke2025fastlens,
     author = {Hepkema, Sven Hielke and Afroozeh, Azim and Felius, Charlotte and Boncz, Peter and Manegold, Stefan},
     title = {G‑ALP: Rethinking Light‑weight Encodings for GPUs},
     booktitle = {DaMoN ’25: Proceedings of the 21st International Workshop on Data Management on New Hardware},

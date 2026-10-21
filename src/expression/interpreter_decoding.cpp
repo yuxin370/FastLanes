@@ -169,12 +169,12 @@ void make_dec_alp_expr(PhysicalExpr& physical_expr, const ColumnView& column_vie
 }
 
 /*--------------------------------------------------------------------------------------------------------------------*\
- * make_dec_galp_expr
+ * make_dec_fastlens_expr
 \*--------------------------------------------------------------------------------------------------------------------*/
 template <typename PT>
-void make_dec_galp_expr(PhysicalExpr& physical_expr, const ColumnView& column_view, InterpreterState& state) {
+void make_dec_fastlens_expr(PhysicalExpr& physical_expr, const ColumnView& column_view, InterpreterState& state) {
 	// Note: dec_alp_opr uses hardcoded segment indices (0-7), so cur_operand is unused.
-	// Unlike other decoders, GALP/ALP encoding does not emit operand_tokens, so
+	// Unlike other decoders, FASTLENS/ALP encoding does not emit operand_tokens, so
 	// accessing operand_tokens() here would dereference a null pointer.
 	physical_expr.operators.emplace_back(dec_physical_operator {make_shared<dec_alp_opr<PT>>(column_view, state)});
 }
@@ -697,12 +697,12 @@ void Interpreter::Decoding::Interpret(const ColumnDescriptor& column_descriptor,
 			make_dec_alp_expr<flt_pt>(physical_expr, column_view, state);
 			break;
 		}
-		case EXP_GALP_FLT: {
-			make_dec_galp_expr<flt_pt>(physical_expr, column_view, state);
+		case EXP_FASTLENS_FLT: {
+			make_dec_fastlens_expr<flt_pt>(physical_expr, column_view, state);
 			break;
 		}
-		case EXP_GALP_DBL: {
-			make_dec_galp_expr<dbl_pt>(physical_expr, column_view, state);
+		case EXP_FASTLENS_DBL: {
+			make_dec_fastlens_expr<dbl_pt>(physical_expr, column_view, state);
 			break;
 		}
 		case EXP_ALP_RD_DBL: {

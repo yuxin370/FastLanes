@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.22)
+project(FastLensCMakeConsumerExample LANGUAGES CXX CUDA)
+
+find_package(FastLens CONFIG REQUIRED)
+
+add_executable(fastlens_public_api_reader ../public_api_reader/public_api_reader.cpp)
+target_compile_features(fastlens_public_api_reader PRIVATE cxx_std_20)
+target_link_libraries(fastlens_public_api_reader PRIVATE FastLens::core)

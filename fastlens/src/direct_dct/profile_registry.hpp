@@ -1,0 +1,39 @@
+#ifndef FASTLENS_DIRECT_DCT_PROFILE_REGISTRY_HPP
+#define FASTLENS_DIRECT_DCT_PROFILE_REGISTRY_HPP
+
+#include "fastlens/jpeg_dct_device.hpp"
+#include <array>
+#include <optional>
+#include <string_view>
+
+namespace fastlens::direct_dct {
+
+// Shadow-only canonical candidate. This registry owns semantic output
+// contracts; execution tuning is resolved separately.
+class SemanticProfileRegistry final {
+public:
+	struct SemanticProfile final {
+		std::string_view                              id;
+		jpeg::JpegDctDeviceLayout                     output_layout;
+		std::optional<jpeg::JpegDctGridTransformSpec> grid_transform;
+		jpeg::JpegDctCoefficientSelection             coefficient_selection;
+	};
+
+	inline static constexpr std::array<std::string_view, 5> kProfileIds = {
+	    "rgbnomore-validation-v1",
+	    "rgbnomore-validation-center-crop-512-v1",
+	    "rgbnomore-swinv2-validation-v1",
+	    "rgbnomore-training-pls-v1",
+	    "rgbnomore-swinv2-block-major-validation-v1",
+	};
+
+	[[nodiscard]] static constexpr const auto& available_profile_ids() noexcept {
+		return kProfileIds;
+	}
+
+	[[nodiscard]] static SemanticProfile resolve(std::string_view profile_id);
+};
+
+} // namespace fastlens::direct_dct
+
+#endif // FASTLENS_DIRECT_DCT_PROFILE_REGISTRY_HPP

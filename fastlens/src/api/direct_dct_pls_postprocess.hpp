@@ -1,0 +1,113 @@
+#ifndef FASTLENS_DIRECT_DCT_PLS_POSTPROCESS_HPP
+#define FASTLENS_DIRECT_DCT_PLS_POSTPROCESS_HPP
+
+#include "fastlens/advanced/direct_dct_pls.hpp"
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <vector>
+
+namespace fastlens::jpeg::detail {
+
+enum class DirectDctPlsRandAugmentOp : uint8_t {
+	kAutoContrast,
+	kPosterize,
+	kSolarizeAdd,
+	kColor,
+	kContrast,
+	kBrightness,
+	kMidfreqAug,
+	kCutout,
+	kTranslateX,
+	kTranslateY,
+	kRotate90,
+	kAutoSaturation,
+	kGrayscale,
+	kChromaDrop,
+};
+
+struct DirectDctPlsRandAugmentDecision {
+	std::array<DirectDctPlsRandAugmentOp, 2> operations {};
+	std::array<float, 2>                     magnitudes {};
+	std::array<int16_t, 2>                   cutout_center_h {};
+	std::array<int16_t, 2>                   cutout_center_w {};
+	std::array<uint8_t, 2>                   chroma_drop_channel {};
+};
+
+struct DirectDctPlsMixupDecision {
+	float original = 1.0F;
+	float rolled   = 0.0F;
+};
+
+// Host decision derivation is exposed only to source-level parity tests and
+// native pipeline composition; it is not part of the installed public API.
+DirectDctPlsRandAugmentDecision derive_published_randaugment_decision(const DirectDctPlsSample&          sample,
+                                                                      const DirectDctPlsScheduleOptions& options);
+DirectDctPlsMixupDecision
+derive_published_mixup_decision(uint64_t training_seed, uint32_t epoch, uint64_t microbatch_index);
+
+class DirectDctPlsCudaPostprocess {
+public:
+	class Stream {
+	public:
+		explicit Stream(int cuda_device);
+		~Stream();
+		Stream(const Stream&)            = delete;
+		Stream& operator=(const Stream&) = delete;
+		Stream(Stream&&)                 = delete;
+		Stream& operator=(Stream&&)      = delete;
+
+	private:
+		friend class DirectDctPlsCudaPostprocess;
+		struct Impl;
+		std::unique_ptr<Impl> impl_;
+	};
+
+	// Reuses the unpublished source's float storage: projected mode compacts
+	// in place; Y/CbCr mode overwrites completed transform accumulators.
+	DirectDctPlsCudaPostprocess(DirectDctBatch&                                  source,
+	                            std::span<const int64_t>                         labels,
+	                            std::span<const DirectDctPlsRandAugmentDecision> randaugment,
+	                            std::span<const DirectDctPlsMixupDecision>       mixup,
+	                            uint32_t                                         microbatch_images,
+	                            uint32_t                                         model_classes,
+	                            bool                                             enable_randaugment,
+	                            bool                                             enable_mixup,
+	                            std::shared_ptr<Stream>                          stream,
+	                            std::span<const JpegDctOutputChannel>            input_channels  = {},
+	                            std::span<const JpegDctOutputChannel>            output_channels = {});
+	// Reuse the same augmentation contract for a framework-owned projected batch.
+	DirectDctPlsCudaPostprocess(DirectDctGridTensorDescriptor                    source,
+	                            void*                                            source_completion_event,
+	                            float*                                           targets,
+	                            std::span<const int64_t>                         labels,
+	                            std::span<const DirectDctPlsRandAugmentDecision> randaugment,
+	                            std::span<const DirectDctPlsMixupDecision>       mixup,
+	                            uint32_t                                         microbatch_images,
+	                            uint32_t                                         model_classes,
+	                            std::shared_ptr<Stream>                          stream,
+	                            std::span<const JpegDctOutputChannel>            input_channels,
+	                            std::span<const JpegDctOutputChannel>            output_channels);
+	~DirectDctPlsCudaPostprocess();
+	DirectDctPlsCudaPostprocess(const DirectDctPlsCudaPostprocess&)            = delete;
+	DirectDctPlsCudaPostprocess& operator=(const DirectDctPlsCudaPostprocess&) = delete;
+	DirectDctPlsCudaPostprocess(DirectDctPlsCudaPostprocess&&) noexcept;
+	DirectDctPlsCudaPostprocess& operator=(DirectDctPlsCudaPostprocess&&) noexcept;
+
+	[[nodiscard]] DirectDctGridTensorDescriptor      y_tensor() const noexcept;
+	[[nodiscard]] DirectDctGridTensorDescriptor      cbcr_tensor() const noexcept;
+	[[nodiscard]] DirectDctGridTensorDescriptor      projected_tensor() const noexcept;
+	[[nodiscard]] DirectDctPlsTargetTensorDescriptor targets() const noexcept;
+	[[nodiscard]] void*                              completion_event() const noexcept;
+	[[nodiscard]] void*                              microbatch_completion_event(size_t index) const;
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> impl_;
+};
+
+} // namespace fastlens::jpeg::detail
+
+#endif // FASTLENS_DIRECT_DCT_PLS_POSTPROCESS_HPP

@@ -34,4 +34,4 @@ target_link_libraries(bench_compression_time PUBLIC FastLanes::benchmarker)
 add_executable(bench_parallel_encoding bench_parallel_encoding.cpp)
 target_link_libraries(bench_parallel_encoding PRIVATE FastLanes::core)
 
-add_subdirectory(bench_galp)
+add_subdirectory(bench_fastlens)

@@ -1,0 +1,321 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# .github/workflows/fastlens.yaml
+# ────────────────────────────────────────────────────────
+# .github/workflows/fastlens.yml
+
+name: FASTLENS
+
+run-name: >-
+  ${{ github.workflow }} on ${{ github.ref_name }} (#${{ github.run_number }})
+  — ${{ github.event.pull_request.title || github.event.head_commit.message }}
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+# Each run step uses system host compilers and explicit Conda CUDA/Python paths.
+defaults:
+  run:
+    shell: bash .github/fastlens-ci-shell.sh {0}
+
+jobs:
+  pr-public-api:
+    if: >-
+      ${{
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    name: FASTLENS public API and package smoke
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - president
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: Verify build tools
+        run: |
+          for cmd in "$CC" "$CXX" "$CUDACXX" "$CUDAHOSTCXX" cmake make "$FASTLENS_CUDA_ENV/bin/python3"; do
+            command -v "$cmd" >/dev/null || { echo "::error::$cmd missing"; exit 127; }
+          done
+
+      - name: CMake configure
+        run: |
+          set -x
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+            -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+            -DPython3_EXECUTABLE="$FASTLENS_CUDA_ENV/bin/python3" \
+            -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
+            -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
+            -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
+            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
+            -DFASTLENS_BUILD_TESTS=ON \
+            -DFASTLENS_BUILD_TOOLS=ON \
+            -DFASTLENS_BUILD_BENCHMARKS=OFF \
+            -DFASTLENS_WITH_NVCOMP=OFF
+
+      - name: Build public smoke targets
+        run: >
+          cmake --build build --parallel
+          --target
+          fastlens_core
+          fastlens_tests
+          fastlens_cuda_transfer_failure_tests
+          fastlens_compact_format_tests
+          fastlens_direct_dct_contract_tests
+          fastlens_native_logical_batch_pipeline_tests
+          fastlens_jpeg_dct_decode_memory_tests
+          fastlens_jpeg_dct_exact_verifier_tests
+          fastlens_block_major_access_tests
+          fastlens_direct_dct_pls_tests
+          fastlens_public_api_smoke
+          fastlens_api_boundary_checks
+          fastlens_cli
+
+      - name: Public API tests
+        run: ctest --test-dir build -L public-api --no-tests=error --output-on-failure --timeout 300
+
+      - name: CPU and static tests
+        run: |
+          discovered=$(ctest --test-dir build -N)
+          for test in CompactSegment GPUArray DevicePool DirectDctShadowContract NativeLogicalBatchPipeline PublicDirectDctApiPython CudaTransferFailure; do
+            grep -F "$test" <<< "$discovered" || exit 1
+          done
+          ctest --test-dir build -j4 -L 'cpu|static' --no-tests=error --output-on-failure --timeout 300
+
+      - name: Package consumer smoke
+        run: ctest --test-dir build -R FastLensPackageConsumerSmoke --no-tests=error --output-on-failure --timeout 300
+
+  gpu-build-test:
+    if: ${{ github.event_name == 'push'}}
+    name: FASTLENS GPU build and tests
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - president
+
+    steps:
+      # ────────────────────────────────────────────────
+      # 0. Checkout
+      # ────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      # ────────────────────────────────────────────────
+      # 1. Quick sanity of the runner
+      # ────────────────────────────────────────────────
+      - name: Verify tools
+        run: |
+          for cmd in nvidia-smi "$CC" "$CXX" "$CUDACXX" "$CUDAHOSTCXX" cmake make "$FASTLENS_CUDA_ENV/bin/python3"; do
+            command -v "$cmd" >/dev/null || { echo "::error::$cmd missing"; exit 127; }
+          done
+
+      - name: Env dump
+        run: |
+          set -x
+          hostname
+          echo "Runner label: president"
+          echo "CUDA path: $CUDA_LIBRARY_PATH"
+          echo "NVCOMP_INC: $NVCOMP_INC"
+          echo "NVCOMP_LIB: $NVCOMP_LIB"
+          echo "HOME: $HOME"
+          nvidia-smi
+          printf 'CC=%s\nCXX=%s\nCUDACXX=%s\nCUDAHOSTCXX=%s\nPython=%s\n' \
+            "$CC" "$CXX" "$CUDACXX" "$CUDAHOSTCXX" "$FASTLENS_CUDA_ENV/bin/python3"
+          "$CUDACXX" --version
+          "$CXX" --version
+          "$CUDAHOSTCXX" --version
+          cmake --version
+          make --version
+
+      - name: Generate FASTLENS CSV fixtures only
+        run: |
+          "$FASTLENS_CUDA_ENV/bin/python3" -m venv "$RUNNER_TEMP/fastlens-fixture-venv"
+          "$RUNNER_TEMP/fastlens-fixture-venv/bin/python" -m pip install Faker
+          PYTHONPATH="$PWD/scripts" "$RUNNER_TEMP/fastlens-fixture-venv/bin/python" - <<'PY'
+          import random
+          from generator_helpers.fastlens_generator import fls_fastlens
+          random.seed(11997733)
+          fls_fastlens()
+          PY
+
+      - name: CMake configure
+        run: |
+          set -x
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+            -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+            -DPython3_EXECUTABLE="$FASTLENS_CUDA_ENV/bin/python3" \
+            -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
+            -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
+            -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
+            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
+            -DFASTLENS_BUILD_TESTS=ON \
+            -DFASTLENS_BUILD_TOOLS=ON \
+            -DFASTLENS_BUILD_BENCHMARKS=OFF \
+            -DFASTLENS_WITH_NVCOMP=OFF
+          cmake -LA -N build | grep -E '^(CMAKE_BUILD_TYPE|FASTLENS_BUILD_TESTS|FASTLENS_BUILD_TOOLS|FASTLENS_BUILD_BENCHMARKS|FASTLENS_WITH_NVCOMP|FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING):'
+
+      - name: Build FASTLENS targets
+        run: >
+          cmake --build build --parallel
+          --target
+          fastlens_core
+          fastlens_tests
+          fastlens_cuda_transfer_failure_tests
+          fastlens_compact_format_tests
+          fastlens_direct_dct_contract_tests
+          fastlens_native_logical_batch_pipeline_tests
+          fastlens_jpeg_dct_decode_memory_tests
+          fastlens_jpeg_dct_exact_verifier_tests
+          fastlens_block_major_access_tests
+          fastlens_direct_dct_pls_tests
+          fastlens_public_api_smoke
+          fastlens_api_boundary_checks
+          fastlens_cli
+
+      - name: Public API tests
+        run: ctest --test-dir build -L public-api --no-tests=error --output-on-failure --timeout 300
+
+      - name: CPU and static tests
+        run: |
+          discovered=$(ctest --test-dir build -N)
+          for test in CompactSegment GPUArray DevicePool DirectDctShadowContract NativeLogicalBatchPipeline PublicDirectDctApiPython CudaTransferFailure; do
+            grep -F "$test" <<< "$discovered" || exit 1
+          done
+          ctest --test-dir build -j4 -L 'cpu|static' --no-tests=error --output-on-failure --timeout 300
+
+      - name: Build host ownership TSAN tests
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+            -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+            -DPython3_EXECUTABLE="$FASTLENS_CUDA_ENV/bin/python3" \
+            -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
+            -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
+            -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
+            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
+            -DFLS_ENABLE_TSAN=ON \
+            -DFASTLENS_BUILD_TESTS=ON -DFASTLENS_BUILD_TOOLS=OFF \
+            -DFASTLENS_BUILD_BENCHMARKS=OFF -DFASTLENS_WITH_NVCOMP=OFF \
+            -DFASTLENS_BUILD_TORCH=OFF
+          cmake --build build-tsan --parallel 4 --target fastlens_cuda_transfer_failure_tests
+
+      - name: Host ownership TSAN (not CUDA driver instrumentation)
+        timeout-minutes: 5
+        run: |
+          TSAN_OPTIONS=halt_on_error=1 build-tsan/fastlens/tests/fastlens_cuda_transfer_failure_tests \
+            --gtest_repeat=30 --gtest_brief=1
+
+      - name: Verify CUDA tests can run
+        run: |
+          gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+          echo "Visible GPUs: $gpu_count. Single-GPU CI passing does not validate multi-GPU ownership."
+          if [ "$gpu_count" -lt 2 ]; then
+            echo "::notice::Multi-GPU tests will skip; multi-GPU behavior is NOT verified by this run."
+          fi
+          result=$(build/fastlens/tests/fastlens_tests --gtest_filter=DevicePool.GPUArrayReleasesFailedCopy)
+          echo "$result"
+          grep -Fq '[  PASSED  ] 1 test.' <<< "$result"
+
+      - name: GPU tests
+        run: |
+          ctest --test-dir build -j4 -R 'GPUArray|DevicePool' --no-tests=error --output-on-failure --timeout 300
+          ctest --test-dir build -j4 -L gpu --no-tests=error --output-on-failure --timeout 300
+
+      - name: Upload CTest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastlens-ctest-logs
+          path: |
+            build/Testing/**/*.log
+            build/Testing/Temporary/*
+          if-no-files-found: ignore
+
+  torch-gpu-smoke:
+    if: ${{ github.event_name == 'push' }}
+    name: Native Torch extension and CUDA runtime smoke
+    runs-on: [self-hosted, Linux, X64, president]
+    env:
+      FASTLENS_REQUIRE_CUDA_SMOKE: '1'
+      FASTLENS_DIRECT_DCT_TEST_BATCH_SIZE: '2'
+      FASTLENS_DIRECT_DCT_TEST_MANIFEST: ${{ github.workspace }}/build-torch/smoke-data/manifest.bin
+    steps:
+      - uses: actions/checkout@v3
+      - name: Require CUDA PyTorch and fixture dependencies
+        run: |
+          for cmd in nvidia-smi "$CC" "$CXX" "$CUDACXX" "$CUDAHOSTCXX" cmake make "$FASTLENS_CUDA_ENV/bin/python3"; do
+            command -v "$cmd" >/dev/null || { echo "::error::$cmd missing"; exit 127; }
+          done
+          nvidia-smi
+          "$FASTLENS_CUDA_ENV/bin/python3" -c "import torch; import PIL; assert torch.version.cuda, 'CPU-only PyTorch'; assert torch.cuda.is_available(), 'CUDA unavailable'; print(torch.__version__, torch.cuda.get_device_name(0))"
+      - name: Configure native Torch binding
+        run: |
+          cmake -S . -B build-torch \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+            -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+            -DTHRUST_INCLUDE_DIR="$FASTLENS_CUDA_ENV/targets/x86_64-linux/include/cccl" \
+            -DJPEG_INCLUDE_DIR="$FASTLENS_CUDA_ENV/include" \
+            -DJPEG_LIBRARY="$FASTLENS_CUDA_ENV/lib/libjpeg.so" \
+            -DFLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING=ON \
+            -DFASTLENS_BUILD_TESTS=ON -DFASTLENS_BUILD_TOOLS=ON \
+            -DFASTLENS_BUILD_BENCHMARKS=OFF -DFASTLENS_WITH_NVCOMP=OFF \
+            -DFASTLENS_BUILD_TORCH=ON -DPython3_EXECUTABLE="$FASTLENS_CUDA_ENV/bin/python3"
+      - name: Build native extension and fixture encoder
+        run: cmake --build build-torch --parallel --target _fastlens_direct_dct fastlens_jpeg_dct_tool fastlens_block_major_access_tool
+      - name: Create a small real JPEG manifest
+        run: |
+          "$FASTLENS_CUDA_ENV/bin/python3" - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          source = Path('build-torch/smoke-jpegs')
+          source.mkdir(parents=True, exist_ok=True)
+          for index in range(2):
+              pixels = bytes((x * (y + 17) + channel * 53 + index * 31) % 256
+                             for y in range(512) for x in range(512) for channel in range(3))
+              Image.frombytes('RGB', (512, 512), pixels).save(source / f'{index}.jpg')
+          PY
+          build-torch/fastlens/tools/jpeg_dct/fastlens_jpeg_dct_tool \
+            --shard --out-dir build-torch/smoke-data --preset balanced \
+            --physical-layout image-major-vector-rowgroups --spatial-order tiled-z-32 \
+            --metadata-profile reconstruct build-torch/smoke-jpegs
+          test -f "$FASTLENS_DIRECT_DCT_TEST_MANIFEST"
+      - name: Run native import and GPU runtime tests (skips are failures)
+        run: |
+          for test in FastLensDirectDctTorchImport FastLensDirectDctTorchRuntimeSmoke FastLensDirectDctPlsTorchRuntimeSmoke; do
+            ctest --test-dir build-torch -R "^${test}$" --no-tests=error --output-on-failure --timeout 300
+          done
+      - name: Upload Torch test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastlens-torch-ctest-logs
+          path: build-torch/Testing/Temporary/*
+          if-no-files-found: ignore

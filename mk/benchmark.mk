@@ -5,7 +5,7 @@
 # ────────────────────────────────────────────────────────
 # mk/benchmark.mk
 # ────────────────
-# Runs benchmark/result/galp/plot.py from *inside* its own folder,
+# Runs benchmark/result/fastlens/plot.py from *inside* its own folder,
 # so the script can see the neighbouring patch.csv file.
 
 # ── Virtual‑env (absolute so it still works after any cd)
@@ -16,8 +16,8 @@ PYTHON   ?= $(if $(wildcard $(PYTHON3)),$(PYTHON3),$(VENV_DIR)/bin/python)
 PIP      := $(PYTHON) -m pip
 
 # ── Script location (relative to project root)
-PY_SCRIPT       := benchmark/result/galp/plot.py
-PY_SCRIPT_DIR   := $(dir $(PY_SCRIPT))     # benchmark/result/galp/
+PY_SCRIPT       := benchmark/result/fastlens/plot.py
+PY_SCRIPT_DIR   := $(dir $(PY_SCRIPT))     # benchmark/result/fastlens/
 PY_SCRIPT_NAME  := $(notdir $(PY_SCRIPT))  # plot.py
 
 .PHONY: venv plot clean-venv

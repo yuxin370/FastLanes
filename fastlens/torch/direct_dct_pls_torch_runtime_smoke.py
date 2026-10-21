@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""CUDA smoke for the experimental physical-PLS Direct-DCT adapter."""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import os
+from pathlib import Path
+import tempfile
+import time
+import torch
+import _fastlens_direct_dct as native_backend
+
+from fastlens.torch.experimental import DirectDctPlsPipeline
+from fastlens.profiles.rgbnomore import TRAINING_PLS
+
+from create_pls_smoke_fixture import create_fixture
+
+
+SKIP_RETURN_CODE = 77
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--jpeg-tool")
+    parser.add_argument("--access-tool")
+    parser.add_argument("--basic-augmentation", action="store_true")
+    args = parser.parse_args()
+    if not torch.cuda.is_available():
+        if os.environ.get("FASTLENS_REQUIRE_CUDA_SMOKE") == "1":
+            raise RuntimeError("CUDA-enabled PyTorch and a working GPU are required")
+        print("skipping: torch.cuda.is_available() is false")
+        return SKIP_RETURN_CODE
+    manifest = os.environ.get("FASTLENS_DIRECT_DCT_PLS_TEST_MANIFEST")
+    mapping = os.environ.get("FASTLENS_DIRECT_DCT_PLS_TEST_MAPPING")
+    mapping_sha256 = os.environ.get("FASTLENS_DIRECT_DCT_PLS_TEST_MAPPING_SHA256")
+    if any((manifest, mapping, mapping_sha256)) and not all((manifest, mapping, mapping_sha256)):
+        raise RuntimeError("external PLS fixture requires manifest, mapping and mapping SHA-256")
+    if manifest:
+        return run_smoke(manifest, mapping, mapping_sha256, basic=args.basic_augmentation)
+    if not args.jpeg_tool or not args.access_tool:
+        if os.environ.get("FASTLENS_REQUIRE_CUDA_SMOKE") == "1":
+            raise RuntimeError("PLS smoke requires fixture encoder tools or an external fixture")
+        print("skipping: build FASTLENS tools for the synthetic PLS fixture, or supply an external fixture")
+        return SKIP_RETURN_CODE
+    with tempfile.TemporaryDirectory(prefix="fastlens-pls-smoke-") as directory:
+        manifest, mapping, mapping_sha256 = create_fixture(
+            Path(directory), args.jpeg_tool, args.access_tool
+        )
+        return run_smoke(manifest, mapping, mapping_sha256, synthetic=True, basic=args.basic_augmentation)
+
+
+def run_smoke(manifest, mapping, mapping_sha256, *, synthetic=False, basic=False) -> int:
+    microbatch_images = 2 if synthetic else int(os.environ.get("FASTLENS_DIRECT_DCT_PLS_TEST_MICROBATCH", "64"))
+    baseline = native_backend._lifetime_reclaim_stats_for_test()
+    if synthetic:
+        # Leave the prepared pool in the native prefetch queue: exporting it
+        # would add a Python-side producer lease and mask native early cleanup.
+        unclaimed = DirectDctPlsPipeline(
+            manifest, mapping, training_seed=11997733,
+            expected_mapping_sha256=mapping_sha256,
+            segments_per_pool=4, microbatch_images=microbatch_images,
+            profile=TRAINING_PLS,
+            enable_randaugment=not basic, enable_mixup=not basic,
+        ).start_epoch(7)
+        deadline = time.monotonic() + 30
+        while unclaimed.prefetch_stats["prepare_completed_count"] == 0:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("PLS did not prepare the unclaimed smoke pool")
+            time.sleep(0.001)
+        unclaimed.close()
+        del unclaimed
+        gc.collect()
+        # Do not synchronize before closing: native destruction must protect
+        # in-flight work without an exported tensor or consumer event.
+        torch.cuda.synchronize()
+        after_close = native_backend._lifetime_reclaim_stats_for_test()
+        for pool_name in ("device_pool", "pinned_pool"):
+            if after_close[pool_name]["in_use_bytes"] != baseline[pool_name]["in_use_bytes"]:
+                raise RuntimeError(f"unclaimed PLS pool retained allocations in {pool_name}")
+    pipeline = DirectDctPlsPipeline(
+        manifest,
+        mapping,
+        training_seed=11997733,
+        expected_mapping_sha256=mapping_sha256,
+        segments_per_pool=4,
+        microbatch_images=microbatch_images,
+        profile=TRAINING_PLS,
+        enable_randaugment=not basic, enable_mixup=not basic,
+    ).start_epoch(7)
+    pool = pipeline.next_pool()
+    if pool.image_count > 4096 or pool.microbatch_count <= 0:
+        raise RuntimeError("unexpected native PLS pool cardinality")
+    microbatch = next(pool)
+    y, cbcr, targets = microbatch.tensors
+    torch.cuda.synchronize()
+
+    if any(tensor.dtype != torch.float32 or not tensor.is_cuda for tensor in (y, cbcr)):
+        raise RuntimeError("PLS must return CUDA float32 tensors")
+    if not targets.is_cuda or targets.dtype != (torch.int64 if basic else torch.float32):
+        raise RuntimeError("PLS targets do not match the augmentation policy")
+    if any(tensor.device != y.device for tensor in (cbcr, targets)):
+        raise RuntimeError("PLS tensor CUDA devices disagree")
+    if synthetic:
+        expected_labels = {0: 7, 1: 23, 2: 41}
+        if microbatch.labels != [expected_labels[i] for i in microbatch.global_image_ids]:
+            raise RuntimeError("PLS sample identities/labels differ from the synthetic input")
+        if y.shape[0] != 2 or pool.image_count != 3 or pool.microbatch_count != 2:
+            raise RuntimeError("synthetic PLS smoke requires a full microbatch and a one-image tail")
+        # The second microbatch reuses augmentation scratch. Its one-image
+        # Mixup partner must wrap within the tail, never into the previous batch.
+        tail = next(pool)
+        tail_y, tail_cbcr, tail_targets = tail.tensors
+        if len(tail.global_image_ids) != 1 or not tail.is_pool_end:
+            raise RuntimeError("PLS did not publish the partial final microbatch")
+        tail_label = expected_labels[tail.global_image_ids[0]]
+        expected_target = torch.tensor([tail_label], device=tail_targets.device)
+        if not basic:
+            expected_target = torch.nn.functional.one_hot(expected_target, 1000).float()
+        torch.testing.assert_close(tail_targets, expected_target, rtol=0, atol=1e-6)
+        if not bool(torch.isfinite(tail_y).all() and torch.isfinite(tail_cbcr).all()):
+            raise RuntimeError("PLS tail inputs are non-finite")
+        if set(microbatch.global_image_ids + tail.global_image_ids) != set(expected_labels):
+            raise RuntimeError("PLS scratch reuse changed sample coverage")
+        del tail_y, tail_cbcr, tail_targets, tail
+
+    if tuple(y.shape[1:]) != (1, 28, 28, 8, 8):
+        raise RuntimeError(f"unexpected PLS Y shape: {tuple(y.shape)}")
+    if tuple(cbcr.shape[1:]) != (2, 14, 14, 8, 8):
+        raise RuntimeError(f"unexpected PLS CbCr shape: {tuple(cbcr.shape)}")
+    if targets.shape != ((y.shape[0],) if basic else (y.shape[0], 1000)):
+        raise RuntimeError(f"unexpected PLS target shape: {tuple(targets.shape)}")
+    if not bool(torch.isfinite(y).all() and torch.isfinite(cbcr).all() and torch.isfinite(targets).all()):
+        raise RuntimeError("PLS pipeline emitted non-finite model tensors")
+    if basic:
+        torch.testing.assert_close(targets, torch.tensor(microbatch.labels, device=y.device), rtol=0, atol=0)
+    elif not torch.allclose(targets.sum(dim=1), torch.ones(y.shape[0], device=y.device)):
+        raise RuntimeError("PLS Mixup targets do not sum to one")
+    if len(microbatch.global_image_ids) != y.shape[0] or len(microbatch.labels) != y.shape[0]:
+        raise RuntimeError("PLS model tensor and identity cardinalities differ")
+    execution_stats = pool.execution_stats
+    if not bool(execution_stats.get("uses_planless_fixed_transform")):
+        raise RuntimeError("PLS runtime did not report planless fixed-transform execution")
+
+    # Exercise the ownership boundary on a stream that was not current when
+    # the native-backed tensors were created. Their deleter must not release
+    # native backing storage until this consumer has finished.
+    consumer_stream = torch.cuda.Stream(device=y.device)
+    microbatch.record_stream(consumer_stream)
+    expected_checksum = (y.square().sum() + cbcr.square().sum() + targets.sum()).item()
+    with torch.cuda.stream(consumer_stream):
+        cross_stream_checksum = y.square().sum() + cbcr.square().sum() + targets.sum()
+
+    summary = (
+        f"images={y.shape[0]} epoch={microbatch.epoch} pool={microbatch.pool_index} "
+        f"pool_images={pool.image_count} "
+        f"device={torch.cuda.get_device_name(0)} y={tuple(y.shape)} cbcr={tuple(cbcr.shape)} "
+        f"targets={tuple(targets.shape)} selected_vectors={execution_stats['selected_vector_count']} "
+        f"full_vectors={execution_stats['full_vector_count']} "
+        f"physical_bytes={execution_stats['compressed_payload_bytes_read']}"
+    )
+    del y, cbcr, targets, microbatch
+    del pool
+    pipeline.close()
+    del pipeline
+    gc.collect()
+    consumer_stream.synchronize()
+    if cross_stream_checksum.item() != expected_checksum:
+        raise RuntimeError("PLS tensor contents changed across the ownership/lifetime boundary")
+    del cross_stream_checksum, consumer_stream
+    torch.cuda.synchronize()
+    native_backend.reclaim_direct_dct_pls_pools()
+    gc.collect()
+    final = native_backend._lifetime_reclaim_stats_for_test()
+    if final["native"]["pending_reclaim_count"] != baseline["native"]["pending_reclaim_count"]:
+        raise RuntimeError("PLS smoke left native owners pending after consumer completion")
+    if final["native"]["reclaimed_batch_count"] <= baseline["native"]["reclaimed_batch_count"]:
+        raise RuntimeError("PLS smoke did not reclaim native tensor backing")
+    for pool_name in ("device_pool", "pinned_pool"):
+        if final[pool_name]["in_use_bytes"] != baseline[pool_name]["in_use_bytes"]:
+            raise RuntimeError(f"PLS smoke left allocations in {pool_name}")
+    print(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

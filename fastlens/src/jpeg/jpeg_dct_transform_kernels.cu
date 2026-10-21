@@ -1,0 +1,1589 @@
+#include "fastlens/jpeg_dct_format.hpp"
+#include "codecs/consts.cuh"
+#include "jpeg/jpeg_dct_kernel_launch.cuh"
+
+namespace fastlens::jpeg::detail {
+
+// Stable 2:1 DCT-domain reference conversion. Tiny non-zero entries are
+// observable at round-to-even boundaries.
+__device__ __constant__ float kReferenceDown2Conversion[8U * 16U] = {
+#include "jpeg/jpeg_dct_reference_down2.inc"
+};
+
+// First eight rows of RGB-no-more's FP32 generate_conversion_matrix(8, 4).
+// Keep its small non-zero entries, as for the shared down2/up2 conversion.
+__device__ __constant__ float kReferenceUp4Conversion[8U * 32U] = {
+#include "jpeg/jpeg_dct_reference_up4.inc"
+};
+
+__device__ __forceinline__ uint8_t natural_to_physical_coeff_device(const uint8_t natural,
+                                                                    const uint8_t zigzag_columns) {
+	if (zigzag_columns == 0) {
+		return natural;
+	}
+	constexpr uint8_t natural_to_zigzag[64] {
+	    0,  1,  5,  6,  14, 15, 27, 28, 2,  4,  7,  13, 16, 26, 29, 42, 3,  8,  12, 17, 25, 30,
+	    41, 43, 9,  11, 18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38,
+	    46, 51, 55, 60, 21, 34, 37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
+	};
+	return natural_to_zigzag[natural];
+}
+
+inline constexpr uint64_t kAllPhysicalCoefficientMask = ~uint64_t {0};
+
+__device__ __forceinline__ float finalize_dct_grid_float(const float value,
+                                                         const float output_add,
+                                                         const float output_scale,
+                                                         const float output_divide,
+                                                         const float output_shift) {
+	float rounded = nearbyintf(value);
+	rounded       = fminf(32767.0F, fmaxf(-32768.0F, rounded));
+	rounded       = __fadd_rn(rounded, output_add);
+	// Division and the final shift must not be folded into a reciprocal or FMA:
+	// RGB-no-more checkpoint inference observes these FP32 rounding boundaries.
+	if (output_divide != 1.0F)
+		rounded = __fdiv_rn(rounded, output_divide);
+	rounded = __fmul_rn(rounded, output_scale);
+	return output_shift == 0.0F ? rounded : __fadd_rn(rounded, output_shift);
+}
+
+__device__ __forceinline__ float dct_grid_madd_rn(const float lhs, const float rhs, const float accum) {
+	return __fmaf_rn(lhs, rhs, accum);
+}
+
+__device__ __forceinline__ float dct_grid_add_rn(const float lhs, const float rhs) {
+	return __fadd_rn(lhs, rhs);
+}
+
+__device__ __forceinline__ float normalize_reference_down2_value(const float value,
+	                                                               const uint32_t factor_product) {
+	return factor_product == 4U   ? __fmul_rn(value, 0.5F)
+	       : factor_product == 2U ? __fdiv_rn(value, 0x1.6a09e60000000p+0F)
+	                              : value;
+}
+
+template <uint32_t PrefixCount>
+__device__ __forceinline__ uint32_t zigzag_prefix_selected_y_count(const uint32_t source_frequency_x) {
+	static_assert(PrefixCount == 16U || PrefixCount == 32U);
+	if constexpr (PrefixCount == 16U) {
+		switch (source_frequency_x) {
+		case 0U: return 5U;
+		case 1U: return 4U;
+		case 2U: return 3U;
+		case 3U: return 2U;
+		case 4U:
+		case 5U: return 1U;
+		default: return 0U;
+		}
+	} else {
+		switch (source_frequency_x) {
+		case 0U: return 7U;
+		case 1U: return 6U;
+		case 2U: return 5U;
+		case 3U:
+		case 4U: return 4U;
+		case 5U: return 3U;
+		case 6U: return 2U;
+		default: return 1U;
+		}
+	}
+}
+
+template <uint32_t PrefixCount>
+__device__ __forceinline__ float zigzag_prefix_vertical_sum(const uint32_t out_y,
+	                                                          const uint32_t source_x,
+	                                                          const uint32_t source_width,
+	                                                          const uint32_t y_down,
+	                                                          const float*   composed) {
+	const auto selected_y_count = zigzag_prefix_selected_y_count<PrefixCount>(source_x % 8U);
+	float      sum              = 0.0F;
+#pragma unroll
+	for (uint32_t subblock_y = 0U; subblock_y < 2U; ++subblock_y) {
+		if (subblock_y < y_down) {
+#pragma unroll
+			for (uint32_t source_frequency_y = 0U; source_frequency_y < 8U; ++source_frequency_y) {
+				if (source_frequency_y < selected_y_count) {
+					const auto source_y = subblock_y * 8U + source_frequency_y;
+					sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
+					                       composed[source_y * source_width + source_x],
+					                       sum);
+				}
+			}
+		}
+	}
+	return sum;
+}
+
+template <uint32_t PrefixCount>
+__device__ __forceinline__ float zigzag_prefix_horizontal_sum(const uint32_t out_y,
+	                                                            const uint32_t out_x,
+	                                                            const uint32_t source_width,
+	                                                            const uint32_t x_down,
+	                                                            const float*   vertical) {
+	static_assert(PrefixCount == 16U || PrefixCount == 32U);
+	constexpr uint32_t active_x_count = PrefixCount == 16U ? 6U : 8U;
+	float              sum            = 0.0F;
+#pragma unroll
+	for (uint32_t subblock_x = 0U; subblock_x < 2U; ++subblock_x) {
+		if (subblock_x < x_down) {
+#pragma unroll
+			for (uint32_t source_frequency_x = 0U; source_frequency_x < active_x_count; ++source_frequency_x) {
+				const auto source_x = subblock_x * 8U + source_frequency_x;
+				sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
+				                       kReferenceDown2Conversion[out_x * 16U + source_x],
+				                       sum);
+			}
+		}
+	}
+	return sum;
+}
+
+__device__ __forceinline__ uint64_t remap_planless_row_base(
+	const uint32_t remap_base,
+	const uint32_t* __restrict logical_to_compact_vectors,
+	const uint64_t logical_row) {
+	if (remap_base == std::numeric_limits<uint32_t>::max()) {
+		return logical_row;
+	}
+	if (logical_to_compact_vectors == nullptr) {
+		return std::numeric_limits<uint64_t>::max();
+	}
+	const uint64_t logical_vector = logical_row / fastlens::codec::consts::VALUES_PER_VECTOR;
+	const uint64_t row_in_vector  = logical_row % fastlens::codec::consts::VALUES_PER_VECTOR;
+	const uint32_t compact_vector = logical_to_compact_vectors[remap_base + logical_vector];
+	if (compact_vector == std::numeric_limits<uint32_t>::max()) {
+		return std::numeric_limits<uint64_t>::max();
+	}
+	return static_cast<uint64_t>(compact_vector) * fastlens::codec::consts::VALUES_PER_VECTOR + row_in_vector;
+}
+
+__device__ __forceinline__ uint64_t remap_planless_row(
+	const JpegDctDevicePlanlessImageDescriptor& image,
+	const uint32_t* __restrict logical_to_compact_vectors,
+	const uint64_t logical_row) {
+	return remap_planless_row_base(image.vector_remap_base, logical_to_compact_vectors, logical_row);
+}
+
+struct PlanlessLocatedRow {
+	uint64_t row          = std::numeric_limits<uint64_t>::max();
+	uint32_t binding_base = std::numeric_limits<uint32_t>::max();
+};
+
+__device__ __forceinline__ bool block_major_group_less(const JpegDctDeviceBlockMajorGroupBinding& group,
+	                                                    const uint32_t shard_id,
+	                                                    const uint32_t semantic_slot_id,
+	                                                    const uint32_t block_y,
+	                                                    const uint32_t block_x) {
+	if (group.shard_id != shard_id) {
+		return group.shard_id < shard_id;
+	}
+	if (group.semantic_slot_id != semantic_slot_id) {
+		return group.semantic_slot_id < semantic_slot_id;
+	}
+	if (group.block_y != block_y) {
+		return group.block_y < block_y;
+	}
+	return group.block_x < block_x;
+}
+
+__device__ __forceinline__ const JpegDctDeviceBlockMajorGroupBinding* find_block_major_group(
+	const JpegDctDeviceBlockMajorGroupBinding* __restrict groups,
+	const size_t group_count,
+	const uint32_t shard_id,
+	const uint32_t semantic_slot_id,
+	const uint32_t block_x,
+	const uint32_t block_y) {
+	size_t begin = 0U;
+	size_t end   = group_count;
+	while (begin < end) {
+		const auto middle = begin + (end - begin) / 2U;
+		if (block_major_group_less(groups[middle], shard_id, semantic_slot_id, block_y, block_x)) {
+			begin = middle + 1U;
+		} else {
+			end = middle;
+		}
+	}
+	if (begin >= group_count) {
+		return nullptr;
+	}
+	const auto& group = groups[begin];
+	return group.shard_id == shard_id && group.semantic_slot_id == semantic_slot_id &&
+	               group.block_x == block_x && group.block_y == block_y
+	           ? &group
+	           : nullptr;
+}
+
+__device__ __forceinline__ bool consume_block_major_uleb128(const uint8_t* __restrict payload,
+	                                                         const uint32_t payload_size,
+	                                                         uint32_t& cursor,
+	                                                         uint32_t& value) {
+	value = 0U;
+	for (uint32_t shift = 0U; shift < 32U; shift += 7U) {
+		if (cursor >= payload_size) {
+			return false;
+		}
+		const auto byte = payload[cursor++];
+		if (shift == 28U && (byte & 0xf0U) != 0U) {
+			return false;
+		}
+		value |= static_cast<uint32_t>(byte & 0x7fU) << shift;
+		if ((byte & 0x80U) == 0U) {
+			return true;
+		}
+	}
+	return false;
+}
+
+__device__ __forceinline__ bool block_major_rank(const JpegDctDeviceBlockMajorRankCell& cell,
+	                                              const uint8_t* __restrict rank_payload,
+	                                              const size_t rank_payload_size,
+	                                              const uint32_t local_image_index,
+	                                              uint32_t& rank) {
+	constexpr uint8_t empty_encoding       = 0U;
+	constexpr uint8_t all_present_encoding = 1U;
+	constexpr uint8_t sparse_encoding      = 2U;
+	constexpr uint8_t missing_encoding     = 3U;
+	constexpr uint8_t bitmap_encoding      = 4U;
+	rank = 0U;
+	if (local_image_index >= cell.image_count || cell.encoding == empty_encoding) {
+		return false;
+	}
+	if (cell.encoding == all_present_encoding) {
+		rank = local_image_index;
+		return true;
+	}
+	if (cell.payload_offset > rank_payload_size || cell.payload_size > rank_payload_size - cell.payload_offset ||
+	    rank_payload == nullptr) {
+		return false;
+	}
+	const auto* payload = rank_payload + cell.payload_offset;
+	if (cell.encoding == bitmap_encoding) {
+		if (cell.rank_checkpoint_images == 0U) {
+			return false;
+		}
+		const auto bit_bytes = (cell.image_count + 7U) / 8U;
+		const auto checkpoint = local_image_index / cell.rank_checkpoint_images;
+		const auto checkpoint_offset = bit_bytes + checkpoint * 2U;
+		if (checkpoint_offset + 1U >= cell.payload_size || local_image_index / 8U >= bit_bytes) {
+			return false;
+		}
+		rank = static_cast<uint32_t>(payload[checkpoint_offset]) |
+		       (static_cast<uint32_t>(payload[checkpoint_offset + 1U]) << 8U);
+		const auto begin = checkpoint * cell.rank_checkpoint_images;
+		for (uint32_t image = begin; image < local_image_index; ++image) {
+			rank += (payload[image / 8U] >> (image % 8U)) & 1U;
+		}
+		return ((payload[local_image_index / 8U] >> (local_image_index % 8U)) & 1U) != 0U;
+	}
+	if (cell.encoding != sparse_encoding && cell.encoding != missing_encoding) {
+		return false;
+	}
+	const auto listed_count =
+	    cell.encoding == sparse_encoding ? static_cast<uint32_t>(cell.present_count)
+	                                    : cell.image_count - static_cast<uint32_t>(cell.present_count);
+	uint32_t cursor = 0U;
+	uint32_t value = 0U;
+	uint32_t listed_before = 0U;
+	bool listed = false;
+	for (uint32_t index = 0U; index < listed_count; ++index) {
+		uint32_t delta = 0U;
+		if (!consume_block_major_uleb128(payload, cell.payload_size, cursor, delta)) {
+			return false;
+		}
+		value = index == 0U ? delta : value + delta;
+		if (value < local_image_index) {
+			++listed_before;
+		} else {
+			listed = value == local_image_index;
+			break;
+		}
+	}
+	if (cell.encoding == sparse_encoding) {
+		rank = listed_before;
+		return listed;
+	}
+	rank = local_image_index - listed_before;
+	return !listed;
+}
+
+__device__ uint64_t planless_block_order_rank(
+    uint32_t width, uint32_t height, uint32_t x, uint32_t y, uint8_t spatial_order);
+
+__device__ __forceinline__ PlanlessLocatedRow locate_planless_row(
+	const JpegDctDevicePlanlessImageDescriptor& image,
+	const JpegDctDevicePlanlessComponentDescriptor& component,
+	const uint32_t block_x,
+	const uint32_t block_y,
+	const uint32_t* __restrict logical_to_compact_vectors,
+	const uint32_t* __restrict image_vector_bindings,
+	const JpegDctDeviceBlockMajorGroupBinding* __restrict block_major_groups,
+	const size_t block_major_group_count,
+	const JpegDctDeviceBlockMajorRankCell* __restrict block_major_rank_cells,
+	const size_t block_major_rank_cell_count,
+	const uint8_t* __restrict block_major_rank_payload,
+	const size_t block_major_rank_payload_size) {
+	if (block_major_groups == nullptr) {
+		const auto rank = planless_block_order_rank(
+		    component.width_in_blocks, component.height_in_blocks, block_x, block_y, image.spatial_order);
+		const auto logical_row =
+		    static_cast<uint64_t>(image.row_start_in_rowgroup) + component.component_row_offset + rank;
+		if (image.vector_binding_count != 0U) {
+			const auto logical_vector = logical_row / fastlens::codec::consts::VALUES_PER_VECTOR;
+			if (image_vector_bindings == nullptr || logical_vector >= image.vector_binding_count) {
+				return {};
+			}
+			const auto binding_base = image_vector_bindings[image.vector_binding_base + logical_vector];
+			if (binding_base == std::numeric_limits<uint32_t>::max()) {
+				return {};
+			}
+			return {logical_row % fastlens::codec::consts::VALUES_PER_VECTOR, binding_base};
+		}
+		return {remap_planless_row(image, logical_to_compact_vectors, logical_row), image.binding_base};
+	}
+	const auto* group = find_block_major_group(block_major_groups,
+	                                           block_major_group_count,
+	                                           image.shard_id,
+	                                           component.semantic_slot_id,
+	                                           block_x,
+	                                           block_y);
+	if (group == nullptr || group->rank_cell_index >= block_major_rank_cell_count ||
+	    group->coefficient_binding_base == std::numeric_limits<uint32_t>::max()) {
+		return {};
+	}
+	uint32_t rank = 0U;
+	if (!block_major_rank(block_major_rank_cells[group->rank_cell_index],
+	                     block_major_rank_payload,
+	                     block_major_rank_payload_size,
+	                     image.local_image_index,
+	                     rank)) {
+		return {};
+	}
+	const auto logical_row = static_cast<uint64_t>(group->row_start_in_rowgroup) + rank;
+	return {remap_planless_row_base(group->vector_remap_base, logical_to_compact_vectors, logical_row),
+	        group->coefficient_binding_base};
+}
+
+__device__ __forceinline__ void store_planless_dct_grid_value(const JpegDctDevicePlanlessImageDescriptor& image,
+                                                              const uint32_t                              component,
+                                                              const uint32_t                              output_x,
+                                                              const uint32_t                              output_y,
+                                                              const uint32_t y_output_width,
+                                                              const uint32_t y_output_height,
+                                                              const uint32_t cbcr_output_width,
+                                                              const uint32_t cbcr_output_height,
+                                                              const uint32_t lane,
+                                                              const float    value,
+                                                              const bool     accumulate,
+                                                              float* __restrict y_accum,
+                                                              float* __restrict cbcr_accum,
+                                                              const JpegDctOutputProjection* projection) {
+	if (lane >= 64U) {
+		return;
+	}
+	const auto stored_x     = image.horizontal_flip != 0U
+	                              ? ((component == 0U ? y_output_width : cbcr_output_width) - 1U - output_x)
+	                              : output_x;
+	const auto stored_value = image.horizontal_flip != 0U && (lane % 8U) % 2U != 0U ? -value : value;
+	if (projection != nullptr) {
+		const int channel = projection->channel[component * 64U + lane];
+		if (channel < 0)
+			return;
+		const uint64_t index =
+		    ((static_cast<uint64_t>(image.request_index) * projection->count + channel) * y_output_height + output_y) *
+		        y_output_width +
+		    stored_x;
+		if (projection->finalize_on_store) {
+			// Match the former zero-initialized accumulation before finalization,
+			// including signed zero after a horizontal flip.
+			const float sum   = accumulate ? __fadd_rn(0.0F, stored_value) : stored_value;
+			const float value = finalize_dct_grid_float(
+			    sum, projection->add, projection->scale, projection->output_divide, projection->shift);
+			y_accum[index] = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
+		} else if (accumulate)
+			y_accum[index] += stored_value;
+		else
+			y_accum[index] = stored_value;
+		return;
+	}
+	if (component == 0U && y_accum != nullptr) {
+		const auto output_block_index =
+		    (static_cast<uint64_t>(image.request_index) * y_output_height + output_y) * y_output_width + stored_x;
+		if (accumulate) {
+			y_accum[output_block_index * 64U + lane] += stored_value;
+		} else {
+			y_accum[output_block_index * 64U + lane] = stored_value;
+		}
+	} else if (component != 0U && cbcr_accum != nullptr) {
+		const auto output_block_index =
+		    ((static_cast<uint64_t>(image.request_index) * 2U + component - 1U) * cbcr_output_height + output_y) *
+		        cbcr_output_width +
+		    stored_x;
+		if (accumulate) {
+			cbcr_accum[output_block_index * 64U + lane] += stored_value;
+		} else {
+			cbcr_accum[output_block_index * 64U + lane] = stored_value;
+		}
+	}
+}
+
+__global__ void finalize_projected_dct_kernel(float*                         output,
+                                              const size_t                   count,
+                                              const size_t                   spatial,
+                                              const JpegDctOutputProjection* projection,
+                                              const float                    add,
+                                              const float                    scale,
+                                              const float                    divide,
+                                              const float                    shift,
+                                              const bool                     initialize) {
+	const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (index >= count)
+		return;
+	const size_t channel = (index / spatial) % projection->count;
+	const float  value   = finalize_dct_grid_float(initialize ? 0.0F : output[index], add, scale, divide, shift);
+	output[index]        = __fdiv_rn(__fsub_rn(value, projection->subtract[channel]), projection->divide[channel]);
+}
+
+__global__ void round_dct_grid_accum_pair_kernel(const float* __restrict y_in,
+                                                 const size_t y_count,
+                                                 const float* __restrict cbcr_in,
+                                                 const size_t cbcr_count,
+                                                 int16_t* __restrict y_out,
+                                                 int16_t* __restrict cbcr_out) {
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= y_count + cbcr_count) {
+		return;
+	}
+	const bool   is_y      = idx < y_count;
+	const size_t local_idx = is_y ? idx : idx - y_count;
+	const float* input     = is_y ? y_in : cbcr_in;
+	int16_t*     output    = is_y ? y_out : cbcr_out;
+	float        value     = nearbyintf(input[local_idx]);
+	value                  = fminf(32767.0F, fmaxf(-32768.0F, value));
+	output[local_idx]      = static_cast<int16_t>(value);
+}
+
+__global__ void round_affine_dct_grid_accum_pair_kernel(float* __restrict y_in_out,
+                                                        const size_t y_count,
+                                                        float* __restrict cbcr_in_out,
+                                                        const size_t cbcr_count,
+                                                        const float  output_add,
+                                                        const float  output_scale,
+                                                        const float  output_divide,
+                                                        const float  output_shift) {
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= y_count + cbcr_count) {
+		return;
+	}
+	const bool   is_y      = idx < y_count;
+	const size_t local_idx = is_y ? idx : idx - y_count;
+	float*       in_out    = is_y ? y_in_out : cbcr_in_out;
+	in_out[local_idx] =
+	    finalize_dct_grid_float(in_out[local_idx], output_add, output_scale, output_divide, output_shift);
+}
+
+__device__ uint64_t planless_rectangle_intersection_count(const uint64_t width,
+                                                          const uint64_t height,
+                                                          const uint64_t origin_x,
+                                                          const uint64_t origin_y,
+                                                          const uint64_t size) {
+	if (origin_x >= width || origin_y >= height) {
+		return 0U;
+	}
+	return min(size, width - origin_x) * min(size, height - origin_y);
+}
+
+__device__ uint64_t planless_morton_rank_in_rectangle(const uint32_t width,
+                                                      const uint32_t height,
+                                                      const uint32_t x,
+                                                      const uint32_t y) {
+	uint64_t size = 1U;
+	while (size < max(static_cast<uint64_t>(width), static_cast<uint64_t>(height))) {
+		size <<= 1U;
+	}
+	uint64_t rank     = 0U;
+	uint64_t origin_x = 0U;
+	uint64_t origin_y = 0U;
+	while (size > 1U) {
+		const auto half            = size >> 1U;
+		const auto qx              = static_cast<uint32_t>(x >= origin_x + half);
+		const auto qy              = static_cast<uint32_t>(y >= origin_y + half);
+		const auto target_quadrant = qx | (qy << 1U);
+		for (uint32_t quadrant = 0; quadrant < target_quadrant; ++quadrant) {
+			const auto child_x = origin_x + ((quadrant & 1U) != 0U ? half : 0U);
+			const auto child_y = origin_y + ((quadrant & 2U) != 0U ? half : 0U);
+			rank += planless_rectangle_intersection_count(width, height, child_x, child_y, half);
+		}
+		origin_x += qx != 0U ? half : 0U;
+		origin_y += qy != 0U ? half : 0U;
+		size = half;
+	}
+	return rank;
+}
+
+__device__ uint64_t planless_block_order_rank(
+    const uint32_t width, const uint32_t height, const uint32_t x, const uint32_t y, const uint8_t spatial_order) {
+	constexpr uint32_t tile_blocks = 32U;
+	if (spatial_order == static_cast<uint8_t>(JpegDctSpatialOrder::kRaster)) {
+		return static_cast<uint64_t>(y) * width + x;
+	}
+	if (spatial_order == static_cast<uint8_t>(JpegDctSpatialOrder::kZOrder)) {
+		return planless_morton_rank_in_rectangle(width, height, x, y);
+	}
+	const auto tile_x          = (x / tile_blocks) * tile_blocks;
+	const auto tile_y          = (y / tile_blocks) * tile_blocks;
+	const auto tile_width      = min(tile_blocks, width - tile_x);
+	const auto tile_height     = min(tile_blocks, height - tile_y);
+	const auto before_tile_row = static_cast<uint64_t>(tile_y) * width;
+	const auto before_tile     = static_cast<uint64_t>(tile_height) * tile_x;
+	const auto local_x         = x - tile_x;
+	const auto local_y         = y - tile_y;
+	const auto within_tile     = spatial_order == static_cast<uint8_t>(JpegDctSpatialOrder::kTiledRaster32)
+	                                 ? static_cast<uint64_t>(local_y) * tile_width + local_x
+	                                 : planless_morton_rank_in_rectangle(tile_width, tile_height, local_x, local_y);
+	return before_tile_row + before_tile + within_tile;
+}
+
+__device__ float planless_axis_phase_weight(const float* __restrict phase_matrices,
+                                            const uint32_t matrix_base,
+                                            const uint16_t up_factor,
+                                            const uint16_t down_factor,
+                                            const uint32_t source_block,
+                                            const uint32_t output_block,
+                                            const uint32_t out_coeff,
+                                            const uint32_t in_coeff) {
+	if (matrix_base != std::numeric_limits<uint32_t>::max()) {
+		const auto relative_phase =
+		    static_cast<int64_t>(source_block) * up_factor - static_cast<int64_t>(output_block) * down_factor;
+		const auto phase_index = static_cast<int64_t>(matrix_base) + relative_phase + up_factor - 1;
+		return phase_matrices[static_cast<size_t>(phase_index) * 64U + out_coeff * 8U + in_coeff];
+	}
+	if (up_factor == 1U && down_factor == 1U) {
+		return out_coeff == in_coeff ? 1.0F : 0.0F;
+	}
+	if (up_factor == 1U && down_factor == 2U) {
+		const auto subblock = source_block - output_block * 2U;
+		return kReferenceDown2Conversion[out_coeff * 16U + subblock * 8U + in_coeff] / 0x1.6a09e60000000p+0F;
+	}
+	return 0.0F;
+}
+
+__device__ __forceinline__ uint64_t active_output_index(uint64_t                              index,
+                                                        const uint64_t                        blocks_per_image,
+                                                        const uint32_t*                       blocks,
+                                                        uint64_t                              blocks_per_repeated_image,
+                                                        const uint32_t*                       image_indices,
+                                                        const JpegDctDeviceActiveOutputGroup* groups,
+                                                        const size_t                          group_count) {
+	if (groups != nullptr) {
+		size_t lo = 0, hi = group_count;
+		while (lo + 1 < hi) {
+			const auto mid = lo + (hi - lo) / 2;
+			if (groups[mid].task_begin <= index)
+				lo = mid;
+			else
+				hi = mid;
+		}
+		const auto group = groups[lo];
+		index -= group.task_begin;
+		blocks += group.block_begin;
+		if (group.image_count == 0)
+			return blocks[index];
+		return uint64_t(image_indices[group.image_begin + index / group.block_count]) * blocks_per_image +
+		       blocks[index % group.block_count];
+	}
+	return blocks_per_repeated_image != 0
+	           ? (index / blocks_per_repeated_image) * blocks_per_image + blocks[index % blocks_per_repeated_image]
+	           : (blocks == nullptr ? index : blocks[index]);
+}
+
+__global__ void
+transformed_dct_grid_integer_upsample_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                             const JpegDctDevicePlanlessImageDescriptor* __restrict images,
+                                             const uint32_t* __restrict logical_to_compact_vectors,
+                                             const uint32_t* __restrict image_vector_bindings,
+                                             const uint32_t* __restrict active_output_blocks,
+                                             const uint64_t active_output_blocks_per_image,
+                                             const uint32_t* __restrict active_image_indices,
+                                             const JpegDctDeviceActiveOutputGroup* active_output_groups,
+                                             size_t                                active_output_group_count,
+                                             const JpegDctDeviceBlockMajorGroupBinding* __restrict block_major_groups,
+                                             const size_t block_major_group_count,
+                                             const JpegDctDeviceBlockMajorRankCell* __restrict block_major_rank_cells,
+                                             const size_t block_major_rank_cell_count,
+                                             const uint8_t* __restrict block_major_rank_payload,
+                                             const size_t   block_major_rank_payload_size,
+                                             const uint64_t selected_physical_coefficient_mask,
+                                             const JpegDctDeviceSparseTransformPlan* __restrict sparse_transform_plans,
+                                             const size_t   image_count,
+                                             const uint64_t output_block_offset,
+                                             const uint64_t output_block_count,
+                                             const uint16_t* __restrict quant_tables,
+                                             const float* __restrict phase_matrices,
+                                             const uint32_t y_output_width,
+                                             const uint32_t y_output_height,
+                                             const uint32_t cbcr_output_width,
+                                             const uint32_t cbcr_output_height,
+                                             const int32_t  clamp_min,
+                                             const int32_t  clamp_max,
+                                             float* __restrict y_accum,
+                                             float* __restrict cbcr_accum,
+                                             const JpegDctOutputProjection* projection,
+                                             const bool                     identity_projection) {
+	// One CTA owns a source block and all of its projected output positions.
+	// The general kernel retains its register/shared-memory footprint.
+	__shared__ float    source[64];
+	__shared__ float    intermediate[16 * 64];
+	__shared__ uint64_t located_row;
+	__shared__ uint32_t located_binding;
+	const uint64_t      y_blocks         = uint64_t(y_output_width) * y_output_height;
+	const uint64_t      c_blocks         = uint64_t(cbcr_output_width) * cbcr_output_height;
+	const auto          blocks_per_image = y_blocks + 2 * c_blocks;
+	for (uint64_t task = blockIdx.x; task < output_block_count; task += gridDim.x) {
+		const auto index     = output_block_offset + task;
+		const auto linear    = active_output_index(index,
+                                                blocks_per_image,
+                                                active_output_blocks,
+                                                active_output_blocks_per_image,
+                                                active_image_indices,
+                                                active_output_groups,
+                                                active_output_group_count);
+		const auto& image     = images[linear / blocks_per_image];
+		const auto spatial   = linear % blocks_per_image;
+		const auto component = spatial < y_blocks ? 0U : 1U + uint32_t((spatial - y_blocks) / c_blocks);
+		const auto width     = component == 0 ? y_output_width : cbcr_output_width;
+		const auto xy        = component == 0 ? spatial : (spatial - y_blocks) % c_blocks;
+		const auto ox = uint32_t(xy % width), oy = uint32_t(xy / width);
+		const auto& descriptor = image.components[component];
+		const auto ux = descriptor.x_up_factor, uy = descriptor.y_up_factor;
+		const auto sx = ox / ux, sy = oy / uy;
+		const auto frequencies = projection->frequency_count[component];
+		if (!frequencies)
+			continue;
+		if (threadIdx.x == 0) {
+			const auto located = locate_planless_row(image,
+			                                         descriptor,
+			                                         uint32_t(descriptor.crop_x + sx),
+			                                         uint32_t(descriptor.crop_y + sy),
+			                                         logical_to_compact_vectors,
+			                                         image_vector_bindings,
+			                                         block_major_groups,
+			                                         block_major_group_count,
+			                                         block_major_rank_cells,
+			                                         block_major_rank_cell_count,
+			                                         block_major_rank_payload,
+			                                         block_major_rank_payload_size);
+			located_row        = located.row;
+			located_binding    = located.binding_base;
+		}
+		__syncthreads();
+		if (threadIdx.x < 64) {
+			const auto coefficient = uint8_t(threadIdx.x);
+			const auto physical    = natural_to_physical_coeff_device(coefficient, image.zigzag_columns != 0);
+			int16_t    value       = 0;
+			if (located_row != std::numeric_limits<uint64_t>::max() &&
+			    located_binding != std::numeric_limits<uint32_t>::max()) {
+				const auto binding = column_bindings[located_binding + physical];
+				if (binding.source == DeviceCoeffSource::kI16)
+					value = binding.column_i16[located_row];
+				else if (binding.source == DeviceCoeffSource::kI8)
+					value = binding.column_i8[located_row];
+			}
+			const int32_t quant = quant_tables[size_t(descriptor.quant_table_index) * 64 + coefficient];
+			source[coefficient] = float(min(clamp_max, max(clamp_min, int32_t(value) * quant)));
+		}
+		__syncthreads();
+		const bool reference_upscale = ux == uy && (ux == 2 || ux == 4);
+		const auto horizontal_count  = projection->horizontal_count[component];
+		if (!reference_upscale) {
+			// Reuse each horizontal phase across every vertical output phase.
+			for (uint32_t t = threadIdx.x; t < ux * horizontal_count; t += blockDim.x) {
+				const auto x   = t / horizontal_count;
+				const auto f   = projection->horizontal_frequencies[component][t % horizontal_count];
+				float      sum = 0.F;
+				for (uint32_t k = 0; k < 8; ++k)
+					sum = dct_grid_madd_rn(
+					    source[(f / 8) * 8 + k],
+					    planless_axis_phase_weight(
+					        phase_matrices, descriptor.x_phase_matrix_base, ux, 1, sx, ox + x, f % 8, k),
+					    sum);
+				intermediate[x * 64 + f] = sum;
+			}
+			__syncthreads();
+		}
+		for (uint32_t y = 0; y < uy; ++y) {
+			const auto* conversion = ux == 2 ? kReferenceDown2Conversion : kReferenceUp4Conversion;
+			if (reference_upscale) {
+				// Preserve the CPU-reference vertical-first rounding order for 2x/4x.
+				if (threadIdx.x < 64) {
+					const auto f   = threadIdx.x;
+					float      sum = 0.F;
+					for (uint32_t k = 0; k < 8; ++k)
+						sum = dct_grid_madd_rn(
+						    conversion[k * ux * 8 + y * 8 + f / 8], __fmul_rn(source[k * 8 + f % 8], float(ux)), sum);
+					intermediate[f] = sum;
+				}
+				__syncthreads();
+			}
+			// Compute in spatial store order so each thread writes its own result.
+			for (uint32_t t = threadIdx.x; t < ux * frequencies; t += blockDim.x) {
+				const auto x = t % ux, slot = t / ux;
+				const auto f   = projection->frequencies[component][slot];
+				float      sum = 0.F;
+				for (uint32_t k = 0; k < 8; ++k) {
+					if (reference_upscale)
+						sum = dct_grid_madd_rn(
+						    intermediate[(f / 8) * 8 + k], conversion[k * ux * 8 + x * 8 + f % 8], sum);
+					else
+						sum = dct_grid_madd_rn(
+						    intermediate[x * 64 + k * 8 + f % 8],
+						    planless_axis_phase_weight(
+						        phase_matrices, descriptor.y_phase_matrix_base, uy, 1, sy, oy + y, f / 8, k),
+						    sum);
+				}
+				store_planless_dct_grid_value(image,
+				                              component,
+				                              ox + x,
+				                              oy + y,
+				                              y_output_width,
+				                              y_output_height,
+				                              cbcr_output_width,
+				                              cbcr_output_height,
+				                              f,
+				                              dct_grid_add_rn(0.F, sum),
+				                              true,
+				                              y_accum,
+				                              cbcr_accum,
+				                              projection);
+			}
+			__syncthreads();
+		}
+	}
+}
+
+__global__ void
+transformed_dct_grid_planless_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                     const JpegDctDevicePlanlessImageDescriptor* __restrict images,
+                                     const uint32_t* __restrict logical_to_compact_vectors,
+                                     const uint32_t* __restrict image_vector_bindings,
+                                     const uint32_t* __restrict active_output_blocks,
+                                     const uint64_t active_output_blocks_per_image,
+                                     const uint32_t* __restrict active_image_indices,
+                                     const JpegDctDeviceActiveOutputGroup* active_output_groups,
+                                     size_t                                active_output_group_count,
+                                     const JpegDctDeviceBlockMajorGroupBinding* __restrict block_major_groups,
+                                     const size_t block_major_group_count,
+                                     const JpegDctDeviceBlockMajorRankCell* __restrict block_major_rank_cells,
+                                     const size_t block_major_rank_cell_count,
+                                     const uint8_t* __restrict block_major_rank_payload,
+                                     const size_t   block_major_rank_payload_size,
+                                     const uint64_t selected_physical_coefficient_mask,
+                                     const JpegDctDeviceSparseTransformPlan* __restrict sparse_transform_plans,
+                                     const size_t   image_count,
+                                     const uint64_t output_block_offset,
+                                     const uint64_t output_block_count,
+                                     const uint16_t* __restrict quant_tables,
+                                     const float* __restrict phase_matrices,
+                                     const uint32_t y_output_width,
+                                     const uint32_t y_output_height,
+                                     const uint32_t cbcr_output_width,
+                                     const uint32_t cbcr_output_height,
+                                     const int32_t  clamp_min,
+                                     const int32_t  clamp_max,
+                                     float* __restrict y_accum,
+                                     float* __restrict cbcr_accum,
+                                     const JpegDctOutputProjection* projection,
+                                     const bool                     identity_projection,
+                                     const JpegDctSplitDown2Block*  split_down2_blocks,
+                                     float*                         split_down2_source,
+                                     const uint32_t                 workset_index) {
+	// Identity projection: neighboring threads own neighboring output blocks,
+	// so each channel is written in spatial order instead of across NCHW planes.
+	// Locate the source once per block and reuse it for every requested channel.
+	if (identity_projection) {
+		const uint64_t spatial          = static_cast<uint64_t>(y_output_width) * y_output_height;
+		const uint64_t blocks_per_image = 3U * spatial;
+		for (uint64_t task = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; task < output_block_count;
+		     task += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+			const uint64_t index     = output_block_offset + task;
+			const uint64_t linear    = active_output_index(index,
+                                                        blocks_per_image,
+                                                        active_output_blocks,
+                                                        active_output_blocks_per_image,
+                                                        active_image_indices,
+                                                        active_output_groups,
+                                                        active_output_group_count);
+			const auto&    image     = images[linear / blocks_per_image];
+			const uint32_t component = (linear % blocks_per_image) / spatial;
+			const uint32_t xy        = linear % spatial;
+			const uint32_t x = xy % y_output_width, y = xy / y_output_width;
+			const auto     descriptor = image.components[component];
+			const int64_t  sx         = static_cast<int64_t>(descriptor.crop_x) + x;
+			const int64_t  sy         = static_cast<int64_t>(descriptor.crop_y) + y;
+			const auto     located =
+                sx >= 0 && sy >= 0 && sx < descriptor.width_in_blocks && sy < descriptor.height_in_blocks
+			            ? locate_planless_row(image,
+                                          descriptor,
+                                          static_cast<uint32_t>(sx),
+                                          static_cast<uint32_t>(sy),
+                                          logical_to_compact_vectors,
+                                          image_vector_bindings,
+                                          block_major_groups,
+                                          block_major_group_count,
+                                          block_major_rank_cells,
+                                          block_major_rank_cell_count,
+                                          block_major_rank_payload,
+                                          block_major_rank_payload_size)
+			            : PlanlessLocatedRow {};
+			if (projection->finalize_on_store && (located.row == std::numeric_limits<uint64_t>::max() ||
+			                                      located.binding_base == std::numeric_limits<uint32_t>::max()))
+				continue;
+			const auto* sparse = selected_physical_coefficient_mask != kAllPhysicalCoefficientMask
+			                         ? &sparse_transform_plans[image.zigzag_columns != 0U ? 1U : 0U]
+			                         : nullptr;
+			for (uint32_t frequency = 0; frequency < 64; ++frequency) {
+				const int channel = projection->channel[component * 64U + frequency];
+				if (channel < 0)
+					continue;
+				const uint8_t binding_index = sparse ? sparse->natural_to_compact_binding[frequency]
+				                                     : natural_to_physical_coeff_device(static_cast<uint8_t>(frequency),
+				                                                                        image.zigzag_columns != 0U);
+				int           value         = 0;
+				if (binding_index != JpegDctDeviceSparseTransformPlan::kMissingBinding &&
+				    located.row != std::numeric_limits<uint64_t>::max() &&
+				    located.binding_base != std::numeric_limits<uint32_t>::max()) {
+					const auto binding = column_bindings[located.binding_base + binding_index];
+					if (binding.source == DeviceCoeffSource::kI16)
+						value = binding.column_i16[located.row];
+					else if (binding.source == DeviceCoeffSource::kI8)
+						value = binding.column_i8[located.row];
+				}
+				const int   quant  = quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + frequency];
+				const float result = static_cast<float>(min(clamp_max, max(clamp_min, value * quant)));
+				store_planless_dct_grid_value(image,
+				                              component,
+				                              x,
+				                              y,
+				                              y_output_width,
+				                              y_output_height,
+				                              cbcr_output_width,
+				                              cbcr_output_height,
+				                              frequency,
+				                              result,
+				                              block_major_groups != nullptr,
+				                              y_accum,
+				                              cbcr_accum,
+				                              projection);
+			}
+		}
+		return;
+	}
+	const auto       lane                = static_cast<uint32_t>(threadIdx.x);
+	const uint64_t   y_blocks            = static_cast<uint64_t>(y_output_width) * y_output_height;
+	const uint64_t   cbcr_channel_blocks = static_cast<uint64_t>(cbcr_output_width) * cbcr_output_height;
+	const uint64_t   blocks_per_image    = y_blocks + 2U * cbcr_channel_blocks;
+	const bool       accumulates_block_major_partials = block_major_groups != nullptr;
+	__shared__ float composed[16U * 16U];
+	__shared__ float vertical[8U * 16U];
+	__shared__ float source[64U];
+	__shared__ float horizontal[64U];
+	__shared__ uint64_t located_rows[4];
+	__shared__ uint32_t located_binding_bases[4];
+	uint64_t            cached_image_component = std::numeric_limits<uint64_t>::max();
+	uint32_t            cached_source_x = 0U, cached_source_y = 0U;
+	// Consecutive projected outputs often share an upsampled source block.
+	// Keep that block dequantized while this CTA processes four neighbors.
+	const uint64_t outputs_per_cta = projection ? 4U : 1U;
+	for (uint64_t task = 0;; ++task) {
+		const uint64_t launch_block =
+		    (blockIdx.x + (task / outputs_per_cta) * gridDim.x) * outputs_per_cta + task % outputs_per_cta;
+		if (launch_block >= output_block_count)
+			break;
+		const uint64_t output_index = output_block_offset + launch_block;
+		const uint64_t linear_block = active_output_index(output_index,
+		                                                  blocks_per_image,
+		                                                  active_output_blocks,
+		                                                  active_output_blocks_per_image,
+		                                                  active_image_indices,
+		                                                  active_output_groups,
+		                                                  active_output_group_count);
+		if (blocks_per_image == 0U || linear_block >= image_count * blocks_per_image || quant_tables == nullptr) {
+			continue;
+		}
+		const auto image_index = static_cast<size_t>(linear_block / blocks_per_image);
+		const auto local_block = linear_block % blocks_per_image;
+		uint32_t   component   = 0U;
+		uint32_t   output_x    = 0U;
+		uint32_t   output_y    = 0U;
+		if (local_block < y_blocks) {
+			output_y = static_cast<uint32_t>(local_block / y_output_width);
+			output_x = static_cast<uint32_t>(local_block % y_output_width);
+		} else {
+			const auto chroma_local  = local_block - y_blocks;
+			component                = 1U + static_cast<uint32_t>(chroma_local / cbcr_channel_blocks);
+			const auto channel_local = chroma_local % cbcr_channel_blocks;
+			output_y                 = static_cast<uint32_t>(channel_local / cbcr_output_width);
+			output_x                 = static_cast<uint32_t>(channel_local % cbcr_output_width);
+		}
+		const auto& image      = images[image_index];
+		const auto& descriptor = image.components[component];
+		if (descriptor.present == 0U || descriptor.x_up_factor == 0U || descriptor.y_up_factor == 0U ||
+		    descriptor.x_down_factor == 0U || descriptor.y_down_factor == 0U) {
+			continue;
+		}
+		const bool sparse_transform = selected_physical_coefficient_mask != kAllPhysicalCoefficientMask;
+		const bool zigzag_prefix16 = image.zigzag_columns != 0U &&
+		                             selected_physical_coefficient_mask == uint64_t {0x000000000000ffffULL};
+		const bool zigzag_prefix32 = image.zigzag_columns != 0U &&
+		                             selected_physical_coefficient_mask == uint64_t {0x00000000ffffffffULL};
+		const auto* sparse_plan = sparse_transform && sparse_transform_plans != nullptr
+		                              ? &sparse_transform_plans[image.zigzag_columns != 0U ? 1U : 0U]
+		                              : nullptr;
+		if (sparse_transform && sparse_plan == nullptr) {
+			continue;
+		}
+		const auto x_down                   = static_cast<uint32_t>(descriptor.x_down_factor);
+		const auto y_down                   = static_cast<uint32_t>(descriptor.y_down_factor);
+		const bool use_reference_down2_axes = descriptor.x_up_factor == 1U && descriptor.y_up_factor == 1U &&
+		                                      x_down >= 1U && x_down <= 2U && y_down >= 1U && y_down <= 2U;
+		if (use_reference_down2_axes) {
+			const auto source_width       = x_down * 8U;
+			const auto source_block_count = x_down * y_down;
+			const auto split =
+			    split_down2_blocks != nullptr ? split_down2_blocks[linear_block] : JpegDctSplitDown2Block {};
+			float* saved_source = split.slot != std::numeric_limits<uint32_t>::max()
+			                          ? split_down2_source + size_t(split.slot) * 256U
+			                          : nullptr;
+			// Keep the block at two warps: the transform produces 64 coefficients, and
+			// the largest canonical down2 source contains only four coefficients per
+			// lane.  A 256-thread block left six warps idle after the source load and
+			// needlessly limited residency across the tens of thousands of output
+			// blocks in an ImageNet batch.
+			// Locate the at-most-four down2 source blocks in parallel, then let every
+			// coefficient lane load all of its source values. The previous lane-0
+			// loop placed a block-wide barrier on both sides of every source load.
+			if (lane < source_block_count) {
+				const uint32_t source_block_slot = lane;
+				const auto subblock_x = source_block_slot % x_down;
+				const auto subblock_y = source_block_slot / x_down;
+				const auto source_x_i = static_cast<int64_t>(descriptor.crop_x) + output_x * x_down + subblock_x;
+				const auto source_y_i = static_cast<int64_t>(descriptor.crop_y) + output_y * y_down + subblock_y;
+				const bool source_in_bounds = source_x_i >= 0 && source_y_i >= 0 &&
+				                              source_x_i < descriptor.width_in_blocks &&
+				                              source_y_i < descriptor.height_in_blocks;
+				const auto located = source_in_bounds
+				                         ? locate_planless_row(image,
+				                                               descriptor,
+				                                               static_cast<uint32_t>(source_x_i),
+				                                               static_cast<uint32_t>(source_y_i),
+				                                               logical_to_compact_vectors,
+				                                               image_vector_bindings,
+				                                               block_major_groups,
+				                                               block_major_group_count,
+				                                               block_major_rank_cells,
+				                                               block_major_rank_cell_count,
+				                                               block_major_rank_payload,
+				                                               block_major_rank_payload_size)
+				                         : PlanlessLocatedRow {};
+				located_rows[source_block_slot]          = located.row;
+				located_binding_bases[source_block_slot] = located.binding_base;
+			}
+			__syncthreads();
+			const auto coeff    = static_cast<uint8_t>(lane);
+			const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
+			const auto compact_binding =
+			    zigzag_prefix16 || zigzag_prefix32
+			        ? (physical < (zigzag_prefix16 ? 16U : 32U)
+			               ? physical
+			               : JpegDctDeviceSparseTransformPlan::kMissingBinding)
+			        : sparse_transform ? sparse_plan->natural_to_compact_binding[coeff]
+			                           : static_cast<uint8_t>(physical);
+			const bool selected = compact_binding != JpegDctDeviceSparseTransformPlan::kMissingBinding;
+			const auto quant =
+			    static_cast<int32_t>(quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
+			for (uint32_t source_block_slot = 0U; source_block_slot < source_block_count; ++source_block_slot) {
+				const auto subblock_x = source_block_slot % x_down;
+				const auto subblock_y = source_block_slot / x_down;
+				int16_t    value    = 0;
+				if (selected && located_rows[source_block_slot] != std::numeric_limits<uint64_t>::max() &&
+				    located_binding_bases[source_block_slot] != std::numeric_limits<uint32_t>::max()) {
+					const auto binding = column_bindings[located_binding_bases[source_block_slot] + compact_binding];
+					if (binding.source == DeviceCoeffSource::kI16) {
+						value = binding.column_i16[located_rows[source_block_slot]];
+					} else if (binding.source == DeviceCoeffSource::kI8) {
+						value = static_cast<int16_t>(binding.column_i8[located_rows[source_block_slot]]);
+					}
+				}
+				// Identity geometry needs neither separable-transform scratch nor
+				// the intervening barriers. Preserve the same dequantization,
+				// clamp, sparse zero-fill, flip and workset accumulation contract.
+				if (source_block_count == 1U) {
+					const auto dequantized =
+					    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+					store_planless_dct_grid_value(image,
+					                              component,
+					                              output_x,
+					                              output_y,
+					                              y_output_width,
+					                              y_output_height,
+					                              cbcr_output_width,
+					                              cbcr_output_height,
+					                              lane,
+					                              dequantized,
+					                              accumulates_block_major_partials,
+					                              y_accum,
+					                              cbcr_accum,
+					                              projection);
+					continue;
+				}
+				const auto composed_y = subblock_y * 8U + coeff / 8U;
+				const auto composed_x = subblock_x * 8U + coeff % 8U;
+				const auto index      = composed_y * source_width + composed_x;
+				const auto dequantized =
+				    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+				if (saved_source != nullptr) {
+					if (located_rows[source_block_slot] != std::numeric_limits<uint64_t>::max() &&
+					    located_binding_bases[source_block_slot] != std::numeric_limits<uint32_t>::max())
+						saved_source[index] = dequantized;
+					composed[index] = saved_source[index];
+				} else {
+					composed[index] = dequantized;
+				}
+			}
+			__syncthreads();
+			if (source_block_count == 1U || (saved_source != nullptr && workset_index != split.last_workset)) {
+				continue;
+			}
+			for (uint32_t vertical_linear = lane; vertical_linear < 8U * source_width; vertical_linear += blockDim.x) {
+				const auto out_y    = vertical_linear / source_width;
+				const auto source_x = vertical_linear % source_width;
+				float      sum      = 0.0F;
+				if (y_down == 1U) {
+					sum = composed[out_y * source_width + source_x];
+				} else if (zigzag_prefix16) {
+					sum = zigzag_prefix_vertical_sum<16U>(out_y, source_x, source_width, y_down, composed);
+				} else if (zigzag_prefix32) {
+					sum = zigzag_prefix_vertical_sum<32U>(out_y, source_x, source_width, y_down, composed);
+				} else if (sparse_transform) {
+					const auto source_frequency_x = source_x % 8U;
+					const auto selected_y_count = sparse_plan->selected_y_count_by_x[source_frequency_x];
+					for (uint32_t subblock_y = 0U; subblock_y < y_down; ++subblock_y) {
+						for (uint32_t selected_y = 0U; selected_y < selected_y_count; ++selected_y) {
+							const auto source_y = subblock_y * 8U +
+							    sparse_plan->selected_y_by_x[source_frequency_x * 8U + selected_y];
+							sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
+							                       composed[source_y * source_width + source_x],
+							                       sum);
+						}
+					}
+				} else {
+#pragma unroll
+					for (uint32_t source_y = 0; source_y < 16U; ++source_y) {
+						sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
+						                       composed[source_y * source_width + source_x],
+						                       sum);
+					}
+				}
+				vertical[out_y * source_width + source_x] = sum;
+			}
+			__syncthreads();
+			if (lane < 64U) {
+				const auto out_y = lane / 8U;
+				const auto out_x = lane % 8U;
+				float      sum   = 0.0F;
+				if (x_down == 1U) {
+					sum = vertical[out_y * source_width + out_x];
+				} else if (zigzag_prefix16) {
+					sum = zigzag_prefix_horizontal_sum<16U>(out_y, out_x, source_width, x_down, vertical);
+				} else if (zigzag_prefix32) {
+					sum = zigzag_prefix_horizontal_sum<32U>(out_y, out_x, source_width, x_down, vertical);
+				} else if (sparse_transform) {
+					for (uint32_t subblock_x = 0U; subblock_x < x_down; ++subblock_x) {
+						for (uint32_t selected_x = 0U; selected_x < sparse_plan->active_x_count; ++selected_x) {
+							const auto source_x = subblock_x * 8U + sparse_plan->active_x[selected_x];
+							sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
+							                       kReferenceDown2Conversion[out_x * 16U + source_x],
+							                       sum);
+						}
+					}
+				} else {
+#pragma unroll
+					for (uint32_t source_x = 0; source_x < 16U; ++source_x) {
+						sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
+						                       kReferenceDown2Conversion[out_x * 16U + source_x],
+						                       sum);
+					}
+				}
+				const auto factor_product = x_down * y_down;
+				const auto value          = normalize_reference_down2_value(sum, factor_product);
+				store_planless_dct_grid_value(image,
+				                              component,
+				                              output_x,
+				                              output_y,
+				                              y_output_width,
+				                              y_output_height,
+				                              cbcr_output_width,
+				                              cbcr_output_height,
+				                              lane,
+				                              value,
+				                              accumulates_block_major_partials,
+				                              y_accum,
+				                              cbcr_accum,
+				                              projection);
+			}
+			__syncthreads();
+			continue;
+		}
+
+		const bool needs_x_program = descriptor.x_phase_matrix_base != std::numeric_limits<uint32_t>::max();
+		const bool needs_y_program = descriptor.y_phase_matrix_base != std::numeric_limits<uint32_t>::max();
+		if ((needs_x_program || needs_y_program) && phase_matrices == nullptr) {
+			continue;
+		}
+		// Source frequencies remain complete. Compact only the requested output
+		// frequencies and the horizontal intermediates needed to produce them.
+		const uint32_t output_frequency_count = projection ? projection->frequency_count[component] : 64U;
+		const uint32_t horizontal_count       = projection ? projection->horizontal_count[component] : 64U;
+		const auto     up_factor              = static_cast<uint32_t>(descriptor.x_up_factor);
+		const bool     reference_upscale =
+		    x_down == 1U && y_down == 1U && descriptor.y_up_factor == up_factor && (up_factor == 2U || up_factor == 4U);
+		if (output_frequency_count == 0U) {
+			continue;
+		}
+		const auto source_x_begin = static_cast<uint32_t>((static_cast<uint64_t>(output_x) * descriptor.x_down_factor) /
+		                                                  descriptor.x_up_factor);
+		const auto source_x_end   = static_cast<uint32_t>(
+            ((static_cast<uint64_t>(output_x + 1U) * descriptor.x_down_factor) - 1U) / descriptor.x_up_factor);
+		const auto source_y_begin = static_cast<uint32_t>((static_cast<uint64_t>(output_y) * descriptor.y_down_factor) /
+		                                                  descriptor.y_up_factor);
+		const auto source_y_end   = static_cast<uint32_t>(
+            ((static_cast<uint64_t>(output_y + 1U) * descriptor.y_down_factor) - 1U) / descriptor.y_up_factor);
+		float output_sum = 0.0F;
+		for (uint32_t source_y_block = source_y_begin; source_y_block <= source_y_end; ++source_y_block) {
+			for (uint32_t source_x_block = source_x_begin; source_x_block <= source_x_end; ++source_x_block) {
+				const auto source_x_i = static_cast<int64_t>(descriptor.crop_x) + source_x_block;
+				const auto source_y_i = static_cast<int64_t>(descriptor.crop_y) + source_y_block;
+				const bool source_in_bounds = source_x_i >= 0 && source_y_i >= 0 &&
+				                              source_x_i < descriptor.width_in_blocks &&
+				                              source_y_i < descriptor.height_in_blocks;
+				const uint64_t image_component = image_index * 3U + component;
+				if (cached_image_component != image_component || cached_source_x != source_x_block ||
+				    cached_source_y != source_y_block) {
+					if (lane == 0U) {
+						const auto located       = source_in_bounds ? locate_planless_row(image,
+                                                                                    descriptor,
+                                                                                    static_cast<uint32_t>(source_x_i),
+                                                                                    static_cast<uint32_t>(source_y_i),
+                                                                                    logical_to_compact_vectors,
+                                                                                    image_vector_bindings,
+                                                                                    block_major_groups,
+                                                                                    block_major_group_count,
+                                                                                    block_major_rank_cells,
+                                                                                    block_major_rank_cell_count,
+                                                                                    block_major_rank_payload,
+                                                                                    block_major_rank_payload_size)
+						                                            : PlanlessLocatedRow {};
+						located_rows[0]          = located.row;
+						located_binding_bases[0] = located.binding_base;
+					}
+					__syncthreads();
+					if (lane < 64U) {
+						const auto coeff    = static_cast<uint8_t>(lane);
+						const auto physical = natural_to_physical_coeff_device(coeff, image.zigzag_columns != 0U);
+						int16_t    value    = 0;
+						const auto compact_binding = sparse_transform ? sparse_plan->natural_to_compact_binding[coeff]
+						                                              : static_cast<uint8_t>(physical);
+						const bool selected = compact_binding != JpegDctDeviceSparseTransformPlan::kMissingBinding;
+						if (selected && located_rows[0] != std::numeric_limits<uint64_t>::max() &&
+						    located_binding_bases[0] != std::numeric_limits<uint32_t>::max()) {
+							const auto binding = column_bindings[located_binding_bases[0] + compact_binding];
+							if (binding.source == DeviceCoeffSource::kI16) {
+								value = binding.column_i16[located_rows[0]];
+							} else if (binding.source == DeviceCoeffSource::kI8) {
+								value = static_cast<int16_t>(binding.column_i8[located_rows[0]]);
+							}
+						}
+						const auto quant = static_cast<int32_t>(
+						    quant_tables[static_cast<size_t>(descriptor.quant_table_index) * 64U + coeff]);
+						source[lane] =
+						    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+					}
+					__syncthreads();
+					cached_image_component = image_component;
+					cached_source_x        = source_x_block;
+					cached_source_y        = source_y_block;
+				}
+				if (reference_upscale) {
+					// Match CPU upsample_dct: scale the source by sqrt(L*M), then
+					// apply the unscaled FP32 conversion vertically and horizontally.
+					// Distributing sqrt(L) into each axis changes half-integer results.
+					const auto* conversion = up_factor == 2U ? kReferenceDown2Conversion : kReferenceUp4Conversion;
+					const auto  stride     = up_factor * 8U;
+					const auto  phase_y    = (output_y % up_factor) * 8U;
+					const auto  phase_x    = (output_x % up_factor) * 8U;
+					float       sum        = 0.0F;
+					for (uint32_t in_y = 0U; in_y < 8U; ++in_y) {
+						const auto value = __fmul_rn(source[in_y * 8U + lane % 8U], static_cast<float>(up_factor));
+						sum = dct_grid_madd_rn(conversion[in_y * stride + phase_y + lane / 8U], value, sum);
+					}
+					vertical[lane] = sum;
+					__syncthreads();
+					if (lane < output_frequency_count) {
+						const auto frequency = projection ? projection->frequencies[component][lane] : lane;
+						sum                  = 0.0F;
+						for (uint32_t in_x = 0U; in_x < 8U; ++in_x) {
+							sum = dct_grid_madd_rn(vertical[(frequency / 8U) * 8U + in_x],
+							                       conversion[in_x * stride + phase_x + frequency % 8U],
+							                       sum);
+						}
+						output_sum = dct_grid_add_rn(output_sum, sum);
+					}
+					__syncthreads();
+					continue;
+				}
+				if (lane < horizontal_count) {
+					const auto frequency      = projection ? projection->horizontal_frequencies[component][lane] : lane;
+					const auto source_y_coeff = frequency / 8U;
+					const auto out_x_coeff    = frequency % 8U;
+					float      x_sum          = 0.0F;
+					const auto selected_x_count =
+					    sparse_transform ? sparse_plan->selected_x_count_by_y[source_y_coeff] : uint8_t {8U};
+					for (uint32_t selected_x = 0U; selected_x < selected_x_count; ++selected_x) {
+						const auto in_x_coeff = sparse_transform
+						                            ? sparse_plan->selected_x_by_y[source_y_coeff * 8U + selected_x]
+						                            : static_cast<uint8_t>(selected_x);
+						const auto wx = planless_axis_phase_weight(phase_matrices,
+						                                           descriptor.x_phase_matrix_base,
+						                                           descriptor.x_up_factor,
+						                                           descriptor.x_down_factor,
+						                                           source_x_block,
+						                                           output_x,
+						                                           out_x_coeff,
+						                                           in_x_coeff);
+						x_sum = dct_grid_madd_rn(source[source_y_coeff * 8U + in_x_coeff], wx, x_sum);
+					}
+					horizontal[source_y_coeff * 8U + out_x_coeff] = x_sum;
+				}
+				__syncthreads();
+				if (lane < output_frequency_count) {
+					const auto frequency = projection ? projection->frequencies[component][lane] : lane;
+					const auto out_x_coeff    = frequency % 8U;
+					const auto out_y_coeff    = frequency / 8U;
+					float      weighted       = 0.0F;
+					const auto active_y_count = sparse_transform ? sparse_plan->active_y_count : uint8_t {8U};
+					for (uint32_t active_y = 0U; active_y < active_y_count; ++active_y) {
+						const auto in_y_coeff =
+						    sparse_transform ? sparse_plan->active_y[active_y] : static_cast<uint8_t>(active_y);
+						const auto wy = planless_axis_phase_weight(phase_matrices,
+						                                           descriptor.y_phase_matrix_base,
+						                                           descriptor.y_up_factor,
+						                                           descriptor.y_down_factor,
+						                                           source_y_block,
+						                                           output_y,
+						                                           out_y_coeff,
+						                                           in_y_coeff);
+						weighted = dct_grid_madd_rn(horizontal[in_y_coeff * 8U + out_x_coeff], wy, weighted);
+					}
+					output_sum = dct_grid_add_rn(output_sum, weighted);
+				}
+				__syncthreads();
+			}
+		}
+		if (lane < output_frequency_count) {
+			store_planless_dct_grid_value(image,
+			                              component,
+			                              output_x,
+			                              output_y,
+			                              y_output_width,
+			                              y_output_height,
+			                              cbcr_output_width,
+			                              cbcr_output_height,
+			                              projection ? projection->frequencies[component][lane] : lane,
+			                              output_sum,
+			                              accumulates_block_major_partials,
+			                              y_accum,
+			                              cbcr_accum,
+			                              projection);
+		}
+		__syncthreads();
+	}
+}
+
+__global__ void transformed_dct_grid_sources_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                                    const JpegDctDeviceFixedTransformBatchItem* __restrict items,
+                                                    const size_t item_count,
+                                                    const uint16_t* __restrict quant_tables,
+                                                    const float* __restrict resize_weight_matrices,
+                                                    const int32_t clamp_min,
+                                                    const int32_t clamp_max,
+                                                    float* __restrict y_accum,
+                                                    float* __restrict cbcr_accum) {
+	const size_t item_idx = static_cast<size_t>(blockIdx.x);
+	const auto   lane     = static_cast<uint8_t>(threadIdx.x);
+	if (item_idx >= item_count || lane >= 64U || quant_tables == nullptr || resize_weight_matrices == nullptr) {
+		return;
+	}
+	const auto       item = items[item_idx];
+	__shared__ float source[64];
+	__shared__ float horizontal[64];
+	const auto       physical = natural_to_physical_coeff_device(lane, item.zigzag_columns);
+	const auto       binding  = column_bindings[item.binding_base + physical];
+	int16_t          value    = 0;
+	if (binding.source == DeviceCoeffSource::kI16) {
+		value = binding.column_i16[item.row_in_rowgroup];
+	} else if (binding.source == DeviceCoeffSource::kI8) {
+		value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
+	}
+	const auto quant = static_cast<int32_t>(quant_tables[static_cast<size_t>(item.quant_table_index) * 64U + lane]);
+	source[lane]     = static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+	__syncthreads();
+	const auto source_y    = static_cast<uint8_t>(lane / 8U);
+	const auto out_x_coeff = static_cast<uint8_t>(lane % 8U);
+	float      x_sum       = 0.0F;
+	for (uint8_t in_x_coeff = 0; in_x_coeff < 8U; ++in_x_coeff) {
+		const float wx = resize_weight_matrices[static_cast<size_t>(item.x_weight_matrix_index) * 64U +
+		                                        out_x_coeff * 8U + in_x_coeff];
+		x_sum += source[source_y * 8U + in_x_coeff] * wx;
+	}
+	horizontal[lane] = x_sum;
+	__syncthreads();
+	const auto out_y_coeff = static_cast<uint8_t>(lane / 8U);
+	float      weighted    = 0.0F;
+	for (uint8_t in_y_coeff = 0; in_y_coeff < 8U; ++in_y_coeff) {
+		const float wy = resize_weight_matrices[static_cast<size_t>(item.y_weight_matrix_index) * 64U +
+		                                        out_y_coeff * 8U + in_y_coeff];
+		weighted += horizontal[in_y_coeff * 8U + out_x_coeff] * wy;
+	}
+	if (weighted == 0.0F) {
+		return;
+	}
+	if (item.component == 0 && y_accum != nullptr) {
+		atomicAdd(y_accum + item.output_block_index * 64U + lane, weighted);
+	} else if (item.component != 0 && cbcr_accum != nullptr) {
+		atomicAdd(cbcr_accum + item.output_block_index * 64U + lane, weighted);
+	}
+}
+
+__global__ void transformed_dct_grid_grouped_kernel(const DeviceCoeffBinding* __restrict column_bindings,
+                                                    const JpegDctDeviceFixedTransformBatchItem* __restrict items,
+                                                    const uint32_t* __restrict group_offsets,
+                                                    const size_t group_count,
+                                                    const uint16_t* __restrict quant_tables,
+                                                    const float* __restrict resize_weight_matrices,
+                                                    const int32_t clamp_min,
+                                                    const int32_t clamp_max,
+                                                    float* __restrict y_accum,
+                                                    float* __restrict cbcr_accum) {
+	const size_t group_idx = static_cast<size_t>(blockIdx.x);
+	const auto   lane      = static_cast<uint32_t>(threadIdx.x);
+	if (group_idx >= group_count || quant_tables == nullptr || resize_weight_matrices == nullptr) {
+		return;
+	}
+	const uint32_t begin = group_offsets[group_idx];
+	const uint32_t end   = group_offsets[group_idx + 1U];
+	if (begin >= end) {
+		return;
+	}
+
+	// The validation profile's dominant resizes downsample either or both axes by
+	// two.  Preserve the reference operation graph instead of distributing the
+	// transform into algebraically equivalent per-source matrices: compose the
+	// source blocks, apply C_y @ source and intermediate @ C_x.T, then let the
+	// common round-to-even kernel quantize the result.  For the 2x2 case this also
+	// performs 3,072 rather than 4,096 multiply-adds per output block.
+	const auto first_item               = items[begin];
+	const auto x_down_factor            = static_cast<uint32_t>(first_item.x_down_factor);
+	const auto y_down_factor            = static_cast<uint32_t>(first_item.y_down_factor);
+	bool       use_reference_down2_axes = first_item.x_up_factor == 1U && first_item.y_up_factor == 1U &&
+	                                x_down_factor >= 1U && x_down_factor <= 2U && y_down_factor >= 1U &&
+	                                y_down_factor <= 2U && end - begin == x_down_factor * y_down_factor;
+	uint8_t subblock_mask = 0U;
+	for (uint32_t item_idx = begin; use_reference_down2_axes && item_idx < end; ++item_idx) {
+		const auto item          = items[item_idx];
+		use_reference_down2_axes = item.x_up_factor == 1U && item.y_up_factor == 1U &&
+		                           item.x_down_factor == x_down_factor && item.y_down_factor == y_down_factor &&
+		                           item.horizontal_flip == first_item.horizontal_flip &&
+		                           item.x_subblock < x_down_factor && item.y_subblock < y_down_factor;
+		if (use_reference_down2_axes) {
+			const auto slot = static_cast<uint32_t>(item.y_subblock) * x_down_factor + item.x_subblock;
+			subblock_mask |= static_cast<uint8_t>(1U << slot);
+		}
+	}
+	const auto expected_subblock_mask =
+	    use_reference_down2_axes ? static_cast<uint8_t>((1U << (x_down_factor * y_down_factor)) - 1U) : 0U;
+	use_reference_down2_axes = use_reference_down2_axes && subblock_mask == expected_subblock_mask;
+
+	__shared__ float composed[16U * 16U];
+	__shared__ float vertical[8U * 16U];
+	if (use_reference_down2_axes) {
+		const auto source_width  = x_down_factor * 8U;
+		const auto source_height = y_down_factor * 8U;
+		const auto source_count  = source_width * source_height;
+		if (lane < source_count) {
+			const auto item     = items[begin + lane / 64U];
+			const auto coeff    = static_cast<uint8_t>(lane % 64U);
+			const auto physical = natural_to_physical_coeff_device(coeff, item.zigzag_columns);
+			const auto binding  = column_bindings[item.binding_base + physical];
+			int16_t    value    = 0;
+			if (binding.source == DeviceCoeffSource::kI16) {
+				value = binding.column_i16[item.row_in_rowgroup];
+			} else if (binding.source == DeviceCoeffSource::kI8) {
+				value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
+			}
+			const auto quant =
+			    static_cast<int32_t>(quant_tables[static_cast<size_t>(item.quant_table_index) * 64U + coeff]);
+			const auto source_y = static_cast<uint32_t>(item.y_subblock) * 8U + coeff / 8U;
+			const auto source_x = static_cast<uint32_t>(item.x_subblock) * 8U + coeff % 8U;
+			composed[source_y * source_width + source_x] =
+			    static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+		}
+		__syncthreads();
+		if (lane < 8U * source_width) {
+			const auto out_y    = lane / source_width;
+			const auto source_x = lane % source_width;
+			float      sum      = 0.0F;
+			if (y_down_factor == 1U) {
+				sum = composed[out_y * source_width + source_x];
+			} else {
+#pragma unroll
+				for (uint32_t source_y = 0; source_y < 16U; ++source_y) {
+						sum = dct_grid_madd_rn(kReferenceDown2Conversion[out_y * 16U + source_y],
+						                       composed[source_y * source_width + source_x],
+						                       sum);
+				}
+			}
+			vertical[out_y * source_width + source_x] = sum;
+		}
+		__syncthreads();
+		if (lane < 64U) {
+			const auto out_y = lane / 8U;
+			const auto out_x = lane % 8U;
+			float      sum   = 0.0F;
+			if (x_down_factor == 1U) {
+				sum = vertical[out_y * source_width + out_x];
+			} else {
+#pragma unroll
+				for (uint32_t source_x = 0; source_x < 16U; ++source_x) {
+						sum = dct_grid_madd_rn(vertical[out_y * source_width + source_x],
+						                       kReferenceDown2Conversion[out_x * 16U + source_x],
+						                       sum);
+				}
+			}
+			const auto target         = items[begin];
+			const auto factor_product = x_down_factor * y_down_factor;
+			const auto value          = normalize_reference_down2_value(sum, factor_product);
+			const auto stored_value   = target.horizontal_flip != 0U && (lane % 8U) % 2U != 0U ? -value : value;
+			if (target.component == 0U && y_accum != nullptr) {
+				// Grouped launches are ordered on one transform stream. A legacy spatial-major output group can
+				// span decode worksets, so retain the deterministic partial sum from every earlier launch.
+				y_accum[target.output_block_index * 64U + lane] += stored_value;
+			} else if (target.component != 0U && cbcr_accum != nullptr) {
+				cbcr_accum[target.output_block_index * 64U + lane] += stored_value;
+			}
+		}
+		return;
+	}
+
+	__shared__ float source[64];
+	__shared__ float horizontal[64];
+	float            sum = 0.0F;
+	for (uint32_t item_idx = begin; item_idx < end; ++item_idx) {
+		const auto item = items[item_idx];
+		if (lane < 64U) {
+			const auto coeff    = static_cast<uint8_t>(lane);
+			const auto physical = natural_to_physical_coeff_device(coeff, item.zigzag_columns);
+			const auto binding  = column_bindings[item.binding_base + physical];
+			int16_t    value    = 0;
+			if (binding.source == DeviceCoeffSource::kI16) {
+				value = binding.column_i16[item.row_in_rowgroup];
+			} else if (binding.source == DeviceCoeffSource::kI8) {
+				value = static_cast<int16_t>(binding.column_i8[item.row_in_rowgroup]);
+			}
+			const auto quant =
+			    static_cast<int32_t>(quant_tables[static_cast<size_t>(item.quant_table_index) * 64U + coeff]);
+			source[lane] = static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+		}
+		__syncthreads();
+		if (lane < 64U) {
+			const auto source_y    = static_cast<uint8_t>(lane / 8U);
+			const auto out_x_coeff = static_cast<uint8_t>(lane % 8U);
+			float      x_sum       = 0.0F;
+			for (uint8_t in_x_coeff = 0; in_x_coeff < 8U; ++in_x_coeff) {
+				const float wx = resize_weight_matrices[static_cast<size_t>(item.x_weight_matrix_index) * 64U +
+				                                        out_x_coeff * 8U + in_x_coeff];
+				x_sum = dct_grid_madd_rn(source[source_y * 8U + in_x_coeff], wx, x_sum);
+			}
+			horizontal[lane] = x_sum;
+		}
+		__syncthreads();
+		if (lane < 64U) {
+			const auto out_x_coeff = static_cast<uint8_t>(lane % 8U);
+			const auto out_y_coeff = static_cast<uint8_t>(lane / 8U);
+			float      weighted    = 0.0F;
+			for (uint8_t in_y_coeff = 0; in_y_coeff < 8U; ++in_y_coeff) {
+				const float wy = resize_weight_matrices[static_cast<size_t>(item.y_weight_matrix_index) * 64U +
+				                                        out_y_coeff * 8U + in_y_coeff];
+				weighted = dct_grid_madd_rn(horizontal[in_y_coeff * 8U + out_x_coeff], wy, weighted);
+			}
+			sum = dct_grid_add_rn(sum, weighted);
+		}
+	}
+	if (lane < 64U) {
+		const auto target = items[begin];
+		if (target.component == 0U && y_accum != nullptr) {
+			y_accum[target.output_block_index * 64U + lane] += sum;
+		} else if (target.component != 0U && cbcr_accum != nullptr) {
+			cbcr_accum[target.output_block_index * 64U + lane] += sum;
+		}
+	}
+}
+
+__global__ void transformed_dct_grid_cached_kernel(const JpegDctDeviceCachedFixedTransformBatchItem* __restrict items,
+                                                   const size_t item_count,
+                                                   const uint16_t* __restrict quant_tables,
+                                                   const float* __restrict resize_weight_matrices,
+                                                   const int32_t clamp_min,
+                                                   const int32_t clamp_max,
+                                                   float* __restrict y_accum,
+                                                   float* __restrict cbcr_accum) {
+	const size_t item_idx = static_cast<size_t>(blockIdx.x);
+	const auto   lane     = static_cast<uint8_t>(threadIdx.x);
+	if (item_idx >= item_count || lane >= 64U || quant_tables == nullptr || resize_weight_matrices == nullptr) {
+		return;
+	}
+	const auto       cached = items[item_idx];
+	const auto       item   = cached.transform;
+	__shared__ float source[64];
+	__shared__ float horizontal[64];
+	const auto       physical = natural_to_physical_coeff_device(lane, item.zigzag_columns);
+	const auto       value    = cached.dense[item.row_in_rowgroup * 64U + physical];
+	const auto quant = static_cast<int32_t>(quant_tables[static_cast<size_t>(item.quant_table_index) * 64U + lane]);
+	source[lane]     = static_cast<float>(min(clamp_max, max(clamp_min, static_cast<int32_t>(value) * quant)));
+	__syncthreads();
+	const auto source_y    = static_cast<uint8_t>(lane / 8U);
+	const auto out_x_coeff = static_cast<uint8_t>(lane % 8U);
+	float      x_sum       = 0.0F;
+	for (uint8_t in_x_coeff = 0; in_x_coeff < 8U; ++in_x_coeff) {
+		const float wx = resize_weight_matrices[static_cast<size_t>(item.x_weight_matrix_index) * 64U +
+		                                        out_x_coeff * 8U + in_x_coeff];
+		x_sum += source[source_y * 8U + in_x_coeff] * wx;
+	}
+	horizontal[lane] = x_sum;
+	__syncthreads();
+	const auto out_y_coeff = static_cast<uint8_t>(lane / 8U);
+	float      weighted    = 0.0F;
+	for (uint8_t in_y_coeff = 0; in_y_coeff < 8U; ++in_y_coeff) {
+		const float wy = resize_weight_matrices[static_cast<size_t>(item.y_weight_matrix_index) * 64U +
+		                                        out_y_coeff * 8U + in_y_coeff];
+		weighted += horizontal[in_y_coeff * 8U + out_x_coeff] * wy;
+	}
+	if (weighted == 0.0F) {
+		return;
+	}
+	if (item.component == 0 && y_accum != nullptr) {
+		atomicAdd(y_accum + item.output_block_index * 64U + lane, weighted);
+	} else if (item.component != 0 && cbcr_accum != nullptr) {
+		atomicAdd(cbcr_accum + item.output_block_index * 64U + lane, weighted);
+	}
+}
+
+} // namespace fastlens::jpeg::detail

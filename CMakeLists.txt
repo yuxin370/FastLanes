@@ -164,8 +164,8 @@ option(FLS_ENABLE_TABLE_LOG "Enable Table Log" OFF)
 option(FLS_ENABLE_VERBOSE_OUTPUT "Enable verbose output" OFF)
 option(FLS_ENABLE_DATA "Enable Data" OFF)
 option(FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING "Build FSST" OFF)
-option(FLS_ENABLE_GALP_TESTING_AND_BENCHMARKING "Build GALP" OFF)
-option(FLS_BUILD_GALP "Build GALP without enabling GALP tests/benchmarks" OFF)
+option(FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING "Build FASTLENS" OFF)
+option(FLS_BUILD_FASTLENS "Build FASTLENS without enabling FASTLENS tests/benchmarks" OFF)
 
 # Definitions: ---------------------------------------------------------------------------------------------------------
 add_compile_definitions(FLS_CMAKE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -199,7 +199,7 @@ endif ()
 
 
 # GTEST : --------------------------------------------------------------------------------------------------------------
-if (FLS_BUILD_TESTING OR FLS_BUILD_CUDA OR FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING OR FLS_ENABLE_GALP_TESTING_AND_BENCHMARKING)
+if (FLS_BUILD_TESTING OR FLS_BUILD_CUDA OR FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING OR FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING)
     message("---------------------------------------------------------------------------------------------------------")
     message("-- FLS: Building GTEST:")
     include(GoogleTest)
@@ -304,7 +304,7 @@ if (FLS_BUILD_TESTING OR
         FLS_BUILD_BENCHMARKING OR
         FLS_BUILD_EXAMPLES OR
         FLS_ENABLE_DATA OR
-        FLS_ENABLE_GALP_TESTING_AND_BENCHMARKING OR
+        FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING OR
         FLS_ENABLE_FSST_TESTING_AND_BENCHMARKING)
     message("---------------------------------------------------------------------------------------------------------")
     message("-- FLS: Enabling Data.")
@@ -393,16 +393,16 @@ if (FLS_BUILD_PYTHON)
 endif ()
 
 # FSST: ----------------------------------------------------------------------------------------------------------------
-if (FLS_BUILD_GALP OR FLS_ENABLE_GALP_TESTING_AND_BENCHMARKING)
+if (FLS_BUILD_FASTLENS OR FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING)
     message("---------------------------------------------------------------------------------------------------------")
-    if (FLS_ENABLE_GALP_TESTING_AND_BENCHMARKING)
-        message("-- FLS: Adding GALP Testing and Benchmarking.")
-        set(GALP_BUILD_TESTS ON CACHE BOOL "Build GALP tests")
-        set(GALP_BUILD_BENCHMARKS ON CACHE BOOL "Build GALP benchmarks")
+    if (FLS_ENABLE_FASTLENS_TESTING_AND_BENCHMARKING)
+        message("-- FLS: Adding FASTLENS Testing and Benchmarking.")
+        set(FASTLENS_BUILD_TESTS ON CACHE BOOL "Build FASTLENS tests")
+        set(FASTLENS_BUILD_BENCHMARKS ON CACHE BOOL "Build FASTLENS benchmarks")
     else ()
-        message("-- FLS: Adding GALP.")
-        set(GALP_BUILD_TESTS OFF CACHE BOOL "Build GALP tests")
-        set(GALP_BUILD_BENCHMARKS OFF CACHE BOOL "Build GALP benchmarks")
+        message("-- FLS: Adding FASTLENS.")
+        set(FASTLENS_BUILD_TESTS OFF CACHE BOOL "Build FASTLENS tests")
+        set(FASTLENS_BUILD_BENCHMARKS OFF CACHE BOOL "Build FASTLENS benchmarks")
     endif ()
-    add_subdirectory(galp)
+    add_subdirectory(fastlens)
 endif ()
