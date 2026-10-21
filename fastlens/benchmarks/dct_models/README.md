@@ -27,7 +27,7 @@ recipe and checkpoint setup.
 
 Use the full-frequency source representation for online crop experiments. Input
 paths and preparation are described in [ONLINE_CROP.md](ONLINE_CROP.md) and the
-[data inventory](../../docs/DATASETS.md).
+[public-source preparation guide](../paper/REBUILDING_REFERENCES.md).
 
 ```bash
 python -m fastlens.benchmarks.dct_models.online_crop_suite \

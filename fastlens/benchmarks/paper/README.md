@@ -5,11 +5,9 @@ This directory follows **Sections 6.2–6.5 of [fastlens-final.pdf](../../docs/p
 [`../development/`](../development/README.md); reader/model implementations remain
 shared in `../baselines/` and the model/training packages. Section-specific workers
 live beside their `run.py`; workers reused across sections live in `shared/`.
-Process execution and logging are in `../execution/`. Historical queue, retry and
-continuation scripts are in `../development/historical/`.
+Process execution and logging are in `../execution/`.
 
-The final PDF contains six RGB baselines. The current paper LaTeX
-has since changed and does not compile to this exact final PDF.
+The final PDF contains six RGB baselines.
 
 ## Start here
 
@@ -132,54 +130,27 @@ historical evidence. Plotting now reads the consolidated result directory,
 including the full tables and 522 end-to-end trial records. The per-experiment READMEs identify the source records
 and the external inputs needed by each workload.
 
-The end-to-end inference and H2D replay workloads still require the original
-full-population prediction/contract artifacts under `results/` in addition to
-ImageNet/checkpoints. Those large artifacts are **not included** with the small
-plotting CSVs. H2D replay also reads `results/paper/selected_max_20261008/` and its
-referenced command records. Without that artifact bundle, these entries cannot
-perform a fresh full experiment; `--help`, `--dry-run` and all published plots
-remain usable. The placeholders printed for accepted inference references in
-`--dry-run` are resolved from those artifacts when executing. Do not interpret
-successful command generation as a completed performance run.
+Full-population predictions and execution contracts are generated inputs rather
+than plotting tables. Follow [Rebuilding reference inputs](REBUILDING_REFERENCES.md)
+to create them from public model code, checkpoints and locally prepared ImageNet
+data, and to capture H2D traffic from a fresh run. The dated reference lookup in
+the section launchers is for replaying the original run tree; the guide also
+provides direct commands that do not require that tree.
 
-On the current machine, preparing the historical H2D inference replay also
-detects changed file identity for
-`fastlens/data/compressed/imagenet512_val_block_major/access/shard_000000.active_output_schedule.bin`.
-The historical contract's size/mtime check fails before measurement. Source-code
-paths in newly generated replay contracts now follow the `baselines/` layout,
-but the dataset check remains enforced. Use the matching historical dataset
-bundle, or perform a fresh input validation before collecting a new H2D run;
-this replay is not currently verified end to end.
+### Published measurement conventions
 
-### 结果口径与已知限制
+- The four source groups contain 522 trial records, including 12 ResNet resident
+  controls unused in the final figure. Arithmetic means across the seven
+  per-configuration median ratios give training speedups of 3.80x/4.20x and
+  inference speedups of 6.17x/7.95x on RTX 4090/H100.
+- Across six RGB baselines, FastLens leads training in 9/10 configurations;
+  inference reaches 97.7% of the fastest RGB path. DCT resident attainment is 99.1%.
+- The training store occupies 107.317 GB, or 2.12 times the JPEG input size.
+  The compressed-transfer control reduces H2D traffic by 87.7%.
+- Table 2 contains 45 measurements with one trial per configuration. Of the 60
+  compact-training points, 53 use one trial and seven use three-trial medians.
+- Each convergence curve contains 300 epochs. Final shared/independent Top-1
+  values are 78.888/79.052% for Swin and 71.976/71.764% for MobileNet.
 
-- 四组源数据共522条逐次记录（含12条未用于最终图的 ResNet resident 对照），原始大型运行树不包含在仓库中。
-  按逐轮比值中位数再跨七配置取算术平均，RTX4090/H100 训练为3.80×/4.20×，
-  推理为6.17×/7.95×，与最终 PDF 一致。
-- 六条 RGB baseline 下，训练领先9/10，推理为最快 RGB 的97.7%，
-  DCT resident 达成率99.1%。
-- FastLens 训练存储107.317 GB、JPEG 的2.12倍；compressed-transfer 对照的
-  H2D 减少87.7%，均与原始计数一致。
-- Table 2 的45条导出记录与最终 PDF 逐项一致，每配置一次正式测量。Compact 的60个点中53个单次、7个三次中位数，
-  不能描述成统一三次重复统计。
-- 四条收敛曲线各300个 epoch。Swin shared/independent 最终 Top-1 为
-  78.888/79.052%，MobileNet 为71.976/71.764%。
-- 完整50K推理、65,536-image窗口和300-epoch训练需要准备对应外部输入。
-  FS 预取路径曾触发输入一致性门禁，差异尚未稳定定位；验证阈值保持1e-5，
-  不能将该路径标为完整验证通过。
-- 仍未通过的既有检查：`FastLensDirectDctTorchRuntimeSmoke` 在 RTX4090、
-  `imagenet512_val_compact_v3/manifest.bin` 上报
-  `consumer-stream delay completed before lifetime verification`。
-  未设置 `FASTLENS_DIRECT_DCT_TEST_MANIFEST` 时该检查会跳过，不能把跳过当通过；
-  换用 block-major 验证 manifest 则在异步 planless 输出契约处被拒绝。
-  PLS GPU smoke 可独立验证；它不能替代该生命周期检查。复查命令如下，GPU 序号按本机配置选择：
-
-```bash
-CUDA_VISIBLE_DEVICES=2 \
-FASTLENS_DIRECT_DCT_TEST_MANIFEST="$PWD/fastlens/data/compressed/imagenet512_val_compact_v3/manifest.bin" \
-FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build \
-  -R '^FastLensDirectDctTorchRuntimeSmoke$' --output-on-failure
-```
-
-nvCOMP compression 属于辅助源码，需要相应的外部依赖，
-不属于最终 PDF 的默认实验配置。CPU 测试或 CLI 加载检查不能替代完整 GPU 测量。
+nvCOMP compression is an auxiliary comparison with its own dependencies and is
+outside the default final-paper experiment matrix.

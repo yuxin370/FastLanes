@@ -345,26 +345,26 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
     training_order = summary.get("full_training_label_order")
     access = summary["access_patterns"]
     lines = [
-        "# FASTLENS 随机与连续 Image ID 端到端实验",
+        "# FastLens random and contiguous image-ID evaluation",
         "",
-        "## 结论",
+        "## Results",
         "",
         (
-            f"在同一 measured cohort 的严格配对比较中，连续批次的吞吐中位数是打散批次的 "
-            f"**{paired['throughput_speedup']['p50']:.2f}×**（{paired['throughput_percent_change_p50']:+.1f}%）；"
-            f"相对当前全局随机 benchmark 的实际迁移比值为 **{operational['throughput_speedup']['p50']:.2f}×**。"
+            f"For the same measured cohort, median contiguous-batch throughput relative to scattered batches is "
+            f"**{paired['throughput_speedup']['p50']:.2f}×** ({paired['throughput_percent_change_p50']:+.1f}%); "
+            f"Relative to the globally random benchmark, the throughput ratio is **{operational['throughput_speedup']['p50']:.2f}×**."
         ),
         (
-            f"对 {inference['sample_count']} 张相同图片按 image ID 对齐后，top-1/top-5 精度变化分别为 "
+            f"For {inference['sample_count']} identical images aligned by image ID, the top-1/top-5 accuracy changes are "
             f"**{inference['accuracy_top1_delta_percentage_points']:+.4f} / "
-            f"{inference['accuracy_top5_delta_percentage_points']:+.4f} 个百分点**，"
-            f"top-1 预测一致率 {inference['top1_prediction_agreement'] * 100:.4f}%，"
-            f"精确 McNemar p={inference['top1_exact_mcnemar_pvalue']:.4f}。"
+            f"{inference['accuracy_top5_delta_percentage_points']:+.4f} percentage points**, "
+            f"top-1 prediction agreement {inference['top1_prediction_agreement'] * 100:.4f}%, "
+            f"exact McNemar p={inference['top1_exact_mcnemar_pvalue']:.4f}."
         ),
         "",
-        "## 端到端性能",
+        "## End-to-end performance",
         "",
-        "| 条件 | 吞吐 p50 (img/s) | 平均 batch 延迟 p50 (ms) | rowgroups / measured window | top-1 | top-5 |",
+        "| Condition | Throughput p50 (img/s) | Mean batch latency p50 (ms) | rowgroups / measured window | top-1 | top-5 |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for condition in ("current_random", "paired_scattered", "contiguous"):
@@ -377,12 +377,12 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
     lines.extend(
         [
             "",
-            f"计时边界：`{performance['timing_boundary']}`。正式汇总排除 repeat 0："
-            f"`{performance['exclude_first_repeat']}`。",
+            f"Timing boundary: `{performance['timing_boundary']}`. Exclude repeat 0 from the aggregate: "
+            f"`{performance['exclude_first_repeat']}`.",
             "",
-            "## 访问与类别结构",
+            "## Access patterns and class distribution",
             "",
-            "| 条件 | 每 batch 物理 rowgroup 均值 | 连续相邻 ID 比例 | 每 batch 唯一类别均值 | 标签熵均值 (bit) |",
+            "| Condition | Mean physical rowgroups/batch | Adjacent ID fraction | Mean unique classes/batch | Mean label entropy (bits) |",
             "| --- | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -397,21 +397,21 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
     lines.extend(
         [
             "",
-            "连续 ID 会显著降低 batch 内类别多样性，因为当前 ImageNet 物理 ID 来自按路径排序的类别目录。"
-            "eval 模式下实测只有极小浮点漂移和未达实际/统计显著阈值的精度变化；训练时每一步的梯度组成则会改变。",
+            "Physical IDs follow class-sorted paths, so contiguous batches have lower class diversity. "
+            "The measured prediction agreement and accuracy differences are reported below; training order also changes the composition of each gradient update.",
             "",
-            "## 推理精度与逐样本语义",
+            "## Inference accuracy and per-sample semantics",
             "",
-            f"- Logit max/mean absolute difference: `{inference['logit_max_abs']:.8g}` / `{inference['logit_mean_abs']:.8g}`。",
-            f"- Logit cosine mean: `{inference['logit_cosine_mean']:.10f}`。",
+            f"- Logit max/mean absolute difference: `{inference['logit_max_abs']:.8g}` / `{inference['logit_mean_abs']:.8g}`.",
+            f"- Logit cosine mean: `{inference['logit_cosine_mean']:.10f}`.",
             f"- Top-1 / top-5 set agreement: `{inference['top1_prediction_agreement']:.6f}` / "
-            f"`{inference['top5_set_agreement']:.6f}`。",
-            f"- Top-1 correctness discordant pairs: left-only `{inference['top1_correctness_left_only']}`，"
-            f"right-only `{inference['top1_correctness_right_only']}`；精确 McNemar "
-            f"p=`{inference['top1_exact_mcnemar_pvalue']:.4f}`。",
-            f"- 变化超过 0.5 个百分点实际显著阈值：`{inference['practically_large_accuracy_change']}`。",
+            f"`{inference['top5_set_agreement']:.6f}`.",
+            f"- Top-1 correctness discordant pairs: left-only `{inference['top1_correctness_left_only']}`, "
+            f"right-only `{inference['top1_correctness_right_only']}`; exact McNemar "
+            f"p=`{inference['top1_exact_mcnemar_pvalue']:.4f}`.",
+            f"- Accuracy change exceeds the 0.5 percentage-point practical threshold: `{inference['practically_large_accuracy_change']}`.",
             "",
-            "## 训练顺序敏感性探针",
+            "## Training-order sensitivity probe",
             "",
         ]
     )
@@ -420,11 +420,11 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
         random_order = training_order["random"]
         lines.extend(
             [
-                f"全量 ImageNet train 索引（{training_order['image_count']:,} 张，batch={training_order['batch_size']}）中，"
-                f"连续 batch 平均只有 **{contiguous_order['unique_classes_mean']:.2f}** 个类别，"
-                f"**{contiguous_order['single_class_batch_fraction'] * 100:.2f}%** 的 batch 为单一类别；"
-                f"全局 shuffle 对应 **{random_order['unique_classes_mean']:.2f}** 个类别和 "
-                f"{random_order['single_class_batch_fraction'] * 100:.2f}% 单类 batch。",
+                f"In the full ImageNet training index ({training_order['image_count']:,} images, batch={training_order['batch_size']}), "
+                f"contiguous batches contain a mean of **{contiguous_order['unique_classes_mean']:.2f}** classes, "
+                f"**{contiguous_order['single_class_batch_fraction'] * 100:.2f}%** of batches contain a single class; "
+                f"global shuffling produces a mean of **{random_order['unique_classes_mean']:.2f}** classes and "
+                f"{random_order['single_class_batch_fraction'] * 100:.2f}% single-class batches.",
                 "",
             ]
         )
@@ -433,23 +433,23 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
         ci = training["contiguous_minus_scattered_top1_mean_bootstrap_95_ci"]
         lines.extend(
             [
-                f"- 配对 seed 数：{training['paired_seed_count']}。",
-                f"- 连续减打散的 held-out top-1：均值 `{top1['mean']:+.4f}` 个百分点，"
-                f"bootstrap 95% CI `[{ci[0]:+.4f}, {ci[1]:+.4f}]`，"
-                f"配对 sign-flip p=`{training['contiguous_minus_scattered_top1_sign_flip_pvalue']:.4f}`。",
-                f"- 预设实际显著阈值：`{training['practical_significance_threshold_percentage_points']:.3f}` 个百分点；"
-                f"当前均值超过阈值：`{training['practically_large_mean']}`；"
-                f"bootstrap CI 不跨零：`{training['bootstrap_ci_excludes_zero']}`；"
-                f"结合精确配对检验后的统计检出：`{training['statistically_detected']}`。",
-                f"- 范围限制：{training.get('scope')}。",
+                f"- Paired seeds: {training['paired_seed_count']}.",
+                f"- Held-out top-1, contiguous minus scattered: mean `{top1['mean']:+.4f}` percentage points, "
+                f"bootstrap 95% CI `[{ci[0]:+.4f}, {ci[1]:+.4f}]`, "
+                f"paired sign-flip p=`{training['contiguous_minus_scattered_top1_sign_flip_pvalue']:.4f}`.",
+                f"- Prespecified practical significance threshold: `{training['practical_significance_threshold_percentage_points']:.3f}` percentage points; "
+                f"Mean exceeds threshold: `{training['practically_large_mean']}`; "
+                f"Bootstrap CI excludes zero: `{training['bootstrap_ci_excludes_zero']}`; "
+                f"Statistically detected by the exact paired test: `{training['statistically_detected']}`.",
+                f"- Scope: {training.get('scope')}.",
             ]
         )
     else:
-        lines.append(f"未执行：{training.get('reason', 'unknown')}。")
+        lines.append(f"Not run: {training.get('reason', 'unknown')}.")
     lines.extend(
         [
             "",
-            "## 解释边界",
+            "## Interpretation",
             "",
         ]
     )

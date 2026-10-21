@@ -1,27 +1,33 @@
-# FASTLENS RGB-no-more 端到端 Benchmark
+# RGB-no-more system benchmarks
 
-## 正式入口
+This package provides paired DCT and RGB workloads for the independent FastLens
+project. Run commands from the FastLens repository root. The final-paper
+experiments are organized under [paper/](../../paper/README.md).
 
-推理只保留四条有明确语义的管线：
-
-| Pipeline | 输入域 | 实现 |
+| Pipeline | Input | Implementation |
 | --- | --- | --- |
-| `fastlens` | JPEG DCT | FASTLENS 原生 Direct-DCT 生产 profile |
-| `rgbnomore` | JPEG DCT | RGB-no-more 参考 reader |
-| `dali` | RGB | DALI JPEG decode 与 GPU 预处理 |
-| `pytorch` | RGB | PyTorch/torchvision 参考路径 |
+| `fastlens` | JPEG DCT | Native Direct-DCT reader and model profile |
+| `rgbnomore` | JPEG DCT | RGB-no-more reference reader |
+| `dali` | RGB | JPEG decoding and GPU preprocessing |
+| `pytorch` | RGB | PyTorch/torchvision reference |
 
-`fastlens_planless`、`fastlens_fixed_items` 等实现版本名已经删除。FASTLENS 对外只暴露
-`fastlens`，其 planner、缓存、kernel launch、stream 和 I/O 策略由 C++ 生产
-profile 固定，不再进入 Python contract 或命令行。
+DCT paths share a DCT checkpoint; RGB paths share an RGB checkpoint. All use the
+same canonical sample order without implicit shuffle. RGB/DCT comparisons are
+system comparisons with distinct model inputs.
+
+## Setup and inference
+
+Use [Rebuilding reference inputs](../../paper/REBUILDING_REFERENCES.md) to obtain
+public model sources/checkpoints and prepare ImageNet-512, manifests and fresh
+prediction records. Published DCT checkpoints expect 512x512 source JPEGs; the
+runner checks their dimensions. The native library and Torch extension are
+built through the repository's root CMake project.
 
 ```bash
-PYTHONPATH=.:build/fastlens/torch \
-python3 \
-  -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset e2e \
-  --pipelines fastlens rgbnomore dali pytorch \
-  --output-dir /tmp/fastlens-e2e \
+export PYTHONPATH="$PWD:$PWD/build/fastlens/torch${PYTHONPATH:+:$PYTHONPATH}"
+python -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
+  --preset e2e --pipelines fastlens rgbnomore dali pytorch \
+  --output-dir "$HOME/tmp/fastlens-e2e" \
   --data-root fastlens/data/system_rgbnomore/e2e_v3/imagenet_512 \
   --index-csv fastlens/data/system_rgbnomore/e2e_v2/indexbase_val.csv \
   --rgb-checkpoint fastlens/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth \
@@ -31,112 +37,33 @@ python3 \
   --torch-binding-dir build/fastlens/torch
 ```
 
-发布的 DCT checkpoint 对应预先 resize 并重新编码为 `512×512` JPEG 的
-ImageNet。正式 runner 默认检查 JPEG SOF 尺寸；`--dct-source-image-size 0`
-只适用于具有不同数据配方的自定义 checkpoint。
+Use a fresh output directory. `--preset smoke` selects a small functional run;
+`--dry-run` generates the contract and commands without executing the pipelines.
+See [the inference guide](docs/E2E_COMPARISON_RUN_GUIDE.md) for model selection.
 
-## 计时与比较边界
-
-主指标覆盖完整 measured window：数据读取、JPEG/DCT decode、变换、H2D、
-模型 forward、指标统计和最终 CUDA 同步。模型创建、checkpoint 加载、contract
-生成和 warmup 不计时。
-
-- `fastlens` 与 `rgbnomore` 使用同一个 DCT checkpoint；
-- `dali` 与 `pytorch` 使用同一个 RGB checkpoint；
-- DCT 与 RGB 的比值用于系统部署参考，不作逐元素跨域等价声明；
-- 每条管线使用相同的 canonical 样本顺序，禁止隐式 shuffle。
-
-Preset：
-
-| Preset | Batch | Warmup | Measured batches | Repeats |
+| Preset | Batch | Warmup batches | Measured batches | Repeats |
 | --- | ---: | ---: | ---: | ---: |
 | `smoke` | 2 | 1 | 2 | 1 |
 | `e2e` | 50 | 0 | 1000 | 5 |
 
-批量、测量长度和 worker 等工作负载参数仍可覆盖，并写入 contract。FASTLENS
-内部运行策略不属于工作负载参数，不能从 Python 覆盖。
+The measured interval includes reads, decoding, transforms, H2D, forward passes,
+metrics and final CUDA synchronization. Model construction, checkpoint loading,
+contract generation and warmup are outside it. Workload overrides are recorded
+in the contract; native planner, cache and launch policies belong to C++ profiles.
 
-## FASTLENS 原生生产 profile
+## Training and outputs
 
-推理使用语义 profile `rgbnomore-validation-v1`，由它定义标准 crop、输出网格和
-FP32 RGB-no-more 数值合同。其 native runtime policy
-`compact-v3-planless-limited-o512-c512-v1` 固定：
+The [training guide](docs/TRAINING_BENCHMARK_RUN_GUIDE.md) describes the four-path
+correctness and throughput runner. Its `dali` path uses planned D2 augmentation.
+The equal-image runner exposes `d2`, `d3` and `pytorch`; D3 uses DALI-native
+shuffle/augmentation and is a separate performance reference.
 
-- planless transformed-grid 路径；
-- decode rowgroup batch 64，decode workset 512 MiB；
-- rowgroup prefetch depth/workers/min-batches 为 `16/8/1`；
-- decoded-rowgroup cache 与 plan cache 关闭；
-- 单 batch limited-overlap、跨 batch bounded two-slot overlap、低优先级 stream、异步 completion；
-- transform launch 上限为 512 blocks / 512 CTAs；
-- double buffer 由 runtime policy 自动管理。
-
-FP32 grid 的反量化 `(coefficient + 4) / 1020` 属于语义 profile，不属于运行策略。
-
-Python 只提交 `image_ids` 和高层 transform 描述并读取结果；output-slot admission、
-future 生命周期、buffer keepalive 和 reclaim 由 native 层封装。
-
-## 常用命令
-
-四管线 smoke：
+Outputs include `contract.json`, a sample manifest, `pipeline_<name>.json`,
+semantic arrays, `results.json/csv`, `report.md`, `validation.json` and commands.
+Diagnostics are separate from the production API. CPU checks:
 
 ```bash
-python3 -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset smoke \
-  --output-dir /tmp/fastlens-system-smoke
-```
-
-只比较 DCT：
-
-```bash
-python3 -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset e2e \
-  --pipelines fastlens rgbnomore \
-  --output-dir /tmp/fastlens-dct-e2e
-```
-
-只生成 contract 和命令：
-
-```bash
-python3 -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset smoke \
-  --output-dir /tmp/fastlens-system-dry-run \
-  --dry-run
-```
-
-完整参数以 `run.py --help` 为准。详细执行说明见
-[E2E comparison guide](docs/E2E_COMPARISON_RUN_GUIDE.md)。
-
-## 训练入口
-
-训练使用 `training/run.py`，管线仍为 `fastlens`、`rgbnomore`、`dali`、`pytorch`；
-其中通用 semantic/correctness runner 的历史名称 `dali` 固定映射为 D2，并写入
-contract。D3 改变顺序和增强语义，只进入下面的 equal-image 性能上限测试。
-模型固定为 RGB-no-more ViT-Ti，augmentation recipe 固定为 published v1，
-precision 固定为 FP32，因此原来的三个单值选项已经删除。
-
-`--workers` 是外层数据 worker/workload 参数，不再转发为 native rowgroup
-prefetch worker 数。所有 pipeline 使用已冻结的 production lookahead；训练入口不再
-提供 `--prefetch-depth`，FASTLENS 的有界预取完全由 native runtime policy 拥有。
-详见 [training guide](docs/TRAINING_BENCHMARK_RUN_GUIDE.md)。
-
-完整 equal-image RGB 性能基线使用 `training/equal_image_epoch_benchmark.py`，
-只注册 `d2`、`d3` 和 `pytorch`：D2 是 canonical order/planned augmentation 的
-原生 DALI 公平基线，D3 是 DALI-native shuffle/augmentation 性能上限。两者都固定
-`fn.readers.file`、ROI decode 和 DLPack zero-copy；历史 Python JPEG
-`external_source` reader 已删除。
-
-## 输出与诊断边界
-
-正式输出包括 `contract.json`、sample manifest、`pipeline_<name>.json`、语义
-artifact、`results.json/csv`、`report.md` 和 `validation.json`。发布结果只从统一
-runner 生成。
-
-`diagnostics/` 下工具用于定位语义或性能回归，不构成可配置的生产 API；历史
-scheduler matrix、fixed-items/planless A/B 和 crop-I/O A/B runner 已删除。
-
-CPU 审计测试：
-
-```bash
-python3 \
-  -m unittest -v fastlens.benchmarks.baselines.system_rgbnomore.tests.test_system_benchmark fastlens.benchmarks.baselines.system_rgbnomore.tests.test_training_benchmark
+python -m unittest -v \
+  fastlens.benchmarks.baselines.system_rgbnomore.tests.test_system_benchmark \
+  fastlens.benchmarks.baselines.system_rgbnomore.tests.test_training_benchmark
 ```

@@ -37,7 +37,7 @@ python -m fastlens.benchmarks.paper.section_6_2_2.compact_input.run --help
 | `common.py`, `training_audit_policy.py` | Common source identity and existing training contracts |
 
 Development-only studies (`dct_retokenization/`, `coefficient_mask_evaluator/`,
-`metadata/`, `model_only_training_calibration.py`, `run_block_major_graph.py`) are
+`metadata/`, `model_only_training_calibration.py`) are
 not final-paper experiment entries.
 Unit tests remain beside the implementations they test; `development.check`
 collects the CPU suites without launching paper measurements.

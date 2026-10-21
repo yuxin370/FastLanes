@@ -1,6 +1,6 @@
 # FastLens
 
-**FastLanes for High-Throughput AI Image Pipelines**
+**Selective Compressed Input for GPU Image Pipelines**
 
 FastLens is a GPU-oriented image input system that combines selective compressed
 storage, compressed host-to-device transfer, GPU decoding, and direct construction
@@ -9,9 +9,11 @@ where a model can consume representations derived from JPEG coefficients without
 reconstructing RGB pixels.
 
 This is the anonymous research artifact accompanying the
-[FastLens paper](docs/paper/outputs/fastlens-final.pdf). The implementation lives
-in `fastlens/` within the FastLanes repository. All commands below run from the
-**repository root**, which contains the top-level `CMakeLists.txt`.
+[FastLens paper](docs/paper/outputs/fastlens-final.pdf). FastLens is an independent
+project. Its implementation is in `fastlens/`, and a modified FastLanes library
+is included as an internal dependency in `third_party/fastlanes/`. The root
+`CMakeLists.txt` builds FastLens and its dependencies together. All commands
+below run from the **FastLens repository root**.
 
 ## How it works
 
@@ -267,11 +269,12 @@ for the selected baselines. The benchmark Python environment also uses
 and L3 are needed for their respective comparisons; JPEG-B8 measurements require
 the RGB-no-more `dct_manip` extension, and transfer diagnostics use Nsight Systems.
 
-Some full-population inference and H2D replay experiments additionally require
-prediction and execution-reference artifacts that are **not included** in the
-small plotting tables. Those experiments cannot be reproduced from the CSVs
-alone. Run timed measurements on an otherwise idle GPU and retain the protocol
-of the selected experiment; dry-run output is not a completed experiment.
+For fresh full-population inference and H2D captures, follow the
+[reference rebuilding guide](benchmarks/paper/REBUILDING_REFERENCES.md). It
+describes how to prepare public model code and checkpoints, generate contracts
+and predictions from the ImageNet inputs, and profile a newly generated command.
+Run timed measurements on an otherwise idle GPU and retain the protocol of the
+selected experiment.
 
 ## Tests
 
@@ -283,7 +286,6 @@ cmake -S . -B build-fastlens-tests -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DFASTLENS_BUILD_TESTS=ON \
   -DBUILD_TESTING=ON \
-  -DFASTLENS_BUILD_TESTS=ON \
   -DFASTLENS_BUILD_BENCHMARKS=OFF \
   -DFASTLENS_BUILD_TOOLS=ON \
   -DFASTLENS_WITH_JPEG_DCT=ON \

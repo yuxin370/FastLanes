@@ -1,151 +1,58 @@
-# RGB-no-more 端到端对比运行指南
+# RGB-no-more end-to-end inference guide
 
-## 当前接口
+Run from the FastLens repository root after the [reference preparation
+steps](../../../paper/REBUILDING_REFERENCES.md). The paired model registry in
+`inference/model_factory.py` specifies each architecture, checkpoint pair,
+preprocessing pipeline, input shape and native semantic profile together.
 
-统一入口是：
+| Model ID | Checkpoint files |
+| --- | --- |
+| `rgbnomore-vitti-224-v1` | `imgnetRGBViTTi_ep300_74.1.pth`, `imgnetDCTViTTi_ep300_75.1.pth` |
+| `rgbnomore-swinv2-t-256-window8-v1` | `imgnetSwinRGB_ep300_79.0.pth`, `imgnetSwinDCT_ep300_79.4.pth` |
 
-```bash
--m fastlens.benchmarks.baselines.system_rgbnomore.inference.run
-```
+The Swin inference model uses input size 256 and window size 8. Select the
+registered model rather than loading those weights into a 224/window-7 training
+variant. The source JPEG recipe is 512x512; the default dimension check is 512.
 
-正式 pipeline 只有 `fastlens`、`rgbnomore`、`dali`、`pytorch`。旧的
-`fastlens_planless`、`fastlens_fixed_items` 名称及其 A/B 参数不再接受；`fastlens` 始终
-使用 native production profile。
-
-先确认 binding 和帮助信息：
-
-```bash
-cmake --build build --target _fastlens_direct_dct -j2
-PYTHONPATH=.:build/fastlens/torch \
-  python3 \
-  -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run --help
-```
-
-## 数据与模型
-
-模型不是散落在四条 pipeline 中分别配置的。`inference/model_factory.py`
-中的注册项同时声明模型构造、RGB/DCT checkpoint 对、RGB/DCT 变换、输入形状和
-FASTLENS semantic profile；`--model` 只选择一个完整契约。当前注册项为：
-
-```text
-rgbnomore-vitti-224-v1
-rgbnomore-swinv2-t-256-window8-v1
-```
-
-正式 DCT checkpoint 的输入是预处理后的 `512×512` JPEG。推荐路径：
-
-```text
-RGB JPEG:   fastlens/data/system_rgbnomore/e2e_v3/imagenet_512
-Index CSV:  fastlens/data/system_rgbnomore/e2e_v2/indexbase_val.csv
-FASTLENS:       fastlens/data/compressed/imagenet512_val_compact_v3/manifest.bin
-Labels:     fastlens/data/compressed/imagenet512_val_compact_v3/labels.json
-RGB model:  fastlens/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth
-DCT model:  fastlens/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth
-```
-
-官方 SwinV2-T 使用 256 输入、window=8 和独立的 RGB/DCT 300-epoch
-checkpoint。将以下两个官方文件放到同一 checkpoints 目录：
-
-```text
-imgnetSwinRGB_ep300_79.0.pth
-imgnetSwinDCT_ep300_79.4.pth
-```
-
-上游发布链接：
-
-```text
-http://www-personal.umich.edu/~jespark/rgbnomore-2023/imgnetSwinRGB_ep300_79.0.pth
-http://www-personal.umich.edu/~jespark/rgbnomore-2023/imgnetSwinDCT_ep300_79.4.pth
-```
-
-Swin 注册项会统一选择 RGB `imagenet_swin`、DCT `imagenet_dct_swin`、
-`Resize_DCT(32)` 和 FASTLENS `rgbnomore-swinv2-validation-v1`，不会把官方
-256/window=8 权重误装进训练实验使用的 224/window=7 变体。
-
-默认 `--dct-source-image-size 512` 会扫描 JPEG SOF 并拒绝数据语义不一致。
-只有自定义 checkpoint/recipe 才应传 `0`。
-
-首次创建、迁移数据目录或数据发生受控变化后，可显式生成 payload fingerprint：
+## Build and run
 
 ```bash
-PYTHONPATH=.:build/fastlens/torch \
-python3 \
-  -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset smoke \
-  --output-dir /tmp/fastlens-fingerprint-preflight \
-  --refresh-fastlens-payload-fingerprints \
-  --dry-run
+cmake --build build --target _fastlens_direct_dct --parallel
+export PYTHONPATH="$PWD:$PWD/build/fastlens/torch${PYTHONPATH:+:$PYTHONPATH}"
+python -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run --help
+python -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
+  --preset smoke --pipelines fastlens rgbnomore dali pytorch \
+  --output-dir "$HOME/tmp/fastlens-inference-smoke"
 ```
 
-普通运行只核对缓存的 fingerprint 和文件快照，不在计时前隐式扫描全部 shard。
+After the functional check, use `--preset e2e` and a new output directory.
+This preset uses batch 50, zero warmup batches, 1,000 measured batches and five
+repeats. Override `--repeats 1` when generating a single-pass prediction reference
+or a single-window profiler input. Supply the checkpoint, data, manifest and
+label-map arguments shown in the [package README](../README.md) when their
+locations differ from the defaults.
 
-## Smoke
+The `fastlens` path uses the native production profile. Workload parameters
+such as batch size and workers are configurable; implementation policies such
+as rowgroup prefetch, caches, streams and kernel launch limits are native-owned.
 
-```bash
-PYTHONPATH=.:build/fastlens/torch \
-python3 \
-  -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset smoke \
-  --pipelines fastlens rgbnomore dali pytorch \
-  --output-dir /tmp/fastlens-rgbnomore-smoke
-```
+## Contracts and validation
 
-Smoke 使用 batch 2、1 个 warmup batch、2 个 measured batch、1 个 repeat。
+`--dry-run` still reads and checks real input metadata, then writes
+`contract.json`, the selected samples and `commands.json`. Removing `--dry-run`
+executes each pipeline and the validator. It is not necessary to obtain an
+old contract from a previous experiment.
 
-SwinV2-T smoke：
+After creating or relocating a store, use
+`--refresh-fastlens-payload-fingerprints` once outside a timed run. Subsequent
+runs reuse and verify the resulting payload fingerprint cache. Generate fresh
+contracts after changes to inputs, binaries or source files.
 
-```bash
-PYTHONPATH=.:build/fastlens/torch \
-python3 \
-  -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset smoke \
-  --model rgbnomore-swinv2-t-256-window8-v1 \
-  --pipelines fastlens rgbnomore dali pytorch \
-  --output-dir /tmp/fastlens-rgbnomore-swinv2-smoke
-```
+DCT pipelines are checked against their same-domain reference. RGB comparisons
+retain their decoder/preprocessing diagnostics. Examine `validation.json`
+separately from performance statistics. Pipeline JSON files link to the contract
+and semantic arrays, including full-population predictions needed by later runs.
 
-## 正式 E2E
-
-```bash
-PYTHONPATH=.:build/fastlens/torch \
-python3 \
-  -m fastlens.benchmarks.baselines.system_rgbnomore.inference.run \
-  --preset e2e \
-  --pipelines fastlens rgbnomore dali pytorch \
-  --output-dir /tmp/fastlens-rgbnomore-e2e \
-  --data-root fastlens/data/system_rgbnomore/e2e_v3/imagenet_512 \
-  --index-csv fastlens/data/system_rgbnomore/e2e_v2/indexbase_val.csv \
-  --fastlens-manifest fastlens/data/compressed/imagenet512_val_compact_v3/manifest.bin \
-  --fastlens-label-map-json fastlens/data/compressed/imagenet512_val_compact_v3/labels.json \
-  --rgb-checkpoint fastlens/data/system_rgbnomore/e2e_v2/checkpoints/imgnetRGBViTTi_ep300_74.1.pth \
-  --dct-checkpoint fastlens/data/system_rgbnomore/e2e_v2/checkpoints/imgnetDCTViTTi_ep300_75.1.pth \
-  --torch-binding-dir build/fastlens/torch
-```
-
-E2E 默认 batch 50、零 warmup、1000 个 measured batch、5 个 repeat。GPU/NUMA
-绑定应由调用环境设置，例如 `CUDA_VISIBLE_DEVICES` 和 `numactl`；它们不写成 FASTLENS
-实现配置。
-
-## 可覆盖参数的边界
-
-可覆盖的是实验输入和工作负载：pipeline 集合、路径、checkpoint、batch、测量
-长度、repeat、外层 workers、semantic sample 数、seed、device、precision 和
-PyTorch/DALI prefetch factor。
-
-下列内容不再是 Python 参数：planless/fixed-items、cache、decode batching、
-workset、rowgroup prefetch、kernel blocks/CTAs、stream priority、async completion、
-double buffer、crop execution、bounded read 和完整 RGB-no-more grid 参数。它们属于
-binding 校验过的 `compact-v3-planless-limited-o512-c512-v1` profile。
-
-## 结果检查
-
-每个输出目录至少应包含：
-
-- `contract.json` 与 canonical sample manifest；
-- `pipeline_fastlens.json`、其他 pipeline JSON 和语义 artifact；
-- `results.json`、`results.csv`、`report.md`；
-- `validation.json`、`commands.json` 和日志。
-
-发布前检查 `validation.json` 通过、样本 trace 一致、DCT/RGB 同域语义 gate
-通过，并确认正式结果来自 fresh 输出目录。诊断脚本的单项结果不能替代统一 E2E
-contract。
+The [rebuilding guide](../../../paper/REBUILDING_REFERENCES.md) shows how to pass
+these files to a direct paper worker and how to capture H2D traffic using the
+newly generated command, without the dated historical selector.

@@ -53,9 +53,10 @@ python -m fastlens.benchmarks.paper.section_6_2_1.matched_dct.run run --dry-run
 
 Plotting uses the included tables and requires NumPy and matplotlib; it does not
 require a GPU or ImageNet. Fresh measurements require ImageNet, checkpoints and
-the selected baseline dependencies. Historical inference/H2D replay also needs
-the original contract/prediction bundle; those large artifacts are not included.
-The reproduction guide identifies these inputs and existing runtime limitations.
+the selected baseline dependencies. Follow the
+[reference rebuilding guide](fastlens/benchmarks/paper/REBUILDING_REFERENCES.md)
+to generate inference contracts, predictions and H2D profiler inputs from public
+sources on your machine.
 
 ## Source organization
 

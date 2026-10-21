@@ -1,6 +1,6 @@
 # eFUN inference and training
 
-> 这里的 N 目标副本仅用于历史复现，已隔离至 `backup/offline_model_input/`；正式在线系统数据见[统一数据清单](../../docs/DATASETS.md)。
+> Offline target-grid copies are used for the target-representation controls. For online source-DCT preparation, see the [rebuilding guide](../paper/REBUILDING_REFERENCES.md).
 
 See the [published result tables](../paper/results/README.md) for the
 configurations adopted by the final paper.
