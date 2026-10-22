@@ -1,0 +1,11 @@
+name: fastlens
+channels:
+  - nvidia/label/cuda-12.8.1
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - cuda-toolkit=12.8.1
+  - pip:
+      - -r requirements.txt

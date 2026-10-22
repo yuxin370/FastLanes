@@ -11,9 +11,10 @@ The final PDF contains six RGB baselines.
 
 ## Start here
 
-Run from the repository root with a Python environment containing PyTorch,
-torchvision, NumPy, Pillow, einops, psutil and matplotlib. JPEG-B8 experiments also
-need the RGB-no-more `dct_manip` extension. DALI, FFCV, CoorDL and L3 are needed
+Follow the root [environment setup](../../../README.md#environment-setup), then
+run from the repository root with the `fastlens` environment active.
+JPEG-B8 experiments also need the RGB-no-more `dct_manip` extension.
+DALI, FFCV, CoorDL and L3 are needed
 only for their respective baseline measurements; Nsight Systems is needed for
 CUPTI diagnostics. ImageNet and pretrained checkpoints are external inputs.
 

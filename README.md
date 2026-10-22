@@ -67,43 +67,64 @@ measurements used by the paper and document their aggregation conventions.
 RGB deployment comparisons use different input representations and are reported
 separately from the matched DCT comparison.
 
-## Requirements and build
+## Environment setup
 
-Run all commands below from the **FastLens repository root**. The build targets
-Linux with an NVIDIA GPU and requires:
+Run all commands below from the **FastLens repository root**. The setup targets
+Linux with an NVIDIA GPU. Install Conda and an NVIDIA driver compatible with
+CUDA 12.8 before creating the environment.
 
-- CMake 3.22 or newer, with Make or Ninja.
-- A C++20 compiler: Clang 13+ (the default) or GCC 11+, plus a CUDA-supported
-  host compiler.
-- A CUDA development toolkit with `nvcc` and Thrust/CCCL, and a compatible driver.
-- The libjpeg development API: `jpeglib.h` and `libjpeg`, such as those provided by
-  `libjpeg-dev` or `libjpeg-turbo8-dev`.
-- Python 3.10+ with development headers and CUDA-enabled PyTorch for the Python
-  interface. The paper uses CUDA 12.8 and PyTorch 2.11.
+### 1. Install system build dependencies
 
-Activate the Python/CUDA environment, then build and run the smoke tests:
+On Ubuntu 22.04 or 24.04:
 
 ```bash
-./scripts/build.sh -DCMAKE_CUDA_ARCHITECTURES='89;90'
-./scripts/smoke_test.sh
+sudo apt-get update
+sudo apt-get install -y build-essential clang cmake libjpeg-dev
 ```
 
-The build script enables the tools, Torch extension, benchmarks and tests.
-Architectures 89 and 90 correspond to RTX 4090 and H100; select the architecture
-of your GPU on other hardware. Set `CUDACXX` and `CUDAHOSTCXX` when the CUDA
-compiler and its host compiler need explicit selection.
+The build requires CMake 3.22+, a C++20 compiler (Clang 13+ or GCC 11+), Make or
+Ninja, and the libjpeg development headers and library.
 
-The script uses Python from the active environment. For a CUDA toolkit installed
-in that environment with Conda, select the compilers explicitly:
+### 2. Create and activate the environment
+
+```bash
+conda env create -f environment.yml
+conda activate fastlens
+```
+
+[`environment.yml`](environment.yml) installs Python 3.11 and the CUDA 12.8.1
+development toolkit, including `nvcc` and Thrust/CCCL. It also installs the
+packages pinned in [`requirements.txt`](requirements.txt): PyTorch 2.11.0 and
+torchvision 0.26.0 for CUDA 12.8, plus the common image, model, benchmark and
+plotting dependencies. The paper uses CUDA 12.8 and PyTorch 2.11.
+
+If Python 3.11 and a compatible CUDA development toolkit are already installed
+in your active environment, install the Python dependencies with:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+DALI, FFCV, CoorDL, L3 and the RGB-no-more `dct_manip` extension have additional
+setup steps in the [benchmark guides](fastlens/benchmarks/README.md).
+
+## Build and smoke test
+
+With the `fastlens` environment active, build and run the smoke tests:
 
 ```bash
 ./scripts/build.sh \
   -DCMAKE_CUDA_COMPILER="$CONDA_PREFIX/bin/nvcc" \
   -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ \
   -DCMAKE_CUDA_ARCHITECTURES='89;90'
+./scripts/smoke_test.sh
 ```
 
-For other CUDA installations, use the full path to that toolkit's `nvcc`.
+The build script uses Python from the active environment and enables the tools,
+Torch extension, benchmarks and tests. Architectures 89 and 90 correspond to
+RTX 4090 and H100; select the architecture of your GPU on other hardware.
+For a toolkit installed outside Conda, set `CMAKE_CUDA_COMPILER` to its `nvcc`
+path. Select a CUDA-supported host compiler with `CMAKE_CUDA_HOST_COMPILER`.
 
 `FASTLENS_BUILD_DIR` selects a different build directory; the examples and paper
 runners below use `build/`. Additional arguments to `build.sh` go to CMake, and
