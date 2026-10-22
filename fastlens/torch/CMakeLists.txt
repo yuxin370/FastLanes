@@ -36,6 +36,9 @@ if (CMAKE_CUDA_ARCHITECTURES AND NOT TORCH_CUDA_ARCH_LIST AND NOT DEFINED ENV{TO
         endif ()
 endif ()
 
+# Torch's legacy FindCUDA must use the toolkit already selected for FastLens.
+set(CUDA_TOOLKIT_ROOT_DIR "${CUDAToolkit_TARGET_DIR}")
+set(CUDA_NVCC_EXECUTABLE "${CMAKE_CUDA_COMPILER}")
 find_package(Torch REQUIRED)
 
 find_library(FASTLENS_TORCH_PYTHON_LIBRARY
