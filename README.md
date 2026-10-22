@@ -93,6 +93,18 @@ Architectures 89 and 90 correspond to RTX 4090 and H100; select the architecture
 of your GPU on other hardware. Set `CUDACXX` and `CUDAHOSTCXX` when the CUDA
 compiler and its host compiler need explicit selection.
 
+The script uses Python from the active environment. For a CUDA toolkit installed
+in that environment with Conda, select the compilers explicitly:
+
+```bash
+./scripts/build.sh \
+  -DCMAKE_CUDA_COMPILER="$CONDA_PREFIX/bin/nvcc" \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ \
+  -DCMAKE_CUDA_ARCHITECTURES='89;90'
+```
+
+For other CUDA installations, use the full path to that toolkit's `nvcc`.
+
 `FASTLENS_BUILD_DIR` selects a different build directory; the examples and paper
 runners below use `build/`. Additional arguments to `build.sh` go to CMake, and
 `CMAKE_BUILD_PARALLEL_LEVEL` controls parallel build jobs. CMake downloads
