@@ -11,7 +11,7 @@ The final PDF contains six RGB baselines.
 
 ## Start here
 
-Follow the root [environment setup](../../../README.md#environment-setup), then
+Follow the root [environment setup](../../../README.md#1-install-dependencies), then
 run from the repository root with the `fastlens` environment active.
 JPEG-B8 experiments also need the RGB-no-more `dct_manip` extension.
 DALI, FFCV, CoorDL and L3 are needed
