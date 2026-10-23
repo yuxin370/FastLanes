@@ -49,10 +49,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', choices=['vitti', 'mobilenet24', 'mobilenet32', 'efun', 'resnet24', 'resnet64'], required=True)
     parser.add_argument('--path', type=lambda name: name.replace('fastlens', 'imagelanes'), metavar='PATH', choices=['pytorch', 'dali', 'coordl', 'ffcv_raw', 'ffcv_jpeg', 'l3', 'cpu_dct', 'imagelanes'], required=True)
-    parser.add_argument('--reference', type=Path, required=True)
+    reference_mode = parser.add_mutually_exclusive_group(required=True)
+    reference_mode.add_argument('--reference', type=Path)
+    reference_mode.add_argument('--prepare-reference', action='store_true',
+                                help='Generate a full-population reference before measured chapter trials')
+    parser.add_argument('--contract', type=Path, help='Pipeline contract when not embedded in the reference')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
+    if args.prepare_reference and args.check:
+        parser.error('--prepare-reference requires the full 50000-image population')
+    previous = {} if args.prepare_reference else read(args.reference)
+    contract_path = args.contract or previous.get('contract')
+    contract = read(contract_path) if contract_path is not None else None
+    if args.contract is not None and 'contract' in previous:
+        original = read(read(previous['contract'])['dataset']['sample_manifest'])['samples']
+        configured = read(contract['dataset']['sample_manifest'])['samples']
+        assert [(s['sample_id'], s['label']) for s in original] == [
+            (s['sample_id'], s['label']) for s in configured]
     args.output.mkdir(parents=True, exist_ok=True)
     assert not (args.output/'result.json').exists()
     os.environ['DCTNET_PROFILE'] = args.model
@@ -76,10 +90,6 @@ def main():
     stream = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
     stream.wait_stream(torch.cuda.current_stream())
     torch.cuda.set_stream(stream)
-    previous = read(args.reference)
-    contract = None
-    if 'contract' in previous:
-        contract = read(previous['contract'])
     if cnn:
         if args.model == 'efun':
             import fastlens.benchmarks.dct_models as package
@@ -93,8 +103,9 @@ def main():
                         ordinal=i, galp_image_id=e['galp_image_id']) for i, e in enumerate(entries)]
         model = (B.model() if dct else rgb.model()).to(device)
         checkpoint_path = B.CHECKPOINT if dct else rgb.CHECKPOINT
-        previous_checkpoint = previous['checkpoint'] if 'checkpoint' in previous else previous['model']['checkpoint']
-        assert Path(previous_checkpoint).resolve() == Path(checkpoint_path).resolve()
+        if not args.prepare_reference:
+            previous_checkpoint = previous['checkpoint'] if 'checkpoint' in previous else previous['model']['checkpoint']
+            assert Path(previous_checkpoint).resolve() == Path(checkpoint_path).resolve()
         shapes = [(sum(map(len, B.INDICES)), B.GRID, B.GRID)] if dct else [(3, 224, 224)]
     else:
         assert contract is not None
@@ -112,8 +123,9 @@ def main():
         shapes = [(1, 28, 28, 8, 8), (2, 14, 14, 8, 8)] if dct else [(3, *contract['preprocess']['rgb']['crop_size'])]
     model.eval()
     selected = samples[:count]
-    expected_predictions = reference_predictions(args.reference)
-    assert set(s['sample_id'] for s in samples) == set(expected_predictions)
+    expected_predictions = None if args.prepare_reference else reference_predictions(args.reference)
+    if expected_predictions is not None:
+        assert set(s['sample_id'] for s in samples) == set(expected_predictions)
     if contract is not None:
         if cnn:
             other = read(contract['dataset']['sample_manifest'])['samples']
@@ -135,7 +147,7 @@ def main():
         paths = [Path(contract['pipelines']['ffcv']['beton'])]
     elif args.path == 'l3':
         from fastlens.benchmarks.baselines.l3.prepare import encoded_path
-        l3 = read(ROOT/'results/l3_patch32_20261006/training/4090/vitti/l3/trial_0/result.json')['l3']
+        l3 = contract['pipelines']['dali']['l3']
         paths = [encoded_path(l3['root'], s['sample_id']) for s in selected]
     else:
         paths = [Path(s['path']) for s in selected]
@@ -195,7 +207,7 @@ def main():
             cls = {'pytorch': M.PyTorchAdapter, 'dali': M.DaliAdapter, 'coordl': M.CoorDLAdapter,
                    'ffcv': M.FfcvAdapter, 'rgbnomore': M.RgbNoMoreAdapter, 'dct_major_pushdown': M.FastLensAdapter}[name]
             if args.path == 'imagelanes':
-                contract['pipelines'][name]['torch_binding_dir'] = os.environ['FASTLENS_TRAINING_NATIVE_DIR']
+                contract['pipelines'][name]['torch_binding_dir'] = str(ROOT / 'build/fastlens/torch')
             # FFCV's producer thread writes these buffers outside InferenceMode.
             with torch.inference_mode(False):
                 source = cls(contract, reader_samples if name in ('ffcv', 'coordl', 'dct_major_pushdown') else selected, device, name)
@@ -250,16 +262,17 @@ def main():
         cleanup_coordl_cache(args.output)
     assert sample_ids == [s['sample_id'] for s in selected]
     mismatches = [dict(sample_id=s, actual=p[0], expected=expected_predictions[s])
-                  for s, p in zip(sample_ids, predictions) if p[0] != expected_predictions[s]]
+                  for s, p in zip(sample_ids, predictions) if expected_predictions is not None and p[0] != expected_predictions[s]]
     if mismatches:
         (args.output/'prediction_mismatch.json').write_text(json.dumps(dict(
-            gpu=torch.cuda.get_device_name(), reference=str(args.reference), mismatches=mismatches), indent=2)+'\n')
+            gpu=torch.cuda.get_device_name(), reference=str(args.reference) if args.reference is not None else None, mismatches=mismatches), indent=2)+'\n')
         raise AssertionError(f'{len(mismatches)}/{count} predictions differ from accepted baseline')
     result = dict(model=args.model, path=args.path, images=count, seconds=seconds, images_per_s=count/seconds,
         top1=100*correct1/count, top5=100*correct5/count, ce=ce/count, predictions=predictions, sample_ids=sample_ids,
         predictions_sha256=hashlib.sha256(json.dumps(predictions).encode()).hexdigest(),
-        checkpoint=str(checkpoint_path), checkpoint_sha256=file_sha(checkpoint_path), correctness_passed=True,
-        reference=str(args.reference), cache=cache, batch=batch_size, precision='fp32', tf32=False, compile=False,
+        checkpoint=str(checkpoint_path), checkpoint_sha256=file_sha(checkpoint_path), correctness_passed=not args.prepare_reference,
+        mode='reference' if args.prepare_reference else 'correctness' if args.check else 'measurement',
+        reference=str(args.reference) if args.reference is not None else None, cache=cache, batch=batch_size, precision='fp32', tf32=False, compile=False,
         host_threads=torch.get_num_threads(), workers=8, model_stream_priority=stream.priority,
         CUBLAS_WORKSPACE_CONFIG=os.environ.get('CUBLAS_WORKSPACE_CONFIG'), gpu=torch.cuda.get_device_name(),
         timing_scope='Reader construction/startup through logits, CE, top1/top5 and prediction copies; model load and 20-batch model warmup excluded.')

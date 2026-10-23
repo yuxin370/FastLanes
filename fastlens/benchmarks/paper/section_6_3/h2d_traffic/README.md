@@ -6,14 +6,15 @@ For a fresh checkout, follow the
 [reference rebuilding guide](../../REBUILDING_REFERENCES.md#capture-h2d-traffic)
 to generate contracts and profile a newly constructed workload.
 
-The batch replay below selects runs from the original
-`results/paper/selected_max_20261008` tree and its referenced commands/contracts.
-It is intended for replaying that archived tree; the rebuilding guide gives the
-direct profiler commands for new runs.
+The chapter entry point profiles newly completed trials under `--run-dir`
+(default: `results/reproduced`). It reads their `run.command.json` and
+`result.json`, selects one trial per workload and checks the replay against that
+trial. Correctness checks and resident-only controls are excluded.
 
 ```bash
 python -m fastlens.benchmarks.paper.section_6_3.h2d_traffic.run --help
-python -m fastlens.benchmarks.paper.section_6_3.h2d_traffic.run run --dry-run
+python -m fastlens.benchmarks.paper.section_6_3.h2d_traffic.run run --run-dir results/reproduced --dry-run
+python -m fastlens.benchmarks.paper.section_6_3.h2d_traffic.run run --run-dir results/reproduced
 python -m fastlens.benchmarks.paper.section_6_3.h2d_traffic.run plot
 ```
 

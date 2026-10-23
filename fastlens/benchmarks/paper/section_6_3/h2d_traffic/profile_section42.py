@@ -1,6 +1,6 @@
 """Instrument the existing inference timer boundaries without changing workload code.
 
-Only the six listed evaluators are instrumented. Their command, warmup, batches,
+Only the listed evaluators are instrumented. Their command, warmup, batches,
 model, predictions and timed loop are otherwise unchanged. Diagnostic timings
 must not replace the paper's unprofiled throughput measurements.
 """
@@ -20,6 +20,18 @@ sys.path.insert(0, str(ROOT))
 
 # Exact, unique anchors at the existing complete-pass timer boundaries.
 BOUNDARIES = {
+    'fastlens/benchmarks/paper/shared/remaining_baseline_inference.py': (
+        '        started = time.perf_counter()',
+        '        seconds = time.perf_counter()-started'),
+    'fastlens/benchmarks/paper/shared/swin_unified_inference.py': (
+        '        started = time.perf_counter()',
+        '        seconds = time.perf_counter() - started'),
+    'fastlens/benchmarks/paper/shared/remaining_baseline_training.py': (
+        '    started = time.perf_counter()',
+        '    seconds = time.perf_counter() - started'),
+    'fastlens/benchmarks/paper/section_6_2_4/resident_training/resident_training_window.py': (
+        '    started = time.perf_counter()',
+        '    seconds = time.perf_counter() - started'),
     'fastlens/benchmarks/paper/section_6_3/h2d_traffic/swin_block_major.py': (
         '        start = time.perf_counter()',
         '        elapsed = time.perf_counter() - start'),

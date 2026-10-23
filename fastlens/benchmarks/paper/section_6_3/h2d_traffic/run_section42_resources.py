@@ -1,4 +1,4 @@
-"""Replay Section 4.2 workloads for IO, H2D and process GPU memory diagnostics."""
+"""Profile completed chapter runs without changing their measured workload."""
 import argparse
 import csv
 import datetime
@@ -12,10 +12,11 @@ import sys
 ROOT = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(ROOT))
 from fastlens.benchmarks.execution.inference_load import run
-from fastlens.benchmarks.paper.shared.references import PROFILES
-from fastlens.benchmarks.system_dct_major.common import file_identity, parse_manifest, sha256_json, sha256_file
+from fastlens.benchmarks.system_dct_major.common import parse_manifest
 
-SELECTED = ROOT / 'results/paper/selected_max_20261008'
+PIPELINES = {'pytorch': 'PyTorch', 'dali': 'DALI', 'coordl': 'CoorDL',
+             'ffcv_raw': 'FFCV', 'l3': 'L3', 'cpu_dct': 'CPU-DCT',
+             'fastlens': 'FastLens', 'fastlens_basic': 'FastLens'}
 
 
 def read(path):
@@ -26,28 +27,28 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
 
 
-def jobs():
+def jobs(run_dir):
+    """Use one completed trial per published workload; never use check runs."""
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise FileNotFoundError(run_dir)
     seen = set()
-    for phase, filename in [('training', 'training_windows.csv'),
-                            ('inference', 'deployment_inference_summary.csv'),
-                            ('inference', 'matched_dct_inference.csv')]:
-        for row in csv.DictReader((SELECTED / filename).open()):
-            pipeline = row.get('pipeline', 'CPU-DCT')
-            model = row.get('paper_workload', row.get('model', row.get('dct_model')))
-            model = model.replace(' (reference)', '')
-            model = 'swinv2' if model == 'SwinV2-T' else PROFILES[model]
-            if phase == 'inference' and model.startswith('resnet') and pipeline not in ('FastLens', 'CPU-DCT'):
-                continue  # RGB ResNet is explicitly excluded from Section 4.2 deployment.
-            if pipeline not in ('FastLens', 'CPU-DCT') and model == 'mobilenet32':
-                model = 'mobilenet24'  # Shared RGB reference, not two measurements.
-            gpu = '4090' if row['gpu'] == 'RTX 4090' else 'H100'
-            key = (phase, gpu, model, pipeline)
-            if key in seen:
-                continue
-            seen.add(key)
-            source = ROOT / row['raw_results'].split(';')[0].split('#')[0]
-            yield dict(phase=phase, gpu=gpu, model=model, pipeline=pipeline,
-                       source=str(source), metadata=read(source.parent / 'run.command.json'))
+    for record in sorted(run_dir.rglob('run.command.json')):
+        if not record.parent.name.startswith('trial_'):
+            continue
+        metadata = read(record)
+        pipeline = metadata['pipeline']
+        if pipeline not in PIPELINES:
+            continue
+        key = (metadata['phase'], metadata['gpu'], metadata['model'], PIPELINES[pipeline])
+        if key in seen:
+            continue
+        source = record.parent / 'result.json'
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        seen.add(key)
+        yield dict(phase=key[0], gpu=key[1], model=key[2], pipeline=key[3],
+                   source=str(source.resolve()), metadata=metadata)
 
 
 def set_arg(command, flag, value):
@@ -70,69 +71,28 @@ def training_inputs(job, command):
     return [Path(s['path']) for s in samples]
 
 
-def refresh_identities(value):
-    if isinstance(value, dict):
-        if 'path' in value and 'file_identity' in value:
-            current = file_identity(Path(value['path']))
-            old = value['file_identity']
-            assert all(current[k] == old[k] for k in ('size_bytes', 'mtime_ns')), value['path']
-            value['file_identity'] = current
-        for item in value.values():
-            refresh_identities(item)
-    elif isinstance(value, list):
-        for item in value:
-            refresh_identities(item)
-
-
 def inference_inputs(job, command, destination):
+    contract = None
     if '--contract' in command:
-        contract = read(command[command.index('--contract')+1])
-        assert contract['execution']['repeats'] == 1
-        assert contract['execution']['warmup_batches'] == 0
-        native, = (ROOT / 'build/fastlens/torch').glob('_fastlens_direct_dct.*.so')
-        artifact = dict(path=str(native), sha256=sha256_file(native), size_bytes=native.stat().st_size,
-                        file_identity=file_identity(native))
-        for config in contract['pipelines'].values():
-            if 'torch_binding_dir' in config:
-                config['torch_binding_dir'] = str(native.parent)
-            for key in ('torch_binding_artifact', 'native_binary_fingerprint'):
-                if key in config:
-                    config[key] = artifact
-        # Historical contracts name the RGB package before it moved into baselines/.
-        old_rgb = ROOT / 'fastlens/benchmarks/system_rgbnomore'
-        for entry in contract.get('source_fingerprints', {}).values():
-            path = Path(entry['path'])
-            if path.is_relative_to(old_rgb):
-                path = ROOT / 'fastlens/benchmarks/baselines/system_rgbnomore' / path.relative_to(old_rgb)
-            entry.update(path=str(path), sha256=sha256_file(path), size_bytes=path.stat().st_size,
-                         file_identity=file_identity(path))
-        samples = read(contract['dataset']['sample_manifest'])
-        refresh_identities(samples)
-        refresh_identities(contract)
-        sample_path = destination / 'samples.json'
-        save(sample_path, samples)
-        contract['dataset']['sample_manifest'] = str(sample_path)
-        key = 'sample_manifest_sha256' if 'sample_manifest_sha256' in contract['dataset'] else 'manifest_sha256'
-        contract['dataset'][key] = sha256_json(samples)
-        save(destination / 'contract.json', contract)
-        set_arg(command, '--contract', destination / 'contract.json')
-        if job['pipeline'] == 'FFCV':
-            return [Path(contract['pipelines']['ffcv']['beton'])]
-        if job['pipeline'] == 'FastLens':
-            name = command[command.index('--pipeline')+1]
-            manifest = Path(contract['pipelines'][name]['manifest'])
-            return [Path(s['fls_path']) for s in parse_manifest(manifest)['shards']]
-        return [Path(s['path']) for s in samples['samples']]
+        contract = read(command[command.index('--contract') + 1])
+    elif '--reference' in command:
+        reference = read(command[command.index('--reference') + 1])
+        if 'contract' in reference:
+            contract = read(reference['contract'])
     if job['pipeline'] == 'FastLens':
-        root = (Path(command[command.index('--new-data')+1]) if '--new-data' in command
-                else ROOT / 'fastlens/data/compressed/imagenet512_val_block_major')
-        return [Path(s['fls_path']) for s in parse_manifest(root / 'manifest.bin')['shards']]
-    from fastlens.benchmarks.baselines.l3.prepare import source_samples, encoded_path
-    samples = source_samples('val')
-    if job['pipeline'] == 'L3':
-        root = command[command.index('--l3-root')+1]
-        return [encoded_path(root, s['logical_sample_id']) for s in samples]
-    return [Path(s['path']) for s in samples]
+        manifest = ROOT / 'fastlens/data/compressed/imagenet512_val_block_major/manifest.bin'
+        return [Path(s['fls_path']) for s in parse_manifest(manifest)['shards']]
+    if job['pipeline'] == 'FFCV':
+        return [Path(contract['pipelines']['ffcv']['beton'])]
+    if contract is not None:
+        samples = read(contract['dataset']['sample_manifest'])['samples']
+        if job['pipeline'] == 'L3':
+            from fastlens.benchmarks.baselines.l3.prepare import encoded_path
+            root = contract['pipelines']['dali']['l3']['root']
+            return [encoded_path(root, s['sample_id']) for s in samples]
+        return [Path(s['path']) for s in samples]
+    from fastlens.benchmarks.baselines.l3.prepare import source_samples
+    return [Path(s['path']) for s in source_samples('val')]
 
 
 def verify(job, result, cold_start=False):
@@ -148,7 +108,7 @@ def verify(job, result, cold_start=False):
         return result['images']
     actual = result['repeats'][0] if 'repeats' in result else result
     expected = source['repeats'][0] if 'repeats' in source else source
-    count = actual['images'] if 'repeats' in result else actual['samples']
+    count = actual['images'] if 'images' in actual else actual['samples']
     assert count == 50000
     for key in ('sample_trace', 'sample_ids', 'image_ids', 'checkpoint', 'top1_predictions_sha256', 'predictions'):
         if key in expected:
@@ -193,10 +153,12 @@ def metrics(destination, mode, images):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'results/section42_resources_20261008')
+    parser.add_argument('--run-dir', type=Path, default=ROOT / 'results/reproduced',
+                        help='Completed chapter trials containing run.command.json and result.json')
+    parser.add_argument('--output', type=Path, default=ROOT / 'results/reproduced/section_6_3/h2d_traffic')
     parser.add_argument('--phases', nargs='+', choices=['training', 'inference'], default=['training', 'inference'])
     parser.add_argument('--gpus', nargs='+', choices=['4090', 'H100'], default=['4090'])
-    parser.add_argument('--models', nargs='+', choices=sorted(set(PROFILES.values())),
+    parser.add_argument('--models', nargs='+', choices=['vitti', 'swinv2', 'mobilenet24', 'mobilenet32', 'resnet24', 'resnet64', 'efun'],
                         help='Defaults: ViT-Ti and MobileNet24 for warm diagnostics; MobileNet24 for cold IO')
     parser.add_argument('--limit', type=int)
     parser.add_argument('--list', action='store_true')
@@ -205,7 +167,9 @@ def main():
     if (args.output.resolve() / 'STOP_AFTER_CURRENT').is_file() and not args.list:
         parser.exit(75, 'Paused by user; STOP_AFTER_CURRENT is present.\n')
     models = args.models or (['mobilenet24'] if args.cold_start else ['vitti', 'mobilenet24'])
-    selected = [j for j in jobs() if j['phase'] in args.phases and j['gpu'] in args.gpus and j['model'] in models]
+    selected = [j for j in jobs(args.run_dir) if j['phase'] in args.phases and j['gpu'] in args.gpus and j['model'] in models]
+    if not selected:
+        parser.error(f'No completed chapter trials match the selected workloads in {args.run_dir}')
     if args.limit:
         selected = selected[:args.limit]
     if args.list:
@@ -227,32 +191,30 @@ def main():
             env.update({k:v for k,v in job['metadata']['environment'].items() if v is not None})
             for key in ('FASTLENS_EVALUATION_SNAPSHOT', 'FASTLENS_ALLOWED_RESIDENT_PIDS'):
                 env.pop(key, None)
+            env.pop('CUBLAS_WORKSPACE_CONFIG', None)
             env.update(PYTHONDONTWRITEBYTECODE='1', TMPDIR=str(Path.home() / 'tmp'),
                        PYTHONPATH=f'{ROOT}:{ROOT}/build/fastlens/torch',
                        FASTLENS_TRAINING_NATIVE_DIR=str(ROOT / 'build/fastlens/torch'))
-            option = '--output' if '--output' in command else '--output-dir'
-            raw = dest / Path(job['source']).name
-            set_arg(command, option, dest if option == '--output-dir' or job['phase'] == 'training' else raw)
+            raw = dest / 'result.json'
+            set_arg(command, '--output', dest)
             paths = None
-            if job['phase'] == 'training':
-                if '--correctness-report' in command:
-                    index = command.index('--correctness-report')
-                    del command[index:index+2]  # Diagnostics validate against the source result below.
-                command.append('--memory' if args.cold_start else '--'+mode)
-                if args.cold_start:
-                    paths = training_inputs(job, command)
-            else:
-                paths = inference_inputs(job, command, dest)
-            if job['phase'] == 'inference' or args.cold_start:
-                # Preserve interpreter and NUMA placement, including CoorDL's environment.
-                index = next(i for i,x in enumerate(command) if Path(x).name in ('python', 'python3', 'coordl-python'))
-                save(dest / 'workload_command.json', command[index+1:])
-                command = command[:index+1] + ['fastlens/benchmarks/paper/section_6_3/h2d_traffic/profile_section42.py', '--command',
-                    str(dest / 'workload_command.json'), '--mode', mode, '--output', str(dest)]
-                if args.cold_start:
-                    save(dest / 'input_paths.json', [str(path) for path in paths])
-                    command += ['--input-paths', str(dest / 'input_paths.json')]
-                    paths = None  # Evict inside the child, after the target-GPU wait.
+            # Replay the original correctness gate and exact timed loop.
+            if args.cold_start:
+                paths = (training_inputs(job, command) if job['phase'] == 'training'
+                         else inference_inputs(job, command, dest))
+            index = next(i for i, x in enumerate(command)
+                         if Path(x).name in ('python', 'python3', 'coordl-python'))
+            arguments = command[index+1:]
+            if arguments[:1] == ['-B']:
+                arguments = arguments[1:]
+            save(dest / 'workload_command.json', arguments)
+            command = command[:index+1] + [
+                str(ROOT / 'fastlens/benchmarks/paper/section_6_3/h2d_traffic/profile_section42.py'),
+                '--command', str(dest / 'workload_command.json'), '--mode', mode, '--output', str(dest)]
+            if args.cold_start:
+                save(dest / 'input_paths.json', [str(path) for path in paths])
+                command += ['--input-paths', str(dest / 'input_paths.json')]
+                paths = None
             if mode == 'profile':
                 command = ['nsys', 'profile', '--trace=cuda,nvtx', '--sample=none', '--cpuctxsw=none',
                     '--capture-range=cudaProfilerApi', '--capture-range-end=stop', '--output', str(dest / 'capture'), *command]
@@ -278,7 +240,7 @@ def main():
                 cold = read(dest / 'cold_start_io.json')
                 record.update({key:value for key,value in cold.items() if key.endswith('storage_read_bytes')})
                 record['cold_start_scope'] = cold['scope']
-            record['scope'] = 'Resource-only replay of selected workload configuration using current Python implementation; not a reproduction of historical throughput'
+            record['scope'] = 'Separate resource profiling of a completed chapter trial; throughput comes from the unprofiled trial'
             save(dest / 'measurement.json', record)
             records = [read(path) for path in sorted(out.glob('*/*/*/*/*/measurement.json'))]
             fields = list(dict.fromkeys(key for row in records for key in row))

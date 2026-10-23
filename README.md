@@ -51,7 +51,7 @@ Install the system build dependencies:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential clang cmake libjpeg-dev
+sudo apt-get install -y build-essential clang cmake libjpeg-dev numactl
 ```
 
 FastLens requires CMake 3.22+, a C++20 compiler (Clang 13+ or GCC 11+), Make or Ninja, and libjpeg development headers.
@@ -245,7 +245,16 @@ Experiment directories follow the paper's evaluation sections:
 
 Running the full experiments requires ImageNet, prepared FastLens stores, model checkpoints, and the dependencies of the baselines being compared. The [benchmark setup guide](fastlens/benchmarks/README.md) covers DALI, FFCV, CoorDL, L3, and other benchmark-specific requirements. JPEG-B8 experiments use the RGB-no-more `dct_manip` extension. H2D traffic measurements require Nsight Systems.
 
-The [reference rebuilding guide](fastlens/benchmarks/paper/REBUILDING_REFERENCES.md) describes how to prepare model code and checkpoints, generate reference predictions, and collect new H2D measurements.
+The [reference rebuilding guide](fastlens/benchmarks/paper/REBUILDING_REFERENCES.md) gives the preparation order: public model code and checkpoints, ImageNet stores, pipeline contracts, then full-population reference predictions. Once its reference configuration is ready:
+
+```bash
+python3 -m fastlens.benchmarks.paper.prepare_references \
+  --references results/rebuilt/references.json
+python3 -m fastlens.benchmarks.paper.section_6_2_1.matched_dct.run run \
+  --references results/rebuilt/references.json
+```
+
+Training also requires the prepared training split described in the guide. Use `--phases inference` for an inference-only run. To capture H2D traffic from completed chapter trials, run `python3 -m fastlens.benchmarks.paper.section_6_3.h2d_traffic.run run --run-dir results/reproduced` with Nsight Systems installed.
 
 To redraw the paper's ten plots from the included measurements:
 

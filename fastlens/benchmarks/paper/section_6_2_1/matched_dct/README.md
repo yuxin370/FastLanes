@@ -1,6 +1,6 @@
 # §6.2.1 — Matched DCT performance (Figure 9)
 
-Uses seven models and both GPUs by default. `--models`, `--gpus`, `--phases` and `--repeats` select a subset. Training checks precede three interleaved restored-state trials. Inference needs the original prediction/contract artifacts; see the main README.
+Uses seven models and both GPUs by default. `--models`, `--gpus`, `--phases` and `--repeats` select a subset. Training checks precede three interleaved restored-state trials. Inference takes fresh prediction/contract inputs through `--references FILE`; see the [rebuilding guide](../../REBUILDING_REFERENCES.md#connect-fresh-references-to-the-chapter-entry-points).
 
 ```bash
 python -m fastlens.benchmarks.paper.section_6_2_1.matched_dct.run --help

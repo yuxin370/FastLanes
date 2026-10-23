@@ -17,6 +17,7 @@ DATA = ROOT / 'fastlens/data/compressed'
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--contract', type=Path, required=True)
     parser.add_argument('--arm', choices=['block', 'compact', 'cpu'], default='block')
     parser.add_argument('--count', type=int, default=50000)
     parser.add_argument('--output', type=Path, required=True)
@@ -31,8 +32,7 @@ def main():
     torch.set_num_threads(8)
     os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(DATA / 'imagenet512_val_block_major/access')
     os.environ['FASTLENS_PHASE6_NATIVE_PHYSICAL'] = '1' if args.arm == 'block' else '0'
-    contract = json.loads((ROOT / 'results/latest_inference_20260930/inference/'
-                         '4090_swinv2_fastlens/trial_1/contract.json').read_text())
+    contract = json.loads(args.contract.read_text())
     samples = sorted(json.loads(Path(contract['dataset']['sample_manifest']).read_text())['samples'],
                      key=lambda x: x['galp_image_id'])[:args.count]
     for i, s in enumerate(samples):

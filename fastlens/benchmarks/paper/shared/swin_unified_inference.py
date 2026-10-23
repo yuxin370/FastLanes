@@ -19,9 +19,11 @@ def read(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--path', type=lambda name: name.replace('fastlens', 'imagelanes'), metavar='PATH', choices=PATHS, required=True)
+    parser.add_argument('--contract', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
+    contract = read(args.contract)
     # Resolve the JPEG ABI before RGB-no-more loads its older JPEG binding.
     import cv2
     cv2.setNumThreads(1)
@@ -34,11 +36,6 @@ def main():
     from fastlens.benchmarks.profiling.input_motivation import cache_pages
 
     args.output.mkdir(parents=True, exist_ok=True)
-    base = ROOT/'results/remaining_inference_recheck_20260929/inference/4090_swinv2_pytorch/trial_1/contract.json'
-    contract = read(base)
-    if args.path == 'l3':
-        l3_contract = read(ROOT/'results/l3_patch32_20261006/inference/4090/swinv2/l3/trial_0/contract.json')
-        contract['pipelines']['dali']['l3'] = l3_contract['pipelines']['dali']['l3']
     samples = read(contract['dataset']['sample_manifest'])['samples']
     dct = args.path in ('imagelanes', 'cpu_dct')
     if dct:
@@ -62,17 +59,9 @@ def main():
             writer.writerow(['Filepath', 'Label'])
             writer.writerows((s['path'], s['label']) for s in selected)
         contract['dataset']['canonical_index_csv'] = str(index)
-    if args.path in ('coordl', 'ffcv_raw', 'ffcv_jpeg'):
-        reference = (ROOT/'results/ffcv_jpeg_20261005/inference/4090/swinv2/trial_1/contract.json'
-                     if args.path == 'ffcv_jpeg' else
-                     ROOT/('results/remaining_inference_recheck_20260929/inference/4090_swinv2_'
-                           + ('coordl' if args.path == 'coordl' else 'ffcv') + '/trial_1/contract.json'))
-        adapter_contract = read(reference)
-        other_samples = read(adapter_contract['dataset']['sample_manifest'])['samples']
-        assert [(s['sample_id'], s['label']) for s in samples] == [(s['sample_id'], s['label']) for s in other_samples]
+    adapter_contract = contract
+    if args.path == 'coordl':
         adapter_contract['pipelines']['coordl']['file_list'] = str(args.output/'coordl_file_list.txt')
-    else:
-        adapter_contract = contract
     adapter_contract['execution'].update(batch_size=50, workers=8, precision='fp32')
     if args.path == 'imagelanes':
         manifest = ROOT/'fastlens/data/compressed/imagenet512_val_block_major/manifest.bin'

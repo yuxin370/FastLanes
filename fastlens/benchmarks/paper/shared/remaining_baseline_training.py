@@ -28,7 +28,11 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--check', action='store_true')
     p.add_argument('--correctness-report', type=Path)
+    p.add_argument('--l3-root', type=Path)
+    p.add_argument('--l3-library', type=Path)
     args = p.parse_args()
+    if args.path == 'l3' and (args.l3_root is None or args.l3_library is None):
+        p.error('L3 requires --l3-root and --l3-library')
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / 'result.json').exists():
         raise FileExistsError(args.output / 'result.json')
@@ -70,7 +74,8 @@ def main():
     expected_state = initial.hashes(model, optimizer, decay, scheduler)
     execute = torch.compile(model, backend='inductor', options={'triton.cudagraphs': False}, dynamic=False)
     precision = 'fp32' if args.model == 'vitti' else 'bf16-autocast'
-    make_source, paths, samples, decisions, variant = training_inputs(args.model, args.path, device, args.output)
+    make_source, paths, samples, decisions, variant = training_inputs(args.model, args.path, device, args.output,
+        l3_root=args.l3_root, l3_library=args.l3_library)
     print('Preparing warm input pages and real inputs', flush=True)
     cache_warm = None if args.check else cache_pages(paths, warm=True)
     source = make_source()

@@ -344,15 +344,160 @@ when profiling other supported training windows. For unprofiled training
 throughput, first run `--check` and pass its `result.json` through
 `--correctness-report`, as required by the training driver.
 
-## Using fresh artifacts with the paper entry points
+## Connect fresh references to the chapter entry points
 
-The dated inference selectors in `shared/references.py` and the H2D batch replay
-in `run_section42_resources.py` locate the original experiment tree. They do not
-automatically discover a new `results/rebuilt/` directory. For a fresh checkout,
-use the explicit `--reference` worker and direct profiler commands above.
-Swin evaluation can run through the contract-generating inference driver shown
-above. The chapter figure commands use the included published CSVs and do not
-need historical prediction files.
+The chapter runners accept `--references FILE`. This JSON configuration maps GPU,
+model and pipeline names to files generated on the current installation. Paths
+are relative to the configuration file; absolute paths also work. The default is
+`results/rebuilt/references.json`. GPU names are `4090` and `H100`; model names are
+`vitti`, `swinv2`, `mobilenet24`, `mobilenet32`, `resnet24`, `resnet64` and `efun`.
+Pipeline names are `cpu_dct`, `fastlens`, `pytorch`, `dali`, `coordl`, `ffcv_raw`,
+`ffcv_jpeg` and `l3`.
+
+Existing evaluator outputs can be used directly. For example:
+
+```json
+{
+  "4090": {
+    "mobilenet24": {
+      "cpu_dct": {"reference": "mobilenet24/reference/J_50000.json"},
+      "fastlens": {"reference": "mobilenet24/native/N_50000.json"}
+    }
+  }
+}
+```
+
+Alternatively, generate the complete matched-DCT reference set with the inference
+workers used by the chapters. First finish the public-input and native-store
+preparation above. ViT uses `vitti_native/contract.json` from the DCT-major driver;
+Swin uses `swin_reference/contract.json` from its model-specific inference driver.
+The following creates the input/output configuration for all seven models:
+
+```bash
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ['FASTLENS_RUNS'])
+contracts = {'vitti': 'vitti_native/contract.json',
+             'swinv2': 'swin_reference/contract.json'}
+models = ('vitti', 'swinv2', 'mobilenet24', 'mobilenet32', 'resnet24', 'resnet64', 'efun')
+references = {}
+for gpu in ('4090', 'H100'):
+    references[gpu] = {}
+    for model in models:
+        references[gpu][model] = {}
+        for pipeline in ('cpu_dct', 'fastlens'):
+            entry = {'reference': f'references/{gpu}/{model}/{pipeline}/result.json'}
+            if model in contracts:
+                entry['contract'] = contracts[model]
+            references[gpu][model][pipeline] = entry
+with (root / 'references.json').open('x') as stream:
+    json.dump(references, stream, indent=2)
+PY
+
+python -m fastlens.benchmarks.paper.prepare_references \
+  --references "$FASTLENS_RUNS/references.json" --gpus 4090 H100
+python -m fastlens.benchmarks.paper.section_6_2_1.matched_dct.run run \
+  --references "$FASTLENS_RUNS/references.json" --phases inference
+```
+
+Reference preparation runs all 50,000 images and refuses to replace an existing
+reference. It is a separate preparation pass, not a measured chapter trial or a
+passed comparison against an independent oracle. Dataset conversion verification
+and the model-specific semantic checks above remain part of preparation.
+Measured chapter runs require references and compare predictions against them;
+they never generate a missing reference automatically. Use
+`--gpus 4090 --models mobilenet24` on both commands to run one workload first.
+`prepare_references --dry-run` validates contract paths and prints commands;
+chapter `run --dry-run` prints the experiment matrix without loading inputs.
+
+For deployment inference, add the six RGB pipelines to the relevant models in
+the configuration. Use `references/<gpu>/<model>/<pipeline>/result.json` as each
+new reference destination. Supply a `contract` for ViT and Swin, and for CNN
+CoorDL, FFCV and L3. Contracts must describe the current samples, checkpoints and
+reader configuration. Inference drivers write contracts with `--dry-run` too;
+this still requires real input files and weights.
+
+Use the DCT-major driver's `--coordl-cache-size` and `--ffcv-beton` options to
+configure those readers, after the [FFCV preparation](../baselines/ffcv/README.md).
+Keep separate contracts for raw and JPEG FFCV. Swin contracts must retain its
+model profile and 256-pixel preprocessing: use its model-specific inference
+contract as the base when adding a reader configuration. CNN input-adapter
+contracts retain the canonical sample IDs/labels and 224-pixel RGB preprocessing;
+the CNN worker supplies its model and ImageNet normalization.
+
+For example, create Swin's FFCV inputs from its own sample manifest, preserving
+both the stored ordinals and the model's preprocessing:
+
+```bash
+python -m fastlens.benchmarks.system_dct_major.ffcv_dataset \
+  --sample-manifest "$FASTLENS_RUNS/swin_reference/sample_manifest.json" \
+  --output "$FASTLENS_RUNS/swin_ffcv_raw/val.beton" --workers 8
+python -m fastlens.benchmarks.baselines.ffcv.prepare_compressed_ffcv \
+  --samples "$FASTLENS_RUNS/swin_reference/sample_manifest.json" \
+  --output "$FASTLENS_RUNS/swin_ffcv_jpeg"
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ['FASTLENS_RUNS'])
+for encoding in ('raw', 'jpeg'):
+    contract = json.loads((root / 'swin_reference/contract.json').read_text())
+    destination = root / f'swin_ffcv_{encoding}'
+    contract['pipelines']['ffcv'] = {'beton': str(destination / 'val.beton'),
+                                    'shuffle': False}
+    with (destination / 'contract.json').open('x') as stream:
+        json.dump(contract, stream, indent=2)
+PY
+```
+
+Use `swin_ffcv_raw/contract.json` and `swin_ffcv_jpeg/contract.json` for the
+corresponding reference entries. For ViT and CNN readers, use the same commands
+with `vitti_native/sample_manifest.json` and `vitti_native/contract.json` as the
+inputs, and distinct output directories. This contract already describes the
+physical sample order and 224-pixel crop expected by those workers. Generate
+each model's reference separately; predictions are not shared between models.
+
+For L3, set `pipelines.dali.l3.root` and `pipelines.dali.l3.library` in the model's
+contract to the converted dataset and decoder from [L3 setup](../baselines/l3/README.md).
+After adding new pipelines, prepare their references with a configuration
+containing only those new entries, then pass the combined configuration to
+`section_6_2_3.deployment.run --references FILE`.
+
+Training entry points accept `--l3-root`, `--l3-library` and `--ffcv-jpeg-root`.
+Their defaults are `fastlens/data/baselines/l3`,
+`build/baselines/l3/libl3-patch32.so` and `results/preparation/ffcv_jpeg/train`.
+Raw FFCV training inputs remain under `results/preparation/p0_ffcv`. Prepare the
+JPEG representation with:
+
+```bash
+python -m fastlens.benchmarks.baselines.ffcv.prepare_compressed_ffcv \
+  --samples results/preparation/p0_ffcv/samples.json --training \
+  --output results/preparation/ffcv_jpeg/train
+```
+
+## Profile newly completed chapter trials
+
+Chapter runs write `run.command.json` beside each result, including the GPU,
+model, pipeline and required environment settings. After completing matched-DCT
+and deployment trials, profile those new trials with:
+
+```bash
+python -m fastlens.benchmarks.paper.section_6_3.h2d_traffic.run run \
+  --run-dir results/reproduced --gpus 4090 --models vitti mobilenet24
+```
+
+The runner selects one completed trial per workload and excludes correctness
+checks and resident-only controls. It preserves the original command and
+training correctness report, then checks the profiled result against the
+unprofiled trial's predictions/checkpoint or training state. Memory diagnostics
+and profiling remain separate from throughput measurement, using the original
+timer boundaries and CUPTI accounting. No archived experiment tree is required.
+The default Fig. 14 matrix retains the seven main paths; the separate FFCV-JPEG
+diagnostic is not added to those 28 points.
 
 New contracts describe your source files, build and checkpoints. Keep them with
 their predictions, sample selections and validation outputs. They reproduce

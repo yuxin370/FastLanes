@@ -134,9 +134,10 @@ and the external inputs needed by each workload.
 Full-population predictions and execution contracts are generated inputs rather
 than plotting tables. Follow [Rebuilding reference inputs](REBUILDING_REFERENCES.md)
 to create them from public model code, checkpoints and locally prepared ImageNet
-data, and to capture H2D traffic from a fresh run. The dated reference lookup in
-the section launchers is for replaying the original run tree; the guide also
-provides direct commands that do not require that tree.
+data, and to capture H2D traffic from a fresh run. Pass the generated configuration with `--references results/rebuilt/references.json`.
+`prepare_references` builds the full-population reference set before measured
+chapter runs. H2D capture accepts `--run-dir results/reproduced` and profiles
+newly completed chapter trials.
 
 ### Published measurement conventions
 

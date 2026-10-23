@@ -78,7 +78,7 @@ class BasicCpuDctWindow(CpuDctWindow):
             self.pipeline.close()
 
 
-def training_inputs(model, path, device, output):
+def training_inputs(model, path, device, output, *, l3_root=None, l3_library=None):
     """Return a restartable source factory and its actual source files."""
     if path == 'cpu_dct':
         def make():
@@ -102,7 +102,7 @@ def training_inputs(model, path, device, output):
     paths = [s.path for s in samples]
     if path == 'l3':
         from fastlens.benchmarks.baselines.l3.prepare import encoded_path
-        config['l3'] = json.loads((ROOT/'results/l3_patch32_20261006/training/4090/vitti/l3/trial_0/result.json').read_text())['l3']
+        config['l3'] = dict(root=str(l3_root), library=str(l3_library))
         paths = [encoded_path(config['l3']['root'], s.logical_sample_id) for s in samples]
 
     def make():

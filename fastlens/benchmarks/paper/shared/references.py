@@ -1,59 +1,55 @@
-"""Accepted full-population references used by paper correctness checks."""
-import csv
+"""Reference inputs generated from the current dataset, models and checkpoints."""
 import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
-
-def read(path):
-    return json.loads(Path(path).read_text())
+DEFAULT_REFERENCES = ROOT / 'results/rebuilt/references.json'
 
 
-def inference_reference(gpu, model, path):
-    """Fixed accepted semantic references; their historical speed is never used."""
-    if path == 'imagelanes':
-        name = 'pipeline_dct_major_pushdown.json' if model == 'vitti' else 'N_50000.json'
-        return ROOT/f'results/imagelanes_remaining_20261008/inference/{gpu}/{model}/trial_0/{name}'
-    if path == 'cpu_dct':
-        name = 'pipeline_rgbnomore.json' if model == 'vitti' else 'J_50000.json'
-        return ROOT/f'results/remaining_inference_recheck_20260929/inference/{gpu}_{model}_cpu-dct/trial_1/{name}'
-    if path == 'l3':
-        name = 'result.json' if model == 'vitti' else 'RGB_l3_50000.json'
-        return ROOT/f'results/l3_patch32_20261006/inference/{gpu}/{model}/l3/trial_0/{name}'
-    if path == 'ffcv_jpeg':
-        folder = ROOT/f'results/ffcv_jpeg_20261005/inference/{gpu}/{model}'
-        return sorted(folder.glob('trial_*/**/pipeline_ffcv.json'))[0]
-    labels = {'vitti': 'ViT-Ti RGB', 'mobilenet24': 'MobileNetV2 RGB', 'efun': 'EfficientNet-B0 reference'}
-    names = {'pytorch': 'PyTorch', 'dali': 'DALI', 'coordl': 'CoorDL', 'ffcv_raw': 'FFCV'}
-    rows = list(csv.DictReader((ROOT/'results/p0/deployment_inference_summary.csv').open()))
-    row, = [r for r in rows if r['gpu'] == ('RTX 4090' if gpu == '4090' else gpu)
-            and r['model'] == labels[model] and r['pipeline'] == names[path]]
-    return ROOT/row['raw_results'].split(';')[0].split('#')[0]
+def reference_inputs(config, gpu, model, path, *, preparing=False):
+    """Resolve a workload's files relative to the reference configuration."""
+    config = Path(config).resolve()
+    records = json.loads(config.read_text())
+    pipeline = path.replace('imagelanes', 'fastlens')
+    entry = records[gpu][model][pipeline]
+    files = {key: (config.parent / entry[key]).resolve()
+             for key in ('reference', 'contract') if key in entry}
+    if 'reference' not in files:
+        raise ValueError(f'{config}: {gpu}/{model}/{pipeline} needs a reference')
+    for key, filename in files.items():
+        if key == 'reference' and preparing:
+            continue
+        if not filename.is_file():
+            raise FileNotFoundError(filename)
+    if model == 'swinv2' and 'contract' not in files:
+        raise ValueError(f'{config}: {gpu}/{model}/{pipeline} needs a contract')
+    return files
 
 
-def expected_predictions(gpu, path):
+def expected_predictions(reference, contract):
+    """Load Swin's full population in the reference's own sample order."""
     import numpy as np
-    if path == 'imagelanes':
-        data = read(ROOT/f'results/imagelanes_remaining_20261008/inference/{gpu}/swinv2/trial_0/result.json')
-        contract = read(ROOT/'results/latest_inference_20260930/inference/4090_swinv2_imagelanes/trial_1/contract.json')
-        samples = sorted(read(contract['dataset']['sample_manifest'])['samples'], key=lambda s: s['galp_image_id'])
-        predictions = [p[0] for p in data['predictions']]
+    data = json.loads(Path(reference).read_text())
+    source = json.loads(Path(contract).read_text())
+    samples = json.loads(Path(source['dataset']['sample_manifest']).read_text())['samples']
+    if 'semantic_artifact' in data:
+        recorded = json.loads(Path(data['contract']).read_text())
+        original = json.loads(Path(recorded['dataset']['sample_manifest']).read_text())['samples']
+        assert [(s['sample_id'], s['label']) for s in samples] == [
+            (s['sample_id'], s['label']) for s in original]
+        with np.load(data['semantic_artifact']) as artifact:
+            predictions = artifact['top1_predictions'].reshape(-1).tolist()
+        ids = [s['sample_id'] for s in samples]
     else:
-        if path == 'l3':
-            source = ROOT/f'results/l3_patch32_20261006/inference/{gpu}/swinv2/l3/trial_0/result.json'
-        elif path == 'ffcv_jpeg':
-            trial = 2 if gpu == 'H100' else 1
-            source = ROOT/f'results/ffcv_jpeg_20261005/inference/{gpu}/swinv2/trial_{trial}/pipeline_ffcv.json'
+        predictions = [p[0] if isinstance(p, list) else p for p in data['predictions']]
+        if 'sample_ids' in data:
+            ids = data['sample_ids']
         else:
-            folder = 'cpu-dct' if path == 'cpu_dct' else 'ffcv' if path == 'ffcv_raw' else path
-            filename = 'rgbnomore' if path == 'cpu_dct' else folder
-            source = ROOT/f'results/remaining_inference_recheck_20260929/inference/{gpu}_swinv2_{folder}/trial_1/pipeline_{filename}.json'
-        data = read(source)
-        contract = read(data['contract'])
-        samples = read(contract['dataset']['sample_manifest'])['samples']
-        predictions = np.load(data['semantic_artifact'])['top1_predictions'].reshape(-1).tolist()
-    assert len(samples) == len(predictions) == 50000
-    return {s['sample_id']: p for s, p in zip(samples, predictions)}
+            by_image = {s['galp_image_id']: s['sample_id'] for s in samples}
+            ids = [by_image[i] for i in data['image_ids']]
+    assert len(ids) == len(predictions) == len(set(ids)) == 50000
+    assert set(ids) == {s['sample_id'] for s in samples}
+    return dict(zip(ids, predictions))
 
 
 PROFILES = {'ViT-Ti DCT': 'vitti', 'ViT-Ti RGB': 'vitti',

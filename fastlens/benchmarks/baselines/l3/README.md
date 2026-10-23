@@ -40,14 +40,14 @@ EfficientNet-B0 remains an RGB deployment reference for eFUN, not the same model
 
 ## Build and verify
 
-Run from the repository root, in the existing `fastlanes-cuda` environment:
+Run from the repository root, in the `fastlens` environment:
 
 ```bash
 export TMPDIR="$HOME/tmp"
 python -m fastlens.benchmarks.baselines.l3.build \
-  --nvcc "$HOME/tmp/coordl-cuda-12.8/bin/nvcc" \
-  --output "$HOME/tmp/l3-baseline/build/libl3-patch32.so"
-L3_LIBRARY="$HOME/tmp/l3-baseline/build/libl3-patch32.so" \
+  --nvcc "$CONDA_PREFIX/bin/nvcc" \
+  --output "build/baselines/l3/libl3-patch32.so"
+L3_LIBRARY="build/baselines/l3/libl3-patch32.so" \
   python -m unittest fastlens.benchmarks.baselines.l3.test_codec -v
 ```
 
@@ -60,9 +60,9 @@ predictions between JPEG/DALI and L3/DALI.
 
 ```bash
 python -m fastlens.benchmarks.baselines.l3.prepare --split val \
-  --library "$HOME/tmp/l3-baseline/build/libl3-patch32.so" --output "$HOME/tmp/l3-baseline/data-patch32"
+  --library "build/baselines/l3/libl3-patch32.so" --output "fastlens/data/baselines/l3"
 python -m fastlens.benchmarks.baselines.l3.prepare --split train \
-  --library "$HOME/tmp/l3-baseline/build/libl3-patch32.so" --output "$HOME/tmp/l3-baseline/data-patch32"
+  --library "build/baselines/l3/libl3-patch32.so" --output "fastlens/data/baselines/l3"
 ```
 
 Validation contains all 50,000 images. Training contains the existing seeded
@@ -81,7 +81,7 @@ serialized lengths in memory:
 
 ```bash
 python -m fastlens.benchmarks.baselines.l3.storage \
-  --library "$HOME/tmp/l3-baseline/build/libl3-patch32.so" \
+  --library "build/baselines/l3/libl3-patch32.so" \
   --output results/l3_patch32_20261006/storage_train_full.json
 ```
 
@@ -99,31 +99,18 @@ not retained. The training-window performance runs still use their original
 
 ## Paper-scale comparison
 
-`run.py` reuses the accepted DALI commands referenced by
-`results/p0/deployment_inference_summary.csv` and `training_window_summary.csv`.
-These local experiment artifacts, `fastlens/benchmarks/paper/shared/training_window_rgb.py`, the
-original model repositories, checkpoints, and ImageNet-512 are required.
-L3 training is exposed as `--pipeline l3 --l3-root ... --l3-library ...` in that
-existing training runner. Model constructors, checkpoint selection, batch size,
-precision, augmentations, warmup and measurement boundaries stay with each
-workload's established recipe.
+After preparation, pass the decoder and data to the chapter runner:
 
 ```bash
-python -m fastlens.benchmarks.baselines.l3.run --gpu H100 --phase inference \
-  --library "$HOME/tmp/l3-baseline/build/libl3-patch32.so" \
-  --data "$HOME/tmp/l3-baseline/data-patch32" --output results/l3_patch32_20261006
-python -m fastlens.benchmarks.baselines.l3.run --gpu H100 --phase training \
-  --library "$HOME/tmp/l3-baseline/build/libl3-patch32.so" \
-  --data "$HOME/tmp/l3-baseline/data-patch32" --output results/l3_patch32_20261006
+python -m fastlens.benchmarks.paper.section_6_2_3.deployment.run run \
+  --phases training --l3-root fastlens/data/baselines/l3 \
+  --l3-library build/baselines/l3/libl3-patch32.so
 ```
 
-Repeat for `--gpu 4090`. Run measurements serially, after conversion finishes.
-Each model runs three L3 and three JPEG/DALI trials in alternating order.
-Inference consumes all 50,000 images; each training trial measures 64 updates
-with microbatch 64 and accumulation 16. L3 training first executes the existing
-input/finite-loss/parameter-update correctness check. The existing resource guard
-and warm-cache protocol apply. Outputs retain the original raw results and a
-`summary.csv`; no manuscript numbers are updated automatically.
+Inference uses a fresh DALI/L3 contract and the reference configuration described
+in the [rebuilding guide](../../paper/REBUILDING_REFERENCES.md#connect-fresh-references-to-the-chapter-entry-points).
+The chapter entry points keep the published sample populations, three trials,
+model construction, preprocessing and timing boundaries.
 
 ## Verification of the corrected configuration (2026-10-06)
 

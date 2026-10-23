@@ -83,6 +83,7 @@ def main():
     p.add_argument('--correctness-report', type=Path)
     p.add_argument('--measured-images', type=int, choices=[16384, 65536], default=65536)
     p.add_argument('--profile', action='store_true')
+    p.add_argument('--ffcv-root', type=Path)
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / 'result.json').exists():
@@ -130,8 +131,8 @@ def main():
     precision = 'fp32' if args.model == 'vitti' else 'bf16-autocast'
     samples, decisions = [], []
     if domain == 'rgb':
-        ffcv_root = ROOT / ('results/ffcv_jpeg_20261005/preparation/train' if args.path == 'ffcv_jpeg'
-                            else 'results/preparation/p0_ffcv')
+        ffcv_root = args.ffcv_root or ROOT / ('results/preparation/ffcv_jpeg/train'
+                                             if args.path == 'ffcv_jpeg' else 'results/preparation/p0_ffcv')
         entries = json.loads((ffcv_root / 'samples.json').read_text())
         samples = [TrainingSample(e['logical_sample_id'], Path(e['path']), e['label'], e['width'], e['height'], e['galp_image_id']) for e in entries]
         decisions = [derive_augmentation(seed=SEED, epoch=2, logical_sample_id=s.logical_sample_id,
