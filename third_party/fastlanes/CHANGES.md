@@ -27,6 +27,4 @@ root project; its unused upstream build options are not artifact entry points.
 Local absolute paths in dataset declarations have been made source-relative.
 
 The upstream snapshot also contained G-ALP/GPU code from which parts of FastLens
-evolved. Original copyright and license notices in those files are preserved;
-the directory split does not imply that every line outside this dependency was
-newly authored for FastLens.
+evolved. Original copyright and license notices in those files are preserved.
