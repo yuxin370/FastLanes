@@ -6,6 +6,10 @@ descriptor and does not contain coefficient data. Building it leaves the
 manifest, metadata, FLS header/footer, compressed rowgroups, and coefficient
 payload unchanged.
 
+The builder reports the 0.5% and 1% storage targets as measurements. Exceeding
+them does not invalidate an index; small datasets often have larger relative
+sidecar overhead.
+
 The dataset builder publishes one
 `shard_NNNNNN.block_major_access.bin` per shard plus
 `manifest.block_major_access.bin` in a separate output directory. Readers must

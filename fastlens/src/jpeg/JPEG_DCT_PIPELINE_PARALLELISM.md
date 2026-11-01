@@ -22,7 +22,7 @@ thread counts do not multiply. The writer enforces both
 `layout_threads <= 256` and
 `shard_workers * max(shard_decode_threads, encoding_workers_per_shard) <= 256`
 before publishing output. The exact verifier has a separate hard maximum of
-16 workers. All phases join their workers and propagate failures before the
+32 workers. All phases join their workers and propagate failures before the
 transactional generation is published.
 
 Shard assignment and output commit remain deterministic. Changing any of the

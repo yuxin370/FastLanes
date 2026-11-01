@@ -170,6 +170,19 @@ if (BUILD_TESTING)
                 LABELS "fastlens;jpeg-dct;direct-dct;torch;gpu;smoke"
                 SKIP_RETURN_CODE 77
         )
+        if (TARGET fastlens_jpeg_dct_tool AND TARGET fastlens_block_major_access_tool)
+                add_test(
+                        NAME FastLensConvertedStoreTorchPython
+                        COMMAND ${CMAKE_COMMAND} -E env
+                                "PYTHONPATH=${PROJECT_SOURCE_DIR}:$<TARGET_FILE_DIR:_fastlens_direct_dct>"
+                                "FASTLENS_BUILD_DIR=${CMAKE_BINARY_DIR}"
+                                ${Python3_EXECUTABLE} -B -m unittest fastlens.torch.tests.test_converted_store -v
+                )
+                set_tests_properties(FastLensConvertedStoreTorchPython PROPERTIES
+                        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+                        LABELS "fastlens;converter;jpeg-dct;torch;gpu;integration"
+                )
+        endif ()
         set(FASTLENS_PLS_SMOKE_FIXTURE_ARGS)
         if (TARGET fastlens_jpeg_dct_tool AND TARGET fastlens_block_major_access_tool)
                 set(FASTLENS_PLS_SMOKE_FIXTURE_ARGS

@@ -1,4 +1,5 @@
 #include "fastlens/jpeg_dct_block_major_access.hpp"
+#include "jpeg/jpeg_dct_metadata.hpp"
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -15,7 +16,8 @@ namespace {
 void usage(const char* program) {
 	std::cerr << "Usage: " << program
 	          << " MANIFEST --output-dir DIRECTORY [--output-json PATH] [--exhaustive-rank-validation] [--skip-validation]"
-	             " [--rank-checkpoint-images N] [--topology-checkpoint-coordinates N]\n";
+	             " [--rank-checkpoint-images N] [--topology-checkpoint-coordinates N]\n"
+	          << "       " << program << " --inspect MANIFEST\n";
 }
 
 uint16_t parse_u16(const std::string_view name, const char* value) {
@@ -41,9 +43,88 @@ void json_string(std::ostream& output, const std::string& value) {
 	output << '"';
 }
 
+// Use the same parsers and source-identity checks as the online reader. No
+// coefficient decoding, CUDA initialization, or source JPEG access is needed.
+void inspect_dataset(const std::filesystem::path& path) {
+	using namespace fastlens::jpeg;
+	const auto                   manifest   = read_jpeg_dct_shard_manifest(path);
+	const auto                   root       = path.parent_path();
+	const auto                   directory  = root / "block_major_access_v1";
+	const auto                   index_path = directory / "manifest.block_major_access.bin";
+	const bool                   indexed    = std::filesystem::exists(index_path);
+	JpegDctBlockMajorAccessIndex index;
+	if (indexed) {
+		index = read_jpeg_dct_block_major_access_index(index_path, path, manifest);
+	}
+	uint64_t              fls_bytes = 0U, metadata_bytes = 0U, index_bytes = index.index_bytes;
+	std::vector<uint64_t> warning_images;
+	for (size_t i = 0; i < manifest.shards.size(); ++i) {
+		const auto& shard         = manifest.shards[i];
+		const auto  fls_path      = root / shard.fls_file_name;
+		const auto  metadata_path = root / shard.metadata_file_name;
+		const auto  fls_size      = std::filesystem::file_size(fls_path);
+		const auto  metadata_size = std::filesystem::file_size(metadata_path);
+		if (fls_size != shard.fls_file_size || metadata_size != shard.metadata_file_size) {
+			throw std::runtime_error("shard file size disagrees with manifest: " + shard.fls_file_name);
+		}
+		fls_bytes += fls_size;
+		metadata_bytes += metadata_size;
+		if (manifest.version == 1U) {
+			const auto metadata = detail::read_jpeg_dct_metadata_file(metadata_path);
+			if (metadata.row_ordering != JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor ||
+			    metadata.images.size() != shard.image_count) {
+				throw std::runtime_error("manifest-v1 requires spatial-major metadata: " + metadata_path.string());
+			}
+			for (size_t local = 0; local < metadata.images.size(); ++local) {
+				if (metadata.images[local].warning_count != 0U) {
+					warning_images.push_back(shard.first_global_image_index + local);
+				}
+			}
+		}
+		if (indexed) {
+			std::ostringstream filename;
+			filename << "shard_" << std::setw(6) << std::setfill('0') << shard.shard_id << ".block_major_access.bin";
+			auto descriptor = JpegDctBlockMajorAccessDescriptor::Open(directory / filename.str());
+			if (descriptor.descriptor_bytes() != index.shards[i].descriptor_bytes ||
+			    descriptor.descriptor_crc64() != index.shards[i].descriptor_crc64) {
+				throw std::runtime_error("block-major descriptor disagrees with companion index: " + filename.str());
+			}
+			descriptor.ValidateSource(path, shard, metadata_path, fls_path);
+			index_bytes += descriptor.descriptor_bytes();
+		}
+	}
+	std::cout << "{\"schema_version\":1,\"manifest_version\":" << manifest.version << ",\"physical_layout\":";
+	json_string(std::cout,
+	            manifest.version == 1U   ? "spatial-major-image-minor"
+	            : manifest.version == 2U ? "image-major"
+	                                     : manifest.physical_layout);
+	std::cout << ",\"image_count\":" << manifest.image_count << ",\"shard_count\":" << manifest.shards.size()
+	          << ",\"rowgroup_vectors\":" << manifest.rowgroup_vectors
+	          << ",\"rowgroups_per_shard\":" << manifest.rowgroups_per_shard
+	          << ",\"coefficient_file_count\":" << manifest.shards.size()
+	          << ",\"metadata_file_count\":" << manifest.shards.size() << ",\"coefficient_bytes\":" << fls_bytes
+	          << ",\"metadata_bytes\":" << metadata_bytes << ",\"manifest_bytes\":" << std::filesystem::file_size(path)
+	          << ",\"index_bytes\":" << index_bytes
+	          << ",\"index_file_count\":" << (indexed ? manifest.shards.size() + 1U : 0U)
+	          << ",\"index\":{\"present\":" << (indexed ? "true" : "false")
+	          << ",\"compatible\":" << (indexed ? "true" : "null") << ",\"version\":" << (indexed ? "1" : "null") << "}"
+	          << ",\"jpeg_warning_image_ids\":[";
+	for (size_t i = 0; i < warning_images.size(); ++i) {
+		if (i != 0U) {
+			std::cout << ',';
+		}
+		std::cout << warning_images[i];
+	}
+	std::cout << "]}\n";
+}
+
 } // namespace
 
 int main(const int argc, char** argv) try {
+	if (argc == 3 && std::string_view(argv[1]) == "--inspect") {
+		inspect_dataset(argv[2]);
+		return 0;
+	}
 	if (argc < 4) {
 		usage(argv[0]);
 		return 2;
@@ -154,6 +235,6 @@ int main(const int argc, char** argv) try {
 	}
 	return 0;
 } catch (const std::exception& error) {
-	std::cerr << "block-major access build failed: " << error.what() << '\n';
+	std::cerr << "block-major access tool failed: " << error.what() << '\n';
 	return 1;
 }

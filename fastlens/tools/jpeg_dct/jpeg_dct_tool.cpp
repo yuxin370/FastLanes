@@ -884,7 +884,8 @@ int main(const int argc, char** argv) {
 			if (options.verify_image_index_specified && options.verify_workers != 1U) {
 				throw std::runtime_error("--verify-workers cannot be combined with --image-index");
 			}
-			if (options.inputs.size() == 1 && options.verify_workers == 1U) {
+			if (options.inputs.size() == 1 && options.verify_workers == 1U &&
+			    (options.input_list.empty() || options.verify_image_index_specified)) {
 				return verify_manifest_image(
 				    options.verify_manifest, options.verify_image_index, options.inputs.front());
 			}

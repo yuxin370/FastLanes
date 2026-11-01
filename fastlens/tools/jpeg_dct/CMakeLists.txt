@@ -31,6 +31,8 @@ target_link_libraries(fastlens_jpeg_dct_tool PRIVATE
 target_link_libraries(fastlens_block_major_access_tool PRIVATE
         fastlens_jpeg_dct_storage
 )
+target_include_directories(fastlens_block_major_access_tool PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 
 target_link_libraries(fastlens_block_major_plan_audit PRIVATE
         fastlens_core

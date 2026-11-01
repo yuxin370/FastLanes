@@ -107,36 +107,157 @@ DALI, FFCV, CoorDL, L3 and the RGB-no-more `dct_manip` extension have additional
 ## Prepare a small image dataset
 
 To try FastLens without a full ImageNet dataset, prepare at least four 512×512 RGB JPEG images with 4:2:0 chroma subsampling and place them in `fastlens/data/example-jpegs/`.
-These images match the source geometry expected by the example model profile. Resize and prepare the JPEGs before conversion.
+These images work with the example model profile. Resize and prepare the JPEGs before conversion if needed.
 
-Convert the images into FastLens storage:
+From the source checkout, convert and inspect the complete dataset:
+
+```bash
+python -m fastlens convert fastlens/data/example-jpegs \
+  --output fastlens/data/example-fastlens --layout block-major \
+  --partition-images 1024 --workers auto --verify full
+python -m fastlens inspect fastlens/data/example-fastlens
+python -m fastlens convert --help
+```
+
+P0-1 runs from a **source checkout**; pip/wheel distribution and an installed
+`fastlens` console script are deferred to P0-3. Both commands use `fastlens.cli.main`.
+No PyTorch import or CUDA device is needed for conversion, inspection, or CLI unit
+tests. Building the existing native targets still requires the CUDA toolkit.
+If you only need to rebuild the converter's tools after configuring CMake:
+
+```bash
+cmake --build build --target fastlens_jpeg_dct_tool fastlens_block_major_access_tool --parallel
+```
+
+Tool discovery uses `--build-dir`, then `FASTLENS_BUILD_DIR`, then `build/`,
+`build-native/`, and sorted `cmake-build-*` directories. An explicitly selected
+build must contain both tools; the CLI does not silently switch builds.
+
+FastLens stores **original JPEG quantized DCT coefficients in FastLanes format**,
+plus quantization tables and spatial geometry. Conversion does not decode to RGB,
+resize, or re-encode JPEGs. The goal is selective, high-throughput execution;
+FastLens storage is **not guaranteed to be smaller than JPEG**. Reconstructable
+metadata preserves the coefficient interpretation, not the original JPEG byte
+stream or EXIF/APP markers.
+
+The converter accepts libjpeg-supported JPEGs, including progressive and grayscale
+images and differing dimensions/sampling grids. Extensions are `.jpg`, `.jpeg`,
+and `.jpe`, case-insensitively. Malformed files, including files that libjpeg could
+recover with corruption warnings, fail conversion even with `--verify none`.
+Model profiles can impose stricter geometry requirements: the example uses
+512×512 RGB, 4:2:0 JPEGs. Prepare that geometry explicitly before conversion
+if needed, and keep source files unchanged throughout conversion and verification.
+
+Directory discovery is recursive, without traversing directory symlinks. It sorts
+relative POSIX paths lexicographically by Unicode code point, case-sensitively.
+Image IDs are consecutive, starting at zero in that order. To choose the IDs:
+
+```bash
+python -m fastlens convert --input-list ordered_paths.txt --output ./test_store
+```
+
+The UTF-8 list contains one unquoted JPEG path per line, in the exact desired order;
+relative paths resolve against the list's directory. Blank lines are ignored, CRLF
+is accepted, and spaces are preserved. Paths containing newlines are unsupported.
+Empty datasets, missing files, and duplicate resolved paths (including symlink
+aliases) are rejected. `source_paths.txt` records the resulting absolute paths in
+image-ID order. It is useful for re-verification; the online reader does not need
+the original JPEGs or this list.
+
+`block-major` is the only public layout: native `--shard --physical-layout
+spatial-major --metadata-profile reconstruct`, manifest v1. Corresponding spatial
+blocks are grouped across images, with DCT frequencies stored as columns. It does
+not select image-major Compact-v3. Default `--verify full` invokes the native exact
+DCT verifier for every image before publication. `--verify none` skips only that
+source comparison; index construction and compatibility checks still run.
+
+```text
+example-fastlens/
+  manifest.bin
+  generation_<id>/
+    shard_000000.fls
+    shard_000000.meta.bin
+    ...
+  block_major_access_v1/
+    manifest.block_major_access.bin
+    shard_000000.block_major_access.bin
+    ...
+  source_paths.txt
+  conversion_report.json
+```
+
+Keep the whole directory together. Manifest references are relative to the store;
+index sidecars identify the manifest and metadata by content. The complete store
+can be moved without rewriting either. The reader discovers `block_major_access_v1`
+automatically; unset `FASTLENS_BLOCK_MAJOR_ACCESS_DIR` if it points at another store.
+
+Conversion uses a sibling `.OUTPUT.fastlens-staging-<id>` directory and preserves
+the native writer's transactional generations within it. Only after compression,
+index validation, and requested verification pass is the directory atomically
+renamed to the destination. A nonempty destination or destination symlink is
+refused; use a new path. Ordinary errors and Ctrl-C clean staging data and preserve
+any existing destination. SIGKILL, machine failure, or abrupt termination may leave
+the named staging directory. Once the converter and its native child have stopped,
+remove that specific staging directory and rerun; there is no resume operation.
+Publication provides process-level atomic visibility, not power-loss durability.
+
+`--dry-run` checks discovery, paths, tools, and parallel bounds without creating
+the destination or decoding JPEGs. `--report /existing/parent/report.json` also saves
+the report at a new external path; existing report files are protected. The report
+contains observed source/file sizes, chosen options, wall times, verification
+status, source revision, and native executable paths/sizes/timestamps. It defines
+source/output as original JPEG bytes divided by all stored file bytes (including
+the report and source list). `compressed_payload_bytes` counts complete FLS files,
+including their headers and footers. Timings cover discovery, compression, index
+construction/inspection, and verification; total time ends before report writing
+and directory publication. No estimated throughput is substituted. Index storage
+targets of 0.5%/1% are informational; small stores can exceed them.
+
+`python -m fastlens inspect STORE --json` gives machine-readable native manifest and
+index details plus current file sizes. Inspection validates sidecar checksums and
+source identities without decoding coefficients. It fails on incompatible indexes;
+an absent index is reported as absent. Source JPEG size is unknown for stores
+without a conversion report. For a later exact check against the original files:
 
 ```bash
 build/fastlens/tools/jpeg_dct/fastlens_jpeg_dct_tool \
-  --shard --out-dir fastlens/data/example-fastlens \
-  --preset balanced --physical-layout spatial-major \
-  --shard-images 1024 --metadata-profile reconstruct \
-  fastlens/data/example-jpegs
+  --verify-manifest ./test_store/manifest.bin --verify-workers 4 \
+  --input-list ./test_store/source_paths.txt
 ```
 
-Build the block-major access indexes:
+Parallel options affect different phases:
+
+| Option | Default and resource effect |
+| --- | --- |
+| `--workers auto\|N` | Budget used to derive defaults. Auto uses half the CPUs visible through process affinity, at least 1 and at most 32. This is conservative, not optimal tuning. `N` is 1–256. Explicit phase options override derived values. |
+| `--layout-threads N` | Header/layout scan before shard processing; defaults to the budget. More threads increase concurrent file access. |
+| `--shard-workers N` | Concurrent resident shards; defaults to `min(4, max(1, budget // 4))`. Increases CPU use and peak memory substantially. |
+| `--shard-decode-threads N` | Coefficient decoders per active shard. Default `min(4, max(1, budget // shard_workers))`. |
+| `--encoding-workers-per-shard N` | FastLanes rowgroup encoders per active shard; same derived default as decode. Additional workers hold additional encoder buffers. |
+| `--verify-workers N` | Independent shard verifiers; default `min(4, budget)`, maximum 32. Each worker holds decompressed shard/source state. |
+| `--partition-images N` | Maximum images per shard, default 1024, range 1–65535. Native rowgroup capacity may split earlier. Larger values increase per-shard memory. |
+| `--preset balanced\|throughput\|crop-latency` | Existing native presets, with 128/256/64 vectors per rowgroup respectively. Larger rowgroups generally require more memory. Encoder algorithms/defaults are unchanged. |
+
+Layout scan and shard processing are sequential. Within a shard, JPEG decode and
+FastLanes encoding are sequential, so their thread counts do not multiply. Native
+bounds remain `layout_threads <= 256` and
+`shard_workers * max(shard_decode_threads, encoding_workers_per_shard) <= 256`.
+The CLI rejects violations rather than silently clamping explicit options. Lower
+partition size and shard/verification concurrency on memory-constrained machines;
+automatic CPU selection does not measure available RAM or tune to workload size.
+
+Converter checks (native tests require Pillow and the built tools; CPU tests do not):
 
 ```bash
-build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool \
-  fastlens/data/example-fastlens/manifest.bin \
-  --output-dir fastlens/data/example-fastlens/block_major_access_v1
+python -B -m unittest fastlens.tests.test_cli -v
+FASTLENS_REQUIRE_NATIVE_TESTS=1 python -B -m unittest fastlens.tests.test_cli_native -v
+ctest --test-dir build --output-on-failure -R 'FastLensConverter|FastLensConvertedStore|JpegDctExactVerifier|JpegDctBlockMajorAccess'
 ```
 
-Verify that the original DCT coefficients are preserved:
-
-```bash
-build/fastlens/tools/jpeg_dct/fastlens_jpeg_dct_tool \
-  --verify-manifest fastlens/data/example-fastlens/manifest.bin fastlens/data/example-jpegs
-```
-
-The `spatial-major` option selects the cross-image block-major layout. Conversion produces a `manifest.bin`, compressed `shard_*.fls` files, and `shard_*.meta.bin` metadata. The access tool generates the indexes used by the block-major reader. Keep these files together.
-
-By default, image IDs are assigned during conversion. To control their order, pass `--input-list ordered_paths.txt` instead of the input directory, with one JPEG path per line.
+The converter suites do not require PyTorch. `FastLensConvertedStoreTorchPython`
+is registered separately when `FASTLENS_BUILD_TORCH=ON` and the native tools are
+enabled. It requires the built extension and skips GPU execution when no CUDA
+device is available.
 
 This small dataset is intended for checking the pipeline. The paper benchmarks use the full datasets described in the reproduction guide.
 
@@ -145,7 +266,7 @@ This small dataset is intended for checking the pipeline. The paper benchmarks u
 The Python API is available through `fastlens.torch`. The example below reads DCT coefficients from the dataset prepared above.
 
 ```python
-from fastlens.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
+from fastlens.profiles.rgbnomore import VALIDATION
 from fastlens.torch import DirectDctReader
 
 reader = DirectDctReader(
@@ -155,7 +276,7 @@ reader = DirectDctReader(
 
 with reader.iter_batches(
     [[0, 1], [2, 3]],
-    profile=VALIDATION_CENTER_CROP_512,
+    profile=VALIDATION,
     coefficients=None,
 ) as batches:
     for batch in batches:
@@ -165,6 +286,12 @@ with reader.iter_batches(
 
 `module_path` points to the compiled PyTorch extension. The profile determines the input geometry, normalization, and tensor representation expected by the model.
 
+The existing `VALIDATION_CENTER_CROP_512` scheduled reader currently requires one
+complete shard per submitted batch, with image IDs in ascending order; subsets,
+reordered IDs, or batches crossing shards can fail with a canonical-plan-digest
+error. The general `VALIDATION` profile used here supports arbitrary sample-ID
+batches. This converter does not change the reader's scheduling implementation.
+
 By default, `coefficients=None` reads all 64 source DCT coefficients. You can also request specific frequencies:
 
 ```python
@@ -172,6 +299,21 @@ coefficients=[5, 0, 2]
 ```
 
 For CNN workloads, `DctModelProfile` defines the output channels, geometry, and normalization. `DirectDctPipeline` then exposes the projected NCHW tensor as `batch.projected`.
+
+The same store also supports the public asynchronous pipeline with a Direct-DCT profile:
+
+```python
+from fastlens.torch import DirectDctPipeline
+
+with DirectDctPipeline(
+    "fastlens/data/example-fastlens/manifest.bin",
+    profile=VALIDATION,
+    batch_size=2,
+    module_path="build/fastlens/torch",
+) as pipeline:
+    for batch in pipeline.start([[0, 1], [2, 3]]):
+        print(batch.sample_ids, batch.y.shape, batch.cbcr.shape)
+```
 
 Training uses `TrainingPolicy` with a dataset mapping. Call `pipeline.start_epoch(epoch)` to start an epoch; training batches provide labels through `batch.targets`.
 
@@ -183,7 +325,7 @@ A complete example with a small CUDA classifier is included:
 python3 fastlens/examples/direct_dct_pipeline_demo.py \
   fastlens/data/example-fastlens/manifest.bin \
   --module-path build/fastlens/torch \
-  --profile validation-center-crop-512 --batch-size 2 --steps 3
+  --profile validation --batch-size 2 --steps 3
 ```
 
 See the [architecture and API guide](fastlens/ARCHITECTURE.md) and
