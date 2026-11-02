@@ -106,18 +106,18 @@ if (FASTLENS_INSTALL_TORCH_PACKAGE)
 endif ()
 
 if (BUILD_TESTING)
-	# Private Phase-4 deterministic outstanding-consumer harness. The module
+	# Private deterministic outstanding-consumer harness. The module
 	# submits its gate, sentinel-read consumer, and completion marker in one
 	# native call and is never linked into or installed with _fastlens_direct_dct.
-	Python3_add_library(_fastlens_phase4_outstanding_test MODULE WITH_SOABI
-		phase4_native_outstanding_harness.cu)
-	target_include_directories(_fastlens_phase4_outstanding_test PRIVATE ${TORCH_INCLUDE_DIRS})
-	target_link_libraries(_fastlens_phase4_outstanding_test PRIVATE CUDA::cudart)
+	Python3_add_library(_fastlens_test_consumer MODULE WITH_SOABI
+		tests/outstanding_consumer.cu)
+	target_include_directories(_fastlens_test_consumer PRIVATE ${TORCH_INCLUDE_DIRS})
+	target_link_libraries(_fastlens_test_consumer PRIVATE CUDA::cudart)
 	if (FASTLENS_TORCH_PYTHON_LIBRARY)
-		target_link_libraries(_fastlens_phase4_outstanding_test PRIVATE ${FASTLENS_TORCH_PYTHON_LIBRARY})
+		target_link_libraries(_fastlens_test_consumer PRIVATE ${FASTLENS_TORCH_PYTHON_LIBRARY})
 	endif ()
-	target_compile_features(_fastlens_phase4_outstanding_test PRIVATE cxx_std_20 cuda_std_20)
-	set_target_properties(_fastlens_phase4_outstanding_test PROPERTIES
+	target_compile_features(_fastlens_test_consumer PRIVATE cxx_std_20 cuda_std_20)
+	set_target_properties(_fastlens_test_consumer PROPERTIES
 		LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fastlens/torch
 		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fastlens/torch)
 
@@ -129,6 +129,7 @@ if (BUILD_TESTING)
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/resolved_execution_policy.cpp
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/native_pipeline_state.cpp
 	)
+	set_target_properties(_fastlens_phase2_native_ab PROPERTIES EXCLUDE_FROM_ALL TRUE)
 	target_include_directories(_fastlens_phase2_native_ab PRIVATE
 		${TORCH_INCLUDE_DIRS}
 		${CMAKE_CURRENT_SOURCE_DIR}/../src
@@ -171,6 +172,18 @@ if (BUILD_TESTING)
                 SKIP_RETURN_CODE 77
         )
         if (TARGET fastlens_jpeg_dct_tool AND TARGET fastlens_block_major_access_tool)
+                add_test(
+                        NAME FastLensDirectDctLifetimeTorchPython
+                        COMMAND ${CMAKE_COMMAND} -E env
+                                "PYTHONPATH=${PROJECT_SOURCE_DIR}:$<TARGET_FILE_DIR:_fastlens_direct_dct>"
+                                "FASTLENS_BUILD_DIR=${CMAKE_BINARY_DIR}"
+                                ${Python3_EXECUTABLE} -B -m unittest fastlens.torch.tests.test_lifetime -v
+                )
+                set_tests_properties(FastLensDirectDctLifetimeTorchPython PROPERTIES
+                        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+                        LABELS "fastlens;direct-dct;torch;gpu;integration"
+                        SKIP_REGULAR_EXPRESSION "skipped 'CUDA device/driver unavailable'"
+                )
                 add_test(
                         NAME FastLensConvertedStoreTorchPython
                         COMMAND ${CMAKE_COMMAND} -E env

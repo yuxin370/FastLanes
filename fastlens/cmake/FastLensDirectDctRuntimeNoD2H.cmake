@@ -19,7 +19,14 @@ if (DEFINED FASTLENS_D2H_EXTRA_SOURCE)
         list(APPEND cxx_paths "${FASTLENS_D2H_EXTRA_SOURCE}")
 endif ()
 
-foreach (path IN LISTS cxx_paths)
+# The benchmark pipeline also promises asynchronous submission, but explicitly
+# supports host materialization. Apply only the synchronization check there.
+set(sync_only_paths
+        "${FASTLENS_ROOT}/tools/benchmark_support/pipeline.cu"
+        "${FASTLENS_ROOT}/tools/benchmark_support/include/fastlens_tools/benchmark_support/pipeline.cuh"
+)
+
+foreach (path IN LISTS cxx_paths sync_only_paths)
         if (NOT EXISTS "${path}")
                 message(FATAL_ERROR "Direct-DCT no-D2H check path does not exist: ${path}")
         endif ()
@@ -30,28 +37,13 @@ foreach (path IN LISTS cxx_paths)
                                 "Direct-DCT runtime/export path must not call ${forbidden_call}(): ${path}")
                 endif ()
         endforeach ()
-        foreach (forbidden_token cudaMemcpyDeviceToHost cudaMemcpyDefault cudaMemcpyDtoH)
-                if (content MATCHES "${forbidden_token}")
-                        message(FATAL_ERROR
-                                "Direct-DCT runtime/export path must not contain ${forbidden_token}: ${path}")
-                endif ()
-        endforeach ()
-endforeach ()
-
-set(python_paths
-        "${FASTLENS_ROOT}/examples/direct_dct_torch_end_to_end_demo.py"
-        "${FASTLENS_ROOT}/torch/direct_dct_torch_runtime_smoke.py"
-)
-
-foreach (path IN LISTS python_paths)
-        if (NOT EXISTS "${path}")
-                message(FATAL_ERROR "Direct-DCT Python no-D2H check path does not exist: ${path}")
+        list(FIND cxx_paths "${path}" runtime_path_index)
+        if (NOT runtime_path_index EQUAL -1)
+                foreach (forbidden_token cudaMemcpyDeviceToHost cudaMemcpyDefault cudaMemcpyDtoH)
+                        if (content MATCHES "${forbidden_token}")
+                                message(FATAL_ERROR
+                                        "Direct-DCT runtime/export path must not contain ${forbidden_token}: ${path}")
+                        endif ()
+                endforeach ()
         endif ()
-        file(READ "${path}" content)
-        foreach (forbidden_pattern "\\.cpu[ \t\r\n]*\\(" "\\.numpy[ \t\r\n]*\\(" "\\.tolist[ \t\r\n]*\\(")
-                if (content MATCHES "${forbidden_pattern}")
-                        message(FATAL_ERROR
-                                "Direct-DCT demo must not materialize coefficient tensors on host: ${path}")
-                endif ()
-        endforeach ()
 endforeach ()

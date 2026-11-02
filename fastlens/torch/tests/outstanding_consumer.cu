@@ -239,8 +239,8 @@ std::shared_ptr<OutstandingConsumerHandle> arm_outstanding_consumer(
 
 } // namespace
 
-PYBIND11_MODULE(_fastlens_phase4_outstanding_test, binding) {
-	binding.doc() = "Private Phase-4A native outstanding-consumer harness";
+PYBIND11_MODULE(_fastlens_test_consumer, binding) {
+	binding.doc() = "Private Direct-DCT outstanding-consumer test harness";
 	py::class_<OutstandingConsumerHandle, std::shared_ptr<OutstandingConsumerHandle>>(
 	    binding, "OutstandingConsumerHandle")
 	    .def_property_readonly("consumer_complete", &OutstandingConsumerHandle::consumer_complete)

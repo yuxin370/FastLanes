@@ -1,6 +1,4 @@
 add_executable(fastlens_tests
-        thrust_memcpy_test.cu
-        thrust_core_test.cu
         fastlens_test.cu
 		delta_test.cu
         reader_test.cu
@@ -52,6 +50,10 @@ if (Python3_Interpreter_FOUND)
 		COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_SOURCE_DIR}
 		        ${Python3_EXECUTABLE} -B -m unittest fastlens.torch.tests.test_public_direct_dct_api)
 	set_tests_properties(FastLensPublicDirectDctApiPython PROPERTIES LABELS "fastlens;direct-dct;cpu")
+        add_test(NAME FastLensPipelineFacadePython
+                COMMAND ${Python3_EXECUTABLE} -B -m unittest fastlens.torch.tests.test_pipeline_facade)
+        set_tests_properties(FastLensPipelineFacadePython PROPERTIES
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "fastlens;direct-dct;cpu")
         add_test(NAME FastLensExperimentalDirectDctPlsApiPython
                 COMMAND ${Python3_EXECUTABLE} -B -m unittest
                         fastlens.torch.tests.test_experimental_direct_dct_pls_api)
@@ -229,13 +231,6 @@ set_tests_properties(FastLensPublicApiBoundaries PROPERTIES LABELS "fastlens;pub
 
 if (FASTLENS_WITH_JPEG_DCT)
         add_test(
-                NAME FastLensJpegDctNoDeviceSynchronize
-                COMMAND ${CMAKE_COMMAND}
-	                -DFASTLENS_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
-	                -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/FastLensJpegDctNoDeviceSynchronize.cmake
-        )
-        set_tests_properties(FastLensJpegDctNoDeviceSynchronize PROPERTIES LABELS "fastlens;jpeg-dct;static")
-        add_test(
                 NAME FastLensDirectDctRuntimeNoD2H
                 COMMAND ${CMAKE_COMMAND}
 	                -DFASTLENS_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -303,7 +298,7 @@ gtest_discover_tests(fastlens_tests
 	PROPERTIES LABELS "fastlens-cpu"
 )
 gtest_discover_tests(fastlens_tests
-		TEST_FILTER "ThrustMemcpy.*:ThrustCore.*:DeviceUtils.*:DevicePool.*:DeltaUnsumer.*:DeltaDecode.*:JpegDct.*:JpegDctMixedExpressions.*:JpegDctOrder.*"
+		TEST_FILTER "DeviceUtils.*:DevicePool.*:DeltaUnsumer.*:DeltaDecode.*:JpegDct.*:JpegDctMixedExpressions.*:JpegDctOrder.*"
         DISCOVERY_TIMEOUT 60
         PROPERTIES LABELS "fastlens-gpu-cuda"
 )

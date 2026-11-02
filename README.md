@@ -276,6 +276,25 @@ ctest --test-dir build --output-on-failure -R '^FastLensConverterDefaultPartitio
 FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build --output-on-failure -R '^FastLensConvertedStoreTorchPython$'
 ```
 
+`FastLensPipelineFacadePython` covers the Python pipeline contract without a GPU
+or the Torch extension. `FastLensDirectDctLifetimeTorchPython` uses a small generated
+JPEG store to check tensor ownership, pending consumer streams, legacy lifetime
+support, and metrics completion. It replaces the Phase-4/5 proof scripts and uses
+the private `_fastlens_test_consumer` module, which is built only for testing.
+The same strict CUDA setting applies to this suite.
+
+```bash
+FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build --output-on-failure \
+  -R 'FastLensPipelineFacadePython|FastLensDirectDctLifetimeTorchPython'
+```
+
+Benchmark tests retain the `benchmark` label; use `-LE 'benchmark|nightly'` for
+regular functional checks, or `-L benchmark` for experiment tooling checks.
+The historical Phase-2 A/B probe is excluded from the default build and remains
+available explicitly with `cmake --build build --target _fastlens_phase2_native_ab`.
+The runtime no-D2H check also enforces asynchronous submission; it scans native
+runtime paths, leaving test reference calculations free to inspect CPU values.
+
 This small dataset is intended for checking the pipeline. The paper benchmarks use the full datasets described in the reproduction guide.
 
 ## PyTorch interface

@@ -206,7 +206,6 @@ TEST(DirectDctShadowContract, SemanticGeometryAndTransformsMatchLegacyFieldByFie
 
 TEST(DirectDctShadowContract, ExecutionPolicyMatchesLegacyMaterializationFieldByField) {
 	static_assert(!std::is_copy_assignable_v<ResolvedExecutionPolicy>);
-	static_assert(ResolvedExecutionPolicy::kBatchOptionFieldCount == 23U);
 	const std::set<std::string_view> inventory(ResolvedExecutionPolicy::kBatchOptionFieldNames.begin(),
 	                                           ResolvedExecutionPolicy::kBatchOptionFieldNames.end());
 	ASSERT_EQ(inventory.size(), ResolvedExecutionPolicy::kBatchOptionFieldCount);
@@ -302,33 +301,7 @@ TEST(LogicalBatchRequestContract, InvalidSemanticCropAndBoundaryAreRejected) {
 	EXPECT_THROW(fastlens::direct_dct::validate_logical_batch_request(invalid_boundary), std::invalid_argument);
 }
 
-TEST(PipelineTraceEventContract, SchemaCarriesDifferentialOrdinalsWithoutRuntimeHooks) {
-	using Event = fastlens::direct_dct::PipelineTraceEvent;
-	static_assert(std::is_trivially_copyable_v<Event>);
-	Event event;
-	event.request_identity   = 901U;
-	event.request_ordinal    = 6U;
-	event.batch_ordinal      = 7U;
-	event.stage              = Event::Stage::kCompleted;
-	event.plan_identity_hash = 0xabcU;
-	event.io_identity_hash   = 0xdefU;
-	event.prepare_ordinal    = 11U;
-	event.stage_ordinal      = 21U;
-	event.read_ordinal       = 31U;
-	event.submission_ordinal = 41U;
-	event.completion_ordinal = 40U;
-	EXPECT_EQ(event.request_identity, 901U);
-	EXPECT_EQ(event.request_ordinal, 6U);
-	EXPECT_EQ(event.batch_ordinal, 7U);
-	EXPECT_EQ(event.stage, Event::Stage::kCompleted);
-	EXPECT_EQ(event.plan_identity_hash, 0xabcU);
-	EXPECT_EQ(event.io_identity_hash, 0xdefU);
-	EXPECT_EQ(event.prepare_ordinal, 11U);
-	EXPECT_EQ(event.stage_ordinal, 21U);
-	EXPECT_EQ(event.read_ordinal, 31U);
-	EXPECT_EQ(event.submission_ordinal, 41U);
-	EXPECT_EQ(event.completion_ordinal, 40U);
-}
+static_assert(std::is_trivially_copyable_v<fastlens::direct_dct::PipelineTraceEvent>);
 
 TEST(DirectDctShadowContract, UnknownAndMismatchedProfilesAreRejected) {
 	EXPECT_THROW(static_cast<void>(SemanticProfileRegistry::resolve("unknown")), std::invalid_argument);

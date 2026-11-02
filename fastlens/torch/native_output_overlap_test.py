@@ -52,7 +52,7 @@ def main() -> int:
     sys.path.insert(0, str(args.module_path.resolve()))
     import torch
     import _fastlens_direct_dct as native
-    import _fastlens_phase4_outstanding_test as harness
+    import _fastlens_test_consumer as harness
     from fastlens.torch import DirectDctReader
 
     batches = [list(range(0, 4)), list(range(4, 8)), list(range(8, 12))]
