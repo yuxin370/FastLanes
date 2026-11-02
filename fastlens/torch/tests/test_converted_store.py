@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -17,6 +18,8 @@ class ConvertedStoreTests(unittest.TestCase):
         import _fastlens_direct_dct as native
 
         if not torch.cuda.is_available():
+            if os.environ.get("FASTLENS_REQUIRE_CUDA_SMOKE") == "1":
+                self.fail("CUDA device/driver unavailable but FASTLENS_REQUIRE_CUDA_SMOKE=1")
             self.skipTest("CUDA device/driver unavailable")
         from PIL import Image
 
@@ -25,8 +28,34 @@ class ConvertedStoreTests(unittest.TestCase):
             source = root / "source images"
             source.mkdir()
             paths = [source / name for name in ("z space.jpg", "A.JPEG", "middle.jpe")]
-            for path in paths:
-                Image.new("RGB", (512, 512), (70, 100, 140)).save(path, format="JPEG", subsampling=2)
+            reference_y, reference_cbcr = [], []
+            for image_id, (path, values) in enumerate(zip(
+                paths, ((48, 96, 160), (128, 160, 96), (208, 64, 192)), strict=True
+            )):
+                Image.new("YCbCr", (512, 512), values).save(
+                    path, format="JPEG", subsampling=2,
+                    qtables=[[2 ** (image_id + 1)] * 64, [2 ** (image_id + 2)] * 64],
+                )
+                # Independent analytic JPEG-DCT reference: a constant component
+                # has DC=8*(value-128), AC=0. Read the JPEG's own quantizers, not
+                # the converted store. Values are exactly divisible, avoiding
+                # encoder rounding differences. Constant planes are invariant
+                # under the validation profiles' resize and center crop.
+                components = []
+                with Image.open(path) as jpeg:
+                    for component, value in enumerate(values):
+                        quantizer = jpeg.quantization[jpeg.layer[component][3]][0]
+                        dc = 8 * (value - 128)
+                        self.assertEqual(dc % quantizer, 0)
+                        coefficients = torch.zeros((8, 8), dtype=torch.float32)
+                        coefficients[0, 0] = (dc // quantizer) * quantizer
+                        normalized = ((coefficients.clamp(-1024, 1016) + 1024) / 2040) * 2 - 1
+                        grid = 28 if component == 0 else 14
+                        components.append(normalized.expand(grid, grid, 8, 8))
+                reference_y.append(components[0].unsqueeze(0))
+                reference_cbcr.append(torch.stack(components[1:]))
+            reference_y = torch.stack(reference_y)
+            reference_cbcr = torch.stack(reference_cbcr)
             listing = root / "ordered.txt"
             listing.write_text("\n".join(str(path) for path in paths) + "\n")
             output = root / "store"
@@ -37,6 +66,14 @@ class ConvertedStoreTests(unittest.TestCase):
                 ]), 0)
 
             reader = DirectDctReader(output / "manifest.bin", native_module=native)
+
+            def check_batch(batch, expected_ids):
+                self.assertEqual(list(batch.sample_ids), expected_ids)
+                self.assertTrue(batch.y.is_cuda)
+                self.assertTrue(batch.cbcr.is_cuda)
+                torch.testing.assert_close(batch.y.cpu(), reference_y[expected_ids], rtol=0, atol=1e-6)
+                torch.testing.assert_close(batch.cbcr.cpu(), reference_cbcr[expected_ids], rtol=0, atol=1e-6)
+
             # Center-crop requires complete shards in canonical order; the
             # general validation profile accepts arbitrary image IDs.
             for profile, schedule in (
@@ -47,14 +84,11 @@ class ConvertedStoreTests(unittest.TestCase):
                     schedule, profile=profile, coefficients=None
                 ) as batches:
                     for expected, batch in zip(schedule, batches, strict=True):
-                        self.assertEqual(list(batch.sample_ids), expected)
-                        self.assertTrue(batch.y.is_cuda)
-                        self.assertTrue(batch.cbcr.is_cuda)
-                        self.assertEqual(batch.y.shape[0], len(expected))
+                        check_batch(batch, expected)
             with DirectDctPipeline(output / "manifest.bin", profile=VALIDATION, native_module=native) as pipeline:
-                batches = list(pipeline.start([[1, 0], [2]]))
-                self.assertEqual([list(batch.sample_ids) for batch in batches], [[1, 0], [2]])
-                self.assertTrue(all(batch.y.is_cuda for batch in batches))
+                schedule = [[2, 0], [1]]  # The first batch crosses the 2-image shard boundary.
+                for expected, batch in zip(schedule, pipeline.start(schedule), strict=True):
+                    check_batch(batch, expected)
             torch.cuda.synchronize()
 
 

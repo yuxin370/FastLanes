@@ -37,9 +37,14 @@ if (Python3_Interpreter_FOUND)
 	        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "fastlens;converter;cpu")
 	if (FASTLENS_WITH_JPEG_DCT AND FASTLENS_BUILD_TOOLS)
 		add_test(NAME FastLensConverterNativePython
-		        COMMAND ${Python3_EXECUTABLE} -B -m unittest fastlens.tests.test_cli_native -v)
+		        COMMAND ${Python3_EXECUTABLE} -B -m unittest fastlens.tests.test_cli_native.NativeCliTests -v)
 		set_tests_properties(FastLensConverterNativePython PROPERTIES
 		        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "fastlens;converter;native"
+		        ENVIRONMENT "FASTLENS_BUILD_DIR=${CMAKE_BINARY_DIR};FASTLENS_REQUIRE_NATIVE_TESTS=1")
+		add_test(NAME FastLensConverterDefaultPartitionCanary
+		        COMMAND ${Python3_EXECUTABLE} -B -m unittest fastlens.tests.test_cli_native.DefaultPartitionCanary -v)
+		set_tests_properties(FastLensConverterDefaultPartitionCanary PROPERTIES
+		        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "fastlens;converter;native;nightly"
 		        ENVIRONMENT "FASTLENS_BUILD_DIR=${CMAKE_BINARY_DIR};FASTLENS_REQUIRE_NATIVE_TESTS=1")
 	endif ()
 	add_test(

@@ -47,7 +47,10 @@ struct JpegDctExactVerificationResult {
 	}
 };
 
-// Verifies every source image against its manifest-backed coefficient blocks.
+// Verifies source dimensions, component geometry/sampling and quantization
+// tables, as well as every manifest-backed coefficient block. Metadata
+// mismatches throw with the image index and field; coefficient mismatches
+// are returned in the result.
 // Work is partitioned only at manifest shard boundaries. Each worker owns one
 // independent dataset reader and visits all images in an assigned shard in
 // increasing global-image order.

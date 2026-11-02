@@ -181,6 +181,7 @@ if (BUILD_TESTING)
                 set_tests_properties(FastLensConvertedStoreTorchPython PROPERTIES
                         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
                         LABELS "fastlens;converter;jpeg-dct;torch;gpu;integration"
+                        SKIP_REGULAR_EXPRESSION "skipped 'CUDA device/driver unavailable'"
                 )
         endif ()
         set(FASTLENS_PLS_SMOKE_FIXTURE_ARGS)

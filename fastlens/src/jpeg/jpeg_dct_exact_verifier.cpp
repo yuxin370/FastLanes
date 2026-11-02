@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -27,6 +28,65 @@ using BlockKey = std::tuple<uint32_t, uint32_t, uint32_t>;
 struct ShardTask {
 	JpegDctShardManifestEntry entry;
 };
+
+void verify_image_metadata(const JpegImageMetadata&      source,
+                           const JpegImageMetadata&      stored,
+                           const JpegDctDatasetMetadata& dataset,
+                           const uint32_t                image_index) {
+	const auto require = [&](const bool matches, const std::string& field) {
+		if (!matches) {
+			throw std::runtime_error("JPEG DCT metadata mismatch for image " + std::to_string(image_index) + ": " +
+			                         field);
+		}
+	};
+	require(stored.image_width == source.image_width, "image_width");
+	require(stored.image_height == source.image_height, "image_height");
+	require(stored.data_precision == source.data_precision, "data_precision");
+	require(stored.jpeg_color_space == source.jpeg_color_space, "jpeg_color_space");
+	require(static_cast<size_t>(std::count_if(stored.components.begin(),
+	                                          stored.components.end(),
+	                                          [](const auto& component) { return component.present; })) ==
+	            source.components.size(),
+	        "component count");
+
+	// Resolve semantic components and quantization tables rather than comparing
+	// shard-local dictionary IDs, component order, or dataset padding.
+	for (const auto& expected : source.components) {
+		const auto context           = "component " + std::to_string(expected.local_component_index) + " ";
+		const auto matches_component = [&](const auto& component) {
+			return component.present && component.local_component_index == expected.local_component_index;
+		};
+		require(std::count_if(stored.components.begin(), stored.components.end(), matches_component) == 1,
+		        context + "identity");
+		const auto& actual = *std::find_if(stored.components.begin(), stored.components.end(), matches_component);
+		require(actual.component_id == expected.component_id, context + "component_id");
+		const auto slot =
+		    std::find_if(dataset.semantic_components.begin(),
+		                 dataset.semantic_components.end(),
+		                 [&](const auto& candidate) { return candidate.semantic_slot_id == actual.semantic_slot_id; });
+		require(slot != dataset.semantic_components.end() && slot->component_id == expected.component_id,
+		        context + "semantic slot");
+		require(actual.width_in_blocks == expected.width_in_blocks, context + "width_in_blocks");
+		require(actual.height_in_blocks == expected.height_in_blocks, context + "height_in_blocks");
+		require(actual.h_samp_factor == expected.h_samp_factor, context + "h_samp_factor");
+		require(actual.v_samp_factor == expected.v_samp_factor, context + "v_samp_factor");
+		require(actual.quant_tbl_no == expected.quant_tbl_no, context + "quant_tbl_no");
+		const auto matches_table = [&](const auto& table) {
+			return table.table_id == expected.quant_tbl_no;
+		};
+		const auto source_table = std::find_if(source.quant_tables.begin(), source.quant_tables.end(), matches_table);
+		require(std::count_if(stored.quant_tables.begin(), stored.quant_tables.end(), matches_table) == 1,
+		        context + "quantization table ID");
+		const auto table = std::find_if(stored.quant_tables.begin(), stored.quant_tables.end(), matches_table);
+		require(table->values == source_table->values, context + "quantization values");
+		const auto profile =
+		    std::find_if(dataset.encoding_profiles.begin(),
+		                 dataset.encoding_profiles.end(),
+		                 [&](const auto& candidate) { return candidate.profile_id == actual.encoding_profile_id; });
+		require(profile != dataset.encoding_profiles.end() && profile->quant_table_values == source_table->values,
+		        context + "encoding profile quantization values");
+	}
+}
 
 auto mismatch_order_key(const JpegDctExactMismatch& mismatch) {
 	return std::tuple {mismatch.global_image_index,
@@ -234,6 +294,8 @@ JpegDctExactVerificationResult verify_image_major_shard(
 		}
 
 		const auto source_table = read_jpeg_dct_file(source_paths.at(static_cast<size_t>(global_image)));
+		verify_image_metadata(
+		    source_table.metadata.images.front(), metadata.images.at(local_image), metadata, global_image);
 		if (std::any_of(source_table.columns.begin(), source_table.columns.end(), [&](const auto& column) {
 			    return column.size() < source_table.row_count;
 		    })) {
@@ -348,6 +410,8 @@ JpegDctExactVerificationResult verify_spatial_major_shard(
 		}
 		const auto global_image = static_cast<uint32_t>(global_image_u64);
 		const auto source_table = read_jpeg_dct_file(source_paths.at(static_cast<size_t>(global_image)));
+		verify_image_metadata(
+		    source_table.metadata.images.front(), metadata.images.at(local_image), metadata, global_image);
 		if (std::any_of(source_table.columns.begin(), source_table.columns.end(), [&](const auto& column) {
 			    return column.size() < source_table.row_count;
 		    })) {

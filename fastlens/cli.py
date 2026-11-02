@@ -62,7 +62,10 @@ def make_parser() -> argparse.ArgumentParser:
     convert.add_argument("--build-dir", type=Path, help="native CMake build directory; overrides FASTLENS_BUILD_DIR")
     convert.add_argument("--dry-run", action="store_true", help="check paths/tools and print plan; do not decode JPEGs or write files")
     convert.add_argument("--report", type=Path, help="also save the report at a new external path")
-    inspect = commands.add_parser("inspect", help="read native metadata and validate access index compatibility")
+    inspect = commands.add_parser(
+        "inspect", help="read metadata and check index compatibility (not full payload integrity)",
+        description="Check dataset structure and index compatibility without decoding or checksumming the full FLS payload.",
+    )
     inspect.add_argument("store", type=Path)
     inspect.add_argument("--build-dir", type=Path)
     inspect.add_argument("--json", action="store_true", help="emit machine-readable inspection results")
@@ -347,6 +350,7 @@ def inspect_store(args: argparse.Namespace) -> int:
               f"metadata: {info['metadata_file_count']} files, {info['metadata_bytes']:,} bytes")
         print(f"Access index: {'compatible v1' if info['index']['compatible'] else 'absent'}; "
               f"{info['index_file_count']} files, {info['index_bytes']:,} bytes")
+        print("Check scope: metadata and index compatibility; full FLS payload integrity is not checked.")
         print(f"Total stored: {info['total_stored_bytes']:,} bytes; "
               + (f"source JPEGs: {source_bytes:,} bytes; source/output={info['source_to_output_ratio']:.3f}" if source_bytes is not None else "source JPEG bytes: unknown"))
     return 0

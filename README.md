@@ -168,7 +168,9 @@ the original JPEGs or this list.
 spatial-major --metadata-profile reconstruct`, manifest v1. Corresponding spatial
 blocks are grouped across images, with DCT frequencies stored as columns. It does
 not select image-major Compact-v3. Default `--verify full` invokes the native exact
-DCT verifier for every image before publication. `--verify none` skips only that
+DCT verifier for every image before publication. Verification compares all 64
+coefficients, image dimensions, component geometry and sampling, and quantization
+table IDs and values against the source JPEGs. `--verify none` skips only that
 source comparison; index construction and compatibility checks still run.
 
 ```text
@@ -215,7 +217,9 @@ targets of 0.5%/1% are informational; small stores can exceed them.
 
 `python -m fastlens inspect STORE --json` gives machine-readable native manifest and
 index details plus current file sizes. Inspection validates sidecar checksums and
-source identities without decoding coefficients. It fails on incompatible indexes;
+source identities without decoding coefficients or recomputing full FLS payload
+checksums. `index.compatible=true` does not establish payload integrity: same-size
+FLS corruption can remain undetected. It fails on incompatible indexes;
 an absent index is reported as absent. Source JPEG size is unknown for stores
 without a conversion report. For a later exact check against the original files:
 
@@ -250,14 +254,27 @@ Converter checks (native tests require Pillow and the built tools; CPU tests do 
 
 ```bash
 python -B -m unittest fastlens.tests.test_cli -v
-FASTLENS_REQUIRE_NATIVE_TESTS=1 python -B -m unittest fastlens.tests.test_cli_native -v
-ctest --test-dir build --output-on-failure -R 'FastLensConverter|FastLensConvertedStore|JpegDctExactVerifier|JpegDctBlockMajorAccess'
+FASTLENS_REQUIRE_NATIVE_TESTS=1 python -B -m unittest fastlens.tests.test_cli_native.NativeCliTests -v
+ctest --test-dir build --output-on-failure -LE nightly -R 'FastLensConverter|FastLensConvertedStore|JpegDctExactVerifier|JpegDctBlockMajorAccess'
 ```
 
 The converter suites do not require PyTorch. `FastLensConvertedStoreTorchPython`
 is registered separately when `FASTLENS_BUILD_TORCH=ON` and the native tools are
 enabled. It requires the built extension and skips GPU execution when no CUDA
-device is available.
+device is available (CTest reports it as skipped). GPU CI must set the existing
+`FASTLENS_REQUIRE_CUDA_SMOKE=1` strict mode so missing CUDA fails the test. The
+test uses distinct constant Y/Cb/Cr images with different quantizers and an
+independent analytic DCT reference to check tensor values and image-ID ordering,
+including cross-shard batches.
+
+The native suite includes 17 mixed-geometry images with partitions of 8. A separate
+nightly-labelled canary converts 1025 images with the default partition size of
+1024 and checks the full source comparison, indexes, and boundary image reads:
+
+```bash
+ctest --test-dir build --output-on-failure -R '^FastLensConverterDefaultPartitionCanary$'
+FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build --output-on-failure -R '^FastLensConvertedStoreTorchPython$'
+```
 
 This small dataset is intended for checking the pipeline. The paper benchmarks use the full datasets described in the reproduction guide.
 

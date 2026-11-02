@@ -1,9 +1,12 @@
 #include "fastlens/jpeg_dct_storage.hpp"
 #include "jpeg/jpeg_dct_exact_verifier.hpp"
+#include "jpeg/jpeg_dct_metadata.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <gtest/gtest.h>
 #include <jpeglib.h>
 #include <memory>
@@ -193,6 +196,85 @@ TEST_F(JpegDctExactVerifierTest, SerialAndParallelExactResultsAreIdentical) {
 	expect_same_result(serial, by_default);
 	expect_same_result(serial, parallel);
 	expect_same_result(serial, capped);
+}
+
+TEST_F(JpegDctExactVerifierTest, RejectsChangedSourceMetadataWithUnchangedCoefficients) {
+	using fastlens::jpeg::JpegDctDatasetMetadata;
+	const auto& entry         = serial_manifest_.shards.front();
+	const auto  metadata_path = manifest_path_.parent_path() / entry.metadata_file_name;
+	const auto  fls_path      = manifest_path_.parent_path() / entry.fls_file_name;
+	const auto  coefficients  = read_binary_file(fls_path);
+	const auto  original      = fastlens::jpeg::detail::read_jpeg_dct_metadata_file(metadata_path);
+	const std::vector<std::pair<std::string, std::function<void(JpegDctDatasetMetadata&)>>> mutations {
+	    {"image width",
+	     [](auto& metadata) {
+		     --metadata.images.front().image_width;
+	     }},
+	    {"image height",
+	     [](auto& metadata) {
+		     --metadata.images.front().image_height;
+	     }},
+	    {"component geometry",
+	     [](auto& metadata) {
+		     --metadata.images.front().components.front().width_in_blocks;
+	     }},
+	    {"component identity",
+	     [](auto& metadata) {
+		     ++metadata.images.front().components.front().component_id;
+	     }},
+	    {"horizontal sampling",
+	     [](auto& metadata) {
+		     ++metadata.encoding_profiles.front().h_samp_factor;
+	     }},
+	    {"vertical sampling",
+	     [](auto& metadata) {
+		     ++metadata.encoding_profiles.front().v_samp_factor;
+	     }},
+	    {"quantization ID",
+	     [](auto& metadata) {
+		     ++metadata.encoding_profiles.front().quant_tbl_no;
+	     }},
+	    {"image quantization values",
+	     [](auto& metadata) {
+		     ++metadata.images.front().quant_tables.front().values[63];
+	     }},
+	    {"profile quantization values",
+	     [](auto& metadata) {
+		     ++metadata.encoding_profiles.front().quant_table_values[63];
+	     }},
+	};
+	for (const auto& [name, mutate] : mutations) {
+		SCOPED_TRACE(name);
+		auto metadata = original;
+		mutate(metadata);
+		fastlens::jpeg::write_jpeg_dct_metadata(
+		    metadata, metadata_path, {fastlens::jpeg::JpegMetadataProfile::kReconstructableJpeg});
+		try {
+			static_cast<void>(fastlens::jpeg::verify_jpeg_dct_manifest_exact(manifest_path_, source_paths_, 4U));
+			FAIL() << "changed source metadata was accepted";
+		} catch (const std::runtime_error& error) {
+			EXPECT_NE(std::string(error.what()).find("metadata mismatch for image 0"), std::string::npos);
+		}
+	}
+	EXPECT_EQ(read_binary_file(fls_path), coefficients);
+}
+
+TEST_F(JpegDctExactVerifierTest, AcceptsEquivalentQuantizationDictionaryRepresentations) {
+	const auto metadata_path = manifest_path_.parent_path() / serial_manifest_.shards.front().metadata_file_name;
+	auto       metadata      = fastlens::jpeg::detail::read_jpeg_dct_metadata_file(metadata_path);
+	std::reverse(metadata.encoding_profiles.begin(), metadata.encoding_profiles.end());
+	for (auto& profile : metadata.encoding_profiles) {
+		profile.profile_id += 100U;
+	}
+	for (auto& image : metadata.images) {
+		std::reverse(image.quant_tables.begin(), image.quant_tables.end());
+		for (auto& component : image.components) {
+			component.encoding_profile_id += 100U;
+		}
+	}
+	fastlens::jpeg::write_jpeg_dct_metadata(
+	    metadata, metadata_path, {fastlens::jpeg::JpegMetadataProfile::kReconstructableJpeg});
+	EXPECT_TRUE(fastlens::jpeg::verify_jpeg_dct_manifest_exact(manifest_path_, source_paths_, 4U).exact());
 }
 
 TEST_F(JpegDctExactVerifierTest, ParallelMergeReportsTheGloballyEarliestMismatch) {

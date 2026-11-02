@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ from unittest.mock import patch
 from fastlens import cli
 
 
-class NativeCliTests(unittest.TestCase):
+class NativeCliFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
@@ -56,6 +57,15 @@ class NativeCliTests(unittest.TestCase):
                                "--verify-workers", "2", "--input-list", str(listing or self.output / "source_paths.txt")],
                               capture_output=True, text=True)
 
+    def extend_inputs(self, image_count):
+        for index in range(len(self.paths), image_count):
+            path = self.source / f"image-{index:04d}.jpg"
+            self.Image.new("RGB", (32, 32), (index % 256, (index * 7) % 256, (index * 13) % 256)).save(path)
+            self.paths.append(path)
+        self.listing.write_text("\n".join(str(path) for path in self.paths) + "\n")
+
+
+class NativeCliTests(NativeCliFixture):
     def test_complete_conversion_inspection_relocation_and_order(self):
         external = self.root / "report.json"
         self.assertEqual(self.convert(extra=("--report", str(external))), 0)
@@ -172,6 +182,78 @@ class NativeCliTests(unittest.TestCase):
         result = subprocess.run([str(self.tools[cli.TOOL_NAMES[0]]), "--verify-manifest", str(self.output / "manifest.bin"),
                                  "--verify-workers", "1", "--input-list", str(single)], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
+
+    def test_multiple_partitions_with_mixed_geometry_and_tail(self):
+        self.extend_inputs(17)
+        self.convert(extra=("--partition-images", "8"))
+        info = cli.native_inspect(self.output, self.tools[cli.TOOL_NAMES[1]])
+        self.assertEqual(info["image_count"], 17)
+        self.assertEqual(info["shard_count"], 3)
+        self.assertEqual(info["index_file_count"], 4)
+        self.assertTrue(info["index"]["compatible"])
+        self.assertEqual((self.output / "source_paths.txt").read_text().splitlines(), [str(path) for path in self.paths])
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_full_verification_rejects_quantization_corruption_before_publication(self):
+        original = cli.run_native
+        phases = []
+
+        def corrupt_before_index(command, log, phase):
+            phases.append(phase)
+            if phase == "Access index":
+                metadata = sorted(log.parent.rglob("*.meta.bin"))[0]
+                data = bytearray(metadata.read_bytes())
+                self.assertEqual(data[:8], b"GJDCTMD3")
+                # Sectioned metadata v3: change the last quantization entry of
+                # the first image, leaving the FLS coefficients and file sizes intact.
+                offset = 38
+                while offset < len(data):
+                    section, size = struct.unpack_from("<HQ", data, offset)
+                    offset += 10
+                    if section == 3:  # ReconstructableImageInfo
+                        value_offset = offset + 8 + 17 + 1 + 63 * 2
+                        value = struct.unpack_from("<H", data, value_offset)[0]
+                        struct.pack_into("<H", data, value_offset, value + 1)
+                        metadata.write_bytes(data)
+                        break
+                    offset += size
+                else:
+                    self.fail("reconstructable quantization metadata missing")
+            original(command, log, phase)
+
+        with patch.object(cli, "run_native", side_effect=corrupt_before_index), self.assertRaisesRegex(
+            cli.ConversionError, "metadata mismatch.*quantization"
+        ):
+            self.convert()
+        self.assertIn("Exact DCT verification", phases)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(list(self.root.glob(".*fastlens-staging-*")), [])
+
+
+class DefaultPartitionCanary(NativeCliFixture):
+    """Run separately for the default 1024-image partition boundary."""
+
+    def test_1025_images_with_default_partition_size(self):
+        self.extend_inputs(1025)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main([
+                "convert", "--input-list", str(self.listing), "--output", str(self.output), "--workers", "4",
+            ]), 0)
+        report = json.loads((self.output / cli.REPORT_NAME).read_text())
+        self.assertEqual(report["partition_images"], 1024)
+        self.assertEqual(report["input_image_count"], 1025)
+        self.assertEqual(report["shard_count"], 2)
+        self.assertEqual(report["verification"], "passed")
+        info = cli.native_inspect(self.output, self.tools[cli.TOOL_NAMES[1]])
+        self.assertTrue(info["index"]["compatible"])
+        self.assertEqual(info["index_file_count"], 3)
+        for image_id in (1023, 1024):
+            result = subprocess.run([
+                str(self.tools[cli.TOOL_NAMES[0]]), "--verify-manifest", str(self.output / "manifest.bin"),
+                "--image-index", str(image_id), str(self.paths[image_id]),
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
