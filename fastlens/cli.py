@@ -13,6 +13,8 @@ import sys
 import tempfile
 import time
 
+from . import annotations
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_NAMES = ("fastlens_jpeg_dct_tool", "fastlens_block_major_access_tool")
@@ -39,12 +41,23 @@ def worker_count(value: str) -> str | int:
     return "auto" if value == "auto" else positive_int(value)
 
 
+def annotation_options(parser: argparse.ArgumentParser, *, required: bool) -> None:
+    parser.add_argument("--image-root", type=Path, help="root for relative sample IDs and CSV paths; no JPEG reading")
+    labels = parser.add_mutually_exclusive_group(required=required)
+    labels.add_argument("--labels-from-folders", action="store_true", help="derive classes from ROOT/CLASS/... paths")
+    labels.add_argument("--labels-jsonl", type=Path, help="complete path,label[,sample_id] JSONL; paths relative to this file")
+    labels.add_argument("--labels-csv", type=Path, help="complete Filepath,Label CSV, with optional sample_id")
+    parser.add_argument("--class-map", type=Path, help="fixed class_to_idx.json for folder labels; preserve original IDs")
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fastlens", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     convert = commands.add_parser("convert", help="convert original JPEG DCT coefficients")
     convert.add_argument("input_dir", nargs="?", type=Path, help="recursively discover JPEG files")
     convert.add_argument("--input-list", type=Path, help="ordered UTF-8 paths, one per line; relative to the list")
+    convert.add_argument("--shuffle-seed", type=int, help="premix before partitioning using fastlens-shuffle-v1; unsigned 64-bit seed")
+    annotation_options(convert, required=False)
     convert.add_argument("--output", type=Path, required=True, help="new or empty destination directory")
     convert.add_argument("--layout", choices=["block-major"], default="block-major")
     convert.add_argument("--partition-images", type=positive_int, default=1024, help="maximum images per shard (default: 1024)")
@@ -69,6 +82,17 @@ def make_parser() -> argparse.ArgumentParser:
     inspect.add_argument("store", type=Path)
     inspect.add_argument("--build-dir", type=Path)
     inspect.add_argument("--json", action="store_true", help="emit machine-readable inspection results")
+    annotation = commands.add_parser("annotations", help="build or validate task annotations without recompression")
+    actions = annotation.add_subparsers(dest="annotation_command", required=True)
+    build = actions.add_parser("build", help="add annotations to an existing store, preserving physical order")
+    build.add_argument("store", type=Path)
+    build.add_argument("--build-dir", type=Path)
+    build.add_argument("--dry-run", action="store_true", help="validate all annotations without writing files")
+    annotation_options(build, required=True)
+    check = actions.add_parser("inspect", help="validate annotation bindings, counts and physical order")
+    check.add_argument("store", type=Path)
+    check.add_argument("--build-dir", type=Path)
+    check.add_argument("--json", action="store_true")
     return parser
 
 
@@ -188,6 +212,40 @@ def native_inspect(store: Path, tool: Path) -> dict:
     return json.loads(result.stdout)
 
 
+def annotation_source(args: argparse.Namespace) -> str | None:
+    return "folders" if args.labels_from_folders else "jsonl" if args.labels_jsonl else "csv" if args.labels_csv else None
+
+
+def annotations_command(args: argparse.Namespace) -> int:
+    tools = find_tools(args.build_dir, (TOOL_NAMES[1],))
+    result = subprocess.run([str(tools[TOOL_NAMES[1]]), "--inspect-manifest", str(args.store / "manifest.bin")],
+                            capture_output=True, text=True)
+    if result.returncode:
+        raise ConversionError(f"native manifest inspection failed: {result.stderr.strip()}; rebuild {TOOL_NAMES[1]}")
+    count = json.loads(result.stdout)["image_count"]
+    if args.annotation_command == "build":
+        destination = args.store / annotations.DIRECTORY
+        if destination.exists() or destination.is_symlink():
+            raise ConversionError(f"refusing to replace existing annotations: {destination}")
+        paths = annotations.physical_paths(args.store, count)
+        records, classes = annotations.prepare_records(
+            paths, image_root=args.image_root, labels_from_folders=args.labels_from_folders,
+            labels_jsonl=args.labels_jsonl, labels_csv=args.labels_csv, class_map=args.class_map,
+        )
+        if args.dry_run:
+            print(f"Validated {len(records)} annotations; dry-run wrote no files.")
+            return 0
+        annotations.publish_annotations(args.store, records, classes, label_source=annotation_source(args))
+        print(f"Published {len(records)} annotations in {destination}; existing image data was not rewritten.")
+    else:
+        _, metadata = annotations.load_annotations(args.store)
+        if metadata["image_count"] != count:
+            raise ConversionError("annotation image count disagrees with native manifest")
+        print(json.dumps(metadata, indent=2) if args.json else
+              f"Compatible {metadata['schema_version']}: {count} images; manifest, source order and annotations verified.")
+    return 0
+
+
 def stored_bytes(store: Path) -> int:
     return sum(path.stat().st_size for path in store.rglob("*") if path.is_file())
 
@@ -235,6 +293,20 @@ def convert(args: argparse.Namespace) -> int:
     output = args.output.absolute()
     check_destination(output)
     inputs, source_bytes, ordering = discover_inputs(args.input_dir, args.input_list)
+    label_source = annotation_source(args)
+    if args.class_map is not None and not args.labels_from_folders:
+        raise ConversionError("--class-map requires --labels-from-folders")
+    records, classes, shuffle = None, None, None
+    if label_source is not None or args.shuffle_seed is not None:
+        records, classes = annotations.prepare_records(
+            inputs, image_root=args.image_root or args.input_dir, labels_from_folders=args.labels_from_folders,
+            labels_jsonl=args.labels_jsonl, labels_csv=args.labels_csv, class_map=args.class_map,
+        )
+        if args.shuffle_seed is not None:
+            annotations.shuffle_records(records, args.shuffle_seed)
+            shuffle = {"algorithm": annotations.SHUFFLE_ALGORITHM, "seed": args.shuffle_seed}
+            ordering += f"; then {annotations.SHUFFLE_ALGORITHM}, seed={args.shuffle_seed}, before partitioning"
+        inputs = [record.source_path for record in records]
     tools = find_tools(args.build_dir)
     extra_report = args.report.absolute() if args.report else None
     if extra_report == output / REPORT_NAME:
@@ -252,6 +324,7 @@ def convert(args: argparse.Namespace) -> int:
         print(json.dumps({"dry_run": True, "output": str(output), "image_count": len(inputs),
                           "physical_layout": PHYSICAL_LAYOUT, "partition_images": args.partition_images,
                           "preset": args.preset, "verify": args.verify, "parallelism": config,
+                          "annotations": records is not None, "shuffle": shuffle,
                           "tools": {name: str(path) for name, path in tools.items()}}, indent=2))
         return 0
     times = {"discovery_preflight_seconds": time.perf_counter() - started}
@@ -291,6 +364,10 @@ def convert(args: argparse.Namespace) -> int:
                         "--input-list", str(ordered_list)], log, "Exact DCT verification")
             times["verification_seconds"] = time.perf_counter() - phase
         log.unlink()
+        if records is not None:
+            phase = time.perf_counter()
+            sample_metadata = annotations.publish_annotations(stage, records, classes, label_source=label_source, shuffle=shuffle)
+            times["annotation_seconds"] = time.perf_counter() - phase
         report = {
             "schema_version": 1, "input_image_count": len(inputs), "original_jpeg_bytes": source_bytes,
             "compressed_payload_bytes": info["coefficient_bytes"], "metadata_bytes": info["metadata_bytes"],
@@ -304,6 +381,10 @@ def convert(args: argparse.Namespace) -> int:
             "verification": "passed" if args.verify == "full" else "not_requested",
             "source_ordering_policy": ordering, "build": build_info(tools),
         }
+        if records is not None:
+            report["annotations"] = annotations.DIRECTORY
+            report["shuffle"] = shuffle
+            report["sample_order_sha256"] = sample_metadata["sample_order_sha256"]
         times["total_seconds"] = time.perf_counter() - started
         report["wall_time_scope"] = "through completion of pipeline and inspection, before report serialization and atomic publication"
         content = write_report(stage / REPORT_NAME, report, stored_bytes(stage))
@@ -359,6 +440,8 @@ def inspect_store(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
     try:
+        if args.command == "annotations":
+            return annotations_command(args)
         return convert(args) if args.command == "convert" else inspect_store(args)
     except (ConversionError, OSError, ValueError) as error:
         print(f"fastlens: {error}", file=sys.stderr)

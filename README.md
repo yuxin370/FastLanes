@@ -150,7 +150,8 @@ if needed, and keep source files unchanged throughout conversion and verificatio
 
 Directory discovery is recursive, without traversing directory symlinks. It sorts
 relative POSIX paths lexicographically by Unicode code point, case-sensitively.
-Image IDs are consecutive, starting at zero in that order. To choose the IDs:
+Image IDs are consecutive, starting at zero in that order unless optional
+`--shuffle-seed` premixing is requested (see below). To choose the IDs:
 
 ```bash
 python -m fastlens convert --input-list ordered_paths.txt --output ./test_store
@@ -253,9 +254,160 @@ automatic CPU selection does not measure available RAM or tune to workload size.
 Converter checks (native tests require Pillow and the built tools; CPU tests do not):
 
 ```bash
-python -B -m unittest fastlens.tests.test_cli -v
+python -B -m unittest fastlens.tests.test_cli fastlens.tests.test_annotations -v
 FASTLENS_REQUIRE_NATIVE_TESTS=1 python -B -m unittest fastlens.tests.test_cli_native.NativeCliTests -v
 ctest --test-dir build --output-on-failure -LE nightly -R 'FastLensConverter|FastLensConvertedStore|JpegDctExactVerifier|JpegDctBlockMajorAccess'
+```
+
+### Task annotations and offline premixing
+
+An existing store can acquire annotations without recompressing images:
+
+```bash
+python -m fastlens annotations build ./train_store \
+  --image-root /datasets/imagenet/train --labels-from-folders \
+  --class-map ./imagenet_class_to_idx.json
+python -m fastlens annotations inspect ./train_store --json
+```
+
+Only the manifest, source path list and supplied annotations are read. Source
+JPEGs, coefficient files and access indexes are not needed for this operation.
+`source_paths.txt` must be the original converter-produced list: row N denotes
+physical `image_id=N`. Building annotations never changes that order.
+`--image-root` names the source root recorded in that list; it need not still
+contain the JPEGs. Moving the store does not require rewriting source paths.
+
+Choose exactly one annotation source:
+
+| Option | Input and interpretation |
+| --- | --- |
+| `--labels-from-folders` | `ROOT/CLASS/...` paths; class is the first directory below `--image-root`. |
+| `--labels-jsonl FILE` | One JSON object with `path`, `label`, and optional `sample_id` per line. Relative paths resolve against the JSONL file's directory. |
+| `--labels-csv FILE` | `Filepath,Label` columns, with optional `sample_id`. Relative paths resolve against `--image-root`, or the CSV directory when no root is given. Labels are nonnegative integers, preserved verbatim. |
+
+For folder labels, a supplied `--class-map` is a JSON object such as
+`{"n01440764": 0, "n01443537": 1}`. Values must be distinct nonnegative integers.
+It may include classes absent from this split. Reuse the same map for train and
+validation, including subsets. Without a map, class names present in the source
+list are sorted by Unicode code point and numbered from zero. **These inferred
+IDs describe this dataset, not necessarily ImageNet-1K or a checkpoint's output
+classes.** Flat `ILSVRC2017_test_*.JPEG` filenames do not supply class labels;
+they require a matching external annotation table.
+
+For RGB-no-more CSV entries such as `train/n01440764/a.JPEG`, set `--image-root`
+to the directory containing `train/`, not to `train/` itself. An example CSV is:
+
+```csv
+Filepath,Label
+train/n01440764/a.JPEG,0
+train/n01443537/b.JPEG,1
+```
+
+JSON labels can be integers, arrays, objects, strings or explicit `null`:
+
+```json
+{"path":"images/a.jpg","sample_id":"sample-a","label":{"classes":[2,5]}}
+{"path":"images/b.jpg","sample_id":"sample-b","label":null}
+```
+
+All selected images must have exactly one annotation. Unknown paths, duplicate
+paths (including resolved aliases), missing records/labels and duplicate sample
+IDs are errors. A full-dataset index must be explicitly filtered to the store's
+subset before use. Explicit `null` means intentionally unlabelled; it does not
+permit missing rows. NaN, Infinity and non-finite numbers are rejected.
+
+Default `sample_id` is the relative POSIX path under `--image-root`. For sources
+outside that root or with no common root, provide unique nonempty `sample_id`
+values in JSONL/CSV. Absolute filesystem paths are not used as default identities.
+The table's row order never determines image IDs.
+
+The following directory is published by one rename after validation:
+
+```text
+STORE/annotations/
+  samples.jsonl
+  samples.meta.json
+  class_to_idx.json    # folder-label mode only
+```
+
+Each sample row is `{"image_id":0,"sample_id":"sample-a","label":3}`.
+Metadata schema `fastlens-samples-v1` records the image count, SHA-256 of the
+manifest, source path list, samples and optional class map, the annotation source
+kind, and the final sample-order hash. The order hash is SHA-256 over successive
+sample IDs, each encoded as its UTF-8 byte length (unsigned 64-bit big-endian)
+followed by its UTF-8 bytes. `shuffle: null` makes no claim about how an existing
+physical order was produced. `annotations inspect` checks these bindings,
+consecutive image IDs, unique sample IDs, and the native manifest's image count.
+It does not audit FLS payload integrity or verify the truth of externally supplied
+labels. Existing annotation directories, including symlinks, are never replaced.
+
+`annotations build --dry-run` validates all supplied annotations without writing.
+There is no UDF execution or import; a UDF interface is deferred. Adding annotations
+does not rewrite `conversion_report.json`: its sizes remain the original conversion
+measurements, while `fastlens inspect` reports current stored bytes.
+
+The same source options are available during conversion. Directory conversion
+defaults `--image-root` to its input directory; input-list conversion needs an
+explicit root or explicit table sample IDs when annotations/premixing are requested.
+
+```bash
+python -m fastlens convert /datasets/imagenet/train --output ./train_store \
+  --labels-from-folders --class-map ./imagenet_class_to_idx.json --shuffle-seed 42
+python -m fastlens convert ./images --output ./flat_store \
+  --labels-jsonl ./annotations.jsonl --shuffle-seed 42
+```
+
+`--shuffle-seed` is optional and accepts 0 through 2^64-1. It mixes entire
+`(source_path, sample_id, label)` records once, before partitioning; the resulting
+`source_paths.txt`, native writer/verifier and samples sidecar all share the same
+physical order. Premixing without labels produces explicit null labels. With
+neither labels nor premixing, conversion produces no annotation sidecar.
+
+Algorithm `fastlens-shuffle-v1` is a fixed Fisher–Yates permutation. For bounds
+N down to 2, candidates are the first eight bytes of
+`SHA256(b"fastlens-shuffle-v1\0" + uint64_be(seed) + uint64_be(counter))`, interpreted
+as unsigned big-endian integers. Counter starts at zero and advances on every
+draw. Reject candidates at least `floor(2^64 / bound) * bound`; otherwise swap
+positions `bound-1` and `candidate % bound`. The algorithm, seed and final order
+hash are recorded. Identical initial record order and seed reproduce the same
+permutation across Python versions; this does not promise byte-identical compressed
+files. Source discovery or membership changes can change the permutation.
+
+Conversion publishes annotations together with the verified dataset; annotation
+failure also prevents dataset publication. `--dry-run` validates the preparation
+plan without compression. Offline premixing does not replace epoch-time sampling.
+In particular, these sidecars **do not implement the PLS training mapping
+contract**: `TrainingPolicy.mapping` still requires its dedicated CSV with actual
+shard membership and PLS fields. General JSON task annotations are interpreted by
+the application, not the JPEG storage layer.
+
+The existing tiny classifier demo can use real integer labels for evaluation
+or training smoke checks (the input geometry must satisfy the chosen DCT profile):
+
+```bash
+python fastlens/examples/direct_dct_pipeline_demo.py ./train_store/manifest.bin \
+  --module-path ./build/fastlens/torch --annotations --num-classes 1000 \
+  --batch-size 32 --steps 3
+# Add --train-smoke to run CrossEntropy backward and optimizer steps.
+```
+
+This demonstrates label alignment with a freshly initialized tiny model; its
+loss is not a pretrained ImageNet accuracy result. In application code, validate
+the sidecar once, then gather labels by the physical IDs returned by the reader:
+
+```python
+from pathlib import Path
+import torch
+from fastlens.annotations import load_annotations
+
+samples, metadata = load_annotations(Path("train_store"))
+# For classification, first check integer labels against your model's class range.
+labels_by_id = torch.tensor([sample["label"] for sample in samples],
+                            dtype=torch.long, device="cuda")
+for batch in batches:  # Your DirectDctReader iterator; IDs may be nonsequential.
+    ids = torch.tensor(batch.sample_ids, dtype=torch.long, device="cuda")
+    targets = labels_by_id[ids]
+    loss = torch.nn.functional.cross_entropy(model(batch.y, batch.cbcr), targets)
 ```
 
 The converter suites do not require PyTorch. `FastLensConvertedStoreTorchPython`

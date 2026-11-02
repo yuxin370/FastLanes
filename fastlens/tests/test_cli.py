@@ -133,6 +133,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob(".*fastlens-staging-*")), [])
 
     @patch.object(cli, "find_tools", return_value={name: Path("/unused") / name for name in cli.TOOL_NAMES})
+    def test_shuffle_dry_run_and_annotation_errors_precede_compression(self, _):
+        self.inputs()
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(cli, "run_native") as native:
+            self.assertEqual(cli.convert(self.args("--shuffle-seed", "42", "--dry-run")), 0)
+            with self.assertRaisesRegex(ValueError, "shuffle seed"):
+                cli.convert(self.args("--shuffle-seed", "-1"))
+            labels = self.root / "labels.jsonl"
+            labels.write_text('{"path":"images/A.JPEG","label":null}\n')
+            with self.assertRaisesRegex(ValueError, "missing annotation"):
+                cli.convert(self.args("--labels-jsonl", str(labels)))
+        native.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    @patch.object(cli, "find_tools", return_value={name: Path("/unused") / name for name in cli.TOOL_NAMES})
     def test_each_failed_phase_cleans_staging_and_preserves_empty_output(self, _):
         self.inputs()
         self.output.mkdir()

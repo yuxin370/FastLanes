@@ -17,7 +17,8 @@ void usage(const char* program) {
 	std::cerr << "Usage: " << program
 	          << " MANIFEST --output-dir DIRECTORY [--output-json PATH] [--exhaustive-rank-validation] [--skip-validation]"
 	             " [--rank-checkpoint-images N] [--topology-checkpoint-coordinates N]\n"
-	          << "       " << program << " --inspect MANIFEST\n";
+	          << "       " << program << " --inspect MANIFEST\n"
+	          << "       " << program << " --inspect-manifest MANIFEST\n";
 }
 
 uint16_t parse_u16(const std::string_view name, const char* value) {
@@ -121,6 +122,12 @@ void inspect_dataset(const std::filesystem::path& path) {
 } // namespace
 
 int main(const int argc, char** argv) try {
+	if (argc == 3 && std::string_view(argv[1]) == "--inspect-manifest") {
+		const auto manifest = fastlens::jpeg::read_jpeg_dct_shard_manifest(argv[2]);
+		std::cout << "{\"image_count\":" << manifest.image_count << ",\"manifest_version\":" << manifest.version
+		          << ",\"shard_count\":" << manifest.shards.size() << "}\n";
+		return 0;
+	}
 	if (argc == 3 && std::string_view(argv[1]) == "--inspect") {
 		inspect_dataset(argv[2]);
 		return 0;

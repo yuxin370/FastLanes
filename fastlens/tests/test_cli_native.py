@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from fastlens import cli
+from fastlens import annotations, cli
 
 
 class NativeCliFixture(unittest.TestCase):
@@ -66,6 +66,31 @@ class NativeCliFixture(unittest.TestCase):
 
 
 class NativeCliTests(NativeCliFixture):
+    def test_add_annotations_without_source_jpegs_or_payload_access(self):
+        self.convert()
+        original = {path.relative_to(self.output): path.read_bytes() for path in self.output.rglob("*") if path.is_file()}
+        table = self.root / "labels.csv"
+        table.write_text("Filepath,Label\n" + "".join(f"{path.name},{997 + index}\n" for index, path in enumerate(self.paths)))
+        for path in self.paths:
+            path.unlink()
+        command = ["annotations", "build", str(self.output), "--image-root", str(self.source), "--labels-csv", str(table)]
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(cli, "run_native", side_effect=AssertionError("compression called")):
+            self.assertEqual(cli.main([*command, "--dry-run"]), 0)
+            self.assertFalse((self.output / "annotations").exists())
+            # The manifest-only native parser must work even without shard files.
+            generation = next(self.output.glob("generation_*"))
+            parked = self.root / "parked-generation"
+            generation.rename(parked)
+            try:
+                self.assertEqual(cli.main(command), 0)
+                self.assertEqual(cli.main(["annotations", "inspect", str(self.output), "--json"]), 0)
+            finally:
+                parked.rename(generation)
+        samples, _ = annotations.load_annotations(self.output)
+        self.assertEqual([sample["label"] for sample in samples], [997, 998, 999])
+        for relative, data in original.items():
+            self.assertEqual((self.output / relative).read_bytes(), data)
+
     def test_complete_conversion_inspection_relocation_and_order(self):
         external = self.root / "report.json"
         self.assertEqual(self.convert(extra=("--report", str(external))), 0)
@@ -109,11 +134,43 @@ class NativeCliTests(NativeCliFixture):
 
     def test_directory_conversion_order_and_none_verification(self):
         self.convert(directory=True, extra=("--verify", "none"))
+        self.assertFalse((self.output / "annotations").exists())
         self.assertEqual((self.output / "source_paths.txt").read_text().splitlines(), [str(path) for path in sorted(self.paths)])
         report = json.loads((self.output / cli.REPORT_NAME).read_text())
         self.assertEqual(report["verification"], "not_requested")
         self.assertEqual(report["wall_times"]["verification_seconds"], 0)
         self.assertEqual(self.verify().returncode, 0)
+
+    def test_premixing_keeps_annotations_and_coefficients_aligned_across_shards(self):
+        self.extend_inputs(17)
+        table = self.root / "annotations.jsonl"
+        rows = [{"path": str(path), "sample_id": f"original-{index}",
+                 "label": {"category": index, "caption": path.stem}}
+                for index, path in enumerate(self.paths)]
+        table.write_text("".join(json.dumps(row) + "\n" for row in reversed(rows)))
+        self.convert(extra=("--shuffle-seed", "42", "--labels-jsonl", str(table), "--partition-images", "8"))
+        samples, metadata = annotations.load_annotations(self.output)
+        ordered = (self.output / "source_paths.txt").read_text().splitlines()
+        self.assertNotEqual(ordered, [str(path) for path in self.paths])
+        self.assertEqual(len(ordered), 17)
+        for sample, path in zip(samples, ordered, strict=True):
+            source = rows[self.paths.index(Path(path))]
+            self.assertEqual(sample["sample_id"], source["sample_id"])
+            self.assertEqual(sample["label"], source["label"])
+        report = json.loads((self.output / cli.REPORT_NAME).read_text())
+        self.assertEqual(report["shard_count"], 3)
+        self.assertEqual(report["sample_order_sha256"], metadata["sample_order_sha256"])
+        self.assertEqual(metadata["shuffle"], {"algorithm": "fastlens-shuffle-v1", "seed": 42})
+        self.assertEqual(report["total_output_bytes"], cli.stored_bytes(self.output))
+        self.assertEqual(self.verify().returncode, 0)
+        self.assertNotEqual(self.verify(self.listing).returncode, 0)
+
+    def test_annotation_publication_failure_does_not_publish_conversion(self):
+        with patch.object(annotations, "publish_annotations", side_effect=ValueError("annotation failure")), \
+                self.assertRaisesRegex(ValueError, "annotation failure"):
+            self.convert(directory=True, extra=("--shuffle-seed", "42"))
+        self.assertFalse(self.output.exists())
+        self.assertEqual(list(self.root.glob(".*fastlens-staging-*")), [])
 
     def test_single_jpeg_and_dry_run(self):
         self.listing.write_text(str(self.paths[0]) + "\n")

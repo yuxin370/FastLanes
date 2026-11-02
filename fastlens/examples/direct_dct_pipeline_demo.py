@@ -25,6 +25,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from fastlens.profiles.rgbnomore import VALIDATION, VALIDATION_CENTER_CROP_512
+from fastlens.annotations import load_annotations
 from fastlens.torch import DirectDctMetrics, DirectDctReader
 
 
@@ -101,6 +102,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--num-classes", type=int, default=200)
     parser.add_argument("--train-smoke", action="store_true")
+    parser.add_argument("--annotations", action="store_true", help="use validated STORE/annotations integer labels")
     parser.add_argument("--output-json", type=Path)
     return parser.parse_args()
 
@@ -118,6 +120,15 @@ def main() -> None:
 
     profile = PROFILES[args.profile]
     reader = DirectDctReader(args.manifest, module_path=args.module_path)
+    labels_by_id = None
+    if args.annotations:
+        samples, _ = load_annotations(args.manifest.parent)
+        if len(samples) != reader.image_count:
+            raise ValueError("annotation count disagrees with reader")
+        labels = [sample["label"] for sample in samples]
+        if any(type(label) is not int or not 0 <= label < args.num_classes for label in labels):
+            raise ValueError("classification requires integer labels in [0, num_classes); null/JSON targets need a task adapter")
+        labels_by_id = torch.tensor(labels, dtype=torch.long, device="cuda")
     schedule = _batch_schedule(
         reader.image_count, args.batch_size, args.warmup + args.steps
     )
@@ -127,7 +138,9 @@ def main() -> None:
     model.train(args.train_smoke)
 
     def run_model_step(batch: Any) -> torch.Tensor:
-        labels = torch.arange(len(batch.sample_ids), device="cuda") % args.num_classes
+        labels = (labels_by_id[torch.tensor(batch.sample_ids, dtype=torch.long, device="cuda")]
+                  if labels_by_id is not None else
+                  torch.arange(len(batch.sample_ids), device="cuda") % args.num_classes)
         if optimizer is None:
             with torch.no_grad():
                 logits = model(batch.y, batch.cbcr)
@@ -173,6 +186,7 @@ def main() -> None:
             "all" if args.coefficients is None else list(args.coefficients)
         ),
         "train_smoke": bool(args.train_smoke),
+        "annotations": bool(args.annotations),
         "images": measured_images,
         "steps": args.steps,
         "seconds": elapsed,

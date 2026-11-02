@@ -91,6 +91,7 @@ if (FASTLENS_INSTALL_TORCH_PACKAGE)
 		RUNTIME DESTINATION fastlens/torch)
 	install(FILES
 		${CMAKE_CURRENT_SOURCE_DIR}/../__init__.py
+		${CMAKE_CURRENT_SOURCE_DIR}/../annotations.py
 		DESTINATION fastlens)
 	install(FILES
 		${CMAKE_CURRENT_SOURCE_DIR}/__init__.py

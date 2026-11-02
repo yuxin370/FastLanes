@@ -2,12 +2,16 @@
 
 import contextlib
 import io
+import json
+import math
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
-from fastlens import cli
+from fastlens import annotations, cli
 from fastlens.profiles.rgbnomore import VALIDATION, VALIDATION_CENTER_CROP_512
 from fastlens.torch import DirectDctPipeline, DirectDctReader
 
@@ -58,12 +62,18 @@ class ConvertedStoreTests(unittest.TestCase):
             reference_cbcr = torch.stack(reference_cbcr)
             listing = root / "ordered.txt"
             listing.write_text("\n".join(str(path) for path in paths) + "\n")
+            labels = root / "labels.csv"
+            labels.write_text("Filepath,Label\n" + "".join(f"{path.name},{index}\n" for index, path in enumerate(paths)))
             output = root / "store"
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main([
                     "convert", "--input-list", str(listing), "--output", str(output),
                     "--partition-images", "2", "--workers", "2",
+                    "--image-root", str(source), "--labels-csv", str(labels), "--shuffle-seed", "42",
                 ]), 0)
+            samples, _ = annotations.load_annotations(output)
+            physical_to_source = [paths.index(Path(path)) for path in (output / "source_paths.txt").read_text().splitlines()]
+            self.assertNotEqual(physical_to_source, [0, 1, 2])
 
             reader = DirectDctReader(output / "manifest.bin", native_module=native)
 
@@ -71,8 +81,10 @@ class ConvertedStoreTests(unittest.TestCase):
                 self.assertEqual(list(batch.sample_ids), expected_ids)
                 self.assertTrue(batch.y.is_cuda)
                 self.assertTrue(batch.cbcr.is_cuda)
-                torch.testing.assert_close(batch.y.cpu(), reference_y[expected_ids], rtol=0, atol=1e-6)
-                torch.testing.assert_close(batch.cbcr.cpu(), reference_cbcr[expected_ids], rtol=0, atol=1e-6)
+                source_ids = [physical_to_source[index] for index in expected_ids]
+                torch.testing.assert_close(batch.y.cpu(), reference_y[source_ids], rtol=0, atol=1e-6)
+                torch.testing.assert_close(batch.cbcr.cpu(), reference_cbcr[source_ids], rtol=0, atol=1e-6)
+                self.assertEqual([samples[index]["label"] for index in batch.sample_ids], source_ids)
 
             # Center-crop requires complete shards in canonical order; the
             # general validation profile accepts arbitrary image IDs.
@@ -90,6 +102,21 @@ class ConvertedStoreTests(unittest.TestCase):
                 for expected, batch in zip(schedule, pipeline.start(schedule), strict=True):
                     check_batch(batch, expected)
             torch.cuda.synchronize()
+            # Exercise the documented classification example with real targets,
+            # both no-grad evaluation and a CrossEntropy backward/optimizer step.
+            for training in (False, True):
+                result = subprocess.run([
+                    sys.executable, "-B", str(cli.REPO_ROOT / "fastlens/examples/direct_dct_pipeline_demo.py"),
+                    str(output / "manifest.bin"), "--module-path", str(Path(native.__file__).parent),
+                    "--annotations", "--num-classes", "3", "--batch-size", "2", "--steps", "2", "--warmup", "0",
+                    *(["--train-smoke"] if training else []),
+                ], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads(next(line.removeprefix("RESULT_JSON ") for line in result.stdout.splitlines()
+                                         if line.startswith("RESULT_JSON ")))
+                self.assertTrue(report["annotations"])
+                self.assertEqual(report["train_smoke"], training)
+                self.assertTrue(math.isfinite(report["final_loss"]))
 
 
 if __name__ == "__main__":
