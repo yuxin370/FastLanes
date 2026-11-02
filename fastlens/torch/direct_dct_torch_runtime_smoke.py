@@ -67,6 +67,10 @@ def main() -> int:
     with torch.cuda.stream(consumer_stream):
         first = next(pipeline)
         first_y, first_cbcr = _validate_batch(first, len(image_ids))
+        # Warm the exact consumer operations on this stream. Cold CUDA kernel
+        # loading can wait for queued work and consume the delay below before
+        # we reach the lifetime check. Keep the result as a value reference.
+        expected_features = first_y.square().mean() + first_cbcr.square().mean()
     consumer_stream.synchronize()
     metrics = pipeline.metrics
     if not metrics.complete:
@@ -97,6 +101,7 @@ def main() -> int:
         raise RuntimeError("Direct-DCT owners were not reclaimable after the consumer stream completed")
     if not bool(torch.isfinite(first_features).item()):
         raise RuntimeError("non-default-stream Direct-DCT consumer produced a non-finite value")
+    torch.testing.assert_close(first_features, expected_features, rtol=0, atol=0)
     if metrics.physical_bytes <= 0 or metrics.logical_bytes <= 0:
         raise RuntimeError("Direct-DCT pipeline reported empty storage metrics")
     pipeline.close()
