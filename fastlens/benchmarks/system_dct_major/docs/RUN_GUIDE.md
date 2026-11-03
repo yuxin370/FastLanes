@@ -6,6 +6,15 @@ Torch extension, paired checkpoints and a canonical validation sample order.
 The [reference rebuilding guide](../../paper/REBUILDING_REFERENCES.md) describes
 public-source data and checkpoint preparation.
 
+The `dataset/prepare.py` utility produces **native experimental datasets**, for
+both `dct-major` and `image-major` comparisons. It retains generation paths and
+explicit encoding parameters; its output is not a published standard Store.
+Use the [Converter](../../../docs/CONVERSION.md) for a standard block-major Store.
+The source512 paper producer `dct_models/prepare_online_source.py` also finalizes
+the standard core and its order binding while retaining the experiment's
+explicit rowgroup settings and auxiliary sample/profile files. The manifest-based
+Reader supports native inputs; opening them does not certify the Store contract.
+
 ## Build and prepare access metadata
 
 ```bash

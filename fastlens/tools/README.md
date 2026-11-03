@@ -1,9 +1,9 @@
 # FASTLENS CLI Quick Usage
 
 For the standalone JPEG dataset commands (`python -m fastlens convert`,
-`inspect`, and `annotations build/inspect`), see the root README:
-[converter usage and output files](../../README.md#prepare-a-small-image-dataset)
-and [annotation formats and premixing](../../README.md#task-annotations-and-offline-premixing).
+`inspect`, and `annotations build/inspect`), see
+[conversion](../docs/CONVERSION.md), [Store format](../docs/STORE_FORMAT.md)
+and [annotation formats and premixing](../docs/ANNOTATIONS.md).
 The commands below document the lower-level native tools.
 
 Replace the placeholders below:

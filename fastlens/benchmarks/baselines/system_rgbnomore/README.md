@@ -67,3 +67,40 @@ python -m unittest -v \
   fastlens.benchmarks.baselines.system_rgbnomore.tests.test_system_benchmark \
   fastlens.benchmarks.baselines.system_rgbnomore.tests.test_training_benchmark
 ```
+
+## ImageNet labels and conversion
+
+RGB-no-more indexes use checkpoint-specific class numbering: `n01440764` maps
+to 448 and `n02119789` to 0; alphabetical folder numbering is different.
+Use the class IDs expected by the checkpoint.
+
+For RGB-no-more entries beginning with `val/` or `train/`, set `--image-root`
+to the directory containing those split directories. For example, these two
+rows illustrate the validation index's path and label convention:
+
+```csv
+Filepath,Label
+val/n01440764/ILSVRC2012_val_00000293.JPEG,448
+val/n02119789/ILSVRC2012_val_00032528.JPEG,0
+```
+
+The paper's prepared validation dataset and complete CSV can be used as follows
+when those external inputs are available locally. The output must be new or empty:
+
+```bash
+PAPER_ROOT="$PWD/fastlens/data/system_rgbnomore/e2e_v3/imagenet_512"
+VAL_CSV="$PWD/fastlens/data/system_rgbnomore/e2e_v2/indexbase_val.csv"
+python -m fastlens convert "$PAPER_ROOT/val" \
+  --image-root "$PAPER_ROOT" --labels-csv "$VAL_CSV" \
+  --output ./imagenet512_val_store --shuffle-seed 42 --verify full
+```
+
+Although the JPEGs are under `e2e_v3` and the CSV is under `e2e_v2`, CSV paths
+in this command resolve against `PAPER_ROOT`. The CSV is an annotation input,
+not a second image source. Its filename is arbitrary; `indexbase_val.csv` is
+the name used by the RGB-no-more reference inputs.
+
+For general folder, CSV and JSONL contracts, see
+[Annotations](../../../docs/ANNOTATIONS.md). The example above uses optional
+offline shuffle; retain the experiment's canonical order when reproducing its
+reference predictions.

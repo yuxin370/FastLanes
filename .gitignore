@@ -26,8 +26,13 @@ build*/
 data/fls/
 data/dct_blocks/
 
-# Publish the final PDF and plotting sources; keep local manuscript drafts private.
+# Publish user guides, the final PDF and plotting sources; keep manuscript drafts private.
 fastlens/docs/*
+!fastlens/docs/CONVERSION.md
+!fastlens/docs/STORE_FORMAT.md
+!fastlens/docs/ANNOTATIONS.md
+!fastlens/docs/DIRECT_DCT.md
+!fastlens/docs/DEVELOPMENT.md
 !fastlens/docs/paper/
 fastlens/docs/paper/*
 !fastlens/docs/paper/scripts/

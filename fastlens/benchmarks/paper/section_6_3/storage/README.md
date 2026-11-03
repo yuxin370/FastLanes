@@ -8,6 +8,20 @@ these representations, not every Table 3 row. IC/FS sizes are recorded by
 train/val conversion artifacts remain required to remeasure the complete table.
 Override `--ffcv-beton` for the measured FFCV file.
 
+Block-major inputs must be complete [standard Stores](../../../../docs/STORE_FORMAT.md).
+The runner checks the layout, geometry descriptors and source-order binding before
+recording results; missing geometry is an error, not zero index bytes. Reprepare
+nonstandard inputs with the Converter or the source512 paper preparation command.
+Native Compact-v3 controls remain separate experimental representations.
+
+For prepared block-major inputs, `core_storage_bytes` matches `fastlens inspect`:
+manifest, referenced coefficients and image metadata, required geometry binaries,
+and `geometry/source_order.sha256`. `representation_bytes` additionally counts the
+experiment's labels, samples, profile and PLS mapping as applicable. Conversion
+logs, arbitrary files and runtime schedule caches are excluded from the core.
+The runner preserves historical timing records verbatim; it does not reinterpret
+them as timings of a new conversion or rewrite published measurements.
+
 ```bash
 python -m fastlens.benchmarks.paper.section_6_3.storage.run --help
 python -m fastlens.benchmarks.paper.section_6_3.storage.run run --dry-run
