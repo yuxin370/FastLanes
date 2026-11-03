@@ -580,6 +580,10 @@ class _DirectDctBatchIterator(Iterator[DirectDctBatch]):
 class DirectDctReader:
     """Read model-ready Direct-DCT batches from a FASTLENS manifest.
 
+    This manifest API also supports native experimental datasets. Use
+    ``python -m fastlens inspect STORE`` to validate the published Store layout;
+    successfully opening a native manifest is not Store-format certification.
+
     A profile defines stable processing semantics and the output contract;
     explicit input selections such as ``coefficients`` complete the request.
     Native scheduling, allocator, I/O, cache, and launch settings are

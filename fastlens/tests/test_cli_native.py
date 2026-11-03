@@ -262,6 +262,71 @@ class NativeCliTests(NativeCliFixture):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["annotations", "inspect", str(self.output)]), 0)
 
+    def test_inspect_requires_valid_order_binding_and_matching_sources(self):
+        self.convert()
+        digest = self.output / annotations.SOURCE_ORDER
+        original = digest.read_bytes()
+        for value in (None, b"", b"g" * 64, b"0" * 63):
+            with self.subTest(value=value):
+                if value is None:
+                    digest.unlink()
+                else:
+                    digest.write_bytes(value)
+                with self.assertRaises((OSError, ValueError)):
+                    cli.inspect_standard_store(self.output, self.tools[cli.TOOL_NAMES[1]])
+                digest.write_bytes(original)
+        sources = self.output / "conversion/sources.txt"
+        sources.write_text("".join(f"{path}\n" for path in reversed(self.paths)))
+        with self.assertRaisesRegex(cli.ConversionError, "physical source order"):
+            cli.inspect_standard_store(self.output, self.tools[cli.TOOL_NAMES[1]])
+
+    def test_paper_and_cli_core_sizes_exclude_auxiliary_files_and_require_geometry(self):
+        from fastlens.benchmarks.paper.section_6_3.storage.storage import standard_store_indexes, measured_files
+
+        self.convert()
+        tool = self.tools[cli.TOOL_NAMES[1]]
+        before = cli.inspect_standard_store(self.output, tool)
+        for member in ("geometry/build.json", "geometry/cache.bin", "partitions/notes.txt"):
+            (self.output / member).write_text("auxiliary data")
+        indexes, core_bytes = standard_store_indexes(self.output / "manifest.bin")
+        self.assertEqual(core_bytes, before["core_storage_bytes"])
+        self.assertIn(self.output / annotations.SOURCE_ORDER, indexes)
+        measured_core = sum(row["logical_bytes"] for row in measured_files(indexes)) + sum(
+            before[key] for key in ("manifest_bytes", "coefficient_bytes", "metadata_bytes"))
+        self.assertEqual(core_bytes, measured_core)
+        self.assertGreater(cli.stored_bytes(self.output), core_bytes)
+        for member in ("geometry/index.bin", "geometry/000000.bin", annotations.SOURCE_ORDER):
+            path = self.output / member
+            data = path.read_bytes()
+            path.unlink()
+            with self.subTest(member=member), self.assertRaises((cli.ConversionError, OSError)):
+                standard_store_indexes(self.output / "manifest.bin")
+            path.write_bytes(data)
+
+    def test_standard_store_contract_is_separate_from_native_manifest_reading(self):
+        self.convert()
+        manifest = self.output / "manifest.bin"
+        original = manifest.read_bytes()
+        # The generic native reader still supports safe, nonstandard member paths.
+        (self.output / "partitions").rename(self.output / "native-set")
+        manifest.write_bytes(original.replace(b"partitions/", b"native-set/"))
+        self.assertEqual(self.verify().returncode, 0)
+        with self.assertRaisesRegex(cli.ConversionError, "nonstandard Store"):
+            cli.native_inspect(self.output, self.tools[cli.TOOL_NAMES[1]])
+        (self.output / "native-set").rename(self.output / "partitions")
+        # Check ranges through manifest-only inspection, before index bindings.
+        for fmt, offset, value in (("I", 34, 1), ("Q", 38, 1), ("I", 46, 0),
+                                   ("I", 46, 4), ("Q", 22, 4)):
+            changed = bytearray(original)
+            struct.pack_into("<" + fmt, changed, offset, value)
+            manifest.write_bytes(changed)
+            result = subprocess.run([str(self.tools[cli.TOOL_NAMES[1]]), "--inspect-manifest", str(manifest)],
+                                    capture_output=True, text=True)
+            with self.subTest(offset=offset, value=value):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Store", result.stderr)
+        manifest.write_bytes(original)
+
     def test_annotations_cannot_be_copied_between_different_physical_orders(self):
         # Equal JPEG payloads deliberately make the native manifests identical;
         # the samples still have distinct identities and externally supplied labels.

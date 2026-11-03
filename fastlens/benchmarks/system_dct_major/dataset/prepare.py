@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare a reconstructable FASTLENS shard set with an explicit physical layout."""
+"""Prepare native comparison data, not a published FastLens Store.
+
+Both layouts retain native generation paths and experimental encoding options.
+Use python -m fastlens convert for the standard block-major Store.
+"""
 
 from __future__ import annotations
 
@@ -71,7 +75,8 @@ def main() -> None:
     if not args.dry_run:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(command, check=True, cwd=REPO_ROOT)
-    print(json.dumps({"layout": args.layout, "output_dir": str(args.output_dir.resolve()), "dry_run": args.dry_run}, sort_keys=True))
+    print(json.dumps({"artifact_kind": "native-experiment", "layout": args.layout,
+                      "output_dir": str(args.output_dir.resolve()), "dry_run": args.dry_run}, sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PIL import Image, JpegImagePlugin
 
+from fastlens import annotations, cli
 import fastlens.benchmarks.dct_models.backend as B
 from fastlens.benchmarks.dct_models.evaluate import samples
 from fastlens.benchmarks.dct_models.online_crop import SOURCE_PROFILE
@@ -62,6 +63,8 @@ def main():
     run("access_index", [B.REPO / "build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool",
                          root / "manifest.bin", "--output-dir", root / "geometry",
                          "--output-json", root / "geometry/build.json"])
+    (root / annotations.SOURCE_ORDER).write_text(annotations.file_sha256(paths) + "\n", encoding="ascii")
+    cli.inspect_standard_store(root, B.REPO / "build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool")
     # Publish only after exact coefficient verification and index construction.
     (root / "profile.json").write_text(json.dumps(SOURCE_PROFILE, indent=2))
     result = dict(samples=50000, offline_work="JPEG entropy decode, lossless columnar compression, access index",

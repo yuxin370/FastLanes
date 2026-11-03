@@ -118,7 +118,7 @@ class AnnotationTests(unittest.TestCase):
     def test_binding_detects_wrong_store_order_samples_and_class_map(self):
         self.publish()
         for relative, message in (("manifest.bin", "manifest"),
-                                  (ann.SOURCE_ORDER, "physical source order"),
+                                  (ann.SOURCE_ORDER, "invalid SHA-256"),
                                   ("annotations/samples.jsonl", "samples"),
                                   ("annotations/class_to_idx.json", "class mapping")):
             path = self.store / relative

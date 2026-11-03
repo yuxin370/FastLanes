@@ -60,6 +60,15 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_source_order(store: Path) -> str:
+    """Read the runtime order binding without requiring conversion records."""
+    path = store / SOURCE_ORDER
+    value = path.read_text(encoding="ascii").rstrip("\n")
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"invalid SHA-256 in {path}")
+    return value
+
+
 def order_sha256(sample_ids) -> str:
     """Hash successive uint64 big-endian UTF-8 byte lengths and sample-ID bytes."""
     digest = hashlib.sha256()
@@ -81,7 +90,7 @@ def physical_paths(store: Path, image_count: int) -> list[Path]:
     source = store / "conversion/sources.txt"
     if not source.is_file():
         raise ValueError("missing conversion/sources.txt; building annotations requires the original physical-order source list")
-    if file_sha256(source) != (store / SOURCE_ORDER).read_text(encoding="ascii").strip():
+    if file_sha256(source) != read_source_order(store):
         raise ValueError("conversion/sources.txt disagrees with the store's physical source order")
     with source.open(encoding="utf-8") as stream:
         lines = [line.rstrip("\r\n") for line in stream]
@@ -206,7 +215,7 @@ def publish_annotations(store: Path, records: list[InputRecord], classes: dict |
         metadata = {
             "schema_version": SCHEMA, "image_count": len(records),
             "manifest_sha256": file_sha256(store / "manifest.bin"),
-            "source_order_sha256": (store / SOURCE_ORDER).read_text(encoding="ascii").strip(),
+            "source_order_sha256": read_source_order(store),
             "samples_sha256": file_sha256(stage / "samples.jsonl"),
             "sample_order_sha256": order_sha256(record.sample_id for record in records),
             "shuffle": shuffle, "label_source": label_source,
@@ -238,7 +247,7 @@ def load_annotations(store: Path, *, directory: Path | None = None) -> tuple[lis
     count = metadata.get("image_count")
     if type(count) is not int or count <= 0:
         raise ValueError("invalid annotation image_count")
-    if metadata.get("source_order_sha256") != (store / SOURCE_ORDER).read_text(encoding="ascii").strip():
+    if metadata.get("source_order_sha256") != read_source_order(store):
         raise ValueError("annotation physical source order SHA-256 mismatch")
     for name, path in (("manifest", store / "manifest.bin"), ("samples", directory / "samples.jsonl")):
         if file_sha256(path) != metadata.get(name + "_sha256"):

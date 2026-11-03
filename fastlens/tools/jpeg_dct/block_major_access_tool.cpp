@@ -29,6 +29,31 @@ std::string partition_name(const uint32_t id, const char* suffix) {
 	return name.str();
 }
 
+// This is the published Store contract, not a restriction on the native
+// manifest parser used by writers, finalization and experimental layouts.
+void validate_store_manifest(const fastlens::jpeg::JpegDctShardManifest& manifest) {
+	if (manifest.version != 1U || manifest.shards.empty()) {
+		throw std::runtime_error("standard Store requires a nonempty manifest-v1 dataset; prepare it with fastlens convert");
+	}
+	uint64_t next_image = 0U;
+	for (size_t i = 0; i < manifest.shards.size(); ++i) {
+		const auto& shard = manifest.shards[i];
+		if (shard.shard_id != i ||
+		    shard.fls_file_name != "partitions/" + partition_name(shard.shard_id, ".fls") ||
+		    shard.metadata_file_name != "partitions/" + partition_name(shard.shard_id, ".images.bin")) {
+			throw std::runtime_error("nonstandard Store partition paths or IDs; prepare it with fastlens convert");
+		}
+		if (shard.image_count == 0U || shard.first_global_image_index != next_image ||
+		    next_image > manifest.image_count || shard.image_count > manifest.image_count - next_image) {
+			throw std::runtime_error("invalid Store partition image ID range");
+		}
+		next_image += shard.image_count;
+	}
+	if (next_image != manifest.image_count) {
+		throw std::runtime_error("Store partition image counts disagree with manifest");
+	}
+}
+
 // The Converter owns this unpublished directory and removes it on failure.
 // Keep native generation transactions intact; only finalize their completed
 // output here, before any geometry index or annotation binds the manifest.
@@ -94,6 +119,7 @@ void json_string(std::ostream& output, const std::string& value) {
 void inspect_dataset(const std::filesystem::path& path) {
 	using namespace fastlens::jpeg;
 	const auto manifest   = read_jpeg_dct_shard_manifest(path);
+	validate_store_manifest(manifest);
 	const auto root       = path.parent_path();
 	const auto directory  = root / "geometry";
 	const auto index_path = directory / "index.bin";
@@ -166,6 +192,7 @@ int main(const int argc, char** argv) try {
 	}
 	if (argc == 3 && std::string_view(argv[1]) == "--inspect-manifest") {
 		const auto manifest = fastlens::jpeg::read_jpeg_dct_shard_manifest(argv[2]);
+		validate_store_manifest(manifest);
 		std::cout << "{\"image_count\":" << manifest.image_count << ",\"manifest_version\":" << manifest.version
 		          << ",\"shard_count\":" << manifest.shards.size() << "}\n";
 		return 0;

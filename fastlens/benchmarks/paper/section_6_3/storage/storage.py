@@ -11,6 +11,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(ROOT))
 from fastlens.benchmarks.system_dct_major.common import parse_manifest
+from fastlens import annotations, cli
 
 
 def measured_files(paths):
@@ -19,6 +20,16 @@ def measured_files(paths):
         stat = path.stat()
         records.append(dict(path=str(path), logical_bytes=stat.st_size, allocated_bytes=stat.st_blocks * 512))
     return records
+
+
+def standard_store_indexes(manifest_path):
+    """Fail on incomplete/nonstandard Stores before recording storage costs."""
+    tool = cli.find_tools(None, (cli.TOOL_NAMES[1],))[cli.TOOL_NAMES[1]]
+    info = cli.inspect_standard_store(manifest_path.parent, tool)
+    geometry = manifest_path.parent / "geometry"
+    return ([geometry / "index.bin", manifest_path.parent / annotations.SOURCE_ORDER,
+             *[geometry / f"{index:06d}.bin" for index in range(info["shard_count"])]],
+            info["core_storage_bytes"])
 
 
 def main():
@@ -58,18 +69,18 @@ def main():
                      if (path.parent / name).is_file()]
         add(name, "imagenet512", split, payload, metadata, sample_count=manifest["image_count"])
         if name == "imagelanes_source":
+            indexes, core_storage_bytes = standard_store_indexes(path)
             if split == "val":
-                indexes = list((path.parent / "geometry").glob("*.bin"))
                 indexes += [compressed / "imagenet512_val_compact_v3/labels.json"]
                 conversion_path = path.parent / "generation.json"
             else:
-                indexes = list((path.parent / "geometry").glob("*.bin"))
                 indexes += [path.parent.parent / "ordered_mapping.csv"]
                 conversion_path = path.parent.parent / "materialization_result.json"
             conversion = json.loads(conversion_path.read_text())
             # Historical evidence is kept verbatim, not silently treated as a new timed run.
             add("imagelanes_prepared", "imagenet512", split, payload, metadata, indexes,
-                sample_count=manifest["image_count"], conversion_raw=str(conversion_path),
+                sample_count=manifest["image_count"], core_storage_bytes=core_storage_bytes,
+                conversion_raw=str(conversion_path),
                 conversion_log=conversion, conversion_scope="historical executed preparation; timing conditions differ from current evaluation" +
                 ("; train access-index construction duration MISSING (conversion_s covers compression only)" if split == "train" else ""))
     beton = args.ffcv_beton
@@ -101,6 +112,7 @@ def main():
         rows.append(dict(timestamp=timestamp, git_commit=commit, representation=representation["name"],
             dataset_view=representation["view"], split=representation["split"], samples=representation["sample_count"],
             payload_bytes=payload, metadata_bytes=metadata, index_bytes=indexes, padding_bytes=padding, representation_bytes=total,
+            core_storage_bytes=representation.get("core_storage_bytes"),
             allocated_bytes=sum(f["allocated_bytes"] for k in ("payload", "metadata", "indexes") for f in representation[k]),
             jpeg_bytes=jpeg[representation["view"], representation["split"]],
             storage_amplification=total / jpeg[representation["view"], representation["split"]],

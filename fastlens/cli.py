@@ -212,6 +212,20 @@ def native_inspect(store: Path, tool: Path) -> dict:
     return json.loads(result.stdout)
 
 
+def inspect_standard_store(store: Path, tool: Path) -> dict:
+    """Validate the published layout and count only required runtime files."""
+    info = native_inspect(store, tool)
+    info["source_order_sha256"] = annotations.read_source_order(store)
+    sources = store / "conversion/sources.txt"
+    if sources.exists() and annotations.file_sha256(sources) != info["source_order_sha256"]:
+        raise ConversionError("conversion/sources.txt disagrees with the store's physical source order")
+    info["source_order_bytes"] = (store / annotations.SOURCE_ORDER).stat().st_size
+    info["core_storage_bytes"] = sum(info[key] for key in (
+        "manifest_bytes", "coefficient_bytes", "metadata_bytes", "index_bytes", "source_order_bytes",
+    ))
+    return info
+
+
 def annotation_source(args: argparse.Namespace) -> str | None:
     return "folders" if args.labels_from_folders else "jsonl" if args.labels_jsonl else "csv" if args.labels_csv else None
 
@@ -416,9 +430,8 @@ def convert(args: argparse.Namespace) -> int:
 
 def inspect_store(args: argparse.Namespace) -> int:
     tools = find_tools(args.build_dir, (TOOL_NAMES[1],))
-    info = native_inspect(args.store, tools[TOOL_NAMES[1]])
+    info = inspect_standard_store(args.store, tools[TOOL_NAMES[1]])
     info["total_stored_bytes"] = stored_bytes(args.store)
-    info["core_storage_bytes"] = info["manifest_bytes"] + stored_bytes(args.store / "partitions") + stored_bytes(args.store / "geometry")
     info["annotation_bytes"] = stored_bytes(args.store / annotations.DIRECTORY)
     info["conversion_record_bytes"] = stored_bytes(args.store / "conversion")
     report_path = args.store / REPORT_NAME
