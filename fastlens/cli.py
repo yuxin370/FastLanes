@@ -60,7 +60,7 @@ def make_parser() -> argparse.ArgumentParser:
     annotation_options(convert, required=False)
     convert.add_argument("--output", type=Path, required=True, help="new or empty destination directory")
     convert.add_argument("--layout", choices=["block-major"], default="block-major")
-    convert.add_argument("--partition-images", type=positive_int, default=1024, help="maximum images per segment (default: 1024)")
+    convert.add_argument("--partition-images", type=positive_int, default=1024, help="maximum images per partition (default: 1024)")
     convert.add_argument("--preset", choices=["balanced", "throughput", "crop-latency"], default="balanced")
     convert.add_argument("--workers", type=worker_count, default="auto", help="CPU budget for defaults: auto or 1..256")
     for option, description in (
@@ -408,7 +408,7 @@ def convert(args: argparse.Namespace) -> int:
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    print(f"Published {output}: {len(inputs)} images, {report['shard_count']} segments, "
+    print(f"Published {output}: {len(inputs)} images, {report['shard_count']} partitions, "
           f"{report['total_output_bytes']:,} bytes, source/output={report['source_to_output_ratio']:.3f}, "
           f"verification={report['verification']}, {times['total_seconds']:.2f}s.")
     return 0
@@ -418,7 +418,7 @@ def inspect_store(args: argparse.Namespace) -> int:
     tools = find_tools(args.build_dir, (TOOL_NAMES[1],))
     info = native_inspect(args.store, tools[TOOL_NAMES[1]])
     info["total_stored_bytes"] = stored_bytes(args.store)
-    info["core_storage_bytes"] = info["manifest_bytes"] + stored_bytes(args.store / "segments") + stored_bytes(args.store / "geometry")
+    info["core_storage_bytes"] = info["manifest_bytes"] + stored_bytes(args.store / "partitions") + stored_bytes(args.store / "geometry")
     info["annotation_bytes"] = stored_bytes(args.store / annotations.DIRECTORY)
     info["conversion_record_bytes"] = stored_bytes(args.store / "conversion")
     report_path = args.store / REPORT_NAME
@@ -436,7 +436,7 @@ def inspect_store(args: argparse.Namespace) -> int:
         print(json.dumps(info, indent=2, sort_keys=True))
     else:
         print(f"Manifest v{info['manifest_version']}; layout={info['physical_layout']}")
-        print(f"Images: {info['image_count']}; segments: {info['shard_count']}")
+        print(f"Images: {info['image_count']}; partitions: {info['shard_count']}")
         print(f"Coefficients: {info['coefficient_file_count']} files, {info['coefficient_bytes']:,} bytes; "
               f"metadata: {info['metadata_file_count']} files, {info['metadata_bytes']:,} bytes")
         print(f"Geometry index: {'compatible v1' if info['index']['compatible'] else 'absent'}; "

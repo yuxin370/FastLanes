@@ -23,7 +23,7 @@ void usage(const char* program) {
 	    << "       " << program << " --finalize-store MANIFEST  (unpublished Converter staging only)\n";
 }
 
-std::string segment_name(const uint32_t id, const char* suffix) {
+std::string partition_name(const uint32_t id, const char* suffix) {
 	std::ostringstream name;
 	name << std::setw(6) << std::setfill('0') << id << suffix;
 	return name.str();
@@ -49,12 +49,12 @@ void finalize_store(const std::filesystem::path& path) {
 			throw std::runtime_error("store finalization requires one complete native generation");
 		}
 	}
-	if (!std::filesystem::create_directory(root / "segments")) {
-		throw std::runtime_error("refusing to replace existing segments directory");
+	if (!std::filesystem::create_directory(root / "partitions")) {
+		throw std::runtime_error("refusing to replace existing partitions directory");
 	}
 	for (auto& shard : manifest.shards) {
-		const auto fls      = std::filesystem::path("segments") / segment_name(shard.shard_id, ".fls");
-		const auto metadata = std::filesystem::path("segments") / segment_name(shard.shard_id, ".images.bin");
+		const auto fls      = std::filesystem::path("partitions") / partition_name(shard.shard_id, ".fls");
+		const auto metadata = std::filesystem::path("partitions") / partition_name(shard.shard_id, ".images.bin");
 		std::filesystem::rename(root / shard.fls_file_name, root / fls);
 		std::filesystem::rename(root / shard.metadata_file_name, root / metadata);
 		shard.fls_file_name      = fls.generic_string();
@@ -126,7 +126,7 @@ void inspect_dataset(const std::filesystem::path& path) {
 				}
 			}
 		}
-		const auto filename   = segment_name(shard.shard_id, ".bin");
+		const auto filename   = partition_name(shard.shard_id, ".bin");
 		auto       descriptor = JpegDctBlockMajorAccessDescriptor::Open(directory / filename);
 		if (descriptor.descriptor_bytes() != index.shards[i].descriptor_bytes ||
 		    descriptor.descriptor_crc64() != index.shards[i].descriptor_crc64) {

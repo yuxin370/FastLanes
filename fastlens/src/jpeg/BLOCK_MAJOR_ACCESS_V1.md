@@ -11,7 +11,7 @@ them does not invalidate an index; small datasets often have larger relative
 sidecar overhead.
 
 The dataset builder publishes one
-`NNNNNN.bin` per segment plus
+`NNNNNN.bin` per partition plus
 `index.bin` in a separate output directory. Published Converter stores require the index and every descriptor. Missing or
 incompatible files are errors; the standard store path never falls back to a
 planner without geometry indexes. Binary descriptor version 1 is unchanged.

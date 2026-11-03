@@ -177,7 +177,7 @@ source comparison; index construction and compatibility checks still run.
 ```text
 example-fastlens/
   manifest.bin
-  segments/
+  partitions/
     000000.fls
     000000.images.bin
     ...
@@ -197,24 +197,25 @@ example-fastlens/
 
 | File or directory | Contents and purpose |
 | --- | --- |
-| `manifest.bin` | Dataset entry point: global image intervals and relative coefficient/metadata paths for each segment. Native binary format remains manifest v1. |
-| `segments/000000.fls` | FastLanes-compressed quantized DCT coefficients for segment 0. These files are not JPEGs or model tensors. |
-| `segments/000000.images.bin` | Complete JPEG-DCT metadata for segment 0: image/component geometry, sampling, quantization tables, encoding profiles and block-group bookkeeping. The existing binary metadata format is unchanged. |
+| `manifest.bin` | Dataset entry point: global image intervals and relative coefficient/metadata paths for each partition. Native binary format remains manifest v1. |
+| `partitions/000000.fls` | FastLanes-compressed quantized DCT coefficients for partition 0. These files are not JPEGs or model tensors. |
+| `partitions/000000.images.bin` | Complete JPEG-DCT metadata for partition 0: image/component geometry, sampling, quantization tables, encoding profiles and block-group bookkeeping. The existing binary metadata format is unchanged. |
 | `geometry/index.bin` | Dataset-level geometry index directory and integrity bindings. |
 | `geometry/source_order.sha256` | SHA-256 of the native input path list in physical image order, retained with the runtime data even when `conversion/` is removed. |
-| `geometry/000000.bin` | Optimized geometry index for segment 0, mapping requested image/component/block positions to rows, vectors and lanes. It is derived from the segment metadata, not another copy of its coefficients. |
+| `geometry/000000.bin` | Optimized geometry index for partition 0, mapping requested image/component/block positions to rows, vectors and lanes. It is derived from the partition metadata, not another copy of its coefficients. |
 | `annotations/samples.jsonl` | One physical-order record per image: `image_id`, stable `sample_id` and task `label`. Input CSV/JSONL files are not needed to read labels. |
 | `annotations/metadata.json` | Annotation schema, count, source kind, shuffle provenance and hashes binding samples to the manifest, retained physical source order and sample order. |
 | `annotations/class_to_idx.json` | Class-name-to-integer mapping, emitted only for folder labels. |
 | `conversion/sources.txt` | Original absolute JPEG paths in final physical order. Required for adding annotations by source path or re-verifying against the source JPEGs. |
 | `conversion/report.json` | Conversion parameters, stage times, byte counts, verification result, source-list hash and tool/source versions. This is a historical report, not a runtime manifest. |
 
-The matching numeric names identify the same segment; annotation `image_id` is
-always the manifest's global physical image ID, not a segment-local offset or an
+The matching numeric names identify the same partition; annotation `image_id` is
+always the manifest's global physical image ID, not a partition-local offset or an
 original input-directory position. Native code still uses `shard` for this object
-in API names, options and JSON fields.
+in API names, options and JSON fields. These dataset partitions are distinct from
+FastLanes' internal segments.
 
-Keep `manifest.bin`, `segments/` and `geometry/` together. Manifest members must
+Keep `manifest.bin`, `partitions/` and `geometry/` together. Manifest members must
 be relative paths inside the store: absolute paths, `..` and escaping symlinks
 are rejected. The store can be moved without rewriting its files. Readers discover
 `geometry/` automatically; unset `FASTLENS_BLOCK_MAJOR_ACCESS_DIR` if it points at
@@ -233,7 +234,7 @@ with the current tools. Low-level native writer transactions still use generatio
 
 Conversion uses a sibling `.OUTPUT.fastlens-staging-<id>` directory and preserves
 the native writer's transactional generations within it. After compression, the
-Converter finalizes `segments/` and rewrites the manifest with the native
+Converter finalizes `partitions/` and rewrites the manifest with the native
 serializer. It then builds the geometry index against that final manifest,
 performs the requested exact verification, and writes annotations and the report.
 Only after all phases pass is the directory atomically renamed to the destination. A nonempty destination or destination symlink is
@@ -263,7 +264,7 @@ FLS corruption can remain undetected. Missing or incompatible geometry indexes
 fail inspection. Source JPEG size is unknown for stores
 without a conversion report. The report's `total_output_bytes` is the original
 publication size; inspection's `total_stored_bytes` is the current size of all
-files. Inspection also reports `core_storage_bytes` (manifest-referenced segment
+files. Inspection also reports `core_storage_bytes` (manifest-referenced partition
 files plus geometry indexes), `annotation_bytes`, and `conversion_record_bytes`.
 Adding annotations or removing conversion records never rewrites the historical
 report. Unrelated files contribute only to the current total, not core storage.
@@ -622,7 +623,7 @@ FastLens also provides native C++ APIs:
 #include <fastlens/fastlens.hpp>
 
 int main() {
-    fastlens::Reader reader("fastlens/data/example-fastlens/segments/000000.fls");
+    fastlens::Reader reader("fastlens/data/example-fastlens/partitions/000000.fls");
     fastlens::DecompressOptions options;
     options.write_output = true;
     options.scope = fastlens::TableDecompressionScope::WholeTable;

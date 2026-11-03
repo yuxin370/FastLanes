@@ -78,7 +78,7 @@ class NativeCliTests(NativeCliFixture):
             self.assertEqual(cli.main([*command, "--dry-run"]), 0)
             self.assertFalse((self.output / "annotations").exists())
             # The manifest-only native parser must work even without shard files.
-            generation = self.output / "segments"
+            generation = self.output / "partitions"
             parked = self.root / "parked-generation"
             generation.rename(parked)
             try:
@@ -112,8 +112,8 @@ class NativeCliTests(NativeCliFixture):
         self.assertEqual(info["shard_count"], 2)
         self.assertEqual(info["manifest_version"], 1)
         self.assertTrue(info["index"]["compatible"])
-        self.assertEqual({path.name for path in moved.iterdir()}, {"manifest.bin", "segments", "geometry", "conversion"})
-        self.assertEqual({path.name for path in (moved / "segments").iterdir()},
+        self.assertEqual({path.name for path in moved.iterdir()}, {"manifest.bin", "partitions", "geometry", "conversion"})
+        self.assertEqual({path.name for path in (moved / "partitions").iterdir()},
                          {"000000.fls", "000000.images.bin", "000001.fls", "000001.images.bin"})
         for field, pattern in (("coefficient", "*.fls"), ("metadata", "*.images.bin")):
             paths = list(moved.rglob(pattern))
@@ -216,7 +216,7 @@ class NativeCliTests(NativeCliFixture):
                     else:
                         if phase == "Store layout":
                             original(command, log, phase)
-                            self.assertTrue((log.parent / "segments/000000.fls").exists())
+                            self.assertTrue((log.parent / "partitions/000000.fls").exists())
                         raise cli.ConversionError("injected index failure")
                 original(command, log, phase)
             with self.subTest(phase=failing), patch.object(cli, "run_native", side_effect=fail), self.assertRaises(cli.ConversionError):
@@ -291,9 +291,9 @@ class NativeCliTests(NativeCliFixture):
         self.convert()
         manifest = self.output / "manifest.bin"
         original = manifest.read_bytes()
-        member = b"segments/000000.fls"
+        member = b"partitions/000000.fls"
         encoded = struct.pack("<I", len(member)) + member
-        for target in (str(self.output / "segments/000000.fls"), "../outside.fls"):
+        for target in (str(self.output / "partitions/000000.fls"), "../outside.fls"):
             value = target.encode()
             manifest.write_bytes(original.replace(encoded, struct.pack("<I", len(value)) + value))
             with self.subTest(target=target), self.assertRaisesRegex(cli.ConversionError, "unsafe"):
@@ -302,15 +302,15 @@ class NativeCliTests(NativeCliFixture):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unsafe", result.stderr)
         manifest.write_bytes(original)
-        segment = self.output / "segments/000000.fls"
+        partition = self.output / "partitions/000000.fls"
         outside = self.root / "outside.fls"
-        segment.rename(outside)
-        segment.symlink_to(outside)
+        partition.rename(outside)
+        partition.symlink_to(outside)
         with self.assertRaisesRegex(cli.ConversionError, "escapes"):
             cli.native_inspect(self.output, self.tools[cli.TOOL_NAMES[1]])
         self.assertNotEqual(self.verify().returncode, 0)
-        segment.unlink()
-        outside.rename(segment)
+        partition.unlink()
+        outside.rename(partition)
         # A valid-looking manifest edit still invalidates the geometry binding.
         changed = bytearray(original)
         changed[14] ^= 1  # rowgroup_vectors, keeping the manifest parseable
@@ -318,7 +318,7 @@ class NativeCliTests(NativeCliFixture):
         with self.assertRaisesRegex(cli.ConversionError, "inspection failed"):
             cli.native_inspect(self.output, self.tools[cli.TOOL_NAMES[1]])
         manifest.write_bytes(original)
-        first, second = self.output / "segments/000000.images.bin", self.output / "segments/000001.images.bin"
+        first, second = self.output / "partitions/000000.images.bin", self.output / "partitions/000001.images.bin"
         first_data, second_data = first.read_bytes(), second.read_bytes()
         first.write_bytes(second_data)
         second.write_bytes(first_data)

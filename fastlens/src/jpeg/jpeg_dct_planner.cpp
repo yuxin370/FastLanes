@@ -1117,7 +1117,7 @@ struct JpegDctShardDatasetReader::Impl {
 		// writer output remains usable before index construction by CPU tools.
 		if (manifest.version == 1U && !lazy_block_major_metadata &&
 		    std::any_of(manifest.shards.begin(), manifest.shards.end(), [](const auto& entry) {
-			    return std::filesystem::path(entry.fls_file_name).parent_path() == "segments";
+			    return std::filesystem::path(entry.fls_file_name).parent_path() == "partitions";
 		    })) {
 			throw std::runtime_error("incomplete store: missing geometry index: " +
 			                         (block_major_access_directory / "index.bin").string());

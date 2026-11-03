@@ -561,7 +561,7 @@ JpegDctShardManifest read_jpeg_dct_shard_manifest_file(const std::filesystem::pa
 		entry.metadata_file_size       = reader.u64();
 		entry.fls_file_name            = reader.string();
 		entry.metadata_file_name       = reader.string();
-		validate_manifest_member(path.parent_path(), entry.fls_file_name, "segment");
+		validate_manifest_member(path.parent_path(), entry.fls_file_name, "partition");
 		validate_manifest_member(path.parent_path(), entry.metadata_file_name, "metadata");
 		manifest.shards.push_back(std::move(entry));
 	}
