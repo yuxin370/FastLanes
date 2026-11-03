@@ -30,7 +30,7 @@ def main():
     from fastlens.benchmarks.baselines.system_rgbnomore.shared.common import sha256_file
 
     torch.set_num_threads(8)
-    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(DATA / 'imagenet512_val_block_major/access')
+    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(DATA / 'imagenet512_val_block_major/geometry')
     os.environ['FASTLENS_PHASE6_NATIVE_PHYSICAL'] = '1' if args.arm == 'block' else '0'
     contract = json.loads(args.contract.read_text())
     samples = sorted(json.loads(Path(contract['dataset']['sample_manifest']).read_text())['samples'],

@@ -345,7 +345,7 @@ def cold_input_files(backend, root, records, reader):
         first = shard["first_global_image_index"]
         if any(first <= image_id < first+shard["image_count"] for image_id in ids):
             paths.update((Path(shard["fls_path"]), Path(shard["metadata_path"])))
-    access = Path(os.environ.get("FASTLENS_BLOCK_MAJOR_ACCESS_DIR", Path(root).resolve().parent/"access"))
+    access = Path(os.environ.get("FASTLENS_BLOCK_MAJOR_ACCESS_DIR", Path(root).resolve().parent/"geometry"))
     paths.update(path for path in access.rglob("*") if path.is_file())
     return sorted(paths)
 

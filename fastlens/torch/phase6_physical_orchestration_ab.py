@@ -269,7 +269,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    access_index = args.block_major_access_dir / "manifest.block_major_access.bin"
+    access_index = args.block_major_access_dir / "index.bin"
     if not access_index.is_file():
         raise FileNotFoundError(f"block-major access index is missing: {access_index}")
     os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(

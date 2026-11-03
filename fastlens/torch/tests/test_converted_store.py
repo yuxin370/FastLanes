@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -71,9 +72,10 @@ class ConvertedStoreTests(unittest.TestCase):
                     "--partition-images", "2", "--workers", "2",
                     "--image-root", str(source), "--labels-csv", str(labels), "--shuffle-seed", "42",
                 ]), 0)
-            samples, _ = annotations.load_annotations(output)
-            physical_to_source = [paths.index(Path(path)) for path in (output / "source_paths.txt").read_text().splitlines()]
+            physical_to_source = [paths.index(Path(path)) for path in (output / "conversion/sources.txt").read_text().splitlines()]
             self.assertNotEqual(physical_to_source, [0, 1, 2])
+            shutil.rmtree(output / "conversion")
+            samples, _ = annotations.load_annotations(output)
 
             reader = DirectDctReader(output / "manifest.bin", native_module=native)
 
@@ -117,6 +119,21 @@ class ConvertedStoreTests(unittest.TestCase):
                 self.assertTrue(report["annotations"])
                 self.assertEqual(report["train_smoke"], training)
                 self.assertTrue(math.isfinite(report["final_loss"]))
+
+            for name in ("index.bin", "000000.bin"):
+                path = output / "geometry" / name
+                original = path.read_bytes()
+                for damaged in (None, original[:-1] + bytes([original[-1] ^ 1])):
+                    with self.subTest(geometry=name, missing=damaged is None):
+                        if damaged is None:
+                            path.unlink()
+                        else:
+                            path.write_bytes(damaged)
+                        with self.assertRaises(RuntimeError):
+                            damaged_reader = DirectDctReader(output / "manifest.bin", native_module=native)
+                            with damaged_reader.iter_batches([[0]], profile=VALIDATION) as batches:
+                                next(batches)
+                        path.write_bytes(original)
 
 
 if __name__ == "__main__":

@@ -15,8 +15,9 @@ import shutil
 import tempfile
 
 
-SCHEMA = "fastlens-samples-v1"
+SCHEMA = "fastlens-samples-v2"
 DIRECTORY = "annotations"
+SOURCE_ORDER = "geometry/source_order.sha256"
 SHUFFLE_ALGORITHM = "fastlens-shuffle-v1"
 
 
@@ -77,15 +78,20 @@ def _json(text: str):
 
 
 def physical_paths(store: Path, image_count: int) -> list[Path]:
-    with (store / "source_paths.txt").open(encoding="utf-8") as stream:
+    source = store / "conversion/sources.txt"
+    if not source.is_file():
+        raise ValueError("missing conversion/sources.txt; building annotations requires the original physical-order source list")
+    if file_sha256(source) != (store / SOURCE_ORDER).read_text(encoding="ascii").strip():
+        raise ValueError("conversion/sources.txt disagrees with the store's physical source order")
+    with source.open(encoding="utf-8") as stream:
         lines = [line.rstrip("\r\n") for line in stream]
     paths = [Path(line) for line in lines]
     if len(paths) != image_count or not paths:
-        raise ValueError("source_paths.txt image count disagrees with manifest")
+        raise ValueError("conversion/sources.txt image count disagrees with manifest")
     if any(not line or not path.is_absolute() for line, path in zip(lines, paths)):
-        raise ValueError("source_paths.txt must contain one absolute source path per image")
+        raise ValueError("conversion/sources.txt must contain one absolute source path per image")
     if len(set(paths)) != len(paths):
-        raise ValueError("duplicate path in source_paths.txt")
+        raise ValueError("duplicate path in conversion/sources.txt")
     return paths
 
 
@@ -188,7 +194,7 @@ def publish_annotations(store: Path, records: list[InputRecord], classes: dict |
         raise ValueError(f"refusing to replace existing annotations: {destination}")
     paths = physical_paths(store, len(records))
     if paths != [record.source_path for record in records]:
-        raise ValueError("annotation order disagrees with source_paths.txt")
+        raise ValueError("annotation order disagrees with conversion/sources.txt")
     stage = Path(tempfile.mkdtemp(prefix=".annotations-staging-", dir=store))
     try:
         with (stage / "samples.jsonl").open("w", encoding="utf-8") as stream:
@@ -200,14 +206,14 @@ def publish_annotations(store: Path, records: list[InputRecord], classes: dict |
         metadata = {
             "schema_version": SCHEMA, "image_count": len(records),
             "manifest_sha256": file_sha256(store / "manifest.bin"),
-            "source_paths_sha256": file_sha256(store / "source_paths.txt"),
+            "source_order_sha256": (store / SOURCE_ORDER).read_text(encoding="ascii").strip(),
             "samples_sha256": file_sha256(stage / "samples.jsonl"),
             "sample_order_sha256": order_sha256(record.sample_id for record in records),
             "shuffle": shuffle, "label_source": label_source,
             "class_mapping": "class_to_idx.json" if classes is not None else None,
             "class_mapping_sha256": file_sha256(stage / "class_to_idx.json") if classes is not None else None,
         }
-        (stage / "samples.meta.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (stage / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         # Check the written representation before making the directory visible.
         load_annotations(store, directory=stage)
         if destination.exists() or destination.is_symlink():
@@ -226,17 +232,17 @@ def load_annotations(store: Path, *, directory: Path | None = None) -> tuple[lis
     hashes detect accidental mismatches, not maliciously rewritten metadata.
     """
     directory = directory if directory is not None else store / DIRECTORY
-    metadata = _json((directory / "samples.meta.json").read_text(encoding="utf-8"))
+    metadata = _json((directory / "metadata.json").read_text(encoding="utf-8"))
     if not isinstance(metadata, dict) or metadata.get("schema_version") != SCHEMA:
         raise ValueError("unsupported samples metadata schema")
     count = metadata.get("image_count")
     if type(count) is not int or count <= 0:
         raise ValueError("invalid annotation image_count")
-    for name, path in (("manifest", store / "manifest.bin"), ("source_paths", store / "source_paths.txt"),
-                       ("samples", directory / "samples.jsonl")):
+    if metadata.get("source_order_sha256") != (store / SOURCE_ORDER).read_text(encoding="ascii").strip():
+        raise ValueError("annotation physical source order SHA-256 mismatch")
+    for name, path in (("manifest", store / "manifest.bin"), ("samples", directory / "samples.jsonl")):
         if file_sha256(path) != metadata.get(name + "_sha256"):
             raise ValueError(f"annotation {name} SHA-256 mismatch")
-    physical_paths(store, count)
     with (directory / "samples.jsonl").open(encoding="utf-8") as stream:
         samples = [_json(line) for line in stream]
     if len(samples) != count:

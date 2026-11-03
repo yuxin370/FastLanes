@@ -27,8 +27,9 @@ def create_fixture(root: Path, jpeg_tool: str, access_tool: str) -> tuple[Path, 
         "--shard-images", "1024", "--metadata-profile", "reconstruct", str(source),
     ], check=True)
     manifest = dataset / "manifest.bin"
+    subprocess.run([access_tool, "--finalize-store", str(manifest)], check=True)
     subprocess.run([
-        access_tool, str(manifest), "--output-dir", str(dataset / "block_major_access_v1"),
+        access_tool, str(manifest), "--output-dir", str(dataset / "geometry"),
     ], check=True)
     # This is the public CSV input contract, not hand-written binary metadata.
     mapping = root / "mapping.csv"

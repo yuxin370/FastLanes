@@ -504,7 +504,7 @@ fastlens::jpeg::detail::JpegDctDeviceBlockMajorActiveOutputSchedule reference_ac
 TEST(JpegDctBlockMajorAccess, MmapRankSelectAndTopologyMatchLegacyMetadata) {
 	BlockMajorTemporaryDirectory temporary;
 	const auto source = make_synthetic_dataset(temporary.path());
-	const auto descriptor_path = temporary.path() / "access" / "shard_000000.block_major_access.bin";
+	const auto descriptor_path = temporary.path() / "access" / "000000.bin";
 	fastlens::jpeg::JpegDctBlockMajorAccessBuildOptions options;
 	options.rank_checkpoint_images          = 8U;
 	options.topology_checkpoint_coordinates = 3U;
@@ -1641,7 +1641,7 @@ TEST(JpegDctBlockMajorPlan, DISABLED_RepresentativeActiveOutputScheduleMicrobenc
 TEST(JpegDctBlockMajorPlan, ProductionPreviewSelectsCompactPlanlessPath) {
 	BlockMajorTemporaryDirectory temporary;
 	const auto source = make_two_shard_synthetic_dataset(temporary.path());
-	const auto sidecars = temporary.path() / "block_major_access_v1";
+	const auto sidecars = temporary.path() / "geometry";
 	fastlens::jpeg::build_jpeg_dct_block_major_access_dataset(source.manifest_path, sidecars);
 	std::vector<fastlens::jpeg::JpegDctImageCropRequest> requests;
 	for (const auto image : {0U, 1U, 2U, 3U, 4U, 9U, 10U, 12U, 15U}) {

@@ -82,7 +82,7 @@ set -euo pipefail
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 prepared="$HOME/tmp/dct-round3-prod-h100-20261010-012949"
 run="$HOME/tmp/dct-round4-inference-$(date +%Y%m%d-%H%M%S)"
-export FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/access"
+export FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/geometry"
 for model in resnet24 vitti; do
   contract="$run/$model/contract"
   "$PYTHON" -B -m fastlens.benchmarks.baselines.dct_baselines prepare \

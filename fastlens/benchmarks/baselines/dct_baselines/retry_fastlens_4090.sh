@@ -6,7 +6,7 @@ export PYTHON="${PYTHON:-python3}"
 export CUDA_VISIBLE_DEVICES=GPU-40c637bd-acf5-ea1a-0df8-617138228467
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export TMPDIR="$HOME/tmp"
-export FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/access"
+export FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/geometry"
 
 old="$HOME/tmp/dct-p0-pilot-4090-20261012-150553/resnet24"
 output="$HOME/tmp/dct-p0-fastlens-retry-4090-$(date +%Y%m%d-%H%M%S)"

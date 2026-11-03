@@ -152,7 +152,7 @@ class CliTests(unittest.TestCase):
         self.output.mkdir()
         info = {"manifest_version": 1, "physical_layout": cli.PHYSICAL_LAYOUT,
                 "index": {"compatible": True}, "image_count": 3, "jpeg_warning_image_ids": []}
-        for failure in ("Compression", "Access index", "Exact DCT verification"):
+        for failure in ("Compression", "Store layout", "Geometry index", "Exact DCT verification"):
             def run(command, log, phase):
                 self.assertTrue(self.output.is_dir())
                 self.assertEqual(list(self.output.iterdir()), [])
@@ -167,6 +167,7 @@ class CliTests(unittest.TestCase):
 
     def test_report_counts_its_own_bytes(self):
         path = self.root / cli.REPORT_NAME
+        path.parent.mkdir()
         report = {"schema_version": 1, "original_jpeg_bytes": 321}
         cli.write_report(path, report, 100)
         actual = json.loads(path.read_text())

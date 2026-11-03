@@ -35,7 +35,7 @@ namespace {
 
 std::filesystem::path sidecar_path(const std::filesystem::path& directory, const uint32_t shard_id) {
 	std::array<char, 64> name {};
-	const auto count = std::snprintf(name.data(), name.size(), "shard_%06u.block_major_access.bin", shard_id);
+	const auto count = std::snprintf(name.data(), name.size(), "%06u.bin", shard_id);
 	if (count < 0 || static_cast<size_t>(count) >= name.size()) {
 		fail("failed to format sidecar name");
 	}
@@ -480,7 +480,7 @@ JpegDctBlockMajorCompactPlanner::JpegDctBlockMajorCompactPlanner(
 	if (impl_->manifest.version != 1U || impl_->manifest.shards.empty()) {
 		fail("compact planner requires a non-empty manifest-v1 dataset");
 	}
-	const auto companion_path = descriptor_directory / "manifest.block_major_access.bin";
+	const auto companion_path = descriptor_directory / "index.bin";
 	if (!std::filesystem::is_regular_file(companion_path)) {
 		fail("block-major companion index is missing; select the legacy planner explicitly");
 	}

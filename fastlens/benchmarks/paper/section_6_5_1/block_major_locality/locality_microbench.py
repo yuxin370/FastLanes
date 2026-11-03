@@ -32,7 +32,7 @@ def main():
         image_major_samples = list(csv.DictReader(stream))
     assert all(a['logical_sample_id'] == b['Filepath'] for a, b in zip(samples, image_major_samples))
     args.output.mkdir(parents=True, exist_ok=True)
-    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(roots['block_major'] / 'access')
+    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(roots['block_major'] / 'geometry')
     readers = {name: native.DirectDctReader(str(root / 'manifest.bin')) for name, root in roots.items()}
     # Four separate source segments, with the same IDs and logical request order for both layouts.
     cohorts = [list(range(i * 1024, (i + 1) * 1024)) for i in (0, 16, 32, 47)]

@@ -75,7 +75,7 @@ def run(config_path, root, module_path, output):
     device = torch.device("cuda:0")
     runtime = numerical_runtime(device)
     torch.set_num_threads(config["torch_threads"])
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(Path(root).resolve().parent/"access")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(Path(root).resolve().parent/"geometry")
     print(f"Checking source q/Q for the {len(selected['images'])} images in microbatch {rows[0]['microbatch_id']}", flush=True)
     report = dict(runtime=runtime, microbatch_id=rows[0]["microbatch_id"], samples=len(rows),
                   diagnostic_only=True, headline_eligible=False, variants={})

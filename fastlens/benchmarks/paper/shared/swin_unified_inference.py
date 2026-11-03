@@ -100,7 +100,7 @@ def main():
         started = time.perf_counter()
         if args.path == 'imagelanes':
             from fastlens.torch import DirectDctReader
-            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'access')
+            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'geometry')
             os.environ['FASTLENS_PHASE6_NATIVE_PHYSICAL'] = '1'
             reader = DirectDctReader(manifest)
             source = reader.pipeline('rgbnomore-swinv2-block-major-validation-v1')

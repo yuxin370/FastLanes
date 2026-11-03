@@ -69,7 +69,7 @@ if [[ -n "$reuse_verification" ]]; then
 fi
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export TMPDIR="$HOME/tmp"
-export FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/access"
+export FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/geometry"
 cpus="${CPU_LIST:-$("$PYTHON" -B -c 'import os; cpus=sorted(os.sched_getaffinity(0)); assert len(cpus)>=8; print(",".join(str(cpu) for cpu in cpus[:8]))')}"
 python=(taskset -c "$cpus" "$PYTHON" -B)
 "${python[@]}" - "$prepared/contract/source.json" "$expected" <<'PY'

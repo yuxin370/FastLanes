@@ -94,7 +94,7 @@ def main():
         sys.path.insert(0, str(B.REPO / "build/fastlens/torch"))
         import _fastlens_direct_dct as native
 
-        os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(root / "access")
+        os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(root / "geometry")
         reader = native.DirectDctReader(str(root / "manifest.bin"))
         metadata = reader.image_metadata(ids[target])
         table_by_id = {t["table_id"]: t["values"] for t in metadata["quant_tables"]}

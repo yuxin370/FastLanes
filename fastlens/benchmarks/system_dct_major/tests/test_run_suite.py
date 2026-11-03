@@ -117,7 +117,7 @@ class CompleteSuiteTest(unittest.TestCase):
     def test_dry_run_writes_only_the_production_phase_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            access_dir = root / "access"
+            access_dir = root / "geometry"
             access_dir.mkdir()
             output = root / "output"
             args = parse_args(
@@ -150,7 +150,7 @@ class CompleteSuiteTest(unittest.TestCase):
     def test_execution_runs_the_eleven_production_phases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            access_dir = root / "access"
+            access_dir = root / "geometry"
             access_dir.mkdir()
             output = root / "output"
             args = parse_args(

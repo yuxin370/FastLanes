@@ -266,7 +266,7 @@ class NativeWindow:
         root=ROOT/'fastlens/data/compressed/imagenet512_train_block_major_premixed'
         contract=json.loads((root/'materialization_contract.json').read_text())
         self.manifest=root/'dct/manifest.bin'
-        os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR']=str(self.manifest.parent/'block_major_access_v1')
+        os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR']=str(self.manifest.parent/'geometry')
         with (root/'ordered_mapping.csv').open() as stream:
             self.records=list(csv.DictReader(stream))
         options={}

@@ -74,7 +74,7 @@ def main():
                 c.permute(2, 0, 1)[indices] for c, indices in zip(components, B.INDICES)]))
     expected = torch.stack(expected).cuda()
     expected_coefficients = torch.stack(expected_coefficients).cuda()
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "block_major_access_v1")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "geometry")
     reader = native.DirectDctReader(str(args.manifest))
     if not reader.initialization_stats["block_major_metadata_lazy"]:
         raise RuntimeError("probe requires existing block-major access sidecars")

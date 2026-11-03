@@ -129,7 +129,7 @@ def main():
     import _fastlens_direct_dct as native
 
     root = args.new_data.resolve()
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(root / "access")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(root / "geometry")
     manifest = parse_manifest(root / "manifest.bin")
     if manifest["physical_layout"] != "dct-major/spatial-major-image-minor":
         raise ValueError("requires true spatial-major/image-minor storage")

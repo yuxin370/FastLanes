@@ -49,7 +49,7 @@ def shutdown_child(manifest, module_path):
 def check_shutdown(manifest, module_path):
     for lifetime in ('1', '0'):
         env = dict(os.environ, FASTLENS_PHASE4_NATIVE_LIFETIME=lifetime,
-                   FASTLENS_BLOCK_MAJOR_ACCESS_DIR=str(manifest.parent/'access'))
+                   FASTLENS_BLOCK_MAJOR_ACCESS_DIR=str(manifest.parent/'geometry'))
         child = subprocess.run([sys.executable, '-B', '-c',
             'from pathlib import Path; import sys; '
             'from fastlens.torch.streamed_projection_test import shutdown_child; '
@@ -60,7 +60,7 @@ def check_shutdown(manifest, module_path):
 
 
 def run(manifest, module_path):
-    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'access')
+    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'geometry')
     reader = DirectDctReader(manifest, module_path=module_path)
     if reader.image_count < 1027:
         raise ValueError('use the source512 fixture with at least two physical shards')

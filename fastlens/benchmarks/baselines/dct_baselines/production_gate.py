@@ -132,7 +132,7 @@ def prepare(output, *, model, selection=SELECTION, original_root=ORIGINAL):
 
 def run(output, *, model, manifest=MANIFEST, prepared=None):
     output = Path(output).resolve()
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(Path(manifest).parent/"access")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(Path(manifest).parent/"geometry")
     if prepared is None:
         config = prepare(output, model=model)
         prepared = output

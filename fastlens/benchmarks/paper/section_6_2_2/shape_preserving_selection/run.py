@@ -69,7 +69,7 @@ def main():
             list(pool.map(lambda command: execute(command, args), commands))
         return
     env = gpu_environment(args.gpu, args.dry_run, OMP_NUM_THREADS=1, MKL_NUM_THREADS=1, OPENBLAS_NUM_THREADS=1,
-                          FASTLENS_BLOCK_MAJOR_ACCESS_DIR=args.native_manifest.parent / 'access')
+                          FASTLENS_BLOCK_MAJOR_ACCESS_DIR=args.native_manifest.parent / 'geometry')
     for model, diagonals, method in cases:
         backend = 'ic' if method.startswith('ic_') else method
         root = (args.native_manifest if method == 'fastlens' else args.fs_store if method == 'fs'

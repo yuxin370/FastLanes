@@ -40,30 +40,6 @@ constexpr float kReferenceDown2Conversion[] = {
 };
 static_assert(sizeof(kReferenceDown2Conversion) / sizeof(kReferenceDown2Conversion[0]) == 8U * 16U);
 
-std::filesystem::path resolve_manifest_member(const std::filesystem::path& root,
-	                                          const std::string&           member,
-	                                          const std::string_view       label) {
-	const std::filesystem::path relative(member);
-	if (relative.empty() || relative.is_absolute() ||
-	    std::any_of(relative.begin(), relative.end(), [](const auto& component) { return component == ".."; })) {
-		throw std::runtime_error("JPEG DCT manifest contains an unsafe " + std::string(label) + " path");
-	}
-	const auto dataset_root   = root.empty() ? std::filesystem::current_path() : root;
-	const auto canonical_root = std::filesystem::weakly_canonical(dataset_root);
-	const auto candidate      = std::filesystem::weakly_canonical(dataset_root / relative);
-	auto root_it = canonical_root.begin();
-	auto path_it = candidate.begin();
-	for (; root_it != canonical_root.end() && path_it != candidate.end(); ++root_it, ++path_it) {
-		if (*root_it != *path_it) {
-			throw std::runtime_error("JPEG DCT manifest " + std::string(label) + " escapes the dataset root");
-		}
-	}
-	if (root_it != canonical_root.end()) {
-		throw std::runtime_error("JPEG DCT manifest " + std::string(label) + " escapes the dataset root");
-	}
-	return candidate;
-}
-
 bool uses_bounded_io_uring(const JpegDctCropExecutionMode mode) noexcept {
 	return mode == JpegDctCropExecutionMode::kBoundedIoUringRangeReadSelectedDecode ||
 	       mode == JpegDctCropExecutionMode::kBoundedIoUringScheduledRangeReadSelectedDecode;
@@ -1129,14 +1105,23 @@ struct JpegDctShardDatasetReader::Impl {
 		initialization_stats.manifest_load_ms = std::chrono::duration<double, std::milli>(
 		    std::chrono::steady_clock::now() - manifest_started).count();
 		initialization_stats.manifest_shard_count = manifest.shards.size();
-		block_major_access_directory = root_dir / "block_major_access_v1";
+		block_major_access_directory = root_dir / "geometry";
 		if (const auto* override_directory = std::getenv("FASTLENS_BLOCK_MAJOR_ACCESS_DIR");
 		    override_directory != nullptr && *override_directory != '\0') {
 			block_major_access_directory = override_directory;
 		}
 		lazy_block_major_metadata =
 		    manifest.version == 1U &&
-		    std::filesystem::is_regular_file(block_major_access_directory / "manifest.block_major_access.bin");
+		    std::filesystem::is_regular_file(block_major_access_directory / "index.bin");
+		// A published Converter store requires its geometry index. Raw native
+		// writer output remains usable before index construction by CPU tools.
+		if (manifest.version == 1U && !lazy_block_major_metadata &&
+		    std::any_of(manifest.shards.begin(), manifest.shards.end(), [](const auto& entry) {
+			    return std::filesystem::path(entry.fls_file_name).parent_path() == "segments";
+		    })) {
+			throw std::runtime_error("incomplete store: missing geometry index: " +
+			                         (block_major_access_directory / "index.bin").string());
+		}
 		initialization_stats.block_major_metadata_lazy = lazy_block_major_metadata;
 		if (manifest.version == 3U && !manifest.uses_compact_descriptor()) {
 			throw std::runtime_error("JPEG DCT manifest-v3 is missing the canonical compact descriptor contract");
@@ -1146,8 +1131,8 @@ struct JpegDctShardDatasetReader::Impl {
 			const auto path_validation_started = std::chrono::steady_clock::now();
 			ShardState state;
 			state.entry             = entry;
-			state.fls_path          = resolve_manifest_member(root_dir, entry.fls_file_name, "shard");
-			state.metadata_path     = resolve_manifest_member(root_dir, entry.metadata_file_name, "metadata");
+			state.fls_path          = std::filesystem::weakly_canonical(root_dir / entry.fls_file_name);
+			state.metadata_path     = std::filesystem::weakly_canonical(root_dir / entry.metadata_file_name);
 			if (manifest.uses_compact_descriptor() &&
 			    (!std::filesystem::is_regular_file(state.fls_path) ||
 			     std::filesystem::file_size(state.fls_path) != entry.fls_file_size)) {
@@ -1434,7 +1419,7 @@ struct JpegDctShardDatasetReader::Impl {
 			                                   JpegDctRowOrdering::kDatasetComponentMajorBlockMajorImageMinor;
 		                            }));
 		if (block_major_v1) {
-			if (std::filesystem::is_regular_file(block_major_access_directory / "manifest.block_major_access.bin")) {
+			if (std::filesystem::is_regular_file(block_major_access_directory / "index.bin")) {
 				block_major_compact_planner =
 				    std::make_unique<JpegDctBlockMajorCompactPlanner>(manifest_path, block_major_access_directory);
 			}

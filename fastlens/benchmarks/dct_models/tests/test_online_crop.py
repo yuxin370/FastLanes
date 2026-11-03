@@ -77,7 +77,7 @@ class OnlineCropTest(unittest.TestCase):
         # Three prefix regressions and the sample whose Top-1 changed. Read one
         # image at a time, without activating a whole shard or loading a model.
         reference = SourceReference(self.upstream, 112)
-        with patch.dict(os.environ, FASTLENS_BLOCK_MAJOR_ACCESS_DIR=str(root / "access")):
+        with patch.dict(os.environ, FASTLENS_BLOCK_MAJOR_ACCESS_DIR=str(root / "geometry")):
             reader = native.DirectDctReader(str(root / "manifest.bin"))
             for image_id in (0, 1, 2, 22858):
                 with self.subTest(image_id=image_id):
@@ -128,7 +128,7 @@ class OnlineCropTest(unittest.TestCase):
         # Nonconsecutive/duplicate images and a tail exercise delivery ownership.
         ids = [2, 0, 2]
         transforms = [dict(crop=CROP, horizontal_flip=(i == 1)) for i in range(len(ids))]
-        with patch.dict(os.environ, FASTLENS_BLOCK_MAJOR_ACCESS_DIR=str(root / "access")):
+        with patch.dict(os.environ, FASTLENS_BLOCK_MAJOR_ACCESS_DIR=str(root / "geometry")):
             reader = native.DirectDctReader(str(root / "manifest.bin"))
             reference = reader.read_prefetched(reader.prefetch_batch(ids, transforms=transforms, **options))
             expected = reference.projected.cpu()

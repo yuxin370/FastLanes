@@ -37,7 +37,8 @@ def main():
                 raise ValueError(f"source512 requires 512px 4:2:0 JPEG: {entry['path']}")
     source_validation_seconds = time.perf_counter() - started
     (root / "samples.json").write_text(json.dumps(entries))
-    paths = root / "source_paths.txt"
+    (root / "conversion").mkdir()
+    paths = root / "conversion/sources.txt"
     paths.write_text("".join(str(Path(s["path"]).resolve()) + "\n" for s in entries))
     tool = B.REPO / "build/fastlens/tools/jpeg_dct/fastlens_jpeg_dct_tool"
     timings = dict(source_validation_seconds=source_validation_seconds)
@@ -54,11 +55,13 @@ def main():
                         "--shard-workers", shard_workers,
                         "--shard-decode-threads", workers_per_shard,
                         "--encoding-workers-per-shard", workers_per_shard, "--input-list", paths])
+    run("store_layout", [B.REPO / "build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool",
+                         "--finalize-store", root / "manifest.bin"])
     run("verification", [tool, "--verify-manifest", root / "manifest.bin", "--verify-workers",
                          verification_workers, "--input-list", paths])
     run("access_index", [B.REPO / "build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool",
-                         root / "manifest.bin", "--output-dir", root / "access",
-                         "--output-json", root / "access/build.json"])
+                         root / "manifest.bin", "--output-dir", root / "geometry",
+                         "--output-json", root / "geometry/build.json"])
     # Publish only after exact coefficient verification and index construction.
     (root / "profile.json").write_text(json.dumps(SOURCE_PROFILE, indent=2))
     result = dict(samples=50000, offline_work="JPEG entropy decode, lossless columnar compression, access index",

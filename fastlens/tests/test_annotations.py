@@ -2,6 +2,7 @@
 
 import csv
 import json
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -20,7 +21,10 @@ class AnnotationTests(unittest.TestCase):
         self.store = self.root / "store"
         self.store.mkdir()
         (self.store / "manifest.bin").write_bytes(b"test manifest identity")
-        (self.store / "source_paths.txt").write_text("".join(f"{path}\n" for path in self.paths))
+        (self.store / "conversion").mkdir()
+        (self.store / "conversion/sources.txt").write_text("".join(f"{path}\n" for path in self.paths))
+        (self.store / "geometry").mkdir()
+        (self.store / ann.SOURCE_ORDER).write_text(ann.file_sha256(self.store / "conversion/sources.txt") + "\n")
         self.rows = [{"path": str(path), "sample_id": f"sample-{index}", "label": index}
                      for index, path in enumerate(self.paths)]
         self.table = self.root / "labels.jsonl"
@@ -97,7 +101,7 @@ class AnnotationTests(unittest.TestCase):
         return ann.publish_annotations(self.store, records, classes, label_source="folders")
 
     def test_publish_without_jpegs_and_relocate_store(self):
-        before = {path.name: path.read_bytes() for path in self.store.iterdir()}
+        before = {path.relative_to(self.store): path.read_bytes() for path in self.store.rglob("*") if path.is_file()}
         metadata = self.publish()
         self.assertEqual({name: (self.store / name).read_bytes() for name in before}, before)
         moved = self.root / "moved"
@@ -113,21 +117,54 @@ class AnnotationTests(unittest.TestCase):
 
     def test_binding_detects_wrong_store_order_samples_and_class_map(self):
         self.publish()
-        for relative, message in (("manifest.bin", "manifest"), ("source_paths.txt", "source_paths"),
+        for relative, message in (("manifest.bin", "manifest"),
+                                  (ann.SOURCE_ORDER, "physical source order"),
                                   ("annotations/samples.jsonl", "samples"),
                                   ("annotations/class_to_idx.json", "class mapping")):
             path = self.store / relative
             original = path.read_bytes()
-            path.write_bytes(original + b" ")
+            path.write_bytes(original + b"!")
             with self.subTest(path=relative), self.assertRaisesRegex(ValueError, message):
                 ann.load_annotations(self.store)
             path.write_bytes(original)
-        metadata_path = self.store / "annotations/samples.meta.json"
+        metadata_path = self.store / "annotations/metadata.json"
         metadata = json.loads(metadata_path.read_text())
         metadata["sample_order_sha256"] = "wrong"
         metadata_path.write_text(json.dumps(metadata))
         with self.assertRaisesRegex(ValueError, "sample order"):
             ann.load_annotations(self.store)
+
+    def test_runtime_annotations_do_not_require_conversion_records(self):
+        metadata = self.publish()
+        shutil.rmtree(self.store / "conversion")
+        samples, loaded = ann.load_annotations(self.store)
+        self.assertEqual(loaded, metadata)
+        self.assertEqual([row["label"] for row in samples], [1, 0, 1])
+        with self.assertRaisesRegex(ValueError, "missing conversion/sources.txt"):
+            ann.physical_paths(self.store, 3)
+        metadata["schema_version"] = "fastlens-samples-v1"
+        (self.store / "annotations/metadata.json").write_text(json.dumps(metadata))
+        with self.assertRaisesRegex(ValueError, "unsupported samples metadata schema"):
+            ann.load_annotations(self.store)
+
+    def test_copied_annotations_reject_different_physical_order_with_identical_manifest(self):
+        self.publish()
+        other = self.root / "other-store"
+        shutil.copytree(self.store, other)
+        source = other / "conversion/sources.txt"
+        source.write_text("".join(f"{path}\n" for path in reversed(self.paths)))
+        (other / ann.SOURCE_ORDER).write_text(ann.file_sha256(source) + "\n")
+        shutil.rmtree(other / "conversion")
+        self.assertEqual((other / "manifest.bin").read_bytes(), (self.store / "manifest.bin").read_bytes())
+        with self.assertRaisesRegex(ValueError, "physical source order"):
+            ann.load_annotations(other)
+
+    def test_changed_source_list_cannot_rebind_annotations(self):
+        (self.store / "conversion/sources.txt").write_text("".join(f"{path}\n" for path in reversed(self.paths)))
+        records, classes = ann.prepare_records(list(reversed(self.paths)), image_root=self.images, labels_from_folders=True)
+        with self.assertRaisesRegex(ValueError, "physical source order"):
+            ann.publish_annotations(self.store, records, classes, label_source="folders")
+        self.assertFalse((self.store / "annotations").exists())
 
     def test_wrong_physical_order_and_failed_publication_leave_no_sidecar(self):
         records, classes = ann.prepare_records(self.paths, image_root=self.images, labels_from_folders=True)

@@ -9,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -508,6 +509,32 @@ void write_jpeg_dct_shard_manifest(const JpegDctShardManifest& manifest, const s
 }
 
 namespace detail {
+namespace {
+
+void validate_manifest_member(const std::filesystem::path& root,
+                              const std::string&           member,
+                              const std::string_view       label) {
+	const std::filesystem::path relative(member);
+	if (relative.empty() || relative.is_absolute() ||
+	    std::any_of(relative.begin(), relative.end(), [](const auto& component) { return component == ".."; })) {
+		throw std::runtime_error("JPEG DCT manifest contains an unsafe " + std::string(label) + " path");
+	}
+	const auto dataset_root   = root.empty() ? std::filesystem::current_path() : root;
+	const auto canonical_root = std::filesystem::weakly_canonical(dataset_root);
+	const auto candidate      = std::filesystem::weakly_canonical(dataset_root / relative);
+	auto       root_it        = canonical_root.begin();
+	auto       path_it        = candidate.begin();
+	for (; root_it != canonical_root.end() && path_it != candidate.end(); ++root_it, ++path_it) {
+		if (*root_it != *path_it) {
+			throw std::runtime_error("JPEG DCT manifest " + std::string(label) + " escapes the dataset root");
+		}
+	}
+	if (root_it != canonical_root.end()) {
+		throw std::runtime_error("JPEG DCT manifest " + std::string(label) + " escapes the dataset root");
+	}
+}
+
+} // namespace
 
 JpegDctShardManifest read_jpeg_dct_shard_manifest_file(const std::filesystem::path& path) {
 	BinaryReader reader(read_binary_file(path));
@@ -534,6 +561,8 @@ JpegDctShardManifest read_jpeg_dct_shard_manifest_file(const std::filesystem::pa
 		entry.metadata_file_size       = reader.u64();
 		entry.fls_file_name            = reader.string();
 		entry.metadata_file_name       = reader.string();
+		validate_manifest_member(path.parent_path(), entry.fls_file_name, "segment");
+		validate_manifest_member(path.parent_path(), entry.metadata_file_name, "metadata");
 		manifest.shards.push_back(std::move(entry));
 	}
 	if (!reader.eof()) {

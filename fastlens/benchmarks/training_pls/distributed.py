@@ -217,7 +217,7 @@ def validate(model, *, model_name, root, count=50000, batch_size=64):
     stored = json.loads((root / 'samples.json').read_text())[:count]
     if len(stored) != count or len({s['logical_sample_id'] for s in stored}) != count:
         raise ValueError('validation population/identities differ')
-    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(root / 'access')
+    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(root / 'geometry')
     if model_name == 'mobilenet24':
         import _fastlens_direct_dct as native
         from fastlens.benchmarks.dct_models import backend
@@ -345,7 +345,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if (args.output_dir / 'latest.pt').exists() and args.resume is None:
         raise FileExistsError('use --resume for an existing training checkpoint')
-    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent / 'block_major_access_v1')
+    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent / 'geometry')
     model = make_model(args.model, args.rgbnomore_root, device, args.seed)
     initial_hash = tensor_state_sha256(model.state_dict())
     ddp = DDP(model, device_ids=[device.index], broadcast_buffers=True)
@@ -379,7 +379,7 @@ def main():
     try:
         for epoch in range(first, args.stop_after_epoch or args.epochs):
             epoch_started = time.perf_counter()
-            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent / 'block_major_access_v1')
+            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent / 'geometry')
             record = train_epoch(ddp, pipeline, optimizer, decayer, scheduler, model_name=args.model,
                 epoch=epoch, microbatch=args.microbatch, global_batch=args.global_batch,
                 precision=args.precision, columns=columns, max_pools=args.max_pools)

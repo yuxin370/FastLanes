@@ -161,7 +161,7 @@ The UTF-8 list contains one unquoted JPEG path per line, in the exact desired or
 relative paths resolve against the list's directory. Blank lines are ignored, CRLF
 is accepted, and spaces are preserved. Paths containing newlines are unsupported.
 Empty datasets, missing files, and duplicate resolved paths (including symlink
-aliases) are rejected. `source_paths.txt` records the resulting absolute paths in
+aliases) are rejected. `conversion/sources.txt` records the resulting absolute paths in
 image-ID order. It is useful for re-verification; the online reader does not need
 the original JPEGs or this list.
 
@@ -177,27 +177,66 @@ source comparison; index construction and compatibility checks still run.
 ```text
 example-fastlens/
   manifest.bin
-  generation_<id>/
-    shard_000000.fls
-    shard_000000.meta.bin
+  segments/
+    000000.fls
+    000000.images.bin
     ...
-  block_major_access_v1/
-    manifest.block_major_access.bin
-    shard_000000.block_major_access.bin
+  geometry/
+    index.bin
+    source_order.sha256
+    000000.bin
     ...
-  source_paths.txt
-  conversion_report.json
+  annotations/                      # when labels or premixing are requested
+    samples.jsonl
+    metadata.json
+    class_to_idx.json               # folder-label mode only
+  conversion/
+    sources.txt
+    report.json
 ```
 
-Keep the whole directory together. Manifest references are relative to the store;
-index sidecars identify the manifest and metadata by content. The complete store
-can be moved without rewriting either. The reader discovers `block_major_access_v1`
-automatically; unset `FASTLENS_BLOCK_MAJOR_ACCESS_DIR` if it points at another store.
+| File or directory | Contents and purpose |
+| --- | --- |
+| `manifest.bin` | Dataset entry point: global image intervals and relative coefficient/metadata paths for each segment. Native binary format remains manifest v1. |
+| `segments/000000.fls` | FastLanes-compressed quantized DCT coefficients for segment 0. These files are not JPEGs or model tensors. |
+| `segments/000000.images.bin` | Complete JPEG-DCT metadata for segment 0: image/component geometry, sampling, quantization tables, encoding profiles and block-group bookkeeping. The existing binary metadata format is unchanged. |
+| `geometry/index.bin` | Dataset-level geometry index directory and integrity bindings. |
+| `geometry/source_order.sha256` | SHA-256 of the native input path list in physical image order, retained with the runtime data even when `conversion/` is removed. |
+| `geometry/000000.bin` | Optimized geometry index for segment 0, mapping requested image/component/block positions to rows, vectors and lanes. It is derived from the segment metadata, not another copy of its coefficients. |
+| `annotations/samples.jsonl` | One physical-order record per image: `image_id`, stable `sample_id` and task `label`. Input CSV/JSONL files are not needed to read labels. |
+| `annotations/metadata.json` | Annotation schema, count, source kind, shuffle provenance and hashes binding samples to the manifest, retained physical source order and sample order. |
+| `annotations/class_to_idx.json` | Class-name-to-integer mapping, emitted only for folder labels. |
+| `conversion/sources.txt` | Original absolute JPEG paths in final physical order. Required for adding annotations by source path or re-verifying against the source JPEGs. |
+| `conversion/report.json` | Conversion parameters, stage times, byte counts, verification result, source-list hash and tool/source versions. This is a historical report, not a runtime manifest. |
+
+The matching numeric names identify the same segment; annotation `image_id` is
+always the manifest's global physical image ID, not a segment-local offset or an
+original input-directory position. Native code still uses `shard` for this object
+in API names, options and JSON fields.
+
+Keep `manifest.bin`, `segments/` and `geometry/` together. Manifest members must
+be relative paths inside the store: absolute paths, `..` and escaping symlinks
+are rejected. The store can be moved without rewriting its files. Readers discover
+`geometry/` automatically; unset `FASTLENS_BLOCK_MAJOR_ACCESS_DIR` if it points at
+another dataset. Missing or incompatible geometry indexes fail; a published store
+does not silently switch to a planner without that index.
+
+`annotations/` is needed only when consuming labels or sample identities.
+`conversion/` can be removed for deployment without affecting Reader, Pipeline or
+annotation loading. Removing it loses the recorded source mapping, automatic
+source-based annotation building and conversion history. Exact re-verification
+then requires a separately retained physical-order JPEG list.
+
+This is the new Converter layout and annotations v2 contract. Older stores are
+not automatically upgraded or loaded through legacy sidecar names; reconvert them
+with the current tools. Low-level native writer transactions still use generations.
 
 Conversion uses a sibling `.OUTPUT.fastlens-staging-<id>` directory and preserves
-the native writer's transactional generations within it. Only after compression,
-index validation, and requested verification pass is the directory atomically
-renamed to the destination. A nonempty destination or destination symlink is
+the native writer's transactional generations within it. After compression, the
+Converter finalizes `segments/` and rewrites the manifest with the native
+serializer. It then builds the geometry index against that final manifest,
+performs the requested exact verification, and writes annotations and the report.
+Only after all phases pass is the directory atomically renamed to the destination. A nonempty destination or destination symlink is
 refused; use a new path. Ordinary errors and Ctrl-C clean staging data and preserve
 any existing destination. SIGKILL, machine failure, or abrupt termination may leave
 the named staging directory. Once the converter and its native child have stopped,
@@ -211,8 +250,8 @@ contains observed source/file sizes, chosen options, wall times, verification
 status, source revision, and native executable paths/sizes/timestamps. It defines
 source/output as original JPEG bytes divided by all stored file bytes (including
 the report and source list). `compressed_payload_bytes` counts complete FLS files,
-including their headers and footers. Timings cover discovery, compression, index
-construction/inspection, and verification; total time ends before report writing
+including their headers and footers. Timings cover discovery, compression, layout
+finalization, index construction/inspection, annotations and verification; total time ends before report writing
 and directory publication. No estimated throughput is substituted. Index storage
 targets of 0.5%/1% are informational; small stores can exceed them.
 
@@ -220,14 +259,20 @@ targets of 0.5%/1% are informational; small stores can exceed them.
 index details plus current file sizes. Inspection validates sidecar checksums and
 source identities without decoding coefficients or recomputing full FLS payload
 checksums. `index.compatible=true` does not establish payload integrity: same-size
-FLS corruption can remain undetected. It fails on incompatible indexes;
-an absent index is reported as absent. Source JPEG size is unknown for stores
-without a conversion report. For a later exact check against the original files:
+FLS corruption can remain undetected. Missing or incompatible geometry indexes
+fail inspection. Source JPEG size is unknown for stores
+without a conversion report. The report's `total_output_bytes` is the original
+publication size; inspection's `total_stored_bytes` is the current size of all
+files. Inspection also reports `core_storage_bytes` (manifest-referenced segment
+files plus geometry indexes), `annotation_bytes`, and `conversion_record_bytes`.
+Adding annotations or removing conversion records never rewrites the historical
+report. Unrelated files contribute only to the current total, not core storage.
+For a later exact check against the original files:
 
 ```bash
 build/fastlens/tools/jpeg_dct/fastlens_jpeg_dct_tool \
   --verify-manifest ./test_store/manifest.bin --verify-workers 4 \
-  --input-list ./test_store/source_paths.txt
+  --input-list ./test_store/conversion/sources.txt
 ```
 
 Parallel options affect different phases:
@@ -261,7 +306,8 @@ ctest --test-dir build --output-on-failure -LE nightly -R 'FastLensConverter|Fas
 
 ### Task annotations and offline premixing
 
-An existing store can acquire annotations without recompressing images:
+An unannotated store produced by the current Converter can acquire annotations
+without recompressing images, provided `conversion/sources.txt` is retained:
 
 ```bash
 python -m fastlens annotations build ./train_store \
@@ -272,7 +318,7 @@ python -m fastlens annotations inspect ./train_store --json
 
 Only the manifest, source path list and supplied annotations are read. Source
 JPEGs, coefficient files and access indexes are not needed for this operation.
-`source_paths.txt` must be the original converter-produced list: row N denotes
+`conversion/sources.txt` must be the original converter-produced list: row N denotes
 physical `image_id=N`. Building annotations never changes that order.
 `--image-root` names the source root recorded in that list; it need not still
 contain the JPEGs. Moving the store does not require rewriting source paths.
@@ -294,14 +340,53 @@ IDs describe this dataset, not necessarily ImageNet-1K or a checkpoint's output
 classes.** Flat `ILSVRC2017_test_*.JPEG` filenames do not supply class labels;
 they require a matching external annotation table.
 
-For RGB-no-more CSV entries such as `train/n01440764/a.JPEG`, set `--image-root`
-to the directory containing `train/`, not to `train/` itself. An example CSV is:
+CSV is optional: use folder labels directly for an ImageFolder dataset. Reusing
+a baseline's CSV preserves its image-to-label assignments and numeric class
+convention; it does not change the FastLanes storage format or automatically
+reproduce the baseline's preprocessing or sample order. For example, the local
+RGB-no-more indexes assign `n01440764` to label 448, while sorting all ImageNet
+class directory names assigns it to 0. Use the mapping expected by your model;
+directory names alone do not define a universal integer class order.
+
+The CSV contract is UTF-8 text with a comma-separated header. Column names are
+case-sensitive:
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `Filepath` | Yes | Nonempty absolute or relative JPEG path. Relative paths resolve against the effective image root: `--image-root`, or the input directory during directory conversion. Without an image root, they resolve against the CSV's directory. |
+| `Label` | Yes | Nonnegative integer class ID, preserved without renumbering. Classification applications must ensure it is within their model's output class range. Blank values and JSON `null` are not integer CSV labels; use JSONL for explicitly unlabelled or structured targets. |
+| `sample_id` | No | Unique, nonempty logical identity. If omitted, the JPEG path relative to the image root is used; supply this column when a root-relative identity cannot be derived. It stays attached to the image during shuffle. |
+
+Use standard CSV quoting for fields containing commas or quotes. Each selected
+image must occur exactly once; extra images are rejected as unknown paths. CSV
+rows are joined by path, so their order does not set physical image IDs. Use
+`--input-list` to choose an input order and `--shuffle-seed` to premix it.
+
+For RGB-no-more entries beginning with `val/` or `train/`, set `--image-root`
+to the directory containing those split directories. For example, these two
+rows illustrate the validation index's path and label convention:
 
 ```csv
 Filepath,Label
-train/n01440764/a.JPEG,0
-train/n01443537/b.JPEG,1
+val/n01440764/ILSVRC2012_val_00000293.JPEG,448
+val/n02119789/ILSVRC2012_val_00032528.JPEG,0
 ```
+
+The paper's prepared validation dataset and complete CSV can be used as follows
+when those external inputs are available locally. The output must be new or empty:
+
+```bash
+PAPER_ROOT="$PWD/fastlens/data/system_rgbnomore/e2e_v3/imagenet_512"
+VAL_CSV="$PWD/fastlens/data/system_rgbnomore/e2e_v2/indexbase_val.csv"
+python -m fastlens convert "$PAPER_ROOT/val" \
+  --image-root "$PAPER_ROOT" --labels-csv "$VAL_CSV" \
+  --output ./imagenet512_val_store --shuffle-seed 42 --verify full
+```
+
+Although the JPEGs are under `e2e_v3` and the CSV is under `e2e_v2`, CSV paths
+in this command resolve against `PAPER_ROOT`. The CSV is an annotation input,
+not a second image source. Its filename is arbitrary; `indexbase_val.csv` is
+the name used by the RGB-no-more reference inputs.
 
 JSON labels can be integers, arrays, objects, strings or explicit `null`:
 
@@ -326,24 +411,31 @@ The following directory is published by one rename after validation:
 ```text
 STORE/annotations/
   samples.jsonl
-  samples.meta.json
+  metadata.json
   class_to_idx.json    # folder-label mode only
 ```
 
 Each sample row is `{"image_id":0,"sample_id":"sample-a","label":3}`.
-Metadata schema `fastlens-samples-v1` records the image count, SHA-256 of the
-manifest, source path list, samples and optional class map, the annotation source
-kind, and the final sample-order hash. The order hash is SHA-256 over successive
+Metadata schema `fastlens-samples-v2` records the image count, SHA-256 of the
+manifest, samples and optional class map, the physical source-order binding,
+the annotation source kind, and the final sample-order hash. The order hash is SHA-256 over successive
 sample IDs, each encoded as its UTF-8 byte length (unsigned 64-bit big-endian)
 followed by its UTF-8 bytes. `shuffle: null` makes no claim about how an existing
 physical order was produced. `annotations inspect` checks these bindings,
 consecutive image IDs, unique sample IDs, and the native manifest's image count.
-It does not audit FLS payload integrity or verify the truth of externally supplied
-labels. Existing annotation directories, including symlinks, are never replaced.
+The source-order binding is checked against `geometry/source_order.sha256`,
+written by the converter from its native input list before publication, even
+without annotations. This rejects annotations copied from a differently ordered
+conversion whose manifest happens to have identical structural fields. Adding
+annotations also checks the source list against this retained digest. Keep this
+file with the store; it contains no source paths. These checks do not audit FLS
+payload integrity or verify the truth of externally supplied labels. Loading
+annotations requires neither `conversion/` nor source JPEGs.
+Existing annotation directories, including symlinks, are never replaced.
 
 `annotations build --dry-run` validates all supplied annotations without writing.
 There is no UDF execution or import; a UDF interface is deferred. Adding annotations
-does not rewrite `conversion_report.json`: its sizes remain the original conversion
+does not rewrite `conversion/report.json`: its sizes remain the original conversion
 measurements, while `fastlens inspect` reports current stored bytes.
 
 The same source options are available during conversion. Directory conversion
@@ -359,7 +451,7 @@ python -m fastlens convert ./images --output ./flat_store \
 
 `--shuffle-seed` is optional and accepts 0 through 2^64-1. It mixes entire
 `(source_path, sample_id, label)` records once, before partitioning; the resulting
-`source_paths.txt`, native writer/verifier and samples sidecar all share the same
+`conversion/sources.txt`, native writer/verifier and samples sidecar all share the same
 physical order. Premixing without labels produces explicit null labels. With
 neither labels nor premixing, conversion produces no annotation sidecar.
 
@@ -530,7 +622,7 @@ FastLens also provides native C++ APIs:
 #include <fastlens/fastlens.hpp>
 
 int main() {
-    fastlens::Reader reader("fastlens/data/example-fastlens/shard_000000.fls");
+    fastlens::Reader reader("fastlens/data/example-fastlens/segments/000000.fls");
     fastlens::DecompressOptions options;
     options.write_output = true;
     options.scope = fastlens::TableDecompressionScope::WholeTable;

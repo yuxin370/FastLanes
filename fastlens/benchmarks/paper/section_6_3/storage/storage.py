@@ -59,11 +59,11 @@ def main():
         add(name, "imagenet512", split, payload, metadata, sample_count=manifest["image_count"])
         if name == "imagelanes_source":
             if split == "val":
-                indexes = list((path.parent / "access").glob("*.bin"))
+                indexes = list((path.parent / "geometry").glob("*.bin"))
                 indexes += [compressed / "imagenet512_val_compact_v3/labels.json"]
                 conversion_path = path.parent / "generation.json"
             else:
-                indexes = list((path.parent / "block_major_access_v1").glob("*.bin"))
+                indexes = list((path.parent / "geometry").glob("*.bin"))
                 indexes += [path.parent.parent / "ordered_mapping.csv"]
                 conversion_path = path.parent.parent / "materialization_result.json"
             conversion = json.loads(conversion_path.read_text())

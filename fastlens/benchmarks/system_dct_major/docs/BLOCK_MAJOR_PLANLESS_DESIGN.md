@@ -173,9 +173,8 @@ python3 \
 
 ## Persistent format
 
-Each shard receives `shard_NNNNNN.block_major_access.bin`. A small companion
-index beside the original manifest binds all sidecars to the exact source
-manifest. The original manifest, metadata, FLS header/footer, coefficient
+Each segment receives `geometry/NNNNNN.bin`. The companion
+`geometry/index.bin` binds all descriptors to the exact source manifest. The original manifest, metadata, FLS header/footer, coefficient
 payload, and compressed rowgroups are not rewritten.
 
 Every sidecar starts with a fixed 256-byte little-endian header containing:

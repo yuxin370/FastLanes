@@ -1,6 +1,6 @@
 # FASTLENS JPEG DCT block-major access descriptor v1
 
-`block_major_access_v1` is a read-only sidecar for manifest-v1
+`geometry` is a read-only sidecar for manifest-v1
 `spatial-major-image-minor` shards. It does not replace the FLS table
 descriptor and does not contain coefficient data. Building it leaves the
 manifest, metadata, FLS header/footer, compressed rowgroups, and coefficient
@@ -11,10 +11,10 @@ them does not invalidate an index; small datasets often have larger relative
 sidecar overhead.
 
 The dataset builder publishes one
-`shard_NNNNNN.block_major_access.bin` per shard plus
-`manifest.block_major_access.bin` in a separate output directory. Readers must
-fall back explicitly to the legacy planner when the index or a compatible
-sidecar is absent.
+`NNNNNN.bin` per segment plus
+`index.bin` in a separate output directory. Published Converter stores require the index and every descriptor. Missing or
+incompatible files are errors; the standard store path never falls back to a
+planner without geometry indexes. Binary descriptor version 1 is unchanged.
 
 ## Byte order and integrity
 

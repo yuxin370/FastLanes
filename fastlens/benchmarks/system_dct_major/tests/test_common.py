@@ -127,6 +127,19 @@ class CommonTest(unittest.TestCase):
                 self.assertEqual(parsed["physical_layout"], expected)
                 self.assertEqual(parsed["image_count"], 5)
 
+    def test_manifest_rejects_unsafe_member_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "manifest.bin"
+            for member in (str(root / "data.fls"), "../outside.fls"):
+                manifest.write_bytes(_manifest_bytes(1, 5, member, "data.meta.bin"))
+                with self.subTest(member=member), self.assertRaisesRegex(ValueError, "unsafe"):
+                    parse_manifest(manifest)
+            (root / "escape").symlink_to(root.parent, target_is_directory=True)
+            manifest.write_bytes(_manifest_bytes(1, 5, "escape/outside.fls", "data.meta.bin"))
+            with self.assertRaisesRegex(ValueError, "escapes"):
+                parse_manifest(manifest)
+
     def test_compact_v3_extension_is_parsed_and_consumed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest-v3.bin"

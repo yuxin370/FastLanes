@@ -691,7 +691,7 @@ class FastLensAdapter(Adapter):
         block_major_access_dir = self.config.get("block_major_access_dir")
         if block_major_access_dir is not None:
             access_dir = Path(block_major_access_dir).resolve()
-            companion_index = access_dir / "manifest.block_major_access.bin"
+            companion_index = access_dir / "index.bin"
             if not companion_index.is_file():
                 raise FileNotFoundError(
                     f"configured block-major access companion index is missing: {companion_index}"

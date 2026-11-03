@@ -19,7 +19,7 @@ def main():
     p.add_argument('--mapping-sha256', required=True)
     p.add_argument('--output-dir', type=Path, required=True)
     args = p.parse_args()
-    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent / 'block_major_access_v1')
+    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent / 'geometry')
     # Deliberately omit transposed frequencies in the requested output. The native dependency closure must add them.
     chosen = [0, 1, 7, 10, 64, 67, 128, 144]
     all_channels = [[c // 64, c % 64, (c + 1) * .1, (c + 2) * .01] for c in range(192)]

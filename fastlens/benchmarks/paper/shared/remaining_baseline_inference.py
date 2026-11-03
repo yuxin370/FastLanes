@@ -162,7 +162,7 @@ def main():
             import _fastlens_direct_dct as native
             from fastlens.benchmarks.dct_models.evaluate_shards import native_options, apply_b6_runtime
             from fastlens.benchmarks.dct_models.online_crop import source_options, CROP
-            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'access')
+            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'geometry')
             reader = native.DirectDctReader(str(manifest))
             options = apply_b6_runtime(source_options(native_options(False, True), 'vector-range-read-selected-decode'))
             source = reader.pipeline_batch_options(**options, output_batch_images=batch_size)

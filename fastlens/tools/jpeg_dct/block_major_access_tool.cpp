@@ -14,11 +14,56 @@
 namespace {
 
 void usage(const char* program) {
-	std::cerr << "Usage: " << program
-	          << " MANIFEST --output-dir DIRECTORY [--output-json PATH] [--exhaustive-rank-validation] [--skip-validation]"
-	             " [--rank-checkpoint-images N] [--topology-checkpoint-coordinates N]\n"
-	          << "       " << program << " --inspect MANIFEST\n"
-	          << "       " << program << " --inspect-manifest MANIFEST\n";
+	std::cerr
+	    << "Usage: " << program
+	    << " MANIFEST --output-dir DIRECTORY [--output-json PATH] [--exhaustive-rank-validation] [--skip-validation]"
+	       " [--rank-checkpoint-images N] [--topology-checkpoint-coordinates N]\n"
+	    << "       " << program << " --inspect MANIFEST\n"
+	    << "       " << program << " --inspect-manifest MANIFEST\n"
+	    << "       " << program << " --finalize-store MANIFEST  (unpublished Converter staging only)\n";
+}
+
+std::string segment_name(const uint32_t id, const char* suffix) {
+	std::ostringstream name;
+	name << std::setw(6) << std::setfill('0') << id << suffix;
+	return name.str();
+}
+
+// The Converter owns this unpublished directory and removes it on failure.
+// Keep native generation transactions intact; only finalize their completed
+// output here, before any geometry index or annotation binds the manifest.
+void finalize_store(const std::filesystem::path& path) {
+	using namespace fastlens::jpeg;
+	auto manifest = read_jpeg_dct_shard_manifest(path);
+	if (manifest.version != 1U || manifest.shards.empty()) {
+		throw std::runtime_error("store finalization requires a nonempty manifest-v1 dataset");
+	}
+	const auto root       = path.parent_path();
+	const auto generation = std::filesystem::path(manifest.shards.front().fls_file_name).parent_path();
+	if (generation.has_parent_path() || generation.string().rfind("generation_", 0) != 0) {
+		throw std::runtime_error("store finalization requires unpublished native generation output");
+	}
+	for (const auto& shard : manifest.shards) {
+		if (std::filesystem::path(shard.fls_file_name).parent_path() != generation ||
+		    std::filesystem::path(shard.metadata_file_name).parent_path() != generation) {
+			throw std::runtime_error("store finalization requires one complete native generation");
+		}
+	}
+	if (!std::filesystem::create_directory(root / "segments")) {
+		throw std::runtime_error("refusing to replace existing segments directory");
+	}
+	for (auto& shard : manifest.shards) {
+		const auto fls      = std::filesystem::path("segments") / segment_name(shard.shard_id, ".fls");
+		const auto metadata = std::filesystem::path("segments") / segment_name(shard.shard_id, ".images.bin");
+		std::filesystem::rename(root / shard.fls_file_name, root / fls);
+		std::filesystem::rename(root / shard.metadata_file_name, root / metadata);
+		shard.fls_file_name      = fls.generic_string();
+		shard.metadata_file_name = metadata.generic_string();
+	}
+	const auto staged_manifest = root / "manifest.bin.tmp";
+	write_jpeg_dct_shard_manifest(manifest, staged_manifest);
+	std::filesystem::rename(staged_manifest, path);
+	std::filesystem::remove(root / generation);
 }
 
 uint16_t parse_u16(const std::string_view name, const char* value) {
@@ -48,15 +93,14 @@ void json_string(std::ostream& output, const std::string& value) {
 // coefficient decoding, CUDA initialization, or source JPEG access is needed.
 void inspect_dataset(const std::filesystem::path& path) {
 	using namespace fastlens::jpeg;
-	const auto                   manifest   = read_jpeg_dct_shard_manifest(path);
-	const auto                   root       = path.parent_path();
-	const auto                   directory  = root / "block_major_access_v1";
-	const auto                   index_path = directory / "manifest.block_major_access.bin";
-	const bool                   indexed    = std::filesystem::exists(index_path);
-	JpegDctBlockMajorAccessIndex index;
-	if (indexed) {
-		index = read_jpeg_dct_block_major_access_index(index_path, path, manifest);
+	const auto manifest   = read_jpeg_dct_shard_manifest(path);
+	const auto root       = path.parent_path();
+	const auto directory  = root / "geometry";
+	const auto index_path = directory / "index.bin";
+	if (!std::filesystem::is_regular_file(index_path)) {
+		throw std::runtime_error("incomplete store: missing geometry/index.bin");
 	}
+	const auto            index     = read_jpeg_dct_block_major_access_index(index_path, path, manifest);
 	uint64_t              fls_bytes = 0U, metadata_bytes = 0U, index_bytes = index.index_bytes;
 	std::vector<uint64_t> warning_images;
 	for (size_t i = 0; i < manifest.shards.size(); ++i) {
@@ -82,17 +126,14 @@ void inspect_dataset(const std::filesystem::path& path) {
 				}
 			}
 		}
-		if (indexed) {
-			std::ostringstream filename;
-			filename << "shard_" << std::setw(6) << std::setfill('0') << shard.shard_id << ".block_major_access.bin";
-			auto descriptor = JpegDctBlockMajorAccessDescriptor::Open(directory / filename.str());
-			if (descriptor.descriptor_bytes() != index.shards[i].descriptor_bytes ||
-			    descriptor.descriptor_crc64() != index.shards[i].descriptor_crc64) {
-				throw std::runtime_error("block-major descriptor disagrees with companion index: " + filename.str());
-			}
-			descriptor.ValidateSource(path, shard, metadata_path, fls_path);
-			index_bytes += descriptor.descriptor_bytes();
+		const auto filename   = segment_name(shard.shard_id, ".bin");
+		auto       descriptor = JpegDctBlockMajorAccessDescriptor::Open(directory / filename);
+		if (descriptor.descriptor_bytes() != index.shards[i].descriptor_bytes ||
+		    descriptor.descriptor_crc64() != index.shards[i].descriptor_crc64) {
+			throw std::runtime_error("geometry descriptor disagrees with index: " + filename);
 		}
+		descriptor.ValidateSource(path, shard, metadata_path, fls_path);
+		index_bytes += descriptor.descriptor_bytes();
 	}
 	std::cout << "{\"schema_version\":1,\"manifest_version\":" << manifest.version << ",\"physical_layout\":";
 	json_string(std::cout,
@@ -105,11 +146,8 @@ void inspect_dataset(const std::filesystem::path& path) {
 	          << ",\"coefficient_file_count\":" << manifest.shards.size()
 	          << ",\"metadata_file_count\":" << manifest.shards.size() << ",\"coefficient_bytes\":" << fls_bytes
 	          << ",\"metadata_bytes\":" << metadata_bytes << ",\"manifest_bytes\":" << std::filesystem::file_size(path)
-	          << ",\"index_bytes\":" << index_bytes
-	          << ",\"index_file_count\":" << (indexed ? manifest.shards.size() + 1U : 0U)
-	          << ",\"index\":{\"present\":" << (indexed ? "true" : "false")
-	          << ",\"compatible\":" << (indexed ? "true" : "null") << ",\"version\":" << (indexed ? "1" : "null") << "}"
-	          << ",\"jpeg_warning_image_ids\":[";
+	          << ",\"index_bytes\":" << index_bytes << ",\"index_file_count\":" << (manifest.shards.size() + 1U)
+	          << ",\"index\":{\"present\":true,\"compatible\":true,\"version\":1}" << ",\"jpeg_warning_image_ids\":[";
 	for (size_t i = 0; i < warning_images.size(); ++i) {
 		if (i != 0U) {
 			std::cout << ',';
@@ -122,6 +160,10 @@ void inspect_dataset(const std::filesystem::path& path) {
 } // namespace
 
 int main(const int argc, char** argv) try {
+	if (argc == 3 && std::string_view(argv[1]) == "--finalize-store") {
+		finalize_store(argv[2]);
+		return 0;
+	}
 	if (argc == 3 && std::string_view(argv[1]) == "--inspect-manifest") {
 		const auto manifest = fastlens::jpeg::read_jpeg_dct_shard_manifest(argv[2]);
 		std::cout << "{\"image_count\":" << manifest.image_count << ",\"manifest_version\":" << manifest.version

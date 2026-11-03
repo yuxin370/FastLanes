@@ -15,18 +15,18 @@ build/fastlens/tools/jpeg_dct/fastlens_jpeg_dct_tool \
   --verify-workers 16 fastlens/data/system_rgbnomore/e2e_v3/imagenet_512/val
 build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool \
   fastlens/data/compressed/imagenet512_val_block_major/manifest.bin \
-  --output-dir fastlens/data/compressed/imagenet512_val_block_major/access \
-  --output-json fastlens/data/compressed/imagenet512_val_block_major/access/build.json
+  --output-dir fastlens/data/compressed/imagenet512_val_block_major/geometry \
+  --output-json fastlens/data/compressed/imagenet512_val_block_major/geometry/build.json
 ```
 
 Coefficient verification must report `coefficient_mismatches: 0` and `exact: true`.
 Build access metadata before taking the contract snapshot. The scheduled profile
-also uses `access/shard_000000.active_output_schedule.bin`; materialize it on a
+also uses `geometry/shard_000000.active_output_schedule.bin`; materialize it on a
 CUDA device before timing:
 
 ```bash
 PYTHONPATH=.:build/fastlens/torch \
-FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/access" \
+FASTLENS_BLOCK_MAJOR_ACCESS_DIR="$PWD/fastlens/data/compressed/imagenet512_val_block_major/geometry" \
 FASTLENS_PHASE6_NATIVE_PHYSICAL=1 \
 python3 - <<'PY'
 from fastlens.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
@@ -41,7 +41,7 @@ pipeline.start([list(range(1024))])
 next(pipeline)
 pipeline.close()
 PY
-test -f fastlens/data/compressed/imagenet512_val_block_major/access/shard_000000.active_output_schedule.bin
+test -f fastlens/data/compressed/imagenet512_val_block_major/geometry/shard_000000.active_output_schedule.bin
 ```
 
 Full-frequency and selected-frequency requests share the ownership schedule;
@@ -56,7 +56,7 @@ python -m fastlens.benchmarks.system_dct_major.run \
   --pipelines dct_major_pushdown rgbnomore dali pytorch \
   --dct-major-manifest fastlens/data/compressed/imagenet512_val_block_major/manifest.bin \
   --dct-major-label-map fastlens/data/compressed/imagenet512_val_compact_v3/labels.json \
-  --block-major-access-dir fastlens/data/compressed/imagenet512_val_block_major/access \
+  --block-major-access-dir fastlens/data/compressed/imagenet512_val_block_major/geometry \
   --dct-coeffs all --sample-count 50000 --batch-size 50 --repeats 1 \
   --output-dir "$HOME/tmp/fastlens-block-major-contract" --dry-run
 ```

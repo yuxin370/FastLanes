@@ -55,7 +55,7 @@ python -m fastlens.benchmarks.system_dct_major.run \
   --pipelines dct_major_pushdown rgbnomore dali pytorch \
   --dct-major-manifest fastlens/data/compressed/imagenet512_val_block_major/manifest.bin \
   --dct-major-label-map fastlens/data/compressed/imagenet512_val_compact_v3/labels.json \
-  --block-major-access-dir fastlens/data/compressed/imagenet512_val_block_major/access \
+  --block-major-access-dir fastlens/data/compressed/imagenet512_val_block_major/geometry \
   --dct-coeffs all --sample-count 50000 --batch-size 50 --repeats 1 \
   --output-dir "$HOME/tmp/fastlens-block-major-evaluation"
 ```

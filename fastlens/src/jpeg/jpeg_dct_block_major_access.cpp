@@ -372,7 +372,7 @@ std::vector<uint8_t> encode_bitmap(const std::vector<uint8_t>& bits,
 
 std::filesystem::path sidecar_name(const std::filesystem::path& directory, const uint32_t shard_id) {
 	std::array<char, 64> name {};
-	const auto count = std::snprintf(name.data(), name.size(), "shard_%06u.block_major_access.bin", shard_id);
+	const auto count = std::snprintf(name.data(), name.size(), "%06u.bin", shard_id);
 	if (count < 0 || static_cast<size_t>(count) >= name.size()) {
 		fail("failed to format block-major sidecar name");
 	}
@@ -2046,7 +2046,7 @@ JpegDctBlockMajorAccessDatasetReport build_jpeg_dct_block_major_access_dataset(
 	if (manifest.version != 1U) {
 		fail("dataset builder requires manifest version 1");
 	}
-	const auto directory = output_directory.empty() ? manifest_path.parent_path() / "block_major_access_v1"
+	const auto directory = output_directory.empty() ? manifest_path.parent_path() / "geometry"
 	                                                : output_directory;
 	std::error_code error;
 	std::filesystem::create_directories(directory, error);
@@ -2082,7 +2082,7 @@ JpegDctBlockMajorAccessDatasetReport build_jpeg_dct_block_major_access_dataset(
 	}
 	put_le<uint64_t>(index, 40U, index.size());
 	put_le<uint64_t>(index, 48U, crc64_with_zeroed_field(index.data(), index.size(), 48U));
-	report.index_path = directory / "manifest.block_major_access.bin";
+	report.index_path = directory / "index.bin";
 	write_staged_file(report.index_path, index);
 	report.index_bytes = index.size();
 	const auto added_bytes = report.descriptor_bytes + report.index_bytes;

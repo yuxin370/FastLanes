@@ -18,7 +18,7 @@ from . import annotations
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_NAMES = ("fastlens_jpeg_dct_tool", "fastlens_block_major_access_tool")
-REPORT_NAME = "conversion_report.json"
+REPORT_NAME = "conversion/report.json"
 PHYSICAL_LAYOUT = "spatial-major-image-minor"
 JPEG_EXTENSIONS = {".jpg", ".jpeg", ".jpe"}
 
@@ -60,7 +60,7 @@ def make_parser() -> argparse.ArgumentParser:
     annotation_options(convert, required=False)
     convert.add_argument("--output", type=Path, required=True, help="new or empty destination directory")
     convert.add_argument("--layout", choices=["block-major"], default="block-major")
-    convert.add_argument("--partition-images", type=positive_int, default=1024, help="maximum images per shard (default: 1024)")
+    convert.add_argument("--partition-images", type=positive_int, default=1024, help="maximum images per segment (default: 1024)")
     convert.add_argument("--preset", choices=["balanced", "throughput", "crop-latency"], default="balanced")
     convert.add_argument("--workers", type=worker_count, default="auto", help="CPU budget for defaults: auto or 1..256")
     for option, description in (
@@ -242,7 +242,7 @@ def annotations_command(args: argparse.Namespace) -> int:
         if metadata["image_count"] != count:
             raise ConversionError("annotation image count disagrees with native manifest")
         print(json.dumps(metadata, indent=2) if args.json else
-              f"Compatible {metadata['schema_version']}: {count} images; manifest, source order and annotations verified.")
+              f"Compatible {metadata['schema_version']}: {count} images; manifest, sample order and annotations verified.")
     return 0
 
 
@@ -334,7 +334,8 @@ def convert(args: argparse.Namespace) -> int:
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.fastlens-staging-", dir=output.parent))
     exported = False
     try:
-        ordered_list = stage / "source_paths.txt"
+        (stage / "conversion").mkdir()
+        ordered_list = stage / "conversion/sources.txt"
         ordered_list.write_text("".join(f"{path}\n" for path in inputs), encoding="utf-8")
         log = stage / ".native.log"
         jpeg = str(tools[TOOL_NAMES[0]])
@@ -348,7 +349,10 @@ def convert(args: argparse.Namespace) -> int:
         run_native(command, log, "Compression")
         times["compression_seconds"] = time.perf_counter() - phase
         phase = time.perf_counter()
-        run_native([str(tools[TOOL_NAMES[1]]), str(stage / "manifest.bin"), "--output-dir", str(stage / "block_major_access_v1")], log, "Access index")
+        run_native([str(tools[TOOL_NAMES[1]]), "--finalize-store", str(stage / "manifest.bin")], log, "Store layout")
+        times["layout_finalization_seconds"] = time.perf_counter() - phase
+        phase = time.perf_counter()
+        run_native([str(tools[TOOL_NAMES[1]]), str(stage / "manifest.bin"), "--output-dir", str(stage / "geometry")], log, "Geometry index")
         info = native_inspect(stage, tools[TOOL_NAMES[1]])
         if (info["manifest_version"] != 1 or info["physical_layout"] != PHYSICAL_LAYOUT
                 or not info["index"]["compatible"] or info["image_count"] != len(inputs)):
@@ -364,15 +368,20 @@ def convert(args: argparse.Namespace) -> int:
                         "--input-list", str(ordered_list)], log, "Exact DCT verification")
             times["verification_seconds"] = time.perf_counter() - phase
         log.unlink()
+        # Preserve the native input order independently of annotations and the
+        # removable conversion records, including stores labelled later.
+        source_order_sha256 = annotations.file_sha256(ordered_list)
+        (stage / annotations.SOURCE_ORDER).write_text(source_order_sha256 + "\n", encoding="ascii")
         if records is not None:
             phase = time.perf_counter()
-            sample_metadata = annotations.publish_annotations(stage, records, classes, label_source=label_source, shuffle=shuffle)
+            annotations.publish_annotations(stage, records, classes, label_source=label_source, shuffle=shuffle)
             times["annotation_seconds"] = time.perf_counter() - phase
         report = {
             "schema_version": 1, "input_image_count": len(inputs), "original_jpeg_bytes": source_bytes,
             "compressed_payload_bytes": info["coefficient_bytes"], "metadata_bytes": info["metadata_bytes"],
             "index_bytes": info["index_bytes"], "manifest_bytes": info["manifest_bytes"],
-            "source_paths_bytes": ordered_list.stat().st_size, "shard_count": info["shard_count"],
+            "source_paths_bytes": ordered_list.stat().st_size,
+            "source_paths_sha256": source_order_sha256, "shard_count": info["shard_count"],
             "manifest_version": info["manifest_version"], "index_version": info["index"]["version"],
             "physical_layout": info["physical_layout"], "metadata_profile": "reconstruct",
             "partition_images": args.partition_images, "preset": args.preset,
@@ -383,8 +392,6 @@ def convert(args: argparse.Namespace) -> int:
         }
         if records is not None:
             report["annotations"] = annotations.DIRECTORY
-            report["shuffle"] = shuffle
-            report["sample_order_sha256"] = sample_metadata["sample_order_sha256"]
         times["total_seconds"] = time.perf_counter() - started
         report["wall_time_scope"] = "through completion of pipeline and inspection, before report serialization and atomic publication"
         content = write_report(stage / REPORT_NAME, report, stored_bytes(stage))
@@ -401,7 +408,7 @@ def convert(args: argparse.Namespace) -> int:
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    print(f"Published {output}: {len(inputs)} images, {report['shard_count']} shards, "
+    print(f"Published {output}: {len(inputs)} images, {report['shard_count']} segments, "
           f"{report['total_output_bytes']:,} bytes, source/output={report['source_to_output_ratio']:.3f}, "
           f"verification={report['verification']}, {times['total_seconds']:.2f}s.")
     return 0
@@ -411,6 +418,9 @@ def inspect_store(args: argparse.Namespace) -> int:
     tools = find_tools(args.build_dir, (TOOL_NAMES[1],))
     info = native_inspect(args.store, tools[TOOL_NAMES[1]])
     info["total_stored_bytes"] = stored_bytes(args.store)
+    info["core_storage_bytes"] = info["manifest_bytes"] + stored_bytes(args.store / "segments") + stored_bytes(args.store / "geometry")
+    info["annotation_bytes"] = stored_bytes(args.store / annotations.DIRECTORY)
+    info["conversion_record_bytes"] = stored_bytes(args.store / "conversion")
     report_path = args.store / REPORT_NAME
     source_bytes = None
     if report_path.is_file():
@@ -426,11 +436,13 @@ def inspect_store(args: argparse.Namespace) -> int:
         print(json.dumps(info, indent=2, sort_keys=True))
     else:
         print(f"Manifest v{info['manifest_version']}; layout={info['physical_layout']}")
-        print(f"Images: {info['image_count']}; shards: {info['shard_count']}")
+        print(f"Images: {info['image_count']}; segments: {info['shard_count']}")
         print(f"Coefficients: {info['coefficient_file_count']} files, {info['coefficient_bytes']:,} bytes; "
               f"metadata: {info['metadata_file_count']} files, {info['metadata_bytes']:,} bytes")
-        print(f"Access index: {'compatible v1' if info['index']['compatible'] else 'absent'}; "
+        print(f"Geometry index: {'compatible v1' if info['index']['compatible'] else 'absent'}; "
               f"{info['index_file_count']} files, {info['index_bytes']:,} bytes")
+        print(f"Core storage: {info['core_storage_bytes']:,} bytes; annotations: {info['annotation_bytes']:,} bytes; "
+              f"conversion records: {info['conversion_record_bytes']:,} bytes")
         print("Check scope: metadata and index compatibility; full FLS payload integrity is not checked.")
         print(f"Total stored: {info['total_stored_bytes']:,} bytes; "
               + (f"source JPEGs: {source_bytes:,} bytes; source/output={info['source_to_output_ratio']:.3f}" if source_bytes is not None else "source JPEG bytes: unknown"))

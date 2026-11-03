@@ -239,7 +239,7 @@ python -m fastlens.benchmarks.system_dct_major.run \
   --pipelines dct_major_pushdown rgbnomore \
   --dct-major-manifest "$FASTLENS_DATA/compressed/imagenet512_val_block_major/manifest.bin" \
   --dct-major-label-map "$FASTLENS_DATA/compressed/imagenet512_val_compact_v3/labels.json" \
-  --block-major-access-dir "$FASTLENS_DATA/compressed/imagenet512_val_block_major/access" \
+  --block-major-access-dir "$FASTLENS_DATA/compressed/imagenet512_val_block_major/geometry" \
   --dct-coeffs all --sample-count 50000 --batch-size 50 \
   --warmup-batches 0 --measurement-batches 1000 --semantic-samples 32 --repeats 1 \
   --output-dir "$FASTLENS_RUNS/vitti_native"

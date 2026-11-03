@@ -53,7 +53,7 @@ def main():
         run([ROOT / 'build/fastlens/benchmarks/fastlens_dct_storage', 'merge-block', directory, *names],
             directory / 'manifest.log')
         run([ROOT / 'build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool', directory / 'manifest.bin',
-             '--output-dir', directory / 'access', '--output-json', directory / 'access/build.json'],
+             '--output-dir', directory / 'geometry', '--output-json', directory / 'geometry/build.json'],
             directory / 'index.log')
     (args.output_root / 'preparation.json').write_text(json.dumps(dict(
         source_manifest=str(args.source_root / 'manifest.bin'), source_shard_ids=args.shard_ids,

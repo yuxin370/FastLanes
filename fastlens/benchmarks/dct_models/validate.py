@@ -17,7 +17,7 @@ def validate_block_major(data, samples, info, ref, net):
     from fastlens.benchmarks.dct_models.evaluate_shards import native_options, organize_batch
     sys.path.insert(0, str(B.REPO / "build/fastlens/torch"))
     import _fastlens_direct_dct as native
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(data.resolve() / "access")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(data.resolve() / "geometry")
     reader = native.DirectDctReader(str(data.resolve() / "manifest.bin"))
     net = net.cuda()
     torch.backends.cuda.matmul.allow_tf32 = False

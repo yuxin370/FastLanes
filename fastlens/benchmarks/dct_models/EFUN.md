@@ -89,7 +89,7 @@ $PYTHON "$EXP/efun.py" generate --count 50000 --layout block-major \
   --shard-images 1024 --workers 8 --shard-workers 2 --encoding-threads 4 \
   --output-dir "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major"
 build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool \
-  "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/manifest.bin" --output-dir "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/access" \
+  "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/manifest.bin" --output-dir "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/geometry" \
   --output-json "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/access.json"
 $PYTHON "$EXP/efun.py" validate "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major"
 OUT="$DATA/runs/efun/pro6000/full"

@@ -237,19 +237,19 @@ def _block_major_access_contract(
     required_active_output_schedule_shard_ids: Sequence[int] = (),
 ) -> dict[str, Any]:
     directory = directory.resolve()
-    companion_index = directory / "manifest.block_major_access.bin"
+    companion_index = directory / "index.bin"
     if not companion_index.is_file():
         raise FileNotFoundError(
             f"block-major access companion index is missing: {companion_index}"
         )
     expected = [
-        directory / f"shard_{int(shard_id):06d}.block_major_access.bin"
+        directory / f"{int(shard_id):06d}.bin"
         for shard_id in shard_ids
     ]
     missing = [path for path in expected if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"block-major shard descriptor is missing: {missing[0]}")
-    observed = sorted(directory.glob("shard_*.block_major_access.bin"))
+    observed = sorted(directory.glob("[0-9]*.bin"))
     if {path.resolve() for path in observed} != {path.resolve() for path in expected}:
         raise ValueError("block-major descriptor directory has unexpected shard files")
 

@@ -48,7 +48,7 @@ def main():
         crop_origin_alignment_blocks=2, chroma_crop_scale_x=2, chroma_crop_scale_y=2,
         allowed_chroma_sampling_ratios=[[1, 2, 1, 2]],
         output_channels=[[c, f, 0., 1.] for c, f in selected.input_channels])
-    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent/'block_major_access_v1')
+    os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(args.manifest.parent/'geometry')
     reader = native.DirectDctReader(str(args.manifest))
     batch = reader.read_batch(list(range(4)), transforms=transforms, **options)
     jpeg_raw = x[:, [c*64+f for c, f in selected.input_channels]]

@@ -91,9 +91,9 @@ class RunContractTest(unittest.TestCase):
     def test_descriptor_contract_freezes_every_shard_and_storage_ratio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "manifest.block_major_access.bin").write_bytes(b"index")
+            (root / "index.bin").write_bytes(b"index")
             for shard_id in (0, 4):
-                (root / f"shard_{shard_id:06d}.block_major_access.bin").write_bytes(
+                (root / f"{shard_id:06d}.bin").write_bytes(
                     bytes(100 + shard_id)
                 )
             storage = {
@@ -110,8 +110,8 @@ class RunContractTest(unittest.TestCase):
     def test_descriptor_contract_rejects_storage_above_one_percent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "manifest.block_major_access.bin").write_bytes(bytes(100))
-            (root / "shard_000000.block_major_access.bin").write_bytes(bytes(1000))
+            (root / "index.bin").write_bytes(bytes(100))
+            (root / "000000.bin").write_bytes(bytes(1000))
             storage = {"persistent_bytes": 10_000, "manifest": {"size_bytes": 100}}
             with self.assertRaisesRegex(ValueError, "exceeds the 1% storage gate"):
                 _block_major_access_contract(root, storage, (0,))
@@ -119,9 +119,9 @@ class RunContractTest(unittest.TestCase):
     def test_scheduled_contract_requires_sidecars_before_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "manifest.block_major_access.bin").write_bytes(b"index")
+            (root / "index.bin").write_bytes(b"index")
             for shard_id in (0, 4):
-                (root / f"shard_{shard_id:06d}.block_major_access.bin").write_bytes(b"descriptor")
+                (root / f"{shard_id:06d}.bin").write_bytes(b"descriptor")
             storage = {
                 "persistent_bytes": 1_000_000,
                 "manifest": {"size_bytes": 1000},

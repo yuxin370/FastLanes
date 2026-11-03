@@ -244,6 +244,10 @@ def parse_manifest(manifest_path: Path) -> dict[str, Any]:
         fls_file_size, metadata_file_size = take("<QQ")
         fls_file_name = take_string()
         metadata_file_name = take_string()
+        for name in (fls_file_name, metadata_file_name):
+            member = Path(name)
+            require(bool(name) and not member.is_absolute() and ".." not in member.parts,
+                    f"unsafe manifest member path: {name}")
         fls_path = (root / fls_file_name).resolve()
         metadata_path = (root / metadata_file_name).resolve()
         require(fls_path.is_relative_to(root), f"FLS payload escapes manifest root: {fls_file_name}")

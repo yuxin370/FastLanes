@@ -69,7 +69,7 @@ def validate(net, count, root):
     from fastlens.benchmarks.dct_models.evaluate import samples
     from fastlens.benchmarks.dct_models.evaluate_shards import native_options, parse_manifest
     import _fastlens_direct_dct as native
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(root / "access")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(root / "geometry")
     selected = {s["galp_image_id"]: s["model_label"] for s in samples(count)}
     stored = json.loads((root / "samples.json").read_text())
     manifest = parse_manifest(root / "manifest.bin")
@@ -219,7 +219,7 @@ def main():
         execution = net if args.no_compile else torch.compile(net, **{
             k: args.compile_mode if k == "mode" else v
             for k, v in recipe["execution"]["model_compile"].items() if k != "enabled"})
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "block_major_access_v1")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "geometry")
     if rgb_backend:
         from fastlens.benchmarks.dct_models.training_rgb import RgbTrainingPipeline
         pipeline = RgbTrainingPipeline(variant=args.input_backend.removeprefix("rgb_"), workers=args.workers,
@@ -323,7 +323,7 @@ def main():
                 initial_validation = validate_rgb(net, args.validation_count, args.workers)
             else:
                 initial_validation = validate(net, args.validation_count, args.validation_data)
-                os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "block_major_access_v1")
+                os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "geometry")
             (args.output_dir / "initial_validation.json").write_text(json.dumps(initial_validation, indent=2) + "\n")
         for epoch in range(complete_epochs, args.epochs):
             finite = torch.ones((), device="cuda", dtype=torch.bool)
@@ -462,7 +462,7 @@ def main():
                     record["validation"] = validate_rgb(net, args.validation_count, args.workers)
                 else:
                     record["validation"] = validate(net, args.validation_count, args.validation_data)
-                os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "block_major_access_v1")
+                os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(args.manifest.parent / "geometry")
             records.append(record)
             (args.output_dir / f"epoch_{epoch}.json").write_text(json.dumps(record, indent=2)+"\n")
             if full and net is not None:

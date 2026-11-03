@@ -55,7 +55,7 @@ def main():
     rows = batches[args.microbatch]
     selected = {r["image_id"] for r in rows}
     source = dict(source, images=[r for r in source["images"] if r["image_id"] in selected])
-    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(MANIFEST.parent/"access")
+    os.environ["FASTLENS_BLOCK_MAJOR_ACCESS_DIR"] = str(MANIFEST.parent/"geometry")
     numerical_runtime("cuda:0")
     torch.set_num_threads(config["torch_threads"])
     with UnifiedReplay("fastlens", MANIFEST, config, source, profile, device="cuda:0",
