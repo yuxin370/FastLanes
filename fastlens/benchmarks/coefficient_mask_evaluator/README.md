@@ -35,13 +35,15 @@ The 76 conditions are:
 ## Run
 
 Use a stable GPU UUID on hosts where CUDA ordinals and `nvidia-smi` indices do
-not agree, and use the device-name guard:
+not agree, and use the device-name guard. Obtain the selected GPU's UUID with
+`nvidia-smi -L` and replace `GPU-SELECTED-UUID` below. Set the guard to its actual
+device name; this example selects an H100.
 
 ```bash
-CUDA_VISIBLE_DEVICES=GPU-d6e80e78-00d8-8e4b-0c81-a403bebe0d76 \
+CUDA_VISIBLE_DEVICES=GPU-SELECTED-UUID \
   python3 \
   -m fastlens.benchmarks.coefficient_mask_evaluator.evaluate \
-  --output-dir fastlens/benchmarks/coefficient_mask_evaluator/runs/imagenet_val_k1_64_20260816_h100 \
+  --output-dir "$HOME/tmp/fastlens-coefficient-masks" \
   --expected-device-name 'NVIDIA H100 80GB HBM3' \
   --batch-size 64 \
   --condition-chunk-size 16 \

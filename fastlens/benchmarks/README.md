@@ -4,7 +4,7 @@ Choose the entry point by purpose:
 
 | Directory | Purpose |
 | --- | --- |
-| [`paper/`](paper/README.md) | Reviewer reproduction of `fastlens.pdf`, organized by section and experiment, with measured defaults |
+| [`paper/`](paper/README.md) | Reproduction of `fastlens.pdf`, organized by section and experiment, with measured defaults |
 | [`development/`](development/README.md) | Supporting microbenchmarks, diagnostics and CPU regression checks |
 | [`baselines/`](baselines/README.md) | RGB/IC/FS/L3/nvCOMP comparison implementations and their tests |
 | [`paper/results/`](paper/results/README.md) | Complete published result tables, trial records and plotting inputs |
@@ -42,15 +42,12 @@ not final-paper experiment entries.
 Unit tests remain beside the implementations they test; `development.check`
 collects the CPU suites without launching paper measurements.
 
-See each package README for low-level APIs and external dependencies. Data,
-checkpoints, profiler captures, historical queues and development reports are
-excluded from the submission. Published measurements are in `paper/results/`.
-Reviewers should use the chapter entries in `paper/`.
+Benchmark implementations, published measurements and reproducibility
+instructions are organized separately. Start with the
+[paper reproduction guide](paper/README.md) for evaluated workloads, and use
+package READMEs for lower-level APIs and dependencies. Published measurements
+and their source references are in [paper/results/](paper/results/README.md).
 
-## What is not required to run a benchmark?
-
-`__pycache__/`, historical `runs/`, profiler captures, generated figures and
-old reports are outputs or reference material. They are not executable
-dependencies. The tests, CMake file, shared headers, data readers, models and
-training recipes are needed for building, validating or running their respective
-workloads; a file is not redundant merely because it is not an entry point.
+Datasets, checkpoints and profiler captures are external inputs or generated
+outputs. Each experiment guide describes how to prepare its inputs. Write new
+runs to a separate output directory; the published tables are reference data.

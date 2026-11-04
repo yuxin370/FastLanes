@@ -53,9 +53,8 @@ registers:
 | `rgbnomore-swinv2-t-dct-224-v1` | grouped/sub-block YCbCr DCT stem | BF16 autocast | active B6-only convergence and runtime baselines |
 
 The SwinV2-T entry adapts the RGB-no-more DCT architecture to the existing
-224-crop B6 contract (`window_size=7`). It is intentionally not compatible
-with the project's 256-crop/window-8 checkpoint and therefore makes no
-official pretrained-accuracy claim. It is suitable for measured throughput,
+224-crop B6 contract (`window_size=7`). The 256-pixel, window-size-8 checkpoint
+is not compatible with this configuration. This configuration supports throughput,
 memory and from-scratch convergence comparisons under the same B6 data path.
 The published convergence configuration and commands are in the
 [paper convergence entry](../paper/section_6_2_5/training_convergence/README.md).

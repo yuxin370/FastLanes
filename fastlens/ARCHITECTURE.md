@@ -48,17 +48,22 @@ and the model-facing representation. `read` processes a single logical batch;
 `iter_batches` and `pipeline` expose repeated reads.
 
 ```python
-from fastlens.profiles.rgbnomore import VALIDATION_CENTER_CROP_512
+from fastlens.profiles.rgbnomore import VALIDATION
 from fastlens.torch import DirectDctReader
 
-reader = DirectDctReader("data/example-fastlens/manifest.bin",
+reader = DirectDctReader("fastlens/data/example-fastlens/manifest.bin",
                          module_path="build/fastlens/torch")
 with reader.iter_batches([[0, 1], [2, 3]],
-                         profile=VALIDATION_CENTER_CROP_512,
+                         profile=VALIDATION,
                          coefficients=None) as batches:
     for batch in batches:
         y, cbcr = batch.tensors
 ```
+
+Prepare at least four 512×512 RGB, 4:2:0 JPEGs with the
+[converter](docs/CONVERSION.md). Run this example from the repository root.
+The [Direct-DCT guide](docs/DIRECT_DCT.md#reader-and-pipeline) describes profile
+geometry and the complete-partition requirement of `VALIDATION_CENTER_CROP_512`.
 
 `coefficients=None` selects all source coefficients. Explicit selection refers
 to storage columns; profile output geometry is a separate contract. CNN
@@ -81,8 +86,8 @@ separate from the model input interface.
 
 ## C++ interface and tests
 
-Use `<fastlens/fastlens.hpp>` with `FastLens::core` for table decompression, or
-`<fastlens/direct_dct.hpp>` with `FastLens::jpeg_dct_device` for device-resident
+Use `<fastlens/stable.hpp>` with `FastLens::core` for table decompression, or
+`<fastlens/advanced/direct_dct.hpp>` with `FastLens::jpeg_dct_device` for device-resident
 DCT inputs. Rowgroup and column views borrow their owning table's storage.
 Installed-package consumers are under `fastlens/examples/`.
 

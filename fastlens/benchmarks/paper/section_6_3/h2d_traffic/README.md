@@ -22,7 +22,7 @@ Published records (repository-relative, unprefixed batch names are under `result
 
 `results/section42_resources_20261008/measurements.csv; results/ffcv_h2d_20261014/measurements.csv`
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.
 
 The [published traffic table](../../results/section_6_3/h2d_traffic.csv) contains the 28 points used in Fig. 14. Memory-diagnostic passes and unused models remain in the historical source CSV rather than the reported table.

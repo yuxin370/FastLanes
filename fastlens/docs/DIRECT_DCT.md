@@ -48,6 +48,7 @@ For CNN workloads, `DctModelProfile` defines the output channels, geometry, and 
 The same store also supports the public asynchronous pipeline with a Direct-DCT profile:
 
 ```python
+from fastlens.profiles.rgbnomore import VALIDATION
 from fastlens.torch import DirectDctPipeline
 
 with DirectDctPipeline(

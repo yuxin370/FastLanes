@@ -1,7 +1,7 @@
 # FastLens final-paper reproduction
 
 This directory follows **Sections 6.2–6.5 of [fastlens.pdf](../../docs/paper/outputs/fastlens.pdf)** (PDF date
-2026-10-18). It is the reviewer entry point. Development checks are in
+2026-10-18). Start here to reproduce the evaluated workloads. Development checks are in
 [`../development/`](../development/README.md); reader/model implementations remain
 shared in `../baselines/` and the model/training packages. Section-specific workers
 live beside their `run.py`; workers reused across sections live in `shared/`.
@@ -11,7 +11,7 @@ The final PDF contains six RGB baselines.
 
 ## Start here
 
-Follow the root [environment setup](../../../README.md#1-install-dependencies), then
+Follow the root [environment setup](../../../README.md#requirements-and-installation), then
 run from the repository root with the `fastlens` environment active.
 JPEG-B8 experiments also need the RGB-no-more `dct_manip` extension.
 DALI, FFCV, CoorDL and L3 are needed

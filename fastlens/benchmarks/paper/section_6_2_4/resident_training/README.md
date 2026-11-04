@@ -12,5 +12,5 @@ Published records (repository-relative, unprefixed batch names are under `result
 
 `resident_study_20261011_fixed, remaining_baselines_20261012`
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.

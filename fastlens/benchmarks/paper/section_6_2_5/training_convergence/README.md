@@ -12,5 +12,5 @@ Published records (repository-relative, unprefixed batch names are under `result
 
 `a800_convergence_20261003/figures/convergence_observed.csv; a800_swin_independent_20261012/remote/independent/metrics.jsonl; a800_crop_policy_20261010/remote/independent/metrics.jsonl`
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.

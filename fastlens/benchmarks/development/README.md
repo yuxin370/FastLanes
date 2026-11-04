@@ -1,8 +1,7 @@
 # Supporting benchmarks and checks
 
-Reviewer experiment entry points are in [`../paper/`](../paper/README.md).
-This directory retains source needed by the build and correctness checks;
-historical run queues, report generators and their tests are not distributed.
+Paper reproduction entry points are in [`../paper/`](../paper/README.md).
+This directory contains microbenchmarks, profiling helpers and correctness checks.
 
 | Source / command | Purpose |
 | --- | --- |

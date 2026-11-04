@@ -41,7 +41,7 @@ DATA=fastlens/data/system_rgbnomore/e2e_v3
 export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2
 export TMPDIR="$HOME/tmp/dctnet" MPLCONFIGDIR="$HOME/tmp/matplotlib"
 mkdir -p "$TMPDIR" "$MPLCONFIGDIR"
-# Already downloaded in this workspace. For a fresh checkout:
+# Download the model source and checkpoint for a fresh checkout.
 git clone https://github.com/kfirgoldberg/FUN.git "$EXP/FUN"
 git -C "$EXP/FUN" checkout 6c2b5f4a43a2b514163ff1f3f114d4feeb174d3c
 $PYTHON -m gdown 17GRexna2lMaqELTK-PYgIlwEUk9Hponp \
@@ -76,15 +76,12 @@ from programs importing a different timm version.
 
 ## GPU inference through FASTLENS
 
-Check utilization **and** active processes before selecting a device. Prefer
-an idle PRO 6000, then an idle H100. Do not use a busy RTX 4090 or stop another
-workload. The commands below assume the PRO 6000 has been confirmed idle;
-replace the UUID with the H100 UUID if that is the idle device.
+Select an idle GPU after checking utilization and active processes. Obtain its
+UUID with `nvidia-smi -L` and replace `GPU-SELECTED-UUID` below.
 
 ```bash
 nvidia-smi
-export CUDA_VISIBLE_DEVICES=GPU-e796262d-3449-6af1-586d-8460d8836d1b
-# H100: GPU-d6e80e78-00d8-8e4b-0c81-a403bebe0d76
+export CUDA_VISIBLE_DEVICES=GPU-SELECTED-UUID
 $PYTHON "$EXP/efun.py" generate --count 50000 --layout block-major \
   --shard-images 1024 --workers 8 --shard-workers 2 --encoding-threads 4 \
   --output-dir "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major"
@@ -92,7 +89,7 @@ build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool \
   "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/manifest.bin" --output-dir "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/geometry" \
   --output-json "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major/access.json"
 $PYTHON "$EXP/efun.py" validate "fastlens/data/compressed/backup/offline_model_input/imagenet512_val_efun28_block_major"
-OUT="$DATA/runs/efun/pro6000/full"
+OUT="$DATA/runs/efun/inference"
 $PYTHON "$EXP/efun.py" evaluate --route R --device cuda --count 50000 \
   --batch-size 64 --workers 16 --output-dir "$OUT"
 for variant in grid_off projected_off projected_on; do
@@ -116,8 +113,8 @@ The complete inference/training Nsight Systems matrix can be collected with
 `efun_profile.sh` after selecting an idle GPU:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=GPU-40c637bd-acf5-ea1a-0df8-617138228467
-bash fastlens/benchmarks/dct_models/efun_profile.sh nsys_20260915
+export CUDA_VISIBLE_DEVICES=GPU-SELECTED-UUID
+bash fastlens/benchmarks/dct_models/efun_profile.sh nsys_capture
 ```
 
 The script checks that the selected GPU has no compute processes and records

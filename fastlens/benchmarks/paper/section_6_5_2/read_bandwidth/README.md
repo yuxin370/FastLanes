@@ -12,5 +12,5 @@ Published records (repository-relative, unprefixed batch names are under `result
 
 `results/paper_rerun_20261007/remaining_continue/{4090,H100}/bandwidth/summary.csv; results/bandwidth_recheck_20261012_2000/H100/bandwidth/summary.csv`
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.

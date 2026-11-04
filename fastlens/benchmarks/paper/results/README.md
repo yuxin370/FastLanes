@@ -108,5 +108,6 @@ cannot overwrite these published tables.
 
 Presentation labels use **FastLens**. Historical trial IDs such as `imagelanes`,
 `imagelanes_basic`, and versioned `galp-*` schemas remain unchanged so the tables
-can still be traced to the original evidence. No measurement was changed to
-force agreement with a rounded prose claim.
+can still be traced to the original evidence. Published values are derived from
+the referenced trial records using the statistics described above; display
+rounding is applied separately.

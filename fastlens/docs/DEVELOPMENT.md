@@ -96,7 +96,7 @@ FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build --output-on-failure -R '^Fa
 `FastLensPipelineFacadePython` covers the Python pipeline contract without a GPU
 or the Torch extension. `FastLensDirectDctLifetimeTorchPython` uses a small generated
 JPEG store to check tensor ownership, pending consumer streams, legacy lifetime
-support, and metrics completion. It replaces the Phase-4/5 proof scripts and uses
+support, and metrics completion. It uses
 the private `_fastlens_test_consumer` module, which is built only for testing.
 The same strict CUDA setting applies to this suite.
 
@@ -107,8 +107,8 @@ FASTLENS_REQUIRE_CUDA_SMOKE=1 ctest --test-dir build --output-on-failure \
 
 Benchmark tests retain the `benchmark` label; use `-LE 'benchmark|nightly'` for
 regular functional checks, or `-L benchmark` for experiment tooling checks.
-The historical Phase-2 A/B probe is excluded from the default build and remains
-available explicitly with `cmake --build build --target _fastlens_phase2_native_ab`.
+The optional native scheduler comparison probe can be built with
+`cmake --build build --target _fastlens_phase2_native_ab`.
 The runtime no-D2H check also enforces asynchronous submission; it scans native
 runtime paths, leaving test reference calculations free to inspect CPU values.
 
@@ -126,15 +126,35 @@ GPU tests require a working CUDA device. Some integration tests also require loc
 
 The CUDA toolkit is required to configure the project, including when only CPU tests are run.
 
+## Documentation checks
+
+Run the documentation checks without CUDA or third-party Python packages:
+
+```bash
+python -B -m unittest fastlens.tests.test_documentation -v
+```
+
+`FastLensDocumentationPython` runs the same checks through CTest. It validates
+relative Markdown links against publishable files and directories, heading
+anchors, introductory Python syntax, and specific internal-session phrases,
+machine GPU UUIDs and dated temporary paths. Dated `history/` records and
+manuscript build notes retain provenance; their relative links are still checked.
+External URLs are not fetched by this check.
+
+`FastLensConvertedStoreTorchPython` also executes the reader examples extracted
+from the root README, architecture guide and Direct-DCT guide against a generated
+four-image Store. Only data and extension paths are replaced for the fixture.
+Use the strict CUDA command above to validate these examples on a GPU.
+
 ## C++ interface
 
 FastLens also provides native C++ APIs:
 
-- `<fastlens/fastlens.hpp>` for reading and decompressing compressed tables (`FastLens::core`).
-- `<fastlens/direct_dct.hpp>` for GPU-resident DCT batches (`FastLens::jpeg_dct_device`).
+- `<fastlens/stable.hpp>` for reading and decompressing compressed tables (`FastLens::core`).
+- `<fastlens/advanced/direct_dct.hpp>` for GPU-resident DCT batches (`FastLens::jpeg_dct_device`).
 
 ```cpp
-#include <fastlens/fastlens.hpp>
+#include <fastlens/stable.hpp>
 
 int main() {
     fastlens::Reader reader("fastlens/data/example-fastlens/partitions/000000.fls");
@@ -151,3 +171,10 @@ The materialized table API supports `int8_t` and `int16_t` columns. Rowgroup and
 For DCT batches that remain on the GPU, use the Direct-DCT interface instead of materializing a CPU table.
 
 See [fastlens/examples/](../examples/) for complete CMake examples.
+
+### API compatibility
+
+The compatibility headers `<fastlens/fastlens.hpp>` and
+`<fastlens/direct_dct.hpp>` remain available for existing integrations.
+See [API boundaries](../DIRECT_DCT_API_BOUNDARIES.md) for stable, advanced and
+diagnostic interfaces.

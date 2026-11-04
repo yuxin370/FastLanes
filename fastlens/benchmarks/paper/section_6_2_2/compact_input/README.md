@@ -12,7 +12,7 @@ Published records (repository-relative, unprefixed batch names are under `result
 
 [`paper/results/section_6_2_2/compact_training.csv`](../../results/section_6_2_2/compact_training.csv)
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.
 
 ## Current validation limitation

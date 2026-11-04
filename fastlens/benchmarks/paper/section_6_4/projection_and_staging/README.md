@@ -12,7 +12,7 @@ Published records (repository-relative, unprefixed batch names are under `result
 
 `results/paper_rerun_20261007/remaining/H100/staging/summary.csv; results/paper_rerun_20261007/summary.csv`
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.
 
 Published report tables: [projection](../../results/section_6_4/projection.csv) (one point) and [staging](../../results/section_6_4/staging.csv) (six trial rows).

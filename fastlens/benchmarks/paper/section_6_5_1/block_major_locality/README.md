@@ -12,5 +12,5 @@ Published records (repository-relative, unprefixed batch names are under `result
 
 `results/paper_rerun_20261007/summary.csv`
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.

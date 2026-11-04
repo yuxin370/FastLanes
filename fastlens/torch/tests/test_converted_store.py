@@ -18,6 +18,48 @@ from fastlens.torch import DirectDctPipeline, DirectDctReader
 
 
 class ConvertedStoreTests(unittest.TestCase):
+    def test_documented_reader_examples(self):
+        import torch
+        import _fastlens_direct_dct as native
+
+        if not torch.cuda.is_available():
+            if os.environ.get("FASTLENS_REQUIRE_CUDA_SMOKE") == "1":
+                self.fail("CUDA device/driver unavailable but FASTLENS_REQUIRE_CUDA_SMOKE=1")
+            self.skipTest("CUDA device/driver unavailable")
+        from PIL import Image
+        from fastlens.tests.test_documentation import introductory_examples
+
+        with tempfile.TemporaryDirectory(prefix="fastlens-doc-examples-") as directory:
+            root = Path(directory)
+            source = root / "images"
+            source.mkdir()
+            for index in range(4):
+                Image.new("RGB", (512, 512), (index * 64, 96, 160)).save(
+                    source / f"{index}.jpg", subsampling=2,
+                )
+            output = root / "store"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main([
+                    "convert", str(source), "--output", str(output),
+                    "--partition-images", "4", "--workers", "2", "--verify", "full",
+                ]), 0)
+            for location, code in introductory_examples():
+                # Run the documented code with fixture data and the built extension.
+                # Four images in one partition catch scheduled-profile/subset misuse.
+                for manifest in ("./store/manifest.bin", "fastlens/data/example-fastlens/manifest.bin"):
+                    code = code.replace(f'"{manifest}"', repr(str(output / "manifest.bin")))
+                for module_path in ("./build/fastlens/torch", "build/fastlens/torch"):
+                    code = code.replace(f'"{module_path}"', repr(str(Path(native.__file__).parent)))
+                with self.subTest(location=location), contextlib.redirect_stdout(io.StringIO()):
+                    namespace = {}
+                    exec(compile(code, location, "exec"), namespace)
+                    batch = namespace["batch"]
+                    self.assertTrue(batch.y.is_cuda)
+                    self.assertTrue(batch.cbcr.is_cuda)
+                    self.assertEqual(tuple(batch.y.shape), (2, 1, 28, 28, 8, 8))
+                    self.assertEqual(tuple(batch.cbcr.shape), (2, 2, 14, 14, 8, 8))
+            torch.cuda.synchronize()
+
     def test_cuda_reader_consumes_store(self):
         import torch
         import _fastlens_direct_dct as native

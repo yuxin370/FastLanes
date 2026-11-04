@@ -37,5 +37,5 @@ the older byte table counts only `.beton`. The
 [result notes](../../results/README.md#storage-evidence-and-source-boundaries)
 explain the 2.157 GB versus 2.180 GB accounting.
 
-See [the reviewer guide](../../README.md) for dependencies, input preparation,
+See [the paper reproduction guide](../../README.md) for dependencies, input preparation,
 default output directories and the distinction between published plots and new runs.

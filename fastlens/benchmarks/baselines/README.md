@@ -20,7 +20,8 @@ CoorDL and FFCV adapters are in
 [`system_rgbnomore/shared/paper_adapters.py`](system_rgbnomore/shared/paper_adapters.py),
 with the measured training inputs and FFCV crop decoder under
 `system_rgbnomore/training/`. Final-paper scheduling and result collection are
-in `../paper/`; historical run queues are excluded from this submission.
+in `../paper/`. Generated runs and profiler outputs are stored separately from
+the implementations.
 
 Examples:
 
@@ -31,8 +32,7 @@ python -m fastlens.benchmarks.baselines.l3.run --help
 python -m fastlens.benchmarks.development.check
 ```
 
-Tests remain alongside the implementations. Historical result files retain the
-measured values and source digests; source paths follow the current layout.
-The dated DCT shell launchers are development continuation/tuning tools and may
-require their original prepared inputs and accepted verification records.
-Reviewers should use the section-specific `paper/` commands.
+Tests remain alongside the implementations. Run the section-specific
+benchmarks from [paper/](../paper/README.md). The dated DCT continuation scripts
+require their original prepared inputs; use the
+[DCT baseline guide](dct_baselines/README.md) to prepare a new comparison.

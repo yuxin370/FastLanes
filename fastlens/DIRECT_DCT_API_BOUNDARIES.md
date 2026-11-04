@@ -14,21 +14,18 @@ normalize to the existing native coefficient-selection request. Legacy
 producer, queue, or scheduling policy: it delegates to the same
 `DirectDctPipeline.start()` and native iterator used by explicit pipeline code.
 
-The canonical `fastlens/stable.hpp` C++ umbrella intentionally does not expose raw
-CUDA events, device descriptors, physical rowgroups, allocator state, or
-rollback selectors.
+Use `fastlens/stable.hpp` for new C++ table-reading integrations. It exposes
+readers, tables, decompression options and errors.
 
 Native C++ integrations that deliberately need device descriptors and runtime
 primitives use `fastlens/advanced/direct_dct.hpp`. Raw, versioned execution
 counters use `fastlens/diagnostics/direct_dct.hpp`. Implementation-only planning,
-submission, lifetime, allocator, and rollback details remain under `fastlens/src`
+scheduling, lifetime and allocation details remain under `fastlens/src`
 or the private `_fastlens_direct_dct` extension.
 
+## API compatibility
+
 `fastlens/direct_dct.hpp` remains a deprecated source-compatible adapter to the
-advanced header. The historical `fastlens/fastlens.hpp` umbrella also remains source
-compatible for one deprecation window; new code should include
-`fastlens/stable.hpp` and opt into advanced Direct-DCT explicitly. The Phase 3,
-Phase 4, and Phase 6 rollback paths are likewise
-internal construction-time seams. They may be removed after one release cycle
-with native scheduler, lifetime, and physical orchestration enabled by default,
-provided downstream compatibility builds and rollback telemetry are clean.
+advanced header. The compatibility umbrella `fastlens/fastlens.hpp` also remains
+available. New code should include `fastlens/stable.hpp` and opt into advanced
+Direct-DCT explicitly.
