@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from fastlens.benchmarks.paper import end_to_end, prepare_references
 from fastlens.benchmarks.paper.shared.references import reference_inputs, expected_predictions
+from fastlens.benchmarks.paper.section_6_2_4.resident_training import resident_training_window
 from fastlens.benchmarks.paper.section_6_3.h2d_traffic.run_section42_resources import jobs, verify
 from fastlens.benchmarks.paper.section_6_3.h2d_traffic import profile_section42
 
@@ -114,6 +115,22 @@ class ReproductionInputsTest(unittest.TestCase):
                 self.assertEqual(command[command.index('--ffcv-root') + 1], str(self.root / 'jpeg'))
             if '--check' not in command:
                 self.assertIn('--correctness-report', command)
+
+    def test_training_rejects_correctness_report_for_different_native_inputs(self):
+        native_root = self.root / 'native'
+        access_dir = self.root / 'geometry'
+        gate = dict(correctness_passed=True, protocol=resident_training_window.PROTOCOL,
+                    gpu_key='H100', model='mobilenet24', path='imagelanes_basic',
+                    native_manifest=str(native_root / 'dct/manifest.bin'),
+                    block_major_access_dir=str(access_dir))
+        for field in ('native_manifest', 'block_major_access_dir'):
+            with self.subTest(field=field):
+                report = self.write('check.json', dict(gate, **{field: str(self.root / 'other')}))
+                argv = ['run', '--gpu', 'H100', '--model', 'mobilenet24', '--path', 'fastlens_basic',
+                        '--native-root', str(native_root), '--block-major-access-dir', str(access_dir),
+                        '--correctness-report', str(report), '--output', str(self.root / 'run')]
+                with patch.object(sys, 'argv', argv), self.assertRaisesRegex(AssertionError, field):
+                    resident_training_window.main()
 
     def test_h2d_uses_completed_trials_and_deduplicates_workloads(self):
         metadata = dict(phase='inference', gpu='4090', model='mobilenet24', pipeline='fastlens',

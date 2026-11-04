@@ -261,12 +261,12 @@ class CpuDctWindow:
 
 
 class NativeWindow:
-    def __init__(self,model,augmentation="full"):
+    def __init__(self,model,augmentation="full", *, root=None, block_major_access_dir=None):
         from fastlens.torch.experimental import DirectDctPlsPipeline
-        root=ROOT/'fastlens/data/compressed/imagenet512_train_block_major_premixed'
+        root=Path(root) if root is not None else ROOT/'fastlens/data/compressed/imagenet512_train_block_major_premixed'
         contract=json.loads((root/'materialization_contract.json').read_text())
         self.manifest=root/'dct/manifest.bin'
-        os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR']=str(self.manifest.parent/'geometry')
+        os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR']=str(block_major_access_dir or self.manifest.parent/'geometry')
         with (root/'ordered_mapping.csv').open() as stream:
             self.records=list(csv.DictReader(stream))
         options={}

@@ -55,6 +55,8 @@ def main():
                                 help='Generate a full-population reference before measured chapter trials')
     parser.add_argument('--contract', type=Path, help='Pipeline contract when not embedded in the reference')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--native-manifest', type=Path)
+    parser.add_argument('--block-major-access-dir', type=Path)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     if args.prepare_reference and args.check:
@@ -140,8 +142,13 @@ def main():
                 writer.writerow(['Filepath', 'Label'])
                 writer.writerows((s['path'], s['label']) for s in selected)
             contract['dataset']['canonical_index_csv'] = str(index)
-    manifest = ROOT/'fastlens/data/compressed/imagenet512_val_block_major/manifest.bin'
     if args.path == 'imagelanes':
+        native_config = {} if cnn else contract['pipelines']['dct_major_pushdown']
+        default_manifest = (ROOT/'fastlens/data/compressed/imagenet512_val_block_major/manifest.bin'
+                            if cnn else native_config['manifest'])
+        manifest = Path(args.native_manifest or default_manifest).resolve()
+        configured_access = native_config.get('block_major_access_dir') if args.native_manifest is None else None
+        access_dir = Path(args.block_major_access_dir or configured_access or manifest.parent/'geometry').resolve()
         paths = [Path(s['fls_path']) for s in parse_manifest(manifest)['shards']]
     elif args.path.startswith('ffcv'):
         paths = [Path(contract['pipelines']['ffcv']['beton'])]
@@ -162,7 +169,7 @@ def main():
             import _fastlens_direct_dct as native
             from fastlens.benchmarks.dct_models.evaluate_shards import native_options, apply_b6_runtime
             from fastlens.benchmarks.dct_models.online_crop import source_options, CROP
-            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'geometry')
+            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(access_dir)
             reader = native.DirectDctReader(str(manifest))
             options = apply_b6_runtime(source_options(native_options(False, True), 'vector-range-read-selected-decode'))
             source = reader.pipeline_batch_options(**options, output_batch_images=batch_size)
@@ -208,6 +215,7 @@ def main():
                    'ffcv': M.FfcvAdapter, 'rgbnomore': M.RgbNoMoreAdapter, 'dct_major_pushdown': M.FastLensAdapter}[name]
             if args.path == 'imagelanes':
                 contract['pipelines'][name]['torch_binding_dir'] = str(ROOT / 'build/fastlens/torch')
+                contract['pipelines'][name].update(manifest=str(manifest), block_major_access_dir=str(access_dir))
             # FFCV's producer thread writes these buffers outside InferenceMode.
             with torch.inference_mode(False):
                 source = cls(contract, reader_samples if name in ('ffcv', 'coordl', 'dct_major_pushdown') else selected, device, name)
@@ -274,6 +282,8 @@ def main():
         mode='reference' if args.prepare_reference else 'correctness' if args.check else 'measurement',
         reference=str(args.reference) if args.reference is not None else None, cache=cache, batch=batch_size, precision='fp32', tf32=False, compile=False,
         host_threads=torch.get_num_threads(), workers=8, model_stream_priority=stream.priority,
+        native_manifest=str(manifest) if args.path == 'imagelanes' else None,
+        block_major_access_dir=str(access_dir) if args.path == 'imagelanes' else None,
         CUBLAS_WORKSPACE_CONFIG=os.environ.get('CUBLAS_WORKSPACE_CONFIG'), gpu=torch.cuda.get_device_name(),
         timing_scope='Reader construction/startup through logits, CE, top1/top5 and prediction copies; model load and 20-batch model warmup excluded.')
     (args.output/'result.json').write_text(json.dumps(result)+'\n')

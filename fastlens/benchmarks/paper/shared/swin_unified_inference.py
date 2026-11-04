@@ -21,6 +21,9 @@ def main():
     parser.add_argument('--path', type=lambda name: name.replace('fastlens', 'imagelanes'), metavar='PATH', choices=PATHS, required=True)
     parser.add_argument('--contract', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--native-manifest', type=Path,
+                        default=ROOT/'fastlens/data/compressed/imagenet512_val_block_major/manifest.bin')
+    parser.add_argument('--block-major-access-dir', type=Path)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     contract = read(args.contract)
@@ -64,7 +67,8 @@ def main():
         adapter_contract['pipelines']['coordl']['file_list'] = str(args.output/'coordl_file_list.txt')
     adapter_contract['execution'].update(batch_size=50, workers=8, precision='fp32')
     if args.path == 'imagelanes':
-        manifest = ROOT/'fastlens/data/compressed/imagenet512_val_block_major/manifest.bin'
+        manifest = args.native_manifest.resolve()
+        access_dir = (args.block_major_access_dir or manifest.parent/'geometry').resolve()
         paths = [Path(s['fls_path']) for s in parse_manifest(manifest)['shards']]
     elif args.path.startswith('ffcv'):
         paths = [Path(adapter_contract['pipelines']['ffcv']['beton'])]
@@ -100,7 +104,7 @@ def main():
         started = time.perf_counter()
         if args.path == 'imagelanes':
             from fastlens.torch import DirectDctReader
-            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(manifest.parent/'geometry')
+            os.environ['FASTLENS_BLOCK_MAJOR_ACCESS_DIR'] = str(access_dir)
             os.environ['FASTLENS_PHASE6_NATIVE_PHYSICAL'] = '1'
             reader = DirectDctReader(manifest)
             source = reader.pipeline('rgbnomore-swinv2-block-major-validation-v1')
@@ -162,6 +166,8 @@ def main():
         host_threads=torch.get_num_threads(), workers=8, model_stream_priority=stream.priority,
         cpu_affinity=sorted(os.sched_getaffinity(0)), CUBLAS_WORKSPACE_CONFIG=os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
         cache=cache, gpu=torch.cuda.get_device_name(), correctness_check=args.check,
+        native_manifest=str(manifest) if args.path == 'imagelanes' else None,
+        block_major_access_dir=str(access_dir) if args.path == 'imagelanes' else None,
         timing_scope='One wall-clock interval: reader construction/startup through all 50000 logits, CE, top1/top5 and prediction copies; model load and 20-batch model warmup excluded.',
         predictions_sha256=hashlib.sha256(json.dumps(predictions).encode()).hexdigest())
     (args.output/'result.json').write_text(json.dumps(result)+'\n')

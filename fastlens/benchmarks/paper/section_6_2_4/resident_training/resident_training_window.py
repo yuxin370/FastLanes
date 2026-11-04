@@ -84,18 +84,27 @@ def main():
     p.add_argument('--measured-images', type=int, choices=[16384, 65536], default=65536)
     p.add_argument('--profile', action='store_true')
     p.add_argument('--ffcv-root', type=Path)
+    p.add_argument('--native-root', type=Path,
+                   default=ROOT/'fastlens/data/compressed/imagenet512_train_block_major_premixed')
+    p.add_argument('--block-major-access-dir', type=Path)
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / 'result.json').exists():
         raise FileExistsError(args.output / 'result.json')
     resident = args.path.endswith('_resident')
     domain = 'dct' if args.path.startswith(('dct_', 'imagelanes_')) else 'rgb'
+    if domain == 'dct':
+        manifest = (args.native_root / 'dct/manifest.bin').resolve()
+        access_dir = (args.block_major_access_dir or manifest.parent/'geometry').resolve()
     if not args.check:
         if args.correctness_report is None:
             p.error('A passed correctness report is required')
         gate = json.loads(args.correctness_report.read_text())
         assert gate['correctness_passed'] and gate['protocol'] == PROTOCOL
         assert (gate['gpu_key'], gate['model'], gate['path']) == (args.gpu, args.model, args.path)
+        if domain == 'dct':
+            assert gate['native_manifest'] == str(manifest), 'native_manifest differs from correctness run'
+            assert gate['block_major_access_dir'] == str(access_dir), 'block_major_access_dir differs from correctness run'
     os.environ['DCTNET_PROFILE'] = args.model
     import cv2
     cv2.setNumThreads(1)
@@ -142,11 +151,11 @@ def main():
             return FfcvWindow(samples, device, decisions, root=ffcv_root)
     else:
         def make_source():
-            source = NativeWindow(args.model, 'full' if args.path == 'imagelanes_full' else 'basic')
+            source = NativeWindow(args.model, 'full' if args.path == 'imagelanes_full' else 'basic',
+                                  root=args.native_root, block_major_access_dir=args.block_major_access_dir)
             source.begin()
             return source
         from fastlens.benchmarks.system_dct_major.common import parse_manifest
-        manifest = ROOT / 'fastlens/data/compressed/imagenet512_train_block_major_premixed/dct/manifest.bin'
         paths = [Path(s['fls_path']) for s in parse_manifest(manifest)['shards']]
     print('Preparing warm input pages and real inputs', flush=True)
     cache_warm = None if args.check else cache_pages(paths, warm=True)
@@ -283,6 +292,8 @@ def main():
         tensor_contract=batch_metadata, native_prefetch=native_prefetch, resource_conditions=resource_conditions,
         cache_warm=cache_warm, cache_before=cache_before, host_threads=torch.get_num_threads(),
         cpu_affinity=sorted(os.sched_getaffinity(0)), model_stream_priority=torch.cuda.current_stream().priority,
+        native_manifest=str(manifest) if domain == 'dct' else None,
+        block_major_access_dir=str(access_dir) if domain == 'dct' else None,
         compile='inductor/default', cuda_graphs=False, tf32=False, profile=args.profile,
         CUBLAS_WORKSPACE_CONFIG=os.environ.get('CUBLAS_WORKSPACE_CONFIG'), command=sys.argv,
         scope='Resident repeats 512 real samples; end-to-end consumes distinct samples; no training-quality claim.')
