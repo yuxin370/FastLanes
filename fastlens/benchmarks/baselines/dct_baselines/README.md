@@ -10,7 +10,6 @@ representation experiments have separate contracts.
 - [Protocol](PROTOCOL.md): source identity, numerical checks, resource budgets and timing.
 - [Results](RESULTS.md): published tables, measurement scope and available evidence.
 - [Integration map](ASSUMPTIONS.md): implementation choices and model adapters.
-- [Development history](history/DEVELOPMENT_RECORD.md): earlier pilots and diagnostics.
 
 ## Supported methods
 

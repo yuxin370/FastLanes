@@ -62,12 +62,9 @@ per trial, three trials per model and pipeline). Medians in images/s:
 | ResNet-50 | 2,046 | 2,025 | 0.990× |
 | EfficientNet-B0 (eFUN RGB reference) | 4,234 | 4,137 | 0.977× |
 
-L3 Top-1 is unchanged from the initial port for all five models and is identical
-across repeats. The corrected L3 inference throughput is 1.046–1.928× that of
-the initial port. These measurements restore the paper's configuration and
-the author's stream arrangement; they do not isolate the contributions of patch
-size and scheduling. The `l3_patch32_20261006/summary.csv` and raw results (external, not distributed)
-are separate from the [initial-port results](history/INITIAL_PORT_20261006.md).
+L3 Top-1 is identical across repeats for all five models. These measurements use
+the paper's configuration and the author's stream arrangement. The
+`l3_patch32_20261006/summary.csv` and raw results are external and not distributed.
 
 All 30 corrected 4090 training trials also completed: each consumed 65,536
 measured images and performed 64 updates after 32 excluded warmup updates.

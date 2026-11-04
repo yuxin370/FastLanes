@@ -106,10 +106,10 @@ class DocumentationTests(unittest.TestCase):
 
     def test_user_guides_avoid_internal_narrative(self):
         files = public_files()
-        # Manuscript build notes and dated history retain experiment provenance.
+        # Manuscript build notes retain experiment provenance.
         documents = sorted(file for file in files if file.suffix.lower() == ".md"
                            and (len(file.parts) == 1 or file.parts[0] == "fastlens")
-                           and not {"upstream", "history"}.intersection(file.parts)
+                           and "upstream" not in file.parts
                            and not file.is_relative_to("fastlens/docs/paper"))
         errors = [f"{document}: {phrase}" for document in documents
                   for phrase in hygiene_errors((ROOT / document).read_text())]

@@ -219,8 +219,9 @@ python -m fastlens.benchmarks.paper.shared.remaining_baseline_inference \
 ## Rebuild existing paper stores in the current directory layout
 
 When the old block-major datasets are available, preserve their exact compression
-version with the following commands. This copies and byte-compares the existing
-FLS payloads and image metadata; it does not re-encode JPEGs or shuffle samples.
+version with the following commands. This copies the existing FLS payloads and
+image metadata without a separate file-hash comparison; it does not re-encode
+JPEGs or shuffle samples.
 Manifest paths and geometry indexes are rebuilt, and annotations v2 is generated
 from the existing physical-order sample mapping. All original rowgroup parameters
 and partition boundaries are checked, including the paper's 128 vectors per
@@ -237,7 +238,7 @@ python -m fastlens.benchmarks.paper.rebuild_store --split train \
   --output "$FASTLENS_DATA/compressed/imagenet512_train_block_major_premixed_rebuilt"
 ```
 
-The default uses up to 32 workers for copying/comparison and exact verification
+The default uses up to 32 workers for copying and exact verification
 (the native verifier limit); `--workers N` sets a smaller shared CPU/I/O budget.
 Each dataset uses that budget in turn. The old directories are never modified.
 Validation retains `samples.json` (including both `label` and `model_label`) and

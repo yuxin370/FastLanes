@@ -109,5 +109,3 @@ Use the [published deployment table](../../paper/results/section_6_2_3_deploymen
 and [result notes](../../paper/results/README.md) for the paper evaluation.
 The [configuration measurements](RESULTS.md) retain the 2026-10-06/07 validation,
 storage and throughput observations, with their evidence availability.
-The [initial-port results](history/INITIAL_PORT_20261006.md) used 64×64 patches
-and one decode stream; they are a separate, superseded configuration.

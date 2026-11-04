@@ -31,23 +31,3 @@ The diagnostic schema retains `headline_eligible=false`. It covers bounded
 inference and training checks, reader studies and adapted IC/FS timing. A
 successful check establishes its recorded scope; it does not qualify an
 unmeasured full dataset, different model, code revision or resource allocation.
-
-## Earlier experiments
-
-The [development record](history/DEVELOPMENT_RECORD.md) retains the original
-numbers, configurations and code-fix rationale from the earlier rounds and
-pilots. Its documentation snapshot is commit `8097fb3dc049`; that is not a
-recovered execution revision for each run.
-
-| Record | Date / hardware / population recorded in the notes | Evidence availability |
-| --- | --- | --- |
-| Paired training checks | Exact date not recorded; CPU and H100; MobileNet24, ViT-Ti, ResNet24; ten updates on synthetic inputs, plus three real-image integer checks | Round-2 CPU/H100 JSON and logs are external and not distributed |
-| Inference pilot | October 2026; H100/RTX 4090; 8194 validation images, ResNet24/ViT-Ti | Original pilot directories are external and not distributed |
-| Reader confirmation | 2026-10-13; RTX 4090; 8194 images, 36 measurements and 12 numerical checks | Summary path is retained as provenance in the history; file is not distributed |
-| Full-validation continuation | October 2026; H100; 50,000 images, baseline-only continuations | Failure/resource notes are retained; no complete raw run bundle is published here |
-
-Exact execution revisions for these historical runs require their original
-verification artifacts; missing values are not inferred from the documentation
-date. There is no public download location recorded for those bundles. Use
-[the run guide](README.md) and [protocol](PROTOCOL.md) to generate new evidence;
-the historical notes are not dependencies of current commands.

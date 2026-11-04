@@ -8,9 +8,7 @@ serialized layout and integrity rules.
 
 The benchmark uses `dct_major_pushdown` with native profile
 `block-major-p4-scheduled-bounded-110-v1`. Follow the [run guide](RUN_GUIDE.md)
-for preparation and execution. Earlier planning comparisons, fallback policies
-and development checks are retained in [history](history/PLANLESS_20260801.md).
-They have separate measurement scope from the current benchmark.
+for preparation and execution.
 
 ## Persistent format
 

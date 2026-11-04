@@ -12,12 +12,6 @@ from fastlens import annotations, cli
 from fastlens.benchmarks.system_dct_major.common import parse_manifest
 
 
-def copy_exact(source, destination):
-    shutil.copyfile(source, destination)
-    if annotations.file_sha256(source) != annotations.file_sha256(destination):
-        raise ValueError(f"copy differs from the original: {source}")
-
-
 def records_from_paper(source, split, paths, manifest):
     positions = ((shard["shard_id"], offset) for shard in manifest["shards"]
                  for offset in range(shard["image_count"]))
@@ -64,7 +58,7 @@ def rebuild(source, output, *, split, workers, build_dir=None):
         store = stage / "dct" if split == "train" else stage
         (store / "conversion").mkdir(parents=True)
         (store / "geometry").mkdir()
-        copy_exact(listing, store / "conversion/sources.txt")
+        shutil.copyfile(listing, store / "conversion/sources.txt")
         (store / annotations.SOURCE_ORDER).write_text(
             annotations.file_sha256(store / "conversion/sources.txt") + "\n", encoding="ascii")
         paths = annotations.physical_paths(store, old_manifest["image_count"])
@@ -76,10 +70,10 @@ def rebuild(source, output, *, split, workers, build_dir=None):
                 destination = store / shard[key]
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 pairs.append((old_store / shard[key], destination))
-        print(f"Copying and comparing {len(pairs)} payload/metadata files with {workers} workers...", flush=True)
+        print(f"Copying {len(pairs)} payload/metadata files with {workers} workers...", flush=True)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda pair: copy_exact(*pair), pairs))
-        copy_exact(old_store / "manifest.bin", store / "manifest.bin")
+            list(pool.map(lambda pair: shutil.copyfile(*pair), pairs))
+        shutil.copyfile(old_store / "manifest.bin", store / "manifest.bin")
         log = store / "conversion/native.log"
         access, jpeg = str(tools[cli.TOOL_NAMES[1]]), str(tools[cli.TOOL_NAMES[0]])
         cli.run_native([access, "--finalize-store", str(store / "manifest.bin")], log, "Store layout")
@@ -104,15 +98,15 @@ def rebuild(source, output, *, split, workers, build_dir=None):
         annotations.publish_annotations(store, records, None,
                                         label_source="ordered_mapping.csv" if split == "train" else "samples.json")
         if split == "train":
-            copy_exact(source / "ordered_mapping.csv", stage / "ordered_mapping.csv")
-            copy_exact(source / "materialization_contract.json", store / "conversion/original_materialization_contract.json")
+            shutil.copyfile(source / "ordered_mapping.csv", stage / "ordered_mapping.csv")
+            shutil.copyfile(source / "materialization_contract.json", store / "conversion/original_materialization_contract.json")
             # The mapping and its hashes are unchanged; writer fields remain historical.
             contract["ordered_mapping"] = str(output / "ordered_mapping.csv")
             contract["ordered_input_list"] = str(output / "dct/conversion/sources.txt")
             (stage / "materialization_contract.json").write_text(json.dumps(contract, indent=2) + "\n")
         else:
             for name in ("samples.json", "profile.json"):
-                copy_exact(source / name, stage / name)
+                shutil.copyfile(source / name, stage / name)
         report = dict(schema_version=1, operation="paper-layout-rebuild", source_store=str(old_store),
                       image_count=info["image_count"], shard_count=info["shard_count"],
                       original_jpeg_bytes=sum(path.stat().st_size for path in paths),

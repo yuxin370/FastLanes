@@ -137,8 +137,8 @@ python -B -m unittest fastlens.tests.test_documentation -v
 `FastLensDocumentationPython` runs the same checks through CTest. It validates
 relative Markdown links against publishable files and directories, heading
 anchors, introductory Python syntax, and specific internal-session phrases,
-machine GPU UUIDs and dated temporary paths. Dated `history/` records and
-manuscript build notes retain provenance; their relative links are still checked.
+machine GPU UUIDs and dated temporary paths. Manuscript build notes retain
+provenance; their relative links are still checked.
 External URLs are not fetched by this check.
 
 `FastLensConvertedStoreTorchPython` also executes the reader examples extracted

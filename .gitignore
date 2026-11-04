@@ -250,7 +250,6 @@ build_win/
 /fastlens/benchmarks/system_dct_major/docs/*
 !/fastlens/benchmarks/system_dct_major/docs/RUN_GUIDE.md
 !/fastlens/benchmarks/system_dct_major/docs/BLOCK_MAJOR_PLANLESS_DESIGN.md
-!/fastlens/benchmarks/system_dct_major/docs/history/
 /fastlens/benchmarks/baselines/system_rgbnomore/docs/*
 !/fastlens/benchmarks/baselines/system_rgbnomore/docs/E2E_COMPARISON_RUN_GUIDE.md
 !/fastlens/benchmarks/baselines/system_rgbnomore/docs/TRAINING_BENCHMARK_RUN_GUIDE.md
