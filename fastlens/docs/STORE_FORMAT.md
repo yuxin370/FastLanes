@@ -57,8 +57,9 @@ source-based annotation building and conversion history. Exact re-verification
 then requires a separately retained physical-order JPEG list.
 
 This is the published Converter layout and annotations v2 contract. Older stores are
-not automatically upgraded or loaded through legacy sidecar names; reconvert them
-with the current tools. Low-level native writer transactions still use generations.
+not automatically upgraded or loaded through legacy sidecar names; follow the
+[order-preserving rebuild procedure](CONVERSION.md#rebuild-an-older-store-without-changing-sample-order).
+Low-level native writer transactions still use generations.
 
 ## Standard Store and native manifest APIs
 

@@ -74,6 +74,67 @@ coefficients, image dimensions, component geometry and sampling, and quantizatio
 table IDs and values against the source JPEGs. `--verify none` skips only that
 source comparison; index construction and compatibility checks still run.
 
+## Rebuild an older Store without changing sample order
+
+Keep the old Store and rebuild into a new directory from the original JPEGs and
+annotation input. Old generation/index directory names and annotations v1 are
+not migrated by renaming files: the final manifest, geometry bindings and
+annotations v2 must be generated together.
+
+The old `source_paths.txt` already contains the **final physical order**, including
+any offline shuffle. Use it as `--input-list` and **omit `--shuffle-seed`**. Applying
+the old seed to that list would shuffle it a second time. For a current Store,
+the equivalent list is `conversion/sources.txt`.
+
+```bash
+OLD_STORE=/datasets/old_store
+NEW_STORE=/datasets/rebuilt_store
+IMAGE_ROOT=/datasets/imagenet512
+LABELS_CSV=/datasets/indexbase_val.csv
+
+python -m fastlens convert --input-list "$OLD_STORE/source_paths.txt" \
+  --image-root "$IMAGE_ROOT" --labels-csv "$LABELS_CSV" \
+  --output "$NEW_STORE" --partition-images 1024 --preset balanced \
+  --workers auto --verify full
+python -m fastlens inspect "$NEW_STORE"
+python -m fastlens annotations inspect "$NEW_STORE" --json
+```
+
+Use the original image root and label convention so logical sample IDs and class
+IDs remain unchanged. The example's partition size and preset must also match the
+intended experiment. Folder labels require the original fixed class map; JSONL
+inputs require the original `path,label[,sample_id]` records. The generated
+`annotations/samples.jsonl` is an output format, not a `--labels-jsonl` input.
+
+Compare the old and new `(image_id, sample_id, label)` sequences before switching
+the application's manifest path. With an existing sample sidecar, this check
+does not need to load the old annotation schema:
+
+```python
+import json
+from pathlib import Path
+from fastlens.annotations import load_annotations
+
+old = Path("/datasets/old_store")
+new = Path("/datasets/rebuilt_store")
+old_samples = [json.loads(line) for line in (old / "annotations/samples.jsonl").read_text().splitlines()]
+new_samples, metadata = load_annotations(new)
+assert new_samples == old_samples
+assert (new / "conversion/sources.txt").read_bytes() == (old / "source_paths.txt").read_bytes()
+```
+
+The new metadata records `shuffle: null` because this conversion consumes an
+already ordered list; it does not apply a new shuffle. The sample-order hash and
+sample/label sequence remain unchanged. Retain the old report for the original
+shuffle provenance. Reusing an original *pre-shuffle* list with the original seed
+is another option, but requires the same membership, initial order and algorithm.
+
+After source verification and Reader/label checks pass, point the downstream
+application to `NEW_STORE/manifest.bin`; keep the old Store until those checks
+complete. PLS experiments additionally require matching physical partition
+boundaries and their dedicated mapping/contract hashes; a generic reconversion
+does not regenerate those experiment contracts.
+
 ## Publication and reports
 
 Conversion uses a sibling `.OUTPUT.fastlens-staging-<id>` directory and preserves

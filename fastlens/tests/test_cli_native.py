@@ -352,6 +352,25 @@ class NativeCliTests(NativeCliFixture):
             self.assertNotEqual(cli.main(["annotations", "inspect", str(self.output)]), 0)
         self.assertIn("physical source order", errors.getvalue())
 
+    def test_reconversion_preserves_saved_physical_order_and_labels(self):
+        table = self.root / "labels.csv"
+        table.write_text("Filepath,Label\n" + "".join(f"{path.name},{997 + index}\n" for index, path in enumerate(self.paths)))
+        options = ("--image-root", str(self.source), "--labels-csv", str(table))
+        self.convert(extra=(*options, "--shuffle-seed", "42"))
+        expected, previous_metadata = annotations.load_annotations(self.output)
+        previous_sources = self.output / "conversion/sources.txt"
+        self.assertNotEqual(previous_sources.read_text().splitlines(), [str(path) for path in self.paths])
+        self.listing = previous_sources
+        self.output = self.root / "rebuilt-store"
+        # A final physical-order list must not be shuffled for a second time.
+        self.convert(extra=options)
+        self.assertEqual((self.output / "conversion/sources.txt").read_bytes(), previous_sources.read_bytes())
+        shutil.rmtree(self.output / "conversion")
+        actual, metadata = annotations.load_annotations(self.output)
+        self.assertEqual(actual, expected)
+        self.assertEqual(metadata["sample_order_sha256"], previous_metadata["sample_order_sha256"])
+        self.assertIsNone(metadata["shuffle"])
+
     def test_manifest_binding_and_member_paths(self):
         self.convert()
         manifest = self.output / "manifest.bin"

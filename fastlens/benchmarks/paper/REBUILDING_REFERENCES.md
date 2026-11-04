@@ -216,6 +216,44 @@ python -m fastlens.benchmarks.paper.shared.remaining_baseline_inference \
   --output "$FASTLENS_RUNS/mobilenet24/cpu_dct_check" --check
 ```
 
+## Rebuild existing paper stores in the current directory layout
+
+When the old block-major datasets are available, preserve their exact compression
+version with the following commands. This copies and byte-compares the existing
+FLS payloads and image metadata; it does not re-encode JPEGs or shuffle samples.
+Manifest paths and geometry indexes are rebuilt, and annotations v2 is generated
+from the existing physical-order sample mapping. All original rowgroup parameters
+and partition boundaries are checked, including the paper's 128 vectors per
+rowgroup and 64-rowgroup limit per partition. Full DCT verification against the original JPEG list
+must pass before the new directory is published. Source JPEGs must remain available.
+
+```bash
+cmake --build build --target fastlens_jpeg_dct_tool fastlens_block_major_access_tool --parallel
+python -m fastlens.benchmarks.paper.rebuild_store --split val \
+  --source "$FASTLENS_DATA/compressed/imagenet512_val_block_major" \
+  --output "$FASTLENS_DATA/compressed/imagenet512_val_block_major_rebuilt"
+python -m fastlens.benchmarks.paper.rebuild_store --split train \
+  --source "$FASTLENS_DATA/compressed/imagenet512_train_block_major_premixed" \
+  --output "$FASTLENS_DATA/compressed/imagenet512_train_block_major_premixed_rebuilt"
+```
+
+The default uses up to 32 workers for copying/comparison and exact verification
+(the native verifier limit); `--workers N` sets a smaller shared CPU/I/O budget.
+Each dataset uses that budget in turn. The old directories are never modified.
+Validation retains `samples.json` (including both `label` and `model_label`) and
+`profile.json`. Training retains `dct/`, the byte-identical `ordered_mapping.csv`
+and its original hashes; its materialization contract points at the new mapping
+and input list while retaining historical writer provenance. The original contract
+is also retained in `dct/conversion/`. Old geometry schedules are not copied;
+materialize them against the new geometry before timing as described below.
+
+The rebuilt data have identical compressed coefficients, image metadata and
+physical partitioning. Manifest/index bytes and auxiliary-file storage can differ,
+so use current Store accounting when reporting those sizes. This operation does
+not rerun model correctness or performance measurements. Point benchmark manifest,
+mapping and geometry paths at the rebuilt dataset and regenerate run contracts
+that bind the old manifest/index before reproducing measurements.
+
 ## Prepare native source-DCT inference
 
 The full-frequency block-major representation is built from those same source
