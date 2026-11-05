@@ -51,7 +51,7 @@ class PaperRebuildTests(NativeCliFixture):
         source, old = self.prepare_old(split)
         original = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
         with contextlib.redirect_stdout(io.StringIO()):
-            report = rebuild(source, self.output, split=split, workers=2)
+            rebuild(source, self.output, split=split, workers=2)
         new = self.output / "dct" if split == "train" else self.output
         before, after = parse_manifest(old / "manifest.bin"), parse_manifest(new / "manifest.bin")
         self.assertEqual((after["rowgroup_vectors"], after["rowgroups_per_shard"]), (128, 64))
@@ -64,7 +64,6 @@ class PaperRebuildTests(NativeCliFixture):
         samples, _ = annotations.load_annotations(new)
         self.assertEqual([(s["sample_id"], s["label"]) for s in samples],
                          [(f"sample-{i}", 23 + i) for i in range(3)])
-        self.assertTrue(report["payload_and_metadata_bytes_unchanged"])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["inspect", str(new)]), 0)
             self.assertEqual(cli.main(["annotations", "inspect", str(new)]), 0)

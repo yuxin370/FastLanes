@@ -111,7 +111,7 @@ def rebuild(source, output, *, split, workers, build_dir=None):
                       image_count=info["image_count"], shard_count=info["shard_count"],
                       original_jpeg_bytes=sum(path.stat().st_size for path in paths),
                       rowgroup_vectors=rebuilt["rowgroup_vectors"], rowgroups_per_shard=rebuilt["rowgroups_per_shard"],
-                      payload_and_metadata_bytes_unchanged=True, verification="full",
+                      verification="full",
                       core_storage_bytes=info["core_storage_bytes"], source_order_sha256=info["source_order_sha256"])
         (store / cli.REPORT_NAME).write_text(json.dumps(report, indent=2) + "\n")
         cli.check_destination(output)

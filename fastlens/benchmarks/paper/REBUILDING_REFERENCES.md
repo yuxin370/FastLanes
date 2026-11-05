@@ -218,10 +218,9 @@ python -m fastlens.benchmarks.paper.shared.remaining_baseline_inference \
 
 ## Rebuild existing paper stores in the current directory layout
 
-When the old block-major datasets are available, preserve their exact compression
-version with the following commands. This copies the existing FLS payloads and
-image metadata without a separate file-hash comparison; it does not re-encode
-JPEGs or shuffle samples.
+When the old block-major datasets are available, use the following commands to
+copy their existing FLS payloads and image metadata into the current layout.
+The rebuild uses `shutil.copyfile()` without re-encoding JPEGs or shuffling samples.
 Manifest paths and geometry indexes are rebuilt, and annotations v2 is generated
 from the existing physical-order sample mapping. All original rowgroup parameters
 and partition boundaries are checked, including the paper's 128 vectors per
@@ -242,15 +241,19 @@ The default uses up to 32 workers for copying and exact verification
 (the native verifier limit); `--workers N` sets a smaller shared CPU/I/O budget.
 Each dataset uses that budget in turn. The old directories are never modified.
 Validation retains `samples.json` (including both `label` and `model_label`) and
-`profile.json`. Training retains `dct/`, the byte-identical `ordered_mapping.csv`
-and its original hashes; its materialization contract points at the new mapping
+`profile.json`. Training retains `dct/`, copies `ordered_mapping.csv`
+and retains its original hashes; its materialization contract points at the new mapping
 and input list while retaining historical writer provenance. The original contract
 is also retained in `dct/conversion/`. Old geometry schedules are not copied;
 materialize them against the new geometry before timing as described below.
 
-The rebuilt data have identical compressed coefficients, image metadata and
-physical partitioning. Manifest/index bytes and auxiliary-file storage can differ,
-so use current Store accounting when reporting those sizes. This operation does
+Full DCT verification compares coefficients, geometry, sampling and quantization
+tables with the original JPEGs. Manifest checks preserve structural fields and
+physical partition boundaries. These semantic and structural checks do not
+independently prove that the old and new FLS and image-metadata files are
+byte-for-byte identical; no separate full-file comparison is performed.
+Manifest/index bytes and auxiliary-file storage can differ, so use current Store
+accounting when reporting those sizes. This operation does
 not rerun model correctness or performance measurements. Point benchmark manifest,
 mapping and geometry paths at the rebuilt dataset and regenerate run contracts
 that bind the old manifest/index before reproducing measurements.
