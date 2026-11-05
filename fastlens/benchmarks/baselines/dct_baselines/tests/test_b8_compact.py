@@ -1,12 +1,14 @@
 """JPEG B8 compact adaptation reuses existing stores and real training updates."""
 import copy
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 import numpy as np
 from PIL import Image
 import torch
 
 from fastlens.benchmarks.baselines.dct_baselines.b8_compact import B8CompactDataset, fit, make_contract
+from fastlens.benchmarks.baselines.dct_baselines.compact_benchmark import check_inputs, reader
 from fastlens.benchmarks.baselines.dct_baselines.compact_training import benchmark
 from fastlens.benchmarks.baselines.dct_baselines.contracts import artifact
 from fastlens.benchmarks.baselines.dct_baselines.materialize import Materializer
@@ -19,6 +21,34 @@ UPSTREAM = str(DEFAULT_RGBNOMORE_ROOT)
 
 
 class B8CompactTests(TemporaryTest):
+    def test_formal_fs_prefetch_checks_real_inputs_across_pools_and_repeated_passes(self):
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        torch.set_num_threads(2)
+        rng = np.random.default_rng(6)
+        samples = []
+        for index in range(9):
+            path = self.root / f"{index}.JPEG"
+            Image.fromarray(rng.integers(0, 256, (512, 512, 3), dtype=np.uint8)).save(
+                path, quality=83, subsampling=2)
+            samples.append(dict(path=str(path), logical_sample_id=f"train/{index}", label=index % 2))
+        selection = self.root / "selection.json"
+        selection.write_text(json.dumps(dict(split="train", samples=samples)))
+        source_path, profile = self.root / "source.json", self.root / "d3.json"
+        freeze_source(selection, source_path, dict(resize="none", encoder="Pillow", quality=83, subsampling=2))
+        fit(source_path, profile, diagonals=3, upstream=UPSTREAM, pool_size=4, workers=2)
+        root = self.root / "fs"
+        build_store(source_images(json.loads(source_path.read_text())), root, "fs_matched_b8",
+                    source_artifact=artifact(source_path), group_size=4)
+        for batch_size, pool_size in ((64, 256), (2, 4)):
+            with self.subTest(batch_size=batch_size, pool_size=pool_size):
+                args = SimpleNamespace(method="fs_prefetched", profile=profile, root=root,
+                                       batch_size=batch_size, pool_size=pool_size, workers=2)
+                with reader(args) as actual, B8CompactDataset(
+                        profile, "cpu_dct", batch_size=batch_size, pool_size=pool_size, workers=2) as reference:
+                    for _ in range(2):
+                        result = check_inputs(actual, reference, batch_size=batch_size, pool_size=pool_size)
+                        self.assertEqual(result["samples"], 9)
+
     def test_source_mask_compact_layout_real_updates_and_train_only_normalization(self):
         rng = np.random.default_rng(6)
         samples = []
