@@ -86,6 +86,7 @@ def hygiene_errors(source):
         r"\breviewers? (?:should|guide|entry point|reproduction)\b",
         r"\bexcluded from (?:this|the) submission\b",
         r"\b(?:in this session|the user's H100|the sandbox itself|supplied plan|final fairness revision)\b",
+        r"\b(?:after the user|the user confirmed)\b",
         r"\bPhase[- ]\d+\b",
     )
     errors = [m.group() for pattern in patterns for m in re.finditer(pattern, prose(source), re.I)]
@@ -150,6 +151,7 @@ class DocumentationTests(unittest.TestCase):
         self.assertEqual(hygiene_errors('Asynchronous submission and legacy APIs.\n'
                                         '```bash\n--phase all\n```'), [])
         self.assertTrue(hygiene_errors('In this session we completed Phase-4.'))
+        self.assertTrue(hygiene_errors('After the user confirmed the GPU was idle, measurements completed.'))
         self.assertTrue(hygiene_errors('CUDA_VISIBLE_DEVICES=GPU-12345678-1234-1234-1234-123456789abc'))
 
 

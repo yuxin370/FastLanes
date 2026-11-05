@@ -263,9 +263,8 @@ and evaluated through R and N: inputs matched exactly, predictions matched
 100%, and sampled logits differed by at most 1.44e-6. These are correctness
 checks, not an accuracy or speedup experiment.
 
-After the user confirmed the RTX 4090 was idle, GPU checks and measurements
-completed under `e2e_v3/runs/efun/rtx4090_20260915/`. PRO 6000 and H100 were
-busy and were not used. GPU block-major roundtrips and the separate projected
+GPU checks and measurements used an idle RTX 4090, with results under
+`e2e_v3/runs/efun/rtx4090_20260915/`. GPU block-major roundtrips and the separate projected
 verification passed. The training input probe passed crop/resize/flip checks
 and a backward/update; grid and projected outputs matched exactly. The
 maximum difference from the unrounded reference was 0.50005, consistent with
