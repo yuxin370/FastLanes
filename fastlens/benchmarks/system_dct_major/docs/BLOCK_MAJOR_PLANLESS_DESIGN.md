@@ -102,10 +102,9 @@ is:
 | Alignment and temporary builder state | 8 MiB |
 | **Compact plan host peak** | **57 MiB** |
 
-The plan has a hard configurable byte budget and reports current/peak bytes.
-Rank/topology pages uploaded for one segment share the same bounded budget;
-the persistent descriptor is never uploaded wholesale. Pinned staging and
-native GPU allocations must remain no higher than the measured legacy path.
+The plan has a configurable byte budget and reports current/peak bytes.
+Rank/topology pages uploaded for one segment share that budget; uploads contain
+only the descriptor pages needed by the segment.
 
 ## Sequential and generic planning
 
@@ -158,14 +157,11 @@ The design distinguishes two launch policies:
 - contiguous/high-density: interval rank and dense touched-group binding pages;
 - generic: bitmap/list rank plus stable request/output-slot indirection.
 
-Both must produce stable tensor hashes, logits, and Top-1 across repeated runs.
-
 ### One-time active-output workset schedule
 
 The runtime first freezes the actual rowgroup worksets, including half-budget
 chunks selected by bounded double buffering. It then builds exactly one
-workset-major active-output schedule for the segment. This replaces the former
-`for each workset -> scan every output block` construction.
+workset-major active-output schedule for the segment.
 
 The builder creates two bounded ownership maps: `(shard,rowgroup)->workset` and
 `(shard,semantic-slot,x,y)->workset`. It enumerates each logical output block
@@ -188,38 +184,28 @@ monotonic and terminal-exact, and workset order preserves deterministic source
 accumulation. Empty worksets and partial tails have explicit empty/suffix
 slices.
 
-Formal validation requires one build per segment, `W` schedule slices for `W`
-executed worksets, `active + skipped == L*W`, exact index/offset byte
-accounting, and valid offsets. CPU schedule time and CUDA kernel time are
-reported separately as
+Each segment has one schedule build and one slice per executed workset, with
+`active + skipped == L*W`. CPU schedule time and CUDA kernel time are reported as
 `planless_transform_active_output_planning_ms` and
-`planless_transform_gpu_kernel_ms`; neither is inferred from whole-operation
-wall time.
+`planless_transform_gpu_kernel_ms`.
 
 ## Cache and prefetch
 
-Allowed caches are descriptor pages, rowgroup metadata, axis/layout templates,
-and compact plans. Expanded plans are never cacheable. The block-major path
-bypasses the legacy exact-batch plan cache and disables the decoded-rowgroup
-cache until those objects can be addressed without retaining segment-scale
-state. Its active decode workset has an explicit byte capacity and reports the
+Caches hold descriptor pages, rowgroup metadata, axis/layout templates and
+compact plans. The block-major path disables exact-batch and decoded-rowgroup
+caching to keep segment data scoped to the active request.
+Its active decode workset has an explicit byte capacity and reports the
 configured capacity, maximum estimated resident bytes, oversized rowgroups,
-double-buffer workset count and overlapped peak estimate. Full-segment pinned
-staging is forbidden. Async rowgroup preparation is restricted to the next
-half-budget workset and back-pressures before the combined estimate exceeds the
-single total budget. The formal contract records
-`decode_workset_capacity_mib` (512 by default), and runtime validation requires
-an exact MiB-to-byte match.
+double-buffer workset count and overlapped peak estimate. Async rowgroup
+preparation stages the next half-budget workset and applies backpressure before
+the combined estimate exceeds `decode_workset_capacity_mib` (512 by default).
 
-Decoded-rowgroup cache insertion now evicts before retaining a new entry, so
+Decoded-rowgroup cache insertion evicts before retaining a new entry, so
 resident bytes never temporarily exceed capacity. It reports current/peak bytes
-and current/peak rowgroup entry counts. Formal planless runs set this cache to
-zero and require all hit/miss/insert/eviction counters to remain zero. Enabling
-the legacy count-bounded exact-plan cache on the planless path is also a formal
-validation failure. The persistent reader/sparse-plan and thread-local
-transform caches are bypassed for the block-major path; plan-local reader sharing is
-runtime-plan state, not a retained cache, and its lifetime is bounded by one
-batch.
+and current/peak rowgroup entry counts. With this cache disabled, all
+hit/miss/insert/eviction counters remain zero. The block-major path also bypasses
+persistent reader/sparse-plan and thread-local transform caches; shared readers
+within a plan live for one batch.
 
 The descriptor cache is planner-owned rather than process-global. Its hard byte
 bound is the sum of indexed descriptor sizes, while current bytes/count include

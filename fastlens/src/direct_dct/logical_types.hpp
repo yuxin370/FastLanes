@@ -14,9 +14,7 @@
 
 namespace fastlens::direct_dct {
 
-// Canonical candidate for a logical batch boundary. It deliberately contains
-// no shard, rowgroup, physical offset, stream/event, allocator, arena, cache,
-// prefetch, CTA, or submission-gate state.
+// Logical batch boundary and per-sample transforms, independent of physical execution.
 struct LogicalBatchRequest final {
 	struct SemanticTransform final {
 		std::optional<jpeg::JpegDctCropBox> source_crop;
@@ -108,9 +106,7 @@ shadow_convert_legacy_requests(const std::span<const jpeg::JpegDctImageCropReque
 	return request;
 }
 
-// Minimal schema only. Explicit shadow/test pipelines may emit it; the Phase-3
-// production delegate passes no trace buffer, so it adds no hook, callback,
-// lock, allocation, CUDA event, synchronization, or Python interaction.
+// Diagnostic events emitted when a pipeline has an explicit trace buffer.
 struct PipelineTraceEvent final {
 	enum class Stage : uint8_t {
 		kRequestAccepted,

@@ -62,7 +62,7 @@ $PYTHON "$EXP/efun.py" validate "$DATA/dct_efun_smoke_cpu"
 for route in R N; do
   $PYTHON "$EXP/efun.py" evaluate --route "$route" --device cpu --count 8 \
     --batch-size 2 --workers 0 --model-threads 2 --new-data "$DATA/dct_efun_smoke_cpu" \
-    --output-dir "$DATA/runs/efun/cpu_smoke_20260915"
+    --output-dir "$DATA/runs/efun/cpu_smoke"
 done
 ```
 
@@ -107,31 +107,6 @@ The workspace's source is ImageNet-512; reproducing the paper's reported
 accuracy requires the original ImageNet dataset, not treating these reencoded
 images as the original validation inputs.
 
-## Nsight Systems captures
-
-The complete inference/training Nsight Systems matrix can be collected with
-`efun_profile.sh` after selecting an idle GPU:
-
-```bash
-export CUDA_VISIBLE_DEVICES=GPU-SELECTED-UUID
-bash fastlens/benchmarks/dct_models/efun_profile.sh nsys_capture
-```
-
-The script checks that the selected GPU has no compute processes and records
-its processes every 100 ms. It captures six inference paths (JPEG reference,
-FASTLENS grid off, projected off/on, RGB PyTorch/DALI), each over 4,096 images
-after 16,384 warmup images. Four training paths (JPEG, FASTLENS B6, RGB PyTorch,
-RGB DALI D2) resume the completed epoch-1 checkpoints, warm up one pool, and
-capture four pools / 16,384 images in epoch 2. Thus training captures exclude
-the first compile and use the audit policy after update 100. They do not
-repeat full training or replace unprofiled throughput measurements.
-
-Reports are written under `e2e_v3/runs/efun/nsys_20260915/`, with per-path
-`.nsys-rep`, SQLite, breakdown JSON and charts; training also exports PNG/PDF
-timelines. Capture logs must report `profile_complete: true`. Training uses
-the JPEG checkpoint from `training_v1_jpeg_rerun_20260915` and the other three
-checkpoints from `training_v1`. Inference uses the official pretrained weights.
-
 ## RGB EfficientNet-B0 with PyTorch and DALI
 
 `efun.py evaluate_rgb` reuses `evaluate_rgb.py` and `rgb.py` with Torchvision's
@@ -167,35 +142,7 @@ rgb_pytorch` or `rgb_d2`, using the existing system training/validation recipe
 (bilinear, mean/std .5) and scratch initialization, separately from these
 pretrained inference transforms. `--initial-validation` records the scratch
 baseline before training; the configured full matrix enables it. The eFUN DALI
-training entrypoint now uses 16 workers and `--dali-prefetch-depth 4`, selected
-from repeated training probes. Historical tuning records are not distributed.
-
-The RTX 4090 results use 50K images, FP32, TF32 disabled and batch 64.
-PyTorch uses the original 16-worker run. DALI uses 4 threads and prefetch depth 4,
-with the median of three interleaved confirmation runs on 2026-09-16 under
-`dali_tuning_20260916/inference_confirmation/`:
-
-| RGB input path | Online seconds | Images/s | Top-1 | Top-5 |
-|---|---:|---:|---:|---:|
-| PyTorch/PIL | 22.338 | 2,238.30 | 76.774% | 93.238% |
-| DALI (4 threads / depth 4) | 11.733 | 4,261.62 | 76.770% | 93.262% |
-
-DALI is 1.90× faster than the recorded PyTorch result. Interleaved confirmation
-medians were 11.929 s for the old 16-thread/depth-2 configuration and 11.733 s
-for 4-thread/depth-4, only a 1.64% elapsed-time reduction. All six confirmation
-runs have identical DALI predictions. Prediction agreement with PyTorch was
-99.244%; the Top-1 difference was -0.004 percentage points. Results preserve
-both prediction arrays and the preprocessing contract. Six integration tests
-passed, including strict RGB checkpoint loading, official PyTorch input
-equality and DALI's 17-image `8+8+1` tail-batch/order check; existing ResNet and
-MobileNet RGB forward checks also passed.
-
-For context, the earlier eFUN/FASTLENS projected run on the same GPU and sample
-population took 10.730 seconds with Top-1 75.428%. Against this stronger RGB
-DALI baseline, its measured speed advantage is about 1.09× with 1.342
-percentage points lower Top-1. This is an architecture/data-path tradeoff,
-not a same-model pushdown ablation. Neither measurement establishes a
-statistical performance bound or forces a cold filesystem cache.
+training entry point uses 16 workers and `--dali-prefetch-depth 4`.
 
 ## Training: two distinct experiments
 
@@ -252,61 +199,3 @@ Begin with `--max-pools 2 --no-compile` for a bounded PLS diagnostic; it does
 not establish convergence. Full runs save epoch checkpoints and accept
 `--resume`. Model-only calibration measures resident-input updates and excludes
 input processing. Use `efun.py TASK --help` for each existing driver's options.
-
-## Validation performed
-
-On 2026-09-15, all four CPU integration tests passed: exact author input,
-strict checkpoint inference and a finite RMSpropTF training update, unchanged
-existing CNN upsampling, and constant-signal preservation during 28-grid
-downsampling. Eight real validation images were encoded into two FASTLENS shards
-and evaluated through R and N: inputs matched exactly, predictions matched
-100%, and sampled logits differed by at most 1.44e-6. These are correctness
-checks, not an accuracy or speedup experiment.
-
-GPU checks and measurements used an idle RTX 4090, with results under
-`e2e_v3/runs/efun/rtx4090_20260915/`. GPU block-major roundtrips and the separate projected
-verification passed. The training input probe passed crop/resize/flip checks
-and a backward/update; grid and projected outputs matched exactly. The
-maximum difference from the unrounded reference was 0.50005, consistent with
-the existing integer-rounding contract.
-
-The complete inference comparison used 50,000 ImageNet-512 validation images,
-FP32, TF32 disabled and batch 64. The reference used 16 CPU workers. All four
-runs achieved Top-1 75.428%, Top-5 92.622%, and all FASTLENS predictions matched R.
-
-| Online inference path | Seconds | Speedup over R |
-|---|---:|---:|
-| R: author JPEG preprocessing | 41.873 | 1.00× |
-| FASTLENS grid, pushdown off | 11.800 | 3.55× |
-| FASTLENS projected, pushdown off | 10.730 | 3.90× |
-| FASTLENS projected, pushdown on | 10.738 | 3.90× |
-
-These are single-run online timings after offline target preparation; cache
-state was not forced cold. Generation took 533.47 seconds and produced about
-5.35 GB before access sidecars. All FASTLENS variants requested the same
-5,274,114,488 compressed payload bytes and retained every frequency. Therefore
-this comparison supports faster online execution through the FASTLENS data path,
-not a benefit from frequency selection: projected off/on are effectively
-equal. The model, input dimensions and arithmetic workload are unchanged;
-different measured forward times do not establish reduced model work.
-Raw results are in `full/R_50000.json` and
-`full/{grid_off,projected_off,projected_on}/N_50000.json` beneath the run root.
-
-Model-only calibration completed 5 warmup plus 120 measured updates using
-BF16/compile and accumulation 16: 122,880 image instances in 42.609 seconds
-(2,883.87 images/s), with parameter updates verified. The calibration reuses
-64 resident training images; it does not measure data loading.
-
-The uncompiled BF16 training diagnostics completed two pools each for native
-B6 and JPEG A0: 8,192 unique images, 8 optimizer updates, finite checks and
-8-image validation passed. Their training windows were 7.984 and 13.630
-seconds respectively. They ran alongside CPU target generation, use different
-ordering/crop policies, and are correctness diagnostics rather than a matched
-training performance or convergence study.
-
-Native A0 was interrupted after its first pool finally completed: 4,096
-images and 4 updates in 423.951 seconds. Its two-pool diagnostic did not finish,
-and no successful `training.json` was emitted. The preserved
-`training_smoke/native_A0/run.log` includes the first-pool record and corrected
-interruption status. Full-epoch convergence and the author's 450-epoch
-training reproduction have not been run.

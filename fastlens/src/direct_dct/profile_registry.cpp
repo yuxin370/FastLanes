@@ -86,7 +86,7 @@ SemanticProfileRegistry::SemanticProfile SemanticProfileRegistry::resolve(const 
 		    {},
 		};
 	}
-	throw std::invalid_argument("unknown shadow Direct-DCT semantic profile '" + std::string(profile_id) + "'");
+	throw std::invalid_argument("unknown Direct-DCT semantic profile '" + std::string(profile_id) + "'");
 }
 
 } // namespace fastlens::direct_dct

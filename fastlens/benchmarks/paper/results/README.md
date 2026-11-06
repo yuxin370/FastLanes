@@ -1,11 +1,9 @@
 # Published results for `fastlens.pdf`
 
-These are the complete retained tables for the final PDF's evaluation, dated
-2026-10-18. The tables contain the adopted measurement points, without adding
-PCR results from the later manuscript. GB/MB use decimal units; throughput is
-images/s. Paths inside `raw_result` and `source_csv` identify historical evidence
-and use repository-relative paths. References to external historical storage use
-`$HOME` or `$FASTLENS_EXPERIMENT_ROOT`; measurement values are unchanged.
+These tables contain the measurements reported in `fastlens.pdf`, dated
+2026-10-18. GB/MB use decimal units; throughput is images/s. Paths inside
+`raw_result` and `source_csv` identify source records relative to the repository.
+External source paths use `$HOME` or `$FASTLENS_EXPERIMENT_ROOT`.
 
 | Section / experiment | Table | Rows |
 | --- | --- | ---: |
@@ -42,8 +40,8 @@ are medians/minima/maxima of the three throughput measurements. The speedup is
 FastLens/CPU-DCT and is repeated on both system rows for the same configuration.
 Averaging the per-configuration matched speedups gives training **3.80× / 4.20×**
 and inference **6.17× / 7.95×** on RTX 4090 / H100, matching Fig. 9.
-Deployment excludes PCR and reuses the same RGB measurement for MobileNet24/32,
-as in the PDF. Resident attainment uses per-round ratios and selects the fastest
+Deployment reuses the same RGB measurement for MobileNet24/32, as in the PDF.
+Resident attainment uses per-round ratios and selects the fastest
 of the six RGB paths within each round.
 
 **Fig. 11b aggregation caveat:** the ten RGB configuration medians have an
@@ -58,8 +56,7 @@ throughput entries match Table 2. Compact training
 has 53 single measurements and seven medians of three measurements, explicitly
 identified by `statistic`; do not infer unmeasured error bars. Fig. 10's
 **6.87×** over CPU-DCT and **13%** over the strongest ImageCalculator baseline
-use geometric means over the twelve configurations (6.87214× / 1.12991×). These two tables
-were previously under `fastlens/docs/paper/figures/evaluation/`.
+use geometric means over the twelve configurations (6.87214× / 1.12991×).
 
 `section_6_2_5/shared.csv` retains the original shared-crop records from
 `a800_convergence_20261003/figures/convergence_observed.csv`. The two independent

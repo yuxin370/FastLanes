@@ -1342,9 +1342,8 @@ private:
 enum class TorchDirectDctLifetimeBackend : uint8_t { kLegacy, kNative };
 
 TorchDirectDctLifetimeBackend requested_phase4_lifetime_backend() noexcept {
-	// Temporary one-release-cycle rollback seam. Remove after the explicit
-	// record_stream contract and native reclaim telemetry have remained clean
-	// in production; the choice is made once when the pipeline is constructed.
+	// Select the lifetime backend once at pipeline construction. Native lifetime
+	// management is the default; the override enables legacy-path comparisons.
 	const auto* override = std::getenv("FASTLENS_PHASE4_NATIVE_LIFETIME");
 	return override == nullptr || std::string_view(override) != "0"
 	           ? TorchDirectDctLifetimeBackend::kNative
@@ -2905,10 +2904,10 @@ PYBIND11_MODULE(_fastlens_direct_dct, m) {
 	         "Register an explicit CUDA stream as an actual consumer before submitting work.")
 	    .def("_enable_lifetime_shadow_for_test",
 	         &TorchDirectDctBatch::enable_lifetime_shadow_for_test,
-	         "Enable the non-authoritative Phase-4 lifetime observer before tensor creation.")
+	         "Enable the test lifetime observer before tensor creation.")
 	    .def("_wait_for_producer_completion_for_test",
 	         &TorchDirectDctBatch::wait_for_producer_completion_for_test,
-	         "Wait for the existing producer event and update the Phase-4 test observer.")
+	         "Wait for the producer event and update the test lifetime observer.")
 	    .def_property_readonly("image_offsets_tensor", &TorchDirectDctBatch::image_offsets_tensor)
 	    .def_property_readonly("image_counts_tensor", &TorchDirectDctBatch::image_counts_tensor)
 	    .def_property_readonly("block_to_image_tensor", &TorchDirectDctBatch::block_to_image_tensor)

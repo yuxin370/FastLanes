@@ -84,8 +84,7 @@ struct NativePipelinePrefetchMetrics final {
 	int64_t submit_to_ready_nanoseconds     = 0;
 };
 
-// Explicitly enabled test/shadow observation buffer. A null buffer pointer is
-// the disabled mode: no trace lock, allocation, callback, CUDA event, or sync.
+// Optional diagnostic buffer. A null buffer pointer disables tracing.
 class NativePipelineTraceBuffer final {
 public:
 	void reset(size_t request_count);

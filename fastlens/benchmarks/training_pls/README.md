@@ -44,13 +44,12 @@ The runner also has a model-independent DCT-native interface. A registered
 model receives exactly two model-facing tensors from either backend:
 `Y[N,1,28,28,8,8]` and `CbCr[N,2,14,14,8,8]`. Storage, Block-major B6
 scheduling, crop pushdown, augmentation, validation, checkpointing and audit
-logic do not import architecture-specific code. `model_registry.py` currently
-registers:
+logic do not import architecture-specific code. `model_registry.py` registers:
 
-| model id | DCT-native stem | execution precision | status |
+| model id | DCT-native stem | execution precision | supported conditions |
 |---|---|---|---|
-| `rgbnomore-vitti-dct-224-v1` | RGB-no-more grouped DCT patch embedding | FP32 | default published ViT-Ti matrix |
-| `rgbnomore-swinv2-t-dct-224-v1` | grouped/sub-block YCbCr DCT stem | BF16 autocast | active B6-only convergence and runtime baselines |
+| `rgbnomore-vitti-dct-224-v1` | RGB-no-more grouped DCT patch embedding | FP32 | A0, A1, B2, B6 and no-shuffle controls |
+| `rgbnomore-swinv2-t-dct-224-v1` | grouped/sub-block YCbCr DCT stem | BF16 autocast | B6 |
 
 The SwinV2-T entry adapts the RGB-no-more DCT architecture to the existing
 224-crop B6 contract (`window_size=7`). The 256-pixel, window-size-8 checkpoint
@@ -58,10 +57,6 @@ is not compatible with this configuration. This configuration supports throughpu
 memory and from-scratch convergence comparisons under the same B6 data path.
 The published convergence configuration and commands are in the
 [paper convergence entry](../paper/section_6_2_5/training_convergence/README.md).
-
-SwinV2 is intentionally registered for `B6` only. `A0`, `A1`, and `B2`
-remain readable/executable only for the historical ViT-Ti factorial experiment;
-they are not part of the active SwinV2 route.
 
 The pre-registered model-effect matrix defaults to semantic emulation over a
 frozen virtual physical mapping. A separate, fail-closed
@@ -75,11 +70,10 @@ The third backend, `standard-rgbnomore-dct`, is the convergence reference. It
 reads source JPEG coefficients with RGB-no-more `dct_manip`, while reusing the
 registered model and the exact premixed B6 position-to-source-sample mapping,
 plus the published DCT augmentation, optimizer, validation and checkpoint
-lifecycle. The premixed mapping path and SHA-256 are mandatory, while a physical
-FASTLENS manifest is forbidden. It accepts any compatible registered DCT-native
-model and carries no physical-FLS or storage-reduction claim. Use a 300-epoch
-recipe with `--stop-after-epoch 50` for the current SwinV2 prefix comparison;
-see the SwinV2 runbook for the exact command and paired report.
+lifecycle. Supply the premixed mapping path and SHA-256, and omit
+`--physical-fastlens-manifest` for this backend. It accepts any compatible
+registered DCT-native model. Use `--stop-after-epoch N` to pause at an epoch
+boundary while retaining the full training schedule.
 
 ## Commands
 
@@ -87,6 +81,7 @@ From the repository root:
 
 ```bash
 export PYTHONPATH="$PWD:$PWD/build/fastlens/torch${PYTHONPATH:+:$PYTHONPATH}"
+export RUN_ROOT="$HOME/tmp/pls-core"
 export TRAIN_JSON="$PWD/fastlens/data/system_rgbnomore/e2e_v3/training_manifests_official_v3/train.json"
 export VAL_JSON="$PWD/fastlens/data/system_rgbnomore/e2e_v3/training_manifests_official_v3/val.json"
 export PHYSICAL="$PWD/fastlens/data/compressed/imagenet512_train_block_major_premixed/dct/manifest.bin"
@@ -108,7 +103,7 @@ Create and inspect the 16-run plan (this never trains without `--execute`):
 
 ```bash
 python -m fastlens.benchmarks.training_pls.run_matrix \
-  --output-dir /tmp/pls-core \
+  --output-dir "$RUN_ROOT" \
   --train-manifest "$TRAIN_JSON" \
   --val-manifest "$VAL_JSON" \
   --layout-plan "$HOME/tmp/pls-layout-current/physical_layout_plan.json" \
@@ -124,16 +119,10 @@ condition, data/layout fingerprints, physical execution inputs and scoped
 training-source identity. Training and reporting both consume this file;
 launch commands use `--run-manifest`.
 
-The manifest retains the full Git commit/status/diff provenance, but only the
-explicitly scoped training runtime source tree is a blocking identity. Changes
-to unrelated repository files are recorded in `environment.json` and no longer
-invalidate a prepared run.
-
-`run_manifest_hash` protects the complete JSON artifact. The separate
-`condition_hash` covers only training/checkpoint compatibility fields, replacing
-full Git provenance with the scoped runtime-source identity. Regenerating a
-manifest after an unrelated repository change therefore preserves checkpoint
-resume compatibility while retaining the new provenance record.
+The manifest records Git provenance. `run_manifest_hash` covers the complete
+JSON, while `condition_hash` covers training/checkpoint compatibility and the
+training runtime source tree. Changes to unrelated files are recorded in
+`environment.json` and preserve checkpoint resume compatibility.
 
 For a physical premixed B6 run, add:
 
@@ -177,7 +166,7 @@ and request an epoch-boundary pause directly from the matrix runner:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.run_matrix \
-  --output-dir /tmp/native-pls-b6-e2 \
+  --output-dir "$HOME/tmp/native-pls-b6-e2" \
   --train-manifest "$TRAIN_JSON" \
   --val-manifest "$VAL_JSON" \
   --layout-plan "$HOME/tmp/pls-layout-current/physical_layout_plan.json" \
@@ -193,21 +182,10 @@ python -m fastlens.benchmarks.training_pls.run_matrix \
   --execute
 ```
 
-`run_matrix` generates the manifest and immediately launches the child training
-process, eliminating the manual plan/contract/train gap. A successful prefix
-run ends with `state=paused-at-epoch-boundary` and `completed_epoch=2`; rerunning
+With `--execute`, `run_matrix` generates the manifest and launches training.
+A successful prefix run ends with `state=paused-at-epoch-boundary` and
+`completed_epoch=2`; rerunning
 the same command does not advance past an already completed requested boundary.
-
-Once N6 has validation records, overlay the matched shuffle controls with:
-
-```bash
-python -m fastlens.benchmarks.training_pls.plot_premixed_progress \
-  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
-  --seed 11997733 \
-  --conditions A1,B6,N6 \
-  --run N6=$FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/explorations/premixed_m4_no_shuffle_n6/runs/N6/seed_11997733 \
-  --x-axis processed-images
-```
 
 In this mode, Python does not construct crop descriptors, PLS membership,
 closed-pool sample order, RandAugment decisions or Mixup decisions. It only
@@ -232,90 +210,53 @@ Run the required 1024-sample A0 reference check:
 python -m fastlens.benchmarks.training_pls.sanity_check \
   --train-manifest "$TRAIN_JSON" \
   --layout-plan "$HOME/tmp/pls-layout-current/physical_layout_plan.json" \
-  --output /tmp/pls-core/a0_reference_sanity.json \
+  --output "$RUN_ROOT/a0_reference_sanity.json" \
   --seed 11997733 \
   --device cuda:0
 ```
 
-Aggregate completed, failed, and still-missing runs without inventing results:
+Summarize completed, failed and missing runs:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.report \
-  --runs-root /tmp/pls-core \
-  --output-dir /tmp/pls-core-report \
+  --runs-root "$RUN_ROOT" \
+  --output-dir "${RUN_ROOT}-report" \
   --conditions A0,A1,B2,B6
 ```
 
-Refresh the live single-seed premixed validation plots without requiring all
-runs to reach the same epoch or to have a `final_result.json`:
+Plot validation progress for a seed:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.plot_premixed_progress \
-  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
+  --experiment-root "$RUN_ROOT" \
   --seed 11997733 \
-  --x-axis epoch
+  --run A0="$RUN_ROOT/runs/A0/seed_11997733" \
+  --run A1="$RUN_ROOT/runs/A1/seed_11997733" \
+  --run B2="$RUN_ROOT/runs/B2/seed_11997733" \
+  --run B6="$RUN_ROOT/runs/B6/seed_11997733" \
+  --x-axis processed-images
 ```
 
-The command rereads each `metrics.jsonl` on every invocation and atomically
-refreshes `premixed_validation_curves.png`, the separate top-1/top-5/loss
-plots, a CSV containing the plotted points, and a JSON source summary. Use
-`--x-axis processed-images` for the primary scientific convergence axis. If a
-future run has a different directory layout, override any source with repeated
-`--run CONDITION=/absolute/run/directory` arguments.
+The command reads each `metrics.jsonl` and writes validation plots, a CSV of the
+plotted points and a JSON source summary. Use `--x-axis epoch` for epoch plots.
+Each `--run` selects a condition's run directory.
 
-After fresh-process historical revalidation, explicitly select the canonical
-CSV so superseded inline validation records are not used:
-
-```bash
-python -m fastlens.benchmarks.training_pls.plot_premixed_progress \
-  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
-  --seed 11997733 \
-  --canonical-csv $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/stages/seed_11997733_historical_revalidation/canonical_historical_validation.csv \
-  --x-axis epoch
-```
-
-Canonical mode requires unique condition/epoch rows marked
-`canonical_fresh_process=True`. The generated CSV and summary preserve the
-canonical input path, SHA-256, checkpoint hash, and validation GPU provenance;
-plot titles are labelled `fresh-process canonical validation`.
-
-Audit the registered formal matrix and an optional live comparison without
-trusting stale `run_status.json` values as proof of an active process:
-
-```bash
-python -m fastlens.benchmarks.training_pls.audit_goal \
-  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
-  --layout-plan $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-layout-20260811/physical_layout_plan.json \
-  --formal-report-dir $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/formal_report \
-  --output-dir $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/audits/current \
-  --comparison-id premixed-layout-M4-seed-11997733 \
-  --comparison-seed 11997733 \
-  --comparison-run A0=/absolute/A0/run \
-  --comparison-run A1=/absolute/A1/run \
-  --comparison-run B2=/absolute/B2/run \
-  --comparison-run B6=/absolute/B6/run
-```
-
-The audit writes `goal_completion_audit.json` and
-`goal_completion_audit.md` atomically. It requires an actual epoch-300
-`final_result.json` for formal completion, reports exact checkpoint and
-validation coverage at every milestone, and labels a single-seed Premixed
-comparison as exploratory rather than as the pre-registered four-seed result.
-
-Generate a strict common-epoch Premixed single-seed report (the command
-rejects missing validation points or permanent checkpoints):
+For a report at a common epoch:
 
 ```bash
 python -m fastlens.benchmarks.training_pls.report_premixed_milestone \
-  --experiment-root $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811 \
-  --seed 11997733 \
-  --epoch 50 \
-  --output-dir $FASTLENS_EXPERIMENT_ROOT/pls-experiments/pls-core-v2-20260811/premixed_milestones/epoch_050
+  --experiment-root "$RUN_ROOT" \
+  --seed 11997733 --epoch 50 \
+  --run A0="$RUN_ROOT/runs/A0/seed_11997733" \
+  --run A1="$RUN_ROOT/runs/A1/seed_11997733" \
+  --run B2="$RUN_ROOT/runs/B2/seed_11997733" \
+  --run B6="$RUN_ROOT/runs/B6/seed_11997733" \
+  --output-dir "${RUN_ROOT}-report/epoch_050"
 ```
 
-This report provides exact fixed-budget metrics, single-seed 2×2 contrasts,
-and partial normalized AUC through the requested epoch. It deliberately does
-not calculate a confidence interval from one seed.
+This report requires validation points and checkpoints at the requested epoch.
+It reports fixed-budget metrics, single-seed 2×2 contrasts and normalized AUC
+through that epoch. Confidence intervals require multiple seeds.
 
 ## Implementation map
 
@@ -332,14 +273,14 @@ not calculate a confidence interval from one seed.
 - `report.py`: curves, final metrics, paired/factorial effects, Student-t CIs.
 - `report_convergence_reference.py`: threshold-free paired Native-B6 versus
   standard-DCT prefix curves, endpoint deltas, and normalized Top-1 AUC.
-- `audit_goal.py`: read-only formal-matrix, live-process, and evidence-boundary audit.
+- `audit_goal.py`: matrix completion, process state and checkpoint coverage checks.
 - `report_premixed_milestone.py`: strict common-epoch single-seed Premixed report.
 - `fastlens/benchmarks/baselines/system_rgbnomore/training/equal_image_epoch_benchmark.py`: GPU-identity-checked
   D2/D3/PyTorch full-ImageNet E1/E2 runner with microbatch 64, accumulation 16,
   exact tail, shared RGB initialization, and epoch-boundary resume. D2 is the
   canonical-order planned-augmentation native DALI baseline; D3 is the
   DALI-native shuffle/augmentation performance ceiling.
-- `report_equal_image_performance.py`: fail-closed equal-image table combining
+- `report_equal_image_performance.py`: equal-image throughput table combining
   Native physical B6 with the D2/D3/PyTorch E1/E2 artifacts.
 
 The report includes every condition and seed. Throughput, memory, loader timing,

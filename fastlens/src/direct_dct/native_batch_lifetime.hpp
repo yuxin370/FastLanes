@@ -43,7 +43,7 @@ struct NativeBatchCompletionSnapshot final {
 
 // Canonical native completion state. In authoritative mode it reuses the
 // producer event owned by DirectDctBatch and owns only the consumer events
-// needed to defer reclaim. Shadow users may still drive the same state by
+// needed to defer reclaim. Tests can drive the same state by
 // explicitly marking dependencies complete.
 class NativeBatchCompletion final {
 public:
@@ -110,9 +110,8 @@ struct NativeBatchReclaimQueueStats final {
 	size_t consumer_event_count = 0U;
 };
 
-// Canonical native lifetime owner. The one-argument constructor preserves the
-// non-authoritative shadow/test form; the two-argument constructor transfers
-// actual DirectDctBatch ownership to the lease.
+// Native lifetime owner. The one-argument constructor observes completion for
+// tests; the two-argument constructors also retain the supplied backing storage.
 class NativeBatchLease final : public std::enable_shared_from_this<NativeBatchLease> {
 public:
 	explicit NativeBatchLease(std::shared_ptr<NativeBatchCompletion> completion);
@@ -126,7 +125,7 @@ public:
 	void mark_consumer_complete(int cuda_device, uintptr_t stream_identity);
 
 	// A reference represents one independent Tensor/Storage deleter that owns
-	// the native batch. The shadow requests final release only after every
+	// the native batch. The lease requests final release only after every
 	// retained storage reference has executed its deleter.
 	void retain_storage_reference();
 	[[nodiscard]] bool release_storage_reference() noexcept;

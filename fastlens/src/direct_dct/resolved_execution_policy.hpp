@@ -9,16 +9,14 @@
 
 namespace fastlens::direct_dct {
 
-// Immutable shadow representation of the execution values materialized by the
-// current production profile resolver. Phase 1 does not make this authoritative.
+// Immutable execution settings for a semantic profile.
 struct ResolvedExecutionPolicy final {
 	enum class SubmissionGatePolicy : uint8_t {
 		kDisabled,
 		kCreatePerAsyncBatch,
 	};
 
-	// Explicit completeness inventory for every field in
-	// jpeg::JpegDctDeviceBatchOptions. Contract tests compare all 23 fields.
+	// Field names used to compare jpeg::JpegDctDeviceBatchOptions in tests.
 	enum class BatchOptionField : size_t {
 		kLayout,
 		kGridTransform,
@@ -103,8 +101,7 @@ static_assert(ResolvedExecutionPolicy::kBatchOptionFieldNames.size() ==
 
 [[nodiscard]] ResolvedExecutionPolicy resolve_execution_policy(std::string_view semantic_profile_id);
 
-// Differential-test materializer only. It reconstructs the legacy option
-// aggregate without installing a submission gate or entering the runtime path.
+// Combine semantic and execution settings without starting runtime work.
 [[nodiscard]] jpeg::JpegDctDeviceBatchOptions
 materialize_shadow_options(const SemanticProfileRegistry::SemanticProfile& semantic,
                            const ResolvedExecutionPolicy&                  policy);

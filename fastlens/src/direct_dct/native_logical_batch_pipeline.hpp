@@ -13,9 +13,7 @@
 
 namespace fastlens::direct_dct {
 
-// Native execution owner. Phase 2 used it only as a shadow executor; Phase 3
-// permits the private Torch adapter to delegate to it without exposing it as a
-// public API.
+// Native execution owner used by the private Torch adapter.
 class NativeLogicalBatchPipeline final {
 public:
 	NativeLogicalBatchPipeline(const std::filesystem::path& manifest_path,

@@ -16,15 +16,13 @@ Relative to the recorded upstream commit, the storage changes include:
 - Footer/column metadata needed by those storage and access paths.
 - FSST/ALP corrections and related expression/type changes.
 
-This relocation keeps those implementations unchanged. Build-only changes make
-FastLanes a subdirectory dependency, remove its former reverse dependency on
-FastLens, preserve the compiler options, and propagate the ALP rowgroup constant
-to consumers of its headers. The submission includes the library source, CMake
-files, dataset declarations and fixture generators needed by FastLens. Upstream
+FastLanes builds as a subdirectory dependency, with compiler options and the ALP
+rowgroup constant propagated to consumers of its headers. This repository includes
+the library source, CMake files, dataset declarations and fixture generators
+needed by FastLens. Upstream
 benchmark records, sample datasets, standalone bindings, publications and other
 optional projects are not distributed. Build this dependency through the FastLens
-root project; its unused upstream build options are not artifact entry points.
-Local absolute paths in dataset declarations have been made source-relative.
+root project. Dataset declarations use source-relative paths.
 
 The upstream snapshot also contained G-ALP/GPU code from which parts of FastLens
 evolved. Original copyright and license notices in those files are preserved.

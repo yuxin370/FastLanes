@@ -186,8 +186,7 @@ struct JpegDctDeviceExecutionStats {
 	size_t      jpeg_dct_projection_items_materialized  = 0;
 	size_t      fixed_grid_round_event_handoff_count    = 0;
 	bool        cache_enabled                           = false;
-	// Phase-2 architecture counters are appended to preserve the positional
-	// initialization order of the legacy public aggregate.
+	// Keep appended counters in order for positional aggregate initialization.
 	bool   exact_batch_plan_cache_enabled           = false;
 	bool   uses_planless_fixed_transform            = false;
 	size_t host_expanded_transform_items_created    = 0;

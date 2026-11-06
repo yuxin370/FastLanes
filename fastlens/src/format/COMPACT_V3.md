@@ -162,47 +162,5 @@ The `fastlens_jpeg_dct_tool` commands are:
 Both print aggregate and per-rowgroup payload hashes; a checksum mismatch is a
 non-zero exit.
 
-## Acceptance probes
-
-`fastlens_compact_v3_runtime_audit` is intentionally a fresh-process probe rather
-than an in-process benchmark helper. Memory mode reports RSS/PSS before and
-after manifest/metadata loading, first planning, and bounded compact-descriptor
-touches, including the actually resident `.fls` mmap pages:
-
-```text
---manifest manifest.bin --memory-probe --batch-size 64 --output memory.json
-```
-
-I/O mode executes exactly one request class per process and reports logical
-bytes, range bytes, 4 KiB coverage, `/proc/self/io` block reads, native
-pread/preadv and coalesced-run counts, vector/coefficient ratios, pinned
-memory, and native device memory:
-
-```text
---manifest manifest.bin --workload full-all --coefficients 64
---manifest manifest.bin --workload crop-all --coefficients 64
---manifest manifest.bin --workload full-prefix --coefficients 8
---manifest manifest.bin --workload crop-prefix --coefficients 8
-```
-
-`compact_v3_acceptance.py run-runtime-matrix` launches the full K=1/4/8/16/32/64
-matrix and the descriptor/index memory probe in independent processes. It
-writes the complete evidence JSON before returning a non-zero status for any
-failed automatic memory, accounting, `preadv`, or two-dimensional locality
-gate. It reports operating-system block reads honestly; formal cold results
-still require the caller to control and record page-cache state.
-
-`compact_v3_acceptance.py run-ab` requires at least ten alternating legs, so
-each variant has at least five fresh processes. It verifies that repeat zero is
-included, warmup is zero, baseline source revisions are clean and hashed, and
-the hardware, dataset, sample order, model, and execution configuration match.
-The current system runner exposes one canonical production name: `fastlens`. The
-old `fastlens_planless`, `fastlens_fixed_items` and `fastlens_legacy` spellings survive only
-inside historical artifacts and are rejected by current production contracts.
-Raw fixed-items/planless selection remains an internal diagnostic concern, not
-a benchmark pipeline choice.
-Its GPU gate counts Torch-reserved plus FASTLENS-native device memory, while the
-process-tree PSS gate includes worker processes and pinned host allocations.
-Both variants require passing semantic validator JSON bound to the identical
-canonical benchmark contract. Formal page-cache control remains an explicit
-unverified field rather than an implicit pass.
+Memory, I/O and comparison commands are documented in the
+[runtime diagnostic guide](../../benchmarks/development/README.md#compact-format-diagnostics).

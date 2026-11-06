@@ -111,21 +111,16 @@ semantic slot, component/profile IDs, quant table number, and a quant dictionary
 reference. Quant tables are deduplicated per shard; each record is an 8-byte
 fingerprint followed by 64 u16 values.
 
-## Measured ImageNet-50K footprint
-
-For `fastlens/data/compressed/imagenet_original_val_fls_v1_rg64/manifest.bin`, the v1 builder
-produced 30 sidecars totaling 62,996,296 bytes plus a 1,024-byte companion
-index. The unchanged FLS plus metadata dataset is 14,106,589,306 bytes, so the
-measured growth is 0.446580804427%. All 9,251,484 positive block groups matched
-the legacy physical topology. This passes both the hard 1% gate and the 0.5%
-target.
-
-Reproduce the build and emit a machine-readable report with:
+## Build an index
 
 ```bash
 ./build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool \
-  fastlens/data/compressed/imagenet_original_val_fls_v1_rg64/manifest.bin \
-  --output-dir /tmp/galp-block-major-access-v1-real \
-  --output-json /tmp/galp-block-major-access-v1-real.json \
+  /path/to/manifest.bin \
+  --output-dir "$HOME/tmp/block-major-access" \
+  --output-json "$HOME/tmp/block-major-access.json" \
   --exhaustive-rank-validation
 ```
+
+The report contains descriptor sizes and topology validation results. See the
+[diagnostic guide](../../benchmarks/development/README.md#geometry-index-footprint)
+for an ImageNet-50K measurement.

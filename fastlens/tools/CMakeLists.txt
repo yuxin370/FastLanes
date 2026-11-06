@@ -16,7 +16,7 @@ target_include_directories(fastlens_cli PRIVATE
 
 apply_warnings(fastlens_cli)
 
-if (BUILD_TESTING)
+if (FASTLENS_BUILD_TESTS)
         add_test(NAME FastLensCliHelp COMMAND fastlens_cli --help)
         set_tests_properties(FastLensCliHelp PROPERTIES LABELS "fastlens;cli;smoke")
         if (Python3_Interpreter_FOUND)

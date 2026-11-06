@@ -31,11 +31,10 @@ with reader.iter_batches(
 
 `module_path` points to the compiled PyTorch extension. The profile determines the input geometry, normalization, and tensor representation expected by the model.
 
-The existing `VALIDATION_CENTER_CROP_512` scheduled reader currently requires one
-complete shard per submitted batch, with image IDs in ascending order; subsets,
-reordered IDs, or batches crossing shards can fail with a canonical-plan-digest
-error. The general `VALIDATION` profile used here supports arbitrary sample-ID
-batches. This converter does not change the reader's scheduling implementation.
+The `VALIDATION` profile used here supports subsets, reordered sample IDs and
+batches crossing shards. For the `VALIDATION_CENTER_CROP_512` scheduled path,
+submit one complete shard per batch with image IDs in ascending order. That
+batching requirement applies specifically to this scheduled profile.
 
 By default, `coefficients=None` reads all 64 source DCT coefficients. You can also request specific frequencies:
 

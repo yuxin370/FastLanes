@@ -106,7 +106,7 @@ if (FASTLENS_INSTALL_TORCH_PACKAGE)
 		PATTERN "__pycache__" EXCLUDE)
 endif ()
 
-if (BUILD_TESTING)
+if (FASTLENS_BUILD_TESTS)
 	# Private deterministic outstanding-consumer harness. The module
 	# submits its gate, sentinel-read consumer, and completion marker in one
 	# native call and is never linked into or installed with _fastlens_direct_dct.
@@ -122,8 +122,7 @@ if (BUILD_TESTING)
 		LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fastlens/torch
 		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fastlens/torch)
 
-	# Private Phase-2 A/B probe. It links the shadow executor into a separate
-	# module and cannot become an authority for the production Torch binding.
+	# Private scheduler comparison probe, built as a separate test module.
 	Python3_add_library(_fastlens_phase2_native_ab MODULE WITH_SOABI
 		phase2_native_ab.cpp
 		${CMAKE_CURRENT_SOURCE_DIR}/../src/direct_dct/profile_registry.cpp

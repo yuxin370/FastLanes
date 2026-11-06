@@ -97,17 +97,17 @@ ResolvedExecutionPolicy resolve_execution_policy(const std::string_view semantic
 		    0U,
 		};
 	}
-	throw std::invalid_argument("unknown shadow Direct-DCT execution profile '" + std::string(semantic_profile_id) +
+	throw std::invalid_argument("unknown Direct-DCT execution profile '" + std::string(semantic_profile_id) +
 	                            "'");
 }
 
 jpeg::JpegDctDeviceBatchOptions materialize_shadow_options(const SemanticProfileRegistry::SemanticProfile& semantic,
                                                            const ResolvedExecutionPolicy&                  policy) {
 	if (semantic.id != policy.source_profile_id) {
-		throw std::invalid_argument("shadow semantic profile and execution policy ids do not match");
+		throw std::invalid_argument("semantic profile and execution policy ids do not match");
 	}
 	if (semantic.output_layout != policy.layout) {
-		throw std::invalid_argument("shadow semantic profile and execution policy layouts do not match");
+		throw std::invalid_argument("semantic profile and execution policy layouts do not match");
 	}
 
 	jpeg::JpegDctDeviceBatchOptions options;

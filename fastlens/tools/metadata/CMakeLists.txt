@@ -22,7 +22,7 @@ add_executable(fastlens_fls_metadata_benchmark
 target_link_libraries(fastlens_fls_metadata_benchmark PRIVATE FastLanes::core)
 apply_warnings(fastlens_fls_metadata_benchmark)
 
-if (BUILD_TESTING)
+if (FASTLENS_BUILD_TESTS)
         add_test(NAME FastLensFlsMetadataToolHelp COMMAND fastlens_fls_metadata_tool --help)
         set_tests_properties(FastLensFlsMetadataToolHelp PROPERTIES LABELS "fastlens;cli;metadata;smoke")
         add_test(NAME FastLensFlsMetadataBenchmarkHelp COMMAND fastlens_fls_metadata_benchmark --help)

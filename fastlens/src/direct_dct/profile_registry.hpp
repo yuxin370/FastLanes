@@ -8,8 +8,7 @@
 
 namespace fastlens::direct_dct {
 
-// Shadow-only canonical candidate. This registry owns semantic output
-// contracts; execution tuning is resolved separately.
+// Semantic output contracts; execution tuning is resolved separately.
 class SemanticProfileRegistry final {
 public:
 	struct SemanticProfile final {

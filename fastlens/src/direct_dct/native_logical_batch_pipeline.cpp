@@ -316,8 +316,7 @@ public:
 	}
 
 	[[nodiscard]] Batch read(PreparedBatch prepared) {
-		// ReadPreparedBatch deliberately performs the same second StageBatchIo
-		// call as the legacy Torch prefetch path. Phase 2 does not normalize it.
+		// ReadPreparedBatch also calls StageBatchIo; prepared I/O can be reused.
 		return runtime_->ReadPreparedBatch(std::move(prepared));
 	}
 
@@ -354,9 +353,8 @@ bool native_physical_orchestration_enabled() noexcept {
 }
 
 size_t materialized_output_slot_capacity() {
-	// Internal construction-time A/B and low-memory rollback. Production uses
-	// two slots so input N+1 can overlap model N; this is intentionally absent
-	// from the Stable Python API.
+	// Two output slots let input N+1 overlap model N. The internal override
+	// selects a single slot for memory-constrained runs and comparisons.
 	const auto* value = std::getenv("FASTLENS_DIRECT_DCT_OUTPUT_SLOT_CAPACITY");
 	if (value == nullptr || std::string_view(value) == "2") {
 		return 2U;

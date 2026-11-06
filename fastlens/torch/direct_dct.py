@@ -46,12 +46,7 @@ _INVALID_COEFFICIENTS = (
 
 @dataclass(frozen=True, slots=True)
 class TrainingPolicy:
-    """Sample ordering and the existing PLS RandAugment/Mixup recipe.
-
-    Mapping and seed retain their native meanings. Model representation and
-    execution tuning are deliberately absent; this does not introduce a new
-    augmentation implementation.
-    """
+    """Sample ordering and the PLS RandAugment/Mixup recipe."""
 
     mapping: str | Path
     seed: int
@@ -64,12 +59,7 @@ class TrainingPolicy:
 
 
 def _cnn_pipeline_options(profile: DctModelProfile) -> dict[str, Any]:
-    """Existing source512 CNN inference configuration, resolved once.
-
-    These are the options formerly composed by native_options,
-    source_options and apply_b6_runtime in the CNN benchmark. Keep the
-    execution policy here private, independent of the model descriptor.
-    """
+    """Resolve private execution settings for source512 CNN inference."""
     selection = profile.source_frequency_policy
     return dict(
         layout="transformed_dct_grid",
@@ -312,11 +302,7 @@ class DirectDctBatch:
 
     @property
     def sample_ids(self) -> list[int]:
-        """Pythonic alias for :attr:`global_image_ids`.
-
-        This does not touch Tensor or native backing storage; it has the same
-        metadata materialization behavior as the compatibility property.
-        """
+        """Alias for :attr:`global_image_ids`."""
 
         return self.global_image_ids
 
@@ -707,12 +693,11 @@ class DirectDctReader:
         transforms_by_batch: Sequence[Sequence[Mapping[str, Any]] | None]
         | None = None,
     ) -> Iterator[DirectDctBatch]:
-        """Iterate a finite schedule using exactly ``pipeline()`` + ``start()``.
+        """Iterate a finite schedule using ``pipeline()`` and ``start()``.
 
         The input is fully consumed before the first batch is returned.
         The returned iterator also supports ``with`` and ``close`` for
-        deterministic early-exit cleanup. It introduces no producer, queue,
-        submission protocol, or execution path of its own.
+        deterministic early-exit cleanup.
         """
 
         pipeline = self.pipeline(
