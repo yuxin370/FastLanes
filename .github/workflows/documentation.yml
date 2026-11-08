@@ -61,9 +61,10 @@ jobs:
           echo "CUDA_HOME=$HOME/miniconda3/envs/fastlanes-cuda" >> "$GITHUB_ENV"
       - name: Build with the runner's installed CUDA and PyTorch environment
         run: |
-          ./scripts/build.sh -DCMAKE_CXX_COMPILER=clang++ \
+          ./scripts/build.sh -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
             -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
-            -DCMAKE_CUDA_HOST_COMPILER=g++ -DCMAKE_CUDA_ARCHITECTURES=89 \
+            -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ -DCUDA_HOST_COMPILER=/usr/bin/g++ \
+            -DCMAKE_CUDA_ARCHITECTURES=89 \
             -DFLS_ENABLE_DATA=OFF
       - name: Execute documented tensor examples and numerical checks
         run: |
