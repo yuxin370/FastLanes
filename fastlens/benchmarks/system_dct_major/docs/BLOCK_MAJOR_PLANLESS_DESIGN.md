@@ -23,7 +23,8 @@ Every sidecar starts with a fixed 256-byte little-endian header containing:
 - source metadata size/CRC64 and FLS size/payload CRC64;
 - semantic-slot, coordinate-position, positive-group, rowgroup, and rank-cell
   counts;
-- offset/size pairs for every section;
+- section offsets; lengths follow from adjacent offsets and the total descriptor size
+  (see the [geometry specification](../../../docs/spec/GEOMETRY.md));
 - descriptor CRC64 with the checksum field zeroed while hashing.
 
 All section bounds, counts, monotonic offsets, checksums, and source identities

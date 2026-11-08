@@ -6,7 +6,7 @@ Torch extension, paired checkpoints and a canonical validation sample order.
 The [reference rebuilding guide](../../paper/REBUILDING_REFERENCES.md) describes
 public-source data and checkpoint preparation.
 
-The `dataset/prepare.py` utility produces **native experimental datasets**, for
+The `dataset/prepare.py` utility produces **native benchmark datasets**, for
 both `dct-major` and `image-major` comparisons. It retains generation paths and
 explicit encoding parameters; its output is not a published standard Store.
 Use the [Converter](../../../docs/CONVERSION.md) for a standard block-major Store.

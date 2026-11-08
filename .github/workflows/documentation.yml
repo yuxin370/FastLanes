@@ -1,0 +1,61 @@
+name: Documentation and format examples
+on:
+  pull_request:
+  push:
+    branches: [fastlens]
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: Run tensor checks on an installed self-hosted GPU runner
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  documentation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check public documents, CLI and binary vectors
+        run: |
+          mkdir -p "$HOME/tmp"
+          export TMPDIR="$HOME/tmp"
+          python -B -m unittest fastlens.tests.test_documentation fastlens.tests.test_binary_spec fastlens.tests.test_cli fastlens.tests.test_annotations fastlens.benchmarks.paper.tests.test_compression_control.CompressionControlTests -v
+  native:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Install build prerequisites
+        run: apt-get update && apt-get install -y git cmake clang g++ make libjpeg-dev python3 python3-pil
+      - uses: actions/checkout@v4
+      - name: Configure and build native checks
+        run: |
+          mkdir -p "$HOME/tmp"
+          export TMPDIR="$HOME/tmp"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=g++ -DCMAKE_CUDA_ARCHITECTURES=89 -DFASTLENS_BUILD_TORCH=OFF -DFASTLENS_BUILD_TESTS=ON -DFASTLENS_BUILD_BENCHMARKS=ON -DFASTLENS_BUILD_TOOLS=ON -DFASTLENS_WITH_JPEG_DCT=ON -DFLS_ENABLE_DATA=OFF
+          cmake --build build --target fastlens_jpeg_dct_tool fastlens_block_major_access_tool fastlens_raw_dct_control fastlens_dct_storage fastlens_compact_format_tests fastlens_block_major_access_tests --parallel 2
+      - name: Convert bundled JPEGs, inspect, verify coefficients and prepare controls
+        run: |
+          export TMPDIR="$HOME/tmp"
+          export FASTLENS_BUILD_DIR="$PWD/build"
+          export FASTLENS_REQUIRE_NATIVE_TESTS=1 FASTLENS_REQUIRE_PREPARATION_TESTS=1
+          python3 -B -m unittest fastlens.tests.test_cli_native.NativeCliTests fastlens.benchmarks.paper.tests.test_compression_control -v
+          build/fastlens/tests/fastlens_compact_format_tests
+          build/fastlens/tests/fastlens_block_major_access_tests
+  gpu:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
+    runs-on: [self-hosted, linux, x64, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with the runner's installed CUDA and PyTorch environment
+        run: ./scripts/build.sh
+      - name: Execute documented tensor examples and numerical checks
+        run: |
+          mkdir -p "$HOME/tmp"
+          export TMPDIR="$HOME/tmp" FASTLENS_REQUIRE_CUDA_SMOKE=1 FASTLENS_REQUIRE_NATIVE_TESTS=1
+          export FASTLENS_BUILD_DIR="$PWD/build"
+          export PYTHONPATH="$PWD:$PWD/build/fastlens/torch"
+          python3 -B -m unittest fastlens.torch.tests.test_converted_store -v

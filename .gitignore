@@ -28,6 +28,8 @@ data/dct_blocks/
 
 # Publish user guides, the final PDF and plotting sources; keep manuscript drafts private.
 fastlens/docs/*
+!fastlens/docs/spec/
+!fastlens/docs/API_STABILITY.md
 !fastlens/docs/CONVERSION.md
 !fastlens/docs/STORE_FORMAT.md
 !fastlens/docs/ANNOTATIONS.md
@@ -52,7 +54,8 @@ fastlens/docs/paper/scripts/*
 !fastlens/docs/paper/scripts/plot_read_bandwidth.py
 !fastlens/docs/paper/outputs/
 fastlens/docs/paper/outputs/*
-fastlens/data
+fastlens/data/*
+!fastlens/data/example-jpegs/
 /fastlens/scripts/*
 !/fastlens/scripts/codegen/
 !/fastlens/scripts/codegen/**

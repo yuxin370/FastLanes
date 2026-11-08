@@ -84,6 +84,36 @@ uses FP32 and batch 64 (Swin: 50), excludes 20 model warmup batches, and include
 reader startup and metrics in the timed interval. TF32 and CUDA graphs are off.
 The default NUMA node is 0, except the ResNet/4090 extension uses node 1.
 
+## Preparation and validation by experiment
+
+Use this sequence for every measured section: **Prerequisites → Prepare →
+Validate → Run → Outputs**. The environment above is shared; the table identifies
+the input-producing workflow and the checks required before timing. `--dry-run`
+shows commands only. It does not prepare data or establish correctness.
+
+| Sections | Prepare | Validate before Run | Outputs |
+| --- | --- | --- | --- |
+| §6.2.1, §6.2.3, §6.2.4 | [Public checkpoints, JPEGs and inference references](REBUILDING_REFERENCES.md); training also needs the physical-order mapping and native training Store described below | Same sample IDs/order, checkpoint and preprocessing; fresh prediction or training correctness pass for each path | Per-trial JSON/CSV and command records under the section's output directory |
+| §6.2.2 | [Compact and selected-frequency preparation](#prepare-compact-and-selected-frequency-inputs) | Same full-frequency source population; each path's input/logit comparison | Prepared contracts/stores, verification results and timing tables |
+| §6.2.5 | [Convergence inputs and limits](section_6_2_5/training_convergence/README.md#prepare-and-validate) | Mapping matches physical order; model-specific validation data and global batch agree with the recipe | Epoch metrics, checkpoints and convergence curves |
+| §6.3 storage | The same JPEG and native layouts used by the measured workloads; [storage instructions](section_6_3/storage/README.md) | Count actual referenced FLS, metadata and index files; retain population and representation identity | Storage table with explicit byte scope |
+| §6.3 H2D | Completed end-to-end trials, then [fresh H2D capture](REBUILDING_REFERENCES.md#profile-newly-completed-chapter-trials) | Replayed predictions/sample IDs and model settings match the source trial | Separate CUPTI traces and traffic summaries |
+| §6.4 projection/staging, §6.5.2 bandwidth | [Native source-DCT validation data](REBUILDING_REFERENCES.md#prepare-native-source-dct-inference), including geometry, samples and profile | Native source coefficient verification, then the workload's correctness pass | Selection/staging counters or bandwidth-controlled timings |
+| §6.4 compressed transfer | [Paired raw/compressed preparation](section_6_4/compressed_transfer_and_tensor/README.md#prepare) | Exact coefficients, rowgroup boundaries, sample order and 16,384-image population | `preparation.json`, two control datasets and paired measurements |
+| §6.5.1 locality | [Aligned Block-major and Image-major preparation](section_6_5_1/block_major_locality/README.md#prepare-and-validate) | Same logical samples at each physical ID; tensor equality before paired timing | Three measured trials per crop policy/layout/batch size |
+
+The historical premixed training Store and `ordered_mapping.csv` are external
+inputs, not files included with this checkout. The [Store rebuilding recipe](REBUILDING_REFERENCES.md#rebuild-existing-paper-stores-in-the-current-directory-layout)
+preserves an existing mapping and cannot recover a missing one. A newly chosen
+physical order is a new measurement population, even when JPEG contents match.
+Published plots remain reproducible from the included records without those
+historical training artifacts. Section guides identify further model-specific
+inputs; missing historical artifacts must not be reported as a successful rerun.
+
+For analysis, use the [published aggregation definitions](results/README.md).
+`python -m fastlens.benchmarks.paper.reproduce statistics` prints the principal
+aggregate values from the retained plotting inputs without changing them.
+
 ## Prepare compact and selected-frequency inputs
 
 The default data tree is `fastlens/data/`. First prepare ImageNet-512 and the native

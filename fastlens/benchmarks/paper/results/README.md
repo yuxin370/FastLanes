@@ -55,8 +55,43 @@ Selected-frequency inference has one measurement per point. All **45** rounded
 throughput entries match Table 2. Compact training
 has 53 single measurements and seven medians of three measurements, explicitly
 identified by `statistic`; do not infer unmeasured error bars. Fig. 10's
-**6.87×** over CPU-DCT and **13%** over the strongest ImageCalculator baseline
+**6.87×** over CPU-DCT and **13%** over the strongest IC/FS baseline
 use geometric means over the twelve configurations (6.87214× / 1.12991×).
+The latter selects the fastest of IC, IC-batched and FS separately for each
+configuration, as stated in the PDF. Restricting the denominator to the two IC
+variants instead gives 1.16084×; the 13% claim includes FS.
+
+## Aggregation specification
+
+Ratios are formed on matched requests before aggregating. Arithmetic mean is
+`sum(x)/N`; geometric mean is `exp(sum(log(x))/N)`. Display rounding follows
+aggregation. Missing trials are not synthesized and one-trial points have no
+inferred error bars.
+
+| Result | Per-point statistic | Cross-configuration or displayed summary |
+| --- | --- | --- |
+| Fig. 9 | Median of three paired FastLens/CPU-DCT ratios; throughput bars show median and min–max | Arithmetic mean of seven model ratios, separately per GPU and phase |
+| Table 2 | One measured throughput per point | Rounded individual measurements; no aggregate trial uncertainty |
+| Fig. 10 | `statistic` column distinguishes one measurement from a three-trial median | Geometric mean of twelve matched ratios; best IC/FS is selected per configuration |
+| Fig. 11a | Three-trial median throughput and min–max | Training win count across ten configurations; arithmetic mean of FastLens/best-RGB inference ratios |
+| Fig. 11b | Median and min–max of three per-round resident ratios; best RGB selected within each round | Historical prose mixes RGB geometric mean and DCT arithmetic mean; both alternatives are reported below |
+| Fig. 12 | Retained per-epoch Top-1 for one seed per curve | Final epoch values, without cross-seed averaging |
+| Table 3 | Published rounded storage values; exact byte evidence where retained | Total representation size divided by JPEG size; GB is decimal |
+| Fig. 13 | Retained projection point and three-trial staging measurements | Matched control ratios; consult row-level metric fields |
+| Fig. 14 | Separate CUPTI capture totals | Decimal traffic volumes; captures are not timing trials |
+| Fig. 15 | Three-trial median elapsed time plus separate traffic measurements | Optimized/control for each metric and GPU |
+| Fig. 16 | Retained matched locality measurements | Block-major/Image-major tiled throughput and issued-byte ratios |
+| §6.5.2 | Three timed trials for each bandwidth/crop/GPU case | Per-configuration median; configured bandwidth uses decimal MB/s |
+
+Recompute the principal prose aggregates using the same record-selection functions
+as the plots (no GPU, dataset or checkpoint needed):
+
+```bash
+python -m fastlens.benchmarks.paper.reproduce statistics
+```
+
+This prints Fig. 9/10/11a summaries and both means for Fig. 11b. It does not change
+published CSVs or the PDF. The existing figure command redraws all ten figures.
 
 `section_6_2_5/shared.csv` retains the original shared-crop records from
 `a800_convergence_20261003/figures/convergence_observed.csv`. The two independent

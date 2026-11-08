@@ -131,7 +131,7 @@ experiments, not part of default RandAugment.
 from fastlens.profiles.rgbnomore import VALIDATION
 from fastlens.torch import DirectDctReader
 
-reader = DirectDctReader("data/example-fastlens/manifest.bin",
+reader = DirectDctReader("fastlens/data/example-fastlens/manifest.bin",
                          module_path="build/fastlens/torch")
 batch = reader.read([0], VALIDATION, transforms=[{
     "crop": {"x": 32, "y": 32, "width": 448, "height": 448},

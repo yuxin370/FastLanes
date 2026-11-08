@@ -30,7 +30,7 @@ gtest_discover_tests(fastlens_compact_format_tests
 	PROPERTIES LABELS "fastlens-cpu")
 if (Python3_Interpreter_FOUND)
 	add_test(NAME FastLensDocumentationPython
-	        COMMAND ${Python3_EXECUTABLE} -B -m unittest fastlens.tests.test_documentation -v)
+	        COMMAND ${Python3_EXECUTABLE} -B -m unittest fastlens.tests.test_documentation fastlens.tests.test_binary_spec -v)
 	set_tests_properties(FastLensDocumentationPython PROPERTIES
 	        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" LABELS "fastlens;documentation;fastlens-cpu")
 	add_test(NAME FastLensConverterCliPython

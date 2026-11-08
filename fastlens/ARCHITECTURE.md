@@ -60,7 +60,7 @@ with reader.iter_batches([[0, 1], [2, 3]],
         y, cbcr = batch.tensors
 ```
 
-Prepare at least four 512×512 RGB, 4:2:0 JPEGs with the
+Convert the four bundled 512×512 RGB, 4:2:0 JPEGs with the
 [converter](docs/CONVERSION.md). Run this example from the repository root.
 The [Direct-DCT guide](docs/DIRECT_DCT.md#reader-and-pipeline) describes profile
 geometry and the complete-partition requirement of `VALIDATION_CENTER_CROP_512`.

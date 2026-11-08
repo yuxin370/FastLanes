@@ -1,5 +1,8 @@
 # Direct-DCT API boundaries
 
+See [API stability and environments](docs/API_STABILITY.md) for the source
+compatibility policy, deprecation rules, ABI limits and tested configurations.
+
 The model-facing stable API is the `fastlens.torch` facade:
 
 - `DirectDctReader`, `DirectDctPipeline`, and `DirectDctBatch`;

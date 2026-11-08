@@ -3,7 +3,9 @@
 import html
 from pathlib import Path
 import re
+import shlex
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
@@ -70,7 +72,7 @@ def link_errors(document, source, files):
 
 
 def introductory_examples():
-    for name in ("README.md", "fastlens/ARCHITECTURE.md", "fastlens/docs/DIRECT_DCT.md"):
+    for name in user_guides():
         source = (ROOT / name).read_text()
         for match in FENCES.finditer(source):
             if match[1] == "python" and re.search(
@@ -78,6 +80,40 @@ def introductory_examples():
                 match[2], re.MULTILINE,
             ):
                 yield f"{name}:{source[:match.start()].count(chr(10)) + 2}", match[2]
+
+
+def user_guides():
+    return sorted(file for file in public_files() if file.suffix == '.md' and (
+        file == Path('README.md') or file.parent == Path('fastlens') or
+        file.is_relative_to('fastlens/docs') and not file.is_relative_to('fastlens/docs/paper') or
+        file.parent == Path('fastlens/tools')))
+
+
+def command_references(source):
+    """Recognize the repository's documented Python and CMake command forms."""
+    for fence in FENCES.finditer(source):
+        if fence[1] not in ('bash', 'sh', 'shell'):
+            continue
+        for line in fence[2].replace('\\\n', ' ').splitlines():
+            words = shlex.split(line, comments=True)
+            if not words:
+                continue
+            if re.fullmatch(r'python(?:3(?:\.\d+)?)?', words[0]):
+                if '-m' in words:
+                    module = words[words.index('-m') + 1]
+                    if module == 'fastlens' or module.startswith('fastlens.'):
+                        yield 'module', module
+                else:
+                    for word in words[1:]:
+                        if word.endswith('.py') and word.startswith(('scripts/', 'fastlens/')):
+                            yield 'script', word
+                            break
+            if words[0] == 'cmake' and '--target' in words:
+                for word in words[words.index('--target') + 1:]:
+                    if word.startswith('-'):
+                        break
+                    if word.startswith('fastlens_') or word == '_fastlens_direct_dct':
+                        yield 'target', word
 
 
 def hygiene_errors(source):
@@ -96,6 +132,38 @@ def hygiene_errors(source):
 
 
 class DocumentationTests(unittest.TestCase):
+    def test_user_guide_python_syntax(self):
+        for document in user_guides():
+            for fence in FENCES.finditer((ROOT / document).read_text()):
+                if fence[1] == 'python':
+                    with self.subTest(document=document):
+                        compile(fence[2], str(document), 'exec')
+
+    def test_documented_command_paths_and_targets(self):
+        files = public_files()
+        targets = set()
+        for path in files:
+            if path.name == 'CMakeLists.txt':
+                targets.update(re.findall(r'add_(?:executable|library)\(\s*([^\s)$]+)', (ROOT / path).read_text()))
+        documents = user_guides() + [Path('fastlens/benchmarks/paper/section_6_4/compressed_transfer_and_tensor/README.md')]
+        for document in documents:
+            for kind, reference in command_references((ROOT / document).read_text()):
+                with self.subTest(document=document, kind=kind, reference=reference):
+                    if kind == 'script':
+                        self.assertIn(Path(reference), files)
+                    elif kind == 'module':
+                        path = Path(*reference.split('.'))
+                        self.assertTrue(path.with_suffix('.py') in files or path / '__main__.py' in files,
+                                        f'missing executable module: {reference}')
+                    else:
+                        self.assertIn(reference, targets)
+
+    def test_public_cli_help(self):
+        for command in (('convert',), ('inspect',), ('annotations', 'build'), ('annotations', 'inspect')):
+            result = subprocess.run([sys.executable, '-B', '-m', 'fastlens', *command, '--help'],
+                                    cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_public_links_and_anchors(self):
         files = public_files()
         documents = sorted(file for file in files if file.suffix.lower() == ".md"

@@ -103,22 +103,8 @@ STORE/annotations/
   class_to_idx.json    # folder-label mode only
 ```
 
-Each sample row is `{"image_id":0,"sample_id":"sample-a","label":3}`.
-Metadata schema `fastlens-samples-v2` records the image count, SHA-256 of the
-manifest, samples and optional class map, the physical source-order binding,
-the annotation source kind, and the final sample-order hash. The order hash is SHA-256 over successive
-sample IDs, each encoded as its UTF-8 byte length (unsigned 64-bit big-endian)
-followed by its UTF-8 bytes. `shuffle: null` makes no claim about how an existing
-physical order was produced. `annotations inspect` checks these bindings,
-consecutive image IDs, unique sample IDs, and the native manifest's image count.
-The source-order binding is checked against `geometry/source_order.sha256`,
-written by the converter from its native input list before publication, even
-without annotations. This rejects annotations copied from a differently ordered
-conversion whose manifest happens to have identical structural fields. Adding
-annotations also checks the source list against this retained digest. Keep this
-file with the store; it contains no source paths. These checks do not audit FLS
-payload integrity or verify the truth of externally supplied labels. Loading
-annotations requires neither `conversion/` nor source JPEGs.
+The [annotation specification](spec/ANNOTATIONS.md) defines sample records, metadata
+fields, hashes and validation. Loading needs neither `conversion/` nor source JPEGs.
 Existing annotation directories, including symlinks, are never replaced.
 
 `annotations build --dry-run` validates all supplied annotations without writing.
@@ -145,14 +131,9 @@ python -m fastlens convert ./images --output ./flat_store \
 physical order. Premixing without labels produces explicit null labels. With
 neither labels nor premixing, conversion produces no annotation sidecar.
 
-Algorithm `fastlens-shuffle-v1` is a fixed Fisher–Yates permutation. For bounds
-N down to 2, candidates are the first eight bytes of
-`SHA256(b"fastlens-shuffle-v1\0" + uint64_be(seed) + uint64_be(counter))`, interpreted
-as unsigned big-endian integers. Counter starts at zero and advances on every
-draw. Reject candidates at least `floor(2^64 / bound) * bound`; otherwise swap
-positions `bound-1` and `candidate % bound`. The algorithm, seed and final order
-hash are recorded. Identical initial record order and seed reproduce the same
-permutation across Python versions; this does not promise byte-identical compressed
+The [premixing specification](spec/ANNOTATIONS.md#deterministic-premixing) defines
+the cross-version permutation. Identical initial order and seed reproduce the same
+permutation; this does not promise byte-identical compressed
 files. Source discovery or membership changes can change the permutation.
 
 Conversion publishes annotations together with the verified dataset; annotation

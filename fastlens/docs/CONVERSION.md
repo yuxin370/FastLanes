@@ -6,8 +6,9 @@ Run commands from the repository root.
 
 ## Convert and inspect
 
-To try FastLens without a full ImageNet dataset, prepare at least four 512×512 RGB JPEG images with 4:2:0 chroma subsampling and place them in `fastlens/data/example-jpegs/`.
-These images work with the example model profile. Resize and prepare the JPEGs before conversion if needed.
+Four [bundled example photographs](../data/example-jpegs/README.md) are ready in
+`fastlens/data/example-jpegs/`: 512×512 RGB JPEGs with 4:2:0 chroma subsampling.
+No external dataset preparation is needed for this example.
 
 From the source checkout, convert and inspect the complete dataset:
 
@@ -65,16 +66,25 @@ aliases) are rejected. `conversion/sources.txt` records the resulting absolute p
 image-ID order. It is useful for re-verification; the online reader does not need
 the original JPEGs or this list.
 
-`block-major` is the only public layout: native `--shard --physical-layout
+`block-major` is the public Converter layout: native `--shard --physical-layout
 spatial-major --metadata-profile reconstruct`, manifest v1. Corresponding spatial
-blocks are grouped across images, with DCT frequencies stored as columns. It does
-not select image-major Compact-v3. Default `--verify full` invokes the native exact
+blocks are grouped across images, with DCT frequencies stored as columns.
+The [Image-major native writer](spec/IMAGE_MAJOR.md#generate-the-layout) is a
+separate entry point with two supported encodings: one image per rowgroup, selected
+by native `random-access`, and explicitly selected tiled vector rowgroups. The
+public Converter's `balanced`, `throughput` and `crop-latency` presets all write
+Block-major; `random-access` is a native-only preset.
+
+Default `--verify full` invokes the native exact
 DCT verifier for every image before publication. Verification compares all 64
 coefficients, image dimensions, component geometry and sampling, and quantization
 table IDs and values against the source JPEGs. `--verify none` skips only that
 source comparison; index construction and compatibility checks still run.
 
 ## Rebuild an older Store without changing sample order
+
+For relocation across machines, first read
+[Cross-machine reproduction and relocation](#cross-machine-reproduction-and-relocation).
 
 Keep the old Store and rebuild into a new directory from the original JPEGs and
 annotation input. Old generation/index directory names and annotations v1 are
@@ -137,6 +147,21 @@ does not regenerate those experiment contracts.
 
 ## Publication and reports
 
+Optional complete FLS file checksums can be recorded before publication:
+
+```bash
+python -m fastlens convert fastlens/data/example-jpegs \
+  --output fastlens/data/example-fastlens-crc --record-payload-crc --verify full
+python -m fastlens inspect fastlens/data/example-fastlens-crc --check-payload
+```
+
+The extra scan uses CRC64-ECMA and writes `geometry/fls_crc64.txt` before the
+conversion report. Explicit inspection streams complete `.fls` files and fails
+on missing checksums or mismatches. Default inspection stays structural; Reader
+does not use this file. Checksums remain usable after removing source JPEGs and
+`conversion/`. They detect accidental damage, not malicious replacement. See the
+[checksum format](spec/STORE.md#optional-complete-fls-checksums).
+
 Conversion uses a sibling `.OUTPUT.fastlens-staging-<id>` directory and preserves
 the native writer's transactional generations within it. After compression, the
 Converter finalizes `partitions/` and rewrites the manifest with the native
@@ -167,6 +192,10 @@ For the required files, inspection checks and storage accounting, see
 
 ## Verification and parallelism
 
+`inspect` checks structure and identity bindings. `inspect --check-payload` also
+checks recorded complete-file CRCs. Source-exact verification below compares the
+stored DCT interpretation with original JPEGs. None substitutes for the others.
+
 For a later exact check against the original files:
 
 ```bash
@@ -195,3 +224,27 @@ bounds remain `layout_threads <= 256` and
 The CLI rejects violations rather than silently clamping explicit options. Lower
 partition size and shard/verification concurrency on memory-constrained machines;
 automatic CPU selection does not measure available RAM or tune to workload size.
+
+## Cross-machine reproduction and relocation
+
+Moving a published Store means copying `manifest.bin`, `partitions/`, `geometry/`
+and any needed annotations together. Relative member paths and recorded identities
+remain valid; do not rewrite or recalculate them. Optional `fls_crc64.txt` moves
+with geometry and remains usable. `conversion/` can be removed for deployment.
+
+Rebuilding consumes the original physical-order JPEG list and matching sample IDs
+and labels. Preserve that list, source mapping and class map separately if the
+conversion records will be deleted. A physical-order list is already shuffled;
+omit `--shuffle-seed` when replaying it.
+
+On another machine, resolve each original source path to its new location while
+retaining the same logical sample ID and input position. Identical JPEG content
+under different absolute paths can produce a different `source_order_sha256`:
+that digest hashes the original absolute UTF-8 path list, not image content.
+The sample-order digest can remain identical when sample IDs and order are retained,
+while source provenance changes. Exact compressed bytes are not promised across
+encoder/build changes.
+
+If content-level dataset identity is required, retain an independent stable sample
+list and content digest in the experiment's existing records. This does not change
+FastLens's source-order algorithm or reinterpret existing hashes.

@@ -20,6 +20,7 @@ void usage(const char* program) {
 	       " [--rank-checkpoint-images N] [--topology-checkpoint-coordinates N]\n"
 	    << "       " << program << " --inspect MANIFEST\n"
 	    << "       " << program << " --inspect-manifest MANIFEST\n"
+	    << "       " << program << " --file-crc64 FILE  (complete file, CRC64-ECMA)\n"
 	    << "       " << program << " --finalize-store MANIFEST  (unpublished Converter staging only)\n";
 }
 
@@ -186,6 +187,15 @@ void inspect_dataset(const std::filesystem::path& path) {
 } // namespace
 
 int main(const int argc, char** argv) try {
+	if (argc == 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
+		usage(argv[0]);
+		return 0;
+	}
+	if (argc == 3 && std::string_view(argv[1]) == "--file-crc64") {
+		std::cout << std::hex << std::setfill('0') << std::setw(16)
+		          << fastlens::jpeg::detail::jpeg_dct_file_crc64(argv[2]) << '\n';
+		return 0;
+	}
 	if (argc == 3 && std::string_view(argv[1]) == "--finalize-store") {
 		finalize_store(argv[2]);
 		return 0;

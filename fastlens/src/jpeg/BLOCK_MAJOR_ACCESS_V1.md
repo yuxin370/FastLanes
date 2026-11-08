@@ -1,126 +1,23 @@
-# FASTLENS JPEG DCT block-major access descriptor v1
+# Geometry access specification
 
-`geometry` is a read-only sidecar for manifest-v1
-`spatial-major-image-minor` shards. It does not replace the FLS table
-descriptor and does not contain coefficient data. Building it leaves the
-manifest, metadata, FLS header/footer, compressed rowgroups, and coefficient
-payload unchanged.
-
-The builder reports the 0.5% and 1% storage targets as measurements. Exceeding
-them does not invalidate an index; small datasets often have larger relative
-sidecar overhead.
-
-The dataset builder publishes one
-`NNNNNN.bin` per partition plus
-`index.bin` in a separate output directory. Published Converter stores require the index and every descriptor. Missing or
-incompatible files are errors; the standard store path never falls back to a
-planner without geometry indexes. Binary descriptor version 1 is unchanged.
+The normative specification is maintained in [GEOMETRY.md](../../docs/spec/GEOMETRY.md).
 
 ## Byte order and integrity
 
-All integers are little-endian. Every sidecar is independently mmap-able and
-starts with a 256-byte header. CRCs use CRC64-ECMA polynomial
-`0x42f0e1eba9ea3693`, initial value zero, no final xor. The descriptor checksum
-field is treated as eight zero bytes while hashing.
-
-| Offset | Type | Meaning |
-| ---: | --- | --- |
-| 0 | byte[8] | `FASTLENSBMA\0` |
-| 8 | u16 | format version, currently 1 |
-| 10 | u16 | header bytes, 256 |
-| 12 | u32 | required format flags |
-| 16 | u64 | complete sidecar bytes |
-| 24 | u64 | complete sidecar CRC64 |
-| 32 | u64 | source manifest CRC64 |
-| 40 | u64 | source manifest bytes |
-| 48 | u64 | source shard metadata CRC64 |
-| 56 | u64 | source shard metadata bytes |
-| 64 | u64 | source FLS payload CRC64 when available, otherwise zero |
-| 72 | u64 | source FLS bytes |
-| 80 | u64 | first global image index |
-| 88 | u32 | shard id |
-| 92 | u32 | local image count |
-| 96 | u32 | vectors per source rowgroup |
-| 100 | u32 | FastLanes vector size, currently 1024 |
-| 104 | u32 | source rowgroup count |
-| 108 | u32 | semantic-slot count |
-| 112 | u32 | present-component record count |
-| 116 | u32 | quant dictionary count |
-| 120 | u32 | positive block-group count |
-| 124 | u32 | dense coordinate-position count |
-| 128 | u32 | shared threshold-cell count |
-| 132 | u32 | topology-checkpoint count |
-| 136 | u16 | bitmap rank-checkpoint image stride |
-| 138 | u16 | topology coordinate stride |
-| 144..200 | u64[8] | offsets of slots, thresholds, cells, rank payload, topology, images, components, and quant tables |
-
-Section offsets are monotonic. Fixed-record section byte counts must agree
-exactly with header counts. The loader validates the descriptor checksum,
-source identities, section bounds, cell encodings, threshold monotonicity, and
-all referenced ranges before exposing records.
+See the [normative specification](../../docs/spec/GEOMETRY.md).
 
 ## Shared presence/rank cells
 
-For one semantic slot, let `W` and `H` be the sorted distinct positive component
-block widths and heights in the shard. Coordinate `(x,y)` maps to
-`lower_bound(W,x+1) * |H| + lower_bound(H,y+1)`. Coordinates with the same width
-and height thresholds share one presence/rank payload even when many physical
-block groups use it.
-
-Each 8-byte cell record contains `u16 present_count`, `u8 encoding`, one reserved
-byte, and a shard-payload-relative `u32 offset`. The builder measures actual
-encoded bytes and chooses the smallest of:
-
-- `Empty` or `AllPresent`, with no payload;
-- `SparseList`, sorted present local-image IDs encoded as delta ULEB128;
-- `MissingList`, sorted missing local-image IDs encoded as delta ULEB128;
-- `BitmapRank`, one image bit plus a u16 prefix rank at the configured image
-  stride.
-
-Sparse/missing lists are selected only when their complete delta stream is
-smaller than the bitmap representation. Rank is the number of present local
-image IDs strictly below the query image. Select returns the local image at a
-present rank. This is exactly the source layout's image-minor row offset.
+See the [normative specification](../../docs/spec/GEOMETRY.md).
 
 ## Group topology
 
-Each 64-byte semantic-slot record stores maximum block dimensions, threshold
-ranges, cell ranges, coordinate/group ranges, topology-checkpoint ranges, and
-the raster/Morton order flag. Zero-presence coordinates are omitted exactly as
-they are in legacy metadata.
-
-A 24-byte checkpoint stores, before one bounded coordinate interval, the
-positive-group rank, cumulative physical row, FLS rowgroup, and row within that
-rowgroup. The reader computes a coordinate's dense raster/Morton rank and scans
-at most one checkpoint stride. Per-coordinate row counts come from shared rank
-cells. Applying the original block-group-aligned rowgroup capacity reconstructs
-`group_id`, `row_start`, `row_count`, `fls_rowgroup_index`, and
-`row_start_in_rowgroup` without a per-group record array.
-
-The source metadata's legacy `z_order_index` can contain gaps inherited from a
-global maximum grid. It is not persisted: coordinate order and every physical
-row/rowgroup field are validated directly.
+See the [normative specification](../../docs/spec/GEOMETRY.md).
 
 ## Image, component, and quant records
 
-The descriptor stores one 24-byte image record and one 24-byte record for each
-present component. Missing chroma appears only as a missing bit/record, allowing
-the runtime to fill Cb/Cr with zero while still reading Y for grayscale JPEGs.
-Component records contain block and padded dimensions, sampling factors,
-semantic slot, component/profile IDs, quant table number, and a quant dictionary
-reference. Quant tables are deduplicated per shard; each record is an 8-byte
-fingerprint followed by 64 u16 values.
+See the [normative specification](../../docs/spec/GEOMETRY.md).
 
 ## Build an index
 
-```bash
-./build/fastlens/tools/jpeg_dct/fastlens_block_major_access_tool \
-  /path/to/manifest.bin \
-  --output-dir "$HOME/tmp/block-major-access" \
-  --output-json "$HOME/tmp/block-major-access.json" \
-  --exhaustive-rank-validation
-```
-
-The report contains descriptor sizes and topology validation results. See the
-[diagnostic guide](../../benchmarks/development/README.md#geometry-index-footprint)
-for an ImageNet-50K measurement.
+See the [normative specification](../../docs/spec/GEOMETRY.md).

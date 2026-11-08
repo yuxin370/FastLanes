@@ -16,6 +16,7 @@ from fastlens.benchmarks.execution.inference_load import run
 from fastlens.benchmarks.common import gpu_uuid
 from fastlens.benchmarks.common import write_csv
 from fastlens.benchmarks.system_dct_major.common import parse_manifest
+from fastlens.benchmarks.paper.section_6_4.compressed_transfer_and_tensor.prepare_compression_control import prepared_controls
 
 
 def read(path):
@@ -47,10 +48,8 @@ def profile_summary(directory, label):
                 diagnostic_raw=str(database))
 
 
-def core_controls(output, env, timing_only=False):
-    source = ROOT / 'fastlens/data/compressed/imagenet512_val_block_major'
-    preparation = read(ROOT / 'results/preparation/raw_int16_phase2_16384/preparation.json')
-    assert preparation['samples'] == 16384
+def core_controls(output, env, preparation, timing_only=False):
+    source = Path(preparation['compressed'])
     cases = [('direct', source, 'projected'), ('grid', source, 'grid'),
              ('compressed', Path(preparation['compressed']), 'projected'),
              ('raw_int16', Path(preparation['raw_int16']), 'projected')]
@@ -146,9 +145,17 @@ def main():
                         default=('core', 'locality', 'frequency'))
     parser.add_argument('--timing-only', action='store_true',
                         help='repeat core warmup and paired timing; retain the existing correctness and resource runs')
+    parser.add_argument('--preparation', type=Path, help='prepared compression-control JSON, required for core')
     parser.add_argument('--projection-coefficients', type=int, nargs='+', choices=(8, 16, 24, 32, 48, 64),
                         default=(8, 16, 24, 32, 48, 64))
     args = parser.parse_args()
+    preparation = None
+    if 'core' in args.experiments:
+        if args.preparation is None:
+            parser.error('--preparation is required for core controls')
+        preparation = prepared_controls(args.preparation)
+        if preparation['samples'] != 16384:
+            parser.error('paper core controls require exactly 16384 prepared images')
     for gpu in args.gpu:
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu_uuid(gpu), DCTNET_PROFILE='mobilenet24',
                    PYTHONPATH=f'{ROOT}:{ROOT}/build/fastlens/torch', TMPDIR=str(Path.home() / 'tmp'),
@@ -158,7 +165,7 @@ def main():
             output = args.output.resolve() / gpu / experiment
             print('BEGIN', gpu, experiment, flush=True)
             if experiment == 'core':
-                core_controls(output, env, timing_only=args.timing_only)
+                core_controls(output, env, preparation, timing_only=args.timing_only)
             else:
                 script = 'fastlens/benchmarks/paper/section_6_5_1/block_major_locality/locality_microbench.py' if experiment == 'locality' else 'fastlens/benchmarks/paper/section_6_4/projection_and_staging/projection_microbench.py'
                 output.mkdir(parents=True, exist_ok=False)

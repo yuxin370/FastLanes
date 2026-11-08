@@ -26,17 +26,11 @@ class ConvertedStoreTests(unittest.TestCase):
             if os.environ.get("FASTLENS_REQUIRE_CUDA_SMOKE") == "1":
                 self.fail("CUDA device/driver unavailable but FASTLENS_REQUIRE_CUDA_SMOKE=1")
             self.skipTest("CUDA device/driver unavailable")
-        from PIL import Image
         from fastlens.tests.test_documentation import introductory_examples
 
         with tempfile.TemporaryDirectory(prefix="fastlens-doc-examples-") as directory:
             root = Path(directory)
-            source = root / "images"
-            source.mkdir()
-            for index in range(4):
-                Image.new("RGB", (512, 512), (index * 64, 96, 160)).save(
-                    source / f"{index}.jpg", subsampling=2,
-                )
+            source = cli.REPO_ROOT / "fastlens/data/example-jpegs"
             output = root / "store"
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main([
@@ -56,8 +50,16 @@ class ConvertedStoreTests(unittest.TestCase):
                     batch = namespace["batch"]
                     self.assertTrue(batch.y.is_cuda)
                     self.assertTrue(batch.cbcr.is_cuda)
-                    self.assertEqual(tuple(batch.y.shape), (2, 1, 28, 28, 8, 8))
-                    self.assertEqual(tuple(batch.cbcr.shape), (2, 2, 14, 14, 8, 8))
+                    count = len(batch.sample_ids)
+                    self.assertEqual(tuple(batch.y.shape), (count, 1, 28, 28, 8, 8))
+                    self.assertEqual(tuple(batch.cbcr.shape), (count, 2, 14, 14, 8, 8))
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        batch.record_stream(side)
+                        copied = batch.y.clone()
+                    side.synchronize()
+                    torch.testing.assert_close(copied, batch.y, rtol=0, atol=0)
             torch.cuda.synchronize()
 
     def test_cuda_reader_consumes_store(self):

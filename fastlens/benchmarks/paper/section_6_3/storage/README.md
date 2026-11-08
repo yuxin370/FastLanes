@@ -12,7 +12,8 @@ Block-major inputs must be complete [standard Stores](../../../../docs/STORE_FOR
 The runner checks the layout, geometry descriptors and source-order binding before
 recording results; missing geometry is an error, not zero index bytes. Reprepare
 nonstandard inputs with the Converter or the source512 paper preparation command.
-Native Compact-v3 controls remain separate experimental representations.
+Native tiled Image-major controls use the [Image-major encoding](../../../../docs/spec/IMAGE_MAJOR.md)
+and remain outside the Published Store directory contract.
 
 For prepared block-major inputs, `core_storage_bytes` matches `fastlens inspect`:
 manifest, referenced coefficients and image metadata, required geometry binaries,

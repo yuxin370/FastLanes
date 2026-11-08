@@ -342,8 +342,8 @@ def _parse_args() -> argparse.Namespace:
         "--physical-layout",
         choices=("image-major", "image-major-vector-rowgroups"),
         help=(
-            "Override the preset layout. image-major-vector-rowgroups writes the manifest-v3 "
-            "one-FastLanes-vector-per-rowgroup upper-bound prototype."
+            "Override the preset layout. image-major-vector-rowgroups writes the tiled "
+            "Image-major layout with one FastLanes vector per rowgroup."
         ),
     )
     parser.add_argument("--shard-images", type=int)
@@ -542,6 +542,8 @@ def main() -> None:
     ):
         if value is not None:
             command.extend((flag, str(value)))
+    if args.physical_layout == "image-major-vector-rowgroups":
+        command.extend(("--spatial-order", "tiled-z-32"))
     command.extend(input_args)
     summary: dict[str, Any] = {
         "command": command,

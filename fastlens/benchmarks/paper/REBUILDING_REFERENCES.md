@@ -112,12 +112,16 @@ python -m fastlens.benchmarks.baselines.system_rgbnomore.dataset.prepare_dataset
   --split val \
   --data-root "$FASTLENS_DATA/system_rgbnomore/e2e_v3/imagenet_512" \
   --out-dir "$FASTLENS_DATA/compressed/imagenet512_val_compact_v3" \
+  --physical-layout image-major-vector-rowgroups \
   --index-file "$RGBNOMORE_ROOT/assets/indexbase_val.csv" \
   --expected-image-size 512 --expected-image-count 50000
 ```
 
-This writes `manifest.bin`, `labels.json` and reconstructable quantization
-metadata. The preparation driver checks the image population and metadata.
+This writes the tiled Image-major `manifest.bin`, `labels.json`, physical-order
+`index.csv` and reconstructable quantization metadata. The explicit layout flag
+is required: the default `random-access` preset still selects one image per
+rowgroup (manifest 2). The tiled writer uses `tiled-z-32` spatial order.
+The preparation driver checks the image population and metadata.
 Next create the full validation selection consumed by the CNN evaluators. It
 uses the same sorted-path physical IDs as the converter:
 

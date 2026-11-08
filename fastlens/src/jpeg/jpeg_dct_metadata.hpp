@@ -9,6 +9,7 @@ namespace fastlens::jpeg::detail {
 
 JpegDctDatasetMetadata read_jpeg_dct_metadata_file(const std::filesystem::path& path);
 JpegDctShardManifest   read_jpeg_dct_shard_manifest_file(const std::filesystem::path& path);
+uint64_t              jpeg_dct_file_crc64(const std::filesystem::path& path);
 
 } // namespace fastlens::jpeg::detail
 

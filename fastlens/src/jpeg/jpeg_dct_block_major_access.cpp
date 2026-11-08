@@ -172,7 +172,9 @@ uint64_t compute_descriptor_crc64(const uint8_t* data, const size_t size) {
 	return crc64_with_zeroed_field(data, size, kDescriptorChecksumByte);
 }
 
-uint64_t crc64_file(const std::filesystem::path& path) {
+} // namespace
+
+uint64_t detail::jpeg_dct_file_crc64(const std::filesystem::path& path) {
 	std::ifstream input(path, std::ios::binary);
 	if (!input) {
 		fail("cannot open source for CRC64: " + path.string());
@@ -191,6 +193,8 @@ uint64_t crc64_file(const std::filesystem::path& path) {
 	}
 	return crc;
 }
+
+namespace {
 
 uint64_t checked_file_size(const std::filesystem::path& path) {
 	std::error_code error;
@@ -609,7 +613,7 @@ JpegDctBlockMajorAccessIndex read_jpeg_dct_block_major_access_index(
 	result.manifest_bytes = read_le<uint64_t>(encoded.data(), encoded.size(), 24U, "companion manifest bytes");
 	result.index_bytes = declared_bytes;
 	if (result.manifest_bytes != checked_file_size(manifest_path) ||
-	    result.manifest_crc64 != crc64_file(manifest_path)) {
+	    result.manifest_crc64 != detail::jpeg_dct_file_crc64(manifest_path)) {
 		fail("companion index belongs to a different manifest");
 	}
 	result.shards.reserve(shard_count);
@@ -1385,11 +1389,11 @@ void JpegDctBlockMajorAccessDescriptor::ValidateSource(const std::filesystem::pa
 	    manifest_entry.block_group_count != impl_->group_count) {
 		fail("descriptor shard identity disagrees with the manifest entry");
 	}
-	if (checked_file_size(manifest_path) != impl_->manifest_size || crc64_file(manifest_path) != impl_->manifest_crc) {
+	if (checked_file_size(manifest_path) != impl_->manifest_size || detail::jpeg_dct_file_crc64(manifest_path) != impl_->manifest_crc) {
 		fail("descriptor source manifest identity mismatch");
 	}
 	if (checked_file_size(metadata_path) != impl_->metadata_size ||
-	    crc64_file(metadata_path) != impl_->metadata_crc) {
+	    detail::jpeg_dct_file_crc64(metadata_path) != impl_->metadata_crc) {
 		fail("descriptor source metadata identity mismatch");
 	}
 	if (checked_file_size(fls_path) != impl_->fls_size ||
@@ -1994,9 +1998,9 @@ JpegDctBlockMajorAccessShardReport build_jpeg_dct_block_major_access_descriptor(
 	put_le<uint16_t>(descriptor, 10U, kHeaderBytes);
 	put_le<uint32_t>(descriptor, 12U, kKnownFlags);
 	put_le<uint64_t>(descriptor, 16U, descriptor.size());
-	put_le<uint64_t>(descriptor, 32U, crc64_file(manifest_path));
+	put_le<uint64_t>(descriptor, 32U, detail::jpeg_dct_file_crc64(manifest_path));
 	put_le<uint64_t>(descriptor, 40U, checked_file_size(manifest_path));
-	put_le<uint64_t>(descriptor, 48U, crc64_file(metadata_path));
+	put_le<uint64_t>(descriptor, 48U, detail::jpeg_dct_file_crc64(metadata_path));
 	put_le<uint64_t>(descriptor, 56U, checked_file_size(metadata_path));
 	put_le<uint64_t>(descriptor, 64U, shard.payload_crc64);
 	put_le<uint64_t>(descriptor, 72U, checked_file_size(fls_path));
@@ -2067,7 +2071,7 @@ JpegDctBlockMajorAccessDatasetReport build_jpeg_dct_block_major_access_dataset(
 	put_le<uint16_t>(index, 8U, kJpegDctBlockMajorAccessVersion);
 	put_le<uint16_t>(index, 10U, 64U);
 	put_le<uint32_t>(index, 12U, kFlagLittleEndian | kFlagCrc64Ecma);
-	put_le<uint64_t>(index, 16U, crc64_file(manifest_path));
+	put_le<uint64_t>(index, 16U, detail::jpeg_dct_file_crc64(manifest_path));
 	put_le<uint64_t>(index, 24U, checked_file_size(manifest_path));
 	put_le<uint32_t>(index, 32U, static_cast<uint32_t>(manifest.shards.size()));
 	for (size_t shard_index = 0U; shard_index < manifest.shards.size(); ++shard_index) {

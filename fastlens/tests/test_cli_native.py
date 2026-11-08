@@ -66,6 +66,77 @@ class NativeCliFixture(unittest.TestCase):
 
 
 class NativeCliTests(NativeCliFixture):
+    def test_bundled_quickstart_and_documented_binary_fields(self):
+        from fastlens.tests.test_binary_spec import describe_store
+        from PIL.JpegImagePlugin import get_sampling
+        self.source = cli.REPO_ROOT / 'fastlens/data/example-jpegs'
+        for path in sorted(self.source.glob('*.jpg')):
+            with self.Image.open(path) as image:
+                self.assertEqual((image.size, image.mode, get_sampling(image)), ((512, 512), 'RGB', 2))
+        self.assertEqual(self.convert(directory=True), 0)
+        self.assertEqual(cli.main(['inspect', str(self.output)]), 0)
+        self.assertEqual(self.verify().returncode, 0)
+        parsed = describe_store(self.output)
+        self.assertEqual(parsed['manifest_header']['22'], 4)
+
+    def test_image_major_writer_matches_documented_binary_fields(self):
+        from fastlens.tests.test_binary_spec import describe_store
+        output = self.root / 'image-major'
+        result = subprocess.run([sys.executable, '-B', '-m',
+                                 'fastlens.benchmarks.baselines.system_rgbnomore.dataset.prepare_dataset',
+                                 '--tool', str(self.tools[cli.TOOL_NAMES[0]]), '--input-dir', str(self.source),
+                                 '--out-dir', str(output), '--physical-layout', 'image-major-vector-rowgroups',
+                                 '--limit', '1', '--expected-image-size', '32', '--expected-image-count', '1',
+                                 '--validate-sample-images', '0'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(describe_store(output)['manifest_header']['22'], 1)
+
+    def test_payload_crc_survives_relocation_and_detects_accidental_damage(self):
+        self.assertEqual(self.convert(extra=('--record-payload-crc',)), 0)
+        checksums = (self.output / cli.PAYLOAD_CRC_FILE).read_bytes()
+        report = json.loads((self.output / cli.REPORT_NAME).read_text())
+        self.assertEqual(report['total_output_bytes'], cli.stored_bytes(self.output))
+        base = cli.inspect_standard_store(self.output, self.tools[cli.TOOL_NAMES[1]])['core_storage_bytes']
+        moved = self.root / 'deployment'
+        self.output.rename(moved)
+        self.output = moved
+        shutil.rmtree(moved / 'conversion')
+        shutil.rmtree(self.source)
+        args = ['inspect', str(moved), '--check-payload', '--json']
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(args), 0)
+        self.assertEqual(cli.inspect_standard_store(moved, self.tools[cli.TOOL_NAMES[1]])['core_storage_bytes'], base)
+        payload = moved / 'partitions/000000.fls'
+        original = payload.read_bytes()
+        damaged = bytearray(original)
+        damaged[24] ^= 1
+        payload.write_bytes(damaged)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(['inspect', str(moved)]), 0)
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(cli.main(args), 1)
+        self.assertIn('CRC64 mismatch', errors.getvalue())
+        payload.write_bytes(original[:-1])
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(args), 1)
+        payload.write_bytes(original)
+        crc_file = moved / cli.PAYLOAD_CRC_FILE
+        crc_file.unlink()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(cli.main(args), 1)
+        self.assertIn('payload check unavailable', errors.getvalue())
+        crc_file.write_bytes(checksums)
+
+    def test_payload_crc_rejects_incomplete_or_duplicate_partition_records(self):
+        self.convert(extra=('--record-payload-crc',))
+        path = self.output / cli.PAYLOAD_CRC_FILE
+        lines = path.read_text().splitlines()
+        for contents in ('\n'.join(lines[:-1]) + '\n', '\n'.join([lines[0], lines[1], lines[1]]) + '\n'):
+            path.write_text(contents)
+            with contextlib.redirect_stderr(io.StringIO()), patch.object(cli, 'payload_crcs') as scan:
+                self.assertEqual(cli.main(['inspect', str(self.output), '--check-payload']), 1)
+            scan.assert_not_called()
+
     def test_add_annotations_without_source_jpegs_or_payload_access(self):
         self.convert()
         original = {path.relative_to(self.output): path.read_bytes() for path in self.output.rglob("*") if path.is_file()}

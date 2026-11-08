@@ -39,6 +39,13 @@ Online:  sample IDs + spatial/frequency requests
 
 The CPU handles selection planning and data staging, while GPU kernels handle decompression and tensor construction.
 
+FastLens supports **Block-major** and **Image-major** physical layouts.
+The public Converter writes Block-major. Native Image-major provides both
+one image per rowgroup (the `random-access` preset's default) and tiled vector
+rowgroups, selected explicitly for the paper's Image-major experiments.
+Both Image-major encodings remain supported; see the
+[layout and entry-point matrix](fastlens/docs/spec/README.md).
+
 ## Requirements and installation
 
 Run commands from the repository root. FastLens currently runs from a source
@@ -70,11 +77,12 @@ for native-only builds, alternate toolkits, build options and offline dependenci
 
 ### Convert JPEGs
 
-Place JPEGs in `./images`. For the tensor example below, use at least two 512×512
-RGB JPEGs with 4:2:0 chroma subsampling. Prepare that geometry before conversion.
+Four [bundled photographs](fastlens/data/example-jpegs/README.md) already meet the
+512×512 RGB, 4:2:0 requirements of the tensor example. Run from the repository root.
 
 ```bash
-python -m fastlens convert ./images --output ./store --verify full
+python -m fastlens convert fastlens/data/example-jpegs \
+  --output fastlens/data/example-fastlens --verify full
 python -m fastlens convert --help
 ```
 
@@ -87,7 +95,7 @@ quantization tables with the source before publication.
 ### Inspect the Store
 
 ```bash
-python -m fastlens inspect ./store
+python -m fastlens inspect fastlens/data/example-fastlens
 ```
 
 A published Store contains `manifest.bin`, `partitions/` and `geometry/`, with
@@ -102,7 +110,7 @@ from fastlens.profiles.rgbnomore import VALIDATION
 from fastlens.torch import DirectDctReader
 
 reader = DirectDctReader(
-    "./store/manifest.bin",
+    "fastlens/data/example-fastlens/manifest.bin",
     module_path="./build/fastlens/torch",
 )
 with reader.iter_batches([[0, 1]], profile=VALIDATION) as batches:
@@ -116,6 +124,9 @@ models. See [Direct-DCT data loading](fastlens/docs/DIRECT_DCT.md) for pipelines
 profiles, labels and CUDA stream ownership.
 
 ## Documentation
+
+- [Binary specifications and layout support](fastlens/docs/spec/README.md)
+- [API stability and environments](fastlens/docs/API_STABILITY.md)
 
 | I want to… | Read |
 | --- | --- |

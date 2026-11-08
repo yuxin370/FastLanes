@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +23,8 @@ TOOL_NAMES = ("fastlens_jpeg_dct_tool", "fastlens_block_major_access_tool")
 REPORT_NAME = "conversion/report.json"
 PHYSICAL_LAYOUT = "spatial-major-image-minor"
 JPEG_EXTENSIONS = {".jpg", ".jpeg", ".jpe"}
+PAYLOAD_CRC_FILE = "geometry/fls_crc64.txt"
+PAYLOAD_CRC_FORMAT = "fastlens-fls-crc64-ecma-1"
 
 
 class ConversionError(RuntimeError):
@@ -72,6 +76,7 @@ def make_parser() -> argparse.ArgumentParser:
     ):
         convert.add_argument(f"--{option}", type=positive_int, help=description)
     convert.add_argument("--verify", choices=["full", "none"], default="full", help="exact native DCT comparison (default: full)")
+    convert.add_argument("--record-payload-crc", action="store_true", help="save complete FLS file CRC64 values for later inspection")
     convert.add_argument("--build-dir", type=Path, help="native CMake build directory; overrides FASTLENS_BUILD_DIR")
     convert.add_argument("--dry-run", action="store_true", help="check paths/tools and print plan; do not decode JPEGs or write files")
     convert.add_argument("--report", type=Path, help="also save the report at a new external path")
@@ -82,6 +87,7 @@ def make_parser() -> argparse.ArgumentParser:
     inspect.add_argument("store", type=Path)
     inspect.add_argument("--build-dir", type=Path)
     inspect.add_argument("--json", action="store_true", help="emit machine-readable inspection results")
+    inspect.add_argument("--check-payload", action="store_true", help="scan complete FLS files against geometry/fls_crc64.txt")
     annotation = commands.add_parser("annotations", help="build or validate task annotations without recompression")
     actions = annotation.add_subparsers(dest="annotation_command", required=True)
     build = actions.add_parser("build", help="add annotations to an existing store, preserving physical order")
@@ -230,6 +236,42 @@ def annotation_source(args: argparse.Namespace) -> str | None:
     return "folders" if args.labels_from_folders else "jsonl" if args.labels_jsonl else "csv" if args.labels_csv else None
 
 
+def payload_crcs(store: Path, tool: Path, partition_count: int, workers: int) -> list[str]:
+    """Hash the contiguous partition set already validated by native inspection."""
+    def checksum(partition: int) -> str:
+        path = store / "partitions" / f"{partition:06d}.fls"
+        result = subprocess.run([str(tool), "--file-crc64", str(path)], capture_output=True, text=True)
+        if result.returncode:
+            raise ConversionError(f"CRC64 failed for {path}: {result.stderr.strip()}")
+        value = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{16}", value):
+            raise ConversionError(f"invalid native CRC64 result for {path}: {value!r}")
+        return value
+
+    with ThreadPoolExecutor(max_workers=min(workers, partition_count)) as pool:
+        return list(pool.map(checksum, range(partition_count)))
+
+
+def check_payload(store: Path, tool: Path, partition_count: int) -> None:
+    path = store / PAYLOAD_CRC_FILE
+    if not path.is_file():
+        raise ConversionError(f"payload check unavailable: missing {path}; record CRC64 during conversion with --record-payload-crc")
+    lines = path.read_text(encoding="ascii").splitlines()
+    if not lines or lines[0] != PAYLOAD_CRC_FORMAT or len(lines) != partition_count + 1:
+        raise ConversionError("invalid FLS CRC64 format or partition set")
+    expected = []
+    for partition, line in enumerate(lines[1:]):
+        match = re.fullmatch(r"([0-9]+) ([0-9a-f]{16})", line)
+        if match is None or int(match[1]) != partition:
+            raise ConversionError("FLS CRC64 records must match every manifest partition in order")
+        expected.append(match[2])
+    workers = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    actual = payload_crcs(store, tool, partition_count, workers)
+    for partition, (wanted, found) in enumerate(zip(expected, actual, strict=True)):
+        if wanted != found:
+            raise ConversionError(f"payload CRC64 mismatch: partitions/{partition:06d}.fls (expected {wanted}, got {found})")
+
+
 def annotations_command(args: argparse.Namespace) -> int:
     tools = find_tools(args.build_dir, (TOOL_NAMES[1],))
     result = subprocess.run([str(tools[TOOL_NAMES[1]]), "--inspect-manifest", str(args.store / "manifest.bin")],
@@ -338,6 +380,7 @@ def convert(args: argparse.Namespace) -> int:
         print(json.dumps({"dry_run": True, "output": str(output), "image_count": len(inputs),
                           "physical_layout": PHYSICAL_LAYOUT, "partition_images": args.partition_images,
                           "preset": args.preset, "verify": args.verify, "parallelism": config,
+                          "record_payload_crc": args.record_payload_crc,
                           "annotations": records is not None, "shuffle": shuffle,
                           "tools": {name: str(path) for name, path in tools.items()}}, indent=2))
         return 0
@@ -381,6 +424,12 @@ def convert(args: argparse.Namespace) -> int:
             run_native([jpeg, "--verify-manifest", str(stage / "manifest.bin"), "--verify-workers", str(config["verify_workers"]),
                         "--input-list", str(ordered_list)], log, "Exact DCT verification")
             times["verification_seconds"] = time.perf_counter() - phase
+        if args.record_payload_crc:
+            phase = time.perf_counter()
+            checksums = payload_crcs(stage, tools[TOOL_NAMES[1]], info["shard_count"], config["verify_workers"])
+            (stage / PAYLOAD_CRC_FILE).write_text(
+                PAYLOAD_CRC_FORMAT + "\n" + "".join(f"{i} {crc}\n" for i, crc in enumerate(checksums)), encoding="ascii")
+            times["payload_crc_seconds"] = time.perf_counter() - phase
         log.unlink()
         # Preserve the native input order independently of annotations and the
         # removable conversion records, including stores labelled later.
@@ -406,6 +455,8 @@ def convert(args: argparse.Namespace) -> int:
         }
         if records is not None:
             report["annotations"] = annotations.DIRECTORY
+        if args.record_payload_crc:
+            report["payload_crc_file"] = PAYLOAD_CRC_FILE
         times["total_seconds"] = time.perf_counter() - started
         report["wall_time_scope"] = "through completion of pipeline and inspection, before report serialization and atomic publication"
         content = write_report(stage / REPORT_NAME, report, stored_bytes(stage))
@@ -431,6 +482,9 @@ def convert(args: argparse.Namespace) -> int:
 def inspect_store(args: argparse.Namespace) -> int:
     tools = find_tools(args.build_dir, (TOOL_NAMES[1],))
     info = inspect_standard_store(args.store, tools[TOOL_NAMES[1]])
+    if args.check_payload:
+        check_payload(args.store, tools[TOOL_NAMES[1]], info["shard_count"])
+        info["payload_crc_checked"] = True
     info["total_stored_bytes"] = stored_bytes(args.store)
     info["annotation_bytes"] = stored_bytes(args.store / annotations.DIRECTORY)
     info["conversion_record_bytes"] = stored_bytes(args.store / "conversion")
@@ -456,7 +510,8 @@ def inspect_store(args: argparse.Namespace) -> int:
               f"{info['index_file_count']} files, {info['index_bytes']:,} bytes")
         print(f"Core storage: {info['core_storage_bytes']:,} bytes; annotations: {info['annotation_bytes']:,} bytes; "
               f"conversion records: {info['conversion_record_bytes']:,} bytes")
-        print("Check scope: metadata and index compatibility; full FLS payload integrity is not checked.")
+        print("Check scope: metadata and index compatibility; " +
+              ("complete FLS file CRC64 passed." if args.check_payload else "full FLS payload integrity is not checked."))
         print(f"Total stored: {info['total_stored_bytes']:,} bytes; "
               + (f"source JPEGs: {source_bytes:,} bytes; source/output={info['source_to_output_ratio']:.3f}" if source_bytes is not None else "source JPEG bytes: unknown"))
     return 0
