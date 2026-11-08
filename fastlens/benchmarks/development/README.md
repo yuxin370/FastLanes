@@ -11,6 +11,7 @@ This directory contains microbenchmarks, profiling helpers and correctness check
 | `transfer_contention.cpp` | CUDA transfer diagnostics |
 | `python -m fastlens.benchmarks.development.check` | Parallel CPU regression suites; no performance measurements |
 | `diagnostics/` | Profiling and input-correctness helpers |
+| [Image-major comparison](image_major_comparison/README.md) | Retained pipeline and crop measurements for the two Image-major encodings |
 
 Build with `FASTLENS_BUILD_TESTS=ON` and `FASTLENS_BUILD_BENCHMARKS=ON`;
 `compressor_bench` also requires nvCOMP and `FASTLENS_WITH_NVCOMP=ON`.

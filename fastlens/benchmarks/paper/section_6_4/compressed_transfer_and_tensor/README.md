@@ -114,3 +114,33 @@ measured outputs. Historical records refer to `results/paper_rerun_20261007/summ
 and separate diagnostics under `results/paper_rerun_20261006/{4090,H100}/core/`.
 The historical raw data directories are not required to regenerate the published
 figure. See the [paper guide](../../README.md) for evidence boundaries.
+
+## Preparation validation on real data
+
+The revised preparation and four-arm runner were exercised on 2026-11-09
+(source revision `a798848`) on an RTX 4090 with PyTorch 2.11.0+cu128.
+The first sixteen 1,024-image partitions of the source512 ImageNet validation
+dataset supplied 16,384 real JPEGs. Both prepared representations passed
+source-exact verification for all images; metadata, sample order and profile
+matched. The settings were MobileNet24, FP32, batch 64, source crop
+`[32,32,448,448]`, 64 source coefficients, B6 runtime and eight model threads.
+
+| Arm | Median seconds (three trials) | Min–max seconds | H2D bytes (separate Nsight pass) |
+| --- | ---: | ---: | ---: |
+| direct | 3.44748 | 3.43997–3.45578 | 1,232,027,224 |
+| grid | 9.30461 | 9.26323–9.34092 | 1,234,103,448 |
+| compressed | 3.45439 | 3.43804–3.45570 | 1,232,027,224 |
+| raw_int16 | 5.55236 | 5.54602–5.57556 | 10,009,376,128 |
+
+All twelve timing records had identical sample IDs, order and predictions for
+all 16,384 images. Each arm's separate eight-image check matched native full-source
+model inputs exactly; three of those images were also checked against independent
+JPEG/CPU transforms, with zero rounded-coefficient disagreements. These checks
+are in addition to the complete source-DCT verification of the prepared datasets.
+
+`direct` and `compressed` intentionally run the same optimized configuration;
+their separate timings agree within 0.3%. The paired controls isolate output
+organization (`direct/grid`) and transfer encoding (`compressed/raw_int16`).
+Timing excludes the separate profiler and memory passes. This validates the new
+preparation path and measurement semantics; it does not replace the historical
+Figure 15 measurements or assert identical performance across dataset selections.

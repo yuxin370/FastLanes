@@ -4,6 +4,8 @@ Normative. Image-major has two supported encodings: one image per rowgroup and
 tiled vector rowgroups. These are choices within one physical-layout family;
 their manifest versions identify the encodings rather than a performance ranking.
 See the [format index](README.md) for writer, Reader and CLI compatibility.
+The [Image-major measurements](../../benchmarks/development/image_major_comparison/README.md)
+record the pipeline and crop evidence behind retaining both encodings.
 
 ## Generate the layout
 
