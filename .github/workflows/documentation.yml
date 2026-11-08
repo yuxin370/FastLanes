@@ -31,6 +31,8 @@ jobs:
       - name: Install build prerequisites
         run: apt-get update && apt-get install -y git cmake clang g++ make libjpeg-dev python3 python3-pil
       - uses: actions/checkout@v4
+      - name: Trust the checked-out workspace in the CUDA container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Configure and build native checks
         run: |
           mkdir -p "$HOME/tmp"
@@ -47,11 +49,22 @@ jobs:
           build/fastlens/tests/fastlens_block_major_access_tests
   gpu:
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
-    runs-on: [self-hosted, linux, x64, gpu]
+    runs-on: [self-hosted, linux, x64, president]
+    env:
+      CUDA_VISIBLE_DEVICES: GPU-40c637bd-acf5-ea1a-0df8-617138228467
+      CMAKE_BUILD_PARALLEL_LEVEL: '8'
     steps:
       - uses: actions/checkout@v4
+      - name: Select the runner's installed FastLens CUDA environment
+        run: |
+          echo "$HOME/miniconda3/envs/fastlanes-cuda/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=$HOME/miniconda3/envs/fastlanes-cuda" >> "$GITHUB_ENV"
       - name: Build with the runner's installed CUDA and PyTorch environment
-        run: ./scripts/build.sh
+        run: |
+          ./scripts/build.sh -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DCMAKE_CUDA_HOST_COMPILER=g++ -DCMAKE_CUDA_ARCHITECTURES=89 \
+            -DFLS_ENABLE_DATA=OFF
       - name: Execute documented tensor examples and numerical checks
         run: |
           mkdir -p "$HOME/tmp"
