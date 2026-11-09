@@ -65,6 +65,7 @@ jobs:
             -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
             -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ -DCUDA_HOST_COMPILER=/usr/bin/g++ \
             -DCMAKE_CUDA_ARCHITECTURES=89 \
+            -DJPEG_INCLUDE_DIR="$CUDA_HOME/include" -DJPEG_LIBRARY_RELEASE="$CUDA_HOME/lib/libjpeg.so" \
             -DFLS_ENABLE_DATA=OFF
       - name: Execute documented tensor examples and numerical checks
         run: |
