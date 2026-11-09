@@ -1,5 +1,7 @@
 # FASTLENS benchmarks
 
+[Documentation index](../docs/README.md)
+
 Choose the entry point by purpose:
 
 | Directory | Purpose |
@@ -47,6 +49,11 @@ instructions are organized separately. Start with the
 [paper reproduction guide](paper/README.md) for evaluated workloads, and use
 package READMEs for lower-level APIs and dependencies. Published measurements
 and their source references are in [paper/results/](paper/results/README.md).
+
+Section directories keep their preparation instructions beside the corresponding
+`run.py`. Baseline implementation conventions belong to `baselines/`; the paper
+entry points select those implementations and specify the evaluated workloads.
+Development diagnostics do not redefine paper protocols or published results.
 
 Datasets, checkpoints and profiler captures are external inputs or generated
 outputs. Each experiment guide describes how to prepare its inputs. Write new

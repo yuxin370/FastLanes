@@ -60,7 +60,7 @@ then requires a separately retained physical-order JPEG list.
 
 This is the published Converter layout and annotations v2 contract. Older stores are
 not automatically upgraded or loaded through legacy sidecar names; follow the
-[order-preserving rebuild procedure](../CONVERSION.md#rebuild-an-older-store-without-changing-sample-order).
+[order-preserving rebuild procedure](../guides/CONVERSION.md#rebuild-an-older-store-without-changing-sample-order).
 Low-level native writer transactions still use generations.
 
 ## Standard Store and native manifest APIs
@@ -125,7 +125,7 @@ The paper storage runner uses this same core count; experiment label maps and PL
 mappings are additional prepared-input overhead, reported separately from the core.
 
 Full source verification, publication timing and report fields are documented in
-[Conversion](../CONVERSION.md). The binary geometry descriptor remains documented in
+[Conversion](../guides/CONVERSION.md). The binary geometry descriptor remains documented in
 [Geometry](GEOMETRY.md); this document does
 not redefine its binary format or the native image-metadata payload.
 

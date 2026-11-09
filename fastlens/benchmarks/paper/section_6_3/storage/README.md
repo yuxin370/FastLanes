@@ -8,7 +8,7 @@ these representations, not every Table 3 row. IC/FS sizes are recorded by
 train/val conversion artifacts remain required to remeasure the complete table.
 Override `--ffcv-beton` for the measured FFCV file.
 
-Block-major inputs must be complete [standard Stores](../../../../docs/STORE_FORMAT.md).
+Block-major inputs must be complete [standard Stores](../../../../docs/spec/STORE.md).
 The runner checks the layout, geometry descriptors and source-order binding before
 recording results; missing geometry is an error, not zero index bytes. Reprepare
 nonstandard inputs with the Converter or the source512 paper preparation command.

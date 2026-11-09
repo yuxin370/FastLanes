@@ -101,6 +101,6 @@ not a second image source. Its filename is arbitrary; `indexbase_val.csv` is
 the name used by the RGB-no-more reference inputs.
 
 For general folder, CSV and JSONL contracts, see
-[Annotations](../../../docs/ANNOTATIONS.md). The example above uses optional
+[Annotations](../../../docs/guides/ANNOTATIONS.md). The example above uses optional
 offline shuffle; retain the experiment's canonical order when reproducing its
 reference predictions.

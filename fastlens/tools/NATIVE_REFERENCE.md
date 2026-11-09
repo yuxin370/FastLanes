@@ -2,8 +2,8 @@
 
 For the standalone JPEG dataset commands (`python -m fastlens convert`,
 `inspect`, and `annotations build/inspect`), see
-[conversion](../docs/CONVERSION.md), [Store format](../docs/STORE_FORMAT.md)
-and [annotation formats and premixing](../docs/ANNOTATIONS.md).
+[conversion](../docs/guides/CONVERSION.md), [Store format](../docs/spec/STORE.md)
+and [annotation formats and premixing](../docs/guides/ANNOTATIONS.md).
 The commands below document the lower-level native tools.
 
 ## Command examples

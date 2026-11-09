@@ -4,6 +4,15 @@ Run modules from the repository root. Baseline code and its tests live here;
 the final-paper experiment entry points and measured defaults are in
 [`../paper/`](../paper/README.md).
 
+For a comparison's numerical and timing assumptions, follow its implementation,
+protocol and result documentation before choosing an experiment configuration:
+
+| Baseline | Implementation and protocol | Results |
+| --- | --- | --- |
+| IC / IC-batched / FS | [Implementation](dct_baselines/IMPLEMENTATION.md) → [Protocol](dct_baselines/PROTOCOL.md) | [DCT results](dct_baselines/RESULTS.md) |
+| L3 | [Codec and comparison guide](l3/README.md) | [L3 evidence](l3/RESULTS.md) |
+| RGB / DALI / FFCV / CoorDL | [System guide](system_rgbnomore/README.md), [FFCV preparation](ffcv/README.md) | [Published tables](../paper/results/README.md) |
+
 | Package | Contents | Used by the final PDF |
 | --- | --- | --- |
 | [`dct_baselines/`](dct_baselines/README.md) | IC/FS stores, JPEG-DCT reference readers, selected-frequency and compact-input comparisons | Yes |

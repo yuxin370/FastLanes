@@ -1,7 +1,7 @@
 # Annotation format
 
 Normative. Current schema identifier: `fastlens-samples-v2`.
-[Format index](README.md); [annotation commands](../ANNOTATIONS.md).
+[Format index](README.md); [annotation commands](../guides/ANNOTATIONS.md).
 
 `annotations/samples.jsonl` is UTF-8 JSON Lines. Each row has `image_id` (consecutive
 integer starting at zero, in physical image order), a unique nonempty string
@@ -48,7 +48,7 @@ draw. Reject values at least `floor(2^64/bound)*bound`; otherwise swap positions
 
 `shuffle: null` makes no claim about how an already ordered input was produced.
 Reusing a physical-order list must not apply the shuffle again. See
-[cross-machine reproduction](../CONVERSION.md#cross-machine-reproduction-and-relocation).
+[cross-machine reproduction](../guides/CONVERSION.md#cross-machine-reproduction-and-relocation).
 
 Loading validates counts, consecutive image IDs, unique sample IDs and the file
 and order hashes. This detects mismatched annotations, not incorrect externally

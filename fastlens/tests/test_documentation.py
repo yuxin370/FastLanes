@@ -145,7 +145,13 @@ class DocumentationTests(unittest.TestCase):
         for path in files:
             if path.name == 'CMakeLists.txt':
                 targets.update(re.findall(r'add_(?:executable|library)\(\s*([^\s)$]+)', (ROOT / path).read_text()))
-        documents = user_guides() + [Path('fastlens/benchmarks/paper/section_6_4/compressed_transfer_and_tensor/README.md')]
+        documents = user_guides() + [
+            Path('fastlens/benchmarks/paper/section_6_4/compressed_transfer_and_tensor/README.md'),
+            Path('fastlens/benchmarks/baselines/dct_baselines/README.md'),
+            Path('fastlens/benchmarks/baselines/dct_baselines/IMPLEMENTATION.md'),
+            Path('fastlens/benchmarks/baselines/dct_baselines/PROTOCOL.md'),
+            Path('fastlens/benchmarks/baselines/dct_baselines/RESULTS.md'),
+        ]
         for document in documents:
             for kind, reference in command_references((ROOT / document).read_text()):
                 with self.subTest(document=document, kind=kind, reference=reference):

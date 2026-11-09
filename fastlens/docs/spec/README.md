@@ -1,5 +1,7 @@
 # FastLens format specifications
 
+[Documentation index](../README.md)
+
 FastLens exposes two physical layouts: **Block-major** and **Image-major**.
 Layout names describe coefficient organization. The manifest, metadata and access
 descriptor have independent binary versions; a larger number is not a performance
@@ -24,7 +26,7 @@ two Image-major encodings. See
 [Image-major comparison](IMAGE_MAJOR.md#one-image-per-rowgroup-and-tiled-comparison).
 Neither native Image-major encoding is a Published Store merely because its
 manifest is readable. Tensor profiles can impose narrower geometry requirements
-than the storage reader. See [API support](../API_STABILITY.md).
+than the storage reader. See [API support](../reference/API_STABILITY.md).
 
 | Specification | Scope |
 | --- | --- |

@@ -28,6 +28,9 @@ data/dct_blocks/
 
 # Publish user guides, the final PDF and plotting sources; keep manuscript drafts private.
 fastlens/docs/*
+!fastlens/docs/README.md
+!fastlens/docs/guides/
+!fastlens/docs/reference/
 !fastlens/docs/spec/
 !fastlens/docs/API_STABILITY.md
 !fastlens/docs/CONVERSION.md

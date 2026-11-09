@@ -101,7 +101,7 @@ python -m fastlens inspect fastlens/data/example-fastlens
 A published Store contains `manifest.bin`, `partitions/` and `geometry/`, with
 optional `annotations/` and removable `conversion/` records. Inspection checks
 structure, metadata, indexes and source-order bindings; it does not checksum
-all FLS payload bytes. Details are in [Store format](fastlens/docs/STORE_FORMAT.md).
+all FLS payload bytes. Details are in [Store format](fastlens/docs/spec/STORE.md).
 
 ### Read DCT tensors
 
@@ -120,25 +120,16 @@ with reader.iter_batches([[0, 1]], profile=VALIDATION) as batches:
 
 This profile requires compatible JPEG geometry and produces CUDA inputs for a
 compatible DCT model. It is not an automatic input adapter for arbitrary RGB
-models. See [Direct-DCT data loading](fastlens/docs/DIRECT_DCT.md) for pipelines,
+models. See [Direct-DCT data loading](fastlens/docs/guides/DIRECT_DCT.md) for pipelines,
 profiles, labels and CUDA stream ownership.
 
 ## Documentation
 
-- [Binary specifications and layout support](fastlens/docs/spec/README.md)
-- [API stability and environments](fastlens/docs/API_STABILITY.md)
-
-| I want to… | Read |
-| --- | --- |
-| Convert JPEG datasets and tune conversion workers | [Conversion](fastlens/docs/CONVERSION.md) |
-| Understand the on-disk Store and integrity checks | [Store format](fastlens/docs/STORE_FORMAT.md) |
-| Add labels, class mappings or offline premixing | [Annotations](fastlens/docs/ANNOTATIONS.md) |
-| Feed models from GPU DCT tensors | [Direct-DCT data loading](fastlens/docs/DIRECT_DCT.md) |
-| Build, debug, use C++ APIs and run tests | [Development](fastlens/docs/DEVELOPMENT.md) |
-| Reproduce paper experiments | [Paper reproduction guide](fastlens/benchmarks/paper/README.md) |
-
-The [architecture guide](fastlens/ARCHITECTURE.md) describes the runtime design.
-The [native tool guide](fastlens/tools/README.md) covers lower-level commands.
+The [documentation index](fastlens/docs/README.md) provides reading paths for
+using FastLens, understanding layouts, integrating APIs, modifying the runtime
+and reproducing experiments. Continue from this Quickstart with
+[Conversion](fastlens/docs/guides/CONVERSION.md) and
+[Direct-DCT data loading](fastlens/docs/guides/DIRECT_DCT.md).
 
 ## Reproduce the paper
 
@@ -161,29 +152,14 @@ python -m fastlens.benchmarks.paper.reproduce figures
 
 ## Testing
 
-```bash
-python -B -m unittest fastlens.tests.test_cli fastlens.tests.test_annotations
-ctest --test-dir build --output-on-failure -LE 'benchmark|nightly'
-```
-
-GPU release checks must set `FASTLENS_REQUIRE_CUDA_SMOKE=1` so missing CUDA fails
-instead of skipping. Native integration, GPU numerical checks and the separate
-1025-image canary are described in [Development](fastlens/docs/DEVELOPMENT.md).
+[Development](fastlens/docs/DEVELOPMENT.md#converter-and-reader-tests) describes CPU/native checks,
+strict GPU tests and the Quickstart integration tests.
 
 ## Repository layout
 
-| Path                                    | Contents                                               |
-| --------------------------------------- | ------------------------------------------------------ |
-| `fastlens/include/fastlens/`            | Public C++ headers                                     |
-| `fastlens/src/`                         | Storage format, readers, codecs, and CPU/GPU execution |
-| `fastlens/src/direct_dct/`              | Direct-DCT runtime and pipeline                        |
-| `fastlens/torch/`, `fastlens/profiles/` | PyTorch interface and model profiles                   |
-| `fastlens/tools/`, `fastlens/examples/` | Conversion tools and usage examples                    |
-| `fastlens/tests/`                       | Correctness and integration tests                      |
-| `fastlens/benchmarks/`                  | Paper experiments, baselines, and results              |
-| `scripts/`                              | Build and smoke-test scripts                           |
-| `third_party/fastlanes/`                | Modified FastLanes dependency                          |
-
+The [architecture guide](fastlens/ARCHITECTURE.md#source-organization) maps the
+implementation packages; the [benchmark index](fastlens/benchmarks/README.md)
+separates paper experiments, baseline implementations and development tools.
 
 ## License
 

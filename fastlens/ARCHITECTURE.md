@@ -1,10 +1,11 @@
-# FastLens architecture and interfaces
+# FastLens architecture
 
 FastLens is a GPU image-input system. Its implementation is in
 `fastlens/`; a modified FastLanes library is an internal dependency under
 `third_party/fastlanes/`. The root CMake project builds both. Dependency
 provenance and modifications are documented in `third_party/fastlanes/CHANGES.md`.
-See [README.md](../README.md) for build and usage examples.
+See the [documentation index](docs/README.md) for user guides and
+[Development](docs/DEVELOPMENT.md) for builds and tests.
 
 ## Execution path
 
@@ -42,56 +43,32 @@ Paths are relative to the FastLens repository root.
 
 ## Python interface
 
-Import the reader and batch interfaces from `fastlens.torch`.
-`DirectDctReader` opens a manifest; a profile specifies geometry, normalization
-and the model-facing representation. `read` processes a single logical batch;
-`iter_batches` and `pipeline` expose repeated reads.
+`fastlens.torch` translates sample IDs and semantic profiles into native logical
+batch requests. The reader and pipeline share native scheduling and lifetime
+management; Python does not maintain a second producer queue. Profiles define
+the model-facing geometry and normalization separately from storage-column
+selection.
 
-```python
-from fastlens.profiles.rgbnomore import VALIDATION
-from fastlens.torch import DirectDctReader
-
-reader = DirectDctReader("fastlens/data/example-fastlens/manifest.bin",
-                         module_path="build/fastlens/torch")
-with reader.iter_batches([[0, 1], [2, 3]],
-                         profile=VALIDATION,
-                         coefficients=None) as batches:
-    for batch in batches:
-        y, cbcr = batch.tensors
-```
-
-Convert the four bundled 512×512 RGB, 4:2:0 JPEGs with the
-[converter](docs/CONVERSION.md). Run this example from the repository root.
-The [Direct-DCT guide](docs/DIRECT_DCT.md#reader-and-pipeline) describes profile
-geometry and the complete-partition requirement of `VALIDATION_CENTER_CROP_512`.
-
-`coefficients=None` selects all source coefficients. Explicit selection refers
-to storage columns; profile output geometry is a separate contract. CNN
-profiles can expose a projected NCHW tensor through `batch.projected`.
-Training combines a dataset mapping and `TrainingPolicy` with an epoch schedule.
-The interfaces under `fastlens.torch.experimental` expose PLS pools and
-microbatches. See the [PLS guide](benchmarks/training_pls/README.md) and
-[DCT augmentation semantics](DCT_DOMAIN_AUGMENTATIONS.md).
+The [Direct-DCT guide](docs/guides/DIRECT_DCT.md) owns usage examples and profile
+requirements. [API boundaries](docs/reference/API_BOUNDARIES.md) identifies
+public and advanced entry points; [augmentation semantics](docs/guides/DCT_AUGMENTATIONS.md)
+defines the coefficient-domain transformations.
 
 ## Ownership and CUDA streams
 
-Returned tensors retain their native storage. Before consuming a batch on
-another CUDA stream, call `batch.record_stream(consumer_stream)`. Native
-completion tracks producer work and registered consumers before reclaiming
-storage. Close pipelines explicitly or use their context managers.
+Native batches retain storage through producer completion and registered consumer
+events. Scheduling and reclamation live in `fastlens/src/direct_dct/`; Python
+exposes the batch lifetime and stream-registration operations described in the
+[Direct-DCT guide](docs/guides/DIRECT_DCT.md#reader-and-pipeline).
 
-Metric snapshots can include pending asynchronous work; finalized measurements
-belong to completed runs. Diagnostics live in `fastlens.diagnostics` and are
-separate from the model input interface.
+Metric snapshots can include pending asynchronous work. Finalized measurements
+belong to completed runs; [diagnostic metrics](tools/DIAGNOSTICS.md) defines their
+scope separately from the model input interface.
 
 ## C++ interface and tests
 
-Use `<fastlens/stable.hpp>` with `FastLens::core` for table decompression, or
-`<fastlens/advanced/direct_dct.hpp>` with `FastLens::jpeg_dct_device` for device-resident
-DCT inputs. Rowgroup and column views borrow their owning table's storage.
-Installed-package consumers are under `fastlens/examples/`.
-
-Native tests live in `fastlens/tests/`; Torch checks live in `fastlens/torch/`.
-Benchmark tests remain beside their implementations. Run
-`./scripts/smoke_test.sh` for public build/import checks and consult the root
-README for the CPU and GPU test labels.
+The public C++ headers expose table operations and opt-in device DCT primitives;
+[API boundaries](docs/reference/API_BOUNDARIES.md) defines those surfaces.
+Installed-package consumers live under `fastlens/examples/`. Native tests are in
+`fastlens/tests/`, Torch checks in `fastlens/torch/`, and benchmark tests beside
+their implementations. See [Development](docs/DEVELOPMENT.md#converter-and-reader-tests) for execution.

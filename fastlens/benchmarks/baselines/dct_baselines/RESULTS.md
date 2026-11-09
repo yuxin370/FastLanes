@@ -1,5 +1,7 @@
 # DCT baseline results and evidence
 
+[Run guide](README.md) · [Implementation](IMPLEMENTATION.md) · [Protocol](PROTOCOL.md)
+
 ## Published measurements
 
 The paper evaluation dated 2026-10-18 has retained, machine-readable tables:

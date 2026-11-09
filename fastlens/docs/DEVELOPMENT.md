@@ -1,6 +1,6 @@
 # Build, test and develop
 
-[Documentation index](../../README.md#documentation)
+[Documentation index](README.md)
 
 Run commands from the repository root.
 
@@ -174,7 +174,6 @@ See [fastlens/examples/](../examples/) for complete CMake examples.
 
 ### API compatibility
 
-The compatibility headers `<fastlens/fastlens.hpp>` and
-`<fastlens/direct_dct.hpp>` remain available for existing integrations.
-See [API boundaries](../DIRECT_DCT_API_BOUNDARIES.md) for stable, advanced and
+See [API stability](reference/API_STABILITY.md) for compatibility and deprecation
+policy, and [API boundaries](reference/API_BOUNDARIES.md) for stable, advanced and
 diagnostic interfaces.

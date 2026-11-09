@@ -1,8 +1,16 @@
 # DCT baseline protocol
 
-[Run guide](README.md) · [Results and evidence](RESULTS.md)
+[Run guide](README.md) · [Implementation](IMPLEMENTATION.md) · [Results](RESULTS.md)
 
 ## Inputs and equivalence
+
+Paper-scale comparisons use a fixed validation-data preparation protocol,
+including image resizing, JPEG encoder settings, and sample ordering. The
+corresponding preparation recipe and data provenance must be recorded with the
+experiment inputs. Measurements using a different preparation recipe are treated
+as a separate configuration rather than an exact reproduction of the published
+evaluation. Follow the [reference preparation guide](../../paper/REBUILDING_REFERENCES.md)
+for the source-data workflow.
 
 `prepare` freezes `matched.json`, `source.json`, `profile.json` and
 occurrence-level `trace.jsonl`. The source records JPEG hashes, original
@@ -10,6 +18,10 @@ quantized coefficients (q), quantization tables (Q), component geometry,
 sampling, labels and image identities. A matched store preserves these values;
 it does not resize or re-encode JPEGs. Record the actual source production
 recipe separately from model preprocessing.
+
+For identical CPU reference operations, verification defaults to exact tolerance.
+Nonzero diagnostic tolerances are explicit choices; they are not automatically
+calibrated or attributed to the original papers.
 
 `verify-inference` loads the pretrained checkpoint and checks source q/Q,
 model inputs, logits, top-5 predictions and task metrics against the independent
@@ -37,6 +49,15 @@ batch size and numerical environment. Bit-identical inputs may reuse checkpoint
 outputs; differing batches require independent input and model comparisons.
 Evidence records whether model outputs were computed directly or reused.
 FastLens uses its own full verifier.
+
+### Validation coverage
+
+Correctness checks cover integer/Q round trips, ragged and odd JPEG geometry,
+negative width boundaries, full-member read amplification, tail groups/batches,
+duplicate/ordered requests, bounded cache eviction, corrupt members, a native
+scalar DCT oracle and IC/IC-b/FS native equality. Real-source checkpoint smoke
+checks are separate from full validation; their sample count and timings apply
+only to the checked subset.
 
 ## Storage and resource accounting
 
@@ -152,8 +173,9 @@ measure this split, rather than a fully CPU-augmented IC implementation or
 storage alone.
 
 `prepare --training` writes disjoint calibration and verification traces. Each
-occurrence freezes crop/flip, RandAugment operations, component-specific
-parameters, Mixup partners/weights and soft targets, including tails. Replay
+occurrence freezes crop/flip, RandAugment operations and magnitudes, component
+Cutout centers/padding, translation blocks, ChromaDrop channels, both Mixup
+weights, actual partner occurrences and soft targets, including tails. Replay
 samples no new augmentation decisions. CNN paths retain the complete
 192-channel intermediate until augmentation and projection. Swin training uses
 the 224-pixel/window-7 architecture; its 256-pixel inference checkpoint is
@@ -184,3 +206,4 @@ order/duplicates. Counters include initialization and consumed batches;
 unconsumed lookahead is outside their accounting. Matching declarations alone
 cannot establish numerical equality or equal global resource use. Small
 calibration runs do not establish full-epoch throughput or convergence.
+Diagnostic microbatch sizes are explicit contract choices.

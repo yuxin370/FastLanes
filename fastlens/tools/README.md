@@ -1,13 +1,15 @@
 # FastLens command reference
 
+[Documentation index](../docs/README.md) · [Development](../docs/DEVELOPMENT.md)
+
 Run commands from the repository root after building the required targets.
 
 | Task | Supported entry point | Details |
 | --- | --- | --- |
-| Convert JPEGs | `python -m fastlens convert INPUT --output STORE` | [Conversion](../docs/CONVERSION.md) |
+| Convert JPEGs | `python -m fastlens convert INPUT --output STORE` | [Conversion](../docs/guides/CONVERSION.md) |
 | Inspect a published Store | `python -m fastlens inspect STORE` | [Store contract](../docs/spec/STORE.md) |
 | Check recorded FLS CRC64 | `python -m fastlens inspect STORE --check-payload` | Requires conversion with `--record-payload-crc` |
-| Build / inspect annotations | `python -m fastlens annotations build STORE` / `inspect STORE` | [Annotations](../docs/ANNOTATIONS.md) |
+| Build / inspect annotations | `python -m fastlens annotations build STORE` / `inspect STORE` | [Annotations](../docs/guides/ANNOTATIONS.md) |
 | Write native Image-major | `fastlens_jpeg_dct_tool` | [Layout and invocation](../docs/spec/IMAGE_MAJOR.md#generate-the-layout) |
 | Benchmark native table / pipeline work | `fastlens_cli` | [Native command reference](NATIVE_REFERENCE.md) |
 | Reproduce paper experiments | Section-specific Python modules | [Paper guide](../benchmarks/paper/README.md) |
@@ -24,6 +26,5 @@ python -m fastlens annotations build --help
 python -m fastlens annotations inspect --help
 ```
 
-The former `scripts/my_tool` summary and prefetch scripts are not distributed.
-Native commands emit metrics directly; use maintained paper entry points when
-reproducing published comparisons.
+Native commands emit metrics directly; use the paper entry points above for
+published comparisons and the diagnostic metrics reference for counter meanings.

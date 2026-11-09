@@ -7,9 +7,9 @@ perform geometry and normalization on CPU; FastLens uses its native CUDA path.
 These are paper-guided adaptations to JPEG coefficients. Native IC/FS
 representation experiments have separate contracts.
 
-- [Protocol](PROTOCOL.md): source identity, numerical checks, resource budgets and timing.
-- [Results](RESULTS.md): published tables, measurement scope and available evidence.
-- [Integration map](ASSUMPTIONS.md): implementation choices and model adapters.
+Read [Implementation](IMPLEMENTATION.md) for storage and numerical conventions,
+then [Protocol](PROTOCOL.md) for input equivalence, resource budgets and timing.
+[Results](RESULTS.md) identifies published measurements and their evidence scope.
 
 ## Supported methods
 
