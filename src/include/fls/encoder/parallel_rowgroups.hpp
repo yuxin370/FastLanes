@@ -26,10 +26,12 @@ void parallel_rowgroups(n_t count, n_t requested_workers, const char* stage, Fun
 	const auto         workers = std::min(count, requested_workers);
 	std::mutex         mutex;
 	std::exception_ptr first_error;
-	const auto         save_error = [&] {
+	n_t                failed_index = count;
+	const auto         save_error   = [&](n_t index) {
         std::lock_guard lock(mutex);
         if (!first_error) {
-            first_error = std::current_exception();
+            first_error  = std::current_exception();
+            failed_index = index;
         }
 	};
 	const auto run = [&](n_t worker) {
@@ -43,15 +45,7 @@ void parallel_rowgroups(n_t count, n_t requested_workers, const char* stage, Fun
 			try {
 				function(index);
 			} catch (...) {
-				// Preserve the original exception as well as stage/index context.
-				std::lock_guard lock(mutex);
-				if (!first_error) {
-					first_error = std::current_exception();
-					try {
-						std::throw_with_nested(std::runtime_error(std::string(stage) + " rowgroup " +
-						                                          std::to_string(index) + " failed; reload input"));
-					} catch (...) { first_error = std::current_exception(); }
-				}
+				save_error(index);
 				return;
 			}
 		}
@@ -66,11 +60,19 @@ void parallel_rowgroups(n_t count, n_t requested_workers, const char* stage, Fun
 				futures.push_back(std::async(std::launch::async, run, worker));
 			}
 		}
-	} catch (...) { save_error(); }
+	} catch (...) { save_error(count); }
 	for (auto& future : futures) {
 		try {
 			future.get();
-		} catch (...) { save_error(); }
+		} catch (...) { save_error(count); }
+	}
+	if (failed_index < count) {
+		try {
+			std::rethrow_exception(first_error);
+		} catch (...) {
+			std::throw_with_nested(std::runtime_error(std::string(stage) + " rowgroup " + std::to_string(failed_index) +
+			                                          " failed; reload input"));
+		}
 	}
 	if (first_error) {
 		std::rethrow_exception(first_error);
