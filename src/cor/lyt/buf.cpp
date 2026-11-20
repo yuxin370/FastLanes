@@ -4,6 +4,7 @@
 // src/cor/lyt/buf.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/cor/lyt/buf.hpp"
+#include "fls/api/api.hpp"
 #include "fls/common/alias.hpp"
 #include "fls/common/assert.hpp"
 #include "fls/io/external_memory.hpp"
@@ -236,21 +237,21 @@ void Buf::Clone(const Buf& a_buf) {
 /*---------------------------------------------------------------------------------------------------------------------\
  * Specialization
 \---------------------------------------------------------------------------------------------------------------------*/
-template const ofs_t* Buf::data<ofs_t>();
-template uint32_t*    Buf::mutable_data<uint32_t>();
-template uint64_t*    Buf::mutable_data<uint64_t>();
-template uint8_t*     Buf::mutable_data<uint8_t>();
-template uint8_t**    Buf::mutable_data<uint8_t*>();
+template FLS_API const ofs_t* Buf::data<ofs_t>();
+template FLS_API uint32_t*    Buf::mutable_data<uint32_t>();
+template FLS_API uint64_t*    Buf::mutable_data<uint64_t>();
+template FLS_API uint8_t*     Buf::mutable_data<uint8_t>();
+template FLS_API uint8_t**    Buf::mutable_data<uint8_t*>();
 
-template i64_pt*   Buf::GetFixedSizeArray<i64_pt>(n_t length);
-template i32_pt*   Buf::GetFixedSizeArray<i32_pt>(n_t length);
-template i16_pt*   Buf::GetFixedSizeArray<i16_pt>(n_t length);
-template i08_pt*   Buf::GetFixedSizeArray<i08_pt>(n_t length);
-template dbl_pt*   Buf::GetFixedSizeArray<dbl_pt>(n_t length);
-template flt_pt*   Buf::GetFixedSizeArray<flt_pt>(n_t length);
-template u08_pt*   Buf::GetFixedSizeArray<u08_pt>(n_t length);
-template uint8_t** Buf::GetFixedSizeArray<uint8_t*>(n_t length);
+template FLS_API i64_pt*   Buf::GetFixedSizeArray<i64_pt>(n_t length);
+template FLS_API i32_pt*   Buf::GetFixedSizeArray<i32_pt>(n_t length);
+template FLS_API i16_pt*   Buf::GetFixedSizeArray<i16_pt>(n_t length);
+template FLS_API i08_pt*   Buf::GetFixedSizeArray<i08_pt>(n_t length);
+template FLS_API dbl_pt*   Buf::GetFixedSizeArray<dbl_pt>(n_t length);
+template FLS_API flt_pt*   Buf::GetFixedSizeArray<flt_pt>(n_t length);
+template FLS_API u08_pt*   Buf::GetFixedSizeArray<u08_pt>(n_t length);
+template FLS_API uint8_t** Buf::GetFixedSizeArray<uint8_t*>(n_t length);
 
-template void Buf::TypedAppend(const ofs_t* data_p);
+template FLS_API void Buf::TypedAppend(const ofs_t* data_p);
 
 } // namespace fastlanes

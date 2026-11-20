@@ -15,13 +15,15 @@
 #include "fls/expression/interpreter.hpp"         // for Interpreter
 #include "fls/expression/physical_expression.hpp" // for PhysicalExpr
 #include "fls/footer/rowgroup_descriptor.hpp"     // for Footer, ColumnMeta...
-#include "fls/io/file.hpp"                        // for File
+#include "fls/footer/table_descriptor.hpp"
+#include "fls/io/file.hpp" // for File
 #include "fls/reader/column_view.hpp"
 #include "fls/reader/rowgroup_view.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/table/chunk.hpp" // for Chunk
 #include <cstdint>             // for std::uint32_t
 #include <memory>              // for make_unique, uniqu...
+#include <utility>
 
 namespace fastlanes {
 

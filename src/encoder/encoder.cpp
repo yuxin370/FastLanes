@@ -7,24 +7,27 @@
 #include "fls/common/alias.hpp" // for up, n_t
 #include "fls/connection.hpp"   // for Connection
 #include "fls/cor/lyt/buf.hpp"  // for Buf
+#include "fls/encoder/encoding_options.hpp"
 #include "fls/encoder/validate_options.hpp"
 #include "fls/expression/expression_executor.hpp" // for ExprExecutor
 #include "fls/expression/interpreter.hpp"         // for Interpreter
 #include "fls/expression/physical_expression.hpp" // for PhysicalExpr
 #include "fls/file/file_header.hpp"
 #include "fls/footer/rowgroup_descriptor_generated.h"
+#include "fls/footer/table_descriptor_generated.h"
 #include "fls/io/file.hpp" // for File
 #include "fls/std/filesystem.hpp"
 #include "fls/std/vector.hpp"     // for vector
 #include "fls/table/rowgroup.hpp" // for Rowgroup
+#include "fls/table/table.hpp"
 #include <algorithm>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <fls/io/io.hpp>
 #include <memory> // for unique_ptr
 #include <mutex>
-#include <stdexcept>
 #include <thread>
 #include <utility>
 

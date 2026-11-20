@@ -10,8 +10,10 @@
 #include "fls/io/external_memory.hpp"
 #include "fls/io/file.hpp"
 #include "fls/io/read_source.hpp"
+#include "fls/std/span.hpp"
 #include "fls/std/variant.hpp"
 #include <stdexcept>
+#include <variant>
 
 namespace fastlanes {
 
@@ -45,7 +47,7 @@ void IO::append(io& io, const char* pointer, n_t size) {
 namespace {
 ReadSource read_source(const io& input) {
 	if (const auto* file = std::get_if<up<File>>(&input); file && *file) {
-		return ReadSource(**file);
+		return {**file};
 	}
 	if (const auto* memory = std::get_if<up<ExternalMemory>>(&input); memory && *memory) {
 		return ReadSource(**memory);

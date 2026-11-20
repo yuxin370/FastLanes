@@ -10,10 +10,10 @@
 #include "alp/decoder.hpp"
 #include "alp/sampler.hpp"
 #include "alp/state.hpp"
-#include "fls/common/assert.hpp" // fix me
 #include "fls/compiler.hpp"
 #include "fls/ffor_util.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cmath> // for std::ceil
 #include <cstdint>
 #include <limits>  // for std::numeric_limits
@@ -51,11 +51,7 @@ void encoder<PT, is_null>::encode(const PT*      input_vector,
                                   ST*            encoded_integers,
                                   state<PT>&     stt,
                                   const uint8_t* null_map) {
-	if constexpr (is_null) {
-		FLS_ASSERT_NOT_NULL_POINTER(null_map)
-	} else {
-		FLS_ASSERT_NULL_POINTER(null_map)
-	}
+	assert((null_map != nullptr) == is_null);
 
 	if (stt.k_combinations > 1) { // Only if more than 1 found top combinations we sample and search
 		find_best_exponent_factor_from_combinations(

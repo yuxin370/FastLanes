@@ -4,6 +4,7 @@
 // src/footer/table_descriptor.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/footer/table_descriptor.hpp"
+#include "flatbuffers/base.h"
 #include "flatbuffers/flatbuffer_builder.h"
 #include "flatbuffers/verifier.h" // flatbuffers::Verifier
 #include "fls/common/alias.hpp"

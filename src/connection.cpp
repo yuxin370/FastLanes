@@ -9,6 +9,7 @@
 #include "fls/common/alias.hpp"    // for make_unique<>, n_t, idx_t, fls_bool, FLS_TRUE
 #include "fls/common/status.hpp"   // for Status
 #include "fls/encoder/encoder.hpp" // for Encoder
+#include "fls/encoder/encoding_options.hpp"
 #include "fls/encoder/parallel_rowgroups.hpp"
 #include "fls/encoder/validate_options.hpp"
 #include "fls/file/file_footer.hpp" // for FileFooter
@@ -32,7 +33,8 @@
 #include <chrono>
 #include <cstdint> // for uint64_t
 #include <filesystem>
-#include <memory>    // for std::make_unique, unique_ptr
+#include <memory> // for std::make_unique, unique_ptr
+#include <optional>
 #include <stdexcept> // for std::runtime_error
 
 namespace fastlanes {

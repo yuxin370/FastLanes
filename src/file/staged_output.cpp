@@ -4,11 +4,15 @@
 // src/file/staged_output.cpp
 // ────────────────────────────────────────────────────────
 #include "staged_output.hpp"
+#include "fls/std/filesystem.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <ranges>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -107,19 +111,19 @@ void StagedOutput::publish(const bool has_external_footer, const bool has_json) 
 	} catch (...) {
 		std::error_code    recovery_error;
 		const SidecarMove* failed_move = nullptr;
-		for (auto move = sidecars.rbegin(); move != sidecars.rend(); ++move) {
+		for (auto& sidecar : std::ranges::reverse_view(sidecars)) {
 			std::error_code ec;
-			if (move->source_was_published) {
-				std::filesystem::remove(move->target, ec);
+			if (sidecar.source_was_published) {
+				std::filesystem::remove(sidecar.target, ec);
 			}
-			if (move->target_was_backed_up && !ec) {
-				std::filesystem::rename(move->backup, move->target, ec);
+			if (sidecar.target_was_backed_up && !ec) {
+				std::filesystem::rename(sidecar.backup, sidecar.target, ec);
 			}
 			if (ec) {
 				m_preserve_backups = true;
 				if (!failed_move) {
 					recovery_error = ec;
-					failed_move    = &*move;
+					failed_move    = &sidecar;
 				}
 			}
 		}

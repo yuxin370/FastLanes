@@ -17,7 +17,11 @@
 #include "fls/std/string.hpp"
 #include <filesystem>         // std::filesystem::path, exists, is_directory, is_regular_file
 #include <flatbuffers/base.h> // flatbuffers::uoffset_t
-#include <utility>            // std::move
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <utility> // std::move
+#include <variant>
 
 namespace fastlanes {
 

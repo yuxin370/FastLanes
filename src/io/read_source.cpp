@@ -4,11 +4,15 @@
 // src/io/read_source.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/io/read_source.hpp"
+#include "fls/common/alias.hpp"
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/io/external_memory.hpp"
 #include "fls/io/file.hpp"
+#include <cstddef>
 #include <cstring>
+#include <span>
 #include <stdexcept>
+#include <variant>
 
 namespace fastlanes {
 namespace {

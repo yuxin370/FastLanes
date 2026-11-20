@@ -4,20 +4,31 @@
 // src/table/memory_table.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/table/memory_table.hpp"
+#include "fls/cfg/cfg.hpp"
 #include "fls/common/alias.hpp"
 #include "fls/connection.hpp"
-#include "fls/expression/data_type.hpp"
 #include "fls/footer/column_descriptor_generated.h"
+#include "fls/footer/datatype_generated.h"
+#include "fls/footer/footer_generated.h"
+#include "fls/footer/operator_token_generated.h"
 #include "fls/footer/rowgroup_descriptor_generated.h"
+#include "fls/footer/rpn_generated.h"
 #include "fls/footer/table_descriptor.hpp"
+#include "fls/std/filesystem.hpp"
+#include "fls/std/string.hpp"
 #include "fls/table/rowgroup.hpp"
 #include "fls/table/table.hpp"
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
+#include <variant>
 
 namespace fastlanes {
 

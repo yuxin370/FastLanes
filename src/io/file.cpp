@@ -5,12 +5,13 @@
 // ────────────────────────────────────────────────────────
 #include "fls/io/file.hpp"
 #include "fls/common/alias.hpp"
-#include "fls/common/assert.hpp"
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/io/read_source.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/std/string.hpp"
 #include <algorithm>
+#include <mutex>
+#include <span>
 #if !defined(_WIN32)
 #include <cerrno>
 #endif
@@ -27,6 +28,7 @@
 #include <string>
 #if !defined(_WIN32)
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -45,11 +47,11 @@ std::runtime_error make_io_error(const path& file_path, const std::string& actio
 void pread_exact(const int fd, const path& file_path, void* dst, const n_t offset, const n_t size) {
 	auto* out     = reinterpret_cast<std::byte*>(dst);
 	n_t   done    = 0;
-	off_t cur_off = static_cast<off_t>(offset);
+	auto  cur_off = static_cast<off_t>(offset);
 
 	while (done < size) {
-		const size_t chunk = static_cast<size_t>(size - done);
-		const auto   nread = ::pread(fd, out + done, chunk, cur_off);
+		const auto chunk = static_cast<size_t>(size - done);
+		const auto nread = ::pread(fd, out + done, chunk, cur_off);
 		if (nread == 0) {
 			throw std::runtime_error("unexpected EOF while reading: " + file_path.string());
 		}
@@ -153,11 +155,11 @@ n_t File::ReadScatterUnchecked(const std::span<const FileScatterReadTarget> targ
 	return read_count;
 #else
 	open_read_handle();
-	const long         configured_iov_max = ::sysconf(_SC_IOV_MAX);
+	const auto         configured_iov_max = ::sysconf(_SC_IOV_MAX);
 	const size_t       iov_max            = configured_iov_max > 0 ? static_cast<size_t>(configured_iov_max) : 1024U;
 	n_t                current_offset     = offset;
 	n_t                read_count         = 0;
-	std::vector<iovec> iovecs;
+	std::vector<iovec> iovecs; // NOLINT(misc-include-cleaner): POSIX declares iovec in <sys/uio.h>.
 	iovecs.reserve(std::min(iov_max, targets.size()));
 
 	const auto flush = [&]() {
@@ -181,7 +183,7 @@ n_t File::ReadScatterUnchecked(const std::span<const FileScatterReadTarget> targ
 			}
 			++read_count;
 			current_offset += static_cast<n_t>(nread);
-			size_t consumed = static_cast<size_t>(nread);
+			auto consumed = static_cast<size_t>(nread);
 			while (first < iovecs.size() && consumed >= iovecs[first].iov_len) {
 				consumed -= iovecs[first].iov_len;
 				++first;
