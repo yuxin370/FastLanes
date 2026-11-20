@@ -9,6 +9,7 @@
 #include "fls/api/api.hpp"
 #include "fls/common/alias.hpp" // for up, idx_t
 #include "fls/common/status.hpp"
+#include "fls/encoder/encoding_options.hpp"
 #include "fls/footer/rowgroup_descriptor.hpp" // for Footer
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/reader/column_view.hpp" //
@@ -18,12 +19,14 @@
 #include "fls/reader/table_reader.hpp"
 #include "fls/std/filesystem.hpp" // for path
 #include "fls/std/vector.hpp"     // for vector
+#include "fls/table/memory_table.hpp"
 #include "fls/table/rowgroup.hpp" // for Rowgroup
 #include "fls/table/table.hpp"    // for Reader
 
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
 class Dir;
+class MemoryTableLoader;
 /*--------------------------------------------------------------------------------------------------------------------*/
 /*--------------------------------------------------------------------------------------------------------------------*\
  * Config
@@ -57,6 +60,7 @@ public:
 	friend class Encoder;
 	friend class CsvReader;
 	friend class Rowgroup;
+	friend class MemoryTableLoader;
 
 public:
 	Connection();
@@ -72,14 +76,23 @@ public:
 	Connection& read_csv(const path& dir_path);
 	/// READ CSV
 	Connection& read_json(const path& dir_path);
+	/// Load numeric and string columns from memory.
+	Connection& read_memory(const MemoryTable& table, const MemoryTableOptions& options = {});
 	///! read a fls file return a reader
 	up<TableReader> read_fls(const path& file_path);
+	/// Borrow the encoded bytes/file until the reader is destroyed. For an external footer,
+	/// pass its descriptor as the second source; it is copied during this call.
+	up<TableReader> read_fls(ReadSource source, std::optional<ReadSource> external_descriptor = {});
 	///!
 	Connection& spell();
 	///!
 	Connection& to_fls(const path& dir_path);
+	///! Encode using explicitly configured generic rowgroup parallelism.
+	/// Failure after preparation starts discards the table; reload input before retrying.
+	Connection& to_fls(const path& dir_path, const EncodingOptions& options);
 	//
 	Status verify_fls(const path& file_path);
+	Status verify_fls(const ReadSource& source);
 
 	/**
 	 *
@@ -124,15 +137,18 @@ public:
 	Connection& inline_footer();
 	//
 	string_view get_version() const;
+	//
+	[[nodiscard]] const EncodingStats& get_last_encoding_stats() const;
 
 private:
-	void prepare_table() const;
+	void prepare_table(n_t worker_count) const;
 	void write_footer(const path& dir_path) const;
 
 private:
 	up<Config>           m_config;
 	up<Table>            m_table;
 	up<TableDescriptorT> m_table_descriptor;
+	EncodingStats        m_last_encoding_stats {};
 };
 
 constexpr static auto const* FASTLANES_FILE_NAME {"data.fls"};

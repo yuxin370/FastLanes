@@ -9,8 +9,11 @@
 #include "fls/api/api.hpp"
 #include "fls/common/alias.hpp"
 #include "fls/footer/table_descriptor.hpp" // for TableDescriptorHandle (complete type needed for dllexport)
+#include "fls/io/read_source.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/std/string.hpp"
+#include <optional>
+#include <variant>
 
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
@@ -21,6 +24,8 @@ class Table;
 class FLS_API TableReader {
 public:
 	explicit TableReader(const path& file_path, Connection& fls);
+
+	TableReader(ReadSource source, Connection& fls, std::optional<ReadSource> external_descriptor = {});
 
 	~TableReader();
 	TableReader(const TableReader&)            = delete;
@@ -41,9 +46,10 @@ public:
 	void to_csv(const char* file_path) const;
 
 private:
-	up<TableDescriptorHandle> m_table_descriptor_handle;
-	Connection&               m_connection;
-	const path                m_file_path;
+	void                           load_descriptor(const ReadSource& source, std::optional<ReadSource> external);
+	sp<TableDescriptorHandle>      m_table_descriptor_handle;
+	Connection&                    m_connection;
+	std::variant<path, ReadSource> m_input;
 };
 
 } // namespace fastlanes

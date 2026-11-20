@@ -1,3 +1,8 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# src/CMakeLists.txt
+# ────────────────────────────────────────────────────────
 ###########################################################################
 # Usage in sub-directories (example)
 ###########################################################################
@@ -12,6 +17,12 @@
 # 1. Public-header interface target
 ###########################################################################
 add_library(fls_headers INTERFACE)
+# Keep ALP header configuration consistent with the compiled library.
+target_compile_definitions(fls_headers INTERFACE ALP_N_VECTORS_PER_ROWGROUP=64)
+find_package(Threads REQUIRED)
+if (CMAKE_THREAD_LIBS_INIT STREQUAL "-pthread")
+    target_compile_options(fls_headers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-pthread>")
+endif ()
 
 target_include_directories(fls_headers
         INTERFACE
@@ -91,6 +102,8 @@ target_compile_features(FastLanes PUBLIC cxx_std_20)
 target_link_libraries(FastLanes
         PUBLIC
         FastLanes::headers
+        # FLSTargets.cmake is also included directly by standalone consumers.
+        ${CMAKE_THREAD_LIBS_INIT}
 )
 
 # Let consumers know whether they are linking against a static or shared build.

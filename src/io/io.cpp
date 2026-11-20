@@ -9,7 +9,9 @@
 #include "fls/cor/lyt/buf.hpp"
 #include "fls/io/external_memory.hpp"
 #include "fls/io/file.hpp"
+#include "fls/io/read_source.hpp"
 #include "fls/std/variant.hpp"
+#include <stdexcept>
 
 namespace fastlanes {
 
@@ -40,31 +42,33 @@ void IO::append(io& io, const char* pointer, n_t size) {
 	      io);
 }
 
-void IO::read(const io& io, Buf& buf) {
-	visit(overloaded {
-	          [&](const up<File>& file) { file->Read(buf); },
-	          [](auto&) { FLS_UNREACHABLE() },
-	      },
-	      io);
+namespace {
+ReadSource read_source(const io& input) {
+	if (const auto* file = std::get_if<up<File>>(&input); file && *file) {
+		return ReadSource(**file);
+	}
+	if (const auto* memory = std::get_if<up<ExternalMemory>>(&input); memory && *memory) {
+		return ReadSource(**memory);
+	}
+	throw std::invalid_argument("read requires a file or external memory source");
 }
-void IO::range_read(const io& io, Buf& buf, const n_t offset, const n_t size) {
-	visit(overloaded {
-	          [&](const up<File>& file) { file->ReadRange(buf, offset, size); },
-	          [](auto&) { FLS_UNREACHABLE() },
-	      },
-	      io);
+} // namespace
+
+void IO::read(const io& input, Buf& buf) {
+	const auto source = read_source(input);
+	source.ReadRange(buf, 0, source.Size());
 }
 
-n_t IO::get_size(const io& io) {
-	n_t size = 0;
-	visit(overloaded {
-	          [&](const up<ExternalMemory>& external_memory) { size = external_memory->GetSpan().size(); },
-	          [&](const up<File>& file) { size = file->Size(); },
-	          [](auto&) { FLS_UNREACHABLE() },
-	      },
-	      io);
+void IO::range_read(const io& input, Buf& buf, n_t offset, n_t size) {
+	read_source(input).ReadRange(buf, offset, size);
+}
 
-	return size;
+void IO::range_read(const io& input, void* dst, n_t offset, n_t size) {
+	read_source(input).ReadRange(dst, offset, size);
+}
+
+n_t IO::get_size(const io& input) {
+	return read_source(input).Size();
 }
 
 template <typename PT>

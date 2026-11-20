@@ -1,8 +1,14 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# src/file/CMakeLists.txt
+# ────────────────────────────────────────────────────────
 add_library(fls_file
         OBJECT
         #[[]]
         file_header.cpp
         file_footer.cpp
+        staged_output.cpp
 )
 
 if (FLS_ENABLE_IWYU)
