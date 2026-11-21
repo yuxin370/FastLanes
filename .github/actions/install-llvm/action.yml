@@ -57,7 +57,7 @@ runs:
 
           UBUNTU_CODENAME=$(lsb_release -cs)
           echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] \
-            http://apt.llvm.org/${UBUNTU_CODENAME}/ \
+            https://apt.llvm.org/${UBUNTU_CODENAME}/ \
             llvm-toolchain-${UBUNTU_CODENAME}-${MAJOR} main" | \
             sudo tee /etc/apt/sources.list.d/llvm${MAJOR}.list
 
@@ -71,15 +71,10 @@ runs:
           echo "/usr/lib/llvm-${MAJOR}/bin" >> "$GITHUB_PATH"
 
         elif [[ "${{ runner.os }}" == "Windows" ]]; then
-          # ── Windows Server 2022 ──────────────────────────────────────────────
-          # MSVC STL (VS 2022 17.11+) needs Clang ≥19. Auto-bump if caller asks for less.
-          if [[ "${MAJOR}" -lt 19 ]]; then
-            echo "::notice ::Requested LLVM ${VERSION} is older than MSVC STL accepts; upgrading to LLVM 20.1.7"
-            VERSION="20.1.7"
-            MAJOR="20"
+          # The MSVC STL on windows-latest requires Clang 22 or newer.
+          if [[ "${MAJOR}" -lt 22 ]]; then
+            VERSION="22.1.8"
           fi
-
-          echo "→ chocolatey upgrade llvm --version=${VERSION}"
           choco upgrade llvm --version="${VERSION}" -y --no-progress --allow-downgrade
 
           # Add to PATH; quoting keeps the space intact
