@@ -7,6 +7,7 @@
 #include "fls/api/api.hpp"
 #include "fls/common/alias.hpp"
 #include "fls/common/assert.hpp"
+#include "fls/expression/data_type.hpp" // IWYU pragma: keep (explicit instantiations)
 #include "fls/io/external_memory.hpp"
 #include "fls/std/span.hpp"
 #include <algorithm>

@@ -10,7 +10,7 @@ description: Cross-platform LLVM installer for macOS, Ubuntu and Windows
 inputs:
   version:
     description: "Latest stable LLVM release, or a release version (major or major.minor.patch)"
-    default: latest
+    default: "23"
 
 runs:
   using: "composite"
@@ -28,7 +28,7 @@ runs:
         elif [[ "$VERSION" =~ ^[0-9]+$ ]]; then
           # Pick a stable patch release from the requested major.
           tag=$(git ls-remote --tags --refs https://github.com/llvm/llvm-project.git "llvmorg-$VERSION.*" |
-            awk -F/ '$NF ~ /^llvmorg-[0-9]+\.[0-9]+\.[0-9]+$/ { print $NF }' | sort -V | tail -1)
+            awk -F/ '$NF ~ /^llvmorg-[0-9]+\.[0-9]+\.[0-9]+$/ { print $NF }' | sort -t. -k2,2n -k3,3n | tail -1)
           VERSION="${tag#llvmorg-}"
         fi
         if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then

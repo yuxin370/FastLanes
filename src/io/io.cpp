@@ -7,11 +7,13 @@
 #include "fls/common/alias.hpp"
 #include "fls/common/common.hpp"
 #include "fls/cor/lyt/buf.hpp"
+#include "fls/expression/data_type.hpp" // IWYU pragma: keep (explicit instantiations)
 #include "fls/io/external_memory.hpp"
 #include "fls/io/file.hpp"
 #include "fls/io/read_source.hpp"
 #include "fls/std/span.hpp"
 #include "fls/std/variant.hpp"
+#include <cstddef> // IWYU pragma: keep (explicit instantiations)
 #include <stdexcept>
 #include <variant>
 
