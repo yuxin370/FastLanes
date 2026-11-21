@@ -429,8 +429,7 @@ void run_benchmarks(std::array<std::pair<string_view, string_view>, N> name_to_p
 	std::ofstream  out(result_path);
 
 	if (!out.is_open()) {
-		std::cerr << "Unable to open " << result_path << std::endl;
-		return;
+		FAIL() << "Unable to open " << result_path;
 	}
 
 	out << "file_name,"
@@ -452,17 +451,17 @@ void run_benchmarks(std::array<std::pair<string_view, string_view>, N> name_to_p
 class TestFLSFSST : public ::testing::Test {};
 
 TEST_F(TestFLSFSST, fsst_test_data) {
-	constexpr std::string_view result_file_path = FSST_CMAKE_SOURCE_DIR "/benchmarks/results/fsst/test.csv";
+	constexpr std::string_view result_file_path = "fsst-test.csv";
 	run_benchmarks<FSSTCompressionRunner, 1>(data::test::NAME_TO_PATH_MAP, result_file_path, false);
 }
 
 TEST_F(TestFLSFSST, fsst_dbtext) {
-	constexpr std::string_view result_file_path = FSST_CMAKE_SOURCE_DIR "/benchmarks/results/fsst/dbtext.csv";
+	constexpr std::string_view result_file_path = "fsst-dbtext.csv";
 	run_benchmarks<FSSTCompressionRunner, 23>(data::dbtext::NAME_TO_PATH_MAP, result_file_path, true);
 }
 
 TEST_F(TestFLSFSST, fsst12_test_data) {
-	constexpr std::string_view result_file_path = FSST_CMAKE_SOURCE_DIR "/benchmarks/results/fsst12/test.csv";
+	constexpr std::string_view result_file_path = "fsst12-test.csv";
 	run_benchmarks<FSST12CompressionRunner, 1>(data::test::NAME_TO_PATH_MAP, result_file_path, false);
 }
 
