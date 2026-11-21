@@ -22,10 +22,11 @@ fsst12_encoder_t* fsst12_helper::make_fsst12(const FlsStrColumnView& col) {
 }
 
 fsst12_encoder_t* fsst12_helper::make_fsst12(n_t n_vals, Buf& length_buf, Buf& string_p_buf) {
-	auto* lengths_p = reinterpret_cast<len_t*>(length_buf.data());
-	auto* strings_p = reinterpret_cast<uint8_t**>(string_p_buf.data());
+	return make_fsst12(n_vals, length_buf.mutable_data<len_t>(), string_p_buf.mutable_data<uint8_t*>());
+}
 
-	return fsst12_create(n_vals, lengths_p, strings_p, CFG::FSST::NULL_TERMINATED);
+fsst12_encoder_t* fsst12_helper::make_fsst12(n_t n_vals, len_t* lengths, uint8_t** strings) {
+	return fsst12_create(n_vals, lengths, strings, CFG::FSST::NULL_TERMINATED);
 }
 
 // optimized adaptive *scalar* compression method

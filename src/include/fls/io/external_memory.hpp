@@ -15,6 +15,10 @@ class Buf;
 class ExternalMemory {
 
 public:
+	explicit ExternalMemory(span<std::byte> bytes)
+	    : m_data_span(bytes) {
+	}
+
 	template <typename T>
 	ExternalMemory(T* pointer, sz_t n_bytes);
 

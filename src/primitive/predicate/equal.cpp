@@ -7,6 +7,7 @@
 #include "fls/cfg/cfg.hpp"
 #include "fls/common/alias.hpp"
 #include "fls/common/restrict.hpp"
+#include "fls/expression/data_type.hpp" // IWYU pragma: keep (explicit instantiations)
 #include "fls/expression/selection_ds.hpp"
 #include <cstdint>
 namespace fastlanes {

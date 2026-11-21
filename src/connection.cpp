@@ -4,15 +4,20 @@
 // src/connection.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/connection.hpp" // for Connection
+#include "file/staged_output.hpp"
 #include "fls/cfg/cfg.hpp"
-#include "fls/common/alias.hpp"     // for make_unique<>, n_t, idx_t, fls_bool, FLS_TRUE
-#include "fls/common/status.hpp"    // for Status
-#include "fls/encoder/encoder.hpp"  // for Encoder
+#include "fls/common/alias.hpp"    // for make_unique<>, n_t, idx_t, fls_bool, FLS_TRUE
+#include "fls/common/status.hpp"   // for Status
+#include "fls/encoder/encoder.hpp" // for Encoder
+#include "fls/encoder/encoding_options.hpp"
+#include "fls/encoder/parallel_rowgroups.hpp"
+#include "fls/encoder/validate_options.hpp"
 #include "fls/file/file_footer.hpp" // for FileFooter
 #include "fls/file/file_header.hpp" // for FileHeader
 #include "fls/flatbuffers/flatbuffers.hpp"
 #include "fls/footer/operator_token_generated.h"
 #include "fls/info.hpp"
+#include "fls/io/file.hpp"
 #include "fls/json/fls_json.hpp"       // for JSON
 #include "fls/reader/csv_reader.hpp"   // for CSVReader
 #include "fls/reader/json_reader.hpp"  // for JSONReader
@@ -20,13 +25,16 @@
 #include "fls/std/filesystem.hpp"      // for std::filesystem::directory_iterator, begin, path
 #include "fls/std/string.hpp"          // for std::string
 #include "fls/std/vector.hpp"          // for fastlanes::vector
+#include "fls/table/memory_table.hpp"  // for MemoryTable
 #include "fls/table/rowgroup.hpp"      // for Rowgroup
 #include "fls/table/table.hpp"         // for Table
 #include "fls/wizard/wizard.hpp"       // for Wizard
 #include <algorithm>                   // for std::ranges::none_of
-#include <cstdint>                     // for uint64_t
+#include <chrono>
+#include <cstdint> // for uint64_t
 #include <filesystem>
-#include <memory>    // for std::make_unique, unique_ptr
+#include <memory> // for std::make_unique, unique_ptr
+#include <optional>
 #include <stdexcept> // for std::runtime_error
 
 namespace fastlanes {
@@ -51,6 +59,11 @@ Connection& Connection::read_json(const path& dir_path) {
 	return *this;
 }
 
+Connection& Connection::read_memory(const MemoryTable& table, const MemoryTableOptions& options) {
+	load_memory_table(*this, table, options);
+	return *this;
+}
+
 up<TableReader> Connection::read_fls(const path& file_path) {
 	FileSystem::check_if_file_exists(file_path);
 
@@ -58,6 +71,9 @@ up<TableReader> Connection::read_fls(const path& file_path) {
 	return make_unique<TableReader>(file_path, *this);
 }
 
+up<TableReader> Connection::read_fls(ReadSource source, std::optional<ReadSource> external_descriptor) {
+	return make_unique<TableReader>(source, *this, external_descriptor);
+}
 void prepare_rowgroup(Rowgroup& rowgroup, const Config& config) {
 	// init
 	rowgroup.Init();
@@ -75,10 +91,10 @@ void prepare_rowgroup(Rowgroup& rowgroup, const Config& config) {
 	rowgroup.PopulateBiMap();
 }
 
-void Connection::prepare_table() const {
-	for (auto& rowgroup : m_table->m_rowgroups) {
-		prepare_rowgroup(*rowgroup, *m_config);
-	}
+void Connection::prepare_table(const n_t worker_count) const {
+	detail::parallel_rowgroups(m_table->get_n_rowgroups(), worker_count, "prepare_table", [&](n_t index) {
+		prepare_rowgroup(*m_table->m_rowgroups[index], *m_config);
+	});
 }
 
 void Connection::write_footer(const path& file_path) const {
@@ -101,12 +117,23 @@ Connection& Connection::spell() {
 		throw std::runtime_error("Data is not loaded.");
 	}
 
-	m_table_descriptor = Wizard::Spell(*this);
+	try {
+		m_table_descriptor = Wizard::Spell(*this);
+	} catch (...) {
+		reset();
+		throw;
+	}
 
 	return *this;
 }
 
 Connection& Connection::to_fls(const path& file_path) {
+	return to_fls(file_path, EncodingOptions {});
+}
+
+Connection& Connection::to_fls(const path& file_path, const EncodingOptions& options) {
+	detail::validate_encoding_options(options);
+	const auto total_started = std::chrono::steady_clock::now();
 	if (exists(file_path)) {
 		throw std::runtime_error("Fastlanes file already exists at: " + file_path.string());
 	}
@@ -116,33 +143,61 @@ Connection& Connection::to_fls(const path& file_path) {
 		throw std::runtime_error("data is not loaded.");
 	}
 
-	prepare_table();
+	try {
+		prepare_table(options.worker_count);
+		if (m_table_descriptor == nullptr) {
+			m_table_descriptor = Wizard::Spell(*this, options.worker_count);
+		}
+		const auto preparation_finished = std::chrono::steady_clock::now();
 
-	//  make a rowgroup-get_descriptor if there is no rowgroup-get_descriptor .
-	if (m_table_descriptor == nullptr) {
-		spell();
+		m_last_encoding_stats = {};
+		detail::StagedOutput staged_output(file_path);
+		FileHeader::Write(*this, staged_output.file_path());
+
+		// encode
+		const auto encoding_started  = std::chrono::steady_clock::now();
+		m_last_encoding_stats        = Encoder::encode(*this, staged_output.file_path(), options);
+		const auto encoding_finished = std::chrono::steady_clock::now();
+
+		if (m_config->enable_verbose) {
+			fs::path json_file = staged_output.file_path();
+			json_file += ".json";
+			JSON::write(*this, json_file, *m_table_descriptor);
+		}
+
+		// write the footer
+		write_footer(staged_output.file_path());
+		staged_output.publish(!static_cast<bool>(m_config->inline_footer), m_config->enable_verbose);
+		const auto total_finished = std::chrono::steady_clock::now();
+		m_last_encoding_stats.preparation_wall_seconds =
+		    std::chrono::duration<double>(preparation_finished - total_started).count();
+		m_last_encoding_stats.encoding_wall_seconds =
+		    std::chrono::duration<double>(encoding_finished - encoding_started).count();
+		m_last_encoding_stats.finalization_wall_seconds =
+		    std::chrono::duration<double>(total_finished - encoding_finished).count();
+		m_last_encoding_stats.total_wall_seconds =
+		    std::chrono::duration<double>(total_finished - total_started).count();
+	} catch (...) {
+		// Preparation mutates columns in place. All workers have exited before
+		// discarding the table; callers must reload input before retrying.
+		reset();
+		m_last_encoding_stats = {};
+		throw;
 	}
-
-	FileHeader::Write(*this, file_path);
-
-	// encode
-	Encoder::encode(*this, file_path);
-
-	if (m_config->enable_verbose) {
-		fs::path json_file = file_path;
-		json_file += ".json";
-		JSON::write(*this, json_file, *m_table_descriptor);
-	}
-
-	// write the footer
-	write_footer(file_path);
 
 	return *this;
 }
 
 Status Connection::verify_fls(const path& file_path) {
+	File file(file_path);
+	return verify_fls(ReadSource(file));
+}
+
+Status Connection::verify_fls(const ReadSource& source) {
 	FileHeader file_header {};
-	FileHeader::Load(file_header, file_path);
+	if (auto status = FileHeader::Load(file_header, source); !status.success) {
+		return status;
+	}
 
 	if (file_header.magic_bytes != Info::get_magic_bytes()) {
 		return Status::Error(Status::ErrorCode::ERR_5_INVALID_MAGIC_BYTES);
@@ -154,13 +209,7 @@ Status Connection::verify_fls(const path& file_path) {
 	}
 
 	FileFooter file_footer {};
-	FileFooter::Load(file_footer, file_path);
-
-	if (file_footer.magic_bytes != Info::get_magic_bytes()) {
-		return Status::Error(Status::ErrorCode::ERR_5_INVALID_MAGIC_BYTES);
-	}
-
-	return Status::Ok();
+	return FileFooter::Load(file_footer, source);
 }
 
 Connection& Connection::reset() {
@@ -235,7 +284,9 @@ n_t Connection::get_sample_size() const {
 }
 
 Table& Connection::get_table() const {
-	//
+	if (!m_table) {
+		throw std::runtime_error("Data is not loaded; reload input before accessing the table.");
+	}
 	return *m_table;
 }
 
@@ -251,6 +302,10 @@ Connection& Connection::inline_footer() {
 
 string_view Connection::get_version() const {
 	return Info::get_version();
+}
+
+const EncodingStats& Connection::get_last_encoding_stats() const {
+	return m_last_encoding_stats;
 }
 
 /*--------------------------------------------------------------------------------------------------------------------*\

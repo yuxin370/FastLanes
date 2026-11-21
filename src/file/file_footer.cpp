@@ -11,9 +11,8 @@
 #include "fls/info.hpp"
 #include "fls/io/file.hpp"
 #include "fls/io/io.hpp"
+#include "fls/io/read_source.hpp"
 #include "fls/std/filesystem.hpp"
-#include <fstream> // for std::ifstream
-#include <ios>     // for std::ios
 
 namespace fastlanes {
 
@@ -24,19 +23,20 @@ void FileFooter::Write(const Connection& connection, const path& file_path, cons
 }
 
 Status FileFooter::Load(FileFooter& file_footer, const path& file_path) {
-	const io io = make_unique<File>(file_path);
+	File file(file_path);
+	return Load(file_footer, file);
+}
 
-	if (const auto file_size = IO::get_size(io); file_size < sizeof(FileHeader) + sizeof(FileFooter)) {
+Status FileFooter::Load(FileFooter& value, File& file) {
+	return Load(value, ReadSource(file));
+}
+
+Status FileFooter::Load(FileFooter& file_footer, const ReadSource& source) {
+	const auto file_size = source.Size();
+	if (file_size < sizeof(FileHeader) + sizeof(FileFooter)) {
 		return Status::Error(Status::ErrorCode::ERR_1_SMALL_FILE_SIZE);
 	}
-
-	std::ifstream file(file_path, std::ios::binary);
-
-	// Seek to 8 bytes before end
-	file.seekg(static_cast<std::streamoff>(-1) * static_cast<std::streamoff>(sizeof(FileFooter)), std::ios::end);
-
-	// Read last 8 bytes
-	file.read(reinterpret_cast<char*>(&file_footer), sizeof(FileFooter));
+	source.ReadRange(&file_footer, file_size - sizeof(FileFooter), sizeof(FileFooter));
 
 	if (file_footer.magic_bytes != Info::get_magic_bytes()) {
 		return Status::Error(Status::ErrorCode::ERR_5_INVALID_MAGIC_BYTES);

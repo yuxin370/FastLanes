@@ -4,13 +4,17 @@
 // src/cor/lyt/buf.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/cor/lyt/buf.hpp"
+#include "fls/api/api.hpp"
 #include "fls/common/alias.hpp"
 #include "fls/common/assert.hpp"
+#include "fls/expression/data_type.hpp" // IWYU pragma: keep (explicit instantiations)
 #include "fls/io/external_memory.hpp"
 #include "fls/std/span.hpp"
+#include <algorithm>
 #include <cstddef> // for std::byte
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace fastlanes {
@@ -77,11 +81,29 @@ uint8_t* Buf::data() const {
 	return m_active_p;
 }
 
+void Buf::ensure_space(n_t size) {
+	if (size > std::numeric_limits<n_t>::max() - m_off) {
+		throw std::overflow_error("buffer size overflow");
+	}
+	const auto required_capacity = m_off + size;
+	if (required_capacity > m_capacity) {
+		n_t new_capacity = m_capacity;
+		while (new_capacity < required_capacity) {
+			if (new_capacity > std::numeric_limits<n_t>::max() / 2) {
+				new_capacity = required_capacity;
+				break;
+			}
+			new_capacity = std::max<n_t>(1, new_capacity * 2);
+		}
+		Resize(new_capacity);
+	}
+}
+
 template <typename PT>
 PT* Buf::GetFixedSizeArray(const n_t size) {
 	FLS_ASSERT_CORRECT_SZ(size)
 
-	FLS_ASSERT_LE(m_off + size, m_capacity)
+	ensure_space(size);
 	m_off += size;
 
 	return reinterpret_cast<PT*>(m_active_p);
@@ -101,11 +123,7 @@ const PT* Buf::data() {
 void Buf::Append(const void* data_p, const n_t sz) {
 	/**/
 	FLS_ASSERT_NOT_NULL_POINTER(data_p)
-	FLS_ASSERT_LE(m_off + sz, m_capacity)
-
-	if (m_off + sz > m_capacity) {
-		FLS_ABORT("NOT ENOUGH SPACE!")
-	}
+	ensure_space(sz);
 
 	std::memcpy(m_active_p + m_off, data_p, sz);
 	m_off += sz;
@@ -180,17 +198,21 @@ void Buf::Resize(const sz_t new_sz) {
 	FLS_ASSERT_CORRECT_SZ(new_sz)
 
 	if (m_owned_p != m_active_p) {
-		throw std::runtime_error("Buffer is already swapped, swapped buffer can be resized.");
+		throw std::runtime_error("Buffer is already swapped, swapped buffer cannot be resized.");
 	}
 	if (new_sz <= m_capacity) {
 		return;
 	}
 
 	auto* tmp_p = new uint8_t[new_sz];
-	ExternalMemory::Copy(tmp_p, m_owned_p, m_capacity);
+	if (m_off != 0) {
+		ExternalMemory::Copy(tmp_p, m_owned_p, m_off);
+	}
 
 	delete[] m_owned_p;
-	m_owned_p = tmp_p;
+	m_owned_p  = tmp_p;
+	m_active_p = tmp_p;
+	m_capacity = new_sz;
 }
 
 sz_t Buf::Size() const {
@@ -216,20 +238,21 @@ void Buf::Clone(const Buf& a_buf) {
 /*---------------------------------------------------------------------------------------------------------------------\
  * Specialization
 \---------------------------------------------------------------------------------------------------------------------*/
-template const ofs_t* Buf::data<ofs_t>();
-template uint32_t*    Buf::mutable_data<uint32_t>();
-template uint64_t*    Buf::mutable_data<uint64_t>();
-template uint8_t*     Buf::mutable_data<uint8_t>();
-template uint8_t**    Buf::mutable_data<uint8_t*>();
+template FLS_API const ofs_t* Buf::data<ofs_t>();
+template FLS_API uint32_t*    Buf::mutable_data<uint32_t>();
+template FLS_API uint64_t*    Buf::mutable_data<uint64_t>();
+template FLS_API uint8_t*     Buf::mutable_data<uint8_t>();
+template FLS_API uint8_t**    Buf::mutable_data<uint8_t*>();
 
-template i64_pt* Buf::GetFixedSizeArray<i64_pt>(n_t length);
-template i32_pt* Buf::GetFixedSizeArray<i32_pt>(n_t length);
-template i16_pt* Buf::GetFixedSizeArray<i16_pt>(n_t length);
-template i08_pt* Buf::GetFixedSizeArray<i08_pt>(n_t length);
-template dbl_pt* Buf::GetFixedSizeArray<dbl_pt>(n_t length);
-template flt_pt* Buf::GetFixedSizeArray<flt_pt>(n_t length);
-template u08_pt* Buf::GetFixedSizeArray<u08_pt>(n_t length);
+template FLS_API i64_pt*   Buf::GetFixedSizeArray<i64_pt>(n_t length);
+template FLS_API i32_pt*   Buf::GetFixedSizeArray<i32_pt>(n_t length);
+template FLS_API i16_pt*   Buf::GetFixedSizeArray<i16_pt>(n_t length);
+template FLS_API i08_pt*   Buf::GetFixedSizeArray<i08_pt>(n_t length);
+template FLS_API dbl_pt*   Buf::GetFixedSizeArray<dbl_pt>(n_t length);
+template FLS_API flt_pt*   Buf::GetFixedSizeArray<flt_pt>(n_t length);
+template FLS_API u08_pt*   Buf::GetFixedSizeArray<u08_pt>(n_t length);
+template FLS_API uint8_t** Buf::GetFixedSizeArray<uint8_t*>(n_t length);
 
-template void Buf::TypedAppend(const ofs_t* data_p);
+template FLS_API void Buf::TypedAppend(const ofs_t* data_p);
 
 } // namespace fastlanes

@@ -1,9 +1,15 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# src/io/CMakeLists.txt
+# ────────────────────────────────────────────────────────
 add_library(fls_io
         OBJECT
         #[[]]
         external_memory.cpp
         file.cpp
         io.cpp
+        read_source.cpp
         mmap.cpp
         s3.cpp
         socket.cpp

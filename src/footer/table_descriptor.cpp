@@ -4,21 +4,22 @@
 // src/footer/table_descriptor.cpp
 // ────────────────────────────────────────────────────────
 #include "fls/footer/table_descriptor.hpp"
+#include "flatbuffers/base.h"
 #include "flatbuffers/flatbuffer_builder.h"
 #include "flatbuffers/verifier.h" // flatbuffers::Verifier
 #include "fls/common/alias.hpp"
-#include "fls/cor/lyt/buf.hpp"
 #include "fls/footer/rowgroup_descriptor.hpp"
 #include "fls/footer/table_descriptor_generated.h"
 #include "fls/io/file.hpp"
+#include "fls/io/read_source.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/std/vector.hpp"
 #include "fls/table/table.hpp"
+#include <algorithm>
 #include <cstddef> // std::size_t
 #include <cstdint> // uint8_t
 #include <cstring> // std::memcpy
-#include <fstream>
-#include <ios>
+#include <limits>
 #include <memory> // std::shared_ptr, std::make_shared
 #include <stdexcept>
 #include <utility> // std::move
@@ -26,13 +27,29 @@
 
 namespace fastlanes {
 
+namespace {
+
+flatbuffers::Verifier::Options table_descriptor_verifier_options(const std::size_t byte_size) {
+	flatbuffers::Verifier::Options options;
+	// Large shards contain many small expression tables per (rowgroup, column). The fixed one-million-table default
+	// rejects a valid descriptor before finding any malformed byte. No valid table can consume fewer than one byte, so
+	// using the buffer size as the ceiling keeps verification finite and input-size-proportional while allowing the
+	// rowgroup index to scale.
+	const auto table_budget = std::max<std::size_t>(options.max_tables, byte_size);
+	options.max_tables      = static_cast<flatbuffers::uoffset_t>(
+        std::min<std::size_t>(table_budget, std::numeric_limits<flatbuffers::uoffset_t>::max()));
+	return options;
+}
+
+} // namespace
+
 const TableDescriptor& get_table_descriptor(const uint8_t* data, std::size_t size) {
 	if (!data || size == 0) {
 		throw std::invalid_argument("get_table_descriptor: null data or zero size");
 	}
 #if defined(DEBUG)
 	{
-		flatbuffers::Verifier v(data, size);
+		flatbuffers::Verifier v(data, size, table_descriptor_verifier_options(size));
 		if (!VerifyTableDescriptorBuffer(v)) {
 			throw std::runtime_error("get_table_descriptor: invalid TableDescriptor FlatBuffer");
 		}
@@ -41,36 +58,44 @@ const TableDescriptor& get_table_descriptor(const uint8_t* data, std::size_t siz
 	return *GetTableDescriptor(data);
 }
 
+namespace {
+
+vector<uint8_t> read_file_bytes(const ReadSource& source) {
+	const auto size = static_cast<std::size_t>(source.Size());
+	if (size == 0) {
+		throw std::runtime_error("TableDescriptorHandle::FromFile: empty file");
+	}
+
+	vector<uint8_t> storage(size);
+	source.ReadRange(storage.data(), 0, size);
+	return storage;
+}
+
+vector<uint8_t> read_file_slice(const ReadSource& source, n_t offset, n_t size) {
+	const auto file_size = source.Size();
+	if (offset > file_size || size > file_size - offset) {
+		throw std::runtime_error("TableDescriptorHandle::FromFileSlice: read range exceeds file size");
+	}
+
+	vector<uint8_t> storage(static_cast<std::size_t>(size));
+	if (size > 0) {
+		source.ReadRange(storage.data(), offset, size);
+	}
+	return storage;
+}
+
+} // namespace
+
 const TableDescriptor& make_table_descriptor(const path& file_path, std::vector<uint8_t>& storage) {
-	std::ifstream in {file_path, std::ios::binary | std::ios::ate};
-	if (!in) {
-		throw std::runtime_error("make_table_descriptor: failed to open footer: " + file_path.string());
-	}
-
-	const auto sz = static_cast<std::size_t>(in.tellg());
-	if (sz == 0) {
-		throw std::runtime_error("make_table_descriptor: empty footer file: " + file_path.string());
-	}
-
-	storage.resize(sz);
-	in.seekg(0, std::ios::beg);
-	if (!in.read(reinterpret_cast<char*>(storage.data()), static_cast<std::streamsize>(sz))) {
-		throw std::runtime_error("make_table_descriptor: failed to read footer: " + file_path.string());
-	}
-
+	File file(file_path);
+	storage = read_file_bytes(file);
 	return get_table_descriptor(storage.data(), storage.size());
 }
 
 const TableDescriptor&
 make_table_descriptor(const path& file_path, n_t offset, n_t size, std::vector<uint8_t>& storage) {
-	File f(file_path);
-	Buf  buf;
-
-	f.ReadRange(buf, offset, size);
-
-	const auto* p = reinterpret_cast<const uint8_t*>(buf.data());
-	storage.assign(p, p + buf.Size());
-
+	File file(file_path);
+	storage = read_file_slice(file, offset, size);
 	return get_table_descriptor(storage.data(), storage.size());
 }
 
@@ -84,13 +109,13 @@ const TableDescriptor* TableDescriptorHandle::MakePtr(const std::shared_ptr<vect
 
 #if defined(DEBUG)
 	(void)verify; // always verify in DEBUG
-	flatbuffers::Verifier v(data, sz);
+	flatbuffers::Verifier v(data, sz, table_descriptor_verifier_options(sz));
 	if (!VerifyTableDescriptorBuffer(v)) {
 		throw std::runtime_error("TableDescriptorHandle: verification failed (DEBUG)");
 	}
 #else
 	if (verify) {
-		flatbuffers::Verifier v(data, sz);
+		flatbuffers::Verifier v(data, sz, table_descriptor_verifier_options(sz));
 		if (!VerifyTableDescriptorBuffer(v)) {
 			throw std::runtime_error("TableDescriptorHandle: verification failed");
 		}
@@ -107,35 +132,30 @@ TableDescriptorHandle TableDescriptorHandle::FromBytes(vector<uint8_t> bytes, bo
 }
 
 TableDescriptorHandle TableDescriptorHandle::FromFile(const path& file_path, bool verify) {
-	std::ifstream in {file_path, std::ios::binary | std::ios::ate};
-	if (!in) {
-		throw std::runtime_error("TableDescriptorHandle::FromFile: failed to open: " + file_path.string());
-	}
+	File file(file_path);
+	return FromSource(file, verify);
+}
 
-	const auto sz = static_cast<std::size_t>(in.tellg());
-	if (sz == 0) {
-		throw std::runtime_error("TableDescriptorHandle::FromFile: empty file: " + file_path.string());
-	}
+TableDescriptorHandle TableDescriptorHandle::FromFile(File& file, bool verify) {
+	return FromSource(file, verify);
+}
 
-	vector<uint8_t> storage(sz);
-	in.seekg(0, std::ios::beg);
-	if (!in.read(reinterpret_cast<char*>(storage.data()), static_cast<std::streamsize>(sz))) {
-		throw std::runtime_error("TableDescriptorHandle::FromFile: failed to read: " + file_path.string());
-	}
-
-	return FromBytes(std::move(storage), verify);
+TableDescriptorHandle TableDescriptorHandle::FromSource(const ReadSource& source, bool verify) {
+	return FromBytes(read_file_bytes(source), verify);
 }
 
 TableDescriptorHandle TableDescriptorHandle::FromFileSlice(const path& file_path, n_t offset, n_t size, bool verify) {
-	File f(file_path);
-	Buf  buf;
-	f.ReadRange(buf, offset, size);
+	File file(file_path);
+	return FromSourceSlice(file, offset, size, verify);
+}
 
-	const auto*     p = reinterpret_cast<const uint8_t*>(buf.data());
-	vector<uint8_t> storage;
-	storage.assign(p, p + size);
+TableDescriptorHandle TableDescriptorHandle::FromFileSlice(File& file, n_t offset, n_t size, bool verify) {
+	return FromSourceSlice(file, offset, size, verify);
+}
 
-	return FromBytes(std::move(storage), verify);
+TableDescriptorHandle
+TableDescriptorHandle::FromSourceSlice(const ReadSource& source, n_t offset, n_t size, bool verify) {
+	return FromBytes(read_file_slice(source, offset, size), verify);
 }
 
 TableDescriptorHandle TableDescriptorHandle::FromNative(const TableDescriptorT& native) {

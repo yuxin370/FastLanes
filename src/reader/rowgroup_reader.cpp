@@ -15,14 +15,15 @@
 #include "fls/expression/interpreter.hpp"         // for Interpreter
 #include "fls/expression/physical_expression.hpp" // for PhysicalExpr
 #include "fls/footer/rowgroup_descriptor.hpp"     // for Footer, ColumnMeta...
-#include "fls/io/file.hpp"                        // for File
-#include "fls/io/io.hpp"                          // for IO, io
+#include "fls/footer/table_descriptor.hpp"
+#include "fls/io/file.hpp" // for File
 #include "fls/reader/column_view.hpp"
 #include "fls/reader/rowgroup_view.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/table/chunk.hpp" // for Chunk
 #include <cstdint>             // for std::uint32_t
 #include <memory>              // for make_unique, uniqu...
+#include <utility>
 
 namespace fastlanes {
 
@@ -33,15 +34,24 @@ RowgroupReader::RowgroupReader(const path&               file_path,
                                Connection&               connection)
     : m_connection(connection)
     , m_rowgroup_descriptor(rowgroup_descriptor) {
+	File file(file_path);
+	initialize(file);
+}
 
-	// read file
-	{
-		// allocate buffer
-		m_buf = make_unique<Buf>(m_rowgroup_descriptor.m_size()); // todo[memory_pool]
-		io io = make_unique<File>(file_path);                     // todo[IO]
-		IO::range_read(io, *m_buf, m_rowgroup_descriptor.m_offset(), m_rowgroup_descriptor.m_size());
-		m_rowgroup_view = make_unique<RowgroupView>(m_buf->Span(), m_rowgroup_descriptor);
-	}
+RowgroupReader::RowgroupReader(const ReadSource&               source,
+                               const RowgroupDescriptor&       rowgroup_descriptor,
+                               Connection&                     connection,
+                               sp<const TableDescriptorHandle> owner)
+    : m_descriptor_owner(std::move(owner))
+    , m_connection(connection)
+    , m_rowgroup_descriptor(rowgroup_descriptor) {
+	initialize(source);
+}
+
+void RowgroupReader::initialize(const ReadSource& source) {
+	m_buf = make_unique<Buf>(0);
+	source.ReadRange(*m_buf, m_rowgroup_descriptor.m_offset(), m_rowgroup_descriptor.m_size());
+	m_rowgroup_view = make_unique<RowgroupView>(m_buf->Span(), m_rowgroup_descriptor);
 
 	// init level 1 expression
 	{

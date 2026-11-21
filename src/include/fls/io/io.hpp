@@ -54,14 +54,16 @@ public:
 	///
 	static void append(io& io, const char* pointer, n_t size);
 	///
-	static void read(const io& io, Buf& buf);
+	static FLS_API void read(const io& io, Buf& buf);
 	///
-	static void range_read(const io& io, Buf& buf, n_t offset, n_t size);
+	static FLS_API void range_read(const io& io, Buf& buf, n_t offset, n_t size);
+	///
+	static FLS_API void range_read(const io& io, void* dst, n_t offset, n_t size);
 	///
 	template <typename PT>
 	static span<PT> read(const io& io);
 	///
-	static n_t get_size(const io& io);
+	static FLS_API n_t get_size(const io& io);
 };
 
 } // namespace fastlanes

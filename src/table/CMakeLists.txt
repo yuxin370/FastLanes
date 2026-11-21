@@ -1,9 +1,15 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# src/table/CMakeLists.txt
+# ────────────────────────────────────────────────────────
 add_library(fls_table
         OBJECT
         attribute.cpp
         chunk.cpp
         #[[]]
         column.cpp
+        memory_table.cpp
         rowgroup.cpp
         stats.cpp
         table.cpp
