@@ -11,12 +11,17 @@
 #include "fls/file/file_header.hpp"
 #include "fls/footer/table_descriptor.hpp"
 #include "fls/footer/table_descriptor_generated.h"
+#include "fls/io/file.hpp"
 #include "fls/reader/rowgroup_reader.hpp"
 #include "fls/std/filesystem.hpp"
 #include "fls/std/string.hpp"
 #include <filesystem>         // std::filesystem::path, exists, is_directory, is_regular_file
 #include <flatbuffers/base.h> // flatbuffers::uoffset_t
-#include <utility>            // std::move
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <utility> // std::move
+#include <variant>
 
 namespace fastlanes {
 
@@ -26,7 +31,11 @@ up<RowgroupReader> TableReader::get_rowgroup_reader(const n_t rowgroup_idx) cons
 	const TableDescriptor* td     = m_table_descriptor_handle->Get();
 	const auto             fb_idx = static_cast<flatbuffers::uoffset_t>(rowgroup_idx);
 	const auto*            rg     = td->m_rowgroup_descriptors()->Get(fb_idx); // pointer to RowgroupDescriptor (table)
-	return make_unique<RowgroupReader>(m_file_path, *rg, m_connection);
+	if (const auto* file_path = std::get_if<path>(&m_input)) {
+		File file(*file_path);
+		return make_unique<RowgroupReader>(ReadSource(file), *rg, m_connection, m_table_descriptor_handle);
+	}
+	return make_unique<RowgroupReader>(std::get<ReadSource>(m_input), *rg, m_connection, m_table_descriptor_handle);
 }
 
 up<Table> TableReader::materialize() const {
@@ -73,20 +82,33 @@ TableReader::~TableReader() = default;
 
 TableReader::TableReader(const path& file_path, Connection& connection)
     : m_connection(connection)
-    , m_file_path(file_path) {
-	FileFooter file_footer {};
-	FileHeader file_header {};
+    , m_input(file_path) {
+	File file(file_path);
+	File external(file_path.parent_path() / TABLE_DESCRIPTOR_FILE_NAME);
+	load_descriptor(file, ReadSource(external));
+}
 
-	FileHeader::Load(file_header, file_path);
-	FileFooter::Load(file_footer, file_path);
+TableReader::TableReader(ReadSource source, Connection& connection, std::optional<ReadSource> external)
+    : m_connection(connection)
+    , m_input(source) {
+	load_descriptor(source, external);
+}
 
-	if (file_header.settings.inline_footer) {
-		// Inline footer: read slice
-		m_table_descriptor_handle =
-		    make_table_descriptor(file_path, file_footer.table_descriptor_offset, file_footer.table_descriptor_size);
+void TableReader::load_descriptor(const ReadSource& source, std::optional<ReadSource> external) {
+	FileHeader header {};
+	FileFooter footer {};
+	if (!FileHeader::Load(header, source).success || !FileFooter::Load(footer, source).success) {
+		throw std::runtime_error("invalid FastLanes header or footer");
+	}
+	if (header.settings.inline_footer) {
+		m_table_descriptor_handle = std::make_shared<TableDescriptorHandle>(TableDescriptorHandle::FromSourceSlice(
+		    source, footer.table_descriptor_offset, footer.table_descriptor_size));
 	} else {
-		// External footer file
-		m_table_descriptor_handle = make_table_descriptor(file_path.parent_path() / TABLE_DESCRIPTOR_FILE_NAME);
+		if (!external) {
+			throw std::invalid_argument("FastLanes input requires an external table descriptor");
+		}
+		m_table_descriptor_handle =
+		    std::make_shared<TableDescriptorHandle>(TableDescriptorHandle::FromSource(*external));
 	}
 }
 

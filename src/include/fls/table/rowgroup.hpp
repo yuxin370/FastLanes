@@ -220,7 +220,9 @@ public:
 
 public:
 	explicit Rowgroup(const RowgroupDescriptorT& rowgroup_footer, const Connection& connection);
+	Rowgroup(const RowgroupDescriptorT& rowgroup_footer, const Connection& connection, n_t capacity_in_rows);
 
+	~Rowgroup();
 	Rowgroup(const Rowgroup&)             = delete;
 	Rowgroup& operator=(const Rowgroup&)  = delete;
 	Rowgroup(const Rowgroup&&)            = delete;

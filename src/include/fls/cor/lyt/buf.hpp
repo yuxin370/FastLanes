@@ -58,6 +58,7 @@ public:
 
 private:
 	void init();
+	void ensure_space(n_t size);
 
 private:
 	/// capacity

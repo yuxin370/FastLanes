@@ -6,6 +6,7 @@
 #ifndef FLS_FILE_FILE_HEADER_HPP
 #define FLS_FILE_FILE_HEADER_HPP
 
+#include "fls/api/api.hpp"
 #include "fls/common/alias.hpp"
 #include "fls/common/status.hpp"
 #include "fls/std/filesystem.hpp"
@@ -13,6 +14,8 @@
 namespace fastlanes {
 /*--------------------------------------------------------------------------------------------------------------------*/
 class Connection;
+class ReadSource;
+class File;
 /*--------------------------------------------------------------------------------------------------------------------*/
 
 class Setting {
@@ -29,10 +32,12 @@ public:
 
 static_assert(sizeof(Setting) == 8);
 
-class FileHeader {
+class FLS_API FileHeader {
 public:
 	static void   Write(const Connection& connection, const path& dir_path);
 	static Status Load(FileHeader& file_footer, const path& file_path);
+	static Status Load(FileHeader& file_footer, File& file);
+	static Status Load(FileHeader& file_footer, const ReadSource& source);
 
 public:
 	uint64_t magic_bytes;

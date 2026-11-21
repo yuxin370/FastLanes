@@ -388,6 +388,10 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             CMAKE_ARGS+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
           fi
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            # Avoid starting sanitizer-instrumented test binaries during parallel linking.
+            CMAKE_ARGS+=(-DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST)
+          fi
           cmake "${CMAKE_ARGS[@]}"
 
       - name: Build tests

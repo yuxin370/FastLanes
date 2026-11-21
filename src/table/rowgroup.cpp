@@ -62,6 +62,8 @@ col_pt init_logical_columns(const ColumnDescriptorT& col_descriptor) {
 	}
 	case DataType::UINT8:
 		return make_unique<u08_col_t>();
+	case DataType::UINT16:
+		return make_unique<u16_col_t>();
 	case DataType::UINT32:
 		return make_unique<u32_col_t>();
 	case DataType::UINT64:
@@ -110,12 +112,18 @@ void init_logical_columns(const ColumnDescriptors& footer, rowgroup_pt& columns)
 	}
 }
 Rowgroup::Rowgroup(const RowgroupDescriptorT& footer, const Connection& connection)
+    : Rowgroup(footer, connection, connection.m_config->n_vector_per_rowgroup * CFG::VEC_SZ) {
+}
+
+Rowgroup::Rowgroup(const RowgroupDescriptorT& footer, const Connection& connection, n_t capacity_in_rows)
     : m_descriptor(footer) // RowgroupDescriptor -> RowgroupDescriptorT
     , n_tup(footer.m_n_tuples)
     , m_connection(connection)
-    , capacity(connection.m_config->n_vector_per_rowgroup * CFG::VEC_SZ) {
+    , capacity(capacity_in_rows) {
 	init_logical_columns(footer.m_column_descriptors, internal_rowgroup);
 }
+
+Rowgroup::~Rowgroup() = default;
 
 up<Rowgroup> Rowgroup::Project(const vector<idx_t>& idxs, const Connection& connection) {
 	/**/
@@ -529,9 +537,19 @@ void cast_from_logical_to_physical(const Rowgroup& old_table, Rowgroup& new_tabl
 }
 
 struct rowgroup_equality_visitor {
+	explicit rowgroup_equality_visitor(const n_t logical_row_count)
+	    : logical_row_count(logical_row_count) {
+	}
+
 	template <typename PT>
 	bool operator()(const up<TypedCol<PT>>& org_col, const up<TypedCol<PT>>& decoded_col) const {
-		for (idx_t idx {0}; idx < org_col->data.size(); ++idx) {
+		// Rowgroups are physically padded to whole vectors.  Equality is a table
+		// semantic and therefore compares only the n_tup logical rows; encodings
+		// are free to choose different values for the inaccessible padding tail.
+		if (org_col->data.size() < logical_row_count || decoded_col->data.size() < logical_row_count) {
+			return false;
+		}
+		for (n_t idx {0}; idx < logical_row_count; ++idx) {
 			if (idx < org_col->null_map_arr.size() && org_col->null_map_arr[idx]) {
 				continue;
 			}
@@ -550,8 +568,9 @@ struct rowgroup_equality_visitor {
 		}
 
 		for (idx_t col_idx {0}; col_idx < left->internal_rowgroup.size(); ++col_idx) {
-			const auto result = visit(
-			    rowgroup_equality_visitor {}, left->internal_rowgroup[col_idx], right->internal_rowgroup[col_idx]);
+			const auto result = visit(rowgroup_equality_visitor {logical_row_count},
+			                          left->internal_rowgroup[col_idx],
+			                          right->internal_rowgroup[col_idx]);
 
 			if (result == false) {
 				return false;
@@ -561,11 +580,11 @@ struct rowgroup_equality_visitor {
 	}
 
 	bool operator()(const up<FLSStrColumn>& org_col, const up<FLSStrColumn>& decoded_col) const {
-		if (org_col->length_arr.size() != decoded_col->length_arr.size()) {
+		if (org_col->length_arr.size() < logical_row_count || decoded_col->length_arr.size() < logical_row_count) {
 			return false;
 		}
 
-		for (idx_t idx {0}; idx < org_col->length_arr.size(); ++idx) {
+		for (n_t idx {0}; idx < logical_row_count; ++idx) {
 			if (idx < org_col->null_map_arr.size() && org_col->null_map_arr[idx]) {
 				continue;
 			}
@@ -579,9 +598,9 @@ struct rowgroup_equality_visitor {
 		return true;
 	}
 
-	bool operator()(const auto& arg1, const auto& arg2) const {
-		FLS_UNREACHABLE_WITH_TYPES(arg1, arg2)
-	}
+	bool operator()(const auto& arg1, const auto& arg2) const {FLS_UNREACHABLE_WITH_TYPES(arg1, arg2)}
+
+	n_t logical_row_count;
 };
 
 RowgroupComparisonResult Rowgroup::operator==(const Rowgroup& other_rowgroup) const {
@@ -599,8 +618,9 @@ RowgroupComparisonResult Rowgroup::operator==(const Rowgroup& other_rowgroup) co
 	}
 
 	for (n_t col_idx {0}; col_idx < this->internal_rowgroup.size(); col_idx++) {
-		const auto is_this_col_equal = visit(
-		    rowgroup_equality_visitor {}, this->internal_rowgroup[col_idx], other_rowgroup.internal_rowgroup[col_idx]);
+		const auto is_this_col_equal = visit(rowgroup_equality_visitor {n_tup},
+		                                     this->internal_rowgroup[col_idx],
+		                                     other_rowgroup.internal_rowgroup[col_idx]);
 		if (is_this_col_equal == false) {
 			result.is_equal                = false;
 			result.first_failed_column_idx = col_idx;
@@ -705,15 +725,17 @@ n_t Rowgroup::ColCount() const {
 template <typename PT>
 TypedColumnView<PT>::TypedColumnView(const col_pt& column)
     : m_vec_idx(INVALID_N) {
-	static const uint8_t zero_null_map[65536] = {};
 	visit(overloaded {//
 	                  [&](const up<TypedCol<PT>>& typed_col) {
 		                  //
 		                  m_data    = typed_col->data.data();
 		                  m_stats_p = &typed_col->m_stats;
 		                  n_vals    = typed_col->data.size();
-		                  m_bools   = typed_col->null_map_arr.empty() ? zero_null_map : typed_col->null_map_arr.data();
-		                  n_tuples  = typed_col->data.size();
+		                  // A missing null map means every value is valid. Keep that state explicit instead of pointing
+		                  // at a rowgroup-sized static array: rowgroups may legitimately contain more than the
+		                  // historical 64 vectors, and offsetting a fixed 64-vector buffer would read out of bounds.
+		                  m_bools  = typed_col->null_map_arr.empty() ? nullptr : typed_col->null_map_arr.data();
+		                  n_tuples = typed_col->data.size();
 	                  },
 	                  [&](const std::monostate&) { FLS_UNREACHABLE() },
 	                  [&](const auto& arg) {
@@ -745,6 +767,10 @@ template <typename PT>
 const uint8_t* TypedColumnView<PT>::NullMap() const {
 	FLS_ASSERT_CORRECT_IDX(m_vec_idx)
 
+	static const uint8_t zero_null_vector[CFG::VEC_SZ] = {};
+	if (m_bools == nullptr) {
+		return zero_null_vector;
+	}
 	return m_bools + (m_vec_idx * CFG::VEC_SZ);
 }
 
@@ -769,13 +795,12 @@ template class TypedColumnView<flt_pt>;
 \*--------------------------------------------------------------------------------------------------------------------*/
 
 NullMapView::NullMapView(const col_pt& column) {
-	static const uint8_t zero_null_map[65536] = {};
 	visit(overloaded {[&]<typename PT>(const up<TypedCol<PT>>& typed_col) {
-		                  m_null_map = typed_col->null_map_arr.empty() ? zero_null_map : typed_col->null_map_arr.data();
+		                  m_null_map = typed_col->null_map_arr.empty() ? nullptr : typed_col->null_map_arr.data();
 	                  },
 	                  [&](const up<FLSStrColumn>& fls_str_column) {
-		                  m_null_map = fls_str_column->null_map_arr.empty() ? zero_null_map
-		                                                                    : fls_str_column->null_map_arr.data();
+		                  m_null_map =
+		                      fls_str_column->null_map_arr.empty() ? nullptr : fls_str_column->null_map_arr.data();
 	                  },
 	                  [&](const std::monostate&) { FLS_UNREACHABLE() },
 	                  [&](const auto& arg) {
@@ -786,6 +811,10 @@ NullMapView::NullMapView(const col_pt& column) {
 const uint8_t* NullMapView::NullMap() const {
 	FLS_ASSERT_CORRECT_IDX(m_vec_idx)
 
+	static const uint8_t zero_null_vector[CFG::VEC_SZ] = {};
+	if (m_null_map == nullptr) {
+		return zero_null_vector;
+	}
 	return m_null_map + (m_vec_idx * CFG::VEC_SZ);
 }
 /*--------------------------------------------------------------------------------------------------------------------*\

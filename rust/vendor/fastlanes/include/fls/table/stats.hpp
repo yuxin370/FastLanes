@@ -37,7 +37,7 @@ public:
 	///!
 	PT max;
 	///!
-	PT last_seen_val;
+	PT last_seen_val {};
 	///!
 	n_t n_nulls;
 	///!

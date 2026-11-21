@@ -1,8 +1,16 @@
+# ────────────────────────────────────────────────────────
+# |                      FastLanes                       |
+# ────────────────────────────────────────────────────────
+# test/src/unit_tests/CMakeLists.txt
+# ────────────────────────────────────────────────────────
 add_executable(unit_test
+        buffer_test.cpp
         csv_parser_trailing_delimiter_test.cpp
         csv_reader_test.cpp
         double_test.cpp
         json_test.cpp
+        memory_table_test.cpp
+        parallel_encoder_test.cpp
         decimal_test.cpp
         parse_integer_test.cpp
         parse_timestamp_test.cpp
@@ -13,10 +21,13 @@ add_executable(unit_test
         validitymask.cpp
 )
 
+target_include_directories(unit_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../src")
+
 target_link_libraries(unit_test
         PRIVATE
         gtest_main     # GoogleTest’s main first
         FastLanes      # your library second
+        fls_alp_primitive  # exercises ALP scratch directly
         msvc_heap_guard
 )
 fls_msvc_test_setup(unit_test)

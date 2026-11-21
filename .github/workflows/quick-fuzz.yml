@@ -19,17 +19,20 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       # 1) Checkout the PR
       - uses: actions/checkout@v4
 
+      - name: Install LLVM
+        uses: ./.github/actions/install-llvm
+
       # 2) Tool-chain
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build jq python3
+          sudo apt-get install -y cmake ninja-build jq python3
 
       # 2½) Enforce base_seed was bumped by exactly +1 vs dev
       - name: Verify base_seed bump
@@ -42,6 +45,7 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DFLS_BUILD_TESTING=ON
 
@@ -51,6 +55,7 @@ jobs:
 
       # 5) Run Quick-Fuzz — job turns red if tests fail
       - name: Run Quick-Fuzz
+        id: fuzz
         env:
           CTEST_TEST_TIMEOUT: 0
         run: |
@@ -64,7 +69,7 @@ jobs:
       # 6) Upload artefacts *only* when Quick-Fuzz failed
       - name: Upload failure artefacts
         id: upload
-        if: failure()
+        if: failure() && steps.fuzz.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: quick-fuzz-failure-${{ github.run_id }}
@@ -75,6 +80,8 @@ jobs:
       # 7) Comment on the PR with deep link to the ZIP
       - name: Comment on failure
         if: failure() &&
+          steps.fuzz.outcome == 'failure' &&
+          steps.upload.outputs.artifact-id != '' &&
           github.event_name == 'pull_request' &&
           github.base_ref == 'dev'
         env:
