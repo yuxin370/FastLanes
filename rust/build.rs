@@ -45,7 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     /* ── 5. Link the static library ───────────────────────────────── */
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=FastLanes");
-    println!("cargo:rustc-link-lib=c++"); // libc++ on clang
 
     /* ── 6. Re-run triggers ───────────────────────────────────────── */
     println!("cargo:rerun-if-changed=vendor/fastlanes");
