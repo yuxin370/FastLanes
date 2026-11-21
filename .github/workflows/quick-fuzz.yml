@@ -19,17 +19,20 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
 
     steps:
       # 1) Checkout the PR
       - uses: actions/checkout@v4
 
+      - name: Install LLVM
+        uses: ./.github/actions/install-llvm
+
       # 2) Tool-chain
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build jq python3
+          sudo apt-get install -y cmake ninja-build jq python3
 
       # 2½) Enforce base_seed was bumped by exactly +1 vs dev
       - name: Verify base_seed bump
@@ -42,7 +45,7 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
-                -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DFLS_BUILD_TESTING=ON
 

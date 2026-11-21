@@ -9,31 +9,42 @@ description: Cross-platform LLVM installer for macOS, Ubuntu and Windows
 
 inputs:
   version:
-    description: "Exact LLVM/Clang version to install, e.g. 18.1.4 or 18"
-    default: "18.1.4"   # macOS & Linux are happy with 18.x; Windows auto-bumps if too old
+    description: "Latest stable LLVM release, or a release version (major or major.minor.patch)"
+    default: latest
 
 runs:
   using: "composite"
   steps:
     - shell: bash
+      env:
+        LLVM_REQUEST: ${{ inputs.version }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-        VERSION="${{ inputs.version }}"
+        VERSION="$LLVM_REQUEST"
+        if [[ "$VERSION" == latest ]]; then
+          tag=$(gh api repos/llvm/llvm-project/releases/latest --jq .tag_name)
+          VERSION="${tag#llvmorg-}"
+        elif [[ "$VERSION" =~ ^[0-9]+$ ]]; then
+          # Pick a stable patch release from the requested major.
+          tag=$(git ls-remote --tags --refs https://github.com/llvm/llvm-project.git "llvmorg-$VERSION.*" |
+            awk -F/ '$NF ~ /^llvmorg-[0-9]+\.[0-9]+\.[0-9]+$/ { print $NF }' | sort -V | tail -1)
+          VERSION="${tag#llvmorg-}"
+        fi
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::Could not resolve a stable LLVM release for $LLVM_REQUEST"
+          exit 1
+        fi
         MAJOR="${VERSION%%.*}"
+        echo "Installing LLVM $VERSION on $RUNNER_OS"
 
-        echo "🟣 Installing LLVM/Clang ${VERSION} on ${{ runner.os }}"
-
-        if [[ "${{ runner.os }}" == "macOS" ]]; then
-          # ── 1. Install LLVM (Homebrew) ────────────────────────────────────────
-          if brew info "llvm@${MAJOR}" > /dev/null 2>&1; then
-            brew install "llvm@${MAJOR}"
-            LLVM_PREFIX="$(brew --prefix "llvm@${MAJOR}")"
-          else
-            echo "::warning ::llvm@${MAJOR} formula not found – installing latest 'llvm' instead"
-            brew install llvm
-            LLVM_PREFIX="$(brew --prefix llvm)"
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          formula=llvm
+          if [[ "$LLVM_REQUEST" != latest ]] && brew info "llvm@${MAJOR}" >/dev/null 2>&1; then
+            formula="llvm@${MAJOR}"
           fi
-          echo "${LLVM_PREFIX}/bin" >> "$GITHUB_PATH"
+          brew install "$formula"
+          LLVM_BIN="$(brew --prefix "$formula")/bin"
 
           # ── 2. Reclaim disk space so large static libs fit ───────────────────
           echo "🧹 Freeing disk space on macOS runner …"
@@ -48,12 +59,12 @@ runs:
           rm -rf "$(brew --cache)" || true
           df -h
 
-        elif [[ "${{ runner.os }}" == "Linux" ]]; then
+        elif [[ "$RUNNER_OS" == Linux ]]; then
           # ── Ubuntu LTS ────────────────────────────────────────────────────────
           sudo apt-get update -y
           sudo apt-get install -y wget gnupg lsb-release software-properties-common
           wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | \
-            sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+            sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/llvm.gpg
 
           UBUNTU_CODENAME=$(lsb_release -cs)
           echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] \
@@ -62,24 +73,43 @@ runs:
             sudo tee /etc/apt/sources.list.d/llvm${MAJOR}.list
 
           sudo apt-get update -y
-          sudo apt-get install -y clang-${MAJOR} clang++-${MAJOR} clang-tidy-${MAJOR} lld-${MAJOR}
+          sudo apt-get install -y clang-${MAJOR} clang-tidy-${MAJOR} lld-${MAJOR} libclang-rt-${MAJOR}-dev
 
-          sudo update-alternatives --install /usr/bin/clang      clang      /usr/bin/clang-${MAJOR}       200
-          sudo update-alternatives --install /usr/bin/clang++    clang++    /usr/bin/clang++-${MAJOR}     200
-          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-${MAJOR}  200
+          LLVM_BIN="/usr/lib/llvm-${MAJOR}/bin"
 
-          echo "/usr/lib/llvm-${MAJOR}/bin" >> "$GITHUB_PATH"
-
-        elif [[ "${{ runner.os }}" == "Windows" ]]; then
-          # The MSVC STL on windows-latest requires Clang 22 or newer.
-          if [[ "${MAJOR}" -lt 22 ]]; then
-            VERSION="22.1.8"
-          fi
-          choco upgrade llvm --version="${VERSION}" -y --no-progress --allow-downgrade
-
-          # Add to PATH; quoting keeps the space intact
-          echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
-
+        elif [[ "$RUNNER_OS" == Windows ]]; then
+          case "$RUNNER_ARCH" in
+            X64)   arch=x86_64 ;;
+            ARM64) arch=aarch64 ;;
+            *) echo "::error::Unsupported Windows architecture $RUNNER_ARCH"; exit 1 ;;
+          esac
+          asset="clang+llvm-${VERSION}-${arch}-pc-windows-msvc.tar.xz"
+          tag="llvmorg-$VERSION"
+          dest="$(cygpath -u "$RUNNER_TEMP")/llvm-$VERSION"
+          mkdir -p "$dest"
+          gh release download "$tag" --repo llvm/llvm-project --pattern "$asset" --dir "$dest"
+          digest=$(gh api "repos/llvm/llvm-project/releases/tags/$tag" |
+            jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest | strings | select(startswith("sha256:"))')
+          (
+            cd "$dest"
+            echo "${digest#sha256:}  $asset" | sha256sum -c -
+            tar -xf "$asset" --strip-components=1
+            rm "$asset"
+          )
+          LLVM_BIN="$dest/bin"
         else
-          echo "::warning ::LLVM install not supported on ${{ runner.os }}"
+          echo "::error::Unsupported runner OS $RUNNER_OS"
+          exit 1
+        fi
+
+        actual=$("$LLVM_BIN/clang" -dumpversion)
+        if [[ ! "$LLVM_REQUEST" =~ ^[0-9]+$ && "$actual" != "$VERSION" ]] || [[ "${actual%%.*}" != "$MAJOR" ]]; then
+          echo "::error::Requested LLVM $LLVM_REQUEST ($VERSION), found $actual"
+          exit 1
+        fi
+        "$LLVM_BIN/clang" --version
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          cygpath -w "$LLVM_BIN" >> "$GITHUB_PATH"
+        else
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
         fi
