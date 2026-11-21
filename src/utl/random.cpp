@@ -5,7 +5,9 @@
 // ────────────────────────────────────────────────────────
 #include "fls/utl/random.hpp"
 #include "fls/common/alias.hpp"
+#include "fls/expression/data_type.hpp" // IWYU pragma: keep (explicit instantiations)
 #include "fls/std/vector.hpp"
+#include <cstdint> // IWYU pragma: keep (explicit instantiations)
 #include <random>
 
 namespace fastlanes {

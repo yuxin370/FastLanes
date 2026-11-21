@@ -7,7 +7,8 @@
 #include "fls/common/alias.hpp"
 #include "fls/common/assert.hpp"
 #include "fls/cor/lyt/buf.hpp"
-#include <cstddef> // for std::byte
+#include "fls/expression/data_type.hpp" // IWYU pragma: keep (explicit instantiations)
+#include <cstddef>                      // for std::byte
 #include <cstring>
 #include <span>
 #include <stdexcept>
